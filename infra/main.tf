@@ -1,0 +1,34 @@
+provider "aws" {
+  region  = var.aws_region
+  profile = var.aws_profile
+
+  default_tags {
+    tags = {
+      Project     = var.project_name
+      Environment = var.environment
+    }
+  }
+}
+
+locals {
+  bucket_prefix = replace(var.project_name, "_", "-")
+}
+
+module "storage" {
+  source = "./modules/storage"
+
+  bucket_names = {
+    landing   = "${local.bucket_prefix}-landing-${var.environment}-${var.run_id}"
+    warehouse = "${local.bucket_prefix}-warehouse-${var.environment}-${var.run_id}"
+  }
+}
+
+module "host" {
+  source = "./modules/host"
+
+  name          = "${var.project_name}_host_${var.environment}"
+  boundary_name = "${var.project_name}_role_boundary"
+  instance_type = var.host_instance_type
+  disk_gib      = var.host_disk_gib
+  bucket_arns   = module.storage.bucket_arns
+}

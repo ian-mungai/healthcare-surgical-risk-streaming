@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from infra.iam.scripts.render_policy import PolicyRenderError, load_documents, scope_problems
+from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
 from scripts.aws_cli import Aws, AwsError
 from scripts.project_config import ConfigurationError, load_configuration
 
@@ -41,8 +41,11 @@ class Names:
     def policy(self, service: str) -> str:
         return f"{self.project}_{service}_policy"
 
+    def boundary(self, kind: str) -> str:
+        return f"{self.project}_{kind}_boundary"
+
     def owns(self, policy_name: str) -> bool:
-        return policy_name.startswith(f"{self.project}_") and policy_name.endswith("_policy")
+        return policy_name.startswith(f"{self.project}_") and policy_name.endswith(("_policy", "_boundary"))
 
 
 @dataclass(frozen=True)
@@ -67,24 +70,33 @@ def canonical(document: Mapping[str, Any]) -> str:
 
 
 def plan_steps(
-    names: Names, documents: Mapping[str, Mapping[str, Any]], *, user_exists: bool, live: Mapping[str, Mapping[str, Any]], attached: set[str]
+    names: Names,
+    documents: Mapping[str, Mapping[str, Any]],
+    *,
+    unattached: frozenset[str] | set[str] = frozenset(),
+    user_exists: bool,
+    live: Mapping[str, Mapping[str, Any]],
+    attached: set[str],
 ) -> list[Step]:
-    """The steps that bring the user, its policies and its attachments to the rendered documents."""
+    """The steps that bring the user, its policies and its attachments to the documents, keyed by policy name.
+
+    A name in ``unattached`` is a permissions boundary: it is created and updated and never attached to the user.
+    """
     steps = [] if user_exists else [Step("create-user", names.user)]
-    for service in sorted(documents):
-        name = names.policy(service)
+    for name in sorted(documents):
         if name not in live:
             steps.append(Step("create-policy", name))
-        elif canonical(live[name]) != canonical(documents[service]):
+        elif canonical(live[name]) != canonical(documents[name]):
             steps.append(Step("update-policy", name))
-        if name not in attached:
+        if name not in unattached and name not in attached:
             steps.append(Step("attach-policy", name))
-    listed = {names.policy(service) for service in documents}
-    return steps + [Step("report-unlisted", name) for name in sorted(set(live) - listed)]
+        if name in unattached and name in attached:
+            steps.append(Step("report-attached-boundary", name))
+    return steps + [Step("report-unlisted", name) for name in sorted(set(live) - set(documents))]
 
 
 def confirmation_code(account: str, documents: Mapping[str, Mapping[str, Any]], steps: list[Step]) -> str:
-    content = [account, [[step.action, step.target] for step in steps], {service: canonical(document) for service, document in sorted(documents.items())}]
+    content = [account, [[step.action, step.target] for step in steps], {name: canonical(document) for name, document in sorted(documents.items())}]
     return hashlib.sha256(json.dumps(content).encode()).hexdigest()[:12]
 
 
@@ -106,7 +118,7 @@ def live_state(aws: Aws, names: Names, account: str) -> tuple[bool, dict[str, di
 
 
 def apply_step(aws: Aws, names: Names, account: str, documents: Mapping[str, Mapping[str, Any]], step: Step) -> None:
-    by_name = {names.policy(service): json.dumps(document) for service, document in documents.items()}
+    by_name = {name: json.dumps(document) for name, document in documents.items()}
     arn = policy_arn(account, step.target)
     if step.action == "create-user":
         tags = [f"Key=Project,Value={names.project}", f"Key=Environment,Value={names.environment}"]
@@ -129,8 +141,9 @@ def run(arguments: argparse.Namespace) -> int:
         raise ConfigurationError("the administrator profile must differ from the project profile")
     names = Names(configuration["PROJECT_NAME"], configuration["ENVIRONMENT"])
     account = configuration["AWS_ACCOUNT_ID"]
-    documents = load_documents(configuration)
-    problems = [f"{service}: {problem}" for service, document in documents.items() for problem in scope_problems(document)]
+    boundaries = {names.boundary(kind): document for kind, document in load_documents(configuration, BOUNDARY_DIRECTORY, suffix="_boundary").items()}
+    documents = {names.policy(service): document for service, document in load_documents(configuration).items()} | boundaries
+    problems = [f"{name}: {problem}" for name, document in documents.items() for problem in scope_problems(document)]
     if problems:
         raise PolicyRenderError("; ".join(problems))
     aws = Aws(arguments.admin_profile, configuration["AWS_REGION"])
@@ -138,16 +151,16 @@ def run(arguments: argparse.Namespace) -> int:
         raise ConfigurationError("the administrator profile is in a different account from AWS_ACCOUNT_ID")
     user_exists, live, attached = live_state(aws, names, account)
     if arguments.command == "export":
-        different = [name for service in sorted(documents) if canonical(live.get(name := names.policy(service), {})) != canonical(documents[service])]
+        different = [name for name in sorted(documents) if canonical(live.get(name, {})) != canonical(documents[name])]
         for name in different:
             sys.stdout.write(f"differs from its template or is missing: {name}\n")
         sys.stdout.write(f"{len(documents) - len(different)} of {len(documents)} live policies equal their templates\n")
         return 1 if different else 0
-    steps = plan_steps(names, documents, user_exists=user_exists, live=live, attached=attached)
+    steps = plan_steps(names, documents, unattached=set(boundaries), user_exists=user_exists, live=live, attached=attached)
     code = confirmation_code(account, documents, steps)
     for step in steps:
         sys.stdout.write(f"{step.action}: {step.target}\n")
-    changes = [step for step in steps if step.action != "report-unlisted"]
+    changes = [step for step in steps if not step.action.startswith("report-")]
     if not changes:
         sys.stdout.write("no change: the user, its policies and its attachments equal the templates\n")
         return 0

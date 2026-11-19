@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 POLICIES_DIRECTORY = Path(__file__).resolve().parents[1] / "policies"
+BOUNDARY_DIRECTORY = Path(__file__).resolve().parents[1] / "boundary"
 PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 PLACEHOLDER_NAMES = ("AWS_REGION", "AWS_ACCOUNT_ID", "PROJECT_NAME", "ENVIRONMENT", "BUCKET_PREFIX")
 TEMPLATE_PREFIX = "healthcare_surgical_risk_"
@@ -65,12 +66,12 @@ def scope_problems(document: Mapping[str, Any]) -> list[str]:
     return problems
 
 
-def load_documents(values: Mapping[str, str], directory: Path = POLICIES_DIRECTORY) -> dict[str, dict[str, Any]]:
-    """Render every ``*_policy.json`` template in the directory, keyed by its service."""
+def load_documents(values: Mapping[str, str], directory: Path = POLICIES_DIRECTORY, *, suffix: str = "_policy") -> dict[str, dict[str, Any]]:
+    """Render every template in the directory whose name ends with the suffix, keyed by the name between the project prefix and the suffix."""
     documents = {}
-    for path in sorted(directory.glob(f"{TEMPLATE_PREFIX}*_policy.json")):
+    for path in sorted(directory.glob(f"{TEMPLATE_PREFIX}*{suffix}.json")):
         try:
-            documents[path.stem.removeprefix(TEMPLATE_PREFIX).removesuffix("_policy")] = render_template(path.read_text(), values)
+            documents[path.stem.removeprefix(TEMPLATE_PREFIX).removesuffix(suffix)] = render_template(path.read_text(), values)
         except PolicyRenderError as error:
             raise PolicyRenderError(f"{path.name}: {error}") from None
     if not documents:

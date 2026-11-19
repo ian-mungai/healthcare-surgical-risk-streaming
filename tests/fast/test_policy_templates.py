@@ -10,7 +10,7 @@ import json
 import unittest
 
 from infra.iam.scripts.manage_policies import Names, Step, plan_steps
-from infra.iam.scripts.render_policy import POLICIES_DIRECTORY, PolicyRenderError, load_documents, render_template, scope_problems
+from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, POLICIES_DIRECTORY, PolicyRenderError, load_documents, render_template, scope_problems
 
 VALUES = {"AWS_REGION": "us-west-2", "AWS_ACCOUNT_ID": "1" * 12, "PROJECT_NAME": "example_project", "ENVIRONMENT": "dev", "BUCKET_PREFIX": "example-project"}
 STATEMENT = {"Sid": "ReadOffers", "Effect": "Allow", "Action": "ec2:DescribeInstanceTypeOfferings", "Resource": "*"}
@@ -31,8 +31,13 @@ class TemplateTest(unittest.TestCase):
                 self.assertEqual([], scope_problems(document))
                 self.assertNotIn("${", json.dumps(document))
 
+    def test_boundary_renders_within_its_scope(self) -> None:
+        boundaries = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")
+        self.assertEqual(["role"], sorted(boundaries))
+        self.assertEqual([], scope_problems(boundaries["role"]))
+
     def test_templates_hold_no_account_number(self) -> None:
-        for path in POLICIES_DIRECTORY.glob("*_policy.json"):
+        for path in [*POLICIES_DIRECTORY.glob("*.json"), *BOUNDARY_DIRECTORY.glob("*.json")]:
             with self.subTest(template=path.name):
                 self.assertNotRegex(path.read_text(), r"\d{12}")
 
@@ -67,7 +72,7 @@ class TemplateTest(unittest.TestCase):
 
 class PlanTest(unittest.TestCase):
     def test_new_account_plans_user_policy_and_attachment(self) -> None:
-        steps = plan_steps(NAMES, {"ec2": GOOD}, user_exists=False, live={}, attached=set())
+        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, user_exists=False, live={}, attached=set())
         self.assertEqual(
             [
                 Step("create-user", "example_project_dev"),
@@ -79,22 +84,48 @@ class PlanTest(unittest.TestCase):
 
     def test_changed_document_plans_one_update(self) -> None:
         live = {"example_project_ec2_policy": {"Version": "2012-10-17", "Statement": []}}
-        steps = plan_steps(NAMES, {"ec2": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy"})
+        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy"})
         self.assertEqual([Step("update-policy", "example_project_ec2_policy")], steps)
 
     def test_rerun_plans_nothing(self) -> None:
         live = {"example_project_ec2_policy": json.loads(json.dumps(GOOD))}
-        self.assertEqual([], plan_steps(NAMES, {"ec2": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy"}))
+        self.assertEqual([], plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy"}))
 
     def test_single_action_string_equals_one_item_list(self) -> None:
         listed = {"Version": "2012-10-17", "Statement": [STATEMENT | {"Action": ["ec2:DescribeInstanceTypeOfferings"]}]}
         self.assertEqual(
-            [], plan_steps(NAMES, {"ec2": GOOD}, user_exists=True, live={"example_project_ec2_policy": listed}, attached={"example_project_ec2_policy"})
+            [],
+            plan_steps(
+                NAMES,
+                {"example_project_ec2_policy": GOOD},
+                user_exists=True,
+                live={"example_project_ec2_policy": listed},
+                attached={"example_project_ec2_policy"},
+            ),
         )
+
+    def test_boundary_is_created_and_never_attached(self) -> None:
+        documents = {"example_project_ec2_policy": GOOD, "example_project_role_boundary": GOOD}
+        steps = plan_steps(NAMES, documents, unattached={"example_project_role_boundary"}, user_exists=True, live={}, attached=set())
+        expected = [
+            Step("create-policy", "example_project_ec2_policy"),
+            Step("attach-policy", "example_project_ec2_policy"),
+            Step("create-policy", "example_project_role_boundary"),
+        ]
+        self.assertEqual(expected, steps)
+
+    def test_attached_boundary_is_reported(self) -> None:
+        documents = {"example_project_role_boundary": GOOD}
+        steps = plan_steps(
+            NAMES, documents, unattached={"example_project_role_boundary"}, user_exists=True, live=documents, attached={"example_project_role_boundary"}
+        )
+        self.assertEqual([Step("report-attached-boundary", "example_project_role_boundary")], steps)
 
     def test_unlisted_live_policy_is_reported_not_removed(self) -> None:
         live = {"example_project_ec2_policy": GOOD, "example_project_old_policy": GOOD}
-        steps = plan_steps(NAMES, {"ec2": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy", "example_project_old_policy"})
+        steps = plan_steps(
+            NAMES, {"example_project_ec2_policy": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy", "example_project_old_policy"}
+        )
         self.assertEqual([Step("report-unlisted", "example_project_old_policy")], steps)
 
 

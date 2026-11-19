@@ -1,0 +1,100 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadProjectRolesAndProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetInstanceProfile",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRolePolicies"
+      ],
+      "Resource": [
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}_*",
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:instance-profile/${PROJECT_NAME}_*"
+      ]
+    },
+    {
+      "Sid": "CreateProjectRolesUnderTheBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}_*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}_role_boundary"
+        }
+      }
+    },
+    {
+      "Sid": "ChangeProjectRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:DeleteRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:UpdateRole"
+      ],
+      "Resource": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}_*"
+    },
+    {
+      "Sid": "ManageProjectInstanceProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AddRoleToInstanceProfile",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile"
+      ],
+      "Resource": "arn:aws:iam::${AWS_ACCOUNT_ID}:instance-profile/${PROJECT_NAME}_*"
+    },
+    {
+      "Sid": "PassProjectRolesToEc2Only",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}_*",
+      "Condition": {
+        "StringEqualsIfExists": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DenyBoundaryChange",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenySelfChange",
+      "Effect": "Deny",
+      "Action": [
+        "iam:AddUserToGroup",
+        "iam:AttachUserPolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:DeleteUserPolicy",
+        "iam:DetachUserPolicy",
+        "iam:PutUserPolicy",
+        "iam:SetDefaultPolicyVersion"
+      ],
+      "Resource": [
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:user/${PROJECT_NAME}_${ENVIRONMENT}",
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}_*"
+      ]
+    }
+  ]
+}

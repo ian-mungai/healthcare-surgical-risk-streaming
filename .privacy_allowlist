@@ -1,0 +1,2 @@
+# type path-glob -- reason
+aws-account infra/tests/*.tftest.hcl -- a made-up account number for the mock provider in plan tests

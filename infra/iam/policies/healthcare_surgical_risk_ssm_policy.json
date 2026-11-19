@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadUbuntuImageParameter",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:${AWS_REGION}::parameter/aws/service/canonical/ubuntu/server/*"
+    }
+  ]
+}
