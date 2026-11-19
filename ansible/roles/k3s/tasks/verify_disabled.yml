@@ -1,0 +1,17 @@
+# Reads k3s_node_arguments and k3s_objects, which the role registers from the running node.
+- name: Decode the arguments the running k3s started with
+  ansible.builtin.set_fact:
+    k3s_started_arguments: "{{ k3s_node_arguments.stdout | from_json }}"
+
+- name: List each name that follows a disable flag directly
+  ansible.builtin.set_fact:
+    k3s_disabled_names: "{{ k3s_started_arguments | zip(k3s_started_arguments[1:]) | selectattr('0', 'equalto', '--disable') | map(attribute='1') | list }}"
+
+- name: Confirm the ingress controller and the service load balancer are off and absent
+  ansible.builtin.assert:
+    that:
+      - "'traefik' in k3s_disabled_names"
+      - "'servicelb' in k3s_disabled_names"
+      - "'traefik' not in k3s_objects.stdout"
+      - "'svclb' not in k3s_objects.stdout"
+    fail_msg: k3s runs with its bundled ingress controller or service load balancer.
