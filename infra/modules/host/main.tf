@@ -134,6 +134,8 @@ resource "aws_security_group" "host" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
+    # The host reaches package mirrors, registries, Tailscale and AWS endpoints at changing addresses, and admits no inbound connection.
+    # trivy:ignore:AWS-0104
     cidr_blocks = ["0.0.0.0/0"]
   }
 }

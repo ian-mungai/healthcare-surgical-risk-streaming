@@ -1,4 +1,4 @@
-"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint and the tflint AWS ruleset, and the working-tree privacy hook.
+"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint, the tflint AWS ruleset and Trivy, and the working-tree privacy hook.
 
 Run from the repository root: ``.venv/bin/python -m scripts.quality.install_tools``. ``--check`` verifies each installed
 binary against its pinned archive without downloading or writing anything. Each archive is checked against its pinned
@@ -73,7 +73,18 @@ TFLINT_AWS = Tool(
         ("Linux", "x86_64"): ("tflint-ruleset-aws_linux_amd64.zip", "cdd433fdbc0929e7b9f9709dd9e72237fdfe1fc235674445c284b1e4b94a5c26"),
     },
 )
-TOOL_LIST = (GITLEAKS, TFLINT, TFLINT_AWS)
+TRIVY = Tool(
+    name="trivy",
+    version="0.76.2",
+    url="https://github.com/aquasecurity/trivy/releases/download/v0.76.2",
+    member="trivy",
+    target="bin/trivy",
+    assets={
+        ("Darwin", "arm64"): ("trivy_0.76.2_macOS-ARM64.tar.gz", "ae7ea358326960406b703c77b2ac490190797d80b306b5b50c2a27221da0a5b8"),
+        ("Linux", "x86_64"): ("trivy_0.76.2_Linux-64bit.tar.gz", "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"),
+    },
+)
+TOOL_LIST = (GITLEAKS, TFLINT, TFLINT_AWS, TRIVY)
 
 
 def pinned_asset(tool: Tool) -> tuple[str, str]:
