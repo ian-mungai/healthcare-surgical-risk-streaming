@@ -12,7 +12,14 @@ import unittest
 from infra.iam.scripts.manage_policies import Names, Step, plan_steps
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, POLICIES_DIRECTORY, PolicyRenderError, load_documents, render_template, scope_problems
 
-VALUES = {"AWS_REGION": "us-west-2", "AWS_ACCOUNT_ID": "1" * 12, "PROJECT_NAME": "example_project", "ENVIRONMENT": "dev", "BUCKET_PREFIX": "example-project"}
+VALUES = {
+    "AWS_REGION": "us-west-2",
+    "AWS_ACCOUNT_ID": "1" * 12,
+    "PROJECT_NAME": "example_project",
+    "ENVIRONMENT": "dev",
+    "BUCKET_PREFIX": "example-project",
+    "TAILSCALE_AUDIENCE": "example-audience",
+}
 STATEMENT = {"Sid": "ReadOffers", "Effect": "Allow", "Action": "ec2:DescribeInstanceTypeOfferings", "Resource": "*"}
 GOOD = {"Version": "2012-10-17", "Statement": [STATEMENT]}
 NAMES = Names("example_project", "dev")
@@ -35,6 +42,22 @@ class TemplateTest(unittest.TestCase):
         boundaries = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")
         self.assertEqual(["role"], sorted(boundaries))
         self.assertEqual([], scope_problems(boundaries["role"]))
+
+    def test_boundary_admits_one_audience_only_and_requires_it(self) -> None:
+        boundary = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        statement = next(item for item in boundary["Statement"] if item["Action"] == "sts:GetWebIdentityToken")
+        self.assertEqual(
+            {
+                "ForAllValues:StringEquals": {"sts:IdentityTokenAudience": "example-audience"},
+                "Null": {"sts:IdentityTokenAudience": "false"},
+                "NumericLessThanEquals": {"sts:DurationSeconds": "300"},
+            },
+            statement["Condition"],
+        )
+
+    def test_boundary_is_refused_without_the_audience(self) -> None:
+        with self.assertRaisesRegex(PolicyRenderError, "missing values for: TAILSCALE_AUDIENCE"):
+            load_documents(VALUES | {"TAILSCALE_AUDIENCE": ""}, BOUNDARY_DIRECTORY, suffix="_boundary")
 
     def test_templates_hold_no_account_number(self) -> None:
         for path in [*POLICIES_DIRECTORY.glob("*.json"), *BOUNDARY_DIRECTORY.glob("*.json")]:

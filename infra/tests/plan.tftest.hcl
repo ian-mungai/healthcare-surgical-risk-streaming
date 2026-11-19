@@ -142,11 +142,14 @@ run "host_joins_tailscale_without_a_stored_key" {
 
   assert {
     condition = alltrue([
-      strcontains(aws_iam_role_policy.host_tailscale.policy, "sts:GetWebIdentityToken"),
-      strcontains(aws_iam_role_policy.host_tailscale.policy, "\"sts:IdentityTokenAudience\":\"example-audience\""),
-      strcontains(aws_iam_role_policy.host_tailscale.policy, "\"sts:DurationSeconds\":\"300\""),
+      jsondecode(aws_iam_role_policy.host_tailscale.policy).Statement[0].Action == "sts:GetWebIdentityToken",
+      jsondecode(aws_iam_role_policy.host_tailscale.policy).Statement[0].Condition == {
+        "ForAllValues:StringEquals" = { "sts:IdentityTokenAudience" = "example-audience" }
+        Null                        = { "sts:IdentityTokenAudience" = "false" }
+        NumericLessThanEquals       = { "sts:DurationSeconds" = "300" }
+      },
     ])
-    error_message = "The host may request an identity token only for the Tailscale audience and for at most 300 seconds."
+    error_message = "The host may request an identity token only when every requested audience is the Tailscale audience, when an audience is given and for at most 300 seconds. ForAnyValue would admit a request that adds a second audience."
   }
 
   assert {

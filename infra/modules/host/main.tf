@@ -81,8 +81,9 @@ resource "aws_iam_role_policy" "host_tailscale" {
       Action   = "sts:GetWebIdentityToken"
       Resource = "*"
       Condition = {
-        "ForAnyValue:StringEquals" = { "sts:IdentityTokenAudience" = var.tailscale.audience }
-        NumericLessThanEquals      = { "sts:DurationSeconds" = "300" }
+        "ForAllValues:StringEquals" = { "sts:IdentityTokenAudience" = var.tailscale.audience }
+        Null                        = { "sts:IdentityTokenAudience" = "false" }
+        NumericLessThanEquals       = { "sts:DurationSeconds" = "300" }
       }
     }]
   })

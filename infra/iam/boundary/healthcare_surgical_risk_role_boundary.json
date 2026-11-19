@@ -41,6 +41,12 @@
       "Action": "sts:GetWebIdentityToken",
       "Resource": "*",
       "Condition": {
+        "ForAllValues:StringEquals": {
+          "sts:IdentityTokenAudience": "${TAILSCALE_AUDIENCE}"
+        },
+        "Null": {
+          "sts:IdentityTokenAudience": "false"
+        },
         "NumericLessThanEquals": {
           "sts:DurationSeconds": "300"
         }
