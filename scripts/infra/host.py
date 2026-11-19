@@ -41,6 +41,7 @@ SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
+WORKLOAD_GID_BASE = 20000
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
 
@@ -120,9 +121,22 @@ def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -
     return address
 
 
-def run_ansible(run_id: str, address: str) -> None:
+def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
+    """The Ansible variables for workload access: the region and each workload role, with a group ID fixed by name order."""
+    roles = state.get("values", {}).get("outputs", {}).get("workload_role_arns", {}).get("value", {})
+    workloads = [{"name": name, "role_arn": roles[name], "gid": WORKLOAD_GID_BASE + index} for index, name in enumerate(sorted(roles))]
+    return {"workload_access_region": region, "workload_access_workloads": workloads}
+
+
+def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
     environment = os.environ | {"ANSIBLE_CONFIG": "ansible.cfg", "PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
-    result = run_command(str(ROOT / ".venv" / "bin" / "ansible-playbook"), ["host.yml"], cwd=ROOT / "ansible", env=environment, timeout=ANSIBLE_TIMEOUT_SECONDS)
+    result = run_command(
+        str(ROOT / ".venv" / "bin" / "ansible-playbook"),
+        ["host.yml", "--extra-vars", json.dumps(variables)],
+        cwd=ROOT / "ansible",
+        env=environment,
+        timeout=ANSIBLE_TIMEOUT_SECONDS,
+    )
     recap = result.stdout[result.stdout.rfind("PLAY RECAP") :] if "PLAY RECAP" in result.stdout else result.stdout[-2000:]
     sys.stdout.write(recap)
     if result.returncode != 0:
@@ -143,8 +157,9 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         sys.stdout.write(f"run {run.run_id}: the host already exists and Terraform does not touch it; deploy to it with the deploy workflow\n")
         write_inventory(binding)
         return 0
-    address = wait_until_reachable(aws, run.run_id, instance_id(state_json(run, configuration)), host_name)
-    run_ansible(run.run_id, address)
+    state = state_json(run, configuration)
+    address = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
+    run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]))
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host is up at {address} and its inventory is written\n")
     return 0

@@ -15,3 +15,4 @@
   roles:
     - docker
     - k3s
+    - workload_access

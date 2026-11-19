@@ -45,6 +45,12 @@
           "sts:DurationSeconds": "300"
         }
       }
+    },
+    {
+      "Sid": "AssumeProjectWorkloadRoles",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}_workload_*"
     }
   ]
 }

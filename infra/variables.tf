@@ -97,6 +97,18 @@ variable "provision_host" {
   default     = true
 }
 
+variable "workloads" {
+  description = "Workloads that get their own role, each with the statements of its permissions policy."
+  type = map(object({
+    statements = list(object({
+      sid       = string
+      actions   = list(string)
+      resources = list(string)
+    }))
+  }))
+  default = {}
+}
+
 variable "host_instance_type" {
   description = "EC2 instance type of the host."
   type        = string

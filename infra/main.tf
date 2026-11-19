@@ -33,6 +33,8 @@ module "host" {
   disk_gib      = var.host_disk_gib
   bucket_arns   = module.storage.bucket_arns
 
+  workload_role_pattern = "${var.project_name}_workload_*"
+
   tailscale = {
     client_id = var.tailscale_client_id
     audience  = var.tailscale_audience
@@ -49,4 +51,15 @@ module "deploy" {
   boundary_name      = "${var.project_name}_role_boundary"
   github_repository  = var.github_repository
   github_environment = var.github_environment
+}
+
+module "workload_roles" {
+  source = "./modules/workload_roles"
+  count  = var.provision_host ? 1 : 0
+
+  name_prefix   = "${var.project_name}_workload"
+  environment   = var.environment
+  boundary_name = "${var.project_name}_role_boundary"
+  host_role_arn = module.host[0].role_arn
+  workloads     = var.workloads
 }

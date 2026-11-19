@@ -29,6 +29,11 @@ variable "tailscale" {
   })
 }
 
+variable "workload_role_pattern" {
+  description = "Name pattern of the workload roles the host may assume."
+  type        = string
+}
+
 variable "bucket_arns" {
   description = "ARN of each project bucket the host may read and write."
   type        = map(string)

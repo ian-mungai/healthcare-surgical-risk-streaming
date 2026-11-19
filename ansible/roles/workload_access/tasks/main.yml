@@ -1,0 +1,102 @@
+# A workload reads its credentials by mounting /run/workload_access/<name> read-only and naming the file in its AWS
+# configuration: credential_process = cat <mount>/credentials.json. The AWS SDK then reads the renewed file by itself.
+- name: Create one group for each workload
+  ansible.builtin.group:
+    name: "workload_{{ item.name }}"
+    gid: "{{ item.gid }}"
+    state: present
+  loop: "{{ workload_access_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create the workload access configuration folder
+  ansible.builtin.file:
+    path: /etc/workload_access
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: List the workloads and their roles for the credential helper
+  ansible.builtin.copy:
+    dest: /etc/workload_access/workloads.json
+    content: "{{ {'region': workload_access_region, 'workloads': workload_access_workloads} | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Install the credential helper
+  ansible.builtin.copy:
+    src: workload_credentials.py
+    dest: /usr/local/sbin/workload_credentials
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install the credential helper's service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/workload-credentials.service
+    content: |
+      [Unit]
+      Description=Renew each workload's short-lived AWS credentials
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/python3 /usr/local/sbin/workload_credentials
+      TimeoutStartSec=120
+    owner: root
+    group: root
+    mode: "0644"
+  register: workload_access_service
+
+- name: Install the credential helper's timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/workload-credentials.timer
+    content: |
+      [Unit]
+      Description=Renew workload credentials before they expire
+
+      [Timer]
+      OnBootSec=30s
+      OnUnitActiveSec=10min
+      AccuracySec=30s
+
+      [Install]
+      WantedBy=timers.target
+    owner: root
+    group: root
+    mode: "0644"
+  register: workload_access_timer
+
+- name: Start the timer now and at boot
+  ansible.builtin.systemd_service:
+    name: workload-credentials.timer
+    state: started
+    enabled: true
+    daemon_reload: "{{ workload_access_service is changed or workload_access_timer is changed }}"
+
+- name: Renew any credentials that are due
+  ansible.builtin.command:
+    cmd: systemctl start workload-credentials.service
+  changed_when: false
+
+- name: Read each workload's credential file
+  ansible.builtin.stat:
+    path: "/run/workload_access/{{ item.name }}/credentials.json"
+  register: workload_access_files
+  loop: "{{ workload_access_workloads }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Confirm each workload has credentials that only its group can read
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.mode == '0640'
+      - item.stat.gid == item.item.gid
+    fail_msg: "The credential file of {{ item.item.name }} is missing or has the wrong group or mode."
+  loop: "{{ workload_access_files.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"

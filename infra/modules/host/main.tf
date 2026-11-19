@@ -88,6 +88,21 @@ resource "aws_iam_role_policy" "host_tailscale" {
   })
 }
 
+resource "aws_iam_role_policy" "host_workloads" {
+  name = "workload_roles"
+  role = aws_iam_role.host.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AssumeProjectWorkloadRoles"
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.workload_role_pattern}"
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "host" {
   name = var.name
   role = aws_iam_role.host.name

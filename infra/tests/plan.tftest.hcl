@@ -62,6 +62,8 @@ run "host_matches_the_design" {
     disk_gib      = 200
     bucket_arns   = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
 
+    workload_role_pattern = "example_project_workload_*"
+
     tailscale = {
       client_id = "example-client-id"
       audience  = "example-audience"
@@ -126,6 +128,8 @@ run "host_joins_tailscale_without_a_stored_key" {
     instance_type = "m6a.2xlarge"
     disk_gib      = 200
     bucket_arns   = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+
+    workload_role_pattern = "example_project_workload_*"
 
     tailscale = {
       client_id = "example-client-id"
@@ -213,6 +217,73 @@ run "given_host_is_not_provisioned" {
   assert {
     condition     = length(output.bucket_names) == 2
     error_message = "The project buckets are planned for a host that already exists too."
+  }
+}
+
+run "each_workload_gets_its_own_role" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    workloads = {
+      reader = { statements = [{ sid = "ReadLanding", actions = ["s3:GetObject"], resources = ["arn:aws:s3:::example-landing/*"] }] }
+      writer = { statements = [{ sid = "WriteWarehouse", actions = ["s3:PutObject"], resources = ["arn:aws:s3:::example-warehouse/*"] }] }
+    }
+  }
+
+  assert {
+    condition     = { for name, role in aws_iam_role.workload : name => role.name } == { reader = "example_project_workload_reader_dev", writer = "example_project_workload_writer_dev" }
+    error_message = "Each workload has its own role, named for the project, the workload and the environment."
+  }
+
+  assert {
+    condition = alltrue([
+      for role in aws_iam_role.workload :
+      jsondecode(role.assume_role_policy).Statement[0].Principal == { AWS = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev" } && endswith(role.permissions_boundary, ":policy/example_project_role_boundary")
+    ])
+    error_message = "Only the host role may assume a workload role, and each workload role carries the permissions boundary."
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.workload["reader"].policy, "example-landing") && !strcontains(aws_iam_role_policy.workload["reader"].policy, "example-warehouse")
+    error_message = "A workload's policy holds its own statements only."
+  }
+}
+
+run "host_may_assume_only_workload_roles" {
+  command = plan
+
+  module {
+    source = "./modules/host"
+  }
+
+  variables {
+    name                  = "example_project_host_dev"
+    boundary_name         = "example_project_role_boundary"
+    instance_type         = "m6a.2xlarge"
+    disk_gib              = 200
+    bucket_arns           = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+    workload_role_pattern = "example_project_workload_*"
+
+    tailscale = {
+      client_id = "example-client-id"
+      audience  = "example-audience"
+      tag       = "tag:example-host"
+      host_name = "platform-dev"
+      version   = "1.104.7"
+    }
+  }
+
+  assert {
+    condition     = jsondecode(aws_iam_role_policy.host_workloads.policy).Statement[0].Action == "sts:AssumeRole" && endswith(jsondecode(aws_iam_role_policy.host_workloads.policy).Statement[0].Resource, ":role/example_project_workload_*")
+    error_message = "The host role may assume the project's workload roles and no other role."
   }
 }
 

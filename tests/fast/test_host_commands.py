@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.infra.host import HostError, instance_id, select_peer
+from scripts.infra.host import HostError, instance_id, select_peer, workload_variables
 from scripts.infra.inventory import inventory_entries
 
 
@@ -71,6 +71,16 @@ STATE = {
         }
     }
 }
+
+
+class WorkloadVariablesTest(unittest.TestCase):
+    def test_each_workload_role_gets_a_group_id_fixed_by_name_order(self) -> None:
+        state = {"values": {"outputs": {"workload_role_arns": {"value": {"writer": "arn:writer", "reader": "arn:reader"}}}}}
+        expected = [{"name": "reader", "role_arn": "arn:reader", "gid": 20000}, {"name": "writer", "role_arn": "arn:writer", "gid": 20001}]
+        self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": expected}, workload_variables(state, "us-west-2"))
+
+    def test_state_without_workloads_gives_an_empty_list(self) -> None:
+        self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": []}, workload_variables({"values": {}}, "us-west-2"))
 
 
 class InventoryTest(unittest.TestCase):

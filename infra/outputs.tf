@@ -27,3 +27,8 @@ output "deploy_role_arn" {
   description = "ARN of the role the protected deploy workflow assumes."
   value       = module.deploy.role_arn
 }
+
+output "workload_role_arns" {
+  description = "ARN of each workload's role, by workload name. Empty for a host that already exists."
+  value       = try(module.workload_roles[0].role_arns, {})
+}
