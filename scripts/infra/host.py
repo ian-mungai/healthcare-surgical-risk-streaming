@@ -131,7 +131,9 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
 
 
 def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
-    environment = os.environ | {"ANSIBLE_CONFIG": "ansible.cfg", "PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
+    home = ROOT / ".tools" / "ansible"
+    settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
+    environment = os.environ | settings | {"PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
     result = run_command(
         str(ROOT / ".venv" / "bin" / "ansible-playbook"),
         ["host.yml", "--extra-vars", json.dumps(variables)],
