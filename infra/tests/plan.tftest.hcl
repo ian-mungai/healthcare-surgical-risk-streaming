@@ -183,15 +183,11 @@ run "deploy_role_trusts_only_the_protected_workflow" {
   assert {
     condition = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Condition == {
       StringEquals = {
-        "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
-        "token.actions.githubusercontent.com:sub"              = "repo:example-owner/example-repository:environment:deploy"
-        "token.actions.githubusercontent.com:repository"       = "example-owner/example-repository"
-        "token.actions.githubusercontent.com:ref"              = "refs/heads/main"
-        "token.actions.githubusercontent.com:environment"      = "deploy"
-        "token.actions.githubusercontent.com:job_workflow_ref" = "example-owner/example-repository/.github/workflows/deploy.yml@refs/heads/main"
+        "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+        "token.actions.githubusercontent.com:sub" = "repo:example-owner/example-repository:environment:deploy:ref:refs/heads/main:workflow_ref:example-owner/example-repository/.github/workflows/deploy.yml@refs/heads/main"
       }
     }
-    error_message = "The trust policy requires the repository, the main branch, the protected environment and the exact workflow, each as an exact string."
+    error_message = "AWS maps only the audience and the subject of a GitHub token, so the trust policy matches the audience and one exact customized subject that carries the repository, the environment, the branch and the workflow file."
   }
 
   assert {
