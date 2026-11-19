@@ -5,6 +5,10 @@ and applies a deadline. The program runs in its own process group. On every exit
 ``TimeoutExpired``, an interrupt or any other error, the whole group is killed and the call waits until the group is gone.
 A process that survives the kill raises ``ProcessGroupSurvived``. A descendant that starts a session of its own leaves the
 group and is outside this cleanup. Other modules import ``run_command`` instead of ``subprocess``.
+
+Output is text with every line ending converted to a newline. A call with ``keep_newlines`` gets its output exactly as the program wrote
+it: carriage returns stay, and a byte that is not UTF-8 comes back as the surrogate that ``os.fsencode`` turns into the same byte.
+That form is for the NUL-separated file names of Git, where a carriage return is part of a name.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
+from typing import Any
 
 __all__ = ["CompletedProcess", "ProcessGroupSurvived", "TimeoutExpired", "run_command"]
 
@@ -29,7 +34,7 @@ class ProcessGroupSurvived(RuntimeError):
     """A process of the program's group was still running after SIGKILL and the wait."""
 
 
-def stop_group(process: subprocess.Popen[str]) -> None:
+def stop_group(process: subprocess.Popen[Any]) -> None:
     """Kill the program's process group, reap the program and wait until no process of the group is left."""
     group = process.pid
     with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -74,18 +79,25 @@ def run_command(
     env: Mapping[str, str] | None = None,
     input_text: str | None = None,
     check: bool = False,
+    keep_newlines: bool = False,
 ) -> CompletedProcess[str]:
     """Run ``program`` with ``args`` and return its exit code and captured output.
 
-    ``timeout`` is the deadline in seconds. ``check`` raises ``CalledProcessError`` on a non-zero exit.
+    ``timeout`` is the deadline in seconds. ``check`` raises ``CalledProcessError`` on a non-zero exit. ``keep_newlines`` returns the output
+    without newline conversion.
     """
     command = [resolve(program, cwd, env), *args]
     stdin = subprocess.PIPE if input_text is not None else subprocess.DEVNULL
-    process = subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env, start_new_session=True)  # noqa: S603 - the sole launcher: full path, list arguments, no shell, closed stdin and a deadline
+    process = subprocess.Popen(  # noqa: S603 - the sole launcher: full path, list arguments, no shell, closed stdin and a deadline
+        command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=not keep_newlines, cwd=cwd, env=env, start_new_session=True
+    )
     try:
-        stdout, stderr = process.communicate(input_text, timeout=timeout)
+        stdin_data = input_text if input_text is None or not keep_newlines else os.fsencode(input_text)
+        stdout, stderr = process.communicate(stdin_data, timeout=timeout)
     finally:
         stop_group(process)
+    if keep_newlines:
+        stdout, stderr = os.fsdecode(stdout), os.fsdecode(stderr)
     if check and process.returncode != 0:
         raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
     return CompletedProcess(command, process.returncode, stdout, stderr)

@@ -36,6 +36,7 @@ FAILED_HOOK = re.compile(r"\.Failed\n- hook id: (\S+)")
 GOOD_MESSAGE = "docs: add a planted note"
 TRACKED_NOTE = "notes/tracked.txt"
 QUOTED_NOTE = "notes/caf\u00e9.txt"
+CARRIAGE_NOTE = "notes/line\rbreak.txt"
 WORKTREE_GUARD = "working-tree privacy hook"
 CLEAN_PYTHON = "def double(value: int) -> int:\n    return value * 2\n"
 
@@ -102,6 +103,13 @@ def planted_cases() -> list[Case]:
             f"{QUOTED_NOTE}:1: {account}",
             Change({QUOTED_NOTE: clean_role}, (QUOTED_NOTE,)),
             Change({QUOTED_NOTE: marker_role}, (QUOTED_NOTE,)),
+        ),
+        hook_case(
+            "privacy marker in a file whose name holds a carriage return",
+            "privacy-scan",
+            f"notes/line\\rbreak.txt:1: {account}",
+            Change({CARRIAGE_NOTE: clean_role}, (CARRIAGE_NOTE,)),
+            Change({CARRIAGE_NOTE: marker_role}, (CARRIAGE_NOTE,)),
         ),
         hook_case(
             "secret-like string in a staged file",

@@ -68,21 +68,22 @@ class Finding:
     fix: str
 
 
-def git(*args: str, cwd: Path | None = None) -> str:
+def git(*args: str, cwd: Path | None = None, keep_newlines: bool = False) -> str:
     """Run Git. A call that names a repository by ``cwd`` ignores the caller's Git environment, such as ``GIT_DIR`` inside a hook."""
     env = None if cwd is None else {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
-    return run_command("git", args, cwd=cwd, env=env, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout
+    return run_command("git", args, cwd=cwd, env=env, timeout=GIT_TIMEOUT_SECONDS, check=True, keep_newlines=keep_newlines).stdout
 
 
 def visible_files(cwd: Path | None = None) -> list[str]:
     """List every path that Git does not ignore, tracked or not, as NUL-delimited names so that no name is quoted."""
-    listed = git("ls-files", "-z", "--cached", "--others", "--exclude-standard", cwd=cwd)
+    listed = git("ls-files", "-z", "--cached", "--others", "--exclude-standard", cwd=cwd, keep_newlines=True)
     return sorted(set(listed.split("\0")) - {""})
 
 
 def report(findings: list[Finding]) -> int:
     for finding in findings:
-        sys.stderr.write(f"{finding.location}: {finding.problem}\n  rule: {finding.rule}\n  fix: {finding.fix}\n  {ASK}\n")
+        location = finding.location.replace("\r", "\\r").replace("\n", "\\n")
+        sys.stderr.write(f"{location}: {finding.problem}\n  rule: {finding.rule}\n  fix: {finding.fix}\n  {ASK}\n")
     return 1 if findings else 0
 
 

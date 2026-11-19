@@ -5,7 +5,7 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` makes the real commits. 
 - A planted fault passes because its hook crashed with another message, since only the hook id and the exit code were read.
 - A timeout, an OS error or an interrupt before or inside the protected run leaves no record, or leaves the scratch folder.
 - Two runs or two shards that start in the same second write into one record folder.
-- The source list reads a path that Git quotes as a missing file and drops it from the copy.
+- The source list reads a path that Git quotes, or one that holds a carriage return, as a missing file and drops it from the copy.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ class RecordFolderTest(unittest.TestCase):
 
 class SourceListTest(TemporaryRepository):
     def test_a_path_that_git_quotes_is_listed(self) -> None:
-        names = ["café.txt", "tab\tname.txt", "plain.txt"]
+        names = ["café.txt", "tab\tname.txt", "carriage\rreturn.txt", "plain.txt"]
         for name in names:
             (self.repo / name).write_text("note\n")
         self.git("add", "--", names[0])

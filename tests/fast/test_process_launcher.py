@@ -10,6 +10,7 @@ Each case runs a real shell that starts a ``sleep`` of its own and records both 
 - A process that survives the kill is reported as a failure and not as success. SIGKILL cannot be survived by a real process
   here, so that one case replaces the group check with a stub.
 - The result of a normal run and the ``check`` error are unchanged.
+- Output that is asked for byte for byte comes back with its carriage returns and bytes that are not UTF-8, so a Git listing keeps each file name.
 """
 
 from __future__ import annotations
@@ -128,6 +129,19 @@ class LauncherTest(unittest.TestCase):
         with self.assertRaises(CalledProcessError) as caught:
             run_command("sh", ["-c", "exit 4"], timeout=10, check=True)
         self.assertEqual(4, caught.exception.returncode)
+
+    def test_output_is_converted_to_newlines_by_default(self) -> None:
+        result = run_command("printf", ["a\\rb\\r\\nc"], timeout=10)
+        self.assertEqual("a\nb\nc", result.stdout)
+
+    def test_output_kept_exact_has_its_carriage_returns_and_undecodable_bytes(self) -> None:
+        result = run_command("sh", ["-c", "printf 'a\\rb\\r\\nc\\377'; printf 'e\\rf' >&2"], timeout=10, keep_newlines=True)
+        self.assertEqual(b"a\rb\r\nc\xff", os.fsencode(result.stdout))
+        self.assertEqual("e\rf", result.stderr)
+
+    def test_input_still_reaches_a_program_whose_output_is_kept_exact(self) -> None:
+        result = run_command("cat", [], timeout=10, input_text="x\ry\n", keep_newlines=True)
+        self.assertEqual("x\ry\n", result.stdout)
 
 
 if __name__ == "__main__":

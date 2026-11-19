@@ -4,6 +4,7 @@ Each case runs ``python -m scripts.quality.repo_checks`` the way a hook or CI ru
 which the planted-fault run in ``tests/e2e/commit_guards.py`` reaches cheaply:
 
 - A path that Git quotes in its default listing (a non-ASCII name or a control character) is skipped by the privacy scan.
+- A path with a carriage return is read as another name, so the privacy scan skips it, or the report of a finding breaks its own line.
 - The ``Generated-with`` trailer is accepted in the commit-msg entry or in the commit-range entry that CI uses.
 - A factual tool mention in the same trailer form is refused (too wide a rule).
 """
@@ -18,6 +19,8 @@ from tests.fast.git_fixture import TemporaryRepository
 EMAIL = "person@" + "mail.io"
 CREDIT = "assistant credit in commit message"
 QUOTED_NAMES = ["café.txt", "tab\tname.txt"]
+CARRIAGE_NAME = "carriage\rreturn.txt"
+ACCOUNT_LINE = "role: arn:aws:iam::" + "1" * 12 + ":role/example\n"
 
 
 class PrivacyScanPathTest(TemporaryRepository):
@@ -36,6 +39,31 @@ class PrivacyScanPathTest(TemporaryRepository):
     def test_clean_quoted_paths_pass(self) -> None:
         for name in QUOTED_NAMES:
             (self.repo / name).write_text("contact: person@example.com\n")
+        self.git("add", "--all")
+        result = self.check("privacy-scan", "--all")
+        self.assertEqual(0, result.returncode, result.stderr)
+
+
+class CarriageReturnPathTest(TemporaryRepository):
+    def test_a_file_whose_name_holds_a_carriage_return_is_scanned_under_its_own_name(self) -> None:
+        (self.repo / f"untracked_{CARRIAGE_NAME}").write_text(ACCOUNT_LINE)
+        (self.repo / f"tracked_{CARRIAGE_NAME}").write_text(ACCOUNT_LINE)
+        self.git("add", "--", f"tracked_{CARRIAGE_NAME}")
+        result = self.check("privacy-scan", "--all")
+        self.assertEqual(1, result.returncode, result.stderr)
+        for prefix in ("tracked_", "untracked_"):
+            with self.subTest(prefix=prefix):
+                self.assertIn(f"{prefix}carriage\\rreturn.txt:1: AWS account ID", result.stderr)
+        self.assertNotIn("\r", result.stderr)
+
+    def test_a_file_whose_name_holds_a_line_feed_is_reported_on_one_line(self) -> None:
+        (self.repo / "line\nfeed.txt").write_text(ACCOUNT_LINE)
+        result = self.check("privacy-scan", "--all")
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertIn("line\\nfeed.txt:1: AWS account ID", result.stderr)
+
+    def test_a_clean_file_with_that_name_passes(self) -> None:
+        (self.repo / CARRIAGE_NAME).write_text("role: arn:aws:iam::<ACCOUNT_ID>:role/example\n")
         self.git("add", "--all")
         result = self.check("privacy-scan", "--all")
         self.assertEqual(0, result.returncode, result.stderr)
