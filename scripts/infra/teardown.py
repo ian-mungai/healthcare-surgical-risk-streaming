@@ -13,7 +13,8 @@ marker in the bucket, the data apart from this run's Terraform state. It prints 
 4. Every data entry in the bucket must match an approved key and version ID.
 5. Every entry at this run's state keys must match an approved key and version ID.
 
-It then deletes the approved data entries by key and version ID, applies the exact plan bytes it checked, and
+It then deletes the approved data entries by key and version ID, logs the host out of Tailscale and waits until its
+device has left the network, applies the exact plan bytes it checked, and
 accepts a new entry in the bucket only when its content shows the destroy of this state wrote it. It deletes the
 approved and recorded state entries, removes the empty bucket last when this run created it, keeps a bucket this
 run did not create, and checks each removal through its service; a resource with no check is verified only through
@@ -36,7 +37,8 @@ from typing import Any
 from scripts.aws_cli import Aws, AwsError
 from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
 from scripts.evidence.receipt import receipt_problems, signature_is_valid, trusted_signers
-from scripts.infra.created import BUCKET_ADDRESS
+from scripts.infra import host
+from scripts.infra.created import BUCKET_ADDRESS, DEVICE_TYPE
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding
 from scripts.infra.terraform_wrapper import (
     APPLY_TIMEOUT_SECONDS,
@@ -54,7 +56,7 @@ from scripts.project_config import ROOT, ConfigurationError, load_configuration
 GONE_DEADLINE_SECONDS = 120
 GONE_POLL_SECONDS = 5
 CHECK_TIMEOUT_SECONDS = 30
-STAGES = ("purge", "apply", "state", "checks")
+STAGES = ("purge", "release", "apply", "state", "checks")
 PARENT_TYPES = {"aws_iam_role_policy": "aws_iam_role"}
 DESTROYED = re.compile(r"Resources: \d+ added, \d+ changed, (\d+) destroyed")
 Target = tuple[str, str, str]
@@ -293,6 +295,14 @@ def clean_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: P
     return "none: no resource is retained"
 
 
+def device_check(entry: dict[str, str], status: Callable[[], dict[str, Any]]) -> str:
+    """What the Tailscale network reports for the host's device: neither the recorded device nor a tagged device with the host's name may remain."""
+    try:
+        return "gone" if host.device_gone(status(), entry["host_name"], entry["service_id"]) else "still exists"
+    except host.HostError:
+        return "unverified: the Tailscale network could not be read"
+
+
 def removal_check(aws: Aws, entry: dict[str, str]) -> str | None:
     """What the service reports for one inventory entry after the teardown, or None for a type with no service check of its own."""
     kind, identifier = entry["type"], entry["service_id"]
@@ -304,6 +314,8 @@ def removal_check(aws: Aws, entry: dict[str, str]) -> str | None:
         "aws_ebs_volume": (["ec2", "describe-volumes", "--volume-ids", identifier], ("InvalidVolume.NotFound",)),
         "aws_network_interface": (["ec2", "describe-network-interfaces", "--network-interface-ids", identifier], ("InvalidNetworkInterfaceID.NotFound",)),
     }
+    if kind == DEVICE_TYPE:
+        return device_check(entry, lambda: host.tailscale_status(CHECK_TIMEOUT_SECONDS))
     if kind == "aws_instance":
         query = ["ec2", "describe-instances", "--instance-ids", identifier, "--query", "Reservations[].Instances[].State.Name"]
         state = aws.call(*query, missing=("InvalidInstanceID.NotFound",), timeout=CHECK_TIMEOUT_SECONDS)
@@ -370,6 +382,10 @@ def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
             if "purge" in left:
                 purge(aws, run.bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == run.bucket])
                 finish_stage(removal, "purge")
+            if "release" in left:
+                for device in (entry for entry in inventory if entry["type"] == DEVICE_TYPE):
+                    host.release_tailscale_device(run.run_id, device["host_name"], device["service_id"])
+                finish_stage(removal, "release")
             output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
             save_raw(run.run_id, "destroy_apply.txt", output)
             destroyed = DESTROYED.search(output)
@@ -409,7 +425,7 @@ def main() -> int:
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         run = load_run(arguments.binding)
         return plan_teardown(aws, configuration, run) if arguments.command == "plan" else destroy(aws, run, arguments.confirm)
-    except (ConfigurationError, WrapperError, TeardownRefused, AwsError) as error:
+    except (ConfigurationError, WrapperError, TeardownRefused, AwsError, host.HostError) as error:
         sys.stderr.write(f"{error}\n")
         return 1
 

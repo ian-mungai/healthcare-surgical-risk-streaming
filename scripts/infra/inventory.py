@@ -6,7 +6,7 @@ Run from the repository root under the project profile in ``.env``:
 
 It reads the run's Terraform state from its bound backend and writes ``runs/<RUN_ID>/inventory.json``: one entry for
 each resource that an applied plan of this run created, with its address, type and service ID, one for the project's bucket
-when this run created it, the managed resources this run did not create and the items the owner authorized to retain.
+when this run created it, one for the host's Tailscale device, the managed resources this run did not create and the items the owner authorized to retain.
 Resources without tags are listed like any other, because the list comes from the creation record and the state.
 """
 
@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from scripts.infra.created import run_inventory
+from scripts.infra.created import DEVICE_FILE, device_entries, run_inventory
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
@@ -33,6 +33,8 @@ def write_inventory(binding: Path) -> Path:
     created_file = folder / "created.json"
     recorded = json.loads(created_file.read_text()) if created_file.is_file() else []
     created, not_created = run_inventory(recorded, state_json(run, configuration), run)
+    device_file = folder / DEVICE_FILE
+    created += device_entries(created, json.loads(device_file.read_text()) if device_file.is_file() else None)
     inventory = {
         "run_id": run.run_id,
         "commit": run.commit,

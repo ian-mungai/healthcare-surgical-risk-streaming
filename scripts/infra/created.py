@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 BUCKET_ADDRESS = "project bucket"
+DEVICE_FILE = "tailscale_device.json"
+DEVICE_TYPE = "tailscale_device"
 HOST_PARTS = (("root volume", "aws_ebs_volume"), ("network interface", "aws_network_interface"))
 
 
@@ -62,3 +64,10 @@ def run_inventory(recorded: list[dict[str, str]], state: dict[str, Any], run: An
     if run.bucket_creation == "created":
         kept.append(entry(BUCKET_ADDRESS, "aws_s3_bucket", run.bucket))
     return kept, sorted(not_created, key=lambda found: found["address"])
+
+
+def device_entries(created: list[dict[str, str]], device: dict[str, str] | None) -> list[dict[str, str]]:
+    """The entry for the host's Tailscale device, when one is recorded and this run created the host."""
+    if device is None or not any(found["type"] == "aws_instance" for found in created):
+        return []
+    return [entry("tailscale device", DEVICE_TYPE, device["device_id"]) | {"host_name": device["host_name"]}]

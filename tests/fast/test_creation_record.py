@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.infra.created import created_entries, merge_created, run_inventory
+from scripts.infra.created import created_entries, device_entries, merge_created, run_inventory
 from scripts.infra.state_bootstrap import RunBinding, adoption_problem, short_lived_bucket_name, state_keys
 from scripts.project_config import ConfigurationError
 
@@ -65,6 +65,18 @@ class CreatedRecordTest(unittest.TestCase):
         gone = {"address": "module.old.aws_s3_bucket.gone", "type": "aws_s3_bucket", "service_id": "example-gone"}
         created, _ = run_inventory([gone, LANDING_ENTRY], STATE, RUN)
         self.assertNotIn(gone, created)
+
+
+class DeviceEntryTest(unittest.TestCase):
+    DEVICE = {"host_name": "platform-dev", "device_id": "nNEWCNTRL"}
+
+    def test_the_hosts_tailscale_device_is_listed_with_a_host_this_run_created(self) -> None:
+        expected = [{"address": "tailscale device", "type": "tailscale_device", "service_id": "nNEWCNTRL", "host_name": "platform-dev"}]
+        self.assertEqual(expected, device_entries(HOST_ENTRIES, self.DEVICE))
+
+    def test_no_device_is_listed_without_a_record_or_without_a_host_this_run_created(self) -> None:
+        self.assertEqual([], device_entries(HOST_ENTRIES, None))
+        self.assertEqual([], device_entries([LANDING_ENTRY], self.DEVICE))
 
 
 class AdoptionTest(unittest.TestCase):

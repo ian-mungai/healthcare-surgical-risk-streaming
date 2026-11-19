@@ -421,9 +421,11 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "state_json", return_value={}))
             stack.enter_context(mock.patch.object(host, "instance_id", return_value="i-0123456789abcdef0"))
             stack.enter_context(mock.patch.object(host, "wait_until_reachable", return_value=Peer("platform-dev.example.ts.net", "nRESTARTEDCNTRL")))
+            write_inventory = stack.enter_context(mock.patch.object(host, "write_inventory"))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             aws = FakeAws("project", "us-west-2")
             self.assertEqual(0, host.host_start(aws, CONFIGURATION, path))
+            write_inventory.assert_called_once_with(path)
             recorded = json.loads((Path(scratch) / "runs" / "20260101t0000-abcdef" / "tailscale_device.json").read_text())
         self.assertEqual({"host_name": "platform-dev", "device_id": "nRESTARTEDCNTRL"}, recorded)
 

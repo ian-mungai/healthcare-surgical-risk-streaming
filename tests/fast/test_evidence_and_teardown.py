@@ -16,11 +16,13 @@ from typing import Any
 from scripts.evidence.manifest import REQUIRED_EVIDENCE, archive_problems, build_manifest, manifest_problems, manifest_sha256, readback_problems
 from scripts.evidence.receipt import receipt_problems
 from scripts.evidence.verify import verify_export
+from scripts.infra.host import HostError
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.teardown import (
     bucket_entry_problems,
     delete_targets,
     destroy_write_problem,
+    device_check,
     local_state_problem,
     parent_check,
     remaining_stages,
@@ -344,12 +346,12 @@ class TeardownStageTest(unittest.TestCase):
         self.assertEqual("the bound local state file does not exist", local_state_problem(state.with_name("missing.tfstate"), unchanged))
 
     def test_a_new_teardown_runs_every_stage(self) -> None:
-        self.assertEqual(["purge", "apply", "state", "checks"], remaining_stages([]))
+        self.assertEqual(["purge", "release", "apply", "state", "checks"], remaining_stages([]))
 
     def test_a_rerun_resumes_after_the_last_finished_stage(self) -> None:
-        self.assertEqual(["apply", "state", "checks"], remaining_stages(["purge"]))
-        self.assertEqual(["state", "checks"], remaining_stages(["purge", "apply"]))
-        self.assertEqual([], remaining_stages(["purge", "apply", "state", "checks"]))
+        self.assertEqual(["release", "apply", "state", "checks"], remaining_stages(["purge"]))
+        self.assertEqual(["state", "checks"], remaining_stages(["purge", "release", "apply"]))
+        self.assertEqual([], remaining_stages(["purge", "release", "apply", "state", "checks"]))
 
     def test_a_part_is_verified_only_through_its_own_check_or_a_parent_that_is_gone(self) -> None:
         reported = {("aws_iam_role", "example_host"): "gone", ("aws_iam_role", "example_deploy"): "still exists"}
@@ -359,6 +361,28 @@ class TeardownStageTest(unittest.TestCase):
             "unverified: its parent was not checked", parent_check({"type": "aws_iam_role_policy", "service_id": "example_other:access"}, reported)
         )
         self.assertEqual("unverified: no check for this type", parent_check({"type": "aws_lambda_function", "service_id": "example"}, reported))
+
+
+DEVICE_ENTRY = {"address": "tailscale device", "type": "tailscale_device", "service_id": "nNEWCNTRL", "host_name": "platform-dev"}
+
+
+class DeviceCheckTest(unittest.TestCase):
+    def test_a_device_that_left_the_network_is_gone(self) -> None:
+        other = {"Peer": {"key": {"ID": "nOTHER", "HostName": "laptop", "Tags": []}}}
+        self.assertEqual("gone", device_check(DEVICE_ENTRY, lambda: other))
+        self.assertEqual("gone", device_check(DEVICE_ENTRY, lambda: {"Peer": None}))
+
+    def test_the_recorded_device_or_a_tagged_device_with_the_hosts_name_still_exists(self) -> None:
+        recorded = {"Peer": {"key": {"ID": "nNEWCNTRL", "HostName": "renamed", "Tags": []}}}
+        rejoined = {"Peer": {"key": {"ID": "nLATER", "HostName": "platform-dev", "Tags": ["tag:surgical-host"]}}}
+        self.assertEqual("still exists", device_check(DEVICE_ENTRY, lambda: recorded))
+        self.assertEqual("still exists", device_check(DEVICE_ENTRY, lambda: rejoined))
+
+    def test_a_network_that_cannot_be_read_leaves_the_device_unverified(self) -> None:
+        def unreadable() -> dict[str, Any]:
+            raise HostError("tailscale status failed")
+
+        self.assertEqual("unverified: the Tailscale network could not be read", device_check(DEVICE_ENTRY, unreadable))
 
 
 class RemovalCheckTest(unittest.TestCase):

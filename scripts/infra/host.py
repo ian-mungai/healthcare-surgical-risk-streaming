@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 
 from scripts.aws_cli import Aws, AwsError
 from scripts.infra import state_bootstrap
-from scripts.infra.created import module_resources
+from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, load_run, sanitized, save_plan, save_raw, state_json
 from scripts.process import TimeoutExpired, run_command
@@ -44,7 +44,6 @@ POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
 RELEASE_DEADLINE_SECONDS = 300
-DEVICE_FILE = "tailscale_device.json"
 WORKLOAD_GID_BASE = 20000
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
@@ -290,6 +289,7 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
     host_name = f"platform-{configuration['ENVIRONMENT']}"
     peer = wait_until_reachable(aws, run.run_id, instance, host_name)
     record_tailscale_device(run.run_id, host_name, peer.device_id)
+    write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host is started and answers at {peer.address}\n")
     return 0
 
