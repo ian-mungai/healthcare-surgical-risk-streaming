@@ -175,6 +175,15 @@ def destroy_write_problem(key: str, content: bytes | None, delete_marker: bool, 
     return "a lock entry that is not for this run's state"
 
 
+def local_state_problem(state_file: Path, approved_hash: str) -> str | None:
+    """Why the bound local state is not the state the destroy plan was saved for, or None when it is."""
+    if not state_file.is_file():
+        return "the bound local state file does not exist"
+    if hashlib.sha256(state_file.read_bytes()).hexdigest() != approved_hash:
+        return "the local state changed after the destroy plan was saved"
+    return None
+
+
 def purge_buckets(targets: list[Target], inventory: list[dict[str, str]]) -> list[str]:
     """The run's application buckets that the saved plan deletes; no other bucket is emptied."""
     deleted = {identifier for _, kind, identifier in targets if kind == "aws_s3_bucket"}
@@ -224,8 +233,8 @@ def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: 
         problems += bucket_entry_problems(bucket, bucket_entries(aws, bucket), approved["application"])
     if run.backend == "s3":
         problems += state_entry_problems(bucket_entries(aws, run.state_bucket), run.state_keys, approved["state"])
-    elif hashlib.sha256(Path(run.state_keys[0]).read_bytes()).hexdigest() != approved["local_state_sha256"]:
-        problems.append("the local state changed after the destroy plan was saved")
+    elif problem := local_state_problem(Path(run.state_keys[0]), approved["local_state_sha256"]):
+        problems.append(problem)
     return problems, targets
 
 

@@ -21,6 +21,7 @@ from scripts.infra.teardown import (
     bucket_entry_problems,
     delete_targets,
     destroy_write_problem,
+    local_state_problem,
     parent_check,
     purge_buckets,
     remaining_stages,
@@ -322,6 +323,14 @@ class DestroyWriteTest(unittest.TestCase):
 
 
 class TeardownStageTest(unittest.TestCase):
+    def test_local_state_must_be_the_file_the_plan_was_saved_for(self) -> None:
+        state = Path(tempfile.mkdtemp(prefix="local_state_")) / "terraform.tfstate"
+        state.write_text("{}")
+        unchanged = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        self.assertIsNone(local_state_problem(state, unchanged))
+        self.assertEqual("the local state changed after the destroy plan was saved", local_state_problem(state, "0" * 64))
+        self.assertEqual("the bound local state file does not exist", local_state_problem(state.with_name("missing.tfstate"), unchanged))
+
     def test_only_buckets_the_plan_deletes_are_purged(self) -> None:
         inventory = [*INVENTORY, {"address": 'module.storage.aws_s3_bucket.this["warehouse"]', "type": "aws_s3_bucket", "service_id": "example-warehouse"}]
         self.assertEqual(["example-landing"], purge_buckets(delete_targets(PLAN), inventory))
