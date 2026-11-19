@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 
 from scripts.infra.created import created_entries, device_entries, merge_created, run_inventory
-from scripts.infra.state_bootstrap import RunBinding, adoption_problem, short_lived_bucket_name, state_keys
+from scripts.infra.state_bootstrap import RunBinding, adoption_problem, bucket_problem, short_lived_bucket_name, state_keys
 from scripts.project_config import ConfigurationError
 
 KEYS = ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"]
@@ -106,6 +106,36 @@ class AdoptionTest(unittest.TestCase):
     def test_created_bucket_that_is_gone_is_refused(self) -> None:
         self.assertEqual("this run's bucket no longer exists", adoption_problem("created", exists=False, owned=False, empty=False, short_lived=False))
         self.assertIsNone(adoption_problem("created", exists=True, owned=True, empty=False, short_lived=False))
+
+
+SETTINGS = {"S3_BUCKET": "example-project"}
+TEST_RUN = RunBinding(**{**RUN.__dict__, "bucket": "example-project-test-01010000abcdef", "bucket_mode": "short_lived"})
+
+
+class BucketModeTest(unittest.TestCase):
+    def test_a_permanent_run_uses_the_bucket_in_the_settings_and_a_test_run_its_own_derived_bucket(self) -> None:
+        self.assertIsNone(bucket_problem(RUN, SETTINGS))
+        self.assertIsNone(bucket_problem(TEST_RUN, SETTINGS))
+        self.assertIsNone(bucket_problem(RUN, SETTINGS, short_lived=False))
+        self.assertIsNone(bucket_problem(TEST_RUN, SETTINGS, short_lived=True))
+
+    def test_a_test_is_refused_on_a_permanent_binding_and_a_permanent_run_on_a_test_binding(self) -> None:
+        self.assertEqual(
+            "the run is bound to the permanent bucket, and a short-lived test bucket was asked for", bucket_problem(RUN, SETTINGS, short_lived=True)
+        )
+        self.assertEqual(
+            "the run is bound to a short-lived test bucket, and the permanent bucket was asked for", bucket_problem(TEST_RUN, SETTINGS, short_lived=False)
+        )
+
+    def test_a_binding_whose_bucket_does_not_fit_its_mode_is_refused(self) -> None:
+        moved = RunBinding(**{**RUN.__dict__, "bucket": "example-other"})
+        self.assertEqual("the binding's permanent bucket is not the bucket named by S3_BUCKET", bucket_problem(moved, SETTINGS))
+        disguised = RunBinding(**{**TEST_RUN.__dict__, "bucket": "example-project"})
+        self.assertEqual("the binding's test bucket is not the short-lived bucket of this run", bucket_problem(disguised, SETTINGS))
+        other_run = RunBinding(**{**TEST_RUN.__dict__, "bucket": "example-project-test-02020000abcdef"})
+        self.assertEqual("the binding's test bucket is not the short-lived bucket of this run", bucket_problem(other_run, SETTINGS))
+        unknown = RunBinding(**{**RUN.__dict__, "bucket_mode": "other"})
+        self.assertEqual("the binding's bucket mode is neither permanent nor short_lived", bucket_problem(unknown, SETTINGS))
 
 
 class BucketLayoutTest(unittest.TestCase):

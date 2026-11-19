@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.infra.created import created_entries, merge_created
-from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding
+from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -172,6 +172,9 @@ def load_run(path: Path) -> RunBinding:
 
 def initialise(run: RunBinding, configuration: dict[str, str]) -> None:
     """Initialise the run's own configuration copy and refuse when Terraform's backend or workspace is not the bound one."""
+    mode_problem = bucket_problem(run, configuration)
+    if mode_problem:
+        raise WrapperError(f"refused before any plan or change: {mode_problem}")
     folder = prepare_configuration(run)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
     record_file = folder / ".terraform" / "terraform.tfstate"

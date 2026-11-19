@@ -39,7 +39,7 @@ from scripts.evidence.manifest import build_manifest, manifest_problems, manifes
 from scripts.evidence.receipt import receipt_problems, signature_is_valid, trusted_signers
 from scripts.infra import host
 from scripts.infra.created import BUCKET_ADDRESS, DEVICE_TYPE
-from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding
+from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding, bucket_problem
 from scripts.infra.terraform_wrapper import (
     APPLY_TIMEOUT_SECONDS,
     PLAN_TIMEOUT_SECONDS,
@@ -424,6 +424,9 @@ def main() -> int:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         run = load_run(arguments.binding)
+        mode_problem = bucket_problem(run, configuration)
+        if mode_problem:
+            raise TeardownRefused(f"refused before any deletion: {mode_problem}")
         return plan_teardown(aws, configuration, run) if arguments.command == "plan" else destroy(aws, run, arguments.confirm)
     except (ConfigurationError, WrapperError, TeardownRefused, AwsError, host.HostError) as error:
         sys.stderr.write(f"{error}\n")

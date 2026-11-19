@@ -51,6 +51,7 @@ class RunBinding:
     status: str
     provision_host: bool = True
     bucket_creation: str = "none"
+    bucket_mode: str = "permanent"
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -76,11 +77,27 @@ def new_binding(configuration: dict[str, str], backend: str = "s3", provision_ho
     commit = run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
     bucket = short_lived_bucket_name(configuration["S3_BUCKET"], run_id) if short_lived else configuration["S3_BUCKET"]
     region = configuration["AWS_REGION"]
+    mode = "short_lived" if short_lived else "permanent"
     if backend == "local":
-        return RunBinding(
-            run_id, commit, "local", region, bucket, WORKSPACE, [str(ROOT / "runs" / run_id / "terraform.tfstate")], "planned", provision_host=False
-        )
-    return RunBinding(run_id, commit, "s3", region, bucket, WORKSPACE, state_keys(configuration["ENVIRONMENT"]), "planned", provision_host=provision_host)
+        keys = [str(ROOT / "runs" / run_id / "terraform.tfstate")]
+        return RunBinding(run_id, commit, "local", region, bucket, WORKSPACE, keys, "planned", provision_host=False, bucket_mode=mode)
+    keys = state_keys(configuration["ENVIRONMENT"])
+    return RunBinding(run_id, commit, "s3", region, bucket, WORKSPACE, keys, "planned", provision_host=provision_host, bucket_mode=mode)
+
+
+def bucket_problem(binding: RunBinding, configuration: dict[str, str], *, short_lived: bool | None = None) -> str | None:
+    """Why the binding's bucket may not be used: it does not fit its recorded mode, or the caller asked for the other mode. Checked before any S3 call."""
+    if binding.bucket_mode not in ("permanent", "short_lived"):
+        return "the binding's bucket mode is neither permanent nor short_lived"
+    if short_lived is True and binding.bucket_mode == "permanent":
+        return "the run is bound to the permanent bucket, and a short-lived test bucket was asked for"
+    if short_lived is False and binding.bucket_mode == "short_lived":
+        return "the run is bound to a short-lived test bucket, and the permanent bucket was asked for"
+    if binding.bucket_mode == "permanent" and binding.bucket != configuration["S3_BUCKET"]:
+        return "the binding's permanent bucket is not the bucket named by S3_BUCKET"
+    if binding.bucket_mode == "short_lived" and binding.bucket != short_lived_bucket_name(configuration["S3_BUCKET"], binding.run_id):
+        return "the binding's test bucket is not the short-lived bucket of this run"
+    return None
 
 
 def adoption_problem(creation: str, *, exists: bool, owned: bool, empty: bool, short_lived: bool) -> str | None:
@@ -153,6 +170,10 @@ def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "
     if binding.backend != backend:
         sys.stderr.write(f"the run is bound to the {binding.backend} backend, not {backend}\n")
         return 1
+    mode_problem = bucket_problem(binding, configuration, short_lived=short_lived)
+    if mode_problem:
+        sys.stderr.write(f"{mode_problem}\n")
+        return 1
     if not path.is_file():
         binding.write(path)
     tags = required_tags(configuration)
@@ -160,7 +181,7 @@ def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "
     exists = bucket_exists(aws, binding.bucket)
     is_owned = exists and owned(aws, binding.bucket, configuration["AWS_ACCOUNT_ID"])
     is_empty = is_owned and binding.bucket_creation == "attempted" and empty(aws, binding.bucket)
-    problem = adoption_problem(binding.bucket_creation, exists=exists, owned=is_owned, empty=is_empty, short_lived=binding.bucket != configuration["S3_BUCKET"])
+    problem = adoption_problem(binding.bucket_creation, exists=exists, owned=is_owned, empty=is_empty, short_lived=binding.bucket_mode == "short_lived")
     if problem:
         sys.stderr.write(f"{problem}\n")
         return 1
@@ -194,6 +215,10 @@ def verify(aws: Aws, configuration: dict[str, str], path: Path) -> int:
         sys.stderr.write("no run binding: run create first\n")
         return 1
     binding = RunBinding(**json.loads(path.read_text()))
+    mode_problem = bucket_problem(binding, configuration)
+    if mode_problem:
+        sys.stderr.write(f"{mode_problem}\n")
+        return 1
     if not bucket_exists(aws, binding.bucket):
         sys.stderr.write("the bound bucket does not exist\n")
         return 1
