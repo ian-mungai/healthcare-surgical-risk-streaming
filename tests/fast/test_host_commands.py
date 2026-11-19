@@ -26,6 +26,7 @@ from scripts.infra import host, state_bootstrap
 from scripts.infra.host import (
     HostError,
     Peer,
+    ansible_failure,
     instance_id,
     record_tailscale_device,
     release_tailscale_device,
@@ -35,7 +36,6 @@ from scripts.infra.host import (
     wait_until_reachable,
     workload_variables,
 )
-from scripts.infra.inventory import inventory_entries
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import TimeoutExpired
 
@@ -486,16 +486,7 @@ class WorkloadVariablesTest(unittest.TestCase):
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": []}, workload_variables({"values": {}}, "us-west-2"))
 
 
-class InventoryTest(unittest.TestCase):
-    def test_managed_resources_and_the_state_bucket_are_listed(self) -> None:
-        entries = inventory_entries(STATE, "example-state")
-        expected = [
-            {"address": "module.host.aws_instance.host", "type": "aws_instance", "service_id": "i-0123456789abcdef0"},
-            {"address": 'module.storage.aws_s3_bucket.this["landing"]', "type": "aws_s3_bucket", "service_id": "example-landing"},
-            {"address": "state bucket", "type": "aws_s3_bucket", "service_id": "example-state"},
-        ]
-        self.assertEqual(expected, entries)
-
+class HostStateTest(unittest.TestCase):
     def test_the_host_instance_is_read_from_the_state(self) -> None:
         self.assertEqual("i-0123456789abcdef0", instance_id(STATE))
 
@@ -503,13 +494,14 @@ class InventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(HostError, "exactly one host instance"):
             instance_id({"values": {}})
 
-    def test_run_with_local_state_lists_no_state_bucket(self) -> None:
-        self.assertEqual([], inventory_entries({"values": {}}, ""))
-        self.assertNotIn("state bucket", [entry["address"] for entry in inventory_entries(STATE, "")])
 
-    def test_empty_state_lists_only_the_state_bucket(self) -> None:
+class AnsibleFailureTest(unittest.TestCase):
+    def test_a_failure_message_carries_no_account_number_or_address(self) -> None:
+        output = "fatal: [100.64.0.7]: FAILED! role arn:aws:iam::" + "1" * 12 + ":role/example_host"
+        message = ansible_failure(output, "ssh: connect to host 100.64.0.7 port 22")
         self.assertEqual(
-            [{"address": "state bucket", "type": "aws_s3_bucket", "service_id": "example-state"}], inventory_entries({"values": {}}, "example-state")
+            "the Ansible host setup failed:\nfatal: [<ADDRESS>]: FAILED! role arn:aws:iam::<ACCOUNT>:role/example_host\nssh: connect to host <ADDRESS> port 22",
+            message,
         )
 
 

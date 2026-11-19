@@ -16,27 +16,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 from scripts.infra.created import run_inventory
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
-
-
-def module_resources(module: dict[str, Any]) -> list[dict[str, Any]]:
-    found = list(module.get("resources", []))
-    for child in module.get("child_modules", []):
-        found += module_resources(child)
-    return found
-
-
-def inventory_entries(state: dict[str, Any], state_bucket: str) -> list[dict[str, str]]:
-    """One entry for each managed resource in the state, in address order, then the state bucket when the run has one."""
-    resources = module_resources(state.get("values", {}).get("root_module", {}))
-    entries = [{"address": item["address"], "type": item["type"], "service_id": str(item["values"]["id"])} for item in resources if item["mode"] == "managed"]
-    state_entry = [{"address": "state bucket", "type": "aws_s3_bucket", "service_id": state_bucket}] if state_bucket else []
-    return [*sorted(entries, key=lambda entry: entry["address"]), *state_entry]
 
 
 def write_inventory(binding: Path) -> Path:

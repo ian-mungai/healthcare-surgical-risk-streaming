@@ -27,8 +27,9 @@ from typing import Any, NamedTuple
 
 from scripts.aws_cli import Aws, AwsError
 from scripts.infra import state_bootstrap
-from scripts.infra.inventory import module_resources, write_inventory
-from scripts.infra.terraform_wrapper import WrapperError, apply_plan, load_run, save_plan, state_json
+from scripts.infra.created import module_resources
+from scripts.infra.inventory import write_inventory
+from scripts.infra.terraform_wrapper import WrapperError, apply_plan, load_run, sanitized, save_plan, save_raw, state_json
 from scripts.process import TimeoutExpired, run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -224,6 +225,11 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
+def ansible_failure(stdout: str, stderr: str) -> str:
+    """The end of a failed playbook's output with account numbers and addresses replaced; the raw output stays in the run's raw folder."""
+    return sanitized(f"the Ansible host setup failed:\n{stdout[-4000:]}\n{stderr[-2000:]}")
+
+
 def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
     home = ROOT / ".tools" / "ansible"
     settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
@@ -235,10 +241,11 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
         env=environment,
         timeout=ANSIBLE_TIMEOUT_SECONDS,
     )
+    save_raw(run_id, "ansible_output.txt", result.stdout + result.stderr)
     recap = result.stdout[result.stdout.rfind("PLAY RECAP") :] if "PLAY RECAP" in result.stdout else result.stdout[-2000:]
-    sys.stdout.write(recap)
+    sys.stdout.write(sanitized(recap))
     if result.returncode != 0:
-        raise HostError(f"the Ansible host setup failed:\n{result.stdout[-4000:]}{result.stderr[-2000:]}")
+        raise HostError(ansible_failure(result.stdout, result.stderr))
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:

@@ -13,7 +13,7 @@ The recordings come from VitalDB, an open dataset of monitor recordings from 6,3
 The checks need Python 3.14, Git, GNU Make and curl.
 
 ```sh
-make setup        # create .venv, install the pinned tools and the commit hooks
+make setup        # create .venv, install the pinned tools, the commit hooks and the working-tree privacy hook
 make check        # run every hook on every file
 make test-guards  # commit planted faults in a temporary repository and confirm each guard refuses its own
 ```
