@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from collections.abc import Mapping
@@ -34,6 +35,25 @@ INIT_TIMEOUT_SECONDS = 600
 PLAN_TIMEOUT_SECONDS = 900
 APPLY_TIMEOUT_SECONDS = 1800
 TAILSCALE_KEYS = ("TAILSCALE_CLIENT_ID", "TAILSCALE_AUDIENCE")
+
+
+PRIVATE_VALUES = ((re.compile(r"\b\d{12}\b"), "<ACCOUNT>"), (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<ADDRESS>"))
+
+
+def sanitized(text: str) -> str:
+    """The text with account numbers and network addresses replaced, for printing and for error messages."""
+    for pattern, replacement in PRIVATE_VALUES:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def save_raw(run_id: str, name: str, text: str) -> None:
+    """Keep raw tool output in an owner-only file that the evidence export leaves out."""
+    raw = ROOT / "runs" / run_id / "raw"
+    raw.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(raw / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(text)
 
 
 class WrapperError(RuntimeError):
@@ -135,7 +155,8 @@ def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
     command = [f"-chdir={configuration_folder(run)}", *arguments]
     result = run_command("terraform", command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
     if result.returncode != 0:
-        raise WrapperError(f"terraform {arguments[0]} failed:\n{result.stdout}{result.stderr}")
+        save_raw(run.run_id, f"terraform_{arguments[0]}_failure.txt", result.stdout + result.stderr)
+        raise WrapperError(f"terraform {arguments[0]} failed:\n{sanitized(result.stderr[-2000:])}")
     return result.stdout
 
 
@@ -226,7 +247,9 @@ def apply_plan(run: RunBinding, code: str) -> int:
     approved = approved_plan_copy(run, plan)
     try:
         applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
-        sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS))
+        output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
+        save_raw(run.run_id, "apply_output.txt", output)
+        sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + "\n")
     finally:
         approved.unlink(missing_ok=True)
     record_created(run, applied_plan)

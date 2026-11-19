@@ -2,19 +2,31 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-EXCLUDED_TOP_LEVEL = ("export", "readback", "removal", "known_hosts")
+EVIDENCE_PATTERNS = (
+    "inventory.json",
+    "created.json",
+    "pre_provisioned.json",
+    "retained.json",
+    "plans/*_binding.json",
+    "teardown/approved_inventory.json",
+    "acceptance/*.json",
+)
 REQUIRED_EVIDENCE = ("inventory.json", "plans/destroy_binding.json", "teardown/approved_inventory.json")
 
 
 def evidence_files(folder: Path) -> list[str]:
-    """Every file of the run folder that is evidence, as sorted relative paths."""
+    """Every file of the run folder that is named evidence, as sorted relative paths.
+
+    Raw plans and tool output hold private infrastructure values and are never evidence: the plan bindings carry their hashes.
+    """
     paths = [path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file() and not path.is_symlink()]
-    return sorted(path for path in paths if path.split("/")[0] not in EXCLUDED_TOP_LEVEL)
+    return sorted(path for path in paths if any(fnmatch.fnmatchcase(path, pattern) for pattern in EVIDENCE_PATTERNS))
 
 
 def build_manifest(folder: Path, run_id: str, commit: str) -> dict[str, Any]:

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from scripts.process import run_command
 
 AWS_TIMEOUT_SECONDS = 120
+ACCOUNT_NUMBER = re.compile(r"\b\d{12}\b")
 
 
 class AwsError(RuntimeError):
@@ -27,5 +29,5 @@ class Aws:
         if result.returncode != 0:
             if any(marker in result.stderr for marker in missing):
                 return None
-            raise AwsError(f"aws {' '.join(arguments[:2])} failed: {result.stderr.strip()}")
+            raise AwsError(f"aws {' '.join(arguments[:2])} failed: {ACCOUNT_NUMBER.sub('<ACCOUNT>', result.stderr.strip())}")
         return json.loads(result.stdout) if result.stdout.strip() else {}

@@ -43,13 +43,18 @@ def receipt(**changes: str) -> bytes:
 class ReadbackTest(unittest.TestCase):
     def setUp(self) -> None:
         self.folder = Path(tempfile.mkdtemp(prefix="evidence_"))
-        (self.folder / "plans").mkdir()
+        for folder in ("plans", "raw", "acceptance"):
+            (self.folder / folder).mkdir()
         (self.folder / "inventory.json").write_text("{}")
-        (self.folder / "plans" / "apply.txt").write_text("plan")
+        (self.folder / "plans" / "apply_binding.json").write_text("binding")
+        (self.folder / "plans" / "apply.txt").write_text("raw plan text with private values")
+        (self.folder / "plans" / "apply.tfplan").write_text("raw plan")
+        (self.folder / "raw" / "apply_output.txt").write_text("raw tool output")
+        (self.folder / "acceptance" / "after-up.json").write_text("{}")
         self.manifest = build_manifest(self.folder, RUN.run_id, RUN.commit)
 
-    def test_manifest_lists_every_file_with_its_hash(self) -> None:
-        self.assertEqual(["inventory.json", "plans/apply.txt"], [item["path"] for item in self.manifest["files"]])
+    def test_manifest_lists_only_the_named_evidence_and_never_raw_tool_files(self) -> None:
+        self.assertEqual(["acceptance/after-up.json", "inventory.json", "plans/apply_binding.json"], [item["path"] for item in self.manifest["files"]])
         self.assertEqual(64, len(manifest_sha256(self.manifest)))
 
     def test_complete_readback_passes(self) -> None:
@@ -60,12 +65,12 @@ class ReadbackTest(unittest.TestCase):
         self.assertEqual(["missing from the readback: inventory.json"], readback_problems(self.manifest, self.folder))
 
     def test_changed_file_is_a_corrupt_readback(self) -> None:
-        (self.folder / "plans" / "apply.txt").write_text("other")
-        self.assertEqual(["differs from its manifest hash: plans/apply.txt"], readback_problems(self.manifest, self.folder))
+        (self.folder / "plans" / "apply_binding.json").write_text("other")
+        self.assertEqual(["differs from its manifest hash: plans/apply_binding.json"], readback_problems(self.manifest, self.folder))
 
     def test_unlisted_file_is_reported(self) -> None:
-        (self.folder / "extra.txt").write_text("extra")
-        self.assertEqual(["not in the manifest: extra.txt"], readback_problems(self.manifest, self.folder))
+        (self.folder / "acceptance" / "extra.json").write_text("extra")
+        self.assertEqual(["not in the manifest: acceptance/extra.json"], readback_problems(self.manifest, self.folder))
 
 
 class ManifestShapeTest(unittest.TestCase):

@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 import tempfile
@@ -46,6 +45,7 @@ from scripts.infra.terraform_wrapper import (
     binding_problems,
     load_run,
     save_plan,
+    save_raw,
     terraform,
 )
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
@@ -324,15 +324,6 @@ def finish_stage(removal: Path, stage: str) -> None:
     (removal / "progress.json").write_text(json.dumps([*finished_stages(removal), stage]) + "\n")
 
 
-def save_raw(folder: Path, name: str, text: str) -> None:
-    """Keep raw tool output in an owner-only file that the evidence export leaves out."""
-    raw = folder / "raw"
-    raw.mkdir(mode=0o700, exist_ok=True)
-    descriptor = os.open(raw / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(text)
-
-
 def settled_checks(check: Callable[[dict[str, str]], str], inventory: list[dict[str, str]], *, attempts: int, pause_seconds: float) -> list[dict[str, str]]:
     """Each inventory entry with what its service reports, asked again while a removal is still reported as existing."""
     reported = {entry["address"]: check(entry) for entry in inventory}
@@ -370,7 +361,7 @@ def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
                     purge(aws, bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == bucket])
                 finish_stage(removal, "purge")
             output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
-            save_raw(folder, "destroy_apply.txt", output)
+            save_raw(run.run_id, "destroy_apply.txt", output)
             destroyed = DESTROYED.search(output)
             sys.stdout.write(
                 f"run {run.run_id}: the destroy plan is applied; resources destroyed: {destroyed.group(1) if destroyed else 'see the raw output'}\n"

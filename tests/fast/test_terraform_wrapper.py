@@ -20,6 +20,7 @@ from scripts.infra.terraform_wrapper import (
     plan_binding,
     plan_label,
     run_variables,
+    sanitized,
     state_location,
 )
 
@@ -133,6 +134,15 @@ class EffectiveLocationTest(unittest.TestCase):
 
     def test_missing_backend_record_is_refused(self) -> None:
         self.assertEqual(["Terraform's backend type is missing, not s3"], effective_location_problems(RUN, {}, "default"))
+
+
+class SanitizedOutputTest(unittest.TestCase):
+    def test_account_numbers_and_addresses_are_removed_from_printed_text(self) -> None:
+        text = "role arn:aws:iam::" + "1" * 12 + ":role/example_host at 203.0.113.7 in account " + "2" * 12
+        self.assertEqual("role arn:aws:iam::<ACCOUNT>:role/example_host at <ADDRESS> in account <ACCOUNT>", sanitized(text))
+
+    def test_other_numbers_stay(self) -> None:
+        self.assertEqual("3000 IOPS, version 1.16.4, 18 to add", sanitized("3000 IOPS, version 1.16.4, 18 to add"))
 
 
 if __name__ == "__main__":
