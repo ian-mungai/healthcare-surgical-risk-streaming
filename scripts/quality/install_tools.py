@@ -1,4 +1,4 @@
-"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint and the tflint AWS ruleset.
+"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint and the tflint AWS ruleset, and the working-tree privacy hook.
 
 Run from the repository root: ``.venv/bin/python -m scripts.quality.install_tools``. ``--check`` verifies each installed
 binary against its pinned archive without downloading or writing anything. Each archive is checked against its pinned
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.process import run_command
+from scripts.quality import worktree_scan_hook
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / ".tools"
@@ -133,12 +134,25 @@ def settle(tool: Tool, *, check: bool) -> bool:
     return True
 
 
+def settle_hook(*, check: bool) -> bool:
+    if worktree_scan_hook.installed(ROOT):
+        sys.stdout.write("working-tree privacy hook: installed and verified\n")
+        return True
+    if check:
+        sys.stderr.write("working-tree privacy hook: missing or changed; run the installer without --check\n")
+        return False
+    worktree_scan_hook.install(ROOT)
+    sys.stdout.write("working-tree privacy hook: installed\n")
+    return True
+
+
 def main() -> int:
     """Install or check every pinned tool and return 1 when one is missing or differs."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--check", action="store_true", help="verify the installed binaries without downloading or writing")
     check = parser.parse_args().check
     results = [settle(tool, check=check) for tool in TOOL_LIST]
+    results.append(settle_hook(check=check))
     return 0 if all(results) else 1
 
 

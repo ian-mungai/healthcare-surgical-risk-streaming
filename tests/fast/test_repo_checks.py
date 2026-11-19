@@ -10,7 +10,19 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.quality.repo_checks import line_privacy, message_findings
+from scripts.quality.repo_checks import credential_files, line_privacy, message_findings
+
+CREDENTIAL_PATHS = [
+    "terraform.tfstate",
+    "infra/terraform.tfstate.backup",
+    "infra/terraform.tfstate.1700000000.backup",
+    "infra/dev.tfstate.old",
+    "infra/saved.tfplan",
+    ".env",
+    ".env.dev",
+    "keys/deploy.pem",
+]
+ORDINARY_PATHS = ["infra/main.tf", ".env.example", "notes/tfstate.txt", "notes/state_backup.md"]
 
 ACCEPTED_MESSAGES = [
     "feat: add the state bootstrap step",
@@ -19,6 +31,7 @@ ACCEPTED_MESSAGES = [
     "# a comment line\nci: pin the hook versions",
     "docs: add a note\n\nCo-authored-by: A Person <person@example.com>",
     "docs: describe how the Copilot extension is configured",
+    "docs: add a note\n\nGenerated-with: ruff",
 ]
 REFUSED_MESSAGES = [
     "",
@@ -29,6 +42,7 @@ REFUSED_MESSAGES = [
     "docs: add a note\n\nAssisted-by: Codex",
     "docs: add a note\n\nGenerated with ChatGPT",
     "docs: add a note\n\nclaude-session: 1234",
+    "docs: add a note\n\nGenerated-with: Claude Code",
 ]
 CLEAN_LINES = [
     "contact: person@example.com",
@@ -54,6 +68,16 @@ class CommitMessageTest(unittest.TestCase):
         for message in REFUSED_MESSAGES:
             with self.subTest(message=message):
                 self.assertNotEqual([], message_findings("message", message, comments=True))
+
+
+class CredentialFileTest(unittest.TestCase):
+    def test_every_state_snapshot_and_credential_is_refused(self) -> None:
+        for path in CREDENTIAL_PATHS:
+            with self.subTest(path=path):
+                self.assertEqual([path], [finding.location for finding in credential_files([path])])
+
+    def test_ordinary_files_pass(self) -> None:
+        self.assertEqual([], credential_files(ORDINARY_PATHS))
 
 
 class PrivacyLineTest(unittest.TestCase):

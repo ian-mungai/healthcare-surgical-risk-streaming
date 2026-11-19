@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,10 +43,13 @@ class Record:
         return passed
 
     def close(self, log: list[str], *, blocked: str = "") -> int:
-        """Set the outcome, write the record and its log, print each assertion and return the exit code."""
+        """Set the outcome, write the record and its log in a new folder, print each assertion and return the exit code."""
         self.outcome = f"blocked: {blocked}" if blocked else ("pass" if self.observations and all(item.passed for item in self.observations) else "fail")
-        folder = ROOT / "runs" / f"{self.started_utc.replace(':', '').replace('-', '')}_{self.slug}"
-        folder.mkdir(parents=True, exist_ok=True)
+        stamp = self.started_utc.replace(":", "").replace("-", "")
+        runs = ROOT / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        mode = re.sub(r"[^a-z0-9]+", "_", self.mode.lower()).strip("_")
+        folder = Path(tempfile.mkdtemp(prefix=f"{stamp}_{self.slug}_{mode}_", dir=runs))
         (folder / "record.json").write_text(json.dumps(asdict(self), indent=2) + "\n")
         (folder / "log.txt").write_text("\n".join(log) + "\n")
         for item in self.observations:

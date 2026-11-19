@@ -21,7 +21,7 @@ GIT_TIMEOUT_SECONDS = 60
 ASK = "if the rule seems wrong here, stop and ask the owner; do not skip the hook"
 
 CREDENTIAL_RULE = "no credential, key or Terraform state file is committed"
-CREDENTIAL_NAMES = ("*.tfstate", "*.tfstate.backup", "*.tfplan", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa", "id_ecdsa", "id_ed25519", "credentials")
+CREDENTIAL_NAMES = ("*.tfstate", "*.tfstate.*", "*.tfplan", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa", "id_ecdsa", "id_ed25519", "credentials")
 
 DATA_RULE = "data files stay out of Git except in the declared fixture folders, and no file is over 5 MB"
 DATA_EXTENSIONS = {".csv", ".tsv", ".parquet", ".xlsx", ".xls", ".jsonl", ".ndjson", ".avro", ".db", ".sqlite", ".vital"}
@@ -33,7 +33,7 @@ COMMIT_TYPES = ("feat", "fix", "docs", "chore", "refactor", "test", "build", "ci
 CONVENTIONAL_SUBJECT = re.compile(rf"(?:{'|'.join(COMMIT_TYPES)})(?:\([a-z0-9._/-]+\))?!?: \S.*")
 ASSISTANTS = ("claude", "codex", "grok", "antigravity", "chatgpt", "copilot", "gemini", "cursor", "devin", "aider", "windsurf")
 ASSISTANT_NAMES = re.compile(rf"\b(?:{'|'.join((*ASSISTANTS, 'anthropic', 'openai', 'xai'))})\b", re.IGNORECASE)
-CREDIT_TRAILER = re.compile(r"^\s*(?:co-authored-by|co-developed-by|assisted-by|generated-by)\s*:\s*(.*)$", re.IGNORECASE)
+CREDIT_TRAILER = re.compile(r"^\s*(?:co-authored-by|co-developed-by|assisted-by|generated-by|generated-with)\s*:\s*(.*)$", re.IGNORECASE)
 GENERATED_LINE = re.compile(r"^\s*(?:generated (?:with|by)|written by)\b(.*)$", re.IGNORECASE)
 SESSION_TRAILER = re.compile(rf"^\s*(?:{'|'.join(ASSISTANTS)})-session\s*:", re.IGNORECASE)
 
@@ -68,8 +68,16 @@ class Finding:
     fix: str
 
 
-def git(*args: str) -> str:
-    return run_command("git", args, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout
+def git(*args: str, cwd: Path | None = None) -> str:
+    """Run Git. A call that names a repository by ``cwd`` ignores the caller's Git environment, such as ``GIT_DIR`` inside a hook."""
+    env = None if cwd is None else {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    return run_command("git", args, cwd=cwd, env=env, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout
+
+
+def visible_files(cwd: Path | None = None) -> list[str]:
+    """List every path that Git does not ignore, tracked or not, as NUL-delimited names so that no name is quoted."""
+    listed = git("ls-files", "-z", "--cached", "--others", "--exclude-standard", cwd=cwd)
+    return sorted(set(listed.split("\0")) - {""})
 
 
 def report(findings: list[Finding]) -> int:
@@ -178,7 +186,7 @@ def privacy_scan() -> tuple[list[Finding], list[str]]:
     values = env_values()
     unreviewed = []
     descriptions = {kind: description for kind, (description, _) in PRIVACY_PATTERNS.items()} | {"env-value": "value declared in .env"}
-    for path in sorted(set(git("ls-files", "--cached", "--others", "--exclude-standard").splitlines())):
+    for path in visible_files():
         if os.path.islink(path) or not os.path.isfile(path):
             continue
         data = Path(path).read_bytes()
