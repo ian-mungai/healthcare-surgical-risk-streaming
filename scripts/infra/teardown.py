@@ -3,22 +3,29 @@
 Run from the repository root under the project profile in ``.env``, through ``make``:
 
 ``make teardown-plan`` saves the destroy plan and records the approved inventory: every object version and delete
-marker in the bucket, the data apart from this run's Terraform state. It prints a confirmation code for the owner.
-``make host-destroy CONFIRM=<CODE>`` runs every guard first and refuses, before any deletion, when one fails:
+marker under the data prefixes, and every entry at this run's state keys. It refuses when the state changed while the
+plan was saved. It prints a confirmation code for the owner. ``make host-destroy CONFIRM=<CODE>`` runs every guard
+first and refuses, before any deletion, when one fails:
 
-1. The owner's signed receipt must cover the current evidence of this run and commit.
+1. The owner's signed receipt must cover the current evidence of this run and commit, and the approval files that
+   were checked must be the files the evidence lists.
 2. The saved destroy plan must be the reviewed one, saved for this run's state location.
-3. Every delete target must be a resource in this run's inventory. A host that existed before the run is refused,
-   and so is any host in a run that was given its host and a bucket this run did not create.
-4. Every data entry in the bucket must match an approved key and version ID.
+3. Every delete target must be a resource in this run's inventory and never a bucket. A host that existed before the
+   run is refused, and so is any host in a run that was given its host, a host with no recorded Tailscale device and
+   a bucket this run did not create.
+4. Every entry under the data prefixes must match an approved key and version ID.
 5. Every entry at this run's state keys must match an approved key and version ID.
+6. A bucket this run created must hold nothing else. In a bucket this run did not create, any other entry, such as
+   another environment's state, is left alone and is never approved or deleted.
 
-It then deletes the approved data entries by key and version ID, logs the host out of Tailscale and waits until its
-device has left the network, applies the exact plan bytes it checked, and
-accepts a new entry in the bucket only when its content shows the destroy of this state wrote it. It deletes the
-approved and recorded state entries, removes the empty bucket last when this run created it, keeps a bucket this
-run did not create, and checks each removal through its service; a resource with no check is verified only through
-a parent that is gone. Each finished stage is recorded, so a second run does nothing and an interrupted run resumes.
+It then logs the host out of Tailscale and waits until its device has left the network, applies the exact plan
+bytes it checked, and only then deletes the approved data entries by key and version ID. Under the state lock, which
+it takes with a write that fails when a lock exists, it accepts a new entry at this run's state keys only when its
+content shows the destroy of this state wrote it, deletes this run's state entries and removes the empty bucket last
+when this run created it and this account still owns it. It checks each removal through its service within one
+deadline; a resource with no check is verified only through a parent that is gone. Each finished stage is recorded
+with the approval the teardown started with: a second run does nothing, and an interrupted run resumes only with
+that same code, plan, inventory, approved inventory and receipt.
 """
 
 from __future__ import annotations
@@ -51,12 +58,15 @@ from scripts.infra.terraform_wrapper import (
     save_raw,
     terraform,
 )
+from scripts.process import TimeoutExpired
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 GONE_DEADLINE_SECONDS = 120
 GONE_POLL_SECONDS = 5
 CHECK_TIMEOUT_SECONDS = 30
-STAGES = ("purge", "release", "apply", "state", "checks")
+STAGES = ("release", "apply", "purge", "state", "checks")
+DATA_PREFIXES = ("landing/", "warehouse/")
+APPROVAL_FILES = ("inventory.json", "plans/destroy_binding.json", "teardown/approved_inventory.json")
 PARENT_TYPES = {"aws_iam_role_policy": "aws_iam_role"}
 DESTROYED = re.compile(r"Resources: \d+ added, \d+ changed, (\d+) destroyed")
 Target = tuple[str, str, str]
@@ -78,12 +88,17 @@ def target_problems(targets: list[Target], inventory: list[dict[str, str]], run:
     listed = [entry["service_id"] for entry in inventory if entry["address"] == BUCKET_ADDRESS]
     problems = []
     for address, kind, identifier in targets:
-        if kind == "aws_instance" and not run.provision_host:
+        if kind == "aws_s3_bucket":
+            problems.append(f"delete target is a bucket, and Terraform manages no bucket: {address}")
+        elif kind == "aws_instance" and not run.provision_host:
             problems.append(f"delete target is a host in a run that did not create its host: {address}")
         elif kind == "aws_instance" and identifier in pre_provisioned:
             problems.append(f"delete target is a host that existed before this run: {address}")
         elif (kind, identifier) not in owned:
             problems.append(f"delete target outside this run's inventory: {address}")
+    deletes_host = any(kind == "aws_instance" for _, kind, _ in targets)
+    if deletes_host and run.provision_host and not any(entry["type"] == DEVICE_TYPE for entry in inventory):
+        problems.append("the plan deletes a host and the run has no record of its Tailscale device: run make host-start or make host-up first")
     if listed != ([run.bucket] if run.bucket_creation == "created" else []):
         problems.append("the bucket in this run's inventory is not the bucket this run created")
     return problems
@@ -123,10 +138,24 @@ def bucket_state_keys(run: RunBinding) -> list[str]:
     return run.state_keys if run.backend == "s3" else []
 
 
-def split_entries(entries: list[dict[str, Any]], run: RunBinding) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """The bucket's entries as data and as this run's state; an entry at any other key is data."""
+def classify_entries(entries: list[dict[str, Any]], run: RunBinding) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """The bucket's entries as data, as this run's state and as everything else. Only the data prefixes hold data; another run's state is neither."""
     keys = bucket_state_keys(run)
-    return [entry for entry in entries if entry["Key"] not in keys], [entry for entry in entries if entry["Key"] in keys]
+    data = [entry for entry in entries if entry["Key"].startswith(DATA_PREFIXES)]
+    state = [entry for entry in entries if entry["Key"] in keys]
+    return data, state, [entry for entry in entries if entry not in data and entry not in state]
+
+
+def other_entry_problems(other: list[dict[str, Any]], run: RunBinding) -> list[str]:
+    """Entries that are neither data nor this run's state are never approved or deleted. They stop the removal of a bucket this run created."""
+    if run.bucket_creation != "created":
+        return []
+    return [f"bucket: entry outside the data prefixes and this run's state keys: {key}" for key in sorted({entry["Key"] for entry in other})]
+
+
+def state_identity(run: RunBinding) -> tuple[str, int]:
+    current = json.loads(terraform(run, ["state", "pull"], PLAN_TIMEOUT_SECONDS))
+    return str(current["lineage"]), int(current["serial"])
 
 
 def teardown_code(plan_hash: str, approved: dict[str, Any]) -> str:
@@ -142,15 +171,17 @@ def read_json(path: Path, what: str) -> Any:
 def plan_teardown(aws: Aws, configuration: dict[str, str], run: RunBinding) -> int:
     folder = ROOT / "runs" / run.run_id
     read_json(folder / "inventory.json", "the run's inventory")
+    before = state_identity(run)
     save_plan(run, configuration, "destroy")
-    data, state = split_entries(bucket_entries(aws, run.bucket), run)
+    data, state, _ = classify_entries(bucket_entries(aws, run.bucket), run)
+    if state_identity(run) != before:
+        raise TeardownRefused("the state changed while the destroy plan was saved: run make teardown-plan again")
     approved: dict[str, Any] = {
         "application": [[run.bucket, entry["Key"], entry["VersionId"]] for entry in data],
         "state": [[entry["Key"], entry["VersionId"]] for entry in state],
+        "state_lineage": before[0],
+        "state_serial": before[1],
     }
-    current_state = json.loads(terraform(run, ["state", "pull"], PLAN_TIMEOUT_SECONDS))
-    approved["state_lineage"] = current_state["lineage"]
-    approved["state_serial"] = current_state["serial"]
     approved["local_state_sha256"] = hashlib.sha256(Path(run.state_keys[0]).read_bytes()).hexdigest() if run.backend == "local" else ""
     (folder / "teardown").mkdir(exist_ok=True)
     (folder / "teardown" / "approved_inventory.json").write_text(json.dumps(approved, indent=2) + "\n")
@@ -210,17 +241,52 @@ def read_bytes(path: Path) -> bytes | None:
     return path.read_bytes() if path.is_file() else None
 
 
-def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path) -> tuple[list[str], list[Target]]:
-    inventory_record = read_json(folder / "inventory.json", "the run's inventory")
+def approval_bytes(folder: Path) -> dict[str, bytes]:
+    """Each approval file, read once. Every check uses these bytes, and the signed manifest must carry their hashes."""
+    found = {}
+    for name in APPROVAL_FILES:
+        data = read_bytes(folder / name)
+        if data is None:
+            raise TeardownRefused(f"an approval file is missing: {name}; run make teardown-plan")
+        found[name] = data
+    return found
+
+
+def consumed_problems(manifest: dict[str, Any], files: dict[str, bytes]) -> list[str]:
+    """Each approval file whose checked bytes are not the bytes the manifest lists."""
+    listed = {item["path"]: item["sha256"] for item in manifest["files"]}
+    return [f"an approval file changed while it was checked: {name}" for name, data in files.items() if listed.get(name) != hashlib.sha256(data).hexdigest()]
+
+
+def approval_binding(confirm: str, files: dict[str, bytes], plan: bytes, receipt: bytes | None) -> dict[str, str]:
+    """What a teardown starts with: the code, the approved inventory, the plan, the inventory and the receipt. A rerun must carry the same."""
+    return {
+        "code": confirm,
+        "approved_sha256": hashlib.sha256(files["teardown/approved_inventory.json"]).hexdigest(),
+        "plan_sha256": hashlib.sha256(plan).hexdigest(),
+        "inventory_sha256": hashlib.sha256(files["inventory.json"]).hexdigest(),
+        "receipt_sha256": hashlib.sha256(receipt or b"").hexdigest(),
+    }
+
+
+def progress_problem(recorded: dict[str, Any], current: dict[str, str]) -> str | None:
+    for name, value in current.items():
+        if recorded.get(name) != value:
+            return f"this teardown started with another {name}: a rerun must use the approval it started with"
+    return None
+
+
+def guard_problems(
+    aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path, files: dict[str, bytes], receipt: bytes | None
+) -> list[str]:
+    inventory_record = json.loads(files["inventory.json"])
     inventory = inventory_record["created"]
-    approved = read_json(folder / "teardown" / "approved_inventory.json", "the approved inventory")
-    saved = read_json(folder / "plans" / "destroy_binding.json", "the destroy plan's binding")
-    receipt = read_bytes(folder / "export" / "receipt.json")
+    approved = json.loads(files["teardown/approved_inventory.json"])
+    saved = json.loads(files["plans/destroy_binding.json"])
     signature = read_bytes(folder / "export" / "receipt.json.sig")
     evidence = build_manifest(folder, run.run_id, run.commit)
-    current = manifest_sha256(evidence)
-    problems = manifest_problems(evidence)
-    problems += receipt_problems(receipt, signature_is_valid(receipt, signature, trusted_signers(run)), run, current)
+    problems = manifest_problems(evidence) + consumed_problems(evidence, files)
+    problems += receipt_problems(receipt, signature_is_valid(receipt, signature, trusted_signers()), run, manifest_sha256(evidence))
     problems += binding_problems(run, saved, plan, saved["plan_sha256"][:12], "destroy")
     if confirm != teardown_code(saved["plan_sha256"], approved):
         problems.append("the confirmation code does not equal the reviewed destroy plan and approved inventory")
@@ -228,14 +294,14 @@ def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: 
         problems.append("this teardown does not yet keep retained items: remove them from the destroy plan first")
     pre_provisioned = json.loads((folder / "pre_provisioned.json").read_text()) if (folder / "pre_provisioned.json").is_file() else []
     saved_plan = json.loads(terraform(run, ["show", "-json", str(approved_plan)], PLAN_TIMEOUT_SECONDS))
-    targets = delete_targets(saved_plan)
-    problems += target_problems(targets, inventory, run, pre_provisioned)
-    data, state = split_entries(bucket_entries(aws, run.bucket), run)
+    problems += target_problems(delete_targets(saved_plan), inventory, run, pre_provisioned)
+    data, state, other = classify_entries(bucket_entries(aws, run.bucket), run)
     problems += bucket_entry_problems(run.bucket, data, approved["application"])
     problems += state_entry_problems(state, run.state_keys, approved["state"])
+    problems += other_entry_problems(other, run)
     if run.backend == "local" and (problem := local_state_problem(Path(run.state_keys[0]), approved["local_state_sha256"])):
         problems.append(problem)
-    return problems, targets
+    return problems
 
 
 def purge(aws: Aws, bucket: str, approved: list[tuple[str, str]]) -> int:
@@ -262,33 +328,60 @@ def entry_content(aws: Aws, bucket: str, entry: dict[str, Any]) -> bytes:
         return target.read_bytes()
 
 
-def clean_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: Path) -> str:
-    """Record each entry the destroy wrote, stop on any entry it did not write, delete the state entries, then remove the bucket this run created."""
-    listing = aws.call("s3api", "list-object-versions", "--bucket", run.bucket)
-    markers = {(entry["Key"], entry["VersionId"]) for entry in listing.get("DeleteMarkers", [])}
-    entries = [*listing.get("Versions", []), *listing.get("DeleteMarkers", [])]
+def hold_state_lock(aws: Aws, run: RunBinding, scratch: Path) -> str:
+    """Take the state lock for the cleanup with a write that succeeds only when no lock exists, and return the version ID of the lock object."""
+    body = scratch / "lock"
+    body.write_text(json.dumps({"ID": f"teardown-{run.run_id}", "Operation": "teardown cleanup", "Path": f"{run.bucket}/{run.state_keys[0]}"}))
+    arguments = ["s3api", "put-object", "--bucket", run.bucket, "--key", run.state_keys[1], "--body", str(body), "--if-none-match", "*"]
+    written = aws.call(*arguments, missing=("PreconditionFailed",))
+    if written is None:
+        raise TeardownRefused("another process holds the state lock: the state entries and the bucket are kept; run the command again when it is released")
+    return str(written["VersionId"])
+
+
+def clean_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: Path, account: str) -> str:
+    """Under the state lock, delete this run's state entries, stop on any entry this run does not own, then remove the bucket this run created."""
+    created = run.bucket_creation == "created"
+    if aws.call("s3api", "head-bucket", "--bucket", run.bucket, missing=MISSING_BUCKET) is None:
+        if created:
+            return "none: no resource is retained"
+        raise TeardownRefused("the bucket, which this run did not create, no longer exists")
     keys = bucket_state_keys(run)
-    known = {(item[0], item[1]) for item in approved["state"]}
-    recorded, foreign = [], []
-    for entry in entries:
-        pair = (entry["Key"], entry["VersionId"])
-        if pair in known:
-            continue
-        is_marker = pair in markers
-        content = None if is_marker or entry["Key"] not in keys else entry_content(aws, run.bucket, entry)
-        problem = destroy_write_problem(entry["Key"], content, is_marker, keys, approved["state_lineage"], approved["state_serial"])
-        if problem:
-            foreign.append(f"bucket: {problem}: {entry['Key']}")
-        else:
-            recorded.append([entry["Key"], entry["VersionId"]])
-    (removal / "destroy_written_state_entries.json").write_text(json.dumps(recorded, indent=2) + "\n")
-    left = foreign + state_entry_problems(entries, keys, approved["state"], recorded)
-    if left:
-        raise TeardownRefused("the environment is gone, and the bucket is kept because:\n" + "\n".join(sorted(set(left))))
-    for entry in entries:
-        aws.call("s3api", "delete-object", "--bucket", run.bucket, "--key", entry["Key"], "--version-id", entry["VersionId"])
-    if run.bucket_creation != "created":
-        return "the empty bucket is kept: this run did not create it; it costs nothing while empty"
+    with tempfile.TemporaryDirectory(prefix="state_lock_") as scratch:
+        lock = [keys[1], hold_state_lock(aws, run, Path(scratch))] if keys else None
+        try:
+            listing = aws.call("s3api", "list-object-versions", "--bucket", run.bucket)
+            markers = {(entry["Key"], entry["VersionId"]) for entry in listing.get("DeleteMarkers", [])}
+            data, state, other = classify_entries([*listing.get("Versions", []), *listing.get("DeleteMarkers", [])], run)
+            known = {(item[0], item[1]) for item in approved["state"]} | ({(lock[0], lock[1])} if lock else set())
+            recorded = [lock] if lock else []
+            foreign = other_entry_problems(other, run)
+            if created:
+                foreign += [f"bucket: data entry that was not approved: {key}" for key in sorted({entry["Key"] for entry in data})]
+            for entry in state:
+                pair = (entry["Key"], entry["VersionId"])
+                if pair in known:
+                    continue
+                content = None if pair in markers else entry_content(aws, run.bucket, entry)
+                problem = destroy_write_problem(entry["Key"], content, pair in markers, keys, approved["state_lineage"], approved["state_serial"])
+                if problem:
+                    foreign.append(f"bucket: {problem}: {entry['Key']}")
+                else:
+                    recorded.append([entry["Key"], entry["VersionId"]])
+            (removal / "destroy_written_state_entries.json").write_text(json.dumps(recorded, indent=2) + "\n")
+            left = foreign + state_entry_problems(state, keys, approved["state"], recorded)
+            if left:
+                raise TeardownRefused("the environment is gone, and the bucket is kept because:\n" + "\n".join(sorted(set(left))))
+            for entry in state:
+                if lock is None or (entry["Key"], entry["VersionId"]) != (lock[0], lock[1]):
+                    aws.call("s3api", "delete-object", "--bucket", run.bucket, "--key", entry["Key"], "--version-id", entry["VersionId"])
+        finally:
+            if lock:
+                aws.call("s3api", "delete-object", "--bucket", run.bucket, "--key", lock[0], "--version-id", lock[1])
+    if not created:
+        return "the bucket is kept: this run did not create it"
+    if aws.call("s3api", "head-bucket", "--bucket", run.bucket, "--expected-bucket-owner", account, missing=("(403)", "AccessDenied")) is None:
+        raise TeardownRefused("the bucket is not owned by this account any more; it is kept")
     aws.call("s3api", "delete-bucket", "--bucket", run.bucket)
     if not wait_gone(aws, run.bucket):
         raise TeardownRefused(f"S3 still reports the bucket {GONE_DEADLINE_SECONDS} seconds after its deletion")
@@ -303,101 +396,135 @@ def device_check(entry: dict[str, str], status: Callable[[], dict[str, Any]]) ->
         return "unverified: the Tailscale network could not be read"
 
 
-def removal_check(aws: Aws, entry: dict[str, str]) -> str | None:
-    """What the service reports for one inventory entry after the teardown, or None for a type with no service check of its own."""
+CHECKS: dict[str, tuple[list[str], tuple[str, ...]]] = {
+    "aws_s3_bucket": (["s3api", "head-bucket", "--bucket"], MISSING_BUCKET),
+    "aws_security_group": (["ec2", "describe-security-groups", "--group-ids"], ("InvalidGroup.NotFound",)),
+    "aws_iam_role": (["iam", "get-role", "--role-name"], ("NoSuchEntity",)),
+    "aws_iam_instance_profile": (["iam", "get-instance-profile", "--instance-profile-name"], ("NoSuchEntity",)),
+    "aws_ebs_volume": (["ec2", "describe-volumes", "--volume-ids"], ("InvalidVolume.NotFound",)),
+    "aws_network_interface": (["ec2", "describe-network-interfaces", "--network-interface-ids"], ("InvalidNetworkInterfaceID.NotFound",)),
+}
+CHECKED_TYPES = {*CHECKS, "aws_instance", DEVICE_TYPE}
+
+
+def removal_check(aws: Aws, entry: dict[str, str], remaining: float) -> str:
+    """What the service reports for one inventory entry of a checked type after the teardown, within the time that is left."""
     kind, identifier = entry["type"], entry["service_id"]
-    lookups: dict[str, tuple[list[str], tuple[str, ...]]] = {
-        "aws_s3_bucket": (["s3api", "head-bucket", "--bucket", identifier], MISSING_BUCKET),
-        "aws_security_group": (["ec2", "describe-security-groups", "--group-ids", identifier], ("InvalidGroup.NotFound",)),
-        "aws_iam_role": (["iam", "get-role", "--role-name", identifier], ("NoSuchEntity",)),
-        "aws_iam_instance_profile": (["iam", "get-instance-profile", "--instance-profile-name", identifier], ("NoSuchEntity",)),
-        "aws_ebs_volume": (["ec2", "describe-volumes", "--volume-ids", identifier], ("InvalidVolume.NotFound",)),
-        "aws_network_interface": (["ec2", "describe-network-interfaces", "--network-interface-ids", identifier], ("InvalidNetworkInterfaceID.NotFound",)),
-    }
+    timeout = min(CHECK_TIMEOUT_SECONDS, remaining)
     if kind == DEVICE_TYPE:
-        return device_check(entry, lambda: host.tailscale_status(CHECK_TIMEOUT_SECONDS))
+        return device_check(entry, lambda: host.tailscale_status(timeout))
     if kind == "aws_instance":
         query = ["ec2", "describe-instances", "--instance-ids", identifier, "--query", "Reservations[].Instances[].State.Name"]
-        state = aws.call(*query, missing=("InvalidInstanceID.NotFound",), timeout=CHECK_TIMEOUT_SECONDS)
+        state = aws.call(*query, missing=("InvalidInstanceID.NotFound",), timeout=timeout)
         return "gone" if state in (None, [], ["terminated"]) else f"still exists: {state}"
-    if kind not in lookups:
-        return None
-    arguments, missing = lookups[kind]
-    return "gone" if aws.call(*arguments, missing=missing, timeout=CHECK_TIMEOUT_SECONDS) is None else "still exists"
+    arguments, missing = CHECKS[kind]
+    return "gone" if aws.call(*arguments, identifier, missing=missing, timeout=timeout) is None else "still exists"
 
 
 def checked_removals(aws: Aws, inventory: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Every inventory entry with its result: a service check where one exists, else its parent's, else unverified."""
-    direct = [entry for entry in inventory if removal_check(aws, entry) is not None]
-    settled = settled_checks(
-        lambda entry: removal_check(aws, entry) or "", direct, attempts=GONE_DEADLINE_SECONDS // GONE_POLL_SECONDS, pause_seconds=GONE_POLL_SECONDS
-    )
-    reported = {(check["type"], check["service_id"]): check["reported"] for check in settled}
-    by_address = {check["address"]: check for check in settled}
+    """Every inventory entry with its result: a service check where one exists, else its parent's, else unverified. All checks share one deadline."""
+    direct = [entry for entry in inventory if entry["type"] in CHECKED_TYPES]
+
+    def check(entry: dict[str, str], remaining: float) -> str:
+        try:
+            return removal_check(aws, entry, remaining)
+        except TimeoutExpired:
+            return "still exists: its service did not answer in time"
+
+    settled = settled_checks(check, direct, deadline_seconds=GONE_DEADLINE_SECONDS, pause_seconds=GONE_POLL_SECONDS)
+    reported = {(found["type"], found["service_id"]): found["reported"] for found in settled}
+    by_address = {found["address"]: found for found in settled}
     return [by_address.get(entry["address"]) or entry | {"reported": parent_check(entry, reported)} for entry in inventory]
 
 
-def finished_stages(removal: Path) -> list[str]:
+def read_progress(removal: Path) -> dict[str, Any] | None:
     progress = removal / "progress.json"
-    finished: list[str] = json.loads(progress.read_text()) if progress.is_file() else []
-    return finished
+    record: dict[str, Any] | None = json.loads(progress.read_text()) if progress.is_file() else None
+    return record
 
 
-def finish_stage(removal: Path, stage: str) -> None:
-    (removal / "progress.json").write_text(json.dumps([*finished_stages(removal), stage]) + "\n")
+def write_progress(removal: Path, binding: dict[str, str], finished: list[str]) -> None:
+    removal.mkdir(exist_ok=True)
+    (removal / "progress.json").write_text(json.dumps(binding | {"finished": finished}, indent=2) + "\n")
 
 
-def settled_checks(check: Callable[[dict[str, str]], str], inventory: list[dict[str, str]], *, attempts: int, pause_seconds: float) -> list[dict[str, str]]:
-    """Each inventory entry with what its service reports, asked again while a removal is still reported as existing."""
-    reported = {entry["address"]: check(entry) for entry in inventory}
-    for _ in range(attempts - 1):
-        late = [entry for entry in inventory if reported[entry["address"]].startswith("still exists")]
-        if not late:
+def settled_checks(
+    check: Callable[[dict[str, str], float], str],
+    inventory: list[dict[str, str]],
+    *,
+    deadline_seconds: float,
+    pause_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[dict[str, str]]:
+    """Each entry with what its service reports. A removal still reported as existing is asked again until one deadline that all checks share."""
+    deadline = clock() + deadline_seconds
+    reported: dict[str, str] = {}
+    pending = list(inventory)
+    while pending:
+        for entry in pending:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                break
+            reported[entry["address"]] = check(entry, remaining)
+        pending = [entry for entry in pending if reported.get(entry["address"], "still exists").startswith("still exists")]
+        if not pending or deadline - clock() <= pause_seconds:
             break
-        time.sleep(pause_seconds)
-        reported.update({entry["address"]: check(entry) for entry in late})
-    return [entry | {"reported": reported[entry["address"]]} for entry in inventory]
+        sleep(pause_seconds)
+    return [entry | {"reported": reported.get(entry["address"], "unverified: not checked before the deadline")} for entry in inventory]
 
 
-def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
-    """Run the stages that are left. A finished teardown does nothing, and an interrupted one resumes after its last finished stage."""
+def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: str) -> int:
+    """Run the stages that are left. A finished teardown does nothing. An interrupted one resumes only with the approval it started with."""
     folder = ROOT / "runs" / run.run_id
     removal = folder / "removal"
-    left = remaining_stages(finished_stages(removal))
+    progress = read_progress(removal)
+    finished: list[str] = progress["finished"] if progress else []
+    left = remaining_stages(finished)
     if not left:
         sys.stdout.write(f"run {run.run_id}: the teardown is already complete; nothing was changed\n")
         return 0
-    inventory = read_json(folder / "inventory.json", "the run's inventory")["created"]
-    approved = read_json(folder / "teardown" / "approved_inventory.json", "the approved inventory")
+    files = approval_bytes(folder)
+    plan = read_bytes(folder / "plans" / "destroy.tfplan")
+    if plan is None:
+        raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
+    receipt = read_bytes(folder / "export" / "receipt.json")
+    binding = approval_binding(confirm, files, plan, receipt)
+    if progress is not None and (problem := progress_problem(progress, binding)):
+        raise TeardownRefused(f"refused before any deletion: {problem}")
+    inventory = json.loads(files["inventory.json"])["created"]
+    approved = json.loads(files["teardown/approved_inventory.json"])
+
+    def finish(stage: str) -> None:
+        finished.append(stage)
+        write_progress(removal, binding, finished)
+
     if "apply" in left:
-        plan = read_bytes(folder / "plans" / "destroy.tfplan")
-        if plan is None:
-            raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
         approved_plan = approved_plan_copy(run, plan)
         try:
-            problems, targets = guard_problems(aws, run, folder, confirm, plan, approved_plan)
+            problems = guard_problems(aws, run, folder, confirm, plan, approved_plan, files, receipt)
             if problems:
                 raise TeardownRefused("refused before any deletion:\n" + "\n".join(problems))
-            removal.mkdir(exist_ok=True)
-            if "purge" in left:
-                purge(aws, run.bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == run.bucket])
-                finish_stage(removal, "purge")
+            write_progress(removal, binding, finished)
             if "release" in left:
                 for device in (entry for entry in inventory if entry["type"] == DEVICE_TYPE):
                     host.release_tailscale_device(run.run_id, device["host_name"], device["service_id"])
-                finish_stage(removal, "release")
+                finish("release")
             output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
             save_raw(run.run_id, "destroy_apply.txt", output)
             destroyed = DESTROYED.search(output)
             sys.stdout.write(
                 f"run {run.run_id}: the destroy plan is applied; resources destroyed: {destroyed.group(1) if destroyed else 'see the raw output'}\n"
             )
-            finish_stage(removal, "apply")
+            finish("apply")
         finally:
             approved_plan.unlink(missing_ok=True)
+    if "purge" in left:
+        purge(aws, run.bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == run.bucket])
+        finish("purge")
     if "state" in left:
-        (removal / "retained.json").write_text(json.dumps(clean_bucket(aws, run, approved, removal)) + "\n")
-        finish_stage(removal, "state")
+        (removal / "retained.json").write_text(json.dumps(clean_bucket(aws, run, approved, removal, configuration["AWS_ACCOUNT_ID"])) + "\n")
+        finish("state")
     checks = checked_removals(aws, inventory)
     (removal / "checks.json").write_text(
         json.dumps({"run_id": run.run_id, "checks": checks, "retained_cost": read_json(removal / "retained.json", "the record of what is kept")}, indent=2)
@@ -408,7 +535,7 @@ def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
     failed = [check for check in checks if not check["reported"].startswith("gone")]
     if failed:
         raise TeardownRefused(f"{len(failed)} removals are not confirmed; see {(removal / 'checks.json').relative_to(ROOT)}")
-    finish_stage(removal, "checks")
+    finish("checks")
     sys.stdout.write(f"run {run.run_id}: every removal is confirmed through its service\n")
     return 0
 
@@ -427,7 +554,7 @@ def main() -> int:
         mode_problem = bucket_problem(run, configuration)
         if mode_problem:
             raise TeardownRefused(f"refused before any deletion: {mode_problem}")
-        return plan_teardown(aws, configuration, run) if arguments.command == "plan" else destroy(aws, run, arguments.confirm)
+        return plan_teardown(aws, configuration, run) if arguments.command == "plan" else destroy(aws, configuration, run, arguments.confirm)
     except (ConfigurationError, WrapperError, TeardownRefused, AwsError, host.HostError) as error:
         sys.stderr.write(f"{error}\n")
         return 1

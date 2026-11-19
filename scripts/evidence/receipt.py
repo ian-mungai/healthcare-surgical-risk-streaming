@@ -20,9 +20,9 @@ NAMESPACE = "evidence-receipt"
 SIGNATURE_TIMEOUT_SECONDS = 60
 
 
-def trusted_signers(run: RunBinding) -> str:
-    """The signer list as committed at the run's bound commit, or an empty text when that commit does not hold it."""
-    result = run_command("git", ["show", f"{run.commit}:infra/evidence/allowed_signers"], cwd=ROOT, timeout=SIGNATURE_TIMEOUT_SECONDS)
+def trusted_signers() -> str:
+    """The signer list as committed at the checked-out commit, or an empty text when that commit does not hold it. A run's files cannot choose it."""
+    result = run_command("git", ["show", "HEAD:infra/evidence/allowed_signers"], cwd=ROOT, timeout=SIGNATURE_TIMEOUT_SECONDS)
     return result.stdout if result.returncode == 0 else ""
 
 

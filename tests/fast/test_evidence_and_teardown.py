@@ -20,14 +20,16 @@ from scripts.infra.host import HostError
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.teardown import (
     bucket_entry_problems,
+    classify_entries,
     delete_targets,
     destroy_write_problem,
     device_check,
     local_state_problem,
+    other_entry_problems,
     parent_check,
+    progress_problem,
     remaining_stages,
     settled_checks,
-    split_entries,
     state_entry_problems,
     target_problems,
 )
@@ -195,6 +197,7 @@ INVENTORY = [
     {"address": "module.host[0].aws_instance.host", "type": "aws_instance", "service_id": "i-0aaa"},
     {"address": "module.host[0].aws_iam_role.host", "type": "aws_iam_role", "service_id": "example_host"},
     {"address": "project bucket", "type": "aws_s3_bucket", "service_id": "example-project"},
+    {"address": "tailscale device", "type": "tailscale_device", "service_id": "nNEWCNTRL", "host_name": "platform-dev"},
 ]
 
 
@@ -210,6 +213,18 @@ class TargetTest(unittest.TestCase):
 
     def test_targets_in_the_inventory_pass(self) -> None:
         self.assertEqual([], target_problems(delete_targets(PLAN), INVENTORY, RUN, []))
+
+    def test_a_bucket_is_never_a_terraform_delete_target(self) -> None:
+        with_bucket = {"resource_changes": [change("aws_s3_bucket.other", "aws_s3_bucket", "example-project", ["delete"])]}
+        self.assertEqual(
+            ["delete target is a bucket, and Terraform manages no bucket: aws_s3_bucket.other"],
+            target_problems(delete_targets(with_bucket), INVENTORY, RUN, []),
+        )
+
+    def test_a_host_with_no_recorded_tailscale_device_is_refused(self) -> None:
+        without_device = [entry for entry in INVENTORY if entry["type"] != "tailscale_device"]
+        expected = ["the plan deletes a host and the run has no record of its Tailscale device: run make host-start or make host-up first"]
+        self.assertEqual(expected, target_problems(delete_targets(PLAN), without_device, RUN, []))
 
     def test_target_outside_the_inventory_is_refused(self) -> None:
         foreign = {"resource_changes": [change("module.host[0].aws_instance.host", "aws_instance", "i-0bbb", ["delete"])]}
@@ -270,10 +285,27 @@ class ObjectInventoryTest(unittest.TestCase):
             bucket_entry_problems("example-landing", [entry("a.vital", "null")], [["example-landing", "a.vital", "null"]]),
         )
 
-    def test_entries_are_split_into_data_and_this_runs_state(self) -> None:
-        found = [entry("landing/a.vital", "v1"), entry(STATE_KEYS[0], "v2"), entry("terraform_state/prod/terraform.tfstate", "v3"), entry(STATE_KEYS[1], "v4")]
-        self.assertEqual(([found[0], found[2]], [found[1], found[3]]), split_entries(found, RUN))
-        self.assertEqual((found, []), split_entries(found, LOCAL))
+    def test_only_the_data_prefixes_hold_data_and_only_this_runs_keys_hold_its_state(self) -> None:
+        found = [
+            entry("landing/a.vital", "v1"),
+            entry(STATE_KEYS[0], "v2"),
+            entry("terraform_state/prod/terraform.tfstate", "v3"),
+            entry(STATE_KEYS[1], "v4"),
+            entry("warehouse/table/data.parquet", "v5"),
+            entry("landing", "v6"),
+            entry("other/notes.txt", "v7"),
+        ]
+        self.assertEqual(([found[0], found[4]], [found[1], found[3]], [found[2], found[5], found[6]]), classify_entries(found, RUN))
+        self.assertEqual(([found[0], found[4]], [], [found[1], found[2], found[3], found[5], found[6]]), classify_entries(found, LOCAL))
+
+    def test_an_entry_that_is_neither_data_nor_this_runs_state_stops_the_removal_of_a_bucket_this_run_created(self) -> None:
+        other = [entry("terraform_state/prod/terraform.tfstate", "v3")]
+        expected = ["bucket: entry outside the data prefixes and this run's state keys: terraform_state/prod/terraform.tfstate"]
+        self.assertEqual(expected, other_entry_problems(other, RUN))
+
+    def test_such_an_entry_is_left_alone_in_a_bucket_this_run_did_not_create(self) -> None:
+        adopted = RunBinding(**{**RUN.__dict__, "bucket_creation": "none"})
+        self.assertEqual([], other_entry_problems([entry("terraform_state/prod/terraform.tfstate", "v3")], adopted))
 
     def test_approved_state_entries_pass(self) -> None:
         approved = [[STATE_KEYS[0], "v1"], [STATE_KEYS[1], "v2"]]
@@ -346,12 +378,20 @@ class TeardownStageTest(unittest.TestCase):
         self.assertEqual("the bound local state file does not exist", local_state_problem(state.with_name("missing.tfstate"), unchanged))
 
     def test_a_new_teardown_runs_every_stage(self) -> None:
-        self.assertEqual(["purge", "release", "apply", "state", "checks"], remaining_stages([]))
+        self.assertEqual(["release", "apply", "purge", "state", "checks"], remaining_stages([]))
 
     def test_a_rerun_resumes_after_the_last_finished_stage(self) -> None:
-        self.assertEqual(["release", "apply", "state", "checks"], remaining_stages(["purge"]))
-        self.assertEqual(["state", "checks"], remaining_stages(["purge", "release", "apply"]))
-        self.assertEqual([], remaining_stages(["purge", "release", "apply", "state", "checks"]))
+        self.assertEqual(["apply", "purge", "state", "checks"], remaining_stages(["release"]))
+        self.assertEqual(["purge", "state", "checks"], remaining_stages(["release", "apply"]))
+        self.assertEqual([], remaining_stages(["release", "apply", "purge", "state", "checks"]))
+
+    def test_a_rerun_must_carry_the_approval_the_teardown_started_with(self) -> None:
+        same = {"code": "abc", "approved_sha256": "1" * 64, "plan_sha256": "2" * 64, "inventory_sha256": "3" * 64, "receipt_sha256": "4" * 64}
+        started: dict[str, Any] = same | {"finished": ["release"]}
+        self.assertIsNone(progress_problem(started, same))
+        for name in same:
+            changed = same | {name: "other"}
+            self.assertEqual(f"this teardown started with another {name}: a rerun must use the approval it started with", progress_problem(started, changed))
 
     def test_a_part_is_verified_only_through_its_own_check_or_a_parent_that_is_gone(self) -> None:
         reported = {("aws_iam_role", "example_host"): "gone", ("aws_iam_role", "example_deploy"): "still exists"}
@@ -385,15 +425,57 @@ class DeviceCheckTest(unittest.TestCase):
         self.assertEqual("unverified: the Tailscale network could not be read", device_check(DEVICE_ENTRY, unreadable))
 
 
+class Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class RemovalCheckTest(unittest.TestCase):
     def test_a_removal_that_the_service_reports_late_is_confirmed(self) -> None:
-        answers = {"example_host": iter(["still exists", "still exists", "gone"]), "i-0aaa": iter(["gone"]), "example-project": iter(["gone"])}
-        checks = settled_checks(lambda entry: next(answers[entry["service_id"]]), INVENTORY, attempts=5, pause_seconds=0)
-        self.assertEqual(["gone", "gone", "gone"], [check["reported"] for check in checks])
+        answers = {
+            "example_host": iter(["still exists", "still exists", "gone"]),
+            "i-0aaa": iter(["gone"]),
+            "example-project": iter(["gone"]),
+            "nNEWCNTRL": iter(["gone"]),
+        }
+        clock = Clock()
+        checks = settled_checks(
+            lambda entry, remaining: next(answers[entry["service_id"]]), INVENTORY, deadline_seconds=60, pause_seconds=5, clock=clock.time, sleep=clock.sleep
+        )
+        self.assertEqual(["gone", "gone", "gone", "gone"], [check["reported"] for check in checks])
 
-    def test_a_resource_that_stays_is_reported_after_the_last_attempt(self) -> None:
-        checks = settled_checks(lambda entry: "still exists" if entry["service_id"] == "i-0aaa" else "gone", INVENTORY, attempts=3, pause_seconds=0)
-        self.assertEqual(["still exists", "gone", "gone"], [check["reported"] for check in checks])
+    def test_a_resource_that_stays_is_reported_at_the_deadline(self) -> None:
+        clock = Clock()
+        checks = settled_checks(
+            lambda entry, remaining: "still exists" if entry["service_id"] == "i-0aaa" else "gone",
+            INVENTORY,
+            deadline_seconds=12,
+            pause_seconds=5,
+            clock=clock.time,
+            sleep=clock.sleep,
+        )
+        self.assertEqual(["still exists", "gone", "gone", "gone"], [check["reported"] for check in checks])
+        self.assertLessEqual(clock.now, 12)
+
+    def test_every_check_gets_only_the_time_that_is_left_and_slow_calls_cannot_pass_the_deadline(self) -> None:
+        clock = Clock()
+        budgets: list[float] = []
+
+        def slow(entry: dict[str, str], remaining: float) -> str:
+            budgets.append(remaining)
+            clock.sleep(min(remaining, 30))
+            return "still exists"
+
+        settled_checks(slow, INVENTORY, deadline_seconds=100, pause_seconds=5, clock=clock.time, sleep=clock.sleep)
+        self.assertLessEqual(clock.now, 100)
+        self.assertTrue(all(0 < budget <= 100 for budget in budgets))
+        self.assertEqual(sorted(budgets, reverse=True), budgets)
 
 
 if __name__ == "__main__":
