@@ -1,0 +1,146 @@
+"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint and the tflint AWS ruleset.
+
+Run from the repository root: ``.venv/bin/python -m scripts.quality.install_tools``. ``--check`` verifies each installed
+binary against its pinned archive without downloading or writing anything. Each archive is checked against its pinned
+SHA-256 before anything is extracted, and the checked archive is kept in ``.tools/downloads``. A rerun with the kept
+archives downloads nothing and rewrites a binary only when its bytes differ. The checksums come from each release's
+published checksum file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import platform
+import sys
+import tarfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from scripts.process import run_command
+
+ROOT = Path(__file__).resolve().parents[2]
+TOOLS = ROOT / ".tools"
+DOWNLOADS = TOOLS / "downloads"
+DOWNLOAD_TIMEOUT_SECONDS = 300
+BINARY_MODE = 0o700
+Platform = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    version: str
+    url: str
+    member: str
+    target: str
+    assets: dict[Platform, tuple[str, str]]
+
+
+GITLEAKS = Tool(
+    name="gitleaks",
+    version="8.30.1",
+    url="https://github.com/gitleaks/gitleaks/releases/download/v8.30.1",
+    member="gitleaks",
+    target="bin/gitleaks",
+    assets={
+        ("Darwin", "arm64"): ("gitleaks_8.30.1_darwin_arm64.tar.gz", "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"),
+        ("Linux", "x86_64"): ("gitleaks_8.30.1_linux_x64.tar.gz", "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"),
+    },
+)
+TFLINT = Tool(
+    name="tflint",
+    version="0.66.0",
+    url="https://github.com/terraform-linters/tflint/releases/download/v0.66.0",
+    member="tflint",
+    target="bin/tflint",
+    assets={
+        ("Darwin", "arm64"): ("tflint_darwin_arm64.zip", "859b26af07ead7e65cee7eec9d050b2e2571dc28395b7a39191cae088cd67803"),
+        ("Linux", "x86_64"): ("tflint_linux_amd64.zip", "22be11cadc25cd02401e94c0ccc91aa63467debb8485c2a755d98f4c0a9d1e2e"),
+    },
+)
+TFLINT_AWS = Tool(
+    name="tflint-ruleset-aws",
+    version="0.50.0",
+    url="https://github.com/terraform-linters/tflint-ruleset-aws/releases/download/v0.50.0",
+    member="tflint-ruleset-aws",
+    target="tflint_plugins/github.com/terraform-linters/tflint-ruleset-aws/0.50.0/tflint-ruleset-aws",
+    assets={
+        ("Darwin", "arm64"): ("tflint-ruleset-aws_darwin_arm64.zip", "0117f75027cbc1bc452db1defd59d40b4a579ef3e7bb3a8b3079eaf6d372a9a6"),
+        ("Linux", "x86_64"): ("tflint-ruleset-aws_linux_amd64.zip", "cdd433fdbc0929e7b9f9709dd9e72237fdfe1fc235674445c284b1e4b94a5c26"),
+    },
+)
+TOOL_LIST = (GITLEAKS, TFLINT, TFLINT_AWS)
+
+
+def pinned_asset(tool: Tool) -> tuple[str, str]:
+    key = (platform.system(), platform.machine())
+    if key not in tool.assets:
+        raise SystemExit(f"no pinned {tool.name} build for {key[0]} {key[1]}; add its checksum to scripts/quality/install_tools.py")
+    return tool.assets[key]
+
+
+def verified_archive(tool: Tool, *, download: bool) -> bytes | None:
+    asset, expected = pinned_asset(tool)
+    kept = DOWNLOADS / f"{tool.name}_{tool.version}_{asset}"
+    if kept.is_file() and hashlib.sha256(kept.read_bytes()).hexdigest() == expected:
+        return kept.read_bytes()
+    if not download:
+        return None
+    DOWNLOADS.mkdir(parents=True, exist_ok=True)
+    partial = kept.with_name(kept.name + ".partial")
+    arguments = ["--fail", "--silent", "--show-error", "--location", "--proto", "=https", "--max-time", str(DOWNLOAD_TIMEOUT_SECONDS), "--output", str(partial)]
+    run_command("curl", [*arguments, f"{tool.url}/{asset}"], timeout=DOWNLOAD_TIMEOUT_SECONDS + 10, check=True)
+    data = partial.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        partial.unlink()
+        raise SystemExit(f"{tool.name} {tool.version}: the download does not match its pinned SHA-256; nothing was installed")
+    partial.replace(kept)
+    return data
+
+
+def pinned_binary(tool: Tool, archive: bytes) -> bytes:
+    if pinned_asset(tool)[0].endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            return bundle.read(tool.member)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tarball:
+        member = tarball.extractfile(tool.member)
+        if member is None:
+            raise SystemExit(f"the {tool.name} archive holds no {tool.member} file")
+        return member.read()
+
+
+def settle(tool: Tool, *, check: bool) -> bool:
+    label = f"{tool.name} {tool.version}"
+    archive = verified_archive(tool, download=not check)
+    if archive is None:
+        sys.stderr.write(f"{label}: no verified archive in .tools/downloads; run the installer without --check\n")
+        return False
+    binary = pinned_binary(tool, archive)
+    target = TOOLS / tool.target
+    if target.is_file() and target.read_bytes() == binary and (target.stat().st_mode & 0o777) == BINARY_MODE:
+        sys.stdout.write(f"{label}: installed and verified\n")
+        return True
+    if check:
+        sys.stderr.write(f"{label}: the installed binary is missing or differs from the pinned archive\n")
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(binary)
+    target.chmod(BINARY_MODE)
+    sys.stdout.write(f"{label}: installed from the verified archive\n")
+    return True
+
+
+def main() -> int:
+    """Install or check every pinned tool and return 1 when one is missing or differs."""
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser.add_argument("--check", action="store_true", help="verify the installed binaries without downloading or writing")
+    check = parser.parse_args().check
+    results = [settle(tool, check=check) for tool in TOOL_LIST]
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

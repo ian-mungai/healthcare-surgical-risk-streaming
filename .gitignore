@@ -1,0 +1,29 @@
+# Local-only project documents
+docs/project_guide.md
+docs/project_standard.md
+docs/issue_register.md
+
+# Local-only plan documents and review records
+docs/plans/
+docs/reviews/
+
+# Local-only run folders with end-to-end evidence
+runs/
+
+# Local-only session state
+.agent_handoff/
+
+# macOS system files
+.DS_Store
+
+# Environment file with the secret store's unlock key. Never commit it.
+.env
+.env.*
+!.env.example
+
+# Local Python environment, pinned tools and tool caches
+.venv
+.tools
+__pycache__/
+.ruff_cache/
+.mypy_cache/
