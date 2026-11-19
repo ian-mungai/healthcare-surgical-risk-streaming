@@ -1,5 +1,5 @@
-# A workload reads its credentials by mounting /run/workload_access/<name> read-only and naming the file in its AWS
-# configuration: credential_process = cat <mount>/credentials.json. The AWS SDK then reads the renewed file by itself.
+# A workload mounts /run/workload_access/<name> read-only at /run/workload_access and /etc/workload_access/client_config
+# read-only as its AWS configuration file (AWS_CONFIG_FILE). The AWS SDK then reads the renewed credentials by itself.
 - name: Create one group for each workload
   ansible.builtin.group:
     name: "workload_{{ item.name }}"
@@ -15,7 +15,7 @@
     state: directory
     owner: root
     group: root
-    mode: "0700"
+    mode: "0755"
 
 - name: List the workloads and their roles for the credential helper
   ansible.builtin.copy:
@@ -24,6 +24,17 @@
     owner: root
     group: root
     mode: "0600"
+
+- name: Write the AWS configuration that a workload mounts beside its credentials
+  ansible.builtin.copy:
+    dest: /etc/workload_access/client_config
+    content: |
+      [default]
+      region = {{ workload_access_region }}
+      credential_process = cat /run/workload_access/credentials.json
+    owner: root
+    group: root
+    mode: "0644"
 
 - name: Install the credential helper
   ansible.builtin.copy:
