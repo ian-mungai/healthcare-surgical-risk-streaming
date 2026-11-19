@@ -34,7 +34,12 @@ variable "workload_role_pattern" {
   type        = string
 }
 
-variable "bucket_arns" {
-  description = "ARN of each project bucket the host may read and write."
-  type        = map(string)
+variable "bucket_arn" {
+  description = "ARN of the project's one bucket."
+  type        = string
+}
+
+variable "data_prefixes" {
+  description = "Prefixes of the bucket the host may list, read and write. The Terraform state lives under another prefix."
+  type        = list(string)
 }

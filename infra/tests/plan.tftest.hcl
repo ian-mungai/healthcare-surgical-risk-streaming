@@ -29,22 +29,20 @@ variables {
   aws_profile  = "example_project_dev"
   project_name = "example_project"
   environment  = "dev"
-  run_id       = "20260101t0000-abcdef"
+
+  data_bucket_name = "example-project"
 
   github_repository   = "example-owner/example-repository"
   tailscale_client_id = "example-client-id"
   tailscale_audience  = "example-audience"
 }
 
-run "environment_names_follow_the_run" {
+run "environment_uses_the_one_bucket_it_is_given" {
   command = plan
 
   assert {
-    condition = output.bucket_names == {
-      landing   = "example-project-landing-dev-20260101t0000-abcdef"
-      warehouse = "example-project-warehouse-dev-20260101t0000-abcdef"
-    }
-    error_message = "Each bucket name is the project, the component, the environment and the run ID, with dashes."
+    condition     = output.data_bucket_name == "example-project" && output.data_prefixes == ["landing", "warehouse"]
+    error_message = "The environment creates no bucket: it uses the given bucket and keeps its data under the landing and warehouse prefixes."
   }
 }
 
@@ -60,7 +58,8 @@ run "host_matches_the_design" {
     boundary_name = "example_project_role_boundary"
     instance_type = "m6a.2xlarge"
     disk_gib      = 200
-    bucket_arns   = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+    bucket_arn    = "arn:aws:s3:::example-project"
+    data_prefixes = ["landing", "warehouse"]
 
     workload_role_pattern = "example_project_workload_*"
 
@@ -113,6 +112,27 @@ run "host_matches_the_design" {
     condition     = !strcontains(aws_iam_role_policy.host_storage.policy, "\"Resource\":\"*\"") && !strcontains(aws_iam_role_policy.host_storage.policy, "s3:*")
     error_message = "The host's storage policy names its buckets and actions."
   }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.host_storage.policy).Statement :
+      statement.Resource == ["arn:aws:s3:::example-project/landing/*", "arn:aws:s3:::example-project/warehouse/*"] if statement.Sid == "ReadAndWriteProjectObjects"
+    ])
+    error_message = "The host reads and writes objects under the data prefixes only, never the Terraform state."
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(aws_iam_role_policy.host_storage.policy).Statement :
+      statement.Resource == "arn:aws:s3:::example-project" && statement.Condition == { StringLike = { "s3:prefix" = ["landing/*", "warehouse/*"] } } if statement.Sid == "ListProjectDataPrefixes"
+    ])
+    error_message = "The host lists the project bucket under the data prefixes only."
+  }
+
+  assert {
+    condition     = length([for statement in jsondecode(aws_iam_role_policy.host_storage.policy).Statement : statement.Sid if contains(["ReadAndWriteProjectObjects", "ListProjectDataPrefixes"], statement.Sid)]) == 2
+    error_message = "Both project statements exist, so the two checks above cannot pass over a missing statement."
+  }
 }
 
 run "host_joins_tailscale_without_a_stored_key" {
@@ -127,7 +147,8 @@ run "host_joins_tailscale_without_a_stored_key" {
     boundary_name = "example_project_role_boundary"
     instance_type = "m6a.2xlarge"
     disk_gib      = 200
-    bucket_arns   = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+    bucket_arn    = "arn:aws:s3:::example-project"
+    data_prefixes = ["landing", "warehouse"]
 
     workload_role_pattern = "example_project_workload_*"
 
@@ -232,8 +253,8 @@ run "given_host_is_not_provisioned" {
   }
 
   assert {
-    condition     = length(output.bucket_names) == 2
-    error_message = "The project buckets are planned for a host that already exists too."
+    condition     = output.data_bucket_name == "example-project"
+    error_message = "A host that already exists uses the same bucket."
   }
 }
 
@@ -286,7 +307,8 @@ run "host_may_assume_only_workload_roles" {
     boundary_name         = "example_project_role_boundary"
     instance_type         = "m6a.2xlarge"
     disk_gib              = 200
-    bucket_arns           = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+    bucket_arn            = "arn:aws:s3:::example-project"
+    data_prefixes         = ["landing", "warehouse"]
     workload_role_pattern = "example_project_workload_*"
 
     tailscale = {
@@ -314,46 +336,12 @@ run "small_disk_is_refused" {
   expect_failures = [var.host_disk_gib]
 }
 
-run "malformed_run_id_is_refused" {
+run "malformed_bucket_name_is_refused" {
   command = plan
 
   variables {
-    run_id = "latest"
+    data_bucket_name = "Example_Bucket"
   }
 
-  expect_failures = [var.run_id]
-}
-
-run "buckets_are_private_and_versioned" {
-  command = plan
-
-  module {
-    source = "./modules/storage"
-  }
-
-  variables {
-    bucket_names = { landing = "example-landing", warehouse = "example-warehouse" }
-  }
-
-  assert {
-    condition     = length(aws_s3_bucket.this) == 2 && alltrue([for bucket in aws_s3_bucket_versioning.this : bucket.versioning_configuration[0].status == "Enabled"])
-    error_message = "Each bucket has versioning enabled."
-  }
-
-  assert {
-    condition = alltrue([
-      toset(keys(aws_s3_bucket.this)) == toset(["landing", "warehouse"]),
-      toset(keys(aws_s3_bucket_versioning.this)) == toset(keys(aws_s3_bucket.this)),
-      toset(keys(aws_s3_bucket_public_access_block.this)) == toset(keys(aws_s3_bucket.this)),
-    ])
-    error_message = "Both controls exist for exactly the buckets, so the checks above cannot pass over an empty or partial control map."
-  }
-
-  assert {
-    condition = alltrue([
-      for block in aws_s3_bucket_public_access_block.this :
-      block.block_public_acls && block.ignore_public_acls && block.block_public_policy && block.restrict_public_buckets
-    ])
-    error_message = "Each bucket has all four public access blocks on."
-  }
+  expect_failures = [var.data_bucket_name]
 }

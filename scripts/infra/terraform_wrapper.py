@@ -73,7 +73,7 @@ def backend_override(run: RunBinding) -> str | None:
 
 def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, str]:
     """The Terraform variables that come from the run and not from the environment's variable file."""
-    return {"run_id": run.run_id, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    return {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
 
 
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:

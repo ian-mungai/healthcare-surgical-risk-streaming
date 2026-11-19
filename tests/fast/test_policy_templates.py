@@ -19,7 +19,7 @@ VALUES = {
     "AWS_ACCOUNT_ID": "1" * 12,
     "PROJECT_NAME": "example_project",
     "ENVIRONMENT": "dev",
-    "BUCKET_PREFIX": "example-project",
+    "S3_BUCKET": "example-project",
     "TAILSCALE_AUDIENCE": "example-audience",
 }
 STATEMENT = {"Sid": "ReadOffers", "Effect": "Allow", "Action": "ec2:DescribeInstanceTypeOfferings", "Resource": "*"}
@@ -76,10 +76,10 @@ class TemplateTest(unittest.TestCase):
             render_template(template({"Sid": "A", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::${OTHER_NAME}/*"}), VALUES)
 
     def test_missing_value_is_refused(self) -> None:
-        with self.assertRaisesRegex(PolicyRenderError, "missing values for: BUCKET_PREFIX"):
+        with self.assertRaisesRegex(PolicyRenderError, "missing values for: S3_BUCKET"):
             render_template(
-                template({"Sid": "A", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::${BUCKET_PREFIX}-x/*"}),
-                VALUES | {"BUCKET_PREFIX": ""},
+                template({"Sid": "A", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::${S3_BUCKET}/*"}),
+                VALUES | {"S3_BUCKET": ""},
             )
 
     def test_wildcard_write_is_refused(self) -> None:
@@ -94,6 +94,31 @@ class TemplateTest(unittest.TestCase):
         actions = [f"s3:GetObject{number:04d}" for number in range(600)]
         with self.assertRaisesRegex(PolicyRenderError, "IAM allows 6144"):
             render_template(template({"Sid": "A", "Effect": "Allow", "Action": actions, "Resource": "arn:aws:s3:::x/*"}), VALUES)
+
+
+def resources(document: Mapping[str, Any], *sids: str) -> list[str]:
+    found: list[str] = []
+    for statement in document["Statement"]:
+        if statement["Sid"] in sids:
+            found += [statement["Resource"]] if isinstance(statement["Resource"], str) else statement["Resource"]
+    return sorted(found)
+
+
+class BucketScopeTest(unittest.TestCase):
+    BUCKETS = ["arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-*"]
+
+    def test_the_projects_user_reaches_only_the_one_bucket_and_its_test_buckets(self) -> None:
+        document = load_documents(VALUES)["s3"]
+        every = sorted({item for statement in document["Statement"] for item in resources(document, statement["Sid"])})
+        self.assertEqual(sorted([*self.BUCKETS, *(f"{bucket}/*" for bucket in self.BUCKETS)]), every)
+        self.assertEqual(sorted(f"{bucket}/*" for bucket in self.BUCKETS), resources(document, "ReadAndWriteProjectObjects"))
+
+    def test_no_role_reaches_objects_outside_the_data_prefixes(self) -> None:
+        document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        self.assertEqual(self.BUCKETS, resources(document, "ProjectBucketListing"))
+        expected = sorted(f"{bucket}/{prefix}/*" for bucket in self.BUCKETS for prefix in ("landing", "warehouse"))
+        self.assertEqual(expected, resources(document, "ProjectDataObjects"))
+        self.assertEqual([], [item for item in resources(document, *[statement["Sid"] for statement in document["Statement"]]) if "terraform_state" in item])
 
 
 def arn(name: str) -> str:

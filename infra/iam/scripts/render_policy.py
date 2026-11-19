@@ -1,7 +1,7 @@
 """Render the per-service IAM policy templates in ``infra/iam/policies/`` with the values of ``.env``.
 
 A template holds ``${AWS_REGION}``, ``${AWS_ACCOUNT_ID}``, ``${PROJECT_NAME}``, ``${ENVIRONMENT}``,
-``${BUCKET_PREFIX}`` and ``${TAILSCALE_AUDIENCE}``. IAM policy variables such as ``${aws:username}`` stay. An unknown placeholder, a missing value, a
+``${S3_BUCKET}`` and ``${TAILSCALE_AUDIENCE}``. IAM policy variables such as ``${aws:username}`` stay. An unknown placeholder, a missing value, a
 document that is not a policy and a policy over the managed policy size limit stop the render.
 """
 
@@ -16,8 +16,8 @@ from typing import Any
 POLICIES_DIRECTORY = Path(__file__).resolve().parents[1] / "policies"
 BOUNDARY_DIRECTORY = Path(__file__).resolve().parents[1] / "boundary"
 PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
-PLACEHOLDER_NAMES = ("AWS_REGION", "AWS_ACCOUNT_ID", "PROJECT_NAME", "ENVIRONMENT", "BUCKET_PREFIX", "TAILSCALE_AUDIENCE")
-TEMPLATE_PREFIX = "healthcare_surgical_risk_"
+PLACEHOLDER_NAMES = ("AWS_REGION", "AWS_ACCOUNT_ID", "PROJECT_NAME", "ENVIRONMENT", "S3_BUCKET", "TAILSCALE_AUDIENCE")
+TEMPLATE_PREFIX = "healthcare_surgical_risk_streaming_"
 MAX_POLICY_CHARACTERS = 6144
 READ_ACTION = re.compile(r"[a-z0-9-]+:(?:Describe|List|Get)[A-Za-z]*")
 

@@ -48,16 +48,29 @@ resource "aws_iam_role_policy" "host_storage" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "ListProjectAndPublisherBuckets"
+        Sid      = "LocateProjectAndPublisherBuckets"
         Effect   = "Allow"
-        Action   = ["s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketVersions"]
-        Resource = concat(sort(values(var.bucket_arns)), [local.publisher_bucket_arn])
+        Action   = "s3:GetBucketLocation"
+        Resource = [var.bucket_arn, local.publisher_bucket_arn]
+      },
+      {
+        Sid       = "ListProjectDataPrefixes"
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket", "s3:ListBucketVersions"]
+        Resource  = var.bucket_arn
+        Condition = { StringLike = { "s3:prefix" = [for prefix in sort(var.data_prefixes) : "${prefix}/*"] } }
+      },
+      {
+        Sid      = "ListPublisherBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = local.publisher_bucket_arn
       },
       {
         Sid      = "ReadAndWriteProjectObjects"
         Effect   = "Allow"
         Action   = ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]
-        Resource = [for arn in sort(values(var.bucket_arns)) : "${arn}/*"]
+        Resource = [for prefix in sort(var.data_prefixes) : "${var.bucket_arn}/${prefix}/*"]
       },
       {
         Sid      = "ReadPublisherObjects"

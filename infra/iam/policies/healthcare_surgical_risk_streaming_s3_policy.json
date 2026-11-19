@@ -5,7 +5,10 @@
       "Sid": "CreateProjectBucketsInTheProjectRegion",
       "Effect": "Allow",
       "Action": "s3:CreateBucket",
-      "Resource": "arn:aws:s3:::${BUCKET_PREFIX}-*",
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ],
       "Condition": {
         "StringEquals": {
           "s3:LocationConstraint": "${AWS_REGION}"
@@ -38,7 +41,10 @@
         "s3:ListBucketMultipartUploads",
         "s3:ListBucketVersions"
       ],
-      "Resource": "arn:aws:s3:::${BUCKET_PREFIX}-*"
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ]
     },
     {
       "Sid": "SecureProjectBuckets",
@@ -53,13 +59,19 @@
         "s3:PutEncryptionConfiguration",
         "s3:PutLifecycleConfiguration"
       ],
-      "Resource": "arn:aws:s3:::${BUCKET_PREFIX}-*"
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ]
     },
     {
       "Sid": "DeleteEmptyProjectBuckets",
       "Effect": "Allow",
       "Action": "s3:DeleteBucket",
-      "Resource": "arn:aws:s3:::${BUCKET_PREFIX}-*"
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ]
     },
     {
       "Sid": "ReadAndWriteProjectObjects",
@@ -75,7 +87,10 @@
         "s3:PutObject",
         "s3:PutObjectTagging"
       ],
-      "Resource": "arn:aws:s3:::${BUCKET_PREFIX}-*/*"
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}/*",
+        "arn:aws:s3:::${S3_BUCKET}-test-*/*"
+      ]
     }
   ]
 }

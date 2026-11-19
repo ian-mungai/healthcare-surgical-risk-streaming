@@ -32,7 +32,7 @@ class ConfigurationError(ValueError):
 
 
 def load_configuration(path: Path = ENV_FILE) -> dict[str, str]:
-    """Return the validated configuration, with ``BUCKET_PREFIX`` derived from the project name."""
+    """Return the validated configuration."""
     if not path.is_file():
         raise ConfigurationError(f"{path.name} is missing; copy .env.example to .env and fill it in")
     values: dict[str, str] = {}
@@ -45,5 +45,4 @@ def load_configuration(path: Path = ENV_FILE) -> dict[str, str]:
     if problems:
         raise ConfigurationError(f"{path.name}: missing or malformed values for: {', '.join(problems)}")
     configuration = {key: values[key] for key in PATTERNS} | {key: values[key] for key in OPTIONAL_PATTERNS if values.get(key)}
-    configuration["BUCKET_PREFIX"] = configuration["PROJECT_NAME"].replace("_", "-")
     return configuration

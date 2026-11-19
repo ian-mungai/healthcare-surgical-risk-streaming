@@ -27,7 +27,7 @@ CONFIGURATION = {
     "AWS_ACCOUNT_ID": ACCOUNT,
     "PROJECT_NAME": "example_project",
     "ENVIRONMENT": "dev",
-    "BUCKET_PREFIX": "example-project",
+    "S3_BUCKET": "example-project",
     "TAILSCALE_AUDIENCE": "example-audience",
 }
 NAMES = Names("example_project", "dev")

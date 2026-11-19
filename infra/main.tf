@@ -11,16 +11,7 @@ provider "aws" {
 }
 
 locals {
-  bucket_prefix = replace(var.project_name, "_", "-")
-}
-
-module "storage" {
-  source = "./modules/storage"
-
-  bucket_names = {
-    landing   = "${local.bucket_prefix}-landing-${var.environment}-${var.run_id}"
-    warehouse = "${local.bucket_prefix}-warehouse-${var.environment}-${var.run_id}"
-  }
+  data_prefixes = ["landing", "warehouse"]
 }
 
 module "host" {
@@ -31,7 +22,8 @@ module "host" {
   boundary_name = "${var.project_name}_role_boundary"
   instance_type = var.host_instance_type
   disk_gib      = var.host_disk_gib
-  bucket_arns   = module.storage.bucket_arns
+  bucket_arn    = "arn:aws:s3:::${var.data_bucket_name}"
+  data_prefixes = local.data_prefixes
 
   workload_role_pattern = "${var.project_name}_workload_*"
 

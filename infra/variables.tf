@@ -33,13 +33,13 @@ variable "environment" {
   }
 }
 
-variable "run_id" {
-  description = "ID of the run that owns these resources, from the run binding. It ends each bucket name."
+variable "data_bucket_name" {
+  description = "Name of the project's one bucket, from the run binding. The state bootstrap step creates it; this configuration creates no bucket."
   type        = string
 
   validation {
-    condition     = can(regex("^[0-9]{8}t[0-9]{4}-[0-9a-f]{6}$", var.run_id))
-    error_message = "Use the run ID that the state bootstrap step wrote to the run binding."
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$", var.data_bucket_name))
+    error_message = "Use the bucket name that the state bootstrap step wrote to the run binding."
   }
 }
 

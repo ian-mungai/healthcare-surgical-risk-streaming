@@ -357,8 +357,9 @@ CONFIGURATION = {"AWS_REGION": "us-west-2", "AWS_PROFILE": "example_project_dev"
 
 def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     path = folder / "run_binding.json"
-    state_bucket = "" if backend == "local" else "example-state-bucket"
-    RunBinding("20260101t0000-abcdef", "0" * 40, backend, "us-west-2", state_bucket, "default", ["terraform.tfstate"], "verified", provision_host).write(path)
+    RunBinding("20260101t0000-abcdef", "0" * 40, backend, "us-west-2", "example-project", "default", ["terraform.tfstate"], "verified", provision_host).write(
+        path
+    )
     return path
 
 
@@ -381,8 +382,10 @@ class HostUpTest(unittest.TestCase):
     def test_a_local_run_is_followed_to_its_inventory_with_no_instance_step(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             path = binding_file(Path(scratch), backend="local", provision_host=False)
-            code, calls = self.run_up(path)
+            with mock.patch.object(state_bootstrap, "create", return_value=0) as create:
+                code, calls = self.run_up(path)
         self.assertEqual(0, code)
+        self.assertEqual(("local", False), create.call_args.args[3:])
         calls["write_inventory"].assert_called_once_with(path)
         for name in ("state_json", "wait_until_reachable", "run_ansible", "instance_id"):
             calls[name].assert_not_called()

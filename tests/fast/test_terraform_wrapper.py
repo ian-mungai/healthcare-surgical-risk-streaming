@@ -68,6 +68,12 @@ class PlanBindingTest(unittest.TestCase):
         given = RunBinding(**{**RUN.__dict__, "provision_host": False})
         self.assertEqual("false", run_variables(given, {"AWS_PROFILE": "example_project_dev"})["provision_host"])
 
+    def test_terraform_is_given_the_bound_bucket_and_no_other_run_value(self) -> None:
+        self.assertEqual(
+            {"data_bucket_name": "example-project", "aws_profile": "example_project_dev", "provision_host": "true"},
+            run_variables(RUN, {"AWS_PROFILE": "example_project_dev"}),
+        )
+
     def test_plan_saved_for_the_s3_backend_is_refused_under_the_local_backend(self) -> None:
         self.assertEqual(
             ["the plan was saved for a different state location than this run's"],

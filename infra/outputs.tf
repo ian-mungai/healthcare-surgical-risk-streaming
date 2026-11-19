@@ -18,9 +18,14 @@ output "host_security_group_id" {
   value       = one(module.host[*].security_group_id)
 }
 
-output "bucket_names" {
-  description = "Names of the project's buckets, by component."
-  value       = module.storage.bucket_names
+output "data_bucket_name" {
+  description = "Name of the project's one bucket, which the state bootstrap step creates."
+  value       = var.data_bucket_name
+}
+
+output "data_prefixes" {
+  description = "Prefixes of the bucket that hold the project's data."
+  value       = local.data_prefixes
 }
 
 output "deploy_role_arn" {
