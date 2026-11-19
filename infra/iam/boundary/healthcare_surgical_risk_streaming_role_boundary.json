@@ -2,10 +2,18 @@
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ProjectBucketLocation",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ]
+    },
+    {
       "Sid": "ProjectBucketListing",
       "Effect": "Allow",
       "Action": [
-        "s3:GetBucketLocation",
         "s3:ListBucket",
         "s3:ListBucketMultipartUploads",
         "s3:ListBucketVersions"
@@ -13,7 +21,15 @@
       "Resource": [
         "arn:aws:s3:::${S3_BUCKET}",
         "arn:aws:s3:::${S3_BUCKET}-test-*"
-      ]
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "landing/*",
+            "warehouse/*"
+          ]
+        }
+      }
     },
     {
       "Sid": "ProjectDataObjects",

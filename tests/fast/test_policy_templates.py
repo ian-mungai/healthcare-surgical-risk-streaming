@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from infra.iam.scripts.manage_policies import LiveState, Names, Step, differences, plan_steps, policy_arn, unchanged_differences
-from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, POLICIES_DIRECTORY, PolicyRenderError, load_documents, render_template, scope_problems
+from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, POLICIES_DIRECTORY, PolicyRenderError, as_list, load_documents, render_template, scope_problems
 
 VALUES = {
     "AWS_REGION": "us-west-2",
@@ -119,6 +119,40 @@ class BucketScopeTest(unittest.TestCase):
         expected = sorted(f"{bucket}/{prefix}/*" for bucket in self.BUCKETS for prefix in ("landing", "warehouse"))
         self.assertEqual(expected, resources(document, "ProjectDataObjects"))
         self.assertEqual([], [item for item in resources(document, *[statement["Sid"] for statement in document["Statement"]]) if "/state/" in item])
+
+
+class RoleListingTest(unittest.TestCase):
+    BUCKETS = ["arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-*"]
+    LISTING = ["s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:ListBucketVersions"]
+    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*"]}}
+
+    def boundary(self) -> dict[str, dict[str, Any]]:
+        document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        return {statement["Sid"]: statement for statement in document["Statement"]}
+
+    def test_a_role_locates_the_project_buckets_with_no_condition(self) -> None:
+        statement = self.boundary()["ProjectBucketLocation"]
+        self.assertEqual(["s3:GetBucketLocation"], as_list(statement["Action"]))
+        self.assertEqual(self.BUCKETS, sorted(as_list(statement["Resource"])))
+        self.assertNotIn("Condition", statement)
+
+    def test_a_role_lists_the_project_buckets_under_the_data_prefixes_only(self) -> None:
+        statement = self.boundary()["ProjectBucketListing"]
+        self.assertEqual(self.LISTING, sorted(as_list(statement["Action"])))
+        self.assertEqual(self.BUCKETS, sorted(as_list(statement["Resource"])))
+        self.assertEqual(self.PREFIXES, statement["Condition"])
+
+    def test_no_allow_statement_lists_a_project_bucket_without_the_prefix_condition(self) -> None:
+        listing = [
+            statement
+            for statement in self.boundary().values()
+            if statement["Effect"] == "Allow"
+            and set(as_list(statement["Action"])) & set(self.LISTING)
+            and set(as_list(statement["Resource"])) & set(self.BUCKETS)
+        ]
+        self.assertEqual(["ProjectBucketListing"], [statement["Sid"] for statement in listing])
+        for statement in listing:
+            self.assertEqual(self.PREFIXES, statement.get("Condition"))
 
 
 def arn(name: str) -> str:
