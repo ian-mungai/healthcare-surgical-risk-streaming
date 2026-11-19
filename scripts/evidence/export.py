@@ -13,7 +13,7 @@ import sys
 import tarfile
 from pathlib import Path
 
-from scripts.evidence.manifest import build_manifest, manifest_sha256
+from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run
 from scripts.project_config import ROOT
@@ -32,8 +32,9 @@ def main() -> int:
     export = folder / "export"
     export.mkdir(parents=True, exist_ok=True)
     manifest = build_manifest(folder, run.run_id, run.commit)
-    if not manifest["files"]:
-        sys.stderr.write(f"run {run.run_id}: the run folder holds no evidence to export\n")
+    problems = manifest_problems(manifest)
+    if problems:
+        sys.stderr.write("".join(f"{problem}\n" for problem in problems) + "nothing was exported\n")
         return 1
     (export / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     with tarfile.open(export / "evidence.tar.gz", "w:gz") as archive:

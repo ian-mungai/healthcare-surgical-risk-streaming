@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 EXCLUDED_TOP_LEVEL = ("export", "readback", "removal", "known_hosts")
+REQUIRED_EVIDENCE = ("inventory.json", "plans/destroy_binding.json", "teardown/approved_inventory.json")
 
 
 def evidence_files(folder: Path) -> list[str]:
@@ -39,3 +40,25 @@ def readback_problems(manifest: dict[str, Any], folder: Path) -> list[str]:
         elif hashlib.sha256(target.read_bytes()).hexdigest() != expected:
             problems.append(f"differs from its manifest hash: {path}")
     return problems + [f"not in the manifest: {path}" for path in evidence_files(folder) if path not in listed]
+
+
+def manifest_problems(manifest: dict[str, Any]) -> list[str]:
+    """Each path that is not a plain relative path or is listed twice, and each required file that is missing."""
+    problems = []
+    seen: set[str] = set()
+    for item in manifest["files"]:
+        path = str(item["path"])
+        parts = path.split("/")
+        if not path or path.startswith("/") or any(part in ("", ".", "..") for part in parts) or "\\" in path:
+            problems.append(f"manifest path is not a plain relative path: {path!r}")
+        elif path in seen:
+            problems.append(f"manifest lists a path twice: {path}")
+        seen.add(path)
+    return problems + [f"required evidence is not in the manifest: {path}" for path in REQUIRED_EVIDENCE if path not in seen]
+
+
+def archive_problems(manifest: dict[str, Any], members: list[str]) -> list[str]:
+    """Each archive member the manifest does not list and each listed file the archive does not hold."""
+    listed = [str(item["path"]) for item in manifest["files"]]
+    extra = [f"in the archive and not in the manifest: {name}" for name in sorted(set(members) - set(listed))]
+    return extra + [f"in the manifest and not in the archive: {path}" for path in listed if path not in members]

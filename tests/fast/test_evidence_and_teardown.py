@@ -7,12 +7,15 @@ cover each refusal as a pure decision, each with a passing control and each fail
 from __future__ import annotations
 
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
-from scripts.evidence.manifest import build_manifest, manifest_sha256, readback_problems
+from scripts.evidence.manifest import REQUIRED_EVIDENCE, archive_problems, build_manifest, manifest_problems, manifest_sha256, readback_problems
 from scripts.evidence.receipt import receipt_problems
+from scripts.evidence.verify import verify_export
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.teardown import bucket_entry_problems, delete_targets, settled_checks, state_entry_problems, target_problems
 
@@ -53,6 +56,76 @@ class ReadbackTest(unittest.TestCase):
     def test_unlisted_file_is_reported(self) -> None:
         (self.folder / "extra.txt").write_text("extra")
         self.assertEqual(["not in the manifest: extra.txt"], readback_problems(self.manifest, self.folder))
+
+
+class ManifestShapeTest(unittest.TestCase):
+    def manifest(self, *paths: str) -> dict[str, object]:
+        return {"run_id": RUN.run_id, "commit": RUN.commit, "files": [{"path": path, "sha256": HASH, "bytes": 1} for path in paths]}
+
+    def test_manifest_with_every_required_file_passes(self) -> None:
+        self.assertEqual([], manifest_problems(self.manifest(*REQUIRED_EVIDENCE, "acceptance/extra.json")))
+
+    def test_missing_required_file_is_refused(self) -> None:
+        kept = [path for path in REQUIRED_EVIDENCE if path != "inventory.json"]
+        self.assertEqual(["required evidence is not in the manifest: inventory.json"], manifest_problems(self.manifest(*kept)))
+
+    def test_path_that_leaves_the_folder_is_refused(self) -> None:
+        for path in ("../outside.json", "/etc/hosts", "plans/../../outside.json", ""):
+            with self.subTest(path=path):
+                self.assertIn(f"manifest path is not a plain relative path: {path!r}", manifest_problems(self.manifest(*REQUIRED_EVIDENCE, path)))
+
+    def test_duplicate_path_is_refused(self) -> None:
+        self.assertEqual(["manifest lists a path twice: inventory.json"], manifest_problems(self.manifest(*REQUIRED_EVIDENCE, "inventory.json")))
+
+    def test_archive_members_must_equal_the_manifest(self) -> None:
+        manifest = self.manifest("a.json", "b.json")
+        self.assertEqual([], archive_problems(manifest, ["b.json", "a.json"]))
+        self.assertEqual(["in the archive and not in the manifest: c.json"], archive_problems(manifest, ["a.json", "b.json", "c.json"]))
+        self.assertEqual(["in the manifest and not in the archive: b.json"], archive_problems(manifest, ["a.json"]))
+
+
+class VerifyExportTest(unittest.TestCase):
+    """The whole verification with a stand-in signer: a failed readback must leave no earlier receipt."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="verify_"))
+        for path in REQUIRED_EVIDENCE:
+            (self.folder / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.folder / path).write_text(path)
+        self.export = self.folder / "export"
+        self.export.mkdir()
+        self.pack(build_manifest(self.folder, RUN.run_id, RUN.commit))
+
+    def pack(self, manifest: dict[str, Any], skip: str = "") -> None:
+        (self.export / "manifest.json").write_text(json.dumps(manifest))
+        with tarfile.open(self.export / "evidence.tar.gz", "w:gz") as archive:
+            for item in manifest["files"]:
+                if item["path"] != skip:
+                    archive.add(self.folder / item["path"], arcname=item["path"])
+
+    def sign(self, receipt: Path) -> bool:
+        receipt.with_name(receipt.name + ".sig").write_text("signed")
+        return True
+
+    def test_complete_export_gets_a_signed_receipt(self) -> None:
+        self.assertEqual([], verify_export(self.folder, RUN, self.sign))
+        self.assertTrue((self.export / "receipt.json").is_file() and (self.export / "receipt.json.sig").is_file())
+
+    def test_failed_readback_removes_the_earlier_receipt(self) -> None:
+        self.assertEqual([], verify_export(self.folder, RUN, self.sign))
+        self.pack(build_manifest(self.folder, RUN.run_id, RUN.commit), skip="inventory.json")
+        self.assertEqual(["in the manifest and not in the archive: inventory.json"], verify_export(self.folder, RUN, self.sign))
+        self.assertFalse((self.export / "receipt.json").exists() or (self.export / "receipt.json.sig").exists())
+
+    def test_corrupt_archive_removes_the_earlier_receipt(self) -> None:
+        self.assertEqual([], verify_export(self.folder, RUN, self.sign))
+        (self.export / "evidence.tar.gz").write_bytes(b"not an archive")
+        self.assertEqual(["the archive cannot be read"], verify_export(self.folder, RUN, self.sign))
+        self.assertFalse((self.export / "receipt.json").exists())
+
+    def test_failed_signing_leaves_no_receipt(self) -> None:
+        self.assertEqual(["the receipt could not be signed"], verify_export(self.folder, RUN, lambda receipt: False))
+        self.assertFalse((self.export / "receipt.json").exists())
 
 
 class ReceiptTest(unittest.TestCase):

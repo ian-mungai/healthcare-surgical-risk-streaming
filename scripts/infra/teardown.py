@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.aws_cli import Aws, AwsError
-from scripts.evidence.manifest import build_manifest, manifest_sha256
+from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
 from scripts.evidence.receipt import receipt_problems, signature_is_valid
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding
 from scripts.infra.terraform_wrapper import APPLY_TIMEOUT_SECONDS, PLAN_TIMEOUT_SECONDS, WrapperError, binding_problems, load_run, save_plan, terraform
@@ -141,8 +141,10 @@ def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str) -> tup
     if not plan_file.is_file():
         raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
     receipt = folder / "export" / "receipt.json"
-    current = manifest_sha256(build_manifest(folder, run.run_id, run.commit))
-    problems = receipt_problems(receipt.read_bytes() if receipt.is_file() else None, signature_is_valid(receipt), run, current)
+    evidence = build_manifest(folder, run.run_id, run.commit)
+    current = manifest_sha256(evidence)
+    problems = manifest_problems(evidence)
+    problems += receipt_problems(receipt.read_bytes() if receipt.is_file() else None, signature_is_valid(receipt), run, current)
     problems += binding_problems(run, saved, plan_file.read_bytes(), saved["plan_sha256"][:12], "destroy")
     if confirm != teardown_code(saved["plan_sha256"], approved):
         problems.append("the confirmation code does not equal the reviewed destroy plan and approved inventory")
