@@ -7,10 +7,10 @@ The owner runs this under the administrator profile, from the repository root:
 ``plan`` is read-only. It lists each step and prints a confirmation code. ``apply --confirm <CODE>`` computes the plan
 again and applies it only when its code equals the reviewed one. It creates the user, creates missing policies,
 publishes a new default version only when a document changed and attaches each policy to the user. A rerun plans
-nothing. ``export`` compares the live documents, the user's attached policies by ARN, its inline policies and its
-group memberships with the templates and exits 1 on a difference. The tool never creates an access key and never
-removes a grant: a live project policy with no template, an extra attachment, an inline policy and a group membership are
-reported, and ``plan`` and ``apply`` exit 1 while one remains.
+nothing. ``export`` compares the live documents, the tags of the policies and the boundary, the user's attached policies by ARN,
+its inline policies and its group memberships with the templates and exits 1 on a difference. The tool never creates an access key and never
+removes a grant or a tag: a live project policy with no template, an extra attachment, an inline policy, a group membership and
+an extra policy tag are reported, and ``plan`` and ``apply`` exit 1 while one remains.
 """
 
 from __future__ import annotations
@@ -46,6 +46,13 @@ class Names:
     def boundary(self, kind: str) -> str:
         return f"{self.project}_{kind}_boundary"
 
+    @property
+    def tags(self) -> dict[str, str]:
+        return {"Project": self.project, "Environment": self.environment}
+
+    def tag_arguments(self) -> list[str]:
+        return ["--tags", *[f"Key={key},Value={value}" for key, value in self.tags.items()]]
+
     def owns(self, policy_name: str) -> bool:
         return policy_name.startswith(f"{self.project}_") and policy_name.endswith(("_policy", "_boundary"))
 
@@ -73,13 +80,14 @@ def canonical(document: Mapping[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class LiveState:
-    """What the account holds now: the user, the project policies by name, and the user's attached ARNs, inline policies and groups."""
+    """What the account holds now: the user, the project policies and their tags by name, and the user's attached ARNs, inline policies and groups."""
 
     user_exists: bool
     documents: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     attached: frozenset[str] = frozenset()
     inline: frozenset[str] = frozenset()
     groups: frozenset[str] = frozenset()
+    tags: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
 def policy_arn(account: str, name: str) -> str:
@@ -99,8 +107,11 @@ def plan_steps(
         arn = policy_arn(account, name)
         if name not in live.documents:
             steps.append(Step("create-policy", name))
-        elif canonical(live.documents[name]) != canonical(documents[name]):
-            steps.append(Step("update-policy", name))
+        else:
+            if canonical(live.documents[name]) != canonical(documents[name]):
+                steps.append(Step("update-policy", name))
+            if any(live.tags.get(name, {}).get(key) != value for key, value in names.tags.items()):
+                steps.append(Step("tag-policy", name))
         if name not in unattached and arn not in live.attached:
             steps.append(Step("attach-policy", name))
         if name in unattached and arn in live.attached:
@@ -111,6 +122,7 @@ def plan_steps(
         *[Step("report-unexpected-attachment", arn.split(":", 5)[5]) for arn in sorted(live.attached - ours)],
         *[Step("report-inline-policy", name) for name in sorted(live.inline)],
         *[Step("report-group-membership", name) for name in sorted(live.groups)],
+        *[Step("report-extra-policy-tag", f"{name} {key}") for name in sorted(documents) for key in sorted(set(live.tags.get(name, {})) - set(names.tags))],
         *[Step("report-unlisted", name) for name in sorted(set(live.documents) - set(documents))],
     ]
 
@@ -133,12 +145,14 @@ def confirmation_code(account: str, documents: Mapping[str, Mapping[str, Any]], 
 def live_state(aws: Aws, names: Names) -> LiveState:
     user_exists = aws.call("iam", "get-user", "--user-name", names.user, missing=("NoSuchEntity",)) is not None
     documents = {}
+    tags = {}
     for policy in aws.call("iam", "list-policies", "--scope", "Local")["Policies"]:
         if names.owns(policy["PolicyName"]):
             version = aws.call("iam", "get-policy-version", "--policy-arn", policy["Arn"], "--version-id", policy["DefaultVersionId"])
             documents[policy["PolicyName"]] = version["PolicyVersion"]["Document"]
+            tags[policy["PolicyName"]] = {tag["Key"]: tag["Value"] for tag in aws.call("iam", "list-policy-tags", "--policy-arn", policy["Arn"])["Tags"]}
     if not user_exists:
-        return LiveState(False, documents)
+        return LiveState(False, documents, tags=tags)
     attached = aws.call("iam", "list-attached-user-policies", "--user-name", names.user)["AttachedPolicies"]
     inline = aws.call("iam", "list-user-policies", "--user-name", names.user)["PolicyNames"]
     groups = aws.call("iam", "list-groups-for-user", "--user-name", names.user)["Groups"]
@@ -148,6 +162,7 @@ def live_state(aws: Aws, names: Names) -> LiveState:
         frozenset(item["PolicyArn"] for item in attached),
         frozenset(inline),
         frozenset(group["GroupName"] for group in groups),
+        tags,
     )
 
 
@@ -155,10 +170,11 @@ def apply_step(aws: Aws, names: Names, account: str, documents: Mapping[str, Map
     by_name = {name: json.dumps(document) for name, document in documents.items()}
     arn = policy_arn(account, step.target)
     if step.action == "create-user":
-        tags = [f"Key=Project,Value={names.project}", f"Key=Environment,Value={names.environment}"]
-        aws.call("iam", "create-user", "--user-name", step.target, "--tags", *tags)
+        aws.call("iam", "create-user", "--user-name", step.target, *names.tag_arguments())
     elif step.action == "create-policy":
-        aws.call("iam", "create-policy", "--policy-name", step.target, "--policy-document", by_name[step.target])
+        aws.call("iam", "create-policy", "--policy-name", step.target, "--policy-document", by_name[step.target], *names.tag_arguments())
+    elif step.action == "tag-policy":
+        aws.call("iam", "tag-policy", "--policy-arn", arn, *names.tag_arguments())
     elif step.action == "update-policy":
         versions = aws.call("iam", "list-policy-versions", "--policy-arn", arn)["Versions"]
         if len(versions) >= MAX_POLICY_VERSIONS:

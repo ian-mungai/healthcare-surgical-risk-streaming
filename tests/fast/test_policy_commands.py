@@ -194,5 +194,54 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(any(call[:2] == ("iam", "attach-user-policy") for call in account.calls))
 
 
+class TagTest(unittest.TestCase):
+    def test_policies_and_the_boundary_without_tags_are_a_difference(self) -> None:
+        code, output, _ = run_command("export", Account.matching_templates(tagged=False))
+        self.assertEqual(1, code, output)
+        for name in templates():
+            self.assertIn(f"tag-policy: {name}", output)
+
+    def test_a_wrong_tag_value_is_a_difference(self) -> None:
+        account = Account.matching_templates()
+        account.policy_tags[NAMES.policy("ec2")] = TAGS | {"Environment": "prod"}
+        code, output, _ = run_command("export", account)
+        self.assertEqual(1, code, output)
+        self.assertIn(f"tag-policy: {NAMES.policy('ec2')}", output)
+
+    def test_an_extra_tag_is_reported_and_never_removed(self) -> None:
+        account = Account.matching_templates()
+        account.policy_tags[NAMES.boundary("role")] = TAGS | {"Owner": "someone"}
+        code, output, _ = run_command("export", account)
+        self.assertEqual(1, code, output)
+        self.assertIn(f"report-extra-policy-tag: {NAMES.boundary('role')} Owner", output)
+
+    def test_tagged_policies_and_boundary_are_no_difference(self) -> None:
+        code, output, _ = run_command("export", Account.matching_templates())
+        self.assertEqual(0, code, output)
+        self.assertNotIn("tag-policy", output)
+
+    def test_apply_creates_each_new_policy_and_the_boundary_with_both_tags(self) -> None:
+        account = Account(user_exists=False)
+        _, plan_output, _ = run_command("plan", account)
+        code, output, _ = run_command("apply", account, confirm=plan_output.rsplit("--confirm ", 1)[1].split()[0])
+        self.assertEqual(0, code, output)
+        creates = [call for call in account.calls if call[:2] == ("iam", "create-policy")]
+        self.assertEqual(sorted(templates()), sorted(call[call.index("--policy-name") + 1] for call in creates))
+        for call in creates:
+            self.assertIn("--tags", call)
+            self.assertEqual(("--tags", "Key=Project,Value=example_project", "Key=Environment,Value=dev"), call[call.index("--tags") :])
+
+    def test_apply_tags_an_existing_untagged_policy(self) -> None:
+        account = Account.matching_templates(tagged=False)
+        _, plan_output, _ = run_command("plan", account)
+        code, output, _ = run_command("apply", account, confirm=plan_output.rsplit("--confirm ", 1)[1].split()[0])
+        self.assertEqual(0, code, output)
+        tagged = [call for call in account.calls if call[:2] == ("iam", "tag-policy")]
+        self.assertEqual(sorted(policy_arn(ACCOUNT, name) for name in templates()), sorted(call[call.index("--policy-arn") + 1] for call in tagged))
+        for call in tagged:
+            self.assertIn("--tags", call)
+            self.assertEqual(("--tags", "Key=Project,Value=example_project", "Key=Environment,Value=dev"), call[call.index("--tags") :])
+
+
 if __name__ == "__main__":
     unittest.main()
