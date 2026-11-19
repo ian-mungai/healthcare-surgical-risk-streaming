@@ -1,6 +1,7 @@
 #!/bin/bash
-# First boot: install the pinned Tailscale client from its package repository and join the network.
-# The host proves its identity with a short-lived token that AWS issues to its role. No key is stored here.
+# First boot: install the pinned Tailscale client from its package repository and join the network from a systemd unit.
+# The host registers as an ephemeral node with a short-lived token that AWS issues to its role. No key is stored here.
+# The unit runs at every boot, so a host that was stopped long enough to leave the network joins again when it starts.
 set -euo pipefail
 
 install -d -m 0755 /usr/share/keyrings
@@ -8,4 +9,24 @@ curl -fsSL --retry 5 --max-time 60 https://pkgs.tailscale.com/stable/ubuntu/nobl
 curl -fsSL --retry 5 --max-time 60 https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list -o /etc/apt/sources.list.d/tailscale.list
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale=${version}
-tailscale up --client-id='${client_id}?ephemeral=false&preauthorized=true' --audience='${audience}' --advertise-tags='${tag}' --hostname='${host_name}' --ssh --timeout=120s
+
+cat > /etc/systemd/system/tailscale-join.service <<'UNIT'
+[Unit]
+Description=Join the Tailscale network with the host's AWS identity
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/tailscale up --client-id='${client_id}?ephemeral=true&preauthorized=true' --audience='${audience}' --advertise-tags='${tag}' --hostname='${host_name}' --ssh --timeout=120s
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now tailscale-join.service

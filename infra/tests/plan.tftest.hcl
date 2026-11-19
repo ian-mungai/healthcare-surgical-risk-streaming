@@ -154,7 +154,8 @@ run "host_joins_tailscale_without_a_stored_key" {
 
   assert {
     condition = alltrue([
-      strcontains(local.user_data, "--client-id='example-client-id?ephemeral=false&preauthorized=true'"),
+      strcontains(local.user_data, "--client-id='example-client-id?ephemeral=true&preauthorized=true'"),
+      !strcontains(local.user_data, "ephemeral=false"),
       strcontains(local.user_data, "--audience='example-audience'"),
       strcontains(local.user_data, "--advertise-tags='tag:example-host'"),
       strcontains(local.user_data, "--hostname='platform-dev'"),
@@ -162,7 +163,24 @@ run "host_joins_tailscale_without_a_stored_key" {
       !strcontains(local.user_data, "tskey"),
       !strcontains(local.user_data, "auth-key"),
     ])
-    error_message = "The boot script joins Tailscale with the federated identity, the tag and the neutral host name, and holds no auth key."
+    error_message = "The boot script registers the host as an ephemeral node with the federated identity, the tag and the neutral host name, and holds no auth key."
+  }
+
+  assert {
+    condition = alltrue([
+      strcontains(local.user_data, "/etc/systemd/system/tailscale-join.service"),
+      strcontains(local.user_data, "Type=oneshot"),
+      strcontains(local.user_data, "Restart=on-failure"),
+      strcontains(local.user_data, "WantedBy=multi-user.target"),
+      strcontains(local.user_data, "systemctl enable --now tailscale-join.service"),
+      length(regexall("tailscale up", local.user_data)) == 1,
+    ])
+    error_message = "The join runs from a systemd unit that is enabled at boot and is the only place that runs tailscale up, so a stopped host rejoins at every start."
+  }
+
+  assert {
+    condition     = strcontains(local.user_data, "After=network-online.target tailscaled.service") && !strcontains(local.user_data, "Before=")
+    error_message = "The join unit orders itself after the network only, so it never slows a reboot or the services that start with it."
   }
 }
 
