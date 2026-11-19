@@ -12,6 +12,7 @@ import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from collections.abc import Iterator, Mapping
@@ -27,6 +28,7 @@ from scripts.infra.host import (
     HostError,
     Peer,
     ansible_failure,
+    host_check,
     instance_id,
     record_tailscale_device,
     release_tailscale_device,
@@ -38,6 +40,7 @@ from scripts.infra.host import (
 )
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import TimeoutExpired
+from scripts.project_config import ROOT
 
 
 def peer(
@@ -169,7 +172,12 @@ STATUS_TOOL = (
     '#!/bin/sh\nsleep "${FAKE_STATUS_DELAY:-0}"\n'
     'if [ -e "$FAKE_SSH_LOG" ] && [ -n "${FAKE_STATUS_AFTER:-}" ]; then cat "$FAKE_STATUS_AFTER"; else cat "$FAKE_STATUS"; fi\n'
 )
-SSH_TOOL = '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\nexit "${FAKE_SSH_EXIT:-0}"\n'
+SSH_TOOL = (
+    '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\n'
+    'case "$*" in *"tailscale logout"*) exit "${FAKE_LOGOUT_EXIT:-0}" ;; esac\nexit "${FAKE_SSH_EXIT:-0}"\n'
+)
+INSTANCE = "i-0123456789abcdef0"
+OTHER_INSTANCE = "i-0fedcba9876543210"
 
 
 @dataclass(frozen=True)
@@ -181,7 +189,9 @@ class FakeAws(Aws):
 
 
 @contextmanager
-def fake_tools(status: Mapping[str, object], instance: str, ssh_exit: int = 0, after: Mapping[str, object] | None = None) -> Iterator[Path]:
+def fake_tools(
+    status: Mapping[str, object], instance: str, ssh_exit: int = 0, after: Mapping[str, object] | None = None, logout_exit: int = 0
+) -> Iterator[Path]:
     """A ``tailscale`` that prints the given status and an ``ssh`` that logs its arguments and prints the given instance ID, first on PATH."""
     with tempfile.TemporaryDirectory() as scratch:
         folder = Path(scratch)
@@ -197,6 +207,7 @@ def fake_tools(status: Mapping[str, object], instance: str, ssh_exit: int = 0, a
             "FAKE_SSH_LOG": str(folder / "ssh.log"),
             "FAKE_INSTANCE": instance,
             "FAKE_SSH_EXIT": str(ssh_exit),
+            "FAKE_LOGOUT_EXIT": str(logout_exit),
         }
         with mock.patch.dict(os.environ, environment), mock.patch.object(host, "ROOT", folder), mock.patch.object(host, "POLL_SECONDS", 0.01):
             yield folder
@@ -375,8 +386,10 @@ class HostUpTest(unittest.TestCase):
             calls["state_json"].return_value = {"values": {}}
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
             calls["instance_id"].return_value = "i-0123456789abcdef0"
-            with contextlib.redirect_stdout(io.StringIO()):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
                 code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
+            self.output = output.getvalue()
         return code, calls
 
     def test_a_local_run_is_followed_to_its_inventory_with_no_instance_step(self) -> None:
@@ -413,6 +426,28 @@ class HostUpTest(unittest.TestCase):
         calls["run_ansible"].assert_called_once()
         calls["write_inventory"].assert_called_once_with(path)
         self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
+
+    def test_the_success_line_of_an_up_run_names_the_host_and_not_its_address(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0):
+                self.run_up(path)
+        self.assertIn("the host platform-dev is up", self.output)
+        self.assertNotIn("example.ts.net", self.output)
+
+    def test_the_success_line_of_a_start_run_names_the_host_and_not_its_address(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            stack.enter_context(mock.patch.object(host, "ROOT", Path(scratch)))
+            stack.enter_context(mock.patch.object(host, "state_json", return_value={}))
+            stack.enter_context(mock.patch.object(host, "instance_id", return_value=INSTANCE))
+            stack.enter_context(mock.patch.object(host, "wait_until_reachable", return_value=Peer("platform-dev.example.ts.net", "nRESTARTEDCNTRL")))
+            stack.enter_context(mock.patch.object(host, "write_inventory"))
+            output = io.StringIO()
+            stack.enter_context(contextlib.redirect_stdout(output))
+            host.host_start(FakeAws("project", "us-west-2"), CONFIGURATION, path)
+        self.assertIn("the host platform-dev is started", output.getvalue())
+        self.assertNotIn("example.ts.net", output.getvalue())
 
     def test_a_started_host_records_the_device_it_has_now(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
@@ -503,11 +538,87 @@ class HostStateTest(unittest.TestCase):
 class AnsibleFailureTest(unittest.TestCase):
     def test_a_failure_message_carries_no_account_number_or_address(self) -> None:
         output = "fatal: [100.64.0.7]: FAILED! role arn:aws:iam::" + "1" * 12 + ":role/example_host"
-        message = ansible_failure(output, "ssh: connect to host 100.64.0.7 port 22")
+        message = ansible_failure(output, "ssh: connect to host 100.64.0.7 port 22", "platform-dev.example.ts.net")
         self.assertEqual(
             "the Ansible host setup failed:\nfatal: [<ADDRESS>]: FAILED! role arn:aws:iam::<ACCOUNT>:role/example_host\nssh: connect to host <ADDRESS> port 22",
             message,
         )
+
+    def test_a_failure_message_carries_no_tailscale_name(self) -> None:
+        message = ansible_failure("", "ssh: Could not resolve hostname platform-dev.example.ts.net: Name or service not known", "platform-dev.example.ts.net")
+        self.assertEqual("the Ansible host setup failed:\n\nssh: Could not resolve hostname <HOST>: Name or service not known", message)
+
+
+class HostCheckTest(unittest.TestCase):
+    """The deploy workflow's check: the peer found by name and tag must answer as the instance the workflow expects."""
+
+    def check(self, reported: str, expected: str = INSTANCE, status: Mapping[str, object] | None = None) -> tuple[int, str, Path]:
+        output = io.StringIO()
+        with (
+            fake_tools(status or {"Peer": {"a": peer("platform-dev")}}, reported) as folder,
+            contextlib.redirect_stdout(output),
+            mock.patch.object(host, "SSH_DEADLINE_SECONDS", 1),
+        ):
+            code = host_check("platform-dev", expected)
+            logged = (folder / "ssh.log").read_text()
+        return code, output.getvalue(), Path(logged)
+
+    def test_the_expected_instance_passes_and_the_output_names_the_host_only(self) -> None:
+        code, output, _ = self.check(INSTANCE)
+        self.assertEqual(0, code)
+        self.assertEqual("the host answers over Tailscale SSH as platform-dev\n", output.replace("ready: SSH over Tailscale\n", ""))
+
+    def test_another_instance_is_refused_with_a_message_that_names_no_id(self) -> None:
+        with self.assertRaises(HostError) as caught:
+            self.check(OTHER_INSTANCE)
+        self.assertIn("belongs to a different instance", str(caught.exception))
+        self.assertNotIn("i-0", str(caught.exception))
+
+    def test_a_peer_that_answers_with_no_instance_is_refused(self) -> None:
+        with self.assertRaisesRegex(HostError, "belongs to a different instance"):
+            self.check("")
+
+    def test_the_instance_is_read_over_ssh_and_not_assumed_from_a_bare_answer(self) -> None:
+        _, _, logged = self.check(INSTANCE)
+        self.assertIn("cat /var/lib/cloud/data/instance-id", str(logged).splitlines())
+
+
+class HostCheckArgumentsTest(unittest.TestCase):
+    """``host check`` needs the host's name and an EC2 instance ID. An empty or malformed ID would let any answer pass, so it is refused at the command line."""
+
+    def run_main(self, *arguments: str) -> tuple[int | None, str]:
+        errors = io.StringIO()
+        with mock.patch.object(sys, "argv", ["host", *arguments]), contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+            host.main()
+        return caught.exception.code if isinstance(caught.exception.code, int) else None, errors.getvalue()
+
+    def test_a_check_without_an_instance_id_is_refused(self) -> None:
+        code, errors = self.run_main("check", "--host-name", "platform-dev")
+        self.assertEqual(2, code)
+        self.assertIn("--instance-id", errors)
+
+    def test_an_empty_or_malformed_instance_id_is_refused_without_naming_it(self) -> None:
+        for value in ("", " ", "i-xyz", "i-123", "i-0123456789abcdef012", "platform-dev", "i-0123456789abcdef0 extra"):
+            with self.subTest(value=value):
+                code, errors = self.run_main("check", "--host-name", "platform-dev", "--instance-id", value)
+                self.assertEqual(2, code)
+                if value.strip():
+                    self.assertNotIn(value, errors)
+
+    def test_a_check_without_a_host_name_is_refused(self) -> None:
+        code, errors = self.run_main("check", "--instance-id", INSTANCE)
+        self.assertEqual(2, code)
+        self.assertIn("--host-name", errors)
+
+
+class DeployWorkflowTest(unittest.TestCase):
+    """The workflow's text is the contract: the host is checked against the instance ID of a protected variable."""
+
+    def test_the_check_step_passes_the_instance_id_from_the_protected_variable(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text()
+        self.assertIn("INSTANCE_ID: ${{ vars.PLATFORM_INSTANCE_ID }}", workflow)
+        self.assertIn('--instance-id "${INSTANCE_ID}"', workflow)
+        self.assertIn("environment: deploy", workflow)
 
 
 if __name__ == "__main__":

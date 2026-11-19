@@ -43,4 +43,5 @@ jobs:
       - name: Reach the host over SSH
         env:
           HOST_NAME: ${{ vars.PLATFORM_HOST_NAME }}
-        run: python -m scripts.infra.host check --host-name "${HOST_NAME}"
+          INSTANCE_ID: ${{ vars.PLATFORM_INSTANCE_ID }}
+        run: python -m scripts.infra.host check --host-name "${HOST_NAME}" --instance-id "${INSTANCE_ID}"

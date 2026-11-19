@@ -9,6 +9,8 @@ for SSH, runs the Ansible host setup and writes the inventory. A run with nothin
 checks, so a second run changes nothing.
 ``make host-stop`` stops the instance, keeps its disk and prints what still bills.
 ``make host-start`` starts it and waits until it answers over Tailscale.
+``host check --host-name <NAME> --instance-id <ID>`` is the deploy workflow's check: the peer with that name and tag must answer over
+SSH as the instance with that ID.
 
 Every wait has a deadline and fails with a message that names what did not happen.
 """
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -37,6 +40,7 @@ TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 HOST_TAG = "tag:surgical-host"
 HOST_USER = "ubuntu"
 INSTANCE_ID_COMMAND = "cat /var/lib/cloud/data/instance-id"
+INSTANCE_ID_FORM = re.compile(r"i-[0-9a-f]{8,17}")
 INSTANCE_DEADLINE_SECONDS = 600
 PEER_DEADLINE_SECONDS = 600
 SSH_DEADLINE_SECONDS = 300
@@ -212,9 +216,14 @@ def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -
     wait_for(f"the Tailscale peer {host_name} to be online", lambda budget: peer_online(host_name, budget) or None, PEER_DEADLINE_SECONDS)
     peer = host_peer(host_name)
     found = wait_for("SSH over Tailscale", lambda budget: ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, budget), SSH_DEADLINE_SECONDS)
-    if found.strip() != instance:
-        raise HostError(f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again")
+    require_instance(found, instance, host_name)
     return peer
+
+
+def require_instance(found: str, expected: str, host_name: str) -> None:
+    """Refuse a peer that answered with another instance ID. The message names no ID."""
+    if found.strip() != expected:
+        raise HostError(f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again")
 
 
 def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
@@ -224,9 +233,9 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
-def ansible_failure(stdout: str, stderr: str) -> str:
-    """The end of a failed playbook's output with account numbers and addresses replaced; the raw output stays in the run's raw folder."""
-    return sanitized(f"the Ansible host setup failed:\n{stdout[-4000:]}\n{stderr[-2000:]}")
+def ansible_failure(stdout: str, stderr: str, address: str) -> str:
+    """The end of a failed playbook's output with account numbers, addresses and the host's name replaced; the raw output stays in the run's raw folder."""
+    return sanitized(f"the Ansible host setup failed:\n{stdout[-4000:]}\n{stderr[-2000:]}".replace(address, "<HOST>"))
 
 
 def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
@@ -244,7 +253,7 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
     recap = result.stdout[result.stdout.rfind("PLAY RECAP") :] if "PLAY RECAP" in result.stdout else result.stdout[-2000:]
     sys.stdout.write(sanitized(recap))
     if result.returncode != 0:
-        raise HostError(ansible_failure(result.stdout, result.stderr))
+        raise HostError(ansible_failure(result.stdout, result.stderr, address))
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
@@ -269,7 +278,7 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     record_tailscale_device(run.run_id, host_name, peer.device_id)
     run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]))
     write_inventory(binding)
-    sys.stdout.write(f"run {run.run_id}: the host is up at {address} and its inventory is written\n")
+    sys.stdout.write(f"run {run.run_id}: the host {host_name} is up and its inventory is written\n")
     return 0
 
 
@@ -290,13 +299,15 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
     peer = wait_until_reachable(aws, run.run_id, instance, host_name)
     record_tailscale_device(run.run_id, host_name, peer.device_id)
     write_inventory(binding)
-    sys.stdout.write(f"run {run.run_id}: the host is started and answers at {peer.address}\n")
+    sys.stdout.write(f"run {run.run_id}: the host {host_name} is started and answers over Tailscale\n")
     return 0
 
 
-def host_check(host_name: str) -> int:
+def host_check(host_name: str, instance: str) -> int:
+    """Succeed only when the peer with the host's name and tag answers over SSH as the instance with the given ID."""
     address = host_peer(host_name).address
-    wait_for("SSH over Tailscale", lambda budget: ssh_output("deploy", address, "true", budget), SSH_DEADLINE_SECONDS)
+    found = wait_for("SSH over Tailscale", lambda budget: ssh_output("deploy", address, INSTANCE_ID_COMMAND, budget), SSH_DEADLINE_SECONDS)
+    require_instance(found, instance, host_name)
     sys.stdout.write(f"the host answers over Tailscale SSH as {host_name}\n")
     return 0
 
@@ -306,12 +317,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["up", "stop", "start", "check"])
     parser.add_argument("--host-name", default="", help="check: the host's Tailscale name, for example platform-dev")
+    parser.add_argument("--instance-id", default="", help="check: the EC2 instance ID that the host must answer with")
     parser.add_argument("--confirm", default="", help="up: the confirmation code of the reviewed plan")
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()
+    if arguments.command == "check" and not arguments.host_name:
+        parser.error("check needs --host-name")
+    if arguments.command == "check" and INSTANCE_ID_FORM.fullmatch(arguments.instance_id) is None:
+        parser.error("check needs --instance-id, an EC2 instance ID: the letters i- and 8 to 17 hexadecimal digits")
     try:
         if arguments.command == "check":
-            return host_check(arguments.host_name)
+            return host_check(arguments.host_name, arguments.instance_id)
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         if arguments.command == "up":
