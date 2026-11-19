@@ -42,6 +42,8 @@ SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
+RELEASE_DEADLINE_SECONDS = 300
+DEVICE_FILE = "tailscale_device.json"
 WORKLOAD_GID_BASE = 20000
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
@@ -103,7 +105,7 @@ def select_peer(status: dict[str, Any], host_name: str, tag: str) -> Peer:
     return Peer(str(peers[0]["DNSName"]).rstrip("."), str(peers[0]["ID"]))
 
 
-def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> Peer:
+def tailscale_status(timeout: float) -> dict[str, Any]:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
@@ -113,7 +115,55 @@ def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> Peer:
         raise NoPeerError("the Tailscale client on this computer did not answer in time") from None
     if result.returncode != 0:
         raise HostError(f"tailscale status failed: {result.stderr.strip()}")
-    return select_peer(json.loads(result.stdout), host_name, HOST_TAG)
+    status: dict[str, Any] = json.loads(result.stdout)
+    return status
+
+
+def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> Peer:
+    return select_peer(tailscale_status(timeout), host_name, HOST_TAG)
+
+
+def tailscale_device_id(host_name: str) -> str:
+    """The Tailscale device ID of the host's one online peer, as this computer's Tailscale status shows it."""
+    return host_peer(host_name).device_id
+
+
+def record_tailscale_device(run_id: str, host_name: str, device_id: str) -> Path:
+    """Write the host's current Tailscale device to the run folder, over any earlier record: a host that left the network and rejoined has a new device."""
+    target = ROOT / "runs" / run_id / DEVICE_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n")
+    return target
+
+
+def device_gone(status: dict[str, Any], host_name: str, device_id: str) -> bool:
+    """Whether no peer is the recorded device or has the host's name and tag, online or not."""
+    return not any(
+        peer.get("ID") == device_id or (peer.get("HostName") == host_name and HOST_TAG in (peer.get("Tags") or []))
+        for peer in (status.get("Peer") or {}).values()
+    )
+
+
+def release_tailscale_device(run_id: str, host_name: str, device_id: str, deadline_seconds: float = RELEASE_DEADLINE_SECONDS) -> None:
+    """Log the host out of Tailscale over SSH, then wait until its recorded device and any device with its name and tag are gone from the network.
+
+    Run before the instance is destroyed. A device that is already gone needs no logout. An ephemeral device that is offline cannot be logged out and
+    leaves the network on its own only after a while, so the wait may end at its deadline.
+    """
+    try:
+        peer = select_peer(tailscale_status(SSH_ATTEMPT_SECONDS), host_name, HOST_TAG)
+    except NoPeerError:
+        peer = None
+    if peer is not None:
+        ssh_output(run_id, peer.address, "sudo -n tailscale logout", SSH_ATTEMPT_SECONDS)
+
+    def gone(budget: float) -> bool | None:
+        try:
+            return device_gone(tailscale_status(budget), host_name, device_id) or None
+        except NoPeerError:
+            return None
+
+    wait_for(f"the Tailscale device of {host_name} to leave the network", gone, deadline_seconds)
 
 
 def peer_online(host_name: str, timeout: float) -> bool:
@@ -206,7 +256,9 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         write_inventory(binding)
         return 0
     state = state_json(run, configuration)
-    address = wait_until_reachable(aws, run.run_id, instance_id(state), host_name).address
+    peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
+    address = peer.address
+    record_tailscale_device(run.run_id, host_name, peer.device_id)
     run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]))
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host is up at {address} and its inventory is written\n")
@@ -226,8 +278,10 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
     run = load_run(binding)
     instance = instance_id(state_json(run, configuration))
     aws.call("ec2", "start-instances", "--instance-ids", instance)
-    address = wait_until_reachable(aws, run.run_id, instance, f"platform-{configuration['ENVIRONMENT']}").address
-    sys.stdout.write(f"run {run.run_id}: the host is started and answers at {address}\n")
+    host_name = f"platform-{configuration['ENVIRONMENT']}"
+    peer = wait_until_reachable(aws, run.run_id, instance, host_name)
+    record_tailscale_device(run.run_id, host_name, peer.device_id)
+    sys.stdout.write(f"run {run.run_id}: the host is started and answers at {peer.address}\n")
     return 0
 
 

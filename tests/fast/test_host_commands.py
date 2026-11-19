@@ -23,7 +23,18 @@ from unittest import mock
 
 from scripts.aws_cli import Aws
 from scripts.infra import host, state_bootstrap
-from scripts.infra.host import HostError, Peer, instance_id, select_peer, wait_for, wait_until_reachable, workload_variables
+from scripts.infra.host import (
+    HostError,
+    Peer,
+    instance_id,
+    record_tailscale_device,
+    release_tailscale_device,
+    select_peer,
+    tailscale_device_id,
+    wait_for,
+    wait_until_reachable,
+    workload_variables,
+)
 from scripts.infra.inventory import inventory_entries
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import TimeoutExpired
@@ -142,7 +153,10 @@ class WaitForTest(unittest.TestCase):
         self.assertEqual(30, clock.now)
 
 
-STATUS_TOOL = '#!/bin/sh\ncat "$FAKE_STATUS"\n'
+STATUS_TOOL = (
+    '#!/bin/sh\nsleep "${FAKE_STATUS_DELAY:-0}"\n'
+    'if [ -e "$FAKE_SSH_LOG" ] && [ -n "${FAKE_STATUS_AFTER:-}" ]; then cat "$FAKE_STATUS_AFTER"; else cat "$FAKE_STATUS"; fi\n'
+)
 SSH_TOOL = '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\nexit "${FAKE_SSH_EXIT:-0}"\n'
 
 
@@ -155,7 +169,7 @@ class FakeAws(Aws):
 
 
 @contextmanager
-def fake_tools(status: Mapping[str, object], instance: str, ssh_exit: int = 0) -> Iterator[Path]:
+def fake_tools(status: Mapping[str, object], instance: str, ssh_exit: int = 0, after: Mapping[str, object] | None = None) -> Iterator[Path]:
     """A ``tailscale`` that prints the given status and an ``ssh`` that logs its arguments and prints the given instance ID, first on PATH."""
     with tempfile.TemporaryDirectory() as scratch:
         folder = Path(scratch)
@@ -163,7 +177,9 @@ def fake_tools(status: Mapping[str, object], instance: str, ssh_exit: int = 0) -
             (folder / name).write_text(text)
             (folder / name).chmod(stat.S_IRWXU)
         (folder / "status.json").write_text(json.dumps(status))
+        (folder / "status_after.json").write_text(json.dumps(after if after is not None else status))
         environment = {
+            "FAKE_STATUS_AFTER": str(folder / "status_after.json") if after is not None else "",
             "PATH": f"{folder}:{os.environ['PATH']}",
             "FAKE_STATUS": str(folder / "status.json"),
             "FAKE_SSH_LOG": str(folder / "ssh.log"),
@@ -209,20 +225,20 @@ class ReachableHostTest(unittest.TestCase):
         status = {"Peer": {"a": peer("platform-dev", device="nAAACNTRL"), "b": peer("platform-dev", device="nBBBCNTRL")}}
         with (
             fake_tools(status, "i-0123456789abcdef0") as folder,
-            mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.5),
+            mock.patch.object(host, "PEER_DEADLINE_SECONDS", 1),
             self.assertRaisesRegex(HostError, "2 online peers"),
         ):
             wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", "i-0123456789abcdef0", "platform-dev")
         self.assertFalse((folder / "ssh.log").exists())
 
     def test_a_status_with_no_peer_map_waits_and_then_expires(self) -> None:
-        with mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.5), self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"):
+        with mock.patch.object(host, "PEER_DEADLINE_SECONDS", 1), self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"):
             self.reach({"Peer": None}, "i-0123456789abcdef0")
 
     def test_a_tailscale_client_that_does_not_answer_is_retried_until_the_deadline(self) -> None:
         with (
             mock.patch.dict(os.environ, {"FAKE_STATUS_DELAY": "5"}),
-            mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.5),
+            mock.patch.object(host, "PEER_DEADLINE_SECONDS", 1),
             mock.patch.object(host, "SSH_ATTEMPT_SECONDS", 0.2),
             self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"),
         ):
@@ -230,16 +246,98 @@ class ReachableHostTest(unittest.TestCase):
 
     def test_a_peer_whose_ssh_never_answers_expires(self) -> None:
         status = {"Peer": {"a": peer("platform-dev")}}
-        with mock.patch.object(host, "SSH_DEADLINE_SECONDS", 0.5), self.assertRaisesRegex(HostError, "while waiting for SSH over Tailscale"):
+        with mock.patch.object(host, "SSH_DEADLINE_SECONDS", 1), self.assertRaisesRegex(HostError, "while waiting for SSH over Tailscale"):
             self.reach(status, "i-0123456789abcdef0", ssh_exit=255)
 
     def test_an_instance_that_is_not_running_expires(self) -> None:
         with (
             fake_tools({"Peer": {}}, ""),
-            mock.patch.object(host, "INSTANCE_DEADLINE_SECONDS", 0.5),
+            mock.patch.object(host, "INSTANCE_DEADLINE_SECONDS", 1),
             self.assertRaisesRegex(HostError, "while waiting for the instance to run"),
         ):
             wait_until_reachable(FakeAws("project", "us-west-2", "pending"), "run-one", "i-0123456789abcdef0", "platform-dev")
+
+
+class TailscaleDeviceTest(unittest.TestCase):
+    """The host's Tailscale device: its ID from the status, its record in the run folder and its removal before the instance is destroyed."""
+
+    def test_the_device_id_is_the_one_online_peer_s_id(self) -> None:
+        with fake_tools({"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}, ""):
+            self.assertEqual("nNEWCNTRL", tailscale_device_id("platform-dev"))
+
+    def test_the_device_is_recorded_in_the_run_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(host, "ROOT", Path(scratch)):
+            record_tailscale_device("run-one", "platform-dev", "nNEWCNTRL")
+            record_tailscale_device("run-one", "platform-dev", "nSECONDCNTRL")
+            written = json.loads((Path(scratch) / "runs" / "run-one" / "tailscale_device.json").read_text())
+        self.assertEqual({"host_name": "platform-dev", "device_id": "nSECONDCNTRL"}, written)
+
+    def test_a_logged_out_host_is_awaited_until_its_device_is_gone(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, "", after={"Peer": {}}) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+            logged = (folder / "ssh.log").read_text().splitlines()
+        address = "platform-dev.example.ts.net"
+        self.assertIn(f"ubuntu@{address}", logged)
+        self.assertIn("sudo -n tailscale logout", logged)
+
+    def test_a_device_that_is_already_gone_needs_no_ssh(self) -> None:
+        with fake_tools({"Peer": {}}, "") as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+            self.assertFalse((folder / "ssh.log").exists())
+
+    def test_the_device_the_host_has_now_is_logged_out_when_it_differs_from_the_recorded_one(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nRESTARTEDCNTRL")}}
+        with fake_tools(before, "", after={"Peer": {}}) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 5)
+            self.assertIn("sudo -n tailscale logout", (folder / "ssh.log").read_text().splitlines())
+
+    def test_the_recorded_device_must_be_gone_too(self) -> None:
+        after = {"Peer": {"b": peer("platform-dev", online=False, device="nRECORDEDCNTRL")}}
+        before = {"Peer": {"a": peer("platform-dev", device="nRESTARTEDCNTRL"), "b": after["Peer"]["b"]}}
+        with (
+            fake_tools(before, "", after=after),
+            self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev to leave the network"),
+        ):
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 1)
+
+    def test_a_restarted_device_that_stays_in_the_network_is_not_gone(self) -> None:
+        still = {"Peer": {"a": peer("platform-dev", device="nRESTARTEDCNTRL")}}
+        with fake_tools(still, "", after=still), self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev"):
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 1)
+
+    def test_the_recorded_device_is_awaited_by_its_id_whatever_its_name_has_become(self) -> None:
+        renamed = {"Peer": {"x": peer("platform-dev-1", device="nRECORDEDCNTRL")}}
+        with fake_tools(renamed, ""), self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev"):
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 1)
+
+    def test_a_dropped_ssh_session_after_the_logout_is_no_failure(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, "", ssh_exit=255, after={"Peer": {}}):
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+
+    def test_a_device_that_stays_in_the_network_ends_at_the_deadline(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, ""), self.assertRaisesRegex(HostError, "deadline of 1 seconds passed while waiting for the Tailscale device of platform-dev"):
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 1)
+
+    def test_an_offline_device_cannot_be_logged_out_and_ends_at_the_deadline(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", online=False, device="nNEWCNTRL")}}
+        with fake_tools(before, "") as folder, self.assertRaisesRegex(HostError, "while waiting for the Tailscale device"):
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 1)
+        self.assertFalse((folder / "ssh.log").exists())
+
+    def test_two_online_peers_are_refused_before_any_logout(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nAAACNTRL"), "b": peer("platform-dev", device="nBBBCNTRL")}}
+        with fake_tools(before, "") as folder, self.assertRaisesRegex(HostError, "2 online peers"):
+            release_tailscale_device("run-one", "platform-dev", "nAAACNTRL", 5)
+        self.assertFalse((folder / "ssh.log").exists())
+
+    def test_a_peer_with_another_name_is_left_alone(self) -> None:
+        before = {"Peer": {"a": peer("laptop", device="nLAPTOPCNTRL", tags=())}}
+        with fake_tools(before, "") as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+            self.assertFalse((folder / "ssh.log").exists())
 
 
 CONFIGURATION = {"AWS_REGION": "us-west-2", "AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "PROJECT_NAME": "example_project"}
@@ -258,6 +356,7 @@ class HostUpTest(unittest.TestCase):
     def run_up(self, path: Path, *, confirm: str = "") -> tuple[int, dict[str, mock.Mock]]:
         names = ("save_plan", "apply_plan", "write_inventory", "state_json", "wait_until_reachable", "run_ansible", "instance_id")
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
             calls["state_json"].return_value = {"values": {}}
@@ -287,16 +386,31 @@ class HostUpTest(unittest.TestCase):
         for name in ("wait_until_reachable", "run_ansible", "instance_id"):
             calls[name].assert_not_called()
 
-    def test_a_run_with_its_own_host_reaches_it_and_runs_ansible(self) -> None:
+    def test_a_run_with_its_own_host_reaches_it_records_its_device_and_runs_ansible(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             path = binding_file(Path(scratch), backend="s3", provision_host=True)
             with mock.patch.object(state_bootstrap, "create", return_value=0) as create:
                 code, calls = self.run_up(path)
+            recorded = json.loads((Path(scratch) / "runs" / "20260101t0000-abcdef" / "tailscale_device.json").read_text())
         self.assertEqual(0, code)
         self.assertEqual(("s3", True), create.call_args.args[3:])
         calls["wait_until_reachable"].assert_called_once()
         calls["run_ansible"].assert_called_once()
         calls["write_inventory"].assert_called_once_with(path)
+        self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
+
+    def test_a_started_host_records_the_device_it_has_now(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            stack.enter_context(mock.patch.object(host, "ROOT", Path(scratch)))
+            stack.enter_context(mock.patch.object(host, "state_json", return_value={}))
+            stack.enter_context(mock.patch.object(host, "instance_id", return_value="i-0123456789abcdef0"))
+            stack.enter_context(mock.patch.object(host, "wait_until_reachable", return_value=Peer("platform-dev.example.ts.net", "nRESTARTEDCNTRL")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            aws = FakeAws("project", "us-west-2")
+            self.assertEqual(0, host.host_start(aws, CONFIGURATION, path))
+            recorded = json.loads((Path(scratch) / "runs" / "20260101t0000-abcdef" / "tailscale_device.json").read_text())
+        self.assertEqual({"host_name": "platform-dev", "device_id": "nRESTARTEDCNTRL"}, recorded)
 
     def test_without_a_binding_the_step_creates_an_s3_run_with_its_own_host(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
