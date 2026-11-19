@@ -1,6 +1,6 @@
 PYTHON := .venv/bin/python
 
-.PHONY: setup lock check check-terraform check-ansible test-fast test-guards
+.PHONY: setup lock check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory
 
 setup:
 	python3.14 -m venv .venv
@@ -29,3 +29,15 @@ test-fast:
 
 test-guards:
 	$(PYTHON) -m tests.e2e.commit_guards
+
+host-up:
+	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM))
+
+host-stop:
+	$(PYTHON) -m scripts.infra.host stop
+
+host-start:
+	$(PYTHON) -m scripts.infra.host start
+
+inventory:
+	$(PYTHON) -m scripts.infra.inventory

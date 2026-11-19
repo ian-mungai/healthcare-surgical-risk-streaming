@@ -1,0 +1,73 @@
+"""Record the service ID of every resource this run created.
+
+Run from the repository root under the project profile in ``.env``:
+
+``.venv/bin/python -m scripts.infra.inventory``
+
+It reads the run's Terraform state from its bound backend and writes ``runs/<RUN_ID>/inventory.json``: one entry for
+each managed resource with its address, type and service ID, one for the state bucket and the list of items the owner
+authorized to retain. Resources without tags are listed like any other, because the list comes from the state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from scripts.infra.state_bootstrap import DEFAULT_BINDING
+from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
+from scripts.project_config import ROOT, ConfigurationError, load_configuration
+
+
+def module_resources(module: dict[str, Any]) -> list[dict[str, Any]]:
+    found = list(module.get("resources", []))
+    for child in module.get("child_modules", []):
+        found += module_resources(child)
+    return found
+
+
+def inventory_entries(state: dict[str, Any], state_bucket: str) -> list[dict[str, str]]:
+    """One entry for each managed resource in the state, in address order, then the state bucket."""
+    resources = module_resources(state.get("values", {}).get("root_module", {}))
+    entries = [{"address": item["address"], "type": item["type"], "service_id": str(item["values"]["id"])} for item in resources if item["mode"] == "managed"]
+    return [*sorted(entries, key=lambda entry: entry["address"]), {"address": "state bucket", "type": "aws_s3_bucket", "service_id": state_bucket}]
+
+
+def write_inventory(binding: Path) -> Path:
+    configuration = load_configuration()
+    run = load_run(binding)
+    folder = ROOT / "runs" / run.run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    retained_file = folder / "retained.json"
+    retained = json.loads(retained_file.read_text()) if retained_file.is_file() else []
+    inventory = {
+        "run_id": run.run_id,
+        "commit": run.commit,
+        "created": inventory_entries(state_json(run, configuration), run.state_bucket),
+        "authorized_retained": retained,
+    }
+    target = folder / "inventory.json"
+    target.write_text(json.dumps(inventory, indent=2) + "\n")
+    return target
+
+
+def main() -> int:
+    """Write the inventory, print its size and return a non-zero code on a failure."""
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
+    try:
+        target = write_inventory(parser.parse_args().binding)
+    except (ConfigurationError, WrapperError) as error:
+        sys.stderr.write(f"{error}\n")
+        return 1
+    inventory = json.loads(target.read_text())
+    counts = f"{len(inventory['created'])} created resources and {len(inventory['authorized_retained'])} retained items"
+    sys.stdout.write(f"run {inventory['run_id']}: {counts} recorded in {target.relative_to(ROOT)}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -80,13 +80,25 @@ def load_run(path: Path) -> RunBinding:
     return RunBinding(**json.loads(path.read_text()))
 
 
+def initialise(run: RunBinding, configuration: dict[str, str]) -> None:
+    terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
+
+
+def state_json(run: RunBinding, configuration: dict[str, str]) -> dict[str, Any]:
+    """The run's current Terraform state, read from its bound backend."""
+    initialise(run, configuration)
+    state: dict[str, Any] = json.loads(terraform(run, ["show", "-json"], PLAN_TIMEOUT_SECONDS))
+    return state
+
+
 def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> int:
+    """Save the plan with its text, JSON and binding, print its changes and return how many resources change."""
     if run.status != "verified":
         raise WrapperError("the run's state bucket is not verified: run the state bootstrap step")
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
     plan_file = folder / f"{action}.tfplan"
-    terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
+    initialise(run, configuration)
     missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
     if missing:
         raise WrapperError(f".env: missing values for: {', '.join(missing)}")
@@ -109,7 +121,7 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     sys.stdout.write(f"run {run.run_id}, {action} plan: {summary}\nfull plan text: {(folder / f'{action}.txt').relative_to(ROOT)}\n")
     if counts and action == "apply":
         sys.stdout.write(f"to apply exactly this plan after review: apply --confirm {saved['plan_sha256'][:12]}\n")
-    return 0
+    return sum(counts.values())
 
 
 def apply_plan(run: RunBinding, code: str) -> int:
@@ -137,7 +149,8 @@ def main() -> int:
         configuration = load_configuration()
         run = load_run(arguments.binding)
         if arguments.command == "plan":
-            return save_plan(run, configuration, "destroy" if arguments.destroy else "apply")
+            save_plan(run, configuration, "destroy" if arguments.destroy else "apply")
+            return 0
         return apply_plan(run, arguments.confirm)
     except (ConfigurationError, WrapperError) as error:
         sys.stderr.write(f"{error}\n")
