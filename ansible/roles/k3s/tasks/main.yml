@@ -63,7 +63,13 @@
 
 - name: Read the running k3s configuration
   ansible.builtin.command:
-    cmd: k3s kubectl get node -o jsonpath={.items[0].metadata.annotations.k3s\.io/node-args}
+    argv:
+      - k3s
+      - kubectl
+      - get
+      - node
+      - --output
+      - jsonpath={.items[0].metadata.annotations.k3s\.io/node-args}
   register: k3s_node_arguments
   changed_when: false
 
