@@ -100,6 +100,10 @@ class InventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(HostError, "exactly one host instance"):
             instance_id({"values": {}})
 
+    def test_run_with_local_state_lists_no_state_bucket(self) -> None:
+        self.assertEqual([], inventory_entries({"values": {}}, ""))
+        self.assertNotIn("state bucket", [entry["address"] for entry in inventory_entries(STATE, "")])
+
     def test_empty_state_lists_only_the_state_bucket(self) -> None:
         self.assertEqual(
             [{"address": "state bucket", "type": "aws_s3_bucket", "service_id": "example-state"}], inventory_entries({"values": {}}, "example-state")

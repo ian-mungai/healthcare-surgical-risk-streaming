@@ -30,10 +30,11 @@ def module_resources(module: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def inventory_entries(state: dict[str, Any], state_bucket: str) -> list[dict[str, str]]:
-    """One entry for each managed resource in the state, in address order, then the state bucket."""
+    """One entry for each managed resource in the state, in address order, then the state bucket when the run has one."""
     resources = module_resources(state.get("values", {}).get("root_module", {}))
     entries = [{"address": item["address"], "type": item["type"], "service_id": str(item["values"]["id"])} for item in resources if item["mode"] == "managed"]
-    return [*sorted(entries, key=lambda entry: entry["address"]), {"address": "state bucket", "type": "aws_s3_bucket", "service_id": state_bucket}]
+    state_entry = [{"address": "state bucket", "type": "aws_s3_bucket", "service_id": state_bucket}] if state_bucket else []
+    return [*sorted(entries, key=lambda entry: entry["address"]), *state_entry]
 
 
 def write_inventory(binding: Path) -> Path:
