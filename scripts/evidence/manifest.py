@@ -70,7 +70,8 @@ def manifest_problems(manifest: dict[str, Any]) -> list[str]:
 
 
 def archive_problems(manifest: dict[str, Any], members: list[str]) -> list[str]:
-    """Each archive member the manifest does not list and each listed file the archive does not hold."""
+    """Each archive member the manifest does not list or the archive holds twice, and each listed file the archive does not hold."""
     listed = [str(item["path"]) for item in manifest["files"]]
-    extra = [f"in the archive and not in the manifest: {name}" for name in sorted(set(members) - set(listed))]
+    repeated = [f"in the archive more than once: {name}" for name in sorted({name for name in members if members.count(name) > 1})]
+    extra = repeated + [f"in the archive and not in the manifest: {name}" for name in sorted(set(members) - set(listed))]
     return extra + [f"in the manifest and not in the archive: {path}" for path in listed if path not in members]

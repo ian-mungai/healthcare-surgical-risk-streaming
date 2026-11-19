@@ -15,7 +15,7 @@ from typing import Any
 
 from scripts.evidence.manifest import REQUIRED_EVIDENCE, archive_problems, build_manifest, manifest_problems, manifest_sha256, readback_problems
 from scripts.evidence.receipt import receipt_problems
-from scripts.evidence.verify import verify_export
+from scripts.evidence.verify import export_problem, verify_export
 from scripts.infra.host import HostError
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.teardown import (
@@ -113,6 +113,7 @@ class ManifestShapeTest(unittest.TestCase):
         self.assertEqual([], archive_problems(manifest, ["b.json", "a.json"]))
         self.assertEqual(["in the archive and not in the manifest: c.json"], archive_problems(manifest, ["a.json", "b.json", "c.json"]))
         self.assertEqual(["in the manifest and not in the archive: b.json"], archive_problems(manifest, ["a.json"]))
+        self.assertEqual(["in the archive more than once: a.json"], archive_problems(manifest, ["a.json", "b.json", "a.json"]))
 
 
 class VerifyExportTest(unittest.TestCase):
@@ -147,6 +148,13 @@ class VerifyExportTest(unittest.TestCase):
         self.pack(build_manifest(self.folder, RUN.run_id, RUN.commit), skip="inventory.json")
         self.assertEqual(["in the manifest and not in the archive: inventory.json"], verify_export(self.folder, RUN, self.sign))
         self.assertFalse((self.export / "receipt.json").exists() or (self.export / "receipt.json.sig").exists())
+
+    def test_a_missing_export_removes_the_earlier_receipt_before_anything_else(self) -> None:
+        self.assertEqual([], verify_export(self.folder, RUN, self.sign))
+        (self.folder / "export" / "evidence.tar.gz").unlink()
+        self.assertEqual("no export to verify: run make evidence-export first", export_problem(self.folder))
+        self.assertFalse((self.folder / "export" / "receipt.json").exists())
+        self.assertFalse((self.folder / "export" / "receipt.json.sig").exists())
 
     def test_corrupt_archive_removes_the_earlier_receipt(self) -> None:
         self.assertEqual([], verify_export(self.folder, RUN, self.sign))

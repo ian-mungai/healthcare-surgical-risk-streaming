@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -127,7 +128,7 @@ def prepare_configuration(run: RunBinding) -> Path:
     for item in configuration_files(source):
         shutil.copy2(item, target / item.name)
     for part in CONFIGURATION_PARTS:
-        shutil.copytree(source / part, target / part)
+        shutil.copytree(source / part, target / part, ignore=shutil.ignore_patterns("*.auto.tfvars", "*.auto.tfvars.json"))
     override = backend_override(run)
     if override is not None:
         (target / "backend_override.tf").write_text(override)
@@ -185,13 +186,19 @@ def initialise(run: RunBinding, configuration: dict[str, str]) -> None:
 
 
 def approved_plan_copy(run: RunBinding, plan: bytes) -> Path:
-    """Write the exact bytes that were checked to an owner-only file, so the plan that is shown and applied is the plan that was checked."""
-    target = configuration_folder(run) / "approved.tfplan"
-    target.unlink(missing_ok=True)
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    """Write the exact bytes that were checked to an owner-only file of this invocation alone, so the plan shown and applied is the plan checked."""
+    descriptor, name = tempfile.mkstemp(dir=configuration_folder(run), prefix="approved_", suffix=".tfplan")
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(plan)
-    return target
+    return Path(name)
+
+
+def write_private(path: Path, content: str | bytes) -> None:
+    """Write a raw plan file that only its owner can read, whatever mode an earlier file had."""
+    path.unlink(missing_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(content.encode() if isinstance(content, str) else content)
 
 
 def state_json(run: RunBinding, configuration: dict[str, str]) -> dict[str, Any]:
@@ -212,6 +219,7 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
         raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o700)
     candidate = folder / f"{action}_candidate.tfplan"
     initialise(run, configuration)
     missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
@@ -229,10 +237,12 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
             sys.stdout.write(f"{actions}: {change['address']}\n")
     label = plan_label(action, changes=sum(counts.values()), reviewed_exists=(folder / f"{action}.tfplan").is_file())
     plan_file = folder / f"{label}.tfplan"
-    candidate.replace(plan_file)
-    (folder / f"{label}.txt").write_text(terraform(run, ["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))
-    (folder / f"{label}.json").write_text(plan_json)
-    saved = plan_binding(run, plan_file.read_bytes(), action)
+    plan = candidate.read_bytes()
+    candidate.unlink()
+    write_private(plan_file, plan)
+    write_private(folder / f"{label}.txt", terraform(run, ["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))
+    write_private(folder / f"{label}.json", plan_json)
+    saved = plan_binding(run, plan, action)
     (folder / f"{label}_binding.json").write_text(json.dumps(saved, indent=2) + "\n")
     summary = ", ".join(f"{count} to {name}" for name, count in sorted(counts.items())) or "no change"
     sys.stdout.write(f"run {run.run_id}, {action} plan: {summary}\nfull plan text: {(folder / f'{label}.txt').relative_to(ROOT)}\n")

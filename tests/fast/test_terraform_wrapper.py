@@ -8,12 +8,16 @@ plan saved for another run.
 from __future__ import annotations
 
 import hashlib
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from scripts.infra import terraform_wrapper
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.terraform_wrapper import (
+    approved_plan_copy,
     backend_arguments,
     backend_override,
     binding_problems,
@@ -22,9 +26,11 @@ from scripts.infra.terraform_wrapper import (
     effective_location_problems,
     plan_binding,
     plan_label,
+    prepare_configuration,
     run_variables,
     sanitized,
     state_location,
+    write_private,
 )
 
 RUN = RunBinding(
@@ -125,6 +131,38 @@ class ConfigurationCopyTest(unittest.TestCase):
         for name in ("main.tf", "backend_override.tf", "extra.auto.tfvars", "terraform.tfvars", ".terraform.lock.hcl"):
             (source / name).write_text("")
         self.assertEqual(["main.tf", ".terraform.lock.hcl"], [item.name for item in configuration_files(source)])
+
+
+class PrivateFilesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+
+    def test_nested_automatic_variable_files_are_left_out_of_a_runs_copy(self) -> None:
+        source = self.root / "infra"
+        for folder in ("modules/host", "environments"):
+            (source / folder).mkdir(parents=True)
+        for name in ("main.tf", ".terraform.lock.hcl", "modules/host/main.tf", "modules/host/extra.auto.tfvars", "environments/dev.tfvars"):
+            (source / name).write_text("")
+        (source / "environments" / "other.auto.tfvars.json").write_text("{}")
+        copied = prepare_configuration(RUN)
+        names = sorted(path.relative_to(copied).as_posix() for path in copied.rglob("*") if path.is_file())
+        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "main.tf", "modules/host/main.tf"], names)
+
+    def test_each_invocation_gets_its_own_owner_only_copy_of_the_approved_plan(self) -> None:
+        (self.root / ".tools" / "terraform" / RUN.run_id / "config").mkdir(parents=True)
+        first, second = approved_plan_copy(RUN, PLAN), approved_plan_copy(RUN, PLAN)
+        self.assertNotEqual(first, second)
+        self.assertEqual([PLAN, PLAN], [first.read_bytes(), second.read_bytes()])
+        self.assertEqual([0o600, 0o600], [stat.S_IMODE(path.stat().st_mode) for path in (first, second)])
+
+    def test_raw_plan_files_are_readable_by_their_owner_only(self) -> None:
+        target = self.root / "plans" / "apply.txt"
+        target.parent.mkdir()
+        target.write_text("older")
+        target.chmod(0o644)
+        write_private(target, "plan text with private values")
+        self.assertEqual(("plan text with private values", 0o600), (target.read_text(), stat.S_IMODE(target.stat().st_mode)))
 
 
 class EffectiveLocationTest(unittest.TestCase):

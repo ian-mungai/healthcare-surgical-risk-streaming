@@ -25,6 +25,21 @@ from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 
+def invalidate_receipt(folder: Path) -> None:
+    """Remove any earlier receipt and its signature. Every verification starts here, so none that stops early leaves a receipt that passes."""
+    receipt = folder / "export" / "receipt.json"
+    receipt.unlink(missing_ok=True)
+    receipt.with_name("receipt.json.sig").unlink(missing_ok=True)
+
+
+def export_problem(folder: Path) -> str | None:
+    """Remove the earlier receipt, then say why there is nothing to verify, or None when the export is there."""
+    invalidate_receipt(folder)
+    if not (folder / "export" / "manifest.json").is_file() or not (folder / "export" / "evidence.tar.gz").is_file():
+        return "no export to verify: run make evidence-export first"
+    return None
+
+
 def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -> list[str]:
     """Check the export in ``folder`` and write its signed receipt, or return each reason it was not written.
 
@@ -32,8 +47,7 @@ def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -
     """
     export = folder / "export"
     receipt = export / "receipt.json"
-    receipt.unlink(missing_ok=True)
-    receipt.with_name("receipt.json.sig").unlink(missing_ok=True)
+    invalidate_receipt(folder)
     manifest = json.loads((export / "manifest.json").read_text())
     problems = manifest_problems(manifest)
     if manifest.get("run_id") != run.run_id or manifest.get("commit") != run.commit:
@@ -81,8 +95,9 @@ def main() -> int:
         sys.stderr.write(f"{error}\n")
         return 1
     folder = ROOT / "runs" / run.run_id
-    if not (folder / "export" / "manifest.json").is_file() or not (folder / "export" / "evidence.tar.gz").is_file():
-        sys.stderr.write("no export to verify: run make evidence-export first\n")
+    missing = export_problem(folder)
+    if missing:
+        sys.stderr.write(f"{missing}\n")
         return 1
     if not key or not Path(key).expanduser().is_file():
         sys.stderr.write(".env: EVIDENCE_VERIFIER_KEY does not name the owner's verifier key file\n")
