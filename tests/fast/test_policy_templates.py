@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from infra.iam.scripts.manage_policies import Names, Step, plan_steps
+from infra.iam.scripts.manage_policies import LiveState, Names, Step, differences, plan_steps, policy_arn, unchanged_differences
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, POLICIES_DIRECTORY, PolicyRenderError, load_documents, render_template, scope_problems
 
 VALUES = {
@@ -23,6 +23,7 @@ VALUES = {
 STATEMENT = {"Sid": "ReadOffers", "Effect": "Allow", "Action": "ec2:DescribeInstanceTypeOfferings", "Resource": "*"}
 GOOD = {"Version": "2012-10-17", "Statement": [STATEMENT]}
 NAMES = Names("example_project", "dev")
+ACCOUNT = "1" * 12
 
 
 def template(statement: dict[str, object]) -> str:
@@ -93,9 +94,13 @@ class TemplateTest(unittest.TestCase):
             render_template(template({"Sid": "A", "Effect": "Allow", "Action": actions, "Resource": "arn:aws:s3:::x/*"}), VALUES)
 
 
+def arn(name: str) -> str:
+    return policy_arn(ACCOUNT, name)
+
+
 class PlanTest(unittest.TestCase):
     def test_new_account_plans_user_policy_and_attachment(self) -> None:
-        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, user_exists=False, live={}, attached=set())
+        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, LiveState(user_exists=False), account=ACCOUNT)
         self.assertEqual(
             [
                 Step("create-user", "example_project_dev"),
@@ -106,30 +111,21 @@ class PlanTest(unittest.TestCase):
         )
 
     def test_changed_document_plans_one_update(self) -> None:
-        live = {"example_project_ec2_policy": {"Version": "2012-10-17", "Statement": []}}
-        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy"})
-        self.assertEqual([Step("update-policy", "example_project_ec2_policy")], steps)
+        live = LiveState(True, {"example_project_ec2_policy": {"Version": "2012-10-17", "Statement": []}}, frozenset({arn("example_project_ec2_policy")}))
+        self.assertEqual([Step("update-policy", "example_project_ec2_policy")], plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT))
 
     def test_rerun_plans_nothing(self) -> None:
-        live = {"example_project_ec2_policy": json.loads(json.dumps(GOOD))}
-        self.assertEqual([], plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy"}))
+        live = LiveState(True, {"example_project_ec2_policy": json.loads(json.dumps(GOOD))}, frozenset({arn("example_project_ec2_policy")}))
+        self.assertEqual([], plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT))
 
     def test_single_action_string_equals_one_item_list(self) -> None:
         listed = {"Version": "2012-10-17", "Statement": [STATEMENT | {"Action": ["ec2:DescribeInstanceTypeOfferings"]}]}
-        self.assertEqual(
-            [],
-            plan_steps(
-                NAMES,
-                {"example_project_ec2_policy": GOOD},
-                user_exists=True,
-                live={"example_project_ec2_policy": listed},
-                attached={"example_project_ec2_policy"},
-            ),
-        )
+        live = LiveState(True, {"example_project_ec2_policy": listed}, frozenset({arn("example_project_ec2_policy")}))
+        self.assertEqual([], plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT))
 
     def test_boundary_is_created_and_never_attached(self) -> None:
         documents = {"example_project_ec2_policy": GOOD, "example_project_role_boundary": GOOD}
-        steps = plan_steps(NAMES, documents, unattached={"example_project_role_boundary"}, user_exists=True, live={}, attached=set())
+        steps = plan_steps(NAMES, documents, LiveState(True), account=ACCOUNT, unattached={"example_project_role_boundary"})
         expected = [
             Step("create-policy", "example_project_ec2_policy"),
             Step("attach-policy", "example_project_ec2_policy"),
@@ -139,17 +135,41 @@ class PlanTest(unittest.TestCase):
 
     def test_attached_boundary_is_reported(self) -> None:
         documents = {"example_project_role_boundary": GOOD}
-        steps = plan_steps(
-            NAMES, documents, unattached={"example_project_role_boundary"}, user_exists=True, live=documents, attached={"example_project_role_boundary"}
-        )
+        live = LiveState(True, documents, frozenset({arn("example_project_role_boundary")}))
+        steps = plan_steps(NAMES, documents, live, account=ACCOUNT, unattached={"example_project_role_boundary"})
         self.assertEqual([Step("report-attached-boundary", "example_project_role_boundary")], steps)
 
     def test_unlisted_live_policy_is_reported_not_removed(self) -> None:
-        live = {"example_project_ec2_policy": GOOD, "example_project_old_policy": GOOD}
-        steps = plan_steps(
-            NAMES, {"example_project_ec2_policy": GOOD}, user_exists=True, live=live, attached={"example_project_ec2_policy", "example_project_old_policy"}
-        )
+        live = LiveState(True, {"example_project_ec2_policy": GOOD, "example_project_old_policy": GOOD}, frozenset({arn("example_project_ec2_policy")}))
+        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT)
         self.assertEqual([Step("report-unlisted", "example_project_old_policy")], steps)
+        self.assertEqual([], differences(steps))
+
+    def test_each_foreign_grant_is_a_reported_difference(self) -> None:
+        live = LiveState(
+            True,
+            {"example_project_ec2_policy": GOOD},
+            frozenset({arn("example_project_ec2_policy"), "arn:aws:iam::aws:policy/AdministratorAccess"}),
+            frozenset({"inline_grant"}),
+            frozenset({"admins"}),
+        )
+        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT)
+        expected = [
+            Step("report-unexpected-attachment", "policy/AdministratorAccess"),
+            Step("report-inline-policy", "inline_grant"),
+            Step("report-group-membership", "admins"),
+        ]
+        self.assertEqual(expected, steps)
+        self.assertEqual(expected, differences(steps))
+        self.assertEqual(expected, unchanged_differences(steps))
+
+    def test_a_policy_with_our_name_in_another_account_is_not_our_attachment(self) -> None:
+        other = "arn:aws:iam::" + "2" * 12 + ":policy/example_project_ec2_policy"
+        live = LiveState(True, {"example_project_ec2_policy": GOOD}, frozenset({other}))
+        steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT)
+        self.assertEqual(
+            [Step("attach-policy", "example_project_ec2_policy"), Step("report-unexpected-attachment", "policy/example_project_ec2_policy")], steps
+        )
 
 
 if __name__ == "__main__":
