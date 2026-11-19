@@ -18,6 +18,17 @@ variable "disk_gib" {
   type        = number
 }
 
+variable "tailscale" {
+  description = "Tailscale enrolment of the host: the federated identity's client ID and audience, the host's tag, its neutral host name and the client version."
+  type = object({
+    client_id = string
+    audience  = string
+    tag       = string
+    host_name = string
+    version   = string
+  })
+}
+
 variable "bucket_arns" {
   description = "ARN of each project bucket the host may read and write."
   type        = map(string)

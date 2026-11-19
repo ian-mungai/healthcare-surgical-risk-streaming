@@ -34,6 +34,17 @@
         "arn:aws:s3:::physionet-open",
         "arn:aws:s3:::physionet-open/vitaldb/1.0.0/*"
       ]
+    },
+    {
+      "Sid": "ShortIdentityTokens",
+      "Effect": "Allow",
+      "Action": "sts:GetWebIdentityToken",
+      "Resource": "*",
+      "Condition": {
+        "NumericLessThanEquals": {
+          "sts:DurationSeconds": "300"
+        }
+      }
     }
   ]
 }

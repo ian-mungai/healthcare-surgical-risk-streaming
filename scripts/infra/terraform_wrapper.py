@@ -6,7 +6,7 @@ Run from the repository root under the project profile in ``.env``:
 ``.venv/bin/python -m scripts.infra.terraform_wrapper apply --confirm <CODE>``
 
 ``plan`` selects the backend from the run binding and the environment's variable file, saves the plan under
-``runs/<RUN_ID>/plans/`` with its readable text and binds the plan file's hash to the run's state location. It prints
+``runs/<RUN_ID>/plans/`` with its readable text and its JSON form and binds the plan file's hash to the run's state location. It prints
 the resource changes and a confirmation code. ``apply`` refuses a changed plan file, a wrong code and a plan saved for
 another state location, then applies the saved plan. ``plan --destroy`` saves a destroy plan the same way; this
 command never applies one.
@@ -29,6 +29,7 @@ from scripts.project_config import ROOT, ConfigurationError, load_configuration
 INIT_TIMEOUT_SECONDS = 600
 PLAN_TIMEOUT_SECONDS = 900
 APPLY_TIMEOUT_SECONDS = 1800
+TAILSCALE_KEYS = ("TAILSCALE_CLIENT_ID", "TAILSCALE_AUDIENCE")
 
 
 class WrapperError(RuntimeError):
@@ -65,8 +66,9 @@ def binding_problems(run: RunBinding, saved: dict[str, Any], plan: bytes, code: 
     return problems
 
 
-def terraform(arguments: list[str], timeout: float) -> str:
-    result = run_command("terraform", ["-chdir=infra", *arguments], cwd=ROOT, env=os.environ | {"TF_IN_AUTOMATION": "1"}, timeout=timeout)
+def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
+    environment = os.environ | {"TF_IN_AUTOMATION": "1", "TF_DATA_DIR": str(ROOT / ".tools" / "terraform" / run.run_id)}
+    result = run_command("terraform", ["-chdir=infra", *arguments], cwd=ROOT, env=environment, timeout=timeout)
     if result.returncode != 0:
         raise WrapperError(f"terraform {arguments[0]} failed:\n{result.stdout}{result.stderr}")
     return result.stdout
@@ -84,15 +86,17 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
     plan_file = folder / f"{action}.tfplan"
-    terraform(["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
-    variables = [
-        f"-var-file=environments/{configuration['ENVIRONMENT']}.tfvars",
-        f"-var=run_id={run.run_id}",
-        f"-var=aws_profile={configuration['AWS_PROFILE']}",
-    ]
-    terraform(["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={plan_file}"], PLAN_TIMEOUT_SECONDS)
-    (folder / f"{action}.txt").write_text(terraform(["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))
-    changes = json.loads(terraform(["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS)).get("resource_changes", [])
+    terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
+    missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
+    if missing:
+        raise WrapperError(f".env: missing values for: {', '.join(missing)}")
+    values = {"run_id": run.run_id, "aws_profile": configuration["AWS_PROFILE"]} | {key.lower(): configuration[key] for key in TAILSCALE_KEYS}
+    variables = [f"-var-file=environments/{configuration['ENVIRONMENT']}.tfvars", *[f"-var={name}={value}" for name, value in values.items()]]
+    terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={plan_file}"], PLAN_TIMEOUT_SECONDS)
+    (folder / f"{action}.txt").write_text(terraform(run, ["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))
+    plan_json = terraform(run, ["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS)
+    (folder / f"{action}.json").write_text(plan_json)
+    changes = json.loads(plan_json).get("resource_changes", [])
     saved = plan_binding(run, plan_file.read_bytes(), action)
     (folder / f"{action}_binding.json").write_text(json.dumps(saved, indent=2) + "\n")
     counts: dict[str, int] = {}
@@ -117,7 +121,7 @@ def apply_plan(run: RunBinding, code: str) -> int:
     problems = binding_problems(run, json.loads(binding_file.read_text()), plan_file.read_bytes(), code, "apply")
     if problems:
         raise WrapperError("refused before any change: " + "; ".join(problems))
-    sys.stdout.write(terraform(["apply", "-input=false", "-no-color", str(plan_file)], APPLY_TIMEOUT_SECONDS))
+    sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(plan_file)], APPLY_TIMEOUT_SECONDS))
     return 0
 
 

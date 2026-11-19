@@ -22,6 +22,7 @@ data "aws_ssm_parameter" "ubuntu" {
 
 locals {
   publisher_bucket_arn = "arn:aws:s3:::physionet-open"
+  user_data            = templatefile("${path.module}/tailscale_join.sh.tftpl", var.tailscale)
 }
 
 resource "aws_iam_role" "host" {
@@ -68,6 +69,25 @@ resource "aws_iam_role_policy" "host_storage" {
   })
 }
 
+resource "aws_iam_role_policy" "host_tailscale" {
+  name = "tailscale_identity"
+  role = aws_iam_role.host.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "RequestShortIdentityTokenForTailscale"
+      Effect   = "Allow"
+      Action   = "sts:GetWebIdentityToken"
+      Resource = "*"
+      Condition = {
+        "ForAnyValue:StringEquals" = { "sts:IdentityTokenAudience" = var.tailscale.audience }
+        NumericLessThanEquals      = { "sts:DurationSeconds" = "300" }
+      }
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "host" {
   name = var.name
   role = aws_iam_role.host.name
@@ -95,6 +115,7 @@ resource "aws_instance" "host" {
   vpc_security_group_ids      = [aws_security_group.host.id]
   iam_instance_profile        = aws_iam_instance_profile.host.name
   associate_public_ip_address = true
+  user_data                   = local.user_data
 
   metadata_options {
     http_tokens                 = "required"

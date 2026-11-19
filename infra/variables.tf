@@ -43,6 +43,38 @@ variable "run_id" {
   }
 }
 
+variable "tailscale_client_id" {
+  description = "Client ID of the Tailscale federated identity for the host. It is not a secret."
+  type        = string
+
+  validation {
+    condition     = length(var.tailscale_client_id) > 0 && !startswith(var.tailscale_client_id, "tskey")
+    error_message = "Give the federated identity's client ID, never an auth key."
+  }
+}
+
+variable "tailscale_audience" {
+  description = "Audience of the Tailscale federated identity for the host. It is not a secret."
+  type        = string
+
+  validation {
+    condition     = length(var.tailscale_audience) > 0
+    error_message = "Give the audience that the Tailscale console shows for the federated identity."
+  }
+}
+
+variable "tailscale_host_tag" {
+  description = "Tailscale tag of the host, as the federated identity names it."
+  type        = string
+  default     = "tag:surgical-host"
+}
+
+variable "tailscale_version" {
+  description = "Version of the Tailscale client on the host. Identity federation with an audience needs 1.94.0 or later."
+  type        = string
+  default     = "1.104.7"
+}
+
 variable "host_instance_type" {
   description = "EC2 instance type of the host."
   type        = string

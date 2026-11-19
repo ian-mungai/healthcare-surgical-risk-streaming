@@ -31,4 +31,12 @@ module "host" {
   instance_type = var.host_instance_type
   disk_gib      = var.host_disk_gib
   bucket_arns   = module.storage.bucket_arns
+
+  tailscale = {
+    client_id = var.tailscale_client_id
+    audience  = var.tailscale_audience
+    tag       = var.tailscale_host_tag
+    host_name = "platform-${var.environment}"
+    version   = var.tailscale_version
+  }
 }

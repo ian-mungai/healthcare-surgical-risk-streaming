@@ -30,6 +30,9 @@ variables {
   project_name = "example_project"
   environment  = "dev"
   run_id       = "20260101t0000-abcdef"
+
+  tailscale_client_id = "example-client-id"
+  tailscale_audience  = "example-audience"
 }
 
 run "environment_names_follow_the_run" {
@@ -57,6 +60,14 @@ run "host_matches_the_design" {
     instance_type = "m6a.2xlarge"
     disk_gib      = 200
     bucket_arns   = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+
+    tailscale = {
+      client_id = "example-client-id"
+      audience  = "example-audience"
+      tag       = "tag:example-host"
+      host_name = "platform-dev"
+      version   = "1.104.7"
+    }
   }
 
   assert {
@@ -98,6 +109,52 @@ run "host_matches_the_design" {
   assert {
     condition     = !strcontains(aws_iam_role_policy.host_storage.policy, "\"Resource\":\"*\"") && !strcontains(aws_iam_role_policy.host_storage.policy, "s3:*")
     error_message = "The host's storage policy names its buckets and actions."
+  }
+}
+
+run "host_joins_tailscale_without_a_stored_key" {
+  command = plan
+
+  module {
+    source = "./modules/host"
+  }
+
+  variables {
+    name          = "example_project_host_dev"
+    boundary_name = "example_project_role_boundary"
+    instance_type = "m6a.2xlarge"
+    disk_gib      = 200
+    bucket_arns   = { landing = "arn:aws:s3:::example-landing", warehouse = "arn:aws:s3:::example-warehouse" }
+
+    tailscale = {
+      client_id = "example-client-id"
+      audience  = "example-audience"
+      tag       = "tag:example-host"
+      host_name = "platform-dev"
+      version   = "1.104.7"
+    }
+  }
+
+  assert {
+    condition = alltrue([
+      strcontains(aws_iam_role_policy.host_tailscale.policy, "sts:GetWebIdentityToken"),
+      strcontains(aws_iam_role_policy.host_tailscale.policy, "\"sts:IdentityTokenAudience\":\"example-audience\""),
+      strcontains(aws_iam_role_policy.host_tailscale.policy, "\"sts:DurationSeconds\":\"300\""),
+    ])
+    error_message = "The host may request an identity token only for the Tailscale audience and for at most 300 seconds."
+  }
+
+  assert {
+    condition = alltrue([
+      strcontains(local.user_data, "--client-id='example-client-id?ephemeral=false&preauthorized=true'"),
+      strcontains(local.user_data, "--audience='example-audience'"),
+      strcontains(local.user_data, "--advertise-tags='tag:example-host'"),
+      strcontains(local.user_data, "--hostname='platform-dev'"),
+      strcontains(local.user_data, "tailscale=1.104.7"),
+      !strcontains(local.user_data, "tskey"),
+      !strcontains(local.user_data, "auth-key"),
+    ])
+    error_message = "The boot script joins Tailscale with the federated identity, the tag and the neutral host name, and holds no auth key."
   }
 }
 

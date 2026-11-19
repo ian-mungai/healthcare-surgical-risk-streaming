@@ -19,6 +19,12 @@ PATTERNS = {
 }
 
 
+OPTIONAL_PATTERNS = {
+    "TAILSCALE_CLIENT_ID": re.compile(r"(?!tskey)\S+"),
+    "TAILSCALE_AUDIENCE": re.compile(r"\S+"),
+}
+
+
 class ConfigurationError(ValueError):
     """The configuration file is missing or one of its values is absent or malformed."""
 
@@ -33,8 +39,9 @@ def load_configuration(path: Path = ENV_FILE) -> dict[str, str]:
         if separator and not line.lstrip().startswith("#"):
             values[key.strip()] = value.strip().strip("\"'")
     problems = sorted(key for key, pattern in PATTERNS.items() if pattern.fullmatch(values.get(key, "")) is None)
+    problems += sorted(key for key, pattern in OPTIONAL_PATTERNS.items() if values.get(key) and pattern.fullmatch(values[key]) is None)
     if problems:
         raise ConfigurationError(f"{path.name}: missing or malformed values for: {', '.join(problems)}")
-    configuration = {key: values[key] for key in PATTERNS}
+    configuration = {key: values[key] for key in PATTERNS} | {key: values[key] for key in OPTIONAL_PATTERNS if values.get(key)}
     configuration["BUCKET_PREFIX"] = configuration["PROJECT_NAME"].replace("_", "-")
     return configuration

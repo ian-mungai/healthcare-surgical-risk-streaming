@@ -1,0 +1,11 @@
+#!/bin/bash
+# First boot: install the pinned Tailscale client from its package repository and join the network.
+# The host proves its identity with a short-lived token that AWS issues to its role. No key is stored here.
+set -euo pipefail
+
+install -d -m 0755 /usr/share/keyrings
+curl -fsSL --retry 5 --max-time 60 https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+curl -fsSL --retry 5 --max-time 60 https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list -o /etc/apt/sources.list.d/tailscale.list
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale=${version}
+tailscale up --client-id='${client_id}?ephemeral=false&preauthorized=true' --audience='${audience}' --advertise-tags='${tag}' --hostname='${host_name}' --ssh --timeout=120s
