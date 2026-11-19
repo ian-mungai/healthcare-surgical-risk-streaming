@@ -277,13 +277,20 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertIn("no change: the user, its policies and its attachments equal the templates", output)
 
-    def test_a_plan_with_changes_still_prints_the_reports_and_the_code(self) -> None:
+    def test_a_plan_with_changes_and_a_report_only_difference_still_prints_both_and_fails(self) -> None:
         account = Account.matching_templates(attached=False)
         account.groups.append("admins")
         code, output, _ = run_command("plan", account)
-        self.assertEqual(0, code, output)
+        self.assertEqual(1, code, output)
         self.assertIn("report-group-membership: admins", output)
         self.assertIn("steps planned", output)
+        self.assertIn("1 differences remain that this tool never removes: review each as the owner", output)
+
+    def test_a_plan_with_changes_and_no_report_only_difference_succeeds(self) -> None:
+        code, output, _ = run_command("plan", Account.matching_templates(attached=False))
+        self.assertEqual(0, code, output)
+        self.assertIn("steps planned", output)
+        self.assertNotIn("never removes", output)
 
     def test_apply_fails_when_a_difference_that_it_never_removes_remains(self) -> None:
         account = Account.matching_templates(attached=False)

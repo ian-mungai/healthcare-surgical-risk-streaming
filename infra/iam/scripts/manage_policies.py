@@ -270,7 +270,9 @@ def run(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.command == "plan":
         sys.stdout.write(f"{len(changes)} steps planned. To apply exactly this plan: apply --admin-profile <ADMIN_PROFILE> --confirm {code}\n")
-        return 0
+        if remaining:
+            sys.stdout.write(f"{len(remaining)} differences remain that this tool never removes: review each as the owner\n")
+        return 1 if remaining else 0
     if arguments.confirm != code:
         sys.stderr.write("the confirmation code does not equal the current plan; run plan again and review it\n")
         return 1
