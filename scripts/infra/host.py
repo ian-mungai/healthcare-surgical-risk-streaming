@@ -49,13 +49,34 @@ class HostError(RuntimeError):
     """A host command refused to continue, a wait passed its deadline or a call failed."""
 
 
-def wait_for(what: str, check: Callable[[], bool], deadline_seconds: int) -> None:
-    deadline = time.monotonic() + deadline_seconds
-    while not check():
-        if time.monotonic() >= deadline:
+def wait_for[T](
+    what: str,
+    probe: Callable[[float], T | None],
+    deadline_seconds: float,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Call ``probe`` until it returns a value, within one absolute deadline.
+
+    Each probe gets the seconds that remain and must stay inside them. A probe call that times out counts as not ready.
+    A result that comes after the deadline is no result.
+    """
+    deadline = clock() + deadline_seconds
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
             raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
-        time.sleep(POLL_SECONDS)
-    sys.stdout.write(f"ready: {what}\n")
+        try:
+            found = probe(remaining)
+        except TimeoutExpired:
+            found = None
+        if clock() > deadline:
+            raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
+        if found is not None:
+            sys.stdout.write(f"ready: {what}\n")
+            return found
+        sleep(min(POLL_SECONDS, max(deadline - clock(), 0)))
 
 
 def select_peer(status: dict[str, Any], host_name: str, tag: str) -> str:
@@ -68,10 +89,10 @@ def select_peer(status: dict[str, Any], host_name: str, tag: str) -> str:
     return str(max(peers, key=lambda peer: peer["Created"])["DNSName"]).rstrip(".")
 
 
-def host_peer(host_name: str) -> str:
+def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> str:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
-        result = run_command(program, ["status", "--json"], timeout=SSH_ATTEMPT_SECONDS)
+        result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
     except (FileNotFoundError, TimeoutExpired) as error:
         raise HostError(f"the Tailscale client on this computer did not answer: {error}") from None
     if result.returncode != 0:
@@ -79,9 +100,9 @@ def host_peer(host_name: str) -> str:
     return select_peer(json.loads(result.stdout), host_name, HOST_TAG)
 
 
-def peer_online(host_name: str) -> bool:
+def peer_online(host_name: str, timeout: float) -> bool:
     try:
-        host_peer(host_name)
+        host_peer(host_name, timeout)
     except HostError:
         return False
     return True
@@ -93,9 +114,9 @@ def ssh_arguments(run_id: str) -> list[str]:
     return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=accept-new"]
 
 
-def ssh_answers(run_id: str, address: str) -> bool:
+def ssh_answers(run_id: str, address: str, timeout: float) -> bool:
     try:
-        return run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "true"], timeout=SSH_ATTEMPT_SECONDS).returncode == 0
+        return run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "true"], timeout=min(timeout, SSH_ATTEMPT_SECONDS)).returncode == 0
     except TimeoutExpired:
         return False
 
@@ -111,15 +132,15 @@ def instance_id(state: dict[str, Any]) -> str:
     return str(found[0])
 
 
-def instance_state(aws: Aws, instance: str) -> str:
-    return str(aws.call("ec2", "describe-instances", "--instance-ids", instance, "--query", "Reservations[0].Instances[0].State.Name"))
+def instance_state(aws: Aws, instance: str, timeout: float) -> str:
+    return str(aws.call("ec2", "describe-instances", "--instance-ids", instance, "--query", "Reservations[0].Instances[0].State.Name", timeout=timeout))
 
 
 def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -> str:
-    wait_for("the instance to run", lambda: instance_state(aws, instance) == "running", INSTANCE_DEADLINE_SECONDS)
-    wait_for(f"the Tailscale peer {host_name} to be online", lambda: peer_online(host_name), PEER_DEADLINE_SECONDS)
+    wait_for("the instance to run", lambda budget: instance_state(aws, instance, budget) == "running" or None, INSTANCE_DEADLINE_SECONDS)
+    wait_for(f"the Tailscale peer {host_name} to be online", lambda budget: peer_online(host_name, budget) or None, PEER_DEADLINE_SECONDS)
     address = host_peer(host_name)
-    wait_for("SSH over Tailscale", lambda: ssh_answers(run_id, address), SSH_DEADLINE_SECONDS)
+    wait_for("SSH over Tailscale", lambda budget: ssh_answers(run_id, address, budget) or None, SSH_DEADLINE_SECONDS)
     return address
 
 
@@ -173,7 +194,7 @@ def host_stop(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
     run = load_run(binding)
     instance = instance_id(state_json(run, configuration))
     aws.call("ec2", "stop-instances", "--instance-ids", instance)
-    wait_for("the instance to stop", lambda: instance_state(aws, instance) == "stopped", INSTANCE_DEADLINE_SECONDS)
+    wait_for("the instance to stop", lambda budget: instance_state(aws, instance, budget) == "stopped" or None, INSTANCE_DEADLINE_SECONDS)
     sys.stdout.write(f"run {run.run_id}: the host is stopped and its disk is kept\n{STOPPED_BILLING}\n")
     return 0
 
@@ -189,7 +210,7 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
 
 def host_check(host_name: str) -> int:
     address = host_peer(host_name)
-    wait_for("SSH over Tailscale", lambda: ssh_answers("deploy", address), SSH_DEADLINE_SECONDS)
+    wait_for("SSH over Tailscale", lambda budget: ssh_answers("deploy", address, budget) or None, SSH_DEADLINE_SECONDS)
     sys.stdout.write(f"the host answers over Tailscale SSH as {host_name}\n")
     return 0
 

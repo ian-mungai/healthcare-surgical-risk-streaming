@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.infra.host import HostError, instance_id, select_peer, workload_variables
+from scripts.infra.host import HostError, instance_id, select_peer, wait_for, workload_variables
 from scripts.infra.inventory import inventory_entries
+from scripts.process import TimeoutExpired
 
 
 def peer(
@@ -44,6 +45,67 @@ class SelectPeerTest(unittest.TestCase):
     def test_empty_status_is_refused(self) -> None:
         with self.assertRaisesRegex(HostError, "no online peer"):
             select_peer({}, "platform-dev", "tag:surgical-host")
+
+
+class FakeClock:
+    """A clock that only moves when a wait sleeps or a probe uses time, so a wait's deadline is exact."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class WaitForTest(unittest.TestCase):
+    def test_the_first_result_is_returned(self) -> None:
+        clock = FakeClock()
+        self.assertEqual("found", wait_for("a thing", lambda budget: "found", 30, clock=lambda: clock.now, sleep=clock.sleep))
+
+    def test_each_probe_gets_the_time_that_remains_and_the_last_sleep_stops_at_the_deadline(self) -> None:
+        clock = FakeClock()
+        budgets: list[float] = []
+
+        def probe(budget: float) -> None:
+            budgets.append(budget)
+
+        with self.assertRaisesRegex(HostError, "deadline of 25 seconds passed while waiting for a thing"):
+            wait_for("a thing", probe, 25, clock=lambda: clock.now, sleep=clock.sleep)
+        self.assertEqual([25, 15, 5], budgets)
+        self.assertEqual(25, clock.now)
+
+    def test_a_probe_that_runs_past_the_deadline_cannot_succeed(self) -> None:
+        clock = FakeClock()
+
+        def slow(budget: float) -> str:
+            clock.now += budget + 1
+            return "late"
+
+        with self.assertRaisesRegex(HostError, "deadline of 20 seconds passed"):
+            wait_for("a thing", slow, 20, clock=lambda: clock.now, sleep=clock.sleep)
+
+    def test_a_call_that_times_out_counts_as_not_ready_and_the_wait_goes_on(self) -> None:
+        clock = FakeClock()
+        answers = iter([True, True, False])
+
+        def probe(budget: float) -> str | None:
+            if next(answers):
+                clock.now += 1
+                raise TimeoutExpired("x", 1)
+            return "ready"
+
+        self.assertEqual("ready", wait_for("a thing", probe, 60, clock=lambda: clock.now, sleep=clock.sleep))
+
+    def test_a_call_that_always_times_out_ends_at_the_deadline(self) -> None:
+        clock = FakeClock()
+
+        def probe(budget: float) -> None:
+            clock.now += budget
+            raise TimeoutExpired("x", budget)
+
+        with self.assertRaisesRegex(HostError, "deadline of 30 seconds passed"):
+            wait_for("a thing", probe, 30, clock=lambda: clock.now, sleep=clock.sleep)
+        self.assertEqual(30, clock.now)
 
 
 STATE = {
