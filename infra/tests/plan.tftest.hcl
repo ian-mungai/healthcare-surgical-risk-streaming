@@ -325,6 +325,15 @@ run "buckets_are_private_and_versioned" {
 
   assert {
     condition = alltrue([
+      toset(keys(aws_s3_bucket.this)) == toset(["landing", "warehouse"]),
+      toset(keys(aws_s3_bucket_versioning.this)) == toset(keys(aws_s3_bucket.this)),
+      toset(keys(aws_s3_bucket_public_access_block.this)) == toset(keys(aws_s3_bucket.this)),
+    ])
+    error_message = "Both controls exist for exactly the buckets, so the checks above cannot pass over an empty or partial control map."
+  }
+
+  assert {
+    condition = alltrue([
       for block in aws_s3_bucket_public_access_block.this :
       block.block_public_acls && block.ignore_public_acls && block.block_public_policy && block.restrict_public_buckets
     ])
