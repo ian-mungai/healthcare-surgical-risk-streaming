@@ -13,6 +13,7 @@
         fail_msg: This playbook supports x86-64 Ubuntu 24.04 only.
 
   roles:
+    - metadata_guard
     - docker
     - k3s
     - workload_access

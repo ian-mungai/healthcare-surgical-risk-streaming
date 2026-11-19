@@ -1,0 +1,98 @@
+# Instance metadata gives out the host role's credentials. A workload on the host network would reach it with no network hop,
+# so only the named system services may send packets to it, matched by cgroup in the output hook, and forwarded packets to it are dropped.
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 300
+
+- name: Create the metadata guard configuration folder
+  ansible.builtin.file:
+    path: /etc/metadata_guard
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: List the services that may reach instance metadata
+  ansible.builtin.copy:
+    dest: /etc/metadata_guard/allowed_units
+    content: "{{ metadata_guard_allowed_units | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the metadata guard loader
+  ansible.builtin.copy:
+    src: metadata_guard.sh
+    dest: /usr/local/sbin/metadata_guard
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the metadata guard's boot unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/metadata-guard.service
+    content: |
+      [Unit]
+      Description=Keep instance metadata away from every process but the allowed services
+      DefaultDependencies=no
+      Wants=network-pre.target
+      Before=network-pre.target docker.service containerd.service k3s.service shutdown.target
+      Conflicts=shutdown.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/metadata_guard /etc/metadata_guard/allowed_units
+
+      [Install]
+      WantedBy=sysinit.target
+    owner: root
+    group: root
+    mode: "0644"
+  register: metadata_guard_unit
+
+- name: Create a drop-in folder for each allowed service
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ metadata_guard_allowed_units }}"
+
+- name: Load the table again whenever an allowed service starts, because its cgroup is new
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.d/metadata_guard.conf"
+    content: |
+      [Service]
+      ExecStartPre=-+/usr/local/sbin/metadata_guard /etc/metadata_guard/allowed_units
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ metadata_guard_allowed_units }}"
+  register: metadata_guard_dropins
+
+- name: Enable the metadata guard at boot
+  ansible.builtin.systemd_service:
+    name: metadata-guard.service
+    enabled: true
+    daemon_reload: "{{ metadata_guard_unit is changed or metadata_guard_dropins is changed }}"
+
+- name: Load the metadata guard now
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/metadata_guard, /etc/metadata_guard/allowed_units]
+  changed_when: false
+
+- name: List the loaded table
+  ansible.builtin.command:
+    argv: [nft, list, table, inet, metadata_guard]
+  register: metadata_guard_listing
+  changed_when: false
+  failed_when: false
+
+- name: Check the metadata guard is loaded
+  ansible.builtin.include_tasks: verify_loaded.yml

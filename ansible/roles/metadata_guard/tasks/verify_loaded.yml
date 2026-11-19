@@ -1,0 +1,11 @@
+# Reads metadata_guard_listing, the result of listing the table: each chain is hooked and drops the metadata address.
+- name: Confirm the metadata guard is loaded
+  ansible.builtin.assert:
+    that:
+      - metadata_guard_listing.rc == 0
+      - metadata_guard_listing.stdout is search(output_chain)
+      - metadata_guard_listing.stdout is search(forward_chain)
+    fail_msg: "The metadata guard is not loaded: the table inet metadata_guard lacks a hooked output chain or a hooked forward chain that drops 169.254.169.254."
+  vars:
+    output_chain: 'chain output \{[^}]*type filter hook output [^}]*ip daddr 169\.254\.169\.254 drop'
+    forward_chain: 'chain forward \{[^}]*type filter hook forward [^}]*ip daddr 169\.254\.169\.254 drop'
