@@ -17,7 +17,17 @@ from scripts.evidence.manifest import REQUIRED_EVIDENCE, archive_problems, build
 from scripts.evidence.receipt import receipt_problems
 from scripts.evidence.verify import verify_export
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.infra.teardown import bucket_entry_problems, delete_targets, settled_checks, state_entry_problems, target_problems
+from scripts.infra.teardown import (
+    bucket_entry_problems,
+    delete_targets,
+    destroy_write_problem,
+    parent_check,
+    purge_buckets,
+    remaining_stages,
+    settled_checks,
+    state_entry_problems,
+    target_problems,
+)
 
 STATE_KEYS = ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified", state_bucket_creation="created")
@@ -264,6 +274,67 @@ class ObjectInventoryTest(unittest.TestCase):
         approved = [[STATE_KEYS[0], "v1"]]
         found = [entry(STATE_KEYS[0], "v1"), entry(STATE_KEYS[0], "v3")]
         self.assertEqual([], state_entry_problems(found, STATE_KEYS, approved, [[STATE_KEYS[0], "v3"]]))
+
+
+LINEAGE = "1b2c3d4e-0000-0000-0000-000000000000"
+
+
+def state_bytes(**changes: object) -> bytes:
+    return json.dumps({"version": 4, "lineage": LINEAGE, "serial": 9, "resources": []} | changes).encode()
+
+
+class DestroyWriteTest(unittest.TestCase):
+    def check(self, key: str, content: bytes | None, marker: bool = False) -> str | None:
+        return destroy_write_problem(key, content, marker, STATE_KEYS, LINEAGE, 7)
+
+    def test_empty_state_of_this_lineage_with_a_higher_serial_is_the_destroys_own(self) -> None:
+        self.assertIsNone(self.check(STATE_KEYS[0], state_bytes()))
+
+    def test_state_of_another_lineage_is_not(self) -> None:
+        self.assertEqual("a state version that this run's destroy did not write", self.check(STATE_KEYS[0], state_bytes(lineage="other")))
+
+    def test_state_that_still_holds_resources_is_not(self) -> None:
+        self.assertEqual("a state version that this run's destroy did not write", self.check(STATE_KEYS[0], state_bytes(resources=[{"type": "aws_instance"}])))
+
+    def test_state_with_an_older_serial_is_not(self) -> None:
+        self.assertEqual("a state version that this run's destroy did not write", self.check(STATE_KEYS[0], state_bytes(serial=7)))
+
+    def test_unreadable_state_and_a_delete_marker_at_the_state_key_are_not(self) -> None:
+        self.assertEqual("a state version that this run's destroy did not write", self.check(STATE_KEYS[0], b"not json"))
+        self.assertEqual("a delete marker at the state key", self.check(STATE_KEYS[0], None, marker=True))
+
+    def test_lock_entries_for_this_state_are_the_destroys_own(self) -> None:
+        lock = json.dumps({"ID": "x", "Operation": "OperationTypeApply", "Path": f"example-state/{STATE_KEYS[0]}"}).encode()
+        self.assertIsNone(self.check(STATE_KEYS[1], lock))
+        self.assertIsNone(self.check(STATE_KEYS[1], None, marker=True))
+
+    def test_lock_entry_for_another_state_is_not(self) -> None:
+        lock = json.dumps({"ID": "x", "Operation": "OperationTypeApply", "Path": "example-state/other/terraform.tfstate"}).encode()
+        self.assertEqual("a lock entry that is not for this run's state", self.check(STATE_KEYS[1], lock))
+
+    def test_entry_at_another_key_is_not(self) -> None:
+        self.assertEqual("an entry outside this run's state keys", self.check("other/terraform.tfstate", state_bytes()))
+
+
+class TeardownStageTest(unittest.TestCase):
+    def test_only_buckets_the_plan_deletes_are_purged(self) -> None:
+        inventory = [*INVENTORY, {"address": 'module.storage.aws_s3_bucket.this["warehouse"]', "type": "aws_s3_bucket", "service_id": "example-warehouse"}]
+        self.assertEqual(["example-landing"], purge_buckets(delete_targets(PLAN), inventory))
+
+    def test_a_new_teardown_runs_every_stage(self) -> None:
+        self.assertEqual(["purge", "apply", "state", "checks"], remaining_stages([]))
+
+    def test_a_rerun_resumes_after_the_last_finished_stage(self) -> None:
+        self.assertEqual(["apply", "state", "checks"], remaining_stages(["purge"]))
+        self.assertEqual(["state", "checks"], remaining_stages(["purge", "apply"]))
+        self.assertEqual([], remaining_stages(["purge", "apply", "state", "checks"]))
+
+    def test_a_part_is_verified_only_through_its_own_check_or_a_parent_that_is_gone(self) -> None:
+        reported = {("aws_iam_role", "example_host"): "gone", ("aws_s3_bucket", "example-landing"): "still exists"}
+        self.assertEqual("gone with its parent", parent_check({"type": "aws_iam_role_policy", "service_id": "example_host:storage"}, reported))
+        self.assertEqual("still exists: its parent remains", parent_check({"type": "aws_s3_bucket_versioning", "service_id": "example-landing"}, reported))
+        self.assertEqual("unverified: its parent was not checked", parent_check({"type": "aws_s3_bucket_versioning", "service_id": "example-other"}, reported))
+        self.assertEqual("unverified: no check for this type", parent_check({"type": "aws_lambda_function", "service_id": "example"}, reported))
 
 
 class RemovalCheckTest(unittest.TestCase):

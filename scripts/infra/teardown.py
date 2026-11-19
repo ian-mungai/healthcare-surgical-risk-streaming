@@ -13,9 +13,11 @@ marker in the run's application buckets and in its state bucket. It prints a con
 4. Every entry in an application bucket must match an approved bucket, key and version ID.
 5. Every entry in the state bucket must be at one of this run's state keys and match an approved key and version ID.
 
-It then deletes the approved application entries by key and version ID, applies the saved destroy plan, records the
-state entries that the destroy wrote, repeats the state checks, deletes the approved and recorded state entries,
-removes the empty state bucket last and checks each removal through its service.
+It then empties, by key and version ID, only the buckets that the saved plan deletes, applies the exact plan bytes it
+checked, and accepts a new state bucket entry only when its content shows the destroy of this state wrote it. It
+deletes the approved and recorded state entries, removes the empty state bucket last and checks each removal
+through its service; a resource with no check is verified only through a parent that is gone. Each finished stage is
+recorded, so a second run does nothing and an interrupted run resumes.
 """
 
 from __future__ import annotations
@@ -23,7 +25,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -47,6 +52,10 @@ from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 GONE_DEADLINE_SECONDS = 120
 GONE_POLL_SECONDS = 5
+CHECK_TIMEOUT_SECONDS = 30
+STAGES = ("purge", "apply", "state", "checks")
+PARENT_TYPES = {"aws_iam_role_policy": "aws_iam_role", "aws_s3_bucket_versioning": "aws_s3_bucket", "aws_s3_bucket_public_access_block": "aws_s3_bucket"}
+DESTROYED = re.compile(r"Resources: \d+ added, \d+ changed, (\d+) destroyed")
 Target = tuple[str, str, str]
 
 
@@ -128,10 +137,14 @@ def plan_teardown(aws: Aws, configuration: dict[str, str], run: RunBinding) -> i
     folder = ROOT / "runs" / run.run_id
     inventory = read_json(folder / "inventory.json", "the run's inventory")["created"]
     save_plan(run, configuration, "destroy")
-    approved = {
+    approved: dict[str, Any] = {
         "application": [[bucket, entry["Key"], entry["VersionId"]] for bucket in application_buckets(inventory) for entry in bucket_entries(aws, bucket)]
     }
     approved["state"] = [[entry["Key"], entry["VersionId"]] for entry in bucket_entries(aws, run.state_bucket)] if run.backend == "s3" else []
+    current_state = json.loads(terraform(run, ["state", "pull"], PLAN_TIMEOUT_SECONDS))
+    approved["state_lineage"] = current_state["lineage"]
+    approved["state_serial"] = current_state["serial"]
+    approved["local_state_sha256"] = hashlib.sha256(Path(run.state_keys[0]).read_bytes()).hexdigest() if run.backend == "local" else ""
     (folder / "teardown").mkdir(exist_ok=True)
     (folder / "teardown" / "approved_inventory.json").write_text(json.dumps(approved, indent=2) + "\n")
     plan_hash = read_json(folder / "plans" / "destroy_binding.json", "the destroy plan's binding")["plan_sha256"]
@@ -143,13 +156,51 @@ def plan_teardown(aws: Aws, configuration: dict[str, str], run: RunBinding) -> i
     return 0
 
 
+def destroy_write_problem(key: str, content: bytes | None, delete_marker: bool, state_keys: list[str], lineage: str, serial: int) -> str | None:
+    """Why a state bucket entry that appeared after approval is not this run's own destroy write, or None when it is."""
+    if key not in state_keys:
+        return "an entry outside this run's state keys"
+    try:
+        record = json.loads(content or b"")
+    except ValueError:
+        record = None
+    if key == state_keys[0]:
+        if delete_marker:
+            return "a delete marker at the state key"
+        newer = isinstance(record, dict) and isinstance(record.get("serial"), int) and record["serial"] > serial
+        own = newer and record.get("lineage") == lineage and record.get("resources") == []
+        return None if own else "a state version that this run's destroy did not write"
+    if delete_marker or (isinstance(record, dict) and str(record.get("Path", "")).endswith(state_keys[0])):
+        return None
+    return "a lock entry that is not for this run's state"
+
+
+def purge_buckets(targets: list[Target], inventory: list[dict[str, str]]) -> list[str]:
+    """The run's application buckets that the saved plan deletes; no other bucket is emptied."""
+    deleted = {identifier for _, kind, identifier in targets if kind == "aws_s3_bucket"}
+    return [bucket for bucket in application_buckets(inventory) if bucket in deleted]
+
+
+def remaining_stages(finished: list[str]) -> list[str]:
+    return [stage for stage in STAGES if stage not in finished]
+
+
+def parent_check(entry: dict[str, str], reported: dict[tuple[str, str], str]) -> str:
+    """The result for a part with no service check of its own: verified only when its parent was checked and is gone."""
+    parent_type = PARENT_TYPES.get(entry["type"])
+    if parent_type is None:
+        return "unverified: no check for this type"
+    parent = reported.get((parent_type, entry["service_id"].split(":")[0]))
+    if parent is None:
+        return "unverified: its parent was not checked"
+    return "gone with its parent" if parent.startswith("gone") else "still exists: its parent remains"
+
+
 def read_bytes(path: Path) -> bytes | None:
     return path.read_bytes() if path.is_file() else None
 
 
-def guard_problems(
-    aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path
-) -> tuple[list[str], dict[str, Any], list[dict[str, str]]]:
+def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path) -> tuple[list[str], list[Target]]:
     inventory_record = read_json(folder / "inventory.json", "the run's inventory")
     inventory = inventory_record["created"]
     approved = read_json(folder / "teardown" / "approved_inventory.json", "the approved inventory")
@@ -167,51 +218,119 @@ def guard_problems(
         problems.append("this teardown does not yet keep retained items: remove them from the destroy plan first")
     pre_provisioned = json.loads((folder / "pre_provisioned.json").read_text()) if (folder / "pre_provisioned.json").is_file() else []
     saved_plan = json.loads(terraform(run, ["show", "-json", str(approved_plan)], PLAN_TIMEOUT_SECONDS))
-    problems += target_problems(delete_targets(saved_plan), inventory, run, pre_provisioned)
+    targets = delete_targets(saved_plan)
+    problems += target_problems(targets, inventory, run, pre_provisioned)
     for bucket in application_buckets(inventory):
         problems += bucket_entry_problems(bucket, bucket_entries(aws, bucket), approved["application"])
     if run.backend == "s3":
         problems += state_entry_problems(bucket_entries(aws, run.state_bucket), run.state_keys, approved["state"])
-    return problems, approved, inventory
+    elif hashlib.sha256(Path(run.state_keys[0]).read_bytes()).hexdigest() != approved["local_state_sha256"]:
+        problems.append("the local state changed after the destroy plan was saved")
+    return problems, targets
 
 
-def delete_entries(aws: Aws, bucket: str, pairs: list[tuple[str, str]]) -> None:
-    for key, version in pairs:
+def purge(aws: Aws, bucket: str, approved: list[tuple[str, str]]) -> int:
+    """Delete, by key and version ID, each approved entry that the bucket still holds, and return how many."""
+    present = {(entry["Key"], entry["VersionId"]) for entry in bucket_entries(aws, bucket)}
+    for key, version in sorted(present & set(approved)):
         aws.call("s3api", "delete-object", "--bucket", bucket, "--key", key, "--version-id", version)
+    return len(present & set(approved))
 
 
 def wait_gone(aws: Aws, bucket: str) -> bool:
     deadline = time.monotonic() + GONE_DEADLINE_SECONDS
-    while time.monotonic() < deadline:
-        if aws.call("s3api", "head-bucket", "--bucket", bucket, missing=MISSING_BUCKET) is None:
+    while (remaining := deadline - time.monotonic()) > 0:
+        if aws.call("s3api", "head-bucket", "--bucket", bucket, missing=MISSING_BUCKET, timeout=remaining) is None:
             return True
-        time.sleep(GONE_POLL_SECONDS)
+        time.sleep(min(GONE_POLL_SECONDS, max(deadline - time.monotonic(), 0)))
     return False
 
 
-def removal_check(aws: Aws, entry: dict[str, str]) -> str:
-    """What the service reports for one inventory entry after the teardown: ``gone`` or what remains."""
+def entry_content(aws: Aws, bucket: str, entry: dict[str, Any]) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="state_entry_") as scratch:
+        target = Path(scratch) / "content"
+        aws.call("s3api", "get-object", "--bucket", bucket, "--key", entry["Key"], "--version-id", entry["VersionId"], str(target))
+        return target.read_bytes()
+
+
+def clean_state_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: Path) -> None:
+    """Record each entry the destroy wrote, stop on any entry it did not write, then delete by key and version ID and remove the bucket."""
+    listing = aws.call("s3api", "list-object-versions", "--bucket", run.state_bucket)
+    markers = {(entry["Key"], entry["VersionId"]) for entry in listing.get("DeleteMarkers", [])}
+    entries = [*listing.get("Versions", []), *listing.get("DeleteMarkers", [])]
+    known = {(item[0], item[1]) for item in approved["state"]}
+    recorded, foreign = [], []
+    for entry in entries:
+        pair = (entry["Key"], entry["VersionId"])
+        if pair in known:
+            continue
+        is_marker = pair in markers
+        content = None if is_marker or entry["Key"] not in run.state_keys else entry_content(aws, run.state_bucket, entry)
+        problem = destroy_write_problem(entry["Key"], content, is_marker, run.state_keys, approved["state_lineage"], approved["state_serial"])
+        if problem:
+            foreign.append(f"state bucket: {problem}: {entry['Key']}")
+        else:
+            recorded.append([entry["Key"], entry["VersionId"]])
+    (removal / "destroy_written_state_entries.json").write_text(json.dumps(recorded, indent=2) + "\n")
+    left = foreign + state_entry_problems(entries, run.state_keys, approved["state"], recorded)
+    if left:
+        raise TeardownRefused("the environment is gone, and the state bucket is kept because:\n" + "\n".join(sorted(set(left))))
+    for entry in entries:
+        aws.call("s3api", "delete-object", "--bucket", run.state_bucket, "--key", entry["Key"], "--version-id", entry["VersionId"])
+    aws.call("s3api", "delete-bucket", "--bucket", run.state_bucket)
+    if not wait_gone(aws, run.state_bucket):
+        raise TeardownRefused(f"S3 still reports the state bucket {GONE_DEADLINE_SECONDS} seconds after its deletion")
+
+
+def removal_check(aws: Aws, entry: dict[str, str]) -> str | None:
+    """What the service reports for one inventory entry after the teardown, or None for a type with no service check of its own."""
     kind, identifier = entry["type"], entry["service_id"]
-    if kind == "aws_s3_bucket":
-        return "gone" if aws.call("s3api", "head-bucket", "--bucket", identifier, missing=MISSING_BUCKET) is None else "still exists"
+    lookups: dict[str, tuple[list[str], tuple[str, ...]]] = {
+        "aws_s3_bucket": (["s3api", "head-bucket", "--bucket", identifier], MISSING_BUCKET),
+        "aws_security_group": (["ec2", "describe-security-groups", "--group-ids", identifier], ("InvalidGroup.NotFound",)),
+        "aws_iam_role": (["iam", "get-role", "--role-name", identifier], ("NoSuchEntity",)),
+        "aws_iam_instance_profile": (["iam", "get-instance-profile", "--instance-profile-name", identifier], ("NoSuchEntity",)),
+        "aws_ebs_volume": (["ec2", "describe-volumes", "--volume-ids", identifier], ("InvalidVolume.NotFound",)),
+        "aws_network_interface": (["ec2", "describe-network-interfaces", "--network-interface-ids", identifier], ("InvalidNetworkInterfaceID.NotFound",)),
+    }
     if kind == "aws_instance":
-        state = aws.call(
-            "ec2",
-            "describe-instances",
-            "--instance-ids",
-            identifier,
-            "--query",
-            "Reservations[].Instances[].State.Name",
-            missing=("InvalidInstanceID.NotFound",),
-        )
+        query = ["ec2", "describe-instances", "--instance-ids", identifier, "--query", "Reservations[].Instances[].State.Name"]
+        state = aws.call(*query, missing=("InvalidInstanceID.NotFound",), timeout=CHECK_TIMEOUT_SECONDS)
         return "gone" if state in (None, [], ["terminated"]) else f"still exists: {state}"
-    if kind == "aws_security_group":
-        return "gone" if aws.call("ec2", "describe-security-groups", "--group-ids", identifier, missing=("InvalidGroup.NotFound",)) is None else "still exists"
-    if kind == "aws_iam_role":
-        return "gone" if aws.call("iam", "get-role", "--role-name", identifier, missing=("NoSuchEntity",)) is None else "still exists"
-    if kind == "aws_iam_instance_profile":
-        return "gone" if aws.call("iam", "get-instance-profile", "--instance-profile-name", identifier, missing=("NoSuchEntity",)) is None else "still exists"
-    return "removed with its parent resource"
+    if kind not in lookups:
+        return None
+    arguments, missing = lookups[kind]
+    return "gone" if aws.call(*arguments, missing=missing, timeout=CHECK_TIMEOUT_SECONDS) is None else "still exists"
+
+
+def checked_removals(aws: Aws, inventory: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Every inventory entry with its result: a service check where one exists, else its parent's, else unverified."""
+    direct = [entry for entry in inventory if removal_check(aws, entry) is not None]
+    settled = settled_checks(
+        lambda entry: removal_check(aws, entry) or "", direct, attempts=GONE_DEADLINE_SECONDS // GONE_POLL_SECONDS, pause_seconds=GONE_POLL_SECONDS
+    )
+    reported = {(check["type"], check["service_id"]): check["reported"] for check in settled}
+    by_address = {check["address"]: check for check in settled}
+    return [by_address.get(entry["address"]) or entry | {"reported": parent_check(entry, reported)} for entry in inventory]
+
+
+def finished_stages(removal: Path) -> list[str]:
+    progress = removal / "progress.json"
+    finished: list[str] = json.loads(progress.read_text()) if progress.is_file() else []
+    return finished
+
+
+def finish_stage(removal: Path, stage: str) -> None:
+    (removal / "progress.json").write_text(json.dumps([*finished_stages(removal), stage]) + "\n")
+
+
+def save_raw(folder: Path, name: str, text: str) -> None:
+    """Keep raw tool output in an owner-only file that the evidence export leaves out."""
+    raw = folder / "raw"
+    raw.mkdir(mode=0o700, exist_ok=True)
+    descriptor = os.open(raw / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(text)
 
 
 def settled_checks(check: Callable[[dict[str, str]], str], inventory: list[dict[str, str]], *, attempts: int, pause_seconds: float) -> list[dict[str, str]]:
@@ -227,50 +346,52 @@ def settled_checks(check: Callable[[dict[str, str]], str], inventory: list[dict[
 
 
 def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
+    """Run the stages that are left. A finished teardown does nothing, and an interrupted one resumes after its last finished stage."""
     folder = ROOT / "runs" / run.run_id
-    plan = read_bytes(folder / "plans" / "destroy.tfplan")
-    if plan is None:
-        raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
-    approved_plan = approved_plan_copy(run, plan)
-    try:
-        return destroy_with_plan(aws, run, folder, confirm, plan, approved_plan)
-    finally:
-        approved_plan.unlink(missing_ok=True)
-
-
-def destroy_with_plan(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path) -> int:
-    problems, approved, inventory = guard_problems(aws, run, folder, confirm, plan, approved_plan)
-    if problems:
-        raise TeardownRefused("refused before any deletion:\n" + "\n".join(problems))
-    for bucket in application_buckets(inventory):
-        delete_entries(aws, bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == bucket])
-    sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)[-1500:])
     removal = folder / "removal"
-    removal.mkdir(exist_ok=True)
-    if run.backend == "s3":
-        entries = bucket_entries(aws, run.state_bucket)
-        known = {(item[0], item[1]) for item in approved["state"]}
-        recorded = [
-            [entry["Key"], entry["VersionId"]] for entry in entries if entry["Key"] in run.state_keys and (entry["Key"], entry["VersionId"]) not in known
-        ]
-        (removal / "destroy_written_state_entries.json").write_text(json.dumps(recorded, indent=2) + "\n")
-        left = state_entry_problems(entries, run.state_keys, approved["state"], recorded)
-        if left:
-            raise TeardownRefused("the environment is gone, and the state bucket is kept because:\n" + "\n".join(left))
-        delete_entries(aws, run.state_bucket, [(entry["Key"], entry["VersionId"]) for entry in entries])
-        aws.call("s3api", "delete-bucket", "--bucket", run.state_bucket)
-        wait_gone(aws, run.state_bucket)
-    checks = settled_checks(
-        lambda entry: removal_check(aws, entry), inventory, attempts=GONE_DEADLINE_SECONDS // GONE_POLL_SECONDS, pause_seconds=GONE_POLL_SECONDS
-    )
-    remaining = [check for check in checks if check["reported"].startswith("still exists")]
+    left = remaining_stages(finished_stages(removal))
+    if not left:
+        sys.stdout.write(f"run {run.run_id}: the teardown is already complete; nothing was changed\n")
+        return 0
+    inventory = read_json(folder / "inventory.json", "the run's inventory")["created"]
+    approved = read_json(folder / "teardown" / "approved_inventory.json", "the approved inventory")
+    if "apply" in left:
+        plan = read_bytes(folder / "plans" / "destroy.tfplan")
+        if plan is None:
+            raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
+        approved_plan = approved_plan_copy(run, plan)
+        try:
+            problems, targets = guard_problems(aws, run, folder, confirm, plan, approved_plan)
+            if problems:
+                raise TeardownRefused("refused before any deletion:\n" + "\n".join(problems))
+            removal.mkdir(exist_ok=True)
+            if "purge" in left:
+                for bucket in purge_buckets(targets, inventory):
+                    purge(aws, bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == bucket])
+                finish_stage(removal, "purge")
+            output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
+            save_raw(folder, "destroy_apply.txt", output)
+            destroyed = DESTROYED.search(output)
+            sys.stdout.write(
+                f"run {run.run_id}: the destroy plan is applied; resources destroyed: {destroyed.group(1) if destroyed else 'see the raw output'}\n"
+            )
+            finish_stage(removal, "apply")
+        finally:
+            approved_plan.unlink(missing_ok=True)
+    if "state" in left:
+        if run.backend == "s3":
+            clean_state_bucket(aws, run, approved, removal)
+        finish_stage(removal, "state")
+    checks = checked_removals(aws, inventory)
     (removal / "checks.json").write_text(
         json.dumps({"run_id": run.run_id, "checks": checks, "retained_cost": "none: no resource is retained"}, indent=2) + "\n"
     )
     for check in checks:
         sys.stdout.write(f"{check['reported']}: {check['address']}\n")
-    if remaining:
-        raise TeardownRefused(f"{len(remaining)} resources still exist after the teardown; see {(removal / 'checks.json').relative_to(ROOT)}")
+    failed = [check for check in checks if not check["reported"].startswith("gone")]
+    if failed:
+        raise TeardownRefused(f"{len(failed)} removals are not confirmed; see {(removal / 'checks.json').relative_to(ROOT)}")
+    finish_stage(removal, "checks")
     sys.stdout.write(f"run {run.run_id}: every removal is confirmed through its service\n")
     return 0
 
