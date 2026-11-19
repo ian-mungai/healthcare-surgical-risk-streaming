@@ -23,7 +23,7 @@ RUN = RunBinding(
     ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"],
     "verified",
 )
-LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified")
+LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified", provision_host=False)
 PLAN = b"saved plan bytes"
 CODE = hashlib.sha256(PLAN).hexdigest()[:12]
 
@@ -49,6 +49,8 @@ class PlanBindingTest(unittest.TestCase):
     def test_local_backend_preserves_the_host_it_was_given(self) -> None:
         self.assertEqual("false", run_variables(LOCAL, {"AWS_PROFILE": "example_project_dev"})["provision_host"])
         self.assertEqual("true", run_variables(RUN, {"AWS_PROFILE": "example_project_dev"})["provision_host"])
+        given = RunBinding(**{**RUN.__dict__, "provision_host": False})
+        self.assertEqual("false", run_variables(given, {"AWS_PROFILE": "example_project_dev"})["provision_host"])
 
     def test_plan_saved_for_the_s3_backend_is_refused_under_the_local_backend(self) -> None:
         self.assertEqual(

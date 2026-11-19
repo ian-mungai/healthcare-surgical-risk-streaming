@@ -18,7 +18,8 @@ from scripts.infra.teardown import bucket_entry_problems, delete_targets, state_
 
 STATE_KEYS = ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified")
-LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified")
+LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified", provision_host=False)
+GIVEN_HOST = RunBinding(RUN.run_id, RUN.commit, "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified", provision_host=False)
 HASH = "a" * 64
 
 
@@ -120,10 +121,11 @@ class TargetTest(unittest.TestCase):
             target_problems(delete_targets(PLAN), INVENTORY, RUN, ["i-0aaa"]),
         )
 
-    def test_any_host_is_refused_under_the_local_backend(self) -> None:
+    def test_any_host_is_refused_in_a_run_that_was_given_its_host(self) -> None:
         local_inventory = [entry for entry in INVENTORY if entry["address"] != "state bucket"]
-        expected = ["delete target is a host under the local backend, which never owns a host: module.host[0].aws_instance.host"]
+        expected = ["delete target is a host in a run that did not create its host: module.host[0].aws_instance.host"]
         self.assertEqual(expected, target_problems(delete_targets(PLAN), local_inventory, LOCAL, []))
+        self.assertEqual(expected, target_problems(delete_targets(PLAN), INVENTORY, GIVEN_HOST, []))
 
     def test_state_bucket_must_be_the_one_this_run_created(self) -> None:
         other = [entry | {"service_id": "other-state"} if entry["address"] == "state bucket" else entry for entry in INVENTORY]

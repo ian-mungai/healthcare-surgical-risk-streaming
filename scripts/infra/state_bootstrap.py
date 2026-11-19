@@ -44,19 +44,32 @@ class RunBinding:
     workspace: str
     state_keys: list[str]
     status: str
+    provision_host: bool = True
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2) + "\n")
 
 
-def new_binding(configuration: dict[str, str], backend: str = "s3") -> RunBinding:
+def new_binding(configuration: dict[str, str], backend: str = "s3", provision_host: bool = True) -> RunBinding:
     run_id = datetime.now(UTC).strftime("%Y%m%dt%H%M") + "-" + secrets.token_hex(3)
     commit = run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
     if backend == "local":
-        return RunBinding(run_id, commit, "local", configuration["AWS_REGION"], "", WORKSPACE, [str(ROOT / "runs" / run_id / "terraform.tfstate")], "verified")
+        return RunBinding(
+            run_id,
+            commit,
+            "local",
+            configuration["AWS_REGION"],
+            "",
+            WORKSPACE,
+            [str(ROOT / "runs" / run_id / "terraform.tfstate")],
+            "verified",
+            provision_host=False,
+        )
     bucket = f"{configuration['BUCKET_PREFIX']}-state-{configuration['ENVIRONMENT']}-{run_id}"
-    return RunBinding(run_id, commit, "s3", configuration["AWS_REGION"], bucket, WORKSPACE, [STATE_KEY, f"{STATE_KEY}.tflock"], "planned")
+    return RunBinding(
+        run_id, commit, "s3", configuration["AWS_REGION"], bucket, WORKSPACE, [STATE_KEY, f"{STATE_KEY}.tflock"], "planned", provision_host=provision_host
+    )
 
 
 def required_tags(configuration: dict[str, str]) -> dict[str, str]:
@@ -102,8 +115,8 @@ def repair(aws: Aws, bucket: str, name: str, tags: dict[str, str]) -> None:
         aws.call("s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging", tag_set)
 
 
-def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3") -> int:
-    binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend)
+def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3", provision_host: bool = True) -> int:
+    binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend, provision_host)
     if binding.backend != backend:
         sys.stderr.write(f"the run is bound to the {binding.backend} backend, not {backend}\n")
         return 1
@@ -159,12 +172,13 @@ def main() -> int:
     parser.add_argument(
         "--backend", choices=["s3", "local"], default="s3", help="create: s3 for a host in AWS, local for a host that already exists outside AWS"
     )
+    parser.add_argument("--given-host", action="store_true", help="create: the host already exists, so Terraform plans and removes no host")
     arguments = parser.parse_args()
     try:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         if arguments.command == "create":
-            return create(aws, configuration, arguments.binding, arguments.backend)
+            return create(aws, configuration, arguments.binding, arguments.backend, not arguments.given_host)
         return verify(aws, configuration, arguments.binding)
     except (ConfigurationError, AwsError) as error:
         sys.stderr.write(f"{error}\n")

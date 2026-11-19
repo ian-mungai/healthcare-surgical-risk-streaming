@@ -9,7 +9,7 @@ marker in the run's application buckets and in its state bucket. It prints a con
 1. The owner's signed receipt must cover the current evidence of this run and commit.
 2. The saved destroy plan must be the reviewed one, saved for this run's state location.
 3. Every delete target must be a resource in this run's inventory. A host that existed before the run is refused,
-   and so is any host or state bucket under the local backend.
+   and so is any host in a run that was given its host and any state bucket under the local backend.
 4. Every entry in an application bucket must match an approved bucket, key and version ID.
 5. Every entry in the state bucket must be at one of this run's state keys and match an approved key and version ID.
 
@@ -32,7 +32,7 @@ from scripts.aws_cli import Aws, AwsError
 from scripts.evidence.manifest import build_manifest, manifest_sha256
 from scripts.evidence.receipt import receipt_problems, signature_is_valid
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding
-from scripts.infra.terraform_wrapper import APPLY_TIMEOUT_SECONDS, WrapperError, binding_problems, load_run, save_plan, terraform
+from scripts.infra.terraform_wrapper import APPLY_TIMEOUT_SECONDS, PLAN_TIMEOUT_SECONDS, WrapperError, binding_problems, load_run, save_plan, terraform
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 GONE_DEADLINE_SECONDS = 120
@@ -56,8 +56,8 @@ def target_problems(targets: list[Target], inventory: list[dict[str, str]], run:
     state_buckets = [entry["service_id"] for entry in inventory if entry["address"] == "state bucket"]
     problems = []
     for address, kind, identifier in targets:
-        if kind == "aws_instance" and run.backend == "local":
-            problems.append(f"delete target is a host under the local backend, which never owns a host: {address}")
+        if kind == "aws_instance" and not run.provision_host:
+            problems.append(f"delete target is a host in a run that did not create its host: {address}")
         elif kind == "aws_instance" and identifier in pre_provisioned:
             problems.append(f"delete target is a host that existed before this run: {address}")
         elif (kind, identifier) not in owned:
@@ -148,7 +148,8 @@ def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str) -> tup
     if inventory_record.get("authorized_retained"):
         problems.append("this teardown does not yet keep retained items: remove them from the destroy plan first")
     pre_provisioned = json.loads((folder / "pre_provisioned.json").read_text()) if (folder / "pre_provisioned.json").is_file() else []
-    problems += target_problems(delete_targets(read_json(folder / "plans" / "destroy.json", "the destroy plan's JSON form")), inventory, run, pre_provisioned)
+    saved_plan = json.loads(terraform(run, ["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS))
+    problems += target_problems(delete_targets(saved_plan), inventory, run, pre_provisioned)
     for bucket in application_buckets(inventory):
         problems += bucket_entry_problems(bucket, bucket_entries(aws, bucket), approved["application"])
     if run.backend == "s3":
