@@ -113,34 +113,41 @@ def state_json(run: RunBinding, configuration: dict[str, str]) -> dict[str, Any]
     return state
 
 
+def plan_label(action: str, *, changes: int, reviewed_exists: bool) -> str:
+    """The name a saved plan gets: a later plan with no change is kept beside the reviewed plan, not over it."""
+    return f"{action}_check" if changes == 0 and reviewed_exists else action
+
+
 def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> int:
     """Save the plan with its text, JSON and binding, print its changes and return how many resources change."""
     if run.status != "verified":
         raise WrapperError("the run's state bucket is not verified: run the state bootstrap step")
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
-    plan_file = folder / f"{action}.tfplan"
+    candidate = folder / f"{action}_candidate.tfplan"
     initialise(run, configuration)
     missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
     if missing:
         raise WrapperError(f".env: missing values for: {', '.join(missing)}")
     values = run_variables(run, configuration) | {key.lower(): configuration[key] for key in TAILSCALE_KEYS}
     variables = [f"-var-file=environments/{configuration['ENVIRONMENT']}.tfvars", *[f"-var={name}={value}" for name, value in values.items()]]
-    terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={plan_file}"], PLAN_TIMEOUT_SECONDS)
-    (folder / f"{action}.txt").write_text(terraform(run, ["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))
-    plan_json = terraform(run, ["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS)
-    (folder / f"{action}.json").write_text(plan_json)
-    changes = json.loads(plan_json).get("resource_changes", [])
-    saved = plan_binding(run, plan_file.read_bytes(), action)
-    (folder / f"{action}_binding.json").write_text(json.dumps(saved, indent=2) + "\n")
+    terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={candidate}"], PLAN_TIMEOUT_SECONDS)
+    plan_json = terraform(run, ["show", "-json", str(candidate)], PLAN_TIMEOUT_SECONDS)
     counts: dict[str, int] = {}
-    for change in changes:
+    for change in json.loads(plan_json).get("resource_changes", []):
         actions = "/".join(change["change"]["actions"])
         if actions != "no-op":
             counts[actions] = counts.get(actions, 0) + 1
             sys.stdout.write(f"{actions}: {change['address']}\n")
+    label = plan_label(action, changes=sum(counts.values()), reviewed_exists=(folder / f"{action}.tfplan").is_file())
+    plan_file = folder / f"{label}.tfplan"
+    candidate.replace(plan_file)
+    (folder / f"{label}.txt").write_text(terraform(run, ["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))
+    (folder / f"{label}.json").write_text(plan_json)
+    saved = plan_binding(run, plan_file.read_bytes(), action)
+    (folder / f"{label}_binding.json").write_text(json.dumps(saved, indent=2) + "\n")
     summary = ", ".join(f"{count} to {name}" for name, count in sorted(counts.items())) or "no change"
-    sys.stdout.write(f"run {run.run_id}, {action} plan: {summary}\nfull plan text: {(folder / f'{action}.txt').relative_to(ROOT)}\n")
+    sys.stdout.write(f"run {run.run_id}, {action} plan: {summary}\nfull plan text: {(folder / f'{label}.txt').relative_to(ROOT)}\n")
     if counts and action == "apply":
         sys.stdout.write(f"to apply exactly this plan after review: apply --confirm {saved['plan_sha256'][:12]}\n")
     return sum(counts.values())

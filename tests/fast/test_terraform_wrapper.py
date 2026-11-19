@@ -11,7 +11,7 @@ import hashlib
 import unittest
 
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.infra.terraform_wrapper import backend_arguments, backend_override, binding_problems, plan_binding, run_variables
+from scripts.infra.terraform_wrapper import backend_arguments, backend_override, binding_problems, plan_binding, plan_label, run_variables
 
 RUN = RunBinding(
     "20260101t0000-abcdef",
@@ -57,6 +57,12 @@ class PlanBindingTest(unittest.TestCase):
             ["the plan was saved for a different state location than this run's"],
             binding_problems(LOCAL, plan_binding(RUN, PLAN, "apply"), PLAN, CODE, "apply"),
         )
+
+    def test_a_later_plan_with_no_change_keeps_the_record_of_the_reviewed_plan(self) -> None:
+        self.assertEqual("apply", plan_label("apply", changes=18, reviewed_exists=False))
+        self.assertEqual("apply", plan_label("apply", changes=0, reviewed_exists=False))
+        self.assertEqual("apply_check", plan_label("apply", changes=0, reviewed_exists=True))
+        self.assertEqual("apply", plan_label("apply", changes=2, reviewed_exists=True))
 
     def test_matching_plan_passes(self) -> None:
         self.assertEqual([], binding_problems(RUN, plan_binding(RUN, PLAN, "apply"), PLAN, CODE, "apply"))
