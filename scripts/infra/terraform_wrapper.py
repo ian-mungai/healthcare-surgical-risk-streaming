@@ -111,6 +111,11 @@ def configuration_folder(run: RunBinding) -> Path:
     return ROOT / ".tools" / "terraform" / run.run_id / "config"
 
 
+def configuration_files(source: Path) -> list[Path]:
+    """The top-level files a run's copy takes: the Terraform files and the provider lock, and no variable file that Terraform would load unasked."""
+    return [*sorted(item for item in source.glob("*.tf") if item.name != "backend_override.tf"), source / ".terraform.lock.hcl"]
+
+
 def prepare_configuration(run: RunBinding) -> Path:
     """Give the run its own copy of the Terraform configuration with its own backend override, apart from every other run."""
     target = configuration_folder(run)
@@ -119,9 +124,8 @@ def prepare_configuration(run: RunBinding) -> Path:
         if stale.name != ".terraform":
             shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
     source = ROOT / "infra"
-    for item in [*source.glob("*.tf"), *source.glob("*.auto.tfvars"), source / ".terraform.lock.hcl"]:
-        if item.name != "backend_override.tf":
-            shutil.copy2(item, target / item.name)
+    for item in configuration_files(source):
+        shutil.copy2(item, target / item.name)
     for part in CONFIGURATION_PARTS:
         shutil.copytree(source / part, target / part)
     override = backend_override(run)

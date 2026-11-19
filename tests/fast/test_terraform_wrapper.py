@@ -8,7 +8,9 @@ plan saved for another run.
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.terraform_wrapper import (
@@ -16,6 +18,7 @@ from scripts.infra.terraform_wrapper import (
     backend_override,
     binding_problems,
     clean_environment,
+    configuration_files,
     effective_location_problems,
     plan_binding,
     plan_label,
@@ -106,6 +109,14 @@ class PlanBindingTest(unittest.TestCase):
 
 S3_RECORD = {"backend": {"type": "s3", "config": {"bucket": RUN.state_bucket, "key": RUN.state_keys[0], "region": RUN.region}}}
 LOCAL_RECORD = {"backend": {"type": "local", "config": {"path": LOCAL.state_keys[0]}}}
+
+
+class ConfigurationCopyTest(unittest.TestCase):
+    def test_a_runs_copy_takes_no_variable_file_that_terraform_loads_unasked(self) -> None:
+        source = Path(tempfile.mkdtemp(prefix="configuration_"))
+        for name in ("main.tf", "backend_override.tf", "extra.auto.tfvars", "terraform.tfvars", ".terraform.lock.hcl"):
+            (source / name).write_text("")
+        self.assertEqual(["main.tf", ".terraform.lock.hcl"], [item.name for item in configuration_files(source)])
 
 
 class EffectiveLocationTest(unittest.TestCase):
