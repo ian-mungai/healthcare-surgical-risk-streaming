@@ -7,28 +7,59 @@ Terraform state with data sources and nested modules.
 
 from __future__ import annotations
 
+import json
+import os
+import stat
+import tempfile
 import unittest
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from unittest import mock
 
-from scripts.infra.host import HostError, instance_id, select_peer, wait_for, workload_variables
+from scripts.aws_cli import Aws
+from scripts.infra import host
+from scripts.infra.host import HostError, Peer, instance_id, select_peer, wait_for, wait_until_reachable, workload_variables
 from scripts.infra.inventory import inventory_entries
 from scripts.process import TimeoutExpired
 
 
 def peer(
-    name: str, *, online: bool = True, tags: tuple[str, ...] = ("tag:surgical-host",), created: str = "2026-01-02T00:00:00Z", dns: str = ""
+    name: str,
+    *,
+    online: bool = True,
+    tags: tuple[str, ...] = ("tag:surgical-host",),
+    created: str = "2026-01-02T00:00:00Z",
+    dns: str = "",
+    device: str = "nA1CNTRL",
 ) -> dict[str, object]:
-    return {"HostName": name, "Online": online, "Tags": list(tags), "Created": created, "DNSName": dns or f"{name}.example.ts.net."}
+    return {"HostName": name, "Online": online, "Tags": list(tags), "Created": created, "DNSName": dns or f"{name}.example.ts.net.", "ID": device}
 
 
 class SelectPeerTest(unittest.TestCase):
-    def test_online_tagged_peer_is_selected(self) -> None:
-        status = {"Peer": {"a": peer("platform-dev"), "b": peer("laptop", tags=())}}
-        self.assertEqual("platform-dev.example.ts.net", select_peer(status, "platform-dev", "tag:surgical-host"))
+    def test_online_tagged_peer_is_selected_with_its_device_id(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev", device="nB2CNTRL"), "b": peer("laptop", tags=())}}
+        self.assertEqual(Peer("platform-dev.example.ts.net", "nB2CNTRL"), select_peer(status, "platform-dev", "tag:surgical-host"))
 
-    def test_newest_of_two_peers_with_the_name_is_selected(self) -> None:
-        old = peer("platform-dev", created="2026-01-01T00:00:00Z", dns="platform-dev.example.ts.net.")
-        new = peer("platform-dev", created="2026-01-03T00:00:00Z", dns="platform-dev-1.example.ts.net.")
-        self.assertEqual("platform-dev-1.example.ts.net", select_peer({"Peer": {"a": old, "b": new}}, "platform-dev", "tag:surgical-host"))
+    def test_two_online_peers_with_the_name_and_tag_are_refused(self) -> None:
+        old = peer("platform-dev", created="2026-01-01T00:00:00Z", dns="platform-dev.example.ts.net.", device="nOLDCNTRL")
+        new = peer("platform-dev", created="2026-01-03T00:00:00Z", dns="platform-dev-1.example.ts.net.", device="nNEWCNTRL")
+        with self.assertRaisesRegex(HostError, "2 online peers are named platform-dev"):
+            select_peer({"Peer": {"a": old, "b": new}}, "platform-dev", "tag:surgical-host")
+
+    def test_an_offline_twin_does_not_make_the_peer_ambiguous(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev", online=False, device="nOLDCNTRL"), "b": peer("platform-dev", device="nNEWCNTRL")}}
+        self.assertEqual("nNEWCNTRL", select_peer(status, "platform-dev", "tag:surgical-host").device_id)
+
+    def test_a_peer_with_another_name_does_not_make_the_peer_ambiguous(self) -> None:
+        status = {"Peer": {"a": peer("platform-prod", device="nOTHERCNTRL"), "b": peer("platform-dev", device="nNEWCNTRL")}}
+        self.assertEqual("nNEWCNTRL", select_peer(status, "platform-dev", "tag:surgical-host").device_id)
+
+    def test_a_twin_without_the_tag_does_not_make_the_peer_ambiguous(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev", tags=(), device="nOTHERCNTRL"), "b": peer("platform-dev", device="nNEWCNTRL")}}
+        self.assertEqual("nNEWCNTRL", select_peer(status, "platform-dev", "tag:surgical-host").device_id)
 
     def test_offline_peer_is_not_the_host(self) -> None:
         with self.assertRaisesRegex(HostError, "no online peer"):
@@ -106,6 +137,97 @@ class WaitForTest(unittest.TestCase):
         with self.assertRaisesRegex(HostError, "deadline of 30 seconds passed"):
             wait_for("a thing", probe, 30, clock=lambda: clock.now, sleep=clock.sleep)
         self.assertEqual(30, clock.now)
+
+
+STATUS_TOOL = '#!/bin/sh\ncat "$FAKE_STATUS"\n'
+SSH_TOOL = '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\nexit "${FAKE_SSH_EXIT:-0}"\n'
+
+
+@dataclass(frozen=True)
+class FakeAws(Aws):
+    state: str = "running"
+
+    def call(self, *arguments: str, missing: tuple[str, ...] = (), timeout: float = 120) -> Any:
+        return self.state
+
+
+@contextmanager
+def fake_tools(status: Mapping[str, object], instance: str, ssh_exit: int = 0) -> Iterator[Path]:
+    """A ``tailscale`` that prints the given status and an ``ssh`` that logs its arguments and prints the given instance ID, first on PATH."""
+    with tempfile.TemporaryDirectory() as scratch:
+        folder = Path(scratch)
+        for name, text in (("tailscale", STATUS_TOOL), ("ssh", SSH_TOOL)):
+            (folder / name).write_text(text)
+            (folder / name).chmod(stat.S_IRWXU)
+        (folder / "status.json").write_text(json.dumps(status))
+        environment = {
+            "PATH": f"{folder}:{os.environ['PATH']}",
+            "FAKE_STATUS": str(folder / "status.json"),
+            "FAKE_SSH_LOG": str(folder / "ssh.log"),
+            "FAKE_INSTANCE": instance,
+            "FAKE_SSH_EXIT": str(ssh_exit),
+        }
+        with mock.patch.dict(os.environ, environment), mock.patch.object(host, "ROOT", folder), mock.patch.object(host, "POLL_SECONDS", 0.01):
+            yield folder
+
+
+class ReachableHostTest(unittest.TestCase):
+    """The host commands' choice of the Tailscale peer, through fake ``tailscale`` and ``ssh`` programs that run as real processes."""
+
+    def reach(self, status: Mapping[str, object], reported_instance: str, instance: str = "i-0123456789abcdef0", ssh_exit: int = 0) -> Peer:
+        with fake_tools(status, reported_instance, ssh_exit):
+            return wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", instance, "platform-dev")
+
+    def test_the_peer_whose_instance_is_the_runs_instance_is_reached(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        self.assertEqual(Peer("platform-dev.example.ts.net", "nNEWCNTRL"), self.reach(status, "i-0123456789abcdef0"))
+
+    def test_the_peer_is_asked_for_its_instance_over_ssh(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev")}}
+        with fake_tools(status, "i-0123456789abcdef0") as folder:
+            wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", "i-0123456789abcdef0", "platform-dev")
+            logged = (folder / "ssh.log").read_text().splitlines()
+        address = "platform-dev.example.ts.net"
+        self.assertIn(f"ubuntu@{address}", logged)
+        self.assertIn("cat /var/lib/cloud/data/instance-id", logged)
+
+    def test_only_an_older_peer_is_visible_while_the_new_instance_starts(self) -> None:
+        status = {"Peer": {"old": peer("platform-dev", created="2026-01-01T00:00:00Z", device="nOLDCNTRL")}}
+        with self.assertRaisesRegex(HostError, "belongs to a different instance than this run's"):
+            self.reach(status, "i-0fedcba9876543210")
+
+    def test_a_refusal_names_no_instance_id(self) -> None:
+        status = {"Peer": {"old": peer("platform-dev")}}
+        with self.assertRaises(HostError) as caught:
+            self.reach(status, "i-0fedcba9876543210")
+        self.assertNotIn("i-0", str(caught.exception))
+
+    def test_two_online_peers_are_refused_before_ssh(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev", device="nAAACNTRL"), "b": peer("platform-dev", device="nBBBCNTRL")}}
+        with (
+            fake_tools(status, "i-0123456789abcdef0") as folder,
+            mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.5),
+            self.assertRaisesRegex(HostError, "2 online peers"),
+        ):
+            wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", "i-0123456789abcdef0", "platform-dev")
+        self.assertFalse((folder / "ssh.log").exists())
+
+    def test_a_status_with_no_peer_map_waits_and_then_expires(self) -> None:
+        with mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.05), self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"):
+            self.reach({"Peer": None}, "i-0123456789abcdef0")
+
+    def test_a_peer_whose_ssh_never_answers_expires(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev")}}
+        with mock.patch.object(host, "SSH_DEADLINE_SECONDS", 0.05), self.assertRaisesRegex(HostError, "while waiting for SSH over Tailscale"):
+            self.reach(status, "i-0123456789abcdef0", ssh_exit=255)
+
+    def test_an_instance_that_is_not_running_expires(self) -> None:
+        with (
+            fake_tools({"Peer": {}}, ""),
+            mock.patch.object(host, "INSTANCE_DEADLINE_SECONDS", 0.05),
+            self.assertRaisesRegex(HostError, "while waiting for the instance to run"),
+        ):
+            wait_until_reachable(FakeAws("project", "us-west-2", "pending"), "run-one", "i-0123456789abcdef0", "platform-dev")
 
 
 STATE = {

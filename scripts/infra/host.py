@@ -23,7 +23,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from scripts.aws_cli import Aws, AwsError
 from scripts.infra import state_bootstrap
@@ -35,6 +35,7 @@ from scripts.project_config import ROOT, ConfigurationError, load_configuration
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 HOST_TAG = "tag:surgical-host"
 HOST_USER = "ubuntu"
+INSTANCE_ID_COMMAND = "cat /var/lib/cloud/data/instance-id"
 INSTANCE_DEADLINE_SECONDS = 600
 PEER_DEADLINE_SECONDS = 600
 SSH_DEADLINE_SECONDS = 300
@@ -47,6 +48,15 @@ STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the o
 
 class HostError(RuntimeError):
     """A host command refused to continue, a wait passed its deadline or a call failed."""
+
+
+class NoPeerError(HostError):
+    """The Tailscale network shows no online peer with the host's name and tag yet."""
+
+
+class Peer(NamedTuple):
+    address: str
+    device_id: str
 
 
 def wait_for[T](
@@ -79,17 +89,21 @@ def wait_for[T](
         sleep(min(POLL_SECONDS, max(deadline - clock(), 0)))
 
 
-def select_peer(status: dict[str, Any], host_name: str, tag: str) -> str:
-    """The Tailscale DNS name of the newest online peer that has the host's name and tag."""
+def select_peer(status: dict[str, Any], host_name: str, tag: str) -> Peer:
+    """The one online peer that has the host's name and tag. Two such peers are refused, because either could be the host."""
     peers = [
         peer for peer in (status.get("Peer") or {}).values() if peer.get("HostName") == host_name and peer.get("Online") and tag in (peer.get("Tags") or [])
     ]
     if not peers:
-        raise HostError(f"no online peer named {host_name} with {tag} in the Tailscale network")
-    return str(max(peers, key=lambda peer: peer["Created"])["DNSName"]).rstrip(".")
+        raise NoPeerError(f"no online peer named {host_name} with {tag} in the Tailscale network")
+    if len(peers) > 1:
+        raise HostError(
+            f"{len(peers)} online peers are named {host_name} with {tag}: remove the extra devices in the Tailscale console, then run the command again"
+        )
+    return Peer(str(peers[0]["DNSName"]).rstrip("."), str(peers[0]["ID"]))
 
 
-def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> str:
+def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> Peer:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
@@ -103,7 +117,7 @@ def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> str:
 def peer_online(host_name: str, timeout: float) -> bool:
     try:
         host_peer(host_name, timeout)
-    except HostError:
+    except NoPeerError:
         return False
     return True
 
@@ -114,11 +128,13 @@ def ssh_arguments(run_id: str) -> list[str]:
     return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=accept-new"]
 
 
-def ssh_answers(run_id: str, address: str, timeout: float) -> bool:
+def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str | None:
+    """The output of one command on the host over SSH, or None when SSH does not answer."""
     try:
-        return run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "true"], timeout=min(timeout, SSH_ATTEMPT_SECONDS)).returncode == 0
+        result = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", command], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
     except TimeoutExpired:
-        return False
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def instance_id(state: dict[str, Any]) -> str:
@@ -136,12 +152,15 @@ def instance_state(aws: Aws, instance: str, timeout: float) -> str:
     return str(aws.call("ec2", "describe-instances", "--instance-ids", instance, "--query", "Reservations[0].Instances[0].State.Name", timeout=timeout))
 
 
-def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -> str:
+def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -> Peer:
+    """Wait for the instance, its Tailscale peer and SSH, then require that the peer is this run's instance."""
     wait_for("the instance to run", lambda budget: instance_state(aws, instance, budget) == "running" or None, INSTANCE_DEADLINE_SECONDS)
     wait_for(f"the Tailscale peer {host_name} to be online", lambda budget: peer_online(host_name, budget) or None, PEER_DEADLINE_SECONDS)
-    address = host_peer(host_name)
-    wait_for("SSH over Tailscale", lambda budget: ssh_answers(run_id, address, budget) or None, SSH_DEADLINE_SECONDS)
-    return address
+    peer = host_peer(host_name)
+    found = wait_for("SSH over Tailscale", lambda budget: ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, budget), SSH_DEADLINE_SECONDS)
+    if found.strip() != instance:
+        raise HostError(f"the Tailscale peer {host_name} belongs to a different instance than this run's: remove the other device, then run the command again")
+    return peer
 
 
 def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
@@ -183,7 +202,7 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         write_inventory(binding)
         return 0
     state = state_json(run, configuration)
-    address = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
+    address = wait_until_reachable(aws, run.run_id, instance_id(state), host_name).address
     run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]))
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host is up at {address} and its inventory is written\n")
@@ -203,14 +222,14 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
     run = load_run(binding)
     instance = instance_id(state_json(run, configuration))
     aws.call("ec2", "start-instances", "--instance-ids", instance)
-    address = wait_until_reachable(aws, run.run_id, instance, f"platform-{configuration['ENVIRONMENT']}")
+    address = wait_until_reachable(aws, run.run_id, instance, f"platform-{configuration['ENVIRONMENT']}").address
     sys.stdout.write(f"run {run.run_id}: the host is started and answers at {address}\n")
     return 0
 
 
 def host_check(host_name: str) -> int:
-    address = host_peer(host_name)
-    wait_for("SSH over Tailscale", lambda budget: ssh_answers("deploy", address, budget) or None, SSH_DEADLINE_SECONDS)
+    address = host_peer(host_name).address
+    wait_for("SSH over Tailscale", lambda budget: ssh_output("deploy", address, "true", budget), SSH_DEADLINE_SECONDS)
     sys.stdout.write(f"the host answers over Tailscale SSH as {host_name}\n")
     return 0
 
