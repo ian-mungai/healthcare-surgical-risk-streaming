@@ -107,8 +107,10 @@ def host_peer(host_name: str, timeout: float = SSH_ATTEMPT_SECONDS) -> Peer:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
-    except (FileNotFoundError, TimeoutExpired) as error:
-        raise HostError(f"the Tailscale client on this computer did not answer: {error}") from None
+    except FileNotFoundError as error:
+        raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
+    except TimeoutExpired:
+        raise NoPeerError("the Tailscale client on this computer did not answer in time") from None
     if result.returncode != 0:
         raise HostError(f"tailscale status failed: {result.stderr.strip()}")
     return select_peer(json.loads(result.stdout), host_name, HOST_TAG)
@@ -188,7 +190,9 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
-    if state_bootstrap.create(aws, configuration, binding) != 0:
+    existing = load_run(binding) if binding.is_file() else None
+    backend, provision_host = (existing.backend, existing.provision_host) if existing else ("s3", True)
+    if state_bootstrap.create(aws, configuration, binding, backend, provision_host) != 0:
         raise HostError("the state bootstrap step failed")
     run = load_run(binding)
     if confirm:
@@ -197,7 +201,7 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         sys.stdout.write("stopped for review: read the full plan text, then run make host-up CONFIRM=<the code above>\n")
         return 0
     host_name = f"platform-{configuration['ENVIRONMENT']}"
-    if run.backend == "local":
+    if run.backend == "local" or not run.provision_host:
         sys.stdout.write(f"run {run.run_id}: the host already exists and Terraform does not touch it; deploy to it with the deploy workflow\n")
         write_inventory(binding)
         return 0

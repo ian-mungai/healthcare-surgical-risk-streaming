@@ -7,6 +7,8 @@ Terraform state with data sources and nested modules.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import stat
@@ -20,9 +22,10 @@ from typing import Any
 from unittest import mock
 
 from scripts.aws_cli import Aws
-from scripts.infra import host
+from scripts.infra import host, state_bootstrap
 from scripts.infra.host import HostError, Peer, instance_id, select_peer, wait_for, wait_until_reachable, workload_variables
 from scripts.infra.inventory import inventory_entries
+from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import TimeoutExpired
 
 
@@ -213,21 +216,107 @@ class ReachableHostTest(unittest.TestCase):
         self.assertFalse((folder / "ssh.log").exists())
 
     def test_a_status_with_no_peer_map_waits_and_then_expires(self) -> None:
-        with mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.05), self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"):
+        with mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.5), self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"):
             self.reach({"Peer": None}, "i-0123456789abcdef0")
+
+    def test_a_tailscale_client_that_does_not_answer_is_retried_until_the_deadline(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"FAKE_STATUS_DELAY": "5"}),
+            mock.patch.object(host, "PEER_DEADLINE_SECONDS", 0.5),
+            mock.patch.object(host, "SSH_ATTEMPT_SECONDS", 0.2),
+            self.assertRaisesRegex(HostError, "while waiting for the Tailscale peer platform-dev"),
+        ):
+            self.reach({"Peer": {}}, "i-0123456789abcdef0")
 
     def test_a_peer_whose_ssh_never_answers_expires(self) -> None:
         status = {"Peer": {"a": peer("platform-dev")}}
-        with mock.patch.object(host, "SSH_DEADLINE_SECONDS", 0.05), self.assertRaisesRegex(HostError, "while waiting for SSH over Tailscale"):
+        with mock.patch.object(host, "SSH_DEADLINE_SECONDS", 0.5), self.assertRaisesRegex(HostError, "while waiting for SSH over Tailscale"):
             self.reach(status, "i-0123456789abcdef0", ssh_exit=255)
 
     def test_an_instance_that_is_not_running_expires(self) -> None:
         with (
             fake_tools({"Peer": {}}, ""),
-            mock.patch.object(host, "INSTANCE_DEADLINE_SECONDS", 0.05),
+            mock.patch.object(host, "INSTANCE_DEADLINE_SECONDS", 0.5),
             self.assertRaisesRegex(HostError, "while waiting for the instance to run"),
         ):
             wait_until_reachable(FakeAws("project", "us-west-2", "pending"), "run-one", "i-0123456789abcdef0", "platform-dev")
+
+
+CONFIGURATION = {"AWS_REGION": "us-west-2", "AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "PROJECT_NAME": "example_project"}
+
+
+def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
+    path = folder / "run_binding.json"
+    state_bucket = "" if backend == "local" else "example-state-bucket"
+    RunBinding("20260101t0000-abcdef", "0" * 40, backend, "us-west-2", state_bucket, "default", ["terraform.tfstate"], "verified", provision_host).write(path)
+    return path
+
+
+class HostUpTest(unittest.TestCase):
+    """``host_up`` follows the run binding that exists. The calls to Terraform, Ansible and the host are replaced and recorded; the live batch proves them."""
+
+    def run_up(self, path: Path, *, confirm: str = "") -> tuple[int, dict[str, mock.Mock]]:
+        names = ("save_plan", "apply_plan", "write_inventory", "state_json", "wait_until_reachable", "run_ansible", "instance_id")
+        with contextlib.ExitStack() as stack:
+            calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
+            calls["save_plan"].return_value = 0
+            calls["state_json"].return_value = {"values": {}}
+            calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
+            calls["instance_id"].return_value = "i-0123456789abcdef0"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
+        return code, calls
+
+    def test_a_local_run_is_followed_to_its_inventory_with_no_instance_step(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="local", provision_host=False)
+            code, calls = self.run_up(path)
+        self.assertEqual(0, code)
+        calls["write_inventory"].assert_called_once_with(path)
+        for name in ("state_json", "wait_until_reachable", "run_ansible", "instance_id"):
+            calls[name].assert_not_called()
+
+    def test_a_run_that_was_given_its_host_on_s3_skips_the_instance_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=False)
+            with mock.patch.object(state_bootstrap, "create", return_value=0) as create:
+                code, calls = self.run_up(path)
+        self.assertEqual(0, code)
+        self.assertEqual(("s3", False), create.call_args.args[3:])
+        calls["write_inventory"].assert_called_once_with(path)
+        for name in ("wait_until_reachable", "run_ansible", "instance_id"):
+            calls[name].assert_not_called()
+
+    def test_a_run_with_its_own_host_reaches_it_and_runs_ansible(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0) as create:
+                code, calls = self.run_up(path)
+        self.assertEqual(0, code)
+        self.assertEqual(("s3", True), create.call_args.args[3:])
+        calls["wait_until_reachable"].assert_called_once()
+        calls["run_ansible"].assert_called_once()
+        calls["write_inventory"].assert_called_once_with(path)
+
+    def test_without_a_binding_the_step_creates_an_s3_run_with_its_own_host(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "run_binding.json"
+            with mock.patch.object(state_bootstrap, "create", return_value=1) as create, self.assertRaisesRegex(HostError, "state bootstrap step failed"):
+                self.run_up(path)
+        self.assertEqual(("s3", True), create.call_args.args[3:])
+
+    def test_a_plan_with_changes_stops_for_review_before_any_instance_step(self) -> None:
+        names = ("wait_until_reachable", "run_ansible", "write_inventory")
+        with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
+            stack.enter_context(mock.patch.object(host, "save_plan", return_value=3))
+            calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
+        self.assertEqual(0, code)
+        for call in calls.values():
+            call.assert_not_called()
 
 
 STATE = {
