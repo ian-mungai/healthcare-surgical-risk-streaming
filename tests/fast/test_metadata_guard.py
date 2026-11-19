@@ -18,6 +18,7 @@ from tests.fast.ansible_support import load_list, role_order, run_task_file
 
 ROLE = ROOT / "ansible" / "roles" / "metadata_guard"
 SCRIPT = ROLE / "files" / "metadata_guard.sh"
+GROUP_VARIABLES = ROOT / "ansible" / "group_vars" / "all.yml"
 ADDRESS = "169.254.169.254"
 NAMED_UNITS = {
     "workload-credentials.service",
@@ -136,7 +137,7 @@ class RoleContractTest(unittest.TestCase):
     """The allowed units are the contract: the credential helper, Tailscale and cloud-init, and the units that the project's other files create."""
 
     def test_the_allowed_units_are_exactly_the_named_services(self) -> None:
-        units = load_list(ROOT / "ansible" / "group_vars" / "all.yml", "metadata_guard_allowed_units")
+        units = load_list(GROUP_VARIABLES, "metadata_guard_allowed_units")
         self.assertEqual(sorted(NAMED_UNITS), sorted(units))
 
     def test_the_credential_helper_and_the_join_unit_exist_under_the_allowed_names(self) -> None:
@@ -148,6 +149,53 @@ class RoleContractTest(unittest.TestCase):
     def test_the_guard_runs_before_the_roles_that_start_workloads(self) -> None:
         roles = role_order("host.yml")
         self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access", "unlock_key"], roles)
+
+
+RUNTIME_UNITS = ["docker.service", "containerd.service", "k3s.service"]
+DROPIN_NAME = "metadata_guard_required.conf"
+DROPIN_TEXT = "[Unit]\nRequires=metadata-guard.service\nAfter=metadata-guard.service\n"
+
+
+class RuntimeDependencyTest(unittest.TestCase):
+    """A runtime starts only after the guard loaded: a guard that failed at boot leaves Docker, containerd and k3s stopped.
+
+    The drop-ins are written by the role's own task file through the real ``ansible-playbook``, into a scratch folder. That systemd
+    refuses to start the runtimes when the guard unit fails is proven on the live host.
+    """
+
+    def write_dropins(self, folder: Path) -> tuple[int, str]:
+        units = load_list(GROUP_VARIABLES, "metadata_guard_runtime_units")
+        result = run_task_file(
+            "metadata_guard", "runtime_dependency.yml", {"metadata_guard_unit_directory": str(folder), "metadata_guard_runtime_units": units}
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    def test_the_runtimes_are_docker_containerd_and_k3s(self) -> None:
+        self.assertEqual(RUNTIME_UNITS, load_list(GROUP_VARIABLES, "metadata_guard_runtime_units"))
+
+    def test_each_runtime_gets_a_drop_in_that_requires_and_follows_the_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output = self.write_dropins(Path(scratch))
+            self.assertEqual(0, code, output)
+            for unit in RUNTIME_UNITS:
+                with self.subTest(unit=unit):
+                    dropin = Path(scratch) / f"{unit}.d" / DROPIN_NAME
+                    self.assertEqual(DROPIN_TEXT, dropin.read_text())
+                    self.assertEqual(0o644, stat.S_IMODE(dropin.stat().st_mode))
+            self.assertEqual(sorted(f"{unit}.d" for unit in RUNTIME_UNITS), sorted(path.name for path in Path(scratch).iterdir()))
+
+    def test_a_second_run_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            self.write_dropins(Path(scratch))
+            code, output = self.write_dropins(Path(scratch))
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, r"changed=0\b")
+
+    def test_the_role_writes_them_and_reloads_systemd_when_they_change(self) -> None:
+        tasks = (ROLE / "tasks" / "main.yml").read_text()
+        self.assertIn("ansible.builtin.include_tasks: runtime_dependency.yml", tasks)
+        self.assertIn("metadata_guard_runtime_dropins is changed", tasks)
+        self.assertLess(tasks.index("runtime_dependency.yml"), tasks.index("Enable the metadata guard at boot"))
 
 
 LOADED = """table inet metadata_guard {

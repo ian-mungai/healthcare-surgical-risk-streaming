@@ -27,6 +27,15 @@ metadata_guard_allowed_units:
   - cloud-config.service
   - cloud-final.service
 
+# The container runtimes. Each requires the metadata guard unit, so none starts while the guard has failed to load.
+metadata_guard_runtime_units:
+  - docker.service
+  - containerd.service
+  - k3s.service
+
+# The folder of the systemd units and their drop-ins.
+metadata_guard_unit_directory: /etc/systemd/system
+
 # The secret store's unlock key file on the host. Its owner is the user that deploys the stack.
 unlock_key_directory: /opt/platform
 unlock_key_file: "{{ unlock_key_directory }}/.env"

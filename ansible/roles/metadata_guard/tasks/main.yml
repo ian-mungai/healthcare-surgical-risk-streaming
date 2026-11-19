@@ -76,11 +76,14 @@
   loop: "{{ metadata_guard_allowed_units }}"
   register: metadata_guard_dropins
 
+- name: Make the container runtimes require the metadata guard
+  ansible.builtin.include_tasks: runtime_dependency.yml
+
 - name: Enable the metadata guard at boot
   ansible.builtin.systemd_service:
     name: metadata-guard.service
     enabled: true
-    daemon_reload: "{{ metadata_guard_unit is changed or metadata_guard_dropins is changed }}"
+    daemon_reload: "{{ metadata_guard_unit is changed or metadata_guard_dropins is changed or metadata_guard_runtime_dropins is changed }}"
 
 - name: Load the metadata guard now
   ansible.builtin.command:

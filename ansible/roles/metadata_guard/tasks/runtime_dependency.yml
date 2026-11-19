@@ -1,0 +1,18 @@
+# A container runtime starts only after the guard loaded. A guard that failed at boot leaves Docker, containerd and k3s stopped.
+- name: Create a drop-in folder for each container runtime
+  ansible.builtin.file:
+    path: "{{ metadata_guard_unit_directory }}/{{ item }}.d"
+    state: directory
+    mode: "0755"
+  loop: "{{ metadata_guard_runtime_units }}"
+
+- name: Make each container runtime require the metadata guard and start after it
+  ansible.builtin.copy:
+    dest: "{{ metadata_guard_unit_directory }}/{{ item }}.d/metadata_guard_required.conf"
+    content: |
+      [Unit]
+      Requires=metadata-guard.service
+      After=metadata-guard.service
+    mode: "0644"
+  loop: "{{ metadata_guard_runtime_units }}"
+  register: metadata_guard_runtime_dropins
