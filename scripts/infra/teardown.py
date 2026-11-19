@@ -31,9 +31,18 @@ from typing import Any
 
 from scripts.aws_cli import Aws, AwsError
 from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
-from scripts.evidence.receipt import receipt_problems, signature_is_valid
+from scripts.evidence.receipt import receipt_problems, signature_is_valid, trusted_signers
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding
-from scripts.infra.terraform_wrapper import APPLY_TIMEOUT_SECONDS, PLAN_TIMEOUT_SECONDS, WrapperError, binding_problems, load_run, save_plan, terraform
+from scripts.infra.terraform_wrapper import (
+    APPLY_TIMEOUT_SECONDS,
+    PLAN_TIMEOUT_SECONDS,
+    WrapperError,
+    approved_plan_copy,
+    binding_problems,
+    load_run,
+    save_plan,
+    terraform,
+)
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 GONE_DEADLINE_SECONDS = 120
@@ -134,26 +143,30 @@ def plan_teardown(aws: Aws, configuration: dict[str, str], run: RunBinding) -> i
     return 0
 
 
-def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str) -> tuple[list[str], dict[str, Any], list[dict[str, str]]]:
+def read_bytes(path: Path) -> bytes | None:
+    return path.read_bytes() if path.is_file() else None
+
+
+def guard_problems(
+    aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path
+) -> tuple[list[str], dict[str, Any], list[dict[str, str]]]:
     inventory_record = read_json(folder / "inventory.json", "the run's inventory")
     inventory = inventory_record["created"]
     approved = read_json(folder / "teardown" / "approved_inventory.json", "the approved inventory")
     saved = read_json(folder / "plans" / "destroy_binding.json", "the destroy plan's binding")
-    plan_file = folder / "plans" / "destroy.tfplan"
-    if not plan_file.is_file():
-        raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
-    receipt = folder / "export" / "receipt.json"
+    receipt = read_bytes(folder / "export" / "receipt.json")
+    signature = read_bytes(folder / "export" / "receipt.json.sig")
     evidence = build_manifest(folder, run.run_id, run.commit)
     current = manifest_sha256(evidence)
     problems = manifest_problems(evidence)
-    problems += receipt_problems(receipt.read_bytes() if receipt.is_file() else None, signature_is_valid(receipt), run, current)
-    problems += binding_problems(run, saved, plan_file.read_bytes(), saved["plan_sha256"][:12], "destroy")
+    problems += receipt_problems(receipt, signature_is_valid(receipt, signature, trusted_signers(run)), run, current)
+    problems += binding_problems(run, saved, plan, saved["plan_sha256"][:12], "destroy")
     if confirm != teardown_code(saved["plan_sha256"], approved):
         problems.append("the confirmation code does not equal the reviewed destroy plan and approved inventory")
     if inventory_record.get("authorized_retained"):
         problems.append("this teardown does not yet keep retained items: remove them from the destroy plan first")
     pre_provisioned = json.loads((folder / "pre_provisioned.json").read_text()) if (folder / "pre_provisioned.json").is_file() else []
-    saved_plan = json.loads(terraform(run, ["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS))
+    saved_plan = json.loads(terraform(run, ["show", "-json", str(approved_plan)], PLAN_TIMEOUT_SECONDS))
     problems += target_problems(delete_targets(saved_plan), inventory, run, pre_provisioned)
     for bucket in application_buckets(inventory):
         problems += bucket_entry_problems(bucket, bucket_entries(aws, bucket), approved["application"])
@@ -215,12 +228,23 @@ def settled_checks(check: Callable[[dict[str, str]], str], inventory: list[dict[
 
 def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
     folder = ROOT / "runs" / run.run_id
-    problems, approved, inventory = guard_problems(aws, run, folder, confirm)
+    plan = read_bytes(folder / "plans" / "destroy.tfplan")
+    if plan is None:
+        raise TeardownRefused("the saved destroy plan is missing: run make teardown-plan")
+    approved_plan = approved_plan_copy(run, plan)
+    try:
+        return destroy_with_plan(aws, run, folder, confirm, plan, approved_plan)
+    finally:
+        approved_plan.unlink(missing_ok=True)
+
+
+def destroy_with_plan(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path) -> int:
+    problems, approved, inventory = guard_problems(aws, run, folder, confirm, plan, approved_plan)
     if problems:
         raise TeardownRefused("refused before any deletion:\n" + "\n".join(problems))
     for bucket in application_buckets(inventory):
         delete_entries(aws, bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == bucket])
-    sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(folder / "plans" / "destroy.tfplan")], APPLY_TIMEOUT_SECONDS)[-1500:])
+    sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)[-1500:])
     removal = folder / "removal"
     removal.mkdir(exist_ok=True)
     if run.backend == "s3":

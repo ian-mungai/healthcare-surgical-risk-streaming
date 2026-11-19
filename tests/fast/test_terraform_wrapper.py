@@ -11,7 +11,17 @@ import hashlib
 import unittest
 
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.infra.terraform_wrapper import backend_arguments, backend_override, binding_problems, plan_binding, plan_label, run_variables
+from scripts.infra.terraform_wrapper import (
+    backend_arguments,
+    backend_override,
+    binding_problems,
+    clean_environment,
+    effective_location_problems,
+    plan_binding,
+    plan_label,
+    run_variables,
+    state_location,
+)
 
 RUN = RunBinding(
     "20260101t0000-abcdef",
@@ -91,6 +101,38 @@ class PlanBindingTest(unittest.TestCase):
     def test_unverified_run_is_refused(self) -> None:
         planned = RunBinding(**{**RUN.__dict__, "status": "planned"})
         self.assertEqual(["the run's state location is not verified"], binding_problems(planned, plan_binding(planned, PLAN, "apply"), PLAN, CODE, "apply"))
+
+
+S3_RECORD = {"backend": {"type": "s3", "config": {"bucket": RUN.state_bucket, "key": RUN.state_keys[0], "region": RUN.region}}}
+LOCAL_RECORD = {"backend": {"type": "local", "config": {"path": LOCAL.state_keys[0]}}}
+
+
+class EffectiveLocationTest(unittest.TestCase):
+    def test_terraform_variables_of_the_caller_do_not_reach_terraform(self) -> None:
+        cleaned = clean_environment({"PATH": "/bin", "HOME": "/srv/example", "TF_WORKSPACE": "other", "TF_VAR_run_id": "x", "TF_CLI_ARGS": "-lock=false"})
+        self.assertEqual({"PATH": "/bin", "HOME": "/srv/example", "TF_IN_AUTOMATION": "1"}, cleaned)
+
+    def test_bound_location_names_the_region_and_every_state_key(self) -> None:
+        self.assertEqual(
+            {"backend": "s3", "bucket": RUN.state_bucket, "workspace": "default", "keys": RUN.state_keys, "region": "us-west-2"}, state_location(RUN)
+        )
+
+    def test_matching_effective_backend_passes(self) -> None:
+        self.assertEqual([], effective_location_problems(RUN, S3_RECORD, "default"))
+        self.assertEqual([], effective_location_problems(LOCAL, LOCAL_RECORD, "default"))
+
+    def test_other_workspace_is_refused(self) -> None:
+        self.assertEqual(["Terraform selected the workspace other, not default"], effective_location_problems(RUN, S3_RECORD, "other"))
+
+    def test_other_backend_values_are_refused(self) -> None:
+        moved = {"backend": {"type": "s3", "config": {"bucket": "other-bucket", "key": RUN.state_keys[0], "region": RUN.region}}}
+        self.assertEqual(["Terraform's backend bucket differs from this run's binding"], effective_location_problems(RUN, moved, "default"))
+        self.assertEqual(["Terraform's backend type is local, not s3"], effective_location_problems(RUN, LOCAL_RECORD, "default"))
+        elsewhere = {"backend": {"type": "local", "config": {"path": "/srv/other/terraform.tfstate"}}}
+        self.assertEqual(["Terraform's backend path differs from this run's binding"], effective_location_problems(LOCAL, elsewhere, "default"))
+
+    def test_missing_backend_record_is_refused(self) -> None:
+        self.assertEqual(["Terraform's backend type is missing, not s3"], effective_location_problems(RUN, {}, "default"))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ Run from the repository root under the project profile in ``.env``:
 ``plan`` selects the backend from the run binding and the environment's variable file, saves the plan under
 ``runs/<RUN_ID>/plans/`` with its readable text and its JSON form and binds the plan file's hash to the run's state location. It prints
 the resource changes and a confirmation code. ``apply`` refuses a changed plan file, a wrong code and a plan saved for
-another state location, then applies the saved plan. ``plan --destroy`` saves a destroy plan the same way; this
+another state location, then applies the exact bytes it checked. Each run has its own copy of the configuration, and
+no Terraform variable of the caller reaches Terraform. ``plan --destroy`` saves a destroy plan the same way; this
 command never applies one.
 """
 
@@ -18,7 +19,9 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +40,8 @@ class WrapperError(RuntimeError):
     """The wrapper refused to continue or a Terraform call failed."""
 
 
-BACKEND_OVERRIDE = ROOT / "infra" / "backend_override.tf"
+CONFIGURATION_PARTS = ("modules", "environments")
+BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
 
 
 def backend_override(run: RunBinding) -> str | None:
@@ -59,8 +63,51 @@ def backend_arguments(run: RunBinding, profile: str) -> list[str]:
     return [f"-backend-config={key}={value}" for key, value in backend.items()]
 
 
-def state_location(run: RunBinding) -> dict[str, str]:
-    return {"backend": run.backend, "bucket": run.state_bucket, "workspace": run.workspace, "key": run.state_keys[0]}
+def state_location(run: RunBinding) -> dict[str, Any]:
+    return {"backend": run.backend, "bucket": run.state_bucket, "workspace": run.workspace, "keys": run.state_keys, "region": run.region}
+
+
+def clean_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """The caller's environment without any Terraform variable, so none can change the workspace, the inputs or the arguments."""
+    return {name: value for name, value in environment.items() if not name.startswith("TF_")} | {"TF_IN_AUTOMATION": "1"}
+
+
+def effective_location_problems(run: RunBinding, backend_record: dict[str, Any], workspace: str) -> list[str]:
+    """Each difference between the backend and workspace Terraform initialised and this run's binding."""
+    backend = backend_record.get("backend", {})
+    kind = backend.get("type", "missing")
+    if kind != run.backend:
+        return [f"Terraform's backend type is {kind}, not {run.backend}"]
+    bound = {"bucket": run.state_bucket, "key": run.state_keys[0], "region": run.region, "path": run.state_keys[0]}
+    problems = [
+        f"Terraform's backend {name} differs from this run's binding" for name in BOUND_BACKEND_KEYS[kind] if backend.get("config", {}).get(name) != bound[name]
+    ]
+    if workspace != run.workspace:
+        problems.append(f"Terraform selected the workspace {workspace}, not {run.workspace}")
+    return problems
+
+
+def configuration_folder(run: RunBinding) -> Path:
+    return ROOT / ".tools" / "terraform" / run.run_id / "config"
+
+
+def prepare_configuration(run: RunBinding) -> Path:
+    """Give the run its own copy of the Terraform configuration with its own backend override, apart from every other run."""
+    target = configuration_folder(run)
+    target.mkdir(parents=True, exist_ok=True)
+    for stale in target.iterdir():
+        if stale.name != ".terraform":
+            shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
+    source = ROOT / "infra"
+    for item in [*source.glob("*.tf"), *source.glob("*.auto.tfvars"), source / ".terraform.lock.hcl"]:
+        if item.name != "backend_override.tf":
+            shutil.copy2(item, target / item.name)
+    for part in CONFIGURATION_PARTS:
+        shutil.copytree(source / part, target / part)
+    override = backend_override(run)
+    if override is not None:
+        (target / "backend_override.tf").write_text(override)
+    return target
 
 
 def plan_binding(run: RunBinding, plan: bytes, action: str) -> dict[str, Any]:
@@ -85,8 +132,8 @@ def binding_problems(run: RunBinding, saved: dict[str, Any], plan: bytes, code: 
 
 
 def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
-    environment = os.environ | {"TF_IN_AUTOMATION": "1", "TF_DATA_DIR": str(ROOT / ".tools" / "terraform" / run.run_id)}
-    result = run_command("terraform", ["-chdir=infra", *arguments], cwd=ROOT, env=environment, timeout=timeout)
+    command = [f"-chdir={configuration_folder(run)}", *arguments]
+    result = run_command("terraform", command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
     if result.returncode != 0:
         raise WrapperError(f"terraform {arguments[0]} failed:\n{result.stdout}{result.stderr}")
     return result.stdout
@@ -99,12 +146,24 @@ def load_run(path: Path) -> RunBinding:
 
 
 def initialise(run: RunBinding, configuration: dict[str, str]) -> None:
-    override = backend_override(run)
-    if override is None:
-        BACKEND_OVERRIDE.unlink(missing_ok=True)
-    else:
-        BACKEND_OVERRIDE.write_text(override)
+    """Initialise the run's own configuration copy and refuse when Terraform's backend or workspace is not the bound one."""
+    folder = prepare_configuration(run)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
+    record_file = folder / ".terraform" / "terraform.tfstate"
+    record = json.loads(record_file.read_text()) if record_file.is_file() else {}
+    problems = effective_location_problems(run, record, terraform(run, ["workspace", "show"], PLAN_TIMEOUT_SECONDS).strip())
+    if problems:
+        raise WrapperError("refused before any plan or change: " + "; ".join(problems))
+
+
+def approved_plan_copy(run: RunBinding, plan: bytes) -> Path:
+    """Write the exact bytes that were checked to an owner-only file, so the plan that is shown and applied is the plan that was checked."""
+    target = configuration_folder(run) / "approved.tfplan"
+    target.unlink(missing_ok=True)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(plan)
+    return target
 
 
 def state_json(run: RunBinding, configuration: dict[str, str]) -> dict[str, Any]:
@@ -160,11 +219,17 @@ def apply_plan(run: RunBinding, code: str) -> int:
     binding_file = folder / "apply_binding.json"
     if not plan_file.is_file() or not binding_file.is_file():
         raise WrapperError("no saved apply plan for this run: run plan first")
-    problems = binding_problems(run, json.loads(binding_file.read_text()), plan_file.read_bytes(), code, "apply")
+    plan = plan_file.read_bytes()
+    problems = binding_problems(run, json.loads(binding_file.read_text()), plan, code, "apply")
     if problems:
         raise WrapperError("refused before any change: " + "; ".join(problems))
-    sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(plan_file)], APPLY_TIMEOUT_SECONDS))
-    record_created(run, json.loads(terraform(run, ["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS)))
+    approved = approved_plan_copy(run, plan)
+    try:
+        applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
+        sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS))
+    finally:
+        approved.unlink(missing_ok=True)
+    record_created(run, applied_plan)
     return 0
 
 
