@@ -37,6 +37,10 @@ class SelectPeerTest(unittest.TestCase):
         with self.assertRaisesRegex(HostError, "no online peer"):
             select_peer({"Peer": {"a": peer("platform-dev", tags=())}}, "platform-dev", "tag:surgical-host")
 
+    def test_status_with_no_peer_list_is_refused(self) -> None:
+        with self.assertRaisesRegex(HostError, "no online peer"):
+            select_peer({"Peer": None}, "platform-dev", "tag:surgical-host")
+
     def test_empty_status_is_refused(self) -> None:
         with self.assertRaisesRegex(HostError, "no online peer"):
             select_peer({}, "platform-dev", "tag:surgical-host")

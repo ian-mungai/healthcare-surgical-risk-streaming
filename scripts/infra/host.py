@@ -60,7 +60,9 @@ def wait_for(what: str, check: Callable[[], bool], deadline_seconds: int) -> Non
 
 def select_peer(status: dict[str, Any], host_name: str, tag: str) -> str:
     """The Tailscale DNS name of the newest online peer that has the host's name and tag."""
-    peers = [peer for peer in status.get("Peer", {}).values() if peer.get("HostName") == host_name and peer.get("Online") and tag in (peer.get("Tags") or [])]
+    peers = [
+        peer for peer in (status.get("Peer") or {}).values() if peer.get("HostName") == host_name and peer.get("Online") and tag in (peer.get("Tags") or [])
+    ]
     if not peers:
         raise HostError(f"no online peer named {host_name} with {tag} in the Tailscale network")
     return str(max(peers, key=lambda peer: peer["Created"])["DNSName"]).rstrip(".")
