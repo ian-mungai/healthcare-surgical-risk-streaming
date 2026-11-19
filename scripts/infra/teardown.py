@@ -25,6 +25,7 @@ import hashlib
 import json
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +197,18 @@ def removal_check(aws: Aws, entry: dict[str, str]) -> str:
     return "removed with its parent resource"
 
 
+def settled_checks(check: Callable[[dict[str, str]], str], inventory: list[dict[str, str]], *, attempts: int, pause_seconds: float) -> list[dict[str, str]]:
+    """Each inventory entry with what its service reports, asked again while a removal is still reported as existing."""
+    reported = {entry["address"]: check(entry) for entry in inventory}
+    for _ in range(attempts - 1):
+        late = [entry for entry in inventory if reported[entry["address"]].startswith("still exists")]
+        if not late:
+            break
+        time.sleep(pause_seconds)
+        reported.update({entry["address"]: check(entry) for entry in late})
+    return [entry | {"reported": reported[entry["address"]]} for entry in inventory]
+
+
 def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
     folder = ROOT / "runs" / run.run_id
     problems, approved, inventory = guard_problems(aws, run, folder, confirm)
@@ -219,7 +232,9 @@ def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
         delete_entries(aws, run.state_bucket, [(entry["Key"], entry["VersionId"]) for entry in entries])
         aws.call("s3api", "delete-bucket", "--bucket", run.state_bucket)
         wait_gone(aws, run.state_bucket)
-    checks = [entry | {"reported": removal_check(aws, entry)} for entry in inventory]
+    checks = settled_checks(
+        lambda entry: removal_check(aws, entry), inventory, attempts=GONE_DEADLINE_SECONDS // GONE_POLL_SECONDS, pause_seconds=GONE_POLL_SECONDS
+    )
     remaining = [check for check in checks if check["reported"].startswith("still exists")]
     (removal / "checks.json").write_text(
         json.dumps({"run_id": run.run_id, "checks": checks, "retained_cost": "none: no resource is retained"}, indent=2) + "\n"

@@ -14,7 +14,7 @@ from pathlib import Path
 from scripts.evidence.manifest import build_manifest, manifest_sha256, readback_problems
 from scripts.evidence.receipt import receipt_problems
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.infra.teardown import bucket_entry_problems, delete_targets, state_entry_problems, target_problems
+from scripts.infra.teardown import bucket_entry_problems, delete_targets, settled_checks, state_entry_problems, target_problems
 
 STATE_KEYS = ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified")
@@ -187,6 +187,17 @@ class ObjectInventoryTest(unittest.TestCase):
         approved = [[STATE_KEYS[0], "v1"]]
         found = [entry(STATE_KEYS[0], "v1"), entry(STATE_KEYS[0], "v3")]
         self.assertEqual([], state_entry_problems(found, STATE_KEYS, approved, [[STATE_KEYS[0], "v3"]]))
+
+
+class RemovalCheckTest(unittest.TestCase):
+    def test_a_removal_that_the_service_reports_late_is_confirmed(self) -> None:
+        answers = {"example-landing": iter(["still exists", "still exists", "gone"]), "i-0aaa": iter(["gone"]), "example-state": iter(["gone"])}
+        checks = settled_checks(lambda entry: next(answers[entry["service_id"]]), INVENTORY, attempts=5, pause_seconds=0)
+        self.assertEqual(["gone", "gone", "gone"], [check["reported"] for check in checks])
+
+    def test_a_resource_that_stays_is_reported_after_the_last_attempt(self) -> None:
+        checks = settled_checks(lambda entry: "still exists" if entry["service_id"] == "i-0aaa" else "gone", INVENTORY, attempts=3, pause_seconds=0)
+        self.assertEqual(["still exists", "gone", "gone"], [check["reported"] for check in checks])
 
 
 if __name__ == "__main__":
