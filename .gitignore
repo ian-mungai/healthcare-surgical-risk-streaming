@@ -34,3 +34,6 @@ __pycache__/
 *.tfstate.*
 *.tfplan
 *_override.tf
+
+# Worktrees of this repository
+/.worktrees/
