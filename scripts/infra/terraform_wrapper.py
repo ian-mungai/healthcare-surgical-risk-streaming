@@ -36,7 +36,24 @@ class WrapperError(RuntimeError):
     """The wrapper refused to continue or a Terraform call failed."""
 
 
+BACKEND_OVERRIDE = ROOT / "infra" / "backend_override.tf"
+
+
+def backend_override(run: RunBinding) -> str | None:
+    """The Terraform override that selects the local backend, or None for the S3 backend that the configuration names."""
+    if run.backend != "local":
+        return None
+    return f'terraform {{\n  backend "local" {{\n    path = "{run.state_keys[0]}"\n  }}\n}}\n'
+
+
+def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, str]:
+    """The Terraform variables that come from the run and not from the environment's variable file."""
+    return {"run_id": run.run_id, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.backend == "s3" else "false"}
+
+
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:
+    if run.backend == "local":
+        return []
     backend = {"bucket": run.state_bucket, "key": run.state_keys[0], "region": run.region, "profile": profile, "use_lockfile": "true"}
     return [f"-backend-config={key}={value}" for key, value in backend.items()]
 
@@ -54,7 +71,7 @@ def binding_problems(run: RunBinding, saved: dict[str, Any], plan: bytes, code: 
     """Each reason to refuse the saved plan, checked before Terraform runs."""
     problems = []
     if run.status != "verified":
-        problems.append("the run's state bucket is not verified")
+        problems.append("the run's state location is not verified")
     if saved["action"] != action:
         problems.append(f"the plan was saved as {saved['action']}, not {action}")
     if saved["state_location"] != state_location(run) or saved["run_id"] != run.run_id:
@@ -81,6 +98,11 @@ def load_run(path: Path) -> RunBinding:
 
 
 def initialise(run: RunBinding, configuration: dict[str, str]) -> None:
+    override = backend_override(run)
+    if override is None:
+        BACKEND_OVERRIDE.unlink(missing_ok=True)
+    else:
+        BACKEND_OVERRIDE.write_text(override)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
 
 
@@ -102,7 +124,7 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
     if missing:
         raise WrapperError(f".env: missing values for: {', '.join(missing)}")
-    values = {"run_id": run.run_id, "aws_profile": configuration["AWS_PROFILE"]} | {key.lower(): configuration[key] for key in TAILSCALE_KEYS}
+    values = run_variables(run, configuration) | {key.lower(): configuration[key] for key in TAILSCALE_KEYS}
     variables = [f"-var-file=environments/{configuration['ENVIRONMENT']}.tfvars", *[f"-var={name}={value}" for name, value in values.items()]]
     terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={plan_file}"], PLAN_TIMEOUT_SECONDS)
     (folder / f"{action}.txt").write_text(terraform(run, ["show", "-no-color", str(plan_file)], PLAN_TIMEOUT_SECONDS))

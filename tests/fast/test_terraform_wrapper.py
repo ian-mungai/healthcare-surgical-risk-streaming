@@ -11,7 +11,7 @@ import hashlib
 import unittest
 
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.infra.terraform_wrapper import backend_arguments, binding_problems, plan_binding
+from scripts.infra.terraform_wrapper import backend_arguments, backend_override, binding_problems, plan_binding, run_variables
 
 RUN = RunBinding(
     "20260101t0000-abcdef",
@@ -23,6 +23,7 @@ RUN = RunBinding(
     ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"],
     "verified",
 )
+LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified")
 PLAN = b"saved plan bytes"
 CODE = hashlib.sha256(PLAN).hexdigest()[:12]
 
@@ -37,6 +38,23 @@ class PlanBindingTest(unittest.TestCase):
             "-backend-config=use_lockfile=true",
         ]
         self.assertEqual(expected, backend_arguments(RUN, "example_project_dev"))
+
+    def test_local_backend_is_rendered_as_an_override_and_takes_no_backend_arguments(self) -> None:
+        self.assertEqual([], backend_arguments(LOCAL, "example_project_dev"))
+        self.assertEqual('terraform {\n  backend "local" {\n    path = "/srv/run/terraform.tfstate"\n  }\n}\n', backend_override(LOCAL))
+
+    def test_s3_backend_renders_no_override(self) -> None:
+        self.assertIsNone(backend_override(RUN))
+
+    def test_local_backend_preserves_the_host_it_was_given(self) -> None:
+        self.assertEqual("false", run_variables(LOCAL, {"AWS_PROFILE": "example_project_dev"})["provision_host"])
+        self.assertEqual("true", run_variables(RUN, {"AWS_PROFILE": "example_project_dev"})["provision_host"])
+
+    def test_plan_saved_for_the_s3_backend_is_refused_under_the_local_backend(self) -> None:
+        self.assertEqual(
+            ["the plan was saved for a different state location than this run's"],
+            binding_problems(LOCAL, plan_binding(RUN, PLAN, "apply"), PLAN, CODE, "apply"),
+        )
 
     def test_matching_plan_passes(self) -> None:
         self.assertEqual([], binding_problems(RUN, plan_binding(RUN, PLAN, "apply"), PLAN, CODE, "apply"))
@@ -64,7 +82,7 @@ class PlanBindingTest(unittest.TestCase):
 
     def test_unverified_run_is_refused(self) -> None:
         planned = RunBinding(**{**RUN.__dict__, "status": "planned"})
-        self.assertEqual(["the run's state bucket is not verified"], binding_problems(planned, plan_binding(planned, PLAN, "apply"), PLAN, CODE, "apply"))
+        self.assertEqual(["the run's state location is not verified"], binding_problems(planned, plan_binding(planned, PLAN, "apply"), PLAN, CODE, "apply"))
 
 
 if __name__ == "__main__":

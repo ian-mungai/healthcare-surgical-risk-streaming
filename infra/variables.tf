@@ -91,6 +91,12 @@ variable "tailscale_version" {
   default     = "1.104.7"
 }
 
+variable "provision_host" {
+  description = "Whether Terraform creates the host. False for a host that already exists, which Terraform never touches."
+  type        = bool
+  default     = true
+}
+
 variable "host_instance_type" {
   description = "EC2 instance type of the host."
   type        = string

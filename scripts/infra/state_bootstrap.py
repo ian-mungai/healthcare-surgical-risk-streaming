@@ -50,9 +50,11 @@ class RunBinding:
         path.write_text(json.dumps(asdict(self), indent=2) + "\n")
 
 
-def new_binding(configuration: dict[str, str]) -> RunBinding:
+def new_binding(configuration: dict[str, str], backend: str = "s3") -> RunBinding:
     run_id = datetime.now(UTC).strftime("%Y%m%dt%H%M") + "-" + secrets.token_hex(3)
     commit = run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
+    if backend == "local":
+        return RunBinding(run_id, commit, "local", configuration["AWS_REGION"], "", WORKSPACE, [str(ROOT / "runs" / run_id / "terraform.tfstate")], "verified")
     bucket = f"{configuration['BUCKET_PREFIX']}-state-{configuration['ENVIRONMENT']}-{run_id}"
     return RunBinding(run_id, commit, "s3", configuration["AWS_REGION"], bucket, WORKSPACE, [STATE_KEY, f"{STATE_KEY}.tflock"], "planned")
 
@@ -100,10 +102,16 @@ def repair(aws: Aws, bucket: str, name: str, tags: dict[str, str]) -> None:
         aws.call("s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging", tag_set)
 
 
-def create(aws: Aws, configuration: dict[str, str], path: Path) -> int:
-    binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration)
+def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3") -> int:
+    binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend)
+    if binding.backend != backend:
+        sys.stderr.write(f"the run is bound to the {binding.backend} backend, not {backend}\n")
+        return 1
     if not path.is_file():
         binding.write(path)
+    if binding.backend == "local":
+        sys.stdout.write(f"run {binding.run_id}: local state at {binding.state_keys[0]}; no state bucket is used\n")
+        return 0
     tags = required_tags(configuration)
     changes = []
     if not bucket_exists(aws, binding.state_bucket):
@@ -130,6 +138,9 @@ def verify(aws: Aws, configuration: dict[str, str], path: Path) -> int:
         sys.stderr.write("no run binding: run create first\n")
         return 1
     binding = RunBinding(**json.loads(path.read_text()))
+    if binding.backend == "local":
+        sys.stdout.write(f"run {binding.run_id}: local state; no state bucket to verify\n")
+        return 0
     if not bucket_exists(aws, binding.state_bucket):
         sys.stderr.write("the bound state bucket does not exist\n")
         return 1
@@ -145,11 +156,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["create", "verify"])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
+    parser.add_argument(
+        "--backend", choices=["s3", "local"], default="s3", help="create: s3 for a host in AWS, local for a host that already exists outside AWS"
+    )
     arguments = parser.parse_args()
     try:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
-        return (create if arguments.command == "create" else verify)(aws, configuration, arguments.binding)
+        if arguments.command == "create":
+            return create(aws, configuration, arguments.binding, arguments.backend)
+        return verify(aws, configuration, arguments.binding)
     except (ConfigurationError, AwsError) as error:
         sys.stderr.write(f"{error}\n")
         return 1

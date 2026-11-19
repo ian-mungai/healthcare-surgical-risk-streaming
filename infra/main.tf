@@ -25,6 +25,7 @@ module "storage" {
 
 module "host" {
   source = "./modules/host"
+  count  = var.provision_host ? 1 : 0
 
   name          = "${var.project_name}_host_${var.environment}"
   boundary_name = "${var.project_name}_role_boundary"

@@ -139,6 +139,10 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         sys.stdout.write("stopped for review: read the full plan text, then run make host-up CONFIRM=<the code above>\n")
         return 0
     host_name = f"platform-{configuration['ENVIRONMENT']}"
+    if run.backend == "local":
+        sys.stdout.write(f"run {run.run_id}: the host already exists and Terraform does not touch it; deploy to it with the deploy workflow\n")
+        write_inventory(binding)
+        return 0
     address = wait_until_reachable(aws, run.run_id, instance_id(state_json(run, configuration)), host_name)
     run_ansible(run.run_id, address)
     write_inventory(binding)

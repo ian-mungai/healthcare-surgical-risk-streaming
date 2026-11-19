@@ -198,6 +198,24 @@ run "deploy_role_trusts_only_the_protected_workflow" {
   }
 }
 
+run "given_host_is_not_provisioned" {
+  command = plan
+
+  variables {
+    provision_host = false
+  }
+
+  assert {
+    condition     = output.host_instance_id == null && output.host_role_arn == null
+    error_message = "With a host that already exists, no instance and no instance role are planned."
+  }
+
+  assert {
+    condition     = length(output.bucket_names) == 2
+    error_message = "The project buckets are planned for a host that already exists too."
+  }
+}
+
 run "small_disk_is_refused" {
   command = plan
 
