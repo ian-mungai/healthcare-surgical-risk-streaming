@@ -22,6 +22,7 @@ PATTERNS = {
 OPTIONAL_PATTERNS = {
     "TAILSCALE_CLIENT_ID": re.compile(r"(?!tskey)\S+"),
     "TAILSCALE_AUDIENCE": re.compile(r"\S+"),
+    "EVIDENCE_VERIFIER_KEY": re.compile(r"\S+"),
 }
 
 

@@ -1,6 +1,6 @@
 PYTHON := .venv/bin/python
 
-.PHONY: setup lock check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory
+.PHONY: setup lock check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy
 
 setup:
 	python3.14 -m venv .venv
@@ -41,3 +41,15 @@ host-start:
 
 inventory:
 	$(PYTHON) -m scripts.infra.inventory
+
+evidence-export:
+	$(PYTHON) -m scripts.evidence.export
+
+evidence-verify:
+	$(PYTHON) -m scripts.evidence.verify
+
+teardown-plan:
+	$(PYTHON) -m scripts.infra.teardown plan
+
+host-destroy:
+	$(PYTHON) -m scripts.infra.teardown destroy --confirm "$(CONFIRM)"
