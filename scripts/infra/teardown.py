@@ -1,23 +1,23 @@
-"""Plan and run the guarded teardown of the resources this run created.
+"""Plan and run the guarded teardown of the resources this run created, at the end of the project.
 
 Run from the repository root under the project profile in ``.env``, through ``make``:
 
 ``make teardown-plan`` saves the destroy plan and records the approved inventory: every object version and delete
-marker in the run's application buckets and in its state bucket. It prints a confirmation code for the owner.
+marker in the bucket, the data apart from this run's Terraform state. It prints a confirmation code for the owner.
 ``make host-destroy CONFIRM=<CODE>`` runs every guard first and refuses, before any deletion, when one fails:
 
 1. The owner's signed receipt must cover the current evidence of this run and commit.
 2. The saved destroy plan must be the reviewed one, saved for this run's state location.
 3. Every delete target must be a resource in this run's inventory. A host that existed before the run is refused,
-   and so is any host in a run that was given its host and any state bucket under the local backend.
-4. Every entry in an application bucket must match an approved bucket, key and version ID.
-5. Every entry in the state bucket must be at one of this run's state keys and match an approved key and version ID.
+   and so is any host in a run that was given its host and a bucket this run did not create.
+4. Every data entry in the bucket must match an approved key and version ID.
+5. Every entry at this run's state keys must match an approved key and version ID.
 
-It then empties, by key and version ID, only the buckets that the saved plan deletes, applies the exact plan bytes it
-checked, and accepts a new state bucket entry only when its content shows the destroy of this state wrote it. It
-deletes the approved and recorded state entries, removes the empty state bucket last and checks each removal
-through its service; a resource with no check is verified only through a parent that is gone. Each finished stage is
-recorded, so a second run does nothing and an interrupted run resumes.
+It then deletes the approved data entries by key and version ID, applies the exact plan bytes it checked, and
+accepts a new entry in the bucket only when its content shows the destroy of this state wrote it. It deletes the
+approved and recorded state entries, removes the empty bucket last when this run created it, keeps a bucket this
+run did not create, and checks each removal through its service; a resource with no check is verified only through
+a parent that is gone. Each finished stage is recorded, so a second run does nothing and an interrupted run resumes.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from typing import Any
 from scripts.aws_cli import Aws, AwsError
 from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
 from scripts.evidence.receipt import receipt_problems, signature_is_valid, trusted_signers
+from scripts.infra.created import BUCKET_ADDRESS
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding
 from scripts.infra.terraform_wrapper import (
     APPLY_TIMEOUT_SECONDS,
@@ -54,7 +55,7 @@ GONE_DEADLINE_SECONDS = 120
 GONE_POLL_SECONDS = 5
 CHECK_TIMEOUT_SECONDS = 30
 STAGES = ("purge", "apply", "state", "checks")
-PARENT_TYPES = {"aws_iam_role_policy": "aws_iam_role", "aws_s3_bucket_versioning": "aws_s3_bucket", "aws_s3_bucket_public_access_block": "aws_s3_bucket"}
+PARENT_TYPES = {"aws_iam_role_policy": "aws_iam_role"}
 DESTROYED = re.compile(r"Resources: \d+ added, \d+ changed, (\d+) destroyed")
 Target = tuple[str, str, str]
 
@@ -70,9 +71,9 @@ def delete_targets(plan: dict[str, Any]) -> list[Target]:
 
 
 def target_problems(targets: list[Target], inventory: list[dict[str, str]], run: RunBinding, pre_provisioned: list[str]) -> list[str]:
-    """Each delete target or state bucket that this run does not own."""
+    """Each delete target that this run does not own, and a bucket named for removal that this run did not create."""
     owned = {(entry["type"], entry["service_id"]) for entry in inventory}
-    state_buckets = [entry["service_id"] for entry in inventory if entry["address"] == "state bucket"]
+    listed = [entry["service_id"] for entry in inventory if entry["address"] == BUCKET_ADDRESS]
     problems = []
     for address, kind, identifier in targets:
         if kind == "aws_instance" and not run.provision_host:
@@ -81,17 +82,13 @@ def target_problems(targets: list[Target], inventory: list[dict[str, str]], run:
             problems.append(f"delete target is a host that existed before this run: {address}")
         elif (kind, identifier) not in owned:
             problems.append(f"delete target outside this run's inventory: {address}")
-    if run.backend == "local" and state_buckets:
-        problems.append("a state bucket is named for removal under the local backend")
-    if run.backend == "s3" and run.state_bucket_creation != "created":
-        problems.append("the state bucket was not created by this run")
-    elif run.backend == "s3" and state_buckets != [run.state_bucket]:
-        problems.append("the bound state bucket is not the state bucket in this run's inventory")
+    if listed != ([run.bucket] if run.bucket_creation == "created" else []):
+        problems.append("the bucket in this run's inventory is not the bucket this run created")
     return problems
 
 
 def bucket_entry_problems(bucket: str, entries: list[dict[str, Any]], approved: list[list[str]]) -> list[str]:
-    """Each object version or delete marker in an application bucket with no approved bucket, key and version ID match."""
+    """Each data object version or delete marker in the bucket with no approved bucket, key and version ID match."""
     allowed = {(item[0], item[1], item[2]) for item in approved}
     problems = []
     for entry in entries:
@@ -103,14 +100,14 @@ def bucket_entry_problems(bucket: str, entries: list[dict[str, Any]], approved: 
 
 
 def state_entry_problems(entries: list[dict[str, Any]], state_keys: list[str], approved: list[list[str]], recorded: list[list[str]] | None = None) -> list[str]:
-    """Each state bucket entry at a foreign key, or with no approved or recorded key and version ID match."""
+    """Each entry at a key that is not this run's state key, or with no approved or recorded key and version ID match."""
     allowed = {(item[0], item[1]) for item in [*approved, *(recorded or [])]}
     problems = []
     for entry in entries:
         if entry["Key"] not in state_keys:
-            problems.append(f"state bucket: key outside this run's state keys: {entry['Key']}")
+            problems.append(f"bucket: key outside this run's state keys: {entry['Key']}")
         elif (entry["Key"], entry["VersionId"]) not in allowed:
-            problems.append(f"state bucket: version outside the approved inventory: {entry['Key']}")
+            problems.append(f"bucket: state version outside the approved inventory: {entry['Key']}")
     return problems
 
 
@@ -119,8 +116,15 @@ def bucket_entries(aws: Aws, bucket: str) -> list[dict[str, Any]]:
     return [*listing.get("Versions", []), *listing.get("DeleteMarkers", [])]
 
 
-def application_buckets(inventory: list[dict[str, str]]) -> list[str]:
-    return sorted(entry["service_id"] for entry in inventory if entry["type"] == "aws_s3_bucket" and entry["address"] != "state bucket")
+def bucket_state_keys(run: RunBinding) -> list[str]:
+    """The keys in the bucket that hold this run's Terraform state: none when the state is a local file."""
+    return run.state_keys if run.backend == "s3" else []
+
+
+def split_entries(entries: list[dict[str, Any]], run: RunBinding) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The bucket's entries as data and as this run's state; an entry at any other key is data."""
+    keys = bucket_state_keys(run)
+    return [entry for entry in entries if entry["Key"] not in keys], [entry for entry in entries if entry["Key"] in keys]
 
 
 def teardown_code(plan_hash: str, approved: dict[str, Any]) -> str:
@@ -135,12 +139,13 @@ def read_json(path: Path, what: str) -> Any:
 
 def plan_teardown(aws: Aws, configuration: dict[str, str], run: RunBinding) -> int:
     folder = ROOT / "runs" / run.run_id
-    inventory = read_json(folder / "inventory.json", "the run's inventory")["created"]
+    read_json(folder / "inventory.json", "the run's inventory")
     save_plan(run, configuration, "destroy")
+    data, state = split_entries(bucket_entries(aws, run.bucket), run)
     approved: dict[str, Any] = {
-        "application": [[bucket, entry["Key"], entry["VersionId"]] for bucket in application_buckets(inventory) for entry in bucket_entries(aws, bucket)]
+        "application": [[run.bucket, entry["Key"], entry["VersionId"]] for entry in data],
+        "state": [[entry["Key"], entry["VersionId"]] for entry in state],
     }
-    approved["state"] = [[entry["Key"], entry["VersionId"]] for entry in bucket_entries(aws, run.state_bucket)] if run.backend == "s3" else []
     current_state = json.loads(terraform(run, ["state", "pull"], PLAN_TIMEOUT_SECONDS))
     approved["state_lineage"] = current_state["lineage"]
     approved["state_serial"] = current_state["serial"]
@@ -184,12 +189,6 @@ def local_state_problem(state_file: Path, approved_hash: str) -> str | None:
     return None
 
 
-def purge_buckets(targets: list[Target], inventory: list[dict[str, str]]) -> list[str]:
-    """The run's application buckets that the saved plan deletes; no other bucket is emptied."""
-    deleted = {identifier for _, kind, identifier in targets if kind == "aws_s3_bucket"}
-    return [bucket for bucket in application_buckets(inventory) if bucket in deleted]
-
-
 def remaining_stages(finished: list[str]) -> list[str]:
     return [stage for stage in STAGES if stage not in finished]
 
@@ -229,11 +228,10 @@ def guard_problems(aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: 
     saved_plan = json.loads(terraform(run, ["show", "-json", str(approved_plan)], PLAN_TIMEOUT_SECONDS))
     targets = delete_targets(saved_plan)
     problems += target_problems(targets, inventory, run, pre_provisioned)
-    for bucket in application_buckets(inventory):
-        problems += bucket_entry_problems(bucket, bucket_entries(aws, bucket), approved["application"])
-    if run.backend == "s3":
-        problems += state_entry_problems(bucket_entries(aws, run.state_bucket), run.state_keys, approved["state"])
-    elif problem := local_state_problem(Path(run.state_keys[0]), approved["local_state_sha256"]):
+    data, state = split_entries(bucket_entries(aws, run.bucket), run)
+    problems += bucket_entry_problems(run.bucket, data, approved["application"])
+    problems += state_entry_problems(state, run.state_keys, approved["state"])
+    if run.backend == "local" and (problem := local_state_problem(Path(run.state_keys[0]), approved["local_state_sha256"])):
         problems.append(problem)
     return problems, targets
 
@@ -262,11 +260,12 @@ def entry_content(aws: Aws, bucket: str, entry: dict[str, Any]) -> bytes:
         return target.read_bytes()
 
 
-def clean_state_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: Path) -> None:
-    """Record each entry the destroy wrote, stop on any entry it did not write, then delete by key and version ID and remove the bucket."""
-    listing = aws.call("s3api", "list-object-versions", "--bucket", run.state_bucket)
+def clean_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: Path) -> str:
+    """Record each entry the destroy wrote, stop on any entry it did not write, delete the state entries, then remove the bucket this run created."""
+    listing = aws.call("s3api", "list-object-versions", "--bucket", run.bucket)
     markers = {(entry["Key"], entry["VersionId"]) for entry in listing.get("DeleteMarkers", [])}
     entries = [*listing.get("Versions", []), *listing.get("DeleteMarkers", [])]
+    keys = bucket_state_keys(run)
     known = {(item[0], item[1]) for item in approved["state"]}
     recorded, foreign = [], []
     for entry in entries:
@@ -274,21 +273,24 @@ def clean_state_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], remo
         if pair in known:
             continue
         is_marker = pair in markers
-        content = None if is_marker or entry["Key"] not in run.state_keys else entry_content(aws, run.state_bucket, entry)
-        problem = destroy_write_problem(entry["Key"], content, is_marker, run.state_keys, approved["state_lineage"], approved["state_serial"])
+        content = None if is_marker or entry["Key"] not in keys else entry_content(aws, run.bucket, entry)
+        problem = destroy_write_problem(entry["Key"], content, is_marker, keys, approved["state_lineage"], approved["state_serial"])
         if problem:
-            foreign.append(f"state bucket: {problem}: {entry['Key']}")
+            foreign.append(f"bucket: {problem}: {entry['Key']}")
         else:
             recorded.append([entry["Key"], entry["VersionId"]])
     (removal / "destroy_written_state_entries.json").write_text(json.dumps(recorded, indent=2) + "\n")
-    left = foreign + state_entry_problems(entries, run.state_keys, approved["state"], recorded)
+    left = foreign + state_entry_problems(entries, keys, approved["state"], recorded)
     if left:
-        raise TeardownRefused("the environment is gone, and the state bucket is kept because:\n" + "\n".join(sorted(set(left))))
+        raise TeardownRefused("the environment is gone, and the bucket is kept because:\n" + "\n".join(sorted(set(left))))
     for entry in entries:
-        aws.call("s3api", "delete-object", "--bucket", run.state_bucket, "--key", entry["Key"], "--version-id", entry["VersionId"])
-    aws.call("s3api", "delete-bucket", "--bucket", run.state_bucket)
-    if not wait_gone(aws, run.state_bucket):
-        raise TeardownRefused(f"S3 still reports the state bucket {GONE_DEADLINE_SECONDS} seconds after its deletion")
+        aws.call("s3api", "delete-object", "--bucket", run.bucket, "--key", entry["Key"], "--version-id", entry["VersionId"])
+    if run.bucket_creation != "created":
+        return "the empty bucket is kept: this run did not create it; it costs nothing while empty"
+    aws.call("s3api", "delete-bucket", "--bucket", run.bucket)
+    if not wait_gone(aws, run.bucket):
+        raise TeardownRefused(f"S3 still reports the bucket {GONE_DEADLINE_SECONDS} seconds after its deletion")
+    return "none: no resource is retained"
 
 
 def removal_check(aws: Aws, entry: dict[str, str]) -> str | None:
@@ -366,8 +368,7 @@ def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
                 raise TeardownRefused("refused before any deletion:\n" + "\n".join(problems))
             removal.mkdir(exist_ok=True)
             if "purge" in left:
-                for bucket in purge_buckets(targets, inventory):
-                    purge(aws, bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == bucket])
+                purge(aws, run.bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == run.bucket])
                 finish_stage(removal, "purge")
             output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
             save_raw(run.run_id, "destroy_apply.txt", output)
@@ -379,12 +380,12 @@ def destroy(aws: Aws, run: RunBinding, confirm: str) -> int:
         finally:
             approved_plan.unlink(missing_ok=True)
     if "state" in left:
-        if run.backend == "s3":
-            clean_state_bucket(aws, run, approved, removal)
+        (removal / "retained.json").write_text(json.dumps(clean_bucket(aws, run, approved, removal)) + "\n")
         finish_stage(removal, "state")
     checks = checked_removals(aws, inventory)
     (removal / "checks.json").write_text(
-        json.dumps({"run_id": run.run_id, "checks": checks, "retained_cost": "none: no resource is retained"}, indent=2) + "\n"
+        json.dumps({"run_id": run.run_id, "checks": checks, "retained_cost": read_json(removal / "retained.json", "the record of what is kept")}, indent=2)
+        + "\n"
     )
     for check in checks:
         sys.stdout.write(f"{check['reported']}: {check['address']}\n")

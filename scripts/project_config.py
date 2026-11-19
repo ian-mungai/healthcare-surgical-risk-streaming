@@ -16,6 +16,7 @@ PATTERNS = {
     "AWS_ACCOUNT_ID": re.compile(r"\d{12}"),
     "PROJECT_NAME": re.compile(r"[a-z][a-z0-9_]*"),
     "ENVIRONMENT": re.compile(r"dev|prod"),
+    "S3_BUCKET": re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"),
 }
 
 

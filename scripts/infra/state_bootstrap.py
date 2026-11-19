@@ -1,14 +1,18 @@
-"""Create and verify the S3 bucket that holds this run's Terraform state.
+"""Create and verify the project's one S3 bucket and bind this run to its Terraform state location.
 
 Run from the repository root under the project profile in ``.env``:
 
 ``.venv/bin/python -m scripts.infra.state_bootstrap create``
 
-``create`` binds a new run ID, the state bucket, the workspace and the state keys in the binding file before it
-creates anything, so an interrupted run is never left with an unrecorded bucket. It then creates the bucket when it
-is absent and sets only what differs: all four public access blocks, versioning and the tags. It marks the binding
-verified only after S3 reports the required settings. A second run changes nothing. ``verify`` reads the settings
-back and exits 1 naming each one that differs. Neither command writes an object to the bucket.
+The project has one bucket, named by ``S3_BUCKET`` in ``.env``. The Terraform state lives under ``terraform_state/``
+and the data under its own prefixes. ``create`` binds a new run ID, the bucket, the workspace and the state keys in
+the binding file before it creates anything, so an interrupted run is never left with an unrecorded bucket. It
+creates the bucket when it is absent, uses the project's bucket when this account already owns it, and sets only
+what differs: all four public access blocks, versioning and the tags. Only the call that created the bucket marks
+it as created by this run, and the teardown removes no other bucket. ``create --short-lived-bucket`` gives a test
+its own bucket, named with the suffix ``-test-`` and the run, which must not exist yet. A second run changes
+nothing. ``verify`` reads the settings back and exits 1 naming each one that differs. Neither command writes an
+object to the bucket.
 """
 
 from __future__ import annotations
@@ -27,7 +31,8 @@ from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 DEFAULT_BINDING = ROOT / "runs" / "run_binding.json"
-STATE_KEY = "environment/terraform.tfstate"
+STATE_PREFIX = "terraform_state"
+BUCKET_NAME_LIMIT = 63
 WORKSPACE = "default"
 BLOCK_NAMES = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
 MISSING_BUCKET = ("(404)", "NoSuchBucket")
@@ -40,53 +45,62 @@ class RunBinding:
     commit: str
     backend: str
     region: str
-    state_bucket: str
+    bucket: str
     workspace: str
     state_keys: list[str]
     status: str
     provision_host: bool = True
-    state_bucket_creation: str = "none"
+    bucket_creation: str = "none"
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2) + "\n")
 
 
-def new_binding(configuration: dict[str, str], backend: str = "s3", provision_host: bool = True) -> RunBinding:
+def state_keys(environment: str) -> list[str]:
+    """The state key and its lock key for one environment, under the state prefix of the bucket."""
+    key = f"{STATE_PREFIX}/{environment}/terraform.tfstate"
+    return [key, f"{key}.tflock"]
+
+
+def short_lived_bucket_name(project_bucket: str, run_id: str) -> str:
+    """A test's own bucket: the project's bucket name, the test suffix and the run ID without its year and separators, to fit an S3 name."""
+    name = f"{project_bucket}-test-{run_id[4:].replace('t', '').replace('-', '')}"
+    if len(name) > BUCKET_NAME_LIMIT:
+        raise ConfigurationError(f"the test bucket name would be longer than {BUCKET_NAME_LIMIT} characters; shorten S3_BUCKET")
+    return name
+
+
+def new_binding(configuration: dict[str, str], backend: str = "s3", provision_host: bool = True, short_lived: bool = False) -> RunBinding:
     run_id = datetime.now(UTC).strftime("%Y%m%dt%H%M") + "-" + secrets.token_hex(3)
     commit = run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
+    bucket = short_lived_bucket_name(configuration["S3_BUCKET"], run_id) if short_lived else configuration["S3_BUCKET"]
+    region = configuration["AWS_REGION"]
     if backend == "local":
         return RunBinding(
-            run_id,
-            commit,
-            "local",
-            configuration["AWS_REGION"],
-            "",
-            WORKSPACE,
-            [str(ROOT / "runs" / run_id / "terraform.tfstate")],
-            "verified",
-            provision_host=False,
+            run_id, commit, "local", region, bucket, WORKSPACE, [str(ROOT / "runs" / run_id / "terraform.tfstate")], "planned", provision_host=False
         )
-    bucket = f"{configuration['BUCKET_PREFIX']}-state-{configuration['ENVIRONMENT']}-{run_id}"
-    return RunBinding(
-        run_id, commit, "s3", configuration["AWS_REGION"], bucket, WORKSPACE, [STATE_KEY, f"{STATE_KEY}.tflock"], "planned", provision_host=provision_host
-    )
+    return RunBinding(run_id, commit, "s3", region, bucket, WORKSPACE, state_keys(configuration["ENVIRONMENT"]), "planned", provision_host=provision_host)
 
 
-def adoption_problem(creation: str, *, exists: bool, owned_and_empty: bool) -> str | None:
-    """Why this run may not use the bucket with its state bucket name, or None when it may create or keep using it."""
-    if creation == "none" and exists:
-        return "a bucket with this run's state bucket name already exists and this run did not create it"
-    if creation == "attempted" and exists and not owned_and_empty:
+def adoption_problem(creation: str, *, exists: bool, owned: bool, empty: bool, short_lived: bool) -> str | None:
+    """Why this run may not use the bucket with its bucket name, or None when it may create it, keep using it or share the project's."""
+    if creation == "none" and exists and short_lived:
+        return "a bucket with this test's bucket name already exists and this run did not create it"
+    if creation == "none" and exists and not owned:
+        return "the project's bucket name belongs to a bucket this account does not own"
+    if creation == "attempted" and exists and not (owned and empty):
         return "the bucket from this run's interrupted creation is not an empty bucket of this account"
     if creation == "created" and not exists:
-        return "this run's state bucket no longer exists"
+        return "this run's bucket no longer exists"
     return None
 
 
-def owned_and_empty(aws: Aws, bucket: str, account: str) -> bool:
-    if aws.call("s3api", "head-bucket", "--bucket", bucket, "--expected-bucket-owner", account, missing=("(403)", "AccessDenied")) is None:
-        return False
+def owned(aws: Aws, bucket: str, account: str) -> bool:
+    return aws.call("s3api", "head-bucket", "--bucket", bucket, "--expected-bucket-owner", account, missing=("(403)", "AccessDenied")) is not None
+
+
+def empty(aws: Aws, bucket: str) -> bool:
     listing = aws.call("s3api", "list-object-versions", "--bucket", bucket, "--max-items", "1")
     return not listing.get("Versions") and not listing.get("DeleteMarkers")
 
@@ -134,44 +148,43 @@ def repair(aws: Aws, bucket: str, name: str, tags: dict[str, str]) -> None:
         aws.call("s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging", tag_set)
 
 
-def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3", provision_host: bool = True) -> int:
-    binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend, provision_host)
+def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3", provision_host: bool = True, short_lived: bool = False) -> int:
+    binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend, provision_host, short_lived)
     if binding.backend != backend:
         sys.stderr.write(f"the run is bound to the {binding.backend} backend, not {backend}\n")
         return 1
     if not path.is_file():
         binding.write(path)
-    if binding.backend == "local":
-        sys.stdout.write(f"run {binding.run_id}: local state at {binding.state_keys[0]}; no state bucket is used\n")
-        return 0
     tags = required_tags(configuration)
     changes = []
-    exists = bucket_exists(aws, binding.state_bucket)
-    adoptable = exists and binding.state_bucket_creation == "attempted" and owned_and_empty(aws, binding.state_bucket, configuration["AWS_ACCOUNT_ID"])
-    problem = adoption_problem(binding.state_bucket_creation, exists=exists, owned_and_empty=adoptable)
+    exists = bucket_exists(aws, binding.bucket)
+    is_owned = exists and owned(aws, binding.bucket, configuration["AWS_ACCOUNT_ID"])
+    is_empty = is_owned and binding.bucket_creation == "attempted" and empty(aws, binding.bucket)
+    problem = adoption_problem(binding.bucket_creation, exists=exists, owned=is_owned, empty=is_empty, short_lived=binding.bucket != configuration["S3_BUCKET"])
     if problem:
         sys.stderr.write(f"{problem}\n")
         return 1
     if not exists:
-        binding.state_bucket_creation = "attempted"
+        binding.bucket_creation = "attempted"
         binding.write(path)
-        aws.call("s3api", "create-bucket", "--bucket", binding.state_bucket, "--create-bucket-configuration", f"LocationConstraint={binding.region}")
+        aws.call("s3api", "create-bucket", "--bucket", binding.bucket, "--create-bucket-configuration", f"LocationConstraint={binding.region}")
         changes.append("bucket created")
-    if binding.state_bucket_creation != "created":
-        binding.state_bucket_creation = "created"
+    if binding.bucket_creation == "attempted":
+        binding.bucket_creation = "created"
         binding.write(path)
-    for name in problems(read_settings(aws, binding.state_bucket), tags):
-        repair(aws, binding.state_bucket, name, tags)
+    for name in problems(read_settings(aws, binding.bucket), tags):
+        repair(aws, binding.bucket, name, tags)
         changes.append(f"{name} set")
-    left = problems(read_settings(aws, binding.state_bucket), tags)
+    left = problems(read_settings(aws, binding.bucket), tags)
     if left:
         sys.stderr.write("".join(f"{problem}\n" for problem in left.values()))
         return 1
     if binding.status != "verified":
         binding.status = "verified"
         binding.write(path)
+    state = "local state" if binding.backend == "local" else f"state under {STATE_PREFIX}/"
     sys.stdout.write(
-        f"run {binding.run_id}: {', '.join(changes) if changes else 'no change'}; S3 reports all four public access blocks and versioning enabled\n"
+        f"run {binding.run_id}: {', '.join(changes) if changes else 'no change'}; {state}; S3 reports all four public access blocks and versioning enabled\n"
     )
     return 0
 
@@ -181,16 +194,13 @@ def verify(aws: Aws, configuration: dict[str, str], path: Path) -> int:
         sys.stderr.write("no run binding: run create first\n")
         return 1
     binding = RunBinding(**json.loads(path.read_text()))
-    if binding.backend == "local":
-        sys.stdout.write(f"run {binding.run_id}: local state; no state bucket to verify\n")
-        return 0
-    if not bucket_exists(aws, binding.state_bucket):
-        sys.stderr.write("the bound state bucket does not exist\n")
+    if not bucket_exists(aws, binding.bucket):
+        sys.stderr.write("the bound bucket does not exist\n")
         return 1
-    found = problems(read_settings(aws, binding.state_bucket), required_tags(configuration))
+    found = problems(read_settings(aws, binding.bucket), required_tags(configuration))
     sys.stderr.write("".join(f"{problem}\n" for problem in found.values()))
     if not found:
-        sys.stdout.write(f"run {binding.run_id}: the state bucket has every required setting\n")
+        sys.stdout.write(f"run {binding.run_id}: the bucket has every required setting\n")
     return 1 if found else 0
 
 
@@ -203,12 +213,13 @@ def main() -> int:
         "--backend", choices=["s3", "local"], default="s3", help="create: s3 for a host in AWS, local for a host that already exists outside AWS"
     )
     parser.add_argument("--given-host", action="store_true", help="create: the host already exists, so Terraform plans and removes no host")
+    parser.add_argument("--short-lived-bucket", action="store_true", help="create: a test's own bucket, named with the test suffix and the run")
     arguments = parser.parse_args()
     try:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         if arguments.command == "create":
-            return create(aws, configuration, arguments.binding, arguments.backend, not arguments.given_host)
+            return create(aws, configuration, arguments.binding, arguments.backend, not arguments.given_host, arguments.short_lived_bucket)
         return verify(aws, configuration, arguments.binding)
     except (ConfigurationError, AwsError) as error:
         sys.stderr.write(f"{error}\n")

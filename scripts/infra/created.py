@@ -1,13 +1,14 @@
 """The record of what a run created, written when an approved plan is applied, and the inventory built from it.
 
 Only a resource that an applied plan of this run created is recorded. A resource that was already in the state, or a
-state bucket this run did not create, is never listed as created, so the teardown cannot be given it as a target.
+bucket this run did not create, is never listed as created, so the teardown cannot be given it as a target.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+BUCKET_ADDRESS = "project bucket"
 HOST_PARTS = (("root volume", "aws_ebs_volume"), ("network interface", "aws_network_interface"))
 
 
@@ -48,7 +49,7 @@ def merge_created(recorded: list[dict[str, str]], new: list[dict[str, str]]) -> 
 
 
 def run_inventory(recorded: list[dict[str, str]], state: dict[str, Any], run: Any) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """What the run created and still holds, with its own state bucket, and the managed resources it did not create."""
+    """What the run created and still holds, with the bucket when this run created it, and the managed resources it did not create."""
     in_state = {(item["address"], str(item["values"]["id"])) for item in managed_resources(state)}
     parents = {item["address"] for item in managed_resources(state)}
     kept = [
@@ -58,6 +59,6 @@ def run_inventory(recorded: list[dict[str, str]], state: dict[str, Any], run: An
     ]
     recorded_addresses = {found["address"] for found in recorded}
     not_created = [entry(item["address"], item["type"], item["values"]["id"]) for item in managed_resources(state) if item["address"] not in recorded_addresses]
-    if run.backend == "s3" and run.state_bucket_creation == "created":
-        kept.append(entry("state bucket", "aws_s3_bucket", run.state_bucket))
+    if run.bucket_creation == "created":
+        kept.append(entry(BUCKET_ADDRESS, "aws_s3_bucket", run.bucket))
     return kept, sorted(not_created, key=lambda found: found["address"])

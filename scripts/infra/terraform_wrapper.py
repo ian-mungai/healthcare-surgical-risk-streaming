@@ -79,12 +79,12 @@ def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, s
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:
     if run.backend == "local":
         return []
-    backend = {"bucket": run.state_bucket, "key": run.state_keys[0], "region": run.region, "profile": profile, "use_lockfile": "true"}
+    backend = {"bucket": run.bucket, "key": run.state_keys[0], "region": run.region, "profile": profile, "use_lockfile": "true"}
     return [f"-backend-config={key}={value}" for key, value in backend.items()]
 
 
 def state_location(run: RunBinding) -> dict[str, Any]:
-    return {"backend": run.backend, "bucket": run.state_bucket, "workspace": run.workspace, "keys": run.state_keys, "region": run.region}
+    return {"backend": run.backend, "bucket": run.bucket, "workspace": run.workspace, "keys": run.state_keys, "region": run.region}
 
 
 def clean_environment(environment: Mapping[str, str]) -> dict[str, str]:
@@ -98,7 +98,7 @@ def effective_location_problems(run: RunBinding, backend_record: dict[str, Any],
     kind = backend.get("type", "missing")
     if kind != run.backend:
         return [f"Terraform's backend type is {kind}, not {run.backend}"]
-    bound = {"bucket": run.state_bucket, "key": run.state_keys[0], "region": run.region, "path": run.state_keys[0]}
+    bound = {"bucket": run.bucket, "key": run.state_keys[0], "region": run.region, "path": run.state_keys[0]}
     problems = [
         f"Terraform's backend {name} differs from this run's binding" for name in BOUND_BACKEND_KEYS[kind] if backend.get("config", {}).get(name) != bound[name]
     ]

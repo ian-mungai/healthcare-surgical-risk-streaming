@@ -23,16 +23,27 @@ from scripts.infra.teardown import (
     destroy_write_problem,
     local_state_problem,
     parent_check,
-    purge_buckets,
     remaining_stages,
     settled_checks,
+    split_entries,
     state_entry_problems,
     target_problems,
 )
 
-STATE_KEYS = ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"]
-RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified", state_bucket_creation="created")
-LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified", provision_host=False)
+STATE_KEYS = ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"]
+RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-project", "default", STATE_KEYS, "verified", bucket_creation="created")
+LOCAL = RunBinding(
+    "20260101t0000-abcdef",
+    "c0ffee",
+    "local",
+    "us-west-2",
+    "example-project",
+    "default",
+    ["/srv/run/terraform.tfstate"],
+    "verified",
+    provision_host=False,
+    bucket_creation="created",
+)
 GIVEN_HOST = RunBinding(**{**RUN.__dict__, "provision_host": False})
 HASH = "a" * 64
 
@@ -174,14 +185,14 @@ def change(address: str, kind: str, identifier: str, actions: list[str]) -> dict
 PLAN = {
     "resource_changes": [
         change("module.host[0].aws_instance.host", "aws_instance", "i-0aaa", ["delete"]),
-        change('module.storage.aws_s3_bucket.this["landing"]', "aws_s3_bucket", "example-landing", ["delete"]),
+        change("module.host[0].aws_iam_role.host", "aws_iam_role", "example_host", ["delete"]),
         change("module.deploy.aws_iam_role.deploy", "aws_iam_role", "example_deploy", ["no-op"]),
     ]
 }
 INVENTORY = [
     {"address": "module.host[0].aws_instance.host", "type": "aws_instance", "service_id": "i-0aaa"},
-    {"address": 'module.storage.aws_s3_bucket.this["landing"]', "type": "aws_s3_bucket", "service_id": "example-landing"},
-    {"address": "state bucket", "type": "aws_s3_bucket", "service_id": "example-state"},
+    {"address": "module.host[0].aws_iam_role.host", "type": "aws_iam_role", "service_id": "example_host"},
+    {"address": "project bucket", "type": "aws_s3_bucket", "service_id": "example-project"},
 ]
 
 
@@ -190,7 +201,7 @@ class TargetTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("module.host[0].aws_instance.host", "aws_instance", "i-0aaa"),
-                ('module.storage.aws_s3_bucket.this["landing"]', "aws_s3_bucket", "example-landing"),
+                ("module.host[0].aws_iam_role.host", "aws_iam_role", "example_host"),
             ],
             delete_targets(PLAN),
         )
@@ -211,25 +222,21 @@ class TargetTest(unittest.TestCase):
         )
 
     def test_any_host_is_refused_in_a_run_that_was_given_its_host(self) -> None:
-        local_inventory = [entry for entry in INVENTORY if entry["address"] != "state bucket"]
         expected = ["delete target is a host in a run that did not create its host: module.host[0].aws_instance.host"]
-        self.assertEqual(expected, target_problems(delete_targets(PLAN), local_inventory, LOCAL, []))
+        self.assertEqual(expected, target_problems(delete_targets(PLAN), INVENTORY, LOCAL, []))
         self.assertEqual(expected, target_problems(delete_targets(PLAN), INVENTORY, GIVEN_HOST, []))
 
-    def test_state_bucket_must_be_the_one_this_run_created(self) -> None:
-        other = [entry | {"service_id": "other-state"} if entry["address"] == "state bucket" else entry for entry in INVENTORY]
-        self.assertEqual(["the bound state bucket is not the state bucket in this run's inventory"], target_problems(delete_targets(PLAN), other, RUN, []))
+    def test_bucket_named_for_removal_must_be_the_one_this_run_created(self) -> None:
+        expected = ["the bucket in this run's inventory is not the bucket this run created"]
+        other = [entry | {"service_id": "other-project"} if entry["address"] == "project bucket" else entry for entry in INVENTORY]
+        self.assertEqual(expected, target_problems(delete_targets(PLAN), other, RUN, []))
+        adopted = RunBinding(**{**RUN.__dict__, "bucket_creation": "none"})
+        self.assertEqual(expected, target_problems(delete_targets(PLAN), INVENTORY, adopted, []))
 
-    def test_state_bucket_the_run_did_not_create_is_refused(self) -> None:
-        adopted = RunBinding(**{**RUN.__dict__, "state_bucket_creation": "none"})
-        self.assertEqual(["the state bucket was not created by this run"], target_problems(delete_targets(PLAN), INVENTORY, adopted, []))
-
-    def test_state_bucket_target_is_refused_under_the_local_backend(self) -> None:
-        only_buckets = {"resource_changes": [change('module.storage.aws_s3_bucket.this["landing"]', "aws_s3_bucket", "example-landing", ["delete"])]}
-        expected = ["a state bucket is named for removal under the local backend"]
-        self.assertEqual(expected, target_problems(delete_targets(only_buckets), INVENTORY, LOCAL, []))
-        local_inventory = [entry for entry in INVENTORY if entry["address"] != "state bucket"]
-        self.assertEqual([], target_problems(delete_targets(only_buckets), local_inventory, LOCAL, []))
+    def test_bucket_the_run_did_not_create_is_kept_without_a_refusal(self) -> None:
+        adopted = RunBinding(**{**RUN.__dict__, "bucket_creation": "none"})
+        without_bucket = [entry for entry in INVENTORY if entry["address"] != "project bucket"]
+        self.assertEqual([], target_problems(delete_targets(PLAN), without_bucket, adopted, []))
 
 
 def entry(key: str, version: str) -> dict[str, str]:
@@ -261,19 +268,24 @@ class ObjectInventoryTest(unittest.TestCase):
             bucket_entry_problems("example-landing", [entry("a.vital", "null")], [["example-landing", "a.vital", "null"]]),
         )
 
+    def test_entries_are_split_into_data_and_this_runs_state(self) -> None:
+        found = [entry("landing/a.vital", "v1"), entry(STATE_KEYS[0], "v2"), entry("terraform_state/prod/terraform.tfstate", "v3"), entry(STATE_KEYS[1], "v4")]
+        self.assertEqual(([found[0], found[2]], [found[1], found[3]]), split_entries(found, RUN))
+        self.assertEqual((found, []), split_entries(found, LOCAL))
+
     def test_approved_state_entries_pass(self) -> None:
         approved = [[STATE_KEYS[0], "v1"], [STATE_KEYS[1], "v2"]]
         self.assertEqual([], state_entry_problems([entry(STATE_KEYS[0], "v1"), entry(STATE_KEYS[1], "v2")], STATE_KEYS, approved))
 
     def test_foreign_state_key_is_refused(self) -> None:
         self.assertEqual(
-            ["state bucket: key outside this run's state keys: other/terraform.tfstate"],
+            ["bucket: key outside this run's state keys: other/terraform.tfstate"],
             state_entry_problems([entry("other/terraform.tfstate", "v1")], STATE_KEYS, [["other/terraform.tfstate", "v1"]]),
         )
 
     def test_unapproved_noncurrent_state_version_is_refused(self) -> None:
         approved = [[STATE_KEYS[0], "v2"]]
-        expected = [f"state bucket: version outside the approved inventory: {STATE_KEYS[0]}"]
+        expected = [f"bucket: state version outside the approved inventory: {STATE_KEYS[0]}"]
         self.assertEqual(expected, state_entry_problems([entry(STATE_KEYS[0], "v1"), entry(STATE_KEYS[0], "v2")], STATE_KEYS, approved))
 
     def test_entries_written_by_the_destroy_apply_pass_once_recorded(self) -> None:
@@ -310,12 +322,12 @@ class DestroyWriteTest(unittest.TestCase):
         self.assertEqual("a delete marker at the state key", self.check(STATE_KEYS[0], None, marker=True))
 
     def test_lock_entries_for_this_state_are_the_destroys_own(self) -> None:
-        lock = json.dumps({"ID": "x", "Operation": "OperationTypeApply", "Path": f"example-state/{STATE_KEYS[0]}"}).encode()
+        lock = json.dumps({"ID": "x", "Operation": "OperationTypeApply", "Path": f"example-project/{STATE_KEYS[0]}"}).encode()
         self.assertIsNone(self.check(STATE_KEYS[1], lock))
         self.assertIsNone(self.check(STATE_KEYS[1], None, marker=True))
 
     def test_lock_entry_for_another_state_is_not(self) -> None:
-        lock = json.dumps({"ID": "x", "Operation": "OperationTypeApply", "Path": "example-state/other/terraform.tfstate"}).encode()
+        lock = json.dumps({"ID": "x", "Operation": "OperationTypeApply", "Path": "example-project/other/terraform.tfstate"}).encode()
         self.assertEqual("a lock entry that is not for this run's state", self.check(STATE_KEYS[1], lock))
 
     def test_entry_at_another_key_is_not(self) -> None:
@@ -331,10 +343,6 @@ class TeardownStageTest(unittest.TestCase):
         self.assertEqual("the local state changed after the destroy plan was saved", local_state_problem(state, "0" * 64))
         self.assertEqual("the bound local state file does not exist", local_state_problem(state.with_name("missing.tfstate"), unchanged))
 
-    def test_only_buckets_the_plan_deletes_are_purged(self) -> None:
-        inventory = [*INVENTORY, {"address": 'module.storage.aws_s3_bucket.this["warehouse"]', "type": "aws_s3_bucket", "service_id": "example-warehouse"}]
-        self.assertEqual(["example-landing"], purge_buckets(delete_targets(PLAN), inventory))
-
     def test_a_new_teardown_runs_every_stage(self) -> None:
         self.assertEqual(["purge", "apply", "state", "checks"], remaining_stages([]))
 
@@ -344,16 +352,18 @@ class TeardownStageTest(unittest.TestCase):
         self.assertEqual([], remaining_stages(["purge", "apply", "state", "checks"]))
 
     def test_a_part_is_verified_only_through_its_own_check_or_a_parent_that_is_gone(self) -> None:
-        reported = {("aws_iam_role", "example_host"): "gone", ("aws_s3_bucket", "example-landing"): "still exists"}
+        reported = {("aws_iam_role", "example_host"): "gone", ("aws_iam_role", "example_deploy"): "still exists"}
         self.assertEqual("gone with its parent", parent_check({"type": "aws_iam_role_policy", "service_id": "example_host:storage"}, reported))
-        self.assertEqual("still exists: its parent remains", parent_check({"type": "aws_s3_bucket_versioning", "service_id": "example-landing"}, reported))
-        self.assertEqual("unverified: its parent was not checked", parent_check({"type": "aws_s3_bucket_versioning", "service_id": "example-other"}, reported))
+        self.assertEqual("still exists: its parent remains", parent_check({"type": "aws_iam_role_policy", "service_id": "example_deploy:access"}, reported))
+        self.assertEqual(
+            "unverified: its parent was not checked", parent_check({"type": "aws_iam_role_policy", "service_id": "example_other:access"}, reported)
+        )
         self.assertEqual("unverified: no check for this type", parent_check({"type": "aws_lambda_function", "service_id": "example"}, reported))
 
 
 class RemovalCheckTest(unittest.TestCase):
     def test_a_removal_that_the_service_reports_late_is_confirmed(self) -> None:
-        answers = {"example-landing": iter(["still exists", "still exists", "gone"]), "i-0aaa": iter(["gone"]), "example-state": iter(["gone"])}
+        answers = {"example_host": iter(["still exists", "still exists", "gone"]), "i-0aaa": iter(["gone"]), "example-project": iter(["gone"])}
         checks = settled_checks(lambda entry: next(answers[entry["service_id"]]), INVENTORY, attempts=5, pause_seconds=0)
         self.assertEqual(["gone", "gone", "gone"], [check["reported"] for check in checks])
 

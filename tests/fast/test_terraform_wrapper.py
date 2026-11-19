@@ -32,12 +32,14 @@ RUN = RunBinding(
     "c0ffee",
     "s3",
     "us-west-2",
-    "example-state-dev-20260101t0000-abcdef",
+    "example-project",
     "default",
-    ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"],
+    ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"],
     "verified",
 )
-LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified", provision_host=False)
+LOCAL = RunBinding(
+    "20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "example-project", "default", ["/srv/run/terraform.tfstate"], "verified", provision_host=False
+)
 PLAN = b"saved plan bytes"
 CODE = hashlib.sha256(PLAN).hexdigest()[:12]
 
@@ -45,8 +47,8 @@ CODE = hashlib.sha256(PLAN).hexdigest()[:12]
 class PlanBindingTest(unittest.TestCase):
     def test_backend_arguments_come_from_the_run_binding(self) -> None:
         expected = [
-            "-backend-config=bucket=example-state-dev-20260101t0000-abcdef",
-            "-backend-config=key=environment/terraform.tfstate",
+            "-backend-config=bucket=example-project",
+            "-backend-config=key=terraform_state/dev/terraform.tfstate",
             "-backend-config=region=us-west-2",
             "-backend-config=profile=example_project_dev",
             "-backend-config=use_lockfile=true",
@@ -93,7 +95,7 @@ class PlanBindingTest(unittest.TestCase):
         )
 
     def test_other_state_location_is_refused(self) -> None:
-        other = RunBinding(**{**RUN.__dict__, "state_bucket": "example-state-dev-20260202t0000-abcdef"})
+        other = RunBinding(**{**RUN.__dict__, "bucket": "example-project-test-02020000abcdef"})
         self.assertEqual(
             ["the plan was saved for a different state location than this run's"],
             binding_problems(RUN, plan_binding(other, PLAN, "apply"), PLAN, CODE, "apply"),
@@ -107,7 +109,7 @@ class PlanBindingTest(unittest.TestCase):
         self.assertEqual(["the run's state location is not verified"], binding_problems(planned, plan_binding(planned, PLAN, "apply"), PLAN, CODE, "apply"))
 
 
-S3_RECORD = {"backend": {"type": "s3", "config": {"bucket": RUN.state_bucket, "key": RUN.state_keys[0], "region": RUN.region}}}
+S3_RECORD = {"backend": {"type": "s3", "config": {"bucket": RUN.bucket, "key": RUN.state_keys[0], "region": RUN.region}}}
 LOCAL_RECORD = {"backend": {"type": "local", "config": {"path": LOCAL.state_keys[0]}}}
 
 
@@ -125,9 +127,7 @@ class EffectiveLocationTest(unittest.TestCase):
         self.assertEqual({"PATH": "/bin", "HOME": "/srv/example", "TF_IN_AUTOMATION": "1"}, cleaned)
 
     def test_bound_location_names_the_region_and_every_state_key(self) -> None:
-        self.assertEqual(
-            {"backend": "s3", "bucket": RUN.state_bucket, "workspace": "default", "keys": RUN.state_keys, "region": "us-west-2"}, state_location(RUN)
-        )
+        self.assertEqual({"backend": "s3", "bucket": RUN.bucket, "workspace": "default", "keys": RUN.state_keys, "region": "us-west-2"}, state_location(RUN))
 
     def test_matching_effective_backend_passes(self) -> None:
         self.assertEqual([], effective_location_problems(RUN, S3_RECORD, "default"))

@@ -1,8 +1,8 @@
-"""What a run created: the record written at apply time, the inventory built from it and the state bucket's adoption.
+"""What a run created: the record written at apply time, the inventory built from it and the use of the project's one bucket.
 
 The apply and the bucket calls are proven in the live batch and the isolated fixtures. These cases cover the decisions
 those runs cannot readily force: a resource that was in the state before the apply, a bucket that already exists for
-a new binding and a retry after an interrupted creation.
+a new binding, a retry after an interrupted creation and the name of a test's own short-lived bucket.
 """
 
 from __future__ import annotations
@@ -10,10 +10,11 @@ from __future__ import annotations
 import unittest
 
 from scripts.infra.created import created_entries, merge_created, run_inventory
-from scripts.infra.state_bootstrap import RunBinding, adoption_problem
+from scripts.infra.state_bootstrap import RunBinding, adoption_problem, short_lived_bucket_name, state_keys
+from scripts.project_config import ConfigurationError
 
-KEYS = ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"]
-RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", KEYS, "verified", state_bucket_creation="created")
+KEYS = ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"]
+RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-project", "default", KEYS, "verified", bucket_creation="created")
 
 
 def resource(address: str, kind: str, identifier: str, **values: object) -> dict[str, object]:
@@ -52,11 +53,11 @@ class CreatedRecordTest(unittest.TestCase):
 
     def test_inventory_separates_what_the_run_did_not_create(self) -> None:
         created, not_created = run_inventory([*HOST_ENTRIES, LANDING_ENTRY], STATE, RUN)
-        self.assertEqual([*HOST_ENTRIES, LANDING_ENTRY, {"address": "state bucket", "type": "aws_s3_bucket", "service_id": "example-state"}], created)
+        self.assertEqual([*HOST_ENTRIES, LANDING_ENTRY, {"address": "project bucket", "type": "aws_s3_bucket", "service_id": "example-project"}], created)
         self.assertEqual([{"address": "module.deploy.aws_iam_role.deploy", "type": "aws_iam_role", "service_id": "example_deploy"}], not_created)
 
-    def test_a_state_bucket_the_run_did_not_create_is_not_in_its_inventory(self) -> None:
-        adopted = RunBinding(**{**RUN.__dict__, "state_bucket_creation": "none"})
+    def test_a_bucket_the_run_did_not_create_is_not_in_its_inventory(self) -> None:
+        adopted = RunBinding(**{**RUN.__dict__, "bucket_creation": "none"})
         created, _ = run_inventory([LANDING_ENTRY], STATE, adopted)
         self.assertEqual([LANDING_ENTRY], created)
 
@@ -68,24 +69,44 @@ class CreatedRecordTest(unittest.TestCase):
 
 class AdoptionTest(unittest.TestCase):
     def test_new_run_with_no_bucket_creates_it(self) -> None:
-        self.assertIsNone(adoption_problem("none", exists=False, owned_and_empty=False))
+        self.assertIsNone(adoption_problem("none", exists=False, owned=False, empty=False, short_lived=False))
+        self.assertIsNone(adoption_problem("none", exists=False, owned=False, empty=False, short_lived=True))
 
-    def test_existing_bucket_is_never_adopted_by_a_run_that_did_not_try_to_create_it(self) -> None:
+    def test_the_projects_bucket_that_already_exists_is_used_when_this_account_owns_it(self) -> None:
+        self.assertIsNone(adoption_problem("none", exists=True, owned=True, empty=False, short_lived=False))
         self.assertEqual(
-            "a bucket with this run's state bucket name already exists and this run did not create it",
-            adoption_problem("none", exists=True, owned_and_empty=True),
+            "the project's bucket name belongs to a bucket this account does not own",
+            adoption_problem("none", exists=True, owned=False, empty=False, short_lived=False),
+        )
+
+    def test_an_existing_bucket_is_never_adopted_as_a_tests_own_bucket(self) -> None:
+        self.assertEqual(
+            "a bucket with this test's bucket name already exists and this run did not create it",
+            adoption_problem("none", exists=True, owned=True, empty=True, short_lived=True),
         )
 
     def test_retry_after_an_interrupted_creation_adopts_only_an_owned_empty_bucket(self) -> None:
-        self.assertIsNone(adoption_problem("attempted", exists=True, owned_and_empty=True))
-        self.assertEqual(
-            "the bucket from this run's interrupted creation is not an empty bucket of this account",
-            adoption_problem("attempted", exists=True, owned_and_empty=False),
-        )
+        self.assertIsNone(adoption_problem("attempted", exists=True, owned=True, empty=True, short_lived=False))
+        expected = "the bucket from this run's interrupted creation is not an empty bucket of this account"
+        self.assertEqual(expected, adoption_problem("attempted", exists=True, owned=True, empty=False, short_lived=False))
+        self.assertEqual(expected, adoption_problem("attempted", exists=True, owned=False, empty=True, short_lived=True))
 
     def test_created_bucket_that_is_gone_is_refused(self) -> None:
-        self.assertEqual("this run's state bucket no longer exists", adoption_problem("created", exists=False, owned_and_empty=False))
-        self.assertIsNone(adoption_problem("created", exists=True, owned_and_empty=False))
+        self.assertEqual("this run's bucket no longer exists", adoption_problem("created", exists=False, owned=False, empty=False, short_lived=False))
+        self.assertIsNone(adoption_problem("created", exists=True, owned=True, empty=False, short_lived=False))
+
+
+class BucketLayoutTest(unittest.TestCase):
+    def test_state_lives_under_its_own_prefix_for_the_environment(self) -> None:
+        self.assertEqual(KEYS, state_keys("dev"))
+
+    def test_a_tests_bucket_carries_the_test_suffix_and_the_run(self) -> None:
+        self.assertEqual("example-project-test-01010000abcdef", short_lived_bucket_name("example-project", RUN.run_id))
+
+    def test_a_tests_bucket_name_over_the_s3_limit_is_refused(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "longer than 63 characters"):
+            short_lived_bucket_name("e" * 44, RUN.run_id)
+        self.assertEqual(63, len(short_lived_bucket_name("e" * 43, RUN.run_id)))
 
 
 if __name__ == "__main__":
