@@ -132,10 +132,23 @@ def live_account(
     groups: frozenset[str] = frozenset(),
 ) -> LiveState:
     """An existing user whose policies carry the required tags."""
-    return LiveState(True, documents, attached, inline, groups, {name: NAMES.tags for name in documents})
+    return LiveState(True, documents, attached, inline, groups, {name: NAMES.tags for name in documents}, NAMES.tags)
 
 
 class PlanTest(unittest.TestCase):
+    def test_an_existing_user_with_missing_or_wrong_tags_plans_a_tag_step_and_extra_tags_are_reported(self) -> None:
+        documents = {"example_project_ec2_policy": GOOD}
+        base = live_account(documents, frozenset({arn("example_project_ec2_policy")}))
+        for tags, expected in (
+            ({}, [Step("tag-user", "example_project_dev")]),
+            ({"Project": "example_project", "Environment": "prod"}, [Step("tag-user", "example_project_dev")]),
+            (NAMES.tags | {"Owner": "someone"}, [Step("report-extra-user-tag", "example_project_dev Owner")]),
+            (NAMES.tags, []),
+        ):
+            with self.subTest(tags=tags):
+                live = LiveState(True, base.documents, base.attached, base.inline, base.groups, base.tags, tags)
+                self.assertEqual(expected, plan_steps(NAMES, documents, live, account=ACCOUNT))
+
     def test_new_account_plans_user_policy_and_attachment(self) -> None:
         steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, LiveState(user_exists=False), account=ACCOUNT)
         self.assertEqual(
@@ -162,7 +175,7 @@ class PlanTest(unittest.TestCase):
 
     def test_boundary_is_created_and_never_attached(self) -> None:
         documents = {"example_project_ec2_policy": GOOD, "example_project_role_boundary": GOOD}
-        steps = plan_steps(NAMES, documents, LiveState(True), account=ACCOUNT, unattached={"example_project_role_boundary"})
+        steps = plan_steps(NAMES, documents, LiveState(True, user_tags=NAMES.tags), account=ACCOUNT, unattached={"example_project_role_boundary"})
         expected = [
             Step("create-policy", "example_project_ec2_policy"),
             Step("attach-policy", "example_project_ec2_policy"),

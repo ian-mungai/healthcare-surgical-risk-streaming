@@ -10,10 +10,10 @@ publishes a new default version only when a document changed and attaches each p
 nothing. ``key`` gives the user its one access key: it creates the key only when the user has none, writes it to an
 owner-only backup file beside the AWS command line's own files, in the column layout of the console's download,
 imports it as the project profile and waits until AWS accepts it. It never prints the secret, never overwrites a
-backup file and never deletes a key. ``export`` compares the live documents, the tags of the policies and the
-boundary, the user's attached policies by ARN, its inline policies and its group memberships with the templates and
+backup file and never deletes a key. ``export`` compares the live documents, the tags of the policies, the boundary
+and the user, the user's attached policies by ARN, its inline policies and its group memberships with the templates and
 exits 1 on a difference. Only ``key`` creates an access key. The tool never removes a grant or a tag: a live project
-policy with no template, an extra attachment, an inline policy, a group membership and an extra policy tag are
+policy with no template, an extra attachment, an inline policy, a group membership and an extra policy or user tag are
 reported, and ``plan`` and ``apply`` exit 1 while one remains.
 """
 
@@ -91,7 +91,7 @@ def canonical(document: Mapping[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class LiveState:
-    """What the account holds now: the user, the project policies and their tags by name, and the user's attached ARNs, inline policies and groups."""
+    """What the account holds now: the user and its tags, the project policies and their tags by name, and the user's attached ARNs, inline policies, groups."""
 
     user_exists: bool
     documents: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -99,6 +99,7 @@ class LiveState:
     inline: frozenset[str] = frozenset()
     groups: frozenset[str] = frozenset()
     tags: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    user_tags: Mapping[str, str] = field(default_factory=dict)
 
 
 def policy_arn(account: str, name: str) -> str:
@@ -114,6 +115,8 @@ def plan_steps(
     step that starts with ``report-`` names a difference that the tool never changes.
     """
     steps = [] if live.user_exists else [Step("create-user", names.user)]
+    if live.user_exists and any(live.user_tags.get(key) != value for key, value in names.tags.items()):
+        steps.append(Step("tag-user", names.user))
     for name in sorted(documents):
         arn = policy_arn(account, name)
         if name not in live.documents:
@@ -134,6 +137,7 @@ def plan_steps(
         *[Step("report-inline-policy", name) for name in sorted(live.inline)],
         *[Step("report-group-membership", name) for name in sorted(live.groups)],
         *[Step("report-extra-policy-tag", f"{name} {key}") for name in sorted(documents) for key in sorted(set(live.tags.get(name, {})) - set(names.tags))],
+        *[Step("report-extra-user-tag", f"{names.user} {key}") for key in sorted(set(live.user_tags) - set(names.tags)) if live.user_exists],
         *[Step("report-unlisted", name) for name in sorted(set(live.documents) - set(documents))],
     ]
 
@@ -164,6 +168,7 @@ def live_state(aws: Aws, names: Names) -> LiveState:
             tags[policy["PolicyName"]] = {tag["Key"]: tag["Value"] for tag in aws.call("iam", "list-policy-tags", "--policy-arn", policy["Arn"])["Tags"]}
     if not user_exists:
         return LiveState(False, documents, tags=tags)
+    user_tags = {tag["Key"]: tag["Value"] for tag in aws.call("iam", "list-user-tags", "--user-name", names.user)["Tags"]}
     attached = aws.call("iam", "list-attached-user-policies", "--user-name", names.user)["AttachedPolicies"]
     inline = aws.call("iam", "list-user-policies", "--user-name", names.user)["PolicyNames"]
     groups = aws.call("iam", "list-groups-for-user", "--user-name", names.user)["Groups"]
@@ -174,6 +179,7 @@ def live_state(aws: Aws, names: Names) -> LiveState:
         frozenset(inline),
         frozenset(group["GroupName"] for group in groups),
         tags,
+        user_tags,
     )
 
 
@@ -182,6 +188,8 @@ def apply_step(aws: Aws, names: Names, account: str, documents: Mapping[str, Map
     arn = policy_arn(account, step.target)
     if step.action == "create-user":
         aws.call("iam", "create-user", "--user-name", step.target, *names.tag_arguments())
+    elif step.action == "tag-user":
+        aws.call("iam", "tag-user", "--user-name", step.target, *names.tag_arguments())
     elif step.action == "create-policy":
         aws.call("iam", "create-policy", "--policy-name", step.target, "--policy-document", by_name[step.target], *names.tag_arguments())
     elif step.action == "tag-policy":

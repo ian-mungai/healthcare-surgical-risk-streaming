@@ -54,6 +54,7 @@ class Account:
     inline: list[str] = field(default_factory=list)
     groups: list[str] = field(default_factory=list)
     policy_tags: dict[str, dict[str, str]] = field(default_factory=dict)
+    user_tags: dict[str, str] = field(default_factory=lambda: dict(TAGS))
     calls: list[tuple[str, ...]] = field(default_factory=list)
     keys: int = 0
     settings: list[tuple[tuple[str, ...], str]] = field(default_factory=list)
@@ -98,6 +99,8 @@ class FakeAws(Aws):
         if verb == "list-policy-tags":
             name = arguments[arguments.index("--policy-arn") + 1].rsplit("/", 1)[1]
             return {"Tags": [{"Key": key, "Value": value} for key, value in state.policy_tags.get(name, {}).items()]}
+        if verb == "list-user-tags":
+            return {"Tags": [{"Key": key, "Value": value} for key, value in state.user_tags.items()]}
         if verb == "list-attached-user-policies":
             return {"AttachedPolicies": [{"PolicyName": arn.rsplit("/", 1)[1], "PolicyArn": arn} for arn in state.attached]}
         if verb == "list-user-policies":
@@ -301,6 +304,56 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(1, code, output)
         self.assertIn("done: attach-policy", output)
         self.assertTrue(any(call[:2] == ("iam", "attach-user-policy") for call in account.calls))
+
+
+class UserTagTest(unittest.TestCase):
+    """An existing user is read for its tags as the policies are: missing or wrong tags are planned, extra tags are reported and never removed."""
+
+    def with_user_tags(self, tags: dict[str, str]) -> Account:
+        account = Account.matching_templates()
+        account.user_tags = tags
+        return account
+
+    def test_a_user_without_the_tags_is_a_difference_and_the_plan_tags_it(self) -> None:
+        for tags in ({}, {"Project": "example_project"}, {"Environment": "dev"}, TAGS | {"Environment": "prod"}, TAGS | {"Project": "other_project"}):
+            with self.subTest(tags=tags):
+                code, output, _ = run_command("export", self.with_user_tags(tags))
+                self.assertEqual(1, code, output)
+                self.assertIn("tag-user: example_project_dev", output)
+                self.assertNotIn("create-user", output)
+
+    def test_a_user_with_both_tags_is_no_difference(self) -> None:
+        code, output, _ = run_command("export", self.with_user_tags(dict(TAGS)))
+        self.assertEqual(0, code, output)
+        self.assertNotIn("tag-user", output)
+
+    def test_an_extra_user_tag_is_reported_and_never_removed(self) -> None:
+        account = self.with_user_tags(TAGS | {"Owner": "someone"})
+        code, output, _ = run_command("export", account)
+        self.assertEqual(1, code, output)
+        self.assertIn("report-extra-user-tag: example_project_dev Owner", output)
+        code, output, _ = run_command("plan", account)
+        self.assertEqual(1, code, output)
+        self.assertFalse(any(call[1] == "untag-user" for call in account.calls))
+
+    def test_apply_tags_an_existing_untagged_user_with_both_tags_and_removes_none(self) -> None:
+        account = self.with_user_tags({"Owner": "someone"})
+        _, plan_output, _ = run_command("plan", account)
+        code, output, _ = run_command("apply", account, confirm=plan_output.rsplit("--confirm ", 1)[1].split()[0])
+        self.assertEqual(1, code, output)
+        tagged = [call for call in account.calls if call[:2] == ("iam", "tag-user")]
+        self.assertEqual(1, len(tagged))
+        self.assertEqual(("--user-name", "example_project_dev", "--tags", "Key=Project,Value=example_project", "Key=Environment,Value=dev"), tagged[0][2:])
+        self.assertFalse(any(call[1] == "untag-user" for call in account.calls))
+
+    def test_a_new_user_is_created_with_its_tags_and_gets_no_tag_step(self) -> None:
+        account = Account(user_exists=False)
+        _, plan_output, _ = run_command("plan", account)
+        self.assertNotIn("tag-user", plan_output)
+        run_command("apply", account, confirm=plan_output.rsplit("--confirm ", 1)[1].split()[0])
+        created = [call for call in account.calls if call[:2] == ("iam", "create-user")]
+        self.assertEqual(("--tags", "Key=Project,Value=example_project", "Key=Environment,Value=dev"), created[0][created[0].index("--tags") :])
+        self.assertFalse(any(call[1] == "list-user-tags" for call in account.calls))
 
 
 class TagTest(unittest.TestCase):
