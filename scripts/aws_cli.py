@@ -20,10 +20,10 @@ class Aws:
     profile: str
     region: str
 
-    def call(self, *arguments: str, missing: tuple[str, ...] = ()) -> Any:
-        """Run one AWS command and return its parsed JSON output, or None when its error names one of ``missing``."""
+    def call(self, *arguments: str, missing: tuple[str, ...] = (), timeout: float = AWS_TIMEOUT_SECONDS) -> Any:
+        """Run one AWS command within ``timeout`` seconds and return its parsed JSON output, or None when its error names one of ``missing``."""
         fixed = ["--profile", self.profile, "--region", self.region, "--output", "json", "--no-cli-pager"]
-        result = run_command("aws", [*arguments, *fixed], timeout=AWS_TIMEOUT_SECONDS)
+        result = run_command("aws", [*arguments, *fixed], timeout=timeout)
         if result.returncode != 0:
             if any(marker in result.stderr for marker in missing):
                 return None
