@@ -113,7 +113,7 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
     except FileNotFoundError as error:
         raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
-    except TimeoutExpired, PermissionError:
+    except TimeoutExpired:
         raise NoPeerError("the Tailscale client on this computer did not answer in time") from None
     if result.returncode != 0:
         raise HostError(f"tailscale status failed: {result.stderr.strip()}")
@@ -186,7 +186,7 @@ def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str |
     """The output of one command on the host over SSH, or None when SSH does not answer."""
     try:
         result = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", command], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
-    except TimeoutExpired, PermissionError:
+    except TimeoutExpired:
         return None
     return result.stdout if result.returncode == 0 else None
 
