@@ -1,0 +1,8 @@
+# Reads docker_logging_driver, docker_daemon_configuration (slurped content), docker_daemon_file (stat) and docker_started (the time Docker last became active, in Unix seconds).
+- name: Confirm log rotation is in effect
+  ansible.builtin.assert:
+    that:
+      - docker_logging_driver.stdout == 'json-file'
+      - "docker_daemon_configuration.content | b64decode | from_json == {'log-driver': 'json-file', 'log-opts': {'max-size': docker_log_max_size, 'max-file': docker_log_max_file}}"
+      - "(docker_started.stdout | trim | regex_replace('^@', '') | int) >= (docker_daemon_file.stat.mtime | int)"
+    fail_msg: "Docker's log rotation is not in effect: its driver, the settings in /etc/docker/daemon.json or the time Docker started after the file was written differs from the pin."

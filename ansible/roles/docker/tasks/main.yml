@@ -56,11 +56,30 @@
 - name: Apply a changed Docker configuration before the checks
   ansible.builtin.meta: flush_handlers
 
-- name: Read Docker's running log settings
+- name: Read Docker's running log driver
   ansible.builtin.command:
     cmd: "docker info --format {% raw %}'{{ .LoggingDriver }}'{% endraw %}"
   register: docker_logging_driver
   changed_when: false
+
+- name: Read the log settings file that Docker was configured with
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: docker_daemon_configuration
+
+- name: Read when the log settings file was written
+  ansible.builtin.stat:
+    path: /etc/docker/daemon.json
+  register: docker_daemon_file
+
+- name: Read when Docker last became active
+  ansible.builtin.command:
+    argv: [systemctl, show, docker, --property=ActiveEnterTimestamp, --timestamp=unix, --value]
+  register: docker_started
+  changed_when: false
+
+- name: Check the effective log rotation
+  ansible.builtin.include_tasks: verify_log_rotation.yml
 
 - name: Read Docker Compose's version
   ansible.builtin.command:
@@ -68,9 +87,8 @@
   register: docker_compose_version
   changed_when: false
 
-- name: Confirm log rotation and Docker Compose are in place
+- name: Confirm the Docker Compose version
   ansible.builtin.assert:
     that:
-      - docker_logging_driver.stdout == 'json-file'
       - docker_compose_version.stdout is version('5.8.0', '==')
-    fail_msg: Docker's log driver or the Docker Compose version differs from the pin.
+    fail_msg: The Docker Compose version differs from the pin.
