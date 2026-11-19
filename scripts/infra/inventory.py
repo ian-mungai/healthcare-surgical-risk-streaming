@@ -5,7 +5,7 @@ Run from the repository root under the project profile in ``.env``:
 ``.venv/bin/python -m scripts.infra.inventory``
 
 It reads the run's Terraform state from its bound backend and writes ``runs/<RUN_ID>/inventory.json``: one entry for
-each resource that an applied plan of this run created, with its address, type and service ID, one for the state bucket
+each resource that an applied plan of this run created, with its address, type and service ID, one for the project's bucket
 when this run created it, the managed resources this run did not create and the items the owner authorized to retain.
 Resources without tags are listed like any other, because the list comes from the creation record and the state.
 """

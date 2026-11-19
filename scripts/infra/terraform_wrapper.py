@@ -206,7 +206,7 @@ def plan_label(action: str, *, changes: int, reviewed_exists: bool) -> str:
 def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> int:
     """Save the plan with its text, JSON and binding, print its changes and return how many resources change."""
     if run.status != "verified":
-        raise WrapperError("the run's state bucket is not verified: run the state bootstrap step")
+        raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
     candidate = folder / f"{action}_candidate.tfplan"

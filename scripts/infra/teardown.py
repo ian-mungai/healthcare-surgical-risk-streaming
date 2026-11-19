@@ -162,7 +162,7 @@ def plan_teardown(aws: Aws, configuration: dict[str, str], run: RunBinding) -> i
 
 
 def destroy_write_problem(key: str, content: bytes | None, delete_marker: bool, state_keys: list[str], lineage: str, serial: int) -> str | None:
-    """Why a state bucket entry that appeared after approval is not this run's own destroy write, or None when it is."""
+    """Why a bucket entry that appeared after approval is not this run's own destroy write, or None when it is."""
     if key not in state_keys:
         return "an entry outside this run's state keys"
     try:

@@ -127,6 +127,7 @@ resource "aws_security_group" "host" {
   description = "Host with no inbound rule. All access comes through Tailscale."
   vpc_id      = data.aws_vpc.default.id
   ingress     = []
+  tags        = { Name = var.name }
 
   egress {
     description = "Outbound to any address"
@@ -145,6 +146,7 @@ resource "aws_instance" "host" {
   iam_instance_profile        = aws_iam_instance_profile.host.name
   associate_public_ip_address = true
   user_data                   = local.user_data
+  tags                        = { Name = var.name }
 
   metadata_options {
     http_tokens                 = "required"
@@ -158,6 +160,7 @@ resource "aws_instance" "host" {
     throughput            = 125
     encrypted             = true
     delete_on_termination = true
+    tags                  = { Name = var.name }
   }
 
   lifecycle {

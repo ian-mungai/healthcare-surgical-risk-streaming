@@ -2,7 +2,7 @@
 
 Run from the repository root under the project profile in ``.env``, through ``make``:
 
-``make host-up`` creates the run's state bucket when it is absent and saves a Terraform plan. When the plan changes
+``make host-up`` creates the project's bucket when it is absent and saves a Terraform plan. When the plan changes
 anything, it prints the changes and a confirmation code and stops for the owner's review.
 ``make host-up CONFIRM=<CODE>`` applies exactly the reviewed plan, waits for the instance, for its Tailscale peer and
 for SSH, runs the Ansible host setup and writes the inventory. A run with nothing to change goes straight to those
