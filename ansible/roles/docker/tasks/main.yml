@@ -19,6 +19,14 @@
     mode: "0644"
   register: docker_repository
 
+- name: Create Docker's configuration folder
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Set container log rotation before Docker first starts
   ansible.builtin.copy:
     dest: /etc/docker/daemon.json
