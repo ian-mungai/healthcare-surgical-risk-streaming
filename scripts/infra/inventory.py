@@ -5,8 +5,9 @@ Run from the repository root under the project profile in ``.env``:
 ``.venv/bin/python -m scripts.infra.inventory``
 
 It reads the run's Terraform state from its bound backend and writes ``runs/<RUN_ID>/inventory.json``: one entry for
-each managed resource with its address, type and service ID, one for the state bucket and the list of items the owner
-authorized to retain. Resources without tags are listed like any other, because the list comes from the state.
+each resource that an applied plan of this run created, with its address, type and service ID, one for the state bucket
+when this run created it, the managed resources this run did not create and the items the owner authorized to retain.
+Resources without tags are listed like any other, because the list comes from the creation record and the state.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from scripts.infra.created import run_inventory
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
@@ -44,10 +46,14 @@ def write_inventory(binding: Path) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     retained_file = folder / "retained.json"
     retained = json.loads(retained_file.read_text()) if retained_file.is_file() else []
+    created_file = folder / "created.json"
+    recorded = json.loads(created_file.read_text()) if created_file.is_file() else []
+    created, not_created = run_inventory(recorded, state_json(run, configuration), run)
     inventory = {
         "run_id": run.run_id,
         "commit": run.commit,
-        "created": inventory_entries(state_json(run, configuration), run.state_bucket),
+        "created": created,
+        "not_created_by_this_run": not_created,
         "authorized_retained": retained,
     }
     target = folder / "inventory.json"

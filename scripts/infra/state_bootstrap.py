@@ -45,6 +45,7 @@ class RunBinding:
     state_keys: list[str]
     status: str
     provision_host: bool = True
+    state_bucket_creation: str = "none"
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +71,24 @@ def new_binding(configuration: dict[str, str], backend: str = "s3", provision_ho
     return RunBinding(
         run_id, commit, "s3", configuration["AWS_REGION"], bucket, WORKSPACE, [STATE_KEY, f"{STATE_KEY}.tflock"], "planned", provision_host=provision_host
     )
+
+
+def adoption_problem(creation: str, *, exists: bool, owned_and_empty: bool) -> str | None:
+    """Why this run may not use the bucket with its state bucket name, or None when it may create or keep using it."""
+    if creation == "none" and exists:
+        return "a bucket with this run's state bucket name already exists and this run did not create it"
+    if creation == "attempted" and exists and not owned_and_empty:
+        return "the bucket from this run's interrupted creation is not an empty bucket of this account"
+    if creation == "created" and not exists:
+        return "this run's state bucket no longer exists"
+    return None
+
+
+def owned_and_empty(aws: Aws, bucket: str, account: str) -> bool:
+    if aws.call("s3api", "head-bucket", "--bucket", bucket, "--expected-bucket-owner", account, missing=("(403)", "AccessDenied")) is None:
+        return False
+    listing = aws.call("s3api", "list-object-versions", "--bucket", bucket, "--max-items", "1")
+    return not listing.get("Versions") and not listing.get("DeleteMarkers")
 
 
 def required_tags(configuration: dict[str, str]) -> dict[str, str]:
@@ -127,9 +146,20 @@ def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "
         return 0
     tags = required_tags(configuration)
     changes = []
-    if not bucket_exists(aws, binding.state_bucket):
+    exists = bucket_exists(aws, binding.state_bucket)
+    adoptable = exists and binding.state_bucket_creation == "attempted" and owned_and_empty(aws, binding.state_bucket, configuration["AWS_ACCOUNT_ID"])
+    problem = adoption_problem(binding.state_bucket_creation, exists=exists, owned_and_empty=adoptable)
+    if problem:
+        sys.stderr.write(f"{problem}\n")
+        return 1
+    if not exists:
+        binding.state_bucket_creation = "attempted"
+        binding.write(path)
         aws.call("s3api", "create-bucket", "--bucket", binding.state_bucket, "--create-bucket-configuration", f"LocationConstraint={binding.region}")
         changes.append("bucket created")
+    if binding.state_bucket_creation != "created":
+        binding.state_bucket_creation = "created"
+        binding.write(path)
     for name in problems(read_settings(aws, binding.state_bucket), tags):
         repair(aws, binding.state_bucket, name, tags)
         changes.append(f"{name} set")

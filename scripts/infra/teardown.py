@@ -65,7 +65,9 @@ def target_problems(targets: list[Target], inventory: list[dict[str, str]], run:
             problems.append(f"delete target outside this run's inventory: {address}")
     if run.backend == "local" and state_buckets:
         problems.append("a state bucket is named for removal under the local backend")
-    if run.backend == "s3" and state_buckets != [run.state_bucket]:
+    if run.backend == "s3" and run.state_bucket_creation != "created":
+        problems.append("the state bucket was not created by this run")
+    elif run.backend == "s3" and state_buckets != [run.state_bucket]:
         problems.append("the bound state bucket is not the state bucket in this run's inventory")
     return problems
 

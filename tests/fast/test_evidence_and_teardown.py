@@ -20,9 +20,9 @@ from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.teardown import bucket_entry_problems, delete_targets, settled_checks, state_entry_problems, target_problems
 
 STATE_KEYS = ["environment/terraform.tfstate", "environment/terraform.tfstate.tflock"]
-RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified")
+RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified", state_bucket_creation="created")
 LOCAL = RunBinding("20260101t0000-abcdef", "c0ffee", "local", "us-west-2", "", "default", ["/srv/run/terraform.tfstate"], "verified", provision_host=False)
-GIVEN_HOST = RunBinding(RUN.run_id, RUN.commit, "s3", "us-west-2", "example-state", "default", STATE_KEYS, "verified", provision_host=False)
+GIVEN_HOST = RunBinding(**{**RUN.__dict__, "provision_host": False})
 HASH = "a" * 64
 
 
@@ -203,6 +203,10 @@ class TargetTest(unittest.TestCase):
     def test_state_bucket_must_be_the_one_this_run_created(self) -> None:
         other = [entry | {"service_id": "other-state"} if entry["address"] == "state bucket" else entry for entry in INVENTORY]
         self.assertEqual(["the bound state bucket is not the state bucket in this run's inventory"], target_problems(delete_targets(PLAN), other, RUN, []))
+
+    def test_state_bucket_the_run_did_not_create_is_refused(self) -> None:
+        adopted = RunBinding(**{**RUN.__dict__, "state_bucket_creation": "none"})
+        self.assertEqual(["the state bucket was not created by this run"], target_problems(delete_targets(PLAN), INVENTORY, adopted, []))
 
     def test_state_bucket_target_is_refused_under_the_local_backend(self) -> None:
         only_buckets = {"resource_changes": [change('module.storage.aws_s3_bucket.this["landing"]', "aws_s3_bucket", "example-landing", ["delete"])]}

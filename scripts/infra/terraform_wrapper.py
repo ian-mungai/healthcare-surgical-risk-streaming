@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from scripts.infra.created import created_entries, merge_created
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
@@ -163,7 +164,16 @@ def apply_plan(run: RunBinding, code: str) -> int:
     if problems:
         raise WrapperError("refused before any change: " + "; ".join(problems))
     sys.stdout.write(terraform(run, ["apply", "-input=false", "-no-color", str(plan_file)], APPLY_TIMEOUT_SECONDS))
+    record_created(run, json.loads(terraform(run, ["show", "-json", str(plan_file)], PLAN_TIMEOUT_SECONDS)))
     return 0
+
+
+def record_created(run: RunBinding, applied_plan: dict[str, Any]) -> None:
+    """Add what the applied plan created to the run's creation record, read from the state the apply left."""
+    target = ROOT / "runs" / run.run_id / "created.json"
+    recorded = json.loads(target.read_text()) if target.is_file() else []
+    state: dict[str, Any] = json.loads(terraform(run, ["show", "-json"], PLAN_TIMEOUT_SECONDS))
+    target.write_text(json.dumps(merge_created(recorded, created_entries(applied_plan, state)), indent=2) + "\n")
 
 
 def main() -> int:
