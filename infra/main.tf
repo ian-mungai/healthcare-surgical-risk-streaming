@@ -40,3 +40,12 @@ module "host" {
     version   = var.tailscale_version
   }
 }
+
+module "deploy" {
+  source = "./modules/deploy"
+
+  name               = "${var.project_name}_deploy_${var.environment}"
+  boundary_name      = "${var.project_name}_role_boundary"
+  github_repository  = var.github_repository
+  github_environment = var.github_environment
+}

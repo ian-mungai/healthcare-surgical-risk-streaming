@@ -164,14 +164,24 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
     return 0
 
 
+def host_check(host_name: str) -> int:
+    address = host_peer(host_name)
+    wait_for("SSH over Tailscale", lambda: ssh_answers("deploy", address), SSH_DEADLINE_SECONDS)
+    sys.stdout.write(f"the host answers over Tailscale SSH as {host_name}\n")
+    return 0
+
+
 def main() -> int:
     """Run one host command and return a non-zero code on a refusal, an expired deadline or a failure."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("command", choices=["up", "stop", "start"])
+    parser.add_argument("command", choices=["up", "stop", "start", "check"])
+    parser.add_argument("--host-name", default="", help="check: the host's Tailscale name, for example platform-dev")
     parser.add_argument("--confirm", default="", help="up: the confirmation code of the reviewed plan")
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()
     try:
+        if arguments.command == "check":
+            return host_check(arguments.host_name)
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         if arguments.command == "up":

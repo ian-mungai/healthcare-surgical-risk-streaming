@@ -31,6 +31,7 @@ variables {
   environment  = "dev"
   run_id       = "20260101t0000-abcdef"
 
+  github_repository   = "example-owner/example-repository"
   tailscale_client_id = "example-client-id"
   tailscale_audience  = "example-audience"
 }
@@ -155,6 +156,45 @@ run "host_joins_tailscale_without_a_stored_key" {
       !strcontains(local.user_data, "auth-key"),
     ])
     error_message = "The boot script joins Tailscale with the federated identity, the tag and the neutral host name, and holds no auth key."
+  }
+}
+
+run "deploy_role_trusts_only_the_protected_workflow" {
+  command = plan
+
+  module {
+    source = "./modules/deploy"
+  }
+
+  variables {
+    name               = "example_project_deploy_dev"
+    boundary_name      = "example_project_role_boundary"
+    github_repository  = "example-owner/example-repository"
+    github_environment = "deploy"
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Condition == {
+      StringEquals = {
+        "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
+        "token.actions.githubusercontent.com:sub"              = "repo:example-owner/example-repository:environment:deploy"
+        "token.actions.githubusercontent.com:repository"       = "example-owner/example-repository"
+        "token.actions.githubusercontent.com:ref"              = "refs/heads/main"
+        "token.actions.githubusercontent.com:environment"      = "deploy"
+        "token.actions.githubusercontent.com:job_workflow_ref" = "example-owner/example-repository/.github/workflows/deploy.yml@refs/heads/main"
+      }
+    }
+    error_message = "The trust policy requires the repository, the main branch, the protected environment and the exact workflow, each as an exact string."
+  }
+
+  assert {
+    condition     = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" && endswith(jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Principal.Federated, ":oidc-provider/token.actions.githubusercontent.com")
+    error_message = "Only GitHub's identity provider may assume the deploy role, and only with a web identity token."
+  }
+
+  assert {
+    condition     = endswith(aws_iam_role.deploy.permissions_boundary, ":policy/example_project_role_boundary")
+    error_message = "The deploy role carries the project's permissions boundary."
   }
 }
 

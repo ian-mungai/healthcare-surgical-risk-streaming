@@ -43,6 +43,22 @@ variable "run_id" {
   }
 }
 
+variable "github_repository" {
+  description = "GitHub repository that may deploy, as owner/name."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
+    error_message = "Give the repository as owner/name."
+  }
+}
+
+variable "github_environment" {
+  description = "Name of the protected GitHub deployment environment."
+  type        = string
+  default     = "deploy"
+}
+
 variable "tailscale_client_id" {
   description = "Client ID of the Tailscale federated identity for the host. It is not a secret."
   type        = string

@@ -1,0 +1,46 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Reach the host with the deploy identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: deploy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      - name: Obtain AWS credentials with the workflow's identity token
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: deploy
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Confirm the AWS identity
+        run: aws sts get-caller-identity --query UserId --output text > /dev/null
+      - name: Join the Tailscale network with the workflow's identity token
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_DEPLOY_CLIENT_ID }}
+          audience: ${{ vars.TS_DEPLOY_AUDIENCE }}
+          tags: tag:surgical-deploy
+          version: 1.104.7
+      - name: Reach the host over SSH
+        env:
+          HOST_NAME: ${{ vars.PLATFORM_HOST_NAME }}
+        run: python -m scripts.infra.host check --host-name "${HOST_NAME}"

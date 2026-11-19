@@ -22,3 +22,8 @@ output "bucket_names" {
   description = "Names of the project's buckets, by component."
   value       = module.storage.bucket_names
 }
+
+output "deploy_role_arn" {
+  description = "ARN of the role the protected deploy workflow assumes."
+  value       = module.deploy.role_arn
+}
