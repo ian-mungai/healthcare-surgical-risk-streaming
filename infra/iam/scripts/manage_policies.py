@@ -7,10 +7,14 @@ The owner runs this under the administrator profile, from the repository root:
 ``plan`` is read-only. It lists each step and prints a confirmation code. ``apply --confirm <CODE>`` computes the plan
 again and applies it only when its code equals the reviewed one. It creates the user, creates missing policies,
 publishes a new default version only when a document changed and attaches each policy to the user. A rerun plans
-nothing. ``export`` compares the live documents, the tags of the policies and the boundary, the user's attached policies by ARN,
-its inline policies and its group memberships with the templates and exits 1 on a difference. The tool never creates an access key and never
-removes a grant or a tag: a live project policy with no template, an extra attachment, an inline policy, a group membership and
-an extra policy tag are reported, and ``plan`` and ``apply`` exit 1 while one remains.
+nothing. ``key`` gives the user its one access key: it creates the key only when the user has none, writes it to an
+owner-only backup file beside the AWS command line's own files, in the column layout of the console's download,
+imports it as the project profile and waits until AWS accepts it. It never prints the secret, never overwrites a
+backup file and never deletes a key. ``export`` compares the live documents, the tags of the policies and the
+boundary, the user's attached policies by ARN, its inline policies and its group memberships with the templates and
+exits 1 on a difference. Only ``key`` creates an access key. The tool never removes a grant or a tag: a live project
+policy with no template, an extra attachment, an inline policy, a group membership and an extra policy tag are
+reported, and ``plan`` and ``apply`` exit 1 while one remains.
 """
 
 from __future__ import annotations
@@ -18,9 +22,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
@@ -28,6 +35,10 @@ from scripts.aws_cli import Aws, AwsError
 from scripts.project_config import ConfigurationError, load_configuration
 
 MAX_POLICY_VERSIONS = 5
+KEY_FOLDER = Path.home() / ".aws"
+KEY_HEADER = "User Name,Access key ID,Secret access key"
+KEY_READY_SECONDS = 120.0
+KEY_POLL_SECONDS = 5.0
 LIST_KEYS = {"Action", "NotAction", "Resource", "NotResource"}
 
 
@@ -185,6 +196,47 @@ def apply_step(aws: Aws, names: Names, account: str, documents: Mapping[str, Map
         aws.call("iam", "attach-user-policy", "--user-name", names.user, "--policy-arn", arn)
 
 
+def profile_is_the_user(project: Aws, user: str) -> bool:
+    try:
+        return str(project.call("sts", "get-caller-identity").get("Arn", "")).endswith(f":user/{user}")
+    except AwsError:
+        return False
+
+
+def create_key(admin: Aws, configuration: dict[str, str], names: Names) -> int:
+    """Give the project user its one access key, a private backup file and a working profile. A second run changes nothing."""
+    user = names.user
+    if configuration["AWS_PROFILE"] != user:
+        raise ConfigurationError(f"AWS_PROFILE must equal the project user's name, {user}, for the key to be imported as that profile")
+    if admin.call("iam", "get-user", "--user-name", user, missing=("NoSuchEntity",)) is None:
+        raise ConfigurationError(f"the user {user} does not exist: run apply first")
+    project = Aws(user, configuration["AWS_REGION"])
+    backup = KEY_FOLDER / f"{user}_accessKeys.csv"
+    if admin.call("iam", "list-access-keys", "--user-name", user)["AccessKeyMetadata"]:
+        if profile_is_the_user(project, user):
+            sys.stdout.write(f"no change: {user} has its access key and the profile {user} works\n")
+            return 0
+        raise ConfigurationError(f"{user} already has an access key and the project profile does not work: this tool never deletes a key; review it")
+    if backup.exists():
+        raise ConfigurationError(f"the backup file already exists and is never overwritten: {backup.name} in {KEY_FOLDER.name}; move it away as the owner")
+    KEY_FOLDER.mkdir(mode=0o700, exist_ok=True)
+    descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        key = admin.call("iam", "create-access-key", "--user-name", user)["AccessKey"]
+        handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
+    admin.call("configure", "import", "--csv", f"file://{backup}")
+    for name, value in (("region", configuration["AWS_REGION"]), ("output", "json")):
+        project.call("configure", "set", name, value)
+    sys.stdout.write(f"access key created for {user}; backup written, readable by its owner only: {backup.name} in {KEY_FOLDER.name}\n")
+    deadline = time.monotonic() + KEY_READY_SECONDS
+    while not profile_is_the_user(project, user):
+        if time.monotonic() >= deadline:
+            raise ConfigurationError(f"the new key did not start to work within {KEY_READY_SECONDS:g} seconds; run key again to check it")
+        time.sleep(KEY_POLL_SECONDS)
+    sys.stdout.write(f"the profile {user} works\n")
+    return 0
+
+
 def run(arguments: argparse.Namespace) -> int:
     configuration = load_configuration()
     if arguments.admin_profile == configuration["AWS_PROFILE"]:
@@ -199,6 +251,8 @@ def run(arguments: argparse.Namespace) -> int:
     aws = Aws(arguments.admin_profile, configuration["AWS_REGION"])
     if aws.call("sts", "get-caller-identity")["Account"] != account:
         raise ConfigurationError("the administrator profile is in a different account from AWS_ACCOUNT_ID")
+    if arguments.command == "key":
+        return create_key(aws, configuration, names)
     steps = plan_steps(names, documents, live_state(aws, names), account=account, unattached=set(boundaries))
     code = confirmation_code(account, documents, steps)
     for step in steps:
@@ -229,13 +283,17 @@ def run(arguments: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    """Run plan, apply or export and return a non-zero code on a refusal, a difference or a failure."""
+    """Run plan, apply, key or export and return a non-zero code on a refusal, a difference or a failure."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("command", choices=["plan", "apply", "export"])
+    parser.add_argument("command", choices=["plan", "apply", "key", "export"])
     parser.add_argument("--admin-profile", required=True, help="the owner's administrator AWS profile; never the project profile")
     parser.add_argument("--confirm", default="", help="apply: the confirmation code that plan printed")
+    return guarded(parser.parse_args())
+
+
+def guarded(arguments: argparse.Namespace) -> int:
     try:
-        return run(parser.parse_args())
+        return run(arguments)
     except (ConfigurationError, PolicyRenderError, AwsError) as error:
         sys.stderr.write(f"{error}\n")
         return 1

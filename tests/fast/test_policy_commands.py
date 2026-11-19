@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import argparse
 import io
+import stat
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from infra.iam.scripts import manage_policies
 from infra.iam.scripts.manage_policies import Names, policy_arn
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, load_documents
-from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws
+from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
 
 ACCOUNT = "1" * 12
 CONFIGURATION = {
@@ -32,6 +35,7 @@ CONFIGURATION = {
 }
 NAMES = Names("example_project", "dev")
 TAGS = {"Project": "example_project", "Environment": "dev"}
+SECRET = "example-secret-" + "value"
 FOREIGN = "arn:aws:iam::aws:policy/AdministratorAccess"
 
 
@@ -51,6 +55,9 @@ class Account:
     groups: list[str] = field(default_factory=list)
     policy_tags: dict[str, dict[str, str]] = field(default_factory=dict)
     calls: list[tuple[str, ...]] = field(default_factory=list)
+    keys: int = 0
+    settings: list[tuple[tuple[str, ...], str]] = field(default_factory=list)
+    profile_works: bool = False
 
     @classmethod
     def matching_templates(cls, *, attached: bool = True, tagged: bool = True) -> Account:
@@ -68,7 +75,20 @@ class FakeAws(Aws):
         state = self.account
         verb = arguments[1]
         if verb == "get-caller-identity":
-            return {"Account": ACCOUNT}
+            if self.profile == CONFIGURATION["AWS_PROFILE"] and not state.profile_works:
+                raise AwsError("aws sts get-caller-identity failed: InvalidClientTokenId")
+            return {"Account": ACCOUNT, "Arn": f"arn:aws:iam::{ACCOUNT}:user/{self.profile}"}
+        if verb == "list-access-keys":
+            return {"AccessKeyMetadata": [{"AccessKeyId": f"key{number}"} for number in range(state.keys)]}
+        if verb == "create-access-key":
+            state.keys += 1
+            return {"AccessKey": {"AccessKeyId": "EXAMPLEKEYID", "SecretAccessKey": SECRET}}
+        if arguments[:2] == ("configure", "set"):
+            state.settings.append((arguments, self.profile))
+            return {}
+        if arguments[:2] == ("configure", "import"):
+            state.profile_works = True
+            return {}
         if verb == "get-user":
             return {"User": {}} if state.user_exists else None
         if verb == "list-policies":
@@ -96,8 +116,90 @@ def run_command(command: str, account: Account, confirm: str = "") -> tuple[int,
         redirect_stdout(out),
         redirect_stderr(err),
     ):
-        code = manage_policies.run(arguments)
+        code = manage_policies.run(arguments) if command != "key" else manage_policies.guarded(arguments)
     return code, out.getvalue(), err.getvalue()
+
+
+class KeyTest(unittest.TestCase):
+    """``key`` gives the project user its one access key, a backup file and a working profile, and never shows the secret."""
+
+    def run_key(self, account: Account, configuration: dict[str, str] | None = None) -> tuple[int, str, Path]:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.folder = folder
+        return self.rerun_key(account, configuration)
+
+    def rerun_key(self, account: Account, configuration: dict[str, str] | None = None) -> tuple[int, str, Path]:
+        with (
+            mock.patch.object(manage_policies, "KEY_FOLDER", self.folder),
+            mock.patch.object(manage_policies, "KEY_READY_SECONDS", 0.05),
+            mock.patch.object(manage_policies, "KEY_POLL_SECONDS", 0.01),
+            mock.patch.dict(CONFIGURATION, configuration or {}),
+        ):
+            code, out, err = run_command("key", account)
+        return code, out + err, self.folder / "example_project_dev_accessKeys.csv"
+
+    def test_a_user_without_a_key_gets_one_with_a_private_backup_and_a_working_profile(self) -> None:
+        account = Account.matching_templates()
+        code, output, backup = self.run_key(account)
+        self.assertEqual(0, code, output)
+        self.assertEqual(f"User Name,Access key ID,Secret access key\nexample_project_dev,EXAMPLEKEYID,{SECRET}\n", backup.read_text())
+        self.assertEqual(0o600, stat.S_IMODE(backup.stat().st_mode))
+        self.assertIn(("configure", "import", "--csv", f"file://{backup}"), account.calls)
+        settings = [(call, self_profile) for call, self_profile in account.settings]
+        self.assertEqual(
+            [(("configure", "set", "region", "us-west-2"), "example_project_dev"), (("configure", "set", "output", "json"), "example_project_dev")], settings
+        )
+        self.assertNotIn(SECRET, output)
+        self.assertNotIn(SECRET, repr(account.calls))
+
+    def test_a_second_run_changes_nothing(self) -> None:
+        account = Account.matching_templates()
+        self.run_key(account)
+        before = len([call for call in account.calls if call[1] == "create-access-key"])
+        code, output, _ = self.rerun_key(account)
+        self.assertEqual(0, code, output)
+        self.assertIn("no change", output)
+        self.assertEqual(before, len([call for call in account.calls if call[1] == "create-access-key"]))
+
+    def test_an_existing_key_with_a_profile_that_does_not_work_is_refused_and_no_key_is_created(self) -> None:
+        account = Account.matching_templates()
+        account.keys = 1
+        code, output, backup = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("already has an access key and the project profile does not work", output)
+        self.assertEqual(1, account.keys)
+        self.assertFalse(backup.exists())
+
+    def test_an_existing_backup_file_is_never_overwritten(self) -> None:
+        account = Account.matching_templates()
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.folder = folder
+        (folder / "example_project_dev_accessKeys.csv").write_text("kept")
+        code, output, backup = self.rerun_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("backup file already exists", output)
+        self.assertEqual(("kept", 0), (backup.read_text(), account.keys))
+
+    def test_a_missing_user_is_refused(self) -> None:
+        code, output, _ = self.run_key(Account(user_exists=False))
+        self.assertEqual(1, code)
+        self.assertIn("does not exist: run apply first", output)
+
+    def test_a_key_that_never_starts_to_work_fails_at_its_deadline(self) -> None:
+        account = Account.matching_templates()
+        with mock.patch.object(FakeAws, "call", autospec=True, side_effect=lambda self, *arguments, **options: stuck(self, *arguments, **options)):
+            code, output, _ = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("did not start to work within", output)
+
+
+ORIGINAL_CALL = FakeAws.call
+
+
+def stuck(self: FakeAws, *arguments: str, **options: Any) -> Any:
+    result = ORIGINAL_CALL(self, *arguments, **options)
+    self.account.profile_works = False
+    return result
 
 
 class ExportTest(unittest.TestCase):
