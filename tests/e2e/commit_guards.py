@@ -12,20 +12,20 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import platform
 import re
 import shutil
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.process import run_command
+from tests.e2e.run_record import Observation, Record
 
 ROOT = Path(__file__).resolve().parents[2]
+RERUN = ".venv/bin/python -m tests.e2e.commit_guards"
 COMMAND_TIMEOUT_SECONDS = 300
 LINKED_FOLDERS = (".venv", ".tools")
 FAILED_HOOK = re.compile(r"\.Failed\n- hook id: (\S+)")
@@ -48,31 +48,6 @@ class Case:
     guard: str
     control: Change
     fault: Change
-
-
-@dataclass
-class Observation:
-    case: str
-    step: str
-    expected: str
-    observed: str
-    passed: bool
-
-
-@dataclass
-class Record:
-    feature: str
-    started_utc: str
-    mode: str
-    environment: dict[str, str]
-    revision: str
-    tree_sha256: str
-    commands: list[str] = field(default_factory=list)
-    observations: list[Observation] = field(default_factory=list)
-    outcome: str = "blocked"
-    limits: list[str] = field(default_factory=list)
-    cleanup: str = "pending"
-    rerun: str = ".venv/bin/python -m tests.e2e.commit_guards"
 
 
 def planted_token() -> str:
@@ -253,36 +228,24 @@ def parse_shard(text: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def write_record(record: Record, log: list[str]) -> Path:
-    folder = ROOT / "runs" / f"{record.started_utc.replace(':', '').replace('-', '')}_commit_guards"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "record.json").write_text(json.dumps(asdict(record), indent=2) + "\n")
-    (folder / "log.txt").write_text("\n".join(log) + "\n")
-    return folder
-
-
 def main() -> int:
     """Run the planted-fault cases, write the run record and return 0 only when every assertion held."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--shard", type=parse_shard, default=(1, 1), metavar="INDEX/COUNT", help="run one share of the cases")
     index, count = parser.parse_args().shard
     paths = source_files()
-    record = Record(
-        feature="commit guards, local commit path",
-        started_utc=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        mode="full" if count == 1 else f"shard {index} of {count}",
-        environment={
-            "platform": f"{platform.system()} {platform.machine()}",
-            "python": platform.python_version(),
-            "pre_commit": tool_version(".venv/bin/pre-commit"),
-            "ruff": tool_version(".venv/bin/ruff"),
-            "mypy": tool_version(".venv/bin/mypy"),
-            "gitleaks": tool_version(".tools/bin/gitleaks"),
-        },
-        revision=revision(),
-        tree_sha256=tree_digest(paths),
-        limits=["local commit path only: the hosted CI path has its own run", "the planted token and account reference are fake values built at run time"],
-    )
+    record = Record(feature="commit guards, local commit path", slug="commit_guards", rerun=RERUN, mode="full" if count == 1 else f"shard {index} of {count}")
+    record.environment = {
+        "platform": f"{platform.system()} {platform.machine()}",
+        "python": platform.python_version(),
+        "pre_commit": tool_version(".venv/bin/pre-commit"),
+        "ruff": tool_version(".venv/bin/ruff"),
+        "mypy": tool_version(".venv/bin/mypy"),
+        "gitleaks": tool_version(".tools/bin/gitleaks"),
+    }
+    record.revision = revision()
+    record.tree_sha256 = tree_digest(paths)
+    record.limits = ["local commit path only: the hosted CI path has its own run", "the planted token and account reference are fake values built at run time"]
     log: list[str] = []
     fixture = Fixture(paths, record)
     try:
@@ -298,15 +261,13 @@ def main() -> int:
                     record.observations.extend(run_case(fixture, case, log))
         unchanged = tree_digest(source_files()) == record.tree_sha256
         record.observations.append(Observation("source tree", "snapshot", "unchanged during the run", f"unchanged: {unchanged}", unchanged))
-        record.outcome = "pass" if all(item.passed for item in record.observations) else "fail"
+    except RuntimeError as error:
+        log.append(str(error))
+        record.expect("fixture", "setup", "every fixture command succeeds", "a fixture command failed; see log.txt", False)
     finally:
         fixture.remove()
         record.cleanup = "temporary repository removed"
-        folder = write_record(record, log)
-    for item in record.observations:
-        sys.stdout.write(f"{'PASS' if item.passed else 'FAIL'} {item.case} ({item.step}): {item.observed}\n")
-    sys.stdout.write(f"{record.outcome}: record in {folder.relative_to(ROOT)}\n")
-    return 0 if record.outcome == "pass" else 1
+    return record.close(log)
 
 
 if __name__ == "__main__":

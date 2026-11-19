@@ -2,7 +2,7 @@
 
 A self-hosted data platform that takes real surgical monitor recordings from ingestion to reporting. It loads the recordings, streams them, builds features, gives a live warning of a blood pressure drop and scores two risks for each surgical case.
 
-The project is in its first phase. This repository holds the repository checks so far.
+The project is in its first phase. So far this repository holds the repository checks, the tool that grants the project's AWS profile its permissions and the step that creates the Terraform state bucket.
 
 ## Data
 
