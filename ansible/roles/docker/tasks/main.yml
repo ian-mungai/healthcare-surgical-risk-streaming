@@ -1,0 +1,70 @@
+- name: Create the apt keyring folder
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install Docker's package signing key, checked against its pinned hash
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    checksum: "sha256:{{ docker_signing_file_sha256 }}"
+    mode: "0644"
+    timeout: 60
+
+- name: Add Docker's package repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.list
+    content: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable\n"
+    mode: "0644"
+  register: docker_repository
+
+- name: Set container log rotation before Docker first starts
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: "{{ {'log-driver': 'json-file', 'log-opts': {'max-size': docker_log_max_size, 'max-file': docker_log_max_file}} | to_nice_json }}\n"
+    mode: "0644"
+  notify: Restart Docker
+
+- name: Install the pinned Docker packages
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: "{{ docker_repository is changed }}"
+    cache_valid_time: 3600
+    allow_downgrade: false
+    lock_timeout: 300
+
+- name: Hold the Docker packages at their pinned versions
+  ansible.builtin.dpkg_selections:
+    name: "{{ item.split('=')[0] }}"
+    selection: hold
+  loop: "{{ docker_packages }}"
+
+- name: Start Docker now and at boot
+  ansible.builtin.systemd_service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Apply a changed Docker configuration before the checks
+  ansible.builtin.meta: flush_handlers
+
+- name: Read Docker's running log settings
+  ansible.builtin.command:
+    cmd: "docker info --format {% raw %}'{{ .LoggingDriver }}'{% endraw %}"
+  register: docker_logging_driver
+  changed_when: false
+
+- name: Read Docker Compose's version
+  ansible.builtin.command:
+    cmd: docker compose version --short
+  register: docker_compose_version
+  changed_when: false
+
+- name: Confirm log rotation and Docker Compose are in place
+  ansible.builtin.assert:
+    that:
+      - docker_logging_driver.stdout == 'json-file'
+      - docker_compose_version.stdout is version('5.8.0', '==')
+    fail_msg: Docker's log driver or the Docker Compose version differs from the pin.

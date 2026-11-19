@@ -1,0 +1,6 @@
+# The host is reached by its Tailscale name. Tailscale SSH admits the owner and the deploy runner, so no key is named here.
+all:
+  hosts:
+    platform:
+      ansible_host: "{{ lookup('ansible.builtin.env', 'PLATFORM_HOST') | default('platform-dev', true) }}"
+      ansible_user: ubuntu

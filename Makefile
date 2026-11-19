@@ -1,6 +1,6 @@
 PYTHON := .venv/bin/python
 
-.PHONY: setup lock check check-terraform test-fast test-guards
+.PHONY: setup lock check check-terraform check-ansible test-fast test-guards
 
 setup:
 	python3.14 -m venv .venv
@@ -20,6 +20,9 @@ check-terraform:
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra validate
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra test
 	TFLINT_PLUGIN_DIR=$(CURDIR)/.tools/tflint_plugins .tools/bin/tflint --chdir=infra --recursive --config=$(CURDIR)/infra/.tflint.hcl
+
+check-ansible:
+	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml
 
 test-fast:
 	$(PYTHON) -m unittest discover --start-directory tests/fast --top-level-directory .

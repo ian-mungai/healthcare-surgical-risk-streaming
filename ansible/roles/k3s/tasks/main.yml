@@ -1,0 +1,83 @@
+- name: Create the k3s configuration folder
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: "0755"
+
+- name: Turn off the bundled ingress controller and service load balancer
+  ansible.builtin.copy:
+    dest: /etc/rancher/k3s/config.yaml
+    content: |
+      disable:
+        - traefik
+        - servicelb
+      write-kubeconfig-mode: "0600"
+    mode: "0600"
+  register: k3s_configuration
+
+- name: Download the k3s installer of the pinned release, checked against its pinned hash
+  ansible.builtin.get_url:
+    url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_version | urlencode }}/install.sh"
+    dest: /usr/local/sbin/k3s_install.sh
+    checksum: "sha256:{{ k3s_install_script_sha256 }}"
+    mode: "0700"
+    timeout: 60
+
+- name: Read the installed k3s version
+  ansible.builtin.command:
+    cmd: k3s --version
+  register: k3s_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install the pinned k3s release
+  ansible.builtin.command:
+    cmd: /usr/local/sbin/k3s_install.sh
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: server
+  when: k3s_installed.rc != 0 or k3s_version not in k3s_installed.stdout
+  changed_when: true
+  timeout: 600
+
+- name: Restart k3s when its configuration changed after the install
+  ansible.builtin.systemd_service:
+    name: k3s
+    state: restarted
+  when: k3s_configuration is changed and k3s_installed.rc == 0 and k3s_version in k3s_installed.stdout
+
+- name: Start k3s now and at boot
+  ansible.builtin.systemd_service:
+    name: k3s
+    state: started
+    enabled: true
+
+- name: Wait for the k3s node to be ready
+  ansible.builtin.command:
+    cmd: k3s kubectl wait --for=condition=Ready node --all --timeout=20s
+  register: k3s_node_ready
+  changed_when: false
+  retries: "{{ (k3s_ready_deadline_seconds / 25) | int }}"
+  delay: 5
+  until: k3s_node_ready.rc == 0
+
+- name: Read the running k3s configuration
+  ansible.builtin.command:
+    cmd: k3s kubectl get node -o jsonpath={.items[0].metadata.annotations.k3s\.io/node-args}
+  register: k3s_node_arguments
+  changed_when: false
+
+- name: Read every workload and service in the cluster
+  ansible.builtin.command:
+    cmd: k3s kubectl get pods,daemonsets,services --all-namespaces -o name
+  register: k3s_objects
+  changed_when: false
+
+- name: Confirm the ingress controller and the service load balancer are off and absent
+  ansible.builtin.assert:
+    that:
+      - "'traefik' in k3s_node_arguments.stdout"
+      - "'servicelb' in k3s_node_arguments.stdout"
+      - "'traefik' not in k3s_objects.stdout"
+      - "'svclb' not in k3s_objects.stdout"
+    fail_msg: k3s runs with its bundled ingress controller or service load balancer.
