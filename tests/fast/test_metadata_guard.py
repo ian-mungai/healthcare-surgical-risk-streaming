@@ -147,7 +147,7 @@ class RoleContractTest(unittest.TestCase):
 
     def test_the_guard_runs_before_the_roles_that_start_workloads(self) -> None:
         roles = role_order("host.yml")
-        self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access"], roles)
+        self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access", "unlock_key"], roles)
 
 
 LOADED = """table inet metadata_guard {

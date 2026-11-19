@@ -1,0 +1,26 @@
+# Reads unlock_key_file and unlock_key_owner. The content is read for its shape only and never shown.
+- name: Read the unlock key file's status
+  ansible.builtin.stat:
+    path: "{{ unlock_key_file }}"
+  register: unlock_key_status
+
+- name: Read the unlock key file's content
+  ansible.builtin.slurp:
+    src: "{{ unlock_key_file }}"
+  register: unlock_key_content
+  when: unlock_key_status.stat.exists
+  no_log: true
+
+- name: Check the shape of the unlock key line
+  ansible.builtin.set_fact:
+    unlock_key_shape_ok: "{{ unlock_key_status.stat.exists and (unlock_key_content.content | b64decode) is match('^OPENBAO_UNLOCK_KEY=[0-9a-f]{64}\\n$') }}"
+
+- name: Confirm the unlock key file exists, is for its owner only and holds one key line
+  ansible.builtin.assert:
+    that:
+      - unlock_key_status.stat.exists
+      - unlock_key_status.stat.isreg
+      - unlock_key_status.stat.mode == '0600'
+      - unlock_key_status.stat.pw_name == unlock_key_owner
+      - unlock_key_shape_ok
+    fail_msg: "The unlock key file is missing, is readable by anyone but its owner, belongs to another user or does not hold exactly one key line."

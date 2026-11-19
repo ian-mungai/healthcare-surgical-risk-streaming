@@ -37,16 +37,19 @@ def run_playbook(folder: Path, playbook: Path, extra: list[str], cwd: Path | Non
     )
 
 
-def run_task_file(role: str, task_file: str, variables: dict[str, object]) -> CompletedProcess[str]:
-    """Run ``ansible/roles/<role>/tasks/<task_file>`` on localhost and return the playbook's exit code and output."""
+def run_task_files(role: str, task_files: list[str], variables: dict[str, object], *, verbose: bool = False) -> CompletedProcess[str]:
+    """Run ``ansible/roles/<role>/tasks/<file>`` for each file in order on localhost and return the playbook's exit code and output."""
     with tempfile.TemporaryDirectory() as scratch:
-        folder = Path(scratch)
-        playbook = folder / "check.yml"
-        playbook.write_text(
-            "- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n"
-            f"    - ansible.builtin.include_tasks: {ROLES / role / 'tasks' / task_file}\n"
-        )
-        return run_playbook(folder, playbook, ["-i", "localhost,", "--extra-vars", json.dumps(variables)])
+        work = Path(scratch)
+        playbook = work / "check.yml"
+        includes = "".join(f"    - ansible.builtin.include_tasks: {ROLES / role / 'tasks' / name}\n" for name in task_files)
+        playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{includes}")
+        return run_playbook(work, playbook, [*(["-v"] if verbose else []), "-i", "localhost,", "--extra-vars", json.dumps(variables)])
+
+
+def run_task_file(role: str, task_file: str, variables: dict[str, object], *, verbose: bool = False) -> CompletedProcess[str]:
+    """Run ``ansible/roles/<role>/tasks/<task_file>`` on localhost and return the playbook's exit code and output."""
+    return run_task_files(role, [task_file], variables, verbose=verbose)
 
 
 def load_list(variables_file: Path, name: str) -> list[str]:

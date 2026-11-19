@@ -1,0 +1,14 @@
+# Reads unlock_key_directory, unlock_key_file, unlock_key_owner and unlock_key_group.
+# The marker is random and is written by the host's own shell with a umask that leaves the new file readable by its owner only.
+- name: Create the folder of the unlock key file
+  ansible.builtin.file:
+    path: "{{ unlock_key_directory }}"
+    state: directory
+    owner: "{{ unlock_key_owner }}"
+    group: "{{ unlock_key_group }}"
+    mode: "0750"
+
+- name: Write a random marker as the unlock key when the file does not exist
+  ansible.builtin.shell:
+    cmd: umask 077 && printf 'OPENBAO_UNLOCK_KEY=%s\n' "$(openssl rand -hex 32)" > {{ unlock_key_file | quote }}
+    creates: "{{ unlock_key_file }}"

@@ -26,3 +26,9 @@ metadata_guard_allowed_units:
   - cloud-init-main.service
   - cloud-config.service
   - cloud-final.service
+
+# The secret store's unlock key file on the host. Its owner is the user that deploys the stack.
+unlock_key_directory: /opt/platform
+unlock_key_file: "{{ unlock_key_directory }}/.env"
+unlock_key_owner: ubuntu
+unlock_key_group: ubuntu

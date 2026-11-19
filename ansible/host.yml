@@ -17,3 +17,4 @@
     - docker
     - k3s
     - workload_access
+    - unlock_key
