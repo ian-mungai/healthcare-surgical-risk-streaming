@@ -91,7 +91,7 @@ run "host_matches_the_design" {
 
   assert {
     condition     = aws_instance.host.metadata_options[0].http_tokens == "required" && aws_instance.host.metadata_options[0].http_put_response_hop_limit == 1
-    error_message = "Instance metadata needs a session token and answers the host only."
+    error_message = "Instance metadata needs a session token and one network hop. Workloads on the host network have no hop, so the metadata guard role keeps them away."
   }
 
   assert {

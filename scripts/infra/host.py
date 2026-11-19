@@ -73,6 +73,8 @@ def wait_for[T](
 
     Each probe gets the seconds that remain and must stay inside them. A probe call that times out counts as not ready.
     A result that comes after the deadline is no result.
+
+    A call that is killed at its timeout can raise PermissionError on macOS when its process has just exited, so that counts as a timeout too.
     """
     deadline = clock() + deadline_seconds
     while True:
@@ -81,7 +83,7 @@ def wait_for[T](
             raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
         try:
             found = probe(remaining)
-        except TimeoutExpired:
+        except TimeoutExpired, PermissionError:
             found = None
         if clock() > deadline:
             raise HostError(f"deadline of {deadline_seconds} seconds passed while waiting for {what}")
@@ -111,7 +113,7 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
     except FileNotFoundError as error:
         raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
-    except TimeoutExpired:
+    except TimeoutExpired, PermissionError:
         raise NoPeerError("the Tailscale client on this computer did not answer in time") from None
     if result.returncode != 0:
         raise HostError(f"tailscale status failed: {result.stderr.strip()}")
@@ -184,7 +186,7 @@ def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str |
     """The output of one command on the host over SSH, or None when SSH does not answer."""
     try:
         result = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", command], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
-    except TimeoutExpired:
+    except TimeoutExpired, PermissionError:
         return None
     return result.stdout if result.returncode == 0 else None
 

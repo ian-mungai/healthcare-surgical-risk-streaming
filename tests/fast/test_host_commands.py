@@ -141,6 +141,18 @@ class WaitForTest(unittest.TestCase):
 
         self.assertEqual("ready", wait_for("a thing", probe, 60, clock=lambda: clock.now, sleep=clock.sleep))
 
+    def test_a_call_whose_kill_is_refused_because_its_process_just_exited_counts_as_a_timeout(self) -> None:
+        clock = FakeClock()
+        calls = []
+
+        def probe(budget: float) -> str | None:
+            calls.append(budget)
+            if len(calls) == 1:
+                raise PermissionError("Operation not permitted")
+            return "ready"
+
+        self.assertEqual("ready", wait_for("a thing", probe, 60, clock=lambda: clock.now, sleep=clock.sleep))
+
     def test_a_call_that_always_times_out_ends_at_the_deadline(self) -> None:
         clock = FakeClock()
 
