@@ -3,8 +3,9 @@
 Run from the repository root: ``.venv/bin/python -m tests.e2e.commit_guards``. ``--shard INDEX/COUNT`` runs one share
 of the cases, for parallel jobs. The run copies every file Git does not ignore into a temporary repository, installs
 the hooks there and makes a baseline commit. Each case then makes a passing control commit and a planted-fault commit.
-The control must advance HEAD. The fault must be refused by its named guard alone, with that guard's expected message, and
-leave HEAD unchanged. Every run, passing, failing, blocked or interrupted, writes one record in a new folder under
+The control must advance HEAD. The fault must be refused by its named guard alone, with every message that guard is expected
+to print, and leave HEAD unchanged. The planted fast test is proven by its full test name, its assertion message and a
+summary of one failure. Every run, passing, failing, blocked or interrupted, writes one record in a new folder under
 ``runs/`` and removes its temporary repository. The source tree is hashed before and after the run, and a change between
 the two fails the run.
 """
@@ -38,6 +39,8 @@ TRACKED_NOTE = "notes/tracked.txt"
 QUOTED_NOTE = "notes/caf\u00e9.txt"
 CARRIAGE_NOTE = "notes/line\rbreak.txt"
 WORKTREE_GUARD = "working-tree privacy hook"
+PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
+PLANTED_MESSAGE = "planted fast-test fault"
 CLEAN_PYTHON = "def double(value: int) -> int:\n    return value * 2\n"
 
 
@@ -57,7 +60,7 @@ class Case:
     name: str
     guard: str
     hooks: tuple[str, ...]
-    message: str
+    messages: tuple[str, ...]
     control: Change
     fault: Change
 
@@ -70,14 +73,17 @@ def planted_account_reference() -> str:
     return "arn:aws:iam::" + "4" * 4 + "7" * 4 + "1" * 4 + ":role/planted"
 
 
-def hook_case(name: str, hook: str, message: str, control: Change, fault: Change) -> Case:
-    return Case(name, hook, (hook,), message, control, fault)
+def hook_case(name: str, hook: str, message: str | tuple[str, ...], control: Change, fault: Change) -> Case:
+    return Case(name, hook, (hook,), (message,) if isinstance(message, str) else message, control, fault)
 
 
 def planted_cases() -> list[Case]:
     note = {"notes/planted.txt": "A planted note.\n"}
     staged_note = ("notes/planted.txt",)
-    failing_test = "import unittest\n\n\nclass PlantedTest(unittest.TestCase):\n    def test_planted(self) -> None:\n        self.assertEqual(1, {value})\n"
+    failing_test = (
+        "import unittest\n\n\nclass PlantedTest(unittest.TestCase):\n    def test_planted(self) -> None:\n"
+        f'        self.assertEqual(1, {{value}}, "{PLANTED_MESSAGE}")\n'
+    )
     clean_role = "role: arn:aws:iam::<ACCOUNT_ID>:role/planted\n"
     marker_role = f"role: {planted_account_reference()}\n"
     account = "AWS account ID"
@@ -93,7 +99,7 @@ def planted_cases() -> list[Case]:
             "privacy marker in a tracked file with an unstaged edit",
             WORKTREE_GUARD,
             (),
-            f"{TRACKED_NOTE}:1: {account}",
+            (f"{TRACKED_NOTE}:1: {account}",),
             Change(note, staged_note, unstaged={TRACKED_NOTE: clean_role}),
             Change(note, staged_note, unstaged={TRACKED_NOTE: marker_role}),
         ),
@@ -184,7 +190,7 @@ def planted_cases() -> list[Case]:
         hook_case(
             "failing fast test",
             "fast-tests",
-            "FAILED (failures=1)",
+            (f"FAIL: test_planted ({PLANTED_TEST})", f"AssertionError: 1 != 2 : {PLANTED_MESSAGE}", "FAILED (failures=1)"),
             Change({"tests/fast/test_planted.py": failing_test.format(value=1)}, ("tests/fast/test_planted.py",)),
             Change({"tests/fast/test_planted.py": failing_test.format(value=2)}, ("tests/fast/test_planted.py",)),
         ),
@@ -277,10 +283,10 @@ class Fixture:
 def judge_fault(case: Case, code: int, output: str, advanced: bool) -> Observation:
     """Judge a planted-fault commit: refused by the named hooks alone, with the guard's expected message, and HEAD unchanged."""
     failed = sorted(set(FAILED_HOOK.findall(output)))
-    found = case.message in output
+    found = all(message in output for message in case.messages)
     named = f"only {', '.join(case.hooks)} failed" if case.hooks else "no pre-commit hook failed"
-    expected = f"non-zero exit, {named}, message {case.message!r} found and HEAD unchanged"
-    observed = f"exit {code}, failed hooks: {failed}, message found: {found}, HEAD advanced: {advanced}"
+    expected = f"non-zero exit, {named}, every message of {list(case.messages)!r} found and HEAD unchanged"
+    observed = f"exit {code}, failed hooks: {failed}, every message found: {found}, HEAD advanced: {advanced}"
     return Observation(case.name, "fault", expected, observed, code != 0 and failed == sorted(case.hooks) and found and not advanced)
 
 

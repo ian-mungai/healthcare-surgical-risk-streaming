@@ -29,7 +29,7 @@ HOOK_FAILURE = "Failing hook\n.....Failed\n- hook id: {hook}\n- exit code: 1\n\n
 
 def planted_case() -> commit_guards.Case:
     change = commit_guards.Change({}, ())
-    return commit_guards.Case("planted", "privacy-scan", ("privacy-scan",), "notes/planted.txt:1: AWS account ID", change, change)
+    return commit_guards.Case("planted", "privacy-scan", ("privacy-scan",), ("notes/planted.txt:1: AWS account ID",), change, change)
 
 
 class FaultJudgementTest(unittest.TestCase):
@@ -58,10 +58,49 @@ class FaultJudgementTest(unittest.TestCase):
 
     def test_a_case_that_names_no_hook_passes_only_when_no_hook_failed(self) -> None:
         change = commit_guards.Change({}, ())
-        worktree = commit_guards.Case("worktree", "worktree privacy scan", (), "AWS account ID", change, change)
+        worktree = commit_guards.Case("worktree", "worktree privacy scan", (), ("AWS account ID",), change, change)
         self.assertTrue(commit_guards.judge_fault(worktree, 1, "notes/x.txt:1: AWS account ID\n", False).passed)
         output = HOOK_FAILURE.format(hook="privacy-scan", detail="notes/x.txt:1: AWS account ID")
         self.assertFalse(commit_guards.judge_fault(worktree, 1, output, False).passed)
+
+
+PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
+PLANTED_FAILURE = (
+    'FAIL: test_planted ({name})\n----------\nTraceback (most recent call last):\n  File "x.py", line 6, in test_planted\nAssertionError: {detail}\n'
+)
+FAST_SUMMARY = "Ran 312 tests in 60.0s\n\nFAILED (failures={count})\n"
+
+
+def fast_test_output(*failures: str, count: int = 1) -> str:
+    return HOOK_FAILURE.format(hook="fast-tests", detail="\n".join(failures) + "\n" + FAST_SUMMARY.format(count=count))
+
+
+class FastTestFaultJudgementTest(unittest.TestCase):
+    """The planted fast-test fault is proven by the planted test's full name and its assertion message, and by no other failure."""
+
+    def judge(self, output: str) -> bool:
+        case = next(case for case in commit_guards.planted_cases() if case.hooks == ("fast-tests",))
+        return commit_guards.judge_fault(case, 1, output, False).passed
+
+    def planted(self, detail: str = "1 != 2 : planted fast-test fault", name: str = PLANTED_TEST) -> str:
+        return PLANTED_FAILURE.format(name=name, detail=detail)
+
+    def test_the_planted_test_failing_with_its_assertion_message_passes(self) -> None:
+        self.assertTrue(self.judge(fast_test_output(self.planted())))
+
+    def test_a_failure_of_another_test_is_not_proof_of_the_fault(self) -> None:
+        other = PLANTED_FAILURE.format(name="tests.fast.test_other.OtherTest.test_other", detail="3 != 4")
+        self.assertFalse(self.judge(fast_test_output(other)))
+
+    def test_the_planted_test_failing_with_another_message_is_not_proof(self) -> None:
+        self.assertFalse(self.judge(fast_test_output(self.planted("KeyError: 'planted'"))))
+
+    def test_the_planted_message_from_another_test_is_not_proof(self) -> None:
+        self.assertFalse(self.judge(fast_test_output(self.planted(name="tests.fast.test_other.OtherTest.test_other"))))
+
+    def test_a_second_failure_beside_the_planted_one_is_not_proof(self) -> None:
+        other = PLANTED_FAILURE.format(name="tests.fast.test_other.OtherTest.test_other", detail="3 != 4")
+        self.assertFalse(self.judge(fast_test_output(self.planted(), other, count=2)))
 
 
 class ProtectedRunTest(unittest.TestCase):
