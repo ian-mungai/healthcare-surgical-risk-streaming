@@ -2,18 +2,29 @@
 
 pre-commit hides every unstaged edit of a tracked file while its hooks run, so no hook sees that content. pre-commit runs
 a file named ``pre-commit.legacy`` in the Git hooks folder first, before it hides anything. That file is this hook.
+
+``pre-commit install`` moves an older hook that it does not own to that same name. The installer keeps such a hook as
+``pre-commit.legacy.previous``, and this hook runs the scan and then that kept hook. It refuses, and overwrites nothing,
+when a kept hook already exists.
 """
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
 from scripts.quality.repo_checks import git
 
 HOOK_NAME = "pre-commit.legacy"
-HOOK_TEXT = "#!/bin/sh\nexec .venv/bin/python -m scripts.quality.repo_checks privacy-scan --all\n"
+KEPT_NAME = "pre-commit.legacy.previous"
+SCAN_COMMAND = ".venv/bin/python -m scripts.quality.repo_checks privacy-scan --all"
+HOOK_TEXT = f'#!/bin/sh\n{SCAN_COMMAND} || exit $?\nprevious="$(dirname "$0")/{KEPT_NAME}"\nif [ -x "$previous" ]; then exec "$previous" "$@"; fi\n'
 HOOK_MODE = 0o755
+
+
+class KeptHookError(RuntimeError):
+    """The older hook that pre-commit moved aside cannot be kept."""
 
 
 def hook_path(root: Path) -> Path:
@@ -25,12 +36,28 @@ def installed(root: Path) -> bool:
     return path.is_file() and path.read_text() == HOOK_TEXT and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
 
 
+def is_scanner(path: Path) -> bool:
+    """Whether the file is a scanner that this installer wrote, in this or an earlier form, and not an older hook."""
+    return path.is_file() and SCAN_COMMAND.encode() in path.read_bytes()
+
+
 def install(root: Path) -> bool:
-    """Write the hook and return True, or return False when it is already installed."""
+    """Write the hook and return True, or return False when it is already installed.
+
+    An older hook at the hook's path is moved to ``pre-commit.legacy.previous`` first, and ``KeptHookError`` is raised when that name is taken.
+    """
     if installed(root):
         return False
     path = hook_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(path) and not is_scanner(path):
+        kept = path.with_name(KEPT_NAME)
+        if os.path.lexists(kept):
+            raise KeptHookError(
+                f"{path.name} holds an older hook and {kept.name} already holds another: compare the two files in {path.parent}, "
+                f"move one away as the owner, then run setup again; nothing was overwritten"
+            )
+        os.rename(path, kept)
     path.write_text(HOOK_TEXT)
     path.chmod(HOOK_MODE)
     return True

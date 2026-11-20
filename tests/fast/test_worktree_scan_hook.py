@@ -49,6 +49,22 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue(worktree_scan_hook.install(self.repo))
         self.assertTrue(worktree_scan_hook.installed(self.repo))
 
+    def test_a_different_hook_at_the_path_is_kept_beside_the_scanner_and_not_overwritten(self) -> None:
+        worktree_scan_hook.install(self.repo)
+        self.hook().write_text("#!/bin/sh\nexit 0\n")
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertEqual("#!/bin/sh\nexit 0\n", (self.hook().parent / "pre-commit.legacy.previous").read_text())
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+
+    def test_a_dangling_link_at_the_path_is_kept_and_nothing_is_written_through_it(self) -> None:
+        self.hook().parent.mkdir(parents=True, exist_ok=True)
+        gone = self.repo / "gone_hook"
+        self.hook().symlink_to(gone)
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertFalse(gone.exists())
+        self.assertTrue((self.hook().parent / "pre-commit.legacy.previous").is_symlink())
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+
     def test_the_callers_git_environment_does_not_redirect_the_hook(self) -> None:
         with mock.patch.dict(os.environ, {"GIT_DIR": str(self.other_repository())}):
             self.assertTrue(worktree_scan_hook.install(self.repo))

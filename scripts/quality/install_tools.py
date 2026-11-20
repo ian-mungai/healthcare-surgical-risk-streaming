@@ -152,7 +152,11 @@ def settle_hook(*, check: bool) -> bool:
     if check:
         sys.stderr.write("working-tree privacy hook: missing or changed; run the installer without --check\n")
         return False
-    worktree_scan_hook.install(ROOT)
+    try:
+        worktree_scan_hook.install(ROOT)
+    except worktree_scan_hook.KeptHookError as error:
+        sys.stderr.write(f"working-tree privacy hook: {error}\n")
+        return False
     sys.stdout.write("working-tree privacy hook: installed\n")
     return True
 
