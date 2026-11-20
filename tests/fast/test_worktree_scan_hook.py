@@ -108,6 +108,18 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue(worktree_scan_hook.installed(self.repo))
         self.assertEqual([self.hook()], [path for path in self.hook().parent.iterdir() if path.name.startswith("pre-commit.legacy")])
 
+    def test_the_file_is_whole_and_executable_when_it_is_renamed_into_place(self) -> None:
+        real_replace = os.replace
+        seen: list[tuple[int, str]] = []
+
+        def look_then_replace(source: Path, target: Path) -> None:
+            seen.append((stat.S_IMODE(Path(source).stat().st_mode), Path(source).read_text()))
+            real_replace(source, target)
+
+        with mock.patch.object(os, "replace", side_effect=look_then_replace):
+            worktree_scan_hook.install(self.repo)
+        self.assertEqual([(worktree_scan_hook.HOOK_MODE, worktree_scan_hook.HOOK_TEXT)], seen)
+
     def test_the_callers_git_environment_does_not_redirect_the_hook(self) -> None:
         with mock.patch.dict(os.environ, {"GIT_DIR": str(self.other_repository())}):
             self.assertTrue(worktree_scan_hook.install(self.repo))
