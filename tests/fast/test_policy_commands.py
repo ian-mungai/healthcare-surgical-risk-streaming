@@ -428,6 +428,19 @@ class KeyTest(unittest.TestCase):
                 self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
                 self.assertIsNone(error.__context__)
 
+    def test_a_backup_file_that_cannot_be_opened_creates_no_key_says_so_and_leaves_no_reservation(self) -> None:
+        account = Account.matching_templates()
+        with mock.patch.object(os, "fdopen", side_effect=OSError("too many open files")):
+            code, output, backup = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertEqual(0, account.keys)
+        self.assertEqual(0, self.creations(account))
+        self.assertFalse(backup.exists())
+        self.assertIn("could not be opened, so no key was created", output)
+        self.assertNotIn("check the access keys", output)
+        code, output, _ = self.rerun_key(account)
+        self.assertEqual((0, 1), (code, account.keys), output)
+
     def raised_by_write_new_key(self, account: Account) -> BaseException:
         backup = self.folder / "direct_accessKeys.csv"
         with mock.patch.object(aws_cli, "run_command", return_value=account.create_refusal) if account.create_refusal else contextlib.nullcontext():

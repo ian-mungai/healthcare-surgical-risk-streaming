@@ -94,31 +94,44 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue(worktree_scan_hook.installed(self.repo))
         self.assertFalse((self.hook().parent / "pre-commit.legacy.previous").exists())
 
-    def test_a_stop_before_the_rename_leaves_the_earlier_state_and_the_next_setup_overwrites_the_leftover(self) -> None:
+    def hook_folder_names(self) -> list[str]:
+        return sorted(path.name for path in self.hook().parent.iterdir())
+
+    def test_a_stop_before_the_rename_leaves_the_earlier_state_and_no_other_file(self) -> None:
         earlier = worktree_scan_hook.EARLIER_HOOK_TEXTS[0]
         self.hook().parent.mkdir(parents=True, exist_ok=True)
         self.hook().write_text(earlier)
+        before = self.hook_folder_names()
         with mock.patch.object(os, "replace", side_effect=OSError("the rename stopped")), self.assertRaises(OSError):
             worktree_scan_hook.install(self.repo)
         self.assertEqual(earlier, self.hook().read_text())
-        leftovers = [path for path in self.hook().parent.iterdir() if path.name.startswith("pre-commit.legacy") and path != self.hook()]
-        self.assertEqual(1, len(leftovers))
-        leftovers[0].write_text("a leftover of a stopped write")
+        self.assertEqual(before, self.hook_folder_names())
         self.assertTrue(worktree_scan_hook.install(self.repo))
         self.assertTrue(worktree_scan_hook.installed(self.repo))
-        self.assertEqual([self.hook()], [path for path in self.hook().parent.iterdir() if path.name.startswith("pre-commit.legacy")])
+        self.assertEqual(before, self.hook_folder_names())
 
-    def test_a_link_left_at_the_pending_name_is_removed_and_the_file_it_points_to_is_untouched(self) -> None:
+    def test_every_file_and_link_already_in_the_hook_folder_is_left_as_it_is(self) -> None:
         self.hook().parent.mkdir(parents=True, exist_ok=True)
         other = self.repo / "other_file.txt"
         other.write_text("kept")
-        pending = self.hook().parent / worktree_scan_hook.PENDING_NAME
-        pending.symlink_to(other)
-        self.assertTrue(worktree_scan_hook.install(self.repo))
+        folder = self.hook().parent
+        (folder / "pre-commit.legacy.pending").write_text("the owner's file")
+        (folder / "pre-commit.pending").symlink_to(other)
+        (folder / "pre-commit.sample").write_text("a sample")
+        before = self.hook_folder_names()
+        for stopped in (True, False):
+            if stopped:
+                with mock.patch.object(os, "replace", side_effect=OSError("the rename stopped")), self.assertRaises(OSError):
+                    worktree_scan_hook.install(self.repo)
+            else:
+                self.assertTrue(worktree_scan_hook.install(self.repo))
+            self.assertEqual("the owner's file", (folder / "pre-commit.legacy.pending").read_text())
+            self.assertTrue((folder / "pre-commit.pending").is_symlink())
+            self.assertEqual("a sample", (folder / "pre-commit.sample").read_text())
+            self.assertEqual("kept", other.read_text())
         self.assertTrue(worktree_scan_hook.installed(self.repo))
-        self.assertEqual("kept", other.read_text())
         self.assertFalse(self.hook().is_symlink())
-        self.assertFalse(os.path.lexists(pending))
+        self.assertEqual(sorted([*before, self.hook().name]), self.hook_folder_names())
 
     def test_the_file_is_whole_and_executable_when_it_is_renamed_into_place(self) -> None:
         real_replace = os.replace
