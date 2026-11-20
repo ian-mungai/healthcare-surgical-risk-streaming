@@ -9,8 +9,12 @@ again and applies it only when its code equals the reviewed one. It creates the 
 publishes a new default version only when a document changed and attaches each policy to the user. A rerun plans
 nothing. ``key`` gives the user its one access key: it creates the key only when the user has none, writes it to an
 owner-only backup file beside the AWS command line's own files, in the column layout of the console's download,
-imports it as the project profile and waits until AWS accepts it. It never prints the secret, never overwrites a
-backup file and never deletes a key. ``export`` compares the live documents, the tags of the policies, the boundary
+imports it as the project profile and waits until AWS accepts it. It refuses to create a key while ``cli_history`` is
+enabled for the administrator profile, because the AWS command line would record the secret in its history database.
+It confirms the project profile by the exact user ARN and account that the administrator's ``get-user`` returned. A
+refusal by IAM removes the empty backup that this call reserved. A call with no clear answer keeps it, and the owner
+checks the user's keys before a retry. It never prints the secret, never overwrites a backup file and never deletes a
+key. ``export`` compares the live documents, the tags of the policies, the boundary
 and the user, the user's attached policies by ARN, its inline policies and its group memberships with the templates and
 exits 1 on a difference. Only ``key`` creates an access key. The tool never removes a grant or a tag: a live project
 policy with no template, an extra attachment, an inline policy, a group membership and an extra policy or user tag are
@@ -23,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -31,7 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
-from scripts.aws_cli import Aws, AwsError
+from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
+from scripts.process import TimeoutExpired, run_command
 from scripts.project_config import ConfigurationError, load_configuration
 
 MAX_POLICY_VERSIONS = 5
@@ -39,6 +45,11 @@ KEY_FOLDER = Path.home() / ".aws"
 KEY_HEADER = "User Name,Access key ID,Secret access key"
 KEY_READY_SECONDS = 120.0
 KEY_POLL_SECONDS = 5.0
+CONFIG_READ_SECONDS = 30.0
+REFUSED_BY_IAM = re.compile(r"^aws iam create-access-key failed: (AccessDenied|LimitExceeded|NoSuchEntity|InvalidInput)(;|$)")
+UNCERTAIN_CREATE = (
+    "the create call gave no clear answer and a key may exist: check the access keys of {user} as the owner before a retry; the empty backup file is kept"
+)
 LIST_KEYS = {"Action", "NotAction", "Resource", "NotResource"}
 
 
@@ -204,11 +215,56 @@ def apply_step(aws: Aws, names: Names, account: str, documents: Mapping[str, Map
         aws.call("iam", "attach-user-policy", "--user-name", names.user, "--policy-arn", arn)
 
 
-def profile_is_the_user(project: Aws, user: str) -> bool:
+def profile_is_the_user(project: Aws, user_arn: str, *, timeout: float = AWS_TIMEOUT_SECONDS) -> bool:
+    """Whether the project profile signs in as the exact user ARN that the administrator profile's ``get-user`` returned, in that ARN's account."""
     try:
-        return str(project.call("sts", "get-caller-identity").get("Arn", "")).endswith(f":user/{user}")
-    except AwsError:
+        identity = project.call("sts", "get-caller-identity", timeout=timeout)
+    except AwsError, TimeoutExpired:
         return False
+    return bool(identity.get("Arn") == user_arn and identity.get("Account") == user_arn.split(":")[4])
+
+
+def refuse_while_history_records(admin: Aws) -> None:
+    """Stop before the key call when the AWS command line would record its answer, secret key included, in its history database."""
+    advice = f"turn it off with: aws configure set cli_history disabled --profile {admin.profile}"
+    unreadable = ConfigurationError(f"the cli_history setting of the profile {admin.profile} could not be read, so key stops before it creates a key; {advice}")
+    try:
+        result = run_command("aws", ["configure", "get", "cli_history", "--profile", admin.profile], timeout=CONFIG_READ_SECONDS)
+    except (OSError, TimeoutExpired) as error:
+        raise unreadable from error
+    value = result.stdout.strip()
+    if result.returncode not in (0, 1):
+        raise unreadable
+    if value == "enabled":
+        raise ConfigurationError(
+            f"cli_history is enabled for the profile {admin.profile}: the AWS command line would record the new secret key; {advice}, then run key again"
+        )
+
+
+def write_new_key(admin: Aws, user: str, backup: Path) -> None:
+    """Reserve the backup file, create the key and write it. A definite refusal by IAM releases the reservation; any other failure keeps it."""
+    descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        try:
+            key = admin.call("iam", "create-access-key", "--user-name", user)["AccessKey"]
+        except AwsError as error:
+            if not REFUSED_BY_IAM.search(str(error)):
+                raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
+            backup.unlink()
+            raise
+        except TimeoutExpired as error:
+            raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
+        handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
+
+
+def wait_until_the_profile_works(project: Aws, user_arn: str) -> None:
+    """Poll until the project profile works. Each call gets the time left, no sleep passes the deadline and an answer after it is refused."""
+    deadline = time.monotonic() + KEY_READY_SECONDS
+    while (remaining := deadline - time.monotonic()) > 0:
+        if profile_is_the_user(project, user_arn, timeout=remaining) and time.monotonic() <= deadline:
+            return
+        time.sleep(max(0.0, min(KEY_POLL_SECONDS, deadline - time.monotonic())))
+    raise ConfigurationError(f"the new key did not start to work within {KEY_READY_SECONDS:g} seconds; run key again to check it")
 
 
 def create_key(admin: Aws, configuration: dict[str, str], names: Names) -> int:
@@ -216,31 +272,27 @@ def create_key(admin: Aws, configuration: dict[str, str], names: Names) -> int:
     user = names.user
     if configuration["AWS_PROFILE"] != user:
         raise ConfigurationError(f"AWS_PROFILE must equal the project user's name, {user}, for the key to be imported as that profile")
-    if admin.call("iam", "get-user", "--user-name", user, missing=("NoSuchEntity",)) is None:
+    found = admin.call("iam", "get-user", "--user-name", user, missing=("NoSuchEntity",))
+    if found is None:
         raise ConfigurationError(f"the user {user} does not exist: run apply first")
+    user_arn = found["User"]["Arn"]
     project = Aws(user, configuration["AWS_REGION"])
     backup = KEY_FOLDER / f"{user}_accessKeys.csv"
     if admin.call("iam", "list-access-keys", "--user-name", user)["AccessKeyMetadata"]:
-        if profile_is_the_user(project, user):
+        if profile_is_the_user(project, user_arn):
             sys.stdout.write(f"no change: {user} has its access key and the profile {user} works\n")
             return 0
         raise ConfigurationError(f"{user} already has an access key and the project profile does not work: this tool never deletes a key; review it")
     if backup.exists():
         raise ConfigurationError(f"the backup file already exists and is never overwritten: {backup.name} in {KEY_FOLDER.name}; move it away as the owner")
+    refuse_while_history_records(admin)
     KEY_FOLDER.mkdir(mode=0o700, exist_ok=True)
-    descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        key = admin.call("iam", "create-access-key", "--user-name", user)["AccessKey"]
-        handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
+    write_new_key(admin, user, backup)
     admin.call("configure", "import", "--csv", f"file://{backup}")
     for name, value in (("region", configuration["AWS_REGION"]), ("output", "json")):
         project.call("configure", "set", name, value)
     sys.stdout.write(f"access key created for {user}; backup written, readable by its owner only: {backup.name} in {KEY_FOLDER.name}\n")
-    deadline = time.monotonic() + KEY_READY_SECONDS
-    while not profile_is_the_user(project, user):
-        if time.monotonic() >= deadline:
-            raise ConfigurationError(f"the new key did not start to work within {KEY_READY_SECONDS:g} seconds; run key again to check it")
-        time.sleep(KEY_POLL_SECONDS)
+    wait_until_the_profile_works(project, user_arn)
     sys.stdout.write(f"the profile {user} works\n")
     return 0
 

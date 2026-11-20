@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import stat
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from infra.iam.scripts import manage_policies
 from infra.iam.scripts.manage_policies import Names, policy_arn
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, load_documents
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
+from scripts.process import TimeoutExpired
 
 ACCOUNT = "1" * 12
 CONFIGURATION = {
@@ -37,6 +39,24 @@ NAMES = Names("example_project", "dev")
 TAGS = {"Project": "example_project", "Environment": "dev"}
 SECRET = "example-secret-" + "value"
 FOREIGN = "arn:aws:iam::aws:policy/AdministratorAccess"
+USER_ARN = f"arn:aws:iam::{ACCOUNT}:user/example_project_dev"
+OTHER_ACCOUNT = "2" * 12
+LIMIT_EXCEEDED = AwsError("aws iam create-access-key failed: LimitExceeded; its full error text is in runs/raw_errors/example.txt")
+
+
+class FakeClock:
+    """A clock that only moves when the code sleeps or a fake AWS call takes time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[tuple[float, float]] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append((self.now, seconds))
+        self.now += seconds
 
 
 def templates() -> dict[str, dict[str, Any]]:
@@ -59,6 +79,13 @@ class Account:
     keys: int = 0
     settings: list[tuple[tuple[str, ...], str]] = field(default_factory=list)
     profile_works: bool = False
+    user_arn: str = USER_ARN
+    project_identity: dict[str, str] | None = None
+    create_error: BaseException | None = None
+    clock: FakeClock | None = None
+    sts_latency: float = 0.0
+    sts_honors_timeout: bool = True
+    sts_calls: list[tuple[float, float]] = field(default_factory=list)
 
     @classmethod
     def matching_templates(cls, *, attached: bool = True, tagged: bool = True) -> Account:
@@ -76,12 +103,22 @@ class FakeAws(Aws):
         state = self.account
         verb = arguments[1]
         if verb == "get-caller-identity":
+            if self.profile == CONFIGURATION["AWS_PROFILE"] and state.clock is not None:
+                state.sts_calls.append((state.clock.now, timeout))
+                if state.sts_honors_timeout and state.sts_latency > timeout:
+                    state.clock.now += timeout
+                    raise TimeoutExpired("aws", timeout)
+                state.clock.now += state.sts_latency
             if self.profile == CONFIGURATION["AWS_PROFILE"] and not state.profile_works:
                 raise AwsError("aws sts get-caller-identity failed: InvalidClientTokenId")
+            if self.profile == CONFIGURATION["AWS_PROFILE"] and state.project_identity is not None:
+                return state.project_identity
             return {"Account": ACCOUNT, "Arn": f"arn:aws:iam::{ACCOUNT}:user/{self.profile}"}
         if verb == "list-access-keys":
             return {"AccessKeyMetadata": [{"AccessKeyId": f"key{number}"} for number in range(state.keys)]}
         if verb == "create-access-key":
+            if state.create_error is not None:
+                raise state.create_error
             state.keys += 1
             return {"AccessKey": {"AccessKeyId": "EXAMPLEKEYID", "SecretAccessKey": SECRET}}
         if arguments[:2] == ("configure", "set"):
@@ -91,7 +128,7 @@ class FakeAws(Aws):
             state.profile_works = True
             return {}
         if verb == "get-user":
-            return {"User": {}} if state.user_exists else None
+            return {"User": {"Arn": state.user_arn}} if state.user_exists else None
         if verb == "list-policies":
             return {"Policies": [{"PolicyName": name, "Arn": policy_arn(ACCOUNT, name), "DefaultVersionId": "v1"} for name in state.policies]}
         if verb == "get-policy-version":
@@ -126,20 +163,34 @@ def run_command(command: str, account: Account, confirm: str = "") -> tuple[int,
 class KeyTest(unittest.TestCase):
     """``key`` gives the project user its one access key, a backup file and a working profile, and never shows the secret."""
 
-    def run_key(self, account: Account, configuration: dict[str, str] | None = None) -> tuple[int, str, Path]:
+    def setUp(self) -> None:
+        self.aws_files = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.write_admin_config("region = us-west-2\n")
+        self.enterContext(
+            mock.patch.dict(os.environ, {"AWS_CONFIG_FILE": str(self.aws_files / "config"), "AWS_SHARED_CREDENTIALS_FILE": str(self.aws_files / "credentials")})
+        )
+
+    def write_admin_config(self, settings: str, profile: str = "admin_profile") -> None:
+        (self.aws_files / "config").write_text(f"[profile {profile}]\n{settings}")
+        (self.aws_files / "credentials").write_text("")
+
+    def run_key(self, account: Account, configuration: dict[str, str] | None = None, *, ready: float = 0.05, poll: float = 0.01) -> tuple[int, str, Path]:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.folder = folder
-        return self.rerun_key(account, configuration)
+        return self.rerun_key(account, configuration, ready=ready, poll=poll)
 
-    def rerun_key(self, account: Account, configuration: dict[str, str] | None = None) -> tuple[int, str, Path]:
+    def rerun_key(self, account: Account, configuration: dict[str, str] | None = None, *, ready: float = 0.05, poll: float = 0.01) -> tuple[int, str, Path]:
         with (
             mock.patch.object(manage_policies, "KEY_FOLDER", self.folder),
-            mock.patch.object(manage_policies, "KEY_READY_SECONDS", 0.05),
-            mock.patch.object(manage_policies, "KEY_POLL_SECONDS", 0.01),
+            mock.patch.object(manage_policies, "KEY_READY_SECONDS", ready),
+            mock.patch.object(manage_policies, "KEY_POLL_SECONDS", poll),
             mock.patch.dict(CONFIGURATION, configuration or {}),
         ):
             code, out, err = run_command("key", account)
         return code, out + err, self.folder / "example_project_dev_accessKeys.csv"
+
+    def creations(self, account: Account) -> int:
+        return len([call for call in account.calls if call[1] == "create-access-key"])
 
     def test_a_user_without_a_key_gets_one_with_a_private_backup_and_a_working_profile(self) -> None:
         account = Account.matching_templates()
@@ -194,6 +245,152 @@ class KeyTest(unittest.TestCase):
             code, output, _ = self.run_key(account)
         self.assertEqual(1, code)
         self.assertIn("did not start to work within", output)
+
+    def test_key_creation_is_refused_while_cli_history_is_enabled_for_the_administrator_profile(self) -> None:
+        self.write_admin_config("region = us-west-2\ncli_history = enabled\n")
+        account = Account.matching_templates()
+        code, output, backup = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("cli_history", output)
+        self.assertIn("aws configure set cli_history disabled --profile admin_profile", output)
+        self.assertEqual(0, self.creations(account))
+        self.assertFalse(backup.exists())
+        self.assertNotIn(SECRET, output)
+
+    def test_a_disabled_history_setting_allows_key_creation(self) -> None:
+        self.write_admin_config("cli_history = disabled\n")
+        account = Account.matching_templates()
+        code, output, backup = self.run_key(account)
+        self.assertEqual(0, code, output)
+        self.assertTrue(backup.exists())
+
+    def test_the_history_setting_of_the_project_profile_does_not_block_key_creation(self) -> None:
+        (self.aws_files / "config").write_text("[profile admin_profile]\nregion = us-west-2\n[profile example_project_dev]\ncli_history = enabled\n")
+        account = Account.matching_templates()
+        code, output, _ = self.run_key(account)
+        self.assertEqual(0, code, output)
+        self.assertEqual(1, self.creations(account))
+
+    def test_a_history_setting_that_cannot_be_read_refuses_key_creation(self) -> None:
+        self.write_admin_config("cli_history = enabled\n", profile="another_profile")
+        account = Account.matching_templates()
+        code, output, backup = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("cli_history", output)
+        self.assertEqual(0, self.creations(account))
+        self.assertFalse(backup.exists())
+
+    def test_a_profile_in_another_account_or_with_another_arn_is_not_the_project_user(self) -> None:
+        wrong = (
+            {"Account": OTHER_ACCOUNT, "Arn": f"arn:aws:iam::{OTHER_ACCOUNT}:user/example_project_dev"},
+            {"Account": ACCOUNT, "Arn": f"arn:aws:iam::{ACCOUNT}:user/path/example_project_dev"},
+            {"Account": OTHER_ACCOUNT, "Arn": USER_ARN},
+            {"Account": ACCOUNT, "Arn": f"arn:aws:iam::{OTHER_ACCOUNT}:user/example_project_dev"},
+            {"Account": ACCOUNT, "Arn": f"arn:aws:sts::{ACCOUNT}:assumed-role/example_project_dev"},
+        )
+        for identity in wrong:
+            with self.subTest(identity=identity):
+                existing = Account.matching_templates()
+                existing.keys = 1
+                existing.profile_works = True
+                existing.project_identity = identity
+                code, output, _ = self.run_key(existing)
+                self.assertEqual(1, code)
+                self.assertIn("project profile does not work", output)
+                self.assertNotIn("no change", output)
+                fresh = Account.matching_templates()
+                fresh.project_identity = identity
+                code, output, _ = self.run_key(fresh)
+                self.assertEqual(1, code)
+                self.assertIn("did not start to work", output)
+                self.assertNotIn("the profile example_project_dev works", output)
+                for value in (OTHER_ACCOUNT, *identity.values()):
+                    self.assertNotIn(value, output)
+
+    def test_a_definite_refusal_of_the_create_call_removes_the_reserved_backup_and_a_retry_succeeds(self) -> None:
+        account = Account.matching_templates()
+        account.create_error = LIMIT_EXCEEDED
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.folder = folder
+        (folder / "other_accessKeys.csv").write_text("kept")
+        code, output, backup = self.rerun_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("LimitExceeded", output)
+        self.assertFalse(backup.exists())
+        self.assertEqual("kept", (folder / "other_accessKeys.csv").read_text())
+        account.create_error = None
+        code, output, _ = self.rerun_key(account)
+        self.assertEqual(0, code, output)
+        self.assertEqual(1, account.keys)
+
+    def test_an_uncertain_result_of_the_create_call_keeps_the_backup_and_says_to_check_the_keys(self) -> None:
+        uncertain = (
+            TimeoutExpired("aws", 120),
+            AwsError("aws iam create-access-key failed: Could not connect to the endpoint URL"),
+            AwsError("aws iam create-access-key failed: ServiceFailure; its full error text is in runs/raw_errors/example.txt"),
+            AwsError("aws iam create-access-key failed: Throttling; its full error text is in runs/raw_errors/example.txt"),
+            AwsError("aws iam create-access-key failed: LimitExceededElsewhere; its full error text is in runs/raw_errors/example.txt"),
+            AwsError("aws iam create-user failed: LimitExceeded; its full error text is in runs/raw_errors/example.txt"),
+            AwsError("aws iam create-access-key failed: "),
+        )
+        for error in uncertain:
+            with self.subTest(error=repr(error)):
+                account = Account.matching_templates()
+                account.create_error = error
+                code, output, backup = self.run_key(account)
+                self.assertEqual(1, code)
+                self.assertTrue(backup.exists())
+                self.assertEqual("", backup.read_text())
+                self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
+
+    def test_every_ready_wait_call_gets_the_time_that_is_left_and_no_sleep_passes_the_deadline(self) -> None:
+        clock = FakeClock()
+        account = Account.matching_templates()
+        account.clock = clock
+        account.sts_latency = 100.0
+        with mock.patch.object(manage_policies, "time", clock), mock.patch.object(FakeAws, "call", autospec=True, side_effect=stuck):
+            code, output, _ = self.run_key(account, ready=120.0, poll=5.0)
+        self.assertEqual(1, code)
+        self.assertIn("did not start to work", output)
+        self.assertEqual(2, len(account.sts_calls))
+        for started, timeout in account.sts_calls:
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(started + timeout, 120.0 + 1e-9)
+        self.assertLessEqual(clock.now, 120.0 + 1e-9)
+
+    def test_no_sleep_in_the_ready_wait_passes_the_deadline(self) -> None:
+        clock = FakeClock()
+        account = Account.matching_templates()
+        account.clock = clock
+        account.profile_works = False
+        with mock.patch.object(manage_policies, "time", clock), mock.patch.object(FakeAws, "call", autospec=True, side_effect=stuck):
+            code, output, _ = self.run_key(account, ready=12.0, poll=5.0)
+        self.assertEqual(1, code)
+        self.assertIn("did not start to work", output)
+        self.assertEqual([5.0, 5.0, 2.0], [seconds for _, seconds in clock.sleeps])
+        self.assertEqual(12.0, clock.now)
+
+    def test_an_answer_that_arrives_after_the_deadline_is_rejected(self) -> None:
+        clock = FakeClock()
+        account = Account.matching_templates()
+        account.clock = clock
+        account.sts_latency = 130.0
+        account.sts_honors_timeout = False
+        with mock.patch.object(manage_policies, "time", clock):
+            code, output, _ = self.run_key(account, ready=120.0, poll=5.0)
+        self.assertEqual(1, code)
+        self.assertIn("did not start to work", output)
+        self.assertNotIn("the profile example_project_dev works", output)
+
+    def test_an_answer_inside_the_deadline_is_accepted(self) -> None:
+        clock = FakeClock()
+        account = Account.matching_templates()
+        account.clock = clock
+        account.sts_latency = 100.0
+        with mock.patch.object(manage_policies, "time", clock):
+            code, output, _ = self.run_key(account, ready=120.0, poll=5.0)
+        self.assertEqual(0, code, output)
+        self.assertIn("the profile example_project_dev works", output)
 
 
 ORIGINAL_CALL = FakeAws.call
