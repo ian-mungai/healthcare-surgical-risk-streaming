@@ -62,6 +62,15 @@ class CarriageReturnPathTest(TemporaryRepository):
         self.assertEqual(1, result.returncode, result.stderr)
         self.assertIn("line\\nfeed.txt:1: AWS account ID", result.stderr)
 
+    def test_a_file_that_cannot_be_read_as_text_is_listed_under_its_name_on_one_line(self) -> None:
+        (self.repo / "binary\rname\nfile.bin").write_bytes(b"\0\1\2")
+        (self.repo / "latin\rname\nfile.txt").write_bytes(b"\xff\xfe")
+        result = self.check("privacy-scan", "--all")
+        for name in ("binary", "latin"):
+            with self.subTest(name=name):
+                self.assertRegex(result.stderr, rf"(?m)^{name}\\rname\\nfile\.\w+: unreviewed: cannot be read as text")
+        self.assertNotIn("\r", result.stderr)
+
     def test_a_clean_file_with_that_name_passes(self) -> None:
         (self.repo / CARRIAGE_NAME).write_text("role: arn:aws:iam::<ACCOUNT_ID>:role/example\n")
         self.git("add", "--all")

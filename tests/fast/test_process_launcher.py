@@ -135,9 +135,9 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual("a\nb\nc", result.stdout)
 
     def test_output_kept_exact_has_its_carriage_returns_and_undecodable_bytes(self) -> None:
-        result = run_command("sh", ["-c", "printf 'a\\rb\\r\\nc\\377'; printf 'e\\rf' >&2"], timeout=10, keep_newlines=True)
+        result = run_command("sh", ["-c", "printf 'a\\rb\\r\\nc\\377'; printf 'e\\rf\\377' >&2"], timeout=10, keep_newlines=True)
         self.assertEqual(b"a\rb\r\nc\xff", os.fsencode(result.stdout))
-        self.assertEqual("e\rf", result.stderr)
+        self.assertEqual(b"e\rf\xff", os.fsencode(result.stderr))
 
     def test_input_still_reaches_a_program_whose_output_is_kept_exact(self) -> None:
         result = run_command("cat", [], timeout=10, input_text="x\ry\n", keep_newlines=True)

@@ -80,10 +80,13 @@ def visible_files(cwd: Path | None = None) -> list[str]:
     return sorted(set(listed.split("\0")) - {""})
 
 
+def on_one_line(text: str) -> str:
+    return text.replace("\r", "\\r").replace("\n", "\\n")
+
+
 def report(findings: list[Finding]) -> int:
     for finding in findings:
-        location = finding.location.replace("\r", "\\r").replace("\n", "\\n")
-        sys.stderr.write(f"{location}: {finding.problem}\n  rule: {finding.rule}\n  fix: {finding.fix}\n  {ASK}\n")
+        sys.stderr.write(f"{on_one_line(finding.location)}: {finding.problem}\n  rule: {finding.rule}\n  fix: {finding.fix}\n  {ASK}\n")
     return 1 if findings else 0
 
 
@@ -192,12 +195,12 @@ def privacy_scan() -> tuple[list[Finding], list[str]]:
             continue
         data = Path(path).read_bytes()
         if b"\0" in data[:8192]:
-            unreviewed.append(f"{path}: unreviewed: cannot be read as text; inspect it before publishing")
+            unreviewed.append(f"{on_one_line(path)}: unreviewed: cannot be read as text; inspect it before publishing")
             continue
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            unreviewed.append(f"{path}: unreviewed: cannot be read as text; inspect it before publishing")
+            unreviewed.append(f"{on_one_line(path)}: unreviewed: cannot be read as text; inspect it before publishing")
             continue
         for number, line in enumerate(text.splitlines(), 1):
             for kind in line_privacy(line, values):
