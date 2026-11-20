@@ -43,7 +43,7 @@ jobs:
   guards:
     name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
     strategy:
       fail-fast: false
       matrix:
