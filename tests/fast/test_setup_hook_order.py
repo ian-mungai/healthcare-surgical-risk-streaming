@@ -9,6 +9,7 @@ Failure modes covered here:
 - The older hook that pre-commit moved to ``pre-commit.legacy`` stops running when the scanner replaces it. A real commit runs the scan, then the older hook.
 - A second setup chains the scanner to itself, loops, or drops the older hook. A scan that fails or an older hook that fails lets the commit through.
 - Setup cannot keep the older hook, because a kept one exists, and does not say so.
+- A hook that only names the scan command, in a comment or after other lines, is taken for the scanner and overwritten.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ OLDER_HOOK = "#!/bin/sh\necho older hook\n"
 MARKING_HOOK = '#!/bin/sh\necho older >> "$HOOK_LOG"\nexit "${OLDER_EXIT:-0}"\n'
 SCAN_STUB = '#!/bin/sh\necho scan >> "$HOOK_LOG"\nexit "${SCAN_EXIT:-0}"\n'
 OLD_SCANNER = "#!/bin/sh\nexec .venv/bin/python -m scripts.quality.repo_checks privacy-scan --all\n"
+NAMING_HOOK = '#!/bin/sh\n# runs .venv/bin/python -m scripts.quality.repo_checks privacy-scan --all elsewhere\necho older >> "$HOOK_LOG"\nexit 1\n'
+NAMING_HOOK_WITH_EXEC = f"{OLD_SCANNER}# the owner added this line\n"
 
 
 class SetupOrderTest(unittest.TestCase):
@@ -154,6 +157,26 @@ class OlderHookChainTest(TemporaryRepository):
         self.assertFalse((self.hooks / "pre-commit.legacy.previous").exists())
         self.assertEqual(0, self.commit())
         self.assertEqual(["scan"], self.ran())
+
+    def test_a_hook_that_only_names_the_scan_command_is_kept_chained_and_still_blocks_the_commit(self) -> None:
+        self.write_hook("pre-commit.legacy", NAMING_HOOK)
+        self.assertTrue(self.setup_steps())
+        self.assertEqual(NAMING_HOOK, (self.hooks / "pre-commit.legacy.previous").read_text())
+        self.assertEqual(worktree_scan_hook.HOOK_TEXT, (self.hooks / "pre-commit.legacy").read_text())
+        self.assertNotEqual(0, self.commit())
+        self.assertEqual(["scan", "older"], self.ran())
+
+    def test_a_hook_that_starts_with_the_old_scanner_text_and_adds_a_line_is_kept(self) -> None:
+        self.write_hook("pre-commit.legacy", NAMING_HOOK_WITH_EXEC)
+        self.assertTrue(self.setup_steps())
+        self.assertEqual(NAMING_HOOK_WITH_EXEC, (self.hooks / "pre-commit.legacy.previous").read_text())
+
+    def test_a_hook_that_is_not_text_is_kept(self) -> None:
+        binary = b"\xff\xfe\x00not text\n"
+        (self.hooks / "pre-commit.legacy").write_bytes(binary)
+        (self.hooks / "pre-commit.legacy").chmod(0o755)
+        self.assertTrue(self.setup_steps())
+        self.assertEqual(binary, (self.hooks / "pre-commit.legacy.previous").read_bytes())
 
     def test_setup_fails_visibly_and_overwrites_nothing_when_an_older_hook_is_already_kept(self) -> None:
         self.write_hook("pre-commit.legacy.previous", "#!/bin/sh\necho kept first\n")

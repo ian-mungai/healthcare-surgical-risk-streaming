@@ -20,6 +20,7 @@ HOOK_NAME = "pre-commit.legacy"
 KEPT_NAME = "pre-commit.legacy.previous"
 SCAN_COMMAND = ".venv/bin/python -m scripts.quality.repo_checks privacy-scan --all"
 HOOK_TEXT = f'#!/bin/sh\n{SCAN_COMMAND} || exit $?\nprevious="$(dirname "$0")/{KEPT_NAME}"\nif [ -x "$previous" ]; then exec "$previous" "$@"; fi\n'
+EARLIER_HOOK_TEXTS = ("#!/bin/sh\nexec .venv/bin/python -m scripts.quality.repo_checks privacy-scan --all\n",)
 HOOK_MODE = 0o755
 
 
@@ -33,12 +34,12 @@ def hook_path(root: Path) -> Path:
 
 def installed(root: Path) -> bool:
     path = hook_path(root)
-    return path.is_file() and path.read_text() == HOOK_TEXT and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
+    return path.is_file() and path.read_bytes() == HOOK_TEXT.encode() and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
 
 
 def is_scanner(path: Path) -> bool:
-    """Whether the file is a scanner that this installer wrote, in this or an earlier form, and not an older hook."""
-    return path.is_file() and SCAN_COMMAND.encode() in path.read_bytes()
+    """Whether the file holds exactly a scan hook text that this repository has shipped, and so is not the owner's hook."""
+    return path.is_file() and path.read_bytes() in (HOOK_TEXT.encode(), *(text.encode() for text in EARLIER_HOOK_TEXTS))
 
 
 def install(root: Path) -> bool:
