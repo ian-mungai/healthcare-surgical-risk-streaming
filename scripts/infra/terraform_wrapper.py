@@ -161,7 +161,7 @@ def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
     result = run_command("terraform", command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
     if result.returncode != 0:
         save_raw(run.run_id, f"terraform_{arguments[0]}_failure.txt", result.stdout + result.stderr)
-        raise WrapperError(f"terraform {arguments[0]} failed:\n{sanitized(result.stderr[-2000:])}")
+        raise WrapperError(f"terraform {arguments[0]} failed; its full output is in runs/{run.run_id}/raw/terraform_{arguments[0]}_failure.txt")
     return result.stdout
 
 
@@ -251,7 +251,10 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     return sum(counts.values())
 
 
-def apply_plan(run: RunBinding, code: str) -> int:
+def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None = None) -> int:
+    mode_problem = bucket_problem(run, configuration or load_configuration())
+    if mode_problem:
+        raise WrapperError(f"refused before any change: {mode_problem}")
     folder = ROOT / "runs" / run.run_id / "plans"
     plan_file = folder / "apply.tfplan"
     binding_file = folder / "apply_binding.json"
@@ -295,7 +298,7 @@ def main() -> int:
         if arguments.command == "plan":
             save_plan(run, configuration, "destroy" if arguments.destroy else "apply")
             return 0
-        return apply_plan(run, arguments.confirm)
+        return apply_plan(run, arguments.confirm, configuration)
     except (ConfigurationError, WrapperError) as error:
         sys.stderr.write(f"{error}\n")
         return 1

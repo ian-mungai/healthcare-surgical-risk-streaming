@@ -97,6 +97,8 @@ def bucket_problem(binding: RunBinding, configuration: dict[str, str], *, short_
         return "the binding's permanent bucket is not the bucket named by S3_BUCKET"
     if binding.bucket_mode == "short_lived" and binding.bucket != short_lived_bucket_name(configuration["S3_BUCKET"], binding.run_id):
         return "the binding's test bucket is not the short-lived bucket of this run"
+    if binding.backend == "s3" and binding.state_keys != state_keys(configuration["ENVIRONMENT"]):
+        return "the binding's state keys are not this environment's keys under the state prefix"
     return None
 
 
@@ -110,6 +112,8 @@ def adoption_problem(creation: str, *, exists: bool, owned: bool, empty: bool, s
         return "the bucket from this run's interrupted creation is not an empty bucket of this account"
     if creation == "created" and not exists:
         return "this run's bucket no longer exists"
+    if creation == "created" and not owned:
+        return "this run's bucket is not owned by this account any more"
     return None
 
 

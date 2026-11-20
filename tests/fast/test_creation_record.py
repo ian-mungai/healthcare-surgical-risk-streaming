@@ -108,7 +108,7 @@ class AdoptionTest(unittest.TestCase):
         self.assertIsNone(adoption_problem("created", exists=True, owned=True, empty=False, short_lived=False))
 
 
-SETTINGS = {"S3_BUCKET": "example-project"}
+SETTINGS = {"S3_BUCKET": "example-project", "ENVIRONMENT": "dev"}
 TEST_RUN = RunBinding(**{**RUN.__dict__, "bucket": "example-project-test-01010000abcdef", "bucket_mode": "short_lived"})
 
 

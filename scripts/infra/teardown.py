@@ -18,14 +18,19 @@ first and refuses, before any deletion, when one fails:
 6. A bucket this run created must hold nothing else. In a bucket this run did not create, any other entry, such as
    another environment's state, is left alone and is never approved or deleted.
 
+The guards also refuse an approved entry in another bucket, outside the data prefixes or outside this run's state
+keys, and a state whose lineage or serial is not the one the destroy plan was saved for.
+
 It then logs the host out of Tailscale and waits until its device has left the network, applies the exact plan
-bytes it checked, and only then deletes the approved data entries by key and version ID. Under the state lock, which
-it takes with a write that fails when a lock exists, it accepts a new entry at this run's state keys only when its
-content shows the destroy of this state wrote it, deletes this run's state entries and removes the empty bucket last
-when this run created it and this account still owns it. It checks each removal through its service within one
-deadline; a resource with no check is verified only through a parent that is gone. Each finished stage is recorded
-with the approval the teardown started with: a second run does nothing, and an interrupted run resumes only with
-that same code, plan, inventory, approved inventory and receipt.
+bytes it checked and records that stage at once, and only then deletes the approved data entries by key and version
+ID. Every delete call names this account as the bucket's expected owner. Under the state lock, which it takes with a
+write that fails when a lock exists, it accepts a new entry at this run's state keys only when its content shows the
+destroy of this state wrote it, deletes this run's state entries and removes the empty bucket last when this run
+created it and this account still owns it. A lock that a stopped cleanup of this run left on this computer is taken
+over; any other lock stops the cleanup. It checks each removal through its service within one deadline; a resource
+with no check is verified only through a parent that is gone. Each finished stage is recorded with the approval the
+teardown started with: a second run does nothing, and an interrupted run resumes only with that same code, plan,
+inventory, approved inventory and receipt.
 """
 
 from __future__ import annotations
@@ -33,7 +38,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -151,6 +158,26 @@ def other_entry_problems(other: list[dict[str, Any]], run: RunBinding) -> list[s
     if run.bucket_creation != "created":
         return []
     return [f"bucket: entry outside the data prefixes and this run's state keys: {key}" for key in sorted({entry["Key"] for entry in other})]
+
+
+def approved_problems(approved: dict[str, Any], run: RunBinding) -> list[str]:
+    """Each approved entry that this run may never delete: in another bucket, outside the data prefixes or not at this run's state keys."""
+    problems = []
+    for bucket, key, _ in approved["application"]:
+        if bucket != run.bucket:
+            problems.append(f"the approved inventory lists an entry in another bucket: {key}")
+        elif not key.startswith(DATA_PREFIXES):
+            problems.append(f"the approved inventory lists an entry outside the data prefixes: {key}")
+    keys = bucket_state_keys(run)
+    problems += [f"the approved inventory lists a state entry outside this run's state keys: {key}" for key, _ in approved["state"] if key not in keys]
+    return problems
+
+
+def snapshot_problem(current: tuple[str, int], approved: dict[str, Any]) -> str | None:
+    """Why the state is not the state the destroy plan was saved for, or None when its lineage and serial are the approved ones."""
+    if current != (approved["state_lineage"], approved["state_serial"]):
+        return "the state changed after the destroy plan was saved: run make teardown-plan again"
+    return None
 
 
 def state_identity(run: RunBinding) -> tuple[str, int]:
@@ -296,6 +323,9 @@ def guard_problems(
     saved_plan = json.loads(terraform(run, ["show", "-json", str(approved_plan)], PLAN_TIMEOUT_SECONDS))
     problems += target_problems(delete_targets(saved_plan), inventory, run, pre_provisioned)
     data, state, other = classify_entries(bucket_entries(aws, run.bucket), run)
+    problems += approved_problems(approved, run)
+    if run.backend == "s3" and (moved := snapshot_problem(state_identity(run), approved)):
+        problems.append(moved)
     problems += bucket_entry_problems(run.bucket, data, approved["application"])
     problems += state_entry_problems(state, run.state_keys, approved["state"])
     problems += other_entry_problems(other, run)
@@ -304,11 +334,16 @@ def guard_problems(
     return problems
 
 
-def purge(aws: Aws, bucket: str, approved: list[tuple[str, str]]) -> int:
+def delete_entry(aws: Aws, bucket: str, key: str, version: str, account: str) -> None:
+    """Delete one entry by key and version ID. S3 refuses the call when the bucket is not this account's."""
+    aws.call("s3api", "delete-object", "--bucket", bucket, "--key", key, "--version-id", version, "--expected-bucket-owner", account)
+
+
+def purge(aws: Aws, bucket: str, approved: list[tuple[str, str]], account: str) -> int:
     """Delete, by key and version ID, each approved entry that the bucket still holds, and return how many."""
     present = {(entry["Key"], entry["VersionId"]) for entry in bucket_entries(aws, bucket)}
     for key, version in sorted(present & set(approved)):
-        aws.call("s3api", "delete-object", "--bucket", bucket, "--key", key, "--version-id", version)
+        delete_entry(aws, bucket, key, version, account)
     return len(present & set(approved))
 
 
@@ -328,15 +363,57 @@ def entry_content(aws: Aws, bucket: str, entry: dict[str, Any]) -> bytes:
         return target.read_bytes()
 
 
+def this_computer() -> str:
+    return socket.gethostname()
+
+
+def process_runs(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lock_takeover_problem(content: bytes, run: RunBinding, computer: str, runs: Callable[[int], bool]) -> str | None:
+    """Why an existing lock is not the lock a stopped cleanup of this run left on this computer, or None when this cleanup may take it over."""
+    other = "another process holds the state lock"
+    try:
+        record = json.loads(content)
+    except ValueError:
+        return other
+    if not isinstance(record, dict) or record.get("ID") != f"teardown-{run.run_id}" or record.get("Path") != f"{run.bucket}/{run.state_keys[0]}":
+        return other
+    holder, _, pid = str(record.get("Who", "")).rpartition(":")
+    if holder != computer or not pid.isdigit():
+        return other
+    return "this run's cleanup still runs in another process" if runs(int(pid)) else None
+
+
 def hold_state_lock(aws: Aws, run: RunBinding, scratch: Path) -> str:
-    """Take the state lock for the cleanup with a write that succeeds only when no lock exists, and return the version ID of the lock object."""
+    """Take the state lock for the cleanup and return the version ID of the lock object.
+
+    The write succeeds only when no lock exists. A lock that a stopped cleanup of this run left on this computer is taken over by its version ID.
+    """
     body = scratch / "lock"
-    body.write_text(json.dumps({"ID": f"teardown-{run.run_id}", "Operation": "teardown cleanup", "Path": f"{run.bucket}/{run.state_keys[0]}"}))
+    record = {"ID": f"teardown-{run.run_id}", "Operation": "teardown cleanup", "Who": f"{this_computer()}:{os.getpid()}"}
+    body.write_text(json.dumps(record | {"Path": f"{run.bucket}/{run.state_keys[0]}"}))
     arguments = ["s3api", "put-object", "--bucket", run.bucket, "--key", run.state_keys[1], "--body", str(body), "--if-none-match", "*"]
     written = aws.call(*arguments, missing=("PreconditionFailed",))
-    if written is None:
-        raise TeardownRefused("another process holds the state lock: the state entries and the bucket are kept; run the command again when it is released")
-    return str(written["VersionId"])
+    if written is not None:
+        return str(written["VersionId"])
+    listing = aws.call("s3api", "list-object-versions", "--bucket", run.bucket, "--prefix", run.state_keys[1])
+    latest = [entry for entry in listing.get("Versions", []) if entry["Key"] == run.state_keys[1] and entry.get("IsLatest")]
+    problem = (
+        lock_takeover_problem(entry_content(aws, run.bucket, latest[0]), run, this_computer(), process_runs)
+        if latest
+        else "another process holds the state lock"
+    )
+    if problem:
+        raise TeardownRefused(f"{problem}: the state entries and the bucket are kept; run the command again when it is released")
+    return str(latest[0]["VersionId"])
 
 
 def clean_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: Path, account: str) -> str:
@@ -374,15 +451,15 @@ def clean_bucket(aws: Aws, run: RunBinding, approved: dict[str, Any], removal: P
                 raise TeardownRefused("the environment is gone, and the bucket is kept because:\n" + "\n".join(sorted(set(left))))
             for entry in state:
                 if lock is None or (entry["Key"], entry["VersionId"]) != (lock[0], lock[1]):
-                    aws.call("s3api", "delete-object", "--bucket", run.bucket, "--key", entry["Key"], "--version-id", entry["VersionId"])
+                    delete_entry(aws, run.bucket, entry["Key"], entry["VersionId"], account)
         finally:
             if lock:
-                aws.call("s3api", "delete-object", "--bucket", run.bucket, "--key", lock[0], "--version-id", lock[1])
+                delete_entry(aws, run.bucket, lock[0], lock[1], account)
     if not created:
         return "the bucket is kept: this run did not create it"
     if aws.call("s3api", "head-bucket", "--bucket", run.bucket, "--expected-bucket-owner", account, missing=("(403)", "AccessDenied")) is None:
         raise TeardownRefused("the bucket is not owned by this account any more; it is kept")
-    aws.call("s3api", "delete-bucket", "--bucket", run.bucket)
+    aws.call("s3api", "delete-bucket", "--bucket", run.bucket, "--expected-bucket-owner", account)
     if not wait_gone(aws, run.bucket):
         raise TeardownRefused(f"S3 still reports the bucket {GONE_DEADLINE_SECONDS} seconds after its deletion")
     return "none: no resource is retained"
@@ -474,6 +551,18 @@ def settled_checks(
     return [entry | {"reported": reported.get(entry["address"], "unverified: not checked before the deadline")} for entry in inventory]
 
 
+def apply_destroy(run: RunBinding, approved_plan: Path, finish: Callable[[str], None]) -> None:
+    """Apply the checked plan and record the stage at once, so that a failed write of the raw output cannot make a rerun apply again."""
+    output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
+    finish("apply")
+    destroyed = DESTROYED.search(output)
+    sys.stdout.write(f"run {run.run_id}: the destroy plan is applied; resources destroyed: {destroyed.group(1) if destroyed else 'see the raw output'}\n")
+    try:
+        save_raw(run.run_id, "destroy_apply.txt", output)
+    except OSError as error:
+        sys.stderr.write(f"the raw output of the destroy could not be kept: {type(error).__name__}\n")
+
+
 def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: str) -> int:
     """Run the stages that are left. A finished teardown does nothing. An interrupted one resumes only with the approval it started with."""
     folder = ROOT / "runs" / run.run_id
@@ -513,17 +602,11 @@ def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: s
                         raise TeardownRefused("refused before any deletion: the inventory lists a Tailscale device and not exactly one host instance")
                     host.release_tailscale_device(run.run_id, device["host_name"], device["service_id"], instances[0])
                 finish("release")
-            output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
-            save_raw(run.run_id, "destroy_apply.txt", output)
-            destroyed = DESTROYED.search(output)
-            sys.stdout.write(
-                f"run {run.run_id}: the destroy plan is applied; resources destroyed: {destroyed.group(1) if destroyed else 'see the raw output'}\n"
-            )
-            finish("apply")
+            apply_destroy(run, approved_plan, finish)
         finally:
             approved_plan.unlink(missing_ok=True)
     if "purge" in left:
-        purge(aws, run.bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == run.bucket])
+        purge(aws, run.bucket, [(item[1], item[2]) for item in approved["application"] if item[0] == run.bucket], configuration["AWS_ACCOUNT_ID"])
         finish("purge")
     if "state" in left:
         (removal / "retained.json").write_text(json.dumps(clean_bucket(aws, run, approved, removal, configuration["AWS_ACCOUNT_ID"])) + "\n")
