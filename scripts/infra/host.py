@@ -32,7 +32,7 @@ from scripts.aws_cli import Aws, AwsError
 from scripts.infra import state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
-from scripts.infra.terraform_wrapper import WrapperError, apply_plan, load_run, sanitized, save_plan, save_raw, state_json
+from scripts.infra.terraform_wrapper import WrapperError, apply_plan, load_run, save_plan, save_raw, state_json
 from scripts.process import TimeoutExpired, run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -41,6 +41,7 @@ HOST_TAG = "tag:surgical-host"
 HOST_USER = "ubuntu"
 INSTANCE_ID_COMMAND = "cat /var/lib/cloud/data/instance-id"
 INSTANCE_ID_FORM = re.compile(r"i-[0-9a-f]{8,17}")
+RECAP_LINE = re.compile(r"platform +: ok=\d+( +\w+=\d+)+ *")
 INSTANCE_DEADLINE_SECONDS = 600
 PEER_DEADLINE_SECONDS = 600
 SSH_DEADLINE_SECONDS = 300
@@ -120,7 +121,7 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
     except TimeoutExpired:
         raise NoPeerError("the Tailscale client on this computer did not answer in time") from None
     if result.returncode != 0:
-        raise HostError(f"tailscale status failed: {result.stderr.strip()}")
+        raise HostError(f"tailscale status failed: exit status {result.returncode}")
     status: dict[str, Any] = json.loads(result.stdout)
     return status
 
@@ -238,9 +239,10 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
-def ansible_failure(stdout: str, stderr: str, address: str) -> str:
-    """The end of a failed playbook's output with account numbers, addresses and the host's name replaced; the raw output stays in the run's raw folder."""
-    return sanitized(f"the Ansible host setup failed:\n{stdout[-4000:]}\n{stderr[-2000:]}".replace(address, "<HOST>"))
+def ansible_recap(stdout: str) -> str:
+    """The count lines of the playbook's recap for the host group, and nothing else: task output can hold variable values."""
+    recap = stdout[stdout.rfind("PLAY RECAP") :].splitlines()[1:] if "PLAY RECAP" in stdout else []
+    return "".join(f"{line.strip()}\n" for line in recap if RECAP_LINE.fullmatch(line.strip()))
 
 
 def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
@@ -255,10 +257,9 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
         timeout=ANSIBLE_TIMEOUT_SECONDS,
     )
     save_raw(run_id, "ansible_output.txt", result.stdout + result.stderr)
-    recap = result.stdout[result.stdout.rfind("PLAY RECAP") :] if "PLAY RECAP" in result.stdout else result.stdout[-2000:]
-    sys.stdout.write(sanitized(recap))
+    sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:
-        raise HostError(ansible_failure(result.stdout, result.stderr, address))
+        raise HostError(f"the Ansible host setup failed; its full output is in runs/{run_id}/raw/ansible_output.txt")
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:

@@ -23,15 +23,15 @@ from typing import Any
 from unittest import mock
 
 from scripts.aws_cli import Aws
-from scripts.infra import host, state_bootstrap
+from scripts.infra import host, state_bootstrap, terraform_wrapper
 from scripts.infra.host import (
     HostError,
     Peer,
-    ansible_failure,
     host_check,
     instance_id,
     record_tailscale_device,
     release_tailscale_device,
+    run_ansible,
     select_peer,
     tailscale_device_id,
     wait_for,
@@ -565,18 +565,84 @@ class HostStateTest(unittest.TestCase):
             instance_id({"values": {}})
 
 
-class AnsibleFailureTest(unittest.TestCase):
-    def test_a_failure_message_carries_no_account_number_or_address(self) -> None:
-        output = "fatal: [100.64.0.7]: FAILED! role arn:aws:iam::" + "1" * 12 + ":role/example_host"
-        message = ansible_failure(output, "ssh: connect to host 100.64.0.7 port 22", "platform-dev.example.ts.net")
-        self.assertEqual(
-            "the Ansible host setup failed:\nfatal: [<ADDRESS>]: FAILED! role arn:aws:iam::<ACCOUNT>:role/example_host\nssh: connect to host <ADDRESS> port 22",
-            message,
-        )
+PRIVATE_TEXT = "bucket example-private-bucket role arn:aws:iam::" + "1" * 12 + ":role/example_private_role"
+ANSIBLE_TOOL = (
+    "#!/bin/sh\n"
+    f"printf 'TASK [secret task]\\nfatal: [platform]: FAILED! {PRIVATE_TEXT}\\n'\n"
+    'if [ -n "$FAKE_RECAP" ]; then printf \'PLAY RECAP *****\\n%s\\n\' "$FAKE_RECAP"; fi\n'
+    f"printf 'stderr line: {PRIVATE_TEXT}\\n' >&2\n"
+    'exit "${FAKE_ANSIBLE_EXIT:-0}"\n'
+)
+RECAP = "platform                   : ok=12   changed=3    unreachable=0    failed=1    skipped=2    rescued=0    ignored=0"
 
-    def test_a_failure_message_carries_no_tailscale_name(self) -> None:
-        message = ansible_failure("", "ssh: Could not resolve hostname platform-dev.example.ts.net: Name or service not known", "platform-dev.example.ts.net")
-        self.assertEqual("the Ansible host setup failed:\n\nssh: Could not resolve hostname <HOST>: Name or service not known", message)
+
+class AnsibleRunTest(unittest.TestCase):
+    """``run_ansible`` through a fake ``ansible-playbook`` that runs as a real process and prints private-looking text."""
+
+    def run_it(self, *, exit_code: int, recap: str = RECAP) -> tuple[str, str | None, str]:
+        output = io.StringIO()
+        with fake_tools({"Peer": {}}, INSTANCE) as folder:
+            tool = folder / ".venv" / "bin" / "ansible-playbook"
+            tool.parent.mkdir(parents=True)
+            tool.write_text(ANSIBLE_TOOL)
+            tool.chmod(stat.S_IRWXU)
+            (folder / "ansible").mkdir()
+            environment = {"FAKE_ANSIBLE_EXIT": str(exit_code), "FAKE_RECAP": recap}
+            with mock.patch.dict(os.environ, environment), mock.patch.object(terraform_wrapper, "ROOT", folder), contextlib.redirect_stdout(output):
+                try:
+                    run_ansible("run-one", "platform-dev.example.ts.net", {})
+                except HostError as error:
+                    message: str | None = str(error)
+                else:
+                    message = None
+            raw = (folder / "runs" / "run-one" / "raw" / "ansible_output.txt").read_text()
+            mode = stat.S_IMODE((folder / "runs" / "run-one" / "raw" / "ansible_output.txt").stat().st_mode)
+        self.assertEqual(0o600, mode)
+        return output.getvalue(), message, raw
+
+    def test_a_failed_setup_names_only_the_failure_and_the_file_that_keeps_the_output(self) -> None:
+        printed, message, raw = self.run_it(exit_code=2)
+        self.assertEqual("the Ansible host setup failed; its full output is in runs/run-one/raw/ansible_output.txt", message)
+        self.assertIn(f"fatal: [platform]: FAILED! {PRIVATE_TEXT}", raw)
+        self.assertIn(f"stderr line: {PRIVATE_TEXT}", raw)
+        self.assertNotIn("example-private-bucket", printed)
+        self.assertNotIn("example_private_role", printed)
+
+    def test_the_recap_counts_are_printed_and_no_task_text(self) -> None:
+        printed, _, _ = self.run_it(exit_code=2)
+        self.assertEqual(RECAP + "\n", printed)
+        self.assertIn("ok=12", printed)
+        self.assertIn("failed=1", printed)
+        self.assertNotIn("TASK", printed)
+        self.assertNotIn("secret task", printed)
+        self.assertNotIn("fatal", printed)
+
+    def test_output_with_no_recap_prints_nothing_and_still_names_the_file(self) -> None:
+        printed, message, _ = self.run_it(exit_code=2, recap="")
+        self.assertEqual("", printed)
+        self.assertEqual("the Ansible host setup failed; its full output is in runs/run-one/raw/ansible_output.txt", message)
+
+    def test_a_recap_line_that_is_not_the_counts_of_the_platform_host_is_not_printed(self) -> None:
+        printed, _, _ = self.run_it(exit_code=2, recap=f"platform : {PRIVATE_TEXT}")
+        self.assertEqual("", printed)
+
+    def test_a_recap_line_of_another_host_name_is_not_printed(self) -> None:
+        printed, _, _ = self.run_it(exit_code=2, recap=RECAP.replace("platform ", "platform-dev.example.ts.net ", 1))
+        self.assertEqual("", printed)
+
+    def test_a_successful_setup_prints_the_recap_and_raises_nothing(self) -> None:
+        printed, message, _ = self.run_it(exit_code=0)
+        self.assertIsNone(message)
+        self.assertIn("ok=12", printed)
+
+
+class TailscaleStatusFailureTest(unittest.TestCase):
+    def test_a_failing_client_is_named_by_its_exit_status_and_its_error_text_is_not_repeated(self) -> None:
+        with fake_tools({"Peer": {}}, INSTANCE) as folder:
+            (folder / "tailscale").write_text(f"#!/bin/sh\necho '{PRIVATE_TEXT}' >&2\necho '{PRIVATE_TEXT}'\nexit 3\n")
+            with self.assertRaises(HostError) as caught:
+                host.tailscale_status(5)
+        self.assertEqual("tailscale status failed: exit status 3", str(caught.exception))
 
 
 class HostCheckTest(unittest.TestCase):
