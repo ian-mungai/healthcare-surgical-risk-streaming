@@ -285,14 +285,7 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
     approved = approved_plan_copy(run, plan)
     try:
         applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
-        try:
-            output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
-        except WrapperError as error:
-            try:
-                record_created(run, applied_plan)
-            except WrapperError:
-                raise WrapperError(f"{error}; what it created before it failed could not be recorded: run the command again") from None
-            raise
+        output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
         kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
         sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")
     finally:
