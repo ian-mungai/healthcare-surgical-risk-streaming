@@ -416,15 +416,20 @@ DEVICE_ENTRY = {"address": "tailscale device", "type": "tailscale_device", "serv
 
 class DeviceCheckTest(unittest.TestCase):
     def test_a_device_that_left_the_network_is_gone(self) -> None:
-        other = {"Peer": {"key": {"ID": "nOTHER", "HostName": "laptop", "Tags": []}}}
+        other = {"BackendState": "Running", "Peer": {"key": {"ID": "nOTHER", "HostName": "laptop", "Tags": []}}}
         self.assertEqual("gone", device_check(DEVICE_ENTRY, lambda: other))
-        self.assertEqual("gone", device_check(DEVICE_ENTRY, lambda: {"Peer": None}))
+        self.assertEqual("gone", device_check(DEVICE_ENTRY, lambda: {"BackendState": "Running", "Peer": None}))
 
     def test_the_recorded_device_or_a_tagged_device_with_the_hosts_name_still_exists(self) -> None:
-        recorded = {"Peer": {"key": {"ID": "nNEWCNTRL", "HostName": "renamed", "Tags": []}}}
-        rejoined = {"Peer": {"key": {"ID": "nLATER", "HostName": "platform-dev", "Tags": ["tag:surgical-host"]}}}
+        recorded = {"BackendState": "Running", "Peer": {"key": {"ID": "nNEWCNTRL", "HostName": "renamed", "Tags": []}}}
+        rejoined = {"BackendState": "Running", "Peer": {"key": {"ID": "nLATER", "HostName": "platform-dev", "Tags": ["tag:surgical-host"]}}}
         self.assertEqual("still exists", device_check(DEVICE_ENTRY, lambda: recorded))
         self.assertEqual("still exists", device_check(DEVICE_ENTRY, lambda: rejoined))
+
+    def test_a_client_that_is_not_connected_leaves_the_device_unverified(self) -> None:
+        unverified = "unverified: the Tailscale network could not be read"
+        self.assertEqual(unverified, device_check(DEVICE_ENTRY, lambda: {"BackendState": "NeedsLogin", "Peer": None}))
+        self.assertEqual(unverified, device_check(DEVICE_ENTRY, lambda: {"Peer": None}))
 
     def test_a_network_that_cannot_be_read_leaves_the_device_unverified(self) -> None:
         def unreadable() -> dict[str, Any]:

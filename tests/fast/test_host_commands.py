@@ -8,6 +8,7 @@ Terraform state with data sources and nested modules.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import json
 import os
@@ -23,7 +24,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.aws_cli import Aws
-from scripts.infra import host, state_bootstrap, terraform_wrapper
+from scripts.infra import host, state_bootstrap, teardown, terraform_wrapper
 from scripts.infra.host import (
     HostError,
     Peer,
@@ -176,6 +177,7 @@ SSH_TOOL = (
     '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\n'
     'case "$*" in *"tailscale logout"*) exit "${FAKE_LOGOUT_EXIT:-0}" ;; esac\nexit "${FAKE_SSH_EXIT:-0}"\n'
 )
+CONNECTED = {"BackendState": "Running"}
 INSTANCE = "i-0123456789abcdef0"
 OTHER_INSTANCE = "i-0fedcba9876543210"
 
@@ -198,8 +200,8 @@ def fake_tools(
         for name, text in (("tailscale", STATUS_TOOL), ("ssh", SSH_TOOL)):
             (folder / name).write_text(text)
             (folder / name).chmod(stat.S_IRWXU)
-        (folder / "status.json").write_text(json.dumps(status))
-        (folder / "status_after.json").write_text(json.dumps(after if after is not None else status))
+        (folder / "status.json").write_text(json.dumps(CONNECTED | dict(status)))
+        (folder / "status_after.json").write_text(json.dumps(CONNECTED | dict(after if after is not None else status)))
         environment = {
             "FAKE_STATUS_AFTER": str(folder / "status_after.json") if after is not None else "",
             "PATH": f"{folder}:{os.environ['PATH']}",
@@ -391,6 +393,64 @@ class TailscaleDeviceTest(unittest.TestCase):
         with fake_tools(before, INSTANCE) as folder:
             release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
             self.assertFalse((folder / "ssh.log").exists())
+
+
+NOT_CONNECTED = ("NeedsLogin", "Stopped", "Starting", "NoState", "NeedsMachineAuth", "running", "", None)
+
+
+def with_state(state: str | None, peers: object = None) -> dict[str, object]:
+    """A status from this computer's Tailscale client in the given backend state with the given peer map, absent when the state is None."""
+    return {"Peer": peers} if state is None else {"BackendState": state, "Peer": peers}
+
+
+class DeviceNotVerifiedTest(unittest.TestCase):
+    """A missing peer means the device is gone only while this computer's Tailscale client is running and connected."""
+
+    def test_a_connected_client_with_no_such_peer_means_gone(self) -> None:
+        for peers in (None, {}, {"a": peer("laptop", tags=(), device="nLAPTOPCNTRL")}):
+            with self.subTest(peers=peers):
+                self.assertTrue(host.device_gone(with_state("Running", peers), "platform-dev", "nNEWCNTRL"))
+
+    def test_a_connected_client_that_still_lists_the_device_means_not_gone(self) -> None:
+        self.assertFalse(host.device_gone(with_state("Running", {"a": peer("platform-dev", device="nNEWCNTRL")}), "platform-dev", "nNEWCNTRL"))
+
+    def test_any_other_state_raises_whatever_the_peer_map_holds(self) -> None:
+        for state in NOT_CONNECTED:
+            for peers in (None, {}, {"a": peer("laptop", tags=(), device="nLAPTOPCNTRL")}):
+                with self.subTest(state=state, peers=peers), self.assertRaisesRegex(HostError, "not running and connected"):
+                    host.device_gone(with_state(state, peers), "platform-dev", "nNEWCNTRL")
+
+    def test_the_removal_check_reports_the_device_as_not_verified_in_any_other_state(self) -> None:
+        entry = {"type": "tailscale_device", "host_name": "platform-dev", "service_id": "nNEWCNTRL"}
+        for state in NOT_CONNECTED:
+            with self.subTest(state=state):
+                self.assertTrue(teardown.device_check(entry, functools.partial(with_state, state)).startswith("unverified"))
+        self.assertEqual("gone", teardown.device_check(entry, lambda: with_state("Running")))
+        self.assertEqual("still exists", teardown.device_check(entry, lambda: with_state("Running", {"a": peer("platform-dev", device="nNEWCNTRL")})))
+
+    def test_a_release_with_a_client_that_needs_login_raises_and_contacts_no_host(self) -> None:
+        for state in NOT_CONNECTED:
+            with self.subTest(state=state), fake_tools(with_state(state), INSTANCE) as folder:
+                (folder / "status.json").write_text(json.dumps(with_state(state)))
+                with self.assertRaisesRegex(HostError, "not running and connected"):
+                    release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+                self.assertFalse((folder / "ssh.log").exists())
+
+    def test_a_client_that_is_not_connected_but_still_lists_the_peer_gets_no_ssh_session(self) -> None:
+        stale = {"a": peer("platform-dev", device="nNEWCNTRL")}
+        with fake_tools(with_state("NeedsLogin", stale), INSTANCE) as folder:
+            (folder / "status.json").write_text(json.dumps(with_state("NeedsLogin", stale)))
+            with self.assertRaisesRegex(HostError, "not running and connected"):
+                release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+            self.assertFalse((folder / "ssh.log").exists())
+
+    def test_a_client_that_loses_its_network_while_the_release_waits_raises_at_once(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, INSTANCE, after=with_state("NeedsLogin")) as folder:
+            (folder / "status_after.json").write_text(json.dumps(with_state("NeedsLogin")))
+            with self.assertRaisesRegex(HostError, "not running and connected"):
+                release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+            self.assertIn("sudo -n tailscale logout", (folder / "ssh.log").read_text().splitlines())
 
 
 CONFIGURATION = {"AWS_REGION": "us-west-2", "AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "PROJECT_NAME": "example_project"}
