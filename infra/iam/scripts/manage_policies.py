@@ -159,8 +159,8 @@ def differences(steps: list[Step]) -> list[Step]:
 
 
 def unchanged_differences(steps: list[Step]) -> list[Step]:
-    """The differences that apply never changes."""
-    return [step for step in differences(steps) if step.action.startswith("report-")]
+    """Every report-only step, an unlisted policy included: what plan and apply never change and still fail on."""
+    return [step for step in steps if step.action.startswith("report-")]
 
 
 def confirmation_code(account: str, documents: Mapping[str, Mapping[str, Any]], steps: list[Step]) -> str:

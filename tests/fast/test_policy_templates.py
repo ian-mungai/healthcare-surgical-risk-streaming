@@ -228,6 +228,7 @@ class PlanTest(unittest.TestCase):
         steps = plan_steps(NAMES, {"example_project_ec2_policy": GOOD}, live, account=ACCOUNT)
         self.assertEqual([Step("report-unlisted", "example_project_old_policy")], steps)
         self.assertEqual([], differences(steps))
+        self.assertEqual(steps, unchanged_differences(steps))
 
     def test_each_foreign_grant_is_a_reported_difference(self) -> None:
         live = live_account(

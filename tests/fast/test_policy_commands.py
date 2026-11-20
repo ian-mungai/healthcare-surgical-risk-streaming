@@ -8,11 +8,14 @@ user with an extra attachment, an inline policy or a group, and a live account t
 from __future__ import annotations
 
 import argparse
+import inspect
 import io
 import os
+import re
 import stat
 import tempfile
 import unittest
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -501,6 +504,61 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(1, code, output)
         self.assertIn("done: attach-policy", output)
         self.assertTrue(any(call[:2] == ("iam", "attach-user-policy") for call in account.calls))
+
+
+REPORT_ONLY: dict[str, Callable[[Account], object]] = {
+    "report-attached-boundary": lambda account: account.attached.append(policy_arn(ACCOUNT, NAMES.boundary("role"))),
+    "report-unexpected-attachment": lambda account: account.attached.append(FOREIGN),
+    "report-inline-policy": lambda account: account.inline.append("grant_everything"),
+    "report-group-membership": lambda account: account.groups.append("admins"),
+    "report-extra-policy-tag": lambda account: account.policy_tags[NAMES.policy("ec2")].update({"Owner": "someone"}),
+    "report-extra-user-tag": lambda account: account.user_tags.update({"Owner": "someone"}),
+    "report-unlisted": lambda account: account.policies.update({"example_project_old_policy": {"Version": "2012-10-17", "Statement": []}}),
+}
+
+
+class ReportOnlyStatusTest(unittest.TestCase):
+    """``plan`` and ``apply`` exit 1 while any report-only step remains, whichever kind it is, with changes pending or not."""
+
+    def test_the_tested_kinds_are_every_report_step_kind_the_tool_can_plan(self) -> None:
+        self.assertEqual(set(re.findall(r'"(report-[a-z-]+)"', inspect.getsource(manage_policies))), set(REPORT_ONLY))
+
+    def test_each_report_only_step_makes_plan_exit_1_when_nothing_else_changes(self) -> None:
+        for kind, plant in REPORT_ONLY.items():
+            with self.subTest(kind=kind):
+                account = Account.matching_templates()
+                plant(account)
+                code, output, _ = run_command("plan", account)
+                self.assertIn(kind, output)
+                self.assertEqual(1, code, output)
+                self.assertNotIn("equal the templates", output)
+
+    def test_each_report_only_step_makes_apply_exit_1_when_nothing_else_changes(self) -> None:
+        for kind, plant in REPORT_ONLY.items():
+            with self.subTest(kind=kind):
+                account = Account.matching_templates()
+                plant(account)
+                code, output, _ = run_command("apply", account)
+                self.assertIn(kind, output)
+                self.assertEqual(1, code, output)
+
+    def test_each_report_only_step_makes_plan_and_apply_exit_1_after_the_changes_are_planned_and_applied(self) -> None:
+        for kind, plant in REPORT_ONLY.items():
+            with self.subTest(kind=kind):
+                account = Account.matching_templates(attached=False)
+                plant(account)
+                code, plan_output, _ = run_command("plan", account)
+                self.assertEqual(1, code, plan_output)
+                self.assertIn("steps planned", plan_output)
+                code, output, _ = run_command("apply", account, confirm=plan_output.rsplit("--confirm ", 1)[1].split()[0])
+                self.assertEqual(1, code, output)
+                self.assertIn("done: attach-policy", output)
+
+    def test_an_account_with_no_report_only_step_exits_0(self) -> None:
+        for command in ("plan", "apply"):
+            with self.subTest(command=command):
+                code, output, _ = run_command(command, Account.matching_templates())
+                self.assertEqual(0, code, output)
 
 
 class UserTagTest(unittest.TestCase):
