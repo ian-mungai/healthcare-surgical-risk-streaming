@@ -19,7 +19,18 @@ from scripts import aws_cli
 from scripts.aws_cli import Aws, AwsError
 from scripts.infra import teardown, terraform_wrapper
 from scripts.infra.state_bootstrap import RunBinding, adoption_problem, bucket_problem
-from scripts.infra.teardown import TeardownRefused, approved_problems, lock_takeover_problem, snapshot_problem
+from scripts.infra.teardown import (
+    TeardownRefused,
+    approved_problems,
+    destroy_already_applied,
+    lock_takeover_problem,
+    other_entry_problems,
+    owner_problem,
+    read_progress,
+    resume_problem,
+    snapshot_problem,
+    write_progress,
+)
 from scripts.infra.terraform_wrapper import WrapperError
 from scripts.process import CompletedProcess
 
@@ -127,22 +138,56 @@ class OwnerTest(unittest.TestCase):
 
 class LockTakeoverTest(unittest.TestCase):
     def record(self, **changes: Any) -> bytes:
-        return json.dumps({"ID": "teardown-20260101t0000-abcdef", "Who": "this-computer:4242", "Path": f"example-project/{STATE_KEYS[0]}"} | changes).encode()
+        return json.dumps(
+            {
+                "ID": "teardown-20260101t0000-abcdef",
+                "Who": "this-computer:4242",
+                "Started": "Thu Jan  1 00:00:00 2026",
+                "Path": f"example-project/{STATE_KEYS[0]}",
+            }
+            | changes
+        ).encode()
 
     def test_the_lock_of_this_runs_own_stopped_cleanup_is_taken_over(self) -> None:
-        self.assertIsNone(lock_takeover_problem(self.record(), RUN, "this-computer", lambda pid: False))
+        self.assertIsNone(lock_takeover_problem(self.record(), RUN, "this-computer", lambda pid, started: False))
 
     def test_a_lock_whose_cleanup_still_runs_is_kept(self) -> None:
-        self.assertEqual("this run's cleanup still runs in another process", lock_takeover_problem(self.record(), RUN, "this-computer", lambda pid: True))
+        self.assertEqual(
+            "this run's cleanup still runs in another process", lock_takeover_problem(self.record(), RUN, "this-computer", lambda pid, started: True)
+        )
 
     def test_a_lock_of_another_holder_is_kept(self) -> None:
         other = "another process holds the state lock"
-        self.assertEqual(other, lock_takeover_problem(self.record(ID="1b2c"), RUN, "this-computer", lambda pid: False))
-        self.assertEqual(other, lock_takeover_problem(self.record(Who="another-computer:4242"), RUN, "this-computer", lambda pid: False))
-        self.assertEqual(other, lock_takeover_problem(self.record(Who="this-computer:x"), RUN, "this-computer", lambda pid: False))
-        self.assertEqual(other, lock_takeover_problem(b"not json", RUN, "this-computer", lambda pid: False))
+        self.assertEqual(other, lock_takeover_problem(self.record(ID="1b2c"), RUN, "this-computer", lambda pid, started: False))
+        self.assertEqual(other, lock_takeover_problem(self.record(Who="another-computer:4242"), RUN, "this-computer", lambda pid, started: False))
+        self.assertEqual(other, lock_takeover_problem(self.record(Who="this-computer:x"), RUN, "this-computer", lambda pid, started: False))
+        self.assertEqual(other, lock_takeover_problem(b"not json", RUN, "this-computer", lambda pid, started: False))
         self.assertEqual(
-            other, lock_takeover_problem(self.record(Path="example-project/state/prod/terraform.tfstate"), RUN, "this-computer", lambda pid: False)
+            other, lock_takeover_problem(self.record(Path="example-project/state/prod/terraform.tfstate"), RUN, "this-computer", lambda pid, started: False)
+        )
+
+    def test_the_start_time_recorded_in_the_lock_is_what_the_process_check_receives(self) -> None:
+        seen: list[tuple[int, str]] = []
+
+        def runs(pid: int, started: str) -> bool:
+            seen.append((pid, started))
+            return False
+
+        lock_takeover_problem(self.record(), RUN, "this-computer", runs)
+        self.assertEqual([(4242, "Thu Jan  1 00:00:00 2026")], seen)
+
+    def test_a_process_with_the_recorded_id_and_another_start_time_is_not_the_stopped_cleanup(self) -> None:
+        with mock.patch.object(teardown, "process_start", return_value="Fri Jan  2 00:00:00 2026"):
+            self.assertFalse(teardown.process_runs(4242, "Thu Jan  1 00:00:00 2026"))
+        with mock.patch.object(teardown, "process_start", return_value="Thu Jan  1 00:00:00 2026"):
+            self.assertTrue(teardown.process_runs(4242, "Thu Jan  1 00:00:00 2026"))
+        with mock.patch.object(teardown, "process_start", return_value=""):
+            self.assertFalse(teardown.process_runs(4242, "Thu Jan  1 00:00:00 2026"))
+            self.assertFalse(teardown.process_runs(4242, ""))
+
+    def test_a_lock_with_no_recorded_start_time_is_kept(self) -> None:
+        self.assertEqual(
+            "another process holds the state lock", lock_takeover_problem(self.record(Started=""), RUN, "this-computer", lambda pid, started: False)
         )
 
     def test_a_refused_lock_write_takes_over_exactly_the_version_this_run_left(self) -> None:
@@ -164,6 +209,173 @@ class LockTakeoverTest(unittest.TestCase):
             self.assertRaises(TeardownRefused),
         ):
             teardown.hold_state_lock(aws, RUN, Path(scratch))
+
+
+class OwnerBeforeAnyStageTest(unittest.TestCase):
+    def test_a_bucket_this_account_owns_passes(self) -> None:
+        self.assertIsNone(owner_problem(RecordingAws([(("s3api", "head-bucket"), {})]), RUN, ACCOUNT))
+
+    def test_an_account_value_that_does_not_own_the_bucket_is_refused(self) -> None:
+        answers: Iterator[dict[str, str] | None] = iter([{}, None])
+        aws = RecordingAws([(("s3api", "head-bucket"), lambda _: next(answers))])
+        self.assertEqual("the bucket is not owned by the account in AWS_ACCOUNT_ID", owner_problem(aws, RUN, "another-account"))
+        self.assertIn("another-account", aws.calls[1])
+
+    def test_a_bucket_that_is_already_gone_has_no_owner_to_check(self) -> None:
+        self.assertIsNone(owner_problem(RecordingAws([(("s3api", "head-bucket"), None)]), RUN, ACCOUNT))
+
+
+def entry(key: str) -> dict[str, str]:
+    return {"Key": key, "VersionId": "v1"}
+
+
+class KeptBucketTest(unittest.TestCase):
+    KEPT = RunBinding(**{**RUN.__dict__, "bucket_creation": "none"})
+
+    def test_another_environments_state_in_a_kept_bucket_is_left_alone(self) -> None:
+        other = [entry("state/prod/terraform.tfstate"), entry("state/prod/terraform.tfstate.tflock")]
+        self.assertEqual([], other_entry_problems(other, self.KEPT))
+
+    def test_an_entry_under_an_unknown_prefix_in_a_kept_bucket_is_refused(self) -> None:
+        expected = ["bucket: entry outside the data prefixes and this run's state keys: staging/control.txt"]
+        self.assertEqual(expected, other_entry_problems([entry("staging/control.txt"), entry("state/prod/terraform.tfstate")], self.KEPT))
+
+    def test_a_file_that_only_looks_like_state_is_refused(self) -> None:
+        for key in (
+            "state/terraform.tfstate",
+            "state/prod/other.tfstate",
+            "state/prod/deeper/terraform.tfstate",
+            "xstate/prod/terraform.tfstate",
+            "state/prod/terraform.tfstate.backup",
+        ):
+            self.assertEqual([f"bucket: entry outside the data prefixes and this run's state keys: {key}"], other_entry_problems([entry(key)], self.KEPT))
+
+    def test_a_created_bucket_refuses_every_other_entry(self) -> None:
+        expected = ["bucket: entry outside the data prefixes and this run's state keys: state/prod/terraform.tfstate"]
+        self.assertEqual(expected, other_entry_problems([entry("state/prod/terraform.tfstate")], RUN))
+
+
+BINDING = {"code": "c", "approved_sha256": "a", "plan_sha256": "p", "inventory_sha256": "i", "receipt_sha256": "r"}
+
+
+class ResumeTest(unittest.TestCase):
+    def test_a_new_approval_is_accepted_while_the_apply_stage_is_unfinished(self) -> None:
+        self.assertIsNone(resume_problem(BINDING | {"finished": ["release"]}, BINDING | {"code": "new", "plan_sha256": "new"}))
+        self.assertIsNone(resume_problem(None, BINDING))
+
+    def test_after_the_apply_stage_a_rerun_must_carry_the_approval_it_started_with(self) -> None:
+        expected = "this teardown started with another code: a rerun must use the approval it started with"
+        self.assertEqual(expected, resume_problem(BINDING | {"finished": ["release", "apply"]}, BINDING | {"code": "new"}))
+        self.assertIsNone(resume_problem(BINDING | {"finished": ["release", "apply"]}, BINDING))
+
+    def test_a_destroy_whose_reply_was_lost_is_recognised_by_the_empty_newer_state(self) -> None:
+        approved = {"state_lineage": "lineage-1", "state_serial": 7}
+        recorded = BINDING | {"finished": ["release"]}
+        self.assertTrue(destroy_already_applied(recorded, BINDING, ("lineage-1", 8, 0), approved))
+
+    def test_a_state_that_still_holds_resources_or_did_not_move_is_not_an_applied_destroy(self) -> None:
+        approved = {"state_lineage": "lineage-1", "state_serial": 7}
+        recorded = BINDING | {"finished": ["release"]}
+        self.assertFalse(destroy_already_applied(recorded, BINDING, ("lineage-1", 8, 2), approved))
+        self.assertFalse(destroy_already_applied(recorded, BINDING, ("lineage-1", 7, 0), approved))
+        self.assertFalse(destroy_already_applied(recorded, BINDING, ("lineage-2", 8, 0), approved))
+
+    def test_an_applied_destroy_is_recognised_only_for_the_approval_that_passed_the_guards_and_released_the_host(self) -> None:
+        approved = {"state_lineage": "lineage-1", "state_serial": 7}
+        self.assertFalse(destroy_already_applied(None, BINDING, ("lineage-1", 8, 0), approved))
+        self.assertFalse(destroy_already_applied(BINDING | {"finished": []}, BINDING, ("lineage-1", 8, 0), approved))
+        self.assertFalse(destroy_already_applied(BINDING | {"finished": ["release"]}, BINDING | {"code": "new"}, ("lineage-1", 8, 0), approved))
+
+
+class ProgressFileTest(unittest.TestCase):
+    def test_a_write_that_stops_before_it_completes_leaves_the_earlier_progress_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            removal = Path(scratch) / "removal"
+            write_progress(removal, BINDING, ["release"])
+            with mock.patch("os.replace", side_effect=OSError("stopped")), self.assertRaises(OSError):
+                write_progress(removal, BINDING, ["release", "apply"])
+            recorded = read_progress(removal)
+            self.assertEqual(["release"], recorded["finished"] if recorded else None)
+            write_progress(removal, BINDING, ["release", "apply"])
+            recorded = read_progress(removal)
+            self.assertEqual(["release", "apply"], recorded["finished"] if recorded else None)
+            self.assertEqual(["progress.json"], sorted(path.name for path in removal.iterdir()))
+
+
+class DestroyCommandTest(unittest.TestCase):
+    """The whole destroy command on a scratch run folder, with every tool call replaced, for the two orders a pure function cannot show."""
+
+    APPROVED = {"application": [], "state": [], "state_lineage": "lineage-1", "state_serial": 7, "local_state_sha256": ""}
+
+    def folder(self, scratch: str) -> Path:
+        folder = Path(scratch) / "runs" / RUN.run_id
+        (folder / "plans").mkdir(parents=True)
+        (folder / "teardown").mkdir()
+        (folder / "inventory.json").write_text(json.dumps({"created": []}))
+        (folder / "plans" / "destroy_binding.json").write_text(json.dumps({"plan_sha256": "0" * 64}))
+        (folder / "plans" / "destroy.tfplan").write_bytes(b"plan")
+        (folder / "teardown" / "approved_inventory.json").write_text(json.dumps(self.APPROVED))
+        return folder
+
+    def test_a_mistyped_account_is_refused_before_the_guards_the_host_release_and_the_apply(self) -> None:
+        answers: Iterator[dict[str, str] | None] = iter([{}, None])
+        aws = RecordingAws([(("s3api", "head-bucket"), lambda _: next(answers))])
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(teardown, "ROOT", Path(scratch)),
+            mock.patch.object(teardown, "guard_problems") as guards,
+            mock.patch.object(teardown, "approved_plan_copy") as copied,
+            mock.patch.object(teardown, "terraform") as called,
+            mock.patch("scripts.infra.host.release_tailscale_device") as released,
+            self.assertRaises(TeardownRefused) as refused,
+        ):
+            self.folder(scratch)
+            teardown.destroy(aws, SETTINGS | {"AWS_ACCOUNT_ID": "another-account"}, RUN, "code")
+        self.assertEqual("refused before any deletion: the bucket is not owned by the account in AWS_ACCOUNT_ID", str(refused.exception))
+        for stage in (guards, copied, called, released):
+            stage.assert_not_called()
+        self.assertEqual([], aws.named("s3api", "delete-object") + aws.named("s3api", "delete-bucket"))
+
+    def test_a_rerun_after_a_lost_apply_reply_records_the_stage_and_does_not_apply_again(self) -> None:
+        aws = RecordingAws([(("s3api", "head-bucket"), {})])
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(teardown, "ROOT", Path(scratch)),
+            mock.patch.object(teardown, "state_snapshot", return_value=("lineage-1", 8, 0)),
+            mock.patch.object(teardown, "guard_problems") as guards,
+            mock.patch.object(teardown, "apply_destroy") as applied,
+            mock.patch.object(teardown, "purge") as purged,
+            mock.patch.object(teardown, "clean_bucket", return_value="none: no resource is retained"),
+            mock.patch.object(teardown, "checked_removals", return_value=[]),
+            mock.patch("sys.stdout"),
+        ):
+            folder = self.folder(scratch)
+            files = teardown.approval_bytes(folder)
+            binding = teardown.approval_binding("code", files, b"plan", None)
+            write_progress(folder / "removal", binding, ["release"])
+            self.assertEqual(0, teardown.destroy(aws, SETTINGS, RUN, "code"))
+            recorded = read_progress(folder / "removal")
+        guards.assert_not_called()
+        applied.assert_not_called()
+        purged.assert_called_once()
+        self.assertEqual(["release", "apply", "purge", "state", "checks"], recorded["finished"] if recorded else None)
+
+    def test_a_rerun_whose_state_still_holds_resources_runs_every_guard_again(self) -> None:
+        aws = RecordingAws([(("s3api", "head-bucket"), {})])
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(teardown, "ROOT", Path(scratch)),
+            mock.patch.object(teardown, "state_snapshot", return_value=("lineage-1", 8, 2)),
+            mock.patch.object(teardown, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
+            mock.patch.object(teardown, "guard_problems", return_value=["the state changed after the destroy plan was saved: run make teardown-plan again"]),
+            mock.patch.object(teardown, "apply_destroy") as applied,
+            self.assertRaises(TeardownRefused),
+        ):
+            folder = self.folder(scratch)
+            binding = teardown.approval_binding("code", teardown.approval_bytes(folder), b"plan", None)
+            write_progress(folder / "removal", binding, ["release"])
+            teardown.destroy(aws, SETTINGS, RUN, "code")
+        applied.assert_not_called()
 
 
 class BindingTest(unittest.TestCase):
