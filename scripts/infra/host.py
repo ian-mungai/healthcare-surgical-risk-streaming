@@ -150,17 +150,22 @@ def device_gone(status: dict[str, Any], host_name: str, device_id: str) -> bool:
     )
 
 
-def release_tailscale_device(run_id: str, host_name: str, device_id: str, deadline_seconds: float = RELEASE_DEADLINE_SECONDS) -> None:
+def release_tailscale_device(run_id: str, host_name: str, device_id: str, instance_id: str, deadline_seconds: float = RELEASE_DEADLINE_SECONDS) -> None:
     """Log the host out of Tailscale over SSH, then wait until its recorded device and any device with its name and tag are gone from the network.
 
-    Run before the instance is destroyed. A device that is already gone needs no logout. An ephemeral device that is offline cannot be logged out and
-    leaves the network on its own only after a while, so the wait may end at its deadline.
+    Run before the instance is destroyed. The peer is logged out only after it has answered over SSH with ``instance_id``, the run's instance;
+    any other answer, or none, raises HostError and sends no logout. A device that is already gone needs no logout. An ephemeral device that is
+    offline cannot be logged out and leaves the network on its own only after a while, so the wait may end at its deadline.
     """
     try:
         peer = select_peer(tailscale_status(SSH_ATTEMPT_SECONDS), host_name, HOST_TAG)
     except NoPeerError:
         peer = None
     if peer is not None:
+        found = ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, SSH_ATTEMPT_SECONDS)
+        if found is None:
+            raise HostError(f"the Tailscale peer {host_name} did not tell its instance over SSH: no logout was sent")
+        require_instance(found, instance_id, host_name)
         ssh_output(run_id, peer.address, "sudo -n tailscale logout", SSH_ATTEMPT_SECONDS)
 
     def gone(budget: float) -> bool | None:

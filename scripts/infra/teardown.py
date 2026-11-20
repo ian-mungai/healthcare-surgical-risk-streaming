@@ -507,8 +507,11 @@ def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: s
                 raise TeardownRefused("refused before any deletion:\n" + "\n".join(problems))
             write_progress(removal, binding, finished)
             if "release" in left:
+                instances = [entry["service_id"] for entry in inventory if entry["type"] == "aws_instance"]
                 for device in (entry for entry in inventory if entry["type"] == DEVICE_TYPE):
-                    host.release_tailscale_device(run.run_id, device["host_name"], device["service_id"])
+                    if len(instances) != 1:
+                        raise TeardownRefused("refused before any deletion: the inventory lists a Tailscale device and not exactly one host instance")
+                    host.release_tailscale_device(run.run_id, device["host_name"], device["service_id"], instances[0])
                 finish("release")
             output = terraform(run, ["apply", "-input=false", "-no-color", str(approved_plan)], APPLY_TIMEOUT_SECONDS)
             save_raw(run.run_id, "destroy_apply.txt", output)

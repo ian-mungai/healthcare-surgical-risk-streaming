@@ -297,69 +297,99 @@ class TailscaleDeviceTest(unittest.TestCase):
 
     def test_a_logged_out_host_is_awaited_until_its_device_is_gone(self) -> None:
         before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
-        with fake_tools(before, "", after={"Peer": {}}) as folder:
-            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+        with fake_tools(before, INSTANCE, after={"Peer": {}}) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
             logged = (folder / "ssh.log").read_text().splitlines()
         address = "platform-dev.example.ts.net"
         self.assertIn(f"ubuntu@{address}", logged)
         self.assertIn("sudo -n tailscale logout", logged)
 
     def test_a_device_that_is_already_gone_needs_no_ssh(self) -> None:
-        with fake_tools({"Peer": {}}, "") as folder:
-            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+        with fake_tools({"Peer": {}}, INSTANCE) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
             self.assertFalse((folder / "ssh.log").exists())
 
-    def test_the_device_the_host_has_now_is_logged_out_when_it_differs_from_the_recorded_one(self) -> None:
+    def test_the_device_the_host_has_now_is_logged_out_when_it_differs_from_the_recorded_one_and_its_instance_is_the_runs(self) -> None:
         before = {"Peer": {"a": peer("platform-dev", device="nRESTARTEDCNTRL")}}
-        with fake_tools(before, "", after={"Peer": {}}) as folder:
-            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 5)
+        with fake_tools(before, INSTANCE, after={"Peer": {}}) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", INSTANCE, 5)
             self.assertIn("sudo -n tailscale logout", (folder / "ssh.log").read_text().splitlines())
+
+    def test_the_peer_is_asked_for_its_instance_before_it_is_logged_out(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, INSTANCE, after={"Peer": {}}) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+            logged = (folder / "ssh.log").read_text().splitlines()
+        self.assertLess(logged.index("cat /var/lib/cloud/data/instance-id"), logged.index("sudo -n tailscale logout"))
+
+    def test_a_peer_that_is_another_instance_is_refused_with_no_logout_and_no_id_in_the_message(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, OTHER_INSTANCE, after={"Peer": {}}) as folder:
+            with self.assertRaises(HostError) as caught:
+                release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+            logged = (folder / "ssh.log").read_text().splitlines()
+        self.assertIn("belongs to a different instance than this run's", str(caught.exception))
+        self.assertNotIn("i-0", str(caught.exception))
+        self.assertIn("cat /var/lib/cloud/data/instance-id", logged)
+        self.assertNotIn("sudo -n tailscale logout", logged)
+
+    def test_a_peer_whose_ssh_does_not_answer_is_refused_with_no_logout(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, INSTANCE, ssh_exit=255, after={"Peer": {}}) as folder:
+            with self.assertRaisesRegex(HostError, "did not tell its instance"):
+                release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+            logged = (folder / "ssh.log").read_text().splitlines()
+        self.assertIn("cat /var/lib/cloud/data/instance-id", logged)
+        self.assertNotIn("sudo -n tailscale logout", logged)
 
     def test_the_recorded_device_must_be_gone_too(self) -> None:
         after = {"Peer": {"b": peer("platform-dev", online=False, device="nRECORDEDCNTRL")}}
         before = {"Peer": {"a": peer("platform-dev", device="nRESTARTEDCNTRL"), "b": after["Peer"]["b"]}}
         with (
-            fake_tools(before, "", after=after),
+            fake_tools(before, INSTANCE, after=after),
             self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev to leave the network"),
         ):
-            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 1)
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", INSTANCE, 1)
 
     def test_a_restarted_device_that_stays_in_the_network_is_not_gone(self) -> None:
         still = {"Peer": {"a": peer("platform-dev", device="nRESTARTEDCNTRL")}}
-        with fake_tools(still, "", after=still), self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev"):
-            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 1)
+        with fake_tools(still, INSTANCE, after=still), self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev"):
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", INSTANCE, 1)
 
     def test_the_recorded_device_is_awaited_by_its_id_whatever_its_name_has_become(self) -> None:
         renamed = {"Peer": {"x": peer("platform-dev-1", device="nRECORDEDCNTRL")}}
-        with fake_tools(renamed, ""), self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev"):
-            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", 1)
+        with fake_tools(renamed, INSTANCE), self.assertRaisesRegex(HostError, "while waiting for the Tailscale device of platform-dev"):
+            release_tailscale_device("run-one", "platform-dev", "nRECORDEDCNTRL", INSTANCE, 1)
 
     def test_a_dropped_ssh_session_after_the_logout_is_no_failure(self) -> None:
         before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
-        with fake_tools(before, "", ssh_exit=255, after={"Peer": {}}):
-            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+        with fake_tools(before, INSTANCE, logout_exit=255, after={"Peer": {}}):
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
 
     def test_a_device_that_stays_in_the_network_ends_at_the_deadline(self) -> None:
         before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
-        with fake_tools(before, ""), self.assertRaisesRegex(HostError, "deadline of 1 seconds passed while waiting for the Tailscale device of platform-dev"):
-            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 1)
+        with (
+            fake_tools(before, INSTANCE),
+            self.assertRaisesRegex(HostError, "deadline of 1 seconds passed while waiting for the Tailscale device of platform-dev"),
+        ):
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 1)
 
     def test_an_offline_device_cannot_be_logged_out_and_ends_at_the_deadline(self) -> None:
         before = {"Peer": {"a": peer("platform-dev", online=False, device="nNEWCNTRL")}}
-        with fake_tools(before, "") as folder, self.assertRaisesRegex(HostError, "while waiting for the Tailscale device"):
-            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 1)
+        with fake_tools(before, INSTANCE) as folder, self.assertRaisesRegex(HostError, "while waiting for the Tailscale device"):
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 1)
         self.assertFalse((folder / "ssh.log").exists())
 
     def test_two_online_peers_are_refused_before_any_logout(self) -> None:
         before = {"Peer": {"a": peer("platform-dev", device="nAAACNTRL"), "b": peer("platform-dev", device="nBBBCNTRL")}}
-        with fake_tools(before, "") as folder, self.assertRaisesRegex(HostError, "2 online peers"):
-            release_tailscale_device("run-one", "platform-dev", "nAAACNTRL", 5)
+        with fake_tools(before, INSTANCE) as folder, self.assertRaisesRegex(HostError, "2 online peers"):
+            release_tailscale_device("run-one", "platform-dev", "nAAACNTRL", INSTANCE, 5)
         self.assertFalse((folder / "ssh.log").exists())
 
     def test_a_peer_with_another_name_is_left_alone(self) -> None:
         before = {"Peer": {"a": peer("laptop", device="nLAPTOPCNTRL", tags=())}}
-        with fake_tools(before, "") as folder:
-            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", 5)
+        with fake_tools(before, INSTANCE) as folder:
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
             self.assertFalse((folder / "ssh.log").exists())
 
 
