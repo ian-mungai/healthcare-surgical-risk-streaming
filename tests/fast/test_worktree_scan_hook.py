@@ -7,6 +7,8 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` proves the hook through 
 - The check reports a missing or changed hook as installed.
 - The hook is written to the wrong repository, when run from a linked worktree or from inside another Git command's hook
   environment (``GIT_DIR`` is set).
+- A write that stops before the hook is complete leaves the earlier hook in place, and the next setup succeeds. It never treats the
+  half-written file as the owner's own hook.
 """
 
 from __future__ import annotations
@@ -64,6 +66,47 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertFalse(gone.exists())
         self.assertTrue((self.hook().parent / "pre-commit.legacy.previous").is_symlink())
         self.assertTrue(worktree_scan_hook.installed(self.repo))
+
+    def stop_half_way(self, path: Path, data: str, *arguments: object, **keywords: object) -> int:
+        with open(path, "w") as handle:
+            handle.write(data[:25])
+        raise OSError("the write stopped")
+
+    def test_a_write_that_stops_half_way_never_reaches_the_hook_path_and_the_next_setup_succeeds(self) -> None:
+        self.hook().parent.mkdir(parents=True, exist_ok=True)
+        self.hook().write_text("#!/bin/sh\nexit 0\n")
+        with mock.patch.object(Path, "write_text", autospec=True, side_effect=self.stop_half_way), self.assertRaises(OSError):
+            worktree_scan_hook.install(self.repo)
+        self.assertFalse(self.hook().exists())
+        self.assertEqual("#!/bin/sh\nexit 0\n", (self.hook().parent / "pre-commit.legacy.previous").read_text())
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+        self.assertEqual("#!/bin/sh\nexit 0\n", (self.hook().parent / "pre-commit.legacy.previous").read_text())
+
+    def test_a_scanner_of_an_earlier_version_stays_whole_when_the_write_stops_and_the_next_setup_replaces_it(self) -> None:
+        earlier = worktree_scan_hook.EARLIER_HOOK_TEXTS[0]
+        self.hook().parent.mkdir(parents=True, exist_ok=True)
+        self.hook().write_text(earlier)
+        with mock.patch.object(Path, "write_text", autospec=True, side_effect=self.stop_half_way), self.assertRaises(OSError):
+            worktree_scan_hook.install(self.repo)
+        self.assertEqual(earlier, self.hook().read_text())
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+        self.assertFalse((self.hook().parent / "pre-commit.legacy.previous").exists())
+
+    def test_a_stop_before_the_rename_leaves_the_earlier_state_and_the_next_setup_overwrites_the_leftover(self) -> None:
+        earlier = worktree_scan_hook.EARLIER_HOOK_TEXTS[0]
+        self.hook().parent.mkdir(parents=True, exist_ok=True)
+        self.hook().write_text(earlier)
+        with mock.patch.object(os, "replace", side_effect=OSError("the rename stopped")), self.assertRaises(OSError):
+            worktree_scan_hook.install(self.repo)
+        self.assertEqual(earlier, self.hook().read_text())
+        leftovers = [path for path in self.hook().parent.iterdir() if path.name.startswith("pre-commit.legacy") and path != self.hook()]
+        self.assertEqual(1, len(leftovers))
+        leftovers[0].write_text("a leftover of a stopped write")
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+        self.assertEqual([self.hook()], [path for path in self.hook().parent.iterdir() if path.name.startswith("pre-commit.legacy")])
 
     def test_the_callers_git_environment_does_not_redirect_the_hook(self) -> None:
         with mock.patch.dict(os.environ, {"GIT_DIR": str(self.other_repository())}):

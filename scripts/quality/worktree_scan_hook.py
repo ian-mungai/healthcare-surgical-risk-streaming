@@ -6,6 +6,9 @@ a file named ``pre-commit.legacy`` in the Git hooks folder first, before it hide
 ``pre-commit install`` moves an older hook that it does not own to that same name. The installer keeps such a hook as
 ``pre-commit.legacy.previous``, and this hook runs the scan and then that kept hook. It refuses, and overwrites nothing,
 when a kept hook already exists.
+
+The installer writes the hook to ``pre-commit.legacy.pending`` and renames it into place, so a write that stops leaves no half-written
+hook at the hook's path. The next setup overwrites the pending file.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from scripts.quality.repo_checks import git
 
 HOOK_NAME = "pre-commit.legacy"
 KEPT_NAME = "pre-commit.legacy.previous"
+PENDING_NAME = "pre-commit.legacy.pending"
 SCAN_COMMAND = ".venv/bin/python -m scripts.quality.repo_checks privacy-scan --all"
 HOOK_TEXT = f'#!/bin/sh\n{SCAN_COMMAND} || exit $?\nprevious="$(dirname "$0")/{KEPT_NAME}"\nif [ -x "$previous" ]; then exec "$previous" "$@"; fi\n'
 EARLIER_HOOK_TEXTS = ("#!/bin/sh\nexec .venv/bin/python -m scripts.quality.repo_checks privacy-scan --all\n",)
@@ -59,6 +63,8 @@ def install(root: Path) -> bool:
                 f"move one away as the owner, then run setup again; nothing was overwritten"
             )
         os.rename(path, kept)
-    path.write_text(HOOK_TEXT)
-    path.chmod(HOOK_MODE)
+    pending = path.with_name(PENDING_NAME)
+    pending.write_text(HOOK_TEXT)
+    pending.chmod(HOOK_MODE)
+    os.replace(pending, path)
     return True
