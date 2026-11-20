@@ -25,8 +25,9 @@ from unittest import mock
 from infra.iam.scripts import manage_policies
 from infra.iam.scripts.manage_policies import Names, policy_arn
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, load_documents
+from scripts import aws_cli
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
-from scripts.process import TimeoutExpired
+from scripts.process import CompletedProcess, TimeoutExpired
 
 ACCOUNT = "1" * 12
 CONFIGURATION = {
@@ -85,6 +86,8 @@ class Account:
     user_arn: str = USER_ARN
     project_identity: dict[str, str] | None = None
     create_error: BaseException | None = None
+    create_refusal: CompletedProcess[str] | None = None
+    attempts: list[tuple[str, int | None]] = field(default_factory=list)
     clock: FakeClock | None = None
     sts_latency: float = 0.0
     sts_honors_timeout: bool = True
@@ -105,6 +108,7 @@ class FakeAws(Aws):
         self.account.calls.append(arguments)
         state = self.account
         verb = arguments[1]
+        state.attempts.append((verb, self.max_attempts))
         if verb == "get-caller-identity":
             if self.profile == CONFIGURATION["AWS_PROFILE"] and state.clock is not None:
                 state.sts_calls.append((state.clock.now, timeout))
@@ -120,6 +124,9 @@ class FakeAws(Aws):
         if verb == "list-access-keys":
             return {"AccessKeyMetadata": [{"AccessKeyId": f"key{number}"} for number in range(state.keys)]}
         if verb == "create-access-key":
+            if state.create_refusal is not None:
+                with mock.patch.object(aws_cli, "run_command", return_value=state.create_refusal):
+                    return Aws.call(self, *arguments, missing=missing, timeout=timeout)
             if state.create_error is not None:
                 raise state.create_error
             state.keys += 1
@@ -322,6 +329,28 @@ class KeyTest(unittest.TestCase):
         self.assertFalse(backup.exists())
         self.assertEqual("kept", (folder / "other_accessKeys.csv").read_text())
         account.create_error = None
+        code, output, _ = self.rerun_key(account)
+        self.assertEqual(0, code, output)
+        self.assertEqual(1, account.keys)
+
+    def test_only_the_create_call_is_limited_to_one_attempt_so_a_lost_reply_cannot_create_a_second_key(self) -> None:
+        account = Account.matching_templates()
+        code, output, _ = self.run_key(account)
+        self.assertEqual(0, code, output)
+        self.assertEqual([("create-access-key", 1)], [pair for pair in account.attempts if pair[0] == "create-access-key"])
+        self.assertEqual({None}, {attempts for verb, attempts in account.attempts if verb != "create-access-key"})
+
+    def test_a_definite_refusal_still_removes_the_reservation_when_the_private_error_file_cannot_be_written(self) -> None:
+        account = Account.matching_templates()
+        account.create_refusal = CompletedProcess(
+            ["aws"], 254, "", "An error occurred (LimitExceeded) when calling the CreateAccessKey operation: example text"
+        )
+        with mock.patch.object(aws_cli, "keep_raw_error", side_effect=OSError("disk full")):
+            code, output, backup = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertIn("LimitExceeded", output)
+        self.assertFalse(backup.exists())
+        account.create_refusal = None
         code, output, _ = self.rerun_key(account)
         self.assertEqual(0, code, output)
         self.assertEqual(1, account.keys)

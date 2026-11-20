@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -37,16 +37,26 @@ class AwsError(RuntimeError):
 class Aws:
     profile: str
     region: str
+    max_attempts: int | None = field(default=None, kw_only=True)
+
+    def single_attempt(self) -> Aws:
+        """The same profile and region with the AWS command line limited to one request for each call: it retries a lost reply by default."""
+        return replace(self, max_attempts=1)
 
     def call(self, *arguments: str, missing: tuple[str, ...] = (), timeout: float = AWS_TIMEOUT_SECONDS) -> Any:
         """Run one AWS command within ``timeout`` seconds and return its parsed JSON output, or None when its error names one of ``missing``."""
         fixed = ["--profile", self.profile, "--region", self.region, "--output", "json", "--no-cli-pager"]
-        result = run_command("aws", [*arguments, *fixed], timeout=timeout)
+        environment = None if self.max_attempts is None else os.environ | {"AWS_MAX_ATTEMPTS": str(self.max_attempts)}
+        result = run_command("aws", [*arguments, *fixed], timeout=timeout, env=environment)
         if result.returncode != 0:
             if any(marker in result.stderr for marker in missing):
                 return None
             code = ERROR_CODE.search(result.stderr)
-            kept = keep_raw_error("_".join(arguments[:2]), result.stderr)
             reason = code.group(1) if code else f"exit status {result.returncode}"
-            raise AwsError(f"aws {' '.join(arguments[:2])} failed: {reason}; its full error text is in {kept.relative_to(RAW_ERRORS.parent.parent)}")
+            summary = f"aws {' '.join(arguments[:2])} failed: {reason}"
+            try:
+                kept = keep_raw_error("_".join(arguments[:2]), result.stderr)
+            except OSError:
+                raise AwsError(f"{summary}; its full error text could not be kept") from None
+            raise AwsError(f"{summary}; its full error text is in {kept.relative_to(RAW_ERRORS.parent.parent)}")
         return json.loads(result.stdout) if result.stdout.strip() else {}

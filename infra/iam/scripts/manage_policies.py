@@ -230,8 +230,8 @@ def refuse_while_history_records(admin: Aws) -> None:
     unreadable = ConfigurationError(f"the cli_history setting of the profile {admin.profile} could not be read, so key stops before it creates a key; {advice}")
     try:
         result = run_command("aws", ["configure", "get", "cli_history", "--profile", admin.profile], timeout=CONFIG_READ_SECONDS)
-    except (OSError, TimeoutExpired) as error:
-        raise unreadable from error
+    except OSError, TimeoutExpired:
+        raise unreadable from None
     value = result.stdout.strip()
     if result.returncode not in (0, 1):
         raise unreadable
@@ -246,7 +246,7 @@ def write_new_key(admin: Aws, user: str, backup: Path) -> None:
     descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         try:
-            key = admin.call("iam", "create-access-key", "--user-name", user)["AccessKey"]
+            key = admin.single_attempt().call("iam", "create-access-key", "--user-name", user)["AccessKey"]
         except AwsError as error:
             if not REFUSED_BY_IAM.search(str(error)):
                 raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
