@@ -13,7 +13,7 @@ from scripts.infra.created import created_entries, device_entries, merge_created
 from scripts.infra.state_bootstrap import RunBinding, adoption_problem, bucket_problem, short_lived_bucket_name, state_keys
 from scripts.project_config import ConfigurationError
 
-KEYS = ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"]
+KEYS = ["state/dev/terraform.tfstate", "state/dev/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-project", "default", KEYS, "verified", bucket_creation="created")
 
 

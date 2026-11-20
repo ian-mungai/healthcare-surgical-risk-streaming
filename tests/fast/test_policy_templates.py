@@ -118,7 +118,7 @@ class BucketScopeTest(unittest.TestCase):
         self.assertEqual(self.BUCKETS, resources(document, "ProjectBucketListing"))
         expected = sorted(f"{bucket}/{prefix}/*" for bucket in self.BUCKETS for prefix in ("landing", "warehouse"))
         self.assertEqual(expected, resources(document, "ProjectDataObjects"))
-        self.assertEqual([], [item for item in resources(document, *[statement["Sid"] for statement in document["Statement"]]) if "terraform_state" in item])
+        self.assertEqual([], [item for item in resources(document, *[statement["Sid"] for statement in document["Statement"]]) if "/state/" in item])
 
 
 def arn(name: str) -> str:

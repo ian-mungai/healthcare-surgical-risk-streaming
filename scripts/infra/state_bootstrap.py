@@ -4,7 +4,7 @@ Run from the repository root under the project profile in ``.env``:
 
 ``.venv/bin/python -m scripts.infra.state_bootstrap create``
 
-The project has one bucket, named by ``S3_BUCKET`` in ``.env``. The Terraform state lives under ``terraform_state/``
+The project has one bucket, named by ``S3_BUCKET`` in ``.env``. The Terraform state lives under ``state/``
 and the data under its own prefixes. ``create`` binds a new run ID, the bucket, the workspace and the state keys in
 the binding file before it creates anything, so an interrupted run is never left with an unrecorded bucket. It
 creates the bucket when it is absent, uses the project's bucket when this account already owns it, and sets only
@@ -31,7 +31,7 @@ from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 DEFAULT_BINDING = ROOT / "runs" / "run_binding.json"
-STATE_PREFIX = "terraform_state"
+STATE_PREFIX = "state"
 BUCKET_NAME_LIMIT = 63
 WORKSPACE = "default"
 BLOCK_NAMES = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")

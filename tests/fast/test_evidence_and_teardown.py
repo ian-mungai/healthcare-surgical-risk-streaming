@@ -34,7 +34,7 @@ from scripts.infra.teardown import (
     target_problems,
 )
 
-STATE_KEYS = ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"]
+STATE_KEYS = ["state/dev/terraform.tfstate", "state/dev/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-project", "default", STATE_KEYS, "verified", bucket_creation="created")
 LOCAL = RunBinding(
     "20260101t0000-abcdef",
@@ -297,7 +297,7 @@ class ObjectInventoryTest(unittest.TestCase):
         found = [
             entry("landing/a.vital", "v1"),
             entry(STATE_KEYS[0], "v2"),
-            entry("terraform_state/prod/terraform.tfstate", "v3"),
+            entry("state/prod/terraform.tfstate", "v3"),
             entry(STATE_KEYS[1], "v4"),
             entry("warehouse/table/data.parquet", "v5"),
             entry("landing", "v6"),
@@ -307,13 +307,13 @@ class ObjectInventoryTest(unittest.TestCase):
         self.assertEqual(([found[0], found[4]], [], [found[1], found[2], found[3], found[5], found[6]]), classify_entries(found, LOCAL))
 
     def test_an_entry_that_is_neither_data_nor_this_runs_state_stops_the_removal_of_a_bucket_this_run_created(self) -> None:
-        other = [entry("terraform_state/prod/terraform.tfstate", "v3")]
-        expected = ["bucket: entry outside the data prefixes and this run's state keys: terraform_state/prod/terraform.tfstate"]
+        other = [entry("state/prod/terraform.tfstate", "v3")]
+        expected = ["bucket: entry outside the data prefixes and this run's state keys: state/prod/terraform.tfstate"]
         self.assertEqual(expected, other_entry_problems(other, RUN))
 
     def test_such_an_entry_is_left_alone_in_a_bucket_this_run_did_not_create(self) -> None:
         adopted = RunBinding(**{**RUN.__dict__, "bucket_creation": "none"})
-        self.assertEqual([], other_entry_problems([entry("terraform_state/prod/terraform.tfstate", "v3")], adopted))
+        self.assertEqual([], other_entry_problems([entry("state/prod/terraform.tfstate", "v3")], adopted))
 
     def test_approved_state_entries_pass(self) -> None:
         approved = [[STATE_KEYS[0], "v1"], [STATE_KEYS[1], "v2"]]

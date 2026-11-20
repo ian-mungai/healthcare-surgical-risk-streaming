@@ -40,7 +40,7 @@ RUN = RunBinding(
     "us-west-2",
     "example-project",
     "default",
-    ["terraform_state/dev/terraform.tfstate", "terraform_state/dev/terraform.tfstate.tflock"],
+    ["state/dev/terraform.tfstate", "state/dev/terraform.tfstate.tflock"],
     "verified",
 )
 LOCAL = RunBinding(
@@ -54,7 +54,7 @@ class PlanBindingTest(unittest.TestCase):
     def test_backend_arguments_come_from_the_run_binding(self) -> None:
         expected = [
             "-backend-config=bucket=example-project",
-            "-backend-config=key=terraform_state/dev/terraform.tfstate",
+            "-backend-config=key=state/dev/terraform.tfstate",
             "-backend-config=region=us-west-2",
             "-backend-config=profile=example_project_dev",
             "-backend-config=use_lockfile=true",
