@@ -9,6 +9,7 @@ Each case runs a real shell that starts a ``sleep`` of its own and records both 
   for them. A real run reaches this only by timing, so that case stubs the check.
 - A process that survives the kill is reported as a failure and not as success. SIGKILL cannot be survived by a real process
   here, so that one case replaces the group check with a stub.
+- A failed cleanup after a deadline shows no argument of the timed-out command anywhere in the exception chain or its formatted traceback.
 - The result of a normal run and the ``check`` error are unchanged.
 - Output that is asked for byte for byte comes back with its carriage returns and bytes that are not UTF-8, so a Git listing keeps each file name.
 """
@@ -21,6 +22,7 @@ import signal
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -30,6 +32,8 @@ from unittest import mock
 from scripts import process
 from scripts.process import run_command
 
+BUCKET = "example-private-bucket"
+ROLE = "private_role_name"
 START_SCRIPT = 'echo $$ > "$1"; sleep 300 >/dev/null 2>&1 & echo $! >> "$1"; {tail}'
 WAIT_SECONDS = 10
 
@@ -108,6 +112,47 @@ class LauncherTest(unittest.TestCase):
         ):
             self.run_program("echo done")
         self.kill_leftovers()
+
+    def run_with_private_arguments(self) -> BaseException:
+        arguments = ["-c", START_SCRIPT.format(tail="wait"), "sh", str(self.pids), BUCKET, ROLE]
+        with self.assertRaises(process.ProcessGroupSurvived) as caught:
+            run_command("sh", arguments, timeout=1)
+        self.kill_leftovers()
+        return caught.exception
+
+    def assert_chain_holds_no_private_argument(self, error: BaseException) -> None:
+        text = "".join(traceback.format_exception(error))
+        chain: list[BaseException] = []
+        link: BaseException | None = error
+        while link is not None and link not in chain:
+            chain.append(link)
+            for part in (link.__context__, link.__cause__):
+                if part is not None and part not in chain:
+                    chain.append(part)
+            link = link.__context__
+        for private in (BUCKET, ROLE):
+            self.assertNotIn(private, text)
+            for link in chain:
+                self.assertNotIn(private, f"{link!s} {link!r} {link.args!r} {getattr(link, 'cmd', '')!r}")
+        self.assertIn("ProcessGroupSurvived", text)
+        self.assertIn("timed out after 1 seconds", text)
+
+    def test_a_group_that_survives_after_a_deadline_shows_no_argument_of_the_timed_out_command(self) -> None:
+        real_killpg = os.killpg
+
+        def kill_but_report_alive(pgid: int, signum: int) -> None:
+            if signum == signal.SIGKILL:
+                real_killpg(pgid, signum)
+
+        with mock.patch.object(os, "killpg", side_effect=kill_but_report_alive), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
+            error = self.run_with_private_arguments()
+        self.assertIsInstance(error.__context__, process.TimeoutExpired)
+        self.assert_chain_holds_no_private_argument(error)
+
+    def test_a_program_that_is_not_reaped_after_a_deadline_shows_no_argument_of_the_timed_out_command(self) -> None:
+        with mock.patch.object(os, "killpg", side_effect=ProcessLookupError), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
+            error = self.run_with_private_arguments()
+        self.assert_chain_holds_no_private_argument(error)
 
     def test_a_group_of_unreaped_processes_is_waited_for(self) -> None:
         answers = [PermissionError(), PermissionError(), ProcessLookupError()]

@@ -3,8 +3,9 @@
 Every call resolves the program to its full path, passes a list of arguments, closes stdin or feeds it the given text
 and applies a deadline. The program runs in its own process group. On every exit, a normal one, a deadline that raises
 ``TimeoutExpired``, an interrupt or any other error, the whole group is killed and the call waits until the group is gone.
-A process that survives the kill raises ``ProcessGroupSurvived``. The ``TimeoutExpired`` text holds the whole command with its arguments,
-so each tool boundary catches it and raises its own error with ``timeout_text``. A descendant that starts a session of its own leaves the
+A process that survives the kill raises ``ProcessGroupSurvived``. A ``TimeoutExpired`` leaves the launcher holding the program's path and
+no argument, so a failed cleanup that follows it shows no argument. Each tool boundary still catches it and raises its own error with
+``timeout_text``. A descendant that starts a session of its own leaves the
 group and is outside this cleanup. Other modules import ``run_command`` instead of ``subprocess``.
 
 Output is text with every line ending converted to a newline. A call with ``keep_newlines`` gets its output exactly as the program wrote
@@ -51,12 +52,17 @@ def stop_group(process: subprocess.Popen[Any]) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(group, signal.SIGKILL)
     deadline = time.monotonic() + KILL_WAIT_SECONDS
+    reaped = True
     try:
         process.wait(timeout=KILL_WAIT_SECONDS)
+    except TimeoutExpired:
+        reaped = False
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+    if not reaped:
+        raise ProcessGroupSurvived(f"process {group} was not reaped {KILL_WAIT_SECONDS} seconds after SIGKILL")
     while True:
         try:
             os.killpg(group, 0)
@@ -105,6 +111,9 @@ def run_command(
     try:
         stdin_data = input_text if input_text is None or not keep_newlines else os.fsencode(input_text)
         stdout, stderr = process.communicate(stdin_data, timeout=timeout)
+    except TimeoutExpired as error:
+        error.cmd, error.args = command[0], (command[0], timeout)
+        raise
     finally:
         stop_group(process)
     if keep_newlines:
