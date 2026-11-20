@@ -5,8 +5,8 @@ PYTHON := .venv/bin/python
 setup:
 	python3.14 -m venv .venv
 	$(PYTHON) -m pip install --require-hashes --requirement requirements.txt
-	$(PYTHON) -m scripts.quality.install_tools
 	.venv/bin/pre-commit install
+	$(PYTHON) -m scripts.quality.install_tools
 
 lock:
 	.venv/bin/uv pip compile requirements.in --generate-hashes --universal --python-version 3.14 --output-file requirements.txt
