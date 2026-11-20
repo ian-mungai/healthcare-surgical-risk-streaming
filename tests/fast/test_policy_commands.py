@@ -26,7 +26,7 @@ from infra.iam.scripts import manage_policies
 from infra.iam.scripts.manage_policies import Names, policy_arn
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, load_documents
 from scripts import aws_cli
-from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
+from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError, AwsTimeout
 from scripts.process import CompletedProcess, TimeoutExpired
 
 ACCOUNT = "1" * 12
@@ -357,7 +357,7 @@ class KeyTest(unittest.TestCase):
 
     def test_an_uncertain_result_of_the_create_call_keeps_the_backup_and_says_to_check_the_keys(self) -> None:
         uncertain = (
-            TimeoutExpired("aws", 120),
+            AwsTimeout("aws iam create-access-key", 120),
             AwsError("aws iam create-access-key failed: Could not connect to the endpoint URL"),
             AwsError("aws iam create-access-key failed: ServiceFailure; its full error text is in runs/raw_errors/example.txt"),
             AwsError("aws iam create-access-key failed: Throttling; its full error text is in runs/raw_errors/example.txt"),

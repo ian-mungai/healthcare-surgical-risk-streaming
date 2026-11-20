@@ -32,8 +32,8 @@ from scripts.aws_cli import Aws, AwsError
 from scripts.infra import state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
-from scripts.infra.terraform_wrapper import WrapperError, apply_plan, load_run, save_plan, save_raw, state_json
-from scripts.process import TimeoutExpired, run_command
+from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, save_raw, state_json
+from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
@@ -119,7 +119,7 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
     except FileNotFoundError as error:
         raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
     except TimeoutExpired:
-        raise NoPeerError("the Tailscale client on this computer did not answer in time") from None
+        raise NoPeerError(timeout_text("tailscale status", min(timeout, SSH_ATTEMPT_SECONDS))) from None
     if result.returncode != 0:
         raise HostError(f"tailscale status failed: exit status {result.returncode}")
     status: dict[str, Any] = json.loads(result.stdout)
@@ -259,17 +259,24 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
     home = ROOT / ".tools" / "ansible"
     settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
     environment = os.environ | settings | {"PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
-    result = run_command(
-        str(ROOT / ".venv" / "bin" / "ansible-playbook"),
-        ["host.yml", "--extra-vars", json.dumps(variables)],
-        cwd=ROOT / "ansible",
-        env=environment,
-        timeout=ANSIBLE_TIMEOUT_SECONDS,
-    )
-    save_raw(run_id, "ansible_output.txt", result.stdout + result.stderr)
+    try:
+        result = run_command(
+            str(ROOT / ".venv" / "bin" / "ansible-playbook"),
+            ["host.yml", "--extra-vars", json.dumps(variables)],
+            cwd=ROOT / "ansible",
+            env=environment,
+            timeout=ANSIBLE_TIMEOUT_SECONDS,
+        )
+    except TimeoutExpired as error:
+        partial = partial_text(error.stdout) + partial_text(error.stderr)
+        note = f"; {kept_note(run_id, 'ansible_output.txt', partial, 'partial output')}" if partial else ""
+        raise HostError(timeout_text("ansible-playbook host.yml", ANSIBLE_TIMEOUT_SECONDS) + note) from None
+    output = result.stdout + result.stderr
+    if result.returncode == 0:
+        save_raw(run_id, "ansible_output.txt", output)
     sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:
-        raise HostError(f"the Ansible host setup failed; its full output is in runs/{run_id}/raw/ansible_output.txt")
+        raise HostError(f"the Ansible host setup failed; {kept_note(run_id, 'ansible_output.txt', output, 'full output')}")
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:

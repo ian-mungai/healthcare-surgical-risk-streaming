@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from scripts.process import run_command
+from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT
 
 AWS_TIMEOUT_SECONDS = 120
@@ -29,8 +29,31 @@ def keep_raw_error(name: str, text: str) -> Path:
     return target
 
 
+def keep_partial_error(arguments: tuple[str, ...], error: TimeoutExpired) -> str:
+    """Keep the error text a timed-out call had written, apart from its standard output, which can hold a new key. Return what to add to the message."""
+    text = partial_text(error.stderr)
+    if not text:
+        return ""
+    try:
+        kept = keep_raw_error("_".join(arguments[:2]) + "_timeout", text)
+    except OSError:
+        return "; its partial error text could not be kept"
+    return f"; its partial error text is in {kept.relative_to(RAW_ERRORS.parent.parent)}"
+
+
 class AwsError(RuntimeError):
     """An AWS command-line call failed."""
+
+
+class AwsTimeout(AwsError, TimeoutExpired):
+    """An AWS command-line call passed its deadline. It stays a TimeoutExpired for callers that wait or retry, and its text and cmd hold no argument."""
+
+    def __init__(self, label: str, deadline: float, note: str = "") -> None:
+        TimeoutExpired.__init__(self, label, deadline)
+        self.message = timeout_text(label, deadline) + note
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass(frozen=True)
@@ -47,7 +70,10 @@ class Aws:
         """Run one AWS command within ``timeout`` seconds and return its parsed JSON output, or None when its error names one of ``missing``."""
         fixed = ["--profile", self.profile, "--region", self.region, "--output", "json", "--no-cli-pager"]
         environment = None if self.max_attempts is None else os.environ | {"AWS_MAX_ATTEMPTS": str(self.max_attempts)}
-        result = run_command("aws", [*arguments, *fixed], timeout=timeout, env=environment)
+        try:
+            result = run_command("aws", [*arguments, *fixed], timeout=timeout, env=environment)
+        except TimeoutExpired as error:
+            raise AwsTimeout(f"aws {' '.join(arguments[:2])}", timeout, keep_partial_error(arguments, error)) from None
         if result.returncode != 0:
             if any(marker in result.stderr for marker in missing):
                 return None

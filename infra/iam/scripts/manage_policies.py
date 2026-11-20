@@ -252,8 +252,6 @@ def write_new_key(admin: Aws, user: str, backup: Path) -> None:
                 raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
             backup.unlink()
             raise
-        except TimeoutExpired as error:
-            raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
         handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
 
 

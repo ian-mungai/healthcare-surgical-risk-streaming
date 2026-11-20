@@ -29,7 +29,7 @@ from typing import Any
 
 from scripts.infra.created import created_entries, merge_created
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem
-from scripts.process import run_command
+from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 INIT_TIMEOUT_SECONDS = 600
@@ -55,6 +55,15 @@ def save_raw(run_id: str, name: str, text: str) -> None:
     descriptor = os.open(raw / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         handle.write(text)
+
+
+def kept_note(run_id: str, name: str, text: str, what: str) -> str:
+    """Keep ``text`` privately as ``name`` and return the clause that tells where it is, or that it could not be kept. A failed write hides no error."""
+    try:
+        save_raw(run_id, name, text)
+    except OSError:
+        return f"its {what} could not be kept"
+    return f"its {what} is in runs/{run_id}/raw/{name}"
 
 
 class WrapperError(RuntimeError):
@@ -158,10 +167,16 @@ def binding_problems(run: RunBinding, saved: dict[str, Any], plan: bytes, code: 
 
 def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
     command = [f"-chdir={configuration_folder(run)}", *arguments]
-    result = run_command("terraform", command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
+    name = f"terraform_{arguments[0]}_failure.txt"
+    try:
+        result = run_command("terraform", command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
+    except TimeoutExpired as error:
+        partial = partial_text(error.stdout) + partial_text(error.stderr)
+        note = f"; {kept_note(run.run_id, name, partial, 'partial output')}" if partial else ""
+        raise WrapperError(timeout_text(f"terraform {arguments[0]}", timeout) + note) from None
     if result.returncode != 0:
-        save_raw(run.run_id, f"terraform_{arguments[0]}_failure.txt", result.stdout + result.stderr)
-        raise WrapperError(f"terraform {arguments[0]} failed; its full output is in runs/{run.run_id}/raw/terraform_{arguments[0]}_failure.txt")
+        kept = kept_note(run.run_id, name, result.stdout + result.stderr, "full output")
+        raise WrapperError(f"terraform {arguments[0]} failed with exit status {result.returncode}; {kept}")
     return result.stdout
 
 

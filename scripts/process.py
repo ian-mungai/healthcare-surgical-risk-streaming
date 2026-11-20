@@ -3,7 +3,8 @@
 Every call resolves the program to its full path, passes a list of arguments, closes stdin or feeds it the given text
 and applies a deadline. The program runs in its own process group. On every exit, a normal one, a deadline that raises
 ``TimeoutExpired``, an interrupt or any other error, the whole group is killed and the call waits until the group is gone.
-A process that survives the kill raises ``ProcessGroupSurvived``. A descendant that starts a session of its own leaves the
+A process that survives the kill raises ``ProcessGroupSurvived``. The ``TimeoutExpired`` text holds the whole command with its arguments,
+so each tool boundary catches it and raises its own error with ``timeout_text``. A descendant that starts a session of its own leaves the
 group and is outside this cleanup. Other modules import ``run_command`` instead of ``subprocess``.
 
 Output is text with every line ending converted to a newline. A call with ``keep_newlines`` gets its output exactly as the program wrote
@@ -24,7 +25,7 @@ from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 from typing import Any
 
-__all__ = ["CompletedProcess", "ProcessGroupSurvived", "TimeoutExpired", "run_command"]
+__all__ = ["CompletedProcess", "ProcessGroupSurvived", "TimeoutExpired", "partial_text", "run_command", "timeout_text"]
 
 KILL_WAIT_SECONDS = 10
 POLL_SECONDS = 0.02
@@ -32,6 +33,16 @@ POLL_SECONDS = 0.02
 
 class ProcessGroupSurvived(RuntimeError):
     """A process of the program's group was still running after SIGKILL and the wait."""
+
+
+def timeout_text(label: str, deadline: float) -> str:
+    """The text of a timeout: the caller's label for the command and the deadline, and never the command's arguments, which can hold private names."""
+    return f"{label} timed out after {deadline:g} seconds"
+
+
+def partial_text(value: bytes | str | None) -> str:
+    """The output a timed-out program had written, which ``TimeoutExpired`` holds as bytes or text, or the empty text."""
+    return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
 
 
 def stop_group(process: subprocess.Popen[Any]) -> None:
