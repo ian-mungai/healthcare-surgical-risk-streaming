@@ -148,6 +148,7 @@ resource "aws_instance" "host" {
   iam_instance_profile        = aws_iam_instance_profile.host.name
   associate_public_ip_address = true
   user_data                   = local.user_data
+  user_data_replace_on_change = true
   tags                        = { Name = var.name }
 
   metadata_options {

@@ -105,6 +105,11 @@ run "host_matches_the_design" {
   }
 
   assert {
+    condition     = aws_instance.host.user_data_replace_on_change == true
+    error_message = "The boot script runs only at an instance's first boot, so a changed boot script must plan a new host. An in-place update would store the new script and leave the old one in effect."
+  }
+
+  assert {
     condition     = aws_instance.host.subnet_id == "subnet-0aaaaaaaaaaaaaaaa"
     error_message = "The host uses the first default subnet in sorted order, so a second plan chooses the same one."
   }
