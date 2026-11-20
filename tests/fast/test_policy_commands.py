@@ -392,8 +392,10 @@ class KeyTest(unittest.TestCase):
                 self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
                 self.assertIsNone(error.__context__)
 
-    def test_a_failed_write_of_the_backup_after_the_key_exists_keeps_the_reservation_gives_the_advice_and_shows_no_secret(self) -> None:
+    def test_a_failed_write_or_flush_of_the_backup_after_the_key_exists_keeps_the_reservation_gives_the_advice_and_shows_no_secret(self) -> None:
         class FailingHandle:
+            fails_in = "write"
+
             def __init__(self, descriptor: int, mode: str) -> None:
                 os.close(descriptor)
 
@@ -404,20 +406,25 @@ class KeyTest(unittest.TestCase):
                 return None
 
             def write(self, text: str) -> int:
-                raise OSError(f"the disk is full {text}")
+                if self.fails_in == "write":
+                    raise OSError(f"the disk is full {text}")
+                return len(text)
 
-        account = Account.matching_templates()
-        with mock.patch.object(os, "fdopen", FailingHandle):
-            code, output, backup = self.run_key(account)
-        self.assertEqual(1, code)
-        self.assertEqual(1, account.keys)
-        self.assertTrue(backup.exists())
-        self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
-        self.assertNotIn(SECRET, output)
-        with mock.patch.object(os, "fdopen", FailingHandle):
-            error = self.raised_by_write_new_key(Account.matching_templates())
-        self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
-        self.assertIsNone(error.__context__)
+            def flush(self) -> None:
+                raise OSError("the disk is full")
+
+        for fails_in in ("write", "flush"):
+            with self.subTest(fails_in=fails_in), mock.patch.object(FailingHandle, "fails_in", fails_in), mock.patch.object(os, "fdopen", FailingHandle):
+                account = Account.matching_templates()
+                code, output, backup = self.run_key(account)
+                self.assertEqual(1, code)
+                self.assertEqual(1, account.keys)
+                self.assertTrue(backup.exists())
+                self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
+                self.assertNotIn(SECRET, output)
+                error = self.raised_by_write_new_key(Account.matching_templates())
+                self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
+                self.assertIsNone(error.__context__)
 
     def raised_by_write_new_key(self, account: Account) -> BaseException:
         backup = self.folder / "direct_accessKeys.csv"
