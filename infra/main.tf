@@ -39,10 +39,12 @@ module "host" {
 module "deploy" {
   source = "./modules/deploy"
 
-  name               = "${var.project_name}_deploy_${var.environment}"
-  boundary_name      = "${var.project_name}_role_boundary"
-  github_repository  = var.github_repository
-  github_environment = var.github_environment
+  name                 = "${var.project_name}_deploy_${var.environment}"
+  boundary_name        = "${var.project_name}_role_boundary"
+  github_repository    = var.github_repository
+  github_owner_id      = var.github_owner_id
+  github_repository_id = var.github_repository_id
+  github_environment   = var.github_environment
 }
 
 module "workload_roles" {

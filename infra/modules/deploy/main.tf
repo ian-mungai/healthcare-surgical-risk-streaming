@@ -4,13 +4,16 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   issuer     = "token.actions.githubusercontent.com"
   branch     = "refs/heads/main"
+  owner      = split("/", var.github_repository)[0]
+  repository = split("/", var.github_repository)[1]
 
   # AWS maps only the audience and the subject of a GitHub token. The owner sets this template as the repository's subject template with
   # `gh api --method PUT repos/<owner>/<repository>/actions/oidc/customization/sub --input infra/modules/deploy/oidc_subject_template.json`.
-  # GitHub then builds the subject from these claims in this order, as key:value pairs joined by colons.
+  # GitHub then builds the subject from these claims in this order, as key:value pairs joined by colons. In the `repo` claim it writes
+  # the owner and the repository each with its immutable numeric ID, as owner@ID/name@ID, and it offers no other form for this repository.
   subject_keys = jsondecode(file("${path.module}/oidc_subject_template.json")).include_claim_keys
   subject_values = {
-    repo         = var.github_repository
+    repo         = "${local.owner}@${var.github_owner_id}/${local.repository}@${var.github_repository_id}"
     environment  = var.github_environment
     ref          = local.branch
     workflow_ref = "${var.github_repository}/.github/workflows/deploy.yml@${local.branch}"

@@ -53,6 +53,26 @@ variable "github_repository" {
   }
 }
 
+variable "github_owner_id" {
+  description = "Numeric ID of the GitHub account that owns the repository. GitHub puts it in the token's subject."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_owner_id))
+    error_message = "Give the numeric ID that `gh api repos/<owner>/<name>` reports."
+  }
+}
+
+variable "github_repository_id" {
+  description = "Numeric ID of the GitHub repository. GitHub puts it in the token's subject."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+$", var.github_repository_id))
+    error_message = "Give the numeric ID that `gh api repos/<owner>/<name>` reports."
+  }
+}
+
 variable "github_environment" {
   description = "Name of the protected GitHub deployment environment."
   type        = string

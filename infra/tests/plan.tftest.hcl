@@ -32,9 +32,11 @@ variables {
 
   data_bucket_name = "example-project"
 
-  github_repository   = "example-owner/example-repository"
-  tailscale_client_id = "example-client-id"
-  tailscale_audience  = "example-audience"
+  github_repository    = "example-owner/example-repository"
+  github_owner_id      = "1234567"
+  github_repository_id = "7654321"
+  tailscale_client_id  = "example-client-id"
+  tailscale_audience   = "example-audience"
 }
 
 run "environment_uses_the_one_bucket_it_is_given" {
@@ -222,20 +224,22 @@ run "deploy_role_trusts_only_the_protected_workflow" {
   }
 
   variables {
-    name               = "example_project_deploy_dev"
-    boundary_name      = "example_project_role_boundary"
-    github_repository  = "example-owner/example-repository"
-    github_environment = "deploy"
+    name                 = "example_project_deploy_dev"
+    boundary_name        = "example_project_role_boundary"
+    github_repository    = "example-owner/example-repository"
+    github_owner_id      = "1234567"
+    github_repository_id = "7654321"
+    github_environment   = "deploy"
   }
 
   assert {
     condition = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Condition == {
       StringEquals = {
         "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-        "token.actions.githubusercontent.com:sub" = "repo:example-owner/example-repository:environment:deploy:ref:refs/heads/main:workflow_ref:example-owner/example-repository/.github/workflows/deploy.yml@refs/heads/main"
+        "token.actions.githubusercontent.com:sub" = "repo:example-owner@1234567/example-repository@7654321:environment:deploy:ref:refs/heads/main:workflow_ref:example-owner/example-repository/.github/workflows/deploy.yml@refs/heads/main"
       }
     }
-    error_message = "AWS maps only the audience and the subject of a GitHub token, so the trust policy matches the audience and one exact customized subject that carries the repository, the environment, the branch and the workflow file."
+    error_message = "AWS maps only the audience and the subject of a GitHub token, so the trust policy matches the audience and one exact customized subject that carries the repository with its immutable owner and repository IDs, the environment, the branch and the workflow file."
   }
 
   assert {
