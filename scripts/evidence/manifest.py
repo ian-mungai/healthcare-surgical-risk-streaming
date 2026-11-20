@@ -17,7 +17,7 @@ EVIDENCE_PATTERNS = (
     "teardown/approved_inventory.json",
     "acceptance/*.json",
 )
-REQUIRED_EVIDENCE = ("inventory.json", "plans/destroy_binding.json", "teardown/approved_inventory.json")
+REQUIRED_EVIDENCE = ("inventory.json",)
 
 
 def evidence_files(folder: Path) -> list[str]:

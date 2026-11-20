@@ -19,8 +19,10 @@ from scripts.evidence.verify import export_problem, verify_export
 from scripts.infra.host import HostError
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.teardown import (
+    APPROVAL_FILES,
     bucket_entry_problems,
     classify_entries,
+    consumed_problems,
     delete_targets,
     destroy_write_problem,
     device_check,
@@ -95,6 +97,18 @@ class ManifestShapeTest(unittest.TestCase):
 
     def test_manifest_with_every_required_file_passes(self) -> None:
         self.assertEqual([], manifest_problems(self.manifest(*REQUIRED_EVIDENCE, "acceptance/extra.json")))
+
+    def test_a_run_that_never_planned_a_teardown_can_be_exported(self) -> None:
+        self.assertEqual([], manifest_problems(self.manifest("inventory.json", "acceptance/after-up.json")))
+        self.assertEqual(("inventory.json",), REQUIRED_EVIDENCE)
+
+    def test_the_teardown_still_requires_its_approval_files_in_the_export(self) -> None:
+        files = {name: b"content" for name in APPROVAL_FILES}
+        listed = self.manifest("inventory.json")
+        missing = consumed_problems(listed, files)
+        self.assertEqual(len(APPROVAL_FILES), len(missing))
+        for name in ("plans/destroy_binding.json", "teardown/approved_inventory.json"):
+            self.assertIn(f"an approval file changed while it was checked: {name}", missing)
 
     def test_missing_required_file_is_refused(self) -> None:
         kept = [path for path in REQUIRED_EVIDENCE if path != "inventory.json"]

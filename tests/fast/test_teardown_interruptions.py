@@ -138,6 +138,34 @@ class ApplyRecordTest(unittest.TestCase):
         recorded.assert_called_once()
         self.assertIn("its raw output could not be kept", "".join(call.args[0] for call in printed.write.call_args_list))
 
+    def failed_apply(self, record: Any) -> tuple[mock.Mock, WrapperError]:
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(terraform_wrapper, "ROOT", Path(scratch)),
+            mock.patch.object(terraform_wrapper, "binding_problems", return_value=[]),
+            mock.patch.object(terraform_wrapper, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
+            mock.patch.object(terraform_wrapper, "terraform", side_effect=['{"planned": true}', WrapperError("terraform apply failed with exit status 1")]),
+            mock.patch.object(terraform_wrapper, "record_created", side_effect=record) as recorded,
+            self.assertRaises(WrapperError) as failed,
+        ):
+            plans = Path(scratch) / "runs" / RUN.run_id / "plans"
+            plans.mkdir(parents=True)
+            (plans / "apply.tfplan").write_bytes(b"plan")
+            (plans / "apply_binding.json").write_text("{}")
+            terraform_wrapper.apply_plan(RUN, "code", SETTINGS)
+        return recorded, failed.exception
+
+    def test_an_apply_that_fails_part_way_still_records_what_it_created(self) -> None:
+        recorded, error = self.failed_apply(None)
+        recorded.assert_called_once_with(RUN, {"planned": True})
+        self.assertEqual("terraform apply failed with exit status 1", str(error))
+
+    def test_a_failed_apply_whose_creations_cannot_be_recorded_says_both(self) -> None:
+        recorded, error = self.failed_apply(WrapperError("terraform show failed"))
+        recorded.assert_called_once()
+        self.assertIn("terraform apply failed with exit status 1", str(error))
+        self.assertIn("what it created before it failed could not be recorded", str(error))
+
 
 class OwnerTest(unittest.TestCase):
     def test_every_delete_call_names_the_expected_owner(self) -> None:
