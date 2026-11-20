@@ -32,7 +32,7 @@ from scripts.aws_cli import Aws, AwsError
 from scripts.infra import state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
-from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, save_raw, state_json
+from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, state_json
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -271,12 +271,11 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
         note = f"; {kept_note(run_id, 'ansible_output.txt', partial, 'partial output')}" if partial else ""
         raise HostError(timeout_text("ansible-playbook host.yml", ANSIBLE_TIMEOUT_SECONDS) + note) from None
-    output = result.stdout + result.stderr
-    if result.returncode == 0:
-        save_raw(run_id, "ansible_output.txt", output)
+    kept = kept_note(run_id, "ansible_output.txt", result.stdout + result.stderr, "full output")
     sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:
-        raise HostError(f"the Ansible host setup failed; {kept_note(run_id, 'ansible_output.txt', output, 'full output')}")
+        raise HostError(f"the Ansible host setup failed; {kept}")
+    sys.stdout.write(f"the Ansible host setup passed; {kept}\n")
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:

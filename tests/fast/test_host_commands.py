@@ -40,7 +40,7 @@ from scripts.infra.host import (
     workload_variables,
 )
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.process import TimeoutExpired
+from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.project_config import ROOT
 
 
@@ -561,6 +561,30 @@ class HostUpTest(unittest.TestCase):
                 self.run_up(path)
         self.assertEqual(("s3", True), create.call_args.args[3:])
 
+    def test_a_failed_write_of_the_ansible_output_after_exit_zero_still_writes_the_inventory_and_says_so(self) -> None:
+        names = ("save_plan", "write_inventory", "state_json", "wait_until_reachable", "instance_id")
+        with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
+            stack.enter_context(mock.patch.object(host, "ROOT", Path(scratch)))
+            calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
+            calls["save_plan"].return_value = 0
+            calls["state_json"].return_value = {"values": {}}
+            calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
+            calls["instance_id"].return_value = "i-0123456789abcdef0"
+            stack.enter_context(mock.patch.object(host, "run_command", return_value=CompletedProcess(["ansible-playbook"], 0, "ok\n", "")))
+            blocked = Path(scratch) / "blocked"
+            blocked.mkdir()
+            (blocked / "runs").write_text("a file where the folder of the raw output should be")
+            stack.enter_context(mock.patch.object(terraform_wrapper, "ROOT", blocked))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
+        self.assertEqual(0, code)
+        calls["write_inventory"].assert_called_once_with(path)
+        self.assertIn("the Ansible host setup passed; its full output could not be kept", output.getvalue())
+        self.assertIn("the host platform-dev is up and its inventory is written", output.getvalue())
+
     def test_a_plan_with_changes_stops_for_review_before_any_instance_step(self) -> None:
         names = ("wait_until_reachable", "run_ansible", "write_inventory")
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
@@ -694,6 +718,10 @@ class AnsibleRunTest(unittest.TestCase):
         printed, message, _ = self.run_it(exit_code=0)
         self.assertIsNone(message)
         self.assertIn("ok=12", printed)
+
+    def test_a_successful_setup_names_the_file_that_keeps_the_output(self) -> None:
+        printed, _, _ = self.run_it(exit_code=0)
+        self.assertIn("the Ansible host setup passed; its full output is in runs/run-one/raw/ansible_output.txt", printed)
 
 
 class TailscaleStatusFailureTest(unittest.TestCase):
