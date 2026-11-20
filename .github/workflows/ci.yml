@@ -41,9 +41,13 @@ jobs:
           fi
 
   guards:
-    name: Planted faults through the real commit path
+    name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,7 +58,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
       - run: make setup
-      - run: make test-guards
+      - run: make test-guards SHARD="${SHARD}/8"
+        env:
+          SHARD: ${{ matrix.shard }}
+      - name: Show the end of the run's log after a failure
+        if: failure()
+        run: tail -n 150 runs/*/log.txt
 
   infrastructure:
     name: Static checks of the Terraform and Ansible code

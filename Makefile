@@ -29,7 +29,7 @@ test-fast:
 	$(PYTHON) -m unittest discover --start-directory tests/fast --top-level-directory .
 
 test-guards:
-	$(PYTHON) -m tests.e2e.commit_guards
+	$(PYTHON) -m tests.e2e.commit_guards $(if $(SHARD),--shard $(SHARD))
 
 host-up:
 	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM))
