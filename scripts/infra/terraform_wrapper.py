@@ -224,8 +224,11 @@ def state_json(run: RunBinding, configuration: dict[str, str]) -> dict[str, Any]
 
 
 def plan_label(action: str, *, changes: int, reviewed_exists: bool) -> str:
-    """The name a saved plan gets: a later plan with no change is kept beside the reviewed plan, not over it."""
-    return f"{action}_check" if changes == 0 and reviewed_exists else action
+    """The name a saved plan gets: a later apply plan with no change is kept beside the reviewed plan, not over it.
+
+    A destroy plan always takes the name the teardown's approval and apply read, so a new approval never names an earlier plan.
+    """
+    return f"{action}_check" if action == "apply" and changes == 0 and reviewed_exists else action
 
 
 def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> int:

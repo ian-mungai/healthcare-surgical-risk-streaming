@@ -91,6 +91,8 @@ class PlanBindingTest(unittest.TestCase):
         self.assertEqual("apply", plan_label("apply", changes=0, reviewed_exists=False))
         self.assertEqual("apply_check", plan_label("apply", changes=0, reviewed_exists=True))
         self.assertEqual("apply", plan_label("apply", changes=2, reviewed_exists=True))
+        self.assertEqual("destroy", plan_label("destroy", changes=0, reviewed_exists=True))
+        self.assertEqual("destroy", plan_label("destroy", changes=3, reviewed_exists=True))
 
     def test_matching_plan_passes(self) -> None:
         self.assertEqual([], binding_problems(RUN, plan_binding(RUN, PLAN, "apply"), PLAN, CODE, "apply"))
