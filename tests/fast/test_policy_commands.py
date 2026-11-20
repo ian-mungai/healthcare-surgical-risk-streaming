@@ -403,7 +403,8 @@ class KeyTest(unittest.TestCase):
                 return self
 
             def __exit__(self, *details: object) -> None:
-                return None
+                if self.fails_in in ("close", "flush and close"):
+                    raise OSError("the disk is full")
 
             def write(self, text: str) -> int:
                 if self.fails_in == "write":
@@ -411,9 +412,10 @@ class KeyTest(unittest.TestCase):
                 return len(text)
 
             def flush(self) -> None:
-                raise OSError("the disk is full")
+                if self.fails_in != "close":
+                    raise OSError("the disk is full")
 
-        for fails_in in ("write", "flush"):
+        for fails_in in ("write", "flush", "close", "flush and close"):
             with self.subTest(fails_in=fails_in), mock.patch.object(FailingHandle, "fails_in", fails_in), mock.patch.object(os, "fdopen", FailingHandle):
                 account = Account.matching_templates()
                 code, output, backup = self.run_key(account)

@@ -64,6 +64,7 @@ def install(root: Path) -> bool:
             )
         os.rename(path, kept)
     pending = path.with_name(PENDING_NAME)
+    pending.unlink(missing_ok=True)
     pending.write_text(HOOK_TEXT)
     pending.chmod(HOOK_MODE)
     os.replace(pending, path)

@@ -3,8 +3,9 @@
 Every call resolves the program to its full path, passes a list of arguments, closes stdin or feeds it the given text
 and applies a deadline. The program runs in its own process group. On every exit, a normal one, a deadline that raises
 ``TimeoutExpired``, an interrupt or any other error, the whole group is killed and the call waits until the group is gone.
-A process that survives the kill raises ``ProcessGroupSurvived``. A ``TimeoutExpired`` leaves the launcher holding the program's path and
-no argument, so a failed cleanup that follows it shows no argument. Each tool boundary still catches it and raises its own error with
+A process that survives the kill raises ``ProcessGroupSurvived``. The started process is given the program's path as its
+only recorded command, so a ``TimeoutExpired`` holds no argument from the moment it is created, and a failed cleanup or an interrupt
+that follows it shows none. Each tool boundary still catches it and raises its own error with
 ``timeout_text``. A descendant that starts a session of its own leaves the
 group and is outside this cleanup. Other modules import ``run_command`` instead of ``subprocess``.
 
@@ -108,12 +109,10 @@ def run_command(
     process = subprocess.Popen(  # noqa: S603 - the sole launcher: full path, list arguments, no shell, closed stdin and a deadline
         command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=not keep_newlines, cwd=cwd, env=env, start_new_session=True
     )
+    process.args = command[0]
     try:
         stdin_data = input_text if input_text is None or not keep_newlines else os.fsencode(input_text)
         stdout, stderr = process.communicate(stdin_data, timeout=timeout)
-    except TimeoutExpired as error:
-        error.cmd, error.args = command[0], (command[0], timeout)
-        raise
     finally:
         stop_group(process)
     if keep_newlines:

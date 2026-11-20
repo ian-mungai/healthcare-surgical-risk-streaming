@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -153,6 +154,21 @@ class LauncherTest(unittest.TestCase):
         with mock.patch.object(os, "killpg", side_effect=ProcessLookupError), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
             error = self.run_with_private_arguments()
         self.assert_chain_holds_no_private_argument(error)
+
+    def test_an_interrupt_while_a_deadline_is_handled_shows_no_argument_of_the_timed_out_command(self) -> None:
+        def interrupted(started: subprocess.Popen[str], *arguments: object, **options: object) -> None:
+            try:
+                raise subprocess.TimeoutExpired(started.args, 1)
+            except subprocess.TimeoutExpired:
+                raise KeyboardInterrupt from None
+
+        with mock.patch.object(subprocess.Popen, "communicate", autospec=True, side_effect=interrupted), self.assertRaises(KeyboardInterrupt) as caught:
+            run_command("sh", ["-c", "sleep 300", "sh", BUCKET, ROLE], timeout=1)
+        text = "".join(traceback.format_exception(caught.exception))
+        context = caught.exception.__context__
+        for private in (BUCKET, ROLE):
+            self.assertNotIn(private, f"{text} {context!s} {context!r}")
+        self.assertIsInstance(context, subprocess.TimeoutExpired)
 
     def test_a_group_of_unreaped_processes_is_waited_for(self) -> None:
         answers = [PermissionError(), PermissionError(), ProcessLookupError()]

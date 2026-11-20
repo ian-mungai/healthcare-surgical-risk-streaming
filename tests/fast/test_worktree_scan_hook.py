@@ -108,6 +108,18 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue(worktree_scan_hook.installed(self.repo))
         self.assertEqual([self.hook()], [path for path in self.hook().parent.iterdir() if path.name.startswith("pre-commit.legacy")])
 
+    def test_a_link_left_at_the_pending_name_is_removed_and_the_file_it_points_to_is_untouched(self) -> None:
+        self.hook().parent.mkdir(parents=True, exist_ok=True)
+        other = self.repo / "other_file.txt"
+        other.write_text("kept")
+        pending = self.hook().parent / worktree_scan_hook.PENDING_NAME
+        pending.symlink_to(other)
+        self.assertTrue(worktree_scan_hook.install(self.repo))
+        self.assertTrue(worktree_scan_hook.installed(self.repo))
+        self.assertEqual("kept", other.read_text())
+        self.assertFalse(self.hook().is_symlink())
+        self.assertFalse(os.path.lexists(pending))
+
     def test_the_file_is_whole_and_executable_when_it_is_renamed_into_place(self) -> None:
         real_replace = os.replace
         seen: list[tuple[int, str]] = []

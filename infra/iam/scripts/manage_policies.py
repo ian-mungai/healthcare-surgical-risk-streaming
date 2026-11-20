@@ -251,19 +251,22 @@ def write_new_key(admin: Aws, user: str, backup: Path) -> None:
     """Reserve the backup file, create the key and write it. A definite refusal by IAM releases the reservation; any other failure keeps it."""
     descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     stored = False
-    with os.fdopen(descriptor, "w") as handle:
-        try:
-            key = admin.single_attempt().call("iam", "create-access-key", "--user-name", user)["AccessKey"]
-            handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
-            handle.flush()
-            stored = True
-        except AwsError as error:
-            if not REFUSED_BY_IAM.search(str(error)):
-                raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
-            backup.unlink()
-            raise
-        except ValueError, LookupError, TypeError, OSError:
-            pass
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            try:
+                key = admin.single_attempt().call("iam", "create-access-key", "--user-name", user)["AccessKey"]
+                handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
+                handle.flush()
+                stored = True
+            except AwsError as error:
+                if not REFUSED_BY_IAM.search(str(error)):
+                    raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
+                backup.unlink()
+                raise
+            except ValueError, LookupError, TypeError, OSError:
+                pass
+    except OSError:
+        stored = False
     if not stored:
         raise ConfigurationError(UNSTORED_KEY.format(user=user))
 
