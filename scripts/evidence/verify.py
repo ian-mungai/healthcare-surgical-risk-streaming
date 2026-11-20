@@ -90,11 +90,16 @@ def main() -> int:
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         run = load_run(parser.parse_args().binding)
-        key = load_configuration().get("EVIDENCE_VERIFIER_KEY", "")
-    except (WrapperError, ConfigurationError) as error:
+    except WrapperError as error:
         sys.stderr.write(f"{error}\n")
         return 1
     folder = ROOT / "runs" / run.run_id
+    invalidate_receipt(folder)
+    try:
+        key = load_configuration().get("EVIDENCE_VERIFIER_KEY", "")
+    except ConfigurationError as error:
+        sys.stderr.write(f"{error}\n")
+        return 1
     missing = export_problem(folder)
     if missing:
         sys.stderr.write(f"{missing}\n")
