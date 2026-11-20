@@ -64,9 +64,9 @@ from scripts.infra.terraform_wrapper import (
     WrapperError,
     approved_plan_copy,
     binding_problems,
+    kept_note,
     load_run,
     save_plan,
-    save_raw,
     terraform,
 )
 from scripts.process import TimeoutExpired, run_command
@@ -605,10 +605,7 @@ def apply_destroy(run: RunBinding, approved_plan: Path, finish: Callable[[str], 
     finish("apply")
     destroyed = DESTROYED.search(output)
     sys.stdout.write(f"run {run.run_id}: the destroy plan is applied; resources destroyed: {destroyed.group(1) if destroyed else 'see the raw output'}\n")
-    try:
-        save_raw(run.run_id, "destroy_apply.txt", output)
-    except OSError as error:
-        sys.stderr.write(f"the raw output of the destroy could not be kept: {type(error).__name__}\n")
+    sys.stdout.write(f"run {run.run_id}: {kept_note(run.run_id, 'destroy_apply.txt', output, 'raw destroy output')}\n")
 
 
 def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: str) -> int:

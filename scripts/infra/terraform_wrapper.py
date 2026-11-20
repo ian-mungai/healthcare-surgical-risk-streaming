@@ -283,8 +283,8 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
     try:
         applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
         output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
-        save_raw(run.run_id, "apply_output.txt", output)
-        sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + "\n")
+        kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
+        sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")
     finally:
         approved.unlink(missing_ok=True)
     record_created(run, applied_plan)

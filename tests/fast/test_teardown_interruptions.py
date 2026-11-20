@@ -97,7 +97,7 @@ class ApplyStageTest(unittest.TestCase):
         finished: list[str] = []
         with (
             mock.patch.object(teardown, "terraform", return_value="Resources: 0 added, 0 changed, 3 destroyed"),
-            mock.patch.object(teardown, "save_raw", side_effect=OSError("disk full")),
+            mock.patch.object(terraform_wrapper, "save_raw", side_effect=OSError("disk full")),
             mock.patch("sys.stdout"),
             mock.patch("sys.stderr"),
         ):
@@ -109,6 +109,27 @@ class ApplyStageTest(unittest.TestCase):
         with mock.patch.object(teardown, "terraform", side_effect=WrapperError("terraform apply failed")), self.assertRaises(WrapperError):
             teardown.apply_destroy(RUN, Path("approved.tfplan"), finished.append)
         self.assertEqual([], finished)
+
+
+class ApplyRecordTest(unittest.TestCase):
+    def test_a_failed_write_of_the_raw_apply_output_still_records_what_the_apply_created(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(terraform_wrapper, "ROOT", Path(scratch)),
+            mock.patch.object(terraform_wrapper, "binding_problems", return_value=[]),
+            mock.patch.object(terraform_wrapper, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
+            mock.patch.object(terraform_wrapper, "terraform", side_effect=["{}", "Apply complete! Resources: 1 added"]),
+            mock.patch.object(terraform_wrapper, "save_raw", side_effect=OSError("disk full")),
+            mock.patch.object(terraform_wrapper, "record_created") as recorded,
+            mock.patch("sys.stdout") as printed,
+        ):
+            plans = Path(scratch) / "runs" / RUN.run_id / "plans"
+            plans.mkdir(parents=True)
+            (plans / "apply.tfplan").write_bytes(b"plan")
+            (plans / "apply_binding.json").write_text("{}")
+            self.assertEqual(0, terraform_wrapper.apply_plan(RUN, "code", SETTINGS))
+        recorded.assert_called_once()
+        self.assertIn("its raw output could not be kept", "".join(call.args[0] for call in printed.write.call_args_list))
 
 
 class OwnerTest(unittest.TestCase):
