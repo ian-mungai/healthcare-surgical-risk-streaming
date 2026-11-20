@@ -8,12 +8,14 @@ user with an extra attachment, an inline policy or a group, and a live account t
 from __future__ import annotations
 
 import argparse
+import contextlib
 import inspect
 import io
 import os
 import re
 import stat
 import tempfile
+import traceback
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
@@ -374,6 +376,57 @@ class KeyTest(unittest.TestCase):
                 self.assertTrue(backup.exists())
                 self.assertEqual("", backup.read_text())
                 self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
+
+    def test_a_create_reply_that_cannot_be_read_keeps_the_backup_gives_the_advice_and_shows_no_secret(self) -> None:
+        replies = (f"not json {SECRET}", f'{{"Other": "{SECRET}"}}', f'{{"AccessKey": "{SECRET}"}}', f'{{"AccessKey": {{"AccessKeyId": "{SECRET}"}}}}')
+        for reply in replies:
+            with self.subTest(reply=reply.split(SECRET)[0]):
+                account = Account.matching_templates()
+                account.create_refusal = CompletedProcess(["aws"], 0, reply, "")
+                code, output, backup = self.run_key(account)
+                self.assertEqual(1, code)
+                self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
+                self.assertTrue(backup.exists())
+                self.assertNotIn(SECRET, output)
+                error = self.raised_by_write_new_key(account)
+                self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
+                self.assertIsNone(error.__context__)
+
+    def test_a_failed_write_of_the_backup_after_the_key_exists_keeps_the_reservation_gives_the_advice_and_shows_no_secret(self) -> None:
+        class FailingHandle:
+            def __init__(self, descriptor: int, mode: str) -> None:
+                os.close(descriptor)
+
+            def __enter__(self) -> FailingHandle:
+                return self
+
+            def __exit__(self, *details: object) -> None:
+                return None
+
+            def write(self, text: str) -> int:
+                raise OSError(f"the disk is full {text}")
+
+        account = Account.matching_templates()
+        with mock.patch.object(os, "fdopen", FailingHandle):
+            code, output, backup = self.run_key(account)
+        self.assertEqual(1, code)
+        self.assertEqual(1, account.keys)
+        self.assertTrue(backup.exists())
+        self.assertIn("check the access keys of example_project_dev as the owner before a retry", output)
+        self.assertNotIn(SECRET, output)
+        with mock.patch.object(os, "fdopen", FailingHandle):
+            error = self.raised_by_write_new_key(Account.matching_templates())
+        self.assertNotIn(SECRET, "".join(traceback.format_exception(error)))
+        self.assertIsNone(error.__context__)
+
+    def raised_by_write_new_key(self, account: Account) -> BaseException:
+        backup = self.folder / "direct_accessKeys.csv"
+        with mock.patch.object(aws_cli, "run_command", return_value=account.create_refusal) if account.create_refusal else contextlib.nullcontext():
+            try:
+                manage_policies.write_new_key(FakeAws("admin_profile", "us-west-2", account), "example_project_dev", backup)
+            except ValueError as error:
+                return error
+        raise AssertionError("write_new_key raised nothing")
 
     def test_every_ready_wait_call_gets_the_time_that_is_left_and_no_sleep_passes_the_deadline(self) -> None:
         clock = FakeClock()

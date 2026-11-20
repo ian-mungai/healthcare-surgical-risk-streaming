@@ -268,6 +268,15 @@ class PolicyToolTest(Boundary):
         self.assertIsInstance(error, ConfigurationError)
         self.assert_private_values_absent(error)
 
+    def test_a_timeout_of_the_history_setting_read_names_the_command_and_the_deadline_and_no_profile(self) -> None:
+        timeout = TimeoutExpired(["/usr/bin/aws", "configure", "get", "cli_history", "--profile", ROLE], 30)
+        with mock.patch.object(manage_policies, "run_command", side_effect=timeout):
+            error = raised(lambda: manage_policies.refuse_while_history_records(Aws("admin_profile", "us-west-2")))
+        self.assertIsInstance(error, ConfigurationError)
+        self.assertIn("aws configure get timed out after 30 seconds", str(error))
+        self.assertNotIn("admin_profile", f"{error!s} {error!r}")
+        self.assert_private_values_absent(error)
+
     def test_a_timeout_of_the_create_call_keeps_the_reservation_message_and_shows_no_argument(self) -> None:
         timeout = TimeoutExpired(["/usr/bin/aws", "iam", "create-access-key", "--user-name", ROLE], 120)
         with tempfile.TemporaryDirectory() as scratch, mock.patch.object(aws_cli, "run_command", side_effect=timeout):

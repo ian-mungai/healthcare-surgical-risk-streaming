@@ -37,7 +37,7 @@ from typing import Any
 
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
-from scripts.process import TimeoutExpired, run_command
+from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ConfigurationError, load_configuration
 
 MAX_POLICY_VERSIONS = 5
@@ -49,6 +49,10 @@ CONFIG_READ_SECONDS = 30.0
 REFUSED_BY_IAM = re.compile(r"^aws iam create-access-key failed: (AccessDenied|LimitExceeded|NoSuchEntity|InvalidInput)(;|$)")
 UNCERTAIN_CREATE = (
     "the create call gave no clear answer and a key may exist: check the access keys of {user} as the owner before a retry; the empty backup file is kept"
+)
+UNSTORED_KEY = (
+    "the create call answered, but its answer could not be read or its backup could not be written, and a key may exist: "
+    "check the access keys of {user} as the owner before a retry; the backup file is kept as it is"
 )
 LIST_KEYS = {"Action", "NotAction", "Resource", "NotResource"}
 
@@ -230,7 +234,9 @@ def refuse_while_history_records(admin: Aws) -> None:
     unreadable = ConfigurationError(f"the cli_history setting of the profile {admin.profile} could not be read, so key stops before it creates a key; {advice}")
     try:
         result = run_command("aws", ["configure", "get", "cli_history", "--profile", admin.profile], timeout=CONFIG_READ_SECONDS)
-    except OSError, TimeoutExpired:
+    except TimeoutExpired:
+        raise ConfigurationError(f"{timeout_text('aws configure get', CONFIG_READ_SECONDS)}, so key stops before it creates a key; run key again") from None
+    except OSError:
         raise unreadable from None
     value = result.stdout.strip()
     if result.returncode not in (0, 1):
@@ -244,15 +250,22 @@ def refuse_while_history_records(admin: Aws) -> None:
 def write_new_key(admin: Aws, user: str, backup: Path) -> None:
     """Reserve the backup file, create the key and write it. A definite refusal by IAM releases the reservation; any other failure keeps it."""
     descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    stored = False
     with os.fdopen(descriptor, "w") as handle:
         try:
             key = admin.single_attempt().call("iam", "create-access-key", "--user-name", user)["AccessKey"]
+            handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
+            handle.flush()
+            stored = True
         except AwsError as error:
             if not REFUSED_BY_IAM.search(str(error)):
                 raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
             backup.unlink()
             raise
-        handle.write(f"{KEY_HEADER}\n{user},{key['AccessKeyId']},{key['SecretAccessKey']}\n")
+        except ValueError, LookupError, TypeError, OSError:
+            pass
+    if not stored:
+        raise ConfigurationError(UNSTORED_KEY.format(user=user))
 
 
 def wait_until_the_profile_works(project: Aws, user_arn: str) -> None:
