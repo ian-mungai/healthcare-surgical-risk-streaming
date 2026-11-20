@@ -15,8 +15,9 @@ first and refuses, before any deletion, when one fails:
    a bucket this run did not create.
 4. Every entry under the data prefixes must match an approved key and version ID.
 5. Every entry at this run's state keys must match an approved key and version ID.
-6. A bucket this run created must hold nothing else. In a bucket this run did not create, another environment's
-   Terraform state is left alone and is never approved or deleted, and any other entry stops the teardown.
+6. A bucket this run created must hold nothing else. In a bucket this run did not create, the Terraform state of
+   the project's other environment is left alone and is never approved or deleted, and any other entry stops the
+   teardown.
 7. The account in the settings must own the bucket. This is checked first, on every run of the command.
 
 The guards also refuse an approved entry in another bucket, outside the data prefixes or outside this run's state
@@ -28,13 +29,15 @@ ID. Every delete call names this account as the bucket's expected owner. Under t
 write that fails when a lock exists, it accepts a new entry at this run's state keys only when its content shows the
 destroy of this state wrote it, deletes this run's state entries and removes the empty bucket last when this run
 created it and this account still owns it. A lock that a stopped cleanup of this run left on this computer, known by its process ID and start time, is taken
-over; any other lock stops the cleanup. It checks each removal through its service within one deadline; a resource
+over; any other lock stops the cleanup, and the message names the lock version the owner deletes by hand when no
+teardown runs. It checks each removal through its service within one deadline; a resource
 with no check is verified only through a parent that is gone. Each finished stage is recorded by a file rename, so a
-stopped write leaves the earlier record whole. A second run does nothing. Until the apply stage is recorded, a rerun
-runs every guard again and so accepts a new approval; when an earlier attempt with the same approval released the
-host and the state is now the approved lineage at a later serial with no resources, the destroy was applied and its
-reply lost, and the stage is recorded without a second apply. After the apply stage, a rerun resumes only with the
-code, plan, inventory, approved inventory and receipt it started with.
+stopped write leaves the earlier record whole. A second run checks the bucket's owner and does nothing else. Until
+the apply stage is recorded, a rerun runs every guard again and so accepts a new approval. The command does not
+recover by itself from an apply whose reply was lost: the state has then moved, the guards refuse before any
+deletion, and the owner saves a new destroy plan, exports and verifies the evidence again and runs the command with
+the new code; the host is not released a second time. After the apply stage, a rerun resumes only with the code,
+plan, inventory, approved inventory and receipt it started with.
 """
 
 from __future__ import annotations
@@ -57,7 +60,7 @@ from scripts.evidence.manifest import build_manifest, manifest_problems, manifes
 from scripts.evidence.receipt import receipt_problems, signature_is_valid, trusted_signers
 from scripts.infra import host
 from scripts.infra.created import BUCKET_ADDRESS, DEVICE_TYPE
-from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, STATE_PREFIX, RunBinding, bucket_exists, bucket_problem, owned
+from scripts.infra.state_bootstrap import DEFAULT_BINDING, MISSING_BUCKET, RunBinding, bucket_exists, bucket_problem, owned, state_keys
 from scripts.infra.terraform_wrapper import (
     APPLY_TIMEOUT_SECONDS,
     PLAN_TIMEOUT_SECONDS,
@@ -70,7 +73,7 @@ from scripts.infra.terraform_wrapper import (
     terraform,
 )
 from scripts.process import TimeoutExpired, run_command
-from scripts.project_config import ROOT, ConfigurationError, load_configuration
+from scripts.project_config import ENVIRONMENTS, ROOT, ConfigurationError, load_configuration
 
 GONE_DEADLINE_SECONDS = 120
 GONE_POLL_SECONDS = 5
@@ -79,7 +82,7 @@ STAGES = ("release", "apply", "purge", "state", "checks")
 DATA_PREFIXES = ("landing/", "warehouse/")
 APPROVAL_FILES = ("inventory.json", "plans/destroy_binding.json", "teardown/approved_inventory.json")
 PARENT_TYPES = {"aws_iam_role_policy": "aws_iam_role"}
-FOREIGN_STATE = re.compile(rf"{re.escape(STATE_PREFIX)}/[A-Za-z0-9_-]+/terraform\.tfstate(\.tflock)?")
+ENVIRONMENT_STATE_KEYS = frozenset(key for environment in ENVIRONMENTS for key in state_keys(environment))
 PROCESS_TIMEOUT_SECONDS = 10
 DESTROYED = re.compile(r"Resources: \d+ added, \d+ changed, (\d+) destroyed")
 Target = tuple[str, str, str]
@@ -162,11 +165,11 @@ def classify_entries(entries: list[dict[str, Any]], run: RunBinding) -> tuple[li
 def other_entry_problems(other: list[dict[str, Any]], run: RunBinding) -> list[str]:
     """Entries that are neither data nor this run's state are never approved or deleted, and they stop the teardown.
 
-    In a bucket this run did not create, another environment's Terraform state is expected and left alone. Nothing else is.
+    In a bucket this run did not create, the Terraform state of the project's other environment is expected and left alone. Nothing else is.
     """
     keys = sorted({entry["Key"] for entry in other})
     if run.bucket_creation != "created":
-        keys = [key for key in keys if not FOREIGN_STATE.fullmatch(key)]
+        keys = [key for key in keys if key not in ENVIRONMENT_STATE_KEYS]
     return [f"bucket: entry outside the data prefixes and this run's state keys: {key}" for key in keys]
 
 
@@ -193,19 +196,17 @@ def approved_problems(approved: dict[str, Any], run: RunBinding) -> list[str]:
 def snapshot_problem(current: tuple[str, int], approved: dict[str, Any]) -> str | None:
     """Why the state is not the state the destroy plan was saved for, or None when its lineage and serial are the approved ones."""
     if current != (approved["state_lineage"], approved["state_serial"]):
-        return "the state changed after the destroy plan was saved: run make teardown-plan again"
+        return (
+            "the state changed after the destroy plan was saved, which also happens when an earlier attempt applied it and stopped: "
+            "run make teardown-plan again, export and verify the evidence again, then run make host-destroy with the new code"
+        )
     return None
 
 
-def state_snapshot(run: RunBinding) -> tuple[str, int, int]:
-    """The lineage, the serial and the number of resources of the run's current Terraform state."""
-    current = json.loads(terraform(run, ["state", "pull"], PLAN_TIMEOUT_SECONDS))
-    return str(current["lineage"]), int(current["serial"]), len(current.get("resources", []))
-
-
 def state_identity(run: RunBinding) -> tuple[str, int]:
-    lineage, serial, _ = state_snapshot(run)
-    return lineage, serial
+    """The lineage and the serial of the run's current Terraform state."""
+    current = json.loads(terraform(run, ["state", "pull"], PLAN_TIMEOUT_SECONDS))
+    return str(current["lineage"]), int(current["serial"])
 
 
 def teardown_code(plan_hash: str, approved: dict[str, Any]) -> str:
@@ -333,17 +334,6 @@ def resume_problem(recorded: dict[str, Any] | None, current: dict[str, str]) -> 
     return progress_problem(recorded, current)
 
 
-def destroy_already_applied(recorded: dict[str, Any] | None, current: dict[str, str], snapshot: tuple[str, int, int], approved: dict[str, Any]) -> bool:
-    """Whether an earlier attempt with this same approval applied the destroy and stopped before it recorded the stage.
-
-    True only when that attempt passed the guards and released the host, and the state is now the approved lineage at a later serial with no resources.
-    """
-    if recorded is None or "release" not in recorded["finished"] or progress_problem(recorded, current):
-        return False
-    lineage, serial, resources = snapshot
-    return lineage == approved["state_lineage"] and serial > approved["state_serial"] and resources == 0
-
-
 def guard_problems(
     aws: Aws, run: RunBinding, folder: Path, confirm: str, plan: bytes, approved_plan: Path, files: dict[str, bytes], receipt: bytes | None
 ) -> list[str]:
@@ -440,7 +430,10 @@ def hold_state_lock(aws: Aws, run: RunBinding, scratch: Path) -> str:
     The write succeeds only when no lock exists. A lock that a stopped cleanup of this run left on this computer is taken over by its version ID.
     """
     body = scratch / "lock"
-    record = {"ID": f"teardown-{run.run_id}", "Operation": "teardown cleanup", "Who": f"{this_computer()}:{os.getpid()}", "Started": process_start(os.getpid())}
+    started = process_start(os.getpid())
+    if not started:
+        raise TeardownRefused("the start time of this process could not be read, so no state lock was taken and nothing was changed: run the command again")
+    record = {"ID": f"teardown-{run.run_id}", "Operation": "teardown cleanup", "Who": f"{this_computer()}:{os.getpid()}", "Started": started}
     body.write_text(json.dumps(record | {"Path": f"{run.bucket}/{run.state_keys[0]}"}))
     arguments = ["s3api", "put-object", "--bucket", run.bucket, "--key", run.state_keys[1], "--body", str(body), "--if-none-match", "*"]
     written = aws.call(*arguments, missing=("PreconditionFailed",))
@@ -454,7 +447,10 @@ def hold_state_lock(aws: Aws, run: RunBinding, scratch: Path) -> str:
         else "another process holds the state lock"
     )
     if problem:
-        raise TeardownRefused(f"{problem}: the state entries and the bucket are kept; run the command again when it is released")
+        raise TeardownRefused(
+            f"{problem}: the state entries and the bucket are kept; run the command again when it is released; "
+            f"if no teardown of this run is running, delete that lock version by hand at {run.state_keys[1]} and run the command again"
+        )
     return str(latest[0]["VersionId"])
 
 
@@ -616,6 +612,8 @@ def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: s
     finished: list[str] = progress["finished"] if progress else []
     left = remaining_stages(finished)
     if not left:
+        if problem := owner_problem(aws, run, configuration["AWS_ACCOUNT_ID"]):
+            raise TeardownRefused(f"refused: {problem}")
         sys.stdout.write(f"run {run.run_id}: the teardown is already complete; nothing was changed\n")
         return 0
     files = approval_bytes(folder)
@@ -633,10 +631,6 @@ def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: s
         finished.append(stage)
         write_progress(removal, binding, finished)
 
-    if "apply" in left and destroy_already_applied(progress, binding, state_snapshot(run), approved):
-        sys.stdout.write(f"run {run.run_id}: an earlier attempt applied the destroy plan and stopped before it recorded it; the stage is recorded now\n")
-        finish("apply")
-        left = remaining_stages(finished)
     if "apply" in left:
         approved_plan = approved_plan_copy(run, plan)
         try:

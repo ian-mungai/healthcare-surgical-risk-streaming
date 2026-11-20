@@ -18,11 +18,10 @@ from unittest import mock
 from scripts import aws_cli
 from scripts.aws_cli import Aws, AwsError
 from scripts.infra import teardown, terraform_wrapper
-from scripts.infra.state_bootstrap import RunBinding, adoption_problem, bucket_problem
+from scripts.infra.state_bootstrap import RunBinding, adoption_problem, bucket_problem, state_keys
 from scripts.infra.teardown import (
     TeardownRefused,
     approved_problems,
-    destroy_already_applied,
     lock_takeover_problem,
     other_entry_problems,
     owner_problem,
@@ -33,6 +32,7 @@ from scripts.infra.teardown import (
 )
 from scripts.infra.terraform_wrapper import WrapperError
 from scripts.process import CompletedProcess
+from scripts.project_config import ENVIRONMENTS
 
 STATE_KEYS = ["state/dev/terraform.tfstate", "state/dev/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-project", "default", STATE_KEYS, "verified", bucket_creation="created")
@@ -87,9 +87,16 @@ class SnapshotTest(unittest.TestCase):
         self.assertIsNone(snapshot_problem(("lineage-1", 7), {"state_lineage": "lineage-1", "state_serial": 7}))
 
     def test_a_state_with_another_serial_or_lineage_is_refused_before_the_host_is_released(self) -> None:
-        expected = "the state changed after the destroy plan was saved: run make teardown-plan again"
-        self.assertEqual(expected, snapshot_problem(("lineage-1", 6), {"state_lineage": "lineage-1", "state_serial": 7}))
-        self.assertEqual(expected, snapshot_problem(("lineage-2", 7), {"state_lineage": "lineage-1", "state_serial": 7}))
+        expected = "the state changed after the destroy plan was saved"
+        self.assertIn(expected, snapshot_problem(("lineage-1", 6), {"state_lineage": "lineage-1", "state_serial": 7}) or "")
+        self.assertIn(expected, snapshot_problem(("lineage-2", 7), {"state_lineage": "lineage-1", "state_serial": 7}) or "")
+
+
+class SnapshotAdviceTest(unittest.TestCase):
+    def test_a_moved_state_names_each_step_the_owner_repeats(self) -> None:
+        problem = snapshot_problem(("lineage-1", 8), {"state_lineage": "lineage-1", "state_serial": 7}) or ""
+        for step in ("make teardown-plan", "export and verify the evidence", "make host-destroy with the new code"):
+            self.assertIn(step, problem)
 
 
 class ApplyStageTest(unittest.TestCase):
@@ -231,6 +238,29 @@ class LockTakeoverTest(unittest.TestCase):
         ):
             teardown.hold_state_lock(aws, RUN, Path(scratch))
 
+    def test_a_refused_lock_names_the_step_the_owner_does_by_hand(self) -> None:
+        listing = {"Versions": [{"Key": STATE_KEYS[1], "VersionId": "lock-v1", "IsLatest": True}]}
+        aws = RecordingAws([(("s3api", "put-object"), None), (("s3api", "list-object-versions"), listing)])
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(teardown, "entry_content", return_value=self.record(Started="")),
+            self.assertRaises(TeardownRefused) as refused,
+        ):
+            teardown.hold_state_lock(aws, RUN, Path(scratch))
+        self.assertIn("if no teardown of this run is running, delete that lock version by hand", str(refused.exception))
+        self.assertEqual([], aws.named("s3api", "delete-object"))
+
+    def test_no_lock_is_written_when_this_process_has_no_readable_start_time(self) -> None:
+        aws = RecordingAws([])
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(teardown, "process_start", return_value=""),
+            self.assertRaises(TeardownRefused) as refused,
+        ):
+            teardown.hold_state_lock(aws, RUN, Path(scratch))
+        self.assertEqual([], aws.calls)
+        self.assertIn("nothing was changed", str(refused.exception))
+
 
 class OwnerBeforeAnyStageTest(unittest.TestCase):
     def test_a_bucket_this_account_owns_passes(self) -> None:
@@ -271,6 +301,15 @@ class KeptBucketTest(unittest.TestCase):
         ):
             self.assertEqual([f"bucket: entry outside the data prefixes and this run's state keys: {key}"], other_entry_problems([entry(key)], self.KEPT))
 
+    def test_a_state_key_of_an_environment_the_project_does_not_have_is_refused(self) -> None:
+        for key in ("state/deev/terraform.tfstate", "state/deev/terraform.tfstate.tflock", "state/staging/terraform.tfstate", "state/DEV/terraform.tfstate"):
+            self.assertEqual([f"bucket: entry outside the data prefixes and this run's state keys: {key}"], other_entry_problems([entry(key)], self.KEPT))
+
+    def test_every_supported_environments_state_and_lock_keys_are_left_alone(self) -> None:
+        kept = [entry(key) for environment in ENVIRONMENTS for key in state_keys(environment) if key not in STATE_KEYS]
+        self.assertEqual(2 * (len(ENVIRONMENTS) - 1), len(kept))
+        self.assertEqual([], other_entry_problems(kept, self.KEPT))
+
     def test_a_created_bucket_refuses_every_other_entry(self) -> None:
         expected = ["bucket: entry outside the data prefixes and this run's state keys: state/prod/terraform.tfstate"]
         self.assertEqual(expected, other_entry_problems([entry("state/prod/terraform.tfstate")], RUN))
@@ -288,24 +327,6 @@ class ResumeTest(unittest.TestCase):
         expected = "this teardown started with another code: a rerun must use the approval it started with"
         self.assertEqual(expected, resume_problem(BINDING | {"finished": ["release", "apply"]}, BINDING | {"code": "new"}))
         self.assertIsNone(resume_problem(BINDING | {"finished": ["release", "apply"]}, BINDING))
-
-    def test_a_destroy_whose_reply_was_lost_is_recognised_by_the_empty_newer_state(self) -> None:
-        approved = {"state_lineage": "lineage-1", "state_serial": 7}
-        recorded = BINDING | {"finished": ["release"]}
-        self.assertTrue(destroy_already_applied(recorded, BINDING, ("lineage-1", 8, 0), approved))
-
-    def test_a_state_that_still_holds_resources_or_did_not_move_is_not_an_applied_destroy(self) -> None:
-        approved = {"state_lineage": "lineage-1", "state_serial": 7}
-        recorded = BINDING | {"finished": ["release"]}
-        self.assertFalse(destroy_already_applied(recorded, BINDING, ("lineage-1", 8, 2), approved))
-        self.assertFalse(destroy_already_applied(recorded, BINDING, ("lineage-1", 7, 0), approved))
-        self.assertFalse(destroy_already_applied(recorded, BINDING, ("lineage-2", 8, 0), approved))
-
-    def test_an_applied_destroy_is_recognised_only_for_the_approval_that_passed_the_guards_and_released_the_host(self) -> None:
-        approved = {"state_lineage": "lineage-1", "state_serial": 7}
-        self.assertFalse(destroy_already_applied(None, BINDING, ("lineage-1", 8, 0), approved))
-        self.assertFalse(destroy_already_applied(BINDING | {"finished": []}, BINDING, ("lineage-1", 8, 0), approved))
-        self.assertFalse(destroy_already_applied(BINDING | {"finished": ["release"]}, BINDING | {"code": "new"}, ("lineage-1", 8, 0), approved))
 
 
 class ProgressFileTest(unittest.TestCase):
@@ -357,46 +378,77 @@ class DestroyCommandTest(unittest.TestCase):
             stage.assert_not_called()
         self.assertEqual([], aws.named("s3api", "delete-object") + aws.named("s3api", "delete-bucket"))
 
-    def test_a_rerun_after_a_lost_apply_reply_records_the_stage_and_does_not_apply_again(self) -> None:
+    def test_a_rerun_after_a_lost_apply_reply_runs_every_guard_again_and_deletes_nothing_when_one_refuses(self) -> None:
         aws = RecordingAws([(("s3api", "head-bucket"), {})])
         with (
             tempfile.TemporaryDirectory() as scratch,
             mock.patch.object(teardown, "ROOT", Path(scratch)),
-            mock.patch.object(teardown, "state_snapshot", return_value=("lineage-1", 8, 0)),
-            mock.patch.object(teardown, "guard_problems") as guards,
+            mock.patch.object(teardown, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
+            mock.patch.object(teardown, "guard_problems", return_value=["the state changed after the destroy plan was saved"]) as guards,
             mock.patch.object(teardown, "apply_destroy") as applied,
             mock.patch.object(teardown, "purge") as purged,
-            mock.patch.object(teardown, "clean_bucket", return_value="none: no resource is retained"),
-            mock.patch.object(teardown, "checked_removals", return_value=[]),
-            mock.patch("sys.stdout"),
-        ):
-            folder = self.folder(scratch)
-            files = teardown.approval_bytes(folder)
-            binding = teardown.approval_binding("code", files, b"plan", None)
-            write_progress(folder / "removal", binding, ["release"])
-            self.assertEqual(0, teardown.destroy(aws, SETTINGS, RUN, "code"))
-            recorded = read_progress(folder / "removal")
-        guards.assert_not_called()
-        applied.assert_not_called()
-        purged.assert_called_once()
-        self.assertEqual(["release", "apply", "purge", "state", "checks"], recorded["finished"] if recorded else None)
-
-    def test_a_rerun_whose_state_still_holds_resources_runs_every_guard_again(self) -> None:
-        aws = RecordingAws([(("s3api", "head-bucket"), {})])
-        with (
-            tempfile.TemporaryDirectory() as scratch,
-            mock.patch.object(teardown, "ROOT", Path(scratch)),
-            mock.patch.object(teardown, "state_snapshot", return_value=("lineage-1", 8, 2)),
-            mock.patch.object(teardown, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
-            mock.patch.object(teardown, "guard_problems", return_value=["the state changed after the destroy plan was saved: run make teardown-plan again"]),
-            mock.patch.object(teardown, "apply_destroy") as applied,
-            self.assertRaises(TeardownRefused),
+            mock.patch.object(teardown, "clean_bucket") as cleaned,
         ):
             folder = self.folder(scratch)
             binding = teardown.approval_binding("code", teardown.approval_bytes(folder), b"plan", None)
             write_progress(folder / "removal", binding, ["release"])
-            teardown.destroy(aws, SETTINGS, RUN, "code")
-        applied.assert_not_called()
+            with self.assertRaises(TeardownRefused):
+                teardown.destroy(aws, SETTINGS, RUN, "code")
+            recorded = read_progress(folder / "removal")
+        guards.assert_called_once()
+        for stage in (applied, purged, cleaned):
+            stage.assert_not_called()
+        self.assertEqual(["release"], recorded["finished"] if recorded else None)
+        self.assertEqual([], aws.named("s3api", "delete-object") + aws.named("s3api", "delete-bucket"))
+
+    def test_a_new_approval_after_a_lost_apply_reply_passes_the_guards_and_does_not_release_the_host_again(self) -> None:
+        aws = RecordingAws([(("s3api", "head-bucket"), {})])
+        with (
+            tempfile.TemporaryDirectory() as scratch,
+            mock.patch.object(teardown, "ROOT", Path(scratch)),
+            mock.patch.object(teardown, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
+            mock.patch.object(teardown, "guard_problems", return_value=[]) as guards,
+            mock.patch.object(teardown, "terraform", return_value="Apply complete! Resources: 0 added, 0 changed, 0 destroyed.") as called,
+            mock.patch.object(teardown, "kept_note", return_value="kept"),
+            mock.patch.object(teardown, "purge") as purged,
+            mock.patch.object(teardown, "clean_bucket", return_value="none: no resource is retained"),
+            mock.patch.object(teardown, "checked_removals", return_value=[]),
+            mock.patch("scripts.infra.host.release_tailscale_device") as released,
+            mock.patch("sys.stdout"),
+        ):
+            folder = self.folder(scratch)
+            earlier = teardown.approval_binding("code", teardown.approval_bytes(folder), b"plan", None)
+            write_progress(folder / "removal", earlier, ["release"])
+            (folder / "plans" / "destroy.tfplan").write_bytes(b"new plan")
+            self.assertEqual(0, teardown.destroy(aws, SETTINGS, RUN, "new code"))
+            recorded = read_progress(folder / "removal")
+        guards.assert_called_once()
+        called.assert_called_once()
+        purged.assert_called_once()
+        released.assert_not_called()
+        self.assertEqual(["release", "apply", "purge", "state", "checks"], recorded["finished"] if recorded else None)
+        self.assertEqual("new code", recorded["code"] if recorded else None)
+
+    def complete(self, scratch: str) -> None:
+        folder = self.folder(scratch)
+        write_progress(folder / "removal", teardown.approval_binding("code", teardown.approval_bytes(folder), b"plan", None), list(teardown.STAGES))
+
+    def test_a_complete_teardown_with_a_mistyped_account_is_refused(self) -> None:
+        answers: Iterator[dict[str, str] | None] = iter([{}, None])
+        aws = RecordingAws([(("s3api", "head-bucket"), lambda _: next(answers))])
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(teardown, "ROOT", Path(scratch)), self.assertRaises(TeardownRefused) as refused:
+            self.complete(scratch)
+            teardown.destroy(aws, SETTINGS | {"AWS_ACCOUNT_ID": "another-account"}, RUN, "code")
+        self.assertEqual("refused: the bucket is not owned by the account in AWS_ACCOUNT_ID", str(refused.exception))
+
+    def test_a_complete_teardown_changes_nothing_when_the_account_owns_the_bucket_or_the_bucket_is_gone(self) -> None:
+        answers: tuple[dict[str, str] | None, ...] = ({}, None)
+        for answer in answers:
+            aws = RecordingAws([(("s3api", "head-bucket"), answer)])
+            with tempfile.TemporaryDirectory() as scratch, mock.patch.object(teardown, "ROOT", Path(scratch)), mock.patch("sys.stdout"):
+                self.complete(scratch)
+                self.assertEqual(0, teardown.destroy(aws, SETTINGS, RUN, "code"))
+            self.assertEqual([], [call for call in aws.calls if call[:2] != ("s3api", "head-bucket")])
 
 
 class BindingTest(unittest.TestCase):
