@@ -96,10 +96,10 @@ run "host_matches_the_design" {
   assert {
     condition = alltrue([
       aws_instance.host.tags == tomap({ Name = "example_project_host_dev" }),
-      aws_instance.host.root_block_device[0].tags == tomap({ Name = "example_project_host_dev" }),
+      aws_instance.host.root_block_device[0].tags == null,
       aws_security_group.host.tags == tomap({ Name = "example_project_host_dev" }),
     ])
-    error_message = "The host, its disk and its security group carry a Name tag, so a console shows which is which. The provider adds the Project and Environment tags."
+    error_message = "The host and its security group carry a Name tag, so a console shows which is which. The disk sets no tag of its own: a tag set there is written after creation, which the project profile may not do. The provider adds the Project and Environment tags."
   }
 
   assert {

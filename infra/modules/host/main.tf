@@ -162,7 +162,6 @@ resource "aws_instance" "host" {
     throughput            = 125
     encrypted             = true
     delete_on_termination = true
-    tags                  = { Name = var.name }
   }
 
   lifecycle {
