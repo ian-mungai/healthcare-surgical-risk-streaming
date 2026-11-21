@@ -1,0 +1,9 @@
+*
+!replay
+!scripts/__init__.py
+!scripts/ingestion
+scripts/ingestion/cli.py
+**/__pycache__
+replay/Dockerfile
+replay/Dockerfile.dockerignore
+replay/requirements.in

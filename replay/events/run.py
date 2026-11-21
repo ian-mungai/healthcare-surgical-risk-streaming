@@ -9,6 +9,8 @@ all rooms. The replay time of a send therefore never goes backwards, and the eve
 **Pacing.** The wall time at which an event is sent is the wall time of the first send plus its replay time since the first due instant, over the speed. The
 speed only moves the wall clock. A restart keeps the wall time of the first send, so a late event is sent at once and the pacing then continues.
 
+**Stop.** When a stop is requested, the loop flushes, writes the position at the last event sent and returns, so a restart sends no event twice.
+
 **Position.** For each room, the number of its admitted occurrences that are complete and the ordinal of the next event of the current one. It is written only
 after a flush, so it never covers a message that Kafka did not acknowledge. A stop between the acknowledgment and the write leaves the position behind: the
 restart sends those events again, with the same IDs and the same payloads, and consumers drop them. The position is written every ``checkpoint_every``
@@ -149,7 +151,17 @@ class Cursor:
 
 
 class Replayer:
-    def __init__(self, frozen: FrozenSchedule, settings: RunSettings, source: RecordingSource, sink: Sink, store: StateStore, clock: Clock) -> None:
+    def __init__(
+        self,
+        frozen: FrozenSchedule,
+        settings: RunSettings,
+        source: RecordingSource,
+        sink: Sink,
+        store: StateStore,
+        clock: Clock,
+        stop_requested: Callable[[], bool] = lambda: False,
+    ) -> None:
+        self.stop_requested = stop_requested
         self.frozen = frozen
         self.settings = settings
         self.source = source
@@ -188,6 +200,9 @@ class Replayer:
             unsaved = 0
 
         while True:
+            if self.stop_requested():
+                checkpoint(finished=False)
+                return RunResult(sent, False)
             live = {room: cursor for room, cursor in cursors.items() if cursor is not None}
             if not live:
                 break

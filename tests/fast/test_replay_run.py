@@ -15,6 +15,7 @@ Failure modes covered here:
 - The replay time goes backwards, or the speed changes the IDs, the payloads or the replay times.
 - An occurrence outside the window is sent, an occurrence inside it is not, or a case is decoded more than once for one occurrence.
 - A finished run sends again when it is started again.
+- A stop that is asked for leaves the position behind the last event sent, so the restart sends events twice that it did not need to.
 """
 
 from __future__ import annotations
@@ -234,6 +235,25 @@ class Restart(unittest.TestCase):
         last = max(event.due_us for event in sink.sent)
         self.assertEqual(anchor + (last - frozen.first_due_us) // 2, clock.now)
         self.assertEqual(anchor, saved_state(store).anchor_wall_us)
+
+    def test_a_stop_that_is_asked_for_saves_the_position_at_the_last_event_sent_and_the_restart_sends_nothing_twice(self) -> None:
+        frozen = boundary_schedule(**self.OPTIONS)
+        sink, store, clock = MemorySink(), MemoryStore(), FakeClock()
+        sink.on_send = lambda event: None
+        stop = {"after": 7}
+
+        def requested() -> bool:
+            return len(sink.sent) >= stop["after"]
+
+        first = Replayer(frozen, FAST, RecordingSource(boundary_recordings()), sink, store, clock, requested).run()
+        self.assertEqual((7, False), (first.sent, first.finished))
+        self.assertFalse(saved_state(store).finished)
+        stop["after"] = 10**9
+        second = Replayer(frozen, FAST, RecordingSource(boundary_recordings()), sink, store, clock).run()
+        manifest = build_manifest(frozen, boundary_recordings())
+        self.assertEqual(len(manifest.events), len(sink.sent))
+        self.assertEqual(len(manifest.events) - 7, second.sent)
+        self.assertTrue(compare(manifest, observed_from(sink, store.state)).ok)
 
     def test_a_finished_run_started_again_sends_nothing(self) -> None:
         frozen = boundary_schedule(**self.OPTIONS)

@@ -4,8 +4,8 @@ The registry holds the schemas. A message carries the registry's content ID in i
 formats. Each format has its own topic here: one room's events stay in order within a topic, and the topics have separate retention limits. This table is the
 one place that names them.
 
-The registry's compatibility rule is ``BACKWARD``: a new version of a format can read data that an older version wrote. Adding a field with a default is
-accepted. Adding a field with no default, removing a field that has none or changing a type is refused.
+The registry's compatibility rule is ``BACKWARD_TRANSITIVE``: a new version of a format can read the data that every older version wrote, which Kafka keeps for
+its retention time. Adding a field with a default is accepted. Adding a field with no default or changing a type is refused.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_FOLDER = Path(__file__).resolve().parent / "schemas"
-COMPATIBILITY_RULE = "BACKWARD"
+COMPATIBILITY_RULE = "BACKWARD_TRANSITIVE"
 REGISTRY_GROUP = "surgical_risk"
 
 

@@ -1,6 +1,6 @@
 PYTHON := .venv/bin/python
 
-.PHONY: setup lock lock-orchestration check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
+.PHONY: setup lock lock-orchestration lock-replay check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -13,6 +13,9 @@ lock:
 
 lock-orchestration:
 	.venv/bin/uv pip compile orchestration/requirements.in --generate-hashes --python-platform x86_64-unknown-linux-gnu --python-version 3.14 --output-file orchestration/requirements.txt
+
+lock-replay:
+	.venv/bin/uv pip compile replay/requirements.in --generate-hashes --python-platform x86_64-unknown-linux-gnu --python-version 3.14 --output-file replay/requirements.txt
 
 check:
 	.venv/bin/pre-commit run --all-files --hook-stage manual

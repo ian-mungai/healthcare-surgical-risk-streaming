@@ -5,7 +5,7 @@ Failure modes covered here:
 - A schema field and the payload field of the same event drift apart, so the message cannot be encoded or a field is dropped without notice.
 - A field of the wrong type is declared, such as a time as a double, so a case time loses its exactness.
 - Two formats share a topic or a subject, or a format has no schema file, so a registration overwrites another format.
-- A field added to a schema has no default, so the registry's compatibility rule would refuse the first change that follows.
+- The compatibility rule is weaker than the guarantee that a new reader can read every older message that Kafka still holds.
 
 The registry's own acceptance and refusal of a change is proved against a real registry by ``tests/e2e/stack_replay.py``.
 """
@@ -83,7 +83,7 @@ class Schemas(unittest.TestCase):
                     self.assertIn(avro_type, ("int", "long"), f"{key}.{name}")
 
     def test_the_registry_checks_each_change_against_the_formats_earlier_versions(self) -> None:
-        self.assertIn(COMPATIBILITY_RULE, ("BACKWARD", "BACKWARD_TRANSITIVE", "FULL", "FULL_TRANSITIVE"))
+        self.assertEqual("BACKWARD_TRANSITIVE", COMPATIBILITY_RULE)
 
     def test_the_schema_files_are_plain_json_with_a_document_for_every_field(self) -> None:
         for key in FORMATS:
