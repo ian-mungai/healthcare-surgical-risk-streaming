@@ -19,7 +19,6 @@ Changes: the publisher's files are not changed. This module reads them and write
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import shutil
 import sys
@@ -32,13 +31,17 @@ from typing import Any
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
     CASE_PREFIX,
+    CHECKSUM_LIST_KEY,
     RELEASE_PREFIX,
     SHA256,
+    TRACK_LIST_URL,
     PublisherError,
     download_key,
     download_url,
     list_release,
     parse_checksum_list,
+    parse_clinical_table,
+    parse_track_list,
     read_pinned,
 )
 from scripts.sample.split import SEED, is_development
@@ -153,15 +156,21 @@ def pin_problems(label: str, pin: Any, *, key: bool) -> list[str]:
 
 
 def release_problems(release: dict[str, Any]) -> list[str]:
-    """The problems in the form of the release pin: the checksum list, the two tables and the track list."""
+    """The problems in the form of the release pin: the checksum list, the two tables and the track list. The pin names exactly the files the code reads."""
+    if not isinstance(release, dict):
+        return ["release pin: not a JSON object"]
     problems = pin_problems("checksum_list", release.get("checksum_list"), key=True)
+    if isinstance(release.get("checksum_list"), dict) and release["checksum_list"].get("key") != CHECKSUM_LIST_KEY:
+        problems.append(f"checksum_list: the key must be {CHECKSUM_LIST_KEY}")
     tables = release.get("tables", [])
     keys = {table.get("key") for table in tables if isinstance(table, dict)}
-    if keys != {CLINICAL_KEY, f"{RELEASE_PREFIX}lab_data.csv"}:
-        problems.append("tables: the pin must name clinical_data.csv and lab_data.csv of the release")
+    if len(tables) != 2 or keys != {CLINICAL_KEY, f"{RELEASE_PREFIX}lab_data.csv"}:
+        problems.append("tables: the pin must name clinical_data.csv and lab_data.csv of the release once each")
     for position, table in enumerate(tables):
         problems += pin_problems(f"tables[{position}]", table, key=True)
     problems += pin_problems("track_list", release.get("track_list"), key=False)
+    if isinstance(release.get("track_list"), dict) and release["track_list"].get("url") != TRACK_LIST_URL:
+        problems.append(f"track_list: the address must be {TRACK_LIST_URL}")
     return problems
 
 
@@ -208,6 +217,21 @@ def select_candidates(facts: Sequence[CaseFacts]) -> list[Candidate]:
     return sorted(chosen.values(), key=lambda item: item.case)
 
 
+def case_facts(rows: Sequence[tuple[int, int, int]], sums: dict[str, str], sizes: dict[str, int], arterial: set[int]) -> list[CaseFacts]:
+    """Bind each case of the table to the publisher's checksum and size. A case with no checksum or file, or a waveform case the table lacks, is an error."""
+    known = {case for case, _, _ in rows}
+    stray = sorted(arterial - known)
+    if stray:
+        raise PublisherError(f"the track list names case {stray[0]}, which the clinical table does not list")
+    facts = []
+    for case, patient, duration in rows:
+        key = case_key(case)
+        if key not in sums or key not in sizes:
+            raise PublisherError(f"case {case}: {key} is missing from the publisher's checksum list or key listing")
+        facts.append(CaseFacts(case, patient, duration, sizes[key], sums[key], case in arterial))
+    return facts
+
+
 def read_inputs(release: dict[str, Any], workdir: Path) -> tuple[list[CaseFacts], dict[str, str], dict[str, int]]:
     """Read the publisher's files into ``workdir`` and return the facts of every case, the checksum list and the sizes of the keys.
 
@@ -229,21 +253,7 @@ def read_inputs(release: dict[str, Any], workdir: Path) -> tuple[list[CaseFacts]
     tracks_path = workdir / "track_list.csv"
     download_url(release["track_list"]["url"], tracks_path)
     read_pinned("the track list", tracks_path, release["track_list"]["size_bytes"], release["track_list"]["sha256"])
-    with tracks_path.open(newline="", encoding="utf-8-sig") as handle:
-        arterial = {int(row["caseid"]) for row in csv.DictReader(handle) if row["tname"] == ARTERIAL_TRACK}
-    with clinical_path.open(newline="", encoding="utf-8-sig") as handle:
-        rows = list(csv.DictReader(handle))
-    facts = [
-        CaseFacts(
-            int(row["caseid"]),
-            int(row["subjectid"]),
-            int(row["caseend"]) - int(row["casestart"]),
-            sizes[case_key(int(row["caseid"]))],
-            sums[case_key(int(row["caseid"]))],
-            int(row["caseid"]) in arterial,
-        )
-        for row in rows
-    ]
+    facts = case_facts(parse_clinical_table(clinical_path), sums, sizes, parse_track_list(tracks_path, ARTERIAL_TRACK))
     return facts, sums, sizes
 
 
