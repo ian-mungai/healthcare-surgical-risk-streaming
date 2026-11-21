@@ -14,3 +14,5 @@ include:
   - services/alloy.yml
   - services/spark.yml
   - services/trino.yml
+  - services/kafka.yml
+  - services/apicurio.yml

@@ -117,3 +117,11 @@ services:
     runtime: k3s
     group: ingestion
     memory_limit_mib: 256
+  kafka:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  apicurio:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768

@@ -1,0 +1,10 @@
+# One line for each Kafka topic. The step that applies this file creates a missing topic and corrects a topic whose settings differ, and a second run changes nothing.
+# Retention limits are for each partition: the size limit is in MiB and the time limit in hours, and whichever is reached first deletes the oldest segment.
+# The worst case of a topic is its partitions times (size limit + segment size). The worst cases add up to at most the number in storage_budget_gib.txt.
+# name           partitions  retention_hours  retention_mib  segment_mib  cleanup
+# The replayed events of the default run: one partition for each of the 10 rooms, keyed by room. The size limit holds 24 hours of the busiest room.
+replay_events    10          36               2048           128          delete
+# The feature-ready events and the scores that the streaming job and the scorer publish, keyed by room so one room's records stay in order.
+feature_ready    10          168              128            32           delete
+warnings         10          168              128            32           delete
+risk_scores      10          168              128            32           delete

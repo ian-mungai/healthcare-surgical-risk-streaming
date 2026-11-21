@@ -4,3 +4,4 @@ nessie
 airbyte: airbyte airbyte_temporal airbyte_temporal_visibility
 dagster
 alloy
+apicurio
