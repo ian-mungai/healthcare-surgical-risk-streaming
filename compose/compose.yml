@@ -12,3 +12,4 @@ include:
   - services/grafana.yml
   - services/loki.yml
   - services/alloy.yml
+  - services/trino.yml

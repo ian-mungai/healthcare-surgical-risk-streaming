@@ -45,3 +45,7 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 768
+  trino:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 2048

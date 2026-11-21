@@ -1,0 +1,74 @@
+services:
+  trino:
+    image: trinodb/trino:484@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_TRINO:?render the limits first}
+    restart: unless-stopped
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      nessie:
+        condition: service_healthy
+    environment:
+      NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      WAREHOUSE_LOCATION: ${WAREHOUSE_LOCATION:-s3://warehouse-location-not-set/warehouse/}
+      TRINO_FS_S3_ENABLED: ${TRINO_FS_S3_ENABLED:-true}
+      TRINO_FS_HADOOP_ENABLED: ${TRINO_FS_HADOOP_ENABLED:-false}
+      TRINO_PINNED_REF: ${TRINO_PINNED_REF:-main}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
+    configs:
+      - source: trino_server
+        target: /etc/trino/config.properties
+      - source: trino_node
+        target: /etc/trino/node.properties
+      - source: trino_jvm
+        target: /etc/trino/jvm.config
+      - source: trino_access_control
+        target: /etc/trino/access-control.properties
+      - source: trino_lake
+        target: /etc/trino/catalog/lake.properties
+      - source: trino_lake_pinned
+        target: /etc/trino/catalog/lake_pinned.properties
+      - source: trino_aws_client_config
+        target: /etc/workload_access/client_config
+    volumes:
+      - trino_data:/data/trino
+      - lake_warehouse:/warehouse:ro
+      - workload_access_trino:/run/workload_access:ro
+    ports:
+      - 127.0.0.1:${TRINO_HOST_PORT:-8080}:8080
+    healthcheck:
+      test: [CMD-SHELL, /usr/lib/trino/bin/health-check]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+configs:
+  trino_server:
+    file: ../trino/config.properties
+  trino_node:
+    file: ../trino/node.properties
+  trino_jvm:
+    file: ../trino/jvm.config
+  trino_access_control:
+    file: ../trino/access-control.properties
+  trino_lake:
+    file: ../trino/lake.properties
+  trino_lake_pinned:
+    file: ../trino/lake_pinned.properties
+  trino_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
+
+volumes:
+  trino_data:
+  lake_warehouse:
+  workload_access_trino:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${TRINO_ACCESS_DIR:-/run/workload_access/trino}
