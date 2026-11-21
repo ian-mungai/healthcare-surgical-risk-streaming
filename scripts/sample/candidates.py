@@ -19,7 +19,6 @@ Changes: the publisher's files are not changed. This module reads them and write
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shutil
 import sys
@@ -29,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import parse_json
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
     BUCKET,
@@ -299,7 +299,7 @@ def difference_problems(tracked: Sequence[Candidate], rebuilt: Sequence[Candidat
 
 
 def rebuild(release_path: Path) -> tuple[list[Candidate], dict[str, str], dict[str, int]]:
-    release = json.loads(release_path.read_text())
+    release = parse_json(release_path.read_text(), "the release pin")
     problems = release_problems(release)
     if problems:
         raise PublisherError("; ".join(problems))

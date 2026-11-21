@@ -25,6 +25,8 @@ SIZE_DIFFERS = "size_differs"
 
 @dataclass(frozen=True)
 class Problem:
+    """A refused key and its cause. A key the manifest does not bind is named by its position in the request (``requested key 2``), never by its text."""
+
     source_key: str
     cause: str
 
@@ -43,16 +45,20 @@ def verify_before_read(store: ObjectStore, reference: ManifestRef, source_keys: 
     except (ManifestError, StoreError) as error:
         raise GateRefused(f"refused before any payload was read: {error}") from error
     bound = {entry.source_key: entry for entry in manifest.entries}
-    wanted = list(dict.fromkeys(bound if source_keys is None else source_keys))
+    requested = list(bound if source_keys is None else source_keys)
     problems: list[Problem] = []
     entries: list[CheckedFile] = []
-    for source_key in wanted:
+    seen: set[str] = set()
+    for position, source_key in enumerate(requested, 1):
+        if source_key in seen:
+            continue
+        seen.add(source_key)
         entry = bound.get(source_key)
         versions = [version for version in listed if entry and version.key == entry.key]
         current = next((version for version in versions if version.is_latest), None)
         held = next((version for version in versions if entry and version.version_id == entry.version_id and not version.is_delete_marker), None)
         if entry is None:
-            problems.append(Problem(source_key, NOT_IN_MANIFEST))
+            problems.append(Problem(f"requested key {position}", NOT_IN_MANIFEST))
         elif entry.bucket != store.bucket:
             problems.append(Problem(source_key, BUCKET_DIFFERS))
         elif current is None or current.is_delete_marker or held is None:

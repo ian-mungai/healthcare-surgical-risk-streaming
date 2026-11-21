@@ -1,6 +1,7 @@
 """Closed input: a JSON object is accepted only with exactly its known fields, each of its known type.
 
-A message names the object and its fields, never a value of the file.
+A field named twice is refused, because the second value would silently replace the first. A message names the object and its fields, never a value of
+the file.
 """
 
 from __future__ import annotations
@@ -14,9 +15,22 @@ class ClosedInputError(ValueError):
     """An input is not valid JSON or is an object with an unknown, missing or mistyped field."""
 
 
+class RepeatedFieldError(ValueError):
+    """A JSON object names one field twice."""
+
+
+def reject_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise RepeatedFieldError
+    return dict(pairs)
+
+
 def parse_json(text: str | bytes, what: str) -> Any:
+    """The JSON value of ``text``. Raise ``ClosedInputError`` when it is not JSON or when any object in it names a field twice."""
     try:
-        return json.loads(text)
+        return json.loads(text, object_pairs_hook=reject_repeats)
+    except RepeatedFieldError:
+        raise ClosedInputError(f"{what} names a field more than once") from None
     except ValueError:
         raise ClosedInputError(f"{what} is not valid JSON") from None
 

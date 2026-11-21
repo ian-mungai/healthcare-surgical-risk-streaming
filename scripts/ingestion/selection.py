@@ -7,26 +7,66 @@ A selection file is JSON::
      "files": ["clinical_data.csv", "lab_data.csv"],
      "case_files": {"pattern": "vital_files/{:04d}.vital", "first": 1, "last": 6388}}
 
-``files`` and ``case_files`` are paths relative to ``source_prefix``; either may be absent, and ``case_files`` expands to one path for each number.
-The checksum list is pinned by its release path and its SHA-256.
+``files`` and ``case_files`` are paths relative to ``source_prefix``; either may be absent, and ``case_files`` expands to one path for each number from
+``first`` to ``last``. The pattern is one known form: a path with one ``{:0Nd}`` place for the number. The checksum list is pinned by its key and its SHA-256.
+
+A selection named ``full_release`` is the whole release and is not an input to shorten: its files are exactly the two tables and the 6,388 case files, and its
+source, release and checksum list are the tracked pin's (``tests/fixtures/vitaldb/release.json``), so its list digest never comes from the caller.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
+from scripts.sample.candidates import RELEASE_FILE, release_problems
 
 NAME = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 RELATIVE_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+CASE_FORMAT = re.compile(r"([A-Za-z0-9._/-]*)\{:0([1-9])d\}([A-Za-z0-9._/-]*)")
+FULL_RELEASE = "full_release"
+FULL_RELEASE_TABLES = ("clinical_data.csv", "lab_data.csv")
+FULL_RELEASE_CASES = 6388
+FULL_RELEASE_CASE_FORMAT = "vital_files/{:04d}.vital"
 
 
 class SelectionError(ValueError):
     """The selection cannot name one set of files."""
+
+
+def case_paths(pattern: str, first: int, last: int) -> list[str]:
+    """One path for each number from ``first`` to ``last``. Raise ``SelectionError`` unless the pattern is the known form and ``0 <= first <= last``."""
+    form = CASE_FORMAT.fullmatch(pattern)
+    if form is None:
+        raise SelectionError("the selection's case_files pattern is not a path with one {:0Nd} place for the number")
+    if not 0 <= first <= last:
+        raise SelectionError("the selection's case_files must have 0 <= first <= last")
+    head, width, tail = form.groups()
+    return [f"{head}{number:0{width}d}{tail}" for number in range(first, last + 1)]
+
+
+@functools.cache
+def pinned_release() -> dict[str, Any]:
+    """The tracked release pin, checked for its form. Raise ``SelectionError`` when it is not valid."""
+    try:
+        pin = parse_json(RELEASE_FILE.read_text(), "the tracked release pin")
+    except (ClosedInputError, OSError) as error:
+        raise SelectionError(f"the tracked release pin cannot be read: {type(error).__name__}") from None
+    problems = release_problems(pin)
+    if problems:
+        raise SelectionError("the tracked release pin is not valid: " + "; ".join(problems))
+    return dict(pin)
+
+
+@functools.cache
+def full_release_files() -> tuple[str, ...]:
+    return tuple(sorted([*FULL_RELEASE_TABLES, *case_paths(FULL_RELEASE_CASE_FORMAT, 1, FULL_RELEASE_CASES)]))
 
 
 @dataclass(frozen=True)
@@ -54,9 +94,31 @@ class Selection:
             problems.append("the selection names no file")
         if len(set(self.files)) != len(self.files):
             problems.append("a file is named twice")
-        problems += [f"not a relative path: {path}" for path in self.files if not RELATIVE_PATH.fullmatch(path) or ".." in path.split("/")]
+        problems += [
+            f"files[{position}] is not a relative path"
+            for position, path in enumerate(self.files, 1)
+            if not RELATIVE_PATH.fullmatch(path) or ".." in path.split("/")
+        ]
+        object.__setattr__(self, "files", tuple(sorted(self.files)))
+        if self.name == FULL_RELEASE and not problems:
+            problems += self.full_release_problems()
         if problems:
             raise SelectionError("; ".join(problems))
+
+    def full_release_problems(self) -> list[str]:
+        """What differs from the whole release as the tracked pin and the 6,390 keys define it. Field names only."""
+        pin = pinned_release()
+        expected = {
+            "release": PurePosixPath(pin["source"]["release_path"]).name,
+            "source_bucket": pin["source"]["bucket"],
+            "source_prefix": pin["source"]["release_path"],
+            "checksum_list_key": pin["checksum_list"]["key"],
+            "checksum_list_sha256": pin["checksum_list"]["sha256"],
+        }
+        problems = [f"the full release's {name} is not the tracked pin's" for name, value in expected.items() if getattr(self, name) != value]
+        if self.files != full_release_files():
+            problems.append(f"the full release's files are not exactly {', '.join(FULL_RELEASE_TABLES)} and {FULL_RELEASE_CASES} case files")
+        return problems
 
     @property
     def source_keys(self) -> tuple[str, ...]:
@@ -91,7 +153,7 @@ class Selection:
                 raise SelectionError("the selection's files must all be text")
             if "case_files" in values:
                 cases = closed_object(values["case_files"], {"pattern": str, "first": int, "last": int}, "the selection's case_files")
-                files += [cases["pattern"].format(number) for number in range(cases["first"], cases["last"] + 1)]
+                files += case_paths(cases["pattern"], cases["first"], cases["last"])
             return cls(
                 name=values["name"],
                 release=values["release"],
@@ -100,11 +162,7 @@ class Selection:
                 measurement_period=values["measurement_period"],
                 checksum_list_key=listed["key"],
                 checksum_list_sha256=listed["sha256"],
-                files=tuple(sorted(files)),
+                files=tuple(files),
             )
         except ClosedInputError as error:
             raise SelectionError(str(error)) from None
-        except (IndexError, KeyError, ValueError) as error:
-            if isinstance(error, SelectionError):
-                raise
-            raise SelectionError(f"the selection's case_files pattern is not valid: {type(error).__name__}") from None

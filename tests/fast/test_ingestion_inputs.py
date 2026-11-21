@@ -39,6 +39,13 @@ def edited(document: dict[str, Any], change: Callable[[dict[str, Any]], None]) -
     return json.dumps(copy)
 
 
+def case_files_set(**fields: object) -> Callable[[dict[str, Any]], None]:
+    def change(document: dict[str, Any]) -> None:
+        document["case_files"].update(fields)
+
+    return change
+
+
 class SelectionInputTest(unittest.TestCase):
     def test_control_the_complete_selection_loads(self) -> None:
         self.assertEqual(3, len(Selection.from_json(json.dumps(SELECTION)).files))
@@ -72,6 +79,66 @@ class SelectionInputTest(unittest.TestCase):
             with self.subTest(pattern=pattern), self.assertRaises(SelectionError) as raised:
                 Selection.from_json(json.dumps(document))
             self.assertNotIn("private-value", str(raised.exception))
+
+
+class SelectionEchoTest(unittest.TestCase):
+    MARKER = "private-value"
+
+    def refused(self, change: Callable[[dict[str, Any]], None]) -> str:
+        with self.assertRaises(SelectionError) as raised:
+            Selection.from_json(edited(SELECTION, change))
+        self.assertNotIn(self.MARKER, str(raised.exception))
+        return str(raised.exception)
+
+    def test_a_path_that_is_not_relative_is_named_by_its_position_and_never_by_its_value(self) -> None:
+        message = self.refused(lambda document: document.update(files=["clinical_data.csv", f"{self.MARKER}/../x.csv"]))
+        self.assertIn("files[2]", message)
+        self.assertNotIn("x.csv", message)
+
+    def test_a_case_format_with_an_attribute_or_an_index_is_refused_as_an_invalid_format(self) -> None:
+        for pattern in (f"{{0.{self.MARKER}}}", f"{{0[{self.MARKER}]}}", f"{{:{self.MARKER}}}", "{:04d}{:04d}", "{:04d}.vital{", "x", "{:4d}", "{!r:04d}"):
+            with self.subTest(pattern=pattern):
+                message = self.refused(case_files_set(pattern=pattern))
+                self.assertIn("case_files", message)
+
+    def test_control_the_known_case_format_expands(self) -> None:
+        for pattern, first in (("vital_files/{:04d}.vital", "vital_files/0001.vital"), ("{:06d}.vital", "000001.vital")):
+            with self.subTest(pattern=pattern):
+                document = json.loads(json.dumps(SELECTION))
+                document["case_files"]["pattern"] = pattern
+                self.assertIn(first, Selection.from_json(json.dumps(document)).files)
+
+    def test_a_range_that_is_reversed_or_negative_is_refused(self) -> None:
+        for first, last in ((2, 1), (6388, 1), (-1, 2)):
+            with self.subTest(first=first, last=last):
+                self.refused(case_files_set(first=first, last=last))
+
+
+class RepeatedFieldTest(unittest.TestCase):
+    MARKER = "private-value"
+
+    def test_a_field_named_twice_is_refused_whatever_the_file_and_never_echoed(self) -> None:
+        selection = json.dumps(SELECTION)
+        cases: list[tuple[str, Callable[[str], object], type[Exception]]] = [
+            (
+                selection.replace('"files": ["clinical_data.csv"]', '"files": ["a.csv", "b.csv"], "files": ["clinical_data.csv"]'),
+                Selection.from_json,
+                SelectionError,
+            ),
+            (selection.replace('"first": 1', '"first": 1, "first": 2'), Selection.from_json, SelectionError),
+            (selection.replace('"release": "1.0.0"', f'"release": "1.0.0", "{self.MARKER}": 1, "{self.MARKER}": 2'), Selection.from_json, SelectionError),
+            ('[{"source_key": "a", "source_key": "b", "landed_key": "c", "size": 1}]', load_pairing_records, PairingError),
+            (landed_set().check().to_json().replace('"findings"', '"findings": [], "findings"', 1), CheckResult.from_json, ResultFormatError),
+            ('{"bucket": "b", "bucket": "c", "key": "k", "version_id": "v", "sha256": "s"}', ManifestRef.from_json, ManifestError),
+        ]
+        for number, (text, load, error) in enumerate(cases):
+            with self.subTest(case=number), self.assertRaises(error) as raised:
+                load(text)
+            self.assertNotIn(self.MARKER, str(raised.exception))
+
+    def test_control_the_same_files_without_a_repeated_field_load(self) -> None:
+        self.assertEqual(3, len(Selection.from_json(json.dumps(SELECTION)).files))
+        self.assertEqual(1, len(load_pairing_records('[{"source_key": "a", "landed_key": "c", "size": 1}]')))
 
 
 class PairingInputTest(unittest.TestCase):

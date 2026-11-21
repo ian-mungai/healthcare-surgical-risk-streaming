@@ -305,6 +305,17 @@ class QuietMessages(unittest.TestCase):
         self.assertIn("checksum_list", errors)
         self.assertNotIn(self.MARKER, errors)
 
+    def test_a_pin_that_repeats_a_field_is_refused_before_any_read(self) -> None:
+        text = Path(RELEASE_FILE).read_text()
+        repeated = text.replace('"tables": [', '"tables": [], "tables": [', 1)
+        self.assertNotEqual(text, repeated)
+        with tempfile.TemporaryDirectory() as folder:
+            pin = Path(folder) / "release.json"
+            pin.write_text(repeated)
+            with mock.patch.object(candidates, "read_inputs", side_effect=AssertionError("a read started")), self.assertRaises(ValueError) as caught:
+                candidates.rebuild(pin)
+        self.assertNotIn("tables", str(caught.exception))
+
     def test_the_command_reports_a_pin_that_is_not_valid_json_without_echoing_it(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             pin = Path(folder) / "release.json"

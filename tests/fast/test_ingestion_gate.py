@@ -93,7 +93,7 @@ class GateTest(unittest.TestCase):
         reference = published(landed)
         landed.store.put_object(LANDING_PREFIX + "sync_99/vital_files/9999.vital", b"landed after the check")
         unbound = SOURCE_PREFIX + "vital_files/9999.vital"
-        self.assertEqual({unbound: "not_in_manifest"}, problems(landed, reference, [WANTED[0], unbound]))
+        self.assertEqual({"requested key 2": "not_in_manifest"}, problems(landed, reference, [WANTED[0], unbound]))
 
     def test_every_refusal_is_listed_with_its_key_and_cause(self) -> None:
         landed = landed_set()
@@ -103,8 +103,17 @@ class GateTest(unittest.TestCase):
         with self.assertRaises(GateRefused) as raised:
             verify_before_read(landed.store, reference, [*WANTED, SOURCE_PREFIX + "other.csv"])
         message = str(raised.exception)
-        for key, cause in ((WANTED[0], "version_substituted"), (WANTED[1], "missing"), (SOURCE_PREFIX + "other.csv", "not_in_manifest")):
+        for key, cause in ((WANTED[0], "version_substituted"), (WANTED[1], "missing"), ("requested key 3", "not_in_manifest")):
             self.assertIn(f"{key}: {cause}", message)
+        self.assertNotIn("other.csv", message)
+
+    def test_a_requested_key_that_is_not_bound_is_never_echoed(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        with self.assertRaises(GateRefused) as raised:
+            verify_before_read(landed.store, reference, ["private-value-key"])
+        self.assertNotIn("private-value", str(raised.exception))
+        self.assertEqual(["requested key 1"], [problem.source_key for problem in raised.exception.problems])
 
     def test_a_manifest_that_does_not_match_its_reference_is_refused(self) -> None:
         landed = landed_set()
