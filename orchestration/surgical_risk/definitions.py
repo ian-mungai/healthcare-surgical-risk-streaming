@@ -16,6 +16,7 @@ from dagster import (
     sensor,
 )
 
+from .housekeeping import defs as housekeeping_defs
 from .lineage_sample import defs as lineage_defs
 from .run_records import run_folder_sensors
 
@@ -52,4 +53,4 @@ def marker_file_sensor(context: SensorEvaluationContext) -> RunRequest | SkipRea
 
 
 proof_defs = Definitions(jobs=[ping_job], schedules=[ping_every_minute], sensors=[marker_file_sensor])
-defs = Definitions.merge(proof_defs, lineage_defs, Definitions(sensors=run_folder_sensors))
+defs = Definitions.merge(proof_defs, lineage_defs, housekeeping_defs, Definitions(sensors=run_folder_sensors))

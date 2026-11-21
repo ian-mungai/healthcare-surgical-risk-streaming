@@ -70,6 +70,7 @@ class RunFacts:
     error: str
     parent_run_id: str | None
     asset_selection: Sequence[str]
+    removed_runs: Sequence[tuple[str, float]] = ()
 
 
 def left_running_tag_value(names: Sequence[str]) -> str:
@@ -213,6 +214,7 @@ def build_record(facts: RunFacts, *, commit: str, environment: Mapping[str, str]
             "steps_failed": sum(step.status == "FAILURE" for step in facts.steps),
         },
         "limits": list(LIMITS),
+        "removed_runs": [{"run_id": run_id, "ended_utc": iso(ended)} for run_id, ended in facts.removed_runs],
         "left_running": names,
         "left_running_reported": reported,
         "cleanup": cleanup_text(names, reported),

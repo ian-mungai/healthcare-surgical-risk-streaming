@@ -24,6 +24,7 @@ from dagster import (
     sensor,
 )
 
+from .retention import PRUNE_JOB, parse_removal
 from .run_folder import LEFT_RUNNING_TAG, CheckFacts, RunFacts, StepFacts, build_record, left_running_tag_value, write_record
 
 RUNS_DIR = Path(os.environ.get("RUN_RECORDS_DIR", "/opt/dagster/runs"))
@@ -53,6 +54,12 @@ def error_text(instance: DagsterInstance, run_id: str) -> str:
     return ""
 
 
+def removals(instance: DagsterInstance, run_id: str) -> tuple[tuple[str, float], ...]:
+    """The run IDs and end times that the pruning run logged as removed."""
+    found = (parse_removal(entry.user_message) for entry in instance.all_logs(run_id) if entry.dagster_event is None)
+    return tuple(item for item in found if item is not None)
+
+
 def run_facts(instance: DagsterInstance, run: DagsterRun) -> RunFacts:
     stats = instance.get_run_stats(run.run_id)
     steps = tuple(
@@ -80,6 +87,7 @@ def run_facts(instance: DagsterInstance, run: DagsterRun) -> RunFacts:
         error=error_text(instance, run.run_id),
         parent_run_id=run.parent_run_id,
         asset_selection=tuple(sorted(key.to_user_string() for key in run.asset_selection or ())),
+        removed_runs=removals(instance, run.run_id) if run.job_name == PRUNE_JOB else (),
     )
 
 
