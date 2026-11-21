@@ -21,6 +21,8 @@ SERVICES = COMPOSE / "services"
 IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest@)[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
+HOST_NETWORK_SERVICES = {"caddy"}
+HOST_PATH_VOLUMES = {"caddy": {"/var/run/tailscale:/var/run/tailscale:ro"}}
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -50,10 +52,10 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
         problems.append(f"{name}: restart must be one of {', '.join(sorted(RESTART_POLICIES))}")
     volumes = service.get("volumes") or []
     declared = document.get("volumes") or {}
-    named = [str(volume).split(":")[0] for volume in volumes]
+    named = [str(volume).split(":")[0] for volume in volumes if str(volume) not in HOST_PATH_VOLUMES.get(name, set())]
     if not volumes or any(not re.fullmatch(r"[a-z][a-z0-9_]*", source) or source not in declared for source in named):
         problems.append(f"{name}: data must live in declared named volumes, with no host path")
-    if service.get("network_mode") == "host":
+    if service.get("network_mode") == "host" and (name not in HOST_NETWORK_SERVICES or service.get("ports")):
         problems.append(f"{name}: network_mode host would listen on every address")
     for port in service.get("ports") or []:
         if not isinstance(port, str) or not re.match(r"127\.0\.0\.1:", port):
@@ -93,6 +95,32 @@ class ServiceFilesTest(unittest.TestCase):
             for port in load(path)["services"][path.stem].get("ports") or []:
                 with self.subTest(service=path.stem, port=port):
                     self.assertRegex(port, r"^127\.0\.0\.1:(\d+|\$\{[A-Z_]+:-\d+\}):\d+$")
+
+
+class HostNetworkExceptionTest(unittest.TestCase):
+    def caddy(self) -> dict[str, Any]:
+        return copy.deepcopy(load(SERVICES / "caddy.yml"))
+
+    def test_the_real_caddy_file_has_no_problem(self) -> None:
+        self.assertEqual([], service_problems("caddy", self.caddy()))
+
+    def test_caddy_with_a_published_port_is_named(self) -> None:
+        document = self.caddy()
+        document["services"]["caddy"]["ports"] = ["127.0.0.1:9440:9440"]
+        self.assertIn("network_mode", service_problems("caddy", document)[0])
+
+    def test_caddy_with_another_host_path_is_named(self) -> None:
+        document = self.caddy()
+        document["services"]["caddy"]["volumes"].append("/etc:/etc:ro")
+        self.assertIn("named volumes", service_problems("caddy", document)[0])
+
+    def test_another_service_on_the_host_network_or_with_the_socket_folder_is_named(self) -> None:
+        document = copy.deepcopy(load(SERVICES / "postgres.yml"))
+        document["services"]["postgres"]["network_mode"] = "host"
+        self.assertIn("network_mode", service_problems("postgres", document)[0])
+        document = copy.deepcopy(load(SERVICES / "postgres.yml"))
+        document["services"]["postgres"]["volumes"].append("/var/run/tailscale:/var/run/tailscale:ro")
+        self.assertIn("named volumes", service_problems("postgres", document)[0])
 
 
 class PlantedDefectTest(unittest.TestCase):

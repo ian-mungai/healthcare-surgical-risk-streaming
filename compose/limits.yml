@@ -13,3 +13,7 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 512
+  caddy:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 256
