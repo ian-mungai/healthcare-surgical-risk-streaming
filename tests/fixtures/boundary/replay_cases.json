@@ -1,0 +1,190 @@
+{
+  "rule": "Hand-built replay cases for the event model. Each case reaches an edge that no published recording is known to reach in a small enough form for a fast test: two readings that share a track and a case time, two string events at one time, a waveform sample that lands exactly on a second boundary, a record that straddles a second, a second with no sample, two cases of different length so that one room starts its next case while the other room is still active, and a case whose file holds readings before its start and after its whole-second end (the published recordings end within a second of the clinical end time). Times are whole microseconds from the case start. The cases are never mixed with the published recordings and never counted as candidates.",
+  "cases": {
+    "9001": {
+      "opstart_us": 4000000,
+      "opend_us": 10000000,
+      "caseend_us": 14000000,
+      "numeric": {
+        "Test/HR": {
+          "unit": "/min",
+          "readings": [
+            [
+              0,
+              60.0
+            ],
+            [
+              1500000,
+              61.0
+            ],
+            [
+              1500000,
+              62.0
+            ],
+            [
+              7250000,
+              63.0
+            ]
+          ]
+        },
+        "Test/NIBP": {
+          "unit": "mmHg",
+          "readings": [
+            [
+              2000000,
+              118.0
+            ],
+            [
+              10000000,
+              119.0
+            ]
+          ]
+        }
+      },
+      "string": {
+        "Test/EVENT": [
+          [
+            0,
+            "Case started"
+          ],
+          [
+            1500000,
+            "Test text"
+          ],
+          [
+            1500000,
+            "Second text at the same time"
+          ],
+          [
+            13000000,
+            "Case ended"
+          ]
+        ]
+      },
+      "waveform": {
+        "Test/WAVE": {
+          "unit": "mV",
+          "sample_rate": 4.0,
+          "gain": 0.5,
+          "offset": -1.0,
+          "records": [
+            [
+              250000,
+              [
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ]
+            ],
+            [
+              3250000,
+              [
+                20,
+                21,
+                22,
+                23
+              ]
+            ],
+            [
+              6900000,
+              [
+                30,
+                31,
+                32
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "9002": {
+      "opstart_us": 6000000,
+      "opend_us": 20000000,
+      "caseend_us": 30000000,
+      "numeric": {
+        "Test/HR": {
+          "unit": "/min",
+          "readings": [
+            [
+              0,
+              70.0
+            ],
+            [
+              5000000,
+              71.0
+            ],
+            [
+              20000000,
+              72.0
+            ],
+            [
+              29000000,
+              73.0
+            ]
+          ]
+        }
+      },
+      "string": {
+        "Test/EVENT": [
+          [
+            0,
+            "Case started"
+          ],
+          [
+            29000000,
+            "Case ended"
+          ]
+        ]
+      },
+      "waveform": {}
+    },
+    "9003": {
+      "opstart_us": 2000000,
+      "opend_us": 6000000,
+      "caseend_us": 10000000,
+      "numeric": {
+        "Test/HR": {
+          "unit": "/min",
+          "readings": [
+            [
+              -500000,
+              80.0
+            ],
+            [
+              0,
+              81.0
+            ],
+            [
+              10400000,
+              82.0
+            ]
+          ]
+        }
+      },
+      "string": {},
+      "waveform": {
+        "Test/WAVE": {
+          "unit": "mV",
+          "sample_rate": 4.0,
+          "gain": 1.0,
+          "offset": 0.0,
+          "records": [
+            [
+              9750000,
+              [
+                1,
+                2,
+                3,
+                4,
+                5
+              ]
+            ]
+          ]
+        }
+      }
+    }
+  }
+}

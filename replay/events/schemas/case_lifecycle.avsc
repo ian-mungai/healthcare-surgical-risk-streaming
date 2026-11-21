@@ -1,0 +1,56 @@
+{
+  "type": "record",
+  "name": "CaseLifecycle",
+  "namespace": "surgical.stream",
+  "doc": "A generated marker of a case occurrence. It is never a source event.",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": "string",
+      "doc": "The stable ID of the event: run, room, case occurrence, track, case time in microseconds and discriminator, joined by vertical bars."
+    },
+    {
+      "name": "run_id",
+      "type": "string",
+      "doc": "The run: a name and 8 hex digits, with an attempt number from 2 for a later attempt."
+    },
+    {
+      "name": "room",
+      "type": "int",
+      "doc": "The operating room, counted from 0. Events are keyed by room."
+    },
+    {
+      "name": "occurrence_id",
+      "type": "string",
+      "doc": "The case occurrence: the publisher's case number, a dot and the number of earlier plays of the case in the run."
+    },
+    {
+      "name": "case_id",
+      "type": "int",
+      "doc": "The publisher's case number."
+    },
+    {
+      "name": "marker",
+      "type": {
+        "type": "enum",
+        "name": "Marker",
+        "symbols": [
+          "FINAL_SCORE",
+          "CASE_END"
+        ],
+        "doc": "FINAL_SCORE is due at opend. CASE_END is due at caseend."
+      },
+      "doc": "Which marker this is."
+    },
+    {
+      "name": "case_time_us",
+      "type": "long",
+      "doc": "The time within the case at which the marker is due, in whole microseconds."
+    },
+    {
+      "name": "replay_time_us",
+      "type": "long",
+      "doc": "The replay time at which the marker is due, in whole microseconds since the replay origin."
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "type": "record",
+  "name": "FeatureReady",
+  "namespace": "surgical.stream",
+  "doc": "The announcement that the features of a case occurrence at a cutoff are written and readable. The streaming job publishes it.",
+  "fields": [
+    {
+      "name": "feature_id",
+      "type": "string",
+      "doc": "The stable ID of the feature row: the occurrence, the cutoff and the feature version."
+    },
+    {
+      "name": "run_id",
+      "type": "string",
+      "doc": "The run."
+    },
+    {
+      "name": "room",
+      "type": "int",
+      "doc": "The operating room."
+    },
+    {
+      "name": "occurrence_id",
+      "type": "string",
+      "doc": "The case occurrence."
+    },
+    {
+      "name": "case_id",
+      "type": "int",
+      "doc": "The publisher's case number."
+    },
+    {
+      "name": "feature_version",
+      "type": "string",
+      "doc": "The version of the feature code that built the row."
+    },
+    {
+      "name": "cutoff_case_time_us",
+      "type": "long",
+      "doc": "The cutoff, as a time within the case in whole microseconds."
+    },
+    {
+      "name": "cutoff_replay_time_us",
+      "type": "long",
+      "doc": "The cutoff, as a replay time in whole microseconds."
+    },
+    {
+      "name": "is_final",
+      "type": "boolean",
+      "doc": "True for the row built at opend, which the final scores use."
+    }
+  ]
+}
