@@ -235,6 +235,34 @@ class ReachableHostTest(unittest.TestCase):
         self.assertIn(f"ubuntu@{address}", logged)
         self.assertIn("cat /var/lib/cloud/data/instance-id", logged)
 
+    def saved_keys_after_reaching(self, saved_for: str | None) -> tuple[str | None, str]:
+        """The run's saved host keys and their recorded instance after the wait, when keys were saved before it for the given instance."""
+        status = {"Peer": {"a": peer("platform-dev")}}
+        with fake_tools(status, INSTANCE) as folder:
+            run_folder = folder / "runs" / "run-one"
+            run_folder.mkdir(parents=True)
+            (run_folder / "known_hosts").write_text("platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n")
+            if saved_for is not None:
+                (run_folder / "known_hosts_instance").write_text(f"{saved_for}\n")
+            wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", INSTANCE, "platform-dev")
+            keys = (run_folder / "known_hosts").read_text() if (run_folder / "known_hosts").exists() else None
+            return keys, (run_folder / "known_hosts_instance").read_text()
+
+    def test_host_keys_saved_for_a_replaced_instance_are_dropped_before_ssh(self) -> None:
+        self.assertEqual((None, f"{INSTANCE}\n"), self.saved_keys_after_reaching(OTHER_INSTANCE))
+
+    def test_host_keys_saved_with_no_recorded_instance_are_dropped_before_ssh(self) -> None:
+        self.assertEqual((None, f"{INSTANCE}\n"), self.saved_keys_after_reaching(None))
+
+    def test_host_keys_saved_for_the_same_instance_are_kept(self) -> None:
+        self.assertEqual(("platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n", f"{INSTANCE}\n"), self.saved_keys_after_reaching(INSTANCE))
+
+    def test_the_first_reach_of_a_run_records_the_instance_its_host_keys_belong_to(self) -> None:
+        status = {"Peer": {"a": peer("platform-dev")}}
+        with fake_tools(status, INSTANCE) as folder:
+            wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", INSTANCE, "platform-dev")
+            self.assertEqual(f"{INSTANCE}\n", (folder / "runs" / "run-one" / "known_hosts_instance").read_text())
+
     def test_only_an_older_peer_is_visible_while_the_new_instance_starts(self) -> None:
         status = {"Peer": {"old": peer("platform-dev", created="2026-01-01T00:00:00Z", device="nOLDCNTRL")}}
         with self.assertRaisesRegex(HostError, "belongs to a different instance than this run's"):
@@ -746,6 +774,16 @@ class HostCheckTest(unittest.TestCase):
             code = host_check("platform-dev", expected)
             logged = (folder / "ssh.log").read_text()
         return code, output.getvalue(), Path(logged)
+
+    def test_host_keys_saved_for_another_instance_are_dropped_before_the_check(self) -> None:
+        with fake_tools({"Peer": {"a": peer("platform-dev")}}, INSTANCE) as folder, contextlib.redirect_stdout(io.StringIO()):
+            saved = folder / "runs" / "deploy"
+            saved.mkdir(parents=True)
+            (saved / "known_hosts").write_text("platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n")
+            (saved / "known_hosts_instance").write_text(f"{OTHER_INSTANCE}\n")
+            self.assertEqual(0, host_check("platform-dev", INSTANCE))
+            self.assertFalse((saved / "known_hosts").exists())
+            self.assertEqual(f"{INSTANCE}\n", (saved / "known_hosts_instance").read_text())
 
     def test_the_expected_instance_passes_and_the_output_names_the_host_only(self) -> None:
         code, output, _ = self.check(INSTANCE)

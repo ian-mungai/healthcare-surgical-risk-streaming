@@ -202,6 +202,21 @@ def ssh_arguments(run_id: str) -> list[str]:
     return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=accept-new"]
 
 
+def keep_host_keys_of(run_id: str, instance: str) -> None:
+    """Drop the run's saved SSH host keys unless they were saved for this instance, and record the instance they now belong to.
+
+    A plan that replaces the host gives the same Tailscale name to an instance with new host keys, and SSH refuses a name whose key changed.
+    Keys of the same instance stay, so a changed key on an unchanged host is still refused.
+    """
+    folder = ROOT / "runs" / run_id
+    owner = folder / "known_hosts_instance"
+    if owner.is_file() and owner.read_text().strip() == instance:
+        return
+    (folder / "known_hosts").unlink(missing_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)
+    owner.write_text(f"{instance}\n")
+
+
 def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str | None:
     """The output of one command on the host over SSH, or None when SSH does not answer."""
     try:
@@ -231,6 +246,7 @@ def wait_until_reachable(aws: Aws, run_id: str, instance: str, host_name: str) -
     wait_for("the instance to run", lambda budget: instance_state(aws, instance, budget) == "running" or None, INSTANCE_DEADLINE_SECONDS)
     wait_for(f"the Tailscale peer {host_name} to be online", lambda budget: peer_online(host_name, budget) or None, PEER_DEADLINE_SECONDS)
     peer = host_peer(host_name)
+    keep_host_keys_of(run_id, instance)
     found = wait_for("SSH over Tailscale", lambda budget: ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, budget), SSH_DEADLINE_SECONDS)
     require_instance(found, instance, host_name)
     return peer
@@ -328,6 +344,7 @@ def host_start(aws: Aws, configuration: dict[str, str], binding: Path) -> int:
 def host_check(host_name: str, instance: str) -> int:
     """Succeed only when the peer with the host's name and tag answers over SSH as the instance with the given ID."""
     address = host_peer(host_name).address
+    keep_host_keys_of("deploy", instance)
     found = wait_for("SSH over Tailscale", lambda budget: ssh_output("deploy", address, INSTANCE_ID_COMMAND, budget), SSH_DEADLINE_SECONDS)
     require_instance(found, instance, host_name)
     sys.stdout.write(f"the host answers over Tailscale SSH as {host_name}\n")
