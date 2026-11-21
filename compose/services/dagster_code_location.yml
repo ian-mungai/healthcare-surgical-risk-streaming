@@ -10,12 +10,18 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    environment:
+      PLATFORM_COMMIT: ${PLATFORM_COMMIT:-unknown}
+    configs:
+      - source: dagster_limits
+        target: /opt/dagster/limits.yml
     secrets:
       - dagster_postgres_password
     tmpfs:
       - /run/dagster:uid=10001,gid=10001,mode=0700
     volumes:
       - dagster_data:/opt/dagster/data
+      - dagster_runs:/opt/dagster/runs
       - dagster_storage:/opt/dagster/instance/storage
     healthcheck:
       test: [CMD, dagster, api, grpc-health-check, --port, "4266"]
@@ -24,10 +30,15 @@ services:
       retries: 12
       start_period: 60s
 
+configs:
+  dagster_limits:
+    file: ../limits.yml
+
 secrets:
   dagster_postgres_password:
     file: ${SECRETS_DIR:?render the host settings first}/postgres/dagster.password
 
 volumes:
   dagster_data:
+  dagster_runs:
   dagster_storage:

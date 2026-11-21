@@ -16,6 +16,9 @@ from dagster import (
     sensor,
 )
 
+from .lineage_sample import defs as lineage_defs
+from .run_records import run_folder_sensors
+
 INBOX = Path(os.environ.get("DAGSTER_INBOX", "/opt/dagster/data/inbox"))
 MARKER_SUFFIX = ".marker"
 
@@ -48,4 +51,5 @@ def marker_file_sensor(context: SensorEvaluationContext) -> RunRequest | SkipRea
     return RunRequest(run_key=f"{marker.name}-{marker.stat().st_mtime_ns}", tags={"marker": marker.name})
 
 
-defs = Definitions(jobs=[ping_job], schedules=[ping_every_minute], sensors=[marker_file_sensor])
+proof_defs = Definitions(jobs=[ping_job], schedules=[ping_every_minute], sensors=[marker_file_sensor])
+defs = Definitions.merge(proof_defs, lineage_defs, Definitions(sensors=run_folder_sensors))

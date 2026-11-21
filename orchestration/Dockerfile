@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
     DAGSTER_HOME=/opt/dagster/instance
 
 RUN useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin dagster \
-    && mkdir -p /opt/dagster/app /opt/dagster/instance/storage /opt/dagster/data \
+    && mkdir -p /opt/dagster/app /opt/dagster/instance/storage /opt/dagster/data /opt/dagster/runs \
     && chown -R dagster:dagster /opt/dagster
 
 COPY requirements.txt /opt/dagster/requirements.txt

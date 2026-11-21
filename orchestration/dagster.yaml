@@ -15,6 +15,14 @@ run_coordinator:
   module: dagster.core.run_coordinator
   class: QueuedRunCoordinator
 
+# One run of a heavy job at a time: the code gives a heavy job the tag below (surgical_risk/concurrency.py) and the run queue holds a second one until the first ends.
+concurrency:
+  runs:
+    tag_concurrency_limits:
+      - key: surgical_risk/heavy
+        value: "true"
+        limit: 1
+
 run_launcher:
   module: dagster
   class: DefaultRunLauncher
