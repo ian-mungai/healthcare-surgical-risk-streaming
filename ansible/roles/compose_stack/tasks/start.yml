@@ -1,0 +1,56 @@
+# Reads compose_stack_docker and the three deadlines. Every wait ends at its deadline and a failure names the service and holds no secret.
+- name: Read the stack's containers before the start
+  ansible.builtin.command:
+    argv: "{{ compose_stack_docker + ['ps', '--all', '--quiet'] }}"
+  register: compose_stack_before
+  changed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Read how long each container has run before the start
+  ansible.builtin.command:
+    argv: "{{ ['docker', 'inspect', '--format', '{{ .Id }} {{ .State.StartedAt }}'] + compose_stack_before.stdout_lines }}"
+  register: compose_stack_started_before
+  changed_when: false
+  check_mode: false
+  when: compose_stack_before.stdout_lines | length > 0
+  timeout: 60
+
+- name: Start the stack and wait for every health check
+  block:
+    - name: Start every service
+      ansible.builtin.command:
+        argv: "{{ compose_stack_docker + ['up', '--detach', '--wait', '--wait-timeout', compose_stack_health_deadline_seconds | string] }}"
+      register: compose_stack_up
+      changed_when: false
+      timeout: "{{ compose_stack_start_deadline_seconds | int }}"
+  rescue:
+    - name: Read each service's state without logs
+      ansible.builtin.command:
+        argv: "{{ compose_stack_docker + ['ps', '--all', '--format', 'table {{ .Service }}\\t{{ .State }}\\t{{ .Status }}'] }}"
+      register: compose_stack_diagnosis
+      changed_when: false
+      failed_when: false
+      timeout: 60
+
+    - name: Stop with the service and its state
+      ansible.builtin.fail:
+        msg: >-
+          The stack did not become healthy within {{ compose_stack_health_deadline_seconds }} seconds (start deadline {{ compose_stack_start_deadline_seconds }}
+          seconds). State of each service: {{ compose_stack_diagnosis.stdout | default('unreadable') }}
+
+- name: Read the stack's containers after the start
+  ansible.builtin.command:
+    argv: "{{ compose_stack_docker + ['ps', '--all', '--quiet'] }}"
+  register: compose_stack_after
+  changed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Read how long each container has run after the start
+  ansible.builtin.command:
+    argv: "{{ ['docker', 'inspect', '--format', '{{ .Id }} {{ .State.StartedAt }}'] + compose_stack_after.stdout_lines }}"
+  register: compose_stack_started_after
+  changed_when: compose_stack_started_before.stdout_lines | default([]) | sort != compose_stack_started_after.stdout_lines | sort
+  check_mode: false
+  timeout: 60

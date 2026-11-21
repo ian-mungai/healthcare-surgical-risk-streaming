@@ -1,0 +1,8 @@
+# Reads compose_stack_docker, compose_stack_tools_file, compose_stack_secrets_directory and compose_stack_provision_deadline_seconds.
+- name: Make the PostgreSQL accounts and databases match the tool list
+  postgres_accounts:
+    step: provision
+    tools_file: "{{ compose_stack_tools_file }}"
+    secrets_directory: "{{ compose_stack_secrets_directory }}"
+    compose_command: "{{ compose_stack_docker }}"
+  timeout: "{{ compose_stack_provision_deadline_seconds | int }}"

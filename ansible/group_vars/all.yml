@@ -41,3 +41,31 @@ unlock_key_directory: /opt/platform
 unlock_key_file: "{{ unlock_key_directory }}/.env"
 unlock_key_owner: ubuntu
 unlock_key_group: ubuntu
+
+# The Compose stack. The password files live outside the placed Compose files, in a folder that only root reads.
+compose_stack_directory: /opt/platform
+compose_stack_compose_directory: "{{ compose_stack_directory }}/compose"
+compose_stack_secrets_directory: "{{ compose_stack_directory }}/secrets"
+# One line for each tool that needs a PostgreSQL account and database.
+compose_stack_tools_file: "{{ compose_stack_compose_directory }}/postgres_tools.txt"
+compose_stack_owner: root
+compose_stack_group: root
+compose_stack_postgres_port: 5432
+# An empty project name keeps the one fixed name in compose.yml.
+compose_stack_project: ""
+# Each deadline is in seconds. The start deadline covers pulling the images and the health deadline each service's health check.
+compose_stack_start_deadline_seconds: 900
+compose_stack_health_deadline_seconds: 180
+compose_stack_provision_deadline_seconds: 120
+compose_stack_command:
+  - docker
+  - compose
+  - --project-directory
+  - "{{ compose_stack_compose_directory }}"
+  - --file
+  - "{{ compose_stack_compose_directory }}/compose.yml"
+  - --env-file
+  - "{{ compose_stack_compose_directory }}/limits.env"
+  - --env-file
+  - "{{ compose_stack_compose_directory }}/host.env"
+compose_stack_docker: "{{ compose_stack_command + (['--project-name', compose_stack_project] if compose_stack_project else []) }}"

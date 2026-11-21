@@ -1,0 +1,35 @@
+# Reads compose_stack_compose_directory, compose_stack_secrets_directory, compose_stack_postgres_port, compose_stack_owner and compose_stack_group.
+# The limits come from the limits file through its loader on the computer that runs Ansible, so no limit is typed in a Compose file or here.
+- name: Render the memory limits from the limits file
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - scripts.stack.limits
+      - render
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: compose_stack_limits
+  timeout: 60
+
+- name: Write the memory limits Compose reads
+  ansible.builtin.copy:
+    dest: "{{ compose_stack_compose_directory }}/limits.env"
+    content: |
+      {{ compose_stack_limits.stdout }}
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0644"
+
+- name: Write the host settings Compose reads
+  ansible.builtin.copy:
+    dest: "{{ compose_stack_compose_directory }}/host.env"
+    content: |
+      SECRETS_DIR={{ compose_stack_secrets_directory }}
+      POSTGRES_HOST_PORT={{ compose_stack_postgres_port }}
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0644"

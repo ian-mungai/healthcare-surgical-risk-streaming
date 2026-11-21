@@ -18,3 +18,4 @@
     - k3s
     - workload_access
     - unlock_key
+    - compose_stack
