@@ -19,6 +19,7 @@ COMPOSE = Path(__file__).resolve().parents[2] / "compose"
 ROOT_FILE = COMPOSE / "compose.yml"
 SERVICES = COMPOSE / "services"
 IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest@)[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
+PROJECT_IMAGE = re.compile(r"^surgical-risk-[a-z0-9_-]+:(?!latest(?:@|$))[0-9][A-Za-z0-9._-]*(?:@sha256:[0-9a-f]{64})?$")
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
 HOST_NETWORK_SERVICES = {"caddy"}
@@ -39,8 +40,11 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
     if not isinstance(services, dict) or list(services) != [name]:
         return [f"{name}: the file must define exactly one service, named like the file"]
     service = services[name]
-    if not IMAGE.match(str(service.get("image", ""))):
-        problems.append(f"{name}: image must be pinned by a tag other than latest and by a sha256 digest")
+    image = str(service.get("image", ""))
+    if not (PROJECT_IMAGE if image.startswith("surgical-risk-") else IMAGE).match(image):
+        problems.append(
+            f"{name}: image must be pinned by a tag other than latest and by a sha256 digest (a project-built image: a version tag, the digest once pushed)"
+        )
     if service.get("platform") != "linux/amd64":
         problems.append(f"{name}: platform must be linux/amd64")
     if not re.fullmatch(rf"\$\{{{variable_name(name)}:\?[^}}]+\}}", str(service.get("mem_limit", ""))):
@@ -146,6 +150,17 @@ class PlantedDefectTest(unittest.TestCase):
                 problems = self.defect(lambda _document, service, value=value: service.update(mem_limit=value))
                 self.assertEqual(1, len(problems))
                 self.assertIn("mem_limit", problems[0])
+
+    def test_a_project_built_image_needs_a_version_tag_and_a_digest_is_optional_until_it_is_pushed(self) -> None:
+        digest = "@sha256:" + "a" * 64
+        for image in ("surgical-risk-dagster:1.13.31", f"surgical-risk-dagster:1.13.31{digest}"):
+            with self.subTest(image=image):
+                self.assertEqual([], self.defect(lambda _document, service, image=image: service.update(image=image)))
+        for image in ("surgical-risk-dagster", "surgical-risk-dagster:latest", f"surgical-risk-dagster:latest{digest}", "other-dagster:1.13.31"):
+            with self.subTest(image=image):
+                problems = self.defect(lambda _document, service, image=image: service.update(image=image))
+                self.assertEqual(1, len(problems))
+                self.assertIn("image", problems[0])
 
     def test_an_image_without_a_digest_or_with_latest_is_named(self) -> None:
         for image in ("postgres:18.7", "postgres@sha256:" + "a" * 64, "postgres:latest@sha256:" + "a" * 64, "postgres:18.7@sha256:abc"):

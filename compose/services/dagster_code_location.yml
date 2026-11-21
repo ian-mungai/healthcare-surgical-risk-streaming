@@ -1,0 +1,33 @@
+services:
+  dagster_code_location:
+    image: surgical-risk-dagster:1.13.31
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_DAGSTER_CODE_LOCATION:?render the limits first}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    command: [dagster, api, grpc, --module-name, surgical_risk.definitions, --host, 0.0.0.0, --port, "4266"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - dagster_postgres_password
+    tmpfs:
+      - /run/dagster:uid=10001,gid=10001,mode=0700
+    volumes:
+      - dagster_data:/opt/dagster/data
+      - dagster_storage:/opt/dagster/instance/storage
+    healthcheck:
+      test: [CMD, dagster, api, grpc-health-check, --port, "4266"]
+      interval: 10s
+      timeout: 30s
+      retries: 12
+      start_period: 60s
+
+secrets:
+  dagster_postgres_password:
+    file: ${SECRETS_DIR:?render the host settings first}/postgres/dagster.password
+
+volumes:
+  dagster_data:
+  dagster_storage:

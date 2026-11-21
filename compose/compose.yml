@@ -5,3 +5,6 @@ include:
   - services/openbao.yml
   - services/postgres.yml
   - services/caddy.yml
+  - services/dagster_code_location.yml
+  - services/dagster_daemon.yml
+  - services/dagster_webserver.yml

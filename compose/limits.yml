@@ -17,3 +17,15 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 256
+  dagster_code_location:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  dagster_daemon:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 512
+  dagster_webserver:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768

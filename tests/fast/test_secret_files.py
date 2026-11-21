@@ -226,19 +226,20 @@ class ListTest(unittest.TestCase):
 class OwnerDataTest(unittest.TestCase):
     """The owners are data. Each one that a file needs is stated in one place, and every copy of it is held to that place."""
 
-    def test_the_numeric_user_of_each_compose_service_that_has_a_line_equals_the_owner_on_its_line(self) -> None:
+    def test_every_compose_service_of_a_listed_service_runs_as_the_numeric_user_on_its_line(self) -> None:
         entries = store_module.parse_entries((ROOT / "compose" / "openbao_services.txt").read_text(), "service")
         checked = []
         for entry in entries:
-            service_file = ROOT / "compose" / "services" / f"{entry.name}.yml"
-            if not service_file.exists():
+            files = sorted((ROOT / "compose" / "services").glob(f"{entry.name}.yml")) + sorted((ROOT / "compose" / "services").glob(f"{entry.name}_*.yml"))
+            if not files:
                 self.assertIsNone(entry.owner, f"{entry.name} runs outside Compose, so its files stay with root until it has a numeric user")
-                continue
-            compose: Any = load_yaml(service_file.read_text())
-            user = compose["services"][entry.name].get("user")
-            checked.append(entry.name)
-            self.assertEqual(None if user is None else tuple(int(part) for part in str(user).split(":")), entry.owner, entry.name)
-        self.assertIn("nessie", checked)
+            for service_file in files:
+                compose: Any = load_yaml(service_file.read_text())
+                (service,) = compose["services"].values()
+                user = service.get("user")
+                checked.append(service_file.stem)
+                self.assertEqual(None if user is None else tuple(int(part) for part in str(user).split(":")), entry.owner, service_file.stem)
+        self.assertLessEqual({"nessie", "dagster_webserver", "dagster_daemon", "dagster_code_location"}, set(checked))
 
     def test_the_openbao_user_in_the_group_variables_is_the_user_of_its_compose_service_and_is_not_root(self) -> None:
         compose: Any = load_yaml((ROOT / "compose" / "services" / "openbao.yml").read_text())

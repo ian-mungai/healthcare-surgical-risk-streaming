@@ -1,0 +1,30 @@
+telemetry:
+  enabled: false
+
+storage:
+  postgres:
+    postgres_db:
+      username: dagster
+      hostname: postgres
+      db_name: dagster
+      port: 5432
+      params:
+        passfile: /run/dagster/pgpass
+
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+
+run_launcher:
+  module: dagster
+  class: DefaultRunLauncher
+
+retention:
+  schedule:
+    purge_after_days: 30
+  sensor:
+    purge_after_days:
+      skipped: 1
+      success: 30
+      failure: 30
+      started: 30
