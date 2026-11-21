@@ -11,11 +11,13 @@ from dagster import (
     ScheduleDefinition,
     SensorEvaluationContext,
     SkipReason,
+    in_process_executor,
     job,
     op,
     sensor,
 )
 
+from .groups import GroupResource
 from .housekeeping import defs as housekeeping_defs
 from .lineage_sample import defs as lineage_defs
 from .run_records import run_folder_sensors
@@ -40,7 +42,23 @@ def ping_job() -> None:
     ping()
 
 
-ping_every_minute = ScheduleDefinition(name="ping_every_minute", job=ping_job, cron_schedule="* * * * *", default_status=DefaultScheduleStatus.RUNNING)
+ping_every_minute = ScheduleDefinition(name="ping_every_minute", job=ping_job, cron_schedule="* * * * *", default_status=DefaultScheduleStatus.STOPPED)
+
+
+class GroupProbeConfig(Config):
+    fail: bool = False
+
+
+@op
+def group_probe(context: OpExecutionContext, config: GroupProbeConfig, group: GroupResource) -> None:
+    context.log.info(f"group {group.group} while the step runs: {group.services_text()}")
+    if config.fail:
+        raise RuntimeError("group_probe was asked to fail")
+
+
+@job(resource_defs={"group": GroupResource.configure_at_launch()}, executor_def=in_process_executor)
+def group_probe_job() -> None:
+    group_probe()
 
 
 @sensor(job=ping_job, minimum_interval_seconds=5, default_status=DefaultSensorStatus.RUNNING)
@@ -52,5 +70,5 @@ def marker_file_sensor(context: SensorEvaluationContext) -> RunRequest | SkipRea
     return RunRequest(run_key=f"{marker.name}-{marker.stat().st_mtime_ns}", tags={"marker": marker.name})
 
 
-proof_defs = Definitions(jobs=[ping_job], schedules=[ping_every_minute], sensors=[marker_file_sensor])
+proof_defs = Definitions(jobs=[ping_job, group_probe_job], schedules=[ping_every_minute], sensors=[marker_file_sensor])
 defs = Definitions.merge(proof_defs, lineage_defs, housekeeping_defs, Definitions(sensors=run_folder_sensors))
