@@ -281,9 +281,9 @@ def listing_problems(candidates: Sequence[Candidate], sums: dict[str, str], size
     problems = []
     for item in candidates:
         if sums.get(item.key) != item.sha256:
-            problems.append(f"case {item.case}: the checksum is not the one the publisher's checksum list gives for {item.key}")
+            problems.append(f"case {item.case}: the checksum is not the one the publisher's checksum list gives for its key")
         if sizes.get(item.key) != item.size_bytes:
-            problems.append(f"case {item.case}: the size is not the one the publisher lists for {item.key}")
+            problems.append(f"case {item.case}: the size is not the one the publisher lists for its key")
     return problems
 
 

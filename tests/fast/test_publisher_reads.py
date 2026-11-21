@@ -271,6 +271,12 @@ class QuietMessages(unittest.TestCase):
             self.assertTrue(problems)
             self.assertNotIn(self.MARKER, " ".join(problems))
 
+    def test_no_problem_against_the_publisher_names_the_key_of_a_candidate(self) -> None:
+        item = candidates.Candidate(**(vars(read_candidates(CANDIDATES_FILE)[0]) | {"key": f"{self.MARKER}/vital_files/0001.vital"}))
+        problems = candidates.listing_problems([item], {}, {})
+        self.assertEqual(2, len(problems))
+        self.assertNotIn(self.MARKER, " ".join(problems))
+
     def test_a_candidate_line_with_a_value_that_is_no_integer_is_refused_by_its_line_alone(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "candidates.tsv"

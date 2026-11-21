@@ -131,7 +131,6 @@ def publish_manifest(store: ObjectStore, selection: Selection, result: CheckResu
             raise PublishRefused("the manifest key holds other content than its name says")
         return ManifestRef(store.bucket, key, existing[0].version_id, sha256)
     version = store.create_object(key, data)
-    refuse_null_version(version)
     if sha256_of(store.get_version_bytes(version, MANIFEST_LIMIT_BYTES)) != sha256:
         raise PublishRefused("the published manifest reads back with other content")
     return ManifestRef(store.bucket, key, version.version_id, sha256)

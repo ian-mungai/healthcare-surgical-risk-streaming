@@ -153,6 +153,12 @@ class PublishTest(unittest.TestCase):
                 publish_manifest(landed.store, landed.selection, changed)
             self.assertEqual([], manifest_objects(landed))
 
+    def test_a_result_that_names_another_selection_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        with self.assertRaisesRegex(PublishRefused, "not for this selection"):
+            publish_manifest(landed.store, landed.selection, replace(checked(landed), selection_name="another_set"))
+        self.assertEqual([], manifest_objects(landed))
+
     def test_a_result_of_another_checksum_list_publishes_nothing_although_its_digest_is_consistent(self) -> None:
         landed = landed_set()
         result = checked(landed)

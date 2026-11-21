@@ -107,6 +107,16 @@ class GateTest(unittest.TestCase):
             self.assertIn(f"{key}: {cause}", message)
         self.assertNotIn("other.csv", message)
 
+    def test_a_bound_key_requested_twice_is_returned_once(self) -> None:
+        landed = landed_set()
+        entries = verify_before_read(landed.store, published(landed), [WANTED[0], WANTED[0]])
+        self.assertEqual([WANTED[0]], [entry.source_key for entry in entries])
+
+    def test_a_key_requested_twice_is_judged_once_and_the_position_is_the_one_in_the_request(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        self.assertEqual({"requested key 3": "not_in_manifest"}, problems(landed, reference, [WANTED[0], WANTED[0], SOURCE_PREFIX + "other.csv"]))
+
     def test_a_requested_key_that_is_not_bound_is_never_echoed(self) -> None:
         landed = landed_set()
         reference = published(landed)
