@@ -1,4 +1,5 @@
 # Temporary: this file is on main only for the refusal run and is purged from history afterwards.
+# This copy runs from a branch other than main and from a pull request.
 # Every job here tries to obtain the deploy identities and must be refused. A job that is let in fails the run.
 name: deploy refusals
 
