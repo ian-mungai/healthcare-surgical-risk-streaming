@@ -7,7 +7,7 @@ github_repository_id = "1463269414"
 
 workloads = {
   airbyte = {
-    access         = { airbyte = ["read", "write"], landing = ["write"] }
+    access         = { landing = ["write"] }
     publisher_read = true
   }
   ingestion_check = {

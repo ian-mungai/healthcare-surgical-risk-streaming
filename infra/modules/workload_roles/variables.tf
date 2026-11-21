@@ -28,11 +28,6 @@ variable "bucket_name" {
   }
 }
 
-variable "data_prefixes" {
-  description = "The prefixes of the bucket that a workload may name. The Terraform state lives under another prefix and is not in this list."
-  type        = list(string)
-}
-
 variable "manifest_writer" {
   description = "Name of the one workload that may write the manifests prefix."
   type        = string
@@ -47,8 +42,8 @@ variable "workloads" {
   }))
 
   validation {
-    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix in keys(workload.access) : contains(var.data_prefixes, prefix)])])
-    error_message = "A workload may name only the prefixes in data_prefixes. The state prefix, another bucket and a wildcard are refused."
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix in keys(workload.access) : contains(["landing", "manifests", "warehouse"], prefix)])])
+    error_message = "A workload may name only the landing, manifests and warehouse prefixes. The state prefix, the airbyte prefix, another bucket and a wildcard are refused."
   }
 
   validation {

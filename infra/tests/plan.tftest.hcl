@@ -307,7 +307,6 @@ run "each_workload_gets_its_own_role" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads = {
       reader = { access = { landing = ["read"] } }
       writer = { access = { warehouse = ["write"] } }
@@ -354,10 +353,9 @@ run "project_workloads_reach_only_their_prefixes_in_the_bound_bucket" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project-test-11212200abcdef"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads = {
       airbyte = {
-        access         = { airbyte = ["read", "write"], landing = ["write"] }
+        access         = { landing = ["write"] }
         publisher_read = true
       }
       ingestion_check = { access = { landing = ["read"], manifests = ["read", "write"] } }
@@ -367,13 +365,11 @@ run "project_workloads_reach_only_their_prefixes_in_the_bound_bucket" {
 
   assert {
     condition = jsondecode(aws_iam_role_policy.workload["airbyte"].policy).Statement == [
-      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project-test-11212200abcdef", Condition = { StringLike = { "s3:prefix" = ["airbyte/*"] } } },
-      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project-test-11212200abcdef/airbyte/*"] },
-      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project-test-11212200abcdef/airbyte/*", "arn:aws:s3:::example-project-test-11212200abcdef/landing/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project-test-11212200abcdef/landing/*"] },
       { Sid = "ListPublisherDataset", Effect = "Allow", Action = "s3:ListBucket", Resource = "arn:aws:s3:::physionet-open", Condition = { StringLike = { "s3:prefix" = ["vitaldb/1.0.0/*"] } } },
       { Sid = "ReadPublisherDataset", Effect = "Allow", Action = "s3:GetObject", Resource = "arn:aws:s3:::physionet-open/vitaldb/1.0.0/*" },
     ]
-    error_message = "The Airbyte workload reads and writes under airbyte, writes under landing and reads the publisher's dataset, in the run's bound bucket, and nothing more."
+    error_message = "The Airbyte workload writes under landing and reads the publisher's dataset, in the run's bound bucket, and nothing more: it keeps no logs or state in the bucket."
   }
 
   assert {
@@ -436,8 +432,7 @@ run "workload_naming_a_prefix_outside_the_allowed_list_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
-    workloads     = { airbyte = { access = { airbyte = ["read"], state = ["read"] } } }
+    workloads     = { airbyte = { access = { landing = ["read"], state = ["read"] } } }
   }
 
   expect_failures = [var.workloads]
@@ -456,8 +451,26 @@ run "workload_naming_another_bucket_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads     = { airbyte = { access = { "../other-bucket/landing" = ["read"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "workload_naming_the_airbyte_prefix_is_refused" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { airbyte = { access = { airbyte = ["read", "write"] } } }
   }
 
   expect_failures = [var.workloads]
@@ -476,7 +489,6 @@ run "workload_naming_a_wildcard_prefix_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads     = { airbyte = { access = { "*" = ["read"] } } }
   }
 
@@ -496,10 +508,9 @@ run "workload_cannot_supply_its_own_resource_patterns" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads = {
       airbyte = {
-        access     = { airbyte = ["read"] }
+        access     = { landing = ["read"] }
         statements = [{ sid = "ReadOther", actions = ["s3:GetObject"], resources = ["arn:aws:s3:::other-bucket/*"] }]
       }
     }
@@ -511,7 +522,7 @@ run "workload_cannot_supply_its_own_resource_patterns" {
   }
 
   assert {
-    condition     = strcontains(aws_iam_role_policy.workload["airbyte"].policy, "arn:aws:s3:::example-project/airbyte/*")
+    condition     = strcontains(aws_iam_role_policy.workload["airbyte"].policy, "arn:aws:s3:::example-project/landing/*")
     error_message = "The policy is built from the prefix and the bound bucket, so the check above cannot pass over an empty policy."
   }
 }
@@ -529,8 +540,7 @@ run "workload_with_an_unknown_mode_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
-    workloads     = { airbyte = { access = { airbyte = ["delete"] } } }
+    workloads     = { airbyte = { access = { landing = ["delete"] } } }
   }
 
   expect_failures = [var.workloads]
@@ -549,8 +559,7 @@ run "workload_with_no_mode_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
-    workloads     = { airbyte = { access = { airbyte = [] } } }
+    workloads     = { airbyte = { access = { landing = [] } } }
   }
 
   expect_failures = [var.workloads]
@@ -569,7 +578,6 @@ run "only_the_checksum_workload_may_write_manifests" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads     = { airbyte = { access = { manifests = ["read", "write"] } } }
   }
 
@@ -589,7 +597,6 @@ run "malformed_workload_bucket_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "other/bucket"
-    data_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
     workloads     = {}
   }
 
@@ -602,7 +609,7 @@ run "environment_builds_workload_patterns_from_the_run_bucket" {
   variables {
     data_bucket_name = "example-project-test-11212200abcdef"
     workloads = {
-      airbyte         = { access = { airbyte = ["read", "write"], landing = ["write"] }, publisher_read = true }
+      airbyte         = { access = { landing = ["write"] }, publisher_read = true }
       ingestion_check = { access = { landing = ["read"], manifests = ["read", "write"] } }
     }
   }

@@ -11,9 +11,8 @@ provider "aws" {
 }
 
 locals {
-  data_prefixes     = ["landing", "warehouse"]
-  read_prefixes     = ["manifests"]
-  workload_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
+  data_prefixes = ["landing", "warehouse"]
+  read_prefixes = ["manifests"]
 }
 
 module "host" {
@@ -59,6 +58,5 @@ module "workload_roles" {
   boundary_name = "${var.project_name}_role_boundary"
   host_role_arn = module.host[0].role_arn
   bucket_name   = var.data_bucket_name
-  data_prefixes = local.workload_prefixes
   workloads     = var.workloads
 }
