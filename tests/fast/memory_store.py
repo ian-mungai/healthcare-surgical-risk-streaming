@@ -1,6 +1,7 @@
 """A stand-in for the object store, for fast tests of the ingestion checks.
 
-It keeps object versions in memory. Its limits: no multipart upload, no ETag, no listing pages, no delay between a write and a listing, no
+It keeps object versions in memory. ``put_object`` plays the copy, which writes any version of any key, and ``create_object`` is the one write of the
+ingestion code. Its limits: no multipart upload, no ETag, no listing pages, no delay between a write and a listing, no
 permissions and no lifecycle rule. It reads a payload only in blocks of ``BLOCK_SIZE`` bytes and records every read, so a test can prove which
 versions were read and that no payload was read whole. The real store is proven by the acceptance test against S3.
 """
@@ -58,6 +59,17 @@ class MemoryStore:
     def put_object(self, key: str, data: bytes) -> ObjectVersion:
         self.writes.append((key, f"{len(data)} bytes"))
         return self.append(key, data, marker=False)
+
+    def create_object(self, key: str, data: bytes) -> ObjectVersion:
+        """The store's rule for a write of the ingestion code: versioning must be on, the first version is created and a key that holds ``data`` is returned."""
+        if not self.versioned:
+            raise StoreError(f"{key}: versioning is not enabled on the bucket, so nothing was written")
+        current = [item for item in self.history.get(key, []) if item.version.is_latest and not item.version.is_delete_marker]
+        if current:
+            if current[0].data != data:
+                raise StoreError(f"{key}: the key already holds other content")
+            return current[0].version
+        return self.put_object(key, data)
 
     def put_delete_marker(self, key: str) -> ObjectVersion:
         return self.append(key, b"", marker=True)

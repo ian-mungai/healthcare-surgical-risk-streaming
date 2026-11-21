@@ -21,7 +21,7 @@ from scripts.ingestion.check import CheckedFile, CheckResult, canonical, checked
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.selection import Selection
-from scripts.ingestion.store import ObjectStore, StoreError
+from scripts.ingestion.store import ObjectStore, ObjectVersion, StoreError
 
 MANIFEST_PREFIX = "manifests/"
 MANIFEST_FORMAT = "landing_manifest_1"
@@ -111,6 +111,11 @@ def build_document(selection: Selection, result: CheckResult) -> dict[str, Any]:
     }
 
 
+def refuse_null_version(version: ObjectVersion) -> None:
+    if version.version_id in NULL_VERSION_IDS:
+        raise PublishRefused("the manifest is a null version, which versioning does not keep apart from the next write")
+
+
 def publish_manifest(store: ObjectStore, selection: Selection, result: CheckResult) -> ManifestRef:
     """Publish the manifest of a complete passed check and return its reference. The same content gives the same reference and writes nothing more."""
     reason = refusal(result, selection, store)
@@ -121,10 +126,12 @@ def publish_manifest(store: ObjectStore, selection: Selection, result: CheckResu
     key = manifest_key(selection.name, sha256)
     existing = [version for version in store.list_versions(key) if version.key == key and version.is_latest and not version.is_delete_marker]
     if existing:
+        refuse_null_version(existing[0])
         if sha256_of(store.get_version_bytes(existing[0], MANIFEST_LIMIT_BYTES)) != sha256:
             raise PublishRefused("the manifest key holds other content than its name says")
         return ManifestRef(store.bucket, key, existing[0].version_id, sha256)
-    version = store.put_object(key, data)
+    version = store.create_object(key, data)
+    refuse_null_version(version)
     if sha256_of(store.get_version_bytes(version, MANIFEST_LIMIT_BYTES)) != sha256:
         raise PublishRefused("the published manifest reads back with other content")
     return ManifestRef(store.bucket, key, version.version_id, sha256)
@@ -134,6 +141,8 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
     """Read the manifest version that the reference names and confirm it. Raise ``ManifestError`` for each way it cannot be trusted."""
     if reference.bucket != store.bucket:
         raise ManifestError("the manifest reference names another bucket than the one in use")
+    if reference.version_id in NULL_VERSION_IDS:
+        raise ManifestError("the manifest reference names a null version")
     if not reference.key.startswith(MANIFEST_PREFIX) or not reference.key.endswith(f"/{reference.sha256}.json"):
         raise ManifestError("the manifest key does not hold the SHA-256 of the reference")
     wanted = [version for version in store.list_versions(reference.key) if version.key == reference.key and version.version_id == reference.version_id]

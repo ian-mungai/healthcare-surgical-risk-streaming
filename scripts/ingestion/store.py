@@ -1,6 +1,7 @@
 """The object store the ingestion checks read and write, with object versions as the unit.
 
-``ObjectStore`` is what the checks need. ``S3Store`` implements it with the project's AWS helper, so the caller's own credentials and profile apply.
+``ObjectStore`` is what the checks need. ``S3Store`` implements it with the project's AWS helper, so the caller's own credentials and profile apply. A write
+checks that versioning is enabled and creates its key with ``If-None-Match: *``, so the command line's retry of a lost reply cannot add a second version.
 A payload is read in ranges of ``RANGE_BYTES`` into a temporary file and handed on in blocks of ``BLOCK_BYTES``, so a file of any size is never held whole.
 """
 
@@ -50,8 +51,12 @@ class ObjectStore(Protocol):
         """The whole of a small version. Raise ``StoreError`` when it is larger than ``limit`` bytes."""
         ...
 
-    def put_object(self, key: str, data: bytes) -> ObjectVersion:
-        """Write a new version of ``key`` and return it. Raise ``StoreError`` when the store gives the write no version ID."""
+    def create_object(self, key: str, data: bytes) -> ObjectVersion:
+        """Create the first version of ``key`` and return it, or return its current version when that already holds exactly ``data``.
+
+        Raise ``StoreError`` when versioning is not enabled, when the key holds other bytes or when the store gives the write no version ID. A second
+        call with the same arguments, also after a lost reply, never adds a version.
+        """
         ...
 
 
@@ -120,7 +125,10 @@ class S3Store:
                 raise StoreError(f"{version.key}: the reply wrote no data")
             return target.read_bytes()
 
-    def put_object(self, key: str, data: bytes) -> ObjectVersion:
+    def create_object(self, key: str, data: bytes) -> ObjectVersion:
+        status = (self.aws.call("s3api", "get-bucket-versioning", "--bucket", self.bucket, timeout=LIST_TIMEOUT_SECONDS) or {}).get("Status")
+        if status != "Enabled":
+            raise StoreError(f"{key}: versioning is not enabled on the bucket, so nothing was written")
         with tempfile.TemporaryDirectory(prefix="ingestion_put_") as scratch:
             source = Path(scratch) / "object"
             source.write_bytes(data)
@@ -135,12 +143,26 @@ class S3Store:
                 str(source),
                 "--content-type",
                 "application/json",
+                "--if-none-match",
+                "*",
+                missing=("PreconditionFailed",),
                 timeout=WRITE_TIMEOUT_SECONDS,
             )
-        version_id = reply.get("VersionId") if reply else None
+        if reply is None:
+            return self.existing_version(key, data)
+        version_id = reply.get("VersionId")
         if not version_id or version_id == "null":
             raise StoreError(f"{key}: the write returned no version ID; versioning is not enabled on the bucket")
         for version in self.list_versions(key):
             if version.key == key and version.version_id == version_id:
                 return version
         raise StoreError(f"{key}: the written version is not in the listing")
+
+    def existing_version(self, key: str, data: bytes) -> ObjectVersion:
+        """The current version of a key that refused the conditional write, once its bytes are confirmed to be ``data``: the write of an earlier try."""
+        current = [version for version in self.list_versions(key) if version.key == key and version.is_latest and not version.is_delete_marker]
+        if not current:
+            raise StoreError(f"{key}: the write was refused because the key exists, but no current version is listed")
+        if current[0].size != len(data) or self.get_version_bytes(current[0], len(data)) != data:
+            raise StoreError(f"{key}: the key already holds other content")
+        return current[0]

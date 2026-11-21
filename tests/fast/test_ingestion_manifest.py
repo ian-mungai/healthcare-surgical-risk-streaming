@@ -11,8 +11,19 @@ import unittest
 from dataclasses import replace
 from typing import Any
 
-from scripts.ingestion.check import CheckResult, Finding
-from scripts.ingestion.manifest import MANIFEST_PREFIX, PublishRefused, publish_manifest, read_manifest
+from scripts.ingestion.check import CheckResult, Finding, canonical
+from scripts.ingestion.gate import GateRefused, verify_before_read
+from scripts.ingestion.manifest import (
+    MANIFEST_PREFIX,
+    ManifestError,
+    ManifestRef,
+    PublishRefused,
+    build_document,
+    manifest_key,
+    publish_manifest,
+    read_manifest,
+)
+from scripts.ingestion.store import StoreError
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
 
 
@@ -182,10 +193,51 @@ class PublishTest(unittest.TestCase):
 class WriteTest(unittest.TestCase):
     def test_a_manifest_that_reads_back_with_other_content_is_refused(self) -> None:
         landed = landed_set()
-        put = landed.store.put_object
-        landed.store.put_object = lambda key, data: put(key, data + b" ") if key.startswith(MANIFEST_PREFIX) else put(key, data)  # type: ignore[method-assign]
+        create = landed.store.create_object
+        landed.store.create_object = lambda key, data: create(key, data + b" ")  # type: ignore[method-assign]
         with self.assertRaisesRegex(PublishRefused, "reads back with other content"):
             publish_manifest(landed.store, landed.selection, checked(landed))
+
+
+class NullVersionTest(unittest.TestCase):
+    def test_a_bucket_whose_versioning_is_off_is_refused_before_the_manifest_is_written(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        landed.store.versioned = False
+        with self.assertRaises(StoreError):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def null_manifest(self, landed: Landed) -> ManifestRef:
+        """A manifest written while versioning was off: its only version is the null version. Versioning is then on again."""
+        result = checked(landed)
+        data = canonical(build_document(landed.selection, result))
+        key = manifest_key(landed.selection.name, digest(data))
+        landed.store.versioned = False
+        version = landed.store.put_object(key, data)
+        landed.store.versioned = True
+        self.assertEqual("null", version.version_id)
+        return ManifestRef(landed.store.bucket, key, version.version_id, digest(data))
+
+    def test_a_manifest_that_exists_only_as_a_null_version_is_not_reused(self) -> None:
+        landed = landed_set()
+        self.null_manifest(landed)
+        with self.assertRaisesRegex(PublishRefused, "null version"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
+
+    def test_a_reference_to_a_null_version_is_not_read(self) -> None:
+        landed = landed_set()
+        reference = self.null_manifest(landed)
+        with self.assertRaisesRegex(ManifestError, "null version"):
+            read_manifest(landed.store, reference)
+        with self.assertRaisesRegex(GateRefused, "null version"):
+            verify_before_read(landed.store, reference)
+
+    def test_control_the_same_manifest_written_with_versioning_on_is_read(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        self.assertEqual(len(SOURCE), len(read_manifest(landed.store, reference).entries))
+        self.assertEqual(len(SOURCE), len(verify_before_read(landed.store, reference)))
 
 
 class RerunTest(unittest.TestCase):

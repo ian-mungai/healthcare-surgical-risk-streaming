@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from scripts.aws_cli import AwsError
 from scripts.ingestion.store import S3Store, StoreError
 
 
@@ -32,6 +33,8 @@ class StubAws:
     def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
         self.calls.append(arguments)
         name = arguments[1]
+        if name == "get-bucket-versioning":
+            return {"Status": "Enabled"}
         if name == "list-object-versions":
             return self.listing
         if name == "put-object":
@@ -47,6 +50,57 @@ class StubAws:
         if not self.omit_length:
             reply["ContentLength"] = len(piece)
         return reply
+
+
+class WriteStubAws:
+    """A bucket as the AWS command line meets it: versioned writes, the listing, the reads and a ``put-object`` that honours ``--if-none-match``.
+
+    ``lose_first_reply`` plays the lost reply: the first request is stored, its reply never arrives and the command line sends the same request again, as
+    it does by default. What the caller sees is the answer to that second request.
+    """
+
+    def __init__(self, versioning: str | None = "Enabled") -> None:
+        self.versioning = versioning
+        self.versions: dict[str, list[tuple[str, bytes]]] = {}
+        self.calls: list[tuple[str, ...]] = []
+        self.lose_first_reply = False
+
+    def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
+        self.calls.append(arguments)
+        name = arguments[1]
+        options = {arguments[index]: arguments[index + 1] for index in range(2, len(arguments) - 1) if arguments[index].startswith("--")}
+        if name == "get-bucket-versioning":
+            return {"Status": self.versioning} if self.versioning else {}
+        if name == "put-object":
+            return self.put(options, "--if-none-match" in arguments, missing)
+        if name == "list-object-versions":
+            found = [
+                {"Key": key, "VersionId": version, "IsLatest": position == len(items) - 1, "Size": len(data), "LastModified": "2026-01-01T00:00:00+00:00"}
+                for key, items in self.versions.items()
+                if key.startswith(options["--prefix"])
+                for position, (version, data) in enumerate(items)
+            ]
+            return {"Versions": found}
+        data = dict(self.versions[options["--key"]])[options["--version-id"]]
+        Path(arguments[-1]).write_bytes(data)
+        return {"VersionId": options["--version-id"], "ContentLength": len(data)}
+
+    def put(self, options: dict[str, str], conditional: bool, missing: Sequence[str]) -> Any:
+        reply: Any = None
+        for _ in range(2 if self.lose_first_reply else 1):
+            items = self.versions.setdefault(options["--key"], [])
+            if conditional and items:
+                if "PreconditionFailed" not in missing:
+                    raise AwsError("aws s3api put-object failed: PreconditionFailed")
+                reply = None
+                continue
+            version = f"v{sum(len(stored) for stored in self.versions.values()) + 1}"
+            items.append((version, Path(options["--body"]).read_bytes()))
+            reply = {"VersionId": version}
+        return reply
+
+    def stored(self, key: str) -> list[bytes]:
+        return [data for _, data in self.versions.get(key, [])]
 
 
 VERSIONS = {
@@ -84,15 +138,57 @@ class WriteTest(unittest.TestCase):
                 aws = StubAws(VERSIONS, {})
                 aws.put_reply = reply
                 with self.assertRaisesRegex(StoreError, "no version ID"):
-                    S3Store(aws, "example-bucket").put_object("manifests/x", b"{}")
+                    S3Store(aws, "example-bucket").create_object("manifests/x", b"{}")
 
     def test_a_write_returns_the_version_the_listing_shows_for_the_returned_id(self) -> None:
         aws = StubAws(VERSIONS, {})
         aws.put_reply = {"VersionId": "v2"}
         self.assertEqual(
             ("landing/a", "v2", 5),
-            (lambda version: (version.key, version.version_id, version.size))(S3Store(aws, "example-bucket").put_object("landing/a", b"12345")),
+            (lambda version: (version.key, version.version_id, version.size))(S3Store(aws, "example-bucket").create_object("landing/a", b"12345")),
         )
+
+
+class ConditionalWriteTest(unittest.TestCase):
+    KEY = "manifests/set/abc.json"
+
+    def test_control_a_write_makes_one_version_and_asks_for_it_only_when_the_key_is_new(self) -> None:
+        aws = WriteStubAws()
+        version = S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
+        self.assertEqual([b"{}"], aws.stored(self.KEY))
+        self.assertEqual(self.KEY, version.key)
+        put = next(call for call in aws.calls if call[1] == "put-object")
+        self.assertEqual("*", put[put.index("--if-none-match") + 1])
+
+    def test_a_lost_reply_that_the_command_line_retries_leaves_one_version_and_returns_it(self) -> None:
+        aws = WriteStubAws()
+        aws.lose_first_reply = True
+        version = S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
+        self.assertEqual([b"{}"], aws.stored(self.KEY))
+        self.assertEqual(aws.versions[self.KEY][0][0], version.version_id)
+
+    def test_a_key_that_already_holds_the_same_bytes_returns_its_version_and_writes_nothing_more(self) -> None:
+        aws = WriteStubAws()
+        store = S3Store(aws, "example-bucket")
+        first = store.create_object(self.KEY, b"{}")
+        self.assertEqual(first, store.create_object(self.KEY, b"{}"))
+        self.assertEqual([b"{}"], aws.stored(self.KEY))
+
+    def test_a_key_that_holds_other_bytes_is_refused_and_left_alone(self) -> None:
+        for other in (b"[]", b"{} "):
+            aws = WriteStubAws()
+            aws.versions[self.KEY] = [("v0", other)]
+            with self.subTest(other=other), self.assertRaisesRegex(StoreError, "other content"):
+                S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
+            self.assertEqual([other], aws.stored(self.KEY))
+
+    def test_a_bucket_whose_versioning_is_not_enabled_is_refused_before_anything_is_written(self) -> None:
+        for status in (None, "Suspended"):
+            aws = WriteStubAws(status)
+            with self.subTest(status=status), self.assertRaisesRegex(StoreError, "versioning is not enabled"):
+                S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
+            self.assertEqual([], [call for call in aws.calls if call[1] == "put-object"])
+            self.assertEqual({}, aws.versions)
 
 
 class TemporaryFileTest(unittest.TestCase):
