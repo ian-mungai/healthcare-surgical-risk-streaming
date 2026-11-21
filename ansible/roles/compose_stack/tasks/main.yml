@@ -1,7 +1,11 @@
-# Deploys the Compose stack: places the Compose files, renders the limits and host settings, creates any missing password file, starts the
-# stack with a bounded wait for health and makes the PostgreSQL accounts match the tool list. A second run changes nothing.
+# Deploys the Compose stack: places the Compose files, writes the gateway's settings, renders the limits and host settings, creates any missing password file
+# and checks it, prepares the secret store's first start, starts the stack with a bounded wait for health, makes the PostgreSQL accounts match the tool list
+# and then makes the secret store match the service list. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
+
+- name: Write the settings the gateway reads
+  ansible.builtin.include_tasks: caddy_host.yml
 
 - name: Render the memory limits and the host settings
   ansible.builtin.include_tasks: render_environment.yml
@@ -12,8 +16,18 @@
 - name: Check the password files
   ansible.builtin.include_tasks: verify_secrets.yml
 
+- name: Prepare the secret store's first start
+  ansible.builtin.include_role:
+    name: openbao
+    tasks_from: prepare.yml
+
 - name: Start the stack and wait for its health
   ansible.builtin.include_tasks: start.yml
 
 - name: Make the PostgreSQL accounts match the tool list
   ansible.builtin.include_tasks: provision.yml
+
+- name: Make the secret store match the service list
+  ansible.builtin.include_role:
+    name: openbao
+    tasks_from: bootstrap.yml

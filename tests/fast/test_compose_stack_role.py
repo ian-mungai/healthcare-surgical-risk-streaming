@@ -15,8 +15,10 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from scripts.stack.limits import load_limits, render_environment
+from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_support import ROLES, run_playbook
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,8 @@ def variables(folder: Path) -> dict[str, object]:
         "compose_stack_owner": OWNER,
         "compose_stack_group": GROUP,
         "compose_stack_postgres_port": 15432,
+        "openbao_port": 18200,
+        "unlock_key_file": str(folder / "unlock.env"),
         "secret_files_root_owner": f"{UID}:{GID}",
     }
 
@@ -75,7 +79,10 @@ class RenderTest(unittest.TestCase):
             again_code, again = run_tasks(["render_environment.yml"], variables(folder))
         self.assertEqual(0, code, output)
         self.assertEqual(render_environment(load_limits()), limits)
-        self.assertEqual(f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\n", host)
+        self.assertEqual(
+            f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n",
+            host,
+        )
         self.assertEqual(0, again_code, again)
         self.assertRegex(again, CHANGED_NONE)
 
@@ -83,6 +90,37 @@ class RenderTest(unittest.TestCase):
 def service_list(*, tool_group: int) -> str:
     """The service list: nessie runs as a user of its own, airbyte has none yet."""
     return f"nessie {UID}:{tool_group}\nairbyte\n"
+
+
+def step_order() -> list[str]:
+    """The steps of the role in the order they run: a task file by name, or a file of another role as ``role/file``."""
+    tasks: Any = load_yaml((ROLE / "tasks" / "main.yml").read_text())
+    steps: list[str] = []
+    for task in tasks:
+        if "ansible.builtin.include_tasks" in task:
+            steps.append(task["ansible.builtin.include_tasks"])
+        else:
+            role = task["ansible.builtin.include_role"]
+            steps.append(f"{role['name']}/{role['tasks_from']}")
+    return steps
+
+
+class StepOrderTest(unittest.TestCase):
+    def test_the_role_runs_each_slice_in_the_order_its_builder_gave(self) -> None:
+        self.assertEqual(
+            [
+                "place_files.yml",
+                "caddy_host.yml",
+                "render_environment.yml",
+                "passwords.yml",
+                "verify_secrets.yml",
+                "openbao/prepare.yml",
+                "start.yml",
+                "provision.yml",
+                "openbao/bootstrap.yml",
+            ],
+            step_order(),
+        )
 
 
 class PasswordFilesTest(unittest.TestCase):
