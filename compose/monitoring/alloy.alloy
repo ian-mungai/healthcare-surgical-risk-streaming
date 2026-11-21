@@ -1,0 +1,166 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+discovery.docker "stack" {
+  host             = "unix:///run/secrets/docker_socket"
+  refresh_interval = "5s"
+
+  filter {
+    name   = "label"
+    values = [string.format("com.docker.compose.project=%s", sys.env("COMPOSE_PROJECT_NAME"))]
+  }
+}
+
+discovery.relabel "stack" {
+  targets = discovery.docker.stack.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "stack" {
+  host       = "unix:///run/secrets/docker_socket"
+  targets    = discovery.relabel.stack.output
+  forward_to = [loki.write.loki.receiver]
+}
+
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+prometheus.exporter.unix "host" {
+  filesystem {
+    fs_types_exclude = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+  }
+}
+
+prometheus.exporter.cadvisor "containers" {
+  docker_host                  = "unix:///run/secrets/docker_socket"
+  containerd_host              = "/run/secrets/containerd_socket"
+  docker_only                  = true
+  enabled_metrics              = ["cpu", "cpuLoad", "memory", "diskIO", "oom_event"]
+  housekeeping_interval        = "10s"
+  allow_dynamic_housekeeping   = false
+}
+
+local.file "postgres_password" {
+  filename  = "/run/secrets/postgres_alloy_password"
+  is_secret = true
+}
+
+prometheus.exporter.postgres "postgres" {
+  enabled_collectors = ["database", "locks", "replication", "replication_slot", "roles", "stat_bgwriter", "stat_checkpointer", "stat_database", "stat_user_tables", "statio_user_tables"]
+  data_source_names = [string.format("postgresql://alloy:%s@postgres:5432/alloy?sslmode=disable", string.trim_space(convert.nonsensitive(local.file.postgres_password.content)))]
+}
+
+discovery.relabel "host" {
+  targets = prometheus.exporter.unix.host.targets
+
+  rule {
+    target_label = "instance"
+    replacement  = "host"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "host"
+  }
+}
+
+discovery.relabel "containers" {
+  targets = prometheus.exporter.cadvisor.containers.targets
+
+  rule {
+    target_label = "instance"
+    replacement  = "host"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "containers"
+  }
+}
+
+discovery.relabel "postgres" {
+  targets = prometheus.exporter.postgres.postgres.targets
+
+  rule {
+    target_label = "instance"
+    replacement  = "postgres:5432"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "postgres"
+  }
+}
+
+prometheus.scrape "host" {
+  job_name        = "host"
+  targets         = discovery.relabel.host.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.prometheus.receiver]
+}
+
+prometheus.scrape "containers" {
+  job_name        = "containers"
+  targets         = discovery.relabel.containers.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.relabel.containers.receiver]
+}
+
+prometheus.scrape "postgres" {
+  job_name        = "postgres"
+  targets         = discovery.relabel.postgres.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.prometheus.receiver]
+}
+
+prometheus.relabel "containers" {
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+
+  rule {
+    action        = "keep"
+    source_labels = ["name", "container_label_com_docker_compose_project"]
+    separator     = "|"
+    regex         = string.format("\\|.*|[^|]+\\|%s", sys.env("COMPOSE_PROJECT_NAME"))
+  }
+
+  rule {
+    source_labels = ["container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+
+  rule {
+    source_labels = ["container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    action = "labeldrop"
+    regex  = "container_label_.*"
+  }
+}
+
+prometheus.remote_write "prometheus" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}

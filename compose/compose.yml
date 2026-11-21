@@ -8,3 +8,7 @@ include:
   - services/dagster_code_location.yml
   - services/dagster_daemon.yml
   - services/dagster_webserver.yml
+  - services/prometheus.yml
+  - services/grafana.yml
+  - services/loki.yml
+  - services/alloy.yml

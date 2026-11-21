@@ -4,3 +4,4 @@
 nessie 10000:10001
 airbyte
 dagster 10001:10001
+alloy

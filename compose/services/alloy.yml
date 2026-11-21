@@ -1,0 +1,56 @@
+services:
+  alloy:
+    image: grafana/alloy:v1.22.0@sha256:f520f92be9ec37af83df426692d578411f039b0663e0456812c8f39015af8f8f
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_ALLOY:?render the limits first}
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/alloy_data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    environment:
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME}
+    cgroup: host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The fast tests allow no host path among the volumes, so the two runtime sockets are passed as files of Compose secrets. Both reach the host's container runtime.
+    secrets:
+      - postgres_alloy_password
+      - docker_socket
+      - containerd_socket
+    configs:
+      - source: alloy_config
+        target: /etc/alloy/config.alloy
+    volumes:
+      - alloy_data:/alloy_data
+    ports:
+      - 127.0.0.1:${ALLOY_HOST_PORT:-12345}:12345
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - exec 3<>/dev/tcp/127.0.0.1/12345 && printf 'GET /-/ready HTTP/1.0\r\n\r\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+secrets:
+  postgres_alloy_password:
+    file: ${SECRETS_DIR:?render the host settings first}/postgres/alloy.password
+  docker_socket:
+    file: /var/run/docker.sock
+  containerd_socket:
+    file: /run/containerd/containerd.sock
+
+configs:
+  alloy_config:
+    file: ../monitoring/alloy.alloy
+
+volumes:
+  alloy_data:

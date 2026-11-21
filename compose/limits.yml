@@ -29,3 +29,19 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 768
+  prometheus:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  grafana:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 512
+  loki:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768
+  alloy:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 768

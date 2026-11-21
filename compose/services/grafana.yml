@@ -1,0 +1,47 @@
+services:
+  grafana:
+    image: grafana/grafana:13.3.1@sha256:1c88285f1dd391a62232c010e6c224846e6a73bdc583b3365be2eba614b7919e
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_GRAFANA:?render the limits first}
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+    secrets:
+      - grafana_admin_password
+    configs:
+      - source: grafana_datasources
+        target: /etc/grafana/provisioning/datasources/datasources.yml
+      - source: grafana_dashboard_provider
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+      - source: grafana_dashboard_service_memory
+        target: /etc/grafana/dashboards/service_memory.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - 127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000
+    healthcheck:
+      test: [CMD, curl, -fsS, "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+secrets:
+  grafana_admin_password:
+    file: ${SECRETS_DIR:?render the host settings first}/grafana/admin.password
+
+configs:
+  grafana_datasources:
+    file: ../monitoring/grafana/datasources.yml
+  grafana_dashboard_provider:
+    file: ../monitoring/grafana/dashboards.yml
+  grafana_dashboard_service_memory:
+    file: ../monitoring/grafana/dashboards/service_memory.json
+
+volumes:
+  grafana_data:
