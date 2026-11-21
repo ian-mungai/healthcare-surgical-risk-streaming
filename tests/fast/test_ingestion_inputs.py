@@ -5,7 +5,9 @@ The files are the selection, the pairing records, the check result, the manifest
 
 from __future__ import annotations
 
+import functools
 import json
+import operator
 import os
 import stat
 import tempfile
@@ -19,6 +21,7 @@ from scripts.ingestion.cli import CLI_ERRORS, InputError, read_input, write_priv
 from scripts.ingestion.landing import PairingError, load_pairing_records
 from scripts.ingestion.manifest import ManifestError, ManifestRef, publish_manifest, read_manifest
 from scripts.ingestion.selection import Selection, SelectionError
+from scripts.sample.candidates import CREDIT_FIELDS, FILE_PIN_FIELDS, RELEASE_FIELDS, SOURCE_FIELDS, TRACK_LIST_FIELDS
 from scripts.sample.publisher import TRACK_LIST_COLUMNS
 from tests.fast.ingestion_support import SOURCE_PREFIX, digest, landed_set
 
@@ -210,9 +213,10 @@ class FrozenAuthorityTest(unittest.TestCase):
     """A field set that closes an input, and a manifest a reader holds, cannot be changed by the code that holds them."""
 
     def test_the_field_sets_of_the_closed_inputs_cannot_be_changed(self) -> None:
-        fields: Any = CHECKED_FILE_FIELDS
+        field_sets: tuple[Any, ...] = (CHECKED_FILE_FIELDS, RELEASE_FIELDS, SOURCE_FIELDS, FILE_PIN_FIELDS, TRACK_LIST_FIELDS, CREDIT_FIELDS)
         columns: Any = TRACK_LIST_COLUMNS
-        edits: tuple[Callable[[], object], ...] = (lambda: fields.__setitem__("size", object), lambda: columns.append("extra"))
+        edits: list[Callable[[], object]] = [functools.partial(operator.setitem, fields, "size_bytes", object) for fields in field_sets]
+        edits.append(functools.partial(operator.iadd, columns, ["extra"]))
         for number, edit in enumerate(edits):
             with self.subTest(edit=number), self.assertRaises((TypeError, AttributeError)):
                 edit()

@@ -22,9 +22,10 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from scripts.ingestion.closed import QuietParser, parse_json
@@ -56,6 +57,11 @@ ARTERIAL_TRACK = "SNUADC/ART"
 CLINICAL_KEY = f"{RELEASE_PREFIX}clinical_data.csv"
 HEADER = ("case", "patient", "key", "size_bytes", "sha256", "arterial_waveform", "slot")
 INTEGER = re.compile(r"[0-9]+")
+RELEASE_FIELDS: Mapping[str, type] = MappingProxyType({"source": dict, "checksum_list": dict, "tables": list, "track_list": dict, "credit": dict})
+SOURCE_FIELDS: Mapping[str, type] = MappingProxyType({"bucket": str, "region": str, "release_path": str, "page": str})
+FILE_PIN_FIELDS: Mapping[str, type] = MappingProxyType({"key": str, "size_bytes": int, "sha256": str})
+TRACK_LIST_FIELDS: Mapping[str, type] = MappingProxyType({"url": str, "size_bytes": int, "sha256": str})
+CREDIT_FIELDS: Mapping[str, type] = MappingProxyType({"citation": str, "source": str, "licence": str, "changes": str})
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,23 @@ def case_key(case: int) -> str:
     return f"{CASE_PREFIX}{case:04d}.vital"
 
 
+def read_text(path: Path, role: str) -> str:
+    """The text of a file the command reads. Raise ``PublisherError`` that names the file by its role, never by its path."""
+    try:
+        return path.read_text()
+    except OSError, UnicodeDecodeError:
+        raise PublisherError(f"cannot read {role}") from None
+
+
+def shape_problems(label: str, value: Any, fields: Mapping[str, type]) -> list[str]:
+    """The problem of an object that must hold exactly ``fields``, each of exactly its type. Names the object only, never a field it holds or a value."""
+    if value is None:
+        return [f"{label}: missing"]
+    if type(value) is not dict or set(value) != set(fields) or any(type(value[name]) is not kind for name, kind in fields.items()):
+        return [f"{label}: must be an object with exactly the fields {', '.join(sorted(fields))}, each of its type"]
+    return []
+
+
 def format_candidates(candidates: Sequence[Candidate]) -> str:
     lines = ["\t".join(HEADER)]
     for item in candidates:
@@ -113,15 +136,15 @@ def format_candidates(candidates: Sequence[Candidate]) -> str:
 
 
 def read_candidates(path: Path) -> list[Candidate]:
-    """Read the tracked candidate file. A malformed line is an error that names the line."""
-    lines = path.read_text().splitlines()
+    """Read the tracked candidate file. A malformed line is an error that names the line by its number, never the file by its path."""
+    lines = read_text(path, "the candidate file").splitlines()
     if not lines or tuple(lines[0].split("\t")) != HEADER:
-        raise ValueError(f"{path.name}: the first line is not the header {HEADER}")
+        raise ValueError(f"the candidate file: the first line is not the header {HEADER}")
     candidates = []
     for number, line in enumerate(lines[1:], 2):
         fields = line.split("\t")
         if len(fields) != len(HEADER) or fields[5] not in ("true", "false") or not all(INTEGER.fullmatch(fields[position]) for position in (0, 1, 3)):
-            raise ValueError(f"{path.name}:{number}: not a candidate line")
+            raise ValueError(f"the candidate file, line {number}: not a candidate line")
         candidates.append(Candidate(int(fields[0]), int(fields[1]), fields[2], int(fields[3]), fields[4], fields[5] == "true", fields[6]))
     return candidates
 
@@ -145,23 +168,25 @@ def candidate_problems(candidates: Sequence[Candidate]) -> list[str]:
     return problems
 
 
-def pin_problems(label: str, pin: Any, *, key: bool) -> list[str]:
-    if not isinstance(pin, dict):
-        return [f"{label}: missing"]
-    problems = []
-    if key and not str(pin.get("key", "")).startswith(RELEASE_PREFIX):
+def pin_problems(label: str, pin: Any, fields: Mapping[str, type]) -> list[str]:
+    """The problems of a pinned file: its shape first, then a key outside the release, a checksum that is not 64 hex digits and a size that is not positive."""
+    problems = shape_problems(label, pin, fields)
+    if problems:
+        return problems
+    if "key" in fields and not pin["key"].startswith(RELEASE_PREFIX):
         problems.append(f"{label}: the key is outside the release path {RELEASE_PREFIX}")
-    if SHA256.fullmatch(str(pin.get("sha256", ""))) is None:
+    if SHA256.fullmatch(pin["sha256"]) is None:
         problems.append(f"{label}: checksum is not 64 hex characters in lower case")
-    if type(pin.get("size_bytes")) is not int or pin["size_bytes"] <= 0:
+    if pin["size_bytes"] <= 0:
         problems.append(f"{label}: size is not a positive number")
     return problems
 
 
 def source_problems(source: Any) -> list[str]:
     """The pin names the bucket, region and release path that every read of this package uses, and no others."""
-    if not isinstance(source, dict):
-        return ["source: missing"]
+    shape = shape_problems("source", source, SOURCE_FIELDS)
+    if shape:
+        return shape
     return [
         f"source: the {name} must be {used}"
         for name, used in (("bucket", BUCKET), ("region", REGION), ("release_path", RELEASE_PREFIX))
@@ -170,26 +195,30 @@ def source_problems(source: Any) -> list[str]:
 
 
 def release_problems(release: dict[str, Any]) -> list[str]:
-    """The problems in the form of the release pin: the checksum list, the two tables and the track list. The pin names exactly the files the code reads."""
-    if not isinstance(release, dict):
+    """The problems in the form of the release pin: the checksum list, the two tables and the track list. The pin names exactly the files the code reads.
+
+    The pin is closed: each object holds exactly its known fields, each of its type. A problem names the object, never a field it holds or a value.
+    """
+    if type(release) is not dict:
         return ["release pin: not a JSON object"]
-    problems = source_problems(release.get("source"))
-    problems += pin_problems("checksum_list", release.get("checksum_list"), key=True)
-    if isinstance(release.get("checksum_list"), dict) and release["checksum_list"].get("key") != CHECKSUM_LIST_KEY:
+    problems = [] if set(release) == set(RELEASE_FIELDS) else [f"release pin: must have exactly the fields {', '.join(sorted(RELEASE_FIELDS))}"]
+    problems += source_problems(release.get("source"))
+    problems += pin_problems("checksum_list", release.get("checksum_list"), FILE_PIN_FIELDS)
+    if not shape_problems("checksum_list", release.get("checksum_list"), FILE_PIN_FIELDS) and release["checksum_list"]["key"] != CHECKSUM_LIST_KEY:
         problems.append(f"checksum_list: the key must be {CHECKSUM_LIST_KEY}")
     tables = release.get("tables")
-    if not isinstance(tables, list):
+    if type(tables) is not list:
         problems.append("tables: not a list")
         tables = []
-    keys = {table.get("key") for table in tables if isinstance(table, dict)}
-    if len(tables) != 2 or keys != {CLINICAL_KEY, f"{RELEASE_PREFIX}lab_data.csv"}:
-        problems.append("tables: the pin must name clinical_data.csv and lab_data.csv of the release once each")
     for position, table in enumerate(tables):
-        problems += pin_problems(f"tables[{position}]", table, key=True)
-    problems += pin_problems("track_list", release.get("track_list"), key=False)
-    if isinstance(release.get("track_list"), dict) and release["track_list"].get("url") != TRACK_LIST_URL:
+        problems += pin_problems(f"tables[{position}]", table, FILE_PIN_FIELDS)
+    keys = sorted(table["key"] for table in tables if not shape_problems("table", table, FILE_PIN_FIELDS))
+    if len(tables) != 2 or keys != sorted((CLINICAL_KEY, f"{RELEASE_PREFIX}lab_data.csv")):
+        problems.append("tables: the pin must name clinical_data.csv and lab_data.csv of the release once each")
+    problems += pin_problems("track_list", release.get("track_list"), TRACK_LIST_FIELDS)
+    if not shape_problems("track_list", release.get("track_list"), TRACK_LIST_FIELDS) and release["track_list"]["url"] != TRACK_LIST_URL:
         problems.append(f"track_list: the address must be {TRACK_LIST_URL}")
-    return problems
+    return problems + shape_problems("credit", release.get("credit"), CREDIT_FIELDS)
 
 
 def select_candidates(facts: Sequence[CaseFacts]) -> list[Candidate]:
@@ -298,7 +327,7 @@ def difference_problems(tracked: Sequence[Candidate], rebuilt: Sequence[Candidat
 
 
 def rebuild(release_path: Path) -> tuple[list[Candidate], dict[str, str], dict[str, int]]:
-    release = parse_json(release_path.read_text(), "the release pin")
+    release = parse_json(read_text(release_path, "the release pin"), "the release pin")
     problems = release_problems(release)
     if problems:
         raise PublisherError("; ".join(problems))
@@ -325,15 +354,18 @@ def main() -> int:
     parser.add_argument("--candidates", type=Path, default=CANDIDATES_FILE, help="check: the tracked candidate file")
     parser.add_argument("--output", type=Path, help="build: where to write the candidate file")
     args = parser.parse_args()
+    if args.command == "build" and args.output is None:
+        raise SystemExit("build needs --output")
     try:
+        tracked = read_candidates(args.candidates) if args.command == "check" else []
         candidates, sums, sizes = rebuild(args.release)
         if args.command == "build":
-            if args.output is None:
-                raise SystemExit("build needs --output")
-            args.output.write_text(format_candidates(candidates))
+            try:
+                args.output.write_text(format_candidates(candidates))
+            except OSError:
+                raise PublisherError("cannot write the candidate file") from None
             sys.stdout.write(f"wrote {len(candidates)} candidates; the checksum list, the clinical table and the track list match their pins\n")
             return 0
-        tracked = read_candidates(args.candidates)
         problems = candidate_problems(tracked) + listing_problems(tracked, sums, sizes) + difference_problems(tracked, candidates)
     except (PublisherError, ValueError) as error:
         sys.stderr.write(f"fixed sample: {error}\n")

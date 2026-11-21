@@ -23,6 +23,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from scripts.process import CompletedProcess, TimeoutExpired
@@ -285,7 +286,7 @@ class QuietMessages(unittest.TestCase):
             path.write_text("\t".join(candidates.HEADER) + "\n" + "\t".join(fields) + "\n")
             with self.assertRaises(ValueError) as caught:
                 read_candidates(path)
-        self.assertIn(":2", str(caught.exception))
+        self.assertIn("line 2", str(caught.exception))
         self.assertNotIn(self.MARKER, str(caught.exception))
 
     def test_no_size_problem_shows_the_size(self) -> None:
@@ -364,6 +365,55 @@ class QuietMessages(unittest.TestCase):
                 candidates.rebuild(pin)
         self.assertNotIn("tables", str(caught.exception))
 
+    def test_an_absent_or_unreadable_input_is_reported_by_its_role_without_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            private = Path(folder) / self.MARKER
+            private.mkdir()
+            undecodable = private / "release.json"
+            undecodable.write_bytes(b"\xff\xfe")
+            for arguments in (["check", "--release", str(private / "absent.json")], ["check", "--release", str(undecodable)]):
+                errors = io.StringIO()
+                with self.subTest(arguments=arguments[-1]), mock.patch("sys.argv", ["candidates", *arguments]), contextlib.redirect_stderr(errors):
+                    self.assertEqual(1, candidates.main())
+                self.assertIn("cannot read the release pin", errors.getvalue())
+                self.assertNotIn(self.MARKER, errors.getvalue())
+            errors = io.StringIO()
+            arguments = ["candidates", "check", "--candidates", str(private / "absent.tsv")]
+            with (
+                mock.patch.object(candidates, "rebuild", side_effect=AssertionError("a read started")),
+                mock.patch("sys.argv", arguments),
+                contextlib.redirect_stderr(errors),
+            ):
+                self.assertEqual(1, candidates.main())
+            self.assertIn("cannot read the candidate file", errors.getvalue())
+            self.assertNotIn(self.MARKER, errors.getvalue())
+
+    def test_a_build_whose_output_cannot_be_written_is_reported_by_its_role(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            blocked = Path(folder) / self.MARKER
+            blocked.write_text("a file where a folder must be")
+            errors = io.StringIO()
+            with (
+                mock.patch.object(candidates, "rebuild", return_value=(read_candidates(CANDIDATES_FILE), {}, {})),
+                mock.patch("sys.argv", ["candidates", "build", "--output", str(blocked / "candidates.tsv")]),
+                contextlib.redirect_stderr(errors),
+            ):
+                self.assertEqual(1, candidates.main())
+        self.assertIn("cannot write the candidate file", errors.getvalue())
+        self.assertNotIn(self.MARKER, errors.getvalue())
+
+    def test_a_pin_whose_table_key_is_no_text_is_reported_and_not_raised(self) -> None:
+        keys: tuple[Any, ...] = ([], {}, [self.MARKER], 5, None)
+        for key in keys:
+            pin = json.loads(Path(RELEASE_FILE).read_text())
+            pin["tables"][0]["key"] = key
+            with self.subTest(key=key):
+                code, errors = self.run_command(pin)
+                self.assertEqual(1, code)
+                self.assertIn("tables[0]", errors)
+                self.assertNotIn(self.MARKER, errors)
+                self.assertNotIn("Traceback", errors)
+
     def test_the_command_reports_a_pin_that_is_not_valid_json_without_echoing_it(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             pin = Path(folder) / "release.json"
@@ -372,6 +422,40 @@ class QuietMessages(unittest.TestCase):
             with mock.patch("sys.argv", ["candidates", "check", "--release", str(pin)]), contextlib.redirect_stderr(errors):
                 self.assertEqual(1, candidates.main())
         self.assertNotIn(self.MARKER, errors.getvalue())
+
+
+class ClosedPinFields(unittest.TestCase):
+    """The release pin is closed: each object holds exactly its known fields, each of its type. A problem names the object, never a field's name or value."""
+
+    MARKER = "private-value"
+
+    def changed(self, change: Callable[[dict[str, Any]], None]) -> list[str]:
+        pin: dict[str, Any] = json.loads(Path(RELEASE_FILE).read_text())
+        change(pin)
+        return release_problems(pin)
+
+    def test_control_the_tracked_pin_is_closed(self) -> None:
+        self.assertEqual([], self.changed(lambda pin: None))
+
+    def test_an_unknown_missing_or_mistyped_field_is_a_problem_of_its_object(self) -> None:
+        changes: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {
+            "unknown top field": (lambda pin: pin.update({self.MARKER: 1}), "release pin"),
+            "unknown source field": (lambda pin: pin["source"].update({self.MARKER: 1}), "source"),
+            "source page missing": (lambda pin: pin["source"].pop("page"), "source"),
+            "unknown list field": (lambda pin: pin["checksum_list"].update({self.MARKER: 1}), "checksum_list"),
+            "unknown table field": (lambda pin: pin["tables"][1].update({self.MARKER: 1}), "tables[1]"),
+            "table size as text": (lambda pin: pin["tables"][0].update(size_bytes="1"), "tables[0]"),
+            "unknown track list field": (lambda pin: pin["track_list"].update({self.MARKER: 1}), "track_list"),
+            "track list address as a list": (lambda pin: pin["track_list"].update(url=[self.MARKER]), "track_list"),
+            "credit missing": (lambda pin: pin.pop("credit"), "credit"),
+            "unknown credit field": (lambda pin: pin["credit"].update({self.MARKER: 1}), "credit"),
+            "credit as text": (lambda pin: pin.update(credit=self.MARKER), "credit"),
+        }
+        for name, (change, label) in changes.items():
+            with self.subTest(name):
+                problems = self.changed(change)
+                self.assertTrue(any(problem.startswith(label) for problem in problems), problems)
+                self.assertNotIn(self.MARKER, " ".join(problems))
 
 
 if __name__ == "__main__":
