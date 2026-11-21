@@ -9,3 +9,7 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 1024
+  openbao:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 512

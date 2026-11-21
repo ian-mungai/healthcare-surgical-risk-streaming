@@ -1,0 +1,7 @@
+# Run before the stack starts. Reads openbao_secrets_directory, openbao_unlock_key_file and openbao_user. Creates only the missing admin secret ID file and prints no secret.
+- name: Create the admin secret ID file that OpenBao reads at its first start
+  openbao_bootstrap:
+    step: prepare
+    secrets_directory: "{{ openbao_secrets_directory }}"
+    unlock_key_file: "{{ openbao_unlock_key_file }}"
+    file_owner: "{{ openbao_user }}"

@@ -1,0 +1,12 @@
+# Run after the stack is healthy. Reads openbao_services_file, openbao_tools_file, openbao_address and the token lifetimes. Prints no secret.
+- name: Make OpenBao match the service list
+  openbao_bootstrap:
+    step: reconcile
+    secrets_directory: "{{ openbao_secrets_directory }}"
+    services_file: "{{ openbao_services_file }}"
+    tools_file: "{{ openbao_tools_file }}"
+    address: "{{ openbao_address }}"
+    ready_deadline_seconds: "{{ openbao_ready_deadline_seconds | int }}"
+    token_ttl_seconds: "{{ openbao_token_ttl_seconds | int }}"
+    token_max_ttl_seconds: "{{ openbao_token_max_ttl_seconds | int }}"
+  timeout: "{{ (openbao_ready_deadline_seconds | int) + 120 }}"

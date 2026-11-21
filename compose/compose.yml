@@ -2,4 +2,5 @@
 name: surgical_risk
 include:
   - services/nessie.yml
+  - services/openbao.yml
   - services/postgres.yml
