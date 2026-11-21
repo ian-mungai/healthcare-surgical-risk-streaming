@@ -11,7 +11,7 @@ import unittest
 from dataclasses import replace
 from typing import Any
 
-from scripts.ingestion.check import CheckedFile, CheckResult, Finding, canonical
+from scripts.ingestion.check import CheckedFile, CheckResult, Finding, canonical, result_digest
 from scripts.ingestion.gate import GateRefused, verify_before_read
 from scripts.ingestion.manifest import (
     MANIFEST_PREFIX,
@@ -302,6 +302,52 @@ class RerunTest(unittest.TestCase):
         with self.assertRaisesRegex(PublishRefused, "holds other content"):
             publish_manifest(landed.store, landed.selection, checked(landed))
         self.assertEqual(2, len(landed.store.list_versions(first.key)))
+
+
+class FormatTest(unittest.TestCase):
+    """The manifest names its format. A manifest of the earlier format, or of this shape under the earlier tag, is refused with the step that replaces it."""
+
+    def stored(self, landed: Landed, document: dict[str, Any]) -> ManifestRef:
+        data = canonical(document)
+        key = manifest_key(landed.selection.name, digest(data))
+        return ManifestRef(landed.store.bucket, key, landed.store.put_object(key, data).version_id, digest(data))
+
+    def earlier(self, landed: Landed) -> dict[str, Any]:
+        """A manifest as the earlier format wrote it: no selection digest, and a check digest over the digest of the keys."""
+        document = build_document(landed.selection, checked(landed))
+        del document["selection"]["selection_sha256"]
+        document["format"] = "landing_manifest_1"
+        document["check_result_sha256"] = result_digest(landed.selection.keys_sha256, landed.selection.checksum_list_sha256, document["entries"])
+        return document
+
+    def test_control_a_published_manifest_names_the_current_format_and_is_read(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        document = json.loads(landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7))
+        self.assertEqual("landing_manifest_2", document["format"])
+        self.assertEqual(len(SOURCE), len(read_manifest(landed.store, reference).entries))
+
+    def test_a_manifest_of_the_earlier_format_is_refused_with_the_advice_to_rerun_check_and_publish(self) -> None:
+        landed = landed_set()
+        reference = self.stored(landed, self.earlier(landed))
+        with self.assertRaisesRegex(ManifestError, "earlier format.*rerun check and publish"):
+            read_manifest(landed.store, reference)
+        with self.assertRaisesRegex(GateRefused, "rerun check and publish"):
+            verify_before_read(landed.store, reference)
+
+    def test_a_manifest_of_this_shape_under_the_earlier_tag_is_refused(self) -> None:
+        landed = landed_set()
+        document = build_document(landed.selection, checked(landed))
+        document["format"] = "landing_manifest_1"
+        with self.assertRaisesRegex(ManifestError, "rerun check and publish"):
+            read_manifest(landed.store, self.stored(landed, document))
+
+    def test_a_manifest_of_an_unknown_format_is_refused(self) -> None:
+        landed = landed_set()
+        document = build_document(landed.selection, checked(landed))
+        document["format"] = "landing_manifest_9"
+        with self.assertRaisesRegex(ManifestError, "not a passed manifest of this format"):
+            read_manifest(landed.store, self.stored(landed, document))
 
 
 if __name__ == "__main__":

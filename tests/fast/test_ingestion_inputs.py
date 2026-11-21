@@ -183,6 +183,15 @@ class ResultInputTest(unittest.TestCase):
             with self.subTest(change=number), self.assertRaises(ResultFormatError):
                 CheckResult.from_json(edited(self.document(), change))
 
+    def test_a_result_names_its_format_and_one_of_an_earlier_check_is_refused_with_the_advice_to_rerun_check(self) -> None:
+        self.assertEqual("check_result_2", self.document().get("format"))
+        earlier = self.document()
+        earlier.pop("format", None)
+        with self.assertRaisesRegex(ResultFormatError, "rerun check"):
+            CheckResult.from_json(json.dumps(earlier))
+        with self.assertRaisesRegex(ResultFormatError, "rerun check"):
+            CheckResult.from_json(json.dumps(earlier | {"format": "check_result_1"}))
+
     def test_text_that_is_not_json_is_refused_without_echoing_it(self) -> None:
         with self.assertRaises(ResultFormatError) as raised:
             CheckResult.from_json("private-value")

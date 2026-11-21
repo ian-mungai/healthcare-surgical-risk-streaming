@@ -5,6 +5,8 @@ object version (bucket, key and non-null version ID), its SHA-256, its source ke
 time S3 gave that version. The selection, the measurement period, the pinned checksum list and the digest of the check result are recorded once. The
 check result is bound to the SHA-256 of every field of the selection, so a publication with any other source, release, period or list key is refused.
 
+Its ``format`` names the shape. A manifest of an earlier format is refused with the step that replaces it: rerun check and publish.
+
 Where it lives: under ``manifests/<selection name>/<SHA-256 of its content>.json`` in the project's bucket, outside the payload prefix, as its own
 object version. The key holds the content's digest, so the same content has the same key and a rerun adds no version. A reader holds a
 ``ManifestRef`` (bucket, key, version ID, SHA-256) and confirms three things: the version's bytes hash to the reference's SHA-256, the key ends
@@ -26,7 +28,8 @@ from scripts.ingestion.selection import Selection
 from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, StoreError
 
 MANIFEST_PREFIX = "manifests/"
-MANIFEST_FORMAT = "landing_manifest_1"
+MANIFEST_FORMAT = "landing_manifest_2"
+EARLIER_MANIFEST_FORMATS = ("landing_manifest_1",)
 MANIFEST_LIMIT_BYTES = 32 * 1024 * 1024
 
 
@@ -158,8 +161,11 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
     if sha256_of(data) != reference.sha256:
         raise ManifestError("the manifest's SHA-256 differs from its reference")
     try:
+        parsed = parse_json(data, "the manifest")
+        if type(parsed) is dict and parsed.get("format") in EARLIER_MANIFEST_FORMATS:
+            raise ManifestError("the manifest is of an earlier format that this code does not read; rerun check and publish to make one of this format")
         document = closed_object(
-            parse_json(data, "the manifest"),
+            parsed,
             {"format": str, "status": str, "measurement_period": str, "selection": dict, "checksum_list": dict, "check_result_sha256": str, "entries": list},
             "the manifest",
         )

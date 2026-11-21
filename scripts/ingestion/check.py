@@ -30,6 +30,7 @@ PAIRING_SIZE_DIFFERS = "pairing_size_differs"
 CHECKSUM_DIFFERS = "checksum_differs"
 NOT_IN_CHECKSUM_LIST = "not_in_checksum_list"
 NULL_VERSION_ID = "null_version_id"
+RESULT_FORMAT = "check_result_2"
 
 
 class PinnedListError(ValueError):
@@ -113,6 +114,7 @@ class CheckResult:
 
     def to_json(self) -> str:
         document = {
+            "format": RESULT_FORMAT,
             "selection_name": self.selection_name,
             "selection_sha256": self.selection_sha256,
             "list_sha256": self.list_sha256,
@@ -126,9 +128,21 @@ class CheckResult:
     @classmethod
     def from_json(cls, text: str) -> CheckResult:
         try:
+            parsed = parse_json(text, "the check result")
+            if type(parsed) is dict and parsed.get("format") != RESULT_FORMAT:
+                raise ResultFormatError("the check result is not of this format: an earlier check wrote it; rerun check to write one of this format")
             document = closed_object(
-                parse_json(text, "the check result"),
-                {"selection_name": str, "selection_sha256": str, "list_sha256": str, "file_count": int, "files": list, "findings": list, "result_sha256": str},
+                parsed,
+                {
+                    "format": str,
+                    "selection_name": str,
+                    "selection_sha256": str,
+                    "list_sha256": str,
+                    "file_count": int,
+                    "files": list,
+                    "findings": list,
+                    "result_sha256": str,
+                },
                 "the check result",
             )
             findings = [
