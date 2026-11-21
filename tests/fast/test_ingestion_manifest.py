@@ -134,9 +134,18 @@ class PublishTest(unittest.TestCase):
         landed = landed_set()
         result = checked(landed)
         landed.store.put_delete_marker(landed.key_for(SOURCE_PREFIX + "clinical_data.csv"))
-        with self.assertRaisesRegex(PublishRefused, "clinical_data.csv"):
+        with self.assertRaisesRegex(PublishRefused, "clinical_data.csv: no longer present after the check"):
             publish_manifest(landed.store, landed.selection, result)
         self.assertEqual([], manifest_objects(landed))
+
+
+class WriteTest(unittest.TestCase):
+    def test_a_manifest_that_reads_back_with_other_content_is_refused(self) -> None:
+        landed = landed_set()
+        put = landed.store.put_object
+        landed.store.put_object = lambda key, data: put(key, data + b" ") if key.startswith(MANIFEST_PREFIX) else put(key, data)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(PublishRefused, "reads back with other content"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
 
 
 class RerunTest(unittest.TestCase):

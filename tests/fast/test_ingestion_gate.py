@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
+from scripts.ingestion.check import result_digest
 from scripts.ingestion.gate import GateRefused, verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.manifest import MANIFEST_PREFIX, ManifestRef, publish_manifest
@@ -19,6 +22,17 @@ WANTED = [SOURCE_PREFIX + "vital_files/0001.vital", SOURCE_PREFIX + "clinical_da
 
 def published(landed: Landed) -> ManifestRef:
     return publish_manifest(landed.store, landed.selection, landed.check())
+
+
+def forged(landed: Landed, reference: ManifestRef, change: Callable[[dict[str, Any]], None], *, consistent: bool) -> ManifestRef:
+    """Publish an edited copy of the manifest under the key of its own SHA-256. With ``consistent`` the check digest is recomputed from the edited entries."""
+    document = json.loads(landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7))
+    change(document)
+    if consistent:
+        document["check_result_sha256"] = result_digest(document["selection"]["keys_sha256"], document["checksum_list"]["sha256"], document["entries"])
+    data = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    key = f"{MANIFEST_PREFIX}probe_set/{digest(data)}.json"
+    return ManifestRef(reference.bucket, key, landed.store.put_object(key, data).version_id, digest(data))
 
 
 def problems(landed: Landed, reference: ManifestRef, wanted: list[str] | None = None) -> dict[str, str]:
@@ -117,6 +131,53 @@ class GateTest(unittest.TestCase):
             version = edited.store.put_object(key, data)
             with self.subTest(expected=expected), self.assertRaisesRegex(GateRefused, expected):
                 verify_before_read(edited.store, ManifestRef(reference.bucket, key, version.version_id, digest(data)), WANTED)
+
+    def test_a_manifest_whose_entries_were_edited_after_the_check_is_refused(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+
+        def other_time(document: dict[str, Any]) -> None:
+            document["entries"][0]["retrieved_utc"] = "2030-01-01T00:00:00Z"
+
+        with self.assertRaisesRegex(GateRefused, "do not match the digest of the check"):
+            verify_before_read(landed.store, forged(landed, reference, other_time, consistent=False), WANTED)
+        self.assertTrue(verify_before_read(landed.store, forged(landed, reference, other_time, consistent=True), None))
+
+    def test_a_manifest_that_binds_another_bucket_is_refused_for_that_key(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+
+        def other_bucket(document: dict[str, Any]) -> None:
+            document["entries"][0]["bucket"] = "another-bucket"
+
+        edited = forged(landed, reference, other_bucket, consistent=True)
+        with self.assertRaises(GateRefused) as raised:
+            verify_before_read(landed.store, edited)
+        self.assertEqual(["bucket_differs"], [problem.cause for problem in raised.exception.problems])
+
+    def test_a_manifest_object_that_does_not_hash_to_its_reference_is_refused(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        substitute = landed.store.put_object(reference.key, b'{"status":"passed"}')
+        with self.assertRaisesRegex(GateRefused, "SHA-256 differs from its reference"):
+            verify_before_read(landed.store, replace(reference, version_id=substitute.version_id), WANTED)
+
+    def test_a_reference_whose_key_does_not_end_with_its_sha256_is_refused(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        data = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        key = f"{MANIFEST_PREFIX}probe_set/{'0' * 64}.json"
+        copy = landed.store.put_object(key, data)
+        with self.assertRaisesRegex(GateRefused, "does not hold the SHA-256"):
+            verify_before_read(landed.store, replace(reference, key=key, version_id=copy.version_id), WANTED)
+
+    def test_a_bound_version_removed_while_another_is_current_is_refused_as_missing(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        bound = landed.versions["clinical_data.csv"].version_id
+        landed.land("clinical_data.csv", b"caseid,age\n1,61\n")
+        landed.store.remove_version(landed.key_for(WANTED[1]), bound)
+        self.assertEqual({WANTED[1]: "missing"}, problems(landed, reference, WANTED))
 
     def test_a_size_that_differs_from_the_bound_size_is_refused(self) -> None:
         landed = landed_set()

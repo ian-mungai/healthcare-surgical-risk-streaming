@@ -23,12 +23,15 @@ class StubAws:
         self.payloads = payloads
         self.calls: list[tuple[str, ...]] = []
         self.reply_version: str | None = None
+        self.put_reply: dict[str, Any] = {}
 
     def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
         self.calls.append(arguments)
         name = arguments[1]
         if name == "list-object-versions":
             return self.listing
+        if name == "put-object":
+            return self.put_reply
         options = {arguments[index]: arguments[index + 1] for index in range(2, len(arguments) - 1) if arguments[index].startswith("--")}
         data = self.payloads[(options["--key"], options["--version-id"])]
         start, _, end = options["--range"].removeprefix("bytes=").partition("-")
@@ -63,6 +66,24 @@ class ListingTest(unittest.TestCase):
         aws = StubAws(VERSIONS, {})
         S3Store(aws, "example-bucket").list_versions("landing/a")
         self.assertIn("--prefix", aws.calls[0])
+
+
+class WriteTest(unittest.TestCase):
+    def test_a_write_that_returns_no_version_id_is_refused_because_versioning_is_off(self) -> None:
+        for reply in ({}, {"ETag": "x"}, {"VersionId": "null"}):
+            with self.subTest(reply=reply):
+                aws = StubAws(VERSIONS, {})
+                aws.put_reply = reply
+                with self.assertRaisesRegex(StoreError, "no version ID"):
+                    S3Store(aws, "example-bucket").put_object("manifests/x", b"{}")
+
+    def test_a_write_returns_the_version_the_listing_shows_for_the_returned_id(self) -> None:
+        aws = StubAws(VERSIONS, {})
+        aws.put_reply = {"VersionId": "v2"}
+        self.assertEqual(
+            ("landing/a", "v2", 5),
+            (lambda version: (version.key, version.version_id, version.size))(S3Store(aws, "example-bucket").put_object("landing/a", b"12345")),
+        )
 
 
 class RangedReadTest(unittest.TestCase):

@@ -254,8 +254,8 @@ class SelectionTest(unittest.TestCase):
 
 class SelectionHelperTest(unittest.TestCase):
     def test_the_digest_of_the_keys_does_not_depend_on_their_order(self) -> None:
-        one = selection_for(["b.csv", "a.csv"], b"list")
-        two = selection_for(["a.csv", "b.csv"], b"list")
+        one = selection_for(["a.csv", "b.csv"], b"list")
+        two = replace(one, files=("b.csv", "a.csv"))
         self.assertEqual(one.keys_sha256, two.keys_sha256)
 
 
