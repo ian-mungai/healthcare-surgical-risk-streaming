@@ -16,7 +16,8 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from scripts.ingestion.check import CheckedFile, CheckResult, canonical, current_versions, result_digest, sha256_of
+from scripts.ingestion.check import CheckedFile, CheckResult, canonical, checked_file_from, current_versions, result_digest, sha256_of
+from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.selection import Selection
 from scripts.ingestion.store import ObjectStore, StoreError
@@ -47,7 +48,14 @@ class ManifestRef:
 
     @classmethod
     def from_json(cls, text: str) -> ManifestRef:
-        return cls(**json.loads(text))
+        try:
+            return cls(
+                **closed_object(
+                    parse_json(text, "the manifest reference"), {"bucket": str, "key": str, "version_id": str, "sha256": str}, "the manifest reference"
+                )
+            )
+        except ClosedInputError as error:
+            raise ManifestError(str(error)) from None
 
 
 @dataclass(frozen=True)
@@ -137,19 +145,29 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
     if sha256_of(data) != reference.sha256:
         raise ManifestError("the manifest's SHA-256 differs from its reference")
     try:
-        document = json.loads(data)
+        document = closed_object(
+            parse_json(data, "the manifest"),
+            {"format": str, "status": str, "measurement_period": str, "selection": dict, "checksum_list": dict, "check_result_sha256": str, "entries": list},
+            "the manifest",
+        )
+        selection = closed_object(
+            document["selection"], {"name": str, "source_bucket": str, "source_prefix": str, "file_count": int, "keys_sha256": str}, "the manifest's selection"
+        )
+        checksum_list = closed_object(document["checksum_list"], {"key": str, "sha256": str}, "the manifest's checksum list")
         manifest = Manifest(
             document["status"],
             document["measurement_period"],
-            document["selection"],
-            document["checksum_list"],
+            selection,
+            checksum_list,
             document["check_result_sha256"],
-            tuple(CheckedFile(**entry) for entry in document["entries"]),
+            tuple(checked_file_from(entry, "an entry of the manifest") for entry in document["entries"]),
         )
-    except (ValueError, KeyError, TypeError) as error:
-        raise ManifestError(f"the manifest is not a manifest of this format: {type(error).__name__}") from error
+    except ClosedInputError as error:
+        raise ManifestError(str(error)) from None
     if document.get("format") != MANIFEST_FORMAT or manifest.status != "passed":
         raise ManifestError("the manifest is not a passed manifest of this format")
+    if reference.key != manifest_key(manifest.selection["name"], reference.sha256):
+        raise ManifestError("the manifest key names another selection than the manifest does")
     if any(entry.version_id in NULL_VERSION_IDS for entry in manifest.entries):
         raise ManifestError("the manifest binds an object with a null version ID")
     if manifest.recomputed_check_result_sha256() != manifest.check_result_sha256:

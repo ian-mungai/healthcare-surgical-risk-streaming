@@ -18,15 +18,15 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import sys
 from pathlib import Path
 
 from scripts.aws_cli import Aws, AwsError
-from scripts.ingestion.check import CheckResult, ChecksumListError, PinnedListError, run_check
+from scripts.ingestion.check import CheckResult, ChecksumListError, PinnedListError, ResultFormatError, run_check
 from scripts.ingestion.gate import GateRefused, verify_before_read
-from scripts.ingestion.landing import load_pairing_records
-from scripts.ingestion.manifest import ManifestRef, PublishRefused, publish_manifest
+from scripts.ingestion.landing import PairingError, load_pairing_records
+from scripts.ingestion.manifest import ManifestError, ManifestRef, PublishRefused, publish_manifest
 from scripts.ingestion.selection import Selection, SelectionError
 from scripts.ingestion.store import S3Store, StoreError
 from scripts.project_config import ConfigurationError, load_configuration
@@ -34,9 +34,50 @@ from scripts.project_config import ConfigurationError, load_configuration
 PROGRESS_EVERY = 250
 
 
-def write_file(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+class InputError(RuntimeError):
+    """A file the command reads or writes cannot be used. The message names the file by its name only."""
+
+
+CLI_ERRORS = (
+    ConfigurationError,
+    AwsError,
+    StoreError,
+    SelectionError,
+    PairingError,
+    PinnedListError,
+    ChecksumListError,
+    ResultFormatError,
+    ManifestError,
+    PublishRefused,
+    GateRefused,
+    InputError,
+)
+
+
+def read_input(path: Path) -> str:
+    try:
+        return path.read_text()
+    except OSError, UnicodeDecodeError:
+        raise InputError(f"cannot read {path.name}") from None
+
+
+def read_input_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        raise InputError(f"cannot read {path.name}") from None
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a result or reference file for its owner only: it holds the bucket's name and object version IDs."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+        path.chmod(0o600)
+    except OSError:
+        raise InputError(f"cannot write {path.name}") from None
 
 
 def show_progress(done: int, total: int) -> None:
@@ -45,10 +86,10 @@ def show_progress(done: int, total: int) -> None:
 
 
 def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
-    selection = Selection.from_json(arguments.selection.read_text())
-    pairings = load_pairing_records(arguments.pairings.read_text())
-    result = run_check(store, selection, arguments.checksum_list.read_bytes(), pairings, show_progress)
-    write_file(arguments.result, result.to_json())
+    selection = Selection.from_json(read_input(arguments.selection))
+    pairings = load_pairing_records(read_input(arguments.pairings))
+    result = run_check(store, selection, read_input_bytes(arguments.checksum_list), pairings, show_progress)
+    write_private(arguments.result, result.to_json())
     for finding in result.findings:
         sys.stderr.write(f"{finding.message}\n")
     if not result.passed:
@@ -59,15 +100,15 @@ def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
 
 
 def command_publish(store: S3Store, arguments: argparse.Namespace) -> int:
-    selection = Selection.from_json(arguments.selection.read_text())
-    reference = publish_manifest(store, selection, CheckResult.from_json(arguments.result.read_text()))
-    write_file(arguments.reference, reference.to_json())
+    selection = Selection.from_json(read_input(arguments.selection))
+    reference = publish_manifest(store, selection, CheckResult.from_json(read_input(arguments.result)))
+    write_private(arguments.reference, reference.to_json())
     sys.stdout.write(f"manifest published: {reference.key} version {reference.version_id}\n")
     return 0
 
 
 def command_verify(store: S3Store, arguments: argparse.Namespace) -> int:
-    entries = verify_before_read(store, ManifestRef.from_json(arguments.reference.read_text()), arguments.source_key or None)
+    entries = verify_before_read(store, ManifestRef.from_json(read_input(arguments.reference)), arguments.source_key or None)
     sys.stdout.write(f"verified: {len(entries)} object versions are the versions of the passed manifest\n")
     return 0
 
@@ -94,18 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         configuration = load_configuration()
         store = S3Store(Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"]), arguments.bucket or configuration["S3_BUCKET"])
         return {"check": command_check, "publish": command_publish, "verify": command_verify}[arguments.command](store, arguments)
-    except (
-        ConfigurationError,
-        AwsError,
-        StoreError,
-        SelectionError,
-        PinnedListError,
-        ChecksumListError,
-        PublishRefused,
-        GateRefused,
-        OSError,
-        json.JSONDecodeError,
-    ) as error:
+    except CLI_ERRORS as error:
         sys.stderr.write(f"{error}\n")
         return 1
 

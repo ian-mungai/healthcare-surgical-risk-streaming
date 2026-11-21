@@ -14,10 +14,11 @@ The checksum list is pinned by its release path and its SHA-256.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from typing import Any
+
+from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 
 NAME = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -78,22 +79,32 @@ class Selection:
     @classmethod
     def from_json(cls, text: str) -> Selection:
         try:
-            values = json.loads(text)
-            files = [*values.get("files", [])]
-            cases = values.get("case_files")
-            if cases:
-                files += [cases["pattern"].format(number) for number in range(int(cases["first"]), int(cases["last"]) + 1)]
+            values = closed_object(
+                parse_json(text, "the selection"),
+                {"name": str, "release": str, "source_bucket": str, "source_prefix": str, "measurement_period": str, "checksum_list": dict},
+                "the selection",
+                {"files": list, "case_files": dict},
+            )
+            listed = closed_object(values["checksum_list"], {"key": str, "sha256": str}, "the selection's checksum_list")
+            files = list(values.get("files", []))
+            if any(type(path) is not str for path in files):
+                raise SelectionError("the selection's files must all be text")
+            if "case_files" in values:
+                cases = closed_object(values["case_files"], {"pattern": str, "first": int, "last": int}, "the selection's case_files")
+                files += [cases["pattern"].format(number) for number in range(cases["first"], cases["last"] + 1)]
             return cls(
                 name=values["name"],
                 release=values["release"],
                 source_bucket=values["source_bucket"],
                 source_prefix=values["source_prefix"],
                 measurement_period=values["measurement_period"],
-                checksum_list_key=values["checksum_list"]["key"],
-                checksum_list_sha256=values["checksum_list"]["sha256"],
+                checksum_list_key=listed["key"],
+                checksum_list_sha256=listed["sha256"],
                 files=tuple(sorted(files)),
             )
-        except (ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
+        except ClosedInputError as error:
+            raise SelectionError(str(error)) from None
+        except (IndexError, KeyError, ValueError) as error:
             if isinstance(error, SelectionError):
                 raise
-            raise SelectionError(f"the selection is not valid: {type(error).__name__}: {error}") from error
+            raise SelectionError(f"the selection's case_files pattern is not valid: {type(error).__name__}") from None

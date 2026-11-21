@@ -171,6 +171,30 @@ class GateTest(unittest.TestCase):
         with self.assertRaisesRegex(GateRefused, "does not hold the SHA-256"):
             verify_before_read(landed.store, replace(reference, key=key, version_id=copy.version_id), WANTED)
 
+    def test_a_manifest_with_an_unknown_or_mistyped_field_is_refused_although_its_digests_agree(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        changes: list[Callable[[dict[str, Any]], None]] = [
+            lambda document: document.update(note="x"),
+            lambda document: document["entries"][0].update(note="x"),
+            lambda document: document["entries"][0].update(size="3"),
+            lambda document: document["selection"].update(note="x"),
+            lambda document: document["checksum_list"].update(note="x"),
+        ]
+        for number, change in enumerate(changes):
+            with self.subTest(change=number), self.assertRaises(GateRefused):
+                verify_before_read(landed.store, forged(landed, reference, change, consistent=True), WANTED)
+
+    def test_a_reference_whose_key_names_another_selection_than_the_manifest_is_refused(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        data = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        key = f"{MANIFEST_PREFIX}another_set/{reference.sha256}.json"
+        copy = landed.store.put_object(key, data)
+        with self.assertRaisesRegex(GateRefused, "selection"):
+            verify_before_read(landed.store, replace(reference, key=key, version_id=copy.version_id), WANTED)
+        self.assertTrue(verify_before_read(landed.store, reference, WANTED))
+
     def test_a_bound_version_removed_while_another_is_current_is_refused_as_missing(self) -> None:
         landed = landed_set()
         reference = published(landed)

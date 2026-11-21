@@ -10,8 +10,9 @@ The neutral form is a JSON list of ``{"source_key": ..., "landed_key": ..., "siz
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+
+from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 
 LANDING_PREFIX = "landing/"
 
@@ -29,12 +30,12 @@ class PairingRecord:
 
 def load_pairing_records(text: str) -> tuple[PairingRecord, ...]:
     try:
-        entries = json.loads(text)
-        if not isinstance(entries, list):
-            raise TypeError("not a list")
-        records = tuple(PairingRecord(entry["source_key"], entry["landed_key"], entry["size"]) for entry in entries)
-    except (ValueError, KeyError, TypeError) as error:
-        raise PairingError(f"the pairing records are not a list of source key, landed key and size: {type(error).__name__}") from error
-    if any(not (record.source_key and record.landed_key and type(record.size) is int and record.size >= 0) for record in records):
+        entries = parse_json(text, "the pairing records")
+        if type(entries) is not list:
+            raise PairingError("the pairing records must be a list")
+        records = tuple(PairingRecord(**closed_object(entry, {"source_key": str, "landed_key": str, "size": int}, "a pairing record")) for entry in entries)
+    except ClosedInputError as error:
+        raise PairingError(str(error)) from None
+    if any(not (record.source_key and record.landed_key and record.size >= 0) for record in records):
         raise PairingError("a pairing record needs a source key, a landed key and a size of zero or more")
     return records

@@ -7,7 +7,7 @@ A payload is read in ranges of ``RANGE_BYTES`` into a temporary file and handed 
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,15 +92,18 @@ class S3Store:
             raise StoreError(f"{version.key}: the version does not exist")
         if reply.get("VersionId") != version.version_id:
             raise StoreError(f"{version.key}: the reply was for another version than the one asked for")
-        return int(reply["ContentLength"])
+        length = reply.get("ContentLength")
+        if type(length) is not int:
+            raise StoreError(f"{version.key}: the reply gave no byte count")
+        return length
 
-    def iter_version(self, version: ObjectVersion) -> Iterator[bytes]:
+    def iter_version(self, version: ObjectVersion) -> Generator[bytes]:
         with tempfile.TemporaryDirectory(prefix="ingestion_range_") as scratch:
             target = Path(scratch) / "range"
             for start in range(0, version.size, self.range_bytes):
                 end = min(start + self.range_bytes, version.size) - 1
                 length = self.fetch(version, target, (start, end))
-                if length != end - start + 1 or target.stat().st_size != length:
+                if not target.is_file() or length != end - start + 1 or target.stat().st_size != length:
                     raise StoreError(f"{version.key}: the reply held {length} bytes of the {end - start + 1} asked for")
                 with target.open("rb") as handle:
                     while block := handle.read(self.block_bytes):
@@ -113,6 +116,8 @@ class S3Store:
         with tempfile.TemporaryDirectory(prefix="ingestion_object_") as scratch:
             target = Path(scratch) / "object"
             self.fetch(version, target, None)
+            if not target.is_file():
+                raise StoreError(f"{version.key}: the reply wrote no data")
             return target.read_bytes()
 
     def put_object(self, key: str, data: bytes) -> ObjectVersion:

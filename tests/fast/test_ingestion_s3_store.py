@@ -24,6 +24,10 @@ class StubAws:
         self.calls: list[tuple[str, ...]] = []
         self.reply_version: str | None = None
         self.put_reply: dict[str, Any] = {}
+        self.targets: list[Path] = []
+        self.write_nothing = False
+        self.omit_length = False
+        self.truncate_file = False
 
     def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
         self.calls.append(arguments)
@@ -34,10 +38,15 @@ class StubAws:
             return self.put_reply
         options = {arguments[index]: arguments[index + 1] for index in range(2, len(arguments) - 1) if arguments[index].startswith("--")}
         data = self.payloads[(options["--key"], options["--version-id"])]
-        start, _, end = options["--range"].removeprefix("bytes=").partition("-")
+        start, _, end = options.get("--range", f"bytes=0-{len(data) - 1}").removeprefix("bytes=").partition("-")
         piece = data[int(start) : int(end) + 1]
-        Path(arguments[-1]).write_bytes(piece)
-        return {"VersionId": self.reply_version or options["--version-id"], "ContentLength": len(piece)}
+        self.targets.append(Path(arguments[-1]))
+        if not self.write_nothing:
+            Path(arguments[-1]).write_bytes(piece[:-1] if self.truncate_file else piece)
+        reply: dict[str, Any] = {"VersionId": self.reply_version or options["--version-id"]}
+        if not self.omit_length:
+            reply["ContentLength"] = len(piece)
+        return reply
 
 
 VERSIONS = {
@@ -84,6 +93,56 @@ class WriteTest(unittest.TestCase):
             ("landing/a", "v2", 5),
             (lambda version: (version.key, version.version_id, version.size))(S3Store(aws, "example-bucket").put_object("landing/a", b"12345")),
         )
+
+
+class TemporaryFileTest(unittest.TestCase):
+    def read_all(self, aws: StubAws) -> None:
+        store = S3Store(aws, "example-bucket", range_bytes=2, block_bytes=1)
+        list(store.iter_version(store.list_versions("landing/")[1]))
+
+    def test_control_the_range_folder_is_gone_after_a_complete_read(self) -> None:
+        aws = StubAws(VERSIONS, {("landing/a", "v2"): b"12345"})
+        self.read_all(aws)
+        self.assertTrue(aws.targets)
+        self.assertFalse(any(target.parent.exists() for target in aws.targets))
+
+    def test_the_range_folder_is_gone_after_each_kind_of_failure(self) -> None:
+        for name in ("short reply", "no file written", "no length", "another version", "file shorter than the reply"):
+            with self.subTest(name):
+                aws = StubAws(VERSIONS, {("landing/a", "v2"): b"123" if name == "short reply" else b"12345"})
+                aws.write_nothing = name == "no file written"
+                aws.omit_length = name == "no length"
+                aws.truncate_file = name == "file shorter than the reply"
+                aws.reply_version = "v1" if name == "another version" else None
+                with self.assertRaises(StoreError):
+                    self.read_all(aws)
+                self.assertTrue(aws.targets)
+                self.assertFalse(any(target.parent.exists() for target in aws.targets))
+
+    def test_the_range_folder_is_gone_when_the_reader_stops_early(self) -> None:
+        aws = StubAws(VERSIONS, {("landing/a", "v2"): b"12345"})
+        store = S3Store(aws, "example-bucket", range_bytes=2, block_bytes=1)
+        blocks = store.iter_version(store.list_versions("landing/")[1])
+        next(blocks)
+        blocks.close()
+        self.assertFalse(any(target.parent.exists() for target in aws.targets))
+
+    def test_a_whole_read_is_refused_when_the_reply_gives_no_byte_count_or_wrote_no_data(self) -> None:
+        for name in ("no length", "no file written"):
+            with self.subTest(name):
+                aws = StubAws(VERSIONS, {("landing/a", "v2"): b"12345"})
+                aws.omit_length = name == "no length"
+                aws.write_nothing = name == "no file written"
+                store = S3Store(aws, "example-bucket")
+                with self.assertRaises(StoreError):
+                    store.get_version_bytes(store.list_versions("landing/")[1], 100)
+                self.assertFalse(any(target.parent.exists() for target in aws.targets))
+
+    def test_a_whole_read_of_a_small_object_also_leaves_no_folder_and_refuses_a_larger_one(self) -> None:
+        aws = StubAws(VERSIONS, {})
+        store = S3Store(aws, "example-bucket")
+        with self.assertRaisesRegex(StoreError, "larger than"):
+            store.get_version_bytes(store.list_versions("landing/")[1], 4)
 
 
 class RangedReadTest(unittest.TestCase):

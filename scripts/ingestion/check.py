@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX, PairingRecord
 from scripts.ingestion.selection import Selection
 from scripts.ingestion.store import ObjectStore, ObjectVersion
@@ -32,6 +33,10 @@ NULL_VERSION_ID = "null_version_id"
 
 class PinnedListError(ValueError):
     """The checksum list differs from its pinned SHA-256."""
+
+
+class ResultFormatError(ValueError):
+    """A check result file is not valid JSON or has an unknown, missing or mistyped field."""
 
 
 class ChecksumListError(ValueError):
@@ -69,6 +74,23 @@ class CheckedFile:
     size: int
     release: str
     retrieved_utc: str
+
+
+CHECKED_FILE_FIELDS: dict[str, type] = {
+    "bucket": str,
+    "key": str,
+    "version_id": str,
+    "sha256": str,
+    "source_key": str,
+    "size": int,
+    "release": str,
+    "retrieved_utc": str,
+}
+
+
+def checked_file_from(entry: object, what: str) -> CheckedFile:
+    """A ``CheckedFile`` from a JSON object with exactly its fields and types. Raise ``ClosedInputError`` otherwise."""
+    return CheckedFile(**closed_object(entry, CHECKED_FILE_FIELDS, what))
 
 
 def result_digest(selection_sha256: str, list_sha256: str, files: Iterable[Mapping[str, Any]]) -> str:
@@ -109,16 +131,26 @@ class CheckResult:
 
     @classmethod
     def from_json(cls, text: str) -> CheckResult:
-        document = json.loads(text)
-        return cls(
-            document["selection_name"],
-            document["selection_sha256"],
-            document["list_sha256"],
-            document["file_count"],
-            tuple(CheckedFile(**file) for file in document["files"]),
-            tuple(Finding(**finding) for finding in document["findings"]),
-            document["result_sha256"],
-        )
+        try:
+            document = closed_object(
+                parse_json(text, "the check result"),
+                {"selection_name": str, "selection_sha256": str, "list_sha256": str, "file_count": int, "files": list, "findings": list, "result_sha256": str},
+                "the check result",
+            )
+            findings = [
+                closed_object(finding, {"source_key": str, "cause": str, "detail": str}, "a finding of the check result") for finding in document["findings"]
+            ]
+            return cls(
+                document["selection_name"],
+                document["selection_sha256"],
+                document["list_sha256"],
+                document["file_count"],
+                tuple(checked_file_from(file, "a file of the check result") for file in document["files"]),
+                tuple(Finding(**finding) for finding in findings),
+                document["result_sha256"],
+            )
+        except ClosedInputError as error:
+            raise ResultFormatError(str(error)) from None
 
 
 def parse_checksum_list(data: bytes) -> dict[str, str]:
