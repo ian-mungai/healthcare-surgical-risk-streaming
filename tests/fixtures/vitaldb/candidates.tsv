@@ -1,0 +1,14 @@
+case	patient	key	size_bytes	sha256	arterial_waveform	slot
+565	5037	vitaldb/1.0.0/vital_files/0565.vital	1644097	147dbd0f1a9061c1c1b8f2ac93d08b128300057d519999b117302b57b732f647	true	arterial_test
+908	1122	vitaldb/1.0.0/vital_files/0908.vital	367776	77ee93ed9aa2bf60b111a05b6387f72283853a1e8c8afb040f609cd39498db34	false	no_arterial_development
+1147	2820	vitaldb/1.0.0/vital_files/1147.vital	3476824	0eef4a51a1b582b6ebdcf9df5f212bd5309639f09546462564e008bc786c81f7	true	short_development
+2367	3093	vitaldb/1.0.0/vital_files/2367.vital	6132291	fa53758e73ff837244ecb57b0e47e8ba9117fc9d34c417371b47d1c2a7e04b88	true	repeat_test
+2466	2318	vitaldb/1.0.0/vital_files/2466.vital	4404486	a4faafe184f334eab8724e7d61d3bfc25fba32325f0e3b94bba779381e036f74	true	repeat_development
+2535	3093	vitaldb/1.0.0/vital_files/2535.vital	7811146	e49aaab08086bac7e47ac09bb8c353b0db33ea57d36842c198ee373879118c20	true	repeat_test
+2806	625	vitaldb/1.0.0/vital_files/2806.vital	5770264	fe4497b76a8133197d285684967863f39ed78e94fa5313d970c59423ba845b71	true	repeat_development
+3137	793	vitaldb/1.0.0/vital_files/3137.vital	17749539	744ae4a8205273aa68f27f75a2ed6f52a86319cbb35770d9faec6934bb29a4aa	true	median_development
+4016	625	vitaldb/1.0.0/vital_files/4016.vital	8194841	002d0af7e729cdec2215eeddf9c92dbdfb43ac8879154f47dfeafa62bb1255f8	true	repeat_development
+5105	4486	vitaldb/1.0.0/vital_files/5105.vital	1207687	fdfda990f4074777dc57b395a1785758e7523955619479f684f5533c43822293	false	no_arterial_test
+5145	2318	vitaldb/1.0.0/vital_files/5145.vital	8542147	34fc4ace75e308440d18183186b87dda893c7be339e01de836b2df1ab22fcb27	true	repeat_development
+5534	2519	vitaldb/1.0.0/vital_files/5534.vital	86738119	a652119f112aa96c8f635771a8f26fbe90f2fcd82898ffc0523c6200f22a1156	true	largest_development
+5754	4506	vitaldb/1.0.0/vital_files/5754.vital	807075	b9d1d4291f7c47b5777e7b8f2f1463d20bc8b748a6b4ef4388b6bf323f2f70ac	false	no_arterial_development

@@ -1,0 +1,36 @@
+{
+  "source": {
+    "bucket": "physionet-open",
+    "region": "us-east-1",
+    "release_path": "vitaldb/1.0.0/",
+    "page": "https://physionet.org/content/vitaldb/1.0.0/"
+  },
+  "checksum_list": {
+    "key": "vitaldb/1.0.0/SHA256SUMS.txt",
+    "size_bytes": 562636,
+    "sha256": "874732d0548b5ba4de2efe851375c4f25f45488a2a19c771e2f9ab0288a5de1d"
+  },
+  "tables": [
+    {
+      "key": "vitaldb/1.0.0/clinical_data.csv",
+      "size_bytes": 2199588,
+      "sha256": "7d6edb471e5eee3fde75e417084240c97bdbf6eff41cbd61e5dace44f1585ecf"
+    },
+    {
+      "key": "vitaldb/1.0.0/lab_data.csv",
+      "size_bytes": 19455257,
+      "sha256": "c6e84fb397afe8182a7e6cc3aac6b34502d6ac0fadf1abf0ef643cc8bd50ea8b"
+    }
+  ],
+  "track_list": {
+    "url": "https://api.vitaldb.net/trks",
+    "size_bytes": 30565770,
+    "sha256": "82b31333be20ca912ded93f46bf3ae42db281da40515a9945acc57749da9ffd0"
+  },
+  "credit": {
+    "citation": "Lee, H., & Jung, C. (2022). VitalDB, a high-fidelity multi-parameter vital signs database in surgical patients (version 1.0.0). PhysioNet. https://doi.org/10.13026/czw8-9p62",
+    "source": "https://physionet.org/content/vitaldb/1.0.0/",
+    "licence": "https://creativecommons.org/licenses/by/4.0/",
+    "changes": "The publisher's case files, tables and checksum list are not changed. This repository pins keys, case numbers, sizes and checksums only."
+  }
+}

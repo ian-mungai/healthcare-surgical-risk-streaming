@@ -8,6 +8,10 @@ The project is in its first phase, which builds the host and its lifecycle. So f
 
 The recordings come from VitalDB, an open dataset of monitor recordings from 6,388 surgical cases, at <https://physionet.org/content/vitaldb/1.0.0/>. It is shared under the Creative Commons Attribution 4.0 licence, <https://creativecommons.org/licenses/by/4.0/>. This repository holds no recordings.
 
+Credit: Lee, H., & Jung, C. (2022). VitalDB, a high-fidelity multi-parameter vital signs database in surgical patients (version 1.0.0). PhysioNet. <https://doi.org/10.13026/czw8-9p62>. Changes: the publisher's files are not changed. The repository pins keys, case numbers, sizes and checksums only, in `tests/fixtures/vitaldb/`, and keeps hand-built boundary cases apart in `tests/fixtures/boundary/`.
+
+The patient assignment rule, one split by patient for all models, is in `scripts/sample/split.py`. Rebuild the candidate cases for the fixed sample with `.venv/bin/python -m scripts.sample.candidates check`.
+
 ## Setup
 
 The checks need Python 3.14, Git, GNU Make and curl.
