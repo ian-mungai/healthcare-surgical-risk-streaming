@@ -80,9 +80,10 @@ class AssignmentRule(unittest.TestCase):
             self.assertAlmostEqual(expected, observed[part], delta=0.01, msg=part)
 
     def test_a_number_that_is_no_patient_number_is_refused(self) -> None:
-        for number in (0, -5):
-            with self.assertRaises(ValueError, msg=str(number)):
+        for number in (0, -987654):
+            with self.assertRaises(ValueError, msg=str(number)) as caught:
                 patient_part(number)
+            self.assertNotIn(str(number), str(caught.exception))
 
 
 class TrackedFiles(unittest.TestCase):

@@ -18,7 +18,6 @@ Changes: the publisher's files are not changed. This module reads them and write
 
 from __future__ import annotations
 
-import argparse
 import re
 import shutil
 import sys
@@ -28,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.ingestion.closed import parse_json
+from scripts.ingestion.closed import QuietParser, parse_json
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
     BUCKET,
@@ -139,7 +138,7 @@ def candidate_problems(candidates: Sequence[Candidate]) -> list[str]:
         if SHA256.fullmatch(item.sha256) is None:
             problems.append(f"case {item.case}: checksum is not 64 hex characters in lower case")
         if item.size_bytes <= 0:
-            problems.append(f"case {item.case}: size {item.size_bytes} is not positive")
+            problems.append(f"case {item.case}: the size is not positive")
         if item.case in seen:
             problems.append(f"case {item.case}: listed twice")
         seen.add(item.case)
@@ -320,7 +319,7 @@ def rebuild(release_path: Path) -> tuple[list[Candidate], dict[str, str], dict[s
 
 def main() -> int:
     """Run ``build`` or ``check`` and return 1 on any problem, with its cause on standard error."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["build", "check"])
     parser.add_argument("--release", type=Path, default=RELEASE_FILE, help="the release pin")
     parser.add_argument("--candidates", type=Path, default=CANDIDATES_FILE, help="check: the tracked candidate file")
@@ -332,9 +331,7 @@ def main() -> int:
             if args.output is None:
                 raise SystemExit("build needs --output")
             args.output.write_text(format_candidates(candidates))
-            sys.stdout.write(
-                f"wrote {len(candidates)} candidates to {args.output}; the checksum list, the clinical table and the track list match their pins\n"
-            )
+            sys.stdout.write(f"wrote {len(candidates)} candidates; the checksum list, the clinical table and the track list match their pins\n")
             return 0
         tracked = read_candidates(args.candidates)
         problems = candidate_problems(tracked) + listing_problems(tracked, sums, sizes) + difference_problems(tracked, candidates)

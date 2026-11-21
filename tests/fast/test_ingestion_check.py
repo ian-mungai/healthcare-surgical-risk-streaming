@@ -60,7 +60,7 @@ class CheckCausesTest(unittest.TestCase):
         list_bytes = list_text_for(listed).encode()
         selection = replace(landed.selection, checksum_list_sha256=digest(list_bytes))
         result = run_check(landed.store, selection, list_bytes, landed.pairings())
-        self.assertEqual({SOURCE_PREFIX + "clinical_data.csv": "not_in_checksum_list"}, {finding.source_key: finding.cause for finding in result.findings})
+        self.assertEqual({"selected file 1": "not_in_checksum_list"}, {finding.source_key: finding.cause for finding in result.findings})
         self.assertEqual([], landed.store.payload_reads(landed.key_for(SOURCE_PREFIX + "clinical_data.csv")))
 
     def test_an_object_with_a_null_version_id_fails_for_that_cause(self) -> None:
@@ -244,6 +244,8 @@ class SelectionTest(unittest.TestCase):
             {"files": ["a.csv", "a.csv"]},
             {"files": ["/a.csv"]},
             {"files": ["../a.csv"]},
+            {"files": ["./a.csv"]},
+            {"files": ["a//b.csv"]},
             {"name": "has space"},
             {"release": ""},
         ]

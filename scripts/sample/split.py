@@ -23,7 +23,7 @@ HEX_DIGITS = 15
 def patient_bucket(patient: int) -> int:
     """The bucket, from 0 to 99, of the publisher's patient number."""
     if patient < 1:
-        raise ValueError(f"not a patient number: {patient}")
+        raise ValueError("not a patient number: a patient number is 1 or more")
     digest = hashlib.sha256(f"{SEED}:{patient}".encode()).hexdigest()
     return int(digest[:HEX_DIGITS], 16) % BUCKETS
 

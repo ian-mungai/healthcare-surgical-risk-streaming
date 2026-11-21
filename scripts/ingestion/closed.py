@@ -1,14 +1,15 @@
 """Closed input: a JSON object is accepted only with exactly its known fields, each of its known type.
 
 A field named twice is refused, because the second value would silently replace the first. A message names the object and its fields, never a value of
-the file.
+the file. The command lines are closed the same way: ``QuietParser`` refuses a command line that is not valid without repeating any of its words.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NoReturn
 
 
 class ClosedInputError(ValueError):
@@ -46,3 +47,10 @@ def closed_object(value: Any, required: Mapping[str, type], what: str, optional:
     if wrong:
         raise ClosedInputError(f"{what} has a field of the wrong type: {', '.join(wrong)}")
     return value
+
+
+class QuietParser(argparse.ArgumentParser):
+    """An argument parser whose usage error names no word of the command line, so a mistyped value is never repeated on standard error."""
+
+    def error(self, message: str) -> NoReturn:
+        self.exit(2, f"{self.prog}: the command line is not valid; run it with --help for its commands and options\n")

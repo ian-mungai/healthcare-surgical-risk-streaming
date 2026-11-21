@@ -106,7 +106,7 @@ class CommandTest(unittest.TestCase):
 
     def test_an_input_file_that_cannot_be_used_is_reported_and_the_command_exits_1(self) -> None:
         self.work.selection.unlink()
-        self.refused(self.work.check(), "cannot read selection.json")
+        self.refused(self.work.check(), "cannot read the selection")
 
     def test_a_selection_a_pairing_file_a_result_and_a_reference_that_are_not_valid_are_reported(self) -> None:
         self.work.write("selection.json", json.dumps({**self.work.selection_document, MARKER: 1}))
@@ -168,6 +168,30 @@ class CommandTest(unittest.TestCase):
             "case_files": {"pattern": "vital_files/{:04d}.vital", "first": 1, "last": 6388},
         }
         return document | change
+
+    def test_a_selected_file_that_the_list_does_not_name_is_reported_by_its_position_and_never_echoed(self) -> None:
+        files = [*self.work.selection_document["files"], f"{MARKER}.csv"]
+        self.work.write("selection.json", json.dumps({**self.work.selection_document, "files": files}))
+        self.refused(self.work.check(), "selected file 2: not_in_checksum_list")
+        self.assertNotIn(MARKER, self.work.result.read_text())
+        self.assertIn("vitaldb/1.0.0/clinical_data.csv", self.work.result.read_text())
+
+    def test_a_malformed_source_prefix_is_refused_before_anything_is_read_and_never_echoed(self) -> None:
+        for prefix in (f"{MARKER} x/", f"vitaldb/../{MARKER}/", f"vitaldb/./{MARKER}/", f"vitaldb//{MARKER}/", f"/{MARKER}/", MARKER, "/"):
+            self.work.write("selection.json", json.dumps({**self.work.selection_document, "source_prefix": prefix}))
+            with self.subTest(prefix=prefix):
+                self.refused(self.work.check(), "source_prefix")
+                self.assertFalse(self.work.result.exists())
+                self.assertEqual([], self.work.landed.store.reads)
+
+    def test_a_command_line_that_is_not_valid_is_refused_without_echoing_it(self) -> None:
+        for arguments in ([MARKER], ["check", f"--{MARKER}"], ["verify", "--reference", "r.json", MARKER], []):
+            errors = io.StringIO()
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+                cli.main(arguments)
+            self.assertEqual(2, stopped.exception.code)
+            self.assertNotIn(MARKER, errors.getvalue())
+            self.assertIn("--help", errors.getvalue())
 
     def test_a_configuration_error_is_reported(self) -> None:
         errors = io.StringIO()

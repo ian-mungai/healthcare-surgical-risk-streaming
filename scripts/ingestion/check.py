@@ -187,6 +187,8 @@ def run_check(
 
     ``pairings`` pairs each source key with the landed key and size that its sync wrote. A file with no record is missing; two records for one
     file, a landed key with no current object and a record whose size differs from the landed object each fail that file without reading it.
+    A finding names a file by its source key only when the pinned list names its path; any other file is named ``selected file N``, its place in the
+    sorted selection, so a value that nothing verified never reaches a message or the result.
     """
     list_sha256 = sha256_of(list_bytes)
     if list_sha256 != selection.checksum_list_sha256:
@@ -200,20 +202,21 @@ def run_check(
     findings: list[Finding] = []
     for done, path in enumerate(selection.files, 1):
         source_key = selection.source_prefix + path
+        label = source_key if path in listed else f"selected file {done}"
         records = recorded.get(source_key, [])
         version = current.get(records[0].landed_key) if len(records) == 1 else None
         if path not in listed:
-            findings.append(Finding(source_key, NOT_IN_CHECKSUM_LIST))
+            findings.append(Finding(label, NOT_IN_CHECKSUM_LIST))
         if not records:
-            findings.append(Finding(source_key, MISSING, "no pairing record"))
+            findings.append(Finding(label, MISSING, "no pairing record"))
         elif len(records) > 1:
-            findings.append(Finding(source_key, DUPLICATE_PAIRING, f"{len(records)} pairing records, for example from a second sync"))
+            findings.append(Finding(label, DUPLICATE_PAIRING, f"{len(records)} pairing records, for example from a second sync"))
         elif version is None or version.is_delete_marker:
-            findings.append(Finding(source_key, LANDED_OBJECT_MISSING, "the landed key has no current object"))
+            findings.append(Finding(label, LANDED_OBJECT_MISSING, "the landed key has no current object"))
         elif version.version_id in ("", "null"):
-            findings.append(Finding(source_key, NULL_VERSION_ID))
+            findings.append(Finding(label, NULL_VERSION_ID))
         elif version.size != records[0].size:
-            findings.append(Finding(source_key, PAIRING_SIZE_DIFFERS, f"record {records[0].size} bytes, landed object {version.size} bytes"))
+            findings.append(Finding(label, PAIRING_SIZE_DIFFERS, f"record {records[0].size} bytes, landed object {version.size} bytes"))
         elif path in listed:
             found = stream_sha256(store, version)
             if found == listed[path]:

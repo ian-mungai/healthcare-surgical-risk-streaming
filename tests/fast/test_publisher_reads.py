@@ -288,6 +288,48 @@ class QuietMessages(unittest.TestCase):
         self.assertIn(":2", str(caught.exception))
         self.assertNotIn(self.MARKER, str(caught.exception))
 
+    def test_no_size_problem_shows_the_size(self) -> None:
+        item = candidates.Candidate(**(vars(read_candidates(CANDIDATES_FILE)[0]) | {"size_bytes": -987654}))
+        problems = candidates.candidate_problems([item])
+        self.assertTrue(any("size" in problem for problem in problems), problems)
+        self.assertNotIn("987654", " ".join(problems))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "file"
+            path.write_bytes(b"abc")
+            with self.assertRaises(PublisherError) as caught:
+                publisher.read_pinned("the track list", path, 987654, "0" * 64)
+        self.assertIn("size", str(caught.exception))
+        self.assertNotIn("987654", str(caught.exception))
+
+    def test_a_build_names_no_path_of_its_output(self) -> None:
+        tracked = read_candidates(CANDIDATES_FILE)
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / self.MARKER / "candidates.tsv"
+            target.parent.mkdir()
+            output = io.StringIO()
+            with (
+                mock.patch.object(candidates, "rebuild", return_value=(tracked, {}, {})),
+                mock.patch("sys.argv", ["candidates", "build", "--output", str(target)]),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(0, candidates.main())
+            self.assertEqual(candidates.format_candidates(tracked), target.read_text())
+        self.assertIn(f"wrote {len(tracked)} candidates", output.getvalue())
+        self.assertNotIn(self.MARKER, output.getvalue())
+
+    def test_a_command_line_that_is_not_valid_is_refused_without_echoing_it(self) -> None:
+        for arguments in ([self.MARKER], ["check", f"--{self.MARKER}"], []):
+            errors = io.StringIO()
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.argv", ["candidates", *arguments]),
+                contextlib.redirect_stderr(errors),
+                self.assertRaises(SystemExit) as stopped,
+            ):
+                candidates.main()
+            self.assertEqual(2, stopped.exception.code)
+            self.assertNotIn(self.MARKER, errors.getvalue())
+
     def run_command(self, release: object, candidates_text: str | None = None) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as folder:
             pin = Path(folder) / "release.json"

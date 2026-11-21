@@ -41,6 +41,11 @@ class SelectionError(ValueError):
     """The selection cannot name one set of files."""
 
 
+def relative_path(text: str) -> bool:
+    """True for a relative path of letters, digits, dots, dashes and underscores, with no empty, ``.`` or ``..`` part."""
+    return RELATIVE_PATH.fullmatch(text) is not None and not {".", ".."} & set(text.split("/"))
+
+
 def case_paths(pattern: str, first: int, last: int) -> list[str]:
     """One path for each number from ``first`` to ``last``. Raise ``SelectionError`` unless the pattern is the known form and ``0 <= first <= last``."""
     form = CASE_FORMAT.fullmatch(pattern)
@@ -99,19 +104,15 @@ class Selection:
             problems.append("name must be lower-case letters, digits and underscores")
         if not (self.release and self.source_bucket and self.measurement_period and self.checksum_list_key):
             problems.append("release, source_bucket, measurement_period and the checksum list key must not be empty")
-        if not self.source_prefix.endswith("/") or self.source_prefix.startswith("/"):
-            problems.append("source_prefix must end with a slash and not start with one")
+        if not (self.source_prefix.endswith("/") and relative_path(self.source_prefix[:-1])):
+            problems.append("source_prefix must be a relative path that ends with a slash")
         if not SHA256.fullmatch(self.checksum_list_sha256):
             problems.append("the checksum list's sha256 must be 64 lower-case hex digits")
         if not self.files:
             problems.append("the selection names no file")
         if len(set(self.files)) != len(self.files):
             problems.append("a file is named twice")
-        problems += [
-            f"files[{position}] is not a relative path"
-            for position, path in enumerate(self.files, 1)
-            if not RELATIVE_PATH.fullmatch(path) or ".." in path.split("/")
-        ]
+        problems += [f"files[{position}] is not a relative path" for position, path in enumerate(self.files, 1) if not relative_path(path)]
         object.__setattr__(self, "files", tuple(sorted(self.files)))
         if self.name == FULL_RELEASE and not problems:
             problems += self.full_release_problems()

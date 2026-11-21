@@ -227,29 +227,28 @@ class FrozenAuthorityTest(unittest.TestCase):
 
 
 class FileHelperTest(unittest.TestCase):
-    def test_a_file_that_cannot_be_read_is_named_by_its_file_name_only(self) -> None:
+    def test_a_file_that_cannot_be_read_is_named_by_its_role_only(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ingestion_inputs_") as folder:
             readable = Path(folder) / "present.json"
             readable.write_text("{}")
-            self.assertEqual("{}", read_input(readable))
-            missing = Path(folder) / "private-folder" / "absent.json"
+            self.assertEqual("{}", read_input(readable, "the selection"))
+            missing = Path(folder) / "private-folder" / "private-value.json"
             with self.assertRaises(InputError) as raised:
-                read_input(missing)
-            self.assertIn("absent.json", str(raised.exception))
-            self.assertNotIn("private-folder", str(raised.exception))
+                read_input(missing, "the selection")
+            self.assertEqual("cannot read the selection", str(raised.exception))
             self.assertNotIn(folder, str(raised.exception))
 
     def test_a_result_or_reference_is_written_for_its_owner_only_and_a_failed_write_names_no_path(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ingestion_inputs_") as folder:
             target = Path(folder) / "made" / "reference.json"
-            write_private(target, "one\n")
-            write_private(target, "two\n")
+            write_private(target, "one\n", "the reference")
+            write_private(target, "two\n", "the reference")
             self.assertEqual("two\n", target.read_text())
             self.assertEqual(0o600, stat.S_IMODE(os.stat(target).st_mode))
             blocked = target / "inside" / "x.json"
             with self.assertRaises(InputError) as raised:
-                write_private(blocked, "x")
-            self.assertNotIn(folder, str(raised.exception))
+                write_private(blocked, "x", "the reference")
+            self.assertEqual("cannot write the reference", str(raised.exception))
 
 
 if __name__ == "__main__":

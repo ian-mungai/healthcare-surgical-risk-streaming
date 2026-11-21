@@ -90,7 +90,7 @@ def download_url(url: str, target: Path) -> None:
 def read_pinned(label: str, target: Path, size_bytes: int, sha256: str) -> None:
     """Refuse a file whose size or SHA-256 is not the pinned one."""
     if target.stat().st_size != size_bytes:
-        raise PublisherError(f"{label} has {target.stat().st_size} bytes, not the pinned {size_bytes}")
+        raise PublisherError(f"{label} does not have the pinned size")
     if file_sha256(target) != sha256:
         raise PublisherError(f"{label} does not match the pinned SHA-256")
 
