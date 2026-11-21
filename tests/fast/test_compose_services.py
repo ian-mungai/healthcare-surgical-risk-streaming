@@ -20,6 +20,7 @@ ROOT_FILE = COMPOSE / "compose.yml"
 SERVICES = COMPOSE / "services"
 IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest@)[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 PROJECT_IMAGE = re.compile(r"^surgical-risk-[a-z0-9_-]+:(?!latest(?:@|$))[0-9][A-Za-z0-9._-]*(?:@sha256:[0-9a-f]{64})?$")
+BATCH_IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest$)[A-Za-z0-9._-]+$")
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
 HOST_NETWORK_SERVICES = {"caddy"}
@@ -51,7 +52,11 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
         return [f"{name}: the file must define exactly one service, named like the file"]
     service = services[name]
     image = str(service.get("image", ""))
-    if not (PROJECT_IMAGE if image.startswith("surgical-risk-") else IMAGE).match(image):
+    batch = service.get("profiles") == ["batch"]
+    build = service.get("build")
+    if batch and not (isinstance(build, dict) and build.get("dockerfile") and BATCH_IMAGE.match(image)):
+        problems.append(f"{name}: a batch job's image must be built from a tracked Dockerfile and named by a tag other than latest")
+    elif not batch and not (PROJECT_IMAGE if image.startswith("surgical-risk-") else IMAGE).match(image):
         problems.append(
             f"{name}: image must be pinned by a tag other than latest and by a sha256 digest (a project-built image: a version tag, the digest once pushed)"
         )
@@ -60,9 +65,11 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
     if not re.fullmatch(rf"\$\{{{variable_name(name)}:\?[^}}]+\}}", str(service.get("mem_limit", ""))):
         problems.append(f"{name}: mem_limit must read {variable_name(name)} from the rendered limits and fail when it is unset")
     health = service.get("healthcheck")
-    if not isinstance(health, dict) or not set(health) >= HEALTHCHECK_FIELDS:
+    if not batch and (not isinstance(health, dict) or not set(health) >= HEALTHCHECK_FIELDS):
         problems.append(f"{name}: healthcheck must set {', '.join(sorted(HEALTHCHECK_FIELDS))}")
-    if service.get("restart") not in RESTART_POLICIES:
+    if batch and service.get("restart") != "no":
+        problems.append(f"{name}: a batch job's restart must be no")
+    if not batch and service.get("restart") not in RESTART_POLICIES:
         problems.append(f"{name}: restart must be one of {', '.join(sorted(RESTART_POLICIES))}")
     volumes = service.get("volumes") or []
     declared = document.get("volumes") or {}
