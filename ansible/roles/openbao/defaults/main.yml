@@ -1,10 +1,9 @@
-# The role reads the variables of the compose_stack role for the folders and the tool list. Each deadline is in seconds.
+# The role reads the variables of the compose_stack role for the folders and the lists. The user of the OpenBao container, openbao_user, and the owner of
+# root-only files, secret_files_root_owner, are in the group variables. Each deadline is in seconds.
 openbao_secrets_directory: "{{ compose_stack_secrets_directory }}"
-openbao_services_file: "{{ compose_stack_compose_directory }}/openbao_services.txt"
+openbao_services_file: "{{ compose_stack_services_file }}"
 openbao_tools_file: "{{ compose_stack_tools_file }}"
 openbao_unlock_key_file: "{{ unlock_key_file }}"
-# The numeric user and group the OpenBao container runs as, the owner of the files it reads. It must equal the user in compose/services/openbao.yml.
-openbao_user: "100:1000"
 openbao_port: 8200
 openbao_address: "http://127.0.0.1:{{ openbao_port }}"
 openbao_ready_deadline_seconds: 120

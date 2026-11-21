@@ -1,12 +1,14 @@
 """Ansible module: the OpenBao admin secret ID file, and the policy, AppRole, secret ID file and PostgreSQL password of each listed service.
 
 ``step: prepare`` creates the admin secret ID file when it is missing, before OpenBao starts for the first time. The server's first start reads it (see
-``compose/openbao/openbao.hcl``). The file is owned by the numeric user that the container runs as and has mode 0400. An existing file keeps its content.
+``compose/openbao/openbao.hcl``). The file is owned by the numeric user that the container runs as and has mode 0400. An existing file keeps its content
+and is given that owner and mode when it has others.
 
 ``step: reconcile`` logs in as the ``bootstrap`` AppRole and makes the running server match the service list: for each service one policy that reads
 only its own path, one AppRole named for the service with a renewable token, one secret ID in a file that only the service reads (mode 0400, owned by
-the numeric user on its list line) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own path. A server that already
-matches needs no change and the step reports none. A service that left the list keeps its role and is reported as unlisted, never removed.
+the numeric user on its list line, or by root when the line has none) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own
+path. A server that already matches needs no change and the step reports none. It reports every secret file with its owner, for the role's check. A
+service that left the list keeps its role and is reported as unlisted, never removed.
 
 It uses only the standard library and runs on the host's Python. No secret is a module argument, a command line, a log line or a message.
 """
@@ -15,10 +17,7 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
-import re
 import secrets
-import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,16 +26,23 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.secret_files import PasswordStore, SecretFileError
+from ansible.module_utils.secret_files import (
+    Entry,
+    PasswordStore,
+    SecretFileError,
+    access_differs,
+    parse_entries,
+    parse_names,
+    parse_owner,
+    read_file,
+    set_access,
+    write_private_file,
+)
 
-SERVICE_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
-OWNER = re.compile(r"([1-9][0-9]*):([0-9]+)")
-RESERVED_NAMES = {"bootstrap", "default", "root"}
 ADMIN_ROLE = "bootstrap"
 OPENBAO_FOLDER = "openbao"
 ADMIN_ID_FILE = "bootstrap.secret_id"
 SECRET_BYTES = 32
-SECRET_FILE_MODE = 0o400
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
 ERROR_CHARACTERS = 300
@@ -44,44 +50,6 @@ ERROR_CHARACTERS = 300
 
 class BootstrapError(RuntimeError):
     """A list, a file or the server's answer is not usable. The message never holds a secret."""
-
-
-@dataclass(frozen=True)
-class Entry:
-    name: str
-    owner: tuple[int, int] | None
-
-
-def parse_owner(text: str) -> tuple[int, int]:
-    """The numeric user and group in ``uid:gid``. The user is never root: a container that reads a secret file runs as a user of its own."""
-    parsed = OWNER.fullmatch(text)
-    if parsed is None:
-        raise BootstrapError(f"owner {text!r} must be a numeric user and group, as uid:gid, with a user other than 0")
-    return int(parsed[1]), int(parsed[2])
-
-
-def parse_entries(text: str, what: str) -> list[Entry]:
-    """The entries of a tracked list: one for each line, with comments and blank lines ignored. A service line may end with the owner of its files."""
-    entries: list[Entry] = []
-    for line in text.splitlines():
-        words = line.split("#", 1)[0].split()
-        if not words:
-            continue
-        name = words[0]
-        if not SERVICE_NAME.fullmatch(name) or name in RESERVED_NAMES:
-            raise BootstrapError(f"{what} name {name!r} must be 1 to 31 lower case letters, digits or underscores, start with a letter and not be reserved")
-        if len(words) > (2 if what == "service" else 1):
-            raise BootstrapError(f"the line of {what} {name!r} holds more than its name" + (" and an owner" if what == "service" else ""))
-        if name in [entry.name for entry in entries]:
-            raise BootstrapError(f"{what} name {name!r} is listed more than once")
-        entries.append(Entry(name, parse_owner(words[1]) if len(words) == 2 else None))
-    if not entries:
-        raise BootstrapError(f"the {what} list names no {what}")
-    return entries
-
-
-def parse_names(text: str, what: str) -> list[str]:
-    return [entry.name for entry in parse_entries(text, what)]
 
 
 def policy_name(service: str) -> str:
@@ -146,48 +114,8 @@ def secret_file(secrets_directory: Path, name: str) -> Path:
     return secrets_directory / OPENBAO_FOLDER / name
 
 
-def read_file(path: Path, what: str) -> str:
-    try:
-        text = path.read_text().rstrip("\n")
-    except OSError as error:
-        raise BootstrapError(f"the {what} cannot be read: {error.strerror}") from error
-    if not text:
-        raise BootstrapError(f"the {what} is empty")
-    return text
-
-
-def make_private_folder(folder: Path) -> None:
-    for missing in reversed([path for path in (folder, *folder.parents) if not path.exists()]):
-        missing.mkdir(mode=0o700)
-
-
-def write_private_file(path: Path, text: str, *, replace: bool, owner: tuple[int, int] | None) -> None:
-    """Write ``text`` to a new file with mode 0400 from the moment it exists, owned by ``owner`` when given. ``replace`` swaps an existing file atomically."""
-    make_private_folder(path.parent)
-    target = path.with_name(f".{path.name}.{secrets.token_hex(4)}.new") if replace else path
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
-    with os.fdopen(descriptor, "w") as handle:
-        if owner is not None:
-            os.fchown(handle.fileno(), *owner)
-        handle.write(text)
-    if replace:
-        os.replace(target, path)
-
-
-def access_differs(path: Path, owner: tuple[int, int] | None) -> bool:
-    """Whether an existing secret file has another mode than 0400 or another owner than ``owner``."""
-    status = path.stat()
-    return stat.S_IMODE(status.st_mode) != SECRET_FILE_MODE or (owner is not None and (status.st_uid, status.st_gid) != owner)
-
-
-def set_access(path: Path, owner: tuple[int, int] | None) -> None:
-    if owner is not None:
-        os.chown(path, *owner)
-    os.chmod(path, SECRET_FILE_MODE)
-
-
-def prepare(secrets_directory: Path, unlock_key_file: Path | None, owner: tuple[int, int] | None, *, check_only: bool) -> bool:
-    """Create the admin secret ID file when it is missing, or set its mode and owner when they differ, and return whether anything changed."""
+def prepare(secrets_directory: Path, unlock_key_file: Path | None, owner: tuple[int, int], *, check_only: bool) -> bool:
+    """Create the admin secret ID file when it is missing, or give it its owner and mode 0400 when it has others, and return whether anything changed."""
     if unlock_key_file is not None and not unlock_key_file.is_file():
         raise BootstrapError("the unlock key file is missing: OpenBao cannot start without it")
     path = secret_file(secrets_directory, ADMIN_ID_FILE)
@@ -293,7 +221,7 @@ def read_state(api: Api, token: str, services: list[str], tools: list[str], secr
     return state
 
 
-def apply(api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int] | None, token_ttl: int, token_max_ttl: int) -> None:
+def apply(api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int], token_ttl: int, token_max_ttl: int) -> None:
     service = action.service
     if action.kind == "policy":
         api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service)})
@@ -317,12 +245,20 @@ def unlisted_roles(api: Api, token: str, services: list[str]) -> list[str]:
     return sorted(key for key in keys if key != ADMIN_ROLE and key not in services)
 
 
-def access_actions(entries: list[Entry], secrets_directory: Path, issued: list[str]) -> list[Action]:
+def secret_files(secrets_directory: Path, entries: list[Entry], admin_owner: tuple[int, int], root_owner: tuple[int, int]) -> dict[Path, tuple[int, int]]:
+    """Every secret file of OpenBao with its owner: the admin file, then the secret ID file of each service (root owns it when the line names no user)."""
+    files = {secret_file(secrets_directory, ADMIN_ID_FILE): admin_owner}
+    for entry in entries:
+        files[secret_file(secrets_directory, f"{entry.name}.secret_id")] = entry.owner or root_owner
+    return files
+
+
+def access_actions(entries: list[Entry], secrets_directory: Path, issued: list[str], root_owner: tuple[int, int]) -> list[Action]:
     """The secret ID files that exist with another mode or owner than the list line asks for. A file issued in this run is already right."""
     actions: list[Action] = []
     for entry in entries:
         path = secret_file(secrets_directory, f"{entry.name}.secret_id")
-        if entry.name not in issued and path.exists() and access_differs(path, entry.owner):
+        if entry.name not in issued and path.exists() and access_differs(path, entry.owner or root_owner):
             actions.append(Action("access", entry.name, f"set the mode and owner of the secret ID file of {entry.name}"))
     return actions
 
@@ -331,7 +267,9 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     secrets_directory = Path(params["secrets_directory"])
     entries = parse_entries(Path(params["services_file"]).read_text(), "service")
     services = [entry.name for entry in entries]
-    owners = {entry.name: entry.owner for entry in entries}
+    root_owner = parse_owner(params["root_owner"], allow_root=True)
+    admin_owner = parse_owner(params["file_owner"])
+    owners = {entry.name: entry.owner or root_owner for entry in entries}
     tools = parse_names(Path(params["tools_file"]).read_text(), "tool")
     if missing := [tool for tool in tools if tool not in services]:
         raise BootstrapError(f"PostgreSQL tool {missing[0]!r} has no entry in the service list, so its password would never reach OpenBao")
@@ -341,14 +279,22 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     ttl, max_ttl = int(params["token_ttl_seconds"]), int(params["token_max_ttl_seconds"])
     state = read_state(api, token, services, tools, secrets_directory)
     actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl)
-    actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"])
+    actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"], root_owner)
     if not check_only:
         for action in actions:
             if action.kind == "access":
                 set_access(secret_file(secrets_directory, f"{action.service}.secret_id"), owners[action.service])
             else:
                 apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl)
-    return {"changed": bool(actions), "actions": [action.description for action in actions], "unlisted": unlisted_roles(api, token, services)}
+    files = [
+        {"path": str(path), "owner": f"{owner[0]}:{owner[1]}"} for path, owner in secret_files(secrets_directory, entries, admin_owner, root_owner).items()
+    ]
+    return {
+        "changed": bool(actions),
+        "actions": [action.description for action in actions],
+        "unlisted": unlisted_roles(api, token, services),
+        "secret_files": files,
+    }
 
 
 def main() -> None:
@@ -357,7 +303,8 @@ def main() -> None:
             "step": {"type": "str", "required": True, "choices": ["prepare", "reconcile"]},
             "secrets_directory": {"type": "path", "required": True},
             "unlock_key_file": {"type": "path"},
-            "file_owner": {"type": "str"},
+            "file_owner": {"type": "str", "required": True},
+            "root_owner": {"type": "str", "default": "0:0"},
             "services_file": {"type": "path"},
             "tools_file": {"type": "path"},
             "address": {"type": "str"},
@@ -371,9 +318,10 @@ def main() -> None:
     try:
         if params["step"] == "prepare":
             unlock = Path(params["unlock_key_file"]) if params["unlock_key_file"] else None
-            owner = parse_owner(params["file_owner"]) if params["file_owner"] else None
+            owner = parse_owner(params["file_owner"])
             created = prepare(Path(params["secrets_directory"]), unlock, owner, check_only=module.check_mode)
-            module.exit_json(changed=created, created=[ADMIN_ID_FILE] if created else [])
+            files = [{"path": str(secret_file(Path(params["secrets_directory"]), ADMIN_ID_FILE)), "owner": params["file_owner"]}]
+            module.exit_json(changed=created, created=[ADMIN_ID_FILE] if created else [], secret_files=files)
         if not all(params[key] for key in ("services_file", "tools_file", "address")):
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
         module.exit_json(**reconcile(params, check_only=module.check_mode))

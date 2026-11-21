@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROLES / "compose_stack"
 OWNER = pwd.getpwuid(os.getuid()).pw_name
 GROUP = grp.getgrgid(os.getgid()).gr_name
+UID, GID = os.getuid(), os.getgid()
+TOOL_GID = next((group for group in os.getgroups() if group != GID), GID)
 CHANGED_NONE = re.compile(r"changed=0\s")
 
 
@@ -34,6 +36,7 @@ def variables(folder: Path) -> dict[str, object]:
         "compose_stack_owner": OWNER,
         "compose_stack_group": GROUP,
         "compose_stack_postgres_port": 15432,
+        "secret_files_root_owner": f"{UID}:{GID}",
     }
 
 
@@ -77,22 +80,34 @@ class RenderTest(unittest.TestCase):
         self.assertRegex(again, CHANGED_NONE)
 
 
+def service_list(*, tool_group: int) -> str:
+    """The service list: nessie runs as a user of its own, airbyte has none yet."""
+    return f"nessie {UID}:{tool_group}\nairbyte\n"
+
+
 class PasswordFilesTest(unittest.TestCase):
-    def create(self, folder: Path, tools: str = "nessie\nairbyte\n") -> tuple[int, str]:
+    def create(self, folder: Path, tools: str = "nessie\nairbyte\n", services: str | None = None) -> tuple[int, str]:
         tools_file = folder / "tools.txt"
         tools_file.write_text(tools)
-        return run_tasks(["passwords.yml", "verify_secrets.yml"], variables(folder) | {"compose_stack_tools_file": str(tools_file)})
+        services_file = folder / "services.txt"
+        services_file.write_text(service_list(tool_group=TOOL_GID) if services is None else services)
+        values = variables(folder) | {"compose_stack_tools_file": str(tools_file), "compose_stack_services_file": str(services_file)}
+        return run_tasks(["passwords.yml", "verify_secrets.yml"], values)
 
-    def test_the_server_and_each_tool_get_a_password_file_for_the_owner_only_and_nothing_prints_a_password(self) -> None:
+    def test_the_server_gets_a_password_file_for_root_and_each_tool_one_for_the_user_of_its_service_and_nothing_prints_a_password(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             code, output = self.create(folder)
             files = {path.name: path.read_text() for path in (folder / "secrets" / "postgres").iterdir()}
-            modes = {path.name: stat.S_IMODE(path.stat().st_mode) for path in (folder / "secrets" / "postgres").iterdir()}
+            status = {path.name: path.stat() for path in (folder / "secrets" / "postgres").iterdir()}
             folder_mode = stat.S_IMODE((folder / "secrets" / "postgres").stat().st_mode)
         self.assertEqual(0, code, output)
         self.assertEqual(["airbyte.password", "nessie.password", "postgres.password"], sorted(files))
-        self.assertEqual({0o600}, set(modes.values()))
+        self.assertEqual({0o400}, {stat.S_IMODE(item.st_mode) for item in status.values()})
+        self.assertEqual(
+            {"airbyte.password": (UID, GID), "nessie.password": (UID, TOOL_GID), "postgres.password": (UID, GID)},
+            {name: (item.st_uid, item.st_gid) for name, item in status.items()},
+        )
         self.assertEqual(0o700, folder_mode)
         for text in files.values():
             self.assertGreaterEqual(len(text), 40)
@@ -109,12 +124,27 @@ class PasswordFilesTest(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertRegex(output, CHANGED_NONE)
 
+    def test_a_file_that_an_earlier_deploy_made_for_root_only_is_given_to_its_user_with_its_password_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            self.create(folder, services=service_list(tool_group=GID))
+            target = folder / "secrets" / "postgres" / "nessie.password"
+            target.chmod(0o600)
+            before = target.read_text()
+            code, output = self.create(folder)
+            status = target.stat()
+            after = target.read_text()
+        self.assertEqual(0, code, output)
+        self.assertNotRegex(output, CHANGED_NONE)
+        self.assertEqual((0o400, UID, TOOL_GID), (stat.S_IMODE(status.st_mode), status.st_uid, status.st_gid))
+        self.assertEqual(before, after)
+
     def test_a_tool_added_later_gets_its_own_password_and_the_others_are_kept(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             self.create(folder)
             before = (folder / "secrets" / "postgres" / "nessie.password").read_text()
-            code, output = self.create(folder, "nessie\nairbyte\nextra\n")
+            code, output = self.create(folder, "nessie\nairbyte\nextra\n", service_list(tool_group=TOOL_GID) + "extra\n")
             after = (folder / "secrets" / "postgres" / "nessie.password").read_text()
             added = (folder / "secrets" / "postgres" / "extra.password").is_file()
         self.assertEqual(0, code, output)
@@ -130,49 +160,80 @@ class PasswordFilesTest(unittest.TestCase):
         self.assertIn("tool name", output)
         self.assertFalse(written)
 
+    def test_a_tool_with_no_line_in_the_service_list_stops_the_step_before_any_file_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = self.create(folder, "nessie\nextra\n")
+            written = (folder / "secrets").exists()
+        self.assertNotEqual(0, code)
+        self.assertIn("tool extra has no line in the service list", output)
+        self.assertFalse(written)
+
 
 class SecretsCheckTest(unittest.TestCase):
-    def verdict(self, *, mode: int = 0o600, owner: str = OWNER, create: bool = True) -> tuple[int, str]:
+    """The check reads the numeric owner and the mode of each file. A file that anyone else can read, or that another user owns, is refused."""
+
+    def verdict(
+        self,
+        *,
+        mode: int = 0o400,
+        group: int = TOOL_GID,
+        expected: tuple[int, int] = (UID, TOOL_GID),
+        create: bool = True,
+        folder_mode: int = 0o700,
+        root_owner: tuple[int, int] = (UID, GID),
+        owner_name: str = "root",
+    ) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             target = folder / "secrets" / "postgres" / "nessie.password"
             target.parent.mkdir(parents=True)
             target.parent.parent.chmod(0o700)
-            target.parent.chmod(0o700)
+            target.parent.chmod(folder_mode)
             if create:
                 target.write_text("a-long-random-value")
+                os.chown(target, UID, group)
                 target.chmod(mode)
-            return run_tasks(["verify_secrets.yml"], variables(folder) | {"compose_stack_accounts": ["nessie"], "compose_stack_owner": owner})
+            values = variables(folder) | {
+                "compose_stack_accounts": ["nessie"],
+                "compose_stack_owners": {"nessie": f"{expected[0]}:{expected[1]}"},
+                "secret_files_root_owner": f"{root_owner[0]}:{root_owner[1]}",
+                "compose_stack_owner": owner_name,
+            }
+            return run_tasks(["verify_secrets.yml"], values)
 
-    def test_a_file_of_the_owner_with_mode_0600_passes(self) -> None:
-        code, output = self.verdict()
-        self.assertEqual(0, code, output)
+    def test_a_private_file_of_its_owner_passes_whatever_the_name_of_that_owner_is(self) -> None:
+        for name in ("root", "nobody_such_user"):
+            with self.subTest(owner_name=name):
+                code, output = self.verdict(owner_name=name)
+                self.assertEqual(0, code, output)
 
-    def test_a_folder_or_file_that_others_can_read_that_another_user_owns_or_that_is_missing_is_refused_by_name(self) -> None:
-        cases = {
-            "file mode 0640": (self.verdict(mode=0o640), "The password file of nessie"),
-            "file mode 0644": (self.verdict(mode=0o644), "The password file of nessie"),
-            "missing file": (self.verdict(create=False), "The password file of nessie"),
-            "another owner": (self.verdict(owner="nobody_such_user"), "The password folder"),
-        }
-        for label, ((code, output), message) in cases.items():
-            with self.subTest(label):
+    def test_a_file_that_anyone_but_its_owner_can_read_or_that_its_owner_can_write_is_refused_by_name_and_its_content_is_not_shown(self) -> None:
+        for mode in (0o600, 0o640, 0o644, 0o440, 0o404, 0o444, 0o500, 0o000):
+            with self.subTest(mode=oct(mode)):
+                code, output = self.verdict(mode=mode)
                 self.assertNotEqual(0, code)
-                self.assertIn(message, output)
+                self.assertIn("The password file of nessie", output)
                 self.assertNotIn("a-long-random-value", output)
 
-    def test_a_folder_that_others_can_read_is_refused(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            target = folder / "secrets" / "postgres" / "nessie.password"
-            target.parent.mkdir(parents=True)
-            target.parent.parent.chmod(0o700)
-            target.parent.chmod(0o755)
-            target.write_text("a-long-random-value")
-            target.chmod(0o600)
-            code, output = run_tasks(["verify_secrets.yml"], variables(folder) | {"compose_stack_accounts": ["nessie"]})
+    def test_a_file_that_another_user_owns_is_refused_by_the_number_of_the_user(self) -> None:
+        for label, expected in (("another user", (UID + 1, TOOL_GID)), ("another group", (UID, TOOL_GID + 1))):
+            with self.subTest(label):
+                code, output = self.verdict(expected=expected)
+                self.assertNotEqual(0, code)
+                self.assertIn("The password file of nessie", output)
+
+    def test_a_missing_file_is_refused(self) -> None:
+        code, output = self.verdict(create=False)
         self.assertNotEqual(0, code)
-        self.assertIn("The password folder", output)
+        self.assertIn("The password file of nessie", output)
+
+    def test_a_folder_that_others_can_read_or_that_another_user_owns_is_refused(self) -> None:
+        for label, kwargs in (("readable folder", {"folder_mode": 0o755}), ("owned elsewhere", {"root_owner": (UID + 1, GID)})):
+            with self.subTest(label):
+                code, output = self.verdict(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn("The password folder", output)
 
 
 if __name__ == "__main__":

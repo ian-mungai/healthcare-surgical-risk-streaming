@@ -25,8 +25,10 @@ SERVER_VERIFIER = "SCRAM-SHA-256$4096:VH4EErGPaqJpsf05kuJoBw==$b6XFM3jOXIKRGszgs
 SERVER_SALT = base64.b64decode("VH4EErGPaqJpsf05kuJoBw==")
 
 
+store_module: Any = shared_module("secret_files")
+
+
 def load_module() -> ModuleType:
-    shared_module("secret_files")
     spec = importlib.util.spec_from_file_location("postgres_accounts", MODULE)
     if spec is None or spec.loader is None:
         raise ImportError(str(MODULE))
@@ -80,6 +82,21 @@ class VerifierTest(unittest.TestCase):
         self.assertNotEqual(one, two)
         self.assertTrue(accounts.verifier_matches(one, "pencil") and accounts.verifier_matches(two, "pencil"))
         self.assertRegex(one, r"^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$")
+
+
+class PasswordOwnerTest(unittest.TestCase):
+    entries = [store_module.Entry("nessie", (10000, 10001)), store_module.Entry("airbyte", None)]
+
+    def test_the_server_and_a_tool_with_no_user_of_its_own_get_the_root_owner_and_a_tool_gets_the_owner_of_its_line(self) -> None:
+        owners = accounts.password_owners(["nessie", "airbyte"], self.entries, (0, 0))
+        self.assertEqual({"postgres": (0, 0), "nessie": (10000, 10001), "airbyte": (0, 0)}, owners)
+
+    def test_a_tool_that_no_service_line_names_is_refused_by_name_because_no_container_user_would_own_its_password(self) -> None:
+        with self.assertRaisesRegex(accounts.AccountError, "tool extra has no line in the service list"):
+            accounts.password_owners(["nessie", "extra"], self.entries, (0, 0))
+
+    def test_the_server_is_always_for_the_root_owner_even_if_a_tool_is_named_for_it(self) -> None:
+        self.assertEqual((7, 8), accounts.password_owners(["nessie"], self.entries, (7, 8))["postgres"])
 
 
 PASSWORDS = {"nessie": "n-secret-value", "airbyte": "a-secret-value", "extra": "e-secret-value"}

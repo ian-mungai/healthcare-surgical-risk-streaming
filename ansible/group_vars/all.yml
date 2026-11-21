@@ -36,7 +36,13 @@ metadata_guard_runtime_units:
 # The folder of the systemd units and their drop-ins.
 metadata_guard_unit_directory: /etc/systemd/system
 
-# The secret store's unlock key file on the host. Its owner is the user that deploys the stack.
+# Every secret file that a container reads is owned by the numeric user that container runs as, has mode 0400 and is read by nobody else. A file that no
+# container reads is owned by root the same way. The numeric user and group of root, and the user of the OpenBao container, are here. The user of a
+# PostgreSQL tool and of an OpenBao service is on its line in compose/openbao_services.txt. Each must equal the user in the service's Compose file (a fast test checks it).
+secret_files_root_owner: "0:0"
+openbao_user: "100:1000"
+
+# The secret store's unlock key file on the host. It is owned by the user of the OpenBao container, so the deploy user does not read it. The folder is the deploy user's.
 unlock_key_directory: /opt/platform
 unlock_key_file: "{{ unlock_key_directory }}/.env"
 unlock_key_owner: ubuntu
@@ -48,6 +54,8 @@ compose_stack_compose_directory: "{{ compose_stack_directory }}/compose"
 compose_stack_secrets_directory: "{{ compose_stack_directory }}/secrets"
 # One line for each tool that needs a PostgreSQL account and database.
 compose_stack_tools_file: "{{ compose_stack_compose_directory }}/postgres_tools.txt"
+# One line for each service that reads a secret. A numeric user and group at the end of a line name the owner of that service's files.
+compose_stack_services_file: "{{ compose_stack_compose_directory }}/openbao_services.txt"
 compose_stack_owner: root
 compose_stack_group: root
 compose_stack_postgres_port: 5432

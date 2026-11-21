@@ -1,3 +1,5 @@
 # One service for each line. Each gets one OpenBao policy and one AppRole. A service named in postgres_tools.txt also gets its PostgreSQL password at its own path.
-nessie
+# A numeric user and group at the end of a line (uid:gid) name the user its container runs as. That user owns the service's secret ID file and, for a PostgreSQL
+# tool, its password file: mode 0400, read by nobody else. A line with no owner is for a service that runs outside Compose, and root owns its files.
+nessie 10000:10001
 airbyte

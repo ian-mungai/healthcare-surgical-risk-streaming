@@ -75,6 +75,14 @@ def run_task_file(role: str, task_file: str, variables: dict[str, object], *, ve
 
 def load_list(variables_file: Path, name: str) -> list[str]:
     """The named list variable of a variables file, as Ansible loads it."""
+    values = load_variable(variables_file, name)
+    if not isinstance(values, list):
+        raise TypeError(f"{name} is not a list")
+    return [str(value) for value in values]
+
+
+def load_variable(variables_file: Path, name: str) -> object:
+    """The named variable of a variables file, as Ansible loads it."""
     with tempfile.TemporaryDirectory() as scratch:
         folder = Path(scratch)
         playbook = folder / "load.yml"
@@ -85,8 +93,7 @@ def load_list(variables_file: Path, name: str) -> list[str]:
         result = run_playbook(folder, playbook, ["-i", "localhost,"])
         if result.returncode != 0:
             raise RuntimeError(result.stdout + result.stderr)
-        values: list[str] = json.loads(base64.b64decode((folder / "value.json").read_text()))
-        return values
+        return json.loads(base64.b64decode((folder / "value.json").read_text()))
 
 
 def role_order(playbook: str) -> list[str]:

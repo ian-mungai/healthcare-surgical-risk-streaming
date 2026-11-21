@@ -1,29 +1,31 @@
-"""The OpenBao bootstrap's rules: the service list, the policy each service gets and the plan that makes the server match the list.
+"""The OpenBao bootstrap's rules: the policy each service gets, the plan that makes the server match the list and the owner of every secret file.
 
-Real runs against a server are the acceptance test's job. Isolated cases are kept for what a fresh server never shows: a list entry that could alter
-a policy or an API path, and a server that drifted (a policy or role that was widened, a stale password, a secret ID that no longer works).
+Real runs against a server are the acceptance test's job. Isolated cases are kept for what a fresh server never shows: a server that drifted (a policy
+or role that was widened, a stale password, a secret ID that no longer works) and a secret file with another mode or owner than the list asks for. A test
+user cannot give a file to another user, so the owners here are the test user's own groups.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_support import shared_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "ansible" / "roles" / "openbao" / "library" / "openbao_bootstrap.py"
-SERVICES_FILE = ROOT / "compose" / "openbao_services.txt"
-TOOLS_FILE = ROOT / "compose" / "postgres_tools.txt"
-COMPOSE_FILE = ROOT / "compose" / "services" / "openbao.yml"
-DEFAULTS_FILE = ROOT / "ansible" / "roles" / "openbao" / "defaults" / "main.yml"
 TTL, MAX_TTL = 3600, 86400
+UID, GID = os.getuid(), os.getgid()
+OTHER_GIDS = [group for group in os.getgroups() if group != GID]
+MY_OWNER = (UID, GID)
 
 
 def load_module() -> ModuleType:
@@ -53,56 +55,6 @@ def good_state(services: list[str], tools: list[str]) -> Any:
 def planned(services: list[str], tools: list[str], state: Any) -> list[str]:
     actions = bootstrap.plan(services, tools, state, lambda name: f"password of {name}", TTL, MAX_TTL)
     return [action.description for action in actions]
-
-
-class ServiceListTest(unittest.TestCase):
-    def test_the_tracked_lists_are_valid_and_every_postgres_tool_is_a_service(self) -> None:
-        services = bootstrap.parse_names(SERVICES_FILE.read_text(), "service")
-        tools = bootstrap.parse_names(TOOLS_FILE.read_text(), "tool")
-        self.assertTrue({"nessie", "airbyte"} <= set(services))
-        self.assertEqual([], sorted(set(tools) - set(services)), "a PostgreSQL tool has no OpenBao role to read its password")
-
-    def test_comments_and_blank_lines_are_ignored_in_order(self) -> None:
-        self.assertEqual(["b", "a"], bootstrap.parse_names("# services\nb\n\n  a  # trailing\n", "service"))
-
-    def test_a_name_that_could_alter_a_policy_or_an_api_path_is_refused(self) -> None:
-        for name in ("Nessie", "nes-sie", "1nessie", 'nes"sie', "nes/sie", "../sie", "nes*", "bootstrap", "a" * 32, "default", "root"):
-            with self.subTest(name=name), self.assertRaises(bootstrap.BootstrapError) as caught:
-                bootstrap.parse_names(f"{name}\n", "service")
-            self.assertIn("service name", str(caught.exception))
-
-    def test_a_repeated_name_or_an_empty_list_is_refused(self) -> None:
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "more than once"):
-            bootstrap.parse_names("nessie\nairbyte\nnessie\n", "service")
-        with self.assertRaisesRegex(bootstrap.BootstrapError, "no service"):
-            bootstrap.parse_names("# nothing\n", "service")
-
-
-class OwnerTest(unittest.TestCase):
-    def test_a_service_line_may_name_the_numeric_user_its_container_runs_as(self) -> None:
-        entries = bootstrap.parse_entries("nessie 185:185  # runs as a fixed user\nairbyte\n", "service")
-        self.assertEqual([("nessie", (185, 185)), ("airbyte", None)], [(entry.name, entry.owner) for entry in entries])
-
-    def test_an_owner_that_is_not_a_numeric_user_other_than_root_is_refused(self) -> None:
-        for owner in ("185", "a:b", "-1:5", "0:5", "5:-1", "1:2:3", "185:", ":185", "5:0x10", "+5:6"):
-            with self.subTest(owner=owner), self.assertRaises(bootstrap.BootstrapError) as caught:
-                bootstrap.parse_entries(f"nessie {owner}\n", "service")
-            self.assertIn("owner", str(caught.exception))
-
-    def test_a_group_of_zero_is_allowed_only_with_a_user_other_than_root(self) -> None:
-        self.assertEqual((5, 0), bootstrap.parse_entries("nessie 5:0\n", "service")[0].owner)
-
-    def test_a_tool_line_holds_a_name_only_and_a_line_holds_nothing_after_the_owner(self) -> None:
-        for text, what in (("nessie 185:185\n", "tool"), ("nessie 185:185 extra\n", "service")):
-            with self.subTest(text=text), self.assertRaises(bootstrap.BootstrapError):
-                bootstrap.parse_entries(text, what)
-
-    def test_the_compose_service_runs_as_the_numeric_user_that_owns_the_secret_files_and_it_is_not_root(self) -> None:
-        compose: Any = load_yaml(COMPOSE_FILE.read_text())
-        defaults: Any = load_yaml(DEFAULTS_FILE.read_text())
-        user = str(compose["services"]["openbao"]["user"])
-        self.assertRegex(user, r"^[1-9]\d*:\d+$")
-        self.assertEqual(user, defaults["openbao_user"])
 
 
 class PolicyTest(unittest.TestCase):
@@ -194,6 +146,94 @@ class PlanTest(unittest.TestCase):
         state = good_state(list(self.services), list(self.tools))
         self.assertNotIn("dagster", state.passwords)
         self.assertEqual([], planned(list(self.services), list(self.tools), state))
+
+
+def secret_file(directory: Path, name: str, owner: tuple[int, int] = MY_OWNER, mode: int = 0o400) -> Path:
+    path = directory / "openbao" / f"{name}.secret_id"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("value")
+    os.chown(path, *owner)
+    path.chmod(mode)
+    return path
+
+
+class OwnerTest(unittest.TestCase):
+    entries = (bootstrap.Entry("nessie", (10000, 10001)), bootstrap.Entry("airbyte", None))
+
+    def test_the_admin_file_and_each_service_file_have_the_owner_of_their_line_and_a_service_with_none_gets_the_root_owner(self) -> None:
+        files = bootstrap.secret_files(Path("/s"), list(self.entries), (100, 1000), (0, 0))
+        self.assertEqual(
+            {
+                "/s/openbao/bootstrap.secret_id": (100, 1000),
+                "/s/openbao/nessie.secret_id": (10000, 10001),
+                "/s/openbao/airbyte.secret_id": (0, 0),
+            },
+            {str(path): owner for path, owner in files.items()},
+        )
+
+    def test_a_file_with_another_mode_or_another_owner_than_its_line_asks_for_is_listed_and_a_file_that_matches_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            entries = [bootstrap.Entry("nessie", MY_OWNER), bootstrap.Entry("airbyte", None), bootstrap.Entry("dagster", MY_OWNER)]
+            secret_file(folder, "nessie")
+            secret_file(folder, "airbyte")
+            secret_file(folder, "dagster", mode=0o440)
+            actions = bootstrap.access_actions(entries, folder, [], MY_OWNER)
+            matched = bootstrap.access_actions(entries[:2], folder, [], MY_OWNER)
+            elsewhere = bootstrap.access_actions(entries[:2], folder, [], (UID + 1, GID))
+        self.assertEqual(["dagster"], [action.service for action in actions])
+        self.assertEqual([], matched)
+        self.assertEqual(["airbyte"], [action.service for action in elsewhere])
+
+    def test_a_file_issued_in_this_run_is_not_listed_again(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            secret_file(Path(scratch), "nessie", mode=0o600)
+            self.assertEqual([], bootstrap.access_actions([bootstrap.Entry("nessie", MY_OWNER)], Path(scratch), ["nessie"], MY_OWNER))
+
+
+class PrepareTest(unittest.TestCase):
+    def prepared(self, folder: Path, owner: tuple[int, int] = MY_OWNER, *, check_only: bool = False) -> bool:
+        unlock = folder / "unlock.env"
+        unlock.write_text("OPENBAO_UNLOCK_KEY=" + "ab" * 32 + "\n")
+        return bool(bootstrap.prepare(folder / "secrets", unlock, owner, check_only=check_only))
+
+    def test_the_admin_file_is_made_for_its_owner_only_and_a_second_run_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            first = self.prepared(Path(scratch))
+            path = Path(scratch) / "secrets" / "openbao" / "bootstrap.secret_id"
+            status = path.stat()
+            content = path.read_text()
+            second = self.prepared(Path(scratch))
+            kept = path.read_text()
+        self.assertEqual((True, False), (first, second))
+        self.assertEqual((0o400, MY_OWNER), (stat.S_IMODE(status.st_mode), (status.st_uid, status.st_gid)))
+        self.assertEqual(content, kept)
+
+    def test_an_admin_file_that_others_can_read_is_made_private_with_its_content_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            self.prepared(Path(scratch))
+            path = Path(scratch) / "secrets" / "openbao" / "bootstrap.secret_id"
+            content = path.read_text()
+            for mode in (0o600, 0o440, 0o404, 0o644):
+                path.chmod(mode)
+                with self.subTest(mode=oct(mode)):
+                    self.assertTrue(self.prepared(Path(scratch)))
+                    self.assertEqual((0o400, content), (stat.S_IMODE(path.stat().st_mode), path.read_text()))
+
+    def test_a_check_run_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            self.assertTrue(self.prepared(Path(scratch), check_only=True))
+            self.assertFalse((Path(scratch) / "secrets").exists())
+            self.prepared(Path(scratch))
+            path = Path(scratch) / "secrets" / "openbao" / "bootstrap.secret_id"
+            path.chmod(0o640)
+            self.assertTrue(self.prepared(Path(scratch), check_only=True))
+            self.assertEqual(0o640, stat.S_IMODE(path.stat().st_mode))
+
+    def test_a_missing_unlock_key_file_stops_the_step_before_any_file_is_made(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, self.assertRaisesRegex(bootstrap.BootstrapError, "unlock key file is missing"):
+            bootstrap.prepare(Path(scratch) / "secrets", Path(scratch) / "none.env", MY_OWNER, check_only=False)
+        self.assertFalse((Path(scratch) / "secrets").exists())
 
 
 if __name__ == "__main__":

@@ -1,9 +1,13 @@
 """Ansible module: the PostgreSQL password files and the one account and one database for each tool in the tracked list.
 
-``step: passwords`` creates each missing password file, for the server's administrator and for each tool, readable by its owner only, and keeps
-existing files. ``step: provision`` makes the running server match the tool list: it creates a missing account and database, repairs an account
-whose password or attributes differ from the file and removes every grant on a tool's database, so that only the tool's own account (and the
-administrator) can connect. A server that already matches needs no change and the step reports none.
+``step: passwords`` creates each missing password file, for the server's administrator and for each tool, and keeps existing files. A file is owned
+by the numeric user of the container that reads it and has mode 0400: the tool's line in the service list names that user, and the administrator's file
+(which the image reads as root, before it drops privileges) and the file of a tool with no user of its own are owned by root. An existing file with another
+mode or owner is given the right ones, and its password is kept.
+
+``step: provision`` makes the running server match the tool list: it creates a missing account and database, repairs an account whose password or
+attributes differ from the file and removes every grant on a tool's database, so that only the tool's own account (and the administrator) can connect.
+A server that already matches needs no change and the step reports none.
 
 The module computes each password's SCRAM-SHA-256 verifier itself and sends only the verifier to the server, so no password reaches a command
 line, a statement or a log. It uses only the standard library and runs on the host's Python.
@@ -21,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.secret_files import PasswordStore, SecretFileError
+from ansible.module_utils.secret_files import Entry, PasswordStore, SecretFileError, access_differs, parse_entries, parse_owner
 
 TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
 RESERVED_NAMES = {"postgres", "public", "template0", "template1"}
@@ -172,15 +176,33 @@ class Server:
         return output
 
 
-def create_missing_passwords(store: PasswordStore, tools: list[str], *, check_only: bool) -> list[str]:
+def password_owners(tools: list[str], services: list[Entry], root_owner: tuple[int, int]) -> dict[str, tuple[int, int]]:
+    """The owner of each password file: root for the server's administrator, and for each tool the owner on its line in the service list."""
+    on_list = {entry.name: entry.owner for entry in services}
+    owners = {ADMINISTRATOR: root_owner}
+    for tool in tools:
+        if tool not in on_list:
+            raise AccountError(f"tool {tool} has no line in the service list, so no container user is known to own its password file")
+        owners[tool] = on_list[tool] or root_owner
+    return owners
+
+
+def make_password_files(store: PasswordStore, owners: dict[str, tuple[int, int]], *, check_only: bool) -> tuple[list[str], list[str]]:
+    """Create each missing password file and give each existing one its owner and mode. Return the accounts that were created and the ones that changed."""
     created: list[str] = []
-    for account in (ADMINISTRATOR, *tools):
-        if check_only:
-            if not store.path(account).exists():
-                created.append(account)
-        elif store.ensure(account):
+    protected: list[str] = []
+    for account, owner in owners.items():
+        if not store.path(account).exists():
             created.append(account)
-    return created
+            if not check_only:
+                store.ensure(account, owner)
+        elif check_only:
+            store.read(account)
+            if access_differs(store.path(account), owner):
+                protected.append(account)
+        elif store.protect(account, owner):
+            protected.append(account)
+    return created, protected
 
 
 def main() -> None:
@@ -189,6 +211,8 @@ def main() -> None:
             "step": {"type": "str", "required": True, "choices": ["passwords", "provision"]},
             "tools_file": {"type": "path", "required": True},
             "secrets_directory": {"type": "path", "required": True},
+            "services_file": {"type": "path"},
+            "root_owner": {"type": "str", "default": "0:0"},
             "compose_command": {"type": "list", "elements": "str"},
         },
         supports_check_mode=True,
@@ -198,8 +222,18 @@ def main() -> None:
         store = PasswordStore.in_secrets(Path(module.params["secrets_directory"]))
         accounts = [ADMINISTRATOR, *tools]
         if module.params["step"] == "passwords":
-            created = create_missing_passwords(store, tools, check_only=module.check_mode)
-            module.exit_json(changed=bool(created), accounts=accounts, created=created)
+            if not module.params["services_file"]:
+                raise AccountError("the passwords step needs services_file")
+            root_owner = parse_owner(module.params["root_owner"], allow_root=True)
+            owners = password_owners(tools, parse_entries(Path(module.params["services_file"]).read_text(), "service"), root_owner)
+            created, protected = make_password_files(store, owners, check_only=module.check_mode)
+            module.exit_json(
+                changed=bool(created or protected),
+                accounts=accounts,
+                created=created,
+                protected=protected,
+                owners={account: f"{owner[0]}:{owner[1]}" for account, owner in owners.items()},
+            )
         if not module.params["compose_command"]:
             raise AccountError("the provision step needs compose_command")
         server = Server(lambda args, data: module.run_command(args, data=data, check_rc=False), module.params["compose_command"])
