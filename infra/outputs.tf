@@ -37,3 +37,8 @@ output "workload_role_arns" {
   description = "ARN of each workload's role, by workload name. Empty for a host that already exists."
   value       = try(module.workload_roles[0].role_arns, {})
 }
+
+output "workload_policies" {
+  description = "The permissions policy document of each workload's role, by workload name. Empty for a host that already exists."
+  value       = merge([for roles in module.workload_roles : roles.policies]...)
+}

@@ -118,13 +118,10 @@ variable "provision_host" {
 }
 
 variable "workloads" {
-  description = "Workloads that get their own role, each with the statements of its permissions policy."
+  description = "Workloads that get their own role. Each names the prefixes of the run's bound bucket it reaches, with the modes read and write for each, and whether it reads the publisher's dataset. Terraform builds the resource patterns from the bound bucket."
   type = map(object({
-    statements = list(object({
-      sid       = string
-      actions   = list(string)
-      resources = list(string)
-    }))
+    access         = map(list(string))
+    publisher_read = optional(bool, false)
   }))
   default = {}
 }

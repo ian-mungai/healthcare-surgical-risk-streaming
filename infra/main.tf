@@ -11,7 +11,9 @@ provider "aws" {
 }
 
 locals {
-  data_prefixes = ["landing", "warehouse"]
+  data_prefixes     = ["landing", "warehouse"]
+  read_prefixes     = ["manifests"]
+  workload_prefixes = ["airbyte", "landing", "manifests", "warehouse"]
 }
 
 module "host" {
@@ -24,6 +26,7 @@ module "host" {
   disk_gib      = var.host_disk_gib
   bucket_arn    = "arn:aws:s3:::${var.data_bucket_name}"
   data_prefixes = local.data_prefixes
+  read_prefixes = local.read_prefixes
 
   workload_role_pattern = "${var.project_name}_workload_*"
 
@@ -55,5 +58,7 @@ module "workload_roles" {
   environment   = var.environment
   boundary_name = "${var.project_name}_role_boundary"
   host_role_arn = module.host[0].role_arn
+  bucket_name   = var.data_bucket_name
+  data_prefixes = local.workload_prefixes
   workloads     = var.workloads
 }

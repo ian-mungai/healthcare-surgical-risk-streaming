@@ -43,3 +43,13 @@ variable "data_prefixes" {
   description = "Prefixes of the bucket the host may list, read and write. The Terraform state lives under another prefix."
   type        = list(string)
 }
+
+variable "read_prefixes" {
+  description = "Prefixes of the bucket the host may list and read and never write. At least one: an empty list would make an empty resource list."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.read_prefixes) > 0
+    error_message = "Give at least one read-only prefix."
+  }
+}
