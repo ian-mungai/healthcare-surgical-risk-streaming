@@ -16,6 +16,8 @@ The inline text in these tests is a refusal case for a parser rule. It is not a 
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -224,6 +226,93 @@ class ClosedPin(unittest.TestCase):
 
     def test_a_pin_that_is_no_object_is_refused(self) -> None:
         self.assertTrue(release_problems([]))  # type: ignore[arg-type]
+
+    def test_a_pin_for_another_bucket_region_or_release_path_than_the_reads_use_is_refused(self) -> None:
+        for field, other in (("bucket", "another-bucket"), ("region", "eu-west-1"), ("release_path", "vitaldb/2.0.0/")):
+            pin = self.pin()
+            pin["source"] = pin["source"] | {field: other}  # type: ignore[operator]
+            with self.subTest(field=field):
+                self.assertTrue(any(problem.startswith(f"source: the {field}") for problem in release_problems(pin)), release_problems(pin))
+        pin = self.pin()
+        del pin["source"]
+        self.assertTrue(any(problem.startswith("source") for problem in release_problems(pin)))
+
+    def test_a_pin_with_a_table_list_of_another_type_is_refused_and_not_raised(self) -> None:
+        for tables in (None, 5, "ab", {"a": 1}):
+            pin = self.pin()
+            pin["tables"] = tables
+            with self.subTest(tables=tables):
+                self.assertTrue(any(problem.startswith("tables") for problem in release_problems(pin)))
+
+    def test_a_size_that_is_a_boolean_is_refused(self) -> None:
+        pin = self.pin()
+        pin["track_list"] = pin["track_list"] | {"size_bytes": True}  # type: ignore[operator]
+        self.assertTrue(any("size" in problem for problem in release_problems(pin)))
+
+
+class QuietMessages(unittest.TestCase):
+    MARKER = "private-value"
+
+    def test_no_problem_of_the_pin_names_a_value_of_the_file(self) -> None:
+        pin = json.loads(Path(RELEASE_FILE).read_text())
+        pin["checksum_list"]["key"] = f"{self.MARKER}/SHA256SUMS.txt"
+        pin["tables"][0]["key"] = f"{self.MARKER}/clinical_data.csv"
+        pin["tables"][1]["sha256"] = self.MARKER
+        pin["track_list"]["url"] = f"https://{self.MARKER}.invalid/trks"
+        pin["source"]["bucket"] = self.MARKER
+        problems = release_problems(pin)
+        self.assertTrue(problems)
+        self.assertNotIn(self.MARKER, " ".join(problems))
+
+    def test_no_problem_of_a_candidate_names_its_key(self) -> None:
+        item = read_candidates(CANDIDATES_FILE)[0]
+        for key in (f"{self.MARKER}/vital_files/0001.vital", f"{publisher.RELEASE_PREFIX}vital_files/{self.MARKER}.vital"):
+            problems = candidates.candidate_problems([candidates.Candidate(**(vars(item) | {"key": key}))])
+            self.assertTrue(problems)
+            self.assertNotIn(self.MARKER, " ".join(problems))
+
+    def test_a_candidate_line_with_a_value_that_is_no_integer_is_refused_by_its_line_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "candidates.tsv"
+            fields = ["x", "7", "k", "10", "a" * 64, "true", "slot"]
+            fields[0] = self.MARKER
+            path.write_text("\t".join(candidates.HEADER) + "\n" + "\t".join(fields) + "\n")
+            with self.assertRaises(ValueError) as caught:
+                read_candidates(path)
+        self.assertIn(":2", str(caught.exception))
+        self.assertNotIn(self.MARKER, str(caught.exception))
+
+    def run_command(self, release: object, candidates_text: str | None = None) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as folder:
+            pin = Path(folder) / "release.json"
+            pin.write_text(json.dumps(release))
+            arguments = ["candidates", "check", "--release", str(pin)]
+            if candidates_text is not None:
+                tracked = Path(folder) / "candidates.tsv"
+                tracked.write_text(candidates_text)
+                arguments += ["--candidates", str(tracked)]
+            errors = io.StringIO()
+            with mock.patch("sys.argv", arguments), contextlib.redirect_stderr(errors):
+                code = candidates.main()
+        return code, errors.getvalue()
+
+    def test_the_command_reports_a_bad_pin_by_field_and_never_by_value(self) -> None:
+        pin = json.loads(Path(RELEASE_FILE).read_text())
+        pin["checksum_list"]["key"] = f"{self.MARKER}/SHA256SUMS.txt"
+        pin["tables"] = self.MARKER
+        code, errors = self.run_command(pin)
+        self.assertEqual(1, code)
+        self.assertIn("checksum_list", errors)
+        self.assertNotIn(self.MARKER, errors)
+
+    def test_the_command_reports_a_pin_that_is_not_valid_json_without_echoing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            pin = Path(folder) / "release.json"
+            pin.write_text(f"{self.MARKER}")
+            errors = io.StringIO()
+            with mock.patch("sys.argv", ["candidates", "check", "--release", str(pin)]), contextlib.redirect_stderr(errors):
+                self.assertEqual(1, candidates.main())
+        self.assertNotIn(self.MARKER, errors.getvalue())
 
 
 if __name__ == "__main__":

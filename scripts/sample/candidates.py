@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -30,8 +31,10 @@ from typing import Any
 
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
+    BUCKET,
     CASE_PREFIX,
     CHECKSUM_LIST_KEY,
+    REGION,
     RELEASE_PREFIX,
     SHA256,
     TRACK_LIST_URL,
@@ -53,6 +56,7 @@ TOTAL_SIZE_LIMIT_BYTES = 1 << 30
 ARTERIAL_TRACK = "SNUADC/ART"
 CLINICAL_KEY = f"{RELEASE_PREFIX}clinical_data.csv"
 HEADER = ("case", "patient", "key", "size_bytes", "sha256", "arterial_waveform", "slot")
+INTEGER = re.compile(r"[0-9]+")
 
 
 @dataclass(frozen=True)
@@ -117,7 +121,7 @@ def read_candidates(path: Path) -> list[Candidate]:
     candidates = []
     for number, line in enumerate(lines[1:], 2):
         fields = line.split("\t")
-        if len(fields) != len(HEADER) or fields[5] not in ("true", "false"):
+        if len(fields) != len(HEADER) or fields[5] not in ("true", "false") or not all(INTEGER.fullmatch(fields[position]) for position in (0, 1, 3)):
             raise ValueError(f"{path.name}:{number}: not a candidate line")
         candidates.append(Candidate(int(fields[0]), int(fields[1]), fields[2], int(fields[3]), fields[4], fields[5] == "true", fields[6]))
     return candidates
@@ -129,9 +133,9 @@ def candidate_problems(candidates: Sequence[Candidate]) -> list[str]:
     seen: set[int] = set()
     for item in candidates:
         if not item.key.startswith(RELEASE_PREFIX):
-            problems.append(f"case {item.case}: key {item.key} is outside the release path {RELEASE_PREFIX}")
+            problems.append(f"case {item.case}: the key is outside the release path {RELEASE_PREFIX}")
         elif item.key != case_key(item.case):
-            problems.append(f"case {item.case}: key {item.key} names another case")
+            problems.append(f"case {item.case}: the key names another case")
         if SHA256.fullmatch(item.sha256) is None:
             problems.append(f"case {item.case}: checksum is not 64 hex characters in lower case")
         if item.size_bytes <= 0:
@@ -147,22 +151,37 @@ def pin_problems(label: str, pin: Any, *, key: bool) -> list[str]:
         return [f"{label}: missing"]
     problems = []
     if key and not str(pin.get("key", "")).startswith(RELEASE_PREFIX):
-        problems.append(f"{label}: key {pin.get('key')} is outside the release path {RELEASE_PREFIX}")
+        problems.append(f"{label}: the key is outside the release path {RELEASE_PREFIX}")
     if SHA256.fullmatch(str(pin.get("sha256", ""))) is None:
         problems.append(f"{label}: checksum is not 64 hex characters in lower case")
-    if not isinstance(pin.get("size_bytes"), int) or pin["size_bytes"] <= 0:
+    if type(pin.get("size_bytes")) is not int or pin["size_bytes"] <= 0:
         problems.append(f"{label}: size is not a positive number")
     return problems
+
+
+def source_problems(source: Any) -> list[str]:
+    """The pin names the bucket, region and release path that every read of this package uses, and no others."""
+    if not isinstance(source, dict):
+        return ["source: missing"]
+    return [
+        f"source: the {name} must be {used}"
+        for name, used in (("bucket", BUCKET), ("region", REGION), ("release_path", RELEASE_PREFIX))
+        if source.get(name) != used
+    ]
 
 
 def release_problems(release: dict[str, Any]) -> list[str]:
     """The problems in the form of the release pin: the checksum list, the two tables and the track list. The pin names exactly the files the code reads."""
     if not isinstance(release, dict):
         return ["release pin: not a JSON object"]
-    problems = pin_problems("checksum_list", release.get("checksum_list"), key=True)
+    problems = source_problems(release.get("source"))
+    problems += pin_problems("checksum_list", release.get("checksum_list"), key=True)
     if isinstance(release.get("checksum_list"), dict) and release["checksum_list"].get("key") != CHECKSUM_LIST_KEY:
         problems.append(f"checksum_list: the key must be {CHECKSUM_LIST_KEY}")
-    tables = release.get("tables", [])
+    tables = release.get("tables")
+    if not isinstance(tables, list):
+        problems.append("tables: not a list")
+        tables = []
     keys = {table.get("key") for table in tables if isinstance(table, dict)}
     if len(tables) != 2 or keys != {CLINICAL_KEY, f"{RELEASE_PREFIX}lab_data.csv"}:
         problems.append("tables: the pin must name clinical_data.csv and lab_data.csv of the release once each")
