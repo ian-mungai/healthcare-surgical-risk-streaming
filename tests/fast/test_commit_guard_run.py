@@ -10,6 +10,7 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` makes the real commits. 
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -18,9 +19,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from subprocess import TimeoutExpired
+from subprocess import CalledProcessError, TimeoutExpired
 from unittest import mock
 
+from scripts.process import run_command
 from tests.e2e import commit_guards, run_record
 from tests.fast.git_fixture import TemporaryRepository
 
@@ -157,6 +159,28 @@ class ProtectedRunTest(unittest.TestCase):
         self.assertEqual("temporary repository removed", record["cleanup"])
         self.assertEqual([], list(self.temp.iterdir()))
 
+    def run_without_cases(self, listed: list[list[str]]) -> int:
+        with (
+            mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
+            mock.patch.object(commit_guards, "Fixture"),
+            mock.patch.object(commit_guards, "run_cases"),
+            mock.patch.object(commit_guards, "remove_fixture"),
+            mock.patch.object(commit_guards, "source_files", side_effect=listed),
+        ):
+            return commit_guards.main()
+
+    def test_the_run_writes_the_recorded_state_and_passes_an_unchanged_snapshot(self) -> None:
+        paths = commit_guards.source_files()
+        self.assertEqual(0, self.run_without_cases([paths, paths]))
+        record = self.record()
+        self.assertEqual(commit_guards.recorded_state(commit_guards.ROOT), (record["revision"], record["tree_sha256"]))
+        self.assertIn('"observed": "unchanged: True"', json.dumps(record["observations"]))
+
+    def test_a_file_that_appears_during_the_run_fails_the_snapshot(self) -> None:
+        paths = commit_guards.source_files()
+        self.assertEqual(1, self.run_without_cases([paths[:-1], paths]))
+        self.assertIn('"observed": "unchanged: False"', json.dumps(self.record()["observations"]))
+
 
 class RecordFolderTest(unittest.TestCase):
     def test_runs_that_start_in_the_same_second_use_different_folders(self) -> None:
@@ -189,6 +213,87 @@ class SourceListTest(TemporaryRepository):
         (self.repo / ".git" / "info" / "exclude").write_text("excluded.txt\n")
         with mock.patch.dict(os.environ, {"GIT_DIR": str(self.other_repository())}):
             self.assertEqual(["plain.txt"], commit_guards.source_files(self.repo))
+
+
+class RecordedStateTest(TemporaryRepository):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "tracked.txt").write_text("one\n")
+        self.git("add", "--", "tracked.txt")
+        self.git("commit", "--quiet", "--message", "first")
+        self.head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.clean = commit_guards.recorded_state(self.repo)
+
+    def test_a_clean_checkout_records_its_commit_and_the_digest_of_that_commits_tree(self) -> None:
+        tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        self.assertEqual((self.head, hashlib.sha256(tree.encode()).hexdigest()), self.clean)
+
+    def test_a_second_clone_of_the_commit_records_the_same_state(self) -> None:
+        clone = self.repo.parent / "clone"
+        run_command("git", ["clone", "--quiet", str(self.repo), str(clone)], cwd=self.repo.parent, env=self.env, timeout=60, check=True)
+        self.assertEqual(self.clean, commit_guards.recorded_state(clone))
+
+    def test_an_untracked_file_changes_nothing_in_the_recorded_state(self) -> None:
+        (self.repo / "untracked.txt").write_text("note\n")
+        self.assertIn("untracked.txt", commit_guards.source_files(self.repo))
+        self.assertEqual(self.clean, commit_guards.recorded_state(self.repo))
+
+    def test_a_new_commit_changes_the_recorded_digest(self) -> None:
+        (self.repo / "tracked.txt").write_text("two\n")
+        self.git("commit", "--quiet", "--all", "--message", "second")
+        revision, digest = commit_guards.recorded_state(self.repo)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), revision)
+        self.assertNotEqual(self.clean[1], digest)
+
+    def test_a_tracked_change_that_is_not_committed_is_named_in_the_revision(self) -> None:
+        (self.repo / "tracked.txt").write_text("two\n")
+        marked = (f"{self.head} with uncommitted changes", self.clean[1])
+        self.assertEqual(marked, commit_guards.recorded_state(self.repo))
+        self.git("add", "--", "tracked.txt")
+        self.assertEqual(marked, commit_guards.recorded_state(self.repo))
+
+    def test_a_removed_tracked_file_is_named_in_the_revision(self) -> None:
+        (self.repo / "tracked.txt").unlink()
+        self.assertEqual((f"{self.head} with uncommitted changes", self.clean[1]), commit_guards.recorded_state(self.repo))
+
+    def test_reading_the_recorded_state_leaves_the_repository_files_as_they_were(self) -> None:
+        os.utime(self.repo / "tracked.txt", (1, 1))
+        store = self.repo / ".git"
+
+        def kept() -> dict[str, tuple[int, int]]:
+            return {str(path.relative_to(store)): (path.stat().st_mtime_ns, path.stat().st_size) for path in store.rglob("*")}
+
+        before = kept()
+        commit_guards.recorded_state(self.repo)
+        self.assertEqual(before, kept())
+
+    def test_the_recorded_state_ignores_the_git_environment_of_the_caller(self) -> None:
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(self.other_repository()), "GIT_INDEX_FILE": str(self.repo.parent / "absent_index")}):
+            self.assertEqual(self.clean, commit_guards.recorded_state(self.repo))
+
+    def test_a_repository_without_a_commit_says_so(self) -> None:
+        empty = self.other_repository().parent
+        self.assertEqual(("no commit", hashlib.sha256(b"no commit").hexdigest()), commit_guards.recorded_state(empty))
+        self.git("switch", "--quiet", "--orphan", "unborn")
+        self.assertEqual(("no commit", hashlib.sha256(b"no commit").hexdigest()), commit_guards.recorded_state(self.repo))
+
+    def test_a_branch_whose_commit_cannot_be_read_is_an_error(self) -> None:
+        ref = self.repo / ".git" / "refs" / "heads" / "main"
+        ref.chmod(0)
+        self.addCleanup(ref.chmod, 0o644)
+        with self.assertRaises(CalledProcessError):
+            commit_guards.recorded_state(self.repo)
+
+    def test_a_folder_that_is_not_a_repository_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, self.assertRaises(CalledProcessError):
+            commit_guards.recorded_state(Path(folder))
+
+    def test_the_run_record_holds_the_recorded_state(self) -> None:
+        (self.repo / "tracked.txt").write_text("two\n")
+        record = run_record.Record(feature="feature", slug="slug", rerun="rerun")
+        with mock.patch.object(commit_guards, "ROOT", self.repo), mock.patch.object(commit_guards, "tool_version", return_value="1"):
+            commit_guards.describe_run(record)
+        self.assertEqual((f"{self.head} with uncommitted changes", self.clean[1]), (record.revision, record.tree_sha256))
 
 
 if __name__ == "__main__":

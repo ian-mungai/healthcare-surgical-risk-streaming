@@ -26,7 +26,7 @@ from pathlib import Path
 
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
-from scripts.quality.repo_checks import visible_files
+from scripts.quality.repo_checks import git, visible_files
 from tests.e2e.run_record import Observation, Record
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -208,9 +208,21 @@ def tree_digest(paths: list[str]) -> str:
     return digest.hexdigest()
 
 
-def revision() -> str:
-    head = run_command("git", ["rev-parse", "--verify", "--quiet", "HEAD"], cwd=ROOT, timeout=COMMAND_TIMEOUT_SECONDS)
-    return head.stdout.strip() or "no commit"
+def recorded_state(root: Path) -> tuple[str, str]:
+    """The revision and the digest a run record holds.
+
+    The digest names the tree of the commit, so a clean checkout of the same content gives the same value. Nothing is hashed from the folder: a
+    tracked change that is not committed is named in the revision instead, and an untracked file changes neither value.
+    """
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    # Exit 1 is Git's answer for a branch with no commit yet, and also for a branch it cannot read, which the checked call then refuses.
+    if run_command("git", ["rev-parse", "--verify", "--quiet", "HEAD"], cwd=root, env=env, timeout=COMMAND_TIMEOUT_SECONDS).returncode == 1:
+        git("symbolic-ref", "--quiet", "HEAD", cwd=root)
+        return "no commit", hashlib.sha256(b"no commit").hexdigest()
+    head, tree = git("rev-parse", "HEAD", "HEAD^{tree}", cwd=root).split()
+    # Without the optional locks, the status call does not rewrite the index.
+    changed = git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no", cwd=root)
+    return head + (" with uncommitted changes" if changed else ""), hashlib.sha256(tree.encode()).hexdigest()
 
 
 def tool_version(program: str, *args: str) -> str:
@@ -310,7 +322,7 @@ def parse_shard(text: str) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def describe_run(record: Record, paths: list[str]) -> None:
+def describe_run(record: Record) -> None:
     record.environment = {
         "platform": f"{platform.system()} {platform.machine()}",
         "python": platform.python_version(),
@@ -319,8 +331,7 @@ def describe_run(record: Record, paths: list[str]) -> None:
         "mypy": tool_version(".venv/bin/mypy"),
         "gitleaks": tool_version(".tools/bin/gitleaks"),
     }
-    record.revision = revision()
-    record.tree_sha256 = tree_digest(paths)
+    record.revision, record.tree_sha256 = recorded_state(ROOT)
 
 
 def run_cases(fixture: Fixture, record: Record, log: list[str], shard: tuple[int, int]) -> None:
@@ -363,11 +374,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     blocked = ""
     try:
         paths = source_files()
-        describe_run(record, paths)
+        before = tree_digest(paths)
+        describe_run(record)
         fixture = Fixture(record)
         fixture.populate(paths)
         run_cases(fixture, record, log, (index, count))
-        unchanged = tree_digest(source_files()) == record.tree_sha256
+        unchanged = tree_digest(source_files()) == before
         record.observations.append(Observation("source tree", "snapshot", "unchanged during the run", f"unchanged: {unchanged}", unchanged))
     except KeyboardInterrupt:
         blocked = "interrupted"
