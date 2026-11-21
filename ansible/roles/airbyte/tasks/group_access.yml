@@ -1,0 +1,117 @@
+# Reads airbyte_namespace, airbyte_directory, airbyte_secrets_directory, airbyte_owner, airbyte_group and, optionally, airbyte_group_access_deadline_seconds
+# (default 60). The group commands of Dagster scale Airbyte's workloads through the Kubernetes API with the token of one service account, and that account's
+# role (templates/group_access.yaml.j2) allows reading and scaling the namespace's workloads and nothing else. The token is a long-lived service account token
+# that the cluster writes into a secret. It is copied to a file that the code-location container reads as its own user, mode 0400, with the cluster's
+# certificate authority beside it. The token never appears in a task result or a log. Replace the token by deleting the secret and running the role again.
+# A second run changes nothing. Every wait ends at its deadline and a failure names the secret.
+- name: Give the group commands their narrow access to Airbyte's workloads
+  vars:
+    airbyte_group_account: dagster-groups
+    airbyte_group_container_user: "10001"
+    airbyte_group_access_directory: "{{ airbyte_secrets_directory }}/k3s"
+    airbyte_group_access_secret: dagster-groups-token
+  block:
+    - name: Write the service account, role, binding and token secret
+      ansible.builtin.template:
+        src: group_access.yaml.j2
+        dest: "{{ airbyte_directory }}/group_access.yaml"
+        owner: "{{ airbyte_owner }}"
+        group: "{{ airbyte_group }}"
+        mode: "0644"
+
+    - name: Apply them
+      ansible.builtin.command:
+        argv: [k3s, kubectl, apply, --filename, "{{ airbyte_directory }}/group_access.yaml"]
+      register: airbyte_group_access_applied
+      changed_when: "'created' in airbyte_group_access_applied.stdout or 'configured' in airbyte_group_access_applied.stdout"
+      timeout: 60
+
+    - name: Wait for the cluster to write the token into the secret
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - secret
+          - "{{ airbyte_group_access_secret }}"
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - --output
+          - jsonpath={.data.token}
+      register: airbyte_group_access_token
+      changed_when: false
+      check_mode: false
+      no_log: true
+      retries: "{{ [((airbyte_group_access_deadline_seconds | default(60)) | int / 2) | int, 1] | max }}"
+      delay: 2
+      until: airbyte_group_access_token.rc == 0 and airbyte_group_access_token.stdout | length > 0
+      timeout: 30
+
+    - name: Read the cluster's certificate authority from the secret
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - secret
+          - "{{ airbyte_group_access_secret }}"
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - --output
+          - "jsonpath={.data.ca\\.crt}"
+      register: airbyte_group_access_ca
+      changed_when: false
+      check_mode: false
+      no_log: true
+      timeout: 30
+
+    - name: Create the folder of the access files
+      ansible.builtin.file:
+        path: "{{ airbyte_group_access_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Place the token and the certificate authority for the code-location container's user
+      ansible.builtin.copy:
+        content: "{{ item.value | b64decode }}"
+        dest: "{{ airbyte_group_access_directory }}/{{ item.name }}"
+        owner: "{{ airbyte_group_container_user }}"
+        group: "{{ airbyte_group_container_user }}"
+        mode: "0400"
+      no_log: true
+      loop:
+        - {name: dagster.token, value: "{{ airbyte_group_access_token.stdout }}"}
+        - {name: ca.crt, value: "{{ airbyte_group_access_ca.stdout }}"}
+
+    - name: Check what the account may do and may not do
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - auth
+          - can-i
+          - "{{ item.verb }}"
+          - "{{ item.resource }}"
+          - --namespace
+          - "{{ item.namespace | default(airbyte_namespace) }}"
+          - --as
+          - "system:serviceaccount:{{ airbyte_namespace }}:{{ airbyte_group_account }}"
+      register: airbyte_group_access_checks
+      changed_when: false
+      failed_when: airbyte_group_access_checks.stdout | trim != item.answer
+      check_mode: false
+      loop:
+        - {verb: patch, resource: deployments/scale, answer: "yes"}
+        - {verb: patch, resource: statefulsets/scale, answer: "yes"}
+        - {verb: list, resource: pods, answer: "yes"}
+        - {verb: get, resource: deployments, answer: "yes"}
+        - {verb: patch, resource: deployments, answer: "no"}
+        - {verb: delete, resource: pods, answer: "no"}
+        - {verb: create, resource: pods/exec, answer: "no"}
+        - {verb: get, resource: secrets, answer: "no"}
+        - {verb: list, resource: pods, namespace: kube-system, answer: "no"}
+      loop_control:
+        label: "{{ item.verb }} {{ item.resource }} {{ item.namespace | default(airbyte_namespace) }}"
+      timeout: 30
