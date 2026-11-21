@@ -20,6 +20,7 @@ import functools
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -55,6 +56,27 @@ def case_paths(pattern: str, first: int, last: int) -> list[str]:
         raise SelectionError("the selection's case_files must have 0 <= first <= last")
     head, width, tail = form.groups()
     return [f"{head}{number:0{width}d}{tail}" for number in range(first, last + 1)]
+
+
+def keys_digest(source_keys: Iterable[str]) -> str:
+    """The SHA-256 of a set of source keys, in sorted order, one on each line."""
+    return hashlib.sha256(("\n".join(sorted(source_keys)) + "\n").encode()).hexdigest()
+
+
+def selection_digest(
+    name: str, release: str, source_bucket: str, source_prefix: str, measurement_period: str, list_key: str, list_sha256: str, keys_sha256: str
+) -> str:
+    """The SHA-256 of every field of a selection. The selection computes it to bind a check, and a manifest's reader recomputes it from the manifest."""
+    document = {
+        "name": name,
+        "release": release,
+        "source_bucket": source_bucket,
+        "source_prefix": source_prefix,
+        "measurement_period": measurement_period,
+        "checksum_list": {"key": list_key, "sha256": list_sha256},
+        "keys_sha256": keys_sha256,
+    }
+    return hashlib.sha256((json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -132,21 +154,21 @@ class Selection:
 
     @property
     def keys_sha256(self) -> str:
-        return hashlib.sha256(("\n".join(sorted(self.source_keys)) + "\n").encode()).hexdigest()
+        return keys_digest(self.source_keys)
 
     @property
     def selection_sha256(self) -> str:
         """The SHA-256 of every field of the selection: the identity that a check result is bound to, so that a publication cannot change any of them."""
-        document = {
-            "name": self.name,
-            "release": self.release,
-            "source_bucket": self.source_bucket,
-            "source_prefix": self.source_prefix,
-            "measurement_period": self.measurement_period,
-            "checksum_list": {"key": self.checksum_list_key, "sha256": self.checksum_list_sha256},
-            "keys_sha256": self.keys_sha256,
-        }
-        return hashlib.sha256((json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+        return selection_digest(
+            self.name,
+            self.release,
+            self.source_bucket,
+            self.source_prefix,
+            self.measurement_period,
+            self.checksum_list_key,
+            self.checksum_list_sha256,
+            self.keys_sha256,
+        )
 
     def record(self) -> dict[str, Any]:
         """What the manifest records once for the set."""

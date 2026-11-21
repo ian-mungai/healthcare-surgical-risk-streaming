@@ -4,6 +4,7 @@ It is published only from a complete passed check and only for the object versio
 object version (bucket, key and non-null version ID), its SHA-256, its source key, its size, its release and its retrieval time, which is the
 time S3 gave that version. The selection, the measurement period, the pinned checksum list and the digest of the check result are recorded once. The
 check result is bound to the SHA-256 of every field of the selection, so a publication with any other source, release, period or list key is refused.
+A reader recomputes that digest from the manifest's own fields as well, so a manifest whose selection, period, list or entries were edited is refused.
 
 Its ``format`` names the shape. A manifest of an earlier format is refused with the step that replaces it: rerun check and publish.
 
@@ -24,7 +25,7 @@ from typing import Any
 from scripts.ingestion.check import CheckedFile, CheckResult, canonical, checked_file_from, current_versions, result_digest, sha256_of
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX
-from scripts.ingestion.selection import Selection
+from scripts.ingestion.selection import Selection, keys_digest, selection_digest
 from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, StoreError
 
 MANIFEST_PREFIX = "manifests/"
@@ -74,6 +75,24 @@ class Manifest:
 
     def recomputed_check_result_sha256(self) -> str:
         return result_digest(self.selection["selection_sha256"], self.checksum_list["sha256"], (asdict(entry) for entry in self.entries))
+
+    def recomputed_selection_sha256(self) -> str:
+        """The selection digest from the manifest's own fields, or "" when its entries do not share one release or do not match its count and keys."""
+        releases = {entry.release for entry in self.entries}
+        keys_sha256 = keys_digest(entry.source_key for entry in self.entries)
+        if len(releases) != 1 or self.selection["file_count"] != len(self.entries) or self.selection["keys_sha256"] != keys_sha256:
+            return ""
+        selection, listed = self.selection, self.checksum_list
+        return selection_digest(
+            selection["name"],
+            releases.pop(),
+            selection["source_bucket"],
+            selection["source_prefix"],
+            self.measurement_period,
+            listed["key"],
+            listed["sha256"],
+            keys_sha256,
+        )
 
 
 def manifest_key(selection_name: str, sha256: str) -> str:
@@ -193,4 +212,6 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
         raise ManifestError("the manifest binds an object with a null version ID")
     if manifest.recomputed_check_result_sha256() != manifest.check_result_sha256:
         raise ManifestError("the manifest's entries do not match the digest of the check that produced it")
+    if manifest.recomputed_selection_sha256() != manifest.selection["selection_sha256"]:
+        raise ManifestError("the manifest's selection, period, list or entries do not match its selection digest")
     return manifest

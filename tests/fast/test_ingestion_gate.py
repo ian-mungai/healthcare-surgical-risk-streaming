@@ -162,6 +162,30 @@ class GateTest(unittest.TestCase):
             verify_before_read(landed.store, forged(landed, reference, other_time, consistent=False), WANTED)
         self.assertTrue(verify_before_read(landed.store, forged(landed, reference, other_time, consistent=True), None))
 
+    def test_a_manifest_whose_selection_fields_were_edited_is_refused_although_its_check_digest_was_recomputed(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+
+        def every_release(document: dict[str, Any]) -> None:
+            for entry in document["entries"]:
+                entry["release"] = "2.0.0"
+
+        changes: dict[str, Callable[[dict[str, Any]], None]] = {
+            "measurement period": lambda document: document.update(measurement_period="2030-01 to 2030-02"),
+            "file count": lambda document: document["selection"].update(file_count=2),
+            "keys digest": lambda document: document["selection"].update(keys_sha256="0" * 64),
+            "source bucket": lambda document: document["selection"].update(source_bucket="another-publisher"),
+            "source prefix": lambda document: document["selection"].update(source_prefix="vitaldb/"),
+            "list key": lambda document: document["checksum_list"].update(key=f"{SOURCE_PREFIX}OTHER_SUMS.txt"),
+            "one entry's release": lambda document: document["entries"][0].update(release="2.0.0"),
+            "every entry's release": every_release,
+            "an entry removed": lambda document: document["entries"].pop(),
+        }
+        for name, change in changes.items():
+            with self.subTest(name), self.assertRaisesRegex(GateRefused, "selection digest"):
+                verify_before_read(landed.store, forged(landed, reference, change, consistent=True))
+        self.assertTrue(verify_before_read(landed.store, reference))
+
     def test_a_manifest_that_binds_another_bucket_is_refused_for_that_key(self) -> None:
         landed = landed_set()
         reference = published(landed)
