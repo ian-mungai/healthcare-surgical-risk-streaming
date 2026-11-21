@@ -1,4 +1,5 @@
-# Reads compose_stack_docker, compose_stack_start_services (the services to start; none named starts every service) and the deadlines. Every wait ends at
+# Reads compose_stack_docker, compose_stack_start_services (the services to start; none named starts every service) and the deadlines. A service whose
+# placed configuration file is newer than its container is recreated alone, because Compose compares no file content. Every wait ends at
 # its deadline and a failure names the service and holds no secret. The containers are read through the first word of compose_stack_docker, the docker command.
 - name: Read the stack's containers before the start
   ansible.builtin.command:
@@ -15,6 +16,13 @@
   changed_when: false
   check_mode: false
   when: compose_stack_before.stdout_lines | length > 0
+  timeout: 60
+
+- name: Read which services run with an older copy of a placed configuration file
+  stale_services:
+    compose_command: "{{ compose_stack_docker }}"
+  register: compose_stack_stale
+  check_mode: false
   timeout: 60
 
 - name: Start the services and wait for every health check
@@ -39,6 +47,17 @@
         msg: >-
           The services did not become healthy within {{ compose_stack_health_deadline_seconds }} seconds (start deadline {{ compose_stack_start_deadline_seconds }}
           seconds). State of each service: {{ compose_stack_diagnosis.stdout | default('unreadable') }}
+
+- name: Recreate the services that run with an older copy of a configuration file, each without its dependencies
+  ansible.builtin.command:
+    argv: >-
+      {{ compose_stack_docker + ['up', '--detach', '--wait', '--wait-timeout', compose_stack_health_deadline_seconds | string, '--force-recreate', '--no-deps']
+      + compose_stack_recreated }}
+  vars:
+    compose_stack_recreated: "{{ compose_stack_stale.stale if not (compose_stack_start_services | default([])) else compose_stack_stale.stale | select('in', compose_stack_start_services) | list }}"
+  when: compose_stack_recreated | length > 0
+  changed_when: false
+  timeout: "{{ compose_stack_start_deadline_seconds | int }}"
 
 - name: Read the stack's containers after the start
   ansible.builtin.command:

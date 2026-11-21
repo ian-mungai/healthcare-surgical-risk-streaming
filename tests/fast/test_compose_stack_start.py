@@ -39,15 +39,21 @@ for word in "$@"; do
     build) verb=build ;;
   esac
 done
+case " $* " in *" config "*) verb=config ;; esac
+case " $* " in *" --format json "*) case "$verb" in ps) verb=ps_json ;; esac ;; esac
 case "$verb" in
+  config) if [ -f "$here/config.json" ]; then cat "$here/config.json"; else echo '{"services": {}}'; fi ;;
+  ps_json) if [ -f "$here/ps.json" ]; then cat "$here/ps.json"; fi ;;
   image_inspect) if [ -f "$here/label" ]; then cat "$here/label"; else echo "Error: No such image" >&2; exit 1; fi ;;
   build)
     if [ -f "$here/fail_build" ]; then echo "build failed" >&2; exit 1; fi
     if [ -f "$here/slow_build" ]; then echo $$ > "$here/slow.pid"; exec sleep 59; fi
     for word in "$@"; do case "$word" in surgical-risk.context=*) printf '%s' "${word#surgical-risk.context=}" > "$here/label" ;; esac; done ;;
-  up) touch "$here/started" ;;
+  up)
+    touch "$here/started"
+    case " $* " in *" --force-recreate "*) sed -i.bak 's/ .*$/ 2099-01-01T00:00:00Z/' "$here/inspect.txt"; rm -f "$here/inspect.txt.bak" ;; esac ;;
   ps) if [ -f "$here/started" ]; then echo abc123; fi ;;
-  inspect) echo "abc123 2026-01-01T00:00:00Z" ;;
+  inspect) if [ -f "$here/inspect.txt" ]; then cat "$here/inspect.txt"; else echo "abc123 2026-01-01T00:00:00Z"; fi ;;
 esac
 """
 
@@ -129,6 +135,84 @@ class StartTest(unittest.TestCase):
             code, output = run_tasks("start.yml", values)
         self.assertEqual((0, 0), (first, code), output)
         self.assertRegex(output, CHANGED_NONE)
+
+
+class RecreateTest(unittest.TestCase):
+    """A service whose placed configuration file is newer than its container is recreated, alone, and a second run changes nothing."""
+
+    def setup(self, folder: Path, *, started: dict[str, str]) -> tuple[Path, Path, Path]:
+        stand_in, context = prepare(folder)
+        files = {"alloy": folder / "alloy.alloy", "grafana": folder / "grafana.yml"}
+        for path in files.values():
+            path.write_text("x")
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+        config = {
+            "services": {"alloy": {"configs": [{"source": "alloy_config"}]}, "grafana": {"configs": ["grafana_config"]}, "nessie": {}},
+            "configs": {"alloy_config": {"file": str(files["alloy"])}, "grafana_config": {"file": str(files["grafana"])}},
+        }
+        (stand_in.parent / "config.json").write_text(json.dumps(config))
+        (stand_in.parent / "ps.json").write_text("".join(json.dumps({"Service": name, "ID": f"id_{name}"}) + "\n" for name in started))
+        (stand_in.parent / "inspect.txt").write_text("".join(f"id_{name} {moment}\n" for name, moment in started.items()))
+        (stand_in.parent / "started").write_text("")
+        return stand_in, files["alloy"], files["grafana"]
+
+    def recreations(self, stand_in: Path) -> list[str]:
+        return [line for line in calls(stand_in) if "--force-recreate" in line]
+
+    def start(self, folder: Path, stand_in: Path, context: Path, services: list[str]) -> tuple[int, str]:
+        return run_tasks("start.yml", variables(folder, stand_in, context, compose_stack_start_services=services))
+
+    def test_only_the_service_whose_file_is_newer_than_its_container_is_recreated_without_its_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
+            code, output = self.start(folder, stand_in, folder, [])
+            forced = self.recreations(stand_in)
+        self.assertEqual(0, code, output)
+        self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps alloy"], forced)
+
+    def test_a_second_run_recreates_nothing_and_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
+            self.start(folder, stand_in, folder, [])
+            code, output = self.start(folder, stand_in, folder, [])
+            forced = self.recreations(stand_in)
+        self.assertEqual(0, code, output)
+        self.assertEqual(1, len(forced), forced)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_stack_whose_files_are_older_than_its_containers_recreates_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, _, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            code, output = self.start(folder, stand_in, folder, [])
+            forced = self.recreations(stand_in)
+        self.assertEqual(0, code, output)
+        self.assertEqual([], forced)
+
+    def test_the_first_start_of_postgresql_alone_leaves_a_stale_service_of_the_second_start(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, alloy_file, _ = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
+            code, output = self.start(folder, stand_in, folder, ["postgres"])
+            forced = self.recreations(stand_in)
+        self.assertEqual(0, code, output)
+        self.assertEqual([], forced)
+
+    def test_a_service_that_is_named_in_the_start_and_stale_is_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, alloy_file, grafana_file = self.setup(folder, started={"alloy": "2025-01-01T00:00:00Z", "grafana": "2025-01-01T00:00:00Z"})
+            os.utime(alloy_file, (1_800_000_000, 1_800_000_000))
+            os.utime(grafana_file, (1_800_000_000, 1_800_000_000))
+            code, output = self.start(folder, stand_in, folder, ["grafana"])
+            forced = self.recreations(stand_in)
+        self.assertEqual(0, code, output)
+        self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps grafana"], forced)
 
 
 class BuildTest(unittest.TestCase):
