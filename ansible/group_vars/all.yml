@@ -87,3 +87,39 @@ compose_stack_command:
   - --env-file
   - "{{ compose_stack_compose_directory }}/host.env"
 compose_stack_docker: "{{ compose_stack_command + (['--project-name', compose_stack_project] if compose_stack_project else []) }}"
+
+# Helm and Airbyte's chart. Each download is checked against its pinned SHA-256. Helm 3 is the line that Airbyte's installation guide uses.
+helm_version: v3.22.1
+helm_archive_sha256: 896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+helm_install_directory: /usr/local/lib/helm
+airbyte_chart_version: 2.5.0
+airbyte_chart_sha256: 7524c22b2338399516025de1d903176c7302170315d4ff88e9dfd11192abb029
+
+# Airbyte on k3s. The tracked values file is placed beside two rendered files: the memory limits from the limits file and the host settings below.
+airbyte_directory: /opt/platform/airbyte
+airbyte_secrets_directory: "{{ compose_stack_secrets_directory }}"
+airbyte_owner: root
+airbyte_group: root
+airbyte_namespace: airbyte
+airbyte_release: airbyte
+airbyte_kubeconfig: /etc/rancher/k3s/k3s.yaml
+# The web service listens on the host's local address only. The forwarder maps this local port to the server service's port.
+airbyte_web_port: 8000
+airbyte_server_service_port: 8001
+airbyte_web_unit: /etc/systemd/system/airbyte-web.service
+# The address that the pods use to reach the shared PostgreSQL server: the k3s bridge's address on the host. It needs the private route that the lead decides.
+airbyte_database_host: 10.42.0.1
+airbyte_database_port: "{{ compose_stack_postgres_port }}"
+airbyte_database_name: airbyte
+airbyte_database_user: airbyte
+# Temporal keeps its own two databases, owned by the same account, because the chart's database account cannot create a database.
+airbyte_temporal_database: airbyte_temporal
+airbyte_temporal_visibility_database: airbyte_temporal_visibility
+# The size limit of a file staged on the host's disk during a copy. An estimate until the ingestion phase measures the peak.
+airbyte_staging_size: 5G
+# The address that the owner's browser uses, set when Caddy's Tailscale name is known. An empty value leaves the chart's setting alone.
+airbyte_public_url: ""
+# Each deadline is in seconds. The release deadline covers pulling the images and running the chart's database migration.
+airbyte_release_deadline_seconds: 1200
+airbyte_ready_deadline_seconds: 300
+airbyte_health_deadline_seconds: 120

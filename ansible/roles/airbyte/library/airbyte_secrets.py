@@ -1,0 +1,171 @@
+"""Ansible module: the secret files that Airbyte needs and the Kubernetes secrets made from them.
+
+``step: files`` creates each missing generated file under ``<secrets_directory>/airbyte`` (the instance admin's password and the object store's two
+keys), readable by its owner only, keeps existing files and requires the database password file that the PostgreSQL step made.
+``step: secrets`` makes three secrets in the namespace match those files: ``airbyte-database``, ``airbyte-storage`` and ``airbyte-auth-secrets``. A secret
+is applied only when a key it holds differs, and keys that Airbyte added to ``airbyte-auth-secrets`` itself are left alone.
+
+A value goes to the cluster on the standard input of ``kubectl apply --server-side``, so no value is in a command line, a rendered file or a last-applied
+annotation. No result or message holds a value. The module uses only the standard library and runs on the host's Python.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import secrets
+from collections.abc import Callable
+from pathlib import Path
+
+from ansible.module_utils.basic import AnsibleModule
+
+ACCOUNT_FOLDER = "airbyte"
+DATABASE_FILE = "postgres/airbyte.password"
+PASSWORD_BYTES = 32
+KEY_ID_BYTES = 10
+FIELD_MANAGER = "platform_airbyte"
+ERROR_CHARACTERS = 400
+GENERATED: dict[str, Callable[[], str]] = {
+    "admin.password": lambda: secrets.token_urlsafe(PASSWORD_BYTES),
+    "storage_access_key_id": lambda: secrets.token_hex(KEY_ID_BYTES),
+    "storage_secret_access_key": lambda: secrets.token_urlsafe(PASSWORD_BYTES),
+}
+Runner = Callable[[list[str], "str | None"], "tuple[int, str, str]"]
+
+
+class SecretError(RuntimeError):
+    """A file or the cluster is not usable. The message never holds a secret value."""
+
+
+class SecretFiles:
+    """The one place that knows where each secret value comes from: a file under one private folder."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    def path(self, relative: str) -> Path:
+        return self.directory / relative
+
+    def read(self, relative: str) -> str:
+        try:
+            text = self.path(relative).read_text().rstrip("\n")
+        except OSError as error:
+            raise SecretError(f"the secret file {relative} cannot be read: {error.strerror}") from error
+        if not text:
+            raise SecretError(f"the secret file {relative} is empty")
+        return text
+
+    def missing(self) -> list[str]:
+        return [name for name in GENERATED if not self.path(f"{ACCOUNT_FOLDER}/{name}").exists()]
+
+    def ensure_generated(self) -> list[str]:
+        """Create each missing generated file and return their names. An existing file is never replaced."""
+        self.read(DATABASE_FILE)
+        folder = self.directory / ACCOUNT_FOLDER
+        folder.mkdir(mode=0o700, exist_ok=True)
+        folder.chmod(0o700)
+        created: list[str] = []
+        for name, generate in GENERATED.items():
+            try:
+                descriptor = os.open(folder / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                self.read(f"{ACCOUNT_FOLDER}/{name}")
+                continue
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(generate())
+            created.append(name)
+        return created
+
+
+def wanted_secrets(files: SecretFiles, database_user: str) -> dict[str, dict[str, str]]:
+    """Each secret's name and its keys with their values, read from the files."""
+    return {
+        "airbyte-auth-secrets": {"instance-admin-password": files.read(f"{ACCOUNT_FOLDER}/admin.password")},
+        "airbyte-database": {"database-user": database_user, "database-password": files.read(DATABASE_FILE)},
+        "airbyte-storage": {
+            "AWS_ACCESS_KEY_ID": files.read(f"{ACCOUNT_FOLDER}/storage_access_key_id"),
+            "AWS_SECRET_ACCESS_KEY": files.read(f"{ACCOUNT_FOLDER}/storage_secret_access_key"),
+        },
+    }
+
+
+def hide(text: str, values: list[str]) -> str:
+    """The text with every secret value, plain or base64, replaced, and cut to a short length."""
+    for value in values:
+        for form in (value, base64.b64encode(value.encode()).decode()):
+            text = text.replace(form, "<value>")
+    return re.sub(r"\s+", " ", text).strip()[:ERROR_CHARACTERS]
+
+
+def stored_data(output: str) -> dict[str, str]:
+    try:
+        data = json.loads(output).get("data") or {}
+    except (json.JSONDecodeError, AttributeError) as error:
+        raise SecretError("the cluster answered with a secret that cannot be read") from error
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def differs(stored: dict[str, str] | None, wanted: dict[str, str]) -> bool:
+    """Whether a key is missing or holds another value. Keys that the secret has beyond the wanted ones do not count."""
+    return stored is None or any(stored.get(key) != base64.b64encode(value.encode()).decode() for key, value in wanted.items())
+
+
+def manifest(name: str, namespace: str, wanted: dict[str, str]) -> str:
+    data = {key: base64.b64encode(value.encode()).decode() for key, value in wanted.items()}
+    return json.dumps({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": namespace}, "type": "Opaque", "data": data})
+
+
+def apply_secrets(run: Runner, kubectl: list[str], namespace: str, files: SecretFiles, database_user: str, *, check_only: bool = False) -> list[str]:
+    """Make each secret match its files and return the names of those that changed."""
+    wanted = wanted_secrets(files, database_user)
+    values = [value for keys in wanted.values() for key, value in keys.items() if key != "database-user"]
+    changed: list[str] = []
+    for name in sorted(wanted):
+        code, output, error = run([*kubectl, "get", "secret", name, "--namespace", namespace, "--output", "json"], None)
+        if code != 0 and "NotFound" not in error:
+            raise SecretError(f"cannot read the secret {name}: {hide(error, values)}")
+        if not differs(stored_data(output) if code == 0 else None, wanted[name]):
+            continue
+        changed.append(name)
+        if check_only:
+            continue
+        arguments = [*kubectl, "apply", "--server-side", "--force-conflicts", "--field-manager", FIELD_MANAGER, "--namespace", namespace, "--filename", "-"]
+        code, _, error = run(arguments, manifest(name, namespace, wanted[name]))
+        if code != 0:
+            raise SecretError(f"cannot apply the secret {name}: {hide(error, values)}")
+    return changed
+
+
+def main() -> None:
+    module = AnsibleModule(
+        argument_spec={
+            "step": {"type": "str", "required": True, "choices": ["files", "secrets"]},
+            "secrets_directory": {"type": "path", "required": True},
+            "namespace": {"type": "str", "default": "airbyte"},
+            "kubectl": {"type": "list", "elements": "str", "default": ["k3s", "kubectl"]},
+            "database_user": {"type": "str", "default": "airbyte"},
+        },
+        supports_check_mode=True,
+    )
+    files = SecretFiles(Path(module.params["secrets_directory"]))
+    try:
+        if module.params["step"] == "files":
+            created = files.missing() if module.check_mode else files.ensure_generated()
+            module.exit_json(changed=bool(created), created=created)
+        changed = apply_secrets(
+            lambda arguments, data: module.run_command(arguments, data=data, check_rc=False),
+            module.params["kubectl"],
+            module.params["namespace"],
+            files,
+            module.params["database_user"],
+            check_only=module.check_mode,
+        )
+        module.exit_json(changed=bool(changed), secrets=changed)
+    except SecretError as error:
+        module.fail_json(msg=str(error))
+
+
+if __name__ == "__main__":
+    main()

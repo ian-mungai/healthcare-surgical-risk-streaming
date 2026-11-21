@@ -1,0 +1,69 @@
+# Airbyte chart 2.5.0 on k3s. This file is the first of three values files. The limits file gives every memory figure (rendered by
+# scripts.stack.k3s_limits) and the role's settings give the database address and the staging size, so no memory figure or host value is typed here.
+# The credentials live in Kubernetes secrets that the role creates from files on the host: this file names them and holds no value.
+global:
+  edition: community
+  auth:
+    enabled: true
+  database:
+    type: external
+    secretName: airbyte-database
+    userSecretKey: database-user
+    passwordSecretKey: database-password
+  storage:
+    type: minio
+    secretName: airbyte-storage
+  tracking:
+    enabled: false
+    strategy: logging
+  workloads:
+    resources:
+      useConnectorResourceDefaults: false
+
+# Airbyte serves its interface from the server. The chart's separate web application is off.
+webapp:
+  enabled: false
+server:
+  enabled: true
+  service:
+    type: ClusterIP
+worker:
+  enabled: true
+workloadLauncher:
+  enabled: true
+workloadApiServer:
+  enabled: true
+manifestServer:
+  enabled: true
+cron:
+  enabled: true
+airbyteBootloader:
+  enabled: true
+temporal:
+  enabled: true
+minio:
+  enabled: true
+  storage:
+    volumeClaimValue: 2Gi
+
+# The shared PostgreSQL server replaces the chart's own database.
+postgresql:
+  enabled: false
+
+connectorRolloutWorker:
+  enabled: false
+metrics:
+  enabled: false
+temporalUi:
+  enabled: false
+keycloak:
+  enabled: false
+directJobRunner:
+  enabled: false
+featureflagServer:
+  enabled: false
+stiggSidecar:
+  enabled: false
+
+ingress:
+  enabled: false

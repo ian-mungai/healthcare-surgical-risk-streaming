@@ -1,0 +1,25 @@
+global:
+{% if airbyte_public_url %}
+  airbyteUrl: {{ airbyte_public_url | to_json }}
+{% endif %}
+  database:
+    host: {{ airbyte_database_host | to_json }}
+    port: {{ airbyte_database_port | int }}
+    name: {{ airbyte_database_name | to_json }}
+  workloads:
+    resources:
+      fileTransfer:
+        storage:
+          request: {{ airbyte_staging_size | to_json }}
+          limit: {{ airbyte_staging_size | to_json }}
+server:
+  service:
+    port: {{ airbyte_server_service_port | int }}
+temporal:
+  extraEnv:
+    - name: DBNAME
+      value: {{ airbyte_temporal_database | to_json }}
+    - name: VISIBILITY_DBNAME
+      value: {{ airbyte_temporal_visibility_database | to_json }}
+    - name: SKIP_DB_CREATE
+      value: "true"

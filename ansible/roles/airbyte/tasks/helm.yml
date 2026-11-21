@@ -1,0 +1,46 @@
+# Reads helm_version, helm_archive_sha256 and helm_install_directory. The binary is kept in a folder named for its version, so a new pin installs beside the old one.
+- name: Download the Helm archive of the pinned release, checked against its pinned hash
+  ansible.builtin.get_url:
+    url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+    dest: "/usr/local/src/helm-{{ helm_version }}-linux-amd64.tar.gz"
+    checksum: "sha256:{{ helm_archive_sha256 }}"
+    mode: "0644"
+    timeout: 60
+
+- name: Create the folder of the pinned Helm release
+  ansible.builtin.file:
+    path: "{{ helm_install_directory }}/{{ helm_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Unpack the Helm binary
+  ansible.builtin.unarchive:
+    src: "/usr/local/src/helm-{{ helm_version }}-linux-amd64.tar.gz"
+    dest: "{{ helm_install_directory }}/{{ helm_version }}"
+    remote_src: true
+    extra_opts:
+      - --strip-components=1
+      - --wildcards
+      - "*/helm"
+    creates: "{{ helm_install_directory }}/{{ helm_version }}/helm"
+
+- name: Point the helm command at the pinned release
+  ansible.builtin.file:
+    src: "{{ helm_install_directory }}/{{ helm_version }}/helm"
+    dest: /usr/local/bin/helm
+    state: link
+
+- name: Read the installed Helm version
+  ansible.builtin.command:
+    argv: [helm, version, --short]
+  register: helm_installed
+  changed_when: false
+  timeout: 30
+
+- name: Confirm the Helm version is the pin
+  ansible.builtin.assert:
+    that:
+      - helm_installed.stdout.startswith(helm_version)
+    fail_msg: The Helm version differs from the pin {{ helm_version }}.

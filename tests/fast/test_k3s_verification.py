@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import unittest
+from typing import Any
 
-from tests.fast.ansible_support import run_task_file
+from scripts.stack.yaml_text import load_yaml
+from tests.fast.ansible_support import ROLES, run_task_file
 
 GOOD_ARGUMENTS = ["server", "--disable", "traefik", "--disable", "servicelb", "--write-kubeconfig-mode", "0600"]
 GOOD_OBJECTS = "pod/coredns-1\nservice/kubernetes\nservice/kube-dns\n"
@@ -59,6 +61,51 @@ class DisabledComponentsTest(unittest.TestCase):
         code, output = verdict(GOOD_ARGUMENTS, GOOD_OBJECTS + "pod/svclb-abc\n")
         self.assertNotEqual(0, code)
         self.assertIn(MESSAGE, output)
+
+
+ENABLED = "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_finished\nServer Encryption Hashes: All hashes match\n"
+ENCRYPTION_MESSAGE = "k3s secret encryption at rest is not on"
+
+
+def encryption_verdict(status: str) -> tuple[int, str]:
+    result = run_task_file("k3s", "verify_secrets_encryption.yml", {"k3s_secrets_status": {"stdout": status}})
+    return result.returncode, result.stdout + result.stderr
+
+
+def configuration() -> dict[str, Any]:
+    tasks = load_yaml((ROLES / "k3s" / "tasks" / "main.yml").read_text())
+    if not isinstance(tasks, list):
+        raise TypeError("the task file must be a list")
+    document = load_yaml(next(task["ansible.builtin.copy"]["content"] for task in tasks if task.get("name", "").startswith("Set the k3s configuration")))
+    if not isinstance(document, dict):
+        raise TypeError("the configuration must be a mapping")
+    return document
+
+
+class SecretsEncryptionTest(unittest.TestCase):
+    def test_the_configuration_turns_encryption_on_and_keeps_the_two_components_off(self) -> None:
+        document = configuration()
+        self.assertIs(True, document["secrets-encryption"])
+        self.assertEqual(["traefik", "servicelb"], document["disable"])
+
+    def test_an_enabled_status_with_a_finished_rotation_passes(self) -> None:
+        code, output = encryption_verdict(ENABLED)
+        self.assertEqual(0, code, output)
+
+    def test_every_other_status_is_refused_with_the_same_message(self) -> None:
+        cases = {
+            "disabled with no file": "Encryption Status: Disabled, no configuration file found\n",
+            "disabled at the start stage": "Encryption Status: Disabled\nCurrent Rotation Stage: start\n",
+            "enabled while keys rotate": "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\n",
+            "disabled with a finished stage": "Encryption Status: Disabled\nCurrent Rotation Stage: reencrypt_finished\n",
+            "empty": "",
+            "unrelated text": "Enabled\n",
+        }
+        for label, status in cases.items():
+            with self.subTest(label):
+                code, output = encryption_verdict(status)
+                self.assertNotEqual(0, code)
+                self.assertIn(ENCRYPTION_MESSAGE, output)
 
 
 if __name__ == "__main__":

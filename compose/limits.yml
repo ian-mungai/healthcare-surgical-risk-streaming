@@ -53,3 +53,67 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 2048
+  airbyte_server:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_worker:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_workload_launcher:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_workload_api_server:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_cron:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_manifest_server:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_bootloader:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_temporal:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_temporal_admin:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 256
+  airbyte_minio:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_minio_create_bucket:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 128
+  airbyte_job_connector:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_job_check:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_job_discover:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 512
+  airbyte_job_replication:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 1024
+  airbyte_job_sidecar:
+    runtime: k3s
+    group: ingestion
+    memory_limit_mib: 256

@@ -1,0 +1,97 @@
+# Reads airbyte_directory, airbyte_chart_version, airbyte_chart_sha256, airbyte_namespace, airbyte_release, airbyte_kubeconfig and
+# airbyte_release_deadline_seconds. The release is installed or upgraded only when it is not deployed or when the chart or a values file changed since
+# the last success, so a second run starts no migration and changes nothing. A failure shows each pod's phase and why it waits, and never a log or a value.
+- name: Read the checksum of each values file
+  ansible.builtin.stat:
+    path: "{{ airbyte_directory }}/{{ item }}"
+    checksum_algorithm: sha256
+  register: airbyte_values_status
+  loop:
+    - values.yaml
+    - limits.values.yaml
+    - host.values.yaml
+
+- name: Work out the inputs that the release is made from
+  ansible.builtin.set_fact:
+    airbyte_release_inputs: "{{ ([airbyte_chart_sha256] + (airbyte_values_status.results | map(attribute='stat.checksum') | list)) | join(':') | hash('sha256') }}"
+
+- name: Read the inputs of the last successful release
+  ansible.builtin.slurp:
+    src: "{{ airbyte_directory }}/release_inputs.sha256"
+  register: airbyte_release_recorded
+  failed_when: false
+
+- name: Read the release's status
+  ansible.builtin.command:
+    argv: [helm, status, "{{ airbyte_release }}", --namespace, "{{ airbyte_namespace }}", --output, json]
+  environment:
+    KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  register: airbyte_release_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Decide whether the release must be installed or upgraded
+  ansible.builtin.set_fact:
+    airbyte_release_needed: >-
+      {{ airbyte_release_status.rc != 0
+         or (airbyte_release_status.stdout | from_json).info.status != 'deployed'
+         or (airbyte_release_recorded.content | default('') | b64decode) != airbyte_release_inputs }}
+
+- name: Install or upgrade the release and wait for it
+  when: airbyte_release_needed | bool
+  block:
+    - name: Install or upgrade the release from the pinned chart archive
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - "{{ airbyte_release }}"
+          - "{{ airbyte_directory }}/airbyte-{{ airbyte_chart_version }}.tgz"
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - --values
+          - "{{ airbyte_directory }}/values.yaml"
+          - --values
+          - "{{ airbyte_directory }}/limits.values.yaml"
+          - --values
+          - "{{ airbyte_directory }}/host.values.yaml"
+          - --wait
+          - --timeout
+          - "{{ airbyte_release_deadline_seconds }}s"
+      environment:
+        KUBECONFIG: "{{ airbyte_kubeconfig }}"
+      changed_when: true
+      timeout: "{{ airbyte_release_deadline_seconds | int + 120 }}"
+
+    - name: Record the inputs of this successful release
+      ansible.builtin.copy:
+        dest: "{{ airbyte_directory }}/release_inputs.sha256"
+        content: "{{ airbyte_release_inputs }}\n"
+        owner: "{{ airbyte_owner }}"
+        group: "{{ airbyte_group }}"
+        mode: "0644"
+  rescue:
+    - name: Read each pod's phase and why it waits, without logs
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - get
+          - pods
+          - --namespace
+          - "{{ airbyte_namespace }}"
+          - --output
+          - custom-columns=NAME:.metadata.name,PHASE:.status.phase,WAITING:.status.containerStatuses[*].state.waiting.reason
+      register: airbyte_release_diagnosis
+      changed_when: false
+      failed_when: false
+      timeout: 60
+
+    - name: Stop with the pods that did not become ready
+      ansible.builtin.fail:
+        msg: >-
+          The Airbyte release did not become ready within {{ airbyte_release_deadline_seconds }} seconds. Pods in namespace {{ airbyte_namespace }}:
+          {{ airbyte_release_diagnosis.stdout | default('unreadable') }}
