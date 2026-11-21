@@ -23,6 +23,7 @@ from replay.events.identity import (
     check_run_id,
     marker_event_id,
     occurrence_for,
+    partition_of,
     room_of,
     run_id,
     source_event_id,
@@ -95,6 +96,16 @@ class OccurrenceAndRoom(unittest.TestCase):
         for call in calls:
             with self.subTest(), self.assertRaises(IdentityError):
                 call()
+
+
+class Partition(unittest.TestCase):
+    def test_a_room_is_sent_to_the_partition_of_its_own_number(self) -> None:
+        self.assertEqual([0, 1, 2, 9], [partition_of(room, 10) for room in (0, 1, 2, 9)])
+
+    def test_a_room_count_above_the_partition_count_is_refused_and_so_is_a_room_that_does_not_fit(self) -> None:
+        for room, partitions in ((10, 10), (3, 2), (-1, 10), (0, 0)):
+            with self.subTest(room=room, partitions=partitions), self.assertRaises(IdentityError):
+                partition_of(room, partitions)
 
 
 class EventIdentity(unittest.TestCase):

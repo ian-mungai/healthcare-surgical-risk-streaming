@@ -27,14 +27,15 @@ class Received:
     partition: int
     offset: int
     content_id: int
+    record_name: str
     payload: dict[str, Any]
 
 
 def observed_document(received: Iterable[Received], run_id: str) -> str:
     """The observed file for one run: for each event ID, the digests of the payloads received under it, in the order received.
 
-    It also holds, for each topic, the count of messages and the content IDs found in their first bytes, the partitions that each room's messages used and the
-    number of times that the replay time went backwards between two messages of one partition in the order of their offsets.
+    It also holds the count of messages of each topic, the content IDs found in the first bytes of the messages of each record name, the partitions that each
+    room's messages used and the number of times that the replay time went backwards between two messages of one partition in the order of their offsets.
     """
     events: dict[str, list[str]] = {}
     topics: dict[str, int] = {}
@@ -48,7 +49,7 @@ def observed_document(received: Iterable[Received], run_id: str) -> str:
             continue
         events.setdefault(str(payload["event_id"]), []).append(payload_digest(payload))
         topics[message.topic] = topics.get(message.topic, 0) + 1
-        content_ids.setdefault(message.topic, set()).add(message.content_id)
+        content_ids.setdefault(message.record_name, set()).add(message.content_id)
         room_partitions.setdefault(str(payload["room"]), set()).add(message.partition)
         key = (message.topic, message.partition)
         if payload["replay_time_us"] < last.get(key, payload["replay_time_us"]):

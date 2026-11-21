@@ -1,8 +1,9 @@
 """The calls to Apicurio Registry's core API version 3 that the replay needs, with the standard library.
 
-``register`` puts a format in the registry under its subject and sets the artifact's compatibility rule. A format that is already registered with the same bytes
-gives the same version and the same content ID, so a rerun adds nothing. ``new_version`` adds a version and is refused by the registry's rule when the change is
-not compatible. Every call has a deadline. The registry in the project has no sign-in, so no credential is sent.
+``register`` puts a format in the registry under its subject. A format that is already registered with the same bytes gives the same version and the same
+content ID, so a rerun adds nothing. ``new_version`` adds a version and is refused by the registry's rule when the change is not compatible. The rule is
+the registry's one global rule, which ``global_rule`` reads and which the stack's own registry step sets. Every call has a deadline. The registry in the
+project has no sign-in, so no credential is sent.
 """
 
 from __future__ import annotations
@@ -91,26 +92,26 @@ class RegistryClient:
             raise RegistryError("the registry's answer holds no version with a content ID and a global ID")
         return Registered(group, artifact_id, str(version["version"]), version["contentId"], version["globalId"])
 
-    def register(self, group: str, artifact_id: str, schema_text: str, rule: str) -> Registered:
-        """Create the artifact with this schema as its first version, or find the version that holds exactly these bytes, then set the compatibility rule."""
+    def register(self, group: str, artifact_id: str, schema_text: str, unused_rule: str | None = None) -> Registered:
+        """Create the artifact with this schema as its first version, or find the version that holds exactly these bytes."""
         body = {
             "artifactId": artifact_id,
             "artifactType": "AVRO",
             "firstVersion": {"version": "1", "content": {"content": schema_text, "contentType": "application/json"}},
         }
         _, document = self.request("POST", f"/groups/{quote(group, safe='')}/artifacts?ifExists=FIND_OR_CREATE_VERSION", body)
-        registered = self.registered(group, artifact_id, (document or {}).get("version"))
-        self.set_rule(group, artifact_id, rule)
-        return registered
+        return self.registered(group, artifact_id, (document or {}).get("version"))
 
-    def set_rule(self, group: str, artifact_id: str, rule: str) -> None:
-        path = self.artifact_path(group, artifact_id) + "/rules"
-        status, _ = self.request("POST", path, {"ruleType": "COMPATIBILITY", "config": rule}, allowed=(409,))
+    def global_rule(self) -> str | None:
+        """The registry's global compatibility rule, or None when it has none."""
+        status, document = self.request("GET", "/admin/rules/COMPATIBILITY", allowed=(404,))
+        return None if status == 404 or not isinstance(document, dict) else str(document.get("config"))
+
+    def set_global_rule(self, rule: str) -> None:
+        """Set the global compatibility rule. The stack's registry step does this on the host. A test's own registry needs it too."""
+        status, _ = self.request("POST", "/admin/rules", {"ruleType": "COMPATIBILITY", "config": rule}, allowed=(409,))
         if status == 409:
-            self.request("PUT", f"{path}/COMPATIBILITY", {"ruleType": "COMPATIBILITY", "config": rule})
-        _, document = self.request("GET", f"{path}/COMPATIBILITY")
-        if not isinstance(document, dict) or document.get("config") != rule:
-            raise RegistryError(f"the compatibility rule of {artifact_id} is not {rule} after it was set")
+            self.request("PUT", "/admin/rules/COMPATIBILITY", {"ruleType": "COMPATIBILITY", "config": rule})
 
     def new_version(self, group: str, artifact_id: str, version: str, schema_text: str) -> Registered:
         """Add a version. A change that the compatibility rule refuses raises ``RegistryRefused``."""

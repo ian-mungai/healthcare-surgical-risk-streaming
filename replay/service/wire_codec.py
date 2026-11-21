@@ -58,6 +58,10 @@ class Reader:
         self.registry = registry
         self.parsed: dict[int, Any] = {}
 
+    def record_name(self, content_id: int) -> str:
+        """The record name of a schema that ``decode`` has read."""
+        return str(self.parsed[content_id]["name"]).rsplit(".", 1)[-1]
+
     def decode(self, message: bytes) -> tuple[int, dict[str, Any]]:
         content_id, body = unframe(message)
         if content_id not in self.parsed:

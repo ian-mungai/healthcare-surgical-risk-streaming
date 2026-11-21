@@ -6,7 +6,8 @@ use the same definitions.
 - **Run.** ``<name>_<8 hex>``, plus ``_2``, ``_3`` for a later attempt of the same run.
 - **Case occurrence.** One play of one case in a run. The occurrences are numbered in the play order, from 0. The case of occurrence ``n`` is the ``n``-th case
   of the sample in turn, and its repeat is the number of times the sample was played through before it. Its ID is ``<case number>.<repeat>``.
-- **Room.** Occurrence ``n`` is played in room ``n`` modulo the number of rooms.
+- **Room.** Occurrence ``n`` is played in room ``n`` modulo the number of rooms. A room's events go to the partition with the room's number, and the message key
+  is the room.
 - **Event.** ``<run>|<room>|<occurrence>|<track>|<case time in microseconds>|<discriminator>``. The discriminator is the position of a reading among the
   readings of its track that share its case time, in the order of the file, so two readings of one track and one time never share an ID. A generated marker has
   a reserved track that starts with ``!``, so a marker ID never equals a source event ID.
@@ -71,6 +72,15 @@ def room_of(sequence: int, rooms: int) -> int:
     if rooms < 1 or sequence < 0:
         raise IdentityError("a room needs at least one room and a sequence from zero")
     return sequence % rooms
+
+
+def partition_of(room: int, partitions: int) -> int:
+    """The partition of a room in the input topic: the room's own number. A room that has no partition of its own is refused."""
+    if partitions < 1 or not 0 <= room < partitions:
+        raise IdentityError(
+            f"room {room} has no partition of its own in a topic of {partitions} partitions: the room count must not exceed the partition count"
+        )
+    return room
 
 
 def occurrence_for(sequence: int, case_ids: Sequence[int], rooms: int) -> Occurrence:

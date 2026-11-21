@@ -5,7 +5,7 @@
 ``manifest``  derive the manifest of expected events from the verified files and the frozen schedule, and write it.
 ``observe``   read every message of the topics and write the digest of each payload under its event ID.
 ``compare``   compare the observed file and the saved state with the manifest. Exit 0 only when every expected ID is there with its payload.
-``formats``   register the Avro formats and their compatibility rule in the registry.
+``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 
 Every command takes the run record (``--run-record``), which holds the settings of the run, the speed among them. Exit codes: 0 done, 1 the check failed,
 3 the gate refused an object version, 2 anything else that stopped the command.
@@ -22,14 +22,15 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-from replay.events.formats import COMPATIBILITY_RULE, FORMATS, REGISTRY_GROUP, schema_text
+from replay.events.formats import COMPATIBILITY_RULE, FORMATS, INPUT_TOPIC, REGISTRY_GROUP, schema_text
+from replay.events.identity import partition_of
 from replay.events.manifest import Manifest, build_manifest, compare
 from replay.events.run import Replayer, RunSettings
 from replay.events.schedule import FrozenSchedule, ScheduleError, admitted_occurrences, first_due_instant, freeze
 from replay.events.stream import earliest_due_offset_us
 from replay.service.check import observed_document, observed_from, report_document
 from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_inputs
-from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, ensure_topics, read_all
+from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
@@ -105,13 +106,13 @@ def command_freeze(record: RunRecord, _: argparse.Namespace) -> int:
 
 
 def command_run(record: RunRecord, _: argparse.Namespace) -> int:
+    partitions = partition_count(record.kafka_bootstrap, INPUT_TOPIC)
+    partition_of(record.rooms - 1, partitions)
     inputs = verify_inputs(record)
     frozen = freeze_run(record, inputs)
     times = inputs.times()
-    registry = RegistryClient(record.registry_url)
-    writer = Writer(registry)
-    ensure_topics(record.kafka_bootstrap, [format_.topic for format_ in FORMATS.values()])
-    sink = KafkaSink(record.kafka_bootstrap, writer)
+    writer = Writer(RegistryClient(record.registry_url))
+    sink = KafkaSink(record.kafka_bootstrap, writer, partitions)
     stopped = False
 
     def request_stop(signum: int, frame: FrameType | None) -> None:
@@ -151,7 +152,7 @@ def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
 
 def command_observe(record: RunRecord, arguments: argparse.Namespace) -> int:
     reader = Reader(RegistryClient(record.registry_url))
-    received = read_all(record.kafka_bootstrap, reader, [format_.topic for format_ in FORMATS.values()], READ_DEADLINE_SECONDS)
+    received = read_all(record.kafka_bootstrap, reader, [INPUT_TOPIC], READ_DEADLINE_SECONDS)
     atomic_write(Path(arguments.out), observed_document(received, record.run_id))
     sys.stdout.write(json.dumps({"messages_read": len(received)}) + "\n")
     return 0
@@ -167,7 +168,10 @@ def command_compare(record: RunRecord, arguments: argparse.Namespace) -> int:
 
 def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
     registry = RegistryClient(record.registry_url)
-    registered = {key: registry.register(REGISTRY_GROUP, format_.subject, schema_text(key), COMPATIBILITY_RULE) for key, format_ in FORMATS.items()}
+    held = registry.global_rule()
+    if held != COMPATIBILITY_RULE:
+        raise RegistryError(f"the registry's global compatibility rule is {held}, not {COMPATIBILITY_RULE}: the stack's registry step sets it first")
+    registered = {key: registry.register(REGISTRY_GROUP, format_.subject, schema_text(key)) for key, format_ in FORMATS.items()}
     sys.stdout.write(
         json.dumps(
             {key: {"subject": item.artifact_id, "version": item.version, "content_id": item.content_id} for key, item in registered.items()}, sort_keys=True

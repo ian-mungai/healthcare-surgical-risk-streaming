@@ -17,6 +17,7 @@ from confluent_kafka import OFFSET_BEGINNING, Consumer, KafkaError, KafkaExcepti
 from confluent_kafka.admin import AdminClient
 
 from replay.events.formats import FORMATS, KIND_FORMAT
+from replay.events.identity import partition_of
 from replay.events.stream import OutgoingEvent
 from replay.service.check import Received
 from replay.service.wire_codec import Reader, Writer
@@ -41,26 +42,26 @@ def producer_settings(bootstrap_servers: str) -> dict[str, Any]:
         "acks": "all",
         "compression.type": "lz4",
         "linger.ms": 20,
-        "partitioner": "murmur2_random",
         "allow.auto.create.topics": False,
         "message.timeout.ms": 60_000,
     }
 
 
-def ensure_topics(bootstrap_servers: str, topics: Iterable[str]) -> None:
-    """Refuse to start when a topic that the replay writes to does not exist."""
+def partition_count(bootstrap_servers: str, topic: str) -> int:
+    """The number of partitions of a topic. Refuse to start when the topic does not exist."""
     try:
         listed = AdminClient({"bootstrap.servers": bootstrap_servers}).list_topics(timeout=METADATA_TIMEOUT_SECONDS).topics
     except KafkaException as error:
         raise KafkaStartError(f"the broker cannot be reached: {error.args[0].name()}") from None
-    missing = sorted(set(topics) - set(listed))
-    if missing:
-        raise KafkaStartError(f"the topics do not exist: {', '.join(missing)}")
+    if topic not in listed or listed[topic].error is not None:
+        raise KafkaStartError(f"the topic does not exist: {topic}")
+    return len(listed[topic].partitions)
 
 
 class KafkaSink:
-    def __init__(self, bootstrap_servers: str, writer: Writer, flush_timeout_seconds: float = 60.0) -> None:
+    def __init__(self, bootstrap_servers: str, writer: Writer, partitions: int, flush_timeout_seconds: float = 60.0) -> None:
         self.producer = Producer(producer_settings(bootstrap_servers))
+        self.partitions = partitions
         self.writer = writer
         self.flush_timeout_seconds = flush_timeout_seconds
         self.failures: list[str] = []
@@ -75,7 +76,13 @@ class KafkaSink:
         deadline = time.monotonic() + SEND_RETRY_SECONDS
         while True:
             try:
-                self.producer.produce(FORMATS[format_key].topic, key=str(event.room).encode(), value=value, on_delivery=self.delivered)
+                self.producer.produce(
+                    FORMATS[format_key].topic,
+                    key=str(event.room).encode(),
+                    value=value,
+                    partition=partition_of(event.room, self.partitions),
+                    on_delivery=self.delivered,
+                )
                 break
             except BufferError:
                 if time.monotonic() > deadline:
@@ -122,14 +129,14 @@ def read_all(bootstrap_servers: str, reader: Reader, topics: Iterable[str], dead
             failure = message.error()
             if failure is not None:
                 raise DeliveryError(f"the read failed: {failure.name()}")
-            topic, partition, offset, value = message.topic(), message.partition(), message.offset(), message.value()
-            if topic is None or partition is None or offset is None or value is None:
+            where, number, offset, value = message.topic(), message.partition(), message.offset(), message.value()
+            if where is None or number is None or offset is None or value is None:
                 raise DeliveryError("a message has no topic, partition, offset or value")
-            if offset < ends[(topic, partition)]:
+            if offset < ends[(where, number)]:
                 content_id, payload = reader.decode(value)
-                received.append(Received(topic, partition, offset, content_id, payload))
-            if offset >= ends[(topic, partition)] - 1:
-                pending.discard((topic, partition))
+                received.append(Received(where, number, offset, content_id, reader.record_name(content_id), payload))
+            if offset >= ends[(where, number)] - 1:
+                pending.discard((where, number))
     finally:
         consumer.close()
     return received
