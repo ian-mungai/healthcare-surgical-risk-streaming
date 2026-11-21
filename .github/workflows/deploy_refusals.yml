@@ -1,0 +1,79 @@
+# Temporary: this file is on main only for the refusal run and is purged from history afterwards.
+# Every job here tries to obtain the deploy identities and must be refused. A job that is let in fails the run.
+name: deploy refusals
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+permissions: {}
+
+jobs:
+  with_environment:
+    name: Refused with the deploy environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: deploy
+    permissions:
+      id-token: write
+    steps:
+      - id: aws
+        name: Try to obtain AWS credentials
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: refusal
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: tailscale
+        name: Try to join the Tailscale network
+        continue-on-error: true
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_DEPLOY_CLIENT_ID }}
+          audience: ${{ vars.TS_DEPLOY_AUDIENCE }}
+          tags: tag:surgical-deploy
+          version: 1.104.7
+      - name: Require both refusals
+        env:
+          AWS_OUTCOME: ${{ steps.aws.outcome }}
+          TAILSCALE_OUTCOME: ${{ steps.tailscale.outcome }}
+        run: |
+          echo "AWS credentials: ${AWS_OUTCOME}. Tailscale enrolment: ${TAILSCALE_OUTCOME}."
+          test "${AWS_OUTCOME}" = "failure"
+          test "${TAILSCALE_OUTCOME}" = "failure"
+
+  without_environment:
+    name: Refused without the deploy environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    steps:
+      - id: aws
+        name: Try to obtain AWS credentials
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: refusal
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: tailscale
+        name: Try to join the Tailscale network
+        continue-on-error: true
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_DEPLOY_CLIENT_ID }}
+          audience: ${{ vars.TS_DEPLOY_AUDIENCE }}
+          tags: tag:surgical-deploy
+          version: 1.104.7
+      - name: Require both refusals
+        env:
+          AWS_OUTCOME: ${{ steps.aws.outcome }}
+          TAILSCALE_OUTCOME: ${{ steps.tailscale.outcome }}
+        run: |
+          echo "AWS credentials: ${AWS_OUTCOME}. Tailscale enrolment: ${TAILSCALE_OUTCOME}."
+          test "${AWS_OUTCOME}" = "failure"
+          test "${TAILSCALE_OUTCOME}" = "failure"
