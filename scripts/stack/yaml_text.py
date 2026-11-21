@@ -1,13 +1,14 @@
 """Parse the stack's YAML files, refusing a key that a mapping repeats.
 
-PyYAML is pinned in ``requirements.txt`` as a dependency of ansible-core. A repeated key would silently keep only its last value, which in the
-limits file would be a limit that is typed twice, so it is refused with its line number.
+PyYAML is a direct requirement of the project, pinned in ``requirements.txt`` with its type stubs. A repeated key would silently keep only its last value,
+which in the limits file would be a limit that is typed twice, so it is refused with its line number.
 """
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
+
+import yaml
 
 
 class YamlError(ValueError):
@@ -34,7 +35,6 @@ def refuse_repeated_keys(node: Any) -> None:
 
 def load_yaml(text: str) -> object:
     """The parsed document, or ``YamlError`` for text that is not YAML or repeats a mapping key."""
-    yaml = importlib.import_module("yaml")
     try:
         node = yaml.compose(text)
         if node is not None:
