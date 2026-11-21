@@ -14,10 +14,10 @@ services:
       - -c
       - |
         case "$$TS_ADDRESS" in
-          ""|0.0.0.0|127.*) echo "caddy: TS_ADDRESS must be the host's Tailscale address, found '$$TS_ADDRESS'" >&2; exit 1 ;;
+          ""|0.0.0.0|127.*) echo "caddy: TS_ADDRESS must be the host's Tailscale address" >&2; exit 1 ;;
         esac
         echo "$$TS_ADDRESS" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$$' || { echo "caddy: TS_ADDRESS is not an IPv4 address" >&2; exit 1; }
-        test -n "$$TS_HOST_NAME" || { echo "caddy: TS_HOST_NAME is empty" >&2; exit 1; }
+        echo "$$TS_HOST_NAME" | grep -Eq '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$$' || { echo "caddy: TS_HOST_NAME is not a lower case host name" >&2; exit 1; }
         exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     configs:
       - source: caddyfile

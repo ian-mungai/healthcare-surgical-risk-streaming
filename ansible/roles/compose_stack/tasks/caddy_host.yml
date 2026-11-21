@@ -5,14 +5,29 @@
     argv: [tailscale, status, --json]
   register: compose_stack_tailscale_status
   changed_when: false
+  failed_when: false
   check_mode: false
+  no_log: true
   timeout: 60
 
+- name: Refuse a host where the tailscale command failed
+  ansible.builtin.assert:
+    that:
+      - compose_stack_tailscale_status.rc | default(-1) == 0
+    fail_msg: tailscale status failed with exit status {{ compose_stack_tailscale_status.rc | default('unknown') }}. Start Tailscale on the host, then run the deploy again.
+
 - name: Read the host's Tailscale name, address and certificate names
-  ansible.builtin.set_fact:
-    compose_stack_tailscale_name: "{{ (compose_stack_tailscale_status.stdout | from_json).Self.DNSName | regex_replace('[.]$', '') }}"
-    compose_stack_tailscale_address: "{{ (compose_stack_tailscale_status.stdout | from_json).Self.TailscaleIPs | select('match', '^[0-9.]+$') | list | first | default('') }}"
-    compose_stack_tailscale_certificate_names: "{{ (compose_stack_tailscale_status.stdout | from_json).CertDomains | default([]) }}"
+  block:
+    - name: Set the name, the address and the certificate names
+      ansible.builtin.set_fact:
+        compose_stack_tailscale_name: "{{ (compose_stack_tailscale_status.stdout | from_json).Self.DNSName | regex_replace('[.]$', '') }}"
+        compose_stack_tailscale_address: "{{ (compose_stack_tailscale_status.stdout | from_json).Self.TailscaleIPs | select('match', '^[0-9.]+$') | list | first | default('') }}"
+        compose_stack_tailscale_certificate_names: "{{ (compose_stack_tailscale_status.stdout | from_json).CertDomains | default([]) }}"
+      no_log: true
+  rescue:
+    - name: Stop without the status
+      ansible.builtin.fail:
+        msg: The Tailscale status holds no name for this host. Join the host to the network, then run the deploy again.
 
 - name: Refuse a host that cannot serve Tailscale certificates on a Tailscale address
   ansible.builtin.assert:
@@ -41,3 +56,4 @@
     owner: "{{ compose_stack_owner }}"
     group: "{{ compose_stack_group }}"
     mode: "0644"
+  diff: false

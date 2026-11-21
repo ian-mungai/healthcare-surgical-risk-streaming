@@ -23,8 +23,9 @@ CADDYFILE = CADDY_FOLDER / "Caddyfile"
 GATEWAY_PORT = 9440
 LOCAL_ADDRESS = "127.0.0.1"
 NAME = re.compile(r"[a-z][a-z0-9_]*")
-UPSTREAM = re.compile(rf"{re.escape(LOCAL_ADDRESS)}:(\d{{1,5}})")
-PLAIN_PORT = re.compile(r"\d{1,5}")
+UPSTREAM = re.compile(rf"{re.escape(LOCAL_ADDRESS)}:([1-9][0-9]{{0,4}})")
+PLAIN_PORT = re.compile(r"[1-9][0-9]{0,4}")
+HEALTH_PATH = re.compile(r"/[A-Za-z0-9._~/-]*")
 SITE_LINE = re.compile(r"^(?P<address>\S.*) \{$")
 SITE_ADDRESS = re.compile(r"\{\$TS_HOST_NAME\}:(?P<port>\d+)")
 ADDRESS_LITERAL = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
@@ -67,8 +68,8 @@ def parse_route(number: int, line: str) -> Route:
     match = UPSTREAM.fullmatch(upstream)
     if match is None or not valid_port(match[1]):
         raise RoutesError(f"line {number}: upstream {upstream!r} must be {LOCAL_ADDRESS} and a port from 1024 to 65535")
-    if not health.startswith("/"):
-        raise RoutesError(f"line {number}: health path {health!r} must start with a slash")
+    if not HEALTH_PATH.fullmatch(health):
+        raise RoutesError(f"line {number}: health path {health!r} must start with a slash and hold only letters, digits and . _ ~ / -")
     return Route(name, int(port), upstream, health)
 
 
@@ -76,8 +77,8 @@ def parse_routes(text: str) -> list[Route]:
     """The checked routes in ``text`` in file order, or ``RoutesError`` naming the line and the fault."""
     routes: list[Route] = []
     for number, raw in enumerate(text.splitlines(), start=1):
-        line = raw.split("#", 1)[0].strip()
-        if not line:
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
         route = parse_route(number, line)
         if route.name in {item.name for item in routes}:

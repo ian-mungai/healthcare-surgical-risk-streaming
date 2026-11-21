@@ -73,6 +73,34 @@ class RouteListTest(unittest.TestCase):
     def test_a_health_path_that_does_not_start_with_a_slash_is_refused(self) -> None:
         self.assertIn("health", refused_routes("x 9441 127.0.0.1:3000 health\n"))
 
+    def test_a_hash_inside_a_line_is_refused_and_never_cuts_the_line_short(self) -> None:
+        self.assertIn("health", refused_routes("x 9441 127.0.0.1:3000 /a#b\n"))
+        self.assertIn("line 1", refused_routes("x 9441 127.0.0.1:3000 /a # a note\n"))
+
+    def test_a_whole_line_comment_is_the_only_comment(self) -> None:
+        self.assertEqual(["x"], [route.name for route in parse_routes("   # a note\nx 9441 127.0.0.1:3000 /a\n")])
+
+    def test_digits_that_are_not_ascii_or_that_start_with_zero_are_refused_in_a_port_or_an_upstream(self) -> None:
+        for line in (
+            "x \u0669\u0664\u0664\u0661 127.0.0.1:3000 /\n",
+            "x 9441 127.0.0.1:\u0663\u0660\u0660\u0660 /\n",
+            "x 09441 127.0.0.1:3000 /\n",
+            "x 9441 127.0.0.1:03000 /\n",
+        ):
+            with self.subTest(line=line):
+                self.assertIn("line 1", refused_routes(line))
+
+    def test_a_health_path_with_a_character_outside_the_closed_set_is_refused(self) -> None:
+        for path in ('/a"b', "/a{b}", "/a?b=1", "/a\\b", "/a;b", "/a%b"):
+            with self.subTest(path=path):
+                self.assertIn("health", refused_routes(f"x 9441 127.0.0.1:3000 {path}\n"))
+
+    def test_the_health_paths_of_the_tracked_list_are_in_the_closed_set(self) -> None:
+        self.assertEqual(
+            ["/v1/sys/health", "/api/health", "/-/healthy", "/v1/info", "/q/health", "/api/v1/health"],
+            [route.health_path for route in load_routes(ROUTES_FILE)],
+        )
+
     def test_a_line_with_the_wrong_number_of_fields_is_refused_with_its_line_number(self) -> None:
         self.assertIn("line 2", refused_routes(GOOD.splitlines()[0] + "\nx 9441 127.0.0.1:3000\n"))
         self.assertIn("line 2", refused_routes(GOOD.splitlines()[0] + "\nx 9441 127.0.0.1:3000 / extra\n"))
