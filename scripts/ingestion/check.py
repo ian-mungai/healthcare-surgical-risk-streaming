@@ -11,16 +11,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from scripts.ingestion.landing import LANDING_PREFIX, landed_key
+from scripts.ingestion.landing import LANDING_PREFIX, PairingRecord
 from scripts.ingestion.selection import Selection
 from scripts.ingestion.store import ObjectStore, ObjectVersion
 
 LIST_LINE = re.compile(r"([0-9a-f]{64}) ([A-Za-z0-9._/-]+)")
 MISSING = "missing"
+DUPLICATE_PAIRING = "duplicate_pairing"
+LANDED_OBJECT_MISSING = "landed_object_missing"
+PAIRING_SIZE_DIFFERS = "pairing_size_differs"
 CHECKSUM_DIFFERS = "checksum_differs"
 NOT_IN_CHECKSUM_LIST = "not_in_checksum_list"
 NULL_VERSION_ID = "null_version_id"
@@ -151,25 +155,39 @@ def stream_sha256(store: ObjectStore, version: ObjectVersion) -> str:
 
 
 def run_check(
-    store: ObjectStore, selection: Selection, list_bytes: bytes, progress: Callable[[int, int], None] | None = None, rule: Callable[[str], str] = landed_key
+    store: ObjectStore, selection: Selection, list_bytes: bytes, pairings: Sequence[PairingRecord], progress: Callable[[int, int], None] | None = None
 ) -> CheckResult:
-    """Check every selected file of the set and return the result. Raise ``PinnedListError`` before any read when the list is not the pinned one."""
+    """Check every selected file of the set and return the result. Raise ``PinnedListError`` before any read when the list is not the pinned one.
+
+    ``pairings`` pairs each source key with the landed key and size that its sync wrote. A file with no record is missing; two records for one
+    file, a landed key with no current object and a record whose size differs from the landed object each fail that file without reading it.
+    """
     list_sha256 = sha256_of(list_bytes)
     if list_sha256 != selection.checksum_list_sha256:
         raise PinnedListError("the checksum list's SHA-256 differs from the pinned SHA-256")
     listed = parse_checksum_list(list_bytes)
     current = current_versions(store.list_versions(LANDING_PREFIX))
+    recorded: dict[str, list[PairingRecord]] = defaultdict(list)
+    for record in pairings:
+        recorded[record.source_key].append(record)
     files: list[CheckedFile] = []
     findings: list[Finding] = []
     for done, path in enumerate(selection.files, 1):
         source_key = selection.source_prefix + path
-        version = current.get(rule(source_key))
+        records = recorded.get(source_key, [])
+        version = current.get(records[0].landed_key) if len(records) == 1 else None
         if path not in listed:
             findings.append(Finding(source_key, NOT_IN_CHECKSUM_LIST))
-        if version is None or version.is_delete_marker:
-            findings.append(Finding(source_key, MISSING))
+        if not records:
+            findings.append(Finding(source_key, MISSING, "no pairing record"))
+        elif len(records) > 1:
+            findings.append(Finding(source_key, DUPLICATE_PAIRING, f"{len(records)} pairing records, for example from a second sync"))
+        elif version is None or version.is_delete_marker:
+            findings.append(Finding(source_key, LANDED_OBJECT_MISSING, "the landed key has no current object"))
         elif version.version_id in ("", "null"):
             findings.append(Finding(source_key, NULL_VERSION_ID))
+        elif version.size != records[0].size:
+            findings.append(Finding(source_key, PAIRING_SIZE_DIFFERS, f"record {records[0].size} bytes, landed object {version.size} bytes"))
         elif path in listed:
             found = stream_sha256(store, version)
             if found == listed[path]:

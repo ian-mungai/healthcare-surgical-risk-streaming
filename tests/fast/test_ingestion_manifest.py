@@ -10,15 +10,13 @@ import json
 import unittest
 from dataclasses import replace
 
-from scripts.ingestion.check import CheckResult, run_check
+from scripts.ingestion.check import CheckResult
 from scripts.ingestion.manifest import MANIFEST_PREFIX, PublishRefused, publish_manifest, read_manifest
-
-from scripts.ingestion.landing import landed_key
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
 
 
 def checked(landed: Landed) -> CheckResult:
-    return run_check(landed.store, landed.selection, landed.list_bytes)
+    return landed.check()
 
 
 def manifest_objects(landed: Landed) -> list[str]:
@@ -64,7 +62,7 @@ class PublishTest(unittest.TestCase):
             self.assertEqual(
                 {
                     "bucket": landed.store.bucket,
-                    "key": landed_key(source_key),
+                    "key": landed.key_for(source_key),
                     "version_id": version.version_id,
                     "sha256": digest(data),
                     "source_key": source_key,
@@ -135,7 +133,7 @@ class PublishTest(unittest.TestCase):
     def test_a_version_removed_after_the_check_publishes_nothing(self) -> None:
         landed = landed_set()
         result = checked(landed)
-        landed.store.put_delete_marker(landed_key(SOURCE_PREFIX + "clinical_data.csv"))
+        landed.store.put_delete_marker(landed.key_for(SOURCE_PREFIX + "clinical_data.csv"))
         with self.assertRaisesRegex(PublishRefused, "clinical_data.csv"):
             publish_manifest(landed.store, landed.selection, result)
         self.assertEqual([], manifest_objects(landed))

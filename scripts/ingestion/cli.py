@@ -2,7 +2,7 @@
 
 ``check``: stream every selected landed object version and compare it with the pinned checksum list; write the result file and exit 1 on any fault.
 
-``.venv/bin/python -m scripts.ingestion.cli check --selection S.json --checksum-list SHA256SUMS.txt --result result.json``
+``.venv/bin/python -m scripts.ingestion.cli check --selection S.json --checksum-list SHA256SUMS.txt --pairings pairings.json --result result.json``
 
 ``publish``: publish the manifest of a complete passed result and write its reference file.
 
@@ -25,6 +25,7 @@ from pathlib import Path
 from scripts.aws_cli import Aws, AwsError
 from scripts.ingestion.check import CheckResult, ChecksumListError, PinnedListError, run_check
 from scripts.ingestion.gate import GateRefused, verify_before_read
+from scripts.ingestion.landing import load_pairing_records
 from scripts.ingestion.manifest import ManifestRef, PublishRefused, publish_manifest
 from scripts.ingestion.selection import Selection, SelectionError
 from scripts.ingestion.store import S3Store, StoreError
@@ -45,7 +46,8 @@ def show_progress(done: int, total: int) -> None:
 
 def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
     selection = Selection.from_json(arguments.selection.read_text())
-    result = run_check(store, selection, arguments.checksum_list.read_bytes(), show_progress)
+    pairings = load_pairing_records(arguments.pairings.read_text())
+    result = run_check(store, selection, arguments.checksum_list.read_bytes(), pairings, show_progress)
     write_file(arguments.result, result.to_json())
     for finding in result.findings:
         sys.stderr.write(f"{finding.message}\n")
@@ -78,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     check = commands.add_parser("check")
     check.add_argument("--selection", type=Path, required=True)
     check.add_argument("--checksum-list", type=Path, required=True, help="the publisher's checksum list, pinned in the selection by its SHA-256")
+    check.add_argument("--pairings", type=Path, required=True, help="the pairing records: each source key with its landed key and size, as a JSON list")
     check.add_argument("--result", type=Path, required=True, help="where to write the result, also when the check fails")
     publish = commands.add_parser("publish")
     publish.add_argument("--selection", type=Path, required=True)

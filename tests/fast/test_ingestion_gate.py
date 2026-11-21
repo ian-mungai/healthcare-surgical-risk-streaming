@@ -9,18 +9,16 @@ import json
 import unittest
 from dataclasses import replace
 
-from scripts.ingestion.check import run_check
 from scripts.ingestion.gate import GateRefused, verify_before_read
+from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.manifest import MANIFEST_PREFIX, ManifestRef, publish_manifest
-
-from scripts.ingestion.landing import LANDING_PREFIX, landed_key
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
 
 WANTED = [SOURCE_PREFIX + "vital_files/0001.vital", SOURCE_PREFIX + "clinical_data.csv"]
 
 
 def published(landed: Landed) -> ManifestRef:
-    return publish_manifest(landed.store, landed.selection, run_check(landed.store, landed.selection, landed.list_bytes))
+    return publish_manifest(landed.store, landed.selection, landed.check())
 
 
 def problems(landed: Landed, reference: ManifestRef, wanted: list[str] | None = None) -> dict[str, str]:
@@ -40,7 +38,9 @@ class GateTest(unittest.TestCase):
         self.assertEqual(WANTED, [entry.source_key for entry in entries])
         for entry in entries:
             path = entry.source_key.removeprefix(SOURCE_PREFIX)
-            self.assertEqual((landed_key(entry.source_key), landed.versions[path].version_id, landed.store.bucket), (entry.key, entry.version_id, entry.bucket))
+            self.assertEqual(
+                (landed.key_for(entry.source_key), landed.versions[path].version_id, landed.store.bucket), (entry.key, entry.version_id, entry.bucket)
+            )
         self.assertEqual([], landed.store.payload_reads(LANDING_PREFIX))
 
     def test_no_keys_named_means_every_entry_of_the_manifest(self) -> None:
@@ -65,19 +65,19 @@ class GateTest(unittest.TestCase):
     def test_an_object_deleted_after_the_manifest_is_refused_as_missing(self) -> None:
         landed = landed_set()
         reference = published(landed)
-        landed.store.remove_version(landed_key(WANTED[1]), landed.versions["clinical_data.csv"].version_id)
+        landed.store.remove_version(landed.key_for(WANTED[1]), landed.versions["clinical_data.csv"].version_id)
         self.assertEqual({WANTED[1]: "missing"}, problems(landed, reference, WANTED))
 
     def test_a_delete_marker_on_top_of_the_bound_version_is_refused(self) -> None:
         landed = landed_set()
         reference = published(landed)
-        landed.store.put_delete_marker(landed_key(WANTED[1]))
+        landed.store.put_delete_marker(landed.key_for(WANTED[1]))
         self.assertEqual({WANTED[1]: "missing"}, problems(landed, reference, WANTED))
 
     def test_a_key_that_the_manifest_does_not_bind_is_refused(self) -> None:
         landed = landed_set()
         reference = published(landed)
-        landed.store.put_object(landed_key(SOURCE_PREFIX + "vital_files/9999.vital"), b"landed after the check")
+        landed.store.put_object(LANDING_PREFIX + "sync_99/vital_files/9999.vital", b"landed after the check")
         unbound = SOURCE_PREFIX + "vital_files/9999.vital"
         self.assertEqual({unbound: "not_in_manifest"}, problems(landed, reference, [WANTED[0], unbound]))
 
@@ -85,7 +85,7 @@ class GateTest(unittest.TestCase):
         landed = landed_set()
         reference = published(landed)
         landed.land("vital_files/0001.vital", b"substituted")
-        landed.store.put_delete_marker(landed_key(WANTED[1]))
+        landed.store.put_delete_marker(landed.key_for(WANTED[1]))
         with self.assertRaises(GateRefused) as raised:
             verify_before_read(landed.store, reference, [*WANTED, SOURCE_PREFIX + "other.csv"])
         message = str(raised.exception)
@@ -121,8 +121,8 @@ class GateTest(unittest.TestCase):
     def test_a_size_that_differs_from_the_bound_size_is_refused(self) -> None:
         landed = landed_set()
         reference = published(landed)
-        version = landed.store.history[landed_key(WANTED[1])][0]
-        landed.store.history[landed_key(WANTED[1])][0] = replace(version, version=replace(version.version, size=version.version.size + 1))
+        version = landed.store.history[landed.key_for(WANTED[1])][0]
+        landed.store.history[landed.key_for(WANTED[1])][0] = replace(version, version=replace(version.version, size=version.version.size + 1))
         self.assertEqual({WANTED[1]: "size_differs"}, problems(landed, reference, WANTED))
 
 
