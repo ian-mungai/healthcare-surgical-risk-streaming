@@ -24,10 +24,13 @@ BATCH_IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest$)[A-Za-z0-9._-]+$")
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
 HOST_NETWORK_SERVICES = {"caddy"}
-HOST_PATH_VOLUMES = {"caddy": {"/var/run/tailscale:/var/run/tailscale:ro"}}
 # The host paths that a collector may read, by the source on the host and always read-only: the runtime sockets of Docker and containerd for container
 # metrics and logs, and the kernel's process and system folders. No other service has one, and the target in the container is free.
 READ_ONLY_HOST_SOURCES = {"alloy": {"/var/run/docker.sock", "/run/containerd/containerd.sock", "/proc", "/sys"}}
+DOCKER_SOCKET = "/var/run/docker.sock:/var/run/docker.sock"
+# The exact host paths that the design names for a service: the Tailscale socket folder for the gateway and, by the owner's decision, the Docker socket for the
+# code location that runs the jobs.
+HOST_PATH_VOLUMES = {"caddy": {"/var/run/tailscale:/var/run/tailscale:ro"}, "dagster_code_location": {DOCKER_SOCKET}}
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -223,6 +226,52 @@ class CollectorMountTest(unittest.TestCase):
                 document = copy.deepcopy(load(SERVICES / f"{name}.yml"))
                 document["services"][name]["volumes"].append("/proc:/host/proc:ro")
                 self.assertIn("named volumes", service_problems(name, document)[0])
+
+
+class DockerSocketExceptionTest(unittest.TestCase):
+    """The owner's decision: the Docker socket is mounted into the Dagster container that runs the jobs, and into no other container."""
+
+    def code_location(self) -> dict[str, Any]:
+        return copy.deepcopy(load(SERVICES / "dagster_code_location.yml"))
+
+    def test_the_real_code_location_file_mounts_the_socket_and_has_no_problem(self) -> None:
+        document = self.code_location()
+        self.assertIn(DOCKER_SOCKET, document["services"]["dagster_code_location"]["volumes"])
+        self.assertEqual([], service_problems("dagster_code_location", document))
+
+    def test_no_other_service_file_mounts_the_socket(self) -> None:
+        """The collector is the one other holder, by the owner's decision, and reads it read-only."""
+        expected = {"dagster_code_location": [DOCKER_SOCKET], "alloy": ["/var/run/docker.sock:/var/run/docker.sock:ro"]}
+        for path in SERVICES.glob("*.yml"):
+            mounted = [volume for volume in load(path)["services"][path.stem].get("volumes") or [] if "docker.sock" in str(volume)]
+            with self.subTest(service=path.stem):
+                self.assertEqual(expected.get(path.stem, []), mounted)
+
+    def test_the_code_location_reaches_the_socket_through_its_group_by_number_and_never_runs_as_root(self) -> None:
+        service = self.code_location()["services"]["dagster_code_location"]
+        self.assertEqual("10001:10001", service["user"])
+        self.assertEqual(["${DOCKER_SOCKET_GID:?write the host settings first}"], service["group_add"])
+        self.assertEqual([{"path": "../host.env", "required": False}], service["env_file"])
+
+    def test_the_code_location_reaches_the_k3s_api_on_the_host_with_the_service_account_files_as_secrets(self) -> None:
+        document = self.code_location()
+        service = document["services"]["dagster_code_location"]
+        self.assertEqual(["k3s_api:host-gateway"], service["extra_hosts"])
+        self.assertEqual({"k3s_token", "k3s_ca"}, set(service["secrets"]) & {"k3s_token", "k3s_ca"})
+        self.assertEqual("${SECRETS_DIR:?render the host settings first}/k3s/dagster.token", document["secrets"]["k3s_token"]["file"])
+        self.assertEqual("${SECRETS_DIR:?render the host settings first}/k3s/ca.crt", document["secrets"]["k3s_ca"]["file"])
+
+    def test_the_socket_in_another_service_is_named(self) -> None:
+        document = copy.deepcopy(load(SERVICES / "postgres.yml"))
+        document["services"]["postgres"]["volumes"].append(DOCKER_SOCKET)
+        self.assertIn("named volumes", service_problems("postgres", document)[0])
+
+    def test_any_other_host_path_or_a_changed_socket_mount_in_the_code_location_is_named(self) -> None:
+        for mount in ("/etc:/etc:ro", "/var/run:/var/run", "/var/run/docker.sock:/var/run/docker.sock:ro", "/var/run/docker.sock:/run/docker.sock"):
+            with self.subTest(mount=mount):
+                document = self.code_location()
+                document["services"]["dagster_code_location"]["volumes"].append(mount)
+                self.assertIn("named volumes", service_problems("dagster_code_location", document)[0])
 
 
 class PlantedDefectTest(unittest.TestCase):

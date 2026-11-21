@@ -6,6 +6,11 @@ services:
     restart: unless-stopped
     init: true
     user: "10001:10001"
+    group_add:
+      - ${DOCKER_SOCKET_GID:?write the host settings first}
+    env_file:
+      - path: ../host.env
+        required: false
     command: [dagster, api, grpc, --module-name, surgical_risk.definitions, --host, 0.0.0.0, --port, "4266"]
     depends_on:
       postgres:
@@ -15,11 +20,16 @@ services:
     configs:
       - source: dagster_limits
         target: /opt/dagster/limits.yml
+    extra_hosts:
+      - k3s_api:host-gateway
     secrets:
       - dagster_postgres_password
+      - k3s_token
+      - k3s_ca
     tmpfs:
       - /run/dagster:uid=10001,gid=10001,mode=0700
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - dagster_data:/opt/dagster/data
       - dagster_runs:/opt/dagster/runs
       - dagster_storage:/opt/dagster/instance/storage
@@ -37,6 +47,10 @@ configs:
 secrets:
   dagster_postgres_password:
     file: ${SECRETS_DIR:?render the host settings first}/postgres/dagster.password
+  k3s_token:
+    file: ${SECRETS_DIR:?render the host settings first}/k3s/dagster.token
+  k3s_ca:
+    file: ${SECRETS_DIR:?render the host settings first}/k3s/ca.crt
 
 volumes:
   dagster_data:
