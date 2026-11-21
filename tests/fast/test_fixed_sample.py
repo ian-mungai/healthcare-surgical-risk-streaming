@@ -15,9 +15,11 @@ The selection itself is proved against the publisher's real files in ``tests/e2e
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import unittest
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 from scripts.sample.candidates import (
@@ -31,7 +33,7 @@ from scripts.sample.candidates import (
     release_problems,
 )
 from scripts.sample.publisher import RELEASE_PREFIX
-from scripts.sample.split import BUCKETS, SEED, patient_bucket, patient_part
+from scripts.sample.split import BUCKETS, SEED, is_development, patient_bucket, patient_part
 
 FROZEN_BUCKETS = {1: 92, 2: 92, 3: 48, 4: 24, 5: 13, 6: 6, 7: 61, 8: 83, 9: 46, 10: 90, 14: 69, 17: 75, 25: 70, 107: 79, 130: 80, 6090: 4, 10000: 67}
 FROZEN_PARTS = {1: "test", 3: "train", 14: "train", 25: "validation", 17: "validation", 107: "validation", 130: "test", 6090: "train"}
@@ -56,8 +58,15 @@ class AssignmentRule(unittest.TestCase):
     def test_the_same_input_gives_the_same_part(self) -> None:
         self.assertEqual([patient_part(patient) for patient in range(1, 500)], [patient_part(patient) for patient in range(1, 500)])
 
-    def test_another_seed_changes_some_part(self) -> None:
-        self.assertTrue(any(patient_part(patient) != patient_part(patient, seed=2) for patient in range(1, 200)))
+    def test_a_caller_cannot_change_the_frozen_seed(self) -> None:
+        assignments: tuple[Callable[..., object], ...] = (patient_bucket, patient_part, is_development)
+        for assign in assignments:
+            with self.subTest(assign=assign.__name__):
+                self.assertNotIn("seed", inspect.signature(assign).parameters)
+                with self.assertRaises(TypeError):
+                    assign(1, seed=2)
+                with self.assertRaises(TypeError):
+                    assign(1, 2)
 
     def test_every_patient_number_has_exactly_one_of_the_three_parts(self) -> None:
         shares = Counter(patient_part(patient) for patient in SHARE_SAMPLE)
