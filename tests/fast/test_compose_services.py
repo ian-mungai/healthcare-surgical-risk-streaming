@@ -24,6 +24,9 @@ RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
 HOST_NETWORK_SERVICES = {"caddy"}
 HOST_PATH_VOLUMES = {"caddy": {"/var/run/tailscale:/var/run/tailscale:ro"}}
+# The host paths that a collector may read, by the source on the host and always read-only: the runtime sockets of Docker and containerd for container
+# metrics and logs, and the kernel's process and system folders. No other service has one, and the target in the container is free.
+READ_ONLY_HOST_SOURCES = {"alloy": {"/var/run/docker.sock", "/run/containerd/containerd.sock", "/proc", "/sys"}}
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -31,6 +34,13 @@ def load(path: Path) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise TypeError(f"{path.name} is not a mapping")
     return document
+
+
+def host_mount_allowed(name: str, volume: object) -> bool:
+    """Whether a volume entry is a host path that the design names for this service: an exact entry, or a source of the read-only list with the mode ro."""
+    text = str(volume)
+    parts = text.split(":")
+    return text in HOST_PATH_VOLUMES.get(name, set()) or (len(parts) == 3 and parts[2] == "ro" and parts[0] in READ_ONLY_HOST_SOURCES.get(name, set()))
 
 
 def service_problems(name: str, document: dict[str, Any]) -> list[str]:
@@ -56,7 +66,7 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
         problems.append(f"{name}: restart must be one of {', '.join(sorted(RESTART_POLICIES))}")
     volumes = service.get("volumes") or []
     declared = document.get("volumes") or {}
-    named = [str(volume).split(":")[0] for volume in volumes if str(volume) not in HOST_PATH_VOLUMES.get(name, set())]
+    named = [str(volume).split(":")[0] for volume in volumes if not host_mount_allowed(name, volume)]
     if not volumes or any(not re.fullmatch(r"[a-z][a-z0-9_]*", source) or source not in declared for source in named):
         problems.append(f"{name}: data must live in declared named volumes, with no host path")
     if service.get("network_mode") == "host" and (name not in HOST_NETWORK_SERVICES or service.get("ports")):
@@ -125,6 +135,57 @@ class HostNetworkExceptionTest(unittest.TestCase):
         document = copy.deepcopy(load(SERVICES / "postgres.yml"))
         document["services"]["postgres"]["volumes"].append("/var/run/tailscale:/var/run/tailscale:ro")
         self.assertIn("named volumes", service_problems("postgres", document)[0])
+
+
+class CollectorMountTest(unittest.TestCase):
+    """Alloy reads the container runtimes' sockets and the kernel's folders from the host, read-only, and nothing else of the host."""
+
+    def alloy(self) -> dict[str, Any]:
+        return copy.deepcopy(load(SERVICES / "alloy.yml"))
+
+    def test_the_real_alloy_file_has_no_problem_and_mounts_both_sockets_read_only_as_volumes_not_as_secrets(self) -> None:
+        document = self.alloy()
+        service = document["services"]["alloy"]
+        self.assertEqual([], service_problems("alloy", document))
+        host_volumes = sorted(str(volume) for volume in service["volumes"] if str(volume).startswith("/"))
+        self.assertEqual(["/run/containerd/containerd.sock:/run/containerd/containerd.sock:ro", "/var/run/docker.sock:/var/run/docker.sock:ro"], host_volumes)
+        self.assertEqual({"postgres_alloy_password"}, set(service["secrets"]))
+        self.assertEqual({"postgres_alloy_password"}, set(document["secrets"]))
+
+    def test_each_named_host_path_is_allowed_read_only_and_a_control_passes(self) -> None:
+        for source in ("/var/run/docker.sock", "/run/containerd/containerd.sock", "/proc", "/sys"):
+            with self.subTest(source=source):
+                document = self.alloy()
+                document["services"]["alloy"]["volumes"].append(f"{source}:/host{source}:ro")
+                self.assertEqual([], service_problems("alloy", document))
+
+    def test_an_extra_host_mount_or_one_that_is_not_read_only_is_named(self) -> None:
+        for volume in (
+            "/etc:/etc:ro",
+            "/:/rootfs:ro",
+            "/var/lib/docker:/var/lib/docker:ro",
+            "/proc:/host/proc",
+            "/sys:/host/sys:rw",
+            "/proc:/host/proc:ro,z",
+            "/proc",
+        ):
+            with self.subTest(volume=volume):
+                document = self.alloy()
+                document["services"]["alloy"]["volumes"].append(volume)
+                self.assertIn("named volumes", service_problems("alloy", document)[0])
+
+    def test_the_docker_socket_without_the_read_only_mode_is_named(self) -> None:
+        document = self.alloy()
+        volumes = document["services"]["alloy"]["volumes"]
+        volumes[:] = [str(volume).removesuffix(":ro") for volume in volumes]
+        self.assertIn("named volumes", service_problems("alloy", document)[0])
+
+    def test_no_other_service_may_read_a_host_path_that_alloy_may(self) -> None:
+        for name in ("postgres", "grafana", "loki"):
+            with self.subTest(service=name):
+                document = copy.deepcopy(load(SERVICES / f"{name}.yml"))
+                document["services"][name]["volumes"].append("/proc:/host/proc:ro")
+                self.assertIn("named volumes", service_problems(name, document)[0])
 
 
 class PlantedDefectTest(unittest.TestCase):

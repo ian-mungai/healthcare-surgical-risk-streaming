@@ -4,7 +4,7 @@ logging {
 }
 
 discovery.docker "stack" {
-  host             = "unix:///run/secrets/docker_socket"
+  host             = "unix:///var/run/docker.sock"
   refresh_interval = "5s"
 
   filter {
@@ -34,7 +34,7 @@ discovery.relabel "stack" {
 }
 
 loki.source.docker "stack" {
-  host       = "unix:///run/secrets/docker_socket"
+  host       = "unix:///var/run/docker.sock"
   targets    = discovery.relabel.stack.output
   forward_to = [loki.write.loki.receiver]
 }
@@ -52,8 +52,8 @@ prometheus.exporter.unix "host" {
 }
 
 prometheus.exporter.cadvisor "containers" {
-  docker_host                  = "unix:///run/secrets/docker_socket"
-  containerd_host              = "/run/secrets/containerd_socket"
+  docker_host                  = "unix:///var/run/docker.sock"
+  containerd_host              = "/run/containerd/containerd.sock"
   docker_only                  = true
   enabled_metrics              = ["cpu", "cpuLoad", "memory", "diskIO", "oom_event"]
   housekeeping_interval        = "10s"
