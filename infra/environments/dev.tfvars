@@ -13,4 +13,10 @@ workloads = {
   ingestion_check = {
     access = { landing = ["read"], manifests = ["read", "write"] }
   }
+  spark = {
+    access = { warehouse = ["read", "write", "delete"] }
+  }
+  trino = {
+    access = { warehouse = ["read"] }
+  }
 }

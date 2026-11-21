@@ -35,7 +35,7 @@ variable "manifest_writer" {
 }
 
 variable "workloads" {
-  description = "Workloads that get their own role. Each names the prefixes it reaches, with the modes read and write for each, and whether it reads the publisher's dataset. The variable file gives no bucket and no resource pattern."
+  description = "Workloads that get their own role. Each names the prefixes it reaches, with the modes read, write and delete for each, and whether it reads the publisher's dataset. The variable file gives no bucket and no resource pattern."
   type = map(object({
     access         = map(list(string))
     publisher_read = optional(bool, false)
@@ -47,8 +47,13 @@ variable "workloads" {
   }
 
   validation {
-    condition     = alltrue([for workload in values(var.workloads) : alltrue([for modes in values(workload.access) : length(modes) > 0 && alltrue([for mode in modes : contains(["read", "write"], mode)])])])
-    error_message = "Each prefix of a workload has at least one mode, and each mode is read or write."
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for modes in values(workload.access) : length(modes) > 0 && alltrue([for mode in modes : contains(["read", "write", "delete"], mode)])])])
+    error_message = "Each prefix of a workload has at least one mode, and each mode is read, write or delete."
+  }
+
+  validation {
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix, modes in workload.access : prefix == "warehouse" || !contains(modes, "delete")])])
+    error_message = "Only the warehouse prefix may have the delete mode."
   }
 
   validation {

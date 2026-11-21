@@ -5,8 +5,9 @@ locals {
   publisher_bucket_arn = "arn:aws:s3:::physionet-open"
   publisher_prefix     = "vitaldb/1.0.0"
 
-  read_prefixes  = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "read")]) }
-  write_prefixes = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "write")]) }
+  read_prefixes   = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "read")]) }
+  delete_prefixes = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "delete")]) }
+  write_prefixes  = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "write")]) }
 
   statements = { for name, workload in var.workloads : name => [
     for statement in [
@@ -36,6 +37,15 @@ locals {
           Effect   = "Allow"
           Action   = ["s3:AbortMultipartUpload", "s3:PutObject"]
           Resource = [for prefix in local.write_prefixes[name] : "${local.bucket_arn}/${prefix}/*"]
+        }
+      },
+      {
+        present = length(local.delete_prefixes[name]) > 0
+        value = {
+          Sid      = "DeleteObjects"
+          Effect   = "Allow"
+          Action   = ["s3:DeleteObject"]
+          Resource = [for prefix in local.delete_prefixes[name] : "${local.bucket_arn}/${prefix}/*"]
         }
       },
       {

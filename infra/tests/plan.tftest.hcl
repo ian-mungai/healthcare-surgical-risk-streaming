@@ -457,6 +457,112 @@ run "workload_naming_another_bucket_is_refused" {
   expect_failures = [var.workloads]
 }
 
+run "warehouse_workloads_reach_only_the_warehouse_prefix" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads = {
+      spark = { access = { warehouse = ["read", "write", "delete"] } }
+      trino = { access = { warehouse = ["read"] } }
+    }
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["spark"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["warehouse/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+    ]
+    error_message = "The Spark workload lists, reads, writes and deletes under warehouse in the bound bucket and does nothing else."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["trino"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["warehouse/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+    ]
+    error_message = "The Trino workload lists and reads under warehouse only."
+  }
+
+  assert {
+    condition     = alltrue([for policy in values(aws_iam_role_policy.workload) : !strcontains(policy.policy, "landing") && !strcontains(policy.policy, "manifests") && !strcontains(policy.policy, "physionet")])
+    error_message = "Neither warehouse workload lists or reaches landing, manifests or the publisher's bucket."
+  }
+}
+
+run "delete_covers_only_the_prefix_that_names_it" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { spark = { access = { warehouse = ["delete"], landing = ["write"] } } }
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["spark"].policy).Statement == [
+      { Sid = "WriteObjects", Effect = "Allow", Action = ["s3:AbortMultipartUpload", "s3:PutObject"], Resource = ["arn:aws:s3:::example-project/landing/*"] },
+      { Sid = "DeleteObjects", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = ["arn:aws:s3:::example-project/warehouse/*"] },
+    ]
+    error_message = "The delete statement names only the prefixes that give the delete mode, never the prefixes that give write."
+  }
+}
+
+run "delete_is_refused_on_landing" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { spark = { access = { warehouse = ["read", "delete"], landing = ["delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "delete_is_refused_on_manifests" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { ingestion_check = { access = { manifests = ["read", "write", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
 run "workload_naming_the_airbyte_prefix_is_refused" {
   command = plan
 
@@ -540,7 +646,7 @@ run "workload_with_an_unknown_mode_is_refused" {
     boundary_name = "example_project_role_boundary"
     host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
     bucket_name   = "example-project"
-    workloads     = { airbyte = { access = { landing = ["delete"] } } }
+    workloads     = { airbyte = { access = { landing = ["execute"] } } }
   }
 
   expect_failures = [var.workloads]
