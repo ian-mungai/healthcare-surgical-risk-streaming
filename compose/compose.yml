@@ -12,4 +12,5 @@ include:
   - services/grafana.yml
   - services/loki.yml
   - services/alloy.yml
+  - services/spark.yml
   - services/trino.yml

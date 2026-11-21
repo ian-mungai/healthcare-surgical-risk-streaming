@@ -1,0 +1,44 @@
+services:
+  spark:
+    image: surgical_risk_spark:4.1.4
+    build:
+      context: ../..
+      dockerfile: spark/Dockerfile
+    platform: linux/amd64
+    profiles: [batch]
+    mem_limit: ${MEM_LIMIT_SPARK:?render the limits first}
+    restart: "no"
+    user: "10100:10100"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      nessie:
+        condition: service_healthy
+    entrypoint: [python, -m, spark.jobs.catalog_proof]
+    environment:
+      NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      WAREHOUSE_LOCATION: ${WAREHOUSE_LOCATION:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
+    configs:
+      - source: spark_aws_client_config
+        target: /etc/workload_access/client_config
+    volumes:
+      - spark_scratch:/scratch
+      - lake_warehouse:/warehouse
+      - workload_access_spark:/run/workload_access:ro
+
+configs:
+  spark_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
+
+volumes:
+  spark_scratch:
+  lake_warehouse:
+  workload_access_spark:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SPARK_ACCESS_DIR:-/run/workload_access/spark}
