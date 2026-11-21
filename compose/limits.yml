@@ -1,6 +1,10 @@
 # The one source of every memory limit. Every figure is an estimate until live testing measures it and replaces it.
 host_reserve_mib: 4096
 services:
+  nessie:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
   postgres:
     runtime: compose
     group: supporting

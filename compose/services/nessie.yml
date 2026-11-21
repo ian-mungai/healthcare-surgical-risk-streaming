@@ -1,0 +1,45 @@
+services:
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.110.1@sha256:47c198849a6fa2be9273ddb9e25f9131a5486301b63c72859961369022e25db9
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_NESSIE:?render the limits first}
+    restart: unless-stopped
+    user: "10000:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NESSIE_VERSION_STORE_TYPE: JDBC2
+      NESSIE_VERSION_STORE_PERSIST_JDBC_DATASOURCE: postgresql
+      QUARKUS_DATASOURCE_POSTGRESQL_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
+      QUARKUS_DATASOURCE_POSTGRESQL_USERNAME: nessie
+    secrets:
+      - nessie_database_password
+    command:
+      - bash
+      - -c
+      - |
+        set -eu
+        password="$$(cat /run/secrets/nessie_database_password)" || { echo "cannot read the database password file" >&2; exit 1; }
+        [ -n "$$password" ] || { echo "the database password file is empty" >&2; exit 1; }
+        export QUARKUS_DATASOURCE_POSTGRESQL_PASSWORD="$$password"
+        exec /opt/jboss/container/java/run/run-java.sh
+    volumes:
+      - nessie_data:/deployments/data
+    ports:
+      - 127.0.0.1:${NESSIE_HOST_PORT:-19120}:19120
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent --max-time 4 http://127.0.0.1:9000/q/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+secrets:
+  nessie_database_password:
+    file: ${SECRETS_DIR:?render the host settings first}/postgres/nessie.password
+
+volumes:
+  nessie_data:
