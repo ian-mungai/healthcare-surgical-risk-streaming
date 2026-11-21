@@ -115,6 +115,7 @@ class StepOrderTest(unittest.TestCase):
                 "render_environment.yml",
                 "passwords.yml",
                 "verify_secrets.yml",
+                "grafana_password.yml",
                 "build_images.yml",
                 "start.yml postgres",
                 "provision.yml",
@@ -209,6 +210,85 @@ class PasswordFilesTest(unittest.TestCase):
         self.assertNotEqual(0, code)
         self.assertIn("tool extra has no line in the service list", output)
         self.assertFalse(written)
+
+
+class GrafanaPasswordTest(unittest.TestCase):
+    """Grafana's administrator password is a file of its own container user, mode 0400, made once and never replaced."""
+
+    def values(self, folder: Path, owner: tuple[int, int]) -> dict[str, object]:
+        return variables(folder) | {"grafana_user": f"{owner[0]}:{owner[1]}"}
+
+    def test_the_file_is_made_for_the_grafana_user_with_mode_0400_in_a_folder_for_root_and_no_output_holds_the_password(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
+            target = folder / "secrets" / "grafana" / "admin.password"
+            status = target.stat()
+            folder_status = target.parent.stat()
+            text = target.read_text()
+        self.assertEqual(0, code, output)
+        self.assertEqual((0o400, UID, TOOL_GID), (stat.S_IMODE(status.st_mode), status.st_uid, status.st_gid))
+        self.assertEqual((0o700, UID, GID), (stat.S_IMODE(folder_status.st_mode), folder_status.st_uid, folder_status.st_gid))
+        self.assertRegex(text, r"^[A-Za-z0-9_-]{40,}$")
+        self.assertNotIn(text, output)
+
+    def test_a_second_run_changes_nothing_and_keeps_the_password(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
+            target = folder / "secrets" / "grafana" / "admin.password"
+            before = target.read_text()
+            code, output = run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
+            after = target.read_text()
+        self.assertEqual(0, code, output)
+        self.assertEqual(before, after)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_file_with_another_mode_or_another_owner_is_given_the_right_ones_with_its_password_kept(self) -> None:
+        for mode, group in ((0o600, TOOL_GID), (0o640, TOOL_GID), (0o444, TOOL_GID), (0o400, GID)):
+            with self.subTest(mode=oct(mode), group=group), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                target = folder / "secrets" / "grafana" / "admin.password"
+                target.parent.mkdir(parents=True, mode=0o700)
+                target.write_text("an-existing-password-of-forty-characters-or-more")
+                os.chown(target, UID, group)
+                target.chmod(mode)
+                code, output = run_tasks(["grafana_password.yml"], self.values(folder, (UID, TOOL_GID)))
+                status = target.stat()
+                self.assertEqual(0, code, output)
+                self.assertEqual(
+                    (0o400, UID, TOOL_GID, "an-existing-password-of-forty-characters-or-more"),
+                    (stat.S_IMODE(status.st_mode), status.st_uid, status.st_gid, target.read_text()),
+                )
+
+    def check(self, *, mode: int = 0o400, group: int = TOOL_GID, expected: tuple[int, int] = (UID, TOOL_GID), create: bool = True) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            target = folder / "secrets" / "grafana" / "admin.password"
+            target.parent.mkdir(parents=True, mode=0o700)
+            if create:
+                target.write_text("a-long-random-value")
+                os.chown(target, UID, group)
+                target.chmod(mode)
+            return run_tasks(["verify_grafana_password.yml"], self.values(folder, expected))
+
+    def test_the_check_passes_a_private_file_of_the_grafana_user_and_refuses_every_other_file_by_name(self) -> None:
+        code, output = self.check()
+        self.assertEqual(0, code, output)
+        for label, kwargs in (
+            ("mode 0600", {"mode": 0o600}),
+            ("mode 0640", {"mode": 0o640}),
+            ("mode 0444", {"mode": 0o444}),
+            ("mode 0404", {"mode": 0o404}),
+            ("another user", {"expected": (UID + 1, TOOL_GID)}),
+            ("another group", {"expected": (UID, TOOL_GID + 1)}),
+            ("missing", {"create": False}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn("The Grafana password file", output)
+                self.assertNotIn("a-long-random-value", output)
 
 
 class SecretsCheckTest(unittest.TestCase):

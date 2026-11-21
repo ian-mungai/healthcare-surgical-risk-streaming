@@ -41,6 +41,8 @@ metadata_guard_unit_directory: /etc/systemd/system
 # PostgreSQL tool and of an OpenBao service is on its line in compose/openbao_services.txt. Each must equal the user in the service's Compose file (a fast test checks it).
 secret_files_root_owner: "0:0"
 openbao_user: "100:1000"
+# The user of the Grafana container, the owner of its administrator password file (the image runs as user 472 in group 0).
+grafana_user: "472:0"
 
 # The secret store's unlock key file on the host. It is owned by the user of the OpenBao container, so the deploy user does not read it. The folder is the deploy user's.
 unlock_key_directory: /opt/platform

@@ -1,7 +1,7 @@
 # Deploys the Compose stack. A service that needs its own database account cannot become healthy before the account exists, so the order is: place the
-# Compose files, write the gateway's settings, render the limits and host settings, create the password files and check them, build the images the project
-# makes itself, start PostgreSQL alone and wait for it, make the PostgreSQL accounts match the tool list, prepare the secret store's first start, start the
-# remaining services and wait for them, and make the secret store match the service list. A second run changes nothing.
+# Compose files, write the gateway's settings, render the limits and host settings, create the password files and check them, create the Grafana password
+# file, build the images the project makes itself, start PostgreSQL alone and wait for it, make the PostgreSQL accounts match the tool list, prepare the
+# secret store's first start, start the remaining services and wait for them, and make the secret store match the service list. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
 
@@ -16,6 +16,9 @@
 
 - name: Check the password files
   ansible.builtin.include_tasks: verify_secrets.yml
+
+- name: Create the Grafana password file
+  ansible.builtin.include_tasks: grafana_password.yml
 
 - name: Build the images the project makes itself
   ansible.builtin.include_tasks: build_images.yml
