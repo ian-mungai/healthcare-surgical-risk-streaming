@@ -2,7 +2,8 @@
 
 Real runs against a server are the acceptance test's job. Isolated cases are kept for what a fresh server never shows: a server that drifted
 (a changed password, a widened role, a grant on a database, a database with another owner) and the verifier arithmetic, which is checked against
-a verifier that PostgreSQL 18.7 itself computed for the password ``pencil``.
+a verifier that PostgreSQL 18.7 itself computed for the password ``pencil``. A tool may own several databases: the list's form and the plan's
+treatment of each database are covered here.
 """
 
 from __future__ import annotations
@@ -42,13 +43,46 @@ accounts = load_module()
 
 
 class ToolListTest(unittest.TestCase):
-    def test_the_tracked_list_is_valid_and_names_each_tool_once(self) -> None:
+    def test_the_tracked_list_is_valid_and_names_each_tool_and_each_database_once(self) -> None:
         tools = accounts.parse_tools(TOOLS_FILE.read_text())
-        self.assertEqual(len(tools), len(set(tools)))
+        owned = [database for databases in tools.values() for database in databases]
+        self.assertEqual(len(owned), len(set(owned)))
         self.assertTrue({"nessie", "airbyte"} <= set(tools))
 
+    def test_the_tracked_list_gives_airbyte_its_own_database_and_the_two_that_temporal_needs(self) -> None:
+        tools = accounts.parse_tools(TOOLS_FILE.read_text())
+        self.assertEqual(["nessie"], tools["nessie"])
+        self.assertEqual(["airbyte", "airbyte_temporal", "airbyte_temporal_visibility"], tools["airbyte"])
+
     def test_comments_and_blank_lines_are_ignored_in_order(self) -> None:
-        self.assertEqual(["b", "a"], accounts.parse_tools("# tools\nb\n\n  a  # trailing\n"))
+        self.assertEqual({"b": ["b"], "a": ["a"]}, accounts.parse_tools("# tools\nb\n\n  a  # trailing\n"))
+        self.assertEqual(["b", "a"], list(accounts.parse_tools("b\na\n")))
+
+    def test_a_tool_with_a_colon_owns_the_databases_after_it_and_a_bare_name_owns_one_named_for_it(self) -> None:
+        tools = accounts.parse_tools("nessie\nairbyte: airbyte  airbyte_temporal # trailing\n")
+        self.assertEqual({"nessie": ["nessie"], "airbyte": ["airbyte", "airbyte_temporal"]}, tools)
+
+    def test_a_database_named_twice_by_one_tool_is_refused_by_its_name(self) -> None:
+        with self.assertRaisesRegex(accounts.AccountError, "database name 'x' is listed more than once"):
+            accounts.parse_tools("a: x y x\n")
+
+    def test_a_database_that_another_tool_owns_is_refused_by_its_name_and_its_owner(self) -> None:
+        for text in ("nessie\nairbyte: airbyte nessie\n", "airbyte: airbyte nessie\nnessie\n", "a: x\nb: x\n"):
+            with self.subTest(text=text), self.assertRaisesRegex(accounts.AccountError, "database name '(nessie|x)' belongs to another tool"):
+                accounts.parse_tools(text)
+
+    def test_a_tool_with_no_database_after_its_colon_is_refused(self) -> None:
+        with self.assertRaisesRegex(accounts.AccountError, "tool 'airbyte' lists no database"):
+            accounts.parse_tools("airbyte:\n")
+
+    def test_a_database_name_that_could_alter_a_statement_or_clash_with_the_server_is_refused(self) -> None:
+        for name in ("Temporal", "tem-poral", "1temporal", 'tem"poral', "tem;poral", "postgres", "pg_catalog", "template0", "a" * 32):
+            with self.subTest(name=name), self.assertRaisesRegex(accounts.AccountError, "database name"):
+                accounts.parse_tools(f"airbyte: airbyte {name}\n")
+
+    def test_a_repeated_tool_is_refused_in_either_form(self) -> None:
+        with self.assertRaisesRegex(accounts.AccountError, "more than once"):
+            accounts.parse_tools("airbyte: airbyte airbyte_temporal\nairbyte\n")
 
     def test_a_name_that_could_alter_a_statement_or_clash_with_the_server_is_refused(self) -> None:
         for name in ("Nessie", "nes-sie", "1nessie", "nes sie", 'nes"sie', "nes;sie", "postgres", "pg_monitor", "template1", "a" * 32, "public"):
@@ -100,22 +134,17 @@ class PasswordOwnerTest(unittest.TestCase):
 
 
 PASSWORDS = {"nessie": "n-secret-value", "airbyte": "a-secret-value", "extra": "e-secret-value"}
-TOOLS = ["nessie", "airbyte"]
+TEMPORAL = ["airbyte", "airbyte_temporal", "airbyte_temporal_visibility"]
+TOOLS = {"nessie": ["nessie"], "airbyte": TEMPORAL}
 
 
-def converged(tool: str) -> tuple[Any, Any]:
-    role = accounts.RoleState(accounts.scram_verifier(PASSWORDS[tool]), True)
-    database = accounts.DatabaseState(tool, ())
-    return role, database
-
-
-def state_of(*tools: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    roles = {tool: converged(tool)[0] for tool in tools}
-    databases = {tool: converged(tool)[1] for tool in tools}
+def state_of(tools: dict[str, list[str]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    roles = {tool: accounts.RoleState(accounts.scram_verifier(PASSWORDS[tool]), True) for tool in tools}
+    databases = {database: accounts.DatabaseState(tool, ()) for tool, owned in tools.items() for database in owned}
     return roles, databases
 
 
-def plan(tools: list[str], roles: dict[str, Any], databases: dict[str, Any]) -> list[Any]:
+def plan(tools: dict[str, list[str]], roles: dict[str, Any], databases: dict[str, Any]) -> list[Any]:
     return list(accounts.plan(tools, roles, databases, PASSWORDS.__getitem__))
 
 
@@ -124,7 +153,7 @@ def descriptions(actions: list[Any]) -> list[str]:
 
 
 class PlanTest(unittest.TestCase):
-    def test_an_empty_server_gets_each_account_then_its_database_then_its_guard(self) -> None:
+    def test_an_empty_server_gets_each_account_then_each_of_its_databases_then_the_guard_of_each(self) -> None:
         actions = plan(TOOLS, {}, {})
         self.assertEqual(
             [
@@ -134,17 +163,68 @@ class PlanTest(unittest.TestCase):
                 "create account airbyte",
                 "create database airbyte",
                 "refuse every other account on database airbyte",
+                "create database airbyte_temporal",
+                "refuse every other account on database airbyte_temporal",
+                "create database airbyte_temporal_visibility",
+                "refuse every other account on database airbyte_temporal_visibility",
             ],
             descriptions(actions),
         )
 
     def test_a_server_that_matches_the_list_needs_no_action(self) -> None:
-        self.assertEqual([], plan(TOOLS, *state_of(*TOOLS)))
+        self.assertEqual([], plan(TOOLS, *state_of(TOOLS)))
 
     def test_a_tool_added_later_gets_only_its_own_actions(self) -> None:
-        roles, databases = state_of(*TOOLS)
-        actions = plan([*TOOLS, "extra"], roles, databases)
+        roles, databases = state_of(TOOLS)
+        actions = plan({**TOOLS, "extra": ["extra"]}, roles, databases)
         self.assertEqual(["create account extra", "create database extra", "refuse every other account on database extra"], descriptions(actions))
+
+    def test_each_database_of_a_tool_is_created_owned_by_that_tool_and_never_by_the_administrator(self) -> None:
+        creates = {action.description: action.sql for action in plan(TOOLS, {}, {}) if action.description.startswith("create database")}
+        self.assertEqual(
+            {
+                "create database airbyte": 'CREATE DATABASE "airbyte" OWNER "airbyte"',
+                "create database airbyte_temporal": 'CREATE DATABASE "airbyte_temporal" OWNER "airbyte"',
+                "create database airbyte_temporal_visibility": 'CREATE DATABASE "airbyte_temporal_visibility" OWNER "airbyte"',
+                "create database nessie": 'CREATE DATABASE "nessie" OWNER "nessie"',
+            },
+            creates,
+        )
+
+    def test_every_database_removes_public_so_no_other_tools_account_can_connect(self) -> None:
+        guards = {action.description: action.sql for action in plan(TOOLS, {}, {}) if action.description.startswith("refuse every other account")}
+        self.assertEqual(4, len(guards))
+        for description, sql in guards.items():
+            database = description.rsplit(" ", 1)[1]
+            with self.subTest(database=database):
+                self.assertEqual(f'REVOKE ALL ON DATABASE "{database}" FROM PUBLIC', sql)
+
+    def test_no_statement_gives_any_account_the_right_to_create_a_database(self) -> None:
+        statements = [action.sql for action in plan(TOOLS, {}, {})]
+        accounts_made = [sql for sql in statements if sql.startswith("CREATE ROLE")]
+        self.assertEqual(2, len(accounts_made))
+        for sql in accounts_made:
+            self.assertIn("NOCREATEDB", sql)
+        self.assertFalse([sql for sql in statements if re.search(r"(?<!NO)CREATEDB", sql)])
+
+    def test_a_missing_temporal_database_is_created_alone_and_the_ones_that_exist_are_left(self) -> None:
+        roles, databases = state_of(TOOLS)
+        del databases["airbyte_temporal"]
+        actions = plan(TOOLS, roles, databases)
+        self.assertEqual(["create database airbyte_temporal", "refuse every other account on database airbyte_temporal"], descriptions(actions))
+
+    def test_a_grant_on_a_temporal_database_is_revoked_for_that_grantee_only(self) -> None:
+        roles, databases = state_of(TOOLS)
+        databases["airbyte_temporal_visibility"] = accounts.DatabaseState("airbyte", ("PUBLIC", '"nessie"'))
+        actions = plan(TOOLS, roles, databases)
+        self.assertEqual(["refuse every other account on database airbyte_temporal_visibility"], descriptions(actions))
+        self.assertEqual('REVOKE ALL ON DATABASE "airbyte_temporal_visibility" FROM PUBLIC, "nessie"', actions[0].sql)
+
+    def test_a_temporal_database_with_another_owner_is_refused_and_named(self) -> None:
+        roles, databases = state_of(TOOLS)
+        databases["airbyte_temporal"] = accounts.DatabaseState("postgres", ())
+        with self.assertRaisesRegex(accounts.AccountError, "database airbyte_temporal is owned by another account"):
+            plan(TOOLS, roles, databases)
 
     def test_no_statement_holds_a_password_and_each_account_statement_holds_a_verifier(self) -> None:
         for action in plan(TOOLS, {}, {}):
@@ -159,28 +239,28 @@ class PlanTest(unittest.TestCase):
         self.assertEqual('REVOKE ALL ON DATABASE "nessie" FROM PUBLIC', sql)
 
     def test_a_changed_password_file_resets_that_accounts_password_only(self) -> None:
-        roles, databases = state_of(*TOOLS)
+        roles, databases = state_of(TOOLS)
         roles["nessie"] = accounts.RoleState(accounts.scram_verifier("an-older-password"), True)
         actions = plan(TOOLS, roles, databases)
         self.assertEqual(["reset the password of account nessie"], descriptions(actions))
         self.assertTrue(actions[0].sql.startswith('ALTER ROLE "nessie" PASSWORD \'SCRAM-SHA-256$'))
 
     def test_a_widened_account_is_narrowed_and_its_password_is_not_touched(self) -> None:
-        roles, databases = state_of(*TOOLS)
+        roles, databases = state_of(TOOLS)
         roles["airbyte"] = accounts.RoleState(roles["airbyte"].verifier, False)
         actions = plan(TOOLS, roles, databases)
         self.assertEqual(["narrow the attributes of account airbyte"], descriptions(actions))
         self.assertEqual('ALTER ROLE "airbyte" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS', actions[0].sql)
 
     def test_a_grant_on_a_tools_database_is_revoked_for_that_grantee(self) -> None:
-        roles, databases = state_of(*TOOLS)
+        roles, databases = state_of(TOOLS)
         databases["nessie"] = accounts.DatabaseState("nessie", ("PUBLIC", '"someone"'))
         actions = plan(TOOLS, roles, databases)
         self.assertEqual(["refuse every other account on database nessie"], descriptions(actions))
         self.assertEqual('REVOKE ALL ON DATABASE "nessie" FROM PUBLIC, "someone"', actions[0].sql)
 
     def test_a_database_with_another_owner_is_refused_and_named_and_nothing_is_planned_for_it(self) -> None:
-        roles, databases = state_of(*TOOLS)
+        roles, databases = state_of(TOOLS)
         databases["airbyte"] = accounts.DatabaseState("postgres", ())
         with self.assertRaisesRegex(accounts.AccountError, "database airbyte is owned by another account"):
             plan(TOOLS, roles, databases)
@@ -198,10 +278,12 @@ class StateTest(unittest.TestCase):
             accounts.parse_state("role|nessie|SCRAM-SHA-256$secret-looking-text\n")
         self.assertNotIn("secret-looking-text", str(caught.exception))
 
-    def test_the_query_holds_no_tool_name_and_reads_the_list_from_one_variable(self) -> None:
+    def test_the_query_holds_no_name_and_reads_the_accounts_and_the_databases_from_one_variable_each(self) -> None:
         self.assertEqual("nessie,airbyte", accounts.tool_variable(TOOLS))
+        self.assertEqual("nessie,airbyte,airbyte_temporal,airbyte_temporal_visibility", accounts.database_variable(TOOLS))
         self.assertNotIn("nessie", accounts.STATE_QUERY)
-        self.assertEqual(2, accounts.STATE_QUERY.count(":'tools'"))
+        self.assertEqual(1, accounts.STATE_QUERY.count(":'tools'"))
+        self.assertEqual(1, accounts.STATE_QUERY.count(":'databases'"))
 
 
 if __name__ == "__main__":

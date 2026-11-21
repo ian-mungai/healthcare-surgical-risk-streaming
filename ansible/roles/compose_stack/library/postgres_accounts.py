@@ -1,13 +1,16 @@
-"""Ansible module: the PostgreSQL password files and the one account and one database for each tool in the tracked list.
+"""Ansible module: the PostgreSQL password files and the account and databases of each tool in the tracked list.
 
 ``step: passwords`` creates each missing password file, for the server's administrator and for each tool, and keeps existing files. A file is owned
 by the numeric user of the container that reads it and has mode 0400: the tool's line in the service list names that user, and the administrator's file
 (which the image reads as root, before it drops privileges) and the file of a tool with no user of its own are owned by root. An existing file with another
 mode or owner is given the right ones, and its password is kept.
 
-``step: provision`` makes the running server match the tool list: it creates a missing account and database, repairs an account whose password or
-attributes differ from the file and removes every grant on a tool's database, so that only the tool's own account (and the administrator) can connect.
-A server that already matches needs no change and the step reports none.
+``step: provision`` makes the running server match the tool list: it creates a missing account and each missing database, repairs an account whose
+password or attributes differ from the file and removes every grant on a tool's databases, so that only the tool's own account (and the administrator)
+can connect. A server that already matches needs no change and the step reports none.
+
+A line of the tool list is a bare tool name, which owns one database named for the tool, or ``tool: database database ...``, which owns the databases it
+lists. A database belongs to one tool: a name listed twice or owned by another tool is refused.
 
 The module computes each password's SCRAM-SHA-256 verifier itself and sends only the verifier to the server, so no password reaches a command
 line, a statement or a log. It uses only the standard library and runs on the host's Python.
@@ -44,20 +47,34 @@ class AccountError(RuntimeError):
     """The tool list, a password file or the server's answer is not usable. The message never holds a password."""
 
 
-def parse_tools(text: str) -> list[str]:
-    """The tool names in the tracked list: one for each line, with comments and blank lines ignored."""
-    tools: list[str] = []
+def check_name(kind: str, name: str) -> None:
+    if not TOOL_NAME.fullmatch(name) or name in RESERVED_NAMES or name.startswith("pg_"):
+        raise AccountError(f"{kind} name {name!r} must be 1 to 31 lower case letters, digits or underscores, start with a letter and not clash with the server")
+
+
+def parse_tools(text: str) -> dict[str, list[str]]:
+    """Each tool's databases from the tracked list, one line each. A bare name owns one database named for it."""
+    tools: dict[str, list[str]] = {}
+    owners: dict[str, str] = {}
     for line in text.splitlines():
-        name = line.split("#", 1)[0].strip()
-        if not name:
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
             continue
-        if not TOOL_NAME.fullmatch(name) or name in RESERVED_NAMES or name.startswith("pg_"):
-            raise AccountError(
-                f"tool name {name!r} must be 1 to 31 lower case letters, digits or underscores, start with a letter and not clash with the server"
-            )
+        name, colon, rest = entry.partition(":")
+        name = name.strip()
+        check_name("tool", name)
         if name in tools:
             raise AccountError(f"tool name {name!r} is listed more than once")
-        tools.append(name)
+        databases = rest.split() if colon else [name]
+        if not databases:
+            raise AccountError(f"tool {name!r} lists no database")
+        for database in databases:
+            check_name("database", database)
+            if database in owners:
+                reason = "is listed more than once" if owners[database] == name else f"belongs to another tool ({owners[database]!r})"
+                raise AccountError(f"database name {database!r} {reason}")
+            owners[database] = name
+        tools[name] = databases
     if not tools:
         raise AccountError("the tool list names no tool")
     return tools
@@ -103,10 +120,10 @@ class Action:
     sql: str
 
 
-def plan(tools: list[str], roles: dict[str, RoleState], databases: dict[str, DatabaseState], password_of: Callable[[str], str]) -> list[Action]:
+def plan(tools: dict[str, list[str]], roles: dict[str, RoleState], databases: dict[str, DatabaseState], password_of: Callable[[str], str]) -> list[Action]:
     """The statements that make the server match the tool list, and none when it already does."""
     actions: list[Action] = []
-    for tool in tools:
+    for tool, owned in tools.items():
         name = f'"{tool}"'
         role = roles.get(tool)
         if role is None:
@@ -116,16 +133,18 @@ def plan(tools: list[str], roles: dict[str, RoleState], databases: dict[str, Dat
                 actions.append(Action(f"reset the password of account {tool}", f"ALTER ROLE {name} PASSWORD '{scram_verifier(password_of(tool))}'"))
             if not role.attributes_ok:
                 actions.append(Action(f"narrow the attributes of account {tool}", f"ALTER ROLE {name} {ATTRIBUTES}"))
-        database = databases.get(tool)
-        if database is None:
-            actions.append(Action(f"create database {tool}", f"CREATE DATABASE {name} OWNER {name}"))
-            grantees: tuple[str, ...] = ("PUBLIC",)
-        elif database.owner != tool:
-            raise AccountError(f"database {tool} is owned by another account")
-        else:
-            grantees = database.grantees
-        if grantees:
-            actions.append(Action(f"refuse every other account on database {tool}", f"REVOKE ALL ON DATABASE {name} FROM {', '.join(grantees)}"))
+        for database_name in owned:
+            database = databases.get(database_name)
+            quoted = f'"{database_name}"'
+            if database is None:
+                actions.append(Action(f"create database {database_name}", f"CREATE DATABASE {quoted} OWNER {name}"))
+                grantees: tuple[str, ...] = ("PUBLIC",)
+            elif database.owner != tool:
+                raise AccountError(f"database {database_name} is owned by another account")
+            else:
+                grantees = database.grantees
+            if grantees:
+                actions.append(Action(f"refuse every other account on database {database_name}", f"REVOKE ALL ON DATABASE {quoted} FROM {', '.join(grantees)}"))
     return actions
 
 
@@ -136,13 +155,18 @@ FROM pg_authid WHERE rolname = ANY (string_to_array(:'tools', ',')) ORDER BY rol
 SELECT 'database', d.datname, pg_get_userbyid(d.datdba),
        coalesce((SELECT string_agg(DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(a.grantee)) END, ',')
                  FROM aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a WHERE a.grantee <> d.datdba), '')
-FROM pg_database d WHERE d.datname = ANY (string_to_array(:'tools', ',')) ORDER BY d.datname;
+FROM pg_database d WHERE d.datname = ANY (string_to_array(:'databases', ',')) ORDER BY d.datname;
 """
 
 
-def tool_variable(tools: list[str]) -> str:
-    """The value of the psql variable ``tools``, which the state query splits into the listed names."""
+def tool_variable(tools: dict[str, list[str]]) -> str:
+    """The value of the psql variable ``tools``, which the state query splits into the listed accounts."""
     return ",".join(tools)
+
+
+def database_variable(tools: dict[str, list[str]]) -> str:
+    """The value of the psql variable ``databases``, which the state query splits into the listed databases."""
+    return ",".join(database for owned in tools.values() for database in owned)
 
 
 def parse_state(output: str) -> tuple[dict[str, RoleState], dict[str, DatabaseState]]:
@@ -166,8 +190,10 @@ class Server:
         self.run = run
         self.compose_command = compose_command
 
-    def psql(self, sql: str, tools: list[str]) -> str:
-        options = f'-X -q -A -t -F "|" -v ON_ERROR_STOP=1 -v tools={tool_variable(tools)} -U {ADMINISTRATOR} -d postgres'
+    def psql(self, sql: str, tools: dict[str, list[str]]) -> str:
+        options = (
+            f'-X -q -A -t -F "|" -v ON_ERROR_STOP=1 -v tools={tool_variable(tools)} -v databases={database_variable(tools)} -U {ADMINISTRATOR} -d postgres'
+        )
         script = f'PGPASSWORD="$(cat {ADMINISTRATOR_FILE_IN_CONTAINER})" exec psql {options}'
         code, output, error = self.run([*self.compose_command, "exec", "-T", SERVICE, "sh", "-c", script], sql)
         if code != 0:
@@ -225,7 +251,7 @@ def main() -> None:
             if not module.params["services_file"]:
                 raise AccountError("the passwords step needs services_file")
             root_owner = parse_owner(module.params["root_owner"], allow_root=True)
-            owners = password_owners(tools, parse_entries(Path(module.params["services_file"]).read_text(), "service"), root_owner)
+            owners = password_owners(list(tools), parse_entries(Path(module.params["services_file"]).read_text(), "service"), root_owner)
             created, protected = make_password_files(store, owners, check_only=module.check_mode)
             module.exit_json(
                 changed=bool(created or protected),

@@ -44,10 +44,15 @@ def parse_owner(text: str, *, allow_root: bool = False) -> tuple[int, int]:
 
 
 def parse_entries(text: str, what: str) -> list[Entry]:
-    """The entries of a tracked list: one for each line, with comments and blank lines ignored. A service line may end with the owner of its files."""
+    """The entries of a tracked list: one for each line, with comments and blank lines ignored. A service line may end with the owner of its files.
+
+    A tool line may list the tool's databases after a colon (``tool: database database``). The entry is the tool; the stack role's accounts module checks the
+    databases.
+    """
     entries: list[Entry] = []
     for line in text.splitlines():
-        words = line.split("#", 1)[0].split()
+        content = line.split("#", 1)[0]
+        words = (content.partition(":")[0] if what == "tool" else content).split()
         if not words:
             continue
         name = words[0]
