@@ -11,10 +11,26 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from scripts.stack.caddy import CADDYFILE, GATEWAY_PORT, ROUTES_FILE, RenderError, RoutesError, load_routes, parse_routes, render, verify_rendered
+from scripts.project_config import ROOT
+from scripts.stack.caddy import (
+    CADDYFILE,
+    GATEWAY_LAST_PORT,
+    GATEWAY_PORT,
+    ROUTES_FILE,
+    RenderError,
+    Route,
+    RoutesError,
+    load_routes,
+    parse_routes,
+    render,
+    verify_rendered,
+)
 from scripts.stack.yaml_text import load_yaml
 
 SERVICE_FILE = Path(__file__).resolve().parents[2] / "compose" / "services" / "caddy.yml"
+SERVICES = ROOT / "compose" / "services"
+TAILSCALE_GRANT = ROOT / "infra" / "tailscale" / "policy_additions.hujson"
+PUBLISHED = re.compile(r"127\.0\.0\.1:\$\{[A-Z_]+:-(\d+)\}:\d+")
 GOOD = """\
 # name  caddy_port  upstream  health_path
 grafana 9442 127.0.0.1:3000 /api/health
@@ -36,6 +52,68 @@ def refused_render(text: str) -> str:
     except RenderError as error:
         return str(error)
     raise AssertionError("the guard accepted a configuration that it must refuse")
+
+
+def published_ports(service_file: Path) -> set[int]:
+    """The host ports on the local address that a Compose service file publishes by default."""
+    document: Any = load_yaml(service_file.read_text())
+    (service,) = document["services"].values()
+    return {int(match[1]) for entry in service.get("ports", []) if (match := PUBLISHED.fullmatch(str(entry)))}
+
+
+def routes_off_their_service(routes: list[Route], services: Path = SERVICES) -> list[str]:
+    """The routes whose service file exists and does not publish the port that the route sends to."""
+    wrong = []
+    for route in routes:
+        service_file = services / f"{route.name}.yml"
+        if service_file.exists() and int(route.upstream.rsplit(":", 1)[1]) not in published_ports(service_file):
+            wrong.append(route.name)
+    return wrong
+
+
+class GatewayRangeTest(unittest.TestCase):
+    """The Tailscale grant admits the owner's devices to the gateway's ports and to nothing else of the host's web ports."""
+
+    def test_the_ports_the_gateway_may_use_are_the_ports_the_tailscale_grant_admits(self) -> None:
+        self.assertIn((str(GATEWAY_PORT), str(GATEWAY_LAST_PORT)), re.findall(r"tcp:(\d+)-(\d+)", TAILSCALE_GRANT.read_text()))
+
+    def test_every_port_of_the_tracked_list_is_inside_the_range_that_the_grant_admits(self) -> None:
+        ports = [route.port for route in load_routes(ROUTES_FILE)]
+        self.assertTrue(ports)
+        self.assertEqual([], [port for port in ports if not GATEWAY_PORT < port <= GATEWAY_LAST_PORT])
+
+    def test_a_route_port_outside_the_range_is_refused_with_the_port_and_the_range_named_and_the_two_ends_pass(self) -> None:
+        self.assertEqual(
+            [GATEWAY_PORT + 1, GATEWAY_LAST_PORT],
+            [route.port for route in parse_routes(f"a {GATEWAY_PORT + 1} 127.0.0.1:3000 /\nb {GATEWAY_LAST_PORT} 127.0.0.1:3001 /\n")],
+        )
+        for port in (GATEWAY_PORT - 1, GATEWAY_LAST_PORT + 1, 9499, 15600, 65535, 1024):
+            with self.subTest(port=port):
+                message = refused_routes(f"x {port} 127.0.0.1:3000 /\n")
+                self.assertIn(str(port), message)
+                self.assertIn(f"{GATEWAY_PORT}", message)
+                self.assertIn(f"{GATEWAY_LAST_PORT}", message)
+
+
+class RouteTargetTest(unittest.TestCase):
+    """A route sends to the host port that its service really publishes, and to its health path only where the service answers there."""
+
+    def test_each_route_whose_service_file_exists_sends_to_the_port_that_file_publishes(self) -> None:
+        routes = load_routes(ROUTES_FILE)
+        self.assertEqual([], routes_off_their_service(routes))
+        self.assertTrue({"openbao", "nessie"} <= {route.name for route in routes if (SERVICES / f"{route.name}.yml").exists()})
+
+    def test_a_route_that_sends_to_another_port_than_its_service_publishes_is_found(self) -> None:
+        planted = parse_routes("openbao 9441 127.0.0.1:8201 /v1/sys/health\nnessie 9445 127.0.0.1:19120 /api/v2/config\n")
+        self.assertEqual(["openbao"], routes_off_their_service(planted))
+
+    def test_a_route_for_a_service_with_no_file_yet_is_not_judged(self) -> None:
+        self.assertEqual([], routes_off_their_service(parse_routes("grafana 9442 127.0.0.1:3000 /api/health\n")))
+
+    def test_nessie_is_checked_on_the_port_of_its_api_because_its_health_path_of_the_management_port_is_not_published(self) -> None:
+        routes = {route.name: route for route in load_routes(ROUTES_FILE)}
+        self.assertEqual(("127.0.0.1:19120", "/api/v2/config"), (routes["nessie"].upstream, routes["nessie"].health_path))
+        self.assertEqual({19120}, published_ports(SERVICES / "nessie.yml"))
 
 
 class RouteListTest(unittest.TestCase):
@@ -97,7 +175,7 @@ class RouteListTest(unittest.TestCase):
 
     def test_the_health_paths_of_the_tracked_list_are_in_the_closed_set(self) -> None:
         self.assertEqual(
-            ["/v1/sys/health", "/api/health", "/-/healthy", "/v1/info", "/q/health", "/api/v1/health"],
+            ["/v1/sys/health", "/api/health", "/-/healthy", "/v1/info", "/api/v2/config", "/api/v1/health"],
             [route.health_path for route in load_routes(ROUTES_FILE)],
         )
 

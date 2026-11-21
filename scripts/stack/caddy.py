@@ -1,7 +1,8 @@
 """Render the Caddy configuration from the list of web interfaces and refuse a configuration that could listen on any other address.
 
-``compose/caddy/routes.txt`` has one line for each web interface: its name, the port Caddy answers on, the local address and port behind it and the
-path that the access test reads as its health check. A later phase adds an interface with one line. The configuration holds the Tailscale host
+``compose/caddy/routes.txt`` has one line for each web interface: its name, the port Caddy answers on (from the gateway port 9440 to 9459, the ports that
+the Tailscale grant in ``infra/tailscale/policy_additions.hujson`` admits), the local address and port behind it and the path that the access test reads
+as its health check. A later phase adds an interface with one line. The configuration holds the Tailscale host
 name and address only as the placeholders ``{$TS_HOST_NAME}`` and ``{$TS_ADDRESS}``, which the container reads from the host's own settings.
 
 ``.venv/bin/python -m scripts.stack.caddy render`` prints the configuration, for another list when a file is given. ``write`` replaces the tracked
@@ -21,6 +22,7 @@ CADDY_FOLDER = ROOT / "compose" / "caddy"
 ROUTES_FILE = CADDY_FOLDER / "routes.txt"
 CADDYFILE = CADDY_FOLDER / "Caddyfile"
 GATEWAY_PORT = 9440
+GATEWAY_LAST_PORT = 9459
 LOCAL_ADDRESS = "127.0.0.1"
 NAME = re.compile(r"[a-z][a-z0-9_]*")
 UPSTREAM = re.compile(rf"{re.escape(LOCAL_ADDRESS)}:([1-9][0-9]{{0,4}})")
@@ -65,6 +67,10 @@ def parse_route(number: int, line: str) -> Route:
         raise RoutesError(f"line {number}: name {name!r} must be lower case letters, digits and underscores, starting with a letter")
     if not valid_port(port):
         raise RoutesError(f"line {number}: port {port!r} must be a whole number from 1024 to 65535")
+    if not GATEWAY_PORT <= int(port) <= GATEWAY_LAST_PORT:
+        raise RoutesError(
+            f"line {number}: port {port} must be inside the gateway's range, {GATEWAY_PORT} to {GATEWAY_LAST_PORT}, which the Tailscale grant admits"
+        )
     match = UPSTREAM.fullmatch(upstream)
     if match is None or not valid_port(match[1]):
         raise RoutesError(f"line {number}: upstream {upstream!r} must be {LOCAL_ADDRESS} and a port from 1024 to 65535")
