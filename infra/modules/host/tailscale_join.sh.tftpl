@@ -1,7 +1,8 @@
 #!/bin/bash
 # First boot: install the pinned Tailscale client from its package repository and join the network from a systemd unit.
-# The host registers as an ephemeral node with a short-lived token that AWS issues to its role. No key is stored here.
-# The unit runs at every boot, so a host that was stopped long enough to leave the network joins again when it starts.
+# The host registers with a short-lived token that AWS issues to its role. No key is stored here.
+# The node is not ephemeral: Tailscale removes an ephemeral node while the host is stopped, and the join command then reports success
+# from its saved login without joining. The unit runs at every boot and starts the client with that saved login.
 set -euo pipefail
 
 install -d -m 0755 /usr/share/keyrings
@@ -19,7 +20,7 @@ After=network-online.target tailscaled.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/tailscale up --client-id='${client_id}?ephemeral=true&preauthorized=true' --audience='${audience}' --advertise-tags='${tag}' --hostname='${host_name}' --ssh --timeout=120s
+ExecStart=/usr/bin/tailscale up --client-id='${client_id}?ephemeral=false&preauthorized=true' --audience='${audience}' --advertise-tags='${tag}' --hostname='${host_name}' --ssh --timeout=120s
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=180

@@ -191,8 +191,8 @@ run "host_joins_tailscale_without_a_stored_key" {
 
   assert {
     condition = alltrue([
-      strcontains(local.user_data, "--client-id='example-client-id?ephemeral=true&preauthorized=true'"),
-      !strcontains(local.user_data, "ephemeral=false"),
+      strcontains(local.user_data, "--client-id='example-client-id?ephemeral=false&preauthorized=true'"),
+      !strcontains(local.user_data, "ephemeral=true"),
       strcontains(local.user_data, "--audience='example-audience'"),
       strcontains(local.user_data, "--advertise-tags='tag:example-host'"),
       strcontains(local.user_data, "--hostname='platform-dev'"),
@@ -200,7 +200,7 @@ run "host_joins_tailscale_without_a_stored_key" {
       !strcontains(local.user_data, "tskey"),
       !strcontains(local.user_data, "auth-key"),
     ])
-    error_message = "The boot script registers the host as an ephemeral node with the federated identity, the tag and the neutral host name, and holds no auth key."
+    error_message = "The boot script registers the host with the federated identity, the tag and the neutral host name, and holds no auth key. The node is not ephemeral: Tailscale removes an ephemeral node while the host is stopped, and the host then stays outside the network at its next start."
   }
 
   assert {
