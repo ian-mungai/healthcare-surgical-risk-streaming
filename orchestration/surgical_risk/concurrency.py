@@ -14,8 +14,8 @@ from pathlib import Path
 
 import yaml
 
-# The one setting: a job above this many MiB is heavy. A proposal for the owner to confirm: 4096 MiB, an eighth of the host's 32768 MiB.
-HEAVY_MEMORY_MIB = 4096
+# The one setting, the owner's figure: a job above this many MiB is heavy. It is 32768 less the 4096 reserve, 12032 always-on and one 4096 Spark job.
+HEAVY_MEMORY_MIB = 12544
 HEAVY_TAG_KEY = "surgical_risk/heavy"
 HEAVY_TAG_VALUE = "true"
 LIMITS_FILE = Path(os.environ.get("LIMITS_FILE", "/opt/dagster/limits.yml"))

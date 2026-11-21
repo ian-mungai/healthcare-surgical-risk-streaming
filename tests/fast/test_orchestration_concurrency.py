@@ -53,6 +53,11 @@ class GroupMemoryTest(unittest.TestCase):
         above = self.write(limits_text({"edge": [HEAVY_MEMORY_MIB - 1024, 1025]}))
         self.assertEqual({HEAVY_TAG_KEY: HEAVY_TAG_VALUE}, heavy_job_tags("edge", above))
 
+    def test_the_owners_figure_is_12544_mib_and_the_boundary_is_at_that_figure(self) -> None:
+        self.assertEqual(12544, HEAVY_MEMORY_MIB)
+        self.assertEqual({}, heavy_job_tags("edge", self.write(limits_text({"edge": [12544]}))))
+        self.assertEqual({HEAVY_TAG_KEY: HEAVY_TAG_VALUE}, heavy_job_tags("edge", self.write(limits_text({"edge": [12545]}))))
+
     def test_an_unknown_group_is_refused_by_name_and_not_taken_as_light(self) -> None:
         path = self.write(limits_text({"batch": [1024]}))
         with self.assertRaisesRegex(ConcurrencyError, "no_such_group"):
