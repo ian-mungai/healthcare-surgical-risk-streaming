@@ -174,7 +174,10 @@ STATUS_TOOL = (
     'if [ -e "$FAKE_SSH_LOG" ] && [ -n "${FAKE_STATUS_AFTER:-}" ]; then cat "$FAKE_STATUS_AFTER"; else cat "$FAKE_STATUS"; fi\n'
 )
 SSH_TOOL = (
-    '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\n'
+    '#!/bin/sh\nif [ ! -e "$FAKE_SSH_LOG" ]; then for a in "$@"; do case "$a" in UserKnownHostsFile=*) f="${a#UserKnownHostsFile=}"\n'
+    '{ cat "$f" 2>/dev/null || echo "no saved keys"; cat "${f}_instance" 2>/dev/null || echo "no recorded instance"; } > "$FAKE_FIRST_SSH_SAW" ;;\n'
+    "esac; done; fi\n"
+    'printf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\n'
     'case "$*" in *"tailscale logout"*) exit "${FAKE_LOGOUT_EXIT:-0}" ;; esac\nexit "${FAKE_SSH_EXIT:-0}"\n'
 )
 CONNECTED = {"BackendState": "Running"}
@@ -207,12 +210,24 @@ def fake_tools(
             "PATH": f"{folder}:{os.environ['PATH']}",
             "FAKE_STATUS": str(folder / "status.json"),
             "FAKE_SSH_LOG": str(folder / "ssh.log"),
+            "FAKE_FIRST_SSH_SAW": str(folder / "first_ssh_saw"),
             "FAKE_INSTANCE": instance,
             "FAKE_SSH_EXIT": str(ssh_exit),
             "FAKE_LOGOUT_EXIT": str(logout_exit),
         }
         with mock.patch.dict(os.environ, environment), mock.patch.object(host, "ROOT", folder), mock.patch.object(host, "POLL_SECONDS", 0.01):
             yield folder
+
+
+SAVED_KEY = "platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n"
+
+
+def save_host_keys(folder: Path, run_id: str, saved_for: str | None) -> None:
+    run_folder = folder / "runs" / run_id
+    run_folder.mkdir(parents=True)
+    (run_folder / "known_hosts").write_text(SAVED_KEY)
+    if saved_for is not None:
+        (run_folder / "known_hosts_instance").write_text(f"{saved_for}\n")
 
 
 class ReachableHostTest(unittest.TestCase):
@@ -235,33 +250,25 @@ class ReachableHostTest(unittest.TestCase):
         self.assertIn(f"ubuntu@{address}", logged)
         self.assertIn("cat /var/lib/cloud/data/instance-id", logged)
 
-    def saved_keys_after_reaching(self, saved_for: str | None) -> tuple[str | None, str]:
-        """The run's saved host keys and their recorded instance after the wait, when keys were saved before it for the given instance."""
-        status = {"Peer": {"a": peer("platform-dev")}}
-        with fake_tools(status, INSTANCE) as folder:
-            run_folder = folder / "runs" / "run-one"
-            run_folder.mkdir(parents=True)
-            (run_folder / "known_hosts").write_text("platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n")
-            if saved_for is not None:
-                (run_folder / "known_hosts_instance").write_text(f"{saved_for}\n")
+    def first_ssh_saw_after_keys_saved_for(self, saved_for: str | None) -> str:
+        with fake_tools({"Peer": {"a": peer("platform-dev")}}, INSTANCE) as folder:
+            save_host_keys(folder, "run-one", saved_for)
             wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", INSTANCE, "platform-dev")
-            keys = (run_folder / "known_hosts").read_text() if (run_folder / "known_hosts").exists() else None
-            return keys, (run_folder / "known_hosts_instance").read_text()
+            return (folder / "first_ssh_saw").read_text()
 
-    def test_host_keys_saved_for_a_replaced_instance_are_dropped_before_ssh(self) -> None:
-        self.assertEqual((None, f"{INSTANCE}\n"), self.saved_keys_after_reaching(OTHER_INSTANCE))
+    def test_host_keys_saved_for_a_replaced_instance_are_dropped_before_the_first_ssh(self) -> None:
+        self.assertEqual(f"no saved keys\n{INSTANCE}\n", self.first_ssh_saw_after_keys_saved_for(OTHER_INSTANCE))
 
-    def test_host_keys_saved_with_no_recorded_instance_are_dropped_before_ssh(self) -> None:
-        self.assertEqual((None, f"{INSTANCE}\n"), self.saved_keys_after_reaching(None))
+    def test_host_keys_saved_with_no_recorded_instance_are_dropped_before_the_first_ssh(self) -> None:
+        self.assertEqual(f"no saved keys\n{INSTANCE}\n", self.first_ssh_saw_after_keys_saved_for(None))
 
     def test_host_keys_saved_for_the_same_instance_are_kept(self) -> None:
-        self.assertEqual(("platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n", f"{INSTANCE}\n"), self.saved_keys_after_reaching(INSTANCE))
+        self.assertEqual(f"{SAVED_KEY}{INSTANCE}\n", self.first_ssh_saw_after_keys_saved_for(INSTANCE))
 
-    def test_the_first_reach_of_a_run_records_the_instance_its_host_keys_belong_to(self) -> None:
-        status = {"Peer": {"a": peer("platform-dev")}}
-        with fake_tools(status, INSTANCE) as folder:
+    def test_the_first_ssh_of_a_run_finds_the_instance_recorded(self) -> None:
+        with fake_tools({"Peer": {"a": peer("platform-dev")}}, INSTANCE) as folder:
             wait_until_reachable(FakeAws("project", "us-west-2"), "run-one", INSTANCE, "platform-dev")
-            self.assertEqual(f"{INSTANCE}\n", (folder / "runs" / "run-one" / "known_hosts_instance").read_text())
+            self.assertEqual(f"no saved keys\n{INSTANCE}\n", (folder / "first_ssh_saw").read_text())
 
     def test_only_an_older_peer_is_visible_while_the_new_instance_starts(self) -> None:
         status = {"Peer": {"old": peer("platform-dev", created="2026-01-01T00:00:00Z", device="nOLDCNTRL")}}
@@ -333,6 +340,13 @@ class TailscaleDeviceTest(unittest.TestCase):
         address = "platform-dev.example.ts.net"
         self.assertIn(f"ubuntu@{address}", logged)
         self.assertIn("sudo -n tailscale logout", logged)
+
+    def test_host_keys_saved_for_a_replaced_instance_are_dropped_before_the_first_ssh_of_a_release(self) -> None:
+        before = {"Peer": {"a": peer("platform-dev", device="nNEWCNTRL")}}
+        with fake_tools(before, INSTANCE, after={"Peer": {}}) as folder:
+            save_host_keys(folder, "run-one", OTHER_INSTANCE)
+            release_tailscale_device("run-one", "platform-dev", "nNEWCNTRL", INSTANCE, 5)
+            self.assertEqual(f"no saved keys\n{INSTANCE}\n", (folder / "first_ssh_saw").read_text())
 
     def test_a_device_that_is_already_gone_needs_no_ssh(self) -> None:
         with fake_tools({"Peer": {}}, INSTANCE) as folder:
@@ -775,15 +789,11 @@ class HostCheckTest(unittest.TestCase):
             logged = (folder / "ssh.log").read_text()
         return code, output.getvalue(), Path(logged)
 
-    def test_host_keys_saved_for_another_instance_are_dropped_before_the_check(self) -> None:
+    def test_host_keys_saved_for_another_instance_are_dropped_before_the_first_ssh_of_the_check(self) -> None:
         with fake_tools({"Peer": {"a": peer("platform-dev")}}, INSTANCE) as folder, contextlib.redirect_stdout(io.StringIO()):
-            saved = folder / "runs" / "deploy"
-            saved.mkdir(parents=True)
-            (saved / "known_hosts").write_text("platform-dev.example.ts.net ssh-ed25519 AAAAsaved\n")
-            (saved / "known_hosts_instance").write_text(f"{OTHER_INSTANCE}\n")
+            save_host_keys(folder, "deploy", OTHER_INSTANCE)
             self.assertEqual(0, host_check("platform-dev", INSTANCE))
-            self.assertFalse((saved / "known_hosts").exists())
-            self.assertEqual(f"{INSTANCE}\n", (saved / "known_hosts_instance").read_text())
+            self.assertEqual(f"no saved keys\n{INSTANCE}\n", (folder / "first_ssh_saw").read_text())
 
     def test_the_expected_instance_passes_and_the_output_names_the_host_only(self) -> None:
         code, output, _ = self.check(INSTANCE)

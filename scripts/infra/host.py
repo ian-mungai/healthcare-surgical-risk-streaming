@@ -173,6 +173,7 @@ def release_tailscale_device(run_id: str, host_name: str, device_id: str, instan
     except NoPeerError:
         peer = None
     if peer is not None:
+        keep_host_keys_of(run_id, instance_id)
         found = ssh_output(run_id, peer.address, INSTANCE_ID_COMMAND, SSH_ATTEMPT_SECONDS)
         if found is None:
             raise HostError(f"the Tailscale peer {host_name} did not tell its instance over SSH: no logout was sent")
@@ -203,11 +204,7 @@ def ssh_arguments(run_id: str) -> list[str]:
 
 
 def keep_host_keys_of(run_id: str, instance: str) -> None:
-    """Drop the run's saved SSH host keys unless they were saved for this instance, and record the instance they now belong to.
-
-    A plan that replaces the host gives the same Tailscale name to an instance with new host keys, and SSH refuses a name whose key changed.
-    Keys of the same instance stay, so a changed key on an unchanged host is still refused.
-    """
+    # A replaced host answers at the same Tailscale name with new host keys, and OpenSSH refuses a name whose saved key changed.
     folder = ROOT / "runs" / run_id
     owner = folder / "known_hosts_instance"
     if owner.is_file() and owner.read_text().strip() == instance:
