@@ -10,13 +10,13 @@ from __future__ import annotations
 import base64
 import importlib.util
 import re
-import stat
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+from tests.fast.ansible_support import shared_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "ansible" / "roles" / "compose_stack" / "library" / "postgres_accounts.py"
@@ -26,6 +26,7 @@ SERVER_SALT = base64.b64decode("VH4EErGPaqJpsf05kuJoBw==")
 
 
 def load_module() -> ModuleType:
+    shared_module("secret_files")
     spec = importlib.util.spec_from_file_location("postgres_accounts", MODULE)
     if spec is None or spec.loader is None:
         raise ImportError(str(MODULE))
@@ -58,47 +59,6 @@ class ToolListTest(unittest.TestCase):
             accounts.parse_tools("nessie\nairbyte\nnessie\n")
         with self.assertRaisesRegex(accounts.AccountError, "no tool"):
             accounts.parse_tools("# nothing\n")
-
-
-class PasswordFileTest(unittest.TestCase):
-    def test_a_missing_password_is_created_for_its_owner_only_and_is_long_and_random(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            store = accounts.PasswordStore(Path(scratch) / "postgres")
-            created = store.ensure("nessie")
-            other = store.ensure("airbyte")
-            first, second = store.read("nessie"), store.read("airbyte")
-            file_mode = stat.S_IMODE(store.path("nessie").stat().st_mode)
-            folder_mode = stat.S_IMODE(store.path("nessie").parent.stat().st_mode)
-        self.assertEqual((True, True), (created, other))
-        self.assertRegex(first, r"^[A-Za-z0-9_-]{40,}$")
-        self.assertNotEqual(first, second)
-        self.assertEqual((0o600, 0o700), (file_mode, folder_mode))
-
-    def test_an_existing_password_is_kept(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            store = accounts.PasswordStore(Path(scratch))
-            store.ensure("nessie")
-            before = store.read("nessie")
-            again = store.ensure("nessie")
-            after = store.read("nessie")
-        self.assertFalse(again)
-        self.assertEqual(before, after)
-
-    def test_an_empty_or_missing_file_is_refused_by_account_name_and_is_never_replaced(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            store = accounts.PasswordStore(Path(scratch))
-            with self.assertRaisesRegex(accounts.AccountError, "nessie"):
-                store.read("nessie")
-            store.path("nessie").write_text("")
-            with self.assertRaisesRegex(accounts.AccountError, "nessie"):
-                store.ensure("nessie")
-            self.assertEqual("", store.path("nessie").read_text())
-
-    def test_a_trailing_newline_is_not_part_of_the_password(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            store = accounts.PasswordStore(Path(scratch))
-            store.path("nessie").write_text("abc\n")
-            self.assertEqual("abc", store.read("nessie"))
 
 
 class VerifierTest(unittest.TestCase):

@@ -7,16 +7,27 @@ registered values a real host would give and show the check's verdict, with no h
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import re
 import tempfile
 from pathlib import Path
+from types import ModuleType
 
 from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT
 
 PLAYBOOK_SECONDS = 120
 ROLES = ROOT / "ansible" / "roles"
+SHARED_MODULE_UTILS = ROLES / "secret_files" / "module_utils"
+
+
+def shared_module(name: str) -> ModuleType:
+    """A module of the shared role under ``ansible.module_utils``, found the way a module of a role finds it when Ansible runs it."""
+    package = importlib.import_module("ansible.module_utils")
+    if str(SHARED_MODULE_UTILS) not in package.__path__:
+        package.__path__.append(str(SHARED_MODULE_UTILS))
+    return importlib.import_module(f"ansible.module_utils.{name}")
 
 
 def environment(folder: Path) -> dict[str, str]:
@@ -43,6 +54,16 @@ def run_task_files(role: str, task_files: list[str], variables: dict[str, object
         work = Path(scratch)
         playbook = work / "check.yml"
         includes = "".join(f"    - ansible.builtin.include_tasks: {ROLES / role / 'tasks' / name}\n" for name in task_files)
+        playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{includes}")
+        return run_playbook(work, playbook, [*(["-v"] if verbose else []), "-i", "localhost,", "--extra-vars", json.dumps(variables)])
+
+
+def run_role_tasks(role: str, task_files: list[str], variables: dict[str, object], *, verbose: bool = False) -> CompletedProcess[str]:
+    """Run ``ansible/roles/<role>/tasks/<file>`` for each file in order as the role's own tasks, so its library and its dependencies load."""
+    with tempfile.TemporaryDirectory() as scratch:
+        work = Path(scratch)
+        playbook = work / "check.yml"
+        includes = "".join(f"    - ansible.builtin.include_role:\n        name: {ROLES / role}\n        tasks_from: {name}\n" for name in task_files)
         playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{includes}")
         return run_playbook(work, playbook, [*(["-v"] if verbose else []), "-i", "localhost,", "--extra-vars", json.dumps(variables)])
 

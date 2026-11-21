@@ -15,6 +15,7 @@ from types import ModuleType
 from typing import Any
 
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.ansible_support import shared_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "ansible" / "roles" / "openbao" / "library" / "openbao_bootstrap.py"
@@ -26,6 +27,7 @@ TTL, MAX_TTL = 3600, 86400
 
 
 def load_module() -> ModuleType:
+    shared_module("secret_files")
     spec = importlib.util.spec_from_file_location("openbao_bootstrap", MODULE)
     if spec is None or spec.loader is None:
         raise ImportError(str(MODULE))

@@ -16,23 +16,21 @@ import hashlib
 import hmac
 import os
 import re
-import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.secret_files import PasswordStore, SecretFileError
 
 TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
 RESERVED_NAMES = {"postgres", "public", "template0", "template1"}
 ADMINISTRATOR = "postgres"
 SERVICE = "postgres"
 ADMINISTRATOR_FILE_IN_CONTAINER = "/run/secrets/postgres_admin_password"
-ACCOUNT_FOLDER = "postgres"
 ITERATIONS = 4096
 MAXIMUM_ITERATIONS = 1_000_000
 SALT_BYTES = 16
-PASSWORD_BYTES = 32
 ATTRIBUTES = "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
 VERIFIER = re.compile(r"SCRAM-SHA-256\$(\d+):([A-Za-z0-9+/=]+)\$([A-Za-z0-9+/=]+):([A-Za-z0-9+/=]+)")
 ERROR_CHARACTERS = 400
@@ -59,38 +57,6 @@ def parse_tools(text: str) -> list[str]:
     if not tools:
         raise AccountError("the tool list names no tool")
     return tools
-
-
-class PasswordStore:
-    """The one place that knows where a password comes from: a file for each account in one private folder."""
-
-    def __init__(self, directory: Path) -> None:
-        self.directory = directory
-
-    def path(self, account: str) -> Path:
-        return self.directory / f"{account}.password"
-
-    def read(self, account: str) -> str:
-        try:
-            text = self.path(account).read_text().rstrip("\n")
-        except OSError as error:
-            raise AccountError(f"the password file of {account} cannot be read: {error.strerror}") from error
-        if not text:
-            raise AccountError(f"the password file of {account} is empty")
-        return text
-
-    def ensure(self, account: str) -> bool:
-        """Create the account's password file when it is missing and return whether it did. An existing file is never replaced."""
-        for missing in reversed([folder for folder in (self.directory, *self.directory.parents) if not folder.exists()]):
-            missing.mkdir(mode=0o700)
-        try:
-            descriptor = os.open(self.path(account), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            self.read(account)
-            return False
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(secrets.token_urlsafe(PASSWORD_BYTES))
-        return True
 
 
 def scram_verifier(password: str, salt: bytes | None = None, iterations: int = ITERATIONS) -> str:
@@ -229,7 +195,7 @@ def main() -> None:
     )
     try:
         tools = parse_tools(Path(module.params["tools_file"]).read_text())
-        store = PasswordStore(Path(module.params["secrets_directory"]) / ACCOUNT_FOLDER)
+        store = PasswordStore.in_secrets(Path(module.params["secrets_directory"]))
         accounts = [ADMINISTRATOR, *tools]
         if module.params["step"] == "passwords":
             created = create_missing_passwords(store, tools, check_only=module.check_mode)
@@ -242,7 +208,7 @@ def main() -> None:
         if actions and not module.check_mode:
             server.psql("".join(f"{action.sql};\n" for action in actions), tools)
         module.exit_json(changed=bool(actions), accounts=accounts, actions=[action.description for action in actions])
-    except AccountError as error:
+    except (AccountError, SecretFileError) as error:
         module.fail_json(msg=str(error))
 
 

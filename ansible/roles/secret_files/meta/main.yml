@@ -1,0 +1,2 @@
+# This role has no tasks. It holds the module_utils that the role of the stack and the role of OpenBao share, and each of them depends on it.
+dependencies: []

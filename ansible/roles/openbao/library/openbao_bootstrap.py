@@ -27,13 +27,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.secret_files import PasswordStore, SecretFileError
 
 SERVICE_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
 OWNER = re.compile(r"([1-9][0-9]*):([0-9]+)")
 RESERVED_NAMES = {"bootstrap", "default", "root"}
 ADMIN_ROLE = "bootstrap"
 OPENBAO_FOLDER = "openbao"
-POSTGRES_FOLDER = "postgres"
 ADMIN_ID_FILE = "bootstrap.secret_id"
 SECRET_BYTES = 32
 SECRET_FILE_MODE = 0o400
@@ -146,11 +146,6 @@ def secret_file(secrets_directory: Path, name: str) -> Path:
     return secrets_directory / OPENBAO_FOLDER / name
 
 
-def password_file(secrets_directory: Path, tool: str) -> Path:
-    """Where a tool's PostgreSQL password is: the file of the PostgreSQL role, ``<secrets>/postgres/<tool>.password``."""
-    return secrets_directory / POSTGRES_FOLDER / f"{tool}.password"
-
-
 def read_file(path: Path, what: str) -> str:
     try:
         text = path.read_text().rstrip("\n")
@@ -253,7 +248,7 @@ class Api:
                 last = f"HTTP {status}, initialized {document.get('initialized')}, sealed {document.get('sealed')}"
                 if status == 200 and document.get("initialized") is True and document.get("sealed") is False:
                     return
-            except BootstrapError as error:
+            except (BootstrapError, SecretFileError) as error:
                 last = str(error)
             if time.monotonic() >= deadline:
                 raise BootstrapError(f"OpenBao at {self.address} did not become ready within {deadline_seconds} seconds (last answer: {last})")
@@ -310,7 +305,7 @@ def apply(api: Api, token: str, action: Action, secrets_directory: Path, owner: 
             raise BootstrapError(f"OpenBao returned no secret ID for {service}")
         write_private_file(secret_file(secrets_directory, f"{service}.secret_id"), issued, replace=True, owner=owner)
     else:
-        password = read_file(password_file(secrets_directory, service), f"password file of {service}")
+        password = PasswordStore.in_secrets(secrets_directory).read(service)
         api.must("POST", f"secret/data/services/{service}/postgres", token, {"data": {"password": password}})
 
 
@@ -345,7 +340,7 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     token = api.login(ADMIN_ROLE, read_file(secret_file(secrets_directory, ADMIN_ID_FILE), "admin secret ID file"))
     ttl, max_ttl = int(params["token_ttl_seconds"]), int(params["token_max_ttl_seconds"])
     state = read_state(api, token, services, tools, secrets_directory)
-    actions = plan(services, tools, state, lambda tool: read_file(password_file(secrets_directory, tool), f"password file of {tool}"), ttl, max_ttl)
+    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl)
     actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"])
     if not check_only:
         for action in actions:
@@ -382,7 +377,7 @@ def main() -> None:
         if not all(params[key] for key in ("services_file", "tools_file", "address")):
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
         module.exit_json(**reconcile(params, check_only=module.check_mode))
-    except BootstrapError as error:
+    except (BootstrapError, SecretFileError) as error:
         module.fail_json(msg=str(error))
 
 
