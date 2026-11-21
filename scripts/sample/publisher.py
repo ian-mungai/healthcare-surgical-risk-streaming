@@ -21,7 +21,7 @@ RELEASE_PREFIX = "vitaldb/1.0.0/"
 CASE_PREFIX = f"{RELEASE_PREFIX}vital_files/"
 CHECKSUM_LIST_KEY = f"{RELEASE_PREFIX}SHA256SUMS.txt"
 TRACK_LIST_URL = "https://api.vitaldb.net/trks"
-TRACK_LIST_COLUMNS = ["caseid", "tname", "tid"]
+TRACK_LIST_COLUMNS = ("caseid", "tname", "tid")
 CLINICAL_COLUMNS = ("caseid", "subjectid", "casestart", "caseend")
 LIST_TIMEOUT_SECONDS = 300
 READ_TIMEOUT_SECONDS = 300
@@ -120,7 +120,7 @@ def csv_rows(path: Path) -> tuple[list[str], list[tuple[int, list[str]]]]:
 def parse_track_list(path: Path, track: str) -> set[int]:
     """The cases that have the named track. The file must have exactly the columns ``caseid``, ``tname`` and ``tid`` and every line three fields."""
     header, rows = csv_rows(path)
-    if header != TRACK_LIST_COLUMNS:
+    if tuple(header) != TRACK_LIST_COLUMNS:
         raise PublisherError(f"the track list does not have the columns {', '.join(TRACK_LIST_COLUMNS)}")
     cases: set[int] = set()
     for number, row in rows:

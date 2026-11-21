@@ -14,11 +14,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from scripts.ingestion.check import CheckResult, ResultFormatError
+from scripts.ingestion.check import CHECKED_FILE_FIELDS, CheckResult, ResultFormatError
 from scripts.ingestion.cli import CLI_ERRORS, InputError, read_input, write_private
 from scripts.ingestion.landing import PairingError, load_pairing_records
-from scripts.ingestion.manifest import ManifestError, ManifestRef
+from scripts.ingestion.manifest import ManifestError, ManifestRef, publish_manifest, read_manifest
 from scripts.ingestion.selection import Selection, SelectionError
+from scripts.sample.publisher import TRACK_LIST_COLUMNS
 from tests.fast.ingestion_support import SOURCE_PREFIX, digest, landed_set
 
 SELECTION: dict[str, Any] = {
@@ -203,6 +204,26 @@ class CommandErrorTest(unittest.TestCase):
     def test_every_error_that_an_input_can_raise_is_reported_and_none_is_a_traceback(self) -> None:
         raised = (SelectionError, PairingError, ResultFormatError, ManifestError, InputError)
         self.assertEqual([], [error.__name__ for error in raised if not issubclass(error, CLI_ERRORS)])
+
+
+class FrozenAuthorityTest(unittest.TestCase):
+    """A field set that closes an input, and a manifest a reader holds, cannot be changed by the code that holds them."""
+
+    def test_the_field_sets_of_the_closed_inputs_cannot_be_changed(self) -> None:
+        fields: Any = CHECKED_FILE_FIELDS
+        columns: Any = TRACK_LIST_COLUMNS
+        edits: tuple[Callable[[], object], ...] = (lambda: fields.__setitem__("size", object), lambda: columns.append("extra"))
+        for number, edit in enumerate(edits):
+            with self.subTest(edit=number), self.assertRaises((TypeError, AttributeError)):
+                edit()
+
+    def test_the_selection_and_list_of_a_read_manifest_cannot_be_changed(self) -> None:
+        landed = landed_set()
+        manifest = read_manifest(landed.store, publish_manifest(landed.store, landed.selection, landed.check()))
+        mappings: tuple[Any, ...] = (manifest.selection, manifest.checksum_list)
+        for mapping in mappings:
+            with self.assertRaises(TypeError):
+                mapping["sha256"] = "0" * 64
 
 
 class FileHelperTest(unittest.TestCase):

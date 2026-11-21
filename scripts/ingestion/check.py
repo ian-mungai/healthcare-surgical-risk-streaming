@@ -14,6 +14,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
+from types import MappingProxyType
 from typing import Any
 
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
@@ -76,16 +77,9 @@ class CheckedFile:
     retrieved_utc: str
 
 
-CHECKED_FILE_FIELDS: dict[str, type] = {
-    "bucket": str,
-    "key": str,
-    "version_id": str,
-    "sha256": str,
-    "source_key": str,
-    "size": int,
-    "release": str,
-    "retrieved_utc": str,
-}
+CHECKED_FILE_FIELDS: Mapping[str, type] = MappingProxyType(
+    {"bucket": str, "key": str, "version_id": str, "sha256": str, "source_key": str, "size": int, "release": str, "retrieved_utc": str}
+)
 
 
 def checked_file_from(entry: object, what: str) -> CheckedFile:

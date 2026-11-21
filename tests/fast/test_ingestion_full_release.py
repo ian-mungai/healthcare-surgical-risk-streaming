@@ -6,12 +6,14 @@ the tracked pin's. The set cannot be shortened by a range, a missing table or an
 
 from __future__ import annotations
 
+import contextlib
 import json
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion import selection
 from scripts.ingestion.selection import Selection, SelectionError
 from scripts.sample.candidates import RELEASE_FILE
 
@@ -83,6 +85,22 @@ class FullReleaseTest(unittest.TestCase):
             )
         )
         self.assertEqual(3, len(selection.files))
+
+    def test_a_caller_that_edits_the_returned_pin_does_not_change_the_pin_the_full_release_is_held_to(self) -> None:
+        self.addCleanup(selection.pinned_release.cache_clear)
+        other = "0" * 64
+        pin: Any = selection.pinned_release()
+        edits: tuple[Callable[[], object], ...] = (
+            lambda: pin["checksum_list"].update(sha256=other),
+            lambda: pin.__setitem__("checksum_list", {"key": PIN["checksum_list"]["key"], "sha256": other}),
+            lambda: setattr(pin, "checksum_list_sha256", other),
+        )
+        for edit in edits:
+            with contextlib.suppress(TypeError, AttributeError):
+                edit()
+        with self.assertRaises(SelectionError):
+            load(lambda document: document["checksum_list"].update(sha256=other))
+        self.assertEqual(6390, len(load().files))
 
     def test_a_full_release_built_in_code_is_held_to_the_same_rule(self) -> None:
         with self.assertRaises(SelectionError):

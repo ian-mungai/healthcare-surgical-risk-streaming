@@ -14,7 +14,9 @@ with that SHA-256, and the digest of the check result in the manifest equals the
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from types import MappingProxyType
 from typing import Any
 
 from scripts.ingestion.check import CheckedFile, CheckResult, canonical, checked_file_from, current_versions, result_digest, sha256_of
@@ -63,8 +65,8 @@ class ManifestRef:
 class Manifest:
     status: str
     measurement_period: str
-    selection: dict[str, Any]
-    checksum_list: dict[str, str]
+    selection: Mapping[str, Any]
+    checksum_list: Mapping[str, str]
     check_result_sha256: str
     entries: tuple[CheckedFile, ...]
 
@@ -168,8 +170,8 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
         manifest = Manifest(
             document["status"],
             document["measurement_period"],
-            selection,
-            checksum_list,
+            MappingProxyType(selection),
+            MappingProxyType(checksum_list),
             document["check_result_sha256"],
             tuple(checked_file_from(entry, "an entry of the manifest") for entry in document["entries"]),
         )

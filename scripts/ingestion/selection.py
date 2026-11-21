@@ -20,7 +20,7 @@ import functools
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -52,17 +52,29 @@ def case_paths(pattern: str, first: int, last: int) -> list[str]:
     return [f"{head}{number:0{width}d}{tail}" for number in range(first, last + 1)]
 
 
+@dataclass(frozen=True)
+class PinnedRelease:
+    """The fields of a full release that the tracked pin fixes, under the names of the selection's fields. Frozen, so no caller can change the cached pin."""
+
+    release: str
+    source_bucket: str
+    source_prefix: str
+    checksum_list_key: str
+    checksum_list_sha256: str
+
+
 @functools.cache
-def pinned_release() -> dict[str, Any]:
+def pinned_release() -> PinnedRelease:
     """The tracked release pin, checked for its form. Raise ``SelectionError`` when it is not valid."""
     try:
         pin = parse_json(RELEASE_FILE.read_text(), "the tracked release pin")
-    except (ClosedInputError, OSError) as error:
+    except (ClosedInputError, OSError, UnicodeDecodeError) as error:
         raise SelectionError(f"the tracked release pin cannot be read: {type(error).__name__}") from None
     problems = release_problems(pin)
     if problems:
         raise SelectionError("the tracked release pin is not valid: " + "; ".join(problems))
-    return dict(pin)
+    source, listed = pin["source"], pin["checksum_list"]
+    return PinnedRelease(PurePosixPath(source["release_path"]).name, source["bucket"], source["release_path"], listed["key"], listed["sha256"])
 
 
 @functools.cache
@@ -108,15 +120,7 @@ class Selection:
 
     def full_release_problems(self) -> list[str]:
         """What differs from the whole release as the tracked pin and the 6,390 keys define it. Field names only."""
-        pin = pinned_release()
-        expected = {
-            "release": PurePosixPath(pin["source"]["release_path"]).name,
-            "source_bucket": pin["source"]["bucket"],
-            "source_prefix": pin["source"]["release_path"],
-            "checksum_list_key": pin["checksum_list"]["key"],
-            "checksum_list_sha256": pin["checksum_list"]["sha256"],
-        }
-        problems = [f"the full release's {name} is not the tracked pin's" for name, value in expected.items() if getattr(self, name) != value]
+        problems = [f"the full release's {name} is not the tracked pin's" for name, value in asdict(pinned_release()).items() if getattr(self, name) != value]
         if self.files != full_release_files():
             problems.append(f"the full release's files are not exactly {', '.join(FULL_RELEASE_TABLES)} and {FULL_RELEASE_CASES} case files")
         return problems
