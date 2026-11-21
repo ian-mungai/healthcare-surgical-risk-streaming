@@ -33,6 +33,7 @@ EXIT_WAIT = 75
 SUPPORTING_GROUP = "supporting"
 COMPOSE_PROJECT = "surgical_risk"
 MEMINFO = Path("/proc/meminfo")
+ASCII_DIGITS = re.compile(r"[0-9]+")
 AVAILABLE_LINE = re.compile(r"^MemAvailable:\s+(\d+) kB$", re.MULTILINE)
 DOCKER_DEADLINE_SECONDS = 30
 KIB_PER_MIB = 1024
@@ -131,7 +132,7 @@ def check_group(group: str, *, limits_path: Path = LIMITS_FILE, available_mib: i
 
 
 def whole_number(text: str) -> int:
-    if not text.isdigit():
+    if not ASCII_DIGITS.fullmatch(text):
         raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
     return int(text)
 

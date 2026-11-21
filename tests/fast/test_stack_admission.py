@@ -260,9 +260,12 @@ class CommandTest(unittest.TestCase):
         self.assertIn(f"supporting services {SUPPORTING_NEED} MiB", self.command("heavy", 100000, "")[1])
 
     def test_a_figure_that_is_not_a_whole_number_is_a_usage_error(self) -> None:
-        code, _, err = run("heavy", "--available-mib", "lots", "--running", "")
-        self.assertEqual(2, code)
-        self.assertIn("--available-mib", err)
+        for text in ("lots", "-1", "1.5", "", "\u0663\u0660\u0660\u0660\u0660", "\u00b2"):
+            with self.subTest(text=text):
+                code, out, err = run("heavy", "--available-mib", text, "--running", "")
+                self.assertEqual((2, ""), (code, out))
+                self.assertIn("--available-mib", err)
+                self.assertIn("is not a whole number", err)
 
 
 if __name__ == "__main__":
