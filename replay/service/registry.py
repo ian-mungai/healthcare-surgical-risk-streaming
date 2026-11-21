@@ -92,7 +92,7 @@ class RegistryClient:
             raise RegistryError("the registry's answer holds no version with a content ID and a global ID")
         return Registered(group, artifact_id, str(version["version"]), version["contentId"], version["globalId"])
 
-    def register(self, group: str, artifact_id: str, schema_text: str, unused_rule: str | None = None) -> Registered:
+    def register(self, group: str, artifact_id: str, schema_text: str) -> Registered:
         """Create the artifact with this schema as its first version, or find the version that holds exactly these bytes."""
         body = {
             "artifactId": artifact_id,
