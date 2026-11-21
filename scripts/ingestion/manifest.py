@@ -2,7 +2,8 @@
 
 It is published only from a complete passed check and only for the object versions that the check verified. Each entry binds the landed
 object version (bucket, key and non-null version ID), its SHA-256, its source key, its size, its release and its retrieval time, which is the
-time S3 gave that version. The selection, the measurement period, the pinned checksum list and the digest of the check result are recorded once.
+time S3 gave that version. The selection, the measurement period, the pinned checksum list and the digest of the check result are recorded once. The
+check result is bound to the SHA-256 of every field of the selection, so a publication with any other source, release, period or list key is refused.
 
 Where it lives: under ``manifests/<selection name>/<SHA-256 of its content>.json`` in the project's bucket, outside the payload prefix, as its own
 object version. The key holds the content's digest, so the same content has the same key and a rerun adds no version. A reader holds a
@@ -68,7 +69,7 @@ class Manifest:
     entries: tuple[CheckedFile, ...]
 
     def recomputed_check_result_sha256(self) -> str:
-        return result_digest(self.selection["keys_sha256"], self.checksum_list["sha256"], (asdict(entry) for entry in self.entries))
+        return result_digest(self.selection["selection_sha256"], self.checksum_list["sha256"], (asdict(entry) for entry in self.entries))
 
 
 def manifest_key(selection_name: str, sha256: str) -> str:
@@ -77,9 +78,9 @@ def manifest_key(selection_name: str, sha256: str) -> str:
 
 def refusal(result: CheckResult, selection: Selection, store: ObjectStore) -> str | None:
     """Why this check result may not be published, or None. Each reason is judged in turn: pass, selection, completeness, edits, the bucket's state."""
-    if result.findings or not result.files:
-        return f"the check did not pass: {len(result.findings)} findings"
-    if result.selection_sha256 != selection.keys_sha256 or result.selection_name != selection.name or result.list_sha256 != selection.checksum_list_sha256:
+    if not result.passed:
+        return f"the check did not pass: {len(result.findings)} findings, {len(result.files)} of {result.file_count} files verified"
+    if result.selection_sha256 != selection.selection_sha256 or result.selection_name != selection.name or result.list_sha256 != selection.checksum_list_sha256:
         return "the check result is not for this selection and its pinned checksum list"
     if {file.source_key for file in result.files} != set(selection.source_keys) or len(result.files) != len(selection.files):
         return "the check result does not hold every selected file once"
@@ -151,7 +152,9 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
             "the manifest",
         )
         selection = closed_object(
-            document["selection"], {"name": str, "source_bucket": str, "source_prefix": str, "file_count": int, "keys_sha256": str}, "the manifest's selection"
+            document["selection"],
+            {"name": str, "source_bucket": str, "source_prefix": str, "file_count": int, "keys_sha256": str, "selection_sha256": str},
+            "the manifest's selection",
         )
         checksum_list = closed_object(document["checksum_list"], {"key": str, "sha256": str}, "the manifest's checksum list")
         manifest = Manifest(

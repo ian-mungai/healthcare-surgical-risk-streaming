@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -128,6 +129,20 @@ class Selection:
     def keys_sha256(self) -> str:
         return hashlib.sha256(("\n".join(sorted(self.source_keys)) + "\n").encode()).hexdigest()
 
+    @property
+    def selection_sha256(self) -> str:
+        """The SHA-256 of every field of the selection: the identity that a check result is bound to, so that a publication cannot change any of them."""
+        document = {
+            "name": self.name,
+            "release": self.release,
+            "source_bucket": self.source_bucket,
+            "source_prefix": self.source_prefix,
+            "measurement_period": self.measurement_period,
+            "checksum_list": {"key": self.checksum_list_key, "sha256": self.checksum_list_sha256},
+            "keys_sha256": self.keys_sha256,
+        }
+        return hashlib.sha256((json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+
     def record(self) -> dict[str, Any]:
         """What the manifest records once for the set."""
         return {
@@ -136,6 +151,7 @@ class Selection:
             "source_prefix": self.source_prefix,
             "file_count": len(self.files),
             "keys_sha256": self.keys_sha256,
+            "selection_sha256": self.selection_sha256,
         }
 
     @classmethod

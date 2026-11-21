@@ -29,7 +29,7 @@ def forged(landed: Landed, reference: ManifestRef, change: Callable[[dict[str, A
     document = json.loads(landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7))
     change(document)
     if consistent:
-        document["check_result_sha256"] = result_digest(document["selection"]["keys_sha256"], document["checksum_list"]["sha256"], document["entries"])
+        document["check_result_sha256"] = result_digest(document["selection"]["selection_sha256"], document["checksum_list"]["sha256"], document["entries"])
     data = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     key = f"{MANIFEST_PREFIX}probe_set/{digest(data)}.json"
     return ManifestRef(reference.bucket, key, landed.store.put_object(key, data).version_id, digest(data))

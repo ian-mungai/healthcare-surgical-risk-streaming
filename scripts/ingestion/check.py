@@ -230,5 +230,5 @@ def run_check(
                 findings.append(Finding(source_key, CHECKSUM_DIFFERS, f"landed {found[:12]}, listed {listed[path][:12]}"))
         if progress:
             progress(done, len(selection.files))
-    result = CheckResult(selection.name, selection.keys_sha256, list_sha256, len(selection.files), tuple(files), tuple(findings))
+    result = CheckResult(selection.name, selection.selection_sha256, list_sha256, len(selection.files), tuple(files), tuple(findings))
     return replace(result, claimed_sha256=result.result_sha256 if result.passed else "")

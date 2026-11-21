@@ -9,8 +9,9 @@ import hashlib
 import json
 import unittest
 from dataclasses import replace
+from typing import Any
 
-from scripts.ingestion.check import CheckResult
+from scripts.ingestion.check import CheckResult, Finding
 from scripts.ingestion.manifest import MANIFEST_PREFIX, PublishRefused, publish_manifest, read_manifest
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
 
@@ -49,6 +50,7 @@ class PublishTest(unittest.TestCase):
                 "source_prefix": SOURCE_PREFIX,
                 "file_count": len(SOURCE),
                 "keys_sha256": landed.selection.keys_sha256,
+                "selection_sha256": landed.selection.selection_sha256,
             },
             document["selection"],
         )
@@ -99,7 +101,8 @@ class PublishTest(unittest.TestCase):
     def test_a_partial_result_publishes_nothing(self) -> None:
         landed = landed_set()
         result = checked(landed)
-        partial = replace(result, files=result.files[:-1])
+        partial = replace(result, files=result.files[:-1], file_count=len(result.files) - 1)
+        partial = replace(partial, claimed_sha256=partial.result_sha256)
         with self.assertRaisesRegex(PublishRefused, "every selected file"):
             publish_manifest(landed.store, landed.selection, partial)
         self.assertEqual([], manifest_objects(landed))
@@ -109,6 +112,43 @@ class PublishTest(unittest.TestCase):
         result = replace(checked(landed), selection_sha256="0" * 64)
         with self.assertRaisesRegex(PublishRefused, "selection"):
             publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_selection_that_differs_from_the_checked_one_in_any_field_publishes_nothing(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        for field, other in (
+            ("source_bucket", "another-publisher"),
+            ("checksum_list_key", f"{SOURCE_PREFIX}OTHER_SUMS.txt"),
+            ("measurement_period", "2020-01 to 2020-02"),
+            ("release", "2.0.0"),
+            ("source_prefix", "vitaldb/2.0.0/"),
+        ):
+            changed: dict[str, Any] = {field: other}
+            with self.subTest(field=field), self.assertRaisesRegex(PublishRefused, "not for this selection"):
+                publish_manifest(landed.store, replace(landed.selection, **changed), result)
+            self.assertEqual([], manifest_objects(landed))
+        self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
+
+    def test_a_result_that_did_not_pass_publishes_nothing_whatever_else_in_it_holds(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        for name, changed in (
+            ("a file count of zero", replace(result, file_count=0)),
+            ("a file count above the files", replace(result, file_count=len(result.files) + 1)),
+            ("a finding", replace(result, findings=(Finding("x", "missing"),), claimed_sha256=result.claimed_sha256)),
+        ):
+            with self.subTest(name), self.assertRaisesRegex(PublishRefused, "did not pass"):
+                publish_manifest(landed.store, landed.selection, changed)
+            self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_of_another_checksum_list_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        other = replace(result, list_sha256="1" * 64)
+        other = replace(other, claimed_sha256=other.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "pinned checksum list"):
+            publish_manifest(landed.store, landed.selection, other)
         self.assertEqual([], manifest_objects(landed))
 
     def test_a_result_file_edited_after_the_check_publishes_nothing(self) -> None:
