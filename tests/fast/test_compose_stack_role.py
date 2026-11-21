@@ -93,12 +93,13 @@ def service_list(*, tool_group: int) -> str:
 
 
 def step_order() -> list[str]:
-    """The steps of the role in the order they run: a task file by name, or a file of another role as ``role/file``."""
+    """The steps of the role in the order they run: a task file by name (with the services it starts), or a file of another role as ``role/file``."""
     tasks: Any = load_yaml((ROLE / "tasks" / "main.yml").read_text())
     steps: list[str] = []
     for task in tasks:
         if "ansible.builtin.include_tasks" in task:
-            steps.append(task["ansible.builtin.include_tasks"])
+            services = (task.get("vars") or {}).get("compose_stack_start_services")
+            steps.append(task["ansible.builtin.include_tasks"] + (f" {','.join(services) or 'all'}" if services is not None else ""))
         else:
             role = task["ansible.builtin.include_role"]
             steps.append(f"{role['name']}/{role['tasks_from']}")
@@ -106,7 +107,7 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_runs_each_slice_in_the_order_its_builder_gave(self) -> None:
+    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_then_starts_the_rest_and_makes_openbao_match_the_list(self) -> None:
         self.assertEqual(
             [
                 "place_files.yml",
@@ -114,9 +115,11 @@ class StepOrderTest(unittest.TestCase):
                 "render_environment.yml",
                 "passwords.yml",
                 "verify_secrets.yml",
-                "openbao/prepare.yml",
-                "start.yml",
+                "build_images.yml",
+                "start.yml postgres",
                 "provision.yml",
+                "openbao/prepare.yml",
+                "start.yml all",
                 "openbao/bootstrap.yml",
             ],
             step_order(),
