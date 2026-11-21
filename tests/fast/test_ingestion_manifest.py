@@ -141,6 +141,17 @@ class PublishTest(unittest.TestCase):
             self.assertEqual([], manifest_objects(landed))
         self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
 
+    def test_a_selection_whose_prefix_moved_into_its_paths_publishes_nothing_although_every_absolute_key_is_the_same(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        moved = replace(landed.selection, source_prefix="vitaldb/", files=tuple(f"1.0.0/{path}" for path in landed.selection.files))
+        self.assertEqual(landed.selection.source_keys, moved.source_keys)
+        self.assertEqual(landed.selection.keys_sha256, moved.keys_sha256)
+        with self.assertRaisesRegex(PublishRefused, "not for this selection"):
+            publish_manifest(landed.store, moved, result)
+        self.assertEqual([], manifest_objects(landed))
+        self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
+
     def test_a_result_that_did_not_pass_publishes_nothing_whatever_else_in_it_holds(self) -> None:
         landed = landed_set()
         result = checked(landed)
@@ -194,6 +205,22 @@ class PublishTest(unittest.TestCase):
         with self.assertRaisesRegex(PublishRefused, "clinical_data.csv: no longer present after the check"):
             publish_manifest(landed.store, landed.selection, result)
         self.assertEqual([], manifest_objects(landed))
+
+
+class RepeatedFieldTest(unittest.TestCase):
+    def test_a_stored_manifest_that_names_a_field_twice_is_refused_although_its_reference_matches(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        data = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        self.assertEqual(1, data.count(b'"status":"passed"'))
+        repeated = data.replace(b'"status":"passed"', b'"status":"failed","status":"passed"')
+        key = manifest_key(landed.selection.name, digest(repeated))
+        forged = ManifestRef(landed.store.bucket, key, landed.store.put_object(key, repeated).version_id, digest(repeated))
+        with self.assertRaisesRegex(ManifestError, "more than once"):
+            read_manifest(landed.store, forged)
+        with self.assertRaisesRegex(GateRefused, "more than once"):
+            verify_before_read(landed.store, forged)
+        self.assertEqual(len(SOURCE), len(read_manifest(landed.store, reference).entries))
 
 
 class WriteTest(unittest.TestCase):
