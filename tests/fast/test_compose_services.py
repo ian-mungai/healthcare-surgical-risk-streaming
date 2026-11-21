@@ -137,6 +137,36 @@ class HostNetworkExceptionTest(unittest.TestCase):
         self.assertIn("named volumes", service_problems("postgres", document)[0])
 
 
+PUBLISHED_PORT = re.compile(r"127\.0\.0\.1:\$\{[A-Z_]+:-(\d+)\}:\d+")
+
+
+def port_clashes(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Each default host port that more than one service publishes, with the services that publish it."""
+    publishers: dict[int, list[str]] = {}
+    for name, document in documents.items():
+        for entry in document["services"][name].get("ports") or []:
+            if match := PUBLISHED_PORT.fullmatch(str(entry)):
+                publishers.setdefault(int(match[1]), []).append(name)
+    return [f"port {port}: {', '.join(names)}" for port, names in sorted(publishers.items()) if len(names) > 1]
+
+
+class PublishedPortTest(unittest.TestCase):
+    """Two services that publish the same default host port cannot both start on one host."""
+
+    def documents(self) -> dict[str, dict[str, Any]]:
+        return {path.stem: copy.deepcopy(load(path)) for path in sorted(SERVICES.glob("*.yml"))}
+
+    def test_no_two_services_publish_the_same_default_host_port(self) -> None:
+        documents = self.documents()
+        self.assertGreaterEqual(sum(1 for document in documents.values() if (next(iter(document["services"].values())).get("ports"))), 6)
+        self.assertEqual([], port_clashes(documents))
+
+    def test_a_planted_second_service_on_a_published_port_is_named_with_both_services(self) -> None:
+        documents = self.documents()
+        documents["loki"]["services"]["loki"]["ports"] = ["127.0.0.1:${LOKI_HOST_PORT:-5432}:3100"]
+        self.assertEqual(["port 5432: loki, postgres"], port_clashes(documents))
+
+
 class CollectorMountTest(unittest.TestCase):
     """Alloy reads the container runtimes' sockets and the kernel's folders from the host, read-only, and nothing else of the host."""
 

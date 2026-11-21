@@ -19,7 +19,7 @@ services:
     volumes:
       - dagster_storage:/opt/dagster/instance/storage
     ports:
-      - 127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000
+      - 127.0.0.1:${DAGSTER_WEBSERVER_HOST_PORT:-3001}:3000
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/server_info', timeout=5).read()"]
       interval: 10s
