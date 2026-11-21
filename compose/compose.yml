@@ -1,0 +1,4 @@
+# The root file only names the project and lists one file for each service. A service is added by a new file in services/ and one line here.
+name: surgical_risk
+include:
+  - services/postgres.yml
