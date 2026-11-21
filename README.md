@@ -37,6 +37,19 @@ make teardown-plan         # save the destroy plan and record what may be delete
 make host-destroy CONFIRM=<code>  # destroy only after every guard passes
 ```
 
+## Service groups
+
+Each service belongs to the group that `compose/limits.yml` gives it. The always-on group (`supporting`) starts with the stack. Every other group is a Compose profile
+of the same name and starts when a job or an operator asks for it, after the admission check. Airbyte's workloads in k3s are scaled through the Kubernetes API.
+A group that does not fit the available memory waits and then fails with the check's four figures.
+
+```sh
+make group-up GROUP=<name>     # admit and start the group, and wait until its services are healthy
+make group-down GROUP=<name>   # stop the group's services and leave every other service running
+```
+
+The commands read the compose folder from `STACK_COMPOSE_DIRECTORY` (default: this repository's `compose`). `.env.example` lists the other variables they read.
+
 ## Licence
 
 The code is under the MIT licence in `LICENSE`.

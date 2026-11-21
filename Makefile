@@ -1,6 +1,6 @@
 PYTHON := .venv/bin/python
 
-.PHONY: setup lock lock-orchestration check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy
+.PHONY: setup lock lock-orchestration check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -57,3 +57,11 @@ teardown-plan:
 
 host-destroy:
 	$(PYTHON) -m scripts.infra.teardown destroy --confirm "$(CONFIRM)"
+
+group-up:
+	$(if $(GROUP),,$(error name the group: make group-up GROUP=<name>))
+	$(PYTHON) -m scripts.stack.groups up $(GROUP)
+
+group-down:
+	$(if $(GROUP),,$(error name the group: make group-down GROUP=<name>))
+	$(PYTHON) -m scripts.stack.groups down $(GROUP)
