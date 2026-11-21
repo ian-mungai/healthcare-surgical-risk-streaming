@@ -1,0 +1,6 @@
+# Everything is excluded first, so the environment file and the run records never enter the build context. The image copies only what is named here.
+*
+!spark
+!scripts/__init__.py
+!scripts/stack/__init__.py
+!scripts/stack/nessie.py

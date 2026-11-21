@@ -1,0 +1,44 @@
+# The image of every Spark job: Python 3.14, Java 21, Spark 4.1.4 on Scala 2.13, Iceberg's Spark runtime (it holds the native Nessie catalog) and
+# Iceberg's AWS bundle (the S3 file system). Every download is checked against its SHA-256 at build, and a job fetches nothing when it starts.
+# Build: docker build --platform linux/amd64 --file spark/Dockerfile --tag surgical_risk_spark:4.1.4 .
+# SPARK_MIRROR names another host for the same Spark file. The checksum still decides whether the build accepts it.
+ARG PYTHON_IMAGE=python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+ARG JRE_IMAGE=eclipse-temurin:21.0.13_9-jre-noble@sha256:b4f9d2a0bc273417cf5219b7b832bbf0493ed500b7b57d5001d9f83374659060
+ARG SPARK_VERSION=4.1.4
+ARG SCALA_VERSION=2.13
+ARG ICEBERG_VERSION=1.12.0
+ARG SPARK_MIRROR=https://archive.apache.org/dist/spark
+ARG SPARK_SHA256=e9430aa52bd947cc0d3f1299afe5089dcd262166cd202ba6aa77095b8541642b
+ARG ICEBERG_RUNTIME_SHA256=3123c3798af642dd537230923548e013ef41cc28b6626e5225808cf5670a0f82
+ARG ICEBERG_AWS_BUNDLE_SHA256=dd7e49ffa4ac9b215bed846581991259e3aec9bb2fa08d6cec029c46cd66d957
+
+FROM --platform=linux/amd64 ${JRE_IMAGE} AS jre
+
+FROM --platform=linux/amd64 ${PYTHON_IMAGE} AS distribution
+ARG SPARK_VERSION
+ARG SPARK_MIRROR
+ARG SPARK_SHA256
+ADD --checksum=sha256:${SPARK_SHA256} ${SPARK_MIRROR}/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz /tmp/spark.tgz
+RUN mkdir /opt/spark && tar --extract --gzip --file /tmp/spark.tgz --directory /opt/spark --strip-components=1 && rm -rf /opt/spark/examples /opt/spark/R /opt/spark/data
+
+FROM --platform=linux/amd64 ${PYTHON_IMAGE}
+ARG SPARK_VERSION
+ARG SCALA_VERSION
+ARG ICEBERG_VERSION
+ARG ICEBERG_RUNTIME_SHA256
+ARG ICEBERG_AWS_BUNDLE_SHA256
+COPY --from=jre /opt/java/openjdk /opt/java/openjdk
+COPY --from=distribution /opt/spark /opt/spark
+ADD --checksum=sha256:${ICEBERG_RUNTIME_SHA256} https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_${SCALA_VERSION}/${ICEBERG_VERSION}/iceberg-spark-runtime-4.1_${SCALA_VERSION}-${ICEBERG_VERSION}.jar /opt/spark/jars/
+ADD --checksum=sha256:${ICEBERG_AWS_BUNDLE_SHA256} https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar /opt/spark/jars/
+ENV JAVA_HOME=/opt/java/openjdk SPARK_HOME=/opt/spark PYSPARK_PYTHON=python3 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV PATH=/opt/java/openjdk/bin:/opt/spark/bin:${PATH} PYTHONPATH=/opt/jobs:/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
+RUN groupadd --gid 10100 spark && useradd --uid 10100 --gid 10100 --no-create-home --home-dir /tmp --shell /usr/sbin/nologin spark \
+    && mkdir /scratch /warehouse && chown 10100:10100 /scratch /warehouse && chmod 0755 /opt/spark/jars/*.jar
+COPY spark /opt/jobs/spark
+COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
+COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
+COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
+WORKDIR /opt/jobs
+USER 10100:10100
+ENTRYPOINT ["python", "-m"]
