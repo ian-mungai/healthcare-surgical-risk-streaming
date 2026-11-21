@@ -11,7 +11,7 @@ import unittest
 from dataclasses import replace
 from typing import Any
 
-from scripts.ingestion.check import CheckResult, Finding, canonical
+from scripts.ingestion.check import CheckedFile, CheckResult, Finding, canonical
 from scripts.ingestion.gate import GateRefused, verify_before_read
 from scripts.ingestion.manifest import (
     MANIFEST_PREFIX,
@@ -23,7 +23,7 @@ from scripts.ingestion.manifest import (
     publish_manifest,
     read_manifest,
 )
-from scripts.ingestion.store import StoreError
+from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
 
 
@@ -238,6 +238,37 @@ class NullVersionTest(unittest.TestCase):
             read_manifest(landed.store, reference)
         with self.assertRaisesRegex(GateRefused, "null version"):
             verify_before_read(landed.store, reference)
+
+    def test_a_result_that_binds_a_null_version_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        landed.store.versioned = False
+        landed.store.history.clear()
+        for path, data in SOURCE.items():
+            landed.land(path, data)
+        landed.store.versioned = True
+        files = tuple(
+            CheckedFile(landed.store.bucket, version.key, version.version_id, digest(SOURCE[path]), SOURCE_PREFIX + path, version.size, "1.0.0", "t")
+            for path, version in landed.versions.items()
+        )
+        self.assertEqual({"null"}, {file.version_id for file in files})
+        result = CheckResult(landed.selection.name, landed.selection.selection_sha256, landed.selection.checksum_list_sha256, len(files), files, ())
+        result = replace(result, claimed_sha256=result.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "null version"):
+            publish_manifest(landed.store, landed.selection, result)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_write_that_returns_a_null_version_publishes_no_reference(self) -> None:
+        landed = landed_set()
+
+        def null_create(key: str, data: bytes) -> ObjectVersion:
+            landed.store.versioned = False
+            version = landed.store.put_object(key, data)
+            landed.store.versioned = True
+            return version
+
+        landed.store.create_object = null_create  # type: ignore[method-assign]
+        with self.assertRaisesRegex(PublishRefused, "null version"):
+            publish_manifest(landed.store, landed.selection, checked(landed))
 
     def test_control_the_same_manifest_written_with_versioning_on_is_read(self) -> None:
         landed = landed_set()

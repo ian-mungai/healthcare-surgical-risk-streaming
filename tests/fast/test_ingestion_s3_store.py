@@ -29,6 +29,7 @@ class StubAws:
         self.write_nothing = False
         self.omit_length = False
         self.truncate_file = False
+        self.raw_reply: Any = None
 
     def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
         self.calls.append(arguments)
@@ -46,6 +47,8 @@ class StubAws:
         self.targets.append(Path(arguments[-1]))
         if not self.write_nothing:
             Path(arguments[-1]).write_bytes(piece[:-1] if self.truncate_file else piece)
+        if self.raw_reply is not None:
+            return self.raw_reply
         reply: dict[str, Any] = {"VersionId": self.reply_version or options["--version-id"]}
         if not self.omit_length:
             reply["ContentLength"] = len(piece)
@@ -130,6 +133,37 @@ class ListingTest(unittest.TestCase):
         S3Store(aws, "example-bucket").list_versions("landing/a")
         self.assertIn("--prefix", aws.calls[0])
 
+    def test_a_listing_that_is_not_in_the_documented_form_is_refused_with_a_fixed_message(self) -> None:
+        entry = VERSIONS["Versions"][1]
+        without_size = {name: value for name, value in entry.items() if name != "Size"}
+        listings: list[Any] = [
+            [],
+            {"Versions": 5},
+            {"Versions": [5]},
+            {"Versions": [without_size]},
+            {"Versions": [{**entry, "Size": "5"}]},
+            {"Versions": [{**entry, "Size": True}]},
+            {"Versions": [{**entry, "IsLatest": "true"}]},
+            {"Versions": [{**entry, "LastModified": "private-value"}]},
+            {"Versions": [{**entry, "Key": 5}]},
+            {"Versions": [{**entry, "VersionId": None}]},
+            {"DeleteMarkers": [{"Key": "private-value", "VersionId": "v3", "IsLatest": True}]},
+        ]
+        for number, listing in enumerate(listings):
+            with self.subTest(listing=number), self.assertRaisesRegex(StoreError, "documented form") as raised:
+                S3Store(StubAws(listing, {}), "example-bucket").list_versions("landing/")
+            self.assertNotIn("private-value", str(raised.exception))
+
+    def test_a_reply_that_is_not_an_object_is_refused(self) -> None:
+        aws = StubAws(VERSIONS, {("landing/a", "v2"): b"12345"})
+        aws.put_reply = ["private-value"]  # type: ignore[assignment]
+        with self.assertRaisesRegex(StoreError, "documented form"):
+            S3Store(aws, "example-bucket").create_object("manifests/x", b"{}")
+        aws.raw_reply = ["private-value"]
+        store = S3Store(aws, "example-bucket")
+        with self.assertRaisesRegex(StoreError, "documented form"):
+            store.get_version_bytes(store.list_versions("landing/")[1], 100)
+
 
 class WriteTest(unittest.TestCase):
     def test_a_write_that_returns_no_version_id_is_refused_because_versioning_is_off(self) -> None:
@@ -181,6 +215,15 @@ class ConditionalWriteTest(unittest.TestCase):
             with self.subTest(other=other), self.assertRaisesRegex(StoreError, "other content"):
                 S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
             self.assertEqual([other], aws.stored(self.KEY))
+
+    def test_a_key_whose_current_version_is_a_null_version_is_refused_although_it_holds_the_same_bytes(self) -> None:
+        for null in ("null", ""):
+            aws = WriteStubAws()
+            aws.versions[self.KEY] = [(null, b"{}")]
+            with self.subTest(null=null), self.assertRaisesRegex(StoreError, "null version"):
+                S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
+            self.assertEqual([b"{}"], aws.stored(self.KEY))
+            self.assertEqual([], [call for call in aws.calls if call[1] == "get-object"])
 
     def test_a_bucket_whose_versioning_is_not_enabled_is_refused_before_anything_is_written(self) -> None:
         for status in (None, "Suspended"):

@@ -20,7 +20,7 @@ from typing import Any
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX, PairingRecord
 from scripts.ingestion.selection import Selection
-from scripts.ingestion.store import ObjectStore, ObjectVersion
+from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion
 
 LIST_LINE = re.compile(r"([0-9a-f]{64}) ([A-Za-z0-9._/-]+)")
 MISSING = "missing"
@@ -213,7 +213,7 @@ def run_check(
             findings.append(Finding(label, DUPLICATE_PAIRING, f"{len(records)} pairing records, for example from a second sync"))
         elif version is None or version.is_delete_marker:
             findings.append(Finding(label, LANDED_OBJECT_MISSING, "the landed key has no current object"))
-        elif version.version_id in ("", "null"):
+        elif version.version_id in NULL_VERSION_IDS:
             findings.append(Finding(label, NULL_VERSION_ID))
         elif version.size != records[0].size:
             findings.append(Finding(label, PAIRING_SIZE_DIFFERS, f"record {records[0].size} bytes, landed object {version.size} bytes"))

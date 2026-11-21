@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
-from scripts.ingestion.store import ObjectVersion, StoreError
+from scripts.ingestion.store import NULL_VERSION_IDS, ObjectVersion, StoreError
 
 BLOCK_SIZE = 8
 
@@ -66,6 +66,8 @@ class MemoryStore:
             raise StoreError(f"{key}: versioning is not enabled on the bucket, so nothing was written")
         current = [item for item in self.history.get(key, []) if item.version.is_latest and not item.version.is_delete_marker]
         if current:
+            if current[0].version.version_id in NULL_VERSION_IDS:
+                raise StoreError(f"{key}: the key holds a null version, which versioning does not keep apart from the next write")
             if current[0].data != data:
                 raise StoreError(f"{key}: the key already holds other content")
             return current[0].version

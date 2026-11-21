@@ -20,6 +20,7 @@ LIST_TIMEOUT_SECONDS = 300
 READ_TIMEOUT_SECONDS = 600
 WRITE_TIMEOUT_SECONDS = 120
 NO_SUCH_VERSION = ("NoSuchVersion", "NoSuchKey", "(404)")
+NULL_VERSION_IDS = ("", "null")
 
 
 class StoreError(RuntimeError):
@@ -68,10 +69,30 @@ def utc_text(stamp: str) -> str:
     return datetime.fromisoformat(stamp).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def listed_version(entry: dict[str, Any], *, marker: bool) -> ObjectVersion:
-    return ObjectVersion(
-        entry["Key"], entry["VersionId"], 0 if marker else int(entry["Size"]), utc_text(entry["LastModified"]), bool(entry["IsLatest"]), marker
-    )
+def reply_object(reply: Any, call: str) -> dict[str, Any]:
+    """The reply of an AWS call as the JSON object it documents. Raise ``StoreError``, which names the call only, for any other reply."""
+    if type(reply) is not dict:
+        raise StoreError(f"the reply of {call} is not in the documented form")
+    return reply
+
+
+def listed_version(entry: Any, *, marker: bool) -> ObjectVersion:
+    """One entry of a version listing. Raise ``StoreError`` unless it has its key, version ID, latest flag and time, and a size unless it is a marker."""
+    try:
+        key, version_id, latest, stamp = entry["Key"], entry["VersionId"], entry["IsLatest"], utc_text(entry["LastModified"])
+        size = 0 if marker else entry["Size"]
+    except KeyError, TypeError, ValueError:
+        raise StoreError("an entry of the version listing is not in the documented form") from None
+    if type(key) is not str or type(version_id) is not str or type(latest) is not bool or type(size) is not int:
+        raise StoreError("an entry of the version listing is not in the documented form")
+    return ObjectVersion(key, version_id, size, stamp, latest, marker)
+
+
+def listed_entries(listing: dict[str, Any], name: str) -> list[Any]:
+    entries = listing.get(name) or []
+    if type(entries) is not list:
+        raise StoreError("the version listing is not in the documented form")
+    return entries
 
 
 class S3Store:
@@ -82,9 +103,10 @@ class S3Store:
         self.block_bytes = block_bytes
 
     def list_versions(self, prefix: str) -> list[ObjectVersion]:
-        listing = self.aws.call("s3api", "list-object-versions", "--bucket", self.bucket, "--prefix", prefix, timeout=LIST_TIMEOUT_SECONDS)
-        found = [listed_version(entry, marker=False) for entry in listing.get("Versions") or []]
-        found += [listed_version(entry, marker=True) for entry in listing.get("DeleteMarkers") or []]
+        reply = self.aws.call("s3api", "list-object-versions", "--bucket", self.bucket, "--prefix", prefix, timeout=LIST_TIMEOUT_SECONDS)
+        listing = reply_object(reply, "list-object-versions")
+        found = [listed_version(entry, marker=False) for entry in listed_entries(listing, "Versions")]
+        found += [listed_version(entry, marker=True) for entry in listed_entries(listing, "DeleteMarkers")]
         return sorted(found, key=lambda item: (item.key, item.last_modified, not item.is_latest))
 
     def fetch(self, version: ObjectVersion, target: Path, byte_range: tuple[int, int] | None) -> int:
@@ -95,7 +117,7 @@ class S3Store:
         reply = self.aws.call(*arguments, str(target), missing=NO_SUCH_VERSION, timeout=READ_TIMEOUT_SECONDS)
         if reply is None:
             raise StoreError(f"{version.key}: the version does not exist")
-        if reply.get("VersionId") != version.version_id:
+        if reply_object(reply, "get-object").get("VersionId") != version.version_id:
             raise StoreError(f"{version.key}: the reply was for another version than the one asked for")
         length = reply.get("ContentLength")
         if type(length) is not int:
@@ -126,7 +148,9 @@ class S3Store:
             return target.read_bytes()
 
     def create_object(self, key: str, data: bytes) -> ObjectVersion:
-        status = (self.aws.call("s3api", "get-bucket-versioning", "--bucket", self.bucket, timeout=LIST_TIMEOUT_SECONDS) or {}).get("Status")
+        status = reply_object(
+            self.aws.call("s3api", "get-bucket-versioning", "--bucket", self.bucket, timeout=LIST_TIMEOUT_SECONDS), "get-bucket-versioning"
+        ).get("Status")
         if status != "Enabled":
             raise StoreError(f"{key}: versioning is not enabled on the bucket, so nothing was written")
         with tempfile.TemporaryDirectory(prefix="ingestion_put_") as scratch:
@@ -150,8 +174,8 @@ class S3Store:
             )
         if reply is None:
             return self.existing_version(key, data)
-        version_id = reply.get("VersionId")
-        if not version_id or version_id == "null":
+        version_id = reply_object(reply, "put-object").get("VersionId")
+        if type(version_id) is not str or version_id in NULL_VERSION_IDS:
             raise StoreError(f"{key}: the write returned no version ID; versioning is not enabled on the bucket")
         for version in self.list_versions(key):
             if version.key == key and version.version_id == version_id:
@@ -163,6 +187,8 @@ class S3Store:
         current = [version for version in self.list_versions(key) if version.key == key and version.is_latest and not version.is_delete_marker]
         if not current:
             raise StoreError(f"{key}: the write was refused because the key exists, but no current version is listed")
+        if current[0].version_id in NULL_VERSION_IDS:
+            raise StoreError(f"{key}: the key holds a null version, which versioning does not keep apart from the next write")
         if current[0].size != len(data) or self.get_version_bytes(current[0], len(data)) != data:
             raise StoreError(f"{key}: the key already holds other content")
         return current[0]

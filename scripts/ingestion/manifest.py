@@ -23,12 +23,11 @@ from scripts.ingestion.check import CheckedFile, CheckResult, canonical, checked
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.selection import Selection
-from scripts.ingestion.store import ObjectStore, ObjectVersion, StoreError
+from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, StoreError
 
 MANIFEST_PREFIX = "manifests/"
 MANIFEST_FORMAT = "landing_manifest_1"
 MANIFEST_LIMIT_BYTES = 32 * 1024 * 1024
-NULL_VERSION_IDS = ("", "null")
 
 
 class PublishRefused(RuntimeError):
@@ -88,6 +87,8 @@ def refusal(result: CheckResult, selection: Selection, store: ObjectStore) -> st
         return "the check result does not hold every selected file once"
     if result.claimed_sha256 != result.result_sha256:
         return "the check result was edited after the check"
+    if any(file.version_id in NULL_VERSION_IDS for file in result.files):
+        return "the check result binds a null version ID, which versioning does not keep apart from the next write"
     current = current_versions(store.list_versions(LANDING_PREFIX))
     changed = []
     for file in result.files:
@@ -133,6 +134,7 @@ def publish_manifest(store: ObjectStore, selection: Selection, result: CheckResu
             raise PublishRefused("the manifest key holds other content than its name says")
         return ManifestRef(store.bucket, key, existing[0].version_id, sha256)
     version = store.create_object(key, data)
+    refuse_null_version(version)
     if sha256_of(store.get_version_bytes(version, MANIFEST_LIMIT_BYTES)) != sha256:
         raise PublishRefused("the published manifest reads back with other content")
     return ManifestRef(store.bucket, key, version.version_id, sha256)
