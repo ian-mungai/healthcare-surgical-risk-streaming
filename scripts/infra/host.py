@@ -50,7 +50,7 @@ SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
-PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101}
+PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103}
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
 
