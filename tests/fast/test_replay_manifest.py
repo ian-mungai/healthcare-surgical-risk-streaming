@@ -120,6 +120,14 @@ class Derivation(unittest.TestCase):
     def test_a_manifest_written_and_read_back_is_the_same_manifest(self) -> None:
         self.assertEqual(self.manifest, Manifest.from_json(self.manifest.to_json()))
 
+    def test_an_event_due_on_the_end_of_the_window_is_not_in_the_window_and_one_due_at_its_start_is(self) -> None:
+        manifest = build_manifest(boundary_schedule(rooms=1, window_us=10 * SECOND, cases=(9001,)), boundary_recordings())
+        by_id = {key: event for key, event in manifest.events.items()}
+        on_end = next(event for key, event in by_id.items() if key.endswith("|Test/NIBP|10000000|0"))
+        on_start = next(event for key, event in by_id.items() if key.endswith("|Test/HR|0|0"))
+        self.assertEqual((10 * SECOND, False), (on_end.due_us, on_end.in_window))
+        self.assertEqual((0, True), (on_start.due_us, on_start.in_window))
+
     def test_the_manifest_is_the_same_on_every_derivation(self) -> None:
         self.assertEqual(self.manifest, build_manifest(self.frozen, boundary_recordings()))
 
