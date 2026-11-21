@@ -1,6 +1,7 @@
 // Entries to merge into the Tailscale network's policy file. Replace <OWNER_LOGIN> with the owner's Tailscale login.
 // The host carries tag:surgical-host. The deploy runner carries tag:surgical-deploy.
-// Only the owner and the deploy runner reach the host, and only on SSH. No other device has a rule to it.
+// The owner and the deploy runner reach the host on SSH. The owner also reaches the web gateway's ports, 9440 to 9459, one port for each
+// web interface. The deploy runner does not. No other device has a rule to the host.
 // A network-wide allow rule (src "*", dst "*") defeats these entries: remove it or narrow it first.
 {
   "tagOwners": {
@@ -12,6 +13,11 @@
       "src": ["<OWNER_LOGIN>", "tag:surgical-deploy"],
       "dst": ["tag:surgical-host"],
       "ip": ["tcp:22"],
+    },
+    {
+      "src": ["<OWNER_LOGIN>"],
+      "dst": ["tag:surgical-host"],
+      "ip": ["tcp:9440-9459"],
     },
   ],
   "ssh": [
