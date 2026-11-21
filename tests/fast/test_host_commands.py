@@ -678,6 +678,18 @@ class WorkloadVariablesTest(unittest.TestCase):
         expected = [{"name": "reader", "role_arn": "arn:reader", "gid": 20000}, {"name": "writer", "role_arn": "arn:writer", "gid": 20001}]
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": expected}, workload_variables(state, "us-west-2"))
 
+    def test_project_workloads_keep_their_own_group_ids_whatever_other_workloads_exist(self) -> None:
+        names = ("airbyte", "ingestion_check")
+        for others in ((), ("reader", "writer"), ("aaa_first", "dagster", "zzz_last")):
+            with self.subTest(others=others):
+                roles = {name: f"arn:{name}" for name in (*names, *others)}
+                workloads = workload_variables({"values": {"outputs": {"workload_role_arns": {"value": roles}}}}, "us-west-2")["workload_access_workloads"]
+                by_name = {workload["name"]: workload["gid"] for workload in workloads}
+                self.assertEqual({"airbyte": 20100, "ingestion_check": 20101}, {name: by_name[name] for name in names})
+                self.assertEqual(len(by_name), len(set(by_name.values())))
+                self.assertEqual(sorted(others), [name for name, _ in sorted(by_name.items(), key=lambda item: item[1]) if name in others])
+                self.assertTrue(all(by_name[name] < 20100 for name in others))
+
     def test_state_without_workloads_gives_an_empty_list(self) -> None:
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": []}, workload_variables({"values": {}}, "us-west-2"))
 

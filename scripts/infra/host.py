@@ -50,6 +50,7 @@ SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
+PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101}
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
 
@@ -256,9 +257,15 @@ def require_instance(found: str, expected: str, host_name: str) -> None:
 
 
 def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
-    """The Ansible variables for workload access: the region and each workload role, with a group ID fixed by name order."""
+    """The Ansible variables for workload access: the region and each workload role.
+
+    A project workload keeps its own fixed group ID, so a pod's group setting never depends on which other workloads exist.
+    Any other workload gets one by name order.
+    """
     roles = state.get("values", {}).get("outputs", {}).get("workload_role_arns", {}).get("value", {})
-    workloads = [{"name": name, "role_arn": roles[name], "gid": WORKLOAD_GID_BASE + index} for index, name in enumerate(sorted(roles))]
+    others = sorted(name for name in roles if name not in PROJECT_WORKLOAD_GIDS)
+    group_ids = PROJECT_WORKLOAD_GIDS | {name: WORKLOAD_GID_BASE + index for index, name in enumerate(others)}
+    workloads = [{"name": name, "role_arn": roles[name], "gid": group_ids[name]} for name in sorted(roles)]
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
