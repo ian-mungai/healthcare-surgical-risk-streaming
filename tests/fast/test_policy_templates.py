@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import unittest
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from typing import Any
 
 from infra.iam.scripts.manage_policies import LiveState, Names, Step, differences, plan_steps, policy_arn, unchanged_differences
@@ -120,11 +121,41 @@ class BucketScopeTest(unittest.TestCase):
         self.assertEqual(expected, resources(document, "ProjectDataObjects"))
         self.assertEqual([], [item for item in resources(document, *[statement["Sid"] for statement in document["Statement"]]) if "/state/" in item])
 
+    def test_airbyte_and_manifest_objects_have_their_own_statements_with_the_fewest_actions(self) -> None:
+        document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        statements = {statement["Sid"]: statement for statement in document["Statement"]}
+        for sid, prefix, actions in (
+            ("ProjectAirbyteObjects", "airbyte", ["s3:AbortMultipartUpload", "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]),
+            ("ProjectManifestObjects", "manifests", ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]),
+        ):
+            with self.subTest(statement=sid):
+                self.assertEqual("Allow", statements[sid]["Effect"])
+                self.assertEqual(actions, sorted(as_list(statements[sid]["Action"])))
+                self.assertEqual(sorted(f"{bucket}/{prefix}/*" for bucket in self.BUCKETS), resources(document, sid))
+                self.assertNotIn("Condition", statements[sid])
+
+    def test_no_allow_statement_of_the_boundary_reaches_the_state_prefix(self) -> None:
+        document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        keys = [f"{bucket}/state/terraform.tfstate" for bucket in ("arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-01020304abcdef")]
+        reaching = []
+        for statement in document["Statement"]:
+            if statement["Effect"] != "Allow" or not any(action.startswith("s3:") for action in as_list(statement["Action"])):
+                continue
+            patterns = as_list(statement["Resource"])
+            listed = as_list(statement.get("Condition", {}).get("StringLike", {}).get("s3:prefix", []))
+            if any(
+                fnmatchcase(key, pattern) for key in keys for pattern in patterns if pattern.count("/") > 0 and not pattern.startswith("arn:aws:s3:::physionet")
+            ):
+                reaching.append(statement["Sid"])
+            if any(fnmatchcase(prefix, pattern) for prefix in ("state/", "state/terraform.tfstate") for pattern in listed):
+                reaching.append(statement["Sid"])
+        self.assertEqual([], reaching)
+
 
 class RoleListingTest(unittest.TestCase):
     BUCKETS = ["arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-*"]
     LISTING = ["s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:ListBucketVersions"]
-    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*"]}}
+    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*", "airbyte/*", "manifests/*"]}}
 
     def boundary(self) -> dict[str, dict[str, Any]]:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]

@@ -26,7 +26,9 @@
         "StringLike": {
           "s3:prefix": [
             "landing/*",
-            "warehouse/*"
+            "warehouse/*",
+            "airbyte/*",
+            "manifests/*"
           ]
         }
       }
@@ -48,6 +50,33 @@
         "arn:aws:s3:::${S3_BUCKET}/warehouse/*",
         "arn:aws:s3:::${S3_BUCKET}-test-*/landing/*",
         "arn:aws:s3:::${S3_BUCKET}-test-*/warehouse/*"
+      ]
+    },
+    {
+      "Sid": "ProjectAirbyteObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:AbortMultipartUpload",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}/airbyte/*",
+        "arn:aws:s3:::${S3_BUCKET}-test-*/airbyte/*"
+      ]
+    },
+    {
+      "Sid": "ProjectManifestObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}/manifests/*",
+        "arn:aws:s3:::${S3_BUCKET}-test-*/manifests/*"
       ]
     },
     {
