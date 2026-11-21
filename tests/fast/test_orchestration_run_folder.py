@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 from orchestration.surgical_risk.run_folder import (
     LEFT_RUNNING_TAG,
@@ -77,10 +78,19 @@ class RecordFieldsTest(unittest.TestCase):
         self.assertEqual([False], [item["passed"] for item in record["assertions"]])
         self.assertEqual("RuntimeError: ping was asked to fail", record["outputs"]["error"])
 
+    def test_a_failed_run_with_no_failed_step_is_still_a_fail(self) -> None:
+        for steps in ((), (StepFacts("ping", "SUCCESS", START + 1, START + 2),)):
+            with self.subTest(steps=len(steps)):
+                record = build_record(
+                    facts(status="FAILURE", steps=steps, error="the code location was lost"), commit="0123abc", environment=ENVIRONMENT, recorded=NOW
+                )
+                self.assertEqual("fail", record["outcome"])
+
     def test_a_check_that_failed_makes_the_run_record_a_failed_assertion_even_when_the_run_succeeded(self) -> None:
         record = build_record(facts(checks=(CheckFacts("result_has_rows", "lineage_result", False),)), commit="0123abc", environment=ENVIRONMENT, recorded=NOW)
         names = {item["name"]: item["passed"] for item in record["assertions"]}
         self.assertEqual({"step ping": True, "check result_has_rows on lineage_result": False}, names)
+        self.assertEqual("fail", record["outcome"])
 
     def test_a_run_that_never_started_has_no_timings_and_a_canceled_run_is_not_a_pass(self) -> None:
         record = build_record(facts(status="CANCELED", started=None, ended=None, steps=()), commit="0123abc", environment=ENVIRONMENT, recorded=NOW)
@@ -167,6 +177,12 @@ class WriteTest(unittest.TestCase):
         later = build_record(never, commit="0123abc", environment=ENVIRONMENT, recorded=datetime(2026, 11, 21, 13, 0, 0, tzinfo=UTC))
         self.assertEqual(first, write_record(self.runs, later))
         self.assertEqual(1, len(list(self.runs.iterdir())))
+
+    def test_no_staging_folder_is_left_when_the_folder_cannot_be_put_in_place(self) -> None:
+        record = build_record(facts(), commit="0123abc", environment=ENVIRONMENT, recorded=NOW)
+        with mock.patch("orchestration.surgical_risk.run_folder.os.rename", side_effect=OSError("disk error")), self.assertRaises(OSError):
+            write_record(self.runs, record)
+        self.assertEqual([], list(self.runs.iterdir()))
 
     def test_no_partial_folder_is_left_when_the_record_cannot_be_written(self) -> None:
         record = build_record(facts(), commit="0123abc", environment=ENVIRONMENT, recorded=NOW)
