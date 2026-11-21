@@ -3,7 +3,7 @@ global:
   airbyteUrl: {{ airbyte_public_url | to_json }}
 {% endif %}
   database:
-    host: {{ airbyte_database_host | to_json }}
+    host: {{ airbyte_bridge_address | to_json }}
     port: {{ airbyte_database_port | int }}
     name: {{ airbyte_database_name | to_json }}
   workloads:

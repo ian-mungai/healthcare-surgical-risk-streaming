@@ -107,8 +107,12 @@ airbyte_kubeconfig: /etc/rancher/k3s/k3s.yaml
 airbyte_web_port: 8000
 airbyte_server_service_port: 8001
 airbyte_web_unit: /etc/systemd/system/airbyte-web.service
-# The address that the pods use to reach the shared PostgreSQL server: the k3s bridge's address on the host. It needs the private route that the lead decides.
-airbyte_database_host: 10.42.0.1
+# The pods reach the shared PostgreSQL server at the k3s bridge's address on the host, which the role reads from k3s's flannel file when it deploys. A socket on
+# that address forwards to the server's local address, where PostgreSQL's published port stays. The deadline is in seconds.
+airbyte_flannel_subnet_file: /run/flannel/subnet.env
+airbyte_bridge_deadline_seconds: 120
+airbyte_postgres_unit_directory: /etc/systemd/system
+airbyte_postgres_unit: airbyte-postgres
 airbyte_database_port: "{{ compose_stack_postgres_port }}"
 airbyte_database_name: airbyte
 airbyte_database_user: airbyte

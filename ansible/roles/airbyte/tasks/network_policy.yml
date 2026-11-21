@@ -1,0 +1,22 @@
+# Reads airbyte_namespace and airbyte_directory. k3s enforces network policies by default (its embedded kube-router policy controller), and the k3s role does not turn it off.
+- name: Read the namespaces of the cluster
+  ansible.builtin.command:
+    argv: [k3s, kubectl, get, namespaces, --output, "jsonpath={.items[*].metadata.name}"]
+  register: airbyte_namespace_listing
+  changed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Work out the namespaces that are not Airbyte's
+  ansible.builtin.set_fact:
+    airbyte_other_namespaces: "{{ airbyte_namespace_listing.stdout.split() | difference([airbyte_namespace]) }}"
+
+- name: Write the network policies
+  ansible.builtin.include_tasks: network_policy_files.yml
+
+- name: Apply the network policies
+  ansible.builtin.command:
+    argv: [k3s, kubectl, apply, --filename, "{{ airbyte_directory }}/network_policies.yaml"]
+  register: airbyte_network_policies
+  changed_when: "'created' in airbyte_network_policies.stdout or 'configured' in airbyte_network_policies.stdout"
+  timeout: 60

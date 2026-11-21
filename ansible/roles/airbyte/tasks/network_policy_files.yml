@@ -1,0 +1,9 @@
+# Reads airbyte_directory, airbyte_owner, airbyte_group, airbyte_namespace, airbyte_bridge_address, airbyte_database_port and airbyte_other_namespaces. The first policy
+# keeps Airbyte's pods to the bridge address on the database port. Every other namespace is refused that address, so no pod outside Airbyte's namespace has a path to it.
+- name: Write the network policies
+  ansible.builtin.template:
+    src: network_policies.yaml.j2
+    dest: "{{ airbyte_directory }}/network_policies.yaml"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"

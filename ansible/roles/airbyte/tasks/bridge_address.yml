@@ -1,0 +1,24 @@
+# Reads airbyte_flannel_subnet_file and airbyte_bridge_deadline_seconds and sets airbyte_bridge_address. When k3s starts, its flannel writes the file with the node's
+# first pod address as FLANNEL_SUBNET. That address is the bridge that every pod's traffic to the host arrives on. The wait ends at its deadline and names the file.
+- name: Read the bridge address that k3s gave the node
+  block:
+    - name: Wait for flannel's subnet file to name the node's subnet
+      ansible.builtin.slurp:
+        src: "{{ airbyte_flannel_subnet_file }}"
+      register: airbyte_flannel_subnet
+      check_mode: false
+      retries: "{{ [(airbyte_bridge_deadline_seconds | int / 2) | int, 1] | max }}"
+      delay: 2
+      until: >-
+        airbyte_flannel_subnet.content is defined and
+        (airbyte_flannel_subnet.content | b64decode) is search('(?m)^FLANNEL_SUBNET=[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$')
+
+    - name: Take the bridge address from the subnet
+      ansible.builtin.set_fact:
+        airbyte_bridge_address: "{{ (airbyte_flannel_subnet.content | b64decode) | regex_search('(?m)^FLANNEL_SUBNET=([0-9]{1,3}(?:\\.[0-9]{1,3}){3})/[0-9]{1,2}$', '\\1') | first }}"
+  rescue:
+    - name: Stop with the file that did not name the subnet
+      ansible.builtin.fail:
+        msg: >-
+          The file {{ airbyte_flannel_subnet_file }} did not hold a FLANNEL_SUBNET line within {{ airbyte_bridge_deadline_seconds }} seconds. k3s writes it when its
+          flannel starts, so the pods' route to PostgreSQL cannot be set up before k3s is running.
