@@ -249,8 +249,9 @@ class RunningTest(unittest.TestCase):
         cluster = Cluster()
         cluster.fail["airbyte-server"] = 500
         kubernetes, _ = control(cluster)
-        with self.assertRaisesRegex(GroupError, "airbyte-server: HTTP 500"):
+        with self.assertRaisesRegex(GroupError, "airbyte-server: HTTP 500") as caught:
             kubernetes.running(GROUP)
+        self.assertNotIn(BODY_TEXT, str(caught.exception))
 
     def test_an_answer_with_a_wrong_type_is_an_error(self) -> None:
         cluster = Cluster()
