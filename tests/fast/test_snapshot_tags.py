@@ -481,7 +481,19 @@ class RecordFirstTest(unittest.TestCase):
         self.assertEqual([], nessie.calls)
 
     def test_a_record_that_cannot_be_read_or_is_not_a_record_of_this_run_refuses_before_any_write(self) -> None:
-        for text in ("not json", "[]", "{}", json.dumps({"hash": HASH_ONE}), json.dumps({"hash": HASH_ONE, "tag": "run-other", "run_id": "other"})):
+        by_one_field = [
+            json.dumps({"hash": HASH_ONE, "tag": f"run-{RUN_ID}", "run_id": "other"}),
+            json.dumps({"hash": HASH_ONE, "tag": "run-other", "run_id": RUN_ID}),
+            json.dumps({"hash": HASH_TWO, "tag": f"run-{RUN_ID}", "run_id": RUN_ID}),
+        ]
+        for text in (
+            "not json",
+            "[]",
+            "{}",
+            json.dumps({"hash": HASH_ONE}),
+            json.dumps({"hash": HASH_ONE, "tag": "run-other", "run_id": "other"}),
+            *by_one_field,
+        ):
             with self.subTest(text=text[:30]):
                 self.folder.mkdir(exist_ok=True)
                 (self.folder / "data_version.json").write_text(text)
