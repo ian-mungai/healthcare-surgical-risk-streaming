@@ -66,10 +66,10 @@ class FakeNessie(NessieClient):
         self.tables[(name, self.heads[name])] = dict(snapshots)
         return self.heads[name]
 
-    def add_main_commit(self, message: str) -> str:
+    def add_main_commit(self, message: str, tables: dict[str, int] | None = None) -> str:
         """A commit on main that is not a merge of this step, as another tool would write it."""
         self.heads["main"] = fake_hash("main", "other", message, str(len(self.commits)))
-        self.tables[("main", self.heads["main"])] = {}
+        self.tables[("main", self.heads["main"])] = dict(tables or {})
         self.commits.append((self.heads["main"], message))
         return self.heads["main"]
 
@@ -303,6 +303,22 @@ class MergeOnceTest(unittest.TestCase):
         self.assertTrue(outcome.merged)
         self.assertEqual([(BRANCH, case.branch_hash, "main")], case.nessie.merges)
         self.assertEqual(2, len(reads))
+
+    def test_a_merge_that_appears_in_the_log_after_the_early_look_is_found_again_just_before_the_merge_is_sent(self) -> None:
+        case, runner = Case(self), Runner()
+        reads: list[int] = []
+        added: list[str] = []
+
+        def another_tool_merges_it() -> None:
+            reads.append(1)
+            if len(reads) == 2:
+                added.append(case.nessie.add_main_commit(f"merged elsewhere\n\n{run.manifest_line(case.reference.sha256)}", SNAPSHOTS))
+
+        case.nessie.on_branch_read = another_tool_merges_it
+        outcome = case.go(runner)
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(outcome.merged)
+        self.assertEqual(added[0], case.saved()["merged_hash"])
 
     def test_a_lost_reply_is_found_in_the_log_of_main_so_the_retry_sends_no_second_merge(self) -> None:
         case, runner = Case(self), Runner()

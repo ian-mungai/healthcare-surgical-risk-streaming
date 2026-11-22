@@ -291,6 +291,18 @@ class ResultTest(unittest.TestCase):
         )
         self.assertEqual([11, 12, 13], [table["snapshot_id"] for table in document["tables"]])
 
+    def test_an_outcome_is_complete_only_with_every_required_check_and_a_result_only_with_every_table(self) -> None:
+        required = rules.REQUIRED_CHECKS["lab_data"]
+        passed = tuple(rules.Check(name, True, "ok") for name in required)
+        self.assertTrue(rules.TableOutcome("lab_data", passed).passed)
+        self.assertFalse(rules.TableOutcome("lab_data", passed[:-1]).passed)
+        self.assertFalse(rules.TableOutcome("lab_data", (*passed[:-1], rules.Check(required[-1], False, "rows_differ;only_file=1;only_table=0"))).passed)
+        self.assertFalse(rules.TableOutcome("lab_data", ()).passed)
+        every = tuple(rules.TableOutcome(name, tuple(rules.Check(check, True, "ok") for check in names)) for name, names in rules.REQUIRED_CHECKS.items())
+        self.assertTrue(rules.JobResult(every).passed)
+        self.assertFalse(rules.JobResult(every[:2]).passed)
+        self.assertFalse(rules.JobResult(every[::-1]).passed)
+
     def test_a_failed_check_fails_the_result_whatever_the_summary_flags_say(self) -> None:
         plan = the_plan()
         results = results_for(plan)
