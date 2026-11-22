@@ -31,7 +31,7 @@ from unittest import mock
 from scripts.ingestion.notice import Code, Notice, Subject, render
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.sample import candidates, publisher
-from scripts.sample.candidates import CANDIDATES_FILE, RELEASE_FILE, read_candidates, release_problems
+from scripts.sample.candidates import CANDIDATES_FILE, RELEASE_FILE, CandidateError, read_candidates, release_problems
 from scripts.sample.publisher import PublisherError
 
 TRACK_HEADER = "caseid,tname,tid\n"
@@ -148,6 +148,23 @@ class LongNumbers(unittest.TestCase):
                 with self.assertRaises(PublisherError) as caught:
                     getattr(publisher, parser)(path, *arguments)
                 self.assertIn(cause, str(caught.exception))
+
+    def test_a_number_that_int_reads_but_the_line_form_does_not_allow_is_refused_by_its_line(self) -> None:
+        tracked = CANDIDATES_FILE.read_text().splitlines()
+        for value in ("+12", " 12", "1_2", "\u0661\u0662"):
+            fields = tracked[1].split("\t")
+            fields[0] = value
+            with tempfile.TemporaryDirectory() as folder, self.subTest(candidate=value):
+                path = Path(folder) / "candidates.tsv"
+                path.write_text("\n".join([tracked[0], "\t".join(fields)]) + "\n")
+                with self.assertRaisesRegex(CandidateError, "line 2: not a candidate line"):
+                    read_candidates(path)
+        for value in ("+12", " 12", "1_2"):
+            with tempfile.TemporaryDirectory() as folder, self.subTest(clinical=value):
+                path = Path(folder) / "file"
+                path.write_text(f"caseid,subjectid,casestart,caseend\n{value},1,0,5\n")
+                with self.assertRaisesRegex(PublisherError, "clinical table line 2: a case, patient or time value is not an integer"):
+                    publisher.parse_clinical_table(path)
 
     def test_a_listing_size_over_the_conversion_limit_is_refused_as_a_listing_not_in_its_form(self) -> None:
         listing = json.dumps({"Contents": [{"Key": "vitaldb/1.0.0/vital_files/0001.vital", "Size": LONG_NUMBER}]})
