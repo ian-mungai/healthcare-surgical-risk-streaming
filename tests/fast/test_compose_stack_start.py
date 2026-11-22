@@ -456,7 +456,7 @@ class NestedSourcesTest(unittest.TestCase):
                 staged = self.staged(folder)
                 builds = [line for line in calls(stand_in) if line.startswith("build ")]
             self.assertNotEqual(0, code, output)
-            self.assertIn("plain relative path", output)
+            self.assertIn("is not a plain relative path inside the repository", output)
             self.assertEqual(([], []), (staged, builds))
 
     def test_a_source_that_does_not_exist_is_refused_by_name(self) -> None:
@@ -466,7 +466,7 @@ class NestedSourcesTest(unittest.TestCase):
             code, output = self.build(folder, stand_in, root, {**image, "sources": ["sample", "tests/fixtures/missing"]})
             staged = self.staged(folder)
         self.assertNotEqual(0, code, output)
-        self.assertIn("tests/fixtures/missing", output)
+        self.assertIn("the source tests/fixtures/missing is missing, is a symbolic link or holds a symbolic link", output)
         self.assertEqual([], staged)
 
     def test_a_source_that_is_a_symbolic_link_or_holds_one_is_refused_and_nothing_is_staged(self) -> None:
@@ -493,7 +493,7 @@ class NestedSourcesTest(unittest.TestCase):
                 staged = self.staged(folder)
                 builds = [line for line in calls(stand_in) if line.startswith("build ")]
             self.assertNotEqual(0, code, output)
-            self.assertIn("symbolic link", output)
+            self.assertIn("is missing, is a symbolic link or holds a symbolic link", output)
             self.assertEqual(([], []), (staged, builds))
 
     def test_a_staged_folder_without_links_passes_the_same_check(self) -> None:
