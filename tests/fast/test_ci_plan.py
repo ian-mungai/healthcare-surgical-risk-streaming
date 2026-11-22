@@ -480,16 +480,15 @@ class PushReuseTest(PlanRepository):
         super().setUp()
         self.passed(self.base)
         self.pull_head = self.commit({"tests/fast/test_new.py": "NEW = 1\n", "infra/main.tf": "# changed\n"})
-        self.merged = self.merge(self.pull_head)
+        self.merge(self.pull_head)
         self.pull_run(60)
 
-    def merge(self, head: str, number: int = 5) -> str:
-        """A squash merge of ``head`` onto the first commit, checked out as main, with its pull request and both trees known to the API."""
-        merged = self.git("commit-tree", self.tree(head), "-p", self.base, "-m", "feat: merge the pull request").stdout.strip()
-        self.git("checkout", "--quiet", "--detach", merged)
-        self.github.add_pull(merged, number, head)
-        self.github.trees |= {merged: self.tree(merged), head: self.tree(head)}
-        return merged
+    def merge(self, head: str, number: int = 5) -> None:
+        """A squash merge of ``head`` onto the first commit, checked out as main and kept as ``merged``, with its pull request and trees known to the API."""
+        self.merged = self.git("commit-tree", self.tree(head), "-p", self.base, "-m", "feat: merge the pull request").stdout.strip()
+        self.git("checkout", "--quiet", "--detach", self.merged)
+        self.github.add_pull(self.merged, number, head)
+        self.github.trees |= {self.merged: self.tree(self.merged), head: self.tree(head)}
 
     def pull_run(self, run_id: int, *, idle: tuple[str, ...] = (), skip: tuple[str, ...] = (), **fields: Any) -> list[str]:
         """A pull request run of the head with every required job passed: the plan, the hooks and each group, ``idle`` ones as not run."""
