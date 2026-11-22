@@ -16,10 +16,21 @@ from dataclasses import replace
 from typing import Any
 
 from features.leakage import FORBIDDEN_FIELDS, row_problems
-from features.model import ClinicalValue, FeatureRow, Reading, WaveformSecond, WaveformWindow, WindowInput
+from features.model import ClinicalValue, FeatureInputError, FeatureRow, Reading, WaveformSecond, WaveformWindow, WindowInput
 from features.registry import NUMERIC_TRACKS, WAVEFORM_STATUS, WAVEFORM_TRACKS, feature_specs, is_registered
 from features.row import build_row
-from tests.fast.features_support import ARTERIAL_MEAN, CUTOFF_US, HEART_RATE, SECOND, SERIES, alternating, arithmetic, numeric_window, waveform_window
+from tests.fast.features_support import (
+    ARTERIAL_MEAN,
+    CUTOFF_US,
+    HEART_RATE,
+    SECOND,
+    SERIES,
+    alternating,
+    arithmetic,
+    numeric_window,
+    series_window,
+    waveform_window,
+)
 
 # The draft feature list, written out independently of the registry.
 LIST_NUMERIC_TRACKS = {
@@ -167,7 +178,7 @@ class Row(unittest.TestCase):
             CUTOFF_US,
             {
                 ARTERIAL_MEAN: numeric_window(arithmetic(100.0, -0.05)),
-                SERIES: numeric_window(arithmetic(100.0, -0.05)),
+                SERIES: series_window(arithmetic(100.0, -0.05)),
                 HEART_RATE: numeric_window([60.0] * 890, cutoff_us=CUTOFF_US - 10 * SECOND),
             },
             {"SNUADC/ART": waveform_window(alternating)},
@@ -189,6 +200,32 @@ class Row(unittest.TestCase):
         self.assertEqual(12.1, row.values["preop_hb"])
         self.assertEqual(0, row.values["solar8000_etco2__valid_count"])
         self.assertEqual([], row_problems(row))
+
+    def test_a_track_in_the_map_of_another_input_kind_or_unknown_is_refused_with_its_name(self) -> None:
+        wave = waveform_window(alternating)
+        readings = numeric_window([80.0] * 5)
+        cases = (
+            ("SNUADC/ART", WindowInput(CUTOFF_US, {"SNUADC/ART": readings}, {}, {})),
+            (HEART_RATE, WindowInput(CUTOFF_US, {}, {HEART_RATE: wave}, {})),
+            (SERIES, WindowInput(CUTOFF_US, {}, {SERIES: wave}, {})),
+            ("Solar8000/NOT_A_TRACK", WindowInput(CUTOFF_US, {"Solar8000/NOT_A_TRACK": readings}, {}, {})),
+            ("SNUADC/NOT_A_TRACK", WindowInput(CUTOFF_US, {}, {"SNUADC/NOT_A_TRACK": wave}, {})),
+        )
+        for name, window in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(FeatureInputError, name):
+                build_row(window)
+
+    def test_a_cutoff_that_is_not_a_whole_number_of_microseconds_is_refused(self) -> None:
+        bad_cutoff: Any = CUTOFF_US + 0.9
+        with self.assertRaisesRegex(FeatureInputError, "cutoff"):
+            build_row(WindowInput(bad_cutoff, {}, {}, {}))
+
+    def test_the_row_types_are_floats_for_numbers_and_ints_for_counts(self) -> None:
+        row = build_row(WindowInput(CUTOFF_US, {HEART_RATE: [Reading(CUTOFF_US, 60, True)]}, {}, {"age": ClinicalValue(63, 0)}))
+        self.assertIsInstance(row.values["solar8000_hr__last"], float)
+        self.assertIsInstance(row.values["age"], float)
+        self.assertIsInstance(row.values["solar8000_hr__valid_count"], int)
+        self.assertIsInstance(row.values["snuadc_art__valid_seconds"], int)
 
     def test_a_track_the_registry_does_not_know_is_refused_in_the_row(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown track"):
@@ -227,6 +264,18 @@ class Leakage(unittest.TestCase):
         self.assertIsNotNone(with_future.latest_clinical_us)
         self.assertLessEqual(with_future.latest_reading_us or 0, with_future.cutoff_us)
         self.assertLessEqual(with_future.latest_clinical_us or 0, with_future.cutoff_us)
+
+    def test_a_block_that_starts_after_its_second_boundary_cannot_put_a_sample_after_the_cutoff(self) -> None:
+        # The reviewer's input: the newest second starts 990001 microseconds late, so its last sample would be 1 microsecond after the cutoff.
+        window = waveform_window(alternating)
+        late = WaveformSecond(window.seconds[-1].second, window.seconds[-1].samples, True, 990_001)
+        with self.assertRaisesRegex(FeatureInputError, "whole second"):
+            build_row(WindowInput(CUTOFF_US, {}, {"SNUADC/ART": WaveformWindow(window.sample_rate, (*window.seconds[:-1], late))}, {}))
+
+    def test_the_latest_reading_time_of_a_waveform_is_the_last_sample_used_and_is_below_the_cutoff(self) -> None:
+        row = build_row(WindowInput(CUTOFF_US, {}, {"SNUADC/ART": waveform_window(alternating)}, {}))
+        self.assertEqual((CUTOFF_US // SECOND - 1) * SECOND + 900_000, row.latest_reading_us)
+        self.assertEqual([], row_problems(row))
 
     def row(self, **changes: Any) -> FeatureRow:
         return replace(FeatureRow(CUTOFF_US, {"age": 63, "solar8000_hr__mean": 60.0}, CUTOFF_US, 0), **changes)

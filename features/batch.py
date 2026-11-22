@@ -34,29 +34,19 @@ def compute_rows(windows: Iterable[WindowInput], include_sensitivity: bool = Fal
 
 
 def parse_window(document: Mapping[str, Any]) -> WindowInput:
+    """The window of a JSON document, with no conversion: ``build_row`` checks every type, so a text is never taken for a flag and a float never for a time."""
     try:
         return WindowInput(
-            int(document["cutoff_us"]),
-            {
-                track: [Reading(int(time), float(value), bool(valid)) for time, value, valid in readings]
-                for track, readings in document.get("numeric", {}).items()
-            },
+            document["cutoff_us"],
+            {track: [Reading(time, value, valid) for time, value, valid in readings] for track, readings in document.get("numeric", {}).items()},
             {
                 track: WaveformWindow(
-                    float(body["sample_rate"]),
-                    tuple(
-                        WaveformSecond(
-                            int(second["second"]), [float(sample) for sample in second["samples"]], bool(second["valid"]), int(second.get("start_offset_us", 0))
-                        )
-                        for second in body["seconds"]
-                    ),
+                    body["sample_rate"],
+                    tuple(WaveformSecond(second["second"], second["samples"], second["valid"], second.get("start_offset_us", 0)) for second in body["seconds"]),
                 )
                 for track, body in document.get("waveforms", {}).items()
             },
-            {
-                field: ClinicalValue(item["value"], None if item["available_us"] is None else int(item["available_us"]))
-                for field, item in document.get("clinical", {}).items()
-            },
+            {field: ClinicalValue(item["value"], item["available_us"]) for field, item in document.get("clinical", {}).items()},
         )
     except (KeyError, TypeError, ValueError, AttributeError) as error:
         raise FeatureInputError(f"a window is not in the batch format: {error!r}") from error
@@ -72,17 +62,20 @@ def row_document(window_id: object, row: FeatureRow) -> dict[str, Any]:
     }
 
 
+def serialise(rows: Iterable[tuple[object, FeatureRow]]) -> str:
+    """The output text for rows with their window IDs: the one way a row is written, for every path."""
+    return json.dumps({"rows": [row_document(window_id, row) for window_id, row in rows]}, sort_keys=True, allow_nan=False) + "\n"
+
+
 def run(source: Path, target: Path) -> int:
     """Read the windows, write the rows. The target is replaced in one step, or not written at all."""
     documents = json.loads(source.read_text())["windows"]
     rows = compute_rows(parse_window(document) for document in documents)
-    text = json.dumps(
-        {"rows": [row_document(document.get("window_id"), row) for document, row in zip(documents, rows, strict=True)]}, sort_keys=True, allow_nan=False
-    )
+    text = serialise((document.get("window_id"), row) for document, row in zip(documents, rows, strict=True))
     handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
     try:
         with os.fdopen(handle, "w") as stream:
-            stream.write(text + "\n")
+            stream.write(text)
         os.replace(temporary, target)
     finally:
         Path(temporary).unlink(missing_ok=True)

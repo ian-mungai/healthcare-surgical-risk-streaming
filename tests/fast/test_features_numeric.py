@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from typing import Any
 
 from features.model import FeatureInputError, FeatureValue, Reading
 from features.numeric import numeric_group
@@ -115,6 +116,83 @@ class Window(unittest.TestCase):
         self.assertEqual(CUTOFF_US, numeric_group(TRACK, readings, cutoff).latest_us)
 
 
+class Edge(unittest.TestCase):
+    def test_the_first_microsecond_inside_the_window_is_used_and_the_one_before_it_is_not(self) -> None:
+        lower = CUTOFF_US - 900 * SECOND
+        self.assertEqual(1, values_of([Reading(lower + 1, 70.0, True)])[PREFIX + "valid_count"])
+        self.assertEqual(0, values_of([Reading(lower, 70.0, True)])[PREFIX + "valid_count"])
+        self.assertEqual(1, values_of([Reading(CUTOFF_US, 70.0, True)])[PREFIX + "valid_count"])
+        self.assertEqual(0, values_of([Reading(CUTOFF_US + 1, 70.0, True)])[PREFIX + "valid_count"])
+
+
+class Types(unittest.TestCase):
+    def test_every_computed_number_is_a_float_and_every_count_an_int_whatever_the_input_types(self) -> None:
+        result = values_of([Reading(CUTOFF_US - 2 * SECOND, 70, True), Reading(CUTOFF_US, 80, True)])
+        for key in ("last", "mean", "median", "min", "max", "std", "slope_per_min", "seconds_since_last"):
+            self.assertIsInstance(result[PREFIX + key], float, key)
+        self.assertIsInstance(result[PREFIX + "valid_count"], int)
+        self.assertNotIsInstance(result[PREFIX + "valid_count"], bool)
+
+    def test_a_flag_that_is_not_a_boolean_and_a_time_or_value_of_the_wrong_type_are_refused_with_the_track(self) -> None:
+        base = numeric_window([80.0] * 5)
+        bad_flag: Any = "false"
+        bad_time: Any = float(CUTOFF_US - 5 * SECOND) + 0.9
+        bad_value: Any = "80"
+        for bad, pattern in (
+            (Reading(CUTOFF_US - 7 * SECOND, 1.0, bad_flag), "valid flag"),
+            (Reading(bad_time, 1.0, True), "time"),
+            (Reading(CUTOFF_US - 7 * SECOND, bad_value, True), "value"),
+        ):
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(FeatureInputError, f"{TRACK}.*{pattern}"):
+                values_of([*base, bad])
+
+    def test_a_cutoff_that_is_not_a_whole_number_of_microseconds_is_refused(self) -> None:
+        bad_cutoff: Any = CUTOFF_US + 0.9
+        with self.assertRaisesRegex(FeatureInputError, "cutoff"):
+            numeric_group(TRACK, numeric_window([80.0] * 5), bad_cutoff)
+
+
+class Range(unittest.TestCase):
+    def test_a_flat_window_has_a_standard_deviation_of_exactly_zero(self) -> None:
+        for level in (0.1, 1 / 3, 1e10 + 0.3, -7.7, 1e-300, 1e308):
+            with self.subTest(level=level):
+                result = values_of(numeric_window([level] * 900))
+                self.assertEqual(0.0, result[PREFIX + "std"])
+                self.assertEqual(0.0, result[PREFIX + "slope_per_min"])
+
+    def test_a_flat_window_has_its_value_as_the_mean_exactly(self) -> None:
+        for level in (0.1, 0.7, 98.6, 63.3):
+            with self.subTest(level=level):
+                uneven = [Reading(CUTOFF_US - 100 * SECOND, level, True), Reading(CUTOFF_US - 37 * SECOND, level, True), Reading(CUTOFF_US, level, True)]
+                for readings in (numeric_window([level] * 3), uneven):
+                    result = values_of(readings)
+                    self.assertEqual(level, result[PREFIX + "mean"])
+                    self.assertEqual(0.0, result[PREFIX + "std"])
+                    self.assertEqual(0.0, result[PREFIX + "slope_per_min"])
+
+    def test_values_of_1e308_do_not_overflow_the_mean_or_the_median(self) -> None:
+        for values in ([1e308, 1e308], [1.7e308, 1.6e308], [1.7e308, 1.6e308, 1.65e308, 1.65e308]):
+            with self.subTest(values=values):
+                result = values_of(spaced_window(values, 250))  # far enough apart that the slope fits a float
+                self.assertTrue(math.isclose(math.fsum(v / len(values) for v in values), get(result, "mean"), rel_tol=1e-12))
+        self.assertTrue(math.isclose(1.65e308, get(values_of(spaced_window([1.7e308, 1.6e308], 250)), "median"), rel_tol=1e-12))
+        self.assertTrue(math.isclose(1.7e308, get(values_of(numeric_window([1.7e308, 1.7e308, 1.7e308, 1.7e308])), "mean"), rel_tol=1e-12))
+
+    def test_values_of_1e200_do_not_overflow_the_standard_deviation(self) -> None:
+        result = values_of(numeric_window([1e200, -1e200] * 450))
+        self.assertAlmostEqual(0.0, get(result, "mean"), places=9)
+        self.assertTrue(math.isclose(1e200 * math.sqrt(900 / 899), get(result, "std"), rel_tol=1e-12))
+
+    def test_a_slope_that_a_float_cannot_hold_is_refused_with_its_name(self) -> None:
+        readings = [Reading(CUTOFF_US - 60 * SECOND, -1e308, True), Reading(CUTOFF_US, 1e308, True)]
+        with self.assertRaisesRegex(FeatureInputError, PREFIX + "slope_per_min"):
+            values_of(readings)
+
+    def test_a_slope_of_large_values_keeps_its_value(self) -> None:
+        readings = [Reading(CUTOFF_US - 120 * SECOND, 0.0, True), Reading(CUTOFF_US - 60 * SECOND, 1e308, True)]
+        self.assertTrue(math.isclose(1e308, get(values_of(readings), "slope_per_min"), rel_tol=1e-12))
+
+
 class Validity(unittest.TestCase):
     def test_an_invalid_reading_is_in_no_value_and_no_count(self) -> None:
         readings = [Reading(r.time_us, 80.0 if r.valid else 5000.0, r.valid) for r in numeric_window([0.0] * 900, valid=lambda index: index % 3 != 0)]
@@ -152,11 +230,12 @@ class Validity(unittest.TestCase):
             self.assertEqual(0, result[PREFIX + "valid_count"])
             self.assertEqual({None}, {value for name, value in result.items() if name != PREFIX + "valid_count"})
 
-    def test_a_valid_reading_that_is_not_a_number_is_refused(self) -> None:
-        readings = numeric_window([80.0] * 900)
-        readings[10] = Reading(readings[10].time_us, math.inf, True)
-        with self.assertRaises(FeatureInputError):
-            values_of(readings)
+    def test_a_valid_reading_that_is_not_a_finite_number_is_refused_with_its_track(self) -> None:
+        for bad in (math.inf, -math.inf, math.nan):
+            readings = numeric_window([80.0] * 900)
+            readings[10] = Reading(readings[10].time_us, bad, True)
+            with self.subTest(bad=bad), self.assertRaisesRegex(FeatureInputError, TRACK):
+                values_of(readings)
 
 
 class Determinism(unittest.TestCase):

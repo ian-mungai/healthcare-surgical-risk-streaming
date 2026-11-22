@@ -14,15 +14,14 @@ from __future__ import annotations
 import unittest
 
 from features.eligibility import Eligibility, warning_eligibility
-
 from features.model import Reading, WaveformSecond, WaveformWindow
 from features.registry import NUMERIC_OVER_10_PERCENT_INVALID, WAVEFORM_INVALID_SECOND
-from tests.fast.features_support import CUTOFF_US, SECOND, alternating, numeric_window, waveform_window
+from tests.fast.features_support import CUTOFF_US, SECOND, alternating, second_of, series_window, waveform_window
 
 
 def series(invalid: int, count: int = 900) -> list[Reading]:
     """A window of ``count`` seconds whose first ``invalid`` seconds are invalid."""
-    return numeric_window([80.0] * count, valid=lambda index: index >= invalid)
+    return series_window([80.0] * count, valid=lambda index: index >= invalid)
 
 
 def check(readings: list[Reading], window: WaveformWindow, cutoff_us: int = CUTOFF_US) -> Eligibility:
@@ -72,7 +71,7 @@ class Numeric(unittest.TestCase):
 
     def test_a_second_outside_the_window_changes_nothing(self) -> None:
         readings = series(90)
-        outside = [Reading(CUTOFF_US - 900 * SECOND, 80.0, True), Reading(CUTOFF_US + SECOND, 80.0, True), Reading(CUTOFF_US + 2 * SECOND, 80.0, False)]
+        outside = [Reading(CUTOFF_US - 901 * SECOND, 80.0, True), Reading(CUTOFF_US, 80.0, True), Reading(CUTOFF_US + 2 * SECOND, 80.0, False)]
         self.assertTrue(check(readings + outside, waveform_window(alternating)).eligible)
         self.assertFalse(check(series(91) + outside, waveform_window(alternating)).eligible)
 
@@ -84,6 +83,52 @@ class Numeric(unittest.TestCase):
     def test_the_reasons_are_the_plan_names(self) -> None:
         self.assertEqual("waveform_invalid_second", WAVEFORM_INVALID_SECOND)
         self.assertEqual("numeric_over_10_percent_invalid", NUMERIC_OVER_10_PERCENT_INVALID)
+
+
+class Cutoffs(unittest.TestCase):
+    """The windows are the newest complete seconds, so a cutoff a microsecond either side of a second boundary moves them as the definition says."""
+
+    K = 3600
+
+    def waveform(self, invalid_second: int) -> WaveformWindow:
+        seconds = tuple(second_of(index, [90.0 + index % 7] * 10, index != invalid_second) for index in range(self.K - 30, self.K + 6))
+        return WaveformWindow(10.0, seconds)
+
+    def series(self, invalid_from: int, invalid_to: int) -> list[Reading]:
+        return [Reading(second * SECOND, 80.0, not invalid_from <= second <= invalid_to) for second in range(self.K - 1000, self.K + 6)]
+
+    def test_the_waveform_limit_looks_at_the_20_newest_complete_seconds(self) -> None:
+        k = self.K
+        # The invalid second k - 1 is the newest complete second at cutoffs from k seconds on and is not complete before.
+        newest = self.waveform(k - 1)
+        # The invalid second k - 21 is the oldest of the window at k seconds minus one microsecond and is outside it from k seconds on.
+        oldest = self.waveform(k - 21)
+        flat = series_window([80.0] * 900, cutoff_us=k * SECOND)
+        for cutoff, newest_eligible, oldest_eligible in (
+            (k * SECOND - 1, True, False),
+            (k * SECOND, False, True),
+            (k * SECOND + 1, False, True),
+            (k * SECOND + 999_999, False, True),
+        ):
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(newest_eligible, warning_eligibility(cutoff, flat, newest).eligible)
+                self.assertEqual(oldest_eligible, warning_eligibility(cutoff, flat, oldest).eligible)
+
+    def test_the_series_limit_looks_at_the_900_newest_complete_seconds(self) -> None:
+        k = self.K
+        readings = self.series(k - 91, k - 1)  # 91 invalid seconds ending with second k - 1
+        window = self.waveform(-1)
+        for cutoff, eligible in (
+            (k * SECOND - 1, True),
+            (k * SECOND, False),
+            (k * SECOND + 1, False),
+            (k * SECOND + 999_999, False),
+            ((k + 1) * SECOND, False),
+        ):
+            with self.subTest(cutoff=cutoff):
+                result = warning_eligibility(cutoff, readings, window)
+                self.assertEqual(eligible, result.eligible)
+                self.assertEqual((), result.reasons) if eligible else self.assertEqual((NUMERIC_OVER_10_PERCENT_INVALID,), result.reasons)
 
 
 if __name__ == "__main__":

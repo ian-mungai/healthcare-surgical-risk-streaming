@@ -21,6 +21,13 @@ def numeric_window(values: Sequence[float], cutoff_us: int = CUTOFF_US, valid: C
     return [Reading(cutoff_us - (count - 1 - index) * SECOND, value, valid(index)) for index, value in enumerate(values)]
 
 
+def series_window(values: Sequence[float], cutoff_us: int = CUTOFF_US, valid: Callable[[int], bool] = lambda index: True) -> list[Reading]:
+    """A per-second series: one reading for each of the newest complete seconds, the last for the newest complete second of the cutoff."""
+    newest = cutoff_us // SECOND - 1
+    count = len(values)
+    return [Reading((newest - (count - 1 - index)) * SECOND, value, valid(index)) for index, value in enumerate(values)]
+
+
 def spaced_window(values: Sequence[float], step_seconds: int, cutoff_us: int = CUTOFF_US, valid: Callable[[int], bool] = lambda index: True) -> list[Reading]:
     """Readings every ``step_seconds``, the last at the cutoff, as a monitor reports them."""
     count = len(values)

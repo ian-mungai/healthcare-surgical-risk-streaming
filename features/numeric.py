@@ -6,35 +6,58 @@ import math
 from collections.abc import Sequence
 
 from features.model import SECOND, FeatureInputError, FeatureValue, GroupResult, NumericWindow, Reading
-from features.registry import NUMERIC_STATS, NUMERIC_TRACKS, NUMERIC_WINDOW_SECONDS, PER_SECOND, slug
+from features.registry import NUMERIC_STATS, NUMERIC_TRACKS, NUMERIC_WINDOW_SECONDS, PER_SECOND, complete_seconds, slug
+from features.validate import boolean, number, whole_microseconds
 
 
-def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, whole_seconds: bool) -> NumericWindow:
-    """The valid readings with ``cutoff - 15 minutes < time <= cutoff``, oldest first. A reading after the cutoff is never read.
+def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, per_second: bool) -> NumericWindow:
+    """The valid readings of the window, oldest first, with their values as floats. A reading after the cutoff is never read.
 
-    A per-second series (``whole_seconds``) holds each reading at a whole second. Two readings of one track at one time are refused for every track.
+    A source-time track has ``cutoff - 15 minutes < time <= cutoff``. The per-second series has the newest 900 complete seconds (``complete_seconds``), each
+    reading at a whole second. Two readings of one track at one time are refused, and so is a reading with a time, a flag or a value of the wrong type.
     """
-    lower = cutoff_us - NUMERIC_WINDOW_SECONDS * SECOND
-    inside = sorted((reading for reading in readings if lower < reading.time_us <= cutoff_us), key=lambda reading: reading.time_us)
+    whole_microseconds(cutoff_us, "the cutoff")
+    for reading in readings:
+        whole_microseconds(reading.time_us, f"{track}: a reading's time")
+        boolean(reading.valid, f"{track}: a reading's valid flag")
+        number(reading.value, f"{track}: a reading's value")
+    if per_second:
+        window = complete_seconds(cutoff_us, NUMERIC_WINDOW_SECONDS)
+        lower, upper = window[0] * SECOND, (window[-1] + 1) * SECOND
+        inside = [reading for reading in readings if lower <= reading.time_us < upper]
+    else:
+        lower = cutoff_us - NUMERIC_WINDOW_SECONDS * SECOND
+        inside = [reading for reading in readings if lower < reading.time_us <= cutoff_us]
+    inside.sort(key=lambda reading: reading.time_us)
     times = [reading.time_us for reading in inside]
     if len(set(times)) != len(times):
         raise FeatureInputError(f"{track}: the window holds more than one reading at one time")
     for reading in inside:
-        if whole_seconds and reading.time_us % SECOND:
+        if per_second and reading.time_us % SECOND:
             raise FeatureInputError(f"{track}: a reading of the per-second series is not at a whole second")
         if reading.valid and not math.isfinite(reading.value):
             raise FeatureInputError(f"{track}: a valid reading is not a finite number")
     valid = [reading for reading in inside if reading.valid]
-    return NumericWindow(cutoff_us, [reading.time_us for reading in valid], [reading.value for reading in valid])
+    return NumericWindow(cutoff_us, [reading.time_us for reading in valid], [float(reading.value) for reading in valid])
 
 
 def numeric_group(track: str, readings: Sequence[Reading], cutoff_us: int) -> GroupResult:
-    """The statistics of the track's input kind. One is missing only when it cannot be computed, and the valid count is always returned."""
+    """The statistics of the track's input kind. One is missing only when it cannot be computed, and the valid count is always returned.
+
+    Every count is an int and every other number a float, and a result that a float cannot hold is refused with its name.
+    """
     spec = NUMERIC_TRACKS.get(track)
     if spec is None:
         raise FeatureInputError(f"unknown track {track}")
     window = window_readings(track, readings, cutoff_us, spec.kind == PER_SECOND)
     values: dict[str, FeatureValue] = {}
     for stat in NUMERIC_STATS[spec.kind]:
-        values[f"{slug(track)}__{stat.key}"] = stat.compute(window) if window.values or not stat.needs_value else None
+        name = f"{slug(track)}__{stat.key}"
+        try:
+            value = stat.compute(window) if window.values or not stat.needs_value else None
+        except OverflowError as error:
+            raise FeatureInputError(f"{name}: the result is outside the range of a float") from error
+        if value is not None and not math.isfinite(value):
+            raise FeatureInputError(f"{name}: the result is outside the range of a float")
+        values[name] = value
     return GroupResult(values, window.times_us[-1] if window.times_us else None)

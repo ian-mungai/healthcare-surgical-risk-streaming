@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import math
 import unittest
+from collections.abc import Callable
+from typing import Any
 
 from features.model import FeatureInputError, FeatureValue, WaveformSecond, WaveformWindow
 from features.waveform import waveform_group
@@ -88,23 +90,28 @@ class OtherWaveforms(unittest.TestCase):
 
 
 class Window(unittest.TestCase):
-    def test_the_window_is_the_20_complete_seconds_that_end_at_the_cutoff(self) -> None:
+    def marker_window(self, first: int, last: int) -> WaveformWindow:
+        """The seconds ``first`` to ``last``, each holding ten samples equal to its index minus ``first``."""
+        return WaveformWindow(RATE_HZ, tuple(second_of(index, [float(index - first)] * 10) for index in range(first, last + 1)))
+
+    def test_the_window_is_the_20_newest_complete_seconds_at_each_cutoff_around_a_second_boundary(self) -> None:
+        k = 3600
+        window = self.marker_window(k - 30, k + 5)
+        cases = ((k * SECOND - 1, k - 2), (k * SECOND, k - 1), (k * SECOND + 1, k - 1), (k * SECOND + 999_999, k - 1), ((k + 1) * SECOND, k))
+        for cutoff, newest in cases:
+            with self.subTest(cutoff=cutoff):
+                group = waveform_group(ART, window, cutoff)
+                self.assertEqual(20, group.values["snuadc_art__valid_seconds"])
+                self.assertAlmostEqual(newest - 9.5 - (k - 30), get(group.values, "snuadc_art__mean"), places=9)
+                self.assertEqual(newest * SECOND + 900_000, group.latest_us)
+                self.assertLess(group.latest_us or 0, cutoff)
+
+    def test_a_second_outside_the_window_changes_nothing(self) -> None:
         indexes = window_seconds(20)
         outside = [second_of(indexes[0] - 1, [999.0] * 10), second_of(indexes[-1] + 1, [999.0] * 10), second_of(indexes[-1] + 5, [999.0] * 10)]
         window = waveform_window(alternating)
         padded = WaveformWindow(window.sample_rate, tuple(outside[:1]) + window.seconds + tuple(outside[1:]))
         self.assertEqual(values_of(ART, window), values_of(ART, padded))
-        self.assertEqual(CUTOFF_US, waveform_group(ART, padded, CUTOFF_US).latest_us)
-
-    def test_a_second_that_is_not_complete_at_the_cutoff_is_not_used(self) -> None:
-        cutoff = CUTOFF_US + 500_000
-        window = waveform_window(alternating)  # ends with the second that ends at CUTOFF_US
-        partial = second_of(CUTOFF_US // SECOND, [999.0] * 10)
-        padded = WaveformWindow(window.sample_rate, window.seconds + (partial,))
-        result = values_of(ART, padded, cutoff)
-        self.assertEqual(20, result["snuadc_art__valid_seconds"])
-        self.assertAlmostEqual(97.75, get(result, "snuadc_art__mean"), places=9)
-        self.assertEqual(CUTOFF_US, waveform_group(ART, padded, cutoff).latest_us)
 
     def test_the_first_second_of_the_window_is_used_and_the_one_before_it_is_not(self) -> None:
         indexes = window_seconds(21)
@@ -112,6 +119,69 @@ class Window(unittest.TestCase):
         result = values_of(ART, WaveformWindow(RATE_HZ, seconds))
         self.assertEqual(100.0, result["snuadc_art__mean"])
         self.assertEqual(20, result["snuadc_art__valid_seconds"])
+
+    def test_the_latest_reading_time_is_the_last_sample_of_the_newest_valid_second_and_never_the_cutoff(self) -> None:
+        group = waveform_group(ART, waveform_window(alternating, invalid=frozenset({19})), CUTOFF_US)
+        self.assertEqual((CUTOFF_US // SECOND - 2) * SECOND + 900_000, group.latest_us)
+        fast = WaveformWindow(500.0, tuple(second_of(index, [1.0, 2.0] * 250) for index in window_seconds(20)))
+        self.assertEqual((CUTOFF_US // SECOND - 1) * SECOND + 998_000, waveform_group(ART, fast, CUTOFF_US).latest_us)
+
+
+class Blocks(unittest.TestCase):
+    def window_with(self, position: int, block: WaveformSecond) -> WaveformWindow:
+        window = waveform_window(alternating)
+        seconds = list(window.seconds)
+        seconds[position] = block
+        return WaveformWindow(window.sample_rate, tuple(seconds))
+
+    def test_a_valid_second_that_does_not_start_on_a_whole_second_is_refused(self) -> None:
+        newest = window_seconds(20)[-1]
+        for offset in (1, 500_000, 990_001, 999_999, -1):
+            with self.subTest(offset=offset), self.assertRaisesRegex(FeatureInputError, "whole second"):
+                values_of(ART, self.window_with(19, WaveformSecond(newest, (1.0,) * 10, True, offset)))
+
+    def test_an_invalid_second_is_not_examined(self) -> None:
+        newest = window_seconds(20)[-1]
+        result = values_of(ART, self.window_with(19, WaveformSecond(newest, (1.0,) * 3, False, 990_001)))
+        self.assertEqual(19, result["snuadc_art__valid_seconds"])
+
+    def test_a_valid_second_whose_sample_count_is_not_the_rate_is_refused(self) -> None:
+        newest = window_seconds(20)[-1]
+        for count in (0, 9, 11, 20):
+            with self.subTest(count=count), self.assertRaisesRegex(FeatureInputError, "sample count"):
+                values_of(ART, self.window_with(19, WaveformSecond(newest, (1.0,) * count, True)))
+
+    def test_two_rates_in_one_window_are_refused(self) -> None:
+        window = waveform_window(alternating)
+        doubled = tuple(
+            WaveformSecond(second.second, tuple(second.samples) * 2, True) if position % 2 else second for position, second in enumerate(window.seconds)
+        )
+        with self.assertRaisesRegex(FeatureInputError, "sample count"):
+            values_of(ART, WaveformWindow(window.sample_rate, doubled))
+
+    def test_a_sample_rate_that_is_not_a_positive_whole_number_is_refused(self) -> None:
+        window = waveform_window(alternating)
+        for rate in (0.0, -10.0, 10.5, 0.5, math.inf, math.nan, True, "10"):
+            with self.subTest(rate=rate), self.assertRaisesRegex(FeatureInputError, "sample rate"):
+                values_of(ART, WaveformWindow(rate, window.seconds))  # type: ignore[arg-type]
+
+    def test_a_flag_that_is_not_a_boolean_and_an_index_that_is_not_an_integer_are_refused(self) -> None:
+        newest = window_seconds(20)[-1]
+        bad_flag: Any = "false"
+        with self.assertRaisesRegex(FeatureInputError, "valid flag"):
+            values_of(ART, self.window_with(19, WaveformSecond(newest, (1.0,) * 10, bad_flag)))
+        bad_index: Any = float(newest)
+        with self.assertRaisesRegex(FeatureInputError, "second index"):
+            values_of(ART, self.window_with(19, WaveformSecond(bad_index, (1.0,) * 10, True)))
+        bad_offset: Any = 0.0
+        with self.assertRaisesRegex(FeatureInputError, "offset"):
+            values_of(ART, self.window_with(19, WaveformSecond(newest, (1.0,) * 10, True, bad_offset)))
+
+    def test_a_valid_sample_that_is_not_a_finite_number_is_refused_with_its_track(self) -> None:
+        newest = window_seconds(20)[-1]
+        for bad in (math.nan, math.inf, "1.0", None):
+            with self.subTest(bad=bad), self.assertRaisesRegex(FeatureInputError, "SNUADC/ART"):
+                values_of(ART, self.window_with(19, WaveformSecond(newest, (1.0,) * 9 + (bad,), True)))  # type: ignore[arg-type]
 
 
 class Validity(unittest.TestCase):
@@ -127,10 +197,6 @@ class Validity(unittest.TestCase):
         window = waveform_window(alternating)
         shorter = WaveformWindow(window.sample_rate, window.seconds[:5] + window.seconds[6:])
         self.assertEqual(19, values_of(ART, shorter)["snuadc_art__valid_seconds"])
-
-    def test_a_gap_does_not_move_the_frequency(self) -> None:
-        window = waveform_window(sine(1.2, 90.0, 20.0), invalid=frozenset({3, 4, 11}))
-        self.assertAlmostEqual(1.2, get(values_of(ART, window), "snuadc_art__dominant_freq_hz"), places=9)
 
     def test_a_window_with_few_valid_seconds_still_returns_its_values(self) -> None:
         # Window seconds 11 to 19 are valid: 4 of pattern A (even positions) and 5 of pattern B.
@@ -160,6 +226,61 @@ class Validity(unittest.TestCase):
         self.assertIsNone(result["snuadc_art__mean"])
 
 
+def flat(level: float) -> Callable[[int], list[float]]:
+    return lambda position: [level] * 10
+
+
+def mixed(low: Callable[[int], list[float]], high: Callable[[int], list[float]], ratio: float) -> Callable[[int], list[float]]:
+    return lambda position: [a + ratio * b for a, b in zip(low(position), high(position), strict=True)]
+
+
+class Frequency(unittest.TestCase):
+    def test_one_invalid_second_makes_the_frequency_missing_and_leaves_the_other_values(self) -> None:
+        window = waveform_window(sine(1.2, 90.0, 20.0), invalid=frozenset({3}))
+        result = values_of(ART, window)
+        self.assertIsNone(result["snuadc_art__dominant_freq_hz"])
+        self.assertEqual(19, result["snuadc_art__valid_seconds"])
+        self.assertIsNotNone(result["snuadc_art__mean"])
+        self.assertAlmostEqual(1.2, get(values_of(ART, waveform_window(sine(1.2, 90.0, 20.0))), "snuadc_art__dominant_freq_hz"), places=9)
+
+    def test_a_flat_signal_has_a_standard_deviation_of_exactly_zero_and_no_frequency(self) -> None:
+        for level in (0.1, 1 / 3, 1e10 + 0.3, -7.7, 90.0, 1e-300, 1e308):
+            for track, prefix in ((ART, "snuadc_art__"), (ECG, "snuadc_ecg_ii__")):
+                with self.subTest(level=level, track=track):
+                    result = values_of(track, waveform_window(flat(level)))
+                    self.assertEqual(0.0, result[prefix + "std"])
+                    self.assertIsNone(result[prefix + "dominant_freq_hz"])
+
+    def test_two_frequencies_of_equal_power_give_the_lower_one_even_when_roundoff_favours_the_higher(self) -> None:
+        low, high = sine(1.0, 0.0, 10.0), sine(2.0, 0.0, 10.0)
+        for ratio in (1.0, 1 + 5e-13, 1 - 5e-13):
+            with self.subTest(ratio=ratio):
+                window = waveform_window(mixed(low, high, ratio))
+                self.assertAlmostEqual(1.0, get(values_of(ART, window), "snuadc_art__dominant_freq_hz"), places=9)
+
+    def test_a_frequency_with_clearly_more_power_wins_over_a_lower_one(self) -> None:
+        low, high = sine(1.0, 0.0, 10.0), sine(2.0, 0.0, 10.0)
+        for ratio in (1.001, 1 + 5e-7):
+            with self.subTest(ratio=ratio):
+                window = waveform_window(mixed(low, high, ratio))
+                self.assertAlmostEqual(2.0, get(values_of(ART, window), "snuadc_art__dominant_freq_hz"), places=9)
+
+
+class Range(unittest.TestCase):
+    def test_samples_of_1e200_do_not_overflow_the_standard_deviation(self) -> None:
+        result = values_of(ART, waveform_window(lambda position: [1e200, -1e200] * 5))
+        self.assertAlmostEqual(0.0, get(result, "snuadc_art__mean"), places=9)
+        self.assertTrue(math.isclose(1e200 * math.sqrt(200 / 199), get(result, "snuadc_art__std"), rel_tol=1e-12))
+
+    def test_samples_of_1e308_do_not_overflow_the_mean(self) -> None:
+        result = values_of(ART, waveform_window(lambda position: [1.7e308, 1.6e308] * 5))
+        self.assertTrue(math.isclose(1.65e308, get(result, "snuadc_art__mean"), rel_tol=1e-12))
+
+    def test_a_result_that_a_float_cannot_hold_is_refused_with_its_name(self) -> None:
+        with self.assertRaisesRegex(FeatureInputError, "snuadc_art__pulse_pressure_mean"):
+            values_of(ART, waveform_window(lambda position: [1e308, -1e308] * 5))
+
+
 class Determinism(unittest.TestCase):
     def test_the_order_of_the_seconds_does_not_change_one_bit(self) -> None:
         window = waveform_window(lambda position: [90.0 + 50.0 * math.sin(position * 10 + sample * 1.7) for sample in range(10)])
@@ -172,24 +293,15 @@ class Determinism(unittest.TestCase):
 
 
 class Refusals(unittest.TestCase):
+    def test_a_cutoff_that_is_not_a_whole_number_of_microseconds_is_refused(self) -> None:
+        bad_cutoff: Any = CUTOFF_US + 0.9
+        with self.assertRaisesRegex(FeatureInputError, "cutoff"):
+            values_of(ART, waveform_window(alternating), bad_cutoff)
+
     def test_two_seconds_with_one_index_are_refused(self) -> None:
         window = waveform_window(alternating)
         with self.assertRaisesRegex(FeatureInputError, "one second"):
             values_of(ART, WaveformWindow(window.sample_rate, window.seconds + (window.seconds[3],)))
-
-    def test_a_valid_second_with_no_sample_or_a_sample_that_is_not_a_number_is_refused(self) -> None:
-        window = waveform_window(alternating)
-        for bad in ((), (1.0, math.nan)):
-            with self.subTest(bad=bad):
-                seconds = (WaveformSecond(window.seconds[0].second, bad, True),) + window.seconds[1:]
-                with self.assertRaises(FeatureInputError):
-                    values_of(ART, WaveformWindow(window.sample_rate, seconds))
-
-    def test_a_sample_rate_that_is_not_positive_and_finite_is_refused(self) -> None:
-        window = waveform_window(alternating)
-        for rate in (0.0, -1.0, math.inf, math.nan):
-            with self.subTest(rate=rate), self.assertRaises(FeatureInputError):
-                values_of(ART, WaveformWindow(rate, window.seconds))
 
     def test_a_track_the_registry_does_not_know_is_refused(self) -> None:
         with self.assertRaisesRegex(FeatureInputError, "unknown track"):

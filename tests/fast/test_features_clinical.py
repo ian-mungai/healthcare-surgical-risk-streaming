@@ -11,10 +11,12 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import math
 import unittest
+from typing import Any
 
 from features.clinical import clinical_group
-from features.model import ClinicalValue
+from features.model import ClinicalValue, FeatureInputError
 
 CUTOFF = 1_000_000
 MAIN = ("age", "sex", "height", "weight", "bmi", "asa", "emop", "department", "optype")
@@ -48,6 +50,40 @@ class Availability(unittest.TestCase):
         group = clinical_group({}, CUTOFF, include_sensitivity=False)
         self.assertEqual(set(MAIN), set(group.values))
         self.assertEqual({None}, set(group.values.values()))
+
+
+class Types(unittest.TestCase):
+    def test_a_number_becomes_a_float_and_a_text_stays_a_text(self) -> None:
+        group = clinical_group(known(age=63, height=170.5, sex="F", preop_hb=12), CUTOFF, include_sensitivity=False)
+        for name in ("age", "height", "preop_hb"):
+            self.assertIsInstance(group.values[name], float, name)
+        self.assertEqual(63.0, group.values["age"])
+        self.assertEqual("F", group.values["sex"])
+
+    def test_a_value_that_is_not_a_finite_number_or_a_text_is_refused_with_its_field(self) -> None:
+        for field in ("age", "preop_hb", "approach"):
+            bad: Any
+            for bad in (math.nan, math.inf, -math.inf, True, [1.0], {"a": 1}):
+                with self.subTest(field=field, bad=bad), self.assertRaisesRegex(FeatureInputError, field):
+                    clinical_group({field: ClinicalValue(bad, 0)}, CUTOFF, include_sensitivity=True)
+
+    def test_a_value_after_the_cutoff_that_is_not_finite_is_refused_too(self) -> None:
+        with self.assertRaisesRegex(FeatureInputError, "age"):
+            clinical_group({"age": ClinicalValue(math.nan, CUTOFF + 1)}, CUTOFF, include_sensitivity=False)
+
+    def test_a_field_the_plan_does_not_use_is_not_examined(self) -> None:
+        group = clinical_group(known(age=63, opdur=math.nan, caseid=math.inf), CUTOFF, include_sensitivity=False)
+        self.assertEqual(63.0, group.values["age"])
+
+    def test_an_availability_time_that_is_not_a_whole_number_of_microseconds_is_refused_with_its_field(self) -> None:
+        for bad in (CUTOFF + 0.9, float(CUTOFF), True, "0", math.nan):
+            with self.subTest(bad=bad), self.assertRaisesRegex(FeatureInputError, "preop_hb"):
+                clinical_group({"preop_hb": ClinicalValue(12.1, bad)}, CUTOFF, include_sensitivity=False)  # type: ignore[arg-type]
+
+    def test_a_cutoff_that_is_not_a_whole_number_of_microseconds_is_refused(self) -> None:
+        bad_cutoff: Any = CUTOFF + 0.5
+        with self.assertRaisesRegex(FeatureInputError, "cutoff"):
+            clinical_group({}, bad_cutoff, include_sensitivity=False)
 
 
 class Fields(unittest.TestCase):

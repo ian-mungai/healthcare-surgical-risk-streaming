@@ -1,4 +1,7 @@
-"""The one entry point of the feature code: ``build_row``. The batch job and the streaming job both call it."""
+"""The one entry point of the feature code: ``build_row``. The batch job and the streaming job both call it, and it makes every row the same way.
+
+It checks every input, refuses a track in the wrong input map, and gives every number as a float and every count as an int.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +16,12 @@ EMPTY_WAVEFORM = WaveformWindow(1.0, ())
 
 def build_row(window: WindowInput, include_sensitivity: bool = False) -> FeatureRow:
     """The features of one window: every registry track has its group, present or not, so the columns never depend on the data."""
-    for track in (*window.numeric, *window.waveforms):
-        if track not in NUMERIC_TRACKS and track not in WAVEFORM_TRACKS:
-            raise FeatureInputError(f"unknown track {track}")
+    for track in window.numeric:
+        if track not in NUMERIC_TRACKS:
+            raise FeatureInputError(f"unknown track {track} in the numeric input")
+    for track in window.waveforms:
+        if track not in WAVEFORM_TRACKS:
+            raise FeatureInputError(f"unknown track {track} in the waveform input")
     values: dict[str, FeatureValue] = {}
     latest: list[int] = []
     for track in NUMERIC_TRACKS:

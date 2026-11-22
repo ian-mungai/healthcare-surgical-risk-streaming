@@ -8,6 +8,14 @@ A change to the frozen feature list is one edit here and its test in ``tests/fas
 
 A statistic is missing only when it cannot be computed. The only limits on the data are the sample eligibility limits of the analysis plan (``eligibility.py``).
 Every track name and unit is ``to_confirm`` until its status says ``confirmed`` with an evidence note.
+
+**Seconds and windows.** A second ``s`` is a block that covers ``[s, s + 1)`` seconds of case time and starts exactly at ``s * 1_000_000``
+microseconds. A waveform block holds exactly ``rate`` samples at ``i / rate`` seconds after its start, and the rate is a positive whole number. A reading of
+the per-second series is at the start of its second. A second is complete at a cutoff when ``(s + 1) * 1_000_000 <= cutoff``. The window of the waveform
+(20 seconds), of the per-second series (900 seconds) and of the sample eligibility limits is the newest ``n`` complete seconds, from ``complete_seconds``: no
+sample of the second that a fractional cutoff falls in is used. A source-time track keeps its published times: its window is
+``cutoff - 15 minutes < time <= cutoff``. The latest reading time of a waveform is the time of the last sample of its newest valid second,
+``s * 1_000_000 + round((rate - 1) * 1_000_000 / rate)``, and never the cutoff.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from dataclasses import dataclass
 from functools import cache
 
 from features import stats
-from features.model import MINUTE, SECOND, FeatureValue, NumericWindow, WaveformValid
+from features.model import MINUTE, SECOND, NumericWindow, WaveformValid
 
 SOURCE_TIME = "source_time"
 PER_SECOND = "per_second"
@@ -43,7 +51,7 @@ MISSING_FEWER_THAN_TWO = "missing when the window holds fewer than 2 valid readi
 MISSING_NO_SECOND = "missing when the window holds no valid second"
 MISSING_ONE_SECOND = "missing when the window holds fewer than 2 valid seconds"
 NEVER_MISSING = "never missing"
-SAMPLE_STD = "the sample standard deviation (n - 1)"
+SAMPLE_STD = "the sample standard deviation (n - 1), exactly 0 when all values are equal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +67,17 @@ ARTERIAL_WAVEFORM_STATUS = TrackStatus(True, "confirmed: the waveform of the fix
 ARTERIAL_MEAN_STATUS = TrackStatus(True, "confirmed in the review of the feature list on Nov 22 2026")
 SERIES_STATUS = TrackStatus(False, "to confirm against the Silver table when it is built")
 PROJECTION_NOTE = "to confirm against Jacquet-Lagrèze 2022 before the list is frozen"
+
+
+def complete_seconds(cutoff_us: int, count: int) -> range:
+    """The newest ``count`` complete seconds at ``cutoff_us``: the seconds ``s`` with ``(s + 1) * 1_000_000 <= cutoff_us``. The one definition of a window."""
+    newest = cutoff_us // SECOND - 1
+    return range(newest - count + 1, newest + 1)
+
+
+def last_sample_us(second: int, rate: int) -> int:
+    """The time of the last sample of the block ``second``, in microseconds, as the latest reading time that a waveform second reports."""
+    return second * SECOND + round((rate - 1) * SECOND / rate)
 
 
 def slug(track: str) -> str:
@@ -125,9 +144,10 @@ class NumericStat:
     unit: str
     missing: str
     definition: str
-    compute: Callable[[NumericWindow], FeatureValue]
+    compute: Callable[[NumericWindow], float | int | None]
     needs_value: bool = True
     note: str = ""
+    count: bool = False
 
 
 SOURCE_STATS: tuple[NumericStat, ...] = (
@@ -150,7 +170,7 @@ SOURCE_STATS: tuple[NumericStat, ...] = (
         "the least-squares slope of the valid readings on their actual times, per minute",
         window_slope_per_minute,
     ),
-    NumericStat("valid_count", "readings", NEVER_MISSING, "the number of valid readings in the window", lambda w: len(w.values), needs_value=False),
+    NumericStat("valid_count", "readings", NEVER_MISSING, "the number of valid readings in the window", lambda w: len(w.values), needs_value=False, count=True),
     NumericStat(
         "seconds_since_last",
         "seconds",
@@ -161,7 +181,7 @@ SOURCE_STATS: tuple[NumericStat, ...] = (
 )
 
 SERIES_STATS: tuple[NumericStat, ...] = (
-    NumericStat("valid_count", "seconds", NEVER_MISSING, "the number of valid seconds in the window", lambda w: len(w.values), needs_value=False),
+    NumericStat("valid_count", "seconds", NEVER_MISSING, "the number of valid seconds in the window", lambda w: len(w.values), needs_value=False, count=True),
     NumericStat(
         "coverage",
         "share of the window's 900 seconds",
@@ -210,8 +230,9 @@ class WaveformStat:
     unit: str
     missing: str
     definition: str
-    compute: Callable[[WaveformValid], FeatureValue]
+    compute: Callable[[WaveformValid], float | int | None]
     needs_value: bool = True
+    count: bool = False
 
 
 def amplitudes(valid: WaveformValid) -> list[float]:
@@ -223,18 +244,20 @@ def all_samples(valid: WaveformValid) -> list[float]:
 
 
 def dominant(valid: WaveformValid) -> float | None:
+    if len(valid.seconds) < WAVEFORM_WINDOW_SECONDS:
+        return None
     return stats.dominant_frequency(valid.seconds, valid.sample_rate, valid.first_second, WAVEFORM_WINDOW_SECONDS, BAND_LOW_HZ, BAND_HIGH_HZ)
 
 
 FREQUENCY = WaveformStat(
     "dominant_freq_hz",
     "Hz",
-    f"{MISSING_NO_SECOND}; missing when the signal is flat",
-    "the frequency from 0.5 to 3.5 Hz in steps of 0.05 Hz with the most power, from the valid samples at their true times; the lowest wins a tie",
+    f"{MISSING_NO_SECOND}; missing unless all 20 seconds of the window are valid; missing when the signal is flat",
+    "the lowest frequency from 0.5 to 3.5 Hz in steps of 0.05 Hz whose power is within a relative 1e-9 of the largest, from the samples at their block times",
     dominant,
 )
 VALID_SECONDS = WaveformStat(
-    "valid_seconds", "seconds", NEVER_MISSING, "the valid seconds in the 20-second window", lambda v: len(v.seconds), needs_value=False
+    "valid_seconds", "seconds", NEVER_MISSING, "the valid seconds in the 20-second window", lambda v: len(v.seconds), needs_value=False, count=True
 )
 WAVEFORM_COVERAGE = WaveformStat(
     "coverage",
@@ -249,7 +272,11 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
     "SNUADC/ART": (
         WaveformStat("mean", "mmHg", MISSING_NO_SECOND, "the mean of the valid samples", lambda v: stats.mean(all_samples(v))),
         WaveformStat(
-            "std", "mmHg", MISSING_NO_SECOND, "the sample standard deviation (n - 1) of the valid samples", lambda v: stats.sample_std(all_samples(v))
+            "std",
+            "mmHg",
+            MISSING_NO_SECOND,
+            "the sample standard deviation (n - 1) of the valid samples, exactly 0 when all are equal",
+            lambda v: stats.sample_std(all_samples(v)),
         ),
         WaveformStat(
             "pulse_pressure_mean",
@@ -263,7 +290,13 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
         WAVEFORM_COVERAGE,
     ),
     "SNUADC/ECG_II": (
-        WaveformStat("std", "mV", MISSING_NO_SECOND, "the sample standard deviation (n - 1) of the valid samples", lambda v: stats.sample_std(all_samples(v))),
+        WaveformStat(
+            "std",
+            "mV",
+            MISSING_NO_SECOND,
+            "the sample standard deviation (n - 1) of the valid samples, exactly 0 when all are equal",
+            lambda v: stats.sample_std(all_samples(v)),
+        ),
         FREQUENCY,
         VALID_SECONDS,
         WAVEFORM_COVERAGE,
@@ -280,7 +313,7 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
             "amplitude_std",
             "signal unit",
             MISSING_ONE_SECOND,
-            "the sample standard deviation (n - 1) of the valid seconds' amplitudes",
+            "the sample standard deviation (n - 1) of the valid seconds' amplitudes, exactly 0 when all are equal",
             lambda v: stats.sample_std(amplitudes(v)),
         ),
         FREQUENCY,

@@ -10,6 +10,8 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -19,15 +21,28 @@ from unittest import mock
 
 from features import batch
 from features.leakage import LeakageError
-from features.model import FeatureRow, WindowInput
+from features.model import ClinicalValue, FeatureRow, Reading, WindowInput
 from features.row import build_row
-from tests.fast.features_support import ARTERIAL_MEAN, CUTOFF_US, SECOND, SERIES, alternating, arithmetic, numeric_window, waveform_window
+from tests.fast.features_support import (
+    ARTERIAL_MEAN,
+    CUTOFF_US,
+    HEART_RATE,
+    SECOND,
+    SERIES,
+    alternating,
+    arithmetic,
+    numeric_window,
+    series_window,
+    waveform_window,
+)
 
 
 def window_document(window_id: str, future: bool = False) -> dict[str, Any]:
     readings = [[reading.time_us, reading.value, reading.valid] for reading in numeric_window(arithmetic(100.0, -0.05), valid=lambda index: index != 10)]
+    series = [[reading.time_us, reading.value, reading.valid] for reading in series_window(arithmetic(100.0, -0.05), valid=lambda index: index != 10)]
     if future:
         readings += [[CUTOFF_US + SECOND, 0.0, True]]
+        series += [[CUTOFF_US, 0.0, True], [CUTOFF_US + SECOND, 0.0, True]]
     wave = waveform_window(alternating)
     seconds = [{"second": second.second, "samples": list(second.samples), "valid": second.valid, "start_offset_us": 0} for second in wave.seconds]
     clinical: dict[str, Any] = {
@@ -40,7 +55,7 @@ def window_document(window_id: str, future: bool = False) -> dict[str, Any]:
     return {
         "window_id": window_id,
         "cutoff_us": CUTOFF_US,
-        "numeric": {ARTERIAL_MEAN: readings, SERIES: readings},
+        "numeric": {ARTERIAL_MEAN: readings, SERIES: series},
         "waveforms": {"SNUADC/ART": {"sample_rate": wave.sample_rate, "seconds": seconds}},
         "clinical": clinical,
     }
@@ -73,6 +88,71 @@ class Entry(unittest.TestCase):
         self.assertEqual(0, features["solar8000_hr__valid_count"])
         self.assertIsNone(features["asa"])
         self.assertNotIn("approach", features)
+
+    def test_the_batch_and_a_direct_call_give_the_same_bytes_whatever_the_number_types(self) -> None:
+        # The JSON holds whole numbers where the direct call holds floats, and the other way round.
+        direct = WindowInput(
+            CUTOFF_US,
+            {HEART_RATE: [Reading(CUTOFF_US - 2 * SECOND, 60.0, True), Reading(CUTOFF_US, 62, True)]},
+            {},
+            {"age": ClinicalValue(73.0, 0), "preop_hb": ClinicalValue(12, 0)},
+        )
+        document = {
+            "window_id": "w",
+            "cutoff_us": CUTOFF_US,
+            "numeric": {HEART_RATE: [[CUTOFF_US - 2 * SECOND, 60, True], [CUTOFF_US, 62.0, True]]},
+            "clinical": {"age": {"value": 73, "available_us": 0}, "preop_hb": {"value": 12.0, "available_us": 0}},
+        }
+        code, target = self.run_batch([document])
+        self.assertEqual(0, code)
+        expected = batch.serialise([("w", build_row(direct))])
+        self.assertEqual(expected, target.read_text())
+        self.assertIn('"age": 73.0', expected)
+        self.assertIn('"preop_hb": 12.0', expected)
+        self.assertIn('"solar8000_hr__valid_count": 2,', expected)
+
+    def test_the_parser_honours_the_valid_flags_of_readings_and_seconds(self) -> None:
+        document = window_document("w")
+        document["waveforms"]["SNUADC/ART"]["seconds"][4]["valid"] = False
+        document["numeric"][HEART_RATE] = [[CUTOFF_US - 2 * SECOND, 60.0, False], [CUTOFF_US - SECOND, 70.0, True]]
+        code, target = self.run_batch([document])
+        self.assertEqual(0, code)
+        features = json.loads(target.read_text())["rows"][0]["features"]
+        self.assertEqual(19, features["snuadc_art__valid_seconds"])
+        self.assertEqual(1, features["solar8000_hr__valid_count"])
+        self.assertEqual(70.0, features["solar8000_hr__last"])
+
+    def test_a_malformed_window_is_refused_with_a_message_and_no_output(self) -> None:
+        bad_cases: dict[str, Any] = {}
+        flag = window_document("w")
+        flag["numeric"][HEART_RATE] = [[CUTOFF_US, 70.0, "false"]]
+        bad_cases["valid flag"] = flag
+        wave_flag = window_document("w")
+        wave_flag["waveforms"]["SNUADC/ART"]["seconds"][4]["valid"] = "false"
+        bad_cases["valid flag "] = wave_flag
+        time = window_document("w")
+        time["numeric"][HEART_RATE] = [[CUTOFF_US + 0.9, 70.0, True]]
+        bad_cases["time"] = time
+        cutoff = window_document("w")
+        cutoff["cutoff_us"] = CUTOFF_US + 0.9
+        bad_cases["cutoff"] = cutoff
+        availability = window_document("w")
+        availability["clinical"]["preop_hb"] = {"value": 1.0, "available_us": CUTOFF_US + 0.9}
+        bad_cases["preop_hb"] = availability
+        wrong_map = window_document("w")
+        wrong_map["numeric"]["SNUADC/ART"] = []
+        bad_cases["SNUADC/ART"] = wrong_map
+        offset = window_document("w")
+        offset["waveforms"]["SNUADC/ART"]["seconds"][19]["start_offset_us"] = 990_001
+        bad_cases["whole second"] = offset
+        for pattern, document in bad_cases.items():
+            with self.subTest(pattern=pattern):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    code, target = self.run_batch([document])
+                self.assertEqual(2, code)
+                self.assertIn(pattern.strip(), stderr.getvalue())
+                self.assertFalse(target.exists())
 
     def test_the_rows_keep_the_order_of_the_windows_and_data_after_the_cutoff_changes_nothing(self) -> None:
         code, target = self.run_batch([window_document("a"), window_document("b", future=True)])

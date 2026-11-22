@@ -74,7 +74,7 @@ class NumericWindow:
 class WaveformValid:
     """The valid seconds of one waveform inside the window, oldest first, with the index of the window's first second."""
 
-    sample_rate: float
+    sample_rate: int
     first_second: int
     seconds: Sequence[WaveformSecond]
 
