@@ -15,6 +15,7 @@ Failure modes covered here, each with a planted case and a control:
 from __future__ import annotations
 
 import json
+import platform
 import re
 import unittest
 from typing import Any
@@ -487,6 +488,17 @@ class WorkflowContractTest(unittest.TestCase):
     def test_every_job_uses_the_runner_and_python_of_the_map(self) -> None:
         self.assertEqual(set(re.findall(r"runs-on: (\S+)", WORKFLOW_TEXT)), {CONFIG["runner"]})
         self.assertEqual(set(re.findall(r'python-version: "([^"]+)"', WORKFLOW_TEXT)), {CONFIG["python"]})
+
+    def test_python_is_one_patch_release_and_the_local_one(self) -> None:
+        self.assertRegex(CONFIG["python"], r"^\d+\.\d+\.\d+$", "a minor version resolves to the runner's newest patch release")
+        self.assertEqual(platform.python_version(), CONFIG["python"], "local checks run on the Python that the hosted jobs install")
+
+    def test_trivy_uses_the_checks_built_into_its_pinned_binary(self) -> None:
+        makefile = (ROOT / "Makefile").read_text()
+        trivy = [line for line in makefile.splitlines() if ".tools/bin/trivy" in line]
+        self.assertEqual(len(trivy), 1)
+        self.assertIn("--skip-check-update", trivy[0], "without it Trivy downloads the newest checks bundle of a rolling tag")
+        self.assertNotIn(".tools/trivy_cache ", trivy[0], "that cache can hold a bundle that an earlier run downloaded")
 
     def test_only_the_plan_job_may_read_the_actions(self) -> None:
         self.assertEqual(WORKFLOW_TEXT.count("actions: read"), 1)
