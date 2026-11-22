@@ -26,26 +26,29 @@ from scripts.process import TimeoutExpired
 from scripts.quality import ci_groups, ci_reuse
 from scripts.quality.repo_checks import git
 
-DOUBTS = (ci_groups.Unverified, ci_reuse.NoReuse, ci_reuse.ApiError, CalledProcessError, TimeoutExpired, KeyError, TypeError, ValueError)
+DOUBTS = (ci_groups.Unverified, ci_reuse.NoReuse, ci_reuse.ApiError, CalledProcessError, TimeoutExpired, OSError, SyntaxError, KeyError, TypeError, ValueError)
 NOT_RUN = ": not run"
 
 
-def checked_range(root: Path, event: str, start: str, environment: Mapping[str, str], api: ci_reuse.Api | None) -> tuple[list[str] | None, str]:
-    """The changed paths and the text of the range, or None and the reason that every group runs."""
+def checked_range(
+    root: Path, event: str, start: str, environment: Mapping[str, str], api: ci_reuse.Api | None
+) -> tuple[list[str] | None, dict[str, ci_groups.Inputs], str]:
+    """The changed paths, the derived inputs and the text of the range, or None, no inputs and the reason that every group runs."""
     run_commit = environment.get("GITHUB_SHA", "")
     config = ci_groups.load(root)
     try:
+        inputs = ci_groups.group_inputs(root, config)
         ci_groups.verify_range(root, event, start, run_commit)
         if api is None:
             raise ci_reuse.NoReuse("no GitHub API token was given, so the start commit's run cannot be read")
         ci_reuse.prove_start(api, ci_reuse.context_of(environment), start)
         changed = ci_groups.changed_paths(root, start, run_commit)
-        wide = ci_groups.widening(config, changed)
+        wide = ci_groups.widening(config, inputs, changed)
         if wide:
             raise ci_groups.Unverified(wide)
     except DOUBTS as reason:
-        return None, f"every group runs: {reason}"
-    return changed, f"{start[:12]}..{run_commit[:12]}: {len(changed)} changed paths"
+        return None, {}, f"every group runs: {reason}"
+    return changed, inputs, f"{start[:12]}..{run_commit[:12]}: {len(changed)} changed paths"
 
 
 def reusable(root: Path, environment: Mapping[str, str], api: ci_reuse.Api | None, runner: str) -> tuple[dict[str, str], str]:
@@ -85,11 +88,11 @@ def group_entry(config: dict[str, Any], name: str, decision: ci_groups.Decision,
 def plan(root: Path, event: str, start: str, environment: Mapping[str, str], api: ci_reuse.Api | None) -> dict[str, Any]:
     """The record of the run: the range and, for each group, whether it runs, why and the names of its jobs."""
     config = ci_groups.load(root)
-    changed, range_text = checked_range(root, event, start, environment, api)
+    changed, inputs, range_text = checked_range(root, event, start, environment, api)
     passed: dict[str, str] | None = None
     passed_doubt = ""
     groups: dict[str, Any] = {}
-    for name, decision in ci_groups.select(config, changed, range_text).items():
+    for name, decision in ci_groups.select(config, inputs, changed, range_text).items():
         definition = config["groups"][name]
         if definition.get("always"):
             groups[name] = {"run": True, "reason": decision.reason, "name": definition["job"]}

@@ -18,16 +18,22 @@ import contextlib
 import json
 import platform
 import re
+import shutil
+import sys
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from pathlib import Path
+from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.process import run_command
 from scripts.quality import ci_groups, ci_plan, ci_reuse
 from scripts.quality.repo_checks import git
-from tests.fast.git_fixture import ROOT, TemporaryRepository
+from tests.e2e import commit_guards
+from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository, fixture_environment
 
 REPOSITORY = "owner/project"
 REPOSITORY_ID = 7
@@ -91,23 +97,35 @@ class FakeGitHub:
 
 
 class PlanRepository(TemporaryRepository):
-    """A repository with the real group map and stand-ins for the files that the reuse key reads."""
+    """A repository that holds a copy of every tracked file of this checkout, so the plan derives each group's inputs from the real code.
+
+    The class makes the copy once; each test starts again from its first commit, with an empty stand-in of the API.
+    """
+
+    template: ClassVar[tuple[Path, dict[str, str], str]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        home = tempfile.TemporaryDirectory(prefix="ci_plan_tree_")
+        cls.addClassCleanup(home.cleanup)
+        repo, env = Path(home.name) / "repo", fixture_environment(home.name)
+        for path in git("ls-files", "-z", cwd=ROOT, keep_newlines=True).split("\0"):
+            if path and (ROOT / path).is_file():
+                (repo / path).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / path, repo / path)
+        for arguments in (["init", "--quiet", "--initial-branch", "main"], ["add", "--all"], ["commit", "--quiet", "-m", "chore: copy the tree"]):
+            run_command("git", arguments, cwd=repo, env=env, timeout=TIMEOUT_SECONDS, check=True)
+        cls.template = (repo, env, git("rev-parse", "HEAD", cwd=repo).strip())
 
     def setUp(self) -> None:
-        super().setUp()
+        self.repo, self.env, self.base = self.template
+        self.start_over()
+
+    def start_over(self) -> None:
+        self.git("reset", "--quiet", "--hard", self.base)
+        self.git("clean", "--quiet", "-fdx")
         self.github = FakeGitHub()
-        self.base = self.commit(
-            {
-                "scripts/quality/ci_groups.json": (ROOT / ci_groups.CONFIG).read_text(),
-                ci_reuse.WORKFLOW: "name: ci\n",
-                "requirements.txt": "ruff==1\n",
-                "scripts/quality/install_tools.py": "VERSION = '1'\n",
-                "scripts/infra/host.py": "HOST = 1\n",
-                "scripts/quality/old_check.py": "CHECK = 1\n",
-                "tests/fast/test_old.py": "OLD = 1\n",
-                "README.md": "readme\n",
-            }
-        )
 
     def commit(self, files: dict[str, str | None], message: str = "chore: change files") -> str:
         for path, content in files.items():
@@ -117,7 +135,7 @@ class PlanRepository(TemporaryRepository):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-        self.git("add", "--all", "--", *files)
+        self.git("add", "--all", "--force", "--", *files)
         self.git("commit", "--quiet", "-m", message)
         return self.head()
 
@@ -153,16 +171,125 @@ GUARDS = {"hooks": True, "infra": False, "guards": True}
 
 
 class MapCompletenessTest(unittest.TestCase):
-    def test_every_tracked_file_maps_to_a_group_or_to_none(self) -> None:
+    inputs: ClassVar[dict[str, ci_groups.Inputs]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.inputs = ci_groups.group_inputs(ROOT, CONFIG)
+
+    def test_every_tracked_file_is_an_input_of_a_job_or_on_none(self) -> None:
         tracked = git("ls-files", "-z", cwd=ROOT, keep_newlines=True).split("\0")
-        self.assertEqual(ci_groups.unmapped([path for path in tracked if path], CONFIG), [])
+        self.assertEqual(ci_groups.unmapped([path for path in tracked if path], CONFIG, self.inputs), [])
 
     def test_a_path_on_no_list_is_reported(self) -> None:
-        self.assertEqual(ci_groups.unmapped(["planned/new.txt", "README.md"], CONFIG), ["planned/new.txt"])
+        self.assertEqual(ci_groups.unmapped(["planned/new.txt", "README.md"], CONFIG, self.inputs), ["planned/new.txt"])
 
     def test_every_pattern_states_its_reason(self) -> None:
-        entries = [*CONFIG["every_group"], *CONFIG["none"], *(entry for group in CONFIG["groups"].values() for entry in group["paths"])]
-        self.assertEqual([entry["pattern"] for entry in entries if not entry.get("reason", "").strip()], [])
+        entries = [
+            *CONFIG["plan"]["paths"],
+            *CONFIG["none"],
+            *CONFIG["loads_by_path"],
+            *(entry for group in CONFIG["groups"].values() for entry in group.get("paths", [])),
+        ]
+        self.assertEqual([entry for entry in entries if not entry.get("reason", "").strip()], [])
+
+
+class DerivedInputsTest(PlanRepository):
+    """Each group runs for a change to a file its job imports, runs or writes, and for no other file."""
+
+    def changed(self, path: str, content: str | None = None) -> dict[str, Any]:
+        """Commit a change to ``path`` (a new line, or ``content``) on the first commit, whose run passed, and plan the pull request."""
+        self.start_over()
+        self.passed(self.base)
+        target = self.repo / path
+        self.commit({path: content if content is not None else (target.read_text() if target.is_file() else "") + "# changed\n"})
+        return self.plan(self.base, event="pull_request")
+
+    def test_a_module_that_the_setup_imports_selects_the_infrastructure(self) -> None:
+        for path in ("scripts/process.py", "scripts/quality/worktree_scan_hook.py", "scripts/quality/install_tools.py"):
+            with self.subTest(path=path):
+                record = self.changed(path)
+                self.assertTrue(record["groups"]["infra"]["run"], record["groups"]["infra"]["reason"])
+                self.assertIn(path, record["groups"]["infra"]["reason"])
+
+    def test_a_path_that_the_guard_suite_writes_selects_the_guards(self) -> None:
+        record = self.changed("notes/planted.txt", "A planted note.\n")
+        self.assertTrue(record["groups"]["guards"]["run"], record["groups"]["guards"]["reason"])
+        self.assertIn("the guard suite writes notes/planted.txt", record["groups"]["guards"]["reason"])
+        written = {commit_guards.TRACKED_NOTE, *commit_guards.LINKED_FOLDERS}
+        written |= {path for case in commit_guards.planted_cases() for change in (case.control, case.fault) for path in (*change.files, *change.unstaged)}
+        guards = ci_groups.group_inputs(self.repo, CONFIG)["guards"]
+        self.assertEqual([path for path in sorted(written) if guards.reason(path) is None], [])
+
+    def test_a_file_where_the_guard_suite_writes_a_folder_selects_the_guards(self) -> None:
+        record = self.changed("notes", "a file where the suite makes its notes folder\n")
+        self.assertTrue(record["groups"]["guards"]["run"], record["groups"]["guards"]["reason"])
+
+    def test_a_module_that_the_fast_tests_import_selects_the_guards(self) -> None:
+        for path in ("scripts/infra/host.py", "scripts/evidence/receipt.py", "infra/iam/scripts/render_policy.py"):
+            with self.subTest(path=path):
+                record = self.changed(path)
+                self.assertTrue(record["groups"]["guards"]["run"], record["groups"]["guards"]["reason"])
+                self.assertIn(path, record["groups"]["guards"]["reason"])
+
+    def test_a_file_that_no_job_reads_selects_no_group(self) -> None:
+        for path in ("README.md", "tests/e2e/ci_plan.py", ".github/workflows/deploy.yml"):
+            with self.subTest(path=path):
+                self.assertEqual(self.runs(self.changed(path)), HOOKS_ONLY)
+
+
+class ImportMapTest(unittest.TestCase):
+    """The derived inputs are complete: they hold every module that each job's entry points load, and every file that loads code by path."""
+
+    inputs: ClassVar[dict[str, ci_groups.Inputs]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.inputs = ci_groups.group_inputs(ROOT, CONFIG)
+
+    def loaded(self, modules: list[str]) -> set[str]:
+        code = (
+            "import importlib, pathlib, sys\n"
+            "root = pathlib.Path.cwd().resolve()\n"
+            "for name in sys.argv[1:]:\n"
+            "    importlib.import_module(name)\n"
+            "for module in list(sys.modules.values()):\n"
+            "    path = pathlib.Path(getattr(module, '__file__', None) or '/').resolve()\n"
+            "    if path.is_relative_to(root) and '.venv' not in path.relative_to(root).parts:\n"
+            "        print(path.relative_to(root).as_posix())\n"
+        )
+        result = run_command(sys.executable, ["-c", code, *modules], cwd=ROOT, timeout=TIMEOUT_SECONDS, check=True)
+        return set(result.stdout.split())
+
+    def test_the_derived_modules_hold_every_module_that_the_entry_points_load(self) -> None:
+        for name, inputs in self.inputs.items():
+            with self.subTest(group=name):
+                self.assertTrue(inputs.entries, "every derived group has an entry module")
+                self.assertEqual(self.loaded(inputs.entries) - set(inputs.modules), set())
+
+    def test_the_entry_points_are_the_modules_that_the_commands_start(self) -> None:
+        self.assertEqual(self.inputs["infra"].entries, ["scripts.quality.install_tools"])
+        fast = sorted(f"tests.fast.{path.stem}" for path in (ROOT / "tests" / "fast").glob("test*.py"))
+        self.assertEqual(
+            self.inputs["guards"].entries, sorted({"scripts.quality.install_tools", "tests.e2e.commit_guards", "scripts.quality.repo_checks", *fast})
+        )
+        self.assertEqual(self.inputs["plan"].entries, ["scripts.quality.ci_plan"])
+
+    def test_every_file_that_loads_code_by_path_is_declared(self) -> None:
+        modules = sorted({path for inputs in self.inputs.values() for path in inputs.modules})
+        declared = {entry["file"]: entry["loads"] for entry in CONFIG["loads_by_path"]}
+        self.assertEqual(ci_groups.code_loaders(ROOT, modules), sorted(declared))
+        for file, target in declared.items():
+            groups = [name for name, inputs in self.inputs.items() if file in inputs.modules]
+            self.assertTrue(groups)
+            for name in groups:
+                self.assertIsNotNone(self.inputs[name].reason(target), f"{name} imports {file}, which loads {target}")
+
+    def test_a_command_that_names_no_make_target_is_refused(self) -> None:
+        config = json.loads(json.dumps(CONFIG))
+        config["groups"]["infra"]["commands"].append("make no-such-target")
+        with self.assertRaisesRegex(ci_groups.Unverified, "no-such-target"):
+            ci_groups.group_inputs(ROOT, config)
 
 
 class SelectionTest(PlanRepository):
@@ -182,38 +309,38 @@ class SelectionTest(PlanRepository):
 
     def test_a_rename_counts_its_old_name(self) -> None:
         self.passed(self.base)
-        self.git("mv", "scripts/quality/old_check.py", "scripts/infra/old_check.py")
+        self.git("mv", "tests/fast/test_repo_checks.py", "tests/e2e/test_repo_checks.py")
         self.git("commit", "--quiet", "-m", "chore: move the check")
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), GUARDS)
-        self.assertIn("scripts/quality/old_check.py", record["groups"]["guards"]["reason"])
+        self.assertIn("tests/fast/test_repo_checks.py", record["groups"]["guards"]["reason"])
 
     def test_a_rename_counts_its_new_name(self) -> None:
         self.passed(self.base)
-        self.git("mv", "scripts/infra/host.py", "scripts/quality/host.py")
+        self.git("mv", "tests/e2e/ci_plan.py", "tests/fast/ci_plan.py")
         self.git("commit", "--quiet", "-m", "chore: move the host code")
         self.assertEqual(self.runs(self.plan(self.base)), GUARDS)
 
     def test_a_rename_between_unguarded_paths_skips_the_guards(self) -> None:
         self.passed(self.base)
-        self.git("mv", "scripts/infra/host.py", "scripts/infra/hosts.py")
+        self.git("mv", "tests/e2e/ci_plan.py", "tests/e2e/ci_plan_moved.py")
         self.git("commit", "--quiet", "-m", "chore: rename the host code")
         self.assertEqual(self.runs(self.plan(self.base)), HOOKS_ONLY)
 
     def test_a_deleted_guarded_file_selects_the_guards(self) -> None:
         self.passed(self.base)
-        self.commit({"tests/fast/test_old.py": None})
+        self.commit({"tests/fast/test_tool_boundaries.py": None})
         self.assertEqual(self.runs(self.plan(self.base)), GUARDS)
 
     def test_a_deleted_unguarded_file_skips_the_guards(self) -> None:
         self.passed(self.base)
-        self.commit({"scripts/infra/host.py": None})
+        self.commit({"scripts/evidence/export.py": None})
         self.assertEqual(self.runs(self.plan(self.base)), HOOKS_ONLY)
 
     def test_a_rollback_lists_the_files_it_restores(self) -> None:
         older = self.commit({"README.md": "one\n"})
-        newer = self.commit({"tests/fast/test_old.py": "CHANGED = 1\n"})
-        self.assertIn("tests/fast/test_old.py", ci_groups.changed_paths(self.repo, newer, older))
+        newer = self.commit({"tests/fast/test_repo_checks.py": "CHANGED = 1\n"})
+        self.assertIn("tests/fast/test_repo_checks.py", ci_groups.changed_paths(self.repo, newer, older))
 
     def test_a_first_push_selects_every_group(self) -> None:
         record = self.plan(ZERO)
