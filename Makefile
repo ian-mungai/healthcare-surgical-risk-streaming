@@ -1,5 +1,5 @@
 PYTHON := .venv/bin/python
-TERRAFORM ?= .tools/bin/terraform
+override TERRAFORM := .tools/bin/terraform
 
 .PHONY: setup lock check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy
 
@@ -16,7 +16,7 @@ check:
 	.venv/bin/pre-commit run --all-files --hook-stage manual
 
 check-terraform:
-	@test -x $(TERRAFORM) || { echo "the pinned Terraform $(TERRAFORM) is missing; run: make setup" >&2; exit 1; }
+	@test -f $(TERRAFORM) -a -x $(TERRAFORM) || { echo "the pinned Terraform $(TERRAFORM) is missing or not an executable file; run: make setup" >&2; exit 1; }
 	$(TERRAFORM) fmt -check -recursive infra
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra init -backend=false -input=false
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra validate

@@ -77,7 +77,7 @@ def pinned_terraform() -> Path:
     """The project's own pinned Terraform, the only Terraform this project runs. A missing copy is never replaced by the computer's."""
     path = ROOT / PINNED_TERRAFORM
     if not path.is_file() or not os.access(path, os.X_OK):
-        raise WrapperError(f"the pinned Terraform is missing at {PINNED_TERRAFORM}; run `make setup` to install it")
+        raise WrapperError(f"the pinned Terraform is missing or not an executable file at {PINNED_TERRAFORM}; run `make setup` to install it")
     return path
 
 
