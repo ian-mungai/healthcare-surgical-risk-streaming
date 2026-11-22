@@ -32,6 +32,11 @@ from spark.bronze.structure import END_TOLERANCE_SECONDS, file_problem, recordin
 READS = {"header": 0, "load": 0}
 
 
+def read_counts() -> dict[str, int]:
+    """The reads of this process so far. A function, so that a Spark worker takes the counts from this module and not from a copy of them."""
+    return dict(READS)
+
+
 def load(path: Path, names: list[str] | None = None, *, header_only: bool = False) -> Any:
     """The library's reading of the file: all tracks (``names`` None) or the named ones, records included unless ``header_only``. A failed read is refused.
 

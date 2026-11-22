@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from spark.bronze.inputs import CaseFile, StoreSpec, fetch_case
-from spark.bronze.library import READS, case_problem, case_rows
+from spark.bronze.library import case_problem, case_rows, read_counts
 from spark.bronze.readers import open_store
 from spark.bronze.rows import Lineage
 from spark.session import SCRATCH_FOLDER
@@ -44,10 +44,11 @@ def partition_rows(kind: str, spec: StoreSpec, peaks: Any, reads: Any, mode: str
     """The function that a Spark partition runs: its cases' rows of one kind. At its end it reports the peak memory to ``peaks`` and the reads to ``reads``."""
 
     def run(files: Iterator[CaseFile]) -> Iterator[tuple[Any, ...]]:
-        before = dict(READS)
+        before = read_counts()
         yield from case_files(list(files), spec, kind=kind, mode=mode)
         peaks.add(worker_peak_mib())
-        reads.add({f"{kind}_{name}": READS[name] - before[name] for name in READS})
+        after = read_counts()
+        reads.add({f"{kind}_{name}": after[name] - before[name] for name in after})
 
     return run
 
