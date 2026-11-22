@@ -119,11 +119,11 @@ def digest_of(lines: Iterable[str]) -> str:
 
 
 def occurrence_differences(rows: Iterable[tuple[str | None, str | None, str | None, str | None, int]]) -> int:
-    """How many rows differ between the occurrence numbers that Spark wrote and the numbers of ``assign_occurrences``, as multisets of rows.
+    """How many rows of ``rows`` carry an occurrence number that differs from the numbers of ``assign_occurrences`` for the same rows, as multisets.
 
-    ``rows`` are the rows of the repeated groups, each with its ``source_occurrence``. The result is 0 only when the two numberings are the same.
+    ``rows`` are the rows of the repeated groups, each with its ``source_occurrence``. The result is 0 only when the two numberings are the same. Both
+    multisets hold as many rows as ``rows``, so the rows of one that are not in the other are all the differences.
     """
     found = Counter(rows)
     plain = [(case, time, name, result) for case, time, name, result, _ in found.elements()]
-    expected = Counter(assign_occurrences(plain))
-    return sum(((found - expected) + (expected - found)).values())
+    return sum((found - Counter(assign_occurrences(plain))).values())

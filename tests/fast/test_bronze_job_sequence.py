@@ -372,6 +372,7 @@ class OccurrenceRuleTest(unittest.TestCase):
         self.assertEqual({"occurrence rule"}, harness.failed(harness.run("verify")))
 
     def test_more_repeated_rows_than_the_limit_are_refused_with_the_limit_in_the_message(self) -> None:
+        self.assertEqual(100_000, REPEATED_ROWS_LIMIT)
         harness = Harness()
         harness.spark.extra_repeated = [("9", "9", "k", "1", 1)] * (REPEATED_ROWS_LIMIT + 1)
         with self.assertRaisesRegex(BronzeRulesError, str(REPEATED_ROWS_LIMIT)):
