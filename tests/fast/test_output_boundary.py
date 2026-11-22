@@ -13,8 +13,10 @@ replies, the configuration, the command line, the paths and the errors of the AW
 that the parsers accept, and ``test_the_baselines_hold_every_field_of_each_schema`` holds that, so a new field of a schema fails that test until the
 baseline holds it, and then gets its markers here.
 
-The S3 stand-in answers the AWS calls of the real ``S3Store`` in the forms the AWS command line documents. The publisher stand-in answers the three reads of
-``scripts.sample.publisher``. Both are not the services: the acceptance tests run the same commands against them.
+The repository does not hold the publisher's checksum list, so each run holds the tracked pin to the list of its synthetic release, and a change
+that rewrites the pin of the list rewrites that one field of the pin too. The S3 stand-in answers the AWS calls of the real ``S3Store`` in the
+forms the AWS command line documents. The publisher stand-in answers the three reads of ``scripts.sample.publisher``. Both are not the services:
+the acceptance tests run the same commands against them.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from scripts.process import CompletedProcess
 from scripts.project_config import ConfigurationError
 from scripts.sample import candidates, publisher
 from scripts.sample.split import is_development
+from tests.fast.ingestion_support import synthetic_pin
 
 RECORDS = frozenset({"result", "manifest", "reference"})
 ALLOWED: dict[str, frozenset[str]] = {
@@ -372,6 +375,7 @@ def repaired_manifest(document: Any) -> Any:
 def run_ingestion(case: IngestionCase, markers: Markers) -> Run:
     run = Run()
     selection, list_text, pairings = ingestion_baseline()
+    baseline_list = list_text
     with tempfile.TemporaryDirectory(prefix="boundary_") as root:
         folder = Path(root) / (case.folder(markers) if case.folder else "work")
         folder.mkdir()
@@ -410,7 +414,11 @@ def run_ingestion(case: IngestionCase, markers: Markers) -> Run:
             ],
             "verify": ["verify", "--reference", str(paths["reference.json"])],
         }
-        with mock.patch.object(cli, "load_configuration", loader), mock.patch.object(cli, "Aws", return_value=s3):
+        with (
+            mock.patch.object(cli, "load_configuration", loader),
+            mock.patch.object(cli, "Aws", return_value=s3),
+            synthetic_pin((list_text if case.repin_list else baseline_list).encode()),
+        ):
             for command, arguments in commands.items():
                 if command == "publish" and case.result and paths["result.json"].is_file():
                     paths["result.json"].write_text(case.result(paths["result.json"].read_text(), markers))

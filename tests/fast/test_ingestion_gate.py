@@ -15,7 +15,7 @@ from scripts.ingestion.check import result_digest
 from scripts.ingestion.gate import GateRefused, verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.manifest import MANIFEST_PREFIX, ManifestRef, publish_manifest
-from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
+from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set, pin_the_synthetic_list
 
 WANTED = [SOURCE_PREFIX + "vital_files/0001.vital", SOURCE_PREFIX + "clinical_data.csv"]
 
@@ -41,6 +41,10 @@ def problems(landed: Landed, reference: ManifestRef, wanted: list[str] | None = 
     except GateRefused as refused:
         return {f"{'requested key' if problem.requested else 'manifest entry'} {problem.position}": problem.cause for problem in refused.problems}
     raise AssertionError("the gate did not refuse")
+
+
+def setUpModule() -> None:
+    pin_the_synthetic_list()
 
 
 class GateTest(unittest.TestCase):

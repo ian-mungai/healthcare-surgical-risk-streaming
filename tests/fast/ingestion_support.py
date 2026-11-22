@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import unittest
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from typing import Any
+from unittest import mock
 
+from scripts.ingestion import selection
 from scripts.ingestion.check import CheckResult, Finding, run_check
 from scripts.ingestion.landing import PairingRecord
 from scripts.ingestion.selection import Selection
@@ -28,6 +33,29 @@ def digest(data: bytes) -> str:
 def list_text_for(source: Mapping[str, bytes]) -> str:
     """The publisher's list: the SHA-256 of each file's source bytes, one space, the path relative to the release."""
     return "".join(f"{digest(data)} {path}\n" for path, data in sorted(source.items()))
+
+
+TRACKED_PIN_VALUES = selection.pinned_values
+
+
+def tracked_pin() -> AbstractContextManager[Any]:
+    """The tracked pin itself, inside a test module that ``pin_the_synthetic_list`` holds to a synthetic release."""
+    return mock.patch.object(selection, "pinned_values", TRACKED_PIN_VALUES)
+
+
+def synthetic_pin(list_bytes: bytes) -> AbstractContextManager[Any]:
+    """The tracked pin with the SHA-256 of a synthetic release's checksum list in the place of the publisher's list.
+
+    The repository does not hold the publisher's list, so a test of a synthetic release pins the list it built, and every other field stays the
+    tracked pin's. Nothing outside the fast tests replaces the pin.
+    """
+    release, bucket, prefix, key, _ = TRACKED_PIN_VALUES()
+    return mock.patch.object(selection, "pinned_values", return_value=(release, bucket, prefix, key, digest(list_bytes)))
+
+
+def pin_the_synthetic_list(list_bytes: bytes | None = None) -> None:
+    """Hold a test module to the checksum list of its synthetic release, ``SOURCE``'s by default. Call it from ``setUpModule``; the module's cleanup ends it."""
+    unittest.enterModuleContext(synthetic_pin(list_text_for(SOURCE).encode() if list_bytes is None else list_bytes))
 
 
 def selection_for(paths: list[str], list_bytes: bytes, name: str = "probe_set") -> Selection:

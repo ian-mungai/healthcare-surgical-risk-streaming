@@ -48,7 +48,7 @@ from scripts.ingestion.store import StoreError
 from scripts.sample import candidates, publisher
 from scripts.sample.candidates import CREDIT_FIELDS, FILE_PIN_FIELDS, RELEASE_FIELDS, RELEASE_FILE, SOURCE_FIELDS, TRACK_LIST_FIELDS, CandidateError
 from scripts.sample.publisher import TRACK_LIST_COLUMNS, PublisherError
-from tests.fast.ingestion_support import SOURCE_PREFIX, digest, landed_set
+from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, digest, landed_set, list_text_for, pin_the_synthetic_list, synthetic_pin, tracked_pin
 
 SELECTION: dict[str, Any] = {
     "name": "probe_set",
@@ -75,7 +75,14 @@ def case_files_set(**fields: object) -> Callable[[dict[str, Any]], None]:
     return change
 
 
+def setUpModule() -> None:
+    pin_the_synthetic_list()
+
+
 class SelectionInputTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(synthetic_pin(b"list"))
+
     def test_control_the_complete_selection_loads(self) -> None:
         self.assertEqual(3, len(Selection.from_json(json.dumps(SELECTION)).files))
 
@@ -113,6 +120,9 @@ class SelectionInputTest(unittest.TestCase):
 
 
 class SelectionEchoTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(synthetic_pin(b"list"))
+
     MARKER = "private-value"
 
     def refused(self, change: Callable[[dict[str, Any]], None]) -> str:
@@ -145,7 +155,16 @@ class SelectionEchoTest(unittest.TestCase):
                 self.refused(case_files_set(first=first, last=last))
 
 
+def synthetic_result() -> str:
+    """The result file of a passed check of the synthetic release, under the pin of that release's list."""
+    with synthetic_pin(list_text_for(SOURCE).encode()):
+        return landed_set().check().to_json()
+
+
 class RepeatedFieldTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(synthetic_pin(b"list"))
+
     MARKER = "private-value"
 
     def test_a_field_named_twice_is_refused_whatever_the_file_and_never_echoed(self) -> None:
@@ -159,7 +178,7 @@ class RepeatedFieldTest(unittest.TestCase):
             (selection.replace('"first": 1', '"first": 1, "first": 2'), Selection.from_json, SelectionError),
             (selection.replace('"release": "1.0.0"', f'"release": "1.0.0", "{self.MARKER}": 1, "{self.MARKER}": 2'), Selection.from_json, SelectionError),
             ('[{"source_key": "a", "source_key": "b", "landed_key": "c", "size": 1}]', load_pairing_records, PairingError),
-            (landed_set().check().to_json().replace('"findings"', '"findings": [], "findings"', 1), CheckResult.from_json, ResultFormatError),
+            (synthetic_result().replace('"findings"', '"findings": [], "findings"', 1), CheckResult.from_json, ResultFormatError),
             ('{"bucket": "b", "bucket": "c", "key": "k", "version_id": "v", "sha256": "s"}', ManifestRef.from_json, ManifestError),
         ]
         for number, (text, load, error) in enumerate(cases):
@@ -272,6 +291,9 @@ class NoticeTest(unittest.TestCase):
 
 
 class TrackedPinTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(tracked_pin())
+
     def test_a_tracked_pin_that_is_not_valid_stops_every_full_release(self) -> None:
         self.addCleanup(selection.pinned_values.cache_clear)
         with tempfile.TemporaryDirectory(prefix="ingestion_pin_") as folder:

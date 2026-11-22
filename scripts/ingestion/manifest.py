@@ -4,7 +4,8 @@ It is published only from a complete passed check and only for the object versio
 object version (bucket, key and non-null version ID), its SHA-256, its source key, its size, its release and its retrieval time, which is the
 time S3 gave that version. The selection, the measurement period, the pinned checksum list and the digest of the check result are recorded once. The
 check result is bound to the SHA-256 of every field of the selection, so a publication with any other source, release, period or list key is refused.
-A reader recomputes that digest from the manifest's own fields as well, so a manifest whose selection, period, list or entries were edited is refused.
+A reader recomputes that digest from the manifest's own fields as well, so a manifest whose selection, period, list or entries were edited is refused,
+and it refuses a manifest whose checksum list is not the tracked pin's publisher list, even when its digests agree.
 
 Its ``format`` names the shape. A manifest of an earlier format is refused with the step that replaces it: rerun check and publish.
 
@@ -27,7 +28,7 @@ from scripts.ingestion.check import CheckedFile, CheckResult, canonical, checked
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
-from scripts.ingestion.selection import Selection, keys_digest, selection_digest
+from scripts.ingestion.selection import Selection, keys_digest, pinned_release, selection_digest
 from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, StoreError
 
 MANIFEST_PREFIX = "manifests/"
@@ -215,6 +216,8 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
         raise ManifestError(Notice(Code.MANIFEST_NOT_PASSED))
     if reference.key != manifest_key(manifest.selection["name"], reference.sha256):
         raise ManifestError(Notice(Code.KEY_OTHER_SELECTION))
+    if manifest.checksum_list["sha256"] != pinned_release().checksum_list_sha256:
+        raise ManifestError(Notice(Code.MANIFEST_LIST_NOT_PIN))
     if any(entry.version_id in NULL_VERSION_IDS for entry in manifest.entries):
         raise ManifestError(Notice(Code.MANIFEST_NULL_ENTRY))
     if manifest.recomputed_check_result_sha256() != manifest.check_result_sha256:

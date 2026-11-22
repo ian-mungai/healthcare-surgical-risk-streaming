@@ -16,12 +16,27 @@ from scripts.ingestion.check import ChecksumListError, PinnedListError, parse_ch
 from scripts.ingestion.landing import LANDING_PREFIX, PairingError, PairingRecord, load_pairing_records
 from scripts.ingestion.notice import render
 from scripts.ingestion.selection import Selection, SelectionError, selection_digest
-from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, finding_label, landed_set, list_text_for, selection_for
+from tests.fast.ingestion_support import (
+    SOURCE,
+    SOURCE_PREFIX,
+    Landed,
+    digest,
+    finding_label,
+    landed_set,
+    list_text_for,
+    pin_the_synthetic_list,
+    selection_for,
+    synthetic_pin,
+)
 from tests.fast.memory_store import BLOCK_SIZE
 
 
 def causes(landed: Landed) -> dict[str, str]:
     return {finding_label(finding): finding.cause for finding in landed.check().findings}
+
+
+def setUpModule() -> None:
+    pin_the_synthetic_list()
 
 
 class CheckCausesTest(unittest.TestCase):
@@ -60,7 +75,8 @@ class CheckCausesTest(unittest.TestCase):
         listed = {path: data for path, data in SOURCE.items() if path != "clinical_data.csv"}
         landed = landed_set()
         list_bytes = list_text_for(listed).encode()
-        selection = replace(landed.selection, checksum_list_sha256=digest(list_bytes))
+        with synthetic_pin(list_bytes):
+            selection = replace(landed.selection, checksum_list_sha256=digest(list_bytes))
         result = run_check(landed.store, selection, list_bytes, landed.pairings())
         self.assertEqual({"selected file 1": "not_in_checksum_list"}, {finding_label(finding): finding.cause for finding in result.findings})
         self.assertEqual([], landed.store.payload_reads(landed.key_for(SOURCE_PREFIX + "clinical_data.csv")))
@@ -232,6 +248,9 @@ class PinnedListTest(unittest.TestCase):
 
 
 class SelectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(synthetic_pin(b"list"))
+
     def text(self, **changes: object) -> str:
         values: dict[str, object] = {
             "name": "probe_set",
@@ -314,12 +333,14 @@ class ResultDigestTest(unittest.TestCase):
 
 
 class SelectionHelperTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(synthetic_pin(b"list"))
+
     def test_the_selection_digest_covers_every_field(self) -> None:
         one = selection_for(["a.csv", "b.csv"], b"list")
         changes: dict[str, dict[str, Any]] = {
             "name": {"name": "other_set"},
             "measurement_period": {"measurement_period": "2020"},
-            "checksum_list_sha256": {"checksum_list_sha256": "0" * 64},
             "files": {"files": ("a.csv",)},
         }
         for name, change in changes.items():
@@ -327,7 +348,7 @@ class SelectionHelperTest(unittest.TestCase):
                 self.assertNotEqual(one.selection_sha256, replace(one, **change).selection_sha256)
         fields = (one.name, one.release, one.source_bucket, one.source_prefix, one.measurement_period, one.checksum_list_key, one.checksum_list_sha256)
         self.assertEqual(one.selection_sha256, selection_digest(*fields, one.keys_sha256))
-        for position, name in ((1, "release"), (2, "source_bucket"), (3, "source_prefix"), (5, "checksum_list_key")):
+        for position, name in ((1, "release"), (2, "source_bucket"), (3, "source_prefix"), (5, "checksum_list_key"), (6, "checksum_list_sha256")):
             with self.subTest(name):
                 other = list(fields)
                 other[position] = f"other {name}"
@@ -337,7 +358,13 @@ class SelectionHelperTest(unittest.TestCase):
 
     def test_every_selection_is_held_to_the_source_of_the_tracked_pin(self) -> None:
         one = selection_for(["a.csv", "b.csv"], b"list")
-        for name, other in (("release", "2.0.0"), ("source_bucket", "another-publisher"), ("source_prefix", "vitaldb/2.0.0/"), ("checksum_list_key", "k")):
+        for name, other in (
+            ("release", "2.0.0"),
+            ("source_bucket", "another-publisher"),
+            ("source_prefix", "vitaldb/2.0.0/"),
+            ("checksum_list_key", "k"),
+            ("checksum_list_sha256", "0" * 64),
+        ):
             changes: dict[str, Any] = {name: other}
             with self.subTest(name), self.assertRaises(SelectionError) as caught:
                 replace(one, **changes)

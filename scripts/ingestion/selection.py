@@ -10,10 +10,11 @@ A selection file is JSON::
 ``files`` and ``case_files`` are paths relative to ``source_prefix``; either may be absent, and ``case_files`` expands to one path for each number from
 ``first`` to ``last``. The pattern is one known form: a path with one ``{:0Nd}`` place for the number. The checksum list is pinned by its key and its SHA-256.
 
-Every selection is of the one release that the tracked pin (``tests/fixtures/vitaldb/release.json``) names: its release, source bucket, source prefix
-and checksum list key are the pin's, so a source key that a check reports is the pin's release path and a path of the pinned checksum list. The case
-numbers of ``case_files`` are within the release's 1 to 6,388. A selection named ``full_release`` is the whole release and is not an input to shorten: its
-files are exactly the two tables and the 6,388 case files, and its checksum list digest is the pin's too, so it never comes from the caller.
+Every selection is of the one release that the tracked pin (``tests/fixtures/vitaldb/release.json``) names: its release, source bucket, source prefix,
+checksum list key and checksum list SHA-256 are the pin's, so the list a check verifies against is always the publisher's own, never a substitute, and a
+source key that a check reports is the pin's release path and a path of that list. The case numbers of ``case_files`` are within the release's 1 to
+6,388. A selection named ``full_release`` is the whole release and is not an input to shorten: its files are exactly the two tables and the 6,388 case
+files.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any
@@ -33,14 +34,13 @@ from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
 from scripts.sample.candidates import RELEASE_FILE, release_problems
 
 NAME = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
-SHA256 = re.compile(r"[0-9a-f]{64}")
 RELATIVE_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
 CASE_FORMAT = re.compile(r"([A-Za-z0-9._/-]*)\{:0([1-9])d\}([A-Za-z0-9._/-]*)")
 FULL_RELEASE = "full_release"
 FULL_RELEASE_TABLES = ("clinical_data.csv", "lab_data.csv")
 FULL_RELEASE_CASES = 6388
 FULL_RELEASE_CASE_FORMAT = "vital_files/{:04d}.vital"
-SOURCE_FIELDS = ("release", "source_bucket", "source_prefix", "checksum_list_key")
+SOURCE_FIELDS = ("release", "source_bucket", "source_prefix", "checksum_list_key", "checksum_list_sha256")
 SELECTION_FIELDS: Mapping[str, type] = MappingProxyType(
     {"name": str, "release": str, "source_bucket": str, "source_prefix": str, "measurement_period": str, "checksum_list": dict}
 )
@@ -149,8 +149,6 @@ class Selection:
             problems.append(Notice(Code.PERIOD_EMPTY))
         pin = pinned_release()
         problems += [Notice(Code.SOURCE_NOT_PIN, fields=(name,)) for name in SOURCE_FIELDS if getattr(self, name) != getattr(pin, name)]
-        if not SHA256.fullmatch(self.checksum_list_sha256):
-            problems.append(Notice(Code.LIST_DIGEST_FORM))
         if not self.files:
             problems.append(Notice(Code.NO_FILES))
         if len(set(self.files)) != len(self.files):
@@ -158,16 +156,13 @@ class Selection:
         problems += [Notice(Code.FILE_NOT_RELATIVE, position=position) for position, path in enumerate(self.files, 1) if not relative_path(path)]
         object.__setattr__(self, "files", tuple(sorted(self.files)))
         if self.name == FULL_RELEASE and not problems:
-            problems += self.full_release_problems(pin)
+            problems += self.full_release_problems()
         if problems:
             raise SelectionError(*problems)
 
-    def full_release_problems(self, pin: PinnedRelease) -> list[Notice]:
-        """What differs from the whole release as the tracked pin and the 6,390 keys define it. Field names only."""
-        problems = [Notice(Code.FULL_RELEASE_NOT_PIN, fields=(name,)) for name, value in asdict(pin).items() if getattr(self, name) != value]
-        if self.files != full_release_files():
-            problems.append(Notice(Code.FULL_RELEASE_FILES, total=FULL_RELEASE_CASES))
-        return problems
+    def full_release_problems(self) -> list[Notice]:
+        """What differs from the whole release as the 6,390 keys define it; its source, list included, is already held to the tracked pin."""
+        return [] if self.files == full_release_files() else [Notice(Code.FULL_RELEASE_FILES, total=FULL_RELEASE_CASES)]
 
     @property
     def source_keys(self) -> tuple[str, ...]:

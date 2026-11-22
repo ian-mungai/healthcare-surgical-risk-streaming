@@ -27,7 +27,7 @@ from scripts.ingestion.manifest import (
 from scripts.ingestion.notice import Cause
 from scripts.ingestion.selection import SelectionError
 from scripts.ingestion.store import ObjectVersion, StoreError
-from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
+from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set, pin_the_synthetic_list
 
 
 def checked(landed: Landed) -> CheckResult:
@@ -36,6 +36,10 @@ def checked(landed: Landed) -> CheckResult:
 
 def manifest_objects(landed: Landed) -> list[str]:
     return [version.key for version in landed.store.list_versions(MANIFEST_PREFIX)]
+
+
+def setUpModule() -> None:
+    pin_the_synthetic_list()
 
 
 class PublishTest(unittest.TestCase):

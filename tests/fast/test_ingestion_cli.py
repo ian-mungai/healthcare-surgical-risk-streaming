@@ -18,12 +18,16 @@ from unittest import mock
 
 from scripts.ingestion import cli
 from scripts.project_config import ConfigurationError
-from tests.fast.ingestion_support import Landed, landed_set
+from tests.fast.ingestion_support import Landed, landed_set, pin_the_synthetic_list, tracked_pin
 from tests.fast.memory_store import MemoryStore
 
 MARKER = "private-value"
 PIN_LIST_KEY = "vitaldb/1.0.0/SHA256SUMS.txt"
 CONFIGURATION = {"AWS_PROFILE": "example_profile", "AWS_REGION": "us-west-2", "S3_BUCKET": "example-bucket"}
+
+
+def setUpModule() -> None:
+    pin_the_synthetic_list()
 
 
 class Workspace:
@@ -144,13 +148,14 @@ class CommandTest(unittest.TestCase):
         self.refused(self.work.verify(), "version_substituted")
 
     def test_a_full_release_that_is_shortened_is_reported_before_anything_is_read(self) -> None:
+        self.enterContext(tracked_pin())
         reversed_range = {"case_files": {"pattern": "vital_files/{:04d}.vital", "first": 6388, "last": 1}}
         one_case_short = {"case_files": {"pattern": "vital_files/{:04d}.vital", "first": 1, "last": 6387}}
         for change, cause in (
             (reversed_range, "case_files"),
             (one_case_short, "the full release's files"),
             ({"checksum_list": {"key": "k", "sha256": "0" * 64}}, "checksum_list_key is not the tracked pin's"),
-            ({"checksum_list": {"key": PIN_LIST_KEY, "sha256": "0" * 64}}, "the full release's checksum_list_sha256 is not the tracked pin's"),
+            ({"checksum_list": {"key": PIN_LIST_KEY, "sha256": "0" * 64}}, "the selection's checksum_list_sha256 is not the tracked pin's"),
         ):
             self.work.write("selection.json", json.dumps(self.full_release(change)))
             with self.subTest(cause=cause):
