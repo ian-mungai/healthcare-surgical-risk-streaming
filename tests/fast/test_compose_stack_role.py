@@ -161,6 +161,8 @@ class StepOrderTest(unittest.TestCase):
                 "provision.yml",
                 "openbao/prepare.yml",
                 "start.yml all",
+                "kafka.yml",
+                "registry.yml",
                 "openbao/bootstrap.yml",
             ],
             step_order(),
