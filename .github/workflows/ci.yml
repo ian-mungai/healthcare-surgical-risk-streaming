@@ -12,12 +12,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# A pull request runs every job. The plan job (scripts/quality/ci_plan.py) lets the push to main after a merge reuse the merged pull
-# request's passed run of the same tree; the group jobs then still start, state the reason in their summary and succeed. The hooks job
-# always runs. The last job waits for every other job and is the one required check. Every checkout takes the pull request's head commit,
-# not GitHub's merge of it into the base, so a pull request run checks the tree that the push after the merge compares. The last step of
-# each job that runs checks, and the plan itself, write the job's proof as a notice annotation (scripts/quality/ci_proof.py), which the
-# push after the merge reads.
+# A pull request runs every job, with no condition that reads the plan. The plan job (scripts/quality/ci_plan.py) lets the push to main
+# after a merge reuse the merged pull request's passed run of the same tree: on a push, a group job skips only when the plan set the
+# output reuse to exactly 'true' after it proved the reuse; any other output, empty or missing, runs the job. The plan and hooks jobs
+# never skip. The last job waits for every other job and is the one required check: it fails when a job failed, was cancelled or was
+# skipped without that proof. Every checkout takes the pull request's head commit, not GitHub's merge of it into the base, so a pull
+# request run checks the tree that the push after the merge compares. The last step of each job that runs checks, and the plan itself,
+# write the job's proof as a notice annotation (scripts/quality/ci_proof.py), which the push after the merge reads.
 jobs:
   plan:
     name: Plan the job groups of this run
@@ -29,7 +30,7 @@ jobs:
       checks: read
       pull-requests: read
     outputs:
-      run: ${{ steps.plan.outputs.run }}
+      reuse: ${{ steps.plan.outputs.reuse }}
       reason: ${{ steps.plan.outputs.reason }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,42 +79,32 @@ jobs:
   infra:
     name: Static checks of the Terraform and Ansible code
     needs: plan
+    if: github.event_name != 'push' || needs.plan.outputs.reuse != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: State the group's decision and its reason
-        env:
-          GROUP_REASON: ${{ needs.plan.outputs.reason }}
-        run: |
-          printf 'Terraform and Ansible checks: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.plan.outputs.run == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: needs.plan.outputs.run == 'true'
         with:
           python-version: "3.14.8"
           cache: pip
           cache-dependency-path: requirements.txt
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        if: needs.plan.outputs.run == 'true'
         with:
           terraform_version: "1.16.4"
           terraform_wrapper: false
       - run: make setup
-        if: needs.plan.outputs.run == 'true'
       - run: make check-terraform
-        if: needs.plan.outputs.run == 'true'
       - run: make check-ansible
-        if: needs.plan.outputs.run == 'true'
       - run: python -m scripts.quality.ci_proof
-        if: needs.plan.outputs.run == 'true'
 
   guards:
     name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
     needs: plan
+    if: github.event_name != 'push' || needs.plan.outputs.reuse != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
     strategy:
@@ -121,32 +112,22 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
-      - name: State the group's decision and its reason
-        env:
-          GROUP_REASON: ${{ needs.plan.outputs.reason }}
-        run: |
-          printf 'Planted faults: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.plan.outputs.run == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: needs.plan.outputs.run == 'true'
         with:
           python-version: "3.14.8"
           cache: pip
           cache-dependency-path: requirements.txt
       - run: make setup
-        if: needs.plan.outputs.run == 'true'
       - run: make test-guards SHARD="${SHARD}/8"
-        if: needs.plan.outputs.run == 'true'
         env:
           SHARD: ${{ matrix.shard }}
       - run: python -m scripts.quality.ci_proof
-        if: needs.plan.outputs.run == 'true'
       - name: Show the end of the run's log after a failure
-        if: failure() && needs.plan.outputs.run == 'true'
+        if: failure()
         run: tail -n 150 runs/*/log.txt
 
   required:
@@ -156,9 +137,26 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Check that every needed job succeeded
+      - name: Check that every needed job succeeded or was skipped for a proven reuse
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          EVENT: ${{ github.event_name }}
+          REUSE: ${{ needs.plan.outputs.reuse }}
+          REASON: ${{ needs.plan.outputs.reason }}
+          PLAN: ${{ needs.plan.result }}
+          HOOKS: ${{ needs.hooks.result }}
+          INFRA: ${{ needs.infra.result }}
+          GUARDS: ${{ needs.guards.result }}
         run: |
-          printf 'Results of the needed jobs: %s\n' "${RESULTS}" >> "${GITHUB_STEP_SUMMARY}"
-          test "${RESULTS}" = "success success success success"
+          printf 'Event %s, reuse output "%s", reason: %s\n' "${EVENT}" "${REUSE}" "${REASON}" >> "${GITHUB_STEP_SUMMARY}"
+          failed=0
+          check() {
+          if [ "$2" = success ]; then return 0; fi
+          if [ "$2" = skipped ] && [ "$3" = may_skip ] && [ "${EVENT}" = push ] && [ "${REUSE}" = true ]; then return 0; fi
+          printf 'The job %s ended as %s without a proven reuse.\n' "$1" "$2" | tee -a "${GITHUB_STEP_SUMMARY}"
+          failed=1
+          }
+          check plan "${PLAN}" must_run
+          check hooks "${HOOKS}" must_run
+          check infra "${INFRA}" may_skip
+          check guards "${GUARDS}" may_skip
+          exit "${failed}"

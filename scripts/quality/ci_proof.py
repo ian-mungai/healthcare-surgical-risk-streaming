@@ -2,12 +2,11 @@
 
 Run from the repository root of the checkout as the last step of a job that runs checks: ``python -m scripts.quality.ci_proof``. The
 plan job writes the same proof itself. A later push to main reads the proof of every job of a pull request run through the API
-(``scripts/quality/ci_reuse.py``), because GitHub keeps neither the pull request that a run belonged to nor the commit of the
-workflow file that it ran once the pull request is merged.
+(``scripts/quality/ci_reuse.py``), because GitHub keeps no record of the runner's tools.
 
-The proof names the run and its attempt, the event, the pull request's number and base branch, the commit of the checkout, the
-commit of the workflow file (``GITHUB_WORKFLOW_SHA``, for a pull request GitHub's merge commit) and the runner: its image and the
-versions of the tools that the checks take from it. It holds no secret: everything in it is shown on the run's page.
+The proof names the run and its attempt, the commit of the checkout and the runner: its image and the versions of the tools that the
+checks take from it. Pull request code writes it, so every field is a claim that the reader checks against what the API says; the
+pull request and the workflow are never read from it. It holds no secret: everything in it is shown on the run's page.
 """
 
 from __future__ import annotations
@@ -45,15 +44,10 @@ def event_payload(environment: Mapping[str, str]) -> dict[str, Any]:
 
 def proof(root: Path, environment: Mapping[str, str]) -> dict[str, Any]:
     """The proof of the job that runs in ``environment`` with its checkout at ``root``."""
-    pull = event_payload(environment).get("pull_request") or {}
     return {
         "run_id": int(environment.get("GITHUB_RUN_ID") or 0),
         "run_attempt": int(environment.get("GITHUB_RUN_ATTEMPT") or 0),
-        "event": environment.get("GITHUB_EVENT_NAME", ""),
-        "pull_request": pull.get("number"),
-        "base_ref": (pull.get("base") or {}).get("ref"),
         "head": git("rev-parse", "HEAD", cwd=root).strip(),
-        "workflow_sha": environment.get("GITHUB_WORKFLOW_SHA", ""),
         "runner": runner(environment),
     }
 
