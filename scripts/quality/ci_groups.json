@@ -1,0 +1,65 @@
+{
+  "runner": "ubuntu-24.04",
+  "python": "3.14",
+  "groups": {
+    "hooks": {
+      "always": true,
+      "job": "Hooks on every file and the commit messages",
+      "reason": "always runs: it holds the privacy scan, the secret scan and the commit-message check, which never skip",
+      "paths": []
+    },
+    "infra": {
+      "job": "Static checks of the Terraform and Ansible code",
+      "paths": [
+        {"pattern": "infra/*", "reason": "the Terraform code, its lock file, tests and lint configuration that the checks read"},
+        {"pattern": "ansible/*", "reason": "the playbook and roles that the syntax check reads"},
+        {"pattern": "Makefile", "reason": "make setup, make check-terraform and make check-ansible run the checks"},
+        {"pattern": "requirements.txt", "reason": "pins ansible-core, which runs the syntax check"},
+        {"pattern": "scripts/quality/install_tools.py", "reason": "pins tflint, its AWS ruleset and Trivy"}
+      ]
+    },
+    "guards": {
+      "job": "Planted faults through the real commit path",
+      "shard_name": ", shard {shard} of {shards}",
+      "shards": 8,
+      "paths": [
+        {"pattern": ".pre-commit-config.yaml", "reason": "defines every hook that the planted commits go through"},
+        {"pattern": "scripts/quality/*", "reason": "the repository checks, the working-tree privacy hook and the tool pins that the hooks run"},
+        {"pattern": "scripts/process.py", "reason": "the launcher that every repository check and the guard suite start programs with"},
+        {"pattern": "scripts/__init__.py", "reason": "makes the scripts package that the hooks import"},
+        {"pattern": "tests/__init__.py", "reason": "makes the tests package that the guard suite and the fast tests import"},
+        {"pattern": "tests/e2e/__init__.py", "reason": "makes the package of the guard suite"},
+        {"pattern": "tests/e2e/commit_guards.py", "reason": "the guard suite itself: its cases, controls and judgement"},
+        {"pattern": "tests/e2e/run_record.py", "reason": "the run record that the guard suite writes and judges"},
+        {"pattern": "tests/fast/*", "reason": "the fast-tests hook runs the whole fast suite inside the suite's copy on every planted commit"},
+        {"pattern": "requirements.txt", "reason": "pins pre-commit, Ruff and MyPy, whose messages the cases match"},
+        {"pattern": "pyproject.toml", "reason": "the Ruff and MyPy settings that the Python cases depend on"},
+        {"pattern": "Makefile", "reason": "make setup installs the hooks and make test-guards runs the suite"},
+        {"pattern": ".privacy_allowlist", "reason": "an entry could allow a planted privacy marker"},
+        {"pattern": ".gitignore", "reason": "decides which files the suite copies and that its planted folders are visible to Git"}
+      ]
+    }
+  },
+  "every_group": [
+    {"pattern": ".github/workflows/ci.yml", "reason": "defines the jobs, their runner, Python and tool setup"},
+    {"pattern": "scripts/quality/ci_groups.json", "reason": "this map decides what runs"},
+    {"pattern": "scripts/quality/ci_groups.py", "reason": "the plan's selection decides what runs"},
+    {"pattern": "scripts/quality/ci_reuse.py", "reason": "the plan's reuse decides what runs"},
+    {"pattern": "scripts/quality/ci_plan.py", "reason": "the plan decides what runs"}
+  ],
+  "none": [
+    {"pattern": ".github/workflows/deploy.yml", "reason": "the deploy workflow: no CI job reads it, and the hooks scan it"},
+    {"pattern": ".env.example", "reason": "documentation of the variables: the hooks scan it"},
+    {"pattern": "LICENSE", "reason": "the licence text: the hooks scan it"},
+    {"pattern": "README.md", "reason": "the readme: the hooks scan it"},
+    {"pattern": "requirements.in", "reason": "the source of requirements.txt: make setup installs requirements.txt only"},
+    {"pattern": "compose/*", "reason": "the Compose stack: its fast tests are in tests/fast and the hooks check its files"},
+    {"pattern": "scripts/aws_cli.py", "reason": "host and teardown code: the hooks lint, type-check and fast-test it"},
+    {"pattern": "scripts/project_config.py", "reason": "host and teardown code: the hooks lint, type-check and fast-test it"},
+    {"pattern": "scripts/evidence/*", "reason": "evidence export code: the hooks lint, type-check and fast-test it"},
+    {"pattern": "scripts/infra/*", "reason": "host and teardown code: the hooks lint, type-check and fast-test it"},
+    {"pattern": "tests/e2e/*", "reason": "the temporary acceptance tests of a phase, which stay off main; the guard suite's own files are on the guards list"},
+    {"pattern": "notes/*", "reason": "the files that the guard suite plants in its temporary copy of the tree; the repository tracks none here"},
+    {"pattern": "scripts/planted.py", "reason": "the file that the guard suite plants in its temporary copy of the tree; the repository does not track it"}
+  ]
+}

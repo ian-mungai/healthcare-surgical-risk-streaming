@@ -12,7 +12,35 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The plan job decides which groups of scripts/quality/ci_groups.json run and which passed jobs an identical tree reuses
+# (scripts/quality/ci_plan.py). The selectable jobs take their names, decisions and reasons from its record. A job that does not run
+# still starts, states its reason in its summary and succeeds. The hooks job always runs.
 jobs:
+  plan:
+    name: Plan the job groups of this run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5 # not measured yet: a checkout, a Python setup from the runner's cache and a few API reads
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      record: ${{ steps.plan.outputs.record }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      - name: Choose the groups and the reused jobs
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RANGE_START: ${{ github.event.pull_request.base.sha || github.event.before }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m scripts.quality.ci_plan --event "${EVENT_NAME}" --start "${RANGE_START}"
+
   hooks:
     name: Hooks on every file and the commit messages
     runs-on: ubuntu-24.04
@@ -41,47 +69,70 @@ jobs:
           fi
 
   guards:
-    name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
+    name: ${{ matrix.name }}
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
     strategy:
       fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+      matrix: ${{ fromJSON(needs.plan.outputs.record).groups.guards.matrix }}
+    env:
+      GROUP_REASON: ${{ fromJSON(needs.plan.outputs.record).groups.guards.reason }}
     steps:
+      - name: State the group's decision and its reason
+        run: |
+          printf 'Planted faults: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: matrix.shard != 0
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: matrix.shard != 0
         with:
           python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements.txt
       - run: make setup
-      - run: make test-guards SHARD="${SHARD}/8"
+        if: matrix.shard != 0
+      - run: make test-guards SHARD="${SHARD}/${SHARDS}"
+        if: matrix.shard != 0
         env:
           SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
       - name: Show the end of the run's log after a failure
-        if: failure()
+        if: failure() && matrix.shard != 0
         run: tail -n 150 runs/*/log.txt
 
   infrastructure:
-    name: Static checks of the Terraform and Ansible code
+    name: ${{ fromJSON(needs.plan.outputs.record).groups.infra.name }}
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      GROUP_RUNS: ${{ fromJSON(needs.plan.outputs.record).groups.infra.run }}
+      GROUP_REASON: ${{ fromJSON(needs.plan.outputs.record).groups.infra.reason }}
     steps:
+      - name: State the group's decision and its reason
+        run: |
+          printf 'Terraform and Ansible checks: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.GROUP_RUNS == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: env.GROUP_RUNS == 'true'
         with:
           python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements.txt
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: env.GROUP_RUNS == 'true'
         with:
           terraform_version: "1.16.4"
           terraform_wrapper: false
       - run: make setup
+        if: env.GROUP_RUNS == 'true'
       - run: make check-terraform
+        if: env.GROUP_RUNS == 'true'
       - run: make check-ansible
+        if: env.GROUP_RUNS == 'true'
