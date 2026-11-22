@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from features.model import SECOND, FeatureInputError, FeatureValue, GroupResult, WaveformSecond, WaveformValid, WaveformWindow
-from features.registry import MIN_VALID_SHARE, WAVEFORM_TRACKS, WAVEFORM_WINDOW_SECONDS, slug
+from features.registry import WAVEFORM_TRACKS, WAVEFORM_WINDOW_SECONDS, slug
 
 
 def window_seconds(track: str, window: WaveformWindow, cutoff_us: int) -> WaveformValid:
@@ -33,6 +33,7 @@ def waveform_group(track: str, window: WaveformWindow, cutoff_us: int) -> GroupR
     if track not in WAVEFORM_TRACKS:
         raise FeatureInputError(f"unknown track {track}")
     valid = window_seconds(track, window, cutoff_us)
-    enough = len(valid.seconds) >= MIN_VALID_SHARE * WAVEFORM_WINDOW_SECONDS
-    values: dict[str, FeatureValue] = {f"{slug(track)}__{stat.key}": stat.compute(valid) if enough or stat.always else None for stat in WAVEFORM_TRACKS[track]}
-    return GroupResult(values, (valid.seconds[-1].second + 1) * SECOND if enough else None)
+    values: dict[str, FeatureValue] = {
+        f"{slug(track)}__{stat.key}": stat.compute(valid) if valid.seconds or not stat.needs_value else None for stat in WAVEFORM_TRACKS[track]
+    }
+    return GroupResult(values, (valid.seconds[-1].second + 1) * SECOND if valid.seconds else None)

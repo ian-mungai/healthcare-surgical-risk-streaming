@@ -5,7 +5,7 @@ Failure modes covered here:
 - A feature's formula is wrong: each value of a hand-built window is compared with its known answer.
 - The window edge moves by one second, or a second that is not complete at the cutoff is used.
 - An invalid second is counted in a value, in the valid seconds or in the coverage share, or a missing second is not counted as invalid.
-- Fewer than half the seconds valid still returns values, or returns zeros.
+- A window with few valid seconds is dropped as a whole, or a statistic that cannot be computed (no valid second, one second for a spread) returns a number.
 - The dominant frequency leaves the band of 0.5 to 3.5 Hz, takes the wrong bin, or is moved by the gap where an invalid second was.
 - A flat signal reports a frequency.
 - The result depends on the order of the seconds.
@@ -132,20 +132,26 @@ class Validity(unittest.TestCase):
         window = waveform_window(sine(1.2, 90.0, 20.0), invalid=frozenset({3, 4, 11}))
         self.assertAlmostEqual(1.2, get(values_of(ART, window), "snuadc_art__dominant_freq_hz"), places=9)
 
-    def test_exactly_half_the_seconds_valid_returns_values(self) -> None:
-        result = values_of(ART, waveform_window(alternating, invalid=frozenset(range(10))))
-        self.assertEqual(10, result["snuadc_art__valid_seconds"])
-        self.assertIsNotNone(result["snuadc_art__mean"])
+    def test_a_window_with_few_valid_seconds_still_returns_its_values(self) -> None:
+        # Window seconds 11 to 19 are valid: 4 of pattern A (even positions) and 5 of pattern B.
+        window = waveform_window(alternating, invalid=frozenset(range(11)))
+        result = values_of(ART, window)
+        self.assertEqual(9, result["snuadc_art__valid_seconds"])
+        self.assertAlmostEqual(9 / 20, get(result, "snuadc_art__coverage"), places=12)
+        self.assertAlmostEqual((4 * 955 + 5 * 1000) / 90, get(result, "snuadc_art__mean"), places=9)
+        self.assertAlmostEqual((4 * 50 + 5 * 30) / 9, get(result, "snuadc_art__pulse_pressure_mean"), places=9)
+        self.assertIsNotNone(values_of(ECG, window)["snuadc_ecg_ii__std"])
+        self.assertAlmostEqual((4 * 50 + 5 * 30) / 9, get(values_of(PLETH, window), "snuadc_pleth__amplitude_mean"), places=9)
 
-    def test_less_than_half_valid_returns_every_value_missing_and_keeps_the_count_and_the_share(self) -> None:
-        for track, prefix in ((ART, "snuadc_art__"), (ECG, "snuadc_ecg_ii__"), (PLETH, "snuadc_pleth__")):
-            with self.subTest(track=track):
-                result = values_of(track, waveform_window(alternating, invalid=frozenset(range(11))))
-                self.assertEqual(9, result[prefix + "valid_seconds"])
-                self.assertAlmostEqual(9 / 20, get(result, prefix + "coverage"), places=12)
-                others = {name: value for name, value in result.items() if name not in (prefix + "valid_seconds", prefix + "coverage")}
-                self.assertTrue(others)
-                self.assertEqual({None}, set(others.values()))
+    def test_one_valid_second_has_no_spread_across_seconds_and_every_other_value(self) -> None:
+        window = waveform_window(alternating, invalid=frozenset(range(1, 20)))
+        result = values_of(PLETH, window)
+        self.assertEqual(1, result["snuadc_pleth__valid_seconds"])
+        self.assertEqual(50.0, result["snuadc_pleth__amplitude_mean"])
+        self.assertIsNone(result["snuadc_pleth__amplitude_std"])
+        art = values_of(ART, window)
+        self.assertAlmostEqual(95.5, get(art, "snuadc_art__mean"), places=9)
+        self.assertAlmostEqual(14.804278660801636, get(art, "snuadc_art__std"), places=9)
 
     def test_a_window_with_no_second_is_all_missing(self) -> None:
         result = values_of(ART, WaveformWindow(RATE_HZ, ()))

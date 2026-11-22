@@ -21,7 +21,7 @@ from features import batch
 from features.leakage import LeakageError
 from features.model import FeatureRow, WindowInput
 from features.row import build_row
-from tests.fast.features_support import ARTERIAL_MEAN, CUTOFF_US, SECOND, alternating, arithmetic, numeric_window, waveform_window
+from tests.fast.features_support import ARTERIAL_MEAN, CUTOFF_US, SECOND, SERIES, alternating, arithmetic, numeric_window, waveform_window
 
 
 def window_document(window_id: str, future: bool = False) -> dict[str, Any]:
@@ -40,7 +40,7 @@ def window_document(window_id: str, future: bool = False) -> dict[str, Any]:
     return {
         "window_id": window_id,
         "cutoff_us": CUTOFF_US,
-        "numeric": {ARTERIAL_MEAN: readings},
+        "numeric": {ARTERIAL_MEAN: readings, SERIES: readings},
         "waveforms": {"SNUADC/ART": {"sample_rate": wave.sample_rate, "seconds": seconds}},
         "clinical": clinical,
     }
@@ -65,7 +65,7 @@ class Entry(unittest.TestCase):
         self.assertEqual(CUTOFF_US, row["cutoff_us"])
         features = row["features"]
         self.assertEqual(899, features["solar8000_art_mbp__valid_count"])
-        self.assertAlmostEqual(899 / 900, features["solar8000_art_mbp__coverage"], places=12)
+        self.assertAlmostEqual(899 / 900, features["silver_art_mbp_1s__coverage"], places=12)
         self.assertEqual(20, features["snuadc_art__valid_seconds"])
         self.assertAlmostEqual(40.0, features["snuadc_art__pulse_pressure_mean"], places=9)
         self.assertEqual(63, features["age"])

@@ -1,8 +1,13 @@
-"""The registry: every feature's name, unit, missing rule and formula in one place.
+"""The registry: every feature's name, unit, missing rule, formula and status in one place.
 
-A change to the frozen feature list is one edit here and its test in ``tests/fast/test_features_row.py``. The tracks are the publisher's, and their exact list
-is fixed from ``bronze.tracks`` on development cases: change ``NUMERIC_TRACKS`` and ``WAVEFORM_TRACKS`` then. A feature of a track is named
-``<track in lower case, / as _>__<statistic>``.
+A change to the frozen feature list is one edit here and its test in ``tests/fast/test_features_row.py``. A feature of a track is named
+``<track in lower case, / as _>__<statistic>``. A track has one input kind:
+
+- ``source_time``: a monitor track at its published times in microseconds, irregular spacing allowed. Silver removes duplicate readings before the features.
+- ``per_second``: Silver's per-second series, one value for each whole second with a valid flag. The pressure features come from this kind only.
+
+A statistic is missing only when it cannot be computed. The only limits on the data are the sample eligibility limits of the analysis plan (``eligibility.py``).
+Every track name and unit is ``to_confirm`` until its status says ``confirmed`` with an evidence note.
 """
 
 from __future__ import annotations
@@ -14,19 +19,46 @@ from functools import cache
 from features import stats
 from features.model import MINUTE, SECOND, FeatureValue, NumericWindow, WaveformValid
 
+SOURCE_TIME = "source_time"
+PER_SECOND = "per_second"
 NUMERIC_WINDOW_SECONDS = 900
 WAVEFORM_WINDOW_SECONDS = 20
-MIN_VALID_SHARE = 0.5
 BAND_LOW_HZ = 0.5
 BAND_HIGH_HZ = 3.5
 LOW_PRESSURE_65 = 65.0
 LOW_PRESSURE_60 = 60.0
 PROJECTION_MINUTES = 5
-ARTERIAL_MEAN_TRACK = "Solar8000/ART_MBP"
+ARTERIAL_SERIES = "Silver/ART_MBP_1S"
 PUBLISHER_UNIT = "the publisher's unit of the track"
 PREOP_PREFIX = "preop_"
 
-MISSING_GROUP = "missing when fewer than half of the window's seconds are valid"
+# The sample eligibility limits of the analysis plan (project standard, "Analysis decisions and their evidence", row 5).
+MAX_INVALID_WAVEFORM_SECONDS = 0
+MAX_INVALID_NUMERIC_PERCENT = 10
+WAVEFORM_INVALID_SECOND = "waveform_invalid_second"
+NUMERIC_OVER_10_PERCENT_INVALID = "numeric_over_10_percent_invalid"
+
+MISSING_NO_VALUE = "missing when the window holds no valid reading"
+MISSING_FEWER_THAN_TWO = "missing when the window holds fewer than 2 valid readings"
+MISSING_NO_SECOND = "missing when the window holds no valid second"
+MISSING_ONE_SECOND = "missing when the window holds fewer than 2 valid seconds"
+NEVER_MISSING = "never missing"
+SAMPLE_STD = "the sample standard deviation (n - 1)"
+
+
+@dataclass(frozen=True, slots=True)
+class TrackStatus:
+    """Whether a track's name and unit are confirmed, and the evidence (confirmed) or what to confirm (not confirmed)."""
+
+    confirmed: bool
+    evidence: str
+
+
+TO_CONFIRM = TrackStatus(False, "to confirm against bronze.tracks before the list is frozen")
+ARTERIAL_WAVEFORM_STATUS = TrackStatus(True, "confirmed: the waveform of the fixed sample's candidate list (scripts/sample/candidates.py)")
+ARTERIAL_MEAN_STATUS = TrackStatus(True, "confirmed in the review of the feature list on Nov 22 2026")
+SERIES_STATUS = TrackStatus(False, "to confirm against the Silver table when it is built")
+PROJECTION_NOTE = "to confirm against Jacquet-Lagrèze 2022 before the list is frozen"
 
 
 def slug(track: str) -> str:
@@ -34,7 +66,7 @@ def slug(track: str) -> str:
 
 
 def below_minutes(window: NumericWindow, limit: float) -> float:
-    """Each valid reading stands for one second of Silver's grid: the minutes below ``limit`` are the readings below it over 60."""
+    """Each valid second of the per-second series stands for one second: the minutes below ``limit`` are the seconds below it over 60."""
     return sum(1 for value in window.values if value < limit) / 60
 
 
@@ -44,111 +76,132 @@ def seconds_since_below(window: NumericWindow, limit: float) -> float | None:
 
 
 def window_slope_per_minute(window: NumericWindow) -> float | None:
+    """The least-squares slope on the actual times of the valid readings, in minutes."""
     return stats.slope([(time - window.cutoff_us) / MINUTE for time in window.times_us], window.values)
 
 
 def projection(window: NumericWindow) -> float | None:
-    """The last valid value plus the window's slope times 5 minutes."""
+    """The last valid value plus the window's slope per minute times 5 minutes."""
     window_slope = window_slope_per_minute(window)
     return None if window_slope is None else window.values[-1] + PROJECTION_MINUTES * window_slope
 
 
 @dataclass(frozen=True, slots=True)
 class NumericTrackSpec:
+    kind: str
     family: str
     unit: str
+    status: TrackStatus
 
 
 NUMERIC_TRACKS: dict[str, NumericTrackSpec] = {
-    "Solar8000/ART_MBP": NumericTrackSpec("arterial pressure, mean", "mmHg"),
-    "Solar8000/ART_SBP": NumericTrackSpec("arterial pressure, systolic", "mmHg"),
-    "Solar8000/ART_DBP": NumericTrackSpec("arterial pressure, diastolic", "mmHg"),
-    "Solar8000/NIBP_MBP": NumericTrackSpec("non-invasive pressure, mean", "mmHg"),
-    "Solar8000/HR": NumericTrackSpec("heart rate", "beats per minute"),
-    "Solar8000/PLETH_SPO2": NumericTrackSpec("oxygen saturation", "%"),
-    "Solar8000/ETCO2": NumericTrackSpec("end-tidal carbon dioxide", "mmHg"),
-    "Primus/MV": NumericTrackSpec("minute ventilation", "L/min"),
-    "Orchestra/PPF20_RATE": NumericTrackSpec("infusion rate, propofol", PUBLISHER_UNIT),
-    "Orchestra/RFTN20_RATE": NumericTrackSpec("infusion rate, remifentanil", PUBLISHER_UNIT),
-    "Orchestra/NEPI_RATE": NumericTrackSpec("infusion rate, vasopressor (norepinephrine)", PUBLISHER_UNIT),
-    "Orchestra/EPI_RATE": NumericTrackSpec("infusion rate, vasopressor (epinephrine)", PUBLISHER_UNIT),
-    "Orchestra/PHEN_RATE": NumericTrackSpec("infusion rate, vasopressor (phenylephrine)", PUBLISHER_UNIT),
-    "Orchestra/VASO_RATE": NumericTrackSpec("infusion rate, vasopressor (vasopressin)", PUBLISHER_UNIT),
-    "Orchestra/DOPA_RATE": NumericTrackSpec("infusion rate, vasopressor (dopamine)", PUBLISHER_UNIT),
+    "Solar8000/ART_MBP": NumericTrackSpec(SOURCE_TIME, "arterial pressure, mean", "mmHg", ARTERIAL_MEAN_STATUS),
+    "Solar8000/ART_SBP": NumericTrackSpec(SOURCE_TIME, "arterial pressure, systolic", "mmHg", TO_CONFIRM),
+    "Solar8000/ART_DBP": NumericTrackSpec(SOURCE_TIME, "arterial pressure, diastolic", "mmHg", TO_CONFIRM),
+    "Solar8000/NIBP_MBP": NumericTrackSpec(SOURCE_TIME, "non-invasive pressure, mean", "mmHg", TO_CONFIRM),
+    "Solar8000/HR": NumericTrackSpec(SOURCE_TIME, "heart rate", "beats per minute", TO_CONFIRM),
+    "Solar8000/PLETH_SPO2": NumericTrackSpec(SOURCE_TIME, "oxygen saturation", "%", TO_CONFIRM),
+    "Solar8000/ETCO2": NumericTrackSpec(SOURCE_TIME, "end-tidal carbon dioxide", "mmHg", TO_CONFIRM),
+    "Primus/MV": NumericTrackSpec(SOURCE_TIME, "minute ventilation", "L/min", TO_CONFIRM),
+    "Orchestra/PPF20_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, propofol", PUBLISHER_UNIT, TO_CONFIRM),
+    "Orchestra/RFTN20_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, remifentanil", PUBLISHER_UNIT, TO_CONFIRM),
+    "Orchestra/NEPI_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, vasopressor (norepinephrine)", PUBLISHER_UNIT, TO_CONFIRM),
+    "Orchestra/EPI_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, vasopressor (epinephrine)", PUBLISHER_UNIT, TO_CONFIRM),
+    "Orchestra/PHEN_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, vasopressor (phenylephrine)", PUBLISHER_UNIT, TO_CONFIRM),
+    "Orchestra/VASO_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, vasopressor (vasopressin)", PUBLISHER_UNIT, TO_CONFIRM),
+    "Orchestra/DOPA_RATE": NumericTrackSpec(SOURCE_TIME, "infusion rate, vasopressor (dopamine)", PUBLISHER_UNIT, TO_CONFIRM),
+    ARTERIAL_SERIES: NumericTrackSpec(PER_SECOND, "arterial mean pressure, per second (the trailing 2-second average of SNUADC/ART)", "mmHg", SERIES_STATUS),
 }
 
 
 @dataclass(frozen=True, slots=True)
 class NumericStat:
-    """One statistic of a numeric track. ``unit`` holds ``{unit}`` for the track's unit. A statistic that is ``always`` is never missing."""
+    """One statistic of a numeric track. ``unit`` holds ``{unit}`` for the track's unit. A statistic that does not ``needs_value`` is never missing.
+
+    A ``note`` marks the statistic as to be confirmed, with what to confirm it against.
+    """
 
     key: str
     unit: str
     missing: str
     definition: str
     compute: Callable[[NumericWindow], FeatureValue]
-    always: bool = False
-    arterial_mean_only: bool = False
+    needs_value: bool = True
+    note: str = ""
 
 
-NUMERIC_STATS: tuple[NumericStat, ...] = (
-    NumericStat("last", "{unit}", MISSING_GROUP, "the value of the latest valid reading in the window", lambda w: w.values[-1]),
-    NumericStat("mean", "{unit}", MISSING_GROUP, "the mean of the valid readings", lambda w: stats.mean(w.values)),
+SOURCE_STATS: tuple[NumericStat, ...] = (
+    NumericStat("last", "{unit}", MISSING_NO_VALUE, "the value of the latest valid reading in the window", lambda w: w.values[-1]),
+    NumericStat("mean", "{unit}", MISSING_NO_VALUE, "the mean of the valid readings", lambda w: stats.mean(w.values)),
     NumericStat(
-        "median", "{unit}", MISSING_GROUP, "the median of the valid readings; the mean of the middle pair for an even count", lambda w: stats.median(w.values)
+        "median",
+        "{unit}",
+        MISSING_NO_VALUE,
+        "the median of the valid readings; the mean of the middle pair for an even count",
+        lambda w: stats.median(w.values),
     ),
-    NumericStat("min", "{unit}", MISSING_GROUP, "the smallest valid reading", lambda w: min(w.values)),
-    NumericStat("max", "{unit}", MISSING_GROUP, "the largest valid reading", lambda w: max(w.values)),
-    NumericStat("std", "{unit}", MISSING_GROUP, "the sample standard deviation (n - 1) of the valid readings", lambda w: stats.sample_std(w.values)),
+    NumericStat("min", "{unit}", MISSING_NO_VALUE, "the smallest valid reading", lambda w: min(w.values)),
+    NumericStat("max", "{unit}", MISSING_NO_VALUE, "the largest valid reading", lambda w: max(w.values)),
+    NumericStat("std", "{unit}", MISSING_FEWER_THAN_TWO, f"{SAMPLE_STD} of the valid readings", lambda w: stats.sample_std(w.values)),
     NumericStat(
         "slope_per_min",
         "{unit} per minute",
-        MISSING_GROUP,
-        "the least-squares slope of the valid readings on their time in minutes",
+        MISSING_FEWER_THAN_TWO,
+        "the least-squares slope of the valid readings on their actual times, per minute",
         window_slope_per_minute,
     ),
-    NumericStat("valid_count", "readings", "never missing", "the number of valid readings in the window", lambda w: len(w.values), always=True),
+    NumericStat("valid_count", "readings", NEVER_MISSING, "the number of valid readings in the window", lambda w: len(w.values), needs_value=False),
+    NumericStat(
+        "seconds_since_last",
+        "seconds",
+        MISSING_NO_VALUE,
+        "the cutoff minus the time of the latest valid reading",
+        lambda w: (w.cutoff_us - w.times_us[-1]) / SECOND,
+    ),
+)
+
+SERIES_STATS: tuple[NumericStat, ...] = (
+    NumericStat("valid_count", "seconds", NEVER_MISSING, "the number of valid seconds in the window", lambda w: len(w.values), needs_value=False),
     NumericStat(
         "coverage",
         "share of the window's 900 seconds",
-        "never missing",
-        "the valid readings over the 900 seconds of the window",
+        NEVER_MISSING,
+        "the valid seconds over the 900 seconds of the window",
         lambda w: len(w.values) / NUMERIC_WINDOW_SECONDS,
-        always=True,
+        needs_value=False,
     ),
     NumericStat(
         "minutes_below_65",
         "minutes",
-        MISSING_GROUP,
-        "the valid readings strictly below 65 mmHg, one second each, over 60",
+        MISSING_NO_VALUE,
+        "the valid seconds strictly below 65 mmHg, one second each, over 60",
         lambda w: below_minutes(w, LOW_PRESSURE_65),
-        arterial_mean_only=True,
     ),
     NumericStat(
         "minutes_below_60",
         "minutes",
-        MISSING_GROUP,
-        "the valid readings strictly below 60 mmHg, one second each, over 60",
+        MISSING_NO_VALUE,
+        "the valid seconds strictly below 60 mmHg, one second each, over 60",
         lambda w: below_minutes(w, LOW_PRESSURE_60),
-        arterial_mean_only=True,
     ),
     NumericStat(
         "seconds_since_below_65",
         "seconds",
-        f"{MISSING_GROUP}; missing when no valid reading in the window is below 65 mmHg",
-        "the cutoff minus the time of the latest valid reading strictly below 65 mmHg",
+        f"{MISSING_NO_VALUE}; missing when no valid second in the window is below 65 mmHg",
+        "the cutoff minus the time of the latest valid second strictly below 65 mmHg",
         lambda w: seconds_since_below(w, LOW_PRESSURE_65),
-        arterial_mean_only=True,
     ),
     NumericStat(
         "projection_5min",
         "mmHg",
-        MISSING_GROUP,
-        "the last valid value plus 5 times the window's slope per minute",
+        MISSING_FEWER_THAN_TWO,
+        "the last valid value plus 5 times the least-squares slope per minute of the window's valid seconds",
         projection,
-        arterial_mean_only=True,
+        note=PROJECTION_NOTE,
     ),
 )
+
+NUMERIC_STATS: dict[str, tuple[NumericStat, ...]] = {SOURCE_TIME: SOURCE_STATS, PER_SECOND: SERIES_STATS}
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +211,7 @@ class WaveformStat:
     missing: str
     definition: str
     compute: Callable[[WaveformValid], FeatureValue]
-    always: bool = False
+    needs_value: bool = True
 
 
 def amplitudes(valid: WaveformValid) -> list[float]:
@@ -176,28 +229,32 @@ def dominant(valid: WaveformValid) -> float | None:
 FREQUENCY = WaveformStat(
     "dominant_freq_hz",
     "Hz",
-    f"{MISSING_GROUP}; missing when the signal is flat",
+    f"{MISSING_NO_SECOND}; missing when the signal is flat",
     "the frequency from 0.5 to 3.5 Hz in steps of 0.05 Hz with the most power, from the valid samples at their true times; the lowest wins a tie",
     dominant,
 )
-VALID_SECONDS = WaveformStat("valid_seconds", "seconds", "never missing", "the valid seconds in the 20-second window", lambda v: len(v.seconds), always=True)
+VALID_SECONDS = WaveformStat(
+    "valid_seconds", "seconds", NEVER_MISSING, "the valid seconds in the 20-second window", lambda v: len(v.seconds), needs_value=False
+)
 WAVEFORM_COVERAGE = WaveformStat(
     "coverage",
     "share of the window's 20 seconds",
-    "never missing",
+    NEVER_MISSING,
     "the valid seconds over 20",
     lambda v: len(v.seconds) / WAVEFORM_WINDOW_SECONDS,
-    always=True,
+    needs_value=False,
 )
 
 WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
     "SNUADC/ART": (
-        WaveformStat("mean", "mmHg", MISSING_GROUP, "the mean of the valid samples", lambda v: stats.mean(all_samples(v))),
-        WaveformStat("std", "mmHg", MISSING_GROUP, "the sample standard deviation (n - 1) of the valid samples", lambda v: stats.sample_std(all_samples(v))),
+        WaveformStat("mean", "mmHg", MISSING_NO_SECOND, "the mean of the valid samples", lambda v: stats.mean(all_samples(v))),
+        WaveformStat(
+            "std", "mmHg", MISSING_NO_SECOND, "the sample standard deviation (n - 1) of the valid samples", lambda v: stats.sample_std(all_samples(v))
+        ),
         WaveformStat(
             "pulse_pressure_mean",
             "mmHg",
-            MISSING_GROUP,
+            MISSING_NO_SECOND,
             "the mean over the valid seconds of each second's largest minus smallest sample",
             lambda v: stats.mean(amplitudes(v)),
         ),
@@ -206,7 +263,7 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
         WAVEFORM_COVERAGE,
     ),
     "SNUADC/ECG_II": (
-        WaveformStat("std", "mV", MISSING_GROUP, "the sample standard deviation (n - 1) of the valid samples", lambda v: stats.sample_std(all_samples(v))),
+        WaveformStat("std", "mV", MISSING_NO_SECOND, "the sample standard deviation (n - 1) of the valid samples", lambda v: stats.sample_std(all_samples(v))),
         FREQUENCY,
         VALID_SECONDS,
         WAVEFORM_COVERAGE,
@@ -215,14 +272,14 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
         WaveformStat(
             "amplitude_mean",
             "signal unit",
-            MISSING_GROUP,
+            MISSING_NO_SECOND,
             "the mean over the valid seconds of each second's largest minus smallest sample",
             lambda v: stats.mean(amplitudes(v)),
         ),
         WaveformStat(
             "amplitude_std",
             "signal unit",
-            MISSING_GROUP,
+            MISSING_ONE_SECOND,
             "the sample standard deviation (n - 1) of the valid seconds' amplitudes",
             lambda v: stats.sample_std(amplitudes(v)),
         ),
@@ -232,6 +289,8 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
     ),
 }
 
+WAVEFORM_STATUS: dict[str, TrackStatus] = {"SNUADC/ART": ARTERIAL_WAVEFORM_STATUS, "SNUADC/ECG_II": TO_CONFIRM, "SNUADC/PLETH": TO_CONFIRM}
+
 CLINICAL_FIELDS = ("age", "sex", "height", "weight", "bmi", "asa", "emop", "department", "optype")
 SENSITIVITY_FIELDS = ("approach", "position", "ane_type")
 CLINICAL_MISSING = "missing when the value is not in the table or its availability time is unknown or after the cutoff"
@@ -240,34 +299,77 @@ CLINICAL_UNITS = {"age": "years", "height": "cm", "weight": "kg", "bmi": "kg/m^2
 
 @dataclass(frozen=True, slots=True)
 class FeatureSpec:
+    """A feature. ``status`` is ``confirmed`` or ``to_confirm``, and ``note`` is the evidence or what to confirm."""
+
     name: str
     unit: str
     group: str
+    input_kind: str
     missing: str
     definition: str
+    status: str
+    note: str
     sensitivity_only: bool = False
+
+
+def status_word(confirmed: bool) -> str:
+    return "confirmed" if confirmed else "to_confirm"
 
 
 def feature_specs() -> tuple[FeatureSpec, ...]:
     """Every feature with a fixed name. The ``preop_`` family has one name per result or condition of the table and is known by its prefix."""
     specs: list[FeatureSpec] = []
     for track, track_spec in NUMERIC_TRACKS.items():
-        for stat in NUMERIC_STATS:
-            if stat.arterial_mean_only and track != ARTERIAL_MEAN_TRACK:
-                continue
+        for stat in NUMERIC_STATS[track_spec.kind]:
+            confirmed = track_spec.status.confirmed and not stat.note
+            note = stat.note or track_spec.status.evidence
+            definition = f"{track_spec.family}: {stat.definition}"
             specs.append(
                 FeatureSpec(
-                    f"{slug(track)}__{stat.key}", stat.unit.format(unit=track_spec.unit), track, stat.missing, f"{track_spec.family}: {stat.definition}"
+                    f"{slug(track)}__{stat.key}",
+                    stat.unit.format(unit=track_spec.unit),
+                    track,
+                    track_spec.kind,
+                    stat.missing,
+                    definition,
+                    status_word(confirmed),
+                    note,
                 )
             )
     for track, waveform_stats in WAVEFORM_TRACKS.items():
-        specs += [FeatureSpec(f"{slug(track)}__{stat.key}", stat.unit, track, stat.missing, stat.definition) for stat in waveform_stats]
+        status = WAVEFORM_STATUS[track]
+        specs += [
+            FeatureSpec(
+                f"{slug(track)}__{stat.key}", stat.unit, track, "waveform", stat.missing, stat.definition, status_word(status.confirmed), status.evidence
+            )
+            for stat in waveform_stats
+        ]
+    plan_note = "a field of the owner-approved feature list"
     specs += [
-        FeatureSpec(field, CLINICAL_UNITS.get(field, "category or code"), "clinical", CLINICAL_MISSING, "the value in the clinical table")
+        FeatureSpec(
+            field,
+            CLINICAL_UNITS.get(field, "category or code"),
+            "clinical",
+            "clinical",
+            CLINICAL_MISSING,
+            "the value in the clinical table",
+            "confirmed",
+            plan_note,
+        )
         for field in CLINICAL_FIELDS
     ]
     specs += [
-        FeatureSpec(field, "category", "clinical", CLINICAL_MISSING, "the value in the clinical table; a sensitivity analysis only", True)
+        FeatureSpec(
+            field,
+            "category",
+            "clinical",
+            "clinical",
+            CLINICAL_MISSING,
+            "the value in the clinical table; a sensitivity analysis only",
+            "confirmed",
+            plan_note,
+            True,
+        )
         for field in SENSITIVITY_FIELDS
     ]
     return tuple(specs)

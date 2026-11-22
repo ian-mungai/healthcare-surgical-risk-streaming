@@ -17,9 +17,9 @@ from typing import Any
 
 from features.leakage import FORBIDDEN_FIELDS, row_problems
 from features.model import ClinicalValue, FeatureRow, Reading, WaveformSecond, WaveformWindow, WindowInput
-from features.registry import NUMERIC_TRACKS, WAVEFORM_TRACKS, feature_specs, is_registered
+from features.registry import NUMERIC_TRACKS, WAVEFORM_STATUS, WAVEFORM_TRACKS, feature_specs, is_registered
 from features.row import build_row
-from tests.fast.features_support import ARTERIAL_MEAN, CUTOFF_US, SECOND, alternating, arithmetic, numeric_window, waveform_window
+from tests.fast.features_support import ARTERIAL_MEAN, CUTOFF_US, HEART_RATE, SECOND, SERIES, alternating, arithmetic, numeric_window, waveform_window
 
 # The draft feature list, written out independently of the registry.
 LIST_NUMERIC_TRACKS = {
@@ -33,8 +33,9 @@ LIST_NUMERIC_TRACKS = {
     "remifentanil": ["Orchestra/RFTN20_RATE"],
     "vasopressor": ["Orchestra/NEPI_RATE", "Orchestra/EPI_RATE", "Orchestra/PHEN_RATE", "Orchestra/VASO_RATE", "Orchestra/DOPA_RATE"],
 }
-LIST_NUMERIC_STATS = ["last", "mean", "median", "min", "max", "std", "slope_per_min", "valid_count", "coverage"]
-LIST_ARTERIAL_MEAN_STATS = ["minutes_below_65", "minutes_below_60", "seconds_since_below_65", "projection_5min"]
+LIST_SOURCE_STATS = ["last", "mean", "median", "min", "max", "std", "slope_per_min", "valid_count", "seconds_since_last"]
+LIST_SERIES = "Silver/ART_MBP_1S"
+LIST_SERIES_STATS = ["valid_count", "coverage", "minutes_below_65", "minutes_below_60", "seconds_since_below_65", "projection_5min"]
 LIST_WAVEFORM_STATS = {
     "SNUADC/ART": ["mean", "std", "pulse_pressure_mean", "dominant_freq_hz", "valid_seconds", "coverage"],
     "SNUADC/ECG_II": ["std", "dominant_freq_hz", "valid_seconds", "coverage"],
@@ -53,8 +54,8 @@ def expected_names() -> set[str]:
     names = set(LIST_CLINICAL)
     for tracks in LIST_NUMERIC_TRACKS.values():
         for track in tracks:
-            names |= {f"{slug(track)}__{stat}" for stat in LIST_NUMERIC_STATS}
-    names |= {f"{slug(ARTERIAL_MEAN)}__{stat}" for stat in LIST_ARTERIAL_MEAN_STATS}
+            names |= {f"{slug(track)}__{stat}" for stat in LIST_SOURCE_STATS}
+    names |= {f"{slug(LIST_SERIES)}__{stat}" for stat in LIST_SERIES_STATS}
     for track, stats in LIST_WAVEFORM_STATS.items():
         names |= {f"{slug(track)}__{stat}" for stat in stats}
     return names
@@ -71,7 +72,7 @@ class Registry(unittest.TestCase):
         self.assertEqual(set(LIST_SENSITIVITY), {spec.name for spec in feature_specs() if spec.sensitivity_only})
 
     def test_the_tracks_of_the_registry_are_those_of_the_list(self) -> None:
-        self.assertEqual({track for tracks in LIST_NUMERIC_TRACKS.values() for track in tracks}, set(NUMERIC_TRACKS))
+        self.assertEqual({track for tracks in LIST_NUMERIC_TRACKS.values() for track in tracks} | {LIST_SERIES}, set(NUMERIC_TRACKS))
         self.assertEqual(set(LIST_WAVEFORM_STATS), set(WAVEFORM_TRACKS))
 
     def test_every_feature_has_a_unit_a_missing_rule_and_a_definition_and_no_name_repeats(self) -> None:
@@ -82,6 +83,51 @@ class Registry(unittest.TestCase):
                 self.assertTrue(spec.unit.strip())
                 self.assertTrue(spec.missing.strip())
                 self.assertTrue(spec.definition.strip())
+
+    def test_every_feature_has_its_input_kind_and_the_registry_keeps_both_kinds_of_numeric_input(self) -> None:
+        kinds = {spec.group: spec.input_kind for spec in feature_specs()}
+        self.assertEqual("per_second", kinds[SERIES])
+        self.assertEqual("source_time", kinds[ARTERIAL_MEAN])
+        self.assertEqual("source_time", kinds[HEART_RATE])
+        self.assertEqual("waveform", kinds["SNUADC/ART"])
+        self.assertEqual("clinical", kinds["clinical"])
+        self.assertEqual({"source_time", "per_second", "waveform", "clinical"}, set(kinds.values()))
+        self.assertEqual({SERIES}, {track for track, spec in NUMERIC_TRACKS.items() if spec.kind == "per_second"})
+
+    def test_a_track_marked_confirmed_has_an_evidence_note_and_an_unconfirmed_one_says_what_to_confirm(self) -> None:
+        statuses = {track: spec.status for track, spec in NUMERIC_TRACKS.items()} | dict(WAVEFORM_STATUS)
+        self.assertEqual(set(NUMERIC_TRACKS) | set(WAVEFORM_TRACKS), set(statuses))
+        for track, status in statuses.items():
+            with self.subTest(track=track):
+                self.assertTrue(status.evidence.strip())
+                if not status.confirmed:
+                    self.assertIn("to confirm", status.evidence)
+        for track in ("SNUADC/ART", "Solar8000/ART_MBP"):
+            self.assertTrue(statuses[track].confirmed)
+        for track in ("Solar8000/HR", "SNUADC/ECG_II", "SNUADC/PLETH", "Orchestra/PPF20_RATE", "Primus/MV"):
+            self.assertFalse(statuses[track].confirmed)
+            self.assertIn("bronze.tracks", statuses[track].evidence)
+
+    def test_every_feature_carries_the_status_of_its_track_and_the_projection_names_its_source_to_confirm(self) -> None:
+        by_name = {spec.name: spec for spec in feature_specs()}
+        for spec in by_name.values():
+            with self.subTest(name=spec.name):
+                self.assertIn(spec.status, ("confirmed", "to_confirm"))
+                self.assertTrue(spec.note.strip())
+                if spec.status == "confirmed":
+                    self.assertNotIn("to confirm", spec.note)
+        self.assertEqual("confirmed", by_name["solar8000_art_mbp__mean"].status)
+        self.assertEqual("to_confirm", by_name["solar8000_hr__mean"].status)
+        self.assertEqual("to_confirm", by_name["snuadc_pleth__amplitude_std"].status)
+        self.assertEqual("to_confirm", by_name["silver_art_mbp_1s__projection_5min"].status)
+        self.assertIn("Jacquet-Lagrèze 2022", by_name["silver_art_mbp_1s__projection_5min"].note)
+
+    def test_every_standard_deviation_says_that_it_divides_by_n_minus_one(self) -> None:
+        stds = [spec for spec in feature_specs() if spec.name.endswith(("__std", "__amplitude_std"))]
+        self.assertEqual(len(NUMERIC_TRACKS) - 1 + 3, len(stds))
+        for spec in stds:
+            with self.subTest(name=spec.name):
+                self.assertIn("n - 1", spec.definition)
 
     def test_the_registry_knows_its_names_and_the_pre_operative_family_and_nothing_else(self) -> None:
         self.assertTrue(is_registered("age"))
@@ -119,12 +165,19 @@ class Row(unittest.TestCase):
     def test_a_row_from_a_full_window_has_known_values_and_recorded_latest_times(self) -> None:
         window = WindowInput(
             CUTOFF_US,
-            {ARTERIAL_MEAN: numeric_window(arithmetic(100.0, -0.05)), "Solar8000/HR": numeric_window([60.0] * 890, cutoff_us=CUTOFF_US - 10 * SECOND)},
+            {
+                ARTERIAL_MEAN: numeric_window(arithmetic(100.0, -0.05)),
+                SERIES: numeric_window(arithmetic(100.0, -0.05)),
+                HEART_RATE: numeric_window([60.0] * 890, cutoff_us=CUTOFF_US - 10 * SECOND),
+            },
             {"SNUADC/ART": waveform_window(alternating)},
             {"age": ClinicalValue(63, 100), "preop_hb": ClinicalValue(12.1, 250)},
         )
         row = build_row(window)
         self.assertEqual(890, row.values["solar8000_hr__valid_count"])
+        self.assertEqual(10.0, row.values["solar8000_hr__seconds_since_last"])
+        self.assertEqual(900, row.values["silver_art_mbp_1s__valid_count"])
+        self.assertEqual(1.0, row.values["silver_art_mbp_1s__coverage"])
         self.assertEqual(0, row.values["snuadc_ecg_ii__valid_seconds"])
         self.assertEqual(0, row.values["snuadc_pleth__valid_seconds"])
         self.assertIsNone(row.values["snuadc_ecg_ii__std"])

@@ -10,6 +10,8 @@ from features.model import Reading, WaveformSecond, WaveformWindow
 SECOND = 1_000_000
 CUTOFF_US = 3_600 * SECOND
 ARTERIAL_MEAN = "Solar8000/ART_MBP"
+SERIES = "Silver/ART_MBP_1S"
+HEART_RATE = "Solar8000/HR"
 RATE_HZ = 10.0
 
 
@@ -17,6 +19,12 @@ def numeric_window(values: Sequence[float], cutoff_us: int = CUTOFF_US, valid: C
     """One reading for each second, the last at the cutoff: reading ``j`` of ``n`` is at ``cutoff - (n - 1 - j)`` seconds."""
     count = len(values)
     return [Reading(cutoff_us - (count - 1 - index) * SECOND, value, valid(index)) for index, value in enumerate(values)]
+
+
+def spaced_window(values: Sequence[float], step_seconds: int, cutoff_us: int = CUTOFF_US, valid: Callable[[int], bool] = lambda index: True) -> list[Reading]:
+    """Readings every ``step_seconds``, the last at the cutoff, as a monitor reports them."""
+    count = len(values)
+    return [Reading(cutoff_us - (count - 1 - index) * step_seconds * SECOND, value, valid(index)) for index, value in enumerate(values)]
 
 
 def arithmetic(start: float, step: float, count: int = 900) -> list[float]:
