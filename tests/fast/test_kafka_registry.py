@@ -17,6 +17,7 @@ from typing import Any
 
 from scripts.stack.limits import load_limits
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.test_postgres_accounts import TOOLS_FILE, accounts
 
 ROOT = Path(__file__).resolve().parents[2]
 LIBRARY = ROOT / "ansible" / "roles" / "compose_stack" / "library"
@@ -263,7 +264,7 @@ class StackBoundsTest(unittest.TestCase):
         self.assertEqual(250, size * int(variables["docker_log_max_file"]))
 
     def test_the_registry_user_owns_its_password_file_and_the_account_and_its_line_exist(self) -> None:
-        self.assertIn("apicurio", (COMPOSE / "postgres_tools.txt").read_text().split())
+        self.assertEqual(["apicurio"], accounts.parse_tools(TOOLS_FILE.read_text()).get("apicurio"))
         self.assertIn("apicurio 10002:10002", (COMPOSE / "openbao_services.txt").read_text())
         self.assertEqual("10002:10002", service_file("apicurio")["services"]["apicurio"]["user"])
 

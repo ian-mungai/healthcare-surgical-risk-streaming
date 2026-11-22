@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.test_postgres_accounts import TOOLS_FILE, accounts
 
 COMPOSE = Path(__file__).resolve().parents[2] / "compose"
-TOOLS = [line.split("#", 1)[0].strip() for line in (COMPOSE / "postgres_tools.txt").read_text().splitlines() if line.split("#", 1)[0].strip()]
+TOOLS: dict[str, list[str]] = accounts.parse_tools(TOOLS_FILE.read_text())
 
 
 def nessie() -> dict[str, Any]:
@@ -25,8 +26,8 @@ def nessie() -> dict[str, Any]:
 
 
 class NessieServiceTest(unittest.TestCase):
-    def test_nessie_is_a_tool_of_the_list_so_its_account_and_database_exist(self) -> None:
-        self.assertIn("nessie", TOOLS)
+    def test_nessie_is_a_tool_of_the_list_so_its_account_and_its_own_database_exist(self) -> None:
+        self.assertEqual(["nessie"], TOOLS.get("nessie"))
 
     def test_the_version_store_is_the_tools_own_database_and_account_on_the_postgres_service(self) -> None:
         environment = nessie()["services"]["nessie"]["environment"]
