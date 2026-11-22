@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
+from scripts.sample.candidates import RELEASE_FILE
 from scripts.stack.groups import Settings, compose_arguments
 from scripts.stack.nessie import NessieClient, NessieError
 from spark import table_checks as rules
@@ -41,11 +43,12 @@ RUN_FORMAT = "table_checks_run_1"
 RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
+JOB_OUTPUT_FILE = "job_output.txt"
+TRACKED_RELEASE_FILE = RELEASE_FILE
 MANIFEST_LINE_PREFIX = "records-manifest: "
 MANIFEST_FIELDS: Mapping[str, type] = {"bucket": str, "key": str, "version_id": str, "sha256": str}
 LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "manifest": dict, "tables": dict}
 FILE_TABLES = tuple(spec.name for spec in rules.TABLES if spec.source == "file")
-ERROR_TAIL_BYTES = 400
 
 
 class TableChecksError(RuntimeError):
@@ -151,8 +154,8 @@ def manifest_line(sha256: str) -> str:
     return f"{MANIFEST_LINE_PREFIX}{sha256}"
 
 
-def read_track_pin(path: Path) -> rules.TrackPin:
-    """The track list's pinned row count and digest from the tracked release file."""
+def read_track_pin(path: Path = TRACKED_RELEASE_FILE) -> rules.TrackPin:
+    """The track list's pinned row count and digest from the tracked release file, whose path is fixed in code. The default is the only caller's path."""
     try:
         return rules.track_pin(json.loads(path.read_text()))
     except (OSError, ValueError) as error:
@@ -239,7 +242,7 @@ def remove_staged(staging: Path) -> None:
             partial.unlink()
 
 
-def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, empty_form: str) -> dict[str, Any]:
+def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, empty_form: str, run_id: str) -> dict[str, Any]:
     by_table = {item.table: item for item in staged}
     tables: list[dict[str, Any]] = []
     for spec in rules.TABLES:
@@ -248,37 +251,52 @@ def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, em
             tables.append({"name": spec.name, "snapshot_id": record.tables[spec.name], "file": item.file, "file_sha256": item.sha256, "file_size": item.size})
         else:
             tables.append({"name": spec.name, "snapshot_id": record.tables[spec.name], "rows": pin.rows, "rows_sha256": pin.sha256})
-    return {"format": rules.PLAN_FORMAT, "branch": record.branch, "branch_hash": record.branch_hash, "empty_form": empty_form, "tables": tables}
+    return {
+        "format": rules.PLAN_FORMAT,
+        "run_id": run_id,
+        "branch": record.branch,
+        "branch_hash": record.branch_hash,
+        "empty_form": empty_form,
+        "tables": tables,
+    }
 
 
-def read_result(reply: RunnerReply, record: LoadRecord) -> dict[str, Any]:
-    """The job's result, held to the load record: its branch, hash, tables and snapshots, and an exit code that agrees with it."""
+def keep_output(run_folder: Path, reply: RunnerReply) -> None:
+    """Keep the raw output of the job in a private file of the run folder. It can hold values of the data, so it is never put into a message."""
+    run_folder.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(run_folder / JOB_OUTPUT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(f"exit code {reply.exit_code}\n--- standard output ---\n{reply.stdout}\n--- standard error ---\n{reply.stderr}\n")
+
+
+def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple[rules.JobResult, dict[str, Any]]:
+    """The job's result held to the plan it was run for, with pass or fail derived from its checks, and an exit code that agrees with it.
+
+    Every message here is fixed text and numbers. The raw output of the job goes to ``JOB_OUTPUT_FILE`` of the run folder, also when the result is refused.
+    """
     lines = [line for line in reply.stdout.splitlines() if line.startswith(RESULT_PREFIX)]
     if not lines:
-        tail = reply.stderr[-ERROR_TAIL_BYTES:].strip()
-        raise TableChecksError(f"the table checks job ended with exit code {reply.exit_code} and printed no result" + (f": {tail}" if tail else ""))
+        keep_output(run_folder, reply)
+        raise TableChecksError(
+            f"the table checks job ended with exit code {reply.exit_code} and printed no result; its output is in {JOB_OUTPUT_FILE} of the run folder"
+        )
+    text = lines[-1].removeprefix(RESULT_PREFIX)
     try:
-        document = json.loads(lines[-1].removeprefix(RESULT_PREFIX))
-    except ValueError:
-        raise TableChecksError("the table checks job's result line is not JSON") from None
-    tables = document.get("tables") if isinstance(document, dict) else None
-    if not isinstance(tables, list) or any(not isinstance(entry, dict) for entry in tables):
-        raise TableChecksError("the table checks job's result holds no list of tables")
-    names = [spec.name for spec in rules.TABLES]
-    if (
-        document.get("format") != rules.RESULT_FORMAT
-        or (document.get("branch"), document.get("branch_hash")) != (record.branch, record.branch_hash)
-        or [entry.get("table") for entry in tables] != names
-        or [entry.get("snapshot_id") for entry in tables] != [record.tables[name] for name in names]
-        or any(type(entry.get("passed")) is not bool for entry in tables)
-        or type(document.get("passed")) is not bool
-    ):
-        raise TableChecksError("the table checks job's result is not for this load: another branch, hash, table list or snapshot, or a field of the wrong type")
-    passed = document["passed"] and all(entry["passed"] for entry in tables)
-    if document["passed"] != all(entry["passed"] for entry in tables) or reply.exit_code != (0 if passed else 1):
-        raise TableChecksError(f"the table checks job ended with exit code {reply.exit_code}, which does not agree with its result")
-    checked: dict[str, Any] = document
-    return checked
+        result = rules.parse_result(text, plan)
+    except rules.RulesError:
+        keep_output(run_folder, reply)
+        raise TableChecksError(
+            f"the table checks job's result is not a result for this plan; the job's output is in {JOB_OUTPUT_FILE} of the run folder"
+        ) from None
+    if reply.exit_code != (0 if result.passed else 1):
+        keep_output(run_folder, reply)
+        raise TableChecksError(
+            f"the table checks job ended with exit code {reply.exit_code}, which does not agree with its result; its output is in {JOB_OUTPUT_FILE}"
+        )
+    if not result.passed:
+        keep_output(run_folder, reply)
+    checked: dict[str, Any] = json.loads(text)
+    return result, checked
 
 
 def write_result(run_folder: Path, document: Mapping[str, Any]) -> None:
@@ -345,18 +363,20 @@ def run_table_checks(
         return Outcome(True, True, held)
     confirm_load(nessie, record)
     staged = stage_verified_files(store, record.manifest, staging)
+    plan_document = build_plan(record, staged, track_pin, empty_form, uuid.uuid4().hex)
+    plan = rules.parse_plan(json.dumps(plan_document))
     try:
-        (staging / PLAN_FILE).write_text(json.dumps(build_plan(record, staged, track_pin, empty_form), indent=1) + "\n")
+        (staging / PLAN_FILE).write_text(json.dumps(plan_document, indent=1) + "\n")
         reply = runner(staging)
     finally:
         remove_staged(staging)
-    checked = read_result(reply, record)
+    result, checked = read_result(reply, plan, run_folder)
     document: dict[str, Any] = {
         "format": RUN_FORMAT,
         "manifest": asdict(record.manifest),
         "load": record.document,
         "empty_form": empty_form,
-        "passed": checked["passed"],
+        "passed": result.passed,
         "merged": False,
         "merged_into": "",
         "main_hash_before": "",
@@ -365,8 +385,8 @@ def run_table_checks(
         "checked": checked,
     }
     write_result(run_folder, document)
-    if checked["passed"]:
+    if result.passed:
         before, after = merge_branch(nessie, record)
         document.update(merged=True, merged_into=str(nessie.config().get("defaultBranch")), main_hash_before=before, merged_hash=after)
         write_result(run_folder, document)
-    return Outcome(bool(checked["passed"]), document["merged"], document)
+    return Outcome(result.passed, document["merged"], document)

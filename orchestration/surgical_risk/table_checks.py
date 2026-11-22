@@ -26,7 +26,6 @@ NESSIE_TIMEOUT_SECONDS = 60.0
 
 class TableChecksConfig(Config):
     load_record: str
-    release_file: str
     results_root: str
     empty_form: str = EMPTY_FORM
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS
@@ -43,7 +42,7 @@ def required(name: str) -> str:
 def table_checks_step(context: OpExecutionContext, config: TableChecksConfig) -> None:
     try:
         record = checks.parse_load_record(Path(config.load_record).read_text())
-        pin = checks.read_track_pin(Path(config.release_file))
+        pin = checks.read_track_pin()
         store = S3Store(Aws(required("AWS_PROFILE"), required("AWS_REGION")), required("S3_BUCKET"))
         runner = checks.compose_runner(
             settings_from_environment(),

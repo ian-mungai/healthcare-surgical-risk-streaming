@@ -29,7 +29,7 @@ from typing import Any
 from spark import table_checks as rules
 from spark.session import build_session, start_deadline
 from spark.settings import SettingsError
-from spark.table_checks import Plan, PlanTable, RulesError, TableResult
+from spark.table_checks import Plan, PlanTable, RulesError, TableResult, TableSpec
 
 JOB = "table_checks"
 RESULT_PREFIX = "RESULT "
@@ -100,16 +100,28 @@ def table_frame(frame: Any, columns: Sequence[str], empty_form: str) -> Any:
     return frame.select(*[value(name) for name in columns])
 
 
-def multiset_check(result: TableResult, name: str, source: Any, table: Any, *, show: bool) -> None:
-    """Pass when the rows of the two frames are the same multiset. A failure counts the rows each side alone holds and, with ``show``, names up to three."""
-    only_source = source.exceptAll(table)
-    only_table = table.exceptAll(source)
-    missing, extra = only_source.count(), only_table.count()
-    detail = f"{missing} row(s) only in the file, {extra} row(s) only in the table"
-    if show and (missing or extra):
-        samples = [" | ".join(row) for row in (only_source.limit(rules.SAMPLE_LIMIT).collect() + only_table.limit(rules.SAMPLE_LIMIT).collect())]
-        detail += f"; for example: {'; '.join(samples)}"
-    result.add(name, missing == 0 and extra == 0, "equal" if missing == 0 and extra == 0 else detail)
+def ticked(names: Sequence[str]) -> list[str]:
+    return [f"`{name}`" for name in names]
+
+
+def multiset_check(result: TableResult, name: str, source: Any, table: Any) -> None:
+    """Pass when the rows of the two frames are the same multiset. A failure counts the rows each side alone holds and shows no row."""
+    missing, extra = source.exceptAll(table).count(), table.exceptAll(source).count()
+    same = missing == 0 and extra == 0
+    result.add(name, same, "ok" if same else f"rows_differ;only_file={missing};only_table={extra}")
+
+
+def compare_rows(result: TableResult, spec: TableSpec, columns: Sequence[str], source: Any, table: Any) -> None:
+    """The three comparisons of a file table, in the order of its required checks: the row count, the key multiset and the row payload.
+
+    The frames need ``select``, ``exceptAll`` and ``count`` only. The key is the spec's key columns, or the whole row when the table has none.
+    """
+    result.rows_source, result.rows_table = source.count(), table.count()
+    same = result.rows_source == result.rows_table
+    result.add("row count", same, "ok" if same else f"row_count;source={result.rows_source};table={result.rows_table}")
+    keys = ticked(spec.key if spec.key else columns)
+    multiset_check(result, "key multiset", source.select(*keys), table.select(*keys))
+    multiset_check(result, "row payload", source, table)
 
 
 def snapshot_of(session: Any, name: str) -> int | None:
@@ -120,59 +132,44 @@ def snapshot_of(session: Any, name: str) -> int | None:
 
 
 def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> TableResult:
+    """Run the required checks of one table in order and stop at the first that fails. Every detail is a code and counts."""
     from pyspark.errors import AnalysisException
+    from pyspark.sql import functions as F  # noqa: N812
 
     spec = rules.SPEC_BY_NAME[entry.name]
     result = TableResult(entry.name, entry.snapshot_id)
     path = staging / entry.file if spec.source == "file" else None
     if path is not None:
         found, size = file_digest(path) if path.is_file() else ("", -1)
-        if not result.add(
-            "staged file",
-            found == entry.file_sha256 and size == entry.file_size,
-            "the verified file's bytes" if found == entry.file_sha256 else "the staged file is not the verified version",
-        ):
+        same = found == entry.file_sha256 and size == entry.file_size
+        if not result.add("staged file", same, "ok" if same else "bytes_differ"):
             return result
     try:
         current = snapshot_of(session, entry.name)
         frame = session.table(f"lake.{rules.NAMESPACE}.{entry.name}")
     except AnalysisException:
-        result.add("table", False, "the table does not exist on the branch at the recorded hash")
+        result.add("snapshot", False, "table_missing")
         return result
-    if not result.add(
-        "snapshot",
-        current == entry.snapshot_id,
-        "the recorded snapshot" if current == entry.snapshot_id else f"the table's snapshot at the recorded hash is {current}, not the recorded one",
-    ):
+    if not result.add("snapshot", current == entry.snapshot_id, "ok" if current == entry.snapshot_id else "snapshot_differs"):
         return result
     expected = read_header(path) if path is not None else list(spec.pinned_columns)
-    found_columns = [(field.name, field.dataType.simpleString()) for field in frame.schema.fields]
-    problems = rules.column_problems(expected, found_columns)
-    if not result.add("columns", not problems, "equal to the file's header" if not problems else "; ".join(problems)):
+    problem = rules.column_detail(expected, [(field.name, field.dataType.simpleString()) for field in frame.schema.fields])
+    if not result.add("columns", problem is None, problem or "ok"):
         return result
     table = table_frame(frame, expected, plan.empty_form)
-    result.rows_table = table.count()
     if path is not None:
-        source = source_frame(session, path, expected)
-        result.rows_source = source.count()
-        result.add("row count", result.rows_source == result.rows_table, f"file {result.rows_source}, table {result.rows_table}")
-        keys = list(spec.key) if spec.key else expected
-        multiset_check(
-            result, "key multiset", source.select(*[f"`{name}`" for name in keys]), table.select(*[f"`{name}`" for name in keys]), show=spec.key is not None
-        )
-        multiset_check(result, "row payload", source, table, show=False)
+        compare_rows(result, spec, expected, source_frame(session, path, expected), table)
         return result
-    from pyspark.sql import functions as F  # noqa: N812
-
-    result.rows_source = entry.rows
-    result.add("row count", result.rows_table == entry.rows, f"pinned {entry.rows}, table {result.rows_table}")
+    result.rows_source, result.rows_table = entry.rows, table.count()
+    same = result.rows_table == entry.rows
+    result.add("row count", same, "ok" if same else f"row_count;source={entry.rows};table={result.rows_table}")
     ambiguous = table.filter(functools.reduce(operator.or_, [F.col(f"`{name}`").rlike(rules.SEPARATOR_PATTERN) for name in expected])).count()
     if ambiguous:
-        result.add("rows digest", False, f"{ambiguous} row(s) hold a tab or a newline in a field, so the digest's tab-joined form is ambiguous")
+        result.add("rows digest", False, f"separator_in_field;rows={ambiguous}")
         return result
     lines = table.select(F.concat_ws("\t", *[F.col(f"`{name}`") for name in expected]).alias("line")).orderBy("line")
     digest = rules.rows_digest(row.line for row in lines.toLocalIterator())
-    result.add("rows digest", digest == entry.rows_sha256, "equal to the pinned digest" if digest == entry.rows_sha256 else "differs from the pinned digest")
+    result.add("rows digest", digest == entry.rows_sha256, "ok" if digest == entry.rows_sha256 else "digest_differs")
     return result
 
 
@@ -183,14 +180,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
         plan = rules.parse_plan((staging / PLAN_FILE).read_text())
         session = build_session(JOB, plan.branch, plan.branch_hash)
-    except (OSError, RulesError, SettingsError) as error:
+    except OSError as error:
+        sys.stderr.write(f"{JOB}: the plan cannot be read ({type(error).__name__})\n")
+        return 2
+    except (RulesError, SettingsError) as error:
         sys.stderr.write(f"{JOB}: {error}\n")
         return 2
     try:
         results = [check_table(session, staging, plan, entry) for entry in plan.tables]
     finally:
         session.stop()
-    document = rules.job_document(plan.branch, plan.branch_hash, plan.empty_form, results)
+    document = rules.job_document(plan, results)
     sys.stdout.write(RESULT_PREFIX + json.dumps(document, sort_keys=True) + "\n")
     return 0 if document["passed"] else 1
 

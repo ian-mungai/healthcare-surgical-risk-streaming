@@ -32,57 +32,59 @@ class HeaderTest(unittest.TestCase):
 
 
 class ColumnTest(unittest.TestCase):
-    def test_control_equal_columns_pass_and_airbyte_columns_are_ignored(self) -> None:
-        self.assertEqual([], rules.column_problems(FILE_COLUMNS, STRINGS))
-        self.assertEqual([], rules.column_problems(FILE_COLUMNS, [*OWN[:1], *STRINGS, *OWN[1:]]))
+    def test_control_equal_columns_pass_and_the_connectors_own_columns_are_ignored(self) -> None:
+        self.assertIsNone(rules.column_detail(FILE_COLUMNS, STRINGS))
+        self.assertIsNone(rules.column_detail(FILE_COLUMNS, [*OWN[:1], *STRINGS, *OWN[1:]]))
 
-    def test_a_missing_column_fails_and_names_it(self) -> None:
-        problems = rules.column_problems(FILE_COLUMNS, STRINGS[:2])
-        self.assertEqual(1, len(problems))
-        self.assertIn("missing", problems[0])
-        self.assertIn("age", problems[0])
+    def test_the_connectors_columns_are_the_four_named_by_its_documentation(self) -> None:
+        self.assertEqual(("_airbyte_raw_id", "_airbyte_extracted_at", "_airbyte_meta", "_airbyte_generation_id"), rules.CONNECTOR_COLUMNS)
+        every = [(name, "string") for name in rules.CONNECTOR_COLUMNS]
+        self.assertIsNone(rules.column_detail(FILE_COLUMNS, [*every, *STRINGS]))
+
+    def test_a_missing_column_fails_with_counts_only(self) -> None:
+        self.assertEqual("columns_differ;missing=1;extra=0;repeated=0;order=0;not_string=0", rules.column_detail(FILE_COLUMNS, STRINGS[:2]))
 
     def test_an_extra_column_fails(self) -> None:
-        problems = rules.column_problems(FILE_COLUMNS, [*STRINGS, ("extra", "string")])
-        self.assertTrue(problems and "not in the file" in problems[0])
+        self.assertEqual("columns_differ;missing=0;extra=1;repeated=0;order=0;not_string=0", rules.column_detail(FILE_COLUMNS, [*STRINGS, ("extra", "string")]))
+
+    def test_an_unknown_column_that_starts_like_a_connector_column_is_an_extra_column(self) -> None:
+        self.assertEqual(
+            "columns_differ;missing=0;extra=1;repeated=0;order=0;not_string=0", rules.column_detail(FILE_COLUMNS, [*STRINGS, ("_airbyte_flag", "string")])
+        )
+        self.assertEqual(
+            "columns_differ;missing=0;extra=1;repeated=0;order=0;not_string=0", rules.column_detail(FILE_COLUMNS, [*STRINGS, ("_airbyte_loaded_at", "string")])
+        )
 
     def test_a_reordered_column_fails_with_the_same_names(self) -> None:
-        problems = rules.column_problems(FILE_COLUMNS, [STRINGS[1], STRINGS[0], STRINGS[2]])
-        self.assertEqual(["the table holds the file's columns in another order"], problems)
+        self.assertEqual(
+            "columns_differ;missing=0;extra=0;repeated=0;order=1;not_string=0", rules.column_detail(FILE_COLUMNS, [STRINGS[1], STRINGS[0], STRINGS[2]])
+        )
 
     def test_a_column_that_is_not_a_string_fails(self) -> None:
-        problems = rules.column_problems(FILE_COLUMNS, [("caseid", "bigint"), *STRINGS[1:]])
-        self.assertTrue(problems and "not string columns" in problems[0])
+        self.assertEqual(
+            "columns_differ;missing=0;extra=0;repeated=0;order=0;not_string=1", rules.column_detail(FILE_COLUMNS, [("caseid", "bigint"), *STRINGS[1:]])
+        )
 
-    def test_a_column_named_like_an_airbyte_column_is_not_a_source_column(self) -> None:
-        problems = rules.column_problems([*FILE_COLUMNS, "_airbyte_flag"], STRINGS)
-        self.assertEqual(1, len(problems))
-        self.assertIn("missing", problems[0])
+    def test_a_repeated_column_fails(self) -> None:
+        self.assertEqual(
+            "columns_differ;missing=0;extra=0;repeated=1;order=0;not_string=0",
+            rules.column_detail(FILE_COLUMNS, [*STRINGS, STRINGS[0]]),
+        )
+
+    def test_no_detail_holds_a_column_name(self) -> None:
+        detail = rules.column_detail(["secret_marker_a", "b"], [("other_marker_b", "string")])
+        self.assertNotIn("marker", detail or "")
+        self.assertRegex(detail or "", rules.DETAIL)
 
 
 class EmptyValueTest(unittest.TestCase):
     def test_the_expected_form_is_the_empty_string_unless_a_run_says_otherwise(self) -> None:
         self.assertEqual("empty", rules.EMPTY_FORM)
-        self.assertEqual("", rules.table_text(""))
-        self.assertEqual(rules.NOT_THE_EMPTY_VALUE, rules.table_text(None))
+        self.assertEqual(("null", "empty"), rules.EMPTY_FORMS)
 
-    def test_control_the_accepted_form_reads_as_the_published_empty_value(self) -> None:
-        self.assertEqual("", rules.table_text(None, "null"))
-        self.assertEqual("", rules.table_text("", "empty"))
-
-    def test_the_other_form_is_a_different_value_that_no_file_holds(self) -> None:
-        self.assertEqual(rules.NOT_THE_EMPTY_VALUE, rules.table_text("", "null"))
-        self.assertEqual(rules.NOT_THE_EMPTY_VALUE, rules.table_text(None, "empty"))
+    def test_the_text_that_stands_for_the_other_form_is_one_that_no_file_holds(self) -> None:
         self.assertNotEqual("", rules.NOT_THE_EMPTY_VALUE)
-
-    def test_a_value_is_never_changed(self) -> None:
-        for value in ("07", "NA", " ", "x ", "0"):
-            for form in rules.EMPTY_FORMS:
-                self.assertEqual(value, rules.table_text(value, form))
-
-    def test_an_unknown_form_is_refused(self) -> None:
-        with self.assertRaises(rules.RulesError):
-            rules.table_text("", "blank")
+        self.assertIn("\x01", rules.NOT_THE_EMPTY_VALUE)
 
 
 class TrackListDigestTest(unittest.TestCase):
@@ -123,6 +125,10 @@ class SeparatorPatternTest(unittest.TestCase):
 
 
 class PinTest(unittest.TestCase):
+    def test_control_the_tracked_pins_other_fields_are_left_alone(self) -> None:
+        pin = {"url": "https://example.test/trks", "size_bytes": 5, "sha256": "b" * 64, "rows": 5, "rows_sha256": "a" * 64}
+        self.assertEqual(rules.TrackPin(5, "a" * 64), rules.track_pin({"track_list": pin}))
+
     def test_control_a_pin_with_a_count_and_a_digest(self) -> None:
         self.assertEqual(rules.TrackPin(5, "a" * 64), rules.track_pin({"track_list": {"rows": 5, "rows_sha256": "a" * 64}}))
 
@@ -134,6 +140,7 @@ class PinTest(unittest.TestCase):
             {"track_list": {"rows": "5", "rows_sha256": digest}},
             {"track_list": {"rows": 5, "rows_sha256": "A" * 64}},
             {"track_list": {"rows": -1, "rows_sha256": digest}},
+            {"track_list": {"rows": 0, "rows_sha256": digest}},
             {"track_list": {"rows": True, "rows_sha256": digest}},
         ]
         for release in releases:
@@ -155,6 +162,7 @@ class TableListTest(unittest.TestCase):
 def plan_document() -> dict[str, Any]:
     return {
         "format": rules.PLAN_FORMAT,
+        "run_id": "f" * 32,
         "branch": "load_run_one",
         "branch_hash": "b" * 64,
         "empty_form": "null",
@@ -178,7 +186,7 @@ class PlanTest(unittest.TestCase):
 
     def test_control_a_plan_with_the_three_tables_is_read(self) -> None:
         plan = self.parse(plan_document())
-        self.assertEqual(("load_run_one", "b" * 64, "null"), (plan.branch, plan.branch_hash, plan.empty_form))
+        self.assertEqual(("f" * 32, "load_run_one", "b" * 64, "null"), (plan.run_id, plan.branch, plan.branch_hash, plan.empty_form))
         self.assertEqual(["clinical_data", "lab_data", "track_list"], [table.name for table in plan.tables])
         self.assertEqual(
             (11, "clinical_data.csv", "c" * 64, 10), (plan.tables[0].snapshot_id, plan.tables[0].file, plan.tables[0].file_sha256, plan.tables[0].file_size)
@@ -199,6 +207,9 @@ class PlanTest(unittest.TestCase):
     def test_the_fields_are_exact_and_typed(self) -> None:
         self.refused(lambda document: document.update(format="table_check_plan_0"))
         self.refused(lambda document: document.update(extra=1))
+        self.refused(lambda document: document.pop("run_id"))
+        self.refused(lambda document: document.update(run_id="F" * 32))
+        self.refused(lambda document: document.update(run_id="f" * 31))
         self.refused(lambda document: document.update(empty_form="blank"))
         self.refused(lambda document: document.update(branch_hash="B" * 64))
         self.refused(lambda document: document.update(branch=""))
@@ -213,26 +224,132 @@ class PlanTest(unittest.TestCase):
             self.refused(lambda document, name=name: document["tables"][0].update(file=name))
 
 
+def the_plan() -> rules.Plan:
+    return rules.parse_plan(json.dumps(plan_document()))
+
+
+def results_for(plan: rules.Plan, *, only: dict[str, int] | None = None) -> list[rules.TableResult]:
+    """Every check of every table, each passed, as the job writes them. ``only`` keeps that many checks of a table."""
+    results = []
+    for entry in plan.tables:
+        result = rules.TableResult(entry.name, entry.snapshot_id)
+        for name in rules.REQUIRED_CHECKS[entry.name][: (only or {}).get(entry.name, 99)]:
+            result.add(name, True, "ok")
+        results.append(result)
+    return results
+
+
+class RequiredChecksTest(unittest.TestCase):
+    def test_each_table_names_its_checks_in_the_order_the_job_runs_them(self) -> None:
+        file_checks = ("staged file", "snapshot", "columns", "row count", "key multiset", "row payload")
+        self.assertEqual(
+            {"clinical_data": file_checks, "lab_data": file_checks, "track_list": ("snapshot", "columns", "row count", "rows digest")},
+            dict(rules.REQUIRED_CHECKS),
+        )
+        self.assertEqual([spec.name for spec in rules.TABLES], list(rules.REQUIRED_CHECKS))
+
+
+class DetailTest(unittest.TestCase):
+    def test_a_detail_is_a_code_and_counts_and_nothing_else(self) -> None:
+        for good in ("ok", "rows_differ;only_file=1;only_table=0", "row_count;file=6388;table=6388"):
+            self.assertRegex(good, rules.DETAIL)
+        for bad in ("", "OK", "caseid 5 differs", "ok;caseid=x", "rows_differ;only_file=-1", "ok\n", "ok;a=1;", "ok; a=1"):
+            self.assertNotRegex(bad, rules.DETAIL)
+
+    def test_a_check_refuses_a_detail_that_is_not_in_that_form(self) -> None:
+        result = rules.TableResult("t", 1)
+        with self.assertRaises(rules.RulesError):
+            result.add("columns", False, "the value MARKER_17 differs")
+
+
 class ResultTest(unittest.TestCase):
-    def test_a_table_passes_only_when_it_has_checks_and_all_pass(self) -> None:
-        empty = rules.TableResult("t", 1)
-        self.assertFalse(empty.passed)
-        empty.add("columns", True, "ok")
-        self.assertTrue(empty.passed)
-        empty.add("rows", False, "differs")
-        self.assertFalse(empty.passed)
+    def document(self, plan: rules.Plan, results: list[rules.TableResult]) -> dict[str, Any]:
+        document: dict[str, Any] = json.loads(json.dumps(rules.job_document(plan, results)))
+        return document
 
-    def test_the_job_passes_only_when_every_table_of_the_list_is_there_and_passes(self) -> None:
-        def passing(name: str) -> rules.TableResult:
-            result = rules.TableResult(name, 1)
-            result.add("columns", True, "ok")
-            return result
+    def parse(self, document: dict[str, Any], plan: rules.Plan | None = None) -> rules.JobResult:
+        return rules.parse_result(json.dumps(document), plan or the_plan())
 
-        every = [passing(spec.name) for spec in rules.TABLES]
-        self.assertTrue(rules.job_document("b", "h", "null", every)["passed"])
-        self.assertFalse(rules.job_document("b", "h", "null", every[:2])["passed"])
-        every[1].add("rows", False, "differs")
-        self.assertFalse(rules.job_document("b", "h", "null", every)["passed"])
+    def refused(self, change: Any) -> None:
+        plan = the_plan()
+        document = self.document(plan, results_for(plan))
+        change(document)
+        with self.assertRaises(rules.RulesError, msg=json.dumps(document)[:300]):
+            self.parse(document, plan)
+
+    def test_control_a_complete_passing_result_passes(self) -> None:
+        plan = the_plan()
+        result = self.parse(self.document(plan, results_for(plan)), plan)
+        self.assertTrue(result.passed)
+        self.assertEqual(["clinical_data", "lab_data", "track_list"], [table.table for table in result.tables])
+
+    def test_the_job_echoes_the_plan_it_ran(self) -> None:
+        plan = the_plan()
+        document = self.document(plan, results_for(plan))
+        self.assertEqual(
+            ("f" * 32, "load_run_one", "b" * 64, "null"), (document["run_id"], document["branch"], document["branch_hash"], document["empty_form"])
+        )
+        self.assertEqual([11, 12, 13], [table["snapshot_id"] for table in document["tables"]])
+
+    def test_a_failed_check_fails_the_result_whatever_the_summary_flags_say(self) -> None:
+        plan = the_plan()
+        results = results_for(plan)
+        results[1].checks[3] = rules.Check("row count", False, "row_count;file=2;table=3")
+        document = self.document(plan, results)
+        document["passed"] = True
+        for table in document["tables"]:
+            table["passed"] = True
+        self.assertFalse(self.parse(document, plan).passed)
+
+    def test_a_table_that_stopped_at_its_first_failure_is_a_failed_result_not_a_malformed_one(self) -> None:
+        plan = the_plan()
+        results = results_for(plan, only={"lab_data": 3})
+        results[1].checks[2] = rules.Check("columns", False, "columns_differ;missing=1;extra=0;repeated=0;order=0;not_string=0")
+        self.assertFalse(self.parse(self.document(plan, results), plan).passed)
+
+    def test_a_table_that_stopped_without_a_failure_is_refused(self) -> None:
+        plan = the_plan()
+        self.refused_results(results_for(plan, only={"lab_data": 5}))
+
+    def refused_results(self, results: list[rules.TableResult]) -> None:
+        plan = the_plan()
+        with self.assertRaises(rules.RulesError):
+            self.parse(self.document(plan, results), plan)
+
+    def test_a_check_missing_from_the_middle_an_extra_check_and_a_renamed_check_are_refused(self) -> None:
+        self.refused(lambda document: document["tables"][0]["checks"].pop(3))
+        self.refused(lambda document: document["tables"][2]["checks"].append({"name": "extra", "passed": True, "detail": "ok"}))
+        self.refused(lambda document: document["tables"][1]["checks"][2].update(name="column list"))
+        self.refused(lambda document: document["tables"][0]["checks"].reverse())
+
+    def test_a_table_missing_an_extra_table_or_a_table_in_another_place_is_refused(self) -> None:
+        self.refused(lambda document: document["tables"].pop())
+        self.refused(lambda document: document["tables"].append(dict(document["tables"][0])))
+        self.refused(lambda document: document["tables"].reverse())
+
+    def test_a_result_that_does_not_repeat_the_plan_is_refused(self) -> None:
+        self.refused(lambda document: document.update(run_id="a" * 32))
+        self.refused(lambda document: document.update(branch="load_other"))
+        self.refused(lambda document: document.update(branch_hash="c" * 64))
+        self.refused(lambda document: document.update(empty_form="empty"))
+        self.refused(lambda document: document["tables"][2].update(snapshot_id=99))
+        self.refused(lambda document: document.update(format="table_checks_1"))
+
+    def test_the_shape_of_every_field_is_checked(self) -> None:
+        self.refused(lambda document: document.update(extra=1))
+        self.refused(lambda document: document.pop("passed"))
+        self.refused(lambda document: document["tables"][0].update(passed="yes"))
+        self.refused(lambda document: document["tables"][0].update(rows_table="5"))
+        self.refused(lambda document: document["tables"][0]["checks"][0].update(passed=1))
+        self.refused(lambda document: document["tables"][0]["checks"][0].update(extra=1))
+        self.refused(lambda document: document["tables"][0]["checks"][0].pop("detail"))
+        self.refused(lambda document: document["tables"][0]["checks"][0].update(detail="MARKER_17 differs"))
+        self.refused(lambda document: document["tables"][0].update(snapshot_id=True))
+
+    def test_text_that_is_not_json_or_names_a_field_twice_is_refused(self) -> None:
+        for text in ("", "[]", "{", '{"format": "table_checks_2", "format": "x"}'):
+            with self.assertRaises(rules.RulesError, msg=text):
+                rules.parse_result(text, the_plan())
 
 
 if __name__ == "__main__":

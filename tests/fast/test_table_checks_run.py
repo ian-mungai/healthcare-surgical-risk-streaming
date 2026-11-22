@@ -7,7 +7,9 @@ job did not run and that nothing was merged.
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import tempfile
 import unittest
@@ -32,6 +34,7 @@ SOURCE = {"vital_files/0001.vital": b"a recording", "clinical_data.csv": CLINICA
 SNAPSHOTS = {"clinical_data": 111, "lab_data": 222, "track_list": 333}
 PIN = rules.TrackPin(7, "a" * 64)
 BRANCH = "load_run_one"
+MARKER = "MARKER_9d2"
 
 
 def setUpModule() -> None:
@@ -93,37 +96,42 @@ class FakeNessie(NessieClient):
         raise AssertionError(f"the stand-in has no answer for {method} {path}")
 
 
-def result_line(*, passed: bool, branch: str = BRANCH, branch_hash: str = "", only: list[str] | None = None, snapshots: dict[str, int] | None = None) -> str:
+def result_line(plan: rules.Plan, *, passed: bool = True, change: Callable[[dict[str, Any]], None] | None = None) -> str:
+    """The result line of a job that ran ``plan``: every required check passed, or ``lab_data`` stopped at a failed row count. ``change`` then edits it."""
     results = []
-    for spec in rules.TABLES:
-        table = rules.TableResult(spec.name, (snapshots or SNAPSHOTS)[spec.name])
-        table.add("columns", passed or spec.name != "lab_data", "stand-in")
+    for entry in plan.tables:
+        table = rules.TableResult(entry.name, entry.snapshot_id)
+        stop = 4 if not passed and entry.name == "lab_data" else 99
+        for name in rules.REQUIRED_CHECKS[entry.name][:stop]:
+            table.add(name, passed or entry.name != "lab_data" or name != "row count", "ok" if name != "row count" or passed else "row_count;source=2;table=3")
         results.append(table)
-    document = rules.job_document(branch, branch_hash, "null", results)
-    if only is not None:
-        document["tables"] = [entry for entry in document["tables"] if entry["table"] in only]
+    document = json.loads(json.dumps(rules.job_document(plan, results)))
+    if change is not None:
+        change(document)
     return "RESULT " + json.dumps(document) + "\n"
 
 
 class Runner:
     """The stand-in for the Spark job. It prints what it is told to, after recording the staged files and the plan that it found."""
 
-    def __init__(self, line: Callable[[str], str] | None = None, exit_code: int | None = None) -> None:
+    def __init__(self, line: Callable[[rules.Plan], str] | None = None, exit_code: int | None = None, error_text: str = "") -> None:
         self.line = line
         self.exit_code = exit_code
+        self.error_text = error_text
         self.calls = 0
         self.seen_files: dict[str, str] = {}
         self.plan: dict[str, Any] = {}
 
     def __call__(self, staging: Path) -> run.RunnerReply:
         self.calls += 1
-        self.plan = json.loads((staging / "plan.json").read_text())
+        plan_text = (staging / "plan.json").read_text()
+        self.plan = json.loads(plan_text)
         self.seen_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in staging.iterdir() if path.name != "plan.json"}
-        text = (self.line or (lambda hash_value: result_line(passed=True, branch_hash=hash_value)))(self.plan["branch_hash"])
+        text = (self.line or result_line)(rules.parse_plan(plan_text))
         code = self.exit_code
         if code is None:
             code = 0 if text.startswith("RESULT ") and json.loads(text.removeprefix("RESULT "))["passed"] else 1
-        return run.RunnerReply(code, text, "")
+        return run.RunnerReply(code, text, self.error_text)
 
 
 class Case:
@@ -229,14 +237,14 @@ class MergeRecordTest(unittest.TestCase):
 
     def test_a_failed_run_writes_no_commit_and_so_no_line(self) -> None:
         case = Case(self)
-        case.go(Runner(lambda hash_value: result_line(passed=False, branch_hash=hash_value)))
+        case.go(Runner(lambda plan: result_line(plan, passed=False)))
         self.assertEqual([], case.nessie.merge_messages)
 
 
 class GrainNoteTest(unittest.TestCase):
     @staticmethod
-    def line_for(passed: bool) -> Callable[[str], str]:
-        return lambda hash_value: result_line(passed=passed, branch_hash=hash_value)
+    def line_for(passed: bool) -> Callable[[rules.Plan], str]:
+        return lambda plan: result_line(plan, passed=passed)
 
     def test_the_saved_result_says_that_the_lab_key_check_and_payload_check_are_the_same_comparison(self) -> None:
         for passed in (True, False):
@@ -309,7 +317,7 @@ class RefusalTest(unittest.TestCase):
 
 class FailedCheckTest(unittest.TestCase):
     def test_a_check_that_fails_merges_nothing_and_the_branch_stays(self) -> None:
-        case, runner = Case(self), Runner(lambda hash_value: result_line(passed=False, branch_hash=hash_value))
+        case, runner = Case(self), Runner(lambda plan: result_line(plan, passed=False))
         outcome = case.go(runner)
         self.assertFalse(outcome.passed or outcome.merged)
         self.assertTrue(case.main_untouched())
@@ -323,14 +331,23 @@ class FailedCheckTest(unittest.TestCase):
             case.go(Runner(exit_code=1))
         self.assertTrue(case.main_untouched())
 
-    def test_a_result_for_another_hash_a_missing_table_or_no_result_merges_nothing(self) -> None:
+    def test_a_result_that_is_not_for_this_plan_or_this_form_merges_nothing(self) -> None:
+        def changed(change: Callable[[dict[str, Any]], None]) -> Callable[[rules.Plan], str]:
+            return lambda plan: result_line(plan, change=change)
+
         for label, line in (
-            ("another hash", lambda hash_value: result_line(passed=True, branch_hash="c" * 64)),
-            ("another branch", lambda hash_value: result_line(passed=True, branch="load_other", branch_hash=hash_value)),
-            ("a missing table", lambda hash_value: result_line(passed=True, branch_hash=hash_value, only=["clinical_data", "lab_data"])),
-            ("another snapshot", lambda hash_value: result_line(passed=True, branch_hash=hash_value, snapshots={**SNAPSHOTS, "track_list": 1})),
-            ("no result line", lambda hash_value: "the job printed nothing useful\n"),
-            ("a result that is not JSON", lambda hash_value: "RESULT {not json\n"),
+            ("another hash", changed(lambda document: document.update(branch_hash="c" * 64))),
+            ("another branch", changed(lambda document: document.update(branch="load_other"))),
+            ("another run", changed(lambda document: document.update(run_id="a" * 32))),
+            ("the other empty form", changed(lambda document: document.update(empty_form="null"))),
+            ("a missing table", changed(lambda document: document["tables"].pop())),
+            ("another snapshot", changed(lambda document: document["tables"][2].update(snapshot_id=1))),
+            ("a check missing", changed(lambda document: document["tables"][0]["checks"].pop(3))),
+            ("a check missing at the end", changed(lambda document: document["tables"][2]["checks"].pop())),
+            ("an extra check", changed(lambda document: document["tables"][1]["checks"].append({"name": "extra", "passed": True, "detail": "ok"}))),
+            ("a free-text detail", changed(lambda document: document["tables"][1]["checks"][0].update(detail="value 17 differs"))),
+            ("no result line", lambda plan: "the job printed nothing useful\n"),
+            ("a result that is not JSON", lambda plan: "RESULT {not json\n"),
         ):
             with self.subTest(label):
                 case = Case(self)
@@ -338,22 +355,68 @@ class FailedCheckTest(unittest.TestCase):
                     case.go(Runner(line, exit_code=0))
                 self.assertTrue(case.main_untouched())
 
+    def test_a_failed_check_with_summary_flags_that_say_passed_is_a_failed_run_and_merges_nothing(self) -> None:
+        def lying(plan: rules.Plan) -> str:
+            def flags(document: dict[str, Any]) -> None:
+                document["tables"][1]["checks"][3].update(passed=False, detail="row_count;source=2;table=3")
+                document["passed"] = True
+                for table in document["tables"]:
+                    table["passed"] = True
+
+            return result_line(plan, change=flags)
+
+        case = Case(self)
+        outcome = case.go(Runner(lying, exit_code=1))
+        self.assertFalse(outcome.passed or outcome.merged)
+        self.assertTrue(case.main_untouched())
+        with self.assertRaisesRegex(run.TableChecksError, "exit code"):
+            Case(self).go(Runner(lying, exit_code=0))
+
     def test_a_job_that_cannot_run_names_its_exit_code_and_merges_nothing(self) -> None:
         case = Case(self)
         with self.assertRaisesRegex(run.TableChecksError, "exit code 2"):
-            case.go(Runner(lambda hash_value: "", exit_code=2))
+            case.go(Runner(lambda plan: "", exit_code=2))
         self.assertTrue(case.main_untouched())
 
     def test_a_branch_that_moves_after_the_checks_is_not_merged(self) -> None:
         case = Case(self)
 
-        def moving(hash_value: str) -> str:
+        def moving(plan: rules.Plan) -> str:
             case.nessie.move_branch(BRANCH)
-            return result_line(passed=True, branch_hash=hash_value)
+            return result_line(plan)
 
         with self.assertRaisesRegex(run.TableChecksError, "moved"):
             case.go(Runner(moving))
         self.assertTrue(case.main_untouched())
+
+
+class FailureOutputTest(unittest.TestCase):
+    """The tables hold per-patient rows: no value of the data reaches a result, a message or an exception. The job's raw output goes to a private file."""
+
+    def test_a_job_that_prints_no_result_gives_a_fixed_message_and_its_output_goes_to_a_file_in_the_run_folder(self) -> None:
+        case = Case(self)
+        runner = Runner(lambda plan: f"stdout {MARKER}\n", exit_code=1, error_text=f"Malformed record [{MARKER}]")
+        with self.assertRaises(run.TableChecksError) as raised:
+            case.go(runner)
+        self.assertNotIn(MARKER, str(raised.exception))
+        self.assertRegex(str(raised.exception), "exit code 1")
+        kept = case.run_folder / run.JOB_OUTPUT_FILE
+        self.assertIn(MARKER, kept.read_text())
+        self.assertEqual(0o600, kept.stat().st_mode & 0o777)
+        self.assertTrue(case.main_untouched())
+
+    def test_a_result_that_is_refused_keeps_the_raw_output_in_the_file_too(self) -> None:
+        case = Case(self)
+        bad = Runner(lambda plan: result_line(plan, change=lambda document: document["tables"][0]["checks"][0].update(detail=f"value {MARKER}")), exit_code=0)
+        with self.assertRaises(run.TableChecksError) as raised:
+            case.go(bad)
+        self.assertNotIn(MARKER, str(raised.exception))
+        self.assertIn(MARKER, (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    def test_no_marker_reaches_the_saved_result_of_a_failed_run(self) -> None:
+        case = Case(self)
+        case.go(Runner(lambda plan: result_line(plan, passed=False), error_text=f"warning {MARKER}"))
+        self.assertNotIn(MARKER, (case.run_folder / run.RESULT_FILE).read_text())
 
 
 class RerunTest(unittest.TestCase):
@@ -367,7 +430,7 @@ class RerunTest(unittest.TestCase):
 
     def test_a_rerun_after_a_failed_check_runs_the_checks_again_and_replaces_the_result(self) -> None:
         case = Case(self)
-        case.go(Runner(lambda hash_value: result_line(passed=False, branch_hash=hash_value)))
+        case.go(Runner(lambda plan: result_line(plan, passed=False)))
         self.assertFalse(case.saved()["passed"])
         runner = Runner()
         outcome = case.go(runner)
@@ -476,16 +539,45 @@ class LoadRecordTest(unittest.TestCase):
 
 
 class TrackPinFileTest(unittest.TestCase):
-    def test_the_pin_is_read_from_the_tracked_release_file_form(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "release.json"
-            path.write_text(json.dumps({"track_list": {"rows": 7, "rows_sha256": "a" * 64}}))
-            self.assertEqual(PIN, run.read_track_pin(path))
-            path.write_text("{}")
+    PIN = {"url": "https://example.test/trks", "size_bytes": 5, "sha256": "b" * 64, "rows": 7, "rows_sha256": "a" * 64}
+
+    def write(self, document: dict[str, Any]) -> Path:
+        folder = tempfile.TemporaryDirectory(prefix="release_")
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "release.json"
+        path.write_text(json.dumps(document))
+        return path
+
+    def test_the_pin_is_read_from_a_release_file_with_the_tracked_files_form(self) -> None:
+        self.assertEqual(PIN, run.read_track_pin(self.write({"track_list": self.PIN})))
+
+    def test_the_default_is_the_tracked_release_file_at_a_path_fixed_in_code(self) -> None:
+        from scripts.sample.candidates import RELEASE_FILE
+
+        self.assertEqual(RELEASE_FILE, run.TRACKED_RELEASE_FILE)
+        self.assertEqual(RELEASE_FILE, inspect.signature(run.read_track_pin).parameters["path"].default)
+
+    def test_a_pin_without_a_positive_count_or_a_digest_is_refused_and_so_is_a_missing_or_unreadable_file(self) -> None:
+        for edit in ({"rows": 0}, {"rows": -3}, {"rows": "7"}, {"rows": True}, {"rows_sha256": "A" * 64}, {"rows_sha256": "a" * 63}):
+            with self.subTest(edit=edit), self.assertRaises(run.TableChecksError):
+                run.read_track_pin(self.write({"track_list": {**self.PIN, **edit}}))
+        for document in (
+            {},
+            {"track_list": {k: v for k, v in self.PIN.items() if k != "rows"}},
+            {"track_list": {k: v for k, v in self.PIN.items() if k != "rows_sha256"}},
+        ):
             with self.assertRaises(run.TableChecksError):
-                run.read_track_pin(path)
-            with self.assertRaises(run.TableChecksError):
-                run.read_track_pin(Path(folder) / "missing.json")
+                run.read_track_pin(self.write(document))
+        with self.assertRaises(run.TableChecksError):
+            run.read_track_pin(Path("/nonexistent/release.json"))
+
+    def test_the_dagster_job_takes_no_pin_path_from_its_configuration(self) -> None:
+        source = (Path(__file__).resolve().parents[2] / "orchestration" / "surgical_risk" / "table_checks.py").read_text()
+        config = next(node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ClassDef) and node.name == "TableChecksConfig")
+        fields = {statement.target.id for statement in config.body if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)}
+        self.assertNotIn("release_file", fields)
+        self.assertNotIn("track_pin", fields)
+        self.assertIn("read_track_pin()", source)
 
 
 if __name__ == "__main__":
