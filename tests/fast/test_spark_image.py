@@ -84,8 +84,11 @@ class ImageTest(unittest.TestCase):
         self.assertLessEqual(copied, allowed)
         self.assertLessEqual(allowed, copied)
 
-    def test_the_image_holds_every_project_module_that_a_job_imports(self) -> None:
-        copied = {line.split()[1] for line in lines() if line.startswith("COPY ") and "--from=" not in line}
+    def test_the_image_holds_every_project_module_that_a_job_imports_at_the_path_that_the_job_imports_from(self) -> None:
+        copies = {parts[1]: parts[2] for parts in (line.split() for line in lines() if line.startswith("COPY ") and "--from=" not in line)}
+        roots = [value for line in lines() if line.startswith("ENV ") for value in re.findall(r"PYTHONPATH=(\S+)", line)]
+        self.assertEqual(1, len(roots))
+        root = roots[0].split(":")[0]
         needed: dict[str, set[str]] = {}
         for job in sorted((ROOT / "spark").rglob("*.py")):
             for node in ast.walk(ast.parse(job.read_text())):
@@ -97,7 +100,8 @@ class ImageTest(unittest.TestCase):
         self.assertTrue(needed)
         for path, importers in sorted(needed.items()):
             with self.subTest(path=path):
-                self.assertIn(path, copied, f"{sorted(importers)} import it and the image does not copy it")
+                self.assertIn(path, copies, f"{sorted(importers)} import it and the image does not copy it")
+                self.assertEqual(f"{root}/{path}", copies[path], f"{sorted(importers)} import it from {root} and the image copies it elsewhere")
 
 
 if __name__ == "__main__":

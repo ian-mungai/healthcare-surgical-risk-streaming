@@ -1,17 +1,25 @@
-"""The rows, the checks and the freeze of the patient split table, in plain data with no Spark.
+"""The rows, the checks, the freeze and the order of a build of the patient split table, in plain data with no Spark.
 
-The job ``spark/jobs/patient_split.py`` reads and writes the tables and calls these functions, so that the card's checks run in the fast tests on plain rows.
-The assignment rule is only in ``scripts/sample/split.py``: this module calls it and keeps no copy. A check returns its problems as plain sentences and
-never raises for a failed check, so that one run names every cause.
+The job ``spark/jobs/patient_split.py`` reads and writes the tables and passes its Spark steps to ``run_build`` and ``run_verify``, so that the card's checks
+and the order of a build run in the fast tests on plain rows and stand-in steps. The assignment rule is only in ``scripts/sample/split.py``: this module
+calls it and keeps no copy.
+
+The test set is sealed until the choice record is frozen, so nothing here may name which set a patient or a case is in. Every failure is a code and a count
+(``two_sets: 1 patient``), never an identifier. A check returns its problems and never raises for a failed check, so that one run names every cause.
+
+A build resolves the branch to one hash and reads only at that hash. It writes only while the branch still has that hash, reads the written table at the
+hash of the write and checks it, and ends only when the branch still has that hash.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from scripts.sample.split import BUCKETS, HEX_DIGITS, SEED, TRAIN_BUCKETS, VALIDATION_BUCKETS, Part, patient_part
 
@@ -26,12 +34,56 @@ PATIENT_NUMBER = re.compile(r"[1-9][0-9]*")
 CASE_NUMBER = re.compile(r"[0-9]+")
 SAFE_VERSION = re.compile(r"[A-Za-z0-9_:=<>.-]+")
 CANDIDATE_HEADER = ("case", "patient", "key", "size_bytes", "sha256", "arterial_waveform", "slot")
+# The complete tracked fixed sample (tests/fixtures/vitaldb/candidates.tsv): a fast test holds both values to the tracked file.
+FIXED_SAMPLE_ROWS = 13
+FIXED_SAMPLE_SHA256 = "2e512b4530fe1ca8a0bfc6a3fde62eb5c102e7ea9d4b182ed1197ca6f0b4212e"
 SLOT_KINDS = {"development": ("training", "validation"), "test": ("test",)}
-MESSAGE_LIMIT = 10
+CODES = frozenset(
+    {
+        "bad_subjectid",
+        "two_sets",
+        "repeated_patient",
+        "unknown_set",
+        "rule_mismatch",
+        "rule_version",
+        "mixed_snapshots",
+        "empty_table",
+        "shares",
+        "pinned_counts",
+        "inherited_empty",
+        "inherited_duplicates",
+        "inherited_versions",
+        "inherited_rule_version",
+        "changed_set",
+        "left_source",
+        "new_patient",
+        "source_missing",
+        "source_extra",
+        "source_snapshot",
+        "schema",
+        "sample_empty",
+        "sample_bad_slot",
+        "sample_missing_case",
+        "sample_wrong_patient",
+        "sample_missing_patient",
+        "sample_mismatch",
+        "sample_file",
+        "case_two_patients",
+        "source_row",
+        "unwritable_row",
+        "readback_differs",
+        "table_missing",
+        "branch_moved",
+        "source_no_snapshot",
+        "source_empty",
+        "source_table",
+    }
+)
+CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_table"})
 
 
 class PatientSplitError(ValueError):
-    """The split cannot be built or a check failed. ``problems`` holds one plain sentence for each cause."""
+    """The split cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
 
     def __init__(self, *problems: str) -> None:
         super().__init__("; ".join(problems))
@@ -53,168 +105,277 @@ class SampleCase:
     slot: str
 
 
+@dataclass(frozen=True, slots=True)
+class Source:
+    """What a read of Bronze at one hash gives: the patient of each case, the distinct patients and the snapshot that was read."""
+
+    cases: dict[int, str]
+    patients: set[str]
+    snapshot_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class TableState:
+    """The rows of the split table at one hash and the snapshot that holds them."""
+
+    rows: list[SplitRow]
+    snapshot_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class Operations:
+    """The Spark steps of a build. ``head`` is the hash of the branch now. The reads are at the hash that is given. ``read_table`` gives ``None`` for a hash
+    that holds no table. ``write`` writes the whole table to the branch."""
+
+    head: Callable[[], str]
+    read_source: Callable[[str], Source]
+    read_table: Callable[[str], TableState | None]
+    write: Callable[..., None]
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    outcome: str
+    head: str
+    rows: list[SplitRow]
+    source: Source
+    table_snapshot_id: int | None
+    checks_run: list[str]
+    sample_cases: int | None
+
+    def facts(self) -> dict[str, Any]:
+        """What the result line may hold: the hash that was checked, snapshot IDs, counts, counts per set, the checks that ran and a digest."""
+        return {
+            "outcome": self.outcome,
+            "branch_hash": self.head,
+            "snapshot_id": self.table_snapshot_id,
+            "source_snapshot_id": self.source.snapshot_id,
+            "rule_version": RULE_VERSION,
+            "patients": len(self.rows),
+            "cases": len(self.source.cases),
+            "counts": counts_of(self.rows),
+            "checks_run": self.checks_run,
+            "table_digest": table_digest(self.rows),
+            "fixed_sample_cases_checked": self.sample_cases,
+        }
+
+
+def unit(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def row_order(row: SplitRow) -> tuple[int, str]:
+    return len(row.subjectid), row.subjectid
+
+
+def table_digest(rows: Sequence[SplitRow]) -> str:
+    """The SHA-256 of the table's patients and sets in patient order, so that two tables compare without either being shown."""
+    text = "".join(f"{row.subjectid},{row.set}\n" for row in sorted(rows, key=row_order))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def patient_number(subjectid: str) -> int:
     """The patient number of a ``subjectid`` in the published form (whole number, no sign, no zero before the first digit), or ``PatientSplitError``."""
     if PATIENT_NUMBER.fullmatch(subjectid) is None or not subjectid.isascii():
-        raise PatientSplitError(f"the subjectid {subjectid!r} is not a patient number in its published form: digits only, no leading zero")
+        raise PatientSplitError(f"bad_subjectid: {unit(1, 'subjectid')}")
     return int(subjectid)
 
 
 def build_assignments(subject_ids: Iterable[str]) -> dict[str, str]:
-    """The set of each patient, by the one rule of ``scripts/sample/split.py``. A ``subjectid`` that is not in its published form is an error that names it."""
+    """The set of each patient, by the one rule of ``scripts/sample/split.py``. A ``subjectid`` that is not in its published form is counted, never named."""
     assignments: dict[str, str] = {}
-    refused: list[str] = []
+    refused = 0
     for subjectid in subject_ids:
         try:
             assignments[subjectid] = SET_NAMES[patient_part(patient_number(subjectid))]
-        except PatientSplitError as error:
-            refused.append(str(error))
+        except PatientSplitError:
+            refused += 1
     if refused:
-        raise PatientSplitError(*refused[:MESSAGE_LIMIT])
+        raise PatientSplitError(f"bad_subjectid: {unit(refused, 'subjectid')}")
     return assignments
 
 
 def share_problems(counts: Mapping[str, int]) -> list[str]:
-    """Each set whose share of the patients is more than one percentage point from its target of 70, 10 or 20 percent. Whole-number arithmetic only."""
+    """The sets whose share of the patients is more than one percentage point from its target of 70, 10 or 20 percent. Whole-number arithmetic only."""
     total = sum(counts.get(name, 0) for name in TARGET_PERCENT)
-    problems = []
-    for name, percent in TARGET_PERCENT.items():
-        count = counts.get(name, 0)
-        if abs(count * 100 - percent * total) > SHARE_TOLERANCE_POINTS * total:
-            problems.append(f"the {name} share is {count} of {total} patients, which is more than {SHARE_TOLERANCE_POINTS} percentage point from {percent}%")
-    return problems
+    off = [name for name, percent in TARGET_PERCENT.items() if abs(counts.get(name, 0) * 100 - percent * total) > SHARE_TOLERANCE_POINTS * total]
+    if not off:
+        return []
+    return [f"shares: {unit(len(off), 'set')} more than {SHARE_TOLERANCE_POINTS} percentage point from 70, 10 and 20 percent, counts {counts_text(counts)}"]
+
+
+def counts_text(counts: Mapping[str, int]) -> str:
+    return ", ".join(f"{name} {counts.get(name, 0)}" for name in TARGET_PERCENT)
 
 
 def table_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
-    """What is wrong with the rows of the table by themselves: a patient twice, a set or a version that is not the rule's, shares and pinned counts."""
+    """What is wrong with the rows by themselves: a patient twice, a set or version that is not the rule's, and for the pinned release the shares and counts."""
     if not rows:
-        return ["the split table has no row"]
+        return [f"empty_table: {unit(0, 'row')}"]
     problems: list[str] = []
-    for subjectid, seen in Counter(row.subjectid for row in rows).items():
-        if seen > 1:
-            names = sorted({row.set for row in rows if row.subjectid == subjectid})
-            problems.append(f"patient {subjectid} is in two sets: {names}" if len(names) > 1 else f"patient {subjectid} is in the table more than once")
-    for version in sorted({row.rule_version for row in rows} - {RULE_VERSION}):
-        problems.append(f"the rule version {version!r} is not the current {RULE_VERSION!r}")
-    if len({row.source_snapshot_id for row in rows}) > 1:
-        problems.append("the rows were built from more than one source snapshot")
+    sets_of: dict[str, set[str]] = {}
+    seen = Counter(row.subjectid for row in rows)
+    for row in rows:
+        sets_of.setdefault(row.subjectid, set()).add(row.set)
+    two = sum(1 for names in sets_of.values() if len(names) > 1)
+    repeated = sum(1 for subjectid, count in seen.items() if count > 1 and len(sets_of[subjectid]) == 1)
+    for code, count, noun in (("two_sets", two, "patient"), ("repeated_patient", repeated, "patient")):
+        if count:
+            problems.append(f"{code}: {unit(count, noun)}")
+    other_version = sum(1 for row in rows if row.rule_version != RULE_VERSION)
+    if other_version:
+        problems.append(f"rule_version: {unit(other_version, 'row')}")
+    snapshots = len({row.source_snapshot_id for row in rows})
+    if snapshots > 1:
+        problems.append(f"mixed_snapshots: {unit(snapshots, 'snapshot')}")
+    unknown = bad = mismatch = 0
     for row in rows:
         if row.set not in TARGET_PERCENT:
-            problems.append(f"patient {row.subjectid} has the set {row.set!r}, which is not one of {sorted(TARGET_PERCENT)}")
+            unknown += 1
             continue
         try:
             expected = SET_NAMES[patient_part(patient_number(row.subjectid))]
-        except PatientSplitError as error:
-            problems.append(str(error))
+        except PatientSplitError:
+            bad += 1
             continue
-        if row.set != expected:
-            problems.append(f"patient {row.subjectid} is in {row.set}, which does not match the rule ({expected})")
-    counts = dict(Counter(row.set for row in rows))
-    problems += share_problems(counts)
-    if pinned and {name: counts.get(name, 0) for name in PINNED_COUNTS} != PINNED_COUNTS:
-        problems.append(f"the pinned release needs exactly {PINNED_COUNTS}, the table holds {counts}")
+        mismatch += row.set != expected
+    for code, count, noun in (("unknown_set", unknown, "row"), ("bad_subjectid", bad, "subjectid"), ("rule_mismatch", mismatch, "patient")):
+        if count:
+            problems.append(f"{code}: {unit(count, noun)}")
+    if pinned:
+        counts = dict(Counter(row.set for row in rows))
+        problems += share_problems(counts)
+        if {name: counts.get(name, 0) for name in PINNED_COUNTS} != PINNED_COUNTS:
+            problems.append(f"pinned_counts: counts {counts_text(counts)} are not exactly {counts_text(PINNED_COUNTS)}")
     return problems
 
 
-def frozen_problems(existing: Sequence[SplitRow], rebuilt: Mapping[str, str], *, pinned: bool) -> list[str]:
-    """How a rebuild would change the merged table: another rule version, a changed set, a patient that left the source and, for a pinned release, a new one."""
-    problems = [
-        f"the merged table was built with the rule version {version!r}, not {RULE_VERSION!r}"
-        for version in sorted({row.rule_version for row in existing} - {RULE_VERSION})
-    ]
+def inherited_problems(rows: Sequence[SplitRow]) -> list[str]:
+    """What makes the table that a rebuild inherits unfit as a freeze, before it is compared with anything: no row, a patient twice or two rule versions."""
+    if not rows:
+        return [f"inherited_empty: {unit(0, 'row')}"]
+    problems = []
+    twice = sum(1 for count in Counter(row.subjectid for row in rows).values() if count > 1)
+    if twice:
+        problems.append(f"inherited_duplicates: {unit(twice, 'patient')}")
+    versions = len({row.rule_version for row in rows})
+    if versions > 1:
+        problems.append(f"inherited_versions: {unit(versions, 'rule version')}")
+    return problems
+
+
+def frozen_problems(existing: Sequence[SplitRow] | None, rebuilt: Mapping[str, str], *, pinned: bool) -> list[str]:
+    """How a rebuild would change the table that the branch holds. ``None`` is a first build and has nothing to freeze.
+
+    The inherited table must be valid by itself first. Then: another rule version, a changed set, a patient that left the source and, for a pinned release,
+    a new patient.
+    """
+    if existing is None:
+        return []
+    problems = inherited_problems(existing)
+    if problems:
+        return problems
+    other_version = sum(1 for row in existing if row.rule_version != RULE_VERSION)
+    if other_version:
+        return [f"inherited_rule_version: {unit(other_version, 'row')}"]
     held = {row.subjectid: row.set for row in existing}
-    for subjectid, name in sorted(held.items()):
-        if subjectid not in rebuilt:
-            problems.append(f"patient {subjectid} is in the merged table and no longer in the source")
-        elif rebuilt[subjectid] != name:
-            problems.append(f"patient {subjectid} would change from {name} to {rebuilt[subjectid]}: the split is frozen")
-    if pinned and held:
-        problems += [f"new patient {subjectid} cannot appear in a pinned release" for subjectid in sorted(set(rebuilt) - set(held))]
-    return problems
+    left = sum(1 for subjectid in held if subjectid not in rebuilt)
+    changed = sum(1 for subjectid, name in held.items() if subjectid in rebuilt and rebuilt[subjectid] != name)
+    new = len(set(rebuilt) - set(held)) if pinned else 0
+    return [f"{code}: {unit(count, 'patient')}" for code, count in (("changed_set", changed), ("left_source", left), ("new_patient", new)) if count]
 
 
 def source_problems(rows: Sequence[SplitRow], source_subjects: set[str], source_snapshot_id: int) -> list[str]:
     """The table must be built from the source as it is now: the same snapshot and exactly the same patients."""
-    problems = []
     held = {row.subjectid for row in rows}
-    for label, names in (
-        ("have no row in the table", sorted(source_subjects - held)),
-        ("are in the table and not in the source", sorted(held - source_subjects)),
-    ):
-        if names:
-            problems.append(f"{len(names)} patients {label}, first {names[:3]}")
+    problems = [
+        f"{code}: {unit(count, 'patient')}"
+        for code, count in (("source_missing", len(source_subjects - held)), ("source_extra", len(held - source_subjects)))
+        if count
+    ]
     if {row.source_snapshot_id for row in rows} - {source_snapshot_id}:
-        problems.append(f"the table was built from another source snapshot than the current {source_snapshot_id}")
+        problems.append("source_snapshot: the table was built from another source snapshot")
     return problems
 
 
 def schema_problems(fields: Sequence[tuple[str, str]], expected: Sequence[tuple[str, str]], label: str) -> list[str]:
-    return [] if list(fields) == list(expected) else [f"the {label} has the columns {list(fields)}, not {list(expected)}"]
+    if list(fields) == list(expected):
+        return []
+    return [f"schema: the {label} has {unit(len(fields), 'column')} that differ from the {len(expected)} of the card"]
 
 
 def fixed_sample_problems(assignments: Mapping[str, str], cases: Mapping[int, str], sample: Sequence[SampleCase]) -> list[str]:
     """Each fixed-sample case must be in Bronze under its patient, and its patient must be in the set that its slot expects (development or test)."""
     if not sample:
-        return ["the fixed sample has no case, so there is nothing to check"]
-    problems = []
+        return [f"sample_empty: {unit(0, 'case')}"]
+    found: Counter[str] = Counter()
     for item in sample:
         kind = item.slot.rsplit("_", 1)[-1]
         if kind not in SLOT_KINDS:
-            problems.append(f"case {item.case}: the slot {item.slot!r} is neither a development nor a test slot")
+            found["sample_bad_slot"] += 1
         elif item.case not in cases:
-            problems.append(f"case {item.case} (slot {item.slot}) has no row in the source table")
+            found["sample_missing_case"] += 1
         elif cases[item.case] != str(item.patient):
-            problems.append(
-                f"case {item.case} (slot {item.slot}) is under patient {cases[item.case]} in the source table, not the fixed sample's patient {item.patient}"
-            )
+            found["sample_wrong_patient"] += 1
         elif str(item.patient) not in assignments:
-            problems.append(f"case {item.case} (slot {item.slot}): patient {item.patient} has no row in the split table")
+            found["sample_missing_patient"] += 1
         elif assignments[str(item.patient)] not in SLOT_KINDS[kind]:
-            held = assignments[str(item.patient)]
-            problems.append(f"case {item.case} (slot {item.slot}) of patient {item.patient} is in {held}, but a {kind} case must be in {SLOT_KINDS[kind]}")
-    return problems
+            found["sample_mismatch"] += 1
+    return [f"{code}: {unit(count, 'case')}" for code, count in found.items()]
 
 
 def read_fixed_sample(path: Path) -> list[SampleCase]:
-    """The case, patient and slot of each line of a candidate file (``tests/fixtures/vitaldb/candidates.tsv``), or ``PatientSplitError``."""
+    """The case, patient and slot of each line of the complete tracked candidate file, or ``PatientSplitError``. Any other file is refused."""
     try:
-        lines = path.read_text().splitlines()
-    except OSError, UnicodeDecodeError:
-        raise PatientSplitError("the fixed-sample file cannot be read") from None
-    if not lines or tuple(lines[0].split("\t")) != CANDIDATE_HEADER:
-        raise PatientSplitError(f"the fixed-sample file does not start with the header {CANDIDATE_HEADER}")
+        data = path.read_bytes()
+    except OSError:
+        raise PatientSplitError("sample_file: the fixed-sample file cannot be read") from None
+    if hashlib.sha256(data).hexdigest() != FIXED_SAMPLE_SHA256:
+        raise PatientSplitError("sample_file: the file is not the complete pinned fixed sample")
+    try:
+        lines = data.decode().splitlines()
+    except UnicodeDecodeError:
+        raise PatientSplitError("sample_file: the fixed-sample file cannot be read") from None
+    if len(lines) - 1 != FIXED_SAMPLE_ROWS or tuple(lines[0].split("\t")) != CANDIDATE_HEADER:
+        raise PatientSplitError("sample_file: the pinned file does not have the pinned form")
     sample = []
-    for number, line in enumerate(lines[1:], 2):
+    for line in lines[1:]:
         fields = line.split("\t")
         if len(fields) != len(CANDIDATE_HEADER) or not CASE_NUMBER.fullmatch(fields[0]) or not CASE_NUMBER.fullmatch(fields[1]):
-            raise PatientSplitError(f"line {number} of the fixed-sample file is not a candidate line")
+            raise PatientSplitError("sample_file: a line is not a candidate line")
         sample.append(SampleCase(int(fields[0]), int(fields[1]), fields[6]))
     return sample
 
 
 def source_cases(rows: Iterable[tuple[str | None, str | None]]) -> tuple[dict[int, str], set[str]]:
-    """The patient of each case and the distinct patients of the source rows. A missing value or a case under two patients is an error."""
+    """The patient of each case and the distinct patients of the source rows. A missing value or a case under two patients is counted."""
     cases: dict[int, str] = {}
     patients: set[str] = set()
-    problems: list[str] = []
+    bad = twice = 0
     for caseid, subjectid in rows:
         if caseid is None or subjectid is None or not CASE_NUMBER.fullmatch(caseid):
-            problems.append(f"a source row has the caseid {caseid!r} and the subjectid {subjectid!r}: both must be present and the caseid must be digits")
+            bad += 1
             continue
         if cases.setdefault(int(caseid), subjectid) != subjectid:
-            problems.append(f"case {caseid} is listed under two patients in the source table")
+            twice += 1
         patients.add(subjectid)
+    problems = [f"{code}: {unit(count, noun)}" for code, count, noun in (("source_row", bad, "row"), ("case_two_patients", twice, "case")) if count]
     if problems:
-        raise PatientSplitError(*problems[:MESSAGE_LIMIT])
+        raise PatientSplitError(*problems)
     return cases, patients
 
 
-def checks(rows: Sequence[SplitRow], source: tuple[dict[int, str], set[str], int], sample: Sequence[SampleCase] | None, *, pinned: bool) -> list[str]:
-    """Every check of the card on ``rows`` against the source: the table by itself, the source, and the fixed sample when there is one."""
-    cases, patients, snapshot = source
-    problems = table_problems(rows, pinned=pinned) + source_problems(rows, patients, snapshot)
+def check_names(*, pinned: bool, sample: Sequence[SampleCase] | None) -> list[str]:
+    """The checks that ``checks`` runs for these options, for the result line."""
+    names = ["two_sets", "rule_match", "rule_version", "source_snapshot", "source_patients"]
+    return names + (["shares", "pinned_counts"] if pinned else []) + (["fixed_sample"] if sample is not None else [])
+
+
+def checks(rows: Sequence[SplitRow], source: Source, sample: Sequence[SampleCase] | None, *, pinned: bool) -> list[str]:
+    """Every check of the card on ``rows`` against the source. The shares and the exact counts are the full cohort's and run only for the pinned release."""
+    problems = table_problems(rows, pinned=pinned) + source_problems(rows, source.patients, source.snapshot_id)
     if sample is not None:
-        problems += fixed_sample_problems({row.subjectid: row.set for row in rows}, cases, sample)
+        problems += fixed_sample_problems({row.subjectid: row.set for row in rows}, source.cases, sample)
     return problems
 
 
@@ -223,19 +384,88 @@ def counts_of(rows: Sequence[SplitRow]) -> dict[str, int]:
     return {name: counted.get(name, 0) for name in TARGET_PERCENT}
 
 
+BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
+
+
+def run_build(ops: Operations, head: str, *, pinned: bool, sample: Sequence[SampleCase] | None) -> Outcome:
+    """Build the table on the branch whose head is ``head``, or leave it as it is when nothing changes.
+
+    The order: read Bronze and the table at ``head``; validate the table that is inherited; freeze (compare with it); check the rows to write; write only
+    while the branch still has ``head``; resolve the head of the write; read the table and Bronze at that hash and check them against what was written; end
+    only when the branch still has that hash.
+    """
+    source = ops.read_source(head)
+    assignments = build_assignments(source.patients)
+    rows = [SplitRow(subjectid, assignments[subjectid], RULE_VERSION, source.snapshot_id) for subjectid in sorted(assignments, key=int)]
+    state = ops.read_table(head)
+    problems = frozen_problems(None if state is None else state.rows, assignments, pinned=pinned) + checks(rows, source, sample, pinned=pinned)
+    if problems:
+        raise PatientSplitError(*problems)
+    unchanged = state is not None and {(row.subjectid, row.set, row.source_snapshot_id) for row in state.rows} == {
+        (row.subjectid, row.set, row.source_snapshot_id) for row in rows
+    }
+    at = head
+    if not unchanged:
+        if ops.head() != head:
+            raise PatientSplitError(BRANCH_MOVED)
+        ops.write(rows, exists=state is not None)
+        at = ops.head()
+    return finish(ops, at, rows, pinned=pinned, sample=sample, outcome="unchanged" if unchanged else "written")
+
+
+def finish(ops: Operations, at: str, rows: Sequence[SplitRow], *, pinned: bool, sample: Sequence[SampleCase] | None, outcome: str) -> Outcome:
+    """Read the table and Bronze at ``at``, check them against ``rows`` and confirm that the branch still has ``at``."""
+    source = ops.read_source(at)
+    state = ops.read_table(at)
+    if state is None:
+        raise PatientSplitError(f"table_missing: {unit(0, 'table')}")
+    problems = checks(state.rows, source, sample, pinned=pinned)
+    if sorted(state.rows, key=row_order) != sorted(rows, key=row_order):
+        problems.append("readback_differs: the table that the branch holds is not the table that was written")
+    if problems:
+        raise PatientSplitError(*problems)
+    if ops.head() != at:
+        raise PatientSplitError(BRANCH_MOVED)
+    return Outcome(
+        outcome,
+        at,
+        sorted(state.rows, key=row_order),
+        source,
+        state.snapshot_id,
+        check_names(pinned=pinned, sample=sample),
+        None if sample is None else len(sample),
+    )
+
+
+def run_verify(ops: Operations, head: str, *, pinned: bool, sample: Sequence[SampleCase] | None) -> Outcome:
+    """Run every check on the table that the branch holds at ``head``, and confirm that the branch still has ``head``. Nothing is written."""
+    source = ops.read_source(head)
+    state = ops.read_table(head)
+    if state is None:
+        raise PatientSplitError(f"table_missing: {unit(0, 'table')}")
+    problems = checks(state.rows, source, sample, pinned=pinned)
+    if problems:
+        raise PatientSplitError(*problems)
+    if ops.head() != head:
+        raise PatientSplitError(BRANCH_MOVED)
+    return Outcome(
+        "verified", head, list(state.rows), source, state.snapshot_id, check_names(pinned=pinned, sample=sample), None if sample is None else len(sample)
+    )
+
+
 def values_query(rows: Sequence[SplitRow]) -> str:
     """One ``VALUES`` query that holds the rows as literals in the order of ``COLUMNS``, so that Spark builds the frame in the JVM.
 
     No Python worker process starts: Spark's Python workers hang from time to time under the amd64 emulation of the test computer. Every value is
     checked before it enters the text: a patient number in its published form, one of the three set names, a rule version of plain characters and a
-    whole number. A value outside that is an error.
+    whole number. A value outside that is an error that names no value.
     """
     if not rows:
-        raise PatientSplitError("the split table has no row to write")
+        raise PatientSplitError("unwritable_row: no row to write")
     tuples = []
     for row in rows:
         patient_number(row.subjectid)
         if row.set not in TARGET_PERCENT or not SAFE_VERSION.fullmatch(row.rule_version) or type(row.source_snapshot_id) is not int:
-            raise PatientSplitError(f"the row of patient {row.subjectid} holds a value that cannot be written")
+            raise PatientSplitError(f"unwritable_row: {unit(1, 'row')}")
         tuples.append(f"('{row.subjectid}', '{row.set}', '{row.rule_version}', {row.source_snapshot_id}L)")
     return f"VALUES {', '.join(tuples)}"
