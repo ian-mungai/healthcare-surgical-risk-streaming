@@ -15,13 +15,15 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
+from scripts.ingestion import selection
 from scripts.ingestion.check import CHECKED_FILE_FIELDS, CheckResult, ResultFormatError
 from scripts.ingestion.cli import CLI_ERRORS, InputError, read_input, write_private
 from scripts.ingestion.landing import PairingError, load_pairing_records
 from scripts.ingestion.manifest import ManifestError, ManifestRef, publish_manifest, read_manifest
 from scripts.ingestion.selection import Selection, SelectionError
-from scripts.sample.candidates import CREDIT_FIELDS, FILE_PIN_FIELDS, RELEASE_FIELDS, SOURCE_FIELDS, TRACK_LIST_FIELDS
+from scripts.sample.candidates import CREDIT_FIELDS, FILE_PIN_FIELDS, RELEASE_FIELDS, RELEASE_FILE, SOURCE_FIELDS, TRACK_LIST_FIELDS
 from scripts.sample.publisher import TRACK_LIST_COLUMNS
 from tests.fast.ingestion_support import SOURCE_PREFIX, digest, landed_set
 
@@ -65,6 +67,8 @@ class SelectionInputTest(unittest.TestCase):
             lambda document: document.update(release=1),
             lambda document: document["case_files"].update(first="1"),
             lambda document: document["case_files"].update(first=True),
+            lambda document: document.update(files=[1]),
+            lambda document: document.update(files=["clinical_data.csv", None]),
         ]
         for number, change in enumerate(changes):
             with self.subTest(change=number), self.assertRaises(SelectionError):
@@ -216,6 +220,19 @@ class CommandErrorTest(unittest.TestCase):
     def test_every_error_that_an_input_can_raise_is_reported_and_none_is_a_traceback(self) -> None:
         raised = (SelectionError, PairingError, ResultFormatError, ManifestError, InputError)
         self.assertEqual([], [error.__name__ for error in raised if not issubclass(error, CLI_ERRORS)])
+
+
+class TrackedPinTest(unittest.TestCase):
+    def test_a_tracked_pin_that_is_not_valid_stops_every_full_release(self) -> None:
+        self.addCleanup(selection.pinned_release.cache_clear)
+        with tempfile.TemporaryDirectory(prefix="ingestion_pin_") as folder:
+            pin = json.loads(RELEASE_FILE.read_text())
+            pin["checksum_list"]["key"] = f"{SOURCE_PREFIX}OTHER.txt"
+            broken = Path(folder) / "release.json"
+            broken.write_text(json.dumps(pin))
+            selection.pinned_release.cache_clear()
+            with mock.patch.object(selection, "RELEASE_FILE", broken), self.assertRaisesRegex(SelectionError, "tracked release pin is not valid"):
+                selection.pinned_release()
 
 
 class FrozenAuthorityTest(unittest.TestCase):

@@ -10,6 +10,7 @@ import json
 import unittest
 from dataclasses import replace
 from typing import Any
+from unittest import mock
 
 from scripts.ingestion.check import CheckedFile, CheckResult, Finding, canonical, result_digest
 from scripts.ingestion.gate import GateRefused, verify_before_read
@@ -152,6 +153,26 @@ class PublishTest(unittest.TestCase):
         self.assertEqual([], manifest_objects(landed))
         self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
 
+    def test_a_result_whose_files_are_not_the_selected_ones_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        other_key = replace(result.files[0], source_key=SOURCE_PREFIX + "vital_files/0009.vital")
+        for name, files in (("another key", (other_key, *result.files[1:])), ("a file twice", (*result.files, result.files[0]))):
+            forged = replace(result, files=files, file_count=len(files))
+            forged = replace(forged, claimed_sha256=forged.result_sha256)
+            with self.subTest(name), self.assertRaisesRegex(PublishRefused, "every selected file once"):
+                publish_manifest(landed.store, landed.selection, forged)
+        self.assertEqual([], manifest_objects(landed))
+
+    def test_a_result_for_another_bucket_publishes_nothing_although_its_digest_is_consistent(self) -> None:
+        landed = landed_set()
+        result = checked(landed)
+        forged = replace(result, files=tuple(replace(file, bucket="another-bucket") for file in result.files))
+        forged = replace(forged, claimed_sha256=forged.result_sha256)
+        with self.assertRaisesRegex(PublishRefused, "another bucket"):
+            publish_manifest(landed.store, landed.selection, forged)
+        self.assertEqual([], manifest_objects(landed))
+
     def test_a_result_that_did_not_pass_publishes_nothing_whatever_else_in_it_holds(self) -> None:
         landed = landed_set()
         result = checked(landed)
@@ -205,6 +226,37 @@ class PublishTest(unittest.TestCase):
         with self.assertRaisesRegex(PublishRefused, "clinical_data.csv: no longer present after the check"):
             publish_manifest(landed.store, landed.selection, result)
         self.assertEqual([], manifest_objects(landed))
+
+
+class ReferenceTest(unittest.TestCase):
+    def test_a_reference_outside_the_manifest_prefix_is_refused_and_no_payload_is_read(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        data = landed.store.get_version_bytes(landed.store.list_versions(reference.key)[0], 10**7)
+        key = f"landing/probe_set/{reference.sha256}.json"
+        planted = ManifestRef(landed.store.bucket, key, landed.store.put_object(key, data).version_id, reference.sha256)
+        landed.store.reads.clear()
+        with self.assertRaisesRegex(ManifestError, "does not hold"):
+            read_manifest(landed.store, planted)
+        self.assertEqual([], landed.store.payload_reads("landing/"))
+
+    def test_a_reference_key_that_is_not_a_manifest_key_is_refused_before_the_store_is_asked(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        landed.store.list_versions = mock.Mock(side_effect=AssertionError("the store was asked"))  # type: ignore[method-assign]
+        for key in (f"manifests/private value/{reference.sha256}.json", f"manifests/a/b/{reference.sha256}.json", f"manifests//{reference.sha256}.json"):
+            with self.subTest(key=key), self.assertRaisesRegex(ManifestError, "does not hold") as raised:
+                read_manifest(landed.store, replace(reference, key=key))
+            self.assertNotIn("private", str(raised.exception))
+        with self.assertRaisesRegex(ManifestError, "does not hold"):
+            read_manifest(landed.store, replace(reference, sha256=reference.sha256.upper(), key=reference.key.upper()))
+
+    def test_a_reference_to_a_delete_marker_is_refused_as_a_version_that_does_not_exist(self) -> None:
+        landed = landed_set()
+        reference = publish_manifest(landed.store, landed.selection, checked(landed))
+        marker = landed.store.put_delete_marker(reference.key)
+        with self.assertRaisesRegex(ManifestError, "the manifest version of the reference does not exist"):
+            read_manifest(landed.store, replace(reference, version_id=marker.version_id))
 
 
 class RepeatedFieldTest(unittest.TestCase):

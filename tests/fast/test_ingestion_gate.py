@@ -177,7 +177,7 @@ class GateTest(unittest.TestCase):
             "source bucket": lambda document: document["selection"].update(source_bucket="another-publisher"),
             "source prefix": lambda document: document["selection"].update(source_prefix="vitaldb/"),
             "list key": lambda document: document["checksum_list"].update(key=f"{SOURCE_PREFIX}OTHER_SUMS.txt"),
-            "one entry's release": lambda document: document["entries"][0].update(release="2.0.0"),
+            "the last entry's release": lambda document: document["entries"][-1].update(release="2.0.0"),
             "every entry's release": every_release,
             "an entry removed": lambda document: document["entries"].pop(),
         }

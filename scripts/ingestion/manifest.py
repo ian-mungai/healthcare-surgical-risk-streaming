@@ -17,6 +17,7 @@ with that SHA-256, and the digest of the check result in the manifest equals the
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
@@ -32,6 +33,7 @@ MANIFEST_PREFIX = "manifests/"
 MANIFEST_FORMAT = "landing_manifest_2"
 EARLIER_MANIFEST_FORMATS = ("landing_manifest_1",)
 MANIFEST_LIMIT_BYTES = 32 * 1024 * 1024
+MANIFEST_KEY = re.compile(r"manifests/[a-z0-9][a-z0-9_]{0,63}/[0-9a-f]{64}\.json")
 
 
 class PublishRefused(RuntimeError):
@@ -78,14 +80,16 @@ class Manifest:
 
     def recomputed_selection_sha256(self) -> str:
         """The selection digest from the manifest's own fields, or "" when its entries do not share one release or do not match its count and keys."""
-        releases = {entry.release for entry in self.entries}
+        release = self.entries[0].release if self.entries else ""
         keys_sha256 = keys_digest(entry.source_key for entry in self.entries)
-        if len(releases) != 1 or self.selection["file_count"] != len(self.entries) or self.selection["keys_sha256"] != keys_sha256:
+        if any(entry.release != release for entry in self.entries):
+            return ""
+        if self.selection["file_count"] != len(self.entries) or self.selection["keys_sha256"] != keys_sha256:
             return ""
         selection, listed = self.selection, self.checksum_list
         return selection_digest(
             selection["name"],
-            releases.pop(),
+            release,
             selection["source_bucket"],
             selection["source_prefix"],
             self.measurement_period,
@@ -168,7 +172,7 @@ def read_manifest(store: ObjectStore, reference: ManifestRef) -> Manifest:
         raise ManifestError("the manifest reference names another bucket than the one in use")
     if reference.version_id in NULL_VERSION_IDS:
         raise ManifestError("the manifest reference names a null version")
-    if not reference.key.startswith(MANIFEST_PREFIX) or not reference.key.endswith(f"/{reference.sha256}.json"):
+    if MANIFEST_KEY.fullmatch(reference.key) is None or not reference.key.endswith(f"/{reference.sha256}.json"):
         raise ManifestError("the manifest key does not hold the SHA-256 of the reference")
     wanted = [version for version in store.list_versions(reference.key) if version.key == reference.key and version.version_id == reference.version_id]
     if not wanted or wanted[0].is_delete_marker:

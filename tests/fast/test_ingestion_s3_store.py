@@ -30,6 +30,7 @@ class StubAws:
         self.omit_length = False
         self.truncate_file = False
         self.raw_reply: Any = None
+        self.version_missing = False
 
     def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
         self.calls.append(arguments)
@@ -49,6 +50,8 @@ class StubAws:
             Path(arguments[-1]).write_bytes(piece[:-1] if self.truncate_file else piece)
         if self.raw_reply is not None:
             return self.raw_reply
+        if self.version_missing:
+            return None
         reply: dict[str, Any] = {"VersionId": self.reply_version or options["--version-id"]}
         if not self.omit_length:
             reply["ContentLength"] = len(piece)
@@ -67,6 +70,7 @@ class WriteStubAws:
         self.versions: dict[str, list[tuple[str, bytes]]] = {}
         self.calls: list[tuple[str, ...]] = []
         self.lose_first_reply = False
+        self.refuse_every_write = False
 
     def call(self, *arguments: str, missing: Sequence[str] = (), timeout: float = 0) -> Any:
         self.calls.append(arguments)
@@ -92,7 +96,7 @@ class WriteStubAws:
         reply: Any = None
         for _ in range(2 if self.lose_first_reply else 1):
             items = self.versions.setdefault(options["--key"], [])
-            if conditional and items:
+            if conditional and (items or self.refuse_every_write):
                 if "PreconditionFailed" not in missing:
                     raise AwsError("aws s3api put-object failed: PreconditionFailed")
                 reply = None
@@ -225,6 +229,12 @@ class ConditionalWriteTest(unittest.TestCase):
             self.assertEqual([b"{}"], aws.stored(self.KEY))
             self.assertEqual([], [call for call in aws.calls if call[1] == "get-object"])
 
+    def test_a_refused_write_whose_key_lists_no_current_version_is_refused(self) -> None:
+        aws = WriteStubAws()
+        aws.refuse_every_write = True
+        with self.assertRaisesRegex(StoreError, "no current version is listed"):
+            S3Store(aws, "example-bucket").create_object(self.KEY, b"{}")
+
     def test_a_bucket_whose_versioning_is_not_enabled_is_refused_before_anything_is_written(self) -> None:
         for status in (None, "Suspended"):
             aws = WriteStubAws(status)
@@ -297,6 +307,13 @@ class RangedReadTest(unittest.TestCase):
         ranges = [call[call.index("--range") + 1] for call in aws.calls if call[1] == "get-object"]
         self.assertEqual(["bytes=0-999", "bytes=1000-1999", "bytes=2000-2999", "bytes=3000-3999", "bytes=4000-4999", "bytes=5000-5119"], ranges)
         self.assertTrue(all(call[call.index("--version-id") + 1] == "v2" for call in aws.calls if call[1] == "get-object"))
+
+    def test_a_version_that_does_not_exist_is_refused(self) -> None:
+        aws = StubAws(VERSIONS, {("landing/a", "v2"): b"12345"})
+        aws.version_missing = True
+        store = S3Store(aws, "example-bucket")
+        with self.assertRaisesRegex(StoreError, "does not exist"):
+            list(store.iter_version(store.list_versions("landing/")[1]))
 
     def test_a_reply_for_another_version_is_refused(self) -> None:
         aws = StubAws(VERSIONS, {("landing/a", "v2"): b"12345"})

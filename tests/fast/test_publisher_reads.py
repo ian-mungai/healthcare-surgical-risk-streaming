@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -153,6 +154,31 @@ class Parsers(unittest.TestCase):
     def test_a_checksum_list_line_with_no_checksum_is_refused(self) -> None:
         with self.assertRaises(PublisherError):
             publisher.parse_checksum_list("not a checksum  vital_files/0001.vital\n")
+
+
+class PinnedFiles(unittest.TestCase):
+    def test_a_file_of_the_pinned_size_with_another_checksum_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "file"
+            path.write_bytes(b"abc")
+            publisher.read_pinned("the track list", path, 3, publisher.file_sha256(path))
+            with self.assertRaisesRegex(PublisherError, "SHA-256"):
+                publisher.read_pinned("the track list", path, 3, "0" * 64)
+
+    def test_a_checksum_list_that_names_a_key_twice_is_refused_by_its_line(self) -> None:
+        good = "0" * 64
+        self.assertEqual({publisher.RELEASE_PREFIX + "a.csv": good}, publisher.parse_checksum_list(f"{good}  a.csv\n"))
+        with self.assertRaisesRegex(PublisherError, "line 2") as caught:
+            publisher.parse_checksum_list(f"{good}  private-value.csv\n{good}  private-value.csv\n")
+        self.assertNotIn("private-value", str(caught.exception))
+
+    def test_an_unsigned_read_runs_without_any_aws_setting_of_the_caller(self) -> None:
+        with mock.patch.dict("os.environ", {"AWS_PROFILE": "owner", "AWS_ACCESS_KEY_ID": "x", "LANG": "C.UTF-8"}):
+            environment = publisher.public_environment()
+        self.assertEqual("C.UTF-8", environment["LANG"])
+        self.assertNotIn("AWS_PROFILE", environment)
+        self.assertNotIn("AWS_ACCESS_KEY_ID", environment)
+        self.assertEqual(os.devnull, environment["AWS_SHARED_CREDENTIALS_FILE"])
 
 
 class CaseFactsBinding(unittest.TestCase):
@@ -424,6 +450,73 @@ class QuietMessages(unittest.TestCase):
         self.assertNotIn(self.MARKER, errors.getvalue())
 
 
+class TrackedFileForms(unittest.TestCase):
+    def read(self, text: str) -> list[candidates.Candidate]:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "candidates.tsv"
+            path.write_text(text)
+            return read_candidates(path)
+
+    def test_control_the_tracked_file_reads(self) -> None:
+        self.assertEqual(read_candidates(CANDIDATES_FILE), self.read(CANDIDATES_FILE.read_text()))
+
+    def test_a_header_line_field_count_or_flag_that_is_not_the_form_is_refused_by_its_line(self) -> None:
+        lines = CANDIDATES_FILE.read_text().splitlines()
+        fields = lines[1].split("\t")
+        cases = {
+            "another header": ("\t".join(reversed(candidates.HEADER)), "header"),
+            "a field too few": ("\t".join(fields[:-1]), "line 2"),
+            "a field too many": ("\t".join([*fields, "x"]), "line 2"),
+            "a flag that is not true or false": ("\t".join([*fields[:5], "yes", fields[6]]), "line 2"),
+        }
+        for name, (line, cause) in cases.items():
+            text = "\n".join([line, *lines[1:]] if cause == "header" else [lines[0], line, *lines[2:]]) + "\n"
+            with self.subTest(name), self.assertRaisesRegex(ValueError, cause):
+                self.read(text)
+
+
+class RebuildChecks(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tracked = read_candidates(CANDIDATES_FILE)
+
+    def rebuilt(self, chosen: list[candidates.Candidate]) -> object:
+        with mock.patch.object(candidates, "read_inputs", return_value=([], {}, {})), mock.patch.object(candidates, "select_candidates", return_value=chosen):
+            return candidates.rebuild(RELEASE_FILE)
+
+    def test_control_a_rebuild_of_the_tracked_candidates_passes(self) -> None:
+        self.assertEqual((self.tracked, {}, {}), self.rebuilt(self.tracked))
+
+    def test_a_rebuild_over_the_size_limit_or_with_a_bad_candidate_is_refused(self) -> None:
+        huge = [candidates.Candidate(**(vars(self.tracked[0]) | {"size_bytes": candidates.TOTAL_SIZE_LIMIT_BYTES})), *self.tracked[1:]]
+        with self.assertRaisesRegex(PublisherError, "over the limit"):
+            self.rebuilt(huge)
+        bad = [candidates.Candidate(**(vars(self.tracked[0]) | {"sha256": "x"})), *self.tracked[1:]]
+        with self.assertRaisesRegex(PublisherError, "64 hex"):
+            self.rebuilt(bad)
+
+    def test_a_tracked_line_that_differs_from_the_rebuild_is_found(self) -> None:
+        changed = [candidates.Candidate(**(vars(self.tracked[0]) | {"slot": "arterial_test_other"})), *self.tracked[1:]]
+        self.assertEqual([], candidates.difference_problems(self.tracked, self.tracked))
+        self.assertEqual(
+            [f"case {self.tracked[0].case}: the tracked line differs from the rebuilt line"], candidates.difference_problems(changed, self.tracked)
+        )
+
+    def test_a_pinned_table_whose_checksum_is_not_the_lists_is_refused_before_the_table_is_read(self) -> None:
+        release = json.loads(RELEASE_FILE.read_text())
+        listed = "".join(f"{table['sha256']}  {table['key'].removeprefix(publisher.RELEASE_PREFIX)}\n" for table in release["tables"])
+        other = listed.replace(release["tables"][1]["sha256"], "0" * 64)
+        for text, error, cause in ((listed, AssertionError, "listing was read"), (other, PublisherError, "pinned checksum")):
+            with (
+                tempfile.TemporaryDirectory() as folder,
+                self.subTest(cause=cause),
+                mock.patch.object(candidates, "download_key", side_effect=lambda key, target, text=text: target.write_text(text)),
+                mock.patch.object(candidates, "read_pinned"),
+                mock.patch.object(candidates, "list_release", side_effect=AssertionError("the listing was read")),
+                self.assertRaisesRegex(error, cause),
+            ):
+                candidates.read_inputs(release, Path(folder))
+
+
 class ClosedPinFields(unittest.TestCase):
     """The release pin is closed: each object holds exactly its known fields, each of its type. A problem names the object, never a field's name or value."""
 
@@ -436,6 +529,14 @@ class ClosedPinFields(unittest.TestCase):
 
     def test_control_the_tracked_pin_is_closed(self) -> None:
         self.assertEqual([], self.changed(lambda pin: None))
+
+    def test_a_missing_object_is_named_missing_and_a_size_that_is_not_positive_is_found(self) -> None:
+        self.assertIn("source: missing", self.changed(lambda pin: pin.pop("source")))
+        self.assertIn("tables[1]: size is not a positive number", self.changed(lambda pin: pin["tables"][1].update(size_bytes=0)))
+
+    def test_a_third_table_that_is_not_well_formed_is_refused_as_another_table_list(self) -> None:
+        problems = self.changed(lambda pin: pin["tables"].append({"key": 1}))
+        self.assertIn("tables: the pin must name clinical_data.csv and lab_data.csv of the release once each", problems)
 
     def test_an_unknown_missing_or_mistyped_field_is_a_problem_of_its_object(self) -> None:
         changes: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {

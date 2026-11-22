@@ -104,7 +104,7 @@ def parse_checksum_list(text: str) -> dict[str, str]:
             raise PublisherError(f"checksum list line {number} is malformed")
         key = RELEASE_PREFIX + match.group(2)
         if key in sums:
-            raise PublisherError(f"checksum list names {key} twice")
+            raise PublisherError(f"checksum list line {number} repeats a path")
         sums[key] = match.group(1)
     return sums
 

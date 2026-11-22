@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import replace
+from typing import Any
 
 from scripts.ingestion.check import ChecksumListError, PinnedListError, parse_checksum_list, run_check
 from scripts.ingestion.landing import LANDING_PREFIX, PairingError, PairingRecord, load_pairing_records
@@ -213,9 +214,21 @@ class PinnedListTest(unittest.TestCase):
     def test_the_list_must_be_well_formed(self) -> None:
         good = digest(b"x")
         self.assertEqual({"a.csv": good}, parse_checksum_list(f"{good} a.csv\n".encode()))
-        for text in (f"{good}  a.csv\n", f"{good[:-1]} a.csv\n", f"{good.upper()} a.csv\n", f"{good} a.csv\r\n", f"{good} a.csv\n{good} a.csv\n", f"{good}\n"):
+        for text in (
+            f"{good}  a.csv\n",
+            f"{good[:-1]} a.csv\n",
+            f"{good.upper()} a.csv\n",
+            f"{good} a.csv\r\n",
+            f"{good} a.csv\n{good} a.csv\n",
+            f"{good}\n",
+            "",
+        ):
             with self.subTest(text=text), self.assertRaises(ChecksumListError):
                 parse_checksum_list(text.encode())
+
+    def test_a_list_that_is_not_utf8_text_is_refused_for_that_cause(self) -> None:
+        with self.assertRaisesRegex(ChecksumListError, "UTF-8"):
+            parse_checksum_list(f"{digest(b'x')} a".encode() + b"\xff.csv\n")
 
 
 class SelectionTest(unittest.TestCase):
@@ -248,13 +261,64 @@ class SelectionTest(unittest.TestCase):
             {"files": ["a//b.csv"]},
             {"name": "has space"},
             {"release": ""},
+            {"checksum_list": {"key": f"{SOURCE_PREFIX}SHA256SUMS.txt", "sha256": "A" * 64}},
+            {"checksum_list": {"key": f"{SOURCE_PREFIX}SHA256SUMS.txt", "sha256": "0" * 63}},
         ]
         for changes in refused:
             with self.subTest(changes=changes), self.assertRaises(SelectionError):
                 Selection.from_json(self.text(**changes))
 
 
+class CurrentVersionTest(unittest.TestCase):
+    def test_the_check_binds_the_current_version_whatever_the_order_of_the_listing(self) -> None:
+        path = "vital_files/0001.vital"
+        landed = landed_set()
+        landed.land(path, SOURCE[path])
+        landed.store.history[landed.keys[path]].reverse()
+        result = landed.check()
+        self.assertTrue(result.passed)
+        self.assertEqual(landed.versions[path].version_id, next(file.version_id for file in result.files if file.source_key.endswith(path)))
+
+
+class ResultDigestTest(unittest.TestCase):
+    def test_the_check_digest_covers_its_selection_its_list_and_every_file(self) -> None:
+        result = landed_set().check()
+        self.assertTrue(result.passed)
+        changed = {
+            "selection": replace(result, selection_sha256="0" * 64),
+            "list": replace(result, list_sha256="0" * 64),
+            "a file": replace(result, files=(replace(result.files[0], size=result.files[0].size + 1), *result.files[1:])),
+        }
+        for name, other in changed.items():
+            with self.subTest(name):
+                self.assertNotEqual(result.result_sha256, other.result_sha256)
+
+    def test_a_result_with_no_file_does_not_pass_and_a_failed_check_claims_no_digest(self) -> None:
+        result = landed_set().check()
+        self.assertFalse(replace(result, file_count=0, files=()).passed)
+        failed = landed_set(skip=("clinical_data.csv",)).check()
+        self.assertFalse(failed.passed)
+        self.assertEqual("", failed.claimed_sha256)
+        self.assertEqual(result.result_sha256, result.claimed_sha256)
+
+
 class SelectionHelperTest(unittest.TestCase):
+    def test_the_selection_digest_covers_every_field(self) -> None:
+        one = selection_for(["a.csv", "b.csv"], b"list")
+        changes: dict[str, dict[str, Any]] = {
+            "name": {"name": "other_set"},
+            "release": {"release": "2.0.0"},
+            "source_bucket": {"source_bucket": "another-publisher"},
+            "source_prefix": {"source_prefix": "vitaldb/2.0.0/"},
+            "measurement_period": {"measurement_period": "2020"},
+            "checksum_list_key": {"checksum_list_key": "vitaldb/1.0.0/OTHER.txt"},
+            "checksum_list_sha256": {"checksum_list_sha256": "0" * 64},
+            "files": {"files": ("a.csv",)},
+        }
+        for name, change in changes.items():
+            with self.subTest(name):
+                self.assertNotEqual(one.selection_sha256, replace(one, **change).selection_sha256)
+
     def test_the_digest_of_the_keys_does_not_depend_on_their_order(self) -> None:
         one = selection_for(["a.csv", "b.csv"], b"list")
         two = replace(one, files=("b.csv", "a.csv"))
