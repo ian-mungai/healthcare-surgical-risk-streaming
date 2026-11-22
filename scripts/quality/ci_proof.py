@@ -5,23 +5,33 @@ plan job writes the same proof itself. A later push to main reads the proof of e
 (``scripts/quality/ci_reuse.py``), because GitHub keeps neither the pull request that a run belonged to nor the commit of the
 workflow file that it ran once the pull request is merged.
 
-The proof names the run and its attempt, the event, the pull request's number and base branch, the commit of the checkout and the
-commit of the workflow file (``GITHUB_WORKFLOW_SHA``, for a pull request GitHub's merge commit). It holds no secret: everything in it
-is shown on the run's page.
+The proof names the run and its attempt, the event, the pull request's number and base branch, the commit of the checkout, the
+commit of the workflow file (``GITHUB_WORKFLOW_SHA``, for a pull request GitHub's merge commit) and the runner: its image and the
+versions of the tools that the checks take from it. It holds no secret: everything in it is shown on the run's page.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import platform
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from scripts.process import run_command
 from scripts.quality.repo_checks import git
 
 TITLE = "ci-proof"
+TOOL_TIMEOUT_SECONDS = 30
+
+
+def runner(environment: Mapping[str, str]) -> dict[str, str]:
+    """The runner image that GitHub names (``ImageOS``, ``ImageVersion``) and the versions of the runner's tools that the checks start
+    without a pin of their own: Python, Git and Make."""
+    tools = {name: run_command(name, ["--version"], timeout=TOOL_TIMEOUT_SECONDS, check=True).stdout.splitlines()[0] for name in ("git", "make")}
+    return {"image_os": environment.get("ImageOS", ""), "image_version": environment.get("ImageVersion", ""), "python": platform.python_version(), **tools}
 
 
 def event_payload(environment: Mapping[str, str]) -> dict[str, Any]:
@@ -44,6 +54,7 @@ def proof(root: Path, environment: Mapping[str, str]) -> dict[str, Any]:
         "base_ref": (pull.get("base") or {}).get("ref"),
         "head": git("rev-parse", "HEAD", cwd=root).strip(),
         "workflow_sha": environment.get("GITHUB_WORKFLOW_SHA", ""),
+        "runner": runner(environment),
     }
 
 

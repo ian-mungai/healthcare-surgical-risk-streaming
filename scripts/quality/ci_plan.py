@@ -80,7 +80,11 @@ def push_reuse(root: Path, config: dict[str, Any], environment: Mapping[str, str
         raise ci_reuse.NoReuse(f"the checkout {checked_out} is not the pushed commit {head}")
     if api is None:
         raise ci_reuse.NoReuse("no GitHub API token was given, so no pull request run can be read")
-    checkout = ci_reuse.Checkout(head, git("rev-parse", "HEAD^{tree}", cwd=root).strip(), git("rev-parse", f"HEAD:{ci_reuse.WORKFLOW}", cwd=root).strip())
+    runner = ci_proof.runner(environment)
+    if not runner["image_os"] or not runner["image_version"]:
+        raise ci_reuse.NoReuse("the runner names no image version, so no run can be shown to have run on the same tools")
+    tree, blob = git("rev-parse", "HEAD^{tree}", cwd=root).strip(), git("rev-parse", f"HEAD:{ci_reuse.WORKFLOW}", cwd=root).strip()
+    checkout = ci_reuse.Checkout(head, tree, blob, runner)
     return ci_reuse.reusable_run(api, ci_reuse.context_of(environment), checkout, run_jobs(config))
 
 

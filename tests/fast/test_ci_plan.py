@@ -38,6 +38,8 @@ EVERY_JOB = sorted(ci_plan.required_jobs(CONFIG))
 GUARD_JOBS = ci_plan.job_names(CONFIG, "guards")
 WORKFLOW_COMMIT = "9" * 40
 WORKFLOW_ID = 425
+RUNNER_IMAGE = {"ImageOS": "ubuntu24", "ImageVersion": "20261116.1.0"}
+HERE = ci_proof.runner(RUNNER_IMAGE)
 ALL = {"hooks": True, "infra": True, "guards": True}
 HOOKS_ONLY = {"hooks": True, "infra": False, "guards": False}
 
@@ -168,6 +170,7 @@ class PlanRepository(TemporaryRepository):
             "GITHUB_REF": ref,
             "GITHUB_REPOSITORY": REPOSITORY,
             "GITHUB_REPOSITORY_ID": str(REPOSITORY_ID),
+            **RUNNER_IMAGE,
         }
 
     def pull_request(self) -> dict[str, Any]:
@@ -247,6 +250,7 @@ class PushReuseTest(PlanRepository):
             "base_ref": base,
             "head": self.pull_head,
             "workflow_sha": WORKFLOW_COMMIT,
+            "runner": HERE,
         }
 
     def fresh(self) -> None:
@@ -361,6 +365,26 @@ class PushReuseTest(PlanRepository):
         self.fresh()
         self.github.workflow_path = ".github/workflows/deploy.yml"
         self.assertIn("is not the workflow", self.push()["basis"])
+
+    def test_a_run_on_other_runner_tools_is_not_reused(self) -> None:
+        for field in ("image_os", "image_version", "python", "git", "make"):
+            with self.subTest(field=field):
+                self.fresh()
+                ids = self.pull_run(60)
+                self.reprove(ids[GUARD_JOBS[3]], self.proof(60) | {"runner": HERE | {field: "other"}})
+                record = self.push()
+                self.assertEqual(self.runs(record), ALL)
+                self.assertIn("ran on the runner", record["basis"])
+        self.fresh()
+        ids = self.pull_run(60)
+        self.reprove(ids[GUARD_JOBS[3]], {key: value for key, value in self.proof(60).items() if key != "runner"})
+        self.assertEqual(self.runs(self.push()), ALL)
+
+    def test_a_push_whose_runner_names_no_image_reuses_nothing(self) -> None:
+        environment = {key: value for key, value in self.environment("push").items() if key != "ImageVersion"}
+        record = ci_plan.plan(self.repo, environment, self.github)
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("names no image version", record["basis"])
 
     def test_a_merge_with_another_tree_runs_every_group(self) -> None:
         other = self.commit({"README.md": "a change that main had and the pull request lacked\n"})
@@ -503,13 +527,17 @@ class ProofTest(PlanRepository):
     def test_the_proof_of_a_pull_request_job_names_its_run(self) -> None:
         event = self.repo.parent / "event.json"
         event.write_text(json.dumps({"pull_request": {"number": 5, "base": {"ref": "main"}, "head": {"sha": self.head()}}}))
-        environment = self.env | {
-            "GITHUB_EVENT_NAME": "pull_request",
-            "GITHUB_EVENT_PATH": str(event),
-            "GITHUB_RUN_ID": "60",
-            "GITHUB_RUN_ATTEMPT": "2",
-            "GITHUB_WORKFLOW_SHA": WORKFLOW_COMMIT,
-        }
+        environment = (
+            self.env
+            | RUNNER_IMAGE
+            | {
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_RUN_ID": "60",
+                "GITHUB_RUN_ATTEMPT": "2",
+                "GITHUB_WORKFLOW_SHA": WORKFLOW_COMMIT,
+            }
+        )
         result = run_command(sys.executable, ["-m", "scripts.quality.ci_proof"], cwd=self.repo, env=environment, timeout=TIMEOUT_SECONDS, check=True)
         command, _, message = result.stdout.rstrip("\n").partition("::")[2].partition("::")
         self.assertEqual(command, f"notice title={ci_proof.TITLE}")
@@ -525,6 +553,11 @@ class ProofTest(PlanRepository):
             "workflow_sha": WORKFLOW_COMMIT,
         }
         self.assertEqual({key: record[key] for key in expected}, expected)
+        tools = {
+            name: run_command(name, ["--version"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS, check=True).stdout.splitlines()[0]
+            for name in ("git", "make")
+        }
+        self.assertEqual(record["runner"], {"image_os": "ubuntu24", "image_version": "20261116.1.0", "python": platform.python_version(), **tools})
 
     def test_a_message_with_a_line_break_or_a_percent_sign_stays_on_one_line(self) -> None:
         line = ci_proof.annotation({"text": "50%\nnext\r"})

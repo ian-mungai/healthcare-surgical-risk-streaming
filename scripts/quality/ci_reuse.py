@@ -14,7 +14,8 @@ A push to main reuses a pull request's result only when all of these hold:
 - of those runs, the one whose latest attempt started last completed with success; an older passed run or attempt never stands in
   for a newer one, and two runs that started together refuse reuse;
 - its jobs, as the latest attempt left them, are every job of the map, each once and passed for the head commit, and each job that
-  runs checks proves this run, its own attempt, the pull request, main and the head commit;
+  runs checks proves this run, its own attempt, the pull request, main and the head commit, on a runner with the image and the tool
+  versions of the push run's own runner;
 - the workflow file that the run ran, at the commit its proofs name (for a pull request, GitHub's merge commit), has the blob of the
   pushed commit's workflow file.
 
@@ -64,11 +65,12 @@ class Context:
 
 @dataclass(frozen=True)
 class Checkout:
-    """What the push run checked out: the pushed commit, its tree and the blob of its workflow file."""
+    """What the push run checked out, the pushed commit, its tree and the blob of its workflow file, and the runner it runs on."""
 
     commit: str
     tree: str
     workflow_blob: str
+    runner: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -281,8 +283,11 @@ def newest(bound: list[tuple[dict[str, Any], list[dict[str, Any]]]], number: int
     return run, jobs
 
 
-def proven_workflow(api: Api, context: Context, run: dict[str, Any], jobs: list[dict[str, Any]], pull: dict[str, Any], waiting: str) -> str:
-    """The commit of the workflow file that every job of ``run`` but ``waiting`` proves, each for this run, attempt, pull request and head."""
+def proven_workflow(
+    api: Api, context: Context, run: dict[str, Any], jobs: list[dict[str, Any]], pull: dict[str, Any], waiting: str, runner: dict[str, str]
+) -> str:
+    """The commit of the workflow file that every job of ``run`` but ``waiting`` proves, each for this run, attempt, pull request and
+    head, on ``runner``."""
     revisions = set()
     for job in jobs:
         if job["name"] == waiting:
@@ -299,6 +304,8 @@ def proven_workflow(api: Api, context: Context, run: dict[str, Any], jobs: list[
         found = {key: proof.get(key) for key in expected}
         if found != expected:
             raise NoReuse(f"the proof of the job {job['name']} of the run {run['id']} names {found}, not {expected}")
+        if proof.get("runner") != runner:
+            raise NoReuse(f"the job {job['name']} of the run {run['id']} ran on the runner {proof.get('runner')}, and this run runs on {runner}")
         revisions.add(proof.get("workflow_sha"))
     if len(revisions) != 1 or not SHA.fullmatch(str(next(iter(revisions)))):
         raise NoReuse(f"the jobs of the run {run['id']} prove the workflow commits {sorted(map(str, revisions))}, not one")
@@ -325,7 +332,7 @@ def reusable_run(api: Api, context: Context, checkout: Checkout, names: Jobs) ->
         raise NoReuse(f"the merged tree {tree} differs from the tree {head_tree} of the head {head} of pull request {number}")
     run, jobs = newest(runs_of_pull_request(api, context, pull, names.plan), number)
     passed = passed_jobs(run, jobs, head, names.every)
-    revision = proven_workflow(api, context, run, jobs, pull, names.waiting)
+    revision = proven_workflow(api, context, run, jobs, pull, names.waiting, checkout.runner)
     blob = workflow_blob(api, context, revision)
     if blob != checkout.workflow_blob:
         raise NoReuse(f"the run {run['id']} ran the workflow file {blob} of the commit {revision}, and the pushed commit holds {checkout.workflow_blob}")
