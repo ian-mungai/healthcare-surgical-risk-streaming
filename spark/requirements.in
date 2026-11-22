@@ -1,0 +1,4 @@
+# The packages of the Spark image that the Bronze decoder needs, in spark/Dockerfile. `make lock-spark` writes requirements.txt with hashes.
+# vitaldb decodes the publisher's case files. boto3 reads the landed object versions from S3 on the host. Both are the replay's pins.
+vitaldb==1.7.2
+boto3==1.43.126

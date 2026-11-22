@@ -1,5 +1,6 @@
 # The image of every Spark job: Python 3.14, Java 21, Spark 4.1.4 on Scala 2.13, Iceberg's Spark runtime (it holds the native Nessie catalog) and
-# Iceberg's AWS bundle (the S3 file system). Every download is checked against its SHA-256 at build, and a job fetches nothing when it starts.
+# Iceberg's AWS bundle (the S3 file system), and the Python packages of the Bronze decoder (spark/requirements.txt, with hashes, wheels only). Every download is
+# checked against its SHA-256 at build, and a job fetches nothing when it starts.
 # Build: docker build --platform linux/amd64 --file spark/Dockerfile --tag surgical-risk-spark:4.1.4 .
 # SPARK_MIRROR names another host for the same Spark file. The checksum still decides whether the build accepts it.
 ARG PYTHON_IMAGE=python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
@@ -35,10 +36,30 @@ ENV JAVA_HOME=/opt/java/openjdk SPARK_HOME=/opt/spark PYSPARK_PYTHON=python3 PYT
 ENV PATH=/opt/java/openjdk/bin:/opt/spark/bin:${PATH} PYTHONPATH=/opt/jobs:/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.9-src.zip
 RUN groupadd --gid 10100 spark && useradd --uid 10100 --gid 10100 --no-create-home --home-dir /tmp --shell /usr/sbin/nologin spark \
     && mkdir /scratch /warehouse && chown 10100:10100 /scratch /warehouse && chmod 0755 /opt/spark/jars/*.jar
+COPY spark/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary :all: --no-deps --requirement /tmp/requirements.txt && rm /tmp/requirements.txt
 COPY spark /opt/jobs/spark
 COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
+# The Bronze decoder imports the replay's decoder and stores and the ingestion gate, and the gate reads the tracked release pin through ROOT.
+COPY replay/__init__.py /opt/jobs/replay/__init__.py
+COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py
+COPY replay/events/errors.py /opt/jobs/replay/events/errors.py
+COPY replay/events/identity.py /opt/jobs/replay/events/identity.py
+COPY replay/events/recording.py /opt/jobs/replay/events/recording.py
+COPY replay/events/schedule.py /opt/jobs/replay/events/schedule.py
+COPY replay/events/stream.py /opt/jobs/replay/events/stream.py
+COPY replay/events/waveform.py /opt/jobs/replay/events/waveform.py
+COPY replay/service/__init__.py /opt/jobs/replay/service/__init__.py
+COPY replay/service/decode.py /opt/jobs/replay/service/decode.py
+COPY replay/service/folder_store.py /opt/jobs/replay/service/folder_store.py
+COPY replay/service/s3_store.py /opt/jobs/replay/service/s3_store.py
+COPY scripts/process.py /opt/jobs/scripts/process.py
+COPY scripts/project_config.py /opt/jobs/scripts/project_config.py
+COPY scripts/ingestion /opt/jobs/scripts/ingestion
+COPY scripts/sample /opt/jobs/scripts/sample
+COPY tests/fixtures/vitaldb/release.json /opt/jobs/tests/fixtures/vitaldb/release.json
 WORKDIR /opt/jobs
 USER 10100:10100
 ENTRYPOINT ["python", "-m"]
