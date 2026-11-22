@@ -26,7 +26,7 @@ check-terraform:
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra validate
 	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra test
 	TFLINT_PLUGIN_DIR=$(CURDIR)/.tools/tflint_plugins .tools/bin/tflint --chdir=infra --recursive --config=$(CURDIR)/infra/.tflint.hcl
-	.tools/bin/trivy config --cache-dir $(CURDIR)/.tools/trivy_cache --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .terraform --quiet infra
+	.tools/bin/trivy config --cache-dir $(CURDIR)/.tools/trivy_embedded_cache --skip-check-update --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .terraform --quiet infra
 
 check-ansible:
 	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml

@@ -9,9 +9,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# A push to main has a concurrency group of its own (its run), so no push cancels or replaces another run, even the same commit pushed again; a
+# newer commit of the same pull request cancels the older run.
+# Every pull request and every push to main runs every job: no job has a condition, no step tolerates a failure and no run takes the
+# result of an earlier run. The last job waits for all the others and is the one required check: it fails unless each of them succeeded, so a failed,
+# cancelled or skipped job fails the run. tests/fast/test_ci_workflow.py holds the workflow to this.
 jobs:
   hooks:
     name: Hooks on every file and the commit messages
@@ -24,7 +29,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.14.10"
           cache: pip
           cache-dependency-path: requirements.txt
       - run: make setup
@@ -40,31 +45,6 @@ jobs:
             .venv/bin/python -m scripts.quality.repo_checks commit-range "${HEAD}"
           fi
 
-  guards:
-    name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: requirements.txt
-      - run: make setup
-      - run: make test-guards SHARD="${SHARD}/8"
-        env:
-          SHARD: ${{ matrix.shard }}
-      - name: Show the end of the run's log after a failure
-        if: failure()
-        run: tail -n 150 runs/*/log.txt
-
   infrastructure:
     name: Static checks of the Terraform and Ansible code
     runs-on: ubuntu-24.04
@@ -75,7 +55,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.14.10"
           cache: pip
           cache-dependency-path: requirements.txt
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
@@ -85,3 +65,55 @@ jobs:
       - run: make setup
       - run: make check-terraform
       - run: make check-ansible
+
+  # Measured hosted wall time of one shard: 5 to 11 minutes.
+  guards:
+    name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: make setup
+      - run: make test-guards SHARD="${SHARD}/8"
+        env:
+          SHARD: ${{ matrix.shard }}
+      - name: Show the end of the run's log after a failure
+        if: failure()
+        run: tail -n 150 runs/*/log.txt
+
+  required:
+    name: Every job of this run passed
+    needs: [hooks, infrastructure, guards]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check that every needed job succeeded
+        shell: bash
+        env:
+          HOOKS: ${{ needs.hooks.result }}
+          INFRASTRUCTURE: ${{ needs.infrastructure.result }}
+          GUARDS: ${{ needs.guards.result }}
+        run: |
+          failed=0
+          check() {
+            if [ "$2" != success ]; then
+              printf 'The job %s ended as %s, not as success.\n' "$1" "$2" | tee -a "${GITHUB_STEP_SUMMARY}"
+              failed=1
+            fi
+          }
+          check hooks "${HOOKS}"
+          check infrastructure "${INFRASTRUCTURE}"
+          check guards "${GUARDS}"
+          exit "${failed}"
