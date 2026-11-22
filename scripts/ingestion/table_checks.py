@@ -41,6 +41,7 @@ RUN_FORMAT = "table_checks_run_1"
 RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
+MANIFEST_LINE_PREFIX = "records-manifest: "
 MANIFEST_FIELDS: Mapping[str, type] = {"bucket": str, "key": str, "version_id": str, "sha256": str}
 LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "manifest": dict, "tables": dict}
 FILE_TABLES = tuple(spec.name for spec in rules.TABLES if spec.source == "file")
@@ -120,7 +121,10 @@ def closed(value: Any, fields: Mapping[str, type], what: str) -> dict[str, Any]:
 
 
 def parse_load_record(text: str) -> LoadRecord:
-    """The load record from its JSON text. Refuse an unknown, missing or mistyped field, a hash that is not 64 hex digits and any table list but ours."""
+    """The load record from the text of the ``<run ID>.load_record.json`` file, which holds exactly its five fields.
+
+    Refuse an unknown, missing or mistyped field, a hash that is not 64 hex digits and any table list but ours.
+    """
     try:
         document = json.loads(text, object_pairs_hook=rules.reject_repeats)
     except rules.RulesError as error:
@@ -138,6 +142,13 @@ def parse_load_record(text: str) -> LoadRecord:
     if sorted(tables) != sorted(names) or any(type(snapshot) is not int for snapshot in tables.values()):
         raise TableChecksError(f"the load record must give an integer snapshot ID for exactly the tables {', '.join(names)}")
     return LoadRecord(fields["branch"], fields["branch_hash"], ManifestRef(**manifest), {name: tables[name] for name in names})
+
+
+def manifest_line(sha256: str) -> str:
+    """The line of a merge commit's message that names the manifest the merged load read. The load step reads it to skip a manifest main holds."""
+    if rules.HASH.fullmatch(sha256) is None:
+        raise TableChecksError("a manifest SHA-256 is 64 lower-case hex digits")
+    return f"{MANIFEST_LINE_PREFIX}{sha256}"
 
 
 def read_track_pin(path: Path) -> rules.TrackPin:
@@ -308,7 +319,7 @@ def merge_branch(nessie: NessieClient, record: LoadRecord) -> tuple[str, str]:
     if not default:
         raise TableChecksError("Nessie names no default branch to merge into")
     before = nessie.reference(default).hash
-    after = nessie.merge(record.branch, default, before, f"merge {record.branch}: table checks passed for manifest {record.manifest.sha256[:12]}")
+    after = nessie.merge(record.branch, default, before, f"merge {record.branch}: table checks passed\n\n{manifest_line(record.manifest.sha256)}")
     for table, snapshot in record.tables.items():
         if table_snapshot(nessie, default, after, table) != snapshot:
             raise TableChecksError(f"after the merge the default branch does not hold {table} at the recorded snapshot")
@@ -350,6 +361,7 @@ def run_table_checks(
         "merged_into": "",
         "main_hash_before": "",
         "merged_hash": "",
+        "notes": [rules.LAB_DATA_NOTE],
         "checked": checked,
     }
     write_result(run_folder, document)

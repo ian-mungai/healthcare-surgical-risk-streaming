@@ -51,6 +51,7 @@ class FakeNessie(NessieClient):
         self.tables: dict[tuple[str, str], dict[str, int]] = {("main", self.heads["main"]): {}}
         self.calls: list[tuple[str, str]] = []
         self.merges: list[tuple[str, str, str]] = []
+        self.merge_messages: list[str] = []
 
     def load_branch(self, name: str, snapshots: dict[str, int]) -> str:
         self.heads[name] = fake_hash(name, "load")
@@ -84,6 +85,7 @@ class FakeNessie(NessieClient):
             if pinned != self.heads[name]:
                 return 409, json.dumps({"errorCode": "REFERENCE_CONFLICT", "message": "the target moved"}).encode()
             self.merges.append((body["fromRefName"], body["fromHash"], name))
+            self.merge_messages.append(body["message"])
             merged = {**self.tables[(name, self.heads[name])], **self.tables[(body["fromRefName"], body["fromHash"])]}
             self.heads[name] = fake_hash(name, "merged", body["fromHash"])
             self.tables[(name, self.heads[name])] = merged
@@ -140,7 +142,8 @@ class Case:
         self.branch_hash = self.nessie.load_branch(BRANCH, SNAPSHOTS)
         self.record = run.LoadRecord(BRANCH, self.branch_hash, self.reference, dict(SNAPSHOTS))
 
-    def go(self, runner: Runner, *, record: run.LoadRecord | None = None, empty_form: str = "null") -> run.Outcome:
+    def go(self, runner: Runner, *, record: run.LoadRecord | None = None, empty_form: str | None = None) -> run.Outcome:
+        options = {} if empty_form is None else {"empty_form": empty_form}
         return run.run_table_checks(
             store=self.landed.store,
             nessie=self.nessie,
@@ -149,7 +152,7 @@ class Case:
             staging=self.staging,
             run_folder=self.run_folder,
             runner=runner,
-            empty_form=empty_form,
+            **options,
         )
 
     def saved(self) -> dict[str, Any]:
@@ -183,7 +186,7 @@ class PassingRunTest(unittest.TestCase):
         case.go(runner)
         self.assertEqual({"clinical_data.csv": hashlib.sha256(CLINICAL).hexdigest(), "lab_data.csv": hashlib.sha256(LAB).hexdigest()}, runner.seen_files)
         plan = rules.parse_plan(json.dumps(runner.plan))
-        self.assertEqual((BRANCH, case.branch_hash, "null"), (plan.branch, plan.branch_hash, plan.empty_form))
+        self.assertEqual((BRANCH, case.branch_hash, "empty"), (plan.branch, plan.branch_hash, plan.empty_form))
         clinical, lab, track = plan.tables
         self.assertEqual(
             (111, "clinical_data.csv", hashlib.sha256(CLINICAL).hexdigest(), len(CLINICAL)),
@@ -194,8 +197,8 @@ class PassingRunTest(unittest.TestCase):
 
     def test_the_empty_form_reaches_the_job(self) -> None:
         case, runner = Case(self), Runner()
-        case.go(runner, empty_form="empty")
-        self.assertEqual("empty", runner.plan["empty_form"])
+        case.go(runner, empty_form="null")
+        self.assertEqual("null", runner.plan["empty_form"])
         with self.assertRaises(run.TableChecksError):
             Case(self).go(Runner(), empty_form="blank")
 
@@ -208,6 +211,40 @@ class PassingRunTest(unittest.TestCase):
         self.assertEqual({"iter_version"}, {read.method for read in reads})
         self.assertEqual({case.landed.keys["clinical_data.csv"], case.landed.keys["lab_data.csv"]}, {read.key for read in reads})
         self.assertLessEqual(case.landed.store.largest_block, 8)
+
+
+class MergeRecordTest(unittest.TestCase):
+    def test_the_merge_message_holds_the_manifest_line_on_a_line_of_its_own(self) -> None:
+        case = Case(self)
+        case.go(Runner())
+        (message,) = case.nessie.merge_messages
+        self.assertIn(f"records-manifest: {case.reference.sha256}", message.splitlines())
+        self.assertEqual(1, sum(line.startswith("records-manifest:") for line in message.splitlines()))
+
+    def test_the_line_has_exactly_the_form_the_load_step_reads(self) -> None:
+        self.assertEqual("records-manifest: " + "ab" * 32, run.manifest_line("ab" * 32))
+        for value in ("", "ab" * 31, "AB" * 32, "ab" * 33, "gg" * 32, "ab" * 32 + "\n"):
+            with self.subTest(value=value), self.assertRaises(run.TableChecksError):
+                run.manifest_line(value)
+
+    def test_a_failed_run_writes_no_commit_and_so_no_line(self) -> None:
+        case = Case(self)
+        case.go(Runner(lambda hash_value: result_line(passed=False, branch_hash=hash_value)))
+        self.assertEqual([], case.nessie.merge_messages)
+
+
+class GrainNoteTest(unittest.TestCase):
+    @staticmethod
+    def line_for(passed: bool) -> Callable[[str], str]:
+        return lambda hash_value: result_line(passed=passed, branch_hash=hash_value)
+
+    def test_the_saved_result_says_that_the_lab_key_check_and_payload_check_are_the_same_comparison(self) -> None:
+        for passed in (True, False):
+            with self.subTest(passed=passed):
+                case = Case(self)
+                case.go(Runner(self.line_for(passed)))
+                notes = case.saved()["notes"]
+                self.assertEqual(1, len([note for note in notes if "lab_data" in note and "same comparison" in note]))
 
 
 class RefusalTest(unittest.TestCase):
@@ -397,9 +434,25 @@ class LoadRecordTest(unittest.TestCase):
         self.assertEqual((BRANCH, "a" * 64, SNAPSHOTS), (record.branch, record.branch_hash, record.tables))
         self.assertEqual("b" * 64, record.manifest.sha256)
 
+    def test_the_load_record_file_is_closed_so_a_field_it_does_not_name_is_refused(self) -> None:
+        for extra in ({"extra": 1}, {"run_id": "run_one"}, {"head_hash": "a" * 64}, {"jobs": {"clinical_data": 7}}, {"connectors": ["image@sha256:x"]}):
+            document = {**self.document(), **extra}
+            with self.subTest(extra=sorted(extra)), self.assertRaises(run.TableChecksError):
+                run.parse_load_record(json.dumps(document))
+
+    def test_a_manifest_or_table_list_with_a_field_it_does_not_name_is_refused(self) -> None:
+        edits: list[Callable[[dict[str, Any]], None]] = [
+            lambda document: document["manifest"].update(extra="x"),
+            lambda document: document["tables"].update(extra=5),
+        ]
+        for edit in edits:
+            document = self.document()
+            edit(document)
+            with self.assertRaises(run.TableChecksError):
+                run.parse_load_record(json.dumps(document))
+
     def test_each_departure_from_the_form_is_refused(self) -> None:
         edits: list[Callable[[dict[str, Any]], None]] = [
-            lambda document: document.update(extra=1),
             lambda document: document.pop("branch"),
             lambda document: document.update(format="load_record_0"),
             lambda document: document.update(branch_hash="A" * 64),
