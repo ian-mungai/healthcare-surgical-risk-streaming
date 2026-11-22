@@ -36,8 +36,12 @@ PINNED_PATH = ".tools/bin/terraform"
 SUBCOMMANDS = "fmt|init|validate|plan|apply|destroy|test|workspace|show|state|output|version|providers|import|console|graph"
 # The bare command in a shell-like file: the lowercase word with no path or variable before it, followed by a flag or a subcommand.
 BARE_COMMAND = re.compile(rf"(?<![\w./$()-])terraform(?=\s+(?:-|(?:{SUBCOMMANDS})\b))")
-# A hook's ``entry`` or a workflow's ``run`` whose first word is the bare command, whatever arguments follow on other lines.
-BARE_ENTRY = re.compile(r"^\s*(?:-\s*)?(?:entry|run):\s*[\"']?terraform[\"']?(?:\s|$)")
+# A hook's ``entry`` or a workflow's ``run`` key and its value on the same line.
+ENTRY_LINE = re.compile(r"^\s*(?:-\s*)?(?:entry|run):[ \t]*(.*?)\s*$")
+# A block or folded scalar header: ``|`` or ``>`` with optional indicators and a comment.
+BLOCK_HEADER = re.compile(r"^[|>][+\-0-9]*(?:\s+#.*)?$")
+HOOK_CONFIG = ".pre-commit-config.yaml"
+NOT_ALLOWED = "an entry given as a block, folded or following-line value is not allowed in this file, so its first word cannot be read"
 
 
 def tracked_files() -> list[str]:
@@ -65,9 +69,33 @@ def bare_calls_in_python(source: str) -> list[int]:
     return lines
 
 
+def bare_entry(line: str) -> bool:
+    """Whether the line is an ``entry`` or ``run`` key whose value, without quotes and surrounding white space, starts with the bare command."""
+    found = ENTRY_LINE.match(line)
+    return found is not None and re.match(r"[ \t\"']*terraform(?:[ \t\"']|$)", found.group(1)) is not None
+
+
 def bare_calls_in_text(text: str) -> list[int]:
     """The lines of a Makefile, a hook configuration or a workflow that start the bare command, with its arguments on the line or apart from it."""
-    return [number for number, line in enumerate(text.splitlines(), 1) if BARE_COMMAND.search(line) or BARE_ENTRY.search(line)]
+    return [number for number, line in enumerate(text.splitlines(), 1) if BARE_COMMAND.search(line) or bare_entry(line)]
+
+
+def hook_entry_problems(text: str) -> list[str]:
+    """The problems of a hook configuration: a bare command, or an entry in a form this scan cannot read and so refuses."""
+    problems = [f"line {number}: the bare command" for number in bare_calls_in_text(text)]
+    for number, line in enumerate(text.splitlines(), 1):
+        found = ENTRY_LINE.match(line)
+        if found and (not found.group(1) or BLOCK_HEADER.match(found.group(1))):
+            problems.append(f"line {number}: {NOT_ALLOWED}")
+    return problems
+
+
+def file_problems(name: str, text: str) -> list[str]:
+    """The bare-command problems of one tracked file: the hook config gets the strict scan, a script the syntax-tree scan and other files the line scan."""
+    if name == HOOK_CONFIG:
+        return [f"{name}: {problem}" for problem in hook_entry_problems(text)]
+    lines = bare_calls_in_python(text) if name.endswith(".py") else bare_calls_in_text(text)
+    return [f"{name}:{line}" for line in lines]
 
 
 def make_stub(path: Path, marker: Path) -> None:
@@ -135,14 +163,17 @@ class OneNamedExecutableTest(unittest.TestCase):
     def test_no_tracked_script_or_config_file_calls_the_bare_command(self) -> None:
         found = []
         for name in tracked_files():
-            if name.startswith("tests/") or not (name.endswith((".py", ".yml", ".yaml", ".sh", ".toml")) or name in {"Makefile", ".pre-commit-config.yaml"}):
+            if name.startswith("tests/") or not (name.endswith((".py", ".yml", ".yaml", ".sh", ".toml")) or name in {"Makefile", HOOK_CONFIG}):
                 continue
-            text = (ROOT / name).read_text()
-            if name.endswith(".py"):
-                found += [f"{name}:{line}" for line in bare_calls_in_python(text)]
-            else:
-                found += [f"{name}:{number}" for number in bare_calls_in_text(text)]
+            found += file_problems(name, (ROOT / name).read_text())
         self.assertEqual([], found)
+
+    def test_the_hook_config_gets_the_strict_scan_and_a_workflow_block_scalar_is_ordinary_shell(self) -> None:
+        block = "      - id: x\n        entry: >-\n          terraform\n"
+        self.assertEqual(1, len(file_problems(HOOK_CONFIG, block)))
+        self.assertEqual([], file_problems(".github/workflows/other.yml", "    steps:\n      - run: |\n          echo done\n"))
+        self.assertEqual(["scripts/x.py:3"], file_problems("scripts/x.py", 'import x\n\nrun_command("terraform", [])\n'))
+        self.assertEqual(["Makefile:1"], file_problems("Makefile", "\tterraform fmt\n"))
 
     def test_no_fast_test_starts_the_bare_command(self) -> None:
         found = []
@@ -182,10 +213,52 @@ class OneNamedExecutableTest(unittest.TestCase):
             self.assertEqual([], bare_calls_in_text(copy.read_text()))
             copy.write_text(copy.read_text() + "\n".join(planted.splitlines()[3:]) + "\n")
             self.assertEqual(1, len(bare_calls_in_text(copy.read_text())))
-        for line in ('        entry: "terraform"', "      - run: terraform", "        entry: terraform"):
-            self.assertIsNotNone(BARE_ENTRY.search(line), line)
-        for line in ("        entry: .tools/bin/terraform fmt", "        entry: .venv/bin/python -m terraform_thing", "        id: terraform"):
-            self.assertIsNone(BARE_ENTRY.search(line), line)
+        for line in (
+            '        entry: "terraform"',
+            "      - run: terraform",
+            "        entry: terraform",
+            '        entry: " terraform"',
+            "        entry: 'terraform fmt'",
+        ):
+            self.assertTrue(bare_entry(line), line)
+        for line in (
+            "        entry: .tools/bin/terraform fmt",
+            "        entry: .venv/bin/python -m terraform_thing",
+            "        id: terraform",
+            "        entry: terraformer",
+        ):
+            self.assertFalse(bare_entry(line), line)
+
+    def planted_copy_problems(self, entry_lines: str) -> list[str]:
+        """The problems the hook-file scan finds in a temporary copy of the real config with one more hook whose ``entry`` is the given lines."""
+        with tempfile.TemporaryDirectory() as folder:
+            copy = Path(folder) / ".pre-commit-config.yaml"
+            copy.write_text(
+                f"{(ROOT / '.pre-commit-config.yaml').read_text()}      - id: planted\n        name: planted\n{entry_lines}        language: system\n"
+            )
+            return hook_entry_problems(copy.read_text())
+
+    def test_the_real_hook_config_has_no_problem_entry(self) -> None:
+        self.assertEqual([], hook_entry_problems((ROOT / ".pre-commit-config.yaml").read_text()))
+
+    def test_a_quoted_entry_with_white_space_before_the_command_is_found(self) -> None:
+        for entry in ('        entry: " terraform"\n', "        entry: '  terraform fmt'\n", '        entry:   "terraform"   # note\n'):
+            self.assertEqual(1, len(self.planted_copy_problems(entry)), entry)
+
+    def test_a_folded_or_block_entry_is_refused_whatever_it_holds(self) -> None:
+        for header in ("|", ">", ">-", "|+", ">2-", "|1", "> # note"):
+            problems = self.planted_copy_problems(f"        entry: {header}\n          terraform\n")
+            self.assertEqual(1, len(problems), header)
+            self.assertIn("not allowed in this file", problems[0], header)
+
+    def test_an_entry_whose_value_is_on_the_following_lines_is_refused(self) -> None:
+        problems = self.planted_copy_problems("        entry:\n          terraform\n")
+        self.assertEqual(1, len(problems))
+        self.assertIn("not allowed in this file", problems[0])
+
+    def test_a_safe_entry_is_not_a_problem(self) -> None:
+        for entry in ("        entry: .tools/bin/terraform fmt\n", '        entry: " .venv/bin/ruff check ."\n', "        entry: ruff terraform\n"):
+            self.assertEqual([], self.planted_copy_problems(entry), entry)
 
 
 class MissingPinnedCopyTest(unittest.TestCase):
@@ -242,25 +315,27 @@ class MakeTargetTest(unittest.TestCase):
         command = ["--no-print-directory", "--file", str(ROOT / "Makefile"), *(arguments or []), "check-terraform"]
         return run_command("make", command, cwd=self.work, env={"PATH": os.environ["PATH"], **(environment or {})}, timeout=TIMEOUT_SECONDS)
 
-    def overrides(self) -> dict[str, dict[str, object]]:
-        return {
-            "exported variable": {"environment": {"TERRAFORM": str(self.other)}},
-            "exported variable with make -e": {"environment": {"TERRAFORM": str(self.other)}, "arguments": ["-e"]},
-            "command-line assignment": {"arguments": [f"TERRAFORM={self.other}"]},
-        }
+    def overrides(self) -> list[tuple[str, dict[str, str], list[str]]]:
+        """Each way a caller can name another program: a label, the environment to add and the make arguments."""
+        exported = {"TERRAFORM": str(self.other)}
+        return [
+            ("exported variable", exported, []),
+            ("exported variable with make -e", exported, ["-e"]),
+            ("command-line assignment", {}, [f"TERRAFORM={self.other}"]),
+        ]
 
     def test_with_the_pinned_copy_absent_no_override_starts_another_program(self) -> None:
-        for label, options in self.overrides().items():
-            result = self.make(**options)  # type: ignore[arg-type]
+        for label, environment, arguments in self.overrides():
+            result = self.make(environment=environment, arguments=arguments)
             self.assertNotEqual(0, result.returncode, label)
             self.assertIn("run: make setup", result.stderr, label)
             self.assertFalse(self.other_marker.exists(), label)
 
     def test_with_the_pinned_copy_present_it_is_the_program_that_starts_whatever_the_override(self) -> None:
         make_stub(self.work / PINNED_PATH, self.pinned_marker)
-        for label, options in self.overrides().items():
+        for label, environment, arguments in self.overrides():
             self.pinned_marker.unlink(missing_ok=True)
-            self.make(**options)  # type: ignore[arg-type]
+            self.make(environment=environment, arguments=arguments)
             self.assertTrue(self.pinned_marker.exists(), label)
             self.assertFalse(self.other_marker.exists(), label)
 
