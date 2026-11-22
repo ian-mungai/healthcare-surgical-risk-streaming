@@ -39,6 +39,7 @@ COPY spark /opt/jobs/spark
 COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
+COPY scripts/stack/tags.py /opt/jobs/scripts/stack/tags.py
 WORKDIR /opt/jobs
 USER 10100:10100
 ENTRYPOINT ["python", "-m"]

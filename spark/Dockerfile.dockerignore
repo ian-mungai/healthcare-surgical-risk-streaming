@@ -4,3 +4,4 @@
 !scripts/__init__.py
 !scripts/stack/__init__.py
 !scripts/stack/nessie.py
+!scripts/stack/tags.py

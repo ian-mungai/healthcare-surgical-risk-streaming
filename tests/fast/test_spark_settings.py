@@ -84,6 +84,12 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(["spark.sql.catalog.lake.client.region", "spark.sql.catalog.lake.io-impl", "spark.sql.catalog.lake.warehouse"], differing)
         self.assertEqual("org.apache.iceberg.hadoop.HadoopFileIO", local["spark.sql.catalog.lake.io-impl"])
 
+    def test_a_second_catalog_of_another_name_on_a_tag_has_every_option_under_its_own_name_and_none_under_lake(self) -> None:
+        options = catalog_options(**{**GOOD, "ref": "run-20261122t0925-4f2a9c", "catalog": "pin0"})
+        self.assertEqual(catalog_options(**GOOD).keys(), {key.replace("catalog.pin0", "catalog.lake") for key in options})
+        self.assertFalse([key for key in options if key.startswith("spark.sql.catalog.lake")])
+        self.assertEqual("run-20261122t0925-4f2a9c", options["spark.sql.catalog.pin0.ref"])
+
     def test_an_address_without_the_version_2_path_is_refused_because_the_client_would_speak_version_1(self) -> None:
         for uri in ("http://nessie:19120", "http://nessie:19120/api/v1", "http://nessie:19120/api/v2/extra", "https://nessie:19120/api/v2", ""):
             with self.subTest(uri=uri):
