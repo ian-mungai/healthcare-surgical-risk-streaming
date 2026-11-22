@@ -9,10 +9,12 @@ from __future__ import annotations
 import copy
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest import mock
 
 from scripts.stack.limits import load_limits
 from scripts.stack.yaml_text import load_yaml
@@ -168,7 +170,9 @@ class FakeBroker:
     def run(self, command: list[str]) -> tuple[int, str, str]:
         self.commands.append(command)
         if command[5].endswith("kafka-topics.sh"):
-            return 0, self.describe, ""
+            return (0, self.describe, "") if "--describe" in command else (0, "", "")
+        if "--alter" in command:
+            return 0, "", ""
         name = command[command.index("--entity-name") + 1]
         if name in self.raw:
             return 0, self.raw[name], ""
@@ -280,6 +284,39 @@ class TopicPlanTest(unittest.TestCase):
         self.assertEqual(1, len(fake.commands))
         self.assertEqual(["create topic replay_events"], [action.description for action in topics_module.plan(self.wanted, state)])
 
+    def test_a_valid_override_that_the_step_does_not_manage_is_kept_whatever_its_value_holds_and_never_blocks_the_flush_repair(self) -> None:
+        throttle = {"leader.replication.throttled.replicas": "0:1,1:1", "follower.replication.throttled.replicas": "0:1,1:1"}
+        without_flush = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        for name, extra in (("leader", dict(list(throttle.items())[:1])), ("follower", dict(list(throttle.items())[1:])), ("both", throttle)):
+            with self.subTest(name=name):
+                overrides = without_flush | extra
+                described = overrides_output("replay_events", overrides)
+                self.assertEqual(overrides, topics_module.parse_overrides("replay_events", described))
+                actions = topics_module.plan(self.wanted, self.state(overrides))
+                self.assertEqual(["set flush.messages of topic replay_events"], [action.description for action in actions])
+                self.assertEqual(["flush.messages=1"], [action.arguments[-1] for action in actions])
+
+    def test_an_unmanaged_value_with_an_equals_sign_or_sensitive_text_is_read_whole_and_a_line_that_does_not_repeat_its_value_is_refused(self) -> None:
+        value = "a=b sensitive=true x"
+        line = f"  custom.setting={value} sensitive=false synonyms={{DYNAMIC_TOPIC_CONFIG:custom.setting={value}, DEFAULT_CONFIG:log.custom=q sensitive=false}}"
+        header = "Dynamic configs for topic replay_events are:\n"
+        self.assertEqual({"custom.setting": value}, topics_module.parse_overrides("replay_events", header + line + "\n"))
+        odd = "  Custom-key_9.x=on sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:Custom-key_9.x=on}"
+        self.assertEqual({"Custom-key_9.x": "on"}, topics_module.parse_overrides("replay_events", header + odd + "\n"))
+        cut = "  flush.messages=1 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:flush.messages=1, DEFAULT_CONFIG:log.flush.interval.messages=9"
+        with self.assertRaisesRegex(topics_module.TopicError, "unexpected shape"):
+            topics_module.parse_overrides("replay_events", header + cut + "\n")
+        other = "  flush.messages=1 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:flush.messages=2}"
+        with self.assertRaisesRegex(topics_module.TopicError, "unexpected shape"):
+            topics_module.parse_overrides("replay_events", header + other + "\n")
+
+    def test_the_repair_of_a_setting_is_one_alter_command_with_the_setting_as_the_value_of_add_config(self) -> None:
+        without = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        actions = topics_module.plan(self.wanted, self.state(without))
+        self.assertEqual(1, len(actions))
+        self.assertEqual("kafka-configs", actions[0].tool)
+        self.assertEqual(["--alter", "--entity-type", "topics", "--entity-name", "replay_events", "--add-config", "flush.messages=1"], actions[0].arguments)
+
     def test_a_topic_with_no_override_at_all_has_an_empty_set_and_gets_every_setting(self) -> None:
         self.assertEqual({}, topics_module.parse_overrides("replay_events", "Dynamic configs for topic replay_events are:\n"))
 
@@ -296,6 +333,92 @@ class TopicPlanTest(unittest.TestCase):
         self.assertEqual([], topics_module.unlisted(self.wanted, self.state()))
         extra = DESCRIBE + "Topic: extra\tTopicId: x\tPartitionCount: 1\tReplicationFactor: 1\tConfigs: \n"
         self.assertEqual(["extra"], topics_module.unlisted(self.wanted, self.state(describe=extra)))
+
+
+class FakeModule:
+    """The Ansible module object that ``main`` builds, with the broker's tools behind its command runner."""
+
+    def __init__(self, broker: FakeBroker, topics_file: str, check_mode: bool = False) -> None:
+        self.params = {"topics_file": topics_file, "compose_command": ["docker", "compose"]}
+        self.check_mode = check_mode
+        self.broker = broker
+        self.result: dict[str, Any] | None = None
+        self.failure: dict[str, Any] | None = None
+
+    def run_command(self, args: list[str], check_rc: bool = False) -> tuple[int, str, str]:
+        return self.broker.run(args)
+
+    def exit_json(self, **kwargs: Any) -> None:
+        self.result = kwargs
+
+    def fail_json(self, **kwargs: Any) -> None:
+        self.failure = kwargs
+
+
+class StepTest(unittest.TestCase):
+    """``main`` with a stand-in command runner: what the step decides and sends, from what the two Kafka tools print."""
+
+    def step(
+        self, overrides: dict[str, str], *, describe: str = DESCRIBE, raw: dict[str, str] | None = None, check_mode: bool = False
+    ) -> tuple[Any, FakeBroker]:
+        broker = FakeBroker(describe, overrides, raw)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "topics.txt"
+            path.write_text("replay_events 10 36 2048 128 delete\n")
+            module = FakeModule(broker, str(path), check_mode)
+            with mock.patch.object(topics_module, "AnsibleModule", lambda **_: module):
+                topics_module.main()
+        return module, broker
+
+    @staticmethod
+    def alters(broker: FakeBroker) -> list[list[str]]:
+        return [command[5:] for command in broker.commands if "--alter" in command]
+
+    def test_a_topic_whose_effective_value_matches_but_that_has_no_override_of_its_own_is_changed_by_one_add_config_command(self) -> None:
+        without = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        self.assertIn("flush.messages=1", DESCRIBE)
+        module, broker = self.step(without)
+        self.assertIsNone(module.failure)
+        self.assertEqual(True, module.result["changed"])
+        self.assertEqual(["set flush.messages of topic replay_events"], module.result["actions"])
+        expected = [
+            "/opt/kafka/bin/kafka-configs.sh",
+            "--bootstrap-server",
+            "127.0.0.1:9092",
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            "replay_events",
+            "--add-config",
+            "flush.messages=1",
+        ]
+        self.assertEqual([expected], self.alters(broker))
+
+    def test_a_topic_with_every_setting_of_its_own_is_unchanged_and_no_command_alters_it(self) -> None:
+        module, broker = self.step(WANTED_OVERRIDES)
+        self.assertEqual((False, []), (module.result["changed"], module.result["actions"]))
+        self.assertEqual([], self.alters(broker))
+
+    def test_in_check_mode_the_step_reports_the_change_and_sends_no_alter_command(self) -> None:
+        without = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        module, broker = self.step(without, check_mode=True)
+        self.assertEqual(True, module.result["changed"])
+        self.assertEqual([], self.alters(broker))
+
+    def test_a_topic_with_a_throttle_override_and_no_flush_setting_gets_the_flush_setting_and_keeps_the_throttle(self) -> None:
+        throttle = {"leader.replication.throttled.replicas": "0:1,1:1", "follower.replication.throttled.replicas": "0:1,1:1"}
+        module, broker = self.step({name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"} | throttle)
+        self.assertIsNone(module.failure)
+        self.assertEqual(["set flush.messages of topic replay_events"], module.result["actions"])
+        self.assertEqual(1, len(self.alters(broker)))
+        self.assertNotIn("throttled", " ".join(self.alters(broker)[0]))
+
+    def test_an_override_description_that_the_step_cannot_read_fails_the_task_and_alters_nothing(self) -> None:
+        module, broker = self.step(WANTED_OVERRIDES, raw={"replay_events": "garbage\n"})
+        self.assertIsNone(module.result)
+        self.assertIn("unexpected shape", module.failure["msg"])
+        self.assertEqual([], self.alters(broker))
 
 
 class ListenerTest(unittest.TestCase):

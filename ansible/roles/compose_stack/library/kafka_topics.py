@@ -35,7 +35,7 @@ FLUSH_MESSAGES = 1
 MANAGED = ("cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes", "flush.messages")
 LIST_SETTINGS = ("cleanup.policy",)
 OVERRIDES_HEADER = re.compile(r"Dynamic configs for topic (\S+) are:")
-OVERRIDE_LINE = re.compile(r"  ([a-z][a-z0-9._]*)=(\S*) sensitive=(?:true|false) synonyms=\{.*\}")
+OVERRIDE_START = re.compile(r"  ([^\s=]+)=")
 ERROR_CHARACTERS = 400
 
 
@@ -154,10 +154,29 @@ def parse_state(output: str) -> dict[str, TopicState]:
     return state
 
 
+def parse_override_line(line: str) -> tuple[str, str] | None:
+    """The setting and the value of one line, ``<key>=<value> sensitive=<true or false> synonyms={DYNAMIC_TOPIC_CONFIG:<key>=<value>, ...}``, or None.
+
+    The value may hold commas, colons, equals signs and the text `` sensitive=``. It ends where the line goes on with the synonyms, whose first entry is the
+    topic's own setting and repeats the value, so a split that does not repeat it is not the value's end.
+    """
+    start = OVERRIDE_START.match(line)
+    if start is None or not line.endswith("}"):
+        return None
+    key, rest = start[1], line[start.end() :]
+    marker = re.compile(rf" sensitive=(?:true|false) synonyms=\{{DYNAMIC_TOPIC_CONFIG:{re.escape(key)}=")
+    for found in marker.finditer(rest):
+        value, tail = rest[: found.start()], rest[found.end() :]
+        if tail.startswith(value) and tail[len(value) :][:1] in (",", "}"):
+            return key, value
+    return None
+
+
 def parse_overrides(topic: str, output: str) -> dict[str, str]:
     """The settings set on the topic itself, from ``kafka-configs --describe`` without ``--all``. Any other shape of output stops the step.
 
-    Each line holds the setting, its value up to the space before ``sensitive=`` and its synonyms. A comma is part of the value only for a list setting.
+    Every setting is kept as read, whether the step manages it or not, and the step never changes one that it does not manage. Only a setting that the step
+    manages has a rule for its value: a comma is part of the value only for a list setting.
     """
     lines = [line.rstrip() for line in output.splitlines() if line.strip()]
     header = OVERRIDES_HEADER.fullmatch(lines[0]) if lines else None
@@ -165,10 +184,10 @@ def parse_overrides(topic: str, output: str) -> dict[str, str]:
         raise TopicError(f"the broker's configuration of topic {topic} has an unexpected shape")
     overrides: dict[str, str] = {}
     for line in lines[1:]:
-        found = OVERRIDE_LINE.fullmatch(line)
-        if found is None or found[1] in overrides or ("," in found[2] and found[1] not in LIST_SETTINGS):
+        found = parse_override_line(line)
+        if found is None or found[0] in overrides or ("," in found[1] and found[0] in MANAGED and found[0] not in LIST_SETTINGS):
             raise TopicError(f"the broker's configuration of topic {topic} has an unexpected shape")
-        overrides[found[1]] = found[2]
+        overrides[found[0]] = found[1]
     return overrides
 
 
