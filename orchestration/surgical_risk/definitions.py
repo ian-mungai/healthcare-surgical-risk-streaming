@@ -17,9 +17,8 @@ from dagster import (
     sensor,
 )
 
+from . import housekeeping, lineage_sample
 from .groups import GroupResource
-from .housekeeping import defs as housekeeping_defs
-from .lineage_sample import defs as lineage_defs
 from .run_records import run_folder_sensors
 
 INBOX = Path(os.environ.get("DAGSTER_INBOX", "/opt/dagster/data/inbox"))
@@ -70,5 +69,10 @@ def marker_file_sensor(context: SensorEvaluationContext) -> RunRequest | SkipRea
     return RunRequest(run_key=f"{marker.name}-{marker.stat().st_mtime_ns}", tags={"marker": marker.name})
 
 
-proof_defs = Definitions(jobs=[ping_job, group_probe_job], schedules=[ping_every_minute], sensors=[marker_file_sensor])
-defs = Definitions.merge(proof_defs, lineage_defs, housekeeping_defs, Definitions(sensors=run_folder_sensors))
+# Dagster loads a code location from the one Definitions object at module scope, so the parts are merged here and none of them is a module-scope name.
+defs = Definitions.merge(
+    Definitions(jobs=[ping_job, group_probe_job], schedules=[ping_every_minute], sensors=[marker_file_sensor]),
+    lineage_sample.defs,
+    housekeeping.defs,
+    Definitions(sensors=run_folder_sensors),
+)
