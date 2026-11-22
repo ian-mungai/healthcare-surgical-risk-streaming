@@ -61,11 +61,15 @@ def published_ports(service_file: Path) -> set[int]:
     return {int(match[1]) for entry in service.get("ports", []) if (match := PUBLISHED.fullmatch(str(entry)))}
 
 
+# A route named for an interface whose service file has another name.
+ROUTE_SERVICES = {"dagster": "dagster_webserver"}
+
+
 def routes_off_their_service(routes: list[Route], services: Path = SERVICES) -> list[str]:
     """The routes whose service file exists and does not publish the port that the route sends to."""
     wrong = []
     for route in routes:
-        service_file = services / f"{route.name}.yml"
+        service_file = services / f"{ROUTE_SERVICES.get(route.name, route.name)}.yml"
         if service_file.exists() and int(route.upstream.rsplit(":", 1)[1]) not in published_ports(service_file):
             wrong.append(route.name)
     return wrong
@@ -119,7 +123,22 @@ class RouteTargetTest(unittest.TestCase):
 class RouteListTest(unittest.TestCase):
     def test_the_tracked_list_loads_and_holds_the_phase_2_interfaces(self) -> None:
         names = [route.name for route in load_routes(ROUTES_FILE)]
-        self.assertEqual(["openbao", "grafana", "prometheus", "trino", "nessie", "airbyte"], names)
+        self.assertEqual(["openbao", "grafana", "prometheus", "trino", "nessie", "airbyte", "dagster", "apicurio"], names)
+
+    def test_dagster_and_the_registry_are_served_on_their_ports_with_the_health_paths_of_their_tools(self) -> None:
+        routes = {route.name: (route.port, route.upstream, route.health_path) for route in load_routes(ROUTES_FILE)}
+        self.assertEqual((9447, "127.0.0.1:3001", "/server_info"), routes["dagster"])
+        self.assertEqual((9448, "127.0.0.1:8081", "/apis/registry/v3/system/info"), routes["apicurio"])
+
+    def test_the_dagster_route_is_held_to_the_port_that_the_web_servers_file_publishes(self) -> None:
+        planted = parse_routes("dagster 9447 127.0.0.1:3000 /server_info\n")
+        self.assertEqual(["dagster"], routes_off_their_service(planted))
+        self.assertEqual({3001}, published_ports(SERVICES / "dagster_webserver.yml"))
+
+    def test_the_airbyte_route_sends_to_the_port_of_airbytes_forwarder(self) -> None:
+        routes = {route.name: route for route in load_routes(ROUTES_FILE)}
+        group_variables: Any = load_yaml((ROOT / "ansible" / "group_vars" / "all.yml").read_text())
+        self.assertEqual(f"127.0.0.1:{group_variables['airbyte_web_port']}", routes["airbyte"].upstream)
 
     def test_a_good_list_loads_each_field_in_file_order(self) -> None:
         routes = parse_routes(GOOD)
@@ -175,7 +194,7 @@ class RouteListTest(unittest.TestCase):
 
     def test_the_health_paths_of_the_tracked_list_are_in_the_closed_set(self) -> None:
         self.assertEqual(
-            ["/v1/sys/health", "/api/health", "/-/healthy", "/v1/info", "/api/v2/config", "/api/v1/health"],
+            ["/v1/sys/health", "/api/health", "/-/healthy", "/v1/info", "/api/v2/config", "/api/v1/health", "/server_info", "/apis/registry/v3/system/info"],
             [route.health_path for route in load_routes(ROUTES_FILE)],
         )
 

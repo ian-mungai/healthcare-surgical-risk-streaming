@@ -59,3 +59,19 @@
 		respond "Gateway error {err.status_code}: the service behind airbyte is not running or does not answer." {err.status_code}
 	}
 }
+
+{$TS_HOST_NAME}:9447 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:3001
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind dagster is not running or does not answer." {err.status_code}
+	}
+}
+
+{$TS_HOST_NAME}:9448 {
+	bind {$TS_ADDRESS}
+	reverse_proxy 127.0.0.1:8081
+	handle_errors {
+		respond "Gateway error {err.status_code}: the service behind apicurio is not running or does not answer." {err.status_code}
+	}
+}
