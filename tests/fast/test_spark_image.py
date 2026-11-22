@@ -6,6 +6,7 @@ start gives a job a different result on each run. These checks read the tracked 
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -82,6 +83,21 @@ class ImageTest(unittest.TestCase):
         allowed = {rule[1:].rstrip("/") for rule in rules[1:] if rule.startswith("!")}
         self.assertLessEqual(copied, allowed)
         self.assertLessEqual(allowed, copied)
+
+    def test_the_image_holds_every_project_module_that_a_job_imports(self) -> None:
+        copied = {line.split()[1] for line in lines() if line.startswith("COPY ") and "--from=" not in line}
+        needed: dict[str, set[str]] = {}
+        for job in sorted((ROOT / "spark").rglob("*.py")):
+            for node in ast.walk(ast.parse(job.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] == "scripts":
+                    parts = (node.module or "").split(".")
+                    module = (ROOT / Path(*parts)).with_suffix(".py")
+                    for file in (module, *(ROOT / Path(*parts[:depth]) / "__init__.py" for depth in range(1, len(parts)))):
+                        needed.setdefault(str(file.relative_to(ROOT)), set()).add(job.name)
+        self.assertTrue(needed)
+        for path, importers in sorted(needed.items()):
+            with self.subTest(path=path):
+                self.assertIn(path, copied, f"{sorted(importers)} import it and the image does not copy it")
 
 
 if __name__ == "__main__":

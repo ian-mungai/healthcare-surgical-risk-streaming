@@ -4,3 +4,5 @@
 !scripts/__init__.py
 !scripts/stack/__init__.py
 !scripts/stack/nessie.py
+!scripts/sample/__init__.py
+!scripts/sample/split.py
