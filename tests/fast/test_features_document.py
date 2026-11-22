@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from features import batch, document
@@ -108,6 +109,11 @@ class ClosedKeys(Entry):
         code, message, target = self.run_text(json.dumps(good_file()))
         self.assertEqual(0, code, message)
         self.assertEqual(batch.serialise([("w", build_row(good_file()["windows"][0]))]), target.read_text())
+
+    def test_a_read_only_mapping_is_read_like_a_dict_at_every_depth(self) -> None:
+        window = good_file()["windows"][0]
+        frozen = MappingProxyType({key: MappingProxyType(value) if isinstance(value, dict) else value for key, value in window.items()})
+        self.assertEqual(build_row(window), build_row(frozen))
 
     def test_the_reviewers_misspelled_offset_is_refused_by_name(self) -> None:
         file = good_file()

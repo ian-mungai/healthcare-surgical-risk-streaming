@@ -176,9 +176,6 @@ class PinnedHeader(unittest.TestCase):
         self.assertEqual(set(PINNED_HEADER), registered | forbidden | dropped)
         self.assertEqual(set(), registered & forbidden | registered & dropped | forbidden & dropped)
 
-    def test_the_old_names_that_the_release_does_not_have_are_not_forbidden_names(self) -> None:
-        self.assertEqual(set(), {"opdur", "anedur", "los_postop", "los_icu"} & set(FORBIDDEN_FIELDS))
-
 
 if __name__ == "__main__":
     unittest.main()

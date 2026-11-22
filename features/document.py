@@ -30,9 +30,9 @@ def load(text: str) -> Any:
 
 
 def as_object(value: object, path: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise FeatureInputError(f"{path} is not an object")
-    return value
+    return dict(value)
 
 
 def as_array(value: object, path: str) -> list[Any]:
