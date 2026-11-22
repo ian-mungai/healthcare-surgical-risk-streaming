@@ -17,6 +17,7 @@ YAML anchor or a merge key cannot hide a change. Failure modes covered here, eac
 
 from __future__ import annotations
 
+import copy
 import functools
 import itertools
 import json
@@ -123,6 +124,75 @@ check infrastructure "${INFRASTRUCTURE}"
 check guards "${GUARDS}"
 exit "${failed}"
 """
+
+
+# The fields that GitHub's create-ruleset API requires, for the rule types that the ruleset file uses.
+REQUIRED_RULESET_FIELDS = ("name", "enforcement")
+REQUIRED_RULE_PARAMETERS = {
+    "pull_request": (
+        "dismiss_stale_reviews_on_push",
+        "require_code_owner_review",
+        "require_last_push_approval",
+        "required_approving_review_count",
+        "required_review_thread_resolution",
+    ),
+    "required_status_checks": ("required_status_checks", "strict_required_status_checks_policy"),
+}
+
+
+def source_problems(text: str) -> list[str]:
+    """What PyYAML reads in the workflow that GitHub's workflow parser does not read the same way, found on the source before any normalising.
+
+    A merge key, an anchor, an alias, a tag or a second YAML document is refused, so the parsed form and the source form are the same. The
+    top-level mapping must have a key spelled ``on``, plain or quoted: PyYAML reads a plain ``on``, ``true`` or ``yes`` as a Boolean key, and
+    GitHub does not read a Boolean key as the trigger.
+    """
+    problems = []
+    documents = 0
+    for event in yaml.parse(text, Loader=yaml.SafeLoader):
+        line = event.start_mark.line + 1 if event.start_mark else 0
+        if isinstance(event, yaml.DocumentStartEvent):
+            documents += 1
+        elif isinstance(event, yaml.AliasEvent):
+            problems.append(f"line {line}: it uses an alias (*{event.anchor}), which GitHub's workflow parser does not read as PyYAML does")
+        elif isinstance(event, yaml.ScalarEvent | yaml.SequenceStartEvent | yaml.MappingStartEvent):
+            if event.anchor is not None:
+                problems.append(f"line {line}: it uses an anchor (&{event.anchor}), which GitHub's workflow parser does not read as PyYAML does")
+            if event.tag is not None:
+                problems.append(f"line {line}: it uses the tag {event.tag!r}, which GitHub's workflow parser does not read as PyYAML does")
+            if isinstance(event, yaml.ScalarEvent) and event.style is None and event.value == "<<":
+                problems.append(f"line {line}: it uses a merge key (<<), which GitHub's workflow parser does not support")
+    if documents != 1:
+        problems.append(f"the file holds {documents} YAML documents, not one")
+    root = next(iter(yaml.compose_all(text, Loader=yaml.SafeLoader)), None)
+    keys = [key.value for key, _ in root.value if isinstance(key, yaml.ScalarNode)] if isinstance(root, yaml.MappingNode) else []
+    if "on" not in keys:
+        problems.append(
+            f"the top-level mapping has no key spelled on (its keys are {keys}): GitHub does not read a Boolean key such as true or yes as the trigger"
+        )
+    return problems
+
+
+def ruleset_problems(ruleset: dict[str, Any]) -> list[str]:
+    """A field that the create-ruleset API requires and the ruleset file lacks: GitHub would refuse the file when the owner applies it."""
+    problems = [f"ruleset: it lacks {field}" for field in REQUIRED_RULESET_FIELDS if field not in ruleset]
+    for number, rule in enumerate(ruleset.get("rules", []), 1):
+        kind = rule.get("type")
+        if kind is None:
+            problems.append(f"rule {number}: it lacks type")
+            continue
+        required = REQUIRED_RULE_PARAMETERS.get(kind)
+        if required is None:
+            continue
+        parameters = rule.get("parameters")
+        if parameters is None:
+            problems.append(f"rule {kind}: it lacks parameters")
+            continue
+        problems += [f"rule {kind}: its parameters lack {field}" for field in required if field not in parameters]
+        for position, check in enumerate(parameters.get("required_status_checks", []) if kind == "required_status_checks" else [], 1):
+            if "context" not in check:
+                problems.append(f"rule {kind}: check {position} lacks context")
+    return problems
 
 
 def load_workflow(text: str) -> dict[str, Any]:
@@ -360,6 +430,7 @@ def contract_problems(text: str) -> list[str]:
     and fail the one required job unless every group job succeeded."""
     problems: list[str] = []
     try:
+        problems += source_problems(text)
         workflow = load_workflow(text)
         if set(workflow) != {"name", "on", "permissions", "concurrency", "jobs"}:
             problems.append(f"the workflow has the keys {sorted(map(str, workflow))}")
@@ -710,7 +781,31 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "no run cancelled": (CANCEL_LINE, "  cancel-in-progress: false\n", "cancel-in-progress is False"),
     "the concurrency emptied": (GROUP_LINE + CANCEL_LINE, "", "the workflow's concurrency is None"),
     "the concurrency removed": ("concurrency:\n" + GROUP_LINE + CANCEL_LINE, "", "the workflow has the keys"),
+    "the trigger spelled true (the reviewer's first plant)": ("\non:\n", "\ntrue:\n", "has no key spelled on"),
+    "the trigger spelled True": ("\non:\n", "\nTrue:\n", "has no key spelled on"),
+    "the trigger spelled yes": ("\non:\n", "\nyes:\n", "has no key spelled on"),
+    "the trigger spelled ON": ("\non:\n", "\nON:\n", "has no key spelled on"),
+    "the trigger spelled On, quoted": ("\non:\n", '\n"On":\n', "has no key spelled on"),
+    "the trigger missing": ("\non:\n  pull_request:\n  push:\n    branches: [main]\n", "", "has no key spelled on"),
+    "fail-fast given by a merge key (the reviewer's second plant)": (
+        "      fail-fast: false\n",
+        "      <<: &guard_defaults {fail-fast: false}\n",
+        ("it uses a merge key", "it uses an anchor"),
+    ),
+    "a merge key alone": ("      fail-fast: false\n", "      <<: {fail-fast: false}\n", "it uses a merge key"),
+    "an anchor on a step": ("      - run: make check\n", "      - &anchored\n        run: make check\n", "it uses an anchor"),
+    "an alias in needs": (NEEDS_LINE, "needs: [hooks, &second infrastructure, *second]", ("it uses an anchor", "it uses an alias")),
+    "an alias of a timeout": (
+        ("    timeout-minutes: 10\n", "    timeout-minutes: 10\n"),
+        ("    timeout-minutes: &limit 10\n", "    timeout-minutes: *limit\n"),
+        "it uses an alias",
+    ),
+    "an explicit tag on a value": ("name: ci\n", "name: !!str ci\n", "it uses the tag"),
+    "an application tag on a value": ("name: ci\n", "name: !ci ci\n", "it uses the tag"),
+    "a second YAML document": ('          exit "${failed}"\n', '          exit "${failed}"\n---\nname: other\n', "holds 2 YAML documents"),
 }
+# Syntax that GitHub reads: the trigger spelled on, in either quote style. The parsed workflow is the same as with the plain key.
+QUOTED_TRIGGERS = ("'on':", '"on":')
 
 
 class WorkflowContractTest(unittest.TestCase):
@@ -724,6 +819,18 @@ class WorkflowContractTest(unittest.TestCase):
 
     def test_the_workflow_has_no_plan_and_no_reuse(self) -> None:
         self.assertNotRegex(WORKFLOW_TEXT.lower(), r"\bplan\b|reuse|ci_proof|ci-proof")
+
+    def test_the_trigger_in_either_quote_style_is_the_same_workflow(self) -> None:
+        """The control of the trigger plants: GitHub reads a quoted ``on`` key, and so does the contract."""
+        for quoted in QUOTED_TRIGGERS:
+            with self.subTest(quoted=quoted):
+                self.assertEqual(contract_problems(WORKFLOW_TEXT.replace("\non:\n", f"\n{quoted}\n", 1)), [])
+
+    def test_a_quoted_double_angle_text_is_not_a_merge_key(self) -> None:
+        self.assertEqual([problem for problem in source_problems(WORKFLOW_TEXT.replace("name: ci\n", 'name: "<<"\n', 1))], [])
+
+    def test_the_workflow_uses_no_anchor_alias_merge_key_tag_or_second_document(self) -> None:
+        self.assertEqual(source_problems(WORKFLOW_TEXT), [])
 
     def test_the_script_probe_runs_the_shell_with_the_options_that_github_gives_bash(self) -> None:
         """A script that fails only under ``-e`` or under ``pipefail`` fails here too: with another shell its failure would look like a pass."""
@@ -743,6 +850,56 @@ class WorkflowContractTest(unittest.TestCase):
                 problems = contract_problems(planted)
                 for diagnostic in as_tuple(diagnostics):
                     self.assertTrue(any(diagnostic in problem for problem in problems), f"no problem names {diagnostic!r}: {problems}")
+
+
+class RulesetRequiredFieldsTest(unittest.TestCase):
+    """The ruleset file has every field that GitHub's create-ruleset API requires for the rule types that it uses; a missing one is refused at
+    creation, so the owner would find out only when applying the file."""
+
+    def setUp(self) -> None:
+        self.ruleset = json.loads((ROOT / ".github/rulesets/main.json").read_text())
+
+    def test_the_ruleset_has_every_required_field(self) -> None:
+        self.assertEqual(ruleset_problems(self.ruleset), [])
+
+    def test_a_ruleset_without_a_required_field_fails_with_its_own_diagnostic(self) -> None:
+        def without(path: tuple[str | int, ...]) -> dict[str, Any]:
+            planted: dict[str, Any] = copy.deepcopy(self.ruleset)
+            holder: Any = planted
+            for step in path[:-1]:
+                holder = holder[step]
+            del holder[path[-1]]
+            return planted
+
+        pull_request = ("rules", 0, "parameters")
+        checks = ("rules", 1, "parameters")
+        planted = {
+            "no name": (("name",), "ruleset: it lacks name"),
+            "no enforcement": (("enforcement",), "ruleset: it lacks enforcement"),
+            "no type on the first rule": (("rules", 0, "type"), "rule 1: it lacks type"),
+            "no type on the second rule": (("rules", 1, "type"), "rule 2: it lacks type"),
+            "no type on the third rule": (("rules", 2, "type"), "rule 3: it lacks type"),
+            "no pull request parameters": (pull_request, "rule pull_request: it lacks parameters"),
+            "no dismissal setting": ((*pull_request, "dismiss_stale_reviews_on_push"), "rule pull_request: its parameters lack dismiss_stale_reviews_on_push"),
+            "no code owner setting": ((*pull_request, "require_code_owner_review"), "rule pull_request: its parameters lack require_code_owner_review"),
+            "no last push setting": ((*pull_request, "require_last_push_approval"), "rule pull_request: its parameters lack require_last_push_approval"),
+            "no approval count": ((*pull_request, "required_approving_review_count"), "rule pull_request: its parameters lack required_approving_review_count"),
+            "no thread setting": (
+                (*pull_request, "required_review_thread_resolution"),
+                "rule pull_request: its parameters lack required_review_thread_resolution",
+            ),
+            "no status check parameters": (checks, "rule required_status_checks: it lacks parameters"),
+            "no strict policy": (
+                (*checks, "strict_required_status_checks_policy"),
+                "rule required_status_checks: its parameters lack strict_required_status_checks_policy",
+            ),
+            "no check list": ((*checks, "required_status_checks"), "rule required_status_checks: its parameters lack required_status_checks"),
+            "no check context": ((*checks, "required_status_checks", 0, "context"), "rule required_status_checks: check 1 lacks context"),
+        }
+        for label, (path, diagnostic) in planted.items():
+            with self.subTest(label=label):
+                problems = ruleset_problems(without(path))
+                self.assertTrue(any(diagnostic in problem for problem in problems), f"no problem names {diagnostic!r}: {problems}")
 
 
 class RulesetTest(unittest.TestCase):
