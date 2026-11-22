@@ -44,6 +44,11 @@ class PinsTest(unittest.TestCase):
         template = (ROLE / "templates" / "host.values.yaml.j2").read_text()
         self.assertEqual(2, template.count("{{ airbyte_staging_size | to_json }}"))
 
+    def test_the_profile_has_no_default_so_a_deployment_without_one_is_refused_and_the_cli_defaults_to_aws(self) -> None:
+        variables = group_variables()
+        self.assertEqual("", variables["airbyte_aws_profile"])
+        self.assertEqual("aws", variables["airbyte_aws_cli"])
+
     def test_the_landing_bucket_has_no_default_so_a_deployment_without_one_is_refused(self) -> None:
         self.assertEqual("", group_variables().get("airbyte_landing_bucket", ""))
 
@@ -63,6 +68,8 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual("{{ airbyte_connection_document }}", arguments["document"])
         self.assertIn("127.0.0.1:{{ airbyte_web_port }}", arguments["base_url"])
         self.assertEqual("{{ airbyte_namespace }}", arguments["namespace"])
+        self.assertEqual("{{ airbyte_secrets_directory }}", arguments["secrets_directory"])
+        self.assertEqual("{{ airbyte_directory }}/connection_key.json", arguments["record_file"])
         self.assertIn("timeout", module)
 
     def test_every_command_of_the_new_files_has_a_deadline_and_runs_on_this_computer_for_the_repository(self) -> None:

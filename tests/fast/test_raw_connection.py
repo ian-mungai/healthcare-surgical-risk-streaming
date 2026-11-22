@@ -121,8 +121,34 @@ class SourceAndDestinationTest(unittest.TestCase):
         self.assertEqual("JSONL", destination["format"]["format_type"])
         self.assertEqual("No Compression", destination["format"]["compression"]["compression_type"])
 
-    def test_no_definition_holds_a_key_a_secret_or_a_role_so_the_access_is_the_workloads_own(self) -> None:
-        self.assertEqual(set(), SECRET_FIELDS & set(keys_of(state())))
+    def test_the_document_on_the_owners_computer_holds_no_key_and_only_names_the_fields_that_the_host_fills(self) -> None:
+        document = state()
+        self.assertEqual(
+            set(), SECRET_FIELDS & set(keys_of({"source": document["source"]["configuration"], "destination": document["destination"]["configuration"]}))
+        )
+        self.assertEqual("iam_user", document["source"]["configuration"]["credentials"]["auth_type"])
+        self.assertEqual(
+            {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"},
+            document["source"]["secret_fields"],
+        )
+        self.assertEqual({"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"}, document["destination"]["secret_fields"])
+
+    def test_the_secret_fields_are_the_connectors_own_field_names(self) -> None:
+        """The source's IAM user form and the destination's access key form, from the connectors' published specifications of the pinned versions."""
+        document = state()
+        self.assertEqual(
+            {"credentials.aws_access_key_id", "credentials.aws_secret_access_key"},
+            set(document["source"]["secret_fields"]),
+        )
+        self.assertEqual({"access_key_id", "secret_access_key"}, set(document["destination"]["secret_fields"]))
+
+    def test_the_source_definition_is_one_shared_pinned_definition_that_another_connection_can_reuse(self) -> None:
+        shared = connection.source_definition(SOURCE_TAG)
+        self.assertEqual({"name": connection.SOURCE_DEFINITION_NAME, "dockerRepository": "airbyte/source-s3", "dockerImageTag": SOURCE_TAG}, shared)
+        self.assertEqual(shared, state()["source"]["definition"])
+        self.assertEqual("s3_source_pinned", connection.SOURCE_DEFINITION_NAME, "the name is the one that the record connection takes the definition by")
+        with self.assertRaises(ConnectionDefinitionError):
+            connection.source_definition("latest")
 
     def test_each_connector_is_pinned_by_the_tag_it_is_given_and_never_by_latest(self) -> None:
         document = state()
@@ -208,6 +234,15 @@ class RenderTest(unittest.TestCase):
             path.write_text("{}")
             code, output, _ = self.render(*self.common(), "--selection", str(path))
         self.assertEqual((1, ""), (code, output))
+
+
+class PinTest(unittest.TestCase):
+    def test_each_connector_has_its_amd64_image_digest_recorded_beside_its_version(self) -> None:
+        variables = group_variables()
+        for name in ("airbyte_source_s3_digest", "airbyte_destination_s3_digest"):
+            with self.subTest(name=name):
+                self.assertRegex(str(variables[name]), r"^sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(variables["airbyte_source_s3_digest"], variables["airbyte_destination_s3_digest"])
 
 
 class StagingTest(unittest.TestCase):

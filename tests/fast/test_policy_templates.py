@@ -108,11 +108,36 @@ def resources(document: Mapping[str, Any], *sids: str) -> list[str]:
 class BucketScopeTest(unittest.TestCase):
     BUCKETS = ["arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-*"]
 
-    def test_the_projects_user_reaches_only_the_one_bucket_and_its_test_buckets(self) -> None:
+    PUBLISHER_SIDS = ("ListPublisherDataset", "ReadPublisherDataset")
+
+    def test_the_projects_user_reaches_only_the_one_bucket_and_its_test_buckets_and_the_publishers_release(self) -> None:
         document = load_documents(VALUES)["s3"]
-        every = sorted({item for statement in document["Statement"] for item in resources(document, statement["Sid"])})
+        project = [statement["Sid"] for statement in document["Statement"] if statement["Sid"] not in self.PUBLISHER_SIDS]
+        every = sorted({item for sid in project for item in resources(document, sid)})
         self.assertEqual(sorted([*self.BUCKETS, *(f"{bucket}/*" for bucket in self.BUCKETS)]), every)
         self.assertEqual(sorted(f"{bucket}/*" for bucket in self.BUCKETS), resources(document, "ReadAndWriteProjectObjects"))
+        self.assertEqual(["arn:aws:s3:::physionet-open", "arn:aws:s3:::physionet-open/vitaldb/1.0.0/*"], resources(document, *self.PUBLISHER_SIDS))
+
+    def test_the_publishers_release_is_listed_under_its_prefix_and_read_only(self) -> None:
+        statements = {statement["Sid"]: statement for statement in load_documents(VALUES)["s3"]["Statement"]}
+        listing, reading = statements["ListPublisherDataset"], statements["ReadPublisherDataset"]
+        self.assertEqual(("Allow", "s3:ListBucket", "arn:aws:s3:::physionet-open"), (listing["Effect"], listing["Action"], listing["Resource"]))
+        self.assertEqual({"StringLike": {"s3:prefix": ["vitaldb/1.0.0/*"]}}, listing["Condition"])
+        self.assertEqual(("Allow", "s3:GetObject", "arn:aws:s3:::physionet-open/vitaldb/1.0.0/*"), (reading["Effect"], reading["Action"], reading["Resource"]))
+        self.assertNotIn("Condition", reading)
+
+    def test_no_statement_writes_to_or_lists_the_publishers_bucket_beyond_the_release(self) -> None:
+        for statement in load_documents(VALUES)["s3"]["Statement"]:
+            if not any("physionet-open" in item for item in as_list(statement["Resource"])):
+                continue
+            with self.subTest(statement=statement["Sid"]):
+                self.assertEqual(["s3:GetObject"] if statement["Sid"] == "ReadPublisherDataset" else ["s3:ListBucket"], as_list(statement["Action"]))
+                self.assertTrue(
+                    all(
+                        item == "arn:aws:s3:::physionet-open" or item.startswith("arn:aws:s3:::physionet-open/vitaldb/1.0.0/")
+                        for item in as_list(statement["Resource"])
+                    )
+                )
 
     def test_no_role_reaches_objects_outside_the_data_prefixes(self) -> None:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]

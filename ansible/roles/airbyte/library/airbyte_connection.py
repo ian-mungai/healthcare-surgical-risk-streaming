@@ -2,13 +2,20 @@
 
 The document is what ``scripts.ingestion.connection render`` prints: a pinned definition, a source and a destination, and one connection. The module reads
 the instance administrator's client credentials from the namespace's secret, asks Airbyte's public API for a token and then, in this order, makes the
-definition of each connector (the pinned version), the source, the destination and the connection match. A object is found by its name, created when it is
+definition of each connector (the pinned version), the source, the destination and the connection match. An object is found by its name, created when it is
 missing, and updated when its answer does not hold every value of the document. The platform adds fields of its own to an answer, so only the document's
-values are compared. A drifted setting, a schedule that was switched on, a changed connector version and a dropped selected file are repaired. A
-structural drift that no update can repair (an object that belongs to another definition, source or destination) is refused with its name and changed
+values are compared. A drifted setting, a schedule that was switched on, a changed connector version and a dropped selected file are repaired.
+
+The access key of the project profile is never in the document: the host reads it from two root-only files and the module puts it into the source and
+the destination at the fields the document names (``secret_fields``). Airbyte answers every secret field as the mask ``**********``, so a secret cannot be
+compared. The module compares the document's other values and keeps a record file with, for each object, a SHA-256 fingerprint of the key's ID, which
+changes when the key is rotated. A key whose fingerprint differs from the record is sent again, and the record is written after the call succeeds. A secret
+changed by hand in Airbyte is not seen; the next rotation or a deleted record sends the key again.
+
+A structural drift that no update can repair (an object that belongs to another definition, source or destination) is refused with its name and changed
 nowhere: deleting a connection would delete its sync state, and the next sync would copy every file again. A name that two objects hold, or a workspace
-count other than one, stops the run before any write. The token, the client credentials and every body of a call stay out of every message: a failed call
-names its method, its path and its status.
+count other than one, stops the run before any write. The token, the client credentials, the key and every body of a call stay out of every message: a
+failed call names its method, its path and its status.
 
 The module uses only the standard library and runs on the host's Python.
 """
@@ -16,10 +23,14 @@ The module uses only the standard library and runs on the host's Python.
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import http.client
 import json
+import os
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from ansible.module_utils.basic import AnsibleModule
@@ -28,6 +39,10 @@ AUTH_OBJECT = "airbyte-auth-secrets"
 ID_FIELD = "instance-admin-client-id"
 KEY_FIELD = "instance-admin-client-secret"
 LOCAL_ADDRESSES = ("127.0.0.1", "localhost")
+KEY_FOLDER = "airbyte"
+KEY_FILES = {"aws_access_key_id": "aws_access_key_id", "aws_secret_access_key": "aws_secret_access_key"}
+FINGERPRINT_OF = "aws_access_key_id"
+RECORD_MODE = 0o600
 PAGE_SIZE = 100
 MAX_PAGES = 1000
 DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
@@ -161,20 +176,95 @@ def ensure_definition(api: Api, workspace: str, kind: str, wanted: dict[str, Any
     return str(current["id"])
 
 
-def ensure_actor(api: Api, workspace: str, kind: str, wanted: dict[str, Any], definition_id: str, changes: list[str]) -> str:
-    """The id of the source or the destination: created when missing, updated when its configuration lacks a value of the document."""
+def read_key_files(directory: Path) -> dict[str, str]:
+    """The two key files under ``<directory>/airbyte``. A missing or empty file stops the run and is named by its file name, never by a value."""
+    values: dict[str, str] = {}
+    for name, file_name in KEY_FILES.items():
+        try:
+            text = (directory / KEY_FOLDER / file_name).read_text().strip()
+        except OSError:
+            raise ApiError(f"the key file {file_name} cannot be read; the deployment places it before the connection is applied") from None
+        if not text:
+            raise ApiError(f"the key file {file_name} is empty")
+        values[name] = text
+    return values
+
+
+def read_record(path: Path) -> dict[str, str]:
+    """The fingerprints that the last runs applied, or nothing when the file is missing or not valid, which sends each key again."""
+    try:
+        record = json.loads(path.read_text())
+    except OSError, ValueError:
+        return {}
+    if not isinstance(record, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in record.items()):
+        return {}
+    return dict(record)
+
+
+def write_record(path: Path, record: Mapping[str, str]) -> None:
+    """Write the record for its owner only, atomically."""
+    partial = path.with_name(f".{path.name}.new")
+    descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, RECORD_MODE)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(json.dumps(dict(record), sort_keys=True) + "\n")
+    os.replace(partial, path)
+
+
+def fingerprint(secrets: Mapping[str, str]) -> str:
+    """The SHA-256 of the key's ID. A rotated key has a new ID, and nothing of the secret is in it."""
+    return hashlib.sha256(secrets[FINGERPRINT_OF].encode()).hexdigest()
+
+
+def inject(configuration: dict[str, Any], fields: dict[str, str], secrets: Mapping[str, str]) -> dict[str, Any]:
+    """A copy of the configuration with each secret put at its path. The document's own configuration is not changed."""
+    filled = copy.deepcopy(configuration)
+    for path, name in fields.items():
+        *parents, last = path.split(".")
+        node = filled
+        for step in parents:
+            node = node[step]
+        node[last] = secrets[name]
+    return filled
+
+
+def check_secret_fields(part: dict[str, Any], what: str) -> dict[str, str]:
+    fields = part.get("secret_fields", {})
+    if not isinstance(fields, dict):
+        raise ApiError(f"the {what}'s secret_fields are not in the documented form")
+    for path, name in fields.items():
+        if not isinstance(path, str) or not path or not isinstance(name, str) or name not in KEY_FILES:
+            raise ApiError(f"the {what}'s secret_fields name a secret that the module does not read")
+        *parents, _ = path.split(".")
+        node: Any = part["configuration"]
+        for step in parents:
+            node = node.get(step) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            raise ApiError(f"the {what}'s secret_fields name a field whose parent is not in its configuration")
+    return {str(path): str(name) for path, name in fields.items()}
+
+
+def ensure_actor(
+    api: Api, workspace: str, kind: str, wanted: dict[str, Any], definition_id: str, changes: list[str], secrets: Mapping[str, str], recorded: dict[str, str]
+) -> str:
+    """The id of the source or the destination, created when missing and updated when it lacks a value of the document or its key is not the applied one.
+
+    The key is put into the configuration that is sent. Airbyte answers its secrets as the mask, so the answer is compared with the document, which holds none.
+    """
     path, id_field = f"/{kind}s", f"{kind}Id"
+    sent = inject(wanted["configuration"], wanted.get("secret_fields", {}), secrets)
+    applied = fingerprint(secrets)
     current = named(listing(api, f"{path}?workspaceIds={workspace}"), wanted["name"], kind)
     if current is None:
-        body = {"name": wanted["name"], "workspaceId": workspace, "definitionId": definition_id, "configuration": wanted["configuration"]}
-        created = api.request("POST", path, body)
+        created = api.request("POST", path, {"name": wanted["name"], "workspaceId": workspace, "definitionId": definition_id, "configuration": sent})
         changes.append(kind)
+        recorded[kind] = applied
         return str(created[id_field])
     if current.get("definitionId") != definition_id:
         raise ApiError(f"the {kind} {wanted['name']} belongs to another definition than the pinned one; delete it in Airbyte and run again")
-    if not covers(current.get("configuration"), wanted["configuration"]):
-        api.request("PATCH", f"{path}/{current[id_field]}", {"configuration": wanted["configuration"]})
+    if not covers(current.get("configuration"), wanted["configuration"]) or recorded.get(kind) != applied:
+        api.request("PATCH", f"{path}/{current[id_field]}", {"configuration": sent})
         changes.append(kind)
+        recorded[kind] = applied
     return str(current[id_field])
 
 
@@ -194,17 +284,35 @@ def ensure_connection(api: Api, workspace: str, wanted: dict[str, Any], source_i
         changes.append("connection")
 
 
-def reconcile(api: Api, wanted: dict[str, Any]) -> list[str]:
-    """Make Airbyte hold the document and return what changed, in the order it changed. A second call returns an empty list."""
+def reconcile(api: Api, wanted: dict[str, Any], secrets: Mapping[str, str], recorded: dict[str, str]) -> list[str]:
+    """Make Airbyte hold the document and return what changed, in the order it changed. A second call returns an empty list.
+
+    ``recorded`` holds the fingerprint of the key that each object was last given. It is updated in place after each successful call.
+    """
     check_document(wanted)
+    if any(name not in secrets or not secrets[name] for name in KEY_FILES):
+        raise ApiError("the access key is not available to the module")
+    for part in ("source", "destination"):
+        wanted[part]["secret_fields"] = check_secret_fields(wanted[part], part)
     workspace = one_workspace(api)
     changes: list[str] = []
     source_definition = ensure_definition(api, workspace, "source", wanted["source"]["definition"], changes)
     destination_definition = ensure_definition(api, workspace, "destination", wanted["destination"]["definition"], changes)
-    source = ensure_actor(api, workspace, "source", wanted["source"], source_definition, changes)
-    destination = ensure_actor(api, workspace, "destination", wanted["destination"], destination_definition, changes)
+    source = ensure_actor(api, workspace, "source", wanted["source"], source_definition, changes, secrets, recorded)
+    destination = ensure_actor(api, workspace, "destination", wanted["destination"], destination_definition, changes, secrets, recorded)
     ensure_connection(api, workspace, wanted["connection"], source, destination, changes)
     return changes
+
+
+def apply_document(api: Api, wanted: dict[str, Any], secrets: Mapping[str, str], record_file: Path) -> list[str]:
+    """Reconcile and keep the record of applied keys. The record is written after a failed run too, so a source that was given its key is not sent it again."""
+    recorded = read_record(record_file)
+    before = dict(recorded)
+    try:
+        return reconcile(api, wanted, secrets, recorded)
+    finally:
+        if recorded != before:
+            write_record(record_file, recorded)
 
 
 def client_credentials(run: Runner, kubectl: list[str], namespace: str) -> tuple[str, str]:
@@ -237,6 +345,8 @@ def main() -> None:
             "namespace": {"type": "str", "default": "airbyte"},
             "kubectl": {"type": "list", "elements": "str", "default": ["k3s", "kubectl"]},
             "timeout_seconds": {"type": "int", "default": 600},
+            "secrets_directory": {"type": "path", "required": True},
+            "record_file": {"type": "path", "required": True},
         },
         supports_check_mode=False,
     )
@@ -244,7 +354,12 @@ def main() -> None:
     try:
         client_id, client_secret = client_credentials(lambda arguments: module.run_command(arguments, check_rc=False), params["kubectl"], params["namespace"])
         token = access_token(params["base_url"], client_id, client_secret, params["timeout_seconds"])
-        changes = reconcile(HttpApi(params["base_url"], lambda: token, timeout_seconds=params["timeout_seconds"]), params["document"])
+        changes = apply_document(
+            HttpApi(params["base_url"], lambda: token, timeout_seconds=params["timeout_seconds"]),
+            params["document"],
+            read_key_files(Path(params["secrets_directory"])),
+            Path(params["record_file"]),
+        )
         module.exit_json(changed=bool(changes), changes=changes)
     except ApiError as error:
         module.fail_json(msg=str(error))

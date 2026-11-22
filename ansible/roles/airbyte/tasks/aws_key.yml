@@ -1,0 +1,37 @@
+# Reads airbyte_aws_cli, airbyte_aws_profile, airbyte_secrets_directory and secret_files_root_owner. The deployment runs on the owner's computer. It reads the project profile's
+# access key there with the AWS command line, so the key is never in a file of the repository, in a rendered file, in a command line or in a log. The command's output is
+# never shown (no_log) and goes to the module as one hidden argument. The module refuses a profile that yields a session token and writes two root-only files, airbyte/aws_access_key_id and
+# airbyte/aws_secret_access_key, that the connection step reads on the host. A second deployment changes nothing and a rotated key is replaced. This is the owner's exception to the short-lived
+# access rule for Airbyte's connectors, which take a static key (the guide's access section records it).
+- name: Refuse a deployment that does not name the project's AWS profile
+  ansible.builtin.assert:
+    that:
+      - airbyte_aws_profile | default('') | length > 0
+    fail_msg: The deployment must give airbyte_aws_profile, the project's AWS profile.
+
+- name: Read the project profile's access key on this computer, and show none of it
+  ansible.builtin.command:
+    argv:
+      - "{{ airbyte_aws_cli }}"
+      - configure
+      - export-credentials
+      - --profile
+      - "{{ airbyte_aws_profile }}"
+      - --format
+      - process
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+  register: airbyte_aws_export
+  timeout: 60
+
+- name: Place the key in two root-only files on the host
+  airbyte_aws_key:
+    exported: "{{ airbyte_aws_export.stdout }}"
+    exit_code: "{{ airbyte_aws_export.rc }}"
+    profile: "{{ airbyte_aws_profile }}"
+    secrets_directory: "{{ airbyte_secrets_directory }}"
+    root_owner: "{{ secret_files_root_owner }}"

@@ -4,8 +4,9 @@
 of the selection, so the selection is the tracked release pin's two tables and 6,388 case files and nothing a wildcard could add. It copies raw files,
 with their folders, through the delivery method "Copy raw files". The destination writes the ``landing`` prefix of the project's bucket and the
 metadata record of each file as JSON lines. The connection has no schedule, so only the orchestrator starts it. It syncs incrementally, so a rerun
-copies only a file that is new. The document holds no key, no secret and no role: how the copy workload gets its own short-lived access is decided
-where the pods start, and is never a value of this document.
+copies only a file that is new. The document holds no key and no secret. It names, for each connector, the fields that take the project profile's access
+key (``secret_fields``, a path in the configuration and the name of a secret), and the host fills them when the document is applied, from two root-only files.
+The document is built on the owner's computer, where no key is.
 
 ``render`` prints the document for the Ansible role, which hands it to the module that applies it to a running Airbyte.
 
@@ -34,6 +35,8 @@ from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
 SOURCE_REPOSITORY = "airbyte/source-s3"
 DESTINATION_REPOSITORY = "airbyte/destination-s3"
+SOURCE_DEFINITION_NAME = "s3_source_pinned"
+DESTINATION_DEFINITION_NAME = "s3_destination_pinned"
 SOURCE_NAME = "vitaldb_release"
 DESTINATION_NAME = "project_landing"
 CONNECTION_NAME = "vitaldb_raw_copy"
@@ -98,7 +101,7 @@ def source_configuration(selection: Selection) -> dict[str, Any]:
     return {
         "bucket": selection.source_bucket,
         "region_name": PUBLISHER_REGION,
-        "credentials": {"auth_type": "default_credentials"},
+        "credentials": {"auth_type": "iam_user"},
         "delivery_method": {"delivery_type": "use_file_transfer", "preserve_directory_structure": True},
         "streams": [{"name": STREAM_NAME, "globs": list(selection.source_keys), "format": {"filetype": "csv"}}],
     }
@@ -111,6 +114,21 @@ def destination_configuration(bucket: str, region: str) -> dict[str, Any]:
         "s3_bucket_region": region,
         "format": {"format_type": "JSONL", "compression": {"compression_type": "No Compression"}, "flattening": "No flattening"},
     }
+
+
+def pinned_definition(name: str, repository: str, tag: str, field: str) -> dict[str, str]:
+    if FULL_VERSION.fullmatch(tag) is None:
+        raise ConnectionDefinitionError(Notice(Code.CONNECTION_TAG, fields=(field,)))
+    return {"name": name, "dockerRepository": repository, "dockerImageTag": tag}
+
+
+def source_definition(tag: str) -> dict[str, str]:
+    """The one pinned definition of the S3 source connector. Every connection that reads S3 takes it by this name, so all of them run the same version."""
+    return pinned_definition(SOURCE_DEFINITION_NAME, SOURCE_REPOSITORY, tag, "source_tag")
+
+
+def destination_definition(tag: str) -> dict[str, str]:
+    return pinned_definition(DESTINATION_DEFINITION_NAME, DESTINATION_REPOSITORY, tag, "destination_tag")
 
 
 def desired_state(selection: Selection, *, bucket: str, region: str, source_tag: str, destination_tag: str) -> dict[str, Any]:
@@ -127,13 +145,15 @@ def desired_state(selection: Selection, *, bucket: str, region: str, source_tag:
     return {
         "source": {
             "name": SOURCE_NAME,
-            "definition": {"name": "S3 source, pinned", "dockerRepository": SOURCE_REPOSITORY, "dockerImageTag": source_tag},
+            "definition": source_definition(source_tag),
             "configuration": source_configuration(selection),
+            "secret_fields": {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"},
         },
         "destination": {
             "name": DESTINATION_NAME,
-            "definition": {"name": "S3 destination, pinned", "dockerRepository": DESTINATION_REPOSITORY, "dockerImageTag": destination_tag},
+            "definition": destination_definition(destination_tag),
             "configuration": destination_configuration(bucket, region),
+            "secret_fields": {"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"},
         },
         "connection": {
             "name": CONNECTION_NAME,
