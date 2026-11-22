@@ -1,8 +1,8 @@
 """The GitHub API facts that let a CI run do less: the passed pull request run that the push to main after a merge reuses.
 
 Every answer comes from GitHub's API about this repository's own runs of ``.github/workflows/ci.yml``, read with the workflow's read-only
-token. A run counts only when its workflow file is that path and its repository and head repository are this repository, so a run of
-another workflow or of a fork never counts.
+token. A run counts only when it has that workflow's ID, its path names that file (alone or with ``@`` and a ref) and its repository and
+head repository are this repository, so a run of another workflow or of a fork never counts.
 
 A push to main reuses a pull request's result only when all of these hold:
 
@@ -43,6 +43,7 @@ API_DEADLINE_SECONDS = 120  # every API read of one plan together; the plan job'
 LOOPBACK = ("127.0.0.1", "localhost")
 SHA = re.compile(r"[0-9a-f]{40}")
 MAIN = "main"
+WORKFLOW_PATH = re.compile(re.escape(WORKFLOW) + r"(?:@\S+)?")
 
 Api = Callable[[str], Any]
 
@@ -154,13 +155,26 @@ def shut_down(sock: socket.socket) -> None:
         sock.shutdown(socket.SHUT_RDWR)
 
 
+def workflow_id(api: Api, context: Context) -> int:
+    """The ID of this repository's workflow at ``WORKFLOW``."""
+    found = api(f"repos/{context.repository}/actions/workflows/{WORKFLOW.rpartition('/')[2]}")
+    if found["path"] != WORKFLOW:
+        raise NoReuse(f"the workflow that the API names, {found['path']}, is not the workflow {WORKFLOW}")
+    return int(found["id"])
+
+
 def own_runs(api: Api, context: Context, event: str, query: str) -> list[dict[str, Any]]:
-    """The runs of this repository's own workflow file for ``event`` among the answer for ``query``."""
-    answer = api(f"repos/{context.repository}/actions/workflows/ci.yml/runs?{query}")
+    """The runs of this repository's own workflow for ``event`` among the answer for ``query``.
+
+    A run is the workflow's when it has the workflow's ID and its ``path`` names the workflow file alone or, in the form that GitHub also
+    documents, with ``@`` and the ref it ran from."""
+    workflow = workflow_id(api, context)
+    answer = api(f"repos/{context.repository}/actions/workflows/{workflow}/runs?{query}")
     return [
         run
         for run in answer["workflow_runs"]
-        if run["path"] == WORKFLOW
+        if run["workflow_id"] == workflow
+        and WORKFLOW_PATH.fullmatch(str(run["path"]))
         and run["event"] == event
         and run["repository"]["id"] == context.repository_id
         and run["head_repository"]["id"] == context.repository_id

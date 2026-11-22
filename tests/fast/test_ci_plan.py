@@ -37,6 +37,7 @@ CONFIG = ci_plan.load(ROOT)
 EVERY_JOB = sorted(ci_plan.required_jobs(CONFIG))
 GUARD_JOBS = ci_plan.job_names(CONFIG, "guards")
 WORKFLOW_COMMIT = "9" * 40
+WORKFLOW_ID = 425
 ALL = {"hooks": True, "infra": True, "guards": True}
 HOOKS_ONLY = {"hooks": True, "infra": False, "guards": False}
 
@@ -50,6 +51,7 @@ class FakeGitHub:
         self.jobs: dict[int, list[dict[str, Any]]] = {}
         self.annotations: dict[int, list[dict[str, Any]]] = {}
         self.workflow_blobs: dict[str, str] = {}
+        self.workflow_path = ci_reuse.WORKFLOW
         self.pulls: dict[str, list[dict[str, Any]]] = {}
         self.trees: dict[str, str] = {}
         self.paths: list[str] = []
@@ -66,6 +68,7 @@ class FakeGitHub:
             "created_at": f"2026-11-21T10:{run_id % 60:02d}:00Z",
             "run_started_at": f"2026-11-21T10:{run_id % 60:02d}:00Z",
             "path": ci_reuse.WORKFLOW,
+            "workflow_id": WORKFLOW_ID,
             "event": event,
             "head_branch": branch,
             "head_sha": head,
@@ -110,7 +113,9 @@ class FakeGitHub:
         url = urlsplit(path)
         query = parse_qs(url.query)
         parts = url.path.split("/")
-        if url.path == f"repos/{REPOSITORY}/actions/workflows/ci.yml/runs":
+        if url.path == f"repos/{REPOSITORY}/actions/workflows/ci.yml":
+            return {"id": WORKFLOW_ID, "path": self.workflow_path}
+        if url.path in (f"repos/{REPOSITORY}/actions/workflows/ci.yml/runs", f"repos/{REPOSITORY}/actions/workflows/{WORKFLOW_ID}/runs"):
             runs = [run for run in self.runs if "head_sha" not in query or run["head_sha"] == query["head_sha"][0]]
             return {"total_count": len(runs), "workflow_runs": runs}
         if url.path.startswith(f"repos/{REPOSITORY}/actions/runs/") and parts[-1] == "jobs" and query.get("filter") == ["latest"]:
@@ -332,6 +337,30 @@ class PushReuseTest(PlanRepository):
     def reprove(self, job_id: int, proof: dict[str, Any] | str) -> None:
         self.github.annotations[job_id].clear()
         self.github.add_proof(job_id, proof)
+
+    def test_a_run_is_found_by_the_workflow_id_in_every_documented_path_form(self) -> None:
+        for path in (ci_reuse.WORKFLOW, f"{ci_reuse.WORKFLOW}@main", f"{ci_reuse.WORKFLOW}@refs/pull/5/merge"):
+            with self.subTest(path=path):
+                self.fresh()
+                self.pull_run(60, path=path)
+                record = self.push()
+                self.assertEqual(record.get("reused", {}).get("run_id"), 60, record["basis"])
+
+    def test_a_run_of_another_workflow_is_not_reused(self) -> None:
+        planted: dict[str, dict[str, Any]] = {
+            "another workflow ID": {"workflow_id": WORKFLOW_ID + 1},
+            "another workflow file with a ref": {"path": ".github/workflows/deploy.yml@main"},
+            "a path that only starts like the workflow": {"path": f"{ci_reuse.WORKFLOW}.old"},
+            "an empty ref": {"path": f"{ci_reuse.WORKFLOW}@"},
+        }
+        for label, fields in planted.items():
+            with self.subTest(label=label):
+                self.fresh()
+                self.pull_run(60, **fields)
+                self.assertEqual(self.runs(self.push()), ALL)
+        self.fresh()
+        self.github.workflow_path = ".github/workflows/deploy.yml"
+        self.assertIn("is not the workflow", self.push()["basis"])
 
     def test_a_merge_with_another_tree_runs_every_group(self) -> None:
         other = self.commit({"README.md": "a change that main had and the pull request lacked\n"})
