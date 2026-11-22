@@ -18,6 +18,7 @@ The destination's AWS access key is sent only in the body of a create or update 
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -30,6 +31,8 @@ DEFAULT_TIMEOUT_SECONDS = 60.0
 BODY_LIMIT_BYTES = 8_000_000
 API_PREFIX = "/api/public/v1"
 UNAUTHORIZED = 401
+REDIRECT_FIRST = 300
+REDIRECT_END = 400
 PAGE_SIZE = 100
 MAX_PAGES = 1000
 SECRET_FIELDS = ("access_key_id", "secret_access_key")
@@ -44,6 +47,36 @@ DEFINITION_NAMES = {
 
 class AirbyteError(RuntimeError):
     """A call did not complete, was refused or answered with something other than what was asked for. The message names the call only."""
+
+
+def check_api_origin(address: str) -> tuple[str, int]:
+    """The host and the port of an address that may receive the client's credentials, or ``AirbyteError``.
+
+    Both credentials and the destination's AWS access key go to this address, so it is only ``http://<IPv4 literal>:<port>`` with a private or link-local
+    address (never a loopback, unspecified or multicast one): no host name that could resolve elsewhere, no path, no query, no fragment. The netloc must equal
+    ``<address>:<port>`` exactly, which leaves no room for user information, a space or a leading zero.
+    """
+    try:
+        parts = urlsplit(address)
+        port = parts.port
+        ip = ipaddress.IPv4Address(parts.hostname or "")
+        refused = (
+            parts.scheme != "http"
+            or parts.path not in ("", "/")
+            or bool(parts.query or parts.fragment)
+            or port is None
+            or not 1 <= port <= 65535
+            or not (ip.is_private or ip.is_link_local)
+            or ip.is_loopback
+            or ip.is_unspecified
+            or ip.is_multicast
+            or parts.netloc != f"{ip}:{port}"
+        )
+    except ValueError:
+        refused, port, ip = True, None, None
+    if refused or port is None or ip is None:
+        raise AirbyteError("the Airbyte address must be http://<a private IPv4 address>:<port> with no host name, no user information and no path")
+    return str(ip), port
 
 
 def table_named(name: str) -> Table:
@@ -70,7 +103,7 @@ def named(objects: list[dict[str, Any]], name: str, what: str) -> dict[str, Any]
 
 
 class HttpAirbyteApi:
-    """One Airbyte server. ``base_url`` is a plain http URL with a host and no path. The two AWS values are the destination's access key."""
+    """One Airbyte server at ``base_url``, which ``check_api_origin`` accepts. The two AWS values are the destination's access key."""
 
     def __init__(
         self,
@@ -81,11 +114,7 @@ class HttpAirbyteApi:
         aws_secret_access_key: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        parts = urlsplit(base_url)
-        if parts.scheme != "http" or not parts.hostname or parts.path not in ("", "/") or parts.query or parts.fragment:
-            raise AirbyteError("the Airbyte address must be a plain http URL with a host and no path, such as http://127.0.0.1:8001")
-        self.host = parts.hostname
-        self.port = parts.port or 80
+        self.host, self.port = check_api_origin(base_url)
         self.timeout_seconds = timeout_seconds
         self.credentials = {"clientId": client_id, "clientSecret": client_secret}
         self.aws = {"access_key_id": aws_access_key_id, "secret_access_key": aws_secret_access_key}
@@ -118,6 +147,8 @@ class HttpAirbyteApi:
             raise AirbyteError(f"{label} did not finish within {self.timeout_seconds:g} seconds") from None
         except OSError, http.client.HTTPException:
             raise AirbyteError(f"{label} could not reach Airbyte") from None
+        if REDIRECT_FIRST <= status < REDIRECT_END:
+            raise AirbyteError(f"{label} answered with a redirect, which is refused: the credentials go to one address only")
         try:
             return status, (json.loads(raw) if raw.strip() else {})
         except ValueError:

@@ -14,10 +14,12 @@ import os
 import re
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
 
+from scripts.process import run_command
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.test_airbyte_role import BRIDGE, CHANGED_NONE, ROLE, flatten, run_tasks, values
 
@@ -171,7 +173,7 @@ class ClientFilesTest(unittest.TestCase):
             found[path.name] = (path.read_text(), stat.S_IMODE(status.st_mode), status.st_uid)
         return found
 
-    def test_the_four_files_are_owned_by_the_container_user_with_mode_0400_in_a_folder_only_root_enters(self) -> None:
+    def test_the_five_files_are_owned_by_the_container_user_with_mode_0400_in_a_folder_only_its_owner_enters(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             place_aws_files(folder)
@@ -179,14 +181,47 @@ class ClientFilesTest(unittest.TestCase):
             found = self.files(folder)
             mode = stat.S_IMODE((folder / "secrets" / "airbyte_api").stat().st_mode)
         self.assertEqual(0, code, output)
-        self.assertEqual({"client_id", "client_secret", "aws_access_key_id", "aws_secret_access_key"}, set(found))
+        self.assertEqual({"api_url", "client_id", "client_secret", "aws_access_key_id", "aws_secret_access_key"}, set(found))
         self.assertEqual(
-            {"client_id": CLIENT_ID, "client_secret": CLIENT_VALUE, "aws_access_key_id": KEY_ID, "aws_secret_access_key": KEY_VALUE},
+            {
+                "api_url": f"http://{BRIDGE}:8001",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_VALUE,
+                "aws_access_key_id": KEY_ID,
+                "aws_secret_access_key": KEY_VALUE,
+            },
             {name: text.rstrip("\n") for name, (text, _, _) in found.items()},
         )
         self.assertEqual({0o400}, {file_mode for _, file_mode, _ in found.values()})
         self.assertEqual({int(USER)}, {owner for _, _, owner in found.values()})
         self.assertEqual(0o700, mode)
+
+    def test_the_address_file_holds_the_bridge_address_and_the_api_route_port_the_deploy_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            place_aws_files(folder)
+            self.write(folder, airbyte_bridge_address="10.42.9.1", airbyte_api_route_port=8123)
+            found = self.files(folder)
+        self.assertEqual("http://10.42.9.1:8123", found["api_url"][0].rstrip("\n"))
+
+    def test_a_bridge_address_that_is_not_a_private_IPv4_literal_or_a_port_that_is_not_a_port_stops_the_run_before_any_file_is_placed(self) -> None:
+        for change in (
+            {"airbyte_bridge_address": "airbyte.example"},
+            {"airbyte_bridge_address": "8.8.8.8"},
+            {"airbyte_bridge_address": "127.0.0.1"},
+            {"airbyte_bridge_address": "10.42.0.1@8.8.8.8"},
+            {"airbyte_bridge_address": "10.42.0.1/x"},
+            {"airbyte_bridge_address": ""},
+            {"airbyte_api_route_port": 0},
+            {"airbyte_api_route_port": 70000},
+            {"airbyte_api_route_port": "80/x"},
+        ):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                place_aws_files(folder)
+                code, output = self.write(folder, **change)
+                self.assertNotEqual(0, code, output)
+                self.assertEqual({}, self.files(folder))
 
     def test_no_secret_value_appears_in_the_playbook_output(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -235,6 +270,71 @@ class ClientFilesTest(unittest.TestCase):
                 self.assertEqual({}, self.files(folder))
 
 
+class ReadWaitTest(unittest.TestCase):
+    """The lookup of the client credentials has one elapsed-time deadline, enforced by ``timeout`` around one loop, and no task outlasts it by a fresh bound."""
+
+    def task(self) -> dict[str, Any]:
+        tasks = flatten(load_yaml((ROLE_TASKS / "record_client_read.yml").read_text()))
+        return next(task for task in tasks if task.get("name", "").startswith("Wait for and read"))
+
+    def argv(self, deadline: int) -> list[str]:
+        words = [
+            str(word).replace("{{ airbyte_record_client_deadline_seconds | default(120) }}", str(deadline)).replace("{{ airbyte_namespace }}", "airbyte")
+            for word in self.task()["ansible.builtin.command"]["argv"]
+        ]
+        self.assertNotIn("{{", "".join(words))
+        return words
+
+    def fake_k3s(self, folder: Path, ready_after: int) -> dict[str, str]:
+        bin_directory = folder / "bin"
+        bin_directory.mkdir()
+        count = folder / "count"
+        count.write_text("0")
+        (bin_directory / "k3s").write_text(
+            f'#!/bin/sh\nn=$(($(cat {count}) + 1))\necho $n > {count}\nif [ "$n" -ge {ready_after} ]; then printf "aWQ=:c2VjcmV0"; else printf ":"; fi\n'
+        )
+        (bin_directory / "k3s").chmod(0o755)
+        return {"PATH": f"{bin_directory}:/usr/bin:/bin"}
+
+    def run_argv(self, folder: Path, ready_after: int, deadline: int) -> tuple[int, str, float]:
+        started = time.monotonic()
+        argv = self.argv(deadline)
+        result = run_command(argv[0], argv[1:], env=self.fake_k3s(folder, ready_after), timeout=deadline + 20)
+        return result.returncode, result.stdout, time.monotonic() - started
+
+    def test_the_command_is_wrapped_by_one_deadline_and_the_task_limit_is_a_little_above_it(self) -> None:
+        task = self.task()
+        argv = [str(word) for word in task["ansible.builtin.command"]["argv"]]
+        self.assertEqual("timeout", argv[0])
+        self.assertIn("airbyte_record_client_deadline_seconds | default(120)", argv[1])
+        self.assertNotIn("retries", task)
+        self.assertNotIn("until", task)
+        self.assertIn("airbyte_record_client_deadline_seconds | default(120)", str(task["timeout"]))
+        self.assertTrue(str(task["timeout"]).strip().endswith("+ 15 }}") or "+ 15" in str(task["timeout"]))
+
+    def test_control_the_values_are_read_as_soon_as_both_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, _ = self.run_argv(Path(scratch), 2, 30)
+        self.assertEqual((0, "aWQ=:c2VjcmV0"), (code, output))
+
+    def test_a_secret_that_never_holds_them_ends_at_the_one_deadline_with_the_timeout_status(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, seconds = self.run_argv(Path(scratch), 10**6, 3)
+        self.assertEqual(124, code)
+        self.assertEqual("", output)
+        self.assertGreaterEqual(seconds, 3.0)
+        self.assertLess(seconds, 3.0 + 4.0, "the total wait is the deadline and one poll, not a deadline for each attempt")
+
+    def test_only_a_value_with_both_parts_ends_the_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            env = self.fake_k3s(folder, 10**6)
+            (folder / "bin" / "k3s").write_text('#!/bin/sh\nprintf "aWQ=:"\n')
+            argv = self.argv(2)
+            result = run_command(argv[0], argv[1:], env=env, timeout=20)
+        self.assertEqual(124, result.returncode)
+
+
 class StaticRulesTest(unittest.TestCase):
     FILES = ("record_routes.yml", "record_route.yml", "record_route_units.yml", "record_route_policy.yml", "record_client_files.yml", "record_client_read.yml")
 
@@ -266,8 +366,24 @@ class StaticRulesTest(unittest.TestCase):
                 for forbidden in ("--from-literal", "from-file", "stringData", "password=", "PASSWORD="):
                     self.assertNotIn(forbidden, text)
 
+    def test_every_systemd_action_has_a_task_deadline(self) -> None:
+        for name, tasks in self.tasks().items():
+            for task in tasks:
+                if "ansible.builtin.systemd_service" in task:
+                    with self.subTest(file=name, task=task["name"]):
+                        self.assertIn("timeout", task)
+                        self.assertLessEqual(int(task["timeout"]), 300)
+
+    def test_every_command_and_every_wait_of_the_files_is_bounded(self) -> None:
+        for name, tasks in self.tasks().items():
+            for task in tasks:
+                if "ansible.builtin.command" in task:
+                    with self.subTest(file=name, task=task["name"]):
+                        self.assertIn("timeout", task)
+                        self.assertNotIn("until", task, "a retry loop gives each attempt a fresh bound, so the total is not the deadline")
+
     def test_the_files_are_owned_by_the_container_user_with_mode_0400(self) -> None:
-        place = next(task for task in self.tasks()["record_client_files.yml"] if task.get("name", "").startswith("Place the four files"))
+        place = next(task for task in self.tasks()["record_client_files.yml"] if task.get("name", "").startswith("Place the five files"))
         copy = place["ansible.builtin.copy"]
         self.assertIn("airbyte_record_container_user", copy["owner"])
         self.assertIn("airbyte_record_container_user", copy["group"])

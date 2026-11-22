@@ -1,16 +1,20 @@
 """Run a record load from the settings of the code location container.
 
-The container sets the settings below and mounts the four secret files. A missing or blank setting stops the load before any call and is named. A secret
-file that is missing or empty is named by its setting, never by its path, and no message holds a secret value.
+The container sets the settings below and mounts the five files. A missing or blank setting stops the load before any call and is named. A file that is
+missing or empty is named by its setting, never by its path, and no message holds a secret value.
 
 Settings: ``RECORD_BUCKET`` and ``RECORD_REGION`` (the project's bucket), ``RECORD_WAREHOUSE_PATH`` (default ``warehouse``), ``NESSIE_URI`` (Nessie as this
-container reaches it), ``RECORD_AIRBYTE_NESSIE_URI`` (Nessie as Airbyte's pods reach it), ``AIRBYTE_API_URL`` (Airbyte's server), ``RECORD_AWS_PROFILE``
-(default ``default``, the profile whose ``credential_process`` gives this workload its short-lived access), ``RECORD_LOAD_DIR`` (default
-``/opt/dagster/runs/record_loads``), ``RECORD_SYNC_DEADLINE_SECONDS`` (default 3600) and ``RECORD_POLL_SECONDS`` (default 10).
-``AIRBYTE_API_URL`` is the forwarder on the k3s bridge address (``http://<bridge address>:<airbyte_api_route_port>``). ``RECORD_AIRBYTE_NESSIE_URI`` is the
-Nessie forwarder (``http://<bridge address>:<airbyte_nessie_route_port>/api/v2``). ``record_routes.yml`` of the Airbyte role makes both. The four files are
-placed by ``record_client_files.yml`` in ``<secrets folder>/airbyte_api/`` (``client_id``, ``client_secret``, ``aws_access_key_id``,
-``aws_secret_access_key``), owned by the container's user with mode 0400, and the code location mounts each as a Compose secret file at ``/run/secrets/<name>``.
+container reaches it), ``RECORD_AIRBYTE_NESSIE_URI`` (Nessie as Airbyte's pods reach it), ``RECORD_AWS_PROFILE`` (default ``default``, the profile whose
+``credential_process`` gives this workload its short-lived access), ``RECORD_LOAD_DIR`` (default ``/opt/dagster/runs/record_loads``),
+``RECORD_SYNC_DEADLINE_SECONDS`` (default 3600), ``RECORD_POLL_SECONDS`` (default 10) and ``RECORD_CANCEL_CONFIRM_SECONDS`` (default 120).
+
+The Airbyte address is not a setting. ``AIRBYTE_API_URL_FILE`` names the file ``api_url`` that the deploy wrote beside the credentials. It holds the
+forwarder on the k3s bridge address, ``http://<bridge address>:<airbyte_api_route_port>``, and is read from that file only. It is checked before any secret
+file is read, because both credentials go to it: ``http://<private IPv4 literal>:<port>``, no host name, no user information, no path.
+``RECORD_AIRBYTE_NESSIE_URI`` is the Nessie forwarder, ``http://<bridge address>:<airbyte_nessie_route_port>/api/v2``. ``record_routes.yml`` of the Airbyte
+role makes both forwarders. The five files are placed by ``record_client_files.yml`` in ``<secrets folder>/airbyte_api/`` (``api_url``, ``client_id``,
+``client_secret``, ``aws_access_key_id``, ``aws_secret_access_key``), owned by the container's user with mode 0400, and the code location mounts each as a
+Compose secret file at ``/run/secrets/<name>``.
 Secret files: ``AIRBYTE_CLIENT_ID_FILE`` and ``AIRBYTE_CLIENT_SECRET_FILE`` (the instance's client credentials) and ``AIRBYTE_AWS_ACCESS_KEY_ID_FILE`` and
 ``AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE`` (the access key that the S3 Data Lake destination needs for the Nessie catalog).
 
@@ -29,7 +33,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from scripts.aws_cli import Aws
-from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi
+from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi, check_api_origin
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.notice import ClosedError
 from scripts.ingestion.record_catalog import NessieCatalog
@@ -42,7 +46,7 @@ DEFAULT_WAREHOUSE_PATH = "warehouse"
 DEFAULT_PROFILE = "default"
 DEFAULT_RECORD_DIR = "/opt/dagster/runs/record_loads"
 SECRET_FILES = ("AIRBYTE_CLIENT_ID_FILE", "AIRBYTE_CLIENT_SECRET_FILE", "AIRBYTE_AWS_ACCESS_KEY_ID_FILE", "AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE")
-URL_SETTINGS = ("NESSIE_URI", "RECORD_AIRBYTE_NESSIE_URI", "AIRBYTE_API_URL")
+URL_SETTINGS = ("NESSIE_URI", "RECORD_AIRBYTE_NESSIE_URI")
 
 
 class SettingsError(RuntimeError):
@@ -99,8 +103,25 @@ def plain_http(name: str, value: str) -> str:
     return value
 
 
+def api_address(environment: Mapping[str, str]) -> str:
+    """The Airbyte address from the file that the deploy wrote, and nowhere else. ``SettingsError`` unless it is ``http://<private IPv4>:<port>``."""
+    try:
+        text = Path(setting(environment, "AIRBYTE_API_URL_FILE")).read_text().strip()
+    except OSError:
+        raise SettingsError("the file named by AIRBYTE_API_URL_FILE cannot be read") from None
+    try:
+        check_api_origin(text)
+    except AirbyteError:
+        raise SettingsError("the address in the file named by AIRBYTE_API_URL_FILE must be http://<a private IPv4 address>:<port>, with no host name") from None
+    return text
+
+
 def settings_from_environment(environment: Mapping[str, str]) -> RecordSettings:
-    """The settings of a load from the container's environment. Raise ``SettingsError`` for the first setting that is missing, blank or not valid."""
+    """The settings of a load from the container's environment. Raise ``SettingsError`` for the first setting that is missing, blank or not valid.
+
+    The Airbyte address is read and checked before any secret file is read, because both credentials go to it.
+    """
+    airbyte_url = api_address(environment)
     urls = {name: plain_http(name, setting(environment, name)) for name in URL_SETTINGS}
     secrets = {name: secret_file(environment, name) for name in SECRET_FILES}
     return RecordSettings(
@@ -111,10 +132,14 @@ def settings_from_environment(environment: Mapping[str, str]) -> RecordSettings:
             urls["RECORD_AIRBYTE_NESSIE_URI"],
         ),
         urls["NESSIE_URI"],
-        urls["AIRBYTE_API_URL"],
+        airbyte_url,
         setting(environment, "RECORD_AWS_PROFILE", DEFAULT_PROFILE),
         Path(setting(environment, "RECORD_LOAD_DIR", DEFAULT_RECORD_DIR)),
-        Deadlines(seconds(environment, "RECORD_SYNC_DEADLINE_SECONDS", 3600.0), seconds(environment, "RECORD_POLL_SECONDS", 10.0)),
+        Deadlines(
+            seconds(environment, "RECORD_SYNC_DEADLINE_SECONDS", 3600.0),
+            seconds(environment, "RECORD_POLL_SECONDS", 10.0),
+            seconds(environment, "RECORD_CANCEL_CONFIRM_SECONDS", 120.0),
+        ),
         secrets["AIRBYTE_CLIENT_ID_FILE"],
         secrets["AIRBYTE_CLIENT_SECRET_FILE"],
         secrets["AIRBYTE_AWS_ACCESS_KEY_ID_FILE"],

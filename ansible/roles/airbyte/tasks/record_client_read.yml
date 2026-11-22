@@ -1,26 +1,30 @@
-# Reads airbyte_namespace. Airbyte writes the instance administrator's client ID and secret into the secret airbyte-auth-secrets when it first starts. They are read into
-# two variables that hold no more than the next task needs, and never shown. A secret that does not hold them within the deadline stops the run and names the secret.
-- name: Read the administrator's client ID and secret from the namespace's auth secret
+# Reads airbyte_namespace and, optionally, airbyte_record_client_deadline_seconds (default 120). Airbyte writes the instance administrator's client ID and secret into the secret
+# airbyte-auth-secrets when it first starts. One command waits for both, inside one elapsed-time deadline that the coreutils timeout program enforces around the whole loop, so no
+# attempt has a fresh bound of its own. The two values are read into two variables that hold no more than the next task needs, and never shown. A secret that does not hold them
+# within the deadline stops the run and names the secret.
+- name: Wait for and read the administrator's client ID and secret from the namespace's auth secret
   ansible.builtin.command:
     argv:
-      - k3s
-      - kubectl
-      - get
-      - secret
-      - airbyte-auth-secrets
-      - --namespace
+      - timeout
+      - "{{ airbyte_record_client_deadline_seconds | default(120) }}"
+      - sh
+      - -c
+      - |
+        while :; do
+          value=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>/dev/null) || value=
+          case "$value" in
+            ?*:?*) printf '%s' "$value"; exit 0 ;;
+          esac
+          sleep 2
+        done
+      - airbyte_record_client_wait
       - "{{ airbyte_namespace }}"
-      - --output
-      - "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}"
   register: airbyte_record_client_read
   changed_when: false
   check_mode: false
   no_log: true
-  retries: "{{ [((airbyte_record_client_deadline_seconds | default(120)) | int / 4) | int, 1] | max }}"
-  delay: 4
-  until: airbyte_record_client_read.rc == 0 and (airbyte_record_client_read.stdout | length) > 1 and not airbyte_record_client_read.stdout.startswith(':') and not airbyte_record_client_read.stdout.endswith(':')
-  timeout: 30
   failed_when: false
+  timeout: "{{ (airbyte_record_client_deadline_seconds | default(120)) | int + 15 }}"
 
 - name: Stop with the secret's name when it holds no client credentials
   ansible.builtin.assert:

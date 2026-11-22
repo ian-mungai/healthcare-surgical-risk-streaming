@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.ingestion import record_definitions as definitions
-from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi
+from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi, check_api_origin
 from scripts.ingestion.record_definitions import DESTINATION, SOURCE_FILE, SOURCE_S3, TRACK_LIST, Environment
 
 RUN = "run_20261122_ab12cd34"
@@ -26,6 +26,7 @@ ACCESS_VALUE = "wJalrXUtnFEMIexample0000000000000000000000"
 MASK = "**********"
 SECRET_FIELDS = ("access_key_id", "secret_access_key")
 PREFIX = "/api/public/v1"
+ORIGIN = "http://10.42.0.1:8001"
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 PLATFORM_FIELD = {"platform_added": "a default"}
 
@@ -145,7 +146,7 @@ class StandIn:
 
 class Api(HttpAirbyteApi):
     def __init__(self, stand_in: StandIn) -> None:
-        super().__init__("http://airbyte.example:8001", "client", "client_value", ACCESS_ID, ACCESS_VALUE)
+        super().__init__(ORIGIN, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
         self.stand_in = stand_in
 
     def send(self, method: str, target: str, payload: bytes | None, headers: dict[str, str]) -> tuple[int, bytes]:
@@ -409,10 +410,82 @@ class FailureTest(unittest.TestCase):
 
 
 class AddressTest(unittest.TestCase):
-    def test_an_address_that_is_not_a_plain_http_URL_is_refused(self) -> None:
-        for address in ("https://airbyte.example", "airbyte.example:8001", "http://", "http://a?b=1", "http://a/api"):
-            with self.subTest(address), self.assertRaises(AirbyteError):
+    """The address is where both credentials go, so only a plain ``http://<private IPv4 literal>:<port>`` is accepted: no name, no userinfo, no path."""
+
+    REFUSED = (
+        ("a host name", "http://airbyte.example:8001"),
+        ("localhost by name", "http://localhost:8001"),
+        ("a public address", "http://8.8.8.8:8001"),
+        ("a public address that looks private", "http://10.42.0.1.example:8001"),
+        ("loopback", "http://127.0.0.1:8001"),
+        ("the unspecified address", "http://0.0.0.0:8001"),
+        ("a multicast address", "http://224.0.0.1:8001"),
+        ("userinfo", "http://user:pass@10.42.0.1:8001"),
+        ("userinfo with an at sign in the host part", "http://10.42.0.1@8.8.8.8:8001"),
+        ("no port", "http://10.42.0.1"),
+        ("port 0", "http://10.42.0.1:0"),
+        ("a port over 65535", "http://10.42.0.1:70000"),
+        ("a path", "http://10.42.0.1:8001/api"),
+        ("a query", "http://10.42.0.1:8001?a=1"),
+        ("a fragment", "http://10.42.0.1:8001#x"),
+        ("an IPv6 literal", "http://[fd00::1]:8001"),
+        ("https", "https://10.42.0.1:8001"),
+        ("no scheme", "10.42.0.1:8001"),
+        ("an empty text", ""),
+        ("leading zeros", "http://010.042.000.001:8001"),
+        ("a space", "http://10.42.0.1 :8001"),
+        ("a decimal address", "http://170524673:8001"),
+    )
+    ACCEPTED = ("http://10.42.0.1:8001", "http://172.16.4.1:8001", "http://192.168.1.1:80", "http://169.254.10.2:8001", "http://10.42.0.1:8001/")
+
+    def test_each_address_that_could_send_a_credential_elsewhere_is_refused(self) -> None:
+        for name, address in self.REFUSED:
+            with self.subTest(name), self.assertRaises(AirbyteError):
                 HttpAirbyteApi(address, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
+            with self.subTest(f"{name} by the check"), self.assertRaises(AirbyteError):
+                check_api_origin(address)
+
+    def test_a_private_or_link_local_IPv4_literal_with_a_port_is_accepted_as_a_host_and_a_port(self) -> None:
+        for address in self.ACCEPTED:
+            with self.subTest(address):
+                host, port = check_api_origin(address)
+                api = HttpAirbyteApi(address, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
+                self.assertEqual((host, port), (api.host, api.port))
+        self.assertEqual(("10.42.0.1", 8001), check_api_origin("http://10.42.0.1:8001"))
+
+    def test_the_messages_name_the_rule_and_never_the_address(self) -> None:
+        with self.assertRaises(AirbyteError) as raised:
+            check_api_origin("http://user:hunter2@8.8.8.8:8001")
+        self.assertNotIn("hunter2", str(raised.exception))
+        self.assertNotIn("8.8.8.8", str(raised.exception))
+
+
+class RedirectTest(unittest.TestCase):
+    """A redirect would send the credentials, or the bearer token, to the place it names, so it is refused and followed nowhere."""
+
+    def test_a_redirect_of_any_call_is_refused_and_no_second_request_is_made(self) -> None:
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status):
+                api, stand_in = prepared()
+                api.running_jobs("connection1")
+                stand_in.failures["GET jobs"] = (status, b"")
+                stand_in.log.clear()
+                with self.assertRaises(AirbyteError) as raised:
+                    api.running_jobs("connection1")
+                self.assertIn("redirect", str(raised.exception))
+                self.assertEqual(["GET jobs"], stand_in.log)
+
+    def test_a_redirect_of_the_token_call_is_refused_before_any_credential_is_sent_again(self) -> None:
+        api, stand_in = prepared()
+        stand_in.failures["POST applications/token"] = (307, b"")
+        with self.assertRaises(AirbyteError) as raised:
+            api.running_jobs("connection1")
+        self.assertIn("redirect", str(raised.exception))
+        self.assertEqual(["POST applications/token"], stand_in.log)
+
+    def test_every_request_goes_to_the_one_origin_of_the_client(self) -> None:
+        api, _ = prepared()
+        self.assertEqual(("10.42.0.1", 8001), (api.host, api.port))
 
 
 if __name__ == "__main__":
