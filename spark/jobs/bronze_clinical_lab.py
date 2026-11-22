@@ -1,41 +1,44 @@
 """The Bronze job for the clinical and laboratory tables: copy the loaded tables into ``bronze.clinical_cases`` and ``bronze.lab_results`` on a
 private Nessie branch.
 
-``python -m spark.jobs.bronze_clinical_lab write --branch <name> --source-hash <hash> [--base <name>]``
-``python -m spark.jobs.bronze_clinical_lab verify --branch <name> --source-hash <hash> [--base <name>]``
+``python -m spark.jobs.bronze_clinical_lab write --branch <name> --source-hash <hash>``
+``python -m spark.jobs.bronze_clinical_lab verify --branch <name> --source-hash <hash>``
 
-``write`` creates the branch ``--branch`` at the hash ``--source-hash`` of ``--base`` (``main``), the merged hash that the table checks
-recorded, and refuses a branch that exists. It reads ``raw_records.clinical_data`` and ``raw_records.lab_data`` on that branch, so it reads
-exactly the tables at that hash, replaces the two Bronze tables on the branch and then runs ``verify`` on what it wrote. The merge of the
-branch is the caller's step and the Bronze table checks' step, never this job's. ``verify`` re-reads a branch and checks the Bronze tables
-against the loaded tables, so any later step can run it again.
+The source hash is the merged hash that the table checks recorded. It is always looked up in the history of Nessie's configured default
+branch (the name comes from Nessie's configuration, never from an argument), so a load that was never merged cannot be a source. ``write``
+creates the branch ``--branch`` from that hash on the default branch and refuses a branch that exists. The loaded tables
+``raw_records.clinical_data`` and ``raw_records.lab_data`` are always read at the pinned reference ``<default branch>@<source hash>``,
+through a second catalog, and never through the run branch. ``write`` replaces the two Bronze tables on the run branch and then runs the
+checks on what it wrote. The merge of the branch is the caller's step and the Bronze table checks' step, never this job's. ``verify`` re-
+reads a branch and runs the same checks, so any later step can run it again.
 
 Each Bronze table holds the loaded table's published columns, every one a string, with no value changed (``spark/bronze_clinical_lab.py``
-has the rules). The laboratory table adds the integer column ``source_occurrence``. The checks of one table are its column list, its row
-count, row equality with the loaded table in both directions as a multiset (a missing value stays missing: ``exceptAll`` treats two nulls as
-equal and a null and an empty string as different), its key (not null, unique) and, for the laboratory table, the occurrence numbers (from 1
-without a gap). ``verify`` also checks that the loaded tables on the branch are the snapshots they had at ``--source-hash``.
+has the rules). The laboratory table adds the integer column ``source_occurrence``. The checks of one table are, in this order:
+``source_changed`` (the run branch's view of the loaded table has the metadata location and the snapshot that Nessie reports for it at the
+source hash), the column list, the row count, row equality with the loaded table in both directions as a multiset (a missing value stays
+missing: ``exceptAll`` treats two nulls as equal and a null and an empty string as different), the key (not null, unique) and, for the
+laboratory table, the occurrence numbers (from 1 without a gap) and the independent occurrence rule: the rows of the repeated groups are
+collected to the driver, numbered again by the pure Python rule and compared with the numbers that Spark wrote. More than 100,000 such rows
+are refused.
 
-The job prints one line that starts with ``RESULT `` and holds the branch, its hash, the source hash, and for each table its row count, its
-snapshot IDs (the loaded table's and Bronze's, as Nessie holds them for the branch), its key digest and its row digest, and the checks with
-their result. It exits 0 when every check passed, 1 when one failed or Nessie refused, and 2 for a setting or an argument that is wrong.
-Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS``
-and ``JOB_DEADLINE_SECONDS``.
-"""
+The job prints one line that starts with ``RESULT `` and holds the branch, its hash, the default branch, the source hash, and for each table
+its row count, the metadata location and snapshot ID of the loaded table at the source hash, Bronze's snapshot ID on the branch, its key
+digest and its row digest, and the checks with their result. It exits 0 when every check passed, 1 when one failed or Nessie refused, and 2
+for a setting or an argument that is wrong. Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for
+an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and ``JOB_DEADLINE_SECONDS``."""
 
 from __future__ import annotations
 
-import argparse
+import functools
+import importlib
 import json
 import os
-import re
 import sys
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+import time
+from collections.abc import Callable, Sequence
 from typing import Any
-from urllib.parse import quote
 
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError, Reference
+from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze_clinical_lab import (
     BRONZE_NAMESPACE,
     GROUP_COLUMNS,
@@ -44,109 +47,49 @@ from spark.bronze_clinical_lab import (
     SOURCE_NAMESPACE,
     TABLES,
     BronzeRulesError,
-    payload_columns,
+    KeyStatistics,
 )
-from spark.session import build_session, required_environment, start_deadline
-from spark.settings import SettingsError
+from spark.bronze_clinical_lab_run import JOB, NessieAdapter, Row, SparkOps, parser, run_job
+from spark.session import SCRATCH_FOLDER, required_environment, start_deadline
+from spark.settings import CATALOG, SettingsError, catalog_options, driver_memory_mib, read_memory_limit_mib
 
-JOB = "bronze_clinical_lab"
 RESULT_PREFIX = "RESULT "
-HASH = re.compile(r"[0-9a-f]{64}")
 DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
 DEFAULT_JOB_DEADLINE_SECONDS = 1800.0
 FIELD_SEPARATOR = "|"
 HALF_HEX = 16
 DIGEST_TYPE = "decimal(38,0)"
-HISTORY_PAGE_SIZE = 500
-HISTORY_PAGE_LIMIT = 200
+SOURCE_CATALOG = "source"
 
 
-class CheckFailure(RuntimeError):
-    """A table check failed. The checks are in the job's result."""
-
-
-@dataclass(slots=True)
-class TableReport:
-    kind: str
-    source_table: str
-    bronze_table: str
-    rows: int = 0
-    source_rows: int = 0
-    source_snapshot_id: int | None = None
-    bronze_snapshot_id: int | None = None
-    keys_digest: str = ""
-    rows_digest: str = ""
-    checks: list[dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def passed(self) -> bool:
-        return bool(self.checks) and all(check["passed"] for check in self.checks)
-
-    def add(self, name: str, passed: bool, detail: str) -> bool:
-        self.checks.append({"name": name, "passed": passed, "detail": detail})
-        return passed
-
-    def document(self) -> dict[str, Any]:
-        return {
-            "source_table": f"{SOURCE_NAMESPACE}.{self.source_table}",
-            "bronze_table": f"{BRONZE_NAMESPACE}.{self.bronze_table}",
-            "rows": self.rows,
-            "source_rows": self.source_rows,
-            "source_snapshot_id": self.source_snapshot_id,
-            "bronze_snapshot_id": self.bronze_snapshot_id,
-            "keys_digest": self.keys_digest,
-            "rows_digest": self.rows_digest,
-            "passed": self.passed,
-            "checks": self.checks,
-        }
-
-
-def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog=f"python -m spark.jobs.{JOB}", description="Copy the loaded clinical and laboratory tables into Bronze on a private branch."
-    )
-    commands = command.add_subparsers(dest="command", required=True)
-    for name, text in (
-        ("write", "create the branch at the source hash, write both Bronze tables and verify them"),
-        ("verify", "check the Bronze tables of a branch"),
-    ):
-        sub = commands.add_parser(name, help=text)
-        sub.add_argument("--branch", required=True, help="the private branch that holds (write: will hold) the Bronze tables")
-        sub.add_argument("--source-hash", required=True, help="the hash of the base at which the table checks merged the loaded tables")
-        sub.add_argument("--base", default="main", help="the branch that the source hash belongs to")
-    return command
-
-
-def snapshot_of(client: NessieClient, reference: str, table: str) -> int | None:
-    """The snapshot ID that Nessie holds for ``table`` on ``reference`` (a name or ``name@hash``), or None when the reference has no such table."""
-    try:
-        document = client.request("GET", f"/trees/{quote(reference, safe='@')}/contents/{table}") or {}
-    except NessieError as error:
-        if error.status == 404:
-            return None
-        raise
-    snapshot = (document.get("content") or {}).get("snapshotId")
-    return int(snapshot) if snapshot is not None else None
-
-
-def check_source_hash(client: NessieClient, base: str, source_hash: str) -> Reference:
-    """The base at ``source_hash``, or a ``NessieError`` when the hash is not a commit in the base's history.
-
-    Nessie serves ``name@hash`` for any commit it holds, also one of another branch, so the history of the base is read page by page until the hash is found.
-    """
-    if not HASH.fullmatch(source_hash):
-        raise SettingsError("the source hash must be 64 lowercase hexadecimal digits")
-    token: str | None = None
-    for _ in range(HISTORY_PAGE_LIMIT):
-        query = {"max-records": str(HISTORY_PAGE_SIZE), **({"page-token": token} if token else {})}
-        page = client.request("GET", f"/trees/{quote(base, safe='')}/history", query=query) or {}
-        entries = page.get("logEntries") or []
-        if any((entry.get("commitMeta") or {}).get("hash") == source_hash for entry in entries):
-            return Reference("BRANCH", base, source_hash)
-        token = page.get("token")
-        if not token:
-            break
-    raise NessieError(f"the hash {source_hash} is not in the history of {base}")
+def build_job_session(branch: str, default_branch: str, source_hash: str) -> Any:
+    """A local Spark session with two catalogs: ``lake`` on the run branch, and ``source`` on the default branch pinned to the source hash."""
+    spark_session = importlib.import_module("pyspark.sql").SparkSession
+    heap = f"{driver_memory_mib(read_memory_limit_mib())}m"
+    arguments = {
+        "nessie_uri": required_environment("NESSIE_URI"),
+        "warehouse": required_environment("WAREHOUSE_LOCATION"),
+        "region": os.environ.get("AWS_REGION", ""),
+    }
+    run_options = catalog_options(**arguments, ref=branch)
+    prefix = f"spark.sql.catalog.{CATALOG}"
+    pinned_options = {
+        f"spark.sql.catalog.{SOURCE_CATALOG}{key.removeprefix(prefix)}": value for key, value in catalog_options(**arguments, ref=default_branch).items()
+    }
+    pinned_options[f"spark.sql.catalog.{SOURCE_CATALOG}.ref.hash"] = source_hash
+    builder = spark_session.builder.appName(JOB).master("local[*]")
+    for key, value in {
+        **run_options,
+        **pinned_options,
+        "spark.driver.memory": heap,
+        "spark.executor.memory": heap,
+        "spark.local.dir": SCRATCH_FOLDER,
+        "spark.ui.enabled": "false",
+    }.items():
+        builder = builder.config(key, value)
+    session = builder.getOrCreate()
+    session.sparkContext.setLogLevel("WARN")
+    return session
 
 
 def text_of(column: Any) -> Any:
@@ -178,109 +121,122 @@ def occurrences(frame: Any) -> Any:
     return frame.withColumn(OCCURRENCE_COLUMN, functions.row_number().over(window))
 
 
-def expected_frame(session: Any, kind: str, source_table: str) -> tuple[Any, list[str]]:
-    """The loaded table as Bronze must hold it, and its published columns. A table that cannot be copied as it is raises ``BronzeRulesError``."""
-    from pyspark.errors import AnalysisException
+def timed(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Report on stderr the seconds that an operation took, so a slow or stalled job shows where it is."""
 
-    try:
-        loaded = session.table(f"lake.{SOURCE_NAMESPACE}.{source_table}")
-    except AnalysisException as error:
-        raise BronzeRulesError(f"the loaded table {SOURCE_NAMESPACE}.{source_table} is not on the branch") from error
-    columns = payload_columns(kind, [(name, column_type) for name, column_type in loaded.dtypes])
-    frame = loaded.select(*columns)
-    return (occurrences(frame) if kind == "lab" else frame), columns
+    @functools.wraps(method)
+    def wrapper(*arguments: Any, **keywords: Any) -> Any:
+        started = time.monotonic()
+        try:
+            return method(*arguments, **keywords)
+        finally:
+            kind = f" {arguments[1]}" if len(arguments) > 1 and isinstance(arguments[1], str) else ""
+            sys.stderr.write(f"{JOB}: {method.__name__}{kind} took {time.monotonic() - started:.1f} seconds\n")
+            sys.stderr.flush()
+
+    return wrapper
 
 
-def verify_table(session: Any, client: NessieClient, branch: str, source_hash_reference: Reference, kind: str) -> TableReport:
-    """Run the checks of one table on ``branch`` and return its report. Nothing is written."""
-    from pyspark.sql import functions as functions
+class SparkAdapter:
+    """``SparkOps`` over a session from ``build_job_session``. Every operation that runs a Spark job reports its seconds on stderr."""
 
-    source_table, bronze_table, key = TABLES[kind]
-    report = TableReport(kind, source_table, bronze_table)
-    reference = f"{source_hash_reference.name}@{source_hash_reference.hash}"
-    report.source_snapshot_id = snapshot_of(client, branch, f"{SOURCE_NAMESPACE}.{source_table}")
-    pinned = snapshot_of(client, reference, f"{SOURCE_NAMESPACE}.{source_table}")
-    report.bronze_snapshot_id = snapshot_of(client, branch, f"{BRONZE_NAMESPACE}.{bronze_table}")
-    report.add(
-        "loaded table at the source hash",
-        report.source_snapshot_id is not None and report.source_snapshot_id == pinned,
-        f"snapshot on the branch {report.source_snapshot_id}, snapshot at the source hash {pinned}",
-    )
-    expected, columns = expected_frame(session, kind, source_table)
-    if report.bronze_snapshot_id is None:
-        report.add("bronze table exists", False, f"{BRONZE_NAMESPACE}.{bronze_table} is not on the branch")
-        return report
-    bronze = session.table(f"lake.{BRONZE_NAMESPACE}.{bronze_table}")
-    wanted = [*columns, OCCURRENCE_COLUMN] if kind == "lab" else columns
-    wanted_types = {name: "string" for name in columns} | ({OCCURRENCE_COLUMN: "int"} if kind == "lab" else {})
-    found_types = dict(bronze.dtypes)
-    report.add(
-        "columns", [name for name, _ in bronze.dtypes] == wanted and found_types == wanted_types, f"expected {len(wanted)} columns, found {len(found_types)}"
-    )
-    if [name for name, _ in bronze.dtypes] != wanted:
-        return report
-    report.source_rows, report.rows = expected.count(), bronze.count()
-    report.add("row count", report.rows == report.source_rows, f"loaded {report.source_rows}, bronze {report.rows}")
-    missing, extra = expected.exceptAll(bronze).count(), bronze.exceptAll(expected).count()
-    report.add(
-        "no value changed", missing == 0 and extra == 0, f"rows of the loaded table not in bronze {missing}, rows of bronze not in the loaded table {extra}"
-    )
-    stats = bronze.agg(
-        functions.count(functions.lit(1)).alias("rows"),
-        functions.countDistinct(*key).alias("distinct"),
-        *[functions.sum(functions.col(name).isNull().cast("int")).alias(f"null_{name}") for name in key],
-    ).collect()[0]
-    nulls = sum(int(stats[f"null_{name}"] or 0) for name in key)
-    report.add("key not null", nulls == 0, f"{nulls} null value(s) in the key columns {', '.join(key)}")
-    report.add("key unique", int(stats["rows"]) == int(stats["distinct"]) and nulls == 0, f"rows {int(stats['rows'])}, distinct keys {int(stats['distinct'])}")
-    if kind == "lab":
-        groups = bronze.groupBy(*GROUP_COLUMNS).agg(
-            functions.count(functions.lit(1)).alias("n"), functions.min(OCCURRENCE_COLUMN).alias("low"), functions.max(OCCURRENCE_COLUMN).alias("high")
+    def __init__(self, session: Any) -> None:
+        self.session = session
+
+    def source(self, kind: str) -> Any:
+        from pyspark.errors import AnalysisException
+
+        source_table = TABLES[kind][0]
+        try:
+            return self.session.table(f"{SOURCE_CATALOG}.{SOURCE_NAMESPACE}.{source_table}")
+        except AnalysisException as error:
+            raise BronzeRulesError(f"the loaded table {SOURCE_NAMESPACE}.{source_table} is not at the source hash") from error
+
+    def expected(self, kind: str, columns: list[str]) -> Any:
+        """The loaded table at the source hash as Bronze must hold it."""
+        frame = self.source(kind).select(*columns)
+        return occurrences(frame) if kind == "lab" else frame
+
+    def bronze(self, kind: str) -> Any:
+        return self.session.table(f"lake.{BRONZE_NAMESPACE}.{TABLES[kind][1]}")
+
+    @timed
+    def source_columns(self, kind: str) -> list[tuple[str, str]]:
+        return [(name, column_type) for name, column_type in self.source(kind).dtypes]
+
+    @timed
+    def prepare(self) -> None:
+        self.session.sql(f"CREATE NAMESPACE IF NOT EXISTS lake.{BRONZE_NAMESPACE}")
+
+    @timed
+    def write(self, kind: str, columns: list[str]) -> None:
+        self.expected(kind, columns).writeTo(f"lake.{BRONZE_NAMESPACE}.{TABLES[kind][1]}").tableProperty("format-version", "2").createOrReplace()
+
+    def bronze_columns(self, kind: str, columns: list[str]) -> list[tuple[str, str]] | None:
+        return [(name, column_type) for name, column_type in self.bronze(kind).dtypes]
+
+    @timed
+    def source_count(self, kind: str, columns: list[str]) -> int:
+        return int(self.expected(kind, columns).count())
+
+    @timed
+    def bronze_count(self, kind: str) -> int:
+        return int(self.bronze(kind).count())
+
+    @timed
+    def difference(self, kind: str, columns: list[str]) -> tuple[int, int]:
+        expected, bronze = self.expected(kind, columns), self.bronze(kind)
+        return int(expected.exceptAll(bronze).count()), int(bronze.exceptAll(expected).count())
+
+    @timed
+    def key_statistics(self, kind: str) -> KeyStatistics:
+        from pyspark.sql import functions as functions
+
+        key = TABLES[kind][2]
+        stats = (
+            self.bronze(kind)
+            .agg(
+                functions.count(functions.lit(1)).alias("rows"),
+                functions.countDistinct(*key).alias("distinct"),
+                *[functions.sum(functions.col(name).isNull().cast("int")).alias(f"null_{name}") for name in key],
+            )
+            .collect()[0]
         )
-        broken = groups.where((functions.col("low") != 1) | (functions.col("high") != functions.col("n"))).count()
-        report.add("occurrence numbers from 1 without a gap", broken == 0, f"{broken} group(s) of case, time and test name with a gap or a start above 1")
-    report.keys_digest, report.rows_digest = digest(bronze, key), digest(bronze, wanted)
-    return report
+        return KeyStatistics(int(stats["rows"]), int(stats["distinct"]), sum(int(stats[f"null_{name}"] or 0) for name in key))
+
+    @timed
+    def occurrence_gaps(self) -> int:
+        from pyspark.sql import functions as functions
+
+        groups = (
+            self.bronze("lab")
+            .groupBy(*GROUP_COLUMNS)
+            .agg(functions.count(functions.lit(1)).alias("n"), functions.min(OCCURRENCE_COLUMN).alias("low"), functions.max(OCCURRENCE_COLUMN).alias("high"))
+        )
+        return int(groups.where((functions.col("low") != 1) | (functions.col("high") != functions.col("n"))).count())
+
+    @timed
+    def repeated_rows(self, limit: int) -> list[Row]:
+        """The rows of the laboratory groups that hold more than one row, at most ``limit`` and one more, collected to the driver."""
+        from pyspark.sql import Window
+        from pyspark.sql import functions as functions
+
+        sized = self.bronze("lab").withColumn("group_rows", functions.count(functions.lit(1)).over(Window.partitionBy(*GROUP_COLUMNS)))
+        rows = sized.where(functions.col("group_rows") > 1).drop("group_rows").limit(limit + 1).collect()
+        return [(row["caseid"], row["dt"], row["name"], row["result"], int(row[OCCURRENCE_COLUMN])) for row in rows]
+
+    @timed
+    def digests(self, kind: str, columns: list[str]) -> tuple[str, str]:
+        wanted = [*columns, OCCURRENCE_COLUMN] if kind == "lab" else columns
+        bronze = self.bronze(kind)
+        return digest(bronze, TABLES[kind][2]), digest(bronze, wanted)
+
+    def close(self) -> None:
+        self.session.stop()
 
 
-def result_document(command: str, branch: str, branch_hash: str, source_hash: str, base: str, reports: Sequence[TableReport]) -> dict[str, Any]:
-    return {
-        "job": JOB,
-        "command": command,
-        "branch": branch,
-        "branch_hash": branch_hash,
-        "base": base,
-        "source_hash": source_hash,
-        "passed": len(reports) == len(TABLES) and all(report.passed for report in reports),
-        "tables": {report.bronze_table: report.document() for report in reports},
-    }
-
-
-def write_tables(session: Any) -> None:
-    """Replace both Bronze tables on the session's branch with the loaded tables."""
-    session.sql(f"CREATE NAMESPACE IF NOT EXISTS lake.{BRONZE_NAMESPACE}")
-    for kind, (source_table, bronze_table, _) in TABLES.items():
-        frame, _ = expected_frame(session, kind, source_table)
-        frame.writeTo(f"lake.{BRONZE_NAMESPACE}.{bronze_table}").tableProperty("format-version", "2").createOrReplace()
-
-
-def run(arguments: argparse.Namespace, client: NessieClient) -> dict[str, Any]:
-    source = check_source_hash(client, arguments.base, arguments.source_hash)
-    if arguments.command == "write":
-        for kind, (source_table, _, _) in TABLES.items():
-            if snapshot_of(client, f"{source.name}@{source.hash}", f"{SOURCE_NAMESPACE}.{source_table}") is None:
-                raise BronzeRulesError(f"the loaded {kind} table {SOURCE_NAMESPACE}.{source_table} is not in {source.name} at the source hash")
-        client.create_reference("BRANCH", arguments.branch, source)
-    elif client.reference(arguments.branch).kind != "BRANCH":
-        raise NessieError(f"{arguments.branch} is not a branch")
-    session = build_session(JOB, arguments.branch)
-    try:
-        if arguments.command == "write":
-            write_tables(session)
-        reports = [verify_table(session, client, arguments.branch, source, kind) for kind in TABLES]
-    finally:
-        session.stop()
-    return result_document(arguments.command, arguments.branch, client.reference(arguments.branch).hash, arguments.source_hash, arguments.base, reports)
+def open_spark(branch: str, default_branch: str, source_hash: str) -> SparkOps:
+    return SparkAdapter(build_job_session(branch, default_branch, source_hash))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -288,8 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
         client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
-        client.config()
-        result = run(arguments, client)
+        result = run_job(arguments.command, arguments.branch, arguments.source_hash, NessieAdapter(client), open_spark)
     except NessieConflict as error:
         sys.stderr.write(f"{JOB}: Nessie refused the branch {arguments.branch}: {error}\n")
         return 1

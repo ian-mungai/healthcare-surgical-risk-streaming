@@ -16,6 +16,7 @@ from spark.bronze_clinical_lab import (
     BronzeRulesError,
     assign_occurrences,
     digest_of,
+    occurrence_differences,
     payload_columns,
     row_text,
 )
@@ -94,6 +95,27 @@ class OccurrenceTest(unittest.TestCase):
             keys = [row[:3] + (row[4],) for row in numbered]
             self.assertEqual(len(keys), len(set(keys)))
             self.assertEqual([1, 2, 3, 1], [row[4] for row in numbered])
+
+
+class IndependentOccurrenceCheckTest(unittest.TestCase):
+    ROWS = [("1", "5", "k", "4.0"), ("1", "5", "k", "4.0"), ("1", "5", "k", "4.1"), ("2", "6", "na", None), ("2", "6", "na", "139")]
+
+    def test_the_numbers_of_assign_occurrences_have_no_difference_in_any_order(self) -> None:
+        numbered = assign_occurrences(self.ROWS)
+        self.assertEqual(0, occurrence_differences(numbered))
+        self.assertEqual(0, occurrence_differences(numbered[::-1]))
+
+    def test_a_dense_rank_differs_because_identical_rows_get_the_same_number(self) -> None:
+        dense = [("1", "5", "k", "4.0", 1), ("1", "5", "k", "4.0", 1), ("1", "5", "k", "4.1", 2), ("2", "6", "na", None, 1), ("2", "6", "na", "139", 2)]
+        self.assertGreater(occurrence_differences(dense), 0)
+
+    def test_a_reversed_rank_a_swapped_pair_and_a_dropped_row_each_differ(self) -> None:
+        good = assign_occurrences(self.ROWS)
+        reversed_rank = [(*row[:4], {1: 2, 2: 1}[row[4]]) if row[:3] == ("2", "6", "na") else row for row in good]
+        swapped = [(*row[:4], {2: 3, 3: 2}.get(row[4], row[4])) if row[:3] == ("1", "5", "k") else row for row in good]
+        for name, rows in (("reversed", reversed_rank), ("swapped", swapped), ("dropped row", good[1:])):
+            with self.subTest(name):
+                self.assertGreater(occurrence_differences(rows), 0)
 
 
 class DigestTest(unittest.TestCase):

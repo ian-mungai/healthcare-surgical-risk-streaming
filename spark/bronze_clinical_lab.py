@@ -16,7 +16,9 @@ never on the order in which a load wrote the rows.
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 SOURCE_NAMESPACE = "raw_records"
 BRONZE_NAMESPACE = "bronze"
@@ -29,7 +31,25 @@ CLINICAL_KEY = ("caseid",)
 LAB_KEY = (*GROUP_COLUMNS, OCCURRENCE_COLUMN)
 TABLES = {"clinical": ("clinical_data", "clinical_cases", CLINICAL_KEY), "lab": ("lab_data", "lab_results", LAB_KEY)}
 MISSING = "n"
+REPEATED_ROWS_LIMIT = 100_000
 HALF_HEX = 16
+
+
+@dataclass(frozen=True)
+class TableContent:
+    """What Nessie holds for an Iceberg table at a reference: the location of its current metadata file and its current snapshot."""
+
+    metadata_location: str
+    snapshot_id: int
+
+
+@dataclass(frozen=True)
+class KeyStatistics:
+    """The rows of a Bronze table, its distinct keys and the null values in its key columns."""
+
+    rows: int
+    distinct: int
+    nulls: int
 
 
 class BronzeRulesError(ValueError):
@@ -96,3 +116,14 @@ def digest_of(lines: Iterable[str]) -> str:
         high += int(hexadecimal[:HALF_HEX], 16)
         low += int(hexadecimal[HALF_HEX : 2 * HALF_HEX], 16)
     return f"{rows}:{high}:{low}"
+
+
+def occurrence_differences(rows: Iterable[tuple[str | None, str | None, str | None, str | None, int]]) -> int:
+    """How many rows differ between the occurrence numbers that Spark wrote and the numbers of ``assign_occurrences``, as multisets of rows.
+
+    ``rows`` are the rows of the repeated groups, each with its ``source_occurrence``. The result is 0 only when the two numberings are the same.
+    """
+    found = Counter(rows)
+    plain = [(case, time, name, result) for case, time, name, result, _ in found.elements()]
+    expected = Counter(assign_occurrences(plain))
+    return sum(((found - expected) + (expected - found)).values())
