@@ -29,17 +29,20 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from scripts.aws_cli import Aws, AwsError
+from scripts.aws_cli import RAW_ERRORS, Aws, AwsError
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WAREHOUSE_PREFIX
 
 INFRA_FOLDER = ROOT / "infra"
 PROTECTED_PREFIX = f"{WAREHOUSE_PREFIX}/"
 NO_CONFIGURATION_CODE = "NoSuchLifecycleConfiguration"
+READ_OPERATION = "GetBucketLifecycleConfiguration"
 STATUSES = ("Enabled", "Disabled")
 DECLARATION_WORDS = ("aws_s3_bucket_lifecycle_configuration", "lifecycle_rule")
 DECLARATION_ENDINGS = (".tf", ".tf.json")
-ERROR_CODE_OF_CLIENT = re.compile(r"aws \S+ \S+ failed: ([A-Za-z0-9.]+);")
+ERROR_LINE_START = "An error occurred ("
+ERROR_LINE = re.compile(r"An error occurred \(([A-Za-z0-9.]+)\) when calling the ([A-Za-z0-9]+) operation: ")
+RAW_TEXT_PATH = re.compile(r"its full error text is in (\S+)$")
 
 
 def rule_prefix(rule: Mapping[str, Any]) -> str:
@@ -111,20 +114,45 @@ def live_rules(document: Any) -> dict[str, Any]:
     return dict(document)
 
 
-def error_code(error: AwsError) -> str | None:
-    """The AWS error code that the shared client parsed from the CLI's error line and put first in its message, or None when it found none."""
-    found = ERROR_CODE_OF_CLIENT.match(str(error))
-    return found.group(1) if found else None
+def no_configuration(stderr: str) -> bool:
+    """Whether the CLI's error output is exactly one error line, in the CLI's form, for the code ``NoSuchLifecycleConfiguration`` and the operation asked for.
+
+    A line counts as an error line when it begins with ``An error occurred (``. Zero such lines, more than one, another code, another operation and a mention of
+    the code anywhere else in the text are not "no configuration": each is a failed read.
+    """
+    lines = [line for line in stderr.splitlines() if line.startswith(ERROR_LINE_START)]
+    if len(lines) != 1:
+        return False
+    found = ERROR_LINE.match(lines[0])
+    return found is not None and found.groups() == (NO_CONFIGURATION_CODE, READ_OPERATION)
+
+
+def raw_error_text(error: AwsError) -> str | None:
+    """The CLI's whole error output, which the shared client keeps in a file and names at the end of its message, or None when it cannot be found or read.
+
+    The shared client words its message from the first error line it finds, so this guard reads the whole text itself.
+    """
+    found = RAW_TEXT_PATH.search(str(error))
+    if found is None:
+        return None
+    path = RAW_ERRORS.parent.parent / found.group(1)
+    if path.parent != RAW_ERRORS:
+        return None
+    try:
+        return path.read_bytes().decode(errors="replace")
+    except OSError:
+        return None
 
 
 def read_live(aws: Aws, bucket: str) -> dict[str, Any] | None:
-    """The bucket's lifecycle configuration, or None when the error code is exactly ``NoSuchLifecycleConfiguration``. Any other error or answer raises."""
+    """The bucket's lifecycle configuration, or None when the error output is exactly the one error for no configuration. Any other error or answer raises."""
     try:
         document = aws.call("s3api", "get-bucket-lifecycle-configuration", "--bucket", bucket)
     except AwsError as error:
-        if error_code(error) == NO_CONFIGURATION_CODE:
+        text = raw_error_text(error)
+        if text is not None and no_configuration(text):
             return None
-        raise
+        raise AwsError(f"{error}; the error output is not exactly one error line for no configuration, so the read failed") from error
     return live_rules(document)
 
 
