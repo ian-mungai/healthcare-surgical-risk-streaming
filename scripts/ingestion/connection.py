@@ -131,8 +131,19 @@ def destination_definition(tag: str) -> dict[str, str]:
     return pinned_definition(DESTINATION_DEFINITION_NAME, DESTINATION_REPOSITORY, tag, "destination_tag")
 
 
+def require_pinned_payloads(selection: Selection) -> Selection:
+    """The selection itself when every key of it is a payload of the pinned release: one of the two tables or one of the 6,388 case files. Refuse anything else.
+
+    A selection is never empty, so it is a non-empty subset of the pinned payloads. The checksum list and every other file of the release are not payloads.
+    """
+    if not set(selection.source_keys) <= set(full_release_selection().source_keys):
+        raise ConnectionDefinitionError(Notice(Code.CONNECTION_SELECTION))
+    return selection
+
+
 def desired_state(selection: Selection, *, bucket: str, region: str, source_tag: str, destination_tag: str) -> dict[str, Any]:
-    """The document that the module applies. Raise ``ConnectionDefinitionError`` for a bucket, region or tag that is not valid."""
+    """The document that the module applies. Raise ``ConnectionDefinitionError`` for a selection, bucket, region or tag that is not valid."""
+    require_pinned_payloads(selection)
     if BUCKET_NAME.fullmatch(bucket) is None or bucket == selection.source_bucket:
         raise ConnectionDefinitionError(Notice(Code.CONNECTION_BUCKET))
     if REGION_NAME.fullmatch(region) is None:
@@ -169,7 +180,7 @@ def desired_state(selection: Selection, *, bucket: str, region: str, source_tag:
 
 def chosen_selection(arguments: argparse.Namespace) -> Selection:
     if arguments.selection:
-        return Selection.from_json(arguments.selection.read_text())
+        return require_pinned_payloads(Selection.from_json(arguments.selection.read_text()))
     return fixed_sample_selection() if arguments.fixed_sample else full_release_selection()
 
 

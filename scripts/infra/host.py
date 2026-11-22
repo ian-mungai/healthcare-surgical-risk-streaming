@@ -34,7 +34,7 @@ from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, state_json
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
-from scripts.project_config import ROOT, ConfigurationError, load_configuration
+from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
 
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
@@ -49,6 +49,8 @@ SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
+UNSAFE_ANSIBLE_SETTINGS = ("ANSIBLE_DEBUG", "ANSIBLE_KEEP_REMOTE_FILES")
+FALSE_SETTING_VALUES = frozenset({"", "0", "false", "no", "off", "n", "f"})
 GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
@@ -277,8 +279,16 @@ def platform_commit() -> str:
 
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
-    """The Ansible variables of the stack's host settings: the deployed commit and the warehouse location of the configured bucket."""
-    return {"compose_stack_platform_commit": commit, "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"])}
+    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, and the bucket and the AWS
+    profile that Airbyte's connection copies into and with. The profile is checked as a profile name, so no other text reaches the playbook."""
+    if PATTERNS["AWS_PROFILE"].fullmatch(configuration["AWS_PROFILE"]) is None:
+        raise HostError("AWS_PROFILE is not a profile name")
+    return {
+        "compose_stack_platform_commit": commit,
+        "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
+        "airbyte_landing_bucket": configuration["S3_BUCKET"],
+        "airbyte_aws_profile": configuration["AWS_PROFILE"],
+    }
 
 
 def ansible_recap(stdout: str) -> str:
@@ -287,7 +297,20 @@ def ansible_recap(stdout: str) -> str:
     return "".join(f"{line.strip()}\n" for line in recap if RECAP_LINE.fullmatch(line.strip()))
 
 
+def refuse_unsafe_ansible_settings() -> None:
+    """Stop before the playbook runs when Ansible's debug or keep-remote-files setting is on in the environment.
+
+    Either setting prints or keeps the project profile's access key that the Airbyte role places, and the launcher saves the whole output. The playbook's
+    first key task refuses the same settings in every other form (the configuration file).
+    """
+    for name in UNSAFE_ANSIBLE_SETTINGS:
+        value = os.environ.get(name)
+        if value is not None and value.strip().lower() not in FALSE_SETTING_VALUES:
+            raise HostError(f"{name} is set, and it can print or keep the project profile's access key; unset it and run the command again")
+
+
 def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
+    refuse_unsafe_ansible_settings()
     home = ROOT / ".tools" / "ansible"
     settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
     environment = os.environ | settings | {"PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}

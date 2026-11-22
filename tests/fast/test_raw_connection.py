@@ -245,6 +245,71 @@ class PinTest(unittest.TestCase):
         self.assertNotEqual(variables["airbyte_source_s3_digest"], variables["airbyte_destination_s3_digest"])
 
 
+class CustomSelectionTest(unittest.TestCase):
+    """A custom selection is a non-empty subset of the pinned payload keys: the two tables and the 6,388 case files and nothing else."""
+
+    def selection(self, files: list[str]) -> Selection:
+        document = {
+            "name": "custom_set",
+            "release": "1.0.0",
+            "source_bucket": PIN["source"]["bucket"],
+            "source_prefix": PREFIX,
+            "measurement_period": "2016-08 to 2017-06",
+            "checksum_list": {"key": PIN["checksum_list"]["key"], "sha256": PIN["checksum_list"]["sha256"]},
+            "files": files,
+        }
+        return Selection.from_json(json.dumps(document))
+
+    def test_a_selection_of_pinned_payloads_is_accepted(self) -> None:
+        for files in (["clinical_data.csv"], ["vital_files/0001.vital"], ["lab_data.csv", "vital_files/6388.vital", "vital_files/0042.vital"]):
+            with self.subTest(files=files):
+                self.assertEqual(
+                    sorted(f"{PREFIX}{name}" for name in files), sorted(state(self.selection(files))["source"]["configuration"]["streams"][0]["globs"])
+                )
+
+    def test_a_selection_that_names_anything_but_a_pinned_payload_is_refused_by_the_field(self) -> None:
+        for name, files in {
+            "the checksum list": ["SHA256SUMS.txt"],
+            "the checksum list with a payload": ["SHA256SUMS.txt", "clinical_data.csv"],
+            "a file of the release that is no payload": ["LICENSE.txt"],
+            "a case that the release does not have": ["vital_files/9999.vital"],
+            "case zero": ["vital_files/0000.vital"],
+            "a folder": ["vital_files"],
+            "a file of another folder": ["other/0001.vital"],
+        }.items():
+            with self.subTest(name), self.assertRaises(ConnectionDefinitionError) as raised:
+                state(self.selection(files))
+            self.assertIn("selection", str(raised.exception))
+            self.assertNotIn("SHA256SUMS", str(raised.exception))
+
+    def test_the_render_and_the_selection_commands_refuse_such_a_file_and_print_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "custom_set",
+                        "release": "1.0.0",
+                        "source_bucket": PIN["source"]["bucket"],
+                        "source_prefix": PREFIX,
+                        "measurement_period": "2016-08 to 2017-06",
+                        "checksum_list": {"key": PIN["checksum_list"]["key"], "sha256": PIN["checksum_list"]["sha256"]},
+                        "files": ["SHA256SUMS.txt"],
+                    }
+                )
+            )
+            for arguments in (
+                ["render", "--bucket", BUCKET, "--region", REGION, "--source-tag", SOURCE_TAG, "--destination-tag", DESTINATION_TAG, "--selection", str(path)],
+                ["selection", "--selection", str(path)],
+            ):
+                with self.subTest(command=arguments[0]):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                        code = connection.main(arguments)
+                    self.assertEqual((1, ""), (code, output.getvalue()))
+                    self.assertIn("selection", errors.getvalue())
+
+
 class StagingTest(unittest.TestCase):
     def staging_bytes(self, text: str) -> int:
         match = QUANTITY.fullmatch(text)

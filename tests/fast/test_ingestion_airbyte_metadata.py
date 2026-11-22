@@ -83,6 +83,44 @@ class ParseTest(unittest.TestCase):
             self.assertNotIn(MARKER, str(raised.exception))
 
 
+class BoundaryTest(unittest.TestCase):
+    """A metadata path is a path below the landing prefix, and a landed file belongs to one source."""
+
+    def refused(self, path: str) -> str:
+        line = json.dumps({"_airbyte_data": {"file_name": "a.vital", "bytes": 1, "_airbyte_file_path": path}})
+        good = record("vital_files/0001.vital", "landing/Files/s1/vital_files/0001.vital", 1)
+        with self.assertRaises(PairingError) as raised:
+            pairings_from_metadata([good + "\n" + line + "\n"], SOURCE_PREFIX)
+        self.assertIn("line 2", str(raised.exception))
+        self.assertNotIn(path, str(raised.exception))
+        return str(raised.exception)
+
+    def test_a_file_path_that_leaves_the_landing_prefix_or_is_not_a_plain_path_is_refused(self) -> None:
+        for path in ("../x", "/../x", "/a/../b", "/a/./b", "//a/b", "/a//b", "/", "/a/b/", "/a\\b", "/a/..", "/./a", "/a/b\x00c"):
+            with self.subTest(path=path):
+                self.refused(path)
+
+    def test_a_plain_path_with_dots_and_spaces_in_a_name_is_accepted(self) -> None:
+        for path in ("/Files/2026_11_22_1763800000000_/vital_files/0001.vital", "Files/s1/a.b.c", "/Files/s 1/a-b_c.vital", "/.hidden/a..b"):
+            with self.subTest(path=path):
+                line = json.dumps({"_airbyte_data": {"file_name": "0001.vital", "folder": "vital_files", "bytes": 1, "_airbyte_file_path": path}})
+                found = pairings_from_metadata([line], SOURCE_PREFIX)
+                self.assertEqual("landing/" + path.lstrip("/"), found[0].landed_key)
+
+    def test_two_sources_pointing_at_one_landed_file_are_refused_in_the_pairing_step(self) -> None:
+        one = record("vital_files/0001.vital", "landing/Files/s1/shared", 1)
+        two = record("vital_files/0002.vital", "landing/Files/s1/shared", 1)
+        with self.assertRaises(PairingError) as raised:
+            pairings_from_metadata([one + "\n", two + "\n"], SOURCE_PREFIX)
+        self.assertIn("record 2", str(raised.exception))
+        self.assertNotIn("shared", str(raised.exception))
+
+    def test_a_source_that_has_two_records_is_left_to_the_check_as_a_duplicate_pairing(self) -> None:
+        one = record("vital_files/0001.vital", "landing/Files/s1/a", 1)
+        two = record("vital_files/0001.vital", "landing/Files/s2/a", 1)
+        self.assertEqual(2, len(pairings_from_metadata([one + "\n", two + "\n"], SOURCE_PREFIX)))
+
+
 class CommandTest(unittest.TestCase):
     def setUp(self) -> None:
         folder = tempfile.TemporaryDirectory(prefix="ingestion_metadata_")
@@ -174,6 +212,45 @@ class CommandTest(unittest.TestCase):
         code, _, errors = self.check()
         self.assertEqual(1, code)
         self.assertIn("duplicate_pairing", errors)
+
+    def test_a_listed_key_outside_the_landing_prefix_is_refused_before_it_is_read_and_no_pairing_file_is_written(self) -> None:
+        self.put_metadata(self.metadata_lines(self.landed))
+        for key in (
+            "outside/probe.jsonl",
+            "landing/../outside/probe.jsonl",
+            "landing//x.jsonl",
+            "/landing/x.jsonl",
+            "landing/a/../../b.jsonl",
+            "landing/./x.jsonl",
+        ):
+            with self.subTest(key=key):
+                self.store.put_object(key, b"x")
+                version = self.store.list_versions(key)[0]
+                self.store.reads.clear()
+                real = self.store.list_versions
+                with mock.patch.object(self.store, "list_versions", lambda prefix, real=real, version=version: [*real(prefix), version]):
+                    code, _, errors = self.pairings()
+                self.assertEqual(1, code)
+                self.assertIn("outside the landing prefix", errors)
+                self.assertNotIn(key, errors)
+                self.assertEqual([], [read for read in self.store.reads if read.key == key])
+                self.assertFalse((self.folder / "pairings.json").exists())
+                self.store.history.pop(key)
+
+    def test_a_metadata_path_with_a_dot_dot_writes_no_pairing_file(self) -> None:
+        self.put_metadata(record("vital_files/0001.vital", "landing/Files/../../outside/a", 1) + "\n")
+        code, _, errors = self.pairings()
+        self.assertEqual(1, code)
+        self.assertIn("line 1", errors)
+        self.assertFalse((self.folder / "pairings.json").exists())
+
+    def test_two_sources_that_name_one_landed_file_stop_the_command_and_write_no_pairing_file(self) -> None:
+        text = record("vital_files/0001.vital", "landing/Files/s1/shared", 1) + "\n" + record("vital_files/0002.vital", "landing/Files/s1/shared", 1) + "\n"
+        self.put_metadata(text)
+        code, _, errors = self.pairings()
+        self.assertEqual(1, code)
+        self.assertIn("record 2", errors)
+        self.assertFalse((self.folder / "pairings.json").exists())
 
     def test_a_metadata_file_that_is_not_valid_stops_the_command_and_writes_no_pairing_file(self) -> None:
         self.put_metadata(f"not json {MARKER}\n")

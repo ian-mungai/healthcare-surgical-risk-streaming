@@ -8,6 +8,7 @@ value. Real calls over HTTP run in the acceptance test and in the host's live ba
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import http.client
@@ -21,10 +22,11 @@ from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 from scripts.ingestion.connection import desired_state, full_release_selection
-from tests.fast.ansible_support import ROLES
+from tests.fast.ansible_support import ROLES, shared_module
 
 MODULE = ROLES / "airbyte" / "library" / "airbyte_connection.py"
 WORKSPACE = "11111111-1111-1111-1111-111111111111"
@@ -41,6 +43,7 @@ MASKED_FIELDS = {"aws_access_key_id", "aws_secret_access_key", "access_key_id", 
 
 
 def load_module() -> ModuleType:
+    shared_module("secret_files")
     spec = importlib.util.spec_from_file_location("airbyte_connection", MODULE)
     if spec is None or spec.loader is None:
         raise ImportError("the module cannot be loaded")
@@ -404,7 +407,11 @@ class KeyInjectionTest(unittest.TestCase):
         self.assertEqual({"source", "destination"}, set(api.recorded))
         for fingerprint in api.recorded.values():
             self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
-        self.assertEqual({"source": hashlib.sha256(KEY_ID.encode()).hexdigest(), "destination": hashlib.sha256(KEY_ID.encode()).hexdigest()}, api.recorded)
+        expected = {
+            "source": hashlib.sha256(f"{api.only('sources')['sourceId']}\n{KEY_ID}".encode()).hexdigest(),
+            "destination": hashlib.sha256(f"{api.only('destinations')['destinationId']}\n{KEY_ID}".encode()).hexdigest(),
+        }
+        self.assertEqual(expected, api.recorded)
 
     def test_no_message_of_a_failed_run_holds_a_key_value(self) -> None:
         for failing in ("POST /sources", "POST /destinations", "PATCH /sources"):
@@ -488,9 +495,10 @@ class KeyFilesTest(unittest.TestCase):
     def test_the_record_is_written_for_its_owner_only_and_read_back(self) -> None:
         path = self.folder / "record.json"
         MODULE_UNDER_TEST.write_record(path, {"source": "a" * 64})
-        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertEqual(0o400, path.stat().st_mode & 0o777)
         self.assertEqual({"source": "a" * 64}, MODULE_UNDER_TEST.read_record(path))
         self.assertEqual({}, MODULE_UNDER_TEST.read_record(self.folder / "none.json"))
+        path.chmod(0o600)
         path.write_text("not json")
         self.assertEqual({}, MODULE_UNDER_TEST.read_record(path))
 
@@ -506,7 +514,7 @@ class KeyFilesTest(unittest.TestCase):
         api.writes.clear()
         self.assertEqual([], MODULE_UNDER_TEST.apply_document(api, document(), KEYS, path))
         self.assertEqual([], api.writes)
-        self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        self.assertEqual(0o400, path.stat().st_mode & 0o777)
         for value in (KEY_ID, KEY_VALUE):
             self.assertNotIn(value, path.read_text())
 
@@ -515,6 +523,180 @@ class KeyFilesTest(unittest.TestCase):
         for forbidden in ("module.log", "module.debug", "module.warn", "no_log=False"):
             self.assertNotIn(forbidden, text)
         self.assertIsNone(re.search(r"(?<![A-Za-z_])print\(", text))
+
+
+class PlanTest(unittest.TestCase):
+    """The run reads every object and decides the whole plan before it writes: a refusal never follows a write."""
+
+    def build(self) -> FakeAirbyte:
+        api = FakeAirbyte()
+        apply(api)
+        api.writes.clear()
+        api.calls.clear()
+        return api
+
+    def refused_without_a_write(self, api: FakeAirbyte) -> None:
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError):
+            apply(api)
+        self.assertEqual([], api.writes)
+
+    def test_a_drifted_version_and_a_wrongly_linked_connection_give_no_write_call(self) -> None:
+        api = self.build()
+        api.only("source_definitions")["dockerImageTag"] = "latest"
+        api.only("connections")["sourceId"] = "elsewhere"
+        self.refused_without_a_write(api)
+        self.assertEqual("latest", api.only("source_definitions")["dockerImageTag"], "the drifted version is not touched when the run is refused")
+
+    def test_a_drifted_source_and_a_destination_of_another_definition_give_no_write_call(self) -> None:
+        api = self.build()
+        api.only("sources")["configuration"]["streams"][0]["globs"].pop()
+        api.only("destinations")["definitionId"] = "other"
+        self.refused_without_a_write(api)
+
+    def test_a_rotated_key_and_a_wrongly_linked_connection_give_no_write_call(self) -> None:
+        api = self.build()
+        api.keys = {"aws_access_key_id": OTHER_KEY_ID, "aws_secret_access_key": OTHER_KEY_VALUE}
+        api.only("connections")["destinationId"] = "elsewhere"
+        self.refused_without_a_write(api)
+
+    def test_a_missing_definition_with_a_connection_that_cannot_follow_gives_no_write_call(self) -> None:
+        api = self.build()
+        api.objects["destination_definitions"].clear()
+        self.refused_without_a_write(api)
+
+    def test_a_missing_source_with_a_connection_left_over_gives_no_write_call(self) -> None:
+        api = self.build()
+        api.objects["sources"].clear()
+        self.refused_without_a_write(api)
+
+    def test_two_objects_of_one_name_and_a_drift_give_no_write_call(self) -> None:
+        api = self.build()
+        api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
+        twin = copy.deepcopy(api.only("destinations"))
+        twin["destinationId"] = "twin"
+        api.objects["destinations"]["twin"] = twin
+        self.refused_without_a_write(api)
+
+    def test_planning_reads_everything_and_writes_nothing_and_the_plan_names_each_step_in_order(self) -> None:
+        api = self.build()
+        api.only("source_definitions")["dockerImageTag"] = "latest"
+        api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
+        steps = MODULE_UNDER_TEST.plan(api, document(), api.keys, api.recorded)
+        self.assertEqual(["source definition", "connection"], [step.label for step in steps])
+        self.assertEqual([], api.writes)
+        self.assertTrue(all(call.startswith("GET ") for call in api.calls))
+
+    def test_a_clean_plan_applies_in_order_and_a_second_plan_is_empty(self) -> None:
+        api = FakeAirbyte()
+        steps = MODULE_UNDER_TEST.plan(api, document(), api.keys, api.recorded)
+        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], [step.label for step in steps])
+        self.assertEqual([], api.writes)
+
+
+class ActorIdentityTest(unittest.TestCase):
+    def test_the_fingerprint_binds_the_key_to_the_actor_it_was_sent_to(self) -> None:
+        one = MODULE_UNDER_TEST.fingerprint("actor-one", KEYS)
+        self.assertNotEqual(one, MODULE_UNDER_TEST.fingerprint("actor-two", KEYS))
+        self.assertNotEqual(one, MODULE_UNDER_TEST.fingerprint("actor-one", {**KEYS, "aws_access_key_id": OTHER_KEY_ID}))
+        self.assertRegex(one, r"^[0-9a-f]{64}$")
+
+    def test_a_replacement_source_of_the_same_name_gets_the_key_again(self) -> None:
+        api = FakeAirbyte()
+        apply(api)
+        old = api.only("sources")
+        replacement = copy.deepcopy(old)
+        replacement["sourceId"] = "99999999-9999-9999-9999-999999999999"
+        for name in ("aws_access_key_id", "aws_secret_access_key"):
+            replacement["configuration"]["credentials"].pop(name)
+        api.objects["sources"] = {replacement["sourceId"]: replacement}
+        api.only("connections")["sourceId"] = replacement["sourceId"]
+        api.writes.clear()
+        self.assertEqual(["source"], apply(api))
+        self.assertEqual({"aws_access_key_id": KEY_ID, "aws_secret_access_key": KEY_VALUE}, stored_values(api, "sources"))
+        api.writes.clear()
+        self.assertEqual([], apply(api))
+
+    def test_a_replacement_destination_of_the_same_name_gets_the_key_again(self) -> None:
+        api = FakeAirbyte()
+        apply(api)
+        replacement = copy.deepcopy(api.only("destinations"))
+        replacement["destinationId"] = "88888888-8888-8888-8888-888888888888"
+        for name in ("access_key_id", "secret_access_key"):
+            replacement["configuration"].pop(name)
+        api.objects["destinations"] = {replacement["destinationId"]: replacement}
+        api.only("connections")["destinationId"] = replacement["destinationId"]
+        self.assertEqual(["destination"], apply(api))
+        self.assertEqual({"access_key_id": KEY_ID, "secret_access_key": KEY_VALUE}, stored_values(api, "destinations"))
+
+
+class RecordFileTest(unittest.TestCase):
+    def setUp(self) -> None:
+        folder = tempfile.TemporaryDirectory(prefix="airbyte_record_file_")
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+
+    def test_a_record_does_not_inherit_the_permissions_of_a_file_that_was_already_there(self) -> None:
+        path = self.folder / "record.json"
+        for name in (".record.json.new", ".record.json.deadbeef.new"):
+            planted = self.folder / name
+            planted.write_text("planted")
+            planted.chmod(0o666)
+        MODULE_UNDER_TEST.write_record(path, {"source": "a" * 64})
+        self.assertEqual(0o400, path.stat().st_mode & 0o777)
+        self.assertFalse((self.folder / ".record.json.deadbeef.new").exists(), "a leftover of this module's temporary name is removed")
+        self.assertEqual("planted", (self.folder / ".record.json.new").read_text(), "a file of another name is left alone")
+        self.assertNotIn("planted", path.read_text())
+
+    def test_a_record_that_exists_with_broader_permissions_is_replaced_by_an_owner_only_file(self) -> None:
+        path = self.folder / "record.json"
+        path.write_text("{}")
+        path.chmod(0o666)
+        MODULE_UNDER_TEST.write_record(path, {"source": "b" * 64})
+        self.assertEqual(0o400, path.stat().st_mode & 0o777)
+        self.assertEqual({"source": "b" * 64}, MODULE_UNDER_TEST.read_record(path))
+
+    def test_a_write_cut_short_leaves_the_old_record_whole(self) -> None:
+        path = self.folder / "record.json"
+        MODULE_UNDER_TEST.write_record(path, {"source": "a" * 64})
+        with mock.patch("ansible.module_utils.secret_files.os.fsync", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            MODULE_UNDER_TEST.write_record(path, {"source": "c" * 64})
+        self.assertEqual({"source": "a" * 64}, MODULE_UNDER_TEST.read_record(path))
+
+
+class DeadlineTest(unittest.TestCase):
+    def call(self, code: int, output: str = "", error: str = "") -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def run(arguments: list[str]) -> tuple[int, str, str]:
+            calls.append(arguments)
+            return code, output, error
+
+        with contextlib.suppress(MODULE_UNDER_TEST.ApiError):
+            MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte")
+        return calls
+
+    def test_the_kubectl_call_carries_its_own_deadline(self) -> None:
+        (arguments,) = self.call(1)
+        self.assertIn(f"--request-timeout={MODULE_UNDER_TEST.KUBECTL_SECONDS}s", arguments)
+        self.assertGreater(MODULE_UNDER_TEST.KUBECTL_SECONDS, 0)
+
+    def test_a_kubectl_that_times_out_or_fails_is_a_named_error_without_its_text(self) -> None:
+        def run(arguments: list[str]) -> tuple[int, str, str]:
+            return 1, "", f"Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded) {HIDDEN_TWO}"
+
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte")
+        self.assertIn("airbyte-auth-secrets", str(raised.exception))
+        self.assertIn("airbyte", str(raised.exception))
+        self.assertNotIn(HIDDEN_TWO, str(raised.exception))
+        self.assertNotIn("Timeout", str(raised.exception))
+
+    def test_the_module_reads_the_credentials_through_that_call_and_the_task_has_a_deadline_too(self) -> None:
+        text = MODULE.read_text()
+        self.assertIn("client_credentials(lambda arguments: module.run_command(arguments, check_rc=False)", text)
+        self.assertIn("--request-timeout=", text)
+        tasks = (ROLES / "airbyte" / "tasks" / "connection.yml").read_text()
+        self.assertIn('timeout: "{{ airbyte_connection_deadline_seconds | int + 60 }}"', tasks)
 
 
 class CoverTest(unittest.TestCase):
@@ -560,11 +742,31 @@ class CredentialsTest(unittest.TestCase):
                 self.assertNotIn(value, str(raised.exception))
 
 
+class Clock:
+    """The time that a test lets pass: each read of a reply advances it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 class HttpTest(unittest.TestCase):
+    class Socket:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
     class Connection:
-        def __init__(self, status: int, text: str, failure: Exception | None, log: list[Any]) -> None:
+        def __init__(self, status: int, text: str, failure: Exception | None, log: list[Any], clock: Clock, header_seconds: float, read_seconds: float) -> None:
             self.status, self.text, self.failure, self.log = status, text, failure, log
+            self.clock, self.header_seconds, self.read_seconds = clock, header_seconds, read_seconds
             self.closed = False
+            self.sock = HttpTest.Socket()
+            self.sent = 0
 
         def request(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> None:
             self.log.append((method, url, body, headers))
@@ -574,26 +776,70 @@ class HttpTest(unittest.TestCase):
         def getresponse(self) -> HttpTest.Connection:
             if self.failure:
                 raise self.failure
+            self.clock.now += self.header_seconds
             return self
 
-        def read(self) -> bytes:
-            return self.text.encode()
+        def read(self, amount: int | None = None) -> bytes:
+            data = self.text.encode()[self.sent :] if amount is None else self.text.encode()[self.sent : self.sent + amount]
+            self.sent += len(data)
+            self.clock.now += self.read_seconds
+            return data
 
         def close(self) -> None:
             self.closed = True
 
-    def api(self, status: int = 200, text: str = "{}", failure: Exception | None = None, base: str = "http://127.0.0.1:8000/api/public/v1") -> Any:
+    def api(
+        self,
+        status: int = 200,
+        text: str = "{}",
+        failure: Exception | None = None,
+        base: str = "http://127.0.0.1:8000/api/public/v1",
+        *,
+        header_seconds: float = 0.0,
+        read_seconds: float = 0.0,
+        limit: float = 7,
+    ) -> Any:
         log: list[Any] = []
         made: list[HttpTest.Connection] = []
+        clock = Clock()
 
         def connect(host: str, port: int, timeout: float) -> HttpTest.Connection:
             log.append((host, port, timeout))
-            made.append(HttpTest.Connection(status, text, failure, log))
+            made.append(HttpTest.Connection(status, text, failure, log, clock, header_seconds, read_seconds))
             return made[-1]
 
-        client = MODULE_UNDER_TEST.HttpApi(base, lambda: HIDDEN_THREE, timeout_seconds=7, connect=connect)
+        client = MODULE_UNDER_TEST.HttpApi(base, lambda: HIDDEN_THREE, timeout_seconds=limit, connect=connect, clock=clock)
         client.log, client.made = log, made
         return client
+
+    def test_a_reply_that_trickles_in_pieces_past_the_deadline_is_a_timeout_even_though_each_piece_is_quick(self) -> None:
+        client = self.api(text="x" * 100_000, read_seconds=0.11, limit=0.25)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            client.request("GET", "/workspaces")
+        self.assertIn("GET /workspaces did not answer within 0.25 seconds", str(raised.exception))
+        self.assertTrue(client.made[0].closed)
+        self.assertLessEqual(len(client.made[0].sock.timeouts), 4, "the read stops at the deadline and does not read on")
+
+    def test_each_read_gets_the_time_that_is_left_as_its_socket_timeout(self) -> None:
+        client = self.api(text="y" * 150_000, read_seconds=0.5, limit=1.2)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError):
+            client.request("GET", "/workspaces")
+        timeouts = client.made[0].sock.timeouts
+        self.assertGreaterEqual(len(timeouts), 2)
+        self.assertEqual(sorted(timeouts, reverse=True), timeouts)
+        self.assertTrue(all(0 < value <= 1.2 for value in timeouts))
+        self.assertLess(timeouts[1], timeouts[0])
+
+    def test_a_slow_start_of_the_reply_that_uses_the_whole_deadline_is_a_timeout(self) -> None:
+        client = self.api(text='{"data": []}', header_seconds=1.0, limit=0.5)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            client.request("GET", "/workspaces")
+        self.assertIn("did not answer within 0.5 seconds", str(raised.exception))
+
+    def test_a_reply_in_many_quick_pieces_is_put_together_whole(self) -> None:
+        body = {"data": [{"name": "n" * 50} for _ in range(5000)]}
+        client = self.api(text=json.dumps(body), read_seconds=0.001, limit=5)
+        self.assertEqual(body, client.request("GET", "/sources"))
 
     def test_a_call_goes_to_the_local_address_with_the_bearer_token_a_deadline_and_the_json_body(self) -> None:
         client = self.api(text='{"data": []}')

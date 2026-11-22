@@ -30,6 +30,7 @@ import argparse
 import dataclasses
 import json
 import os
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -117,9 +118,17 @@ def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
     return 0
 
 
+def inside_landing(key: str) -> bool:
+    """Whether a listed key is a plain key below the landing prefix: it starts with the prefix and is its own normal form (no ``..``, ``.`` or empty part)."""
+    return key.startswith(LANDING_PREFIX) and posixpath.normpath(key) == key
+
+
 def command_pairings(store: S3Store, arguments: argparse.Namespace) -> int:
     """Read every current metadata file under the landing prefix, and only those, and write the pairing records sorted by source key."""
-    versions = [item for item in store.list_versions(LANDING_PREFIX) if item.is_latest and not item.is_delete_marker and item.key.endswith(METADATA_SUFFIX)]
+    listed = store.list_versions(LANDING_PREFIX)
+    if any(not inside_landing(item.key) for item in listed):
+        raise InputError(Notice(Code.LISTED_OUTSIDE))
+    versions = [item for item in listed if item.is_latest and not item.is_delete_marker and item.key.endswith(METADATA_SUFFIX)]
     if not versions:
         raise InputError(Notice(Code.NO_METADATA))
     try:

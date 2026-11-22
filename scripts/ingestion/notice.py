@@ -135,6 +135,7 @@ class Cause(StrEnum):
     BUCKET_DIFFERS = "bucket_differs"
     VERSION_SUBSTITUTED = "version_substituted"
     SIZE_DIFFERS = "size_differs"
+    LANDED_SHARED = "landed_shared"
 
 
 @unique
@@ -274,6 +275,9 @@ class Code(StrEnum):
     BUILD_NEEDS_OUTPUT = "build needs --output"
     WROTE = "wrote {count} candidates; the checksum list, the clinical table and the track list match their pins"
     CHECKED = "{count} tracked candidates equal the rebuild and match the pinned checksum list (seed {total})"
+    CONNECTION_SELECTION = "the selection names a file that is not a payload of the pinned release; only the two tables and the case files may be copied"
+    LISTED_OUTSIDE = "a listed key is outside the landing prefix, so nothing was read"
+    PAIRING_LANDED_TWICE = "metadata record {position} pairs a landed file that an earlier record pairs with another source"
     CONNECTION_BUCKET = "the bucket is not a valid bucket name of the project, or it is the publisher's bucket"
     CONNECTION_REGION = "the region is not an AWS region name"
     METADATA_LINE = "line {position} of a metadata file is not a record of a file name, a byte count and a file path"

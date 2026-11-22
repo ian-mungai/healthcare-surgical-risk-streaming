@@ -3,9 +3,12 @@
 The deployment reads the key on the owner's computer with the AWS command line (``aws configure export-credentials --format process``) and hands the
 command's answer to this module as one hidden argument. The module reads the answer in memory and refuses a profile that yields a session token, because the
 connectors take an IAM user's own key. It writes ``airbyte/aws_access_key_id`` and ``airbyte/aws_secret_access_key`` under the secrets folder, owned like
-every secret file that no container reads, with mode 0400 from the moment each exists. A file that holds another value is replaced atomically (a rotated
-key), a file with another mode or owner is given the right ones, and a second run changes nothing. No value is in the module's output, its messages or its
-logs. It uses only the standard library and runs on the host's Python.
+every secret file that no container reads, with mode 0400. Each file is written through a fresh temporary file that is flushed and synced before it takes its
+place, so a file is whole or absent and never empty. The leftovers of an interrupted write are removed at the next run, an empty or short file is replaced like
+a changed one (a rotated key), a file with another mode or owner is given the right ones, and a second run changes nothing.
+
+The module never fails with text that could hold a value. It always returns ``reason``, one of a fixed set of codes (``REASONS``), and the playbook prints the
+message that belongs to the code. It uses only the standard library and runs on the host's Python.
 """
 
 from __future__ import annotations
@@ -15,39 +18,56 @@ import re
 from pathlib import Path
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.secret_files import SecretFileError, access_differs, parse_owner, read_file, set_access, write_private_file
+from ansible.module_utils.secret_files import SecretFileError, access_differs, parse_owner, remove_leftovers, set_access, write_private_file
 
 FOLDER = "airbyte"
 ID_FILE = "aws_access_key_id"
 VALUE_FILE = "aws_secret_access_key"
 KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
 KEY_VALUE_FORM = re.compile(r"[A-Za-z0-9/+=]{20,128}")
+REASONS = ("ok", "session_token", "not_a_static_key", "empty", "export_failed", "cannot_write")
 
 
 class KeyFormError(RuntimeError):
-    """The key cannot be used. The message names a cause and the profile and never a value."""
+    """The key cannot be used. The error holds a reason code and no other text, so nothing of an answer can be in it."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
-def parse_export(text: str, exit_code: int, profile: str) -> tuple[str, str]:
-    """The access key ID and the secret from the answer of the AWS command line. Raise ``KeyFormError`` for anything that is not a static key."""
+def parse_export(text: str, exit_code: int) -> tuple[str, str]:
+    """The access key ID and the secret from the answer of the AWS command line. Raise ``KeyFormError`` with a code for anything that is not a static key."""
     if exit_code != 0:
-        raise KeyFormError(
-            f"the AWS command line could not export the credentials of the profile {profile} (exit status {exit_code}); run it by hand to see why"
-        )
+        raise KeyFormError("export_failed")
+    if not text.strip():
+        raise KeyFormError("empty")
     try:
         document = json.loads(text)
     except ValueError:
         document = None
-    if not isinstance(document, dict) or not isinstance(document.get("AccessKeyId"), str) or not isinstance(document.get("SecretAccessKey"), str):
-        raise KeyFormError(f"the answer for the profile {profile} is not the process credential form with an AccessKeyId and a SecretAccessKey")
+    if not isinstance(document, dict):
+        raise KeyFormError("not_a_static_key")
     if "SessionToken" in document:
-        raise KeyFormError(
-            f"the profile {profile} yields a session token; Airbyte's connectors need the own access key of an IAM user, not a temporary credential"
-        )
-    key_id, value = document["AccessKeyId"], document["SecretAccessKey"]
+        raise KeyFormError("session_token")
+    key_id, value = document.get("AccessKeyId"), document.get("SecretAccessKey")
+    if not isinstance(key_id, str) or not isinstance(value, str):
+        raise KeyFormError("not_a_static_key")
+    if not key_id or not value:
+        raise KeyFormError("empty")
     if KEY_ID_FORM.fullmatch(key_id) is None or KEY_VALUE_FORM.fullmatch(value) is None:
-        raise KeyFormError(f"the access key of the profile {profile} is not in the form of an AWS access key")
+        raise KeyFormError("not_a_static_key")
     return key_id, value
+
+
+def current_value(path: Path) -> str | None:
+    """What the file holds, or ``None`` when it is absent. An empty file holds the empty text, which no key equals."""
+    try:
+        return path.read_text().rstrip("\n")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        raise KeyFormError("cannot_write") from None
 
 
 def place_key(directory: Path, owner: tuple[int, int], key_id: str, value: str, *, check_only: bool = False) -> list[str]:
@@ -56,10 +76,10 @@ def place_key(directory: Path, owner: tuple[int, int], key_id: str, value: str, 
     for name, wanted in ((VALUE_FILE, value), (ID_FILE, key_id)):
         path = directory / FOLDER / name
         try:
-            if not path.exists():
-                if not check_only:
-                    write_private_file(path, wanted, replace=False, owner=owner)
-            elif read_file(path, f"key file {name}") != wanted:
+            if not check_only and path.parent.exists():
+                remove_leftovers(path)
+            held = current_value(path)
+            if held != wanted:
                 if not check_only:
                     write_private_file(path, wanted, replace=True, owner=owner)
             elif access_differs(path, owner):
@@ -67,8 +87,8 @@ def place_key(directory: Path, owner: tuple[int, int], key_id: str, value: str, 
                     set_access(path, owner)
             else:
                 continue
-        except SecretFileError as error:
-            raise KeyFormError(str(error)) from None
+        except (SecretFileError, OSError):
+            raise KeyFormError("cannot_write") from None
         changed.append(name)
     return changed
 
@@ -78,7 +98,6 @@ def main() -> None:
         argument_spec={
             "exported": {"type": "str", "required": True, "no_log": True},
             "exit_code": {"type": "int", "required": True},
-            "profile": {"type": "str", "required": True},
             "secrets_directory": {"type": "path", "required": True},
             "root_owner": {"type": "str", "default": "0:0"},
         },
@@ -86,11 +105,13 @@ def main() -> None:
     )
     params = module.params
     try:
-        key_id, value = parse_export(params["exported"], params["exit_code"], params["profile"])
+        key_id, value = parse_export(params["exported"], params["exit_code"])
         changed = place_key(Path(params["secrets_directory"]), parse_owner(params["root_owner"], allow_root=True), key_id, value, check_only=module.check_mode)
-        module.exit_json(changed=bool(changed), files=changed)
-    except (KeyFormError, SecretFileError) as error:
-        module.fail_json(msg=str(error))
+    except KeyFormError as error:
+        module.exit_json(changed=False, reason=error.code, files=[])
+    except SecretFileError:
+        module.exit_json(changed=False, reason="cannot_write", files=[])
+    module.exit_json(changed=bool(changed), reason="ok", files=changed)
 
 
 if __name__ == "__main__":

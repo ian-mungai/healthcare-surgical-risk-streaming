@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest import mock
 
 from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
@@ -149,6 +150,57 @@ class SecretFileTest(unittest.TestCase):
         self.assertEqual(("first", 0o400, 0o700), first)
         self.assertEqual(("second", 0o400), second)
         self.assertEqual(["a.secret_id"], leftovers)
+
+    def test_a_write_that_is_cut_short_never_leaves_an_empty_final_file_and_the_retry_removes_its_leftover(self) -> None:
+        for replace in (False, True):
+            with self.subTest(replace=replace), tempfile.TemporaryDirectory() as scratch:
+                path = Path(scratch) / "a.secret_id"
+                if replace:
+                    store_module.write_private_file(path, "old", replace=False, owner=MY_OWNER)
+                with mock.patch.object(store_module.os, "fsync", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+                    store_module.write_private_file(path, "new value", replace=replace, owner=MY_OWNER)
+                self.assertEqual("old" if replace else None, path.read_text() if path.exists() else None)
+                store_module.write_private_file(path, "final", replace=True, owner=MY_OWNER)
+                self.assertEqual("final", path.read_text())
+                self.assertEqual(["a.secret_id"], sorted(item.name for item in path.parent.iterdir()))
+
+    def test_a_temporary_file_is_private_from_the_moment_it_exists_and_is_synced_before_it_takes_its_place(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "a.secret_id"
+            seen: list[tuple[str, int]] = []
+            real_fsync, real_replace = os.fsync, os.replace
+
+            def fsync(descriptor: int) -> None:
+                seen.append(("fsync", max(stat.S_IMODE(item.stat().st_mode) for item in path.parent.iterdir())))
+                real_fsync(descriptor)
+
+            def replace(source: object, target: object) -> None:
+                seen.append(("replace", 0))
+                real_replace(source, target)  # type: ignore[arg-type]
+
+            with mock.patch.object(store_module.os, "fsync", fsync), mock.patch.object(store_module.os, "replace", replace):
+                store_module.write_private_file(path, "x", replace=True, owner=MY_OWNER)
+        self.assertEqual(["fsync", "replace"], [name for name, _ in seen])
+        self.assertEqual(0o400, seen[0][1])
+
+    def test_only_the_leftovers_of_the_same_file_are_removed_at_the_start_of_a_write(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            mine, other, plain = folder / ".a.secret_id.deadbeef.new", folder / ".b.secret_id.deadbeef.new", folder / "a.secret_id.new"
+            for leftover in (mine, other, plain):
+                leftover.write_text("a value that an interrupted write left")
+            store_module.write_private_file(folder / "a.secret_id", "x", replace=False, owner=MY_OWNER)
+            left = sorted(item.name for item in folder.iterdir())
+        self.assertEqual([".b.secret_id.deadbeef.new", "a.secret_id", "a.secret_id.new"], left)
+
+    def test_a_write_that_must_not_replace_refuses_an_existing_file_and_keeps_it(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "a"
+            store_module.write_private_file(path, "first", replace=False, owner=MY_OWNER)
+            with self.assertRaises(FileExistsError):
+                store_module.write_private_file(path, "second", replace=False, owner=MY_OWNER)
+            self.assertEqual("first", path.read_text())
+            self.assertEqual(["a"], sorted(item.name for item in path.parent.iterdir()))
 
     def test_any_mode_but_0400_differs_and_so_does_any_owner_but_the_one_asked_for(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

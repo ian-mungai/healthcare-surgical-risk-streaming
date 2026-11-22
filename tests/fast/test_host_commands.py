@@ -570,6 +570,8 @@ class HostUpTest(unittest.TestCase):
                 "workload_access_workloads": [],
                 "compose_stack_platform_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
+                "airbyte_landing_bucket": "example-bucket",
+                "airbyte_aws_profile": "example_project_dev",
             },
             calls["run_ansible"].call_args.args[2],
         )
@@ -714,11 +716,21 @@ class WorkloadVariablesTest(unittest.TestCase):
 
 
 class DeployVariablesTest(unittest.TestCase):
-    def test_the_deploy_gets_the_commit_it_deploys_and_the_warehouse_location_of_the_configured_bucket(self) -> None:
+    def test_the_deploy_gets_the_commit_it_deploys_the_warehouse_location_and_the_bucket_and_profile_of_the_connection(self) -> None:
         self.assertEqual(
-            {"compose_stack_platform_commit": "b" * 40, "compose_stack_warehouse_location": "s3://example-bucket/warehouse/"},
+            {
+                "compose_stack_platform_commit": "b" * 40,
+                "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
+                "airbyte_landing_bucket": "example-bucket",
+                "airbyte_aws_profile": "example_project_dev",
+            },
             host.deploy_variables(CONFIGURATION, "b" * 40),
         )
+
+    def test_a_profile_that_is_not_a_profile_name_stops_the_deploy_before_ansible_runs(self) -> None:
+        for profile in ("", "has space", "a;b", "$(x)"):
+            with self.subTest(profile=profile), self.assertRaises(HostError):
+                host.deploy_variables(CONFIGURATION | {"AWS_PROFILE": profile}, "b" * 40)
 
     def test_a_bucket_name_that_s3_refuses_stops_the_deploy_before_ansible_runs(self) -> None:
         with self.assertRaises(WarehouseError):
@@ -771,6 +783,38 @@ class AnsibleRunTest(unittest.TestCase):
             mode = stat.S_IMODE((folder / "runs" / "run-one" / "raw" / "ansible_output.txt").stat().st_mode)
         self.assertEqual(0o600, mode)
         return output.getvalue(), message, raw
+
+    def refused(self, **environment: str) -> tuple[str | None, bool]:
+        """Run the launcher with the given Ansible settings in its environment and return its refusal and whether the playbook program ran."""
+        with fake_tools({"Peer": {}}, INSTANCE) as folder:
+            tool = folder / ".venv" / "bin" / "ansible-playbook"
+            tool.parent.mkdir(parents=True)
+            ran = folder / "ran"
+            tool.write_text(f"#!/bin/sh\ntouch {ran}\n")
+            tool.chmod(stat.S_IRWXU)
+            (folder / "ansible").mkdir()
+            with mock.patch.dict(os.environ, environment), mock.patch.object(terraform_wrapper, "ROOT", folder), contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    run_ansible("run-one", "platform-dev.example.ts.net", {})
+                except HostError as error:
+                    return str(error), ran.exists()
+            return None, ran.exists()
+
+    def test_the_launcher_refuses_the_ansible_settings_that_print_or_keep_a_secret_and_runs_nothing(self) -> None:
+        for name in ("ANSIBLE_DEBUG", "ANSIBLE_KEEP_REMOTE_FILES"):
+            for value in ("True", "true", "1", "yes", "anything"):
+                with self.subTest(name=name, value=value):
+                    message, ran = self.refused(**{name: value})
+                    self.assertIsNotNone(message)
+                    self.assertIn(name, message or "")
+                    self.assertFalse(ran)
+
+    def test_the_launcher_runs_when_those_settings_are_off_or_absent(self) -> None:
+        for environment in ({}, {"ANSIBLE_DEBUG": "False"}, {"ANSIBLE_KEEP_REMOTE_FILES": "0"}, {"ANSIBLE_DEBUG": "no", "ANSIBLE_KEEP_REMOTE_FILES": "false"}):
+            with self.subTest(environment=environment):
+                message, ran = self.refused(**environment)
+                self.assertIsNone(message)
+                self.assertTrue(ran)
 
     def test_a_failed_setup_names_only_the_failure_and_the_file_that_keeps_the_output(self) -> None:
         printed, message, raw = self.run_it(exit_code=2)

@@ -199,7 +199,8 @@ def run_check(
     """Check every selected file of the set and return the result. Raise ``PinnedListError`` before any read when the list is not the pinned one.
 
     ``pairings`` pairs each source key with the landed key and size that its sync wrote. A file with no record is missing; two records for one
-    file, a landed key with no current object and a record whose size differs from the landed object each fail that file without reading it.
+    file, a landed key that another source is also paired with (a landed version stands for one source), a landed key with no current object and a record
+    whose size differs from the landed object each fail that file without reading it.
     A finding holds a file's source key only when the pinned list names its path: the selection's source prefix is the tracked pin's, so that key is
     verified. Any other file is named by its place in the sorted selection, so a value that nothing verified never reaches a message or the result.
     """
@@ -211,6 +212,9 @@ def run_check(
     recorded: dict[str, list[PairingRecord]] = defaultdict(list)
     for record in pairings:
         recorded[record.source_key].append(record)
+    sources_of: dict[str, set[str]] = defaultdict(set)
+    for record in pairings:
+        sources_of[record.landed_key].add(record.source_key)
     files: list[CheckedFile] = []
     findings: list[Finding] = []
     for done, path in enumerate(selection.files, 1):
@@ -224,6 +228,8 @@ def run_check(
             findings.append(Finding(done, Cause.MISSING, verified))
         elif len(records) > 1:
             findings.append(Finding(done, Cause.DUPLICATE_PAIRING, verified))
+        elif len(sources_of[records[0].landed_key]) > 1:
+            findings.append(Finding(done, Cause.LANDED_SHARED, verified))
         elif version is None or version.is_delete_marker:
             findings.append(Finding(done, Cause.LANDED_OBJECT_MISSING, verified))
         elif version.version_id in NULL_VERSION_IDS:
