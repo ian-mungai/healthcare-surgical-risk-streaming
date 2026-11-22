@@ -17,6 +17,7 @@ services:
         condition: service_healthy
     environment:
       PLATFORM_COMMIT: ${PLATFORM_COMMIT:-unknown}
+      NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
     configs:
       - source: dagster_limits
         target: /opt/dagster/limits.yml

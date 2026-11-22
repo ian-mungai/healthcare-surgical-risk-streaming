@@ -24,7 +24,8 @@ COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b
     /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 COPY --from=stack_scripts __init__.py process.py project_config.py /opt/dagster/app/scripts/
-COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/limits.py stack/yaml_text.py /opt/dagster/app/scripts/stack/
+COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/limits.py stack/nessie.py stack/yaml_text.py \
+    /opt/dagster/app/scripts/stack/
 COPY --from=stack_compose compose.yml limits.yml /opt/dagster/stack/compose/
 COPY --from=stack_compose services /opt/dagster/stack/compose/services
 

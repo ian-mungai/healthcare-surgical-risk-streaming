@@ -147,7 +147,9 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_then_starts_the_rest_and_makes_openbao_match_the_list(self) -> None:
+    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_gives_nessie_its_first_commit_and_makes_openbao_match(
+        self,
+    ) -> None:
         self.assertEqual(
             [
                 "place_files.yml",
@@ -161,6 +163,7 @@ class StepOrderTest(unittest.TestCase):
                 "provision.yml",
                 "openbao/prepare.yml",
                 "start.yml all",
+                "nessie.yml",
                 "kafka.yml",
                 "registry.yml",
                 "openbao/bootstrap.yml",

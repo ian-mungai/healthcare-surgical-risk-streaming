@@ -1,0 +1,9 @@
+# Reads compose_stack_docker and compose_stack_nessie_namespace. Nessie cannot merge into a branch that has no commit, so the deploy gives main its first
+# commit, the project's namespace, from the code location container, which holds the project's Nessie client and reaches Nessie on the Compose network.
+# The command commits only when main's history is empty, so a second deploy changes nothing.
+- name: Give Nessie's main branch its first commit, the project's namespace, when its history is empty
+  ansible.builtin.command:
+    argv: "{{ compose_stack_docker + ['exec', '-T', 'dagster_code_location', 'python', '-m', 'scripts.stack.nessie', 'initialise', '--namespace', compose_stack_nessie_namespace] }}"
+  register: compose_stack_nessie
+  changed_when: compose_stack_nessie.stdout.startswith('initialised')
+  timeout: 120

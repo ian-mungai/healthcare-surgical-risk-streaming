@@ -86,6 +86,8 @@ compose_stack_built_images:
     sources: [replay, scripts, tests]
     context: "."
     dockerfile: replay/Dockerfile
+# The namespace of the first commit that the deploy gives Nessie's main branch.
+compose_stack_nessie_namespace: surgical_risk
 # An empty project name keeps the one fixed name in compose.yml.
 compose_stack_project: ""
 # Each deadline is in seconds. The start deadline covers pulling the images and the health deadline each service's health check.

@@ -3,18 +3,30 @@
 A batch run writes to a private branch and merges it after its checks pass. A reported run tags the hash of the merged data. A training run reads a
 reference's hash. Every call has a deadline. A refusal is an error that carries Nessie's own error code, and a refusal caused by a hash that no longer
 matches is a ``NessieConflict``. Nessie's free edition as deployed here has no sign-in, so the client sends no credential.
+
+The command line is the deploy's step that gives main its first commit, which every later merge needs. It runs in the code location container, which
+reaches Nessie on the Compose network at ``NESSIE_URI``:
+
+``python -m scripts.stack.nessie initialise --namespace surgical_risk``
+
+It commits the namespace only when main's history is empty and says ``initialised``; otherwise it says ``unchanged``, so a second run changes nothing.
 """
 
 from __future__ import annotations
 
+import argparse
 import http.client
 import json
+import os
+import re
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
+NAMESPACE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 CONFLICT_STATUS = 409
 BODY_LIMIT_BYTES = 1_000_000
 
@@ -167,3 +179,34 @@ class NessieClient:
                 f"merge of {source} into {target} was not applied (wasApplied {result.get('wasApplied')}, wasSuccessful {result.get('wasSuccessful')})"
             )
         return str(result["resultantTargetHash"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Give main its first commit when its history is empty. Exit 0 when main has its first commit, 1 when Nessie fails or refuses, 2 for bad input."""
+    parser = argparse.ArgumentParser(prog="scripts.stack.nessie", description="Give Nessie's main branch its first commit, a namespace, once.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    initialise = commands.add_parser("initialise")
+    initialise.add_argument("--namespace", required=True, help="the namespace of the first commit: lower-case letters, digits and underscores")
+    initialise.add_argument("--branch", default="main")
+    arguments = parser.parse_args(argv)
+    uri = os.environ.get("NESSIE_URI", "")
+    if not uri:
+        sys.stderr.write("NESSIE_URI is not set: it names Nessie's API, such as http://nessie:19120/api/v2\n")
+        return 2
+    if not NAMESPACE.fullmatch(arguments.namespace):
+        sys.stderr.write("the namespace must be lower-case letters, digits and underscores, starting with a letter\n")
+        return 2
+    try:
+        created = NessieClient(uri).initialise(arguments.branch, arguments.namespace)
+    except NessieError as error:
+        sys.stderr.write(f"{error}\n")
+        return 1
+    if created:
+        sys.stdout.write(f"initialised: {arguments.branch} has its first commit, the namespace {arguments.namespace}\n")
+    else:
+        sys.stdout.write(f"unchanged: {arguments.branch} already has a commit\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
