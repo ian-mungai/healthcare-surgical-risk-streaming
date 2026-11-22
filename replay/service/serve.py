@@ -14,14 +14,18 @@ archived and a delayed submit can never put back a request that was archived mea
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
 reference fails at once with its reason. A request that already has a finished or failed result is only moved: it is never run again and its result is never
-written again. A result file that is not a valid terminal result (bad JSON, not an object, no ``finished`` or ``failed`` outcome) is logged, kept beside its
-place as ``<name>.json.invalid`` for inspection and treated as no result. A run that a stop signal ends stays in the inbox, so the restarted service runs it
+written again. A result file that is not a valid terminal result (larger than 64 KiB, not a regular file, not UTF-8 or JSON, too deeply nested, not an
+object, no ``finished`` or ``failed`` outcome) is logged, kept beside its place as ``<name>.json.invalid`` for inspection and treated as no result; judging it
+can never raise. A run that a stop signal ends stays in the inbox, so the restarted service runs it
 again and the replay resumes from its saved position.
 
 Before it starts a request, ``serve`` adds one to the count in ``<run ID>.attempts`` beside it. A request that is found with the count at 3 has stopped the
 service three times, whatever the error was, so it fails with that reason and is archived without a replay and the next request runs. A planned stop ends
 every wait of the replay at once (``stopping.py``), so the service stops within the grace period of its container, the position is saved and the count is put
-back: only a start that did not end cleanly counts. An arithmetic or value error of a replay fails that request at once.
+back: only a start that did not end cleanly counts. A result, finished or failed, is never written once the stop flag was seen: a request that ends in a
+refusal, an error or a finish after the stop arrived stays queued with its count put back, and the next start repeats it. An arithmetic or value error of a
+replay fails that request at once. Recorded limit: one operation already running when the stop arrives (a verification, one case's decode) is not
+interrupted; if it outlasts the grace period the container is killed and that start counts as an attempt.
 
 The health file says whether the service waits, runs or stopped and when it last made progress. ``healthy`` is the container's health check: a waiting or
 running service whose file is fresh and was not written in the future.
@@ -36,6 +40,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
@@ -53,6 +58,7 @@ TERMINAL_OUTCOMES = {"finished": "done", "failed": "failed"}
 RESERVED = "reserved"
 LOCKS = "locks"
 INVALID_SUFFIX = ".invalid"
+RESULT_LIMIT_BYTES = 64 * 1024
 REFERENCE_SUFFIX = ".reference"
 ATTEMPTS_SUFFIX = ".attempts"
 MAX_ATTEMPTS = 3
@@ -158,28 +164,39 @@ def archive(inbox: Path, request: Path, kind: str) -> None:
         attempts_of(request).unlink(missing_ok=True)
 
 
+def read_result(path: Path) -> tuple[str | None, str]:
+    """Judge a result file without ever raising: ``(outcome, "")`` for a valid terminal result, ``(None, "")`` when there is no file and ``(None, reason)``
+    when there is one that is not valid. It is read through a handle opened without blocking, only when it is a regular file, and at most
+    ``RESULT_LIMIT_BYTES`` of it; a larger one is invalid. Any error of reading, decoding or parsing (a deeply nested document included) is a reason."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, ""
+    except OSError as error:
+        return None, f"it cannot be opened: {type(error).__name__}"
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, "it is not a regular file"
+            data = handle.read(RESULT_LIMIT_BYTES + 1)
+        if len(data) > RESULT_LIMIT_BYTES:
+            return None, f"it is larger than {RESULT_LIMIT_BYTES} bytes"
+        document = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError, RecursionError) as error:
+        return None, f"it cannot be read as JSON text: {type(error).__name__}"
+    outcome = document.get("outcome") if isinstance(document, dict) else None
+    if isinstance(outcome, str) and outcome in TERMINAL_OUTCOMES:
+        return outcome, ""
+    return None, "it is not an object with the outcome finished or failed"
+
+
 def kept_outcome(inbox: Path, request: Path, log: Callable[..., None]) -> str | None:
     """``finished`` or ``failed`` when a terminal result of this request is already written, else None. A result file that is not a valid terminal result is
-    logged with its reason and renamed with the suffix ``.invalid``, and counts as no result."""
+    logged with its reason and renamed with the suffix ``.invalid``, and counts as no result. Nothing in the file can raise out of here."""
     path = inbox / "results" / request.name
-    try:
-        text = path.read_text()
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as error:
-        reason = f"it cannot be read: {type(error).__name__}"
-    else:
-        reason = ""
-        try:
-            document = json.loads(text)
-        except ValueError:
-            document = None
-            reason = "it is not JSON"
-        if not reason:
-            outcome = document.get("outcome") if isinstance(document, dict) else None
-            if isinstance(outcome, str) and outcome in TERMINAL_OUTCOMES:
-                return outcome
-            reason = "it is not an object with the outcome finished or failed"
+    outcome, reason = read_result(path)
+    if outcome is not None or not reason:
+        return outcome
     log("result_invalid", request=request.stem, path=str(path), reason=reason)
     try:
         os.replace(path, path.with_name(path.name + INVALID_SUFFIX))
@@ -254,7 +271,9 @@ def serve(
             outcome = run_request(request, functools.partial(health.beat, "running", request.stem))
         except (ArithmeticError, ValueError) as error:
             outcome = Outcome("failed", 2, f"{type(error).__name__}: {error}")
-        if outcome.kind == "stopped":
+        if outcome.kind == "stopped" or stopped():
+            if outcome.kind != "stopped":
+                log("request_left_queued", request=request.stem, outcome=outcome.kind, error=outcome.error)
             atomic_write(attempts_of(request), f"{started}\n")
             break
         health.last = keep(inbox, request, outcome)
@@ -303,10 +322,15 @@ def bytes_of(path: Path) -> bytes | None:
 
 def conflicts_with_held(inbox: Path, name: str, record_bytes: bytes, reference_bytes: bytes) -> bool:
     """Whether a record from before reservations is held under this name with other bytes. An ID whose reference is reserved is judged by its reservation alone,
-    never by the files that archival moves. The caller holds the lock of the ID, so no archival is half done."""
+    never by the files that archival moves. The caller holds the lock of the ID, so no archival runs, but one that was cut off can have moved the reference and
+    not yet the record: the reference is then looked for beside the record, in the inbox and in the folder that the written result names."""
     if (inbox / RESERVED / (Path(name).stem + REFERENCE_SUFFIX)).exists() or (earlier := record_held(inbox, name)) is None:
         return False
-    return (bytes_of(earlier), bytes_of(reference_of(earlier))) != (record_bytes, reference_bytes)
+    outcome, _ = read_result(inbox / "results" / name)
+    reference_name = reference_of(Path(name)).name
+    sides = [earlier.parent, inbox, *([inbox / TERMINAL_OUTCOMES[outcome]] if outcome else [])]
+    reference = next((side / reference_name for side in sides if (side / reference_name).is_file()), None)
+    return (bytes_of(earlier), None if reference is None else bytes_of(reference)) != (record_bytes, reference_bytes)
 
 
 def read_submission(reference_file: Path, stream: BinaryIO) -> tuple[bytes, bytes]:

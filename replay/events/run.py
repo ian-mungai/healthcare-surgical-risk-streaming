@@ -11,7 +11,8 @@ speed only moves the wall clock. A restart keeps the wall time of the first send
 
 **Stop.** When a stop is requested, the loop flushes, writes the position at the last event sent and returns, so a restart sends no event twice. The stop is
 checked before each event and again after each wait, so a stop that ends a wait stops the loop before the event that the wait was for. It is also checked
-before each room's case is decoded at the start, and a stop there returns at once: nothing was sent, so the saved state stays as it was.
+before each room's case is decoded at the start (a stop there returns at once: nothing was sent, so the saved state stays as it was) and before the next case
+of a room is decoded after the last event of one (the position is saved first).
 
 **Position.** For each room, the number of its admitted occurrences that are complete and the ordinal of the next event of the current one. It is written only
 after a flush, so it never covers a message that Kafka did not acknowledge. A stop between the acknowledgment and the write leaves the position behind: the
@@ -240,8 +241,11 @@ class Replayer:
             completed = positions[room].completed
             if cursor.ordinal >= len(cursor.events):
                 completed += 1
-                cursors[room] = self.cursor_at(room, completed, 0)
                 positions[room] = RoomPosition(completed, 0)
+                if self.stop_requested():
+                    checkpoint(finished=False)
+                    return RunResult(sent, False)
+                cursors[room] = self.cursor_at(room, completed, 0)
             else:
                 positions[room] = RoomPosition(completed, cursor.ordinal)
             if unsaved >= self.settings.checkpoint_every:

@@ -31,7 +31,7 @@ from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
-from replay.service.serve import Outcome, SubmitError, archive, healthy, held, kept_outcome, queued_record, read_submission, serve, submit, submit_command
+from replay.service.serve import Outcome, SubmitError, archive, healthy, held, keep, kept_outcome, queued_record, read_submission, serve, submit, submit_command
 from scripts.ingestion.manifest import ManifestRef
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
@@ -64,6 +64,12 @@ class Clock:
 
     def __call__(self) -> float:
         return self.now
+
+
+def serve_until_idle(inbox: Path, health: Path, run_request: Callable[[Path, Callable[[], None]], Outcome]) -> int:
+    """Serve the inbox until it is empty and the loop would sleep: the stop comes from the idle wait, never from a request."""
+    stop = [False]
+    return serve(inbox, health, run_request, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
 
 
 class Loop:
@@ -117,6 +123,10 @@ class Loop:
         (self.inbox / name).write_text(text)
         if reference is not None and name.endswith(".json"):
             (self.inbox / name).with_suffix(".reference").write_text(reference)
+
+
+def nested(depth: int) -> str:
+    return "[" * depth + "]" * depth
 
 
 class ServeTest(unittest.TestCase):
@@ -286,6 +296,47 @@ class ServeTest(unittest.TestCase):
             self.assertIsNone(kept_outcome(loop.inbox, loop.inbox / "a.json", lambda event, **fields: loop.logged.append(event)))
         self.assertEqual(["result_invalid", "result_invalid_not_kept"], loop.logged)
 
+    def planted_result(self, plant: Callable[[Path], object]) -> Loop:
+        loop = self.loop({"a.json": Outcome("finished", 0)})
+        loop.put("a.json", json.dumps(RECORD))
+        (loop.inbox / "results").mkdir()
+        plant(loop.inbox / "results" / "a.json")
+        loop.serve()
+        return loop
+
+    def assert_set_aside(self, loop: Loop) -> None:
+        self.assertEqual(["a.json"], loop.ran)
+        self.assertEqual("finished", json.loads((loop.inbox / "results" / "a.json").read_text())["outcome"])
+        self.assertTrue((loop.inbox / "results" / "a.json.invalid").exists())
+        self.assertTrue(any("result_invalid" in line for line in loop.logged), loop.logged)
+        self.assertTrue((loop.inbox / "done" / "a.json").is_file())
+
+    def test_a_result_file_that_cannot_be_judged_never_stops_the_serve_loop_and_is_set_aside(self) -> None:
+        padded = json.dumps({"outcome": "finished", "pad": "x" * 70_000})
+        cases: dict[str, Callable[[Path], object]] = {
+            "the reviewers deeply nested array of 256 KB": lambda path: path.write_text(nested(128_000)),
+            "a nested array under the size cap": lambda path: path.write_text(nested(30_000)),
+            "a result that is too large": lambda path: path.write_text(padded),
+            "bytes that are not UTF-8": lambda path: path.write_bytes(b'{"outcome": "\xff"}'),
+            "a directory in place of the file": lambda path: path.mkdir(),
+        }
+        for label, plant in cases.items():
+            with self.subTest(case=label):
+                self.assert_set_aside(self.planted_result(plant))
+
+    def test_a_fifo_in_place_of_the_result_file_is_set_aside_without_a_wait(self) -> None:
+        self.assert_set_aside(self.planted_result(lambda path: os.mkfifo(path)))
+
+    def test_a_valid_terminal_result_at_the_size_cap_is_kept_and_one_byte_more_is_not(self) -> None:
+        def sized(size: int) -> str:
+            base = json.dumps({"request": "a", "outcome": "finished", "exit_code": 0, "error": "", "pad": ""})
+            return json.dumps({"request": "a", "outcome": "finished", "exit_code": 0, "error": "", "pad": "x" * (size - len(base))})
+
+        loop = self.planted_result(lambda path: path.write_text(sized(serve_module.RESULT_LIMIT_BYTES)))
+        self.assertEqual([], loop.ran)
+        self.assertFalse((loop.inbox / "results" / "a.json.invalid").exists())
+        self.assert_set_aside(self.planted_result(lambda path: path.write_text(sized(serve_module.RESULT_LIMIT_BYTES + 1))))
+
     def test_a_planted_invalid_result_still_counts_the_start_and_three_stops_with_it_fail_the_request(self) -> None:
         loop = self.loop({"a.json": Outcome("stopped", 2)})
         loop.put("a.json", json.dumps(RECORD))
@@ -337,6 +388,53 @@ class CrashLoopTest(unittest.TestCase):
         if path.name == "a.json":
             raise KeyError("an error that nothing handles")
         return Outcome("finished", 0)
+
+    def test_no_result_is_written_after_the_stop_was_seen_whatever_the_request_ended_in_and_the_next_start_repeats_it(self) -> None:
+        endings: dict[str, Exception | Outcome] = {
+            "a value error": ValueError("a value"),
+            "an arithmetic error": OverflowError("int too large"),
+            "a gate refusal": Outcome("failed", 3, "an object version was refused"),
+            "a failed run": Outcome("failed", 2, "KafkaStartError: the broker cannot be reached"),
+            "a finish": Outcome("finished", 0),
+        }
+        for label, ending in endings.items():
+            with self.subTest(ending=label):
+                self.setUp()
+                self.put("a")
+
+                def run(path: Path, beat: Callable[[], None], ending: Exception | Outcome = ending) -> Outcome:
+                    self.ran.append(path.name)
+                    self.stop = True
+                    if isinstance(ending, Exception):
+                        raise ending
+                    return ending
+
+                self.assertEqual(0, self.start(run))
+                self.assertEqual(["a.json"], self.ran)
+                self.assertTrue((self.inbox / "a.json").is_file())
+                self.assertTrue((self.inbox / "a.reference").is_file())
+                self.assertFalse((self.inbox / "results" / "a.json").exists())
+                self.assertFalse((self.inbox / "failed").exists() or (self.inbox / "done").exists())
+                self.assertEqual("0", (self.inbox / "a.attempts").read_text().strip())
+                self.assertEqual(0, self.start(lambda path, beat: Outcome("finished", 0)))
+                self.assertTrue((self.inbox / "done" / "a.json").is_file())
+
+    def test_control_a_gate_refusal_and_an_error_without_a_stop_are_kept_as_failed(self) -> None:
+        for ending in (Outcome("failed", 3, "an object version was refused"), ValueError("a value")):
+            with self.subTest(ending=type(ending).__name__):
+                self.setUp()
+                self.put("a")
+
+                def run(path: Path, beat: Callable[[], None], ending: Exception | Outcome = ending) -> Outcome:
+                    if isinstance(ending, Exception):
+                        raise ending
+                    return ending
+
+                self.assertEqual(0, self.start(run))
+                result = json.loads((self.inbox / "results" / "a.json").read_text())
+                self.assertEqual("failed", result["outcome"])
+                self.assertTrue((self.inbox / "failed" / "a.json").is_file())
+                self.assertFalse((self.inbox / "a.json").exists())
 
     def test_a_request_that_stops_the_service_three_starts_in_a_row_fails_on_the_fourth_and_the_next_request_runs(self) -> None:
         self.put("a")
@@ -486,14 +584,13 @@ class SubmitTest(unittest.TestCase):
         submit(self.inbox, text, REFERENCE)
         folder = tempfile.TemporaryDirectory(prefix="replay_submit_serve_")
         self.addCleanup(folder.cleanup)
-        stops = iter([False, True])
         ran: list[str] = []
 
         def run_request(path: Path, beat: object) -> Outcome:
             ran.append(path.name)
             return Outcome("finished", 0)
 
-        serve(self.inbox, Path(folder.name) / "health.json", run_request, lambda: next(stops), Clock(), lambda seconds: None, 1.0)
+        serve_until_idle(self.inbox, Path(folder.name) / "health.json", run_request)
         self.assertEqual([f"{self.name}.json"], ran)
         self.assertTrue((self.inbox / "done" / f"{self.name}.json").is_file())
         self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
@@ -744,6 +841,40 @@ class SubmitTest(unittest.TestCase):
                 results = self.archive_paused_after_its_first_move(lambda: submit(self.inbox, other, REFERENCE))
                 self.assertEqual(1, len(results))
                 self.assertIsInstance(results[0], SubmitError)
+                self.assertFalse((self.inbox / f"{self.name}.json").exists())
+
+    def interrupted_archival(self, outcome: Outcome) -> None:
+        """The result is written and the archival is cut off right after the reference moved: the reference is in ``done/`` or ``failed/`` and the record is
+        still in the inbox."""
+        real = os.replace
+
+        def interrupting(source: Any, target: Any) -> None:
+            real(source, target)
+            if str(target).endswith(".reference") and Path(target).parent.name in ("done", "failed"):
+                raise KeyboardInterrupt
+
+        with mock.patch("os.replace", interrupting), self.assertRaises(KeyboardInterrupt):
+            keep(self.inbox, self.inbox / f"{self.name}.json", outcome)
+
+    def test_an_identical_submit_of_an_id_without_a_reservation_after_an_interrupted_archival_is_already_submitted_and_a_different_one_is_refused(self) -> None:
+        text = json.dumps(RECORD)
+        for outcome, folder in ((Outcome("finished", 0), "done"), (Outcome("failed", 2, "an error"), "failed")):
+            with self.subTest(outcome=outcome.kind):
+                self.setUp()
+                self.plant("")
+                self.interrupted_archival(outcome)
+                self.assertTrue((self.inbox / folder / f"{self.name}.reference").is_file())
+                self.assertTrue((self.inbox / f"{self.name}.json").is_file())
+                for label, record, reference in (("record", json.dumps({**RECORD, "speed": 120.0}), REFERENCE), ("reference", text, OTHER_REFERENCE)):
+                    with self.subTest(different=label), self.assertRaises(SubmitError):
+                        submit(self.inbox, record, reference)
+                    self.assertFalse((self.inbox / "reserved").exists())
+                self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
+                self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
+                self.assertEqual(REFERENCE, (self.inbox / "reserved" / f"{self.name}.reference").read_text())
+                self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
+                serve_until_idle(self.inbox, self.inbox.parent / "health.json", lambda path, beat: Outcome("finished", 0))
+                self.assertTrue((self.inbox / folder / f"{self.name}.json").is_file())
                 self.assertFalse((self.inbox / f"{self.name}.json").exists())
 
     def test_a_reserved_run_id_is_compared_with_its_reservation_only_whatever_the_files_that_archival_moved_hold(self) -> None:

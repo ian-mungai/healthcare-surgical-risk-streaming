@@ -103,9 +103,18 @@ def command_freeze(record: RunRecord, _: argparse.Namespace) -> int:
 
 def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -> int:
     """Replay one run record into Kafka from its saved position. ``beat`` is called as the run makes progress and ``flag`` ends every wait of the run when a
-    stop is asked for. Return 0 when every occurrence is done."""
+    stop is asked for. Return 0 when every occurrence is done and ``STOPPED_CODE`` when a stop ended it first.
+
+    The stop flag is checked immediately before each start-up step (the Kafka lookup, the input verification, the freezing, the clinical table, the Kafka
+    producer) and, inside the loop, before each event, after each wait and before each case is decoded. Limit: one operation that is already running when the
+    stop arrives (a Kafka lookup, a verification, one case's decode) is not interrupted; if it outlasts the grace period of the container, the container is
+    killed and that start counts as an attempt."""
+    if flag.is_set():
+        return STOPPED_CODE
     partitions = partition_count(record.kafka_bootstrap, INPUT_TOPIC)
     partition_of(record.rooms - 1, partitions)
+    if flag.is_set():
+        return STOPPED_CODE
     inputs = verify_inputs(record)
     beat()
     if flag.is_set():
@@ -115,6 +124,8 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
     if flag.is_set():
         return STOPPED_CODE
     times = inputs.times()
+    if flag.is_set():
+        return STOPPED_CODE
     writer = Writer(RegistryClient(record.registry_url))
     sink = KafkaSink(record.kafka_bootstrap, writer, partitions)
     prefetched = dict(frozen.decoded)

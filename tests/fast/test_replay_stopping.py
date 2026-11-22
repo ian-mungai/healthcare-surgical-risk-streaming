@@ -122,8 +122,6 @@ class StoppedWaitLoopTest(unittest.TestCase):
             result = replayer.run()
             outcome = Outcome("finished", 0) if result.finished else Outcome("stopped", 2)
             results.append(outcome)
-            if result.finished:
-                flag.request()
             return outcome
 
         for seconds in (stop_after, WATCHDOG_SECONDS):
@@ -133,7 +131,8 @@ class StoppedWaitLoopTest(unittest.TestCase):
                 self.addCleanup(timer.cancel)
                 timer.start()
         started = time.monotonic()
-        serve(self.inbox, self.health, run_request, flag.is_set, Clock(), flag.wait, 1.0 if stop_after is None else 60.0)
+        sleep = flag.wait if stop_after is not None else lambda seconds: flag.request()
+        serve(self.inbox, self.health, run_request, flag.is_set, Clock(), sleep, 60.0)
         return time.monotonic() - started, len(results)
 
     def attempts(self) -> str:

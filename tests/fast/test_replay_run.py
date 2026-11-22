@@ -302,6 +302,23 @@ class Restart(unittest.TestCase):
         self.assertEqual(len(build_manifest(frozen, boundary_recordings()).events), resumed.sent)
         self.assertTrue(resumed.finished)
 
+    def test_a_stop_asked_for_with_the_final_send_of_a_case_decodes_no_further_case_saves_the_position_and_the_restart_sends_nothing_twice(self) -> None:
+        frozen = boundary_schedule(**self.OPTIONS)
+        source = RecordingSource(boundary_recordings())
+        sink, store = MemorySink(), MemoryStore()
+        result = Replayer(frozen, FAST, source, sink, store, FakeClock(), lambda: any(event.kind == "case_end" for event in sink.sent)).run()
+        self.assertFalse(result.finished)
+        self.assertEqual(self.OPTIONS["rooms"], len(source.reads), "the next case was decoded after the stop was asked for")
+        self.assertEqual("case_end", sink.sent[-1].kind)
+        state = saved_state(store)
+        self.assertFalse(state.finished)
+        self.assertEqual(1, sum(position.completed for position in state.positions.values()))
+        sent_before = len(sink.sent)
+        resumed = Replayer(frozen, FAST, RecordingSource(boundary_recordings()), sink, store, FakeClock(), lambda: False).run()
+        manifest = build_manifest(frozen, boundary_recordings())
+        self.assertEqual(len(manifest.events) - sent_before, resumed.sent)
+        self.assertTrue(compare(manifest, observed_from(sink, store.state)).ok)
+
     def test_a_finished_run_started_again_sends_nothing(self) -> None:
         frozen = boundary_schedule(**self.OPTIONS)
         sink, store, clock = MemorySink(), MemoryStore(), FakeClock()
