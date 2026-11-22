@@ -19,7 +19,7 @@ jobs:
   plan:
     name: Plan the job groups of this run
     runs-on: ubuntu-24.04
-    timeout-minutes: 5 # not measured yet: a checkout, a Python setup from the runner's cache and a few API reads
+    timeout-minutes: 5 # not measured yet: a checkout, a Python setup and API reads that share one 120-second deadline
     permissions:
       contents: read
       actions: read

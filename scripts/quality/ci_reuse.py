@@ -14,9 +14,13 @@ that cannot be read, reuses nothing.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import json
+import socket
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +34,7 @@ WORKFLOW = ".github/workflows/ci.yml"
 KEY_FILES = {"workflow": WORKFLOW, "requirements": "requirements.txt", "tools": "scripts/quality/install_tools.py"}
 KEY_LENGTH = 16
 API_TIMEOUT_SECONDS = 30
+API_DEADLINE_SECONDS = 120  # every API read of one plan together; the plan job's own limit is 5 minutes
 LOOPBACK = ("127.0.0.1", "localhost")
 CANDIDATE_RUNS = 20
 
@@ -65,8 +70,12 @@ def context_of(environment: Mapping[str, str]) -> Context:
         raise NoReuse(f"the run's environment does not name the repository and run ({type(error).__name__}: {error})") from error
 
 
-def github_api(base_url: str, token: str) -> Api:
-    """A reader of the API at ``base_url``: HTTPS, or HTTP on the loopback address for a local stand-in."""
+def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE_SECONDS) -> Api:
+    """A reader of the API at ``base_url``: HTTPS, or HTTP on the loopback address for a local stand-in.
+
+    Every request of the reader shares one deadline, ``deadline_seconds`` from now. A request that would start after it is refused, and at
+    the deadline the open connection is shut, so an answer that arrives slowly cannot keep the plan waiting.
+    """
     address = urlsplit(base_url)
     if address.scheme == "https":
         connection_type: type[http.client.HTTPConnection] = http.client.HTTPSConnection
@@ -75,18 +84,31 @@ def github_api(base_url: str, token: str) -> Api:
     else:
         raise ApiError("the API address must use HTTPS, or HTTP on the loopback address")
     headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "ci-plan"}
+    deadline = time.monotonic() + deadline_seconds
+    expired = f"the API reads passed their deadline of {deadline_seconds:g} seconds"
 
     def get(path: str) -> Any:
         where = path.split("?")[0]
-        connection = connection_type(address.netloc, timeout=API_TIMEOUT_SECONDS)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ApiError(f"GET {where} not sent: {expired}")
+        connection = connection_type(address.netloc, timeout=min(API_TIMEOUT_SECONDS, left))
+        shut: threading.Timer | None = None
         try:
+            connection.connect()
+            shut = threading.Timer(deadline - time.monotonic(), shut_down, args=(connection.sock,))
+            shut.start()
             connection.request("GET", f"{address.path.rstrip('/')}/{path}", headers=headers)
             response = connection.getresponse()
             body = response.read()
         except (OSError, http.client.HTTPException) as error:
-            raise ApiError(f"GET {where} failed: {type(error).__name__}") from error
+            raise ApiError(f"GET {where} failed: {expired if time.monotonic() >= deadline else type(error).__name__}") from error
         finally:
+            if shut is not None:
+                shut.cancel()
             connection.close()
+        if time.monotonic() >= deadline:
+            raise ApiError(f"GET {where} answered too late: {expired}")
         if response.status != 200:
             raise ApiError(f"GET {where} answered {response.status}")
         try:
@@ -95,6 +117,12 @@ def github_api(base_url: str, token: str) -> Api:
             raise ApiError(f"GET {where} answered with text that is not JSON") from error
 
     return get
+
+
+def shut_down(sock: socket.socket) -> None:
+    """End a blocked read on ``sock`` from the deadline's timer thread; the response may hold the socket after the connection let it go."""
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
 
 
 def key_parts(root: Path, config: dict[str, Any], group: str) -> dict[str, Any]:

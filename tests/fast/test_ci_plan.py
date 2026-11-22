@@ -14,10 +14,14 @@ Failure modes covered here, each with a planted case and a control:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import platform
 import re
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -263,6 +267,14 @@ class SelectionTest(PlanRepository):
         self.assertEqual(self.runs(record), ALL)
         self.assertIn("502", record["range"])
 
+    def test_an_api_past_its_deadline_selects_every_group(self) -> None:
+        self.passed(self.base)
+        self.commit({"README.md": "changed\n"})
+        api = ci_reuse.github_api(SlowApi(self, pause=0.2).url, "token", deadline_seconds=0.5)
+        record = ci_plan.plan(self.repo, "push", self.base, self.environment(), api)
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("deadline of 0.5 seconds", record["range"])
+
     def test_no_api_selects_every_group(self) -> None:
         self.commit({"README.md": "changed\n"})
         record = ci_plan.plan(self.repo, "push", self.base, self.environment(), None)
@@ -480,6 +492,62 @@ class RecordAndSummaryTest(PlanRepository):
         self.assertEqual(name, "record")
         self.assertEqual(json.loads(value), record)
         self.assertNotIn("\n", value)
+
+
+class SlowApi:
+    """A stand-in for the API on the loopback interface that waits ``pause`` seconds before each byte of its answer."""
+
+    def __init__(self, test: unittest.TestCase, pause: float, body: bytes = b'{"answer": 1}') -> None:
+        self.requests = 0
+        stand_in = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                stand_in.requests += 1
+                with contextlib.suppress(OSError):
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    for byte in body:
+                        time.sleep(pause)
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        server.block_on_close = False
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        test.addCleanup(server.server_close)
+        test.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_address[1]}"
+
+
+class ApiDeadlineTest(unittest.TestCase):
+    """The API phase has one deadline from the moment its reader is made, so neither a slow answer nor many requests pass it."""
+
+    def test_an_answer_that_arrives_slowly_ends_at_the_deadline(self) -> None:
+        api = ci_reuse.github_api(SlowApi(self, pause=0.2).url, "token", deadline_seconds=1.0)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ci_reuse.ApiError, "deadline of 1 seconds"):
+            api("repos/owner/project/actions/runs")
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_the_deadline_covers_every_request_together(self) -> None:
+        slow = SlowApi(self, pause=0.02)
+        api = ci_reuse.github_api(slow.url, "token", deadline_seconds=1.0)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ci_reuse.ApiError, "deadline of 1 seconds"):
+            for _ in range(20):
+                self.assertEqual(api("repos/owner/project/actions/runs"), {"answer": 1})
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertGreater(slow.requests, 1)
+
+    def test_an_answer_within_the_deadline_is_read(self) -> None:
+        api = ci_reuse.github_api(SlowApi(self, pause=0.0).url, "token", deadline_seconds=5.0)
+        self.assertEqual(api("repos/owner/project/actions/runs"), {"answer": 1})
 
 
 class WorkflowContractTest(unittest.TestCase):

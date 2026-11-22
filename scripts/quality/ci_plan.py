@@ -7,7 +7,8 @@ pull request's base commit or the push's previous commit. GitHub's job environme
 A group can skip only when the range is verified (scripts/quality/ci_groups.py) and the start commit's own push run passed, because a
 skipped group trusts the start's result. Reuse needs the reuse key of each group (scripts/quality/ci_reuse.py). Every doubt runs the group.
 The plan writes one output, ``record``: JSON that the jobs read for their names, their decisions and their reasons. The run's summary
-shows each group's decision and reason. The plan never fails for a doubt: it fails only when the map or the checkout cannot be read.
+shows each group's decision and reason. Every API read shares one deadline (``--api-deadline``, 120 seconds by default); past it,
+every group runs. The plan never fails for a doubt: it fails only when the map or the checkout cannot be read.
 """
 
 from __future__ import annotations
@@ -131,12 +132,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--event", required=True, help="the name of the event that started the run")
     parser.add_argument("--start", default="", help="the pull request's base commit or the push's previous commit")
+    parser.add_argument("--api-deadline", type=float, default=ci_reuse.API_DEADLINE_SECONDS, help="seconds that every API read of the plan shares")
     args = parser.parse_args(argv)
     token = os.environ.get("GITHUB_TOKEN", "")
     api: ci_reuse.Api | None = None
     if token:
         try:
-            api = ci_reuse.github_api(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token)
+            api = ci_reuse.github_api(os.environ.get("GITHUB_API_URL", "https://api.github.com"), token, args.api_deadline)
         except ci_reuse.ApiError as error:
             sys.stderr.write(f"no API reader: {error}\n")
     record = plan(Path.cwd(), args.event, args.start, os.environ, api)
