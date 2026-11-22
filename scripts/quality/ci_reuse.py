@@ -2,14 +2,23 @@
 
 Every answer comes from GitHub's API about this repository's own runs of ``.github/workflows/ci.yml``, read with the workflow's read-only
 token. A run counts only when its workflow file is that path and its repository and head repository are this repository, so a run of
-another workflow or of a fork never counts. Of the runs that count, only the newest execution decides: the newest run by creation time,
-run number and attempt, and its jobs as the latest attempt left them. It must have completed with success; an older passed run or attempt
-never stands in for a newer one.
+another workflow or of a fork never counts.
 
-A push to main reuses a pull request's result only when exactly one pull request of this repository was merged into main with the pushed
-commit as its merge commit, the tree of the checkout equals the tree that the API gives for the pushed commit and for the pull request's
-head commit, and the newest pull request run of that head commit on that head branch passed with every job of the map, each once and
-no other. Any answer that cannot be read reuses nothing.
+A push to main reuses a pull request's result only when all of these hold:
+
+- exactly one pull request of this repository was merged into main with the pushed commit as its merge commit;
+- the tree of the checkout equals the tree that the API gives for the pushed commit and for the pull request's head commit;
+- the runs of that head commit on that head branch are the pull request's own: the proof of each run's plan job
+  (``scripts/quality/ci_proof.py``) names the pull request and main as its base, and a run whose plan job proves nothing refuses
+  reuse, because it could be the newest;
+- of those runs, the one whose latest attempt started last completed with success; an older passed run or attempt never stands in
+  for a newer one, and two runs that started together refuse reuse;
+- its jobs, as the latest attempt left them, are every job of the map, each once and passed for the head commit, and each job that
+  runs checks proves this run, its own attempt, the pull request, main and the head commit;
+- the workflow file that the run ran, at the commit its proofs name (for a pull request, GitHub's merge commit), has the blob of the
+  pushed commit's workflow file.
+
+Any answer that cannot be read reuses nothing.
 """
 
 from __future__ import annotations
@@ -25,6 +34,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
+
+from scripts.quality import ci_proof
 
 WORKFLOW = ".github/workflows/ci.yml"
 API_TIMEOUT_SECONDS = 30
@@ -48,6 +59,25 @@ class ApiError(Exception):
 class Context:
     repository: str
     repository_id: int
+
+
+@dataclass(frozen=True)
+class Checkout:
+    """What the push run checked out: the pushed commit, its tree and the blob of its workflow file."""
+
+    commit: str
+    tree: str
+    workflow_blob: str
+
+
+@dataclass(frozen=True)
+class Jobs:
+    """The jobs of a run: ``every`` job, the ``plan`` job whose proof binds a run to its pull request and the ``waiting`` job, which waits
+    for every other job, runs no check and writes no proof."""
+
+    every: frozenset[str]
+    plan: str
+    waiting: str
 
 
 @dataclass(frozen=True)
@@ -137,16 +167,6 @@ def own_runs(api: Api, context: Context, event: str, query: str) -> list[dict[st
     ]
 
 
-def newest_passed(runs: list[dict[str, Any]], what: str) -> dict[str, Any]:
-    """The newest of ``runs``, which must have completed with success."""
-    if not runs:
-        raise NoReuse(f"{what} has no run of {WORKFLOW}")
-    latest = max(runs, key=lambda run: (str(run["created_at"]), int(run["run_number"]), int(run["run_attempt"])))
-    if latest["status"] != "completed" or latest["conclusion"] != "success":
-        raise NoReuse(f"the newest run {latest['id']} of {what} is {latest['status']} and concluded {latest['conclusion']}")
-    return latest
-
-
 def tree_of(api: Api, context: Context, commit: str) -> str:
     tree = api(f"repos/{context.repository}/git/commits/{commit}")["tree"]["sha"]
     if not isinstance(tree, str) or not SHA.fullmatch(tree):
@@ -168,12 +188,42 @@ def merged_pull_request(api: Api, context: Context, commit: str) -> dict[str, An
     return pull
 
 
-def passed_jobs(api: Api, context: Context, run: dict[str, Any], head: str, required: frozenset[str]) -> list[str]:
-    """The names of the jobs of ``run`` in their latest attempt, each of which passed for ``head``: exactly the ``required`` jobs."""
+def latest_jobs(api: Api, context: Context, run: dict[str, Any]) -> list[dict[str, Any]]:
+    """The jobs of ``run`` as its latest attempt left them, all on one page."""
     answer = api(f"repos/{context.repository}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
-    jobs = answer["jobs"]
+    jobs: list[dict[str, Any]] = answer["jobs"]
     if answer["total_count"] != len(jobs):
         raise NoReuse(f"the run {run['id']} has {answer['total_count']} jobs and the answer holds {len(jobs)}")
+    return jobs
+
+
+def proof_of(api: Api, context: Context, run: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    """The one proof that ``job`` of ``run`` wrote as a notice annotation on its own check run."""
+    where = f"the job {job['name']} of the run {run['id']}"
+    if not str(job["check_run_url"]).endswith(f"/repos/{context.repository}/check-runs/{int(job['id'])}"):
+        raise NoReuse(f"{where} names a check run that is not its own: {job['check_run_url']}")
+    found = api(f"repos/{context.repository}/check-runs/{int(job['id'])}/annotations?per_page=100")
+    proofs = [note for note in found if note["title"] == ci_proof.TITLE and note["annotation_level"] == "notice"]
+    if len(proofs) != 1:
+        raise NoReuse(f"{where} holds {len(proofs)} proofs, not one")
+    try:
+        record = json.loads(proofs[0]["message"])
+    except ValueError as error:
+        raise NoReuse(f"the proof of {where} is not JSON") from error
+    if not isinstance(record, dict):
+        raise NoReuse(f"the proof of {where} is not a JSON object")
+    return record
+
+
+def job_named(jobs: list[dict[str, Any]], name: str, run: dict[str, Any]) -> dict[str, Any]:
+    found = [job for job in jobs if job["name"] == name]
+    if len(found) != 1:
+        raise NoReuse(f"the run {run['id']} has {len(found)} jobs named {name}")
+    return found[0]
+
+
+def passed_jobs(run: dict[str, Any], jobs: list[dict[str, Any]], head: str, required: frozenset[str]) -> list[str]:
+    """The names of ``jobs``, each of which passed for ``head``: exactly the ``required`` jobs, each once."""
     names = [str(job["name"]) for job in jobs]
     if len(set(names)) != len(names):
         raise NoReuse(f"the run {run['id']} has two jobs with one name")
@@ -186,15 +236,83 @@ def passed_jobs(api: Api, context: Context, run: dict[str, Any], head: str, requ
     return sorted(names)
 
 
-def reusable_run(api: Api, context: Context, commit: str, tree: str, required: frozenset[str]) -> Reused:
-    """The passed pull request run that the push of ``commit``, whose checkout has ``tree``, reuses; ``NoReuse`` names why there is none."""
+def runs_of_pull_request(api: Api, context: Context, pull: dict[str, Any], plan_job: str) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Each run of the pull request's head commit and head branch whose plan job proves that it ran for ``pull`` into main, with its jobs.
+
+    A run of that head whose plan job proves nothing refuses reuse: it could be the pull request's newest run."""
+    head, branch, number = str(pull["head"]["sha"]), str(pull["head"]["ref"]), int(pull["number"])
+    runs = own_runs(api, context, "pull_request", f"head_sha={head}&event=pull_request&per_page=100")
+    bound = []
+    for run in (run for run in runs if run["head_sha"] == head and run["head_branch"] == branch):
+        jobs = latest_jobs(api, context, run)
+        try:
+            proof = proof_of(api, context, run, job_named(jobs, plan_job, run))
+        except NoReuse as error:
+            raise NoReuse(f"the run {run['id']} of the head {head} proves no pull request: {error}") from error
+        if proof.get("pull_request") == number and proof.get("base_ref") == MAIN:
+            bound.append((run, jobs))
+    if not bound:
+        raise NoReuse(f"no run of the head {head} proves that it ran for pull request {number} into {MAIN}")
+    return bound
+
+
+def newest(bound: list[tuple[dict[str, Any], list[dict[str, Any]]]], number: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The run that started last, by the start of its latest attempt and the attempt's number, which must have completed with success."""
+    order = sorted(bound, key=lambda pair: (str(pair[0]["run_started_at"]), int(pair[0]["run_attempt"])))
+    run, jobs = order[-1]
+    if len(order) > 1 and (order[-2][0]["run_started_at"], order[-2][0]["run_attempt"]) == (run["run_started_at"], run["run_attempt"]):
+        raise NoReuse(f"the runs {order[-2][0]['id']} and {run['id']} of pull request {number} started together")
+    if run["status"] != "completed" or run["conclusion"] != "success":
+        raise NoReuse(f"the newest run {run['id']} of pull request {number} is {run['status']} and concluded {run['conclusion']}")
+    return run, jobs
+
+
+def proven_workflow(api: Api, context: Context, run: dict[str, Any], jobs: list[dict[str, Any]], pull: dict[str, Any], waiting: str) -> str:
+    """The commit of the workflow file that every job of ``run`` but ``waiting`` proves, each for this run, attempt, pull request and head."""
+    revisions = set()
+    for job in jobs:
+        if job["name"] == waiting:
+            continue
+        proof = proof_of(api, context, run, job)
+        expected = {
+            "run_id": int(run["id"]),
+            "run_attempt": int(job["run_attempt"]),
+            "event": "pull_request",
+            "pull_request": int(pull["number"]),
+            "base_ref": MAIN,
+            "head": str(pull["head"]["sha"]),
+        }
+        found = {key: proof.get(key) for key in expected}
+        if found != expected:
+            raise NoReuse(f"the proof of the job {job['name']} of the run {run['id']} names {found}, not {expected}")
+        revisions.add(proof.get("workflow_sha"))
+    if len(revisions) != 1 or not SHA.fullmatch(str(next(iter(revisions)))):
+        raise NoReuse(f"the jobs of the run {run['id']} prove the workflow commits {sorted(map(str, revisions))}, not one")
+    return str(revisions.pop())
+
+
+def workflow_blob(api: Api, context: Context, commit: str) -> str:
+    """The blob of the workflow file in ``commit``."""
+    found = api(f"repos/{context.repository}/contents/{WORKFLOW}?ref={commit}")
+    if found["type"] != "file" or found["path"] != WORKFLOW or not SHA.fullmatch(str(found["sha"])):
+        raise NoReuse(f"the API names no workflow file in the commit {commit}")
+    return str(found["sha"])
+
+
+def reusable_run(api: Api, context: Context, checkout: Checkout, names: Jobs) -> Reused:
+    """The passed pull request run that the push of ``checkout`` reuses, holding exactly the jobs ``names``; ``NoReuse`` names why there is none."""
+    commit, tree = checkout.commit, checkout.tree
     pull = merged_pull_request(api, context, commit)
-    head, branch = str(pull["head"]["sha"]), str(pull["head"]["ref"])
+    head, number = str(pull["head"]["sha"]), int(pull["number"])
     if tree_of(api, context, commit) != tree:
         raise NoReuse(f"the tree of the checkout differs from the tree that the API gives for the commit {commit}")
     head_tree = tree_of(api, context, head)
     if head_tree != tree:
-        raise NoReuse(f"the merged tree {tree} differs from the tree {head_tree} of the head {head} of pull request {pull['number']}")
-    runs = own_runs(api, context, "pull_request", f"head_sha={head}&event=pull_request&per_page=100")
-    run = newest_passed([run for run in runs if run["head_sha"] == head and run["head_branch"] == branch], f"the head {head} of pull request {pull['number']}")
-    return Reused(commit, int(pull["number"]), head, tree, int(run["id"]), str(run["html_url"]), passed_jobs(api, context, run, head, required))
+        raise NoReuse(f"the merged tree {tree} differs from the tree {head_tree} of the head {head} of pull request {number}")
+    run, jobs = newest(runs_of_pull_request(api, context, pull, names.plan), number)
+    passed = passed_jobs(run, jobs, head, names.every)
+    revision = proven_workflow(api, context, run, jobs, pull, names.waiting)
+    blob = workflow_blob(api, context, revision)
+    if blob != checkout.workflow_blob:
+        raise NoReuse(f"the run {run['id']} ran the workflow file {blob} of the commit {revision}, and the pushed commit holds {checkout.workflow_blob}")
+    return Reused(commit, number, head, tree, int(run["id"]), str(run["html_url"]), passed)

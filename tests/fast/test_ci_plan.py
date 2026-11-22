@@ -13,9 +13,11 @@ Failure modes covered here, each with a planted case and a control:
 from __future__ import annotations
 
 import contextlib
+import json
 import platform
 import re
 import shutil
+import sys
 import threading
 import time
 import unittest
@@ -24,8 +26,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.quality import ci_plan, ci_reuse
-from tests.fast.git_fixture import ROOT, TemporaryRepository
+from scripts.process import run_command
+from scripts.quality import ci_plan, ci_proof, ci_reuse
+from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository
 
 REPOSITORY = "owner/project"
 REPOSITORY_ID = 7
@@ -33,16 +36,20 @@ WORKFLOW_TEXT = (ROOT / ci_reuse.WORKFLOW).read_text()
 CONFIG = ci_plan.load(ROOT)
 EVERY_JOB = sorted(ci_plan.required_jobs(CONFIG))
 GUARD_JOBS = ci_plan.job_names(CONFIG, "guards")
+WORKFLOW_COMMIT = "9" * 40
 ALL = {"hooks": True, "infra": True, "guards": True}
 HOOKS_ONLY = {"hooks": True, "infra": False, "guards": False}
 
 
 class FakeGitHub:
-    """The answers of the GitHub API for workflow runs, their jobs, the pull requests of a commit and commit trees, with every path kept."""
+    """The answers of the GitHub API for workflow runs, their jobs and the annotations of each job, the pull requests of a commit, commit
+    trees and the workflow file's blob at a commit, with every path kept."""
 
     def __init__(self) -> None:
         self.runs: list[dict[str, Any]] = []
         self.jobs: dict[int, list[dict[str, Any]]] = {}
+        self.annotations: dict[int, list[dict[str, Any]]] = {}
+        self.workflow_blobs: dict[str, str] = {}
         self.pulls: dict[str, list[dict[str, Any]]] = {}
         self.trees: dict[str, str] = {}
         self.paths: list[str] = []
@@ -57,6 +64,7 @@ class FakeGitHub:
             "run_number": run_id,
             "run_attempt": 1,
             "created_at": f"2026-11-21T10:{run_id % 60:02d}:00Z",
+            "run_started_at": f"2026-11-21T10:{run_id % 60:02d}:00Z",
             "path": ci_reuse.WORKFLOW,
             "event": event,
             "head_branch": branch,
@@ -71,9 +79,19 @@ class FakeGitHub:
         self.runs.append(run)
         self.jobs.setdefault(run_id, [])
 
-    def add_job(self, run_id: int, name: str, *, conclusion: str = "success", status: str = "completed", head: str | None = None) -> None:
+    def add_job(self, run_id: int, name: str, *, conclusion: str = "success", status: str = "completed", head: str | None = None) -> int:
+        """Add a job to the run's latest attempt and return its ID, which is also the ID of its check run."""
         run = next(run for run in self.runs if run["id"] == run_id)
-        self.jobs[run_id].append({"name": name, "status": status, "conclusion": conclusion, "head_sha": head or run["head_sha"]})
+        job_id = run_id * 100 + len(self.jobs[run_id])
+        job = {"id": job_id, "name": name, "status": status, "conclusion": conclusion, "head_sha": head or run["head_sha"], "run_attempt": run["run_attempt"]}
+        job["check_run_url"] = f"https://api.example.invalid/repos/{REPOSITORY}/check-runs/{job_id}"
+        self.jobs[run_id].append(job)
+        self.annotations[job_id] = []
+        return job_id
+
+    def add_proof(self, job_id: int, proof: dict[str, Any] | str) -> None:
+        message = proof if isinstance(proof, str) else json.dumps(proof)
+        self.annotations[job_id].append({"title": ci_proof.TITLE, "annotation_level": "notice", "message": message})
 
     def add_pull(self, commit: str, number: int, head: str, *, branch: str = "feature") -> None:
         pull = {
@@ -102,6 +120,10 @@ class FakeGitHub:
             return self.pulls.get(parts[-2], [])
         if url.path.startswith(f"repos/{REPOSITORY}/git/commits/") and parts[-1] in self.trees:
             return {"sha": parts[-1], "tree": {"sha": self.trees[parts[-1]]}}
+        if url.path.startswith(f"repos/{REPOSITORY}/check-runs/") and parts[-1] == "annotations" and int(parts[-2]) in self.annotations:
+            return self.annotations[int(parts[-2])]
+        if url.path == f"repos/{REPOSITORY}/contents/{ci_reuse.WORKFLOW}" and query.get("ref", [""])[0] in self.workflow_blobs:
+            return {"type": "file", "path": ci_reuse.WORKFLOW, "sha": self.workflow_blobs[query["ref"][0]]}
         raise ci_reuse.ApiError(f"GET {url.path} answered 404")
 
 
@@ -188,19 +210,39 @@ class PushReuseTest(PlanRepository):
         self.merge(self.pull_head)
         self.pull_run(60)
 
+    def workflow_blob(self) -> str:
+        return self.git("rev-parse", f"HEAD:{ci_reuse.WORKFLOW}").stdout.strip()
+
     def merge(self, head: str, number: int = 5) -> None:
         """A squash merge of ``head`` onto the first commit, checked out as main and kept as ``merged``, with its pull request and trees known to the API."""
         self.merged = self.git("commit-tree", self.tree(head), "-p", self.base, "-m", "feat: merge the pull request").stdout.strip()
         self.git("checkout", "--quiet", "--detach", self.merged)
         self.github.add_pull(self.merged, number, head)
         self.github.trees |= {self.merged: self.tree(self.merged), head: self.tree(head)}
+        self.github.workflow_blobs[WORKFLOW_COMMIT] = self.workflow_blob()
 
-    def pull_run(self, run_id: int, *, skip: tuple[str, ...] = (), **fields: Any) -> None:
-        """A pull request run of the head with every job of the map passed, except the jobs named in ``skip``."""
+    def pull_run(self, run_id: int, *, skip: tuple[str, ...] = (), number: int = 5, base: str = "main", proven: bool = True, **fields: Any) -> dict[str, int]:
+        """A pull request run of the head for pull request ``number`` into ``base`` with every job of the map passed, except the jobs named
+        in ``skip``, and the proof of each job that runs checks. Returns the ID of each job by name."""
         self.github.add_run(run_id, self.pull_head, **fields)
+        ids = {}
         for name in EVERY_JOB:
             if name not in skip:
-                self.github.add_job(run_id, name)
+                ids[name] = self.github.add_job(run_id, name)
+                if proven and name != CONFIG["required"]["job"]:
+                    self.github.add_proof(ids[name], self.proof(run_id, number=number, base=base, run_attempt=fields.get("run_attempt", 1)))
+        return ids
+
+    def proof(self, run_id: int, *, number: int = 5, base: str = "main", run_attempt: int = 1) -> dict[str, Any]:
+        return {
+            "run_id": run_id,
+            "run_attempt": run_attempt,
+            "event": "pull_request",
+            "pull_request": number,
+            "base_ref": base,
+            "head": self.pull_head,
+            "workflow_sha": WORKFLOW_COMMIT,
+        }
 
     def fresh(self) -> None:
         self.github = FakeGitHub()
@@ -214,6 +256,82 @@ class PushReuseTest(PlanRepository):
         self.assertEqual((record["reused"]["pull_request"], record["reused"]["head"], record["reused"]["tree"]), (5, self.pull_head, self.tree()))
         self.assertEqual(record["reused"]["jobs"], EVERY_JOB)
         self.assertIn("reused: every job passed on this tree in https://github.example.invalid/runs/60", record["groups"]["guards"]["reason"])
+
+    def test_a_passed_run_of_another_pull_request_with_the_same_head_is_not_reused(self) -> None:
+        self.fresh()
+        self.pull_run(60, conclusion="failure")
+        self.pull_run(61, number=6, base="release")
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("the newest run 60 of pull request 5", record["basis"])
+
+    def test_the_newest_attempt_is_the_one_that_started_last(self) -> None:
+        early, late = "2026-11-21T10:00:00Z", "2026-11-21T10:30:00Z"
+        self.fresh()
+        self.pull_run(60, conclusion="failure", run_attempt=2, run_started_at=late)
+        self.pull_run(61, run_started_at=early)
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL, "the run created last is not the newest attempt: run 60 was rerun after it")
+        self.assertIn("the newest run 60 of pull request 5", record["basis"])
+        self.fresh()
+        self.pull_run(60, conclusion="failure", run_started_at=early)
+        self.pull_run(61, run_started_at=late)
+        self.assertEqual(self.push()["reused"]["run_id"], 61)
+
+    def test_two_runs_that_started_together_refuse_reuse(self) -> None:
+        self.fresh()
+        self.pull_run(60, run_started_at="2026-11-21T10:30:00Z")
+        self.pull_run(61, run_started_at="2026-11-21T10:30:00Z")
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("started together", record["basis"])
+
+    def test_a_run_whose_workflow_is_not_the_pushed_commits_is_not_reused(self) -> None:
+        self.github.workflow_blobs[WORKFLOW_COMMIT] = "8" * 40
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("ran the workflow file 8888", record["basis"])
+
+    def test_a_run_of_the_head_that_proves_no_pull_request_refuses_reuse(self) -> None:
+        self.pull_run(61, proven=False)
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("the run 61 of the head", record["basis"])
+
+    def test_a_run_without_the_proof_of_every_job_is_not_reused(self) -> None:
+        planted: dict[str, Callable[[dict[str, int]], None]] = {
+            "a shard without a proof": lambda ids: self.github.annotations[ids[GUARD_JOBS[3]]].clear(),
+            "a shard with two proofs": lambda ids: self.github.add_proof(ids[GUARD_JOBS[3]], self.proof(60)),
+            "a proof that is not JSON": lambda ids: self.reprove(ids[GUARD_JOBS[3]], "not json"),
+            "a proof of another run": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(59)),
+            "a proof of another attempt": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(60, run_attempt=2)),
+            "a proof of another pull request": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(60, number=6)),
+            "a proof of another base": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(60, base="release")),
+            "a proof of another head": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(60) | {"head": "3" * 40}),
+            "a proof of another event": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(60) | {"event": "push"}),
+            "a proof of another workflow revision": lambda ids: self.reprove(ids[GUARD_JOBS[3]], self.proof(60) | {"workflow_sha": "7" * 40}),
+            "a proof with another title": lambda ids: self.github.annotations[ids[GUARD_JOBS[3]]][0].update(title="other"),
+            "a warning, not a notice": lambda ids: self.github.annotations[ids[GUARD_JOBS[3]]][0].update(annotation_level="warning"),
+            "the plan's proof missing": lambda ids: self.github.annotations[ids[CONFIG["plan"]["job"]]].clear(),
+            "a check run of another repository": lambda ids: self.job(60, ids[GUARD_JOBS[3]]).update(
+                check_run_url=f"https://api.example.invalid/repos/other/project/check-runs/{ids[GUARD_JOBS[3]]}"
+            ),
+            "the check run of another job": lambda ids: self.job(60, ids[GUARD_JOBS[3]]).update(
+                check_run_url=f"https://api.example.invalid/repos/{REPOSITORY}/check-runs/{ids[GUARD_JOBS[4]]}"
+            ),
+        }
+        for label, plant in planted.items():
+            with self.subTest(label=label):
+                self.fresh()
+                plant(self.pull_run(60))
+                self.assertEqual(self.runs(self.push()), ALL)
+
+    def job(self, run_id: int, job_id: int) -> dict[str, Any]:
+        return next(job for job in self.github.jobs[run_id] if job["id"] == job_id)
+
+    def reprove(self, job_id: int, proof: dict[str, Any] | str) -> None:
+        self.github.annotations[job_id].clear()
+        self.github.add_proof(job_id, proof)
 
     def test_a_merge_with_another_tree_runs_every_group(self) -> None:
         other = self.commit({"README.md": "a change that main had and the pull request lacked\n"})
@@ -231,7 +349,7 @@ class PushReuseTest(PlanRepository):
         self.assertIn("no pull request was merged", record["basis"])
 
     def test_a_newer_failed_run_is_not_overridden_by_an_older_pass(self) -> None:
-        self.github.add_run(62, self.pull_head, conclusion="failure")
+        self.pull_run(62, conclusion="failure")
         record = self.push()
         self.assertEqual(self.runs(record), ALL)
         self.assertIn("the newest run 62", record["basis"])
@@ -348,6 +466,40 @@ class PushReuseTest(PlanRepository):
         record = ci_plan.plan(self.repo, self.environment("push"), None)
         self.assertEqual(self.runs(record), ALL)
         self.assertIn("no GitHub API token", record["basis"])
+
+
+class ProofTest(PlanRepository):
+    """The proof command writes one notice annotation whose message, as the runner reads it, names the job's run, pull request and head."""
+
+    def test_the_proof_of_a_pull_request_job_names_its_run(self) -> None:
+        event = self.repo.parent / "event.json"
+        event.write_text(json.dumps({"pull_request": {"number": 5, "base": {"ref": "main"}, "head": {"sha": self.head()}}}))
+        environment = self.env | {
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_EVENT_PATH": str(event),
+            "GITHUB_RUN_ID": "60",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_WORKFLOW_SHA": WORKFLOW_COMMIT,
+        }
+        result = run_command(sys.executable, ["-m", "scripts.quality.ci_proof"], cwd=self.repo, env=environment, timeout=TIMEOUT_SECONDS, check=True)
+        command, _, message = result.stdout.rstrip("\n").partition("::")[2].partition("::")
+        self.assertEqual(command, f"notice title={ci_proof.TITLE}")
+        self.assertEqual(result.stdout.count("\n"), 1)
+        record = json.loads(message.replace("%0A", "\n").replace("%0D", "\r").replace("%25", "%"))
+        expected = {
+            "run_id": 60,
+            "run_attempt": 2,
+            "event": "pull_request",
+            "pull_request": 5,
+            "base_ref": "main",
+            "head": self.head(),
+            "workflow_sha": WORKFLOW_COMMIT,
+        }
+        self.assertEqual({key: record[key] for key in expected}, expected)
+
+    def test_a_message_with_a_line_break_or_a_percent_sign_stays_on_one_line(self) -> None:
+        line = ci_proof.annotation({"text": "50%\nnext\r"})
+        self.assertEqual(line, f'::notice title={ci_proof.TITLE}::{{"text":"50%25\\nnext\\r"}}\n')
 
 
 class RecordAndSummaryTest(PlanRepository):
@@ -529,6 +681,8 @@ HEAD_REF = "${{ github.event.pull_request.head.sha || github.sha }}"
 REASON = "${{ needs.plan.outputs.reason }}"
 STATES_REASON = re.compile(r"printf '[^']*%s\\n' \"\$\{GROUP_REASON\}\" >> \"\$\{GITHUB_STEP_SUMMARY\}\"")
 SHARD_COMMAND = 'make test-guards SHARD="${SHARD}/{shards}"'
+PROOF = "python -m scripts.quality.ci_proof"
+PROOF_STEP = f"      - run: {PROOF}\n        if: needs.plan.outputs.run == 'true'\n"
 
 
 def executed(steps: list[dict[str, Any]], run: bool, *, failed: bool = False) -> list[dict[str, Any]]:
@@ -582,6 +736,8 @@ def group_problems(name: str, job: dict[str, Any], config: dict[str, Any]) -> li
         if not stated:
             problems.append(f"{name} {'runs' if run else 'skips'}: no step states the plan's reason in the run summary")
         tail = [step for step in job["steps"] if step.get("if") == AFTER_FAILURE]
+        if run and (not steps or steps[-1].get("run") != PROOF):
+            problems.append(f"{name} runs: its last step does not write its proof")
         if run and len(steps) != len(job["steps"]) - len(tail):
             problems.append(f"{name} runs: it leaves out {len(job['steps']) - len(tail) - len(steps)} of its steps")
         if not run and len(steps) != len(stated):
@@ -615,6 +771,7 @@ def contract_problems(text: str, config: dict[str, Any]) -> list[str]:
         if workflow.get("permissions") != {"contents": "read"} or jobs["plan"].get("permissions") != {
             "contents": "read",
             "actions": "read",
+            "checks": "read",
             "pull-requests": "read",
         }:
             problems.append("the workflow or the plan job asks for more than reading")
@@ -645,6 +802,8 @@ def contract_problems(text: str, config: dict[str, Any]) -> list[str]:
             problems += setup_problems(
                 "hooks", hooks["steps"], config, next(index for index, step in enumerate(hooks["steps"]) if step.get("run") == "make setup")
             )
+        if hooks["steps"][-1].get("run") != PROOF:
+            problems.append("the hooks job's last step does not write its proof")
         for name in ci_plan.selectable(config):
             problems += group_problems(name, jobs[name], config)
         guards = jobs["guards"]
@@ -725,6 +884,13 @@ class WorkflowContractTest(unittest.TestCase):
             "another Python in one job": ('python-version: "3.14.8"\n          cache', 'python-version: "3.14"\n          cache'),
             "a job asks to write": ("    timeout-minutes: 10\n    steps:", "    timeout-minutes: 10\n    permissions:\n      contents: write\n    steps:"),
             "pull requests into main only": ("  pull_request:\n", "  pull_request:\n    branches: [main]\n"),
+            "a shard without its proof": ("          SHARD: ${{ matrix.shard }}\n" + PROOF_STEP, "          SHARD: ${{ matrix.shard }}\n"),
+            "the proof before the checks": (terraform + ansible + PROOF_STEP, PROOF_STEP + terraform + ansible),
+            "the hooks job without its proof": (
+                'commit-range "${HEAD}"\n          fi\n      - run: python -m scripts.quality.ci_proof\n',
+                'commit-range "${HEAD}"\n          fi\n',
+            ),
+            "the plan job cannot read the proofs": ("      actions: read\n      checks: read\n", "      actions: read\n"),
         }
         for label, (before, after) in planted.items():
             with self.subTest(label=label):

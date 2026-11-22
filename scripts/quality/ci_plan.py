@@ -10,7 +10,8 @@ Run from the repository root of the checkout: ``python -m scripts.quality.ci_pla
   checked the pushed tree. The record and the summary name the reused run.
 - Any other event, a push without a pull request and every doubt run every group; nothing is reused then.
 
-The hooks job never skips. The plan writes two outputs that the group jobs read: ``run`` (``true`` or ``false``) and ``reason``. Every
+The plan job writes its own proof (``scripts/quality/ci_proof.py``), which binds a pull request run to its pull request. The hooks job
+never skips. The plan writes two outputs that the group jobs read: ``run`` (``true`` or ``false``) and ``reason``. Every
 API read shares one deadline (``--api-deadline``, 120 seconds by default); past it, every group runs. The plan never fails for a doubt:
 it fails only when the map or the checkout cannot be read.
 """
@@ -28,7 +29,7 @@ from subprocess import CalledProcessError
 from typing import Any
 
 from scripts.process import TimeoutExpired
-from scripts.quality import ci_reuse
+from scripts.quality import ci_proof, ci_reuse
 from scripts.quality.repo_checks import git
 
 CONFIG = Path("scripts/quality/ci_groups.json")
@@ -63,6 +64,10 @@ def required_jobs(config: dict[str, Any]) -> frozenset[str]:
     return frozenset(names)
 
 
+def run_jobs(config: dict[str, Any]) -> ci_reuse.Jobs:
+    return ci_reuse.Jobs(required_jobs(config), config["plan"]["job"], config["required"]["job"])
+
+
 def push_reuse(root: Path, config: dict[str, Any], environment: Mapping[str, str], api: ci_reuse.Api | None) -> ci_reuse.Reused:
     """The passed pull request run that a push to main after a merge reuses."""
     head = environment.get("GITHUB_SHA", "")
@@ -70,13 +75,13 @@ def push_reuse(root: Path, config: dict[str, Any], environment: Mapping[str, str
         raise ci_reuse.NoReuse(f"the push is to {environment.get('GITHUB_REF') or 'no branch'}, not to {MAIN_REF}")
     if not COMMIT.fullmatch(head):
         raise ci_reuse.NoReuse("the run names no pushed commit")
-    checkout = git("rev-parse", "HEAD", cwd=root).strip()
-    if checkout != head:
-        raise ci_reuse.NoReuse(f"the checkout {checkout} is not the pushed commit {head}")
+    checked_out = git("rev-parse", "HEAD", cwd=root).strip()
+    if checked_out != head:
+        raise ci_reuse.NoReuse(f"the checkout {checked_out} is not the pushed commit {head}")
     if api is None:
         raise ci_reuse.NoReuse("no GitHub API token was given, so no pull request run can be read")
-    tree = git("rev-parse", "HEAD^{tree}", cwd=root).strip()
-    return ci_reuse.reusable_run(api, ci_reuse.context_of(environment), head, tree, required_jobs(config))
+    checkout = ci_reuse.Checkout(head, git("rev-parse", "HEAD^{tree}", cwd=root).strip(), git("rev-parse", f"HEAD:{ci_reuse.WORKFLOW}", cwd=root).strip())
+    return ci_reuse.reusable_run(api, ci_reuse.context_of(environment), checkout, run_jobs(config))
 
 
 def plan(root: Path, environment: Mapping[str, str], api: ci_reuse.Api | None) -> dict[str, Any]:
@@ -160,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     append("GITHUB_OUTPUT", output_lines(record))
     append("GITHUB_STEP_SUMMARY", text)
     sys.stdout.write(text)
+    sys.stdout.write(ci_proof.annotation(ci_proof.proof(Path.cwd(), os.environ)))
     return 0
 
 

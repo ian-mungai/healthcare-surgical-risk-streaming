@@ -15,7 +15,9 @@ concurrency:
 # A pull request runs every job. The plan job (scripts/quality/ci_plan.py) lets the push to main after a merge reuse the merged pull
 # request's passed run of the same tree; the group jobs then still start, state the reason in their summary and succeed. The hooks job
 # always runs. The last job waits for every other job and is the one required check. Every checkout takes the pull request's head commit,
-# not GitHub's merge of it into the base, so a pull request run checks the tree that the push after the merge compares.
+# not GitHub's merge of it into the base, so a pull request run checks the tree that the push after the merge compares. The last step of
+# each job that runs checks, and the plan itself, write the job's proof as a notice annotation (scripts/quality/ci_proof.py), which the
+# push after the merge reads.
 jobs:
   plan:
     name: Plan the job groups of this run
@@ -24,6 +26,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      checks: read
       pull-requests: read
     outputs:
       run: ${{ steps.plan.outputs.run }}
@@ -70,6 +73,7 @@ jobs:
           else
             .venv/bin/python -m scripts.quality.repo_checks commit-range "${HEAD}"
           fi
+      - run: python -m scripts.quality.ci_proof
 
   infra:
     name: Static checks of the Terraform and Ansible code
@@ -104,6 +108,8 @@ jobs:
         if: needs.plan.outputs.run == 'true'
       - run: make check-ansible
         if: needs.plan.outputs.run == 'true'
+      - run: python -m scripts.quality.ci_proof
+        if: needs.plan.outputs.run == 'true'
 
   guards:
     name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
@@ -137,6 +143,8 @@ jobs:
         if: needs.plan.outputs.run == 'true'
         env:
           SHARD: ${{ matrix.shard }}
+      - run: python -m scripts.quality.ci_proof
+        if: needs.plan.outputs.run == 'true'
       - name: Show the end of the run's log after a failure
         if: failure() && needs.plan.outputs.run == 'true'
         run: tail -n 150 runs/*/log.txt
