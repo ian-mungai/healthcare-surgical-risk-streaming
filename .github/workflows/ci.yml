@@ -12,41 +12,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# A pull request runs every job, with no condition that reads the plan. The plan job (scripts/quality/ci_plan.py) lets the push to main
-# after a merge reuse the merged pull request's passed run of the same tree: on a push, a group job skips only when the plan set the
-# output reuse to exactly 'true' after it proved the reuse; any other output, empty or missing, runs the job. The plan and hooks jobs
-# never skip. The last job waits for every other job and is the one required check: it fails when a job failed, was cancelled or was
-# skipped without that proof. Every checkout takes the pull request's head commit, not GitHub's merge of it into the base, so a pull
-# request run checks the tree that the push after the merge compares. The last step of each job that runs checks, and the plan itself,
-# write the job's proof as a notice annotation (scripts/quality/ci_proof.py), which the push after the merge reads.
+# Every pull request and every push to main runs every job: no job has a condition, no step tolerates a failure and no run takes the
+# result of an earlier run. The last job waits for all the others and is the one required check: it fails unless each of them succeeded, so a failed,
+# cancelled or skipped job fails the run. tests/fast/test_ci_workflow.py holds the workflow to this.
 jobs:
-  plan:
-    name: Plan the job groups of this run
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5 # not measured yet: a checkout, a Python setup and API reads that share one 120-second deadline
-    permissions:
-      contents: read
-      actions: read
-      checks: read
-      pull-requests: read
-    outputs:
-      reuse: ${{ steps.plan.outputs.reuse }}
-      reason: ${{ steps.plan.outputs.reason }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.14.8"
-      - name: Choose whether the groups run or reuse a passed run
-        id: plan
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python -m scripts.quality.ci_plan
-
   hooks:
     name: Hooks on every file and the commit messages
     runs-on: ubuntu-24.04
@@ -54,7 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -74,18 +42,14 @@ jobs:
           else
             .venv/bin/python -m scripts.quality.repo_checks commit-range "${HEAD}"
           fi
-      - run: python -m scripts.quality.ci_proof
 
-  infra:
+  infrastructure:
     name: Static checks of the Terraform and Ansible code
-    needs: plan
-    if: github.event_name != 'push' || needs.plan.outputs.reuse != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -99,14 +63,12 @@ jobs:
       - run: make setup
       - run: make check-terraform
       - run: make check-ansible
-      - run: python -m scripts.quality.ci_proof
 
+  # Measured hosted wall time of one shard: 5 to 11 minutes.
   guards:
     name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
-    needs: plan
-    if: github.event_name != 'push' || needs.plan.outputs.reuse != 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +76,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -125,38 +86,31 @@ jobs:
       - run: make test-guards SHARD="${SHARD}/8"
         env:
           SHARD: ${{ matrix.shard }}
-      - run: python -m scripts.quality.ci_proof
       - name: Show the end of the run's log after a failure
         if: failure()
         run: tail -n 150 runs/*/log.txt
 
   required:
     name: Every job of this run passed
-    needs: [plan, hooks, infra, guards]
+    needs: [hooks, infrastructure, guards]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Check that every needed job succeeded or was skipped for a proven reuse
+      - name: Check that every needed job succeeded
         env:
-          EVENT: ${{ github.event_name }}
-          REUSE: ${{ needs.plan.outputs.reuse }}
-          REASON: ${{ needs.plan.outputs.reason }}
-          PLAN: ${{ needs.plan.result }}
           HOOKS: ${{ needs.hooks.result }}
-          INFRA: ${{ needs.infra.result }}
+          INFRASTRUCTURE: ${{ needs.infrastructure.result }}
           GUARDS: ${{ needs.guards.result }}
         run: |
-          printf 'Event %s, reuse output "%s", reason: %s\n' "${EVENT}" "${REUSE}" "${REASON}" >> "${GITHUB_STEP_SUMMARY}"
           failed=0
           check() {
-          if [ "$2" = success ]; then return 0; fi
-          if [ "$2" = skipped ] && [ "$3" = may_skip ] && [ "${EVENT}" = push ] && [ "${REUSE}" = true ]; then return 0; fi
-          printf 'The job %s ended as %s without a proven reuse.\n' "$1" "$2" | tee -a "${GITHUB_STEP_SUMMARY}"
-          failed=1
+            if [ "$2" != success ]; then
+              printf 'The job %s ended as %s, not as success.\n' "$1" "$2" | tee -a "${GITHUB_STEP_SUMMARY}"
+              failed=1
+            fi
           }
-          check plan "${PLAN}" must_run
-          check hooks "${HOOKS}" must_run
-          check infra "${INFRA}" may_skip
-          check guards "${GUARDS}" may_skip
+          check hooks "${HOOKS}"
+          check infrastructure "${INFRASTRUCTURE}"
+          check guards "${GUARDS}"
           exit "${failed}"
