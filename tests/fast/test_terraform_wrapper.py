@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from scripts.infra import terraform_wrapper
+from scripts.infra import teardown, terraform_wrapper
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.terraform_wrapper import (
     HEAVY_INPUT_NAMES,
@@ -390,11 +390,11 @@ class ConfirmedPlanTest(unittest.TestCase):
         (folder / "apply_binding.json").write_text(json.dumps(plan_binding(RUN, PLAN, "apply")))
         configuration_folder_of(self.root).mkdir(parents=True)
         self.calls: list[str] = []
-        plan = json.dumps(plan_with(HEAVY_INPUTS))
+        self.plan_text = json.dumps(plan_with(HEAVY_INPUTS))
 
         def fake_terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
             self.calls.append(arguments[0])
-            return "Apply complete! Resources: 0 added, 0 changed, 0 destroyed." if arguments[0] == "apply" else plan
+            return "Apply complete! Resources: 0 added, 0 changed, 0 destroyed." if arguments[0] == "apply" else self.plan_text
 
         self.enterContext(mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None))
         self.enterContext(mock.patch.object(terraform_wrapper, "terraform", side_effect=fake_terraform))
@@ -410,6 +410,39 @@ class ConfirmedPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(WrapperError, "the limits changed after this plan was saved; save a new plan"):
             apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
         self.assertNotIn("apply", self.calls)
+
+    def test_a_plan_document_of_any_shape_that_is_not_the_three_whole_numbers_is_refused_with_a_wrapper_error_before_any_apply(self) -> None:
+        good = {name: {"value": value} for name, value in HEAVY_INPUTS.items()}
+        shapes = {
+            "null": "null",
+            "text": '"text"',
+            "a list": "[]",
+            "a number": "5",
+            "an empty object": "{}",
+            "variables missing keys": json.dumps({"variables": {}}),
+            "variables one key": json.dumps({"variables": {"host_reserve_mib": {"value": 4096}}}),
+            "variables a list": json.dumps({"variables": []}),
+            "variables null": json.dumps({"variables": None}),
+            "variables text": json.dumps({"variables": "text"}),
+            "an entry that is a number": json.dumps({"variables": good | {"spark_limit_mib": 4096}}),
+            "an entry with no value": json.dumps({"variables": good | {"spark_limit_mib": {}}}),
+            "a null value": json.dumps({"variables": good | {"spark_limit_mib": {"value": None}}}),
+            "a text value": json.dumps({"variables": good | {"spark_limit_mib": {"value": "4096"}}}),
+            "a boolean value": json.dumps({"variables": good | {"spark_limit_mib": {"value": True}}}),
+            "a fractional value": json.dumps({"variables": good | {"spark_limit_mib": {"value": 4096.5}}}),
+            "a whole float value": json.dumps({"variables": good | {"spark_limit_mib": {"value": 4096.0}}}),
+            "a nested value": json.dumps({"variables": good | {"spark_limit_mib": {"value": {"value": 4096}}}}),
+            "another number": json.dumps({"variables": good | {"host_reserve_mib": {"value": 1}}}),
+            "a truncated file": '{"variables": {"host_reserve_mib": {"val',
+            "nothing": "",
+        }
+        for name, text in shapes.items():
+            with self.subTest(shape=name):
+                self.calls.clear()
+                self.plan_text = text
+                with self.assertRaises(WrapperError):
+                    apply_plan(RUN, CODE, {"AWS_PROFILE": "example_project_dev"})
+                self.assertNotIn("apply", self.calls)
 
 
 class CallerVariableTest(unittest.TestCase):
@@ -437,8 +470,9 @@ class CallerVariableTest(unittest.TestCase):
 
 
 class SavedPlanTest(unittest.TestCase):
-    """Right after a plan is saved, the wrapper reads what Terraform decided. A plan made with other heavy inputs than the loader gives is refused, whatever
-    overrode them: a variable file, a TF_VAR variable or a ``-var``. The refused plan is kept and marked, and no confirmation code is given."""
+    """Right after an up plan is saved, the wrapper reads what Terraform decided. A plan made with other heavy inputs than the loader gives is not given a
+    confirmation code, whatever overrode them. That notice is a convenience and writes no state: the check that matters runs when a plan is applied. The
+    figure has no effect when the host is destroyed, so a destroy plan is not checked."""
 
     CONFIGURATION = {"AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "TAILSCALE_CLIENT_ID": "example-id", "TAILSCALE_AUDIENCE": "example-audience"}
 
@@ -477,7 +511,7 @@ class SavedPlanTest(unittest.TestCase):
         self.assertTrue((self.plans / "apply.tfplan").is_file())
         self.assertFalse((self.plans / "apply_refused.json").exists())
 
-    def test_a_plan_whose_json_carries_another_number_is_refused_with_both_sets_and_no_confirmation_code(self) -> None:
+    def test_an_up_plan_whose_json_carries_another_number_gets_no_confirmation_code_and_writes_no_state(self) -> None:
         for name in HEAVY_INPUT_NAMES:
             with self.subTest(name=name):
                 self.plan_inputs = HEAVY_INPUTS | {name: HEAVY_INPUTS[name] + 1}
@@ -487,43 +521,27 @@ class SavedPlanTest(unittest.TestCase):
                 for text in ("overrode", str(HEAVY_INPUTS[name]), str(HEAVY_INPUTS[name] + 1)):
                     self.assertIn(text, str(caught.exception))
                 self.assertNotIn("--confirm", self.output.getvalue())
-                self.assertFalse((self.plans / "apply.tfplan").exists())
-                self.assertTrue((self.plans / "apply_candidate.tfplan").is_file())
-                self.assertTrue((self.plans / "apply_refused.json").is_file())
+                self.assertEqual(["apply_candidate.tfplan"], sorted(path.name for path in self.plans.iterdir()))
 
-    def test_a_plan_without_the_variables_or_with_a_string_number_is_refused_too(self) -> None:
+    def test_an_up_plan_without_the_variables_or_with_a_string_number_gets_no_confirmation_code_either(self) -> None:
         for inputs in ({}, {name: str(value) for name, value in HEAVY_INPUTS.items()}):
             with self.subTest(inputs=inputs):
                 self.plan_inputs = inputs
                 with self.assertRaisesRegex(WrapperError, "overrode"):
                     save_plan(RUN, self.CONFIGURATION, "apply")
 
-    def test_the_teardown_plan_is_refused_the_same_way_and_marked_under_its_own_name(self) -> None:
-        self.plan_inputs = HEAVY_INPUTS | {"host_reserve_mib": 1}
-        with self.assertRaisesRegex(WrapperError, "overrode"):
-            save_plan(RUN, self.CONFIGURATION, "destroy")
-        self.assertTrue((self.plans / "destroy_refused.json").is_file())
-        self.assertFalse((self.plans / "destroy.tfplan").exists())
-        self.assertNotIn("--confirm", self.output.getvalue())
-
-    def test_a_refused_plan_cannot_be_confirmed_even_when_an_earlier_reviewed_plan_is_still_there_and_the_inputs_are_good_again(self) -> None:
-        self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "apply"))
-        code = hashlib.sha256((self.plans / "apply.tfplan").read_bytes()).hexdigest()[:12]
-        self.plan_inputs = HEAVY_INPUTS | {"host_reserve_mib": 1}
-        with self.assertRaises(WrapperError):
-            save_plan(RUN, self.CONFIGURATION, "apply")
-        self.plan_inputs = dict(HEAVY_INPUTS)
-        with mock.patch.object(terraform_wrapper, "record_created"), self.assertRaisesRegex(WrapperError, "the last apply plan was refused"):
-            apply_plan(RUN, code, self.CONFIGURATION)
-
-    def test_a_later_good_plan_lifts_the_mark(self) -> None:
-        self.plan_inputs = HEAVY_INPUTS | {"host_reserve_mib": 1}
-        with self.assertRaises(WrapperError):
-            save_plan(RUN, self.CONFIGURATION, "apply")
-        self.plan_inputs = dict(HEAVY_INPUTS)
-        self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "apply"))
-        self.assertFalse((self.plans / "apply_refused.json").exists())
-        self.assertFalse((self.plans / "apply_candidate.tfplan").exists())
+    def test_a_destroy_plan_with_other_numbers_is_saved_and_applied_because_the_figure_does_not_matter_when_the_host_is_destroyed(self) -> None:
+        self.plan_inputs = {"host_reserve_mib": 1}
+        self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "destroy"))
+        self.assertTrue((self.plans / "destroy.tfplan").is_file())
+        self.assertTrue((self.plans / "destroy_binding.json").is_file())
+        finished: list[str] = []
+        with (
+            mock.patch.object(terraform_wrapper, "heavy_inputs", side_effect=AssertionError("the destroy path compared the heavy inputs")),
+            mock.patch.object(teardown, "terraform", return_value="Resources: 0 added, 0 changed, 1 destroyed"),
+        ):
+            teardown.apply_destroy(RUN, self.plans / "destroy.tfplan", finished.append)
+        self.assertEqual(["apply"], finished)
 
     def test_the_wrapper_never_reads_a_variable_file_it_only_passes_its_path_to_terraform(self) -> None:
         """Terraform alone reads ``.tfvars`` text. A reader of its own cannot match Terraform's language, so the check is on what Terraform decided."""

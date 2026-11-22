@@ -11,8 +11,9 @@ the resource changes and a confirmation code. ``apply`` refuses a changed plan f
 another state location, then applies the exact bytes it checked. Each run has its own copy of the configuration, and
 no Terraform variable of the caller reaches Terraform. The three heavy-job inputs come from the limits loader and are staged in the copy of a call that
 makes a plan, and of no other call, so a limits file that the loader refuses stops a plan and never a read of the state. The wrapper reads no
-variable file: right after it saves a plan it reads the plan's JSON, and a plan made with other heavy inputs than the loader gives, whatever overrode
-them, is kept, marked as refused and given no confirmation code.
+variable file. Before it applies a plan it reads that plan's own JSON, and a plan whose three heavy inputs are not the whole numbers that
+the loader gives is refused. A plan that was made with other numbers gets no confirmation code when it is saved, as a courtesy that writes no state.
+A destroy plan is not checked: the figure has no effect when the host is destroyed.
 A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this command never applies one.
 """
 
@@ -78,7 +79,6 @@ class WrapperError(RuntimeError):
 CONFIGURATION_PARTS = ("modules", "environments")
 HEAVY_INPUTS_FILE = "heavy_inputs.tfvars.json"
 HEAVY_INPUT_NAMES = ("host_reserve_mib", "always_on_limits_mib", "spark_limit_mib")
-ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)\s*=(?!=)")
 BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
 
 
@@ -142,19 +142,20 @@ def heavy_inputs() -> str:
         raise WrapperError(f"refused before Terraform starts: the limits file cannot give the heavy-job inputs: limits: {error}") from error
 
 
-def inputs_difference(plan: dict[str, Any]) -> tuple[dict[str, object], dict[str, Any]] | None:
+def inputs_difference(plan: object) -> tuple[dict[str, object], dict[str, Any]] | None:
     """The heavy inputs that a plan's JSON records and the loader's current ones, or None when they are equal.
 
-    A plan without the three variables, or with one that is not a whole number, differs.
+    A document of any other shape than ``{"variables": {name: {"value": whole number}}}`` for the three names differs, and none of its parts raises.
     """
-    recorded = plan.get("variables", {})
-    planned = {name: recorded.get(name, {}).get("value") if isinstance(recorded.get(name), dict) else None for name in HEAVY_INPUT_NAMES}
+    variables = plan.get("variables") if isinstance(plan, dict) else None
+    recorded = variables if isinstance(variables, dict) else {}
+    planned = {name: recorded[name].get("value") if isinstance(recorded.get(name), dict) else None for name in HEAVY_INPUT_NAMES}
     current = json.loads(heavy_inputs())
     exact = all(isinstance(value, int) and not isinstance(value, bool) for value in planned.values())
     return None if exact and planned == current else (planned, current)
 
 
-def stale_inputs_problem(plan: dict[str, Any]) -> str | None:
+def stale_inputs_problem(plan: object) -> str | None:
     """The refusal for a plan made with other heavy inputs than the limits file gives now, or None."""
     difference = inputs_difference(plan)
     if difference is None:
@@ -170,7 +171,7 @@ def environment_override_problems(environment: Mapping[str, str]) -> list[str]:
     ]
 
 
-def overridden_inputs_problem(plan: dict[str, Any]) -> str | None:
+def overridden_inputs_problem(plan: object) -> str | None:
     """The refusal for a saved plan that Terraform made with other heavy inputs than the loader gives, whatever overrode them, or None."""
     difference = inputs_difference(plan)
     if difference is None:
@@ -327,13 +328,11 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={candidate}"], PLAN_TIMEOUT_SECONDS)
     plan_json = terraform(run, ["show", "-json", str(candidate)], PLAN_TIMEOUT_SECONDS)
     plan_document = json.loads(plan_json)
-    refused = folder / f"{action}_refused.json"
-    overridden = overridden_inputs_problem(plan_document)
+    # The figure has no effect when the host is destroyed, so a destroy plan is not checked. For an up plan this notice only spares a confirmation code that
+    # apply_plan would refuse. It writes no state: the check that matters runs on the plan that is applied.
+    overridden = overridden_inputs_problem(plan_document) if action == "apply" else None
     if overridden:
-        # The plan is kept, not deleted. The mark keeps it from being confirmed, and no confirmation code is given.
-        refused.write_text(json.dumps({"reason": overridden, "plan_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()}, indent=2) + "\n")
-        raise WrapperError(f"refused: {overridden}")
-    refused.unlink(missing_ok=True)
+        raise WrapperError(f"no confirmation code: {overridden}")
     counts: dict[str, int] = {}
     for actions, address in plan_changes(plan_document):
         counts[actions] = counts.get(actions, 0) + 1
@@ -361,8 +360,6 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
     folder = ROOT / "runs" / run.run_id / "plans"
     plan_file = folder / "apply.tfplan"
     binding_file = folder / "apply_binding.json"
-    if (folder / "apply_refused.json").is_file():
-        raise WrapperError("refused before any change: the last apply plan was refused because a heavy input was overridden; save a new plan")
     if not plan_file.is_file() or not binding_file.is_file():
         raise WrapperError("no saved apply plan for this run: run plan first")
     plan = plan_file.read_bytes()
@@ -371,7 +368,11 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         raise WrapperError("refused before any change: " + "; ".join(problems))
     approved = approved_plan_copy(run, plan)
     try:
-        applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
+        # The one check on the plan that is applied: its own JSON, read from the exact bytes that were checked, holds the three numbers the loader gives now.
+        try:
+            applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
+        except ValueError as error:
+            raise WrapperError("refused before any change: the JSON of the saved plan cannot be read, so its heavy inputs are unknown") from error
         stale = stale_inputs_problem(applied_plan)
         if stale:
             raise WrapperError(f"refused before any change: {stale}")
