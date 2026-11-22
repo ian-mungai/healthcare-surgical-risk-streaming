@@ -83,6 +83,8 @@ class RenderTest(unittest.TestCase):
             code, output = run_tasks(["render_environment.yml"], variables(folder))
             limits = (folder / "compose" / "limits.env").read_text()
             host = (folder / "compose" / "host.env").read_text()
+            heavy = (folder / "compose" / "heavy.env").read_text()
+            heavy_mode = (folder / "compose" / "heavy.env").stat().st_mode
             socket_gid = folder.stat().st_gid
             again_code, again = run_tasks(["render_environment.yml"], variables(folder))
         self.assertEqual(0, code, output)
@@ -90,9 +92,11 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(
             f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n"
             f"DOCKER_SOCKET_GID={socket_gid}\nSTACK_K3S_NAMESPACE=airbyte\nSTACK_K3S_RELEASE=airbyte\nPLATFORM_COMMIT={'c' * 40}\n"
-            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\nHEAVY_MEMORY_MIB=11008\n",
+            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n",
             host,
         )
+        self.assertEqual("HEAVY_MEMORY_MIB=11008\n", heavy)
+        self.assertEqual(0o644, stat.S_IMODE(heavy_mode))
         self.assertEqual(0, again_code, again)
         self.assertRegex(again, CHANGED_NONE)
 
@@ -104,6 +108,20 @@ class RenderTest(unittest.TestCase):
             host = (folder / "compose" / "host.env").read_text()
         self.assertEqual(0, code, output)
         self.assertIn("\nDOCKER_SOCKET_GID=991\n", host)
+
+    def test_a_changed_heavy_figure_is_written_to_the_heavy_file_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "compose").mkdir()
+            run_tasks(["render_environment.yml"], variables(folder))
+            host_before = (folder / "compose" / "host.env").read_text()
+            code, output = run_tasks(["render_environment.yml"], variables(folder) | {"compose_stack_heavy_memory_mib": 9984})
+            heavy = (folder / "compose" / "heavy.env").read_text()
+            host_after = (folder / "compose" / "host.env").read_text()
+        self.assertEqual(0, code, output)
+        self.assertEqual("HEAVY_MEMORY_MIB=9984\n", heavy)
+        self.assertEqual(host_before, host_after)
+        self.assertNotIn("HEAVY_MEMORY_MIB", host_after)
 
     def test_a_missing_socket_stops_the_step_with_the_socket_named_and_writes_no_host_settings(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -122,10 +140,11 @@ class RenderTest(unittest.TestCase):
                 (folder / "compose").mkdir()
                 values = {name: value for name, value in variables(folder).items() if name != missing}
                 code, output = run_tasks(["render_environment.yml"], values)
-                written = (folder / "compose" / "host.env").exists()
+                written = [name for name in ("host.env", "heavy.env") if (folder / "compose" / name).exists()]
             self.assertNotEqual(0, code)
             self.assertIn(missing, output)
-            self.assertFalse(written)
+            # The heavy file is written first: a deploy with no commit leaves it, valid, beside no host settings, and a deploy with no figure writes neither.
+            self.assertEqual([] if missing == "compose_stack_heavy_memory_mib" else ["heavy.env"], written)
 
 
 def service_list(*, tool_group: int) -> str:

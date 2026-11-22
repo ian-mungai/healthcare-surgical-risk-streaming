@@ -7,6 +7,7 @@ rename in one place would silently stop the limiting: the last test holds the tw
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import tempfile
@@ -33,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DAGSTER_YAML = ROOT / "orchestration" / "dagster.yaml"
 LIMITS = ROOT / "compose" / "limits.yml"
 CODE_LOCATION = ROOT / "compose" / "services" / "dagster_code_location.yml"
+DEFINITIONS = ROOT / "orchestration" / "surgical_risk" / "definitions.py"
 # A figure of these tests only. The real one is calculated by Terraform from the host's memory and the limits file.
 FIGURE = 10000
 ENVIRONMENT = {HEAVY_MEMORY_ENVIRONMENT: str(FIGURE)}
@@ -147,10 +149,34 @@ class HeavyFigureTest(unittest.TestCase):
             with self.assertRaisesRegex(ConcurrencyError, "positive whole number"):
                 job_tags("bronze", limits, {"bronze": "batch"}, {HEAVY_MEMORY_ENVIRONMENT: "0"})
 
-    def test_the_code_location_service_passes_the_figure_from_the_host_settings_and_fails_without_it(self) -> None:
+    def test_the_code_location_loads_the_figure_from_the_heavy_file_that_the_deploy_renders_and_fails_without_it(self) -> None:
         document: Any = load_yaml(CODE_LOCATION.read_text())
-        environment = document["services"]["dagster_code_location"]["environment"]
-        self.assertEqual("${HEAVY_MEMORY_MIB:?write the host settings first}", environment[HEAVY_MEMORY_ENVIRONMENT])
+        service = document["services"]["dagster_code_location"]
+        self.assertEqual([{"path": "../host.env", "required": False}, {"path": "../heavy.env", "required": True}], service["env_file"])
+
+    def test_no_shell_variable_reaches_the_figure_because_the_service_file_interpolates_none(self) -> None:
+        """Compose reads ``${NAME}`` in a file from the shell first, and a value there wins over a file. The figure arrives through ``env_file`` instead, which
+        no shell variable overrides, so neither the service's environment nor any other line of its file names the variable."""
+        text = CODE_LOCATION.read_text()
+        document: Any = load_yaml(text)
+        self.assertNotIn(HEAVY_MEMORY_ENVIRONMENT, document["services"]["dagster_code_location"].get("environment", {}))
+        self.assertNotIn("${" + HEAVY_MEMORY_ENVIRONMENT, text)
+        self.assertNotIn("$" + HEAVY_MEMORY_ENVIRONMENT, text)
+
+    def test_the_definitions_check_the_figure_when_the_code_location_loads(self) -> None:
+        """The figure is read at import, so a missing or invalid one fails the load with its reason and not the first launch. The definitions import Dagster,
+        which the fast tests do not have, so the test reads the module's own statements."""
+        tree = ast.parse(DEFINITIONS.read_text())
+        calls = [
+            node.value.func.id
+            for node in tree.body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+        ]
+        self.assertIn("heavy_memory_mib", calls)
+        imported = [
+            alias.name for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "concurrency" and node.level == 1 for alias in node.names
+        ]
+        self.assertIn("heavy_memory_mib", imported)
 
 
 class InstanceSettingTest(unittest.TestCase):

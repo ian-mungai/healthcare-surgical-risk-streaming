@@ -11,6 +11,8 @@ services:
     env_file:
       - path: ../host.env
         required: false
+      - path: ../heavy.env
+        required: true
     command: [dagster, api, grpc, --module-name, surgical_risk.definitions, --host, 0.0.0.0, --port, "4266"]
     depends_on:
       postgres:
@@ -18,7 +20,6 @@ services:
     environment:
       PLATFORM_COMMIT: ${PLATFORM_COMMIT:-unknown}
       NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
-      HEAVY_MEMORY_MIB: ${HEAVY_MEMORY_MIB:?write the host settings first}
     configs:
       - source: dagster_limits
         target: /opt/dagster/limits.yml

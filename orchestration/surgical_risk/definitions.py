@@ -18,8 +18,12 @@ from dagster import (
 )
 
 from . import housekeeping, lineage_sample
+from .concurrency import heavy_memory_mib
 from .groups import GroupResource
 from .run_records import run_folder_sensors
+
+# The figure above which a job is heavy is read when the code location loads: a missing or invalid one fails the load with its reason, not a later launch.
+heavy_memory_mib()
 
 INBOX = Path(os.environ.get("DAGSTER_INBOX", "/opt/dagster/data/inbox"))
 MARKER_SUFFIX = ".marker"

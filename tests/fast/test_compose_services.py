@@ -252,7 +252,7 @@ class DockerSocketExceptionTest(unittest.TestCase):
         service = self.code_location()["services"]["dagster_code_location"]
         self.assertEqual("10001:10001", service["user"])
         self.assertEqual(["${DOCKER_SOCKET_GID:?write the host settings first}"], service["group_add"])
-        self.assertEqual([{"path": "../host.env", "required": False}], service["env_file"])
+        self.assertEqual([{"path": "../host.env", "required": False}, {"path": "../heavy.env", "required": True}], service["env_file"])
 
     def test_the_code_location_reaches_the_k3s_api_on_the_host_with_the_service_account_files_as_secrets(self) -> None:
         document = self.code_location()

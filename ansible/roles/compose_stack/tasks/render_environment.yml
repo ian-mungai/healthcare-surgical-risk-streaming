@@ -37,8 +37,19 @@
     msg: "the Docker socket {{ compose_stack_docker_socket }} does not exist, so the code location cannot be given its group"
   when: compose_stack_docker_socket_gid is not defined and not compose_stack_socket.stat.exists
 
+# The heavy-job figure is the one that Terraform calculated, which the host command reads from the run's state. It has a file of its own, which the code
+# location loads with env_file: a value in Compose's interpolation can be overridden by a shell variable of the caller, and a file loaded this way cannot.
+# It is written first, so a deploy with no figure stops before it writes any host setting.
+- name: Write the heavy-job figure the code location loads
+  ansible.builtin.copy:
+    dest: "{{ compose_stack_compose_directory }}/heavy.env"
+    content: |
+      HEAVY_MEMORY_MIB={{ compose_stack_heavy_memory_mib }}
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0644"
+
 # The commit and the warehouse location come from the host command (scripts/infra/host.py), which reads them from the checkout and the project configuration.
-# The heavy-job figure is the one that Terraform calculated, which the host command reads from the run's state.
 - name: Write the host settings Compose reads
   ansible.builtin.copy:
     dest: "{{ compose_stack_compose_directory }}/host.env"
@@ -53,7 +64,6 @@
       PLATFORM_COMMIT={{ compose_stack_platform_commit }}
       WAREHOUSE_LOCATION={{ compose_stack_warehouse_location }}
       AWS_REGION={{ workload_access_region }}
-      HEAVY_MEMORY_MIB={{ compose_stack_heavy_memory_mib }}
     owner: "{{ compose_stack_owner }}"
     group: "{{ compose_stack_group }}"
     mode: "0644"
