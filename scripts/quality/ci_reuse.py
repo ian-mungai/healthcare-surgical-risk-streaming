@@ -6,7 +6,9 @@ head repository are this repository, so a run of another workflow or of a fork n
 
 A push to main reuses a pull request's result only when all of these hold:
 
-- exactly one pull request of this repository was merged into main with the pushed commit as its merge commit;
+- exactly one pull request of this repository was merged into main with the pushed commit as its merge commit, and the push run is
+  this workflow's run of that commit, created within 15 minutes after the merge (``scripts/quality/ci_plan.py`` also requires the
+  push event to have moved main from the merge commit's first parent without force);
 - the tree of the checkout equals the tree that the API gives for the pushed commit and for the pull request's head commit;
 - the runs of that head commit on that head branch are the pull request's own: the proof of each run's plan job
   (``scripts/quality/ci_proof.py``) names the pull request and main as its base, and a run whose plan job proves nothing refuses
@@ -33,6 +35,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -44,6 +47,7 @@ API_DEADLINE_SECONDS = 120  # every API read of one plan together; the plan job'
 LOOPBACK = ("127.0.0.1", "localhost")
 SHA = re.compile(r"[0-9a-f]{40}")
 MAIN = "main"
+MERGE_WINDOW_SECONDS = 15 * 60  # GitHub starts the push run within seconds of a merge; a later run may come from another push of the same commit
 WORKFLOW_PATH = re.compile(re.escape(WORKFLOW) + r"(?:@\S+)?")
 
 Api = Callable[[str], Any]
@@ -65,12 +69,14 @@ class Context:
 
 @dataclass(frozen=True)
 class Checkout:
-    """What the push run checked out, the pushed commit, its tree and the blob of its workflow file, and the runner it runs on."""
+    """What the push run checked out, the pushed commit, its tree and the blob of its workflow file, the runner it runs on and the ID
+    of the push run itself."""
 
     commit: str
     tree: str
     workflow_blob: str
     runner: dict[str, str]
+    run_id: int
 
 
 @dataclass(frozen=True)
@@ -320,11 +326,24 @@ def workflow_blob(api: Api, context: Context, commit: str) -> str:
     return str(found["sha"])
 
 
+def started_by_merge(api: Api, context: Context, checkout: Checkout, pull: dict[str, Any]) -> None:
+    """Raise ``NoReuse`` unless the push run is this workflow's run of the pushed commit, created within ``MERGE_WINDOW_SECONDS`` after
+    the pull request was merged; a forced reset of main to an older merge commit starts a run long after that merge."""
+    own = api(f"repos/{context.repository}/actions/runs/{checkout.run_id}")
+    if own["head_sha"] != checkout.commit or own["event"] != "push" or own["workflow_id"] != workflow_id(api, context):
+        raise NoReuse(f"the run {checkout.run_id} is not the push run of {checkout.commit} by this workflow")
+    seconds = (datetime.fromisoformat(own["created_at"]) - datetime.fromisoformat(pull["merged_at"])).total_seconds()
+    if not 0 <= seconds <= MERGE_WINDOW_SECONDS:
+        window = MERGE_WINDOW_SECONDS // 60
+        raise NoReuse(f"the push run was created {seconds / 60:.1f} minutes after pull request {pull['number']} was merged, not within {window} minutes after")
+
+
 def reusable_run(api: Api, context: Context, checkout: Checkout, names: Jobs) -> Reused:
     """The passed pull request run that the push of ``checkout`` reuses, holding exactly the jobs ``names``; ``NoReuse`` names why there is none."""
     commit, tree = checkout.commit, checkout.tree
     pull = merged_pull_request(api, context, commit)
     head, number = str(pull["head"]["sha"]), int(pull["number"])
+    started_by_merge(api, context, checkout, pull)
     if tree_of(api, context, commit) != tree:
         raise NoReuse(f"the tree of the checkout differs from the tree that the API gives for the commit {commit}")
     head_tree = tree_of(api, context, head)

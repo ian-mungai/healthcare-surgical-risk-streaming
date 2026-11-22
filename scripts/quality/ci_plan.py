@@ -7,7 +7,8 @@ Run from the repository root of the checkout: ``python -m scripts.quality.ci_pla
 - A pull request runs every group. Its run is the gate before the merge, and a group that skipped on a pull request would trust a
   selection that cannot see every file a check reads.
 - A push to main after a merge reuses the passed run of the merged pull request when ``scripts/quality/ci_reuse.py`` proves that it
-  checked the pushed tree. The record and the summary name the reused run.
+  checked the pushed tree, and the push event shows the move that a merge makes: from the merge commit's first parent, without force.
+  A rebase merge of several commits is not that move and runs every group. The record and the summary name the reused run.
 - Any other event, a push without a pull request and every doubt run every group; nothing is reused then.
 
 The plan job writes its own proof (``scripts/quality/ci_proof.py``), which binds a pull request run to its pull request. The hooks job
@@ -68,6 +69,18 @@ def run_jobs(config: dict[str, Any]) -> ci_reuse.Jobs:
     return ci_reuse.Jobs(required_jobs(config), config["plan"]["job"], config["required"]["job"])
 
 
+def from_merge(root: Path, environment: Mapping[str, str], head: str) -> None:
+    """Raise ``NoReuse`` unless the push event moved main to ``head`` from its first parent, without force: the move that a merge makes."""
+    event = ci_proof.event_payload(environment)
+    if not event:
+        raise ci_reuse.NoReuse("the run names no event, so the push cannot be shown to come from a merge")
+    if event["forced"] is not False:
+        raise ci_reuse.NoReuse("the push moved main by force")
+    parent = git("rev-parse", "--verify", "--quiet", f"{head}^1", cwd=root).strip()
+    if event["after"] != head or event["before"] != parent:
+        raise ci_reuse.NoReuse(f"the push moved main from {event['before']} to {event['after']}, not from the first parent {parent} of {head}")
+
+
 def push_reuse(root: Path, config: dict[str, Any], environment: Mapping[str, str], api: ci_reuse.Api | None) -> ci_reuse.Reused:
     """The passed pull request run that a push to main after a merge reuses."""
     head = environment.get("GITHUB_SHA", "")
@@ -78,13 +91,14 @@ def push_reuse(root: Path, config: dict[str, Any], environment: Mapping[str, str
     checked_out = git("rev-parse", "HEAD", cwd=root).strip()
     if checked_out != head:
         raise ci_reuse.NoReuse(f"the checkout {checked_out} is not the pushed commit {head}")
+    from_merge(root, environment, head)
     if api is None:
         raise ci_reuse.NoReuse("no GitHub API token was given, so no pull request run can be read")
     runner = ci_proof.runner(environment)
     if not runner["image_os"] or not runner["image_version"]:
         raise ci_reuse.NoReuse("the runner names no image version, so no run can be shown to have run on the same tools")
     tree, blob = git("rev-parse", "HEAD^{tree}", cwd=root).strip(), git("rev-parse", f"HEAD:{ci_reuse.WORKFLOW}", cwd=root).strip()
-    checkout = ci_reuse.Checkout(head, tree, blob, runner)
+    checkout = ci_reuse.Checkout(head, tree, blob, runner, int(environment["GITHUB_RUN_ID"]))
     return ci_reuse.reusable_run(api, ci_reuse.context_of(environment), checkout, run_jobs(config))
 
 

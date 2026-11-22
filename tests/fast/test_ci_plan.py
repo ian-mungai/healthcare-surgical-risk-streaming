@@ -38,6 +38,7 @@ EVERY_JOB = sorted(ci_plan.required_jobs(CONFIG))
 GUARD_JOBS = ci_plan.job_names(CONFIG, "guards")
 WORKFLOW_COMMIT = "9" * 40
 WORKFLOW_ID = 425
+PUSH_RUN = 900
 RUNNER_IMAGE = {"ImageOS": "ubuntu24", "ImageVersion": "20261116.1.0"}
 HERE = ci_proof.runner(RUNNER_IMAGE)
 ALL = {"hooks": True, "infra": True, "guards": True}
@@ -123,6 +124,8 @@ class FakeGitHub:
         if url.path.startswith(f"repos/{REPOSITORY}/actions/runs/") and parts[-1] == "jobs" and query.get("filter") == ["latest"]:
             jobs = self.jobs[int(parts[-2])]
             return {"total_count": len(jobs) + (1 if int(parts[-2]) in self.short_job_pages else 0), "jobs": jobs}
+        if url.path.startswith(f"repos/{REPOSITORY}/actions/runs/") and parts[-1].isdigit():
+            return next(run for run in self.runs if run["id"] == int(parts[-1]))
         if url.path.startswith(f"repos/{REPOSITORY}/commits/") and parts[-1] == "pulls":
             return self.pulls.get(parts[-2], [])
         if url.path.startswith(f"repos/{REPOSITORY}/git/commits/") and parts[-1] in self.trees:
@@ -177,9 +180,31 @@ class PlanRepository(TemporaryRepository):
         """The plan of a pull request run whose checkout is the head commit."""
         return ci_plan.plan(self.repo, self.environment("pull_request", ref="refs/pull/5/merge"), self.github)
 
-    def push(self, *, sha: str | None = None, ref: str = "refs/heads/main", event: str = "push") -> dict[str, Any]:
-        """The plan of a push of ``sha`` (the checkout by default) to ``ref``."""
-        return ci_plan.plan(self.repo, self.environment(event, sha, ref), self.github)
+    def push(
+        self,
+        *,
+        sha: str | None = None,
+        ref: str = "refs/heads/main",
+        event: str = "push",
+        before: str | None = None,
+        forced: bool = False,
+        created: str = "2026-11-21T11:00:30Z",
+        own: dict[str, Any] | None = None,
+        without: tuple[str, ...] = (),
+        no_api: bool = False,
+    ) -> dict[str, Any]:
+        """The plan of the push run 900 of ``sha`` (the checkout by default) to ``ref``, created at ``created``, whose event moved the
+        branch from ``before`` (the pushed commit's first parent by default), by force when ``forced``, with the variables ``without``
+        left out of its environment, and with no API reader when ``no_api``."""
+        sha = sha or self.head()
+        parent = self.git("rev-parse", "--verify", "--quiet", f"{sha}^1").stdout.strip() if self.git("rev-list", "--count", sha).stdout.strip() != "1" else ""
+        event_file = self.repo.parent / "event.json"
+        event_file.write_text(json.dumps({"ref": ref, "before": parent if before is None else before, "after": sha, "forced": forced}))
+        self.github.runs = [run for run in self.github.runs if run["id"] != PUSH_RUN]
+        self.github.add_run(PUSH_RUN, sha, event="push", branch="main", created_at=created)
+        self.github.runs[-1].update(own or {})
+        environment = self.environment(event, sha, ref) | {"GITHUB_EVENT_PATH": str(event_file), "GITHUB_RUN_ID": str(PUSH_RUN)}
+        return ci_plan.plan(self.repo, {key: value for key, value in environment.items() if key not in without}, None if no_api else self.github)
 
     def runs(self, record: dict[str, Any]) -> dict[str, bool]:
         return {group: decision["run"] for group, decision in record["groups"].items()}
@@ -381,10 +406,28 @@ class PushReuseTest(PlanRepository):
         self.assertEqual(self.runs(self.push()), ALL)
 
     def test_a_push_whose_runner_names_no_image_reuses_nothing(self) -> None:
-        environment = {key: value for key, value in self.environment("push").items() if key != "ImageVersion"}
-        record = ci_plan.plan(self.repo, environment, self.github)
+        record = self.push(without=("ImageVersion",))
         self.assertEqual(self.runs(record), ALL)
         self.assertIn("names no image version", record["basis"])
+
+    def test_a_push_that_did_not_come_from_the_merge_reuses_nothing(self) -> None:
+        later = self.git("commit-tree", self.tree(self.merged), "-p", self.merged, "-m", "feat: a later merge").stdout.strip()
+        planted: dict[str, tuple[dict[str, Any], str]] = {
+            "a forced reset of main to the merge": ({"forced": True}, "by force"),
+            "a push from another commit than the merge's parent": ({"before": later}, "moved main from"),
+            "a push run created long after the merge": ({"created": "2026-11-21T13:00:00Z"}, "minutes after"),
+            "a push run created before the merge": ({"created": "2026-11-21T10:59:00Z"}, "minutes after"),
+            "a push run of another commit": ({"own": {"head_sha": later}}, "is not the push run"),
+            "a push run of another event": ({"own": {"event": "workflow_dispatch"}}, "is not the push run"),
+            "a push run of another workflow": ({"own": {"workflow_id": WORKFLOW_ID + 1}}, "is not the push run"),
+        }
+        for label, (fields, reason) in planted.items():
+            with self.subTest(label=label):
+                record = self.push(**fields)
+                self.assertEqual(self.runs(record), ALL)
+                self.assertIn(reason, record["basis"])
+        environment = self.environment("push") | {"GITHUB_RUN_ID": str(PUSH_RUN)}
+        self.assertIn("names no event", ci_plan.plan(self.repo, environment, self.github)["basis"])
 
     def test_a_merge_with_another_tree_runs_every_group(self) -> None:
         other = self.commit({"README.md": "a change that main had and the pull request lacked\n"})
@@ -516,7 +559,7 @@ class PushReuseTest(PlanRepository):
         self.assertIn("502", record["basis"])
 
     def test_no_api_reuses_nothing(self) -> None:
-        record = ci_plan.plan(self.repo, self.environment("push"), None)
+        record = self.push(no_api=True)
         self.assertEqual(self.runs(record), ALL)
         self.assertIn("no GitHub API token", record["basis"])
 
