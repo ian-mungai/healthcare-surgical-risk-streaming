@@ -4,30 +4,40 @@ The loop is tested here with a stand-in for one replay run, because a real run n
 holds. Isolation covers what a real run cannot produce on demand: a run that stops on a signal, a run that fails, a record that cannot be read and a loop
 that stops making progress. The replay image, its real run and its Compose health check are proved by the acceptance test of the joined stack.
 
-Failure modes, each with its case: an empty inbox (waits, health fresh, no run), a malformed record (moved to failed, serving continues), a failed run (moved to
-failed with its exit code, serving continues), a stop while waiting (returns at once), a stop during a run (the record stays in the inbox for the restart, which
-resumes it), two records (run one at a time in name order), a stale, future, infinite or not-a-number health stamp (unhealthy), a record submitted twice (one
-record), a record that differs from the one already submitted under its run ID (refused, the first kept, also when two submits race and after the run was
-archived), a record whose timing field is not a finite number from 0 to 86,400 (refused at submit, and failed with its reason when planted in the queue) and a
-restart after a result was written but before the record was archived (the result stays, the record is archived, nothing runs again).
+Failure modes, each with its case: an empty inbox (waits, health fresh, no run), a malformed record (moved to failed, serving continues), a failed run
+(moved to failed with its exit code, serving continues), a stop while waiting (returns at once), a stop during a run (the record stays in the inbox
+for the restart, which resumes it), two records (run one at a time in name order), a stale, future, infinite or not-a-number health stamp (unhealthy),
+a record submitted twice (one record), a record that differs from the one already submitted under its run ID (refused, the first kept, also when two
+submits race and after the run was archived, and when the ID already holds a record in the inbox, in done or in failed from before reservations
+existed), a delayed submit that meets an archival (waits for it, then queues nothing), a record whose timing field is not a finite number from 0 to
+86,400 or whose speed is not a finite number from 0.01 to 1,000 (refused at submit, and failed with its reason when planted in the queue), a restart
+after a result was written but before the record was archived (the result stays, the record is archived, nothing runs again), a replay that raises an
+arithmetic or value error (that request fails at once), a request that stops the service three starts in a row whatever the error (fails on the fourth
+start and the next request runs), a stop by signal (not counted) and a submission that is not valid UTF-8 (refused with its reason).
 """
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import threading
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
-from replay.service.serve import Outcome, SubmitError, healthy, queued_record, serve, submit
+from replay.service import serve as serve_module
+from replay.service.serve import Outcome, SubmitError, archive, healthy, held, queued_record, read_submission, serve, submit
 from scripts.ingestion.manifest import ManifestRef
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
 OTHER_REFERENCE = ManifestRef("bucket", "manifests/replay/" + "c" * 64 + ".json", "version_2", "d" * 64).to_json()
 BAD_TIMES = (1e308, float("inf"), float("-inf"), float("nan"), -1, 86_401, 10**400)
+BAD_SPEEDS = (0, -5, float("inf"), float("nan"), 10**400, 5e-324, 0.0099, 1000.5, 1001)
+GOOD_SPEEDS = (0.01, 1000, 60)
 TIMING_FIELDS = ("idle_checkpoint_seconds", "stagger_seconds", "turnover_seconds", "window_seconds")
 
 RECORD = {
@@ -172,7 +182,7 @@ class ServeTest(unittest.TestCase):
     def test_a_queued_record_that_does_not_parse_or_validate_fails_with_its_reason_and_serving_continues(self) -> None:
         planted = ["not json", "{}", json.dumps({**RECORD, "rooms": "one"})]
         planted += [json.dumps({**RECORD, field: value}) for field in TIMING_FIELDS for value in BAD_TIMES]
-        planted += [json.dumps({**RECORD, "speed": value}) for value in (0, -5, float("inf"), float("nan"), 10**400)]
+        planted += [json.dumps({**RECORD, "speed": value}) for value in BAD_SPEEDS]
         for index, text in enumerate(planted):
             with self.subTest(text=text[:70]):
                 loop = self.loop({"b.json": Outcome("finished", 0)})
@@ -239,6 +249,100 @@ class ServeTest(unittest.TestCase):
         loop.put("a.json.writing", json.dumps(RECORD))
         loop.serve()
         self.assertEqual([], loop.ran)
+
+
+class CrashLoopTest(unittest.TestCase):
+    """A request that stops the whole service is counted at each start, so a service that restarts on it cannot loop for ever, whatever the error."""
+
+    def setUp(self) -> None:
+        folder = tempfile.TemporaryDirectory(prefix="replay_crash_")
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.inbox = self.root / "inbox"
+        self.inbox.mkdir()
+        self.ran: list[str] = []
+        self.stop = False
+
+    def put(self, name: str) -> None:
+        (self.inbox / f"{name}.json").write_text(json.dumps(RECORD))
+        (self.inbox / f"{name}.reference").write_text(REFERENCE)
+
+    def start(self, run_request: Callable[[Path, Callable[[], None]], Outcome]) -> int:
+        self.stop = False
+
+        def sleep(seconds: float) -> None:
+            self.stop = True
+
+        return serve(self.inbox, self.root / "health.json", run_request, lambda: self.stop, Clock(), sleep, 1.0)
+
+    def crash_on_a(self, path: Path, beat: Callable[[], None]) -> Outcome:
+        self.ran.append(path.name)
+        if path.name == "a.json":
+            raise KeyError("an error that nothing handles")
+        return Outcome("finished", 0)
+
+    def test_a_request_that_stops_the_service_three_starts_in_a_row_fails_on_the_fourth_and_the_next_request_runs(self) -> None:
+        self.put("a")
+        self.put("b")
+        for count in (1, 2, 3):
+            with self.assertRaises(KeyError):
+                self.start(self.crash_on_a)
+            self.assertEqual(str(count), (self.inbox / "a.attempts").read_text().strip())
+        self.assertEqual(["a.json"] * 3, self.ran)
+        self.assertEqual(0, self.start(self.crash_on_a))
+        self.assertEqual(["a.json"] * 3 + ["b.json"], self.ran)
+        result = json.loads((self.inbox / "results" / "a.json").read_text())
+        self.assertEqual(("failed", "the service stopped during this request 3 times"), (result["outcome"], result["error"]))
+        self.assertTrue((self.inbox / "failed" / "a.json").is_file())
+        self.assertTrue((self.inbox / "failed" / "a.reference").is_file())
+        self.assertTrue((self.inbox / "done" / "b.json").is_file())
+        self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+
+    def test_two_stops_then_a_finish_is_not_a_failure_and_the_count_goes_with_the_archived_request(self) -> None:
+        self.put("a")
+        for _ in range(2):
+            with self.assertRaises(KeyError):
+                self.start(self.crash_on_a)
+        self.assertEqual(0, self.start(lambda path, beat: Outcome("finished", 0)))
+        self.assertTrue((self.inbox / "done" / "a.json").is_file())
+        self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+
+    def test_a_stop_by_signal_is_not_counted_so_any_number_of_deploys_keep_the_run(self) -> None:
+        self.put("a")
+        for _ in range(6):
+            self.start(lambda path, beat: Outcome("stopped", 2))
+            self.assertTrue((self.inbox / "a.json").is_file())
+        self.assertEqual("0", (self.inbox / "a.attempts").read_text().strip())
+        self.assertEqual(0, self.start(lambda path, beat: Outcome("finished", 0)))
+        self.assertTrue((self.inbox / "done" / "a.json").is_file())
+
+    def test_an_arithmetic_or_value_error_of_a_replay_fails_that_request_at_once_and_the_next_runs(self) -> None:
+        for error in (OverflowError("int too large"), ZeroDivisionError("division"), ValueError("a value")):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                self.put("a")
+                self.put("b")
+
+                def run(path: Path, beat: Callable[[], None], error: Exception = error) -> Outcome:
+                    self.ran.append(path.name)
+                    if path.name == "a.json":
+                        raise error
+                    return Outcome("finished", 0)
+
+                self.assertEqual(0, self.start(run))
+                self.assertEqual(["a.json", "b.json"], self.ran)
+                result = json.loads((self.inbox / "results" / "a.json").read_text())
+                self.assertEqual(("failed", 2, f"{type(error).__name__}: {error}"), (result["outcome"], result["exit_code"], result["error"]))
+                self.assertTrue((self.inbox / "failed" / "a.json").is_file())
+                self.assertTrue((self.inbox / "done" / "b.json").is_file())
+
+    def test_a_queued_record_with_a_speed_that_overflows_the_loop_fails_without_a_run(self) -> None:
+        (self.inbox / "a.json").write_text(json.dumps({**RECORD, "speed": 5e-324}))
+        (self.inbox / "a.reference").write_text(REFERENCE)
+        self.put("b")
+        self.assertEqual(0, self.start(self.crash_on_a))
+        self.assertEqual(["b.json"], self.ran)
+        self.assertTrue((self.inbox / "failed" / "a.json").is_file())
 
 
 class HealthTest(unittest.TestCase):
@@ -417,6 +521,131 @@ class SubmitTest(unittest.TestCase):
             with self.subTest(text=text[:30], reference=reference[:10]), self.assertRaises(SubmitError):
                 submit(self.inbox, text, reference)
         self.assertFalse(self.inbox.exists() and any(self.inbox.iterdir()))
+
+    def plant(self, folder: str, text: str = "", reference: str | None = REFERENCE) -> None:
+        """A record that is held under this run ID without a reservation, as one was before reservations existed."""
+        target = self.inbox / folder if folder else self.inbox
+        target.mkdir(parents=True, exist_ok=True)
+        (target / f"{self.name}.json").write_text(text or json.dumps(RECORD))
+        if reference is not None:
+            (target / f"{self.name}.reference").write_text(reference)
+
+    def test_a_record_held_in_the_inbox_done_or_failed_without_a_reservation_is_already_submitted_and_gets_its_reservation(self) -> None:
+        text = json.dumps(RECORD)
+        for folder in ("", "done", "failed"):
+            with self.subTest(folder=folder):
+                self.setUp()
+                self.plant(folder)
+                self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
+                self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
+                self.assertEqual(REFERENCE, (self.inbox / "reserved" / f"{self.name}.reference").read_text())
+                self.assertEqual(folder == "", (self.inbox / f"{self.name}.json").exists())
+                self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
+
+    def test_a_different_record_or_reference_under_an_id_that_a_record_already_holds_is_refused_and_nothing_is_reserved(self) -> None:
+        other_record = json.dumps({**RECORD, "speed": 120.0})
+        for folder in ("", "done", "failed"):
+            for label, text, reference in (("record", other_record, REFERENCE), ("reference", json.dumps(RECORD), OTHER_REFERENCE)):
+                with self.subTest(folder=folder, different=label):
+                    self.setUp()
+                    self.plant(folder)
+                    with self.assertRaises(SubmitError):
+                        submit(self.inbox, text, reference)
+                    self.assertFalse((self.inbox / "reserved").exists())
+                    self.assertEqual(json.dumps(RECORD), (self.inbox / folder / f"{self.name}.json").read_text())
+
+    def test_a_record_held_without_its_reference_is_not_the_same_submission(self) -> None:
+        for folder in ("", "done", "failed"):
+            with self.subTest(folder=folder):
+                self.setUp()
+                self.plant(folder, reference=None)
+                with self.assertRaises(SubmitError):
+                    submit(self.inbox, json.dumps(RECORD), REFERENCE)
+                self.assertFalse((self.inbox / "reserved").exists())
+
+    def test_a_delayed_submit_waits_for_the_lock_of_its_run_id_and_queues_nothing_when_the_record_was_archived_meanwhile(self) -> None:
+        text = json.dumps(RECORD)
+        reserved = self.inbox / "reserved"
+        reserved.mkdir(parents=True)
+        (reserved / self.name).write_text(text)
+        (reserved / f"{self.name}.reference").write_text(REFERENCE)
+        results: list[str] = []
+        with held(self.inbox, self.name):
+            thread = threading.Thread(target=lambda: results.append(submit(self.inbox, text, REFERENCE)))
+            thread.start()
+            thread.join(timeout=0.5)
+            self.assertTrue(thread.is_alive())
+            self.plant("done")
+        thread.join(timeout=30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(["already submitted"], results)
+        self.assertFalse((self.inbox / f"{self.name}.json").exists())
+        self.assertFalse((self.inbox / f"{self.name}.reference").exists())
+
+    def test_an_archival_waits_for_the_lock_of_its_run_id(self) -> None:
+        submit(self.inbox, json.dumps(RECORD), REFERENCE)
+        thread = threading.Thread(target=lambda: archive(self.inbox, self.inbox / f"{self.name}.json", "finished"))
+        with held(self.inbox, self.name):
+            thread.start()
+            thread.join(timeout=0.5)
+            self.assertTrue(thread.is_alive())
+            self.assertTrue((self.inbox / f"{self.name}.json").is_file())
+        thread.join(timeout=30)
+        self.assertTrue((self.inbox / "done" / f"{self.name}.json").is_file())
+
+    def test_a_lock_that_is_not_released_in_time_fails_visibly(self) -> None:
+        submit(self.inbox, json.dumps(RECORD), REFERENCE)
+        failures: list[BaseException] = []
+
+        def contend() -> None:
+            try:
+                with mock.patch.object(serve_module, "LOCK_SECONDS", 0.3), held(self.inbox, self.name):
+                    pass
+            except TimeoutError as error:
+                failures.append(error)
+
+        with held(self.inbox, self.name):
+            thread = threading.Thread(target=contend)
+            started = time.monotonic()
+            thread.start()
+            thread.join(timeout=30)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(1, len(failures))
+        self.assertIn(self.name, str(failures[0]))
+
+    def test_a_run_id_without_a_reservation_has_no_lock_to_wait_for(self) -> None:
+        with held(self.inbox, "nothing_reserved"):
+            pass
+
+    def test_a_speed_outside_0_01_to_1000_is_refused_and_the_edges_and_a_normal_speed_are_accepted(self) -> None:
+        for value in BAD_SPEEDS:
+            with self.subTest(speed=value), self.assertRaises(SubmitError) as caught:
+                submit(self.inbox, json.dumps({**RECORD, "speed": value}), REFERENCE)
+            self.assertIn("speed", str(caught.exception))
+        self.assertFalse(self.inbox.exists() and any(self.inbox.iterdir()))
+        for value in GOOD_SPEEDS:
+            with self.subTest(speed=value):
+                folder = tempfile.TemporaryDirectory(prefix="replay_submit_speed_")
+                self.addCleanup(folder.cleanup)
+                self.assertEqual("submitted", submit(Path(folder.name) / "inbox", json.dumps({**RECORD, "speed": value}), REFERENCE))
+
+    def test_a_submission_that_is_not_valid_utf_8_or_a_reference_file_that_is_missing_is_refused_with_its_reason(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="replay_read_")
+        self.addCleanup(scratch.cleanup)
+        folder = Path(scratch.name)
+        good, bad, missing = folder / "good.reference", folder / "bad.reference", folder / "missing.reference"
+        good.write_text(REFERENCE)
+        bad.write_bytes(b'{"bucket": "\xff"}')
+        text = io.TextIOWrapper(io.BytesIO(json.dumps(RECORD).encode()), encoding="utf-8")
+        self.assertEqual((json.dumps(RECORD), REFERENCE), read_submission(good, text))
+        for label, reference, stream in (
+            ("reference", bad, io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8")),
+            ("reference", missing, io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8")),
+            ("record", good, io.TextIOWrapper(io.BytesIO(b'{"a": "\xff"}'), encoding="utf-8")),
+        ):
+            with self.subTest(label=label, reference=reference.name), self.assertRaises(SubmitError) as caught:
+                read_submission(reference, stream)
+            self.assertIn(label, str(caught.exception))
 
 
 if __name__ == "__main__":

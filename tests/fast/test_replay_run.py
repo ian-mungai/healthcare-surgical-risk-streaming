@@ -271,7 +271,9 @@ class Restart(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "schedule"):
             other.run()
 
-    def test_a_speed_that_is_not_positive_or_a_checkpoint_that_is_not_positive_is_refused(self) -> None:
-        for settings in ((0.0, 5), (-1.0, 5), (float("inf"), 5), (1.0, 0)):
+    def test_a_speed_outside_0_01_to_1000_or_a_checkpoint_that_is_not_positive_is_refused_and_the_edges_are_accepted(self) -> None:
+        for settings in ((0.0, 5), (-1.0, 5), (float("inf"), 5), (float("nan"), 5), (5e-324, 5), (0.0099, 5), (1000.5, 5), (1.0, 0)):
             with self.subTest(settings=settings), self.assertRaises(ReplayError):
                 RunSettings(speed=settings[0], checkpoint_every=settings[1])
+        for speed in (0.01, 1000.0):
+            self.assertEqual(speed, RunSettings(speed=speed).speed)

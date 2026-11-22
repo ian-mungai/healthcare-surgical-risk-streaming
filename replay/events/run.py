@@ -32,6 +32,8 @@ from replay.events.stream import CaseEvent, OutgoingEvent, occurrence_events, ou
 STATE_FORMAT = "replay_state_1"
 DEFAULT_CHECKPOINT_EVENTS = 100
 DEFAULT_IDLE_CHECKPOINT_US = 5_000_000
+MIN_SPEED = 0.01
+MAX_SPEED = 1000.0
 
 
 class ReplayError(RuntimeError):
@@ -47,8 +49,8 @@ class RunSettings:
     idle_checkpoint_us: int = DEFAULT_IDLE_CHECKPOINT_US
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.speed) or self.speed <= 0:
-            raise ReplayError("the speed must be a positive finite number")
+        if not math.isfinite(self.speed) or not MIN_SPEED <= self.speed <= MAX_SPEED:
+            raise ReplayError(f"the speed must be a finite number from {MIN_SPEED:g} to {MAX_SPEED:,.0f}")
         if self.checkpoint_every < 1 or self.idle_checkpoint_us < 0:
             raise ReplayError("the checkpoint interval is at least one event and the idle checkpoint is not negative")
 

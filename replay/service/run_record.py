@@ -3,7 +3,7 @@
 It holds what the run is told and nothing the run decides: the run ID, the rooms, the speed, the stagger, the turnover and the window, the cases (all case
 files of the manifest when absent), where the manifest reference and the object store are, and where Kafka, the registry and the saved files are. The speed
 is here, so a run's record says how fast it was played. A missing, extra or mistyped field refuses the file, and so does a timing that is not a finite
-number from 0 to 86,400 seconds (a day) or a speed that is not a positive finite number.
+number from 0 to 86,400 seconds (a day) or a speed that is not a finite number from 0.01 to 1,000.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from replay.events.run import DEFAULT_CHECKPOINT_EVENTS
+from replay.events.run import DEFAULT_CHECKPOINT_EVENTS, MAX_SPEED, MIN_SPEED
 
 
 class RunRecordError(ValueError):
@@ -100,8 +100,8 @@ def parse_run_record(text: str) -> RunRecord:
         speed = float(document["speed"])
     except OverflowError:
         speed = math.inf
-    if not math.isfinite(speed) or speed <= 0:
-        raise RunRecordError("speed must be a positive finite number")
+    if not math.isfinite(speed) or not MIN_SPEED <= speed <= MAX_SPEED:
+        raise RunRecordError(f"speed must be a finite number from {MIN_SPEED:g} to {MAX_SPEED:,.0f}")
     store = closed(document["object_store"], {"kind": str}, {"root": str, "region": str, "read_log": str}, "the run record's object_store")
     if store["kind"] not in ("folder", "s3") or (store["kind"] == "folder" and "root" not in store) or (store["kind"] == "s3" and "region" not in store):
         raise RunRecordError("object_store is a folder with a root or an s3 store with a region")

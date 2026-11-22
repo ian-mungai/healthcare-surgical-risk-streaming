@@ -8,7 +8,8 @@
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 ``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
 ``submit``    read a run record on standard input and put it in the inbox under its run ID, with the manifest reference file that ``--manifest-reference``
-              names beside it; the same record and reference again change nothing, another one under that run ID is refused (exit 2).
+              names beside it; the same record and reference again change nothing, another one under that run ID is refused (exit 2), as is a
+              record or reference that is not valid UTF-8 text.
 ``health``    exit 0 when the service waits or runs and its health file is fresh: the container's health check.
 
 Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. A run that ``serve``
@@ -39,7 +40,7 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import Outcome, SubmitError, healthy, queued_record, serve, submit
+from replay.service.serve import Outcome, SubmitError, healthy, queued_record, read_submission, serve, submit
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.gate import GateRefused
@@ -236,12 +237,8 @@ def command_serve(arguments: argparse.Namespace) -> int:
 
 def command_submit(arguments: argparse.Namespace) -> int:
     try:
-        reference_text = arguments.manifest_reference.read_text()
-    except OSError:
-        log("submit_refused", message="the manifest reference file cannot be read")
-        return 2
-    try:
-        sys.stdout.write(submit(arguments.inbox, sys.stdin.read(), reference_text) + "\n")
+        text, reference_text = read_submission(arguments.manifest_reference, sys.stdin)
+        sys.stdout.write(submit(arguments.inbox, text, reference_text) + "\n")
     except SubmitError as error:
         log("submit_refused", message=str(error))
         return 2
@@ -265,6 +262,7 @@ COMMANDS = {
 STOPPING_ERRORS = (
     OSError,
     ValueError,
+    ArithmeticError,
     RuntimeError,
     ManifestError,
     StoreError,
