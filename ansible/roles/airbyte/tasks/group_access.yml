@@ -3,7 +3,8 @@
 # role (templates/group_access.yaml.j2) allows reading and scaling the namespace's workloads and nothing else. The token is a long-lived service account token
 # that the cluster writes into a secret. It is copied to a file that the code-location container reads as its own user, mode 0400, with the cluster's
 # certificate authority beside it. The token never appears in a task result or a log. Replace the token by deleting the secret and running the role again.
-# A second run changes nothing. Every wait ends at its deadline and a failure names the secret.
+# A second run changes nothing. Every wait ends at its deadline and a failure names the secret. The stack role runs this step, after cluster.yml, before it
+# starts the code location, so the step creates Airbyte's folder itself.
 - name: Give the group commands their narrow access to Airbyte's workloads
   vars:
     airbyte_group_account: dagster-groups
@@ -11,6 +12,14 @@
     airbyte_group_access_directory: "{{ airbyte_secrets_directory }}/k3s"
     airbyte_group_access_secret: dagster-groups-token
   block:
+    - name: Create Airbyte's folder
+      ansible.builtin.file:
+        path: "{{ airbyte_directory }}"
+        state: directory
+        owner: "{{ airbyte_owner }}"
+        group: "{{ airbyte_group }}"
+        mode: "0755"
+
     - name: Write the service account, role, binding and token secret
       ansible.builtin.template:
         src: group_access.yaml.j2

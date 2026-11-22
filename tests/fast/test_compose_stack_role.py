@@ -159,6 +159,8 @@ class StepOrderTest(unittest.TestCase):
                 "verify_secrets.yml",
                 "grafana_password.yml",
                 "build_images.yml",
+                "airbyte/cluster.yml",
+                "airbyte/group_access.yml",
                 "start.yml postgres",
                 "provision.yml",
                 "openbao/prepare.yml",
@@ -170,6 +172,16 @@ class StepOrderTest(unittest.TestCase):
             ],
             step_order(),
         )
+
+    def test_the_k3s_access_files_exist_before_the_first_start_so_a_fresh_host_deploys_in_one_pass(self) -> None:
+        """The code location reads the k3s token and certificate authority as Compose secrets, which the Airbyte role's access step writes."""
+        steps = step_order()
+        first_start = next(index for index, step in enumerate(steps) if step.startswith("start.yml"))
+        self.assertLess(steps.index("airbyte/cluster.yml"), steps.index("airbyte/group_access.yml"))
+        self.assertLess(steps.index("airbyte/group_access.yml"), first_start)
+        document: Any = load_yaml((ROOT / "compose" / "services" / "dagster_code_location.yml").read_text())
+        secrets = document["secrets"]
+        self.assertEqual({"k3s/dagster.token", "k3s/ca.crt"}, {secrets[name]["file"].split("}/", 1)[1] for name in ("k3s_token", "k3s_ca")})
 
 
 class PasswordFilesTest(unittest.TestCase):

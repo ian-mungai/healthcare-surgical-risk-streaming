@@ -3,7 +3,9 @@
 # The command commits only when main's history is empty, so a second deploy changes nothing.
 - name: Give Nessie's main branch its first commit, the project's namespace, when its history is empty
   ansible.builtin.command:
-    argv: "{{ compose_stack_docker + ['exec', '-T', 'dagster_code_location', 'python', '-m', 'scripts.stack.nessie', 'initialise', '--namespace', compose_stack_nessie_namespace] }}"
+    argv: "{{ compose_stack_docker + ['exec', '-T', 'dagster_code_location'] + compose_stack_nessie_command }}"
+  vars:
+    compose_stack_nessie_command: [python, -m, scripts.stack.nessie, initialise, --namespace, "{{ compose_stack_nessie_namespace }}"]
   register: compose_stack_nessie
   changed_when: compose_stack_nessie.stdout.startswith('initialised')
   timeout: 120

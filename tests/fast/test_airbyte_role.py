@@ -336,6 +336,18 @@ class PostgresRouteTest(unittest.TestCase):
         self.assertLess(main.index("group_access.yml"), main.index("release.yml"))
 
 
+class GroupAccessAloneTest(unittest.TestCase):
+    """The stack role runs the access step before the rest of this role, so the step creates the folder it writes into itself."""
+
+    def test_the_access_step_creates_airbytes_folder_before_it_writes_the_account_file(self) -> None:
+        document: Any = load_yaml((ROLE / "tasks" / "group_access.yml").read_text())
+        tasks = document[0]["block"]
+        folder = next(index for index, task in enumerate(tasks) if (task.get("ansible.builtin.file") or {}).get("path") == "{{ airbyte_directory }}")
+        template = next(index for index, task in enumerate(tasks) if "ansible.builtin.template" in task)
+        self.assertEqual("directory", tasks[folder]["ansible.builtin.file"]["state"])
+        self.assertLess(folder, template)
+
+
 def policies(text: str) -> list[dict[str, Any]]:
     return [mapping(load_yaml(part)) for part in text.split("\n---\n") if part.strip()]
 
