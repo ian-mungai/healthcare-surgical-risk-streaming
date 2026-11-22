@@ -8,9 +8,11 @@ locals {
   always_on_group = "supporting"
   spark_service   = "spark"
 
+  reserve_mib = local.limits.host_reserve_mib
+
   always_on_memory_mib = sum([for service in values(local.limits.services) : service.memory_limit_mib if service.group == local.always_on_group])
   spark_memory_mib     = local.limits.services[local.spark_service].memory_limit_mib
-  heavy_memory_mib     = data.aws_ec2_instance_type.host.memory_size - var.host_memory_reserve_mib - local.always_on_memory_mib - local.spark_memory_mib
+  heavy_memory_mib     = data.aws_ec2_instance_type.host.memory_size - local.reserve_mib - local.always_on_memory_mib - local.spark_memory_mib
 }
 
 data "aws_ec2_instance_type" "host" {
