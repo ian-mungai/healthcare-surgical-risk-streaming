@@ -285,39 +285,92 @@ ACCESS_ROOT = "/run/workload_access"
 OWN_MOUNT = re.compile(r"[a-z][a-z0-9_]*:/run/workload_access:ro")
 
 
+class Unresolvable(ValueError):
+    """A field that the credential checks read holds a variable whose value the test cannot know."""
+
+
+DEFAULTED = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-|-)([^${}]*)\}")
+REQUIRED = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::\?|\?)[^${}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+HOST_RENDERED_GROUPS = {"dagster_code_location": {"DOCKER_SOCKET_GID"}}
+"""The variables that a service's user and group fields may name without a default, each rendered into the host settings file by the Ansible role from the
+host itself (the group of the Docker socket). Their value is the host's, so each stands for one group that is not a workload group. No other field and no
+other service may name a variable without a default."""
+HOST_SETTINGS_RENDERER = COMPOSE.parent / "ansible" / "roles" / "compose_stack" / "tasks" / "render_environment.yml"
+
+
+def resolve(text: str, rendered: frozenset[str] | set[str] = frozenset()) -> str:
+    """The text with every Compose interpolation resolved as Compose resolves it: ``${VAR:-default}`` and ``${VAR-default}`` take their default (the innermost
+    first), and ``${VAR}``, ``$VAR``, ``${VAR:?message}`` and ``${VAR?message}`` are refused unless the variable is one of ``rendered``, which stands for the
+    host's own value. Any other use of ``$`` is refused."""
+    previous = None
+    while previous != text:
+        previous, text = text, DEFAULTED.sub(lambda match: match.group(1), text)
+
+    def required(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        if name not in rendered:
+            raise Unresolvable(text)
+        return f"<{name}>"
+
+    text = REQUIRED.sub(required, text)
+    if "$" in text:
+        raise Unresolvable(text)
+    return text
+
+
 def credential_folder(source: str) -> str | None:
-    """The folder under ``/run/workload_access/`` that a bind source names, with a variable default, trailing slashes and dots resolved: the empty text for the
-    root itself and None for a path outside it."""
-    text = source.strip()
-    if default := re.fullmatch(r"\$\{[A-Za-z0-9_]+:-(.*)\}", text):
-        text = default.group(1)
-    normal = posixpath.normpath(text)
+    """The folder under ``/run/workload_access/`` that a resolved bind source names, as Linux reads the path: any run of slashes is one, ``.`` segments and a
+    trailing slash are dropped and ``..`` is resolved lexically. The empty text is the root itself and None is a path outside it."""
+    normal = posixpath.normpath(re.sub(r"/+", "/", source.strip()))
     if normal == ACCESS_ROOT:
         return ""
     return normal.removeprefix(f"{ACCESS_ROOT}/") if normal.startswith(f"{ACCESS_ROOT}/") else None
 
 
-def credential_mounts(service: dict[str, Any], document: dict[str, Any]) -> list[tuple[str, str]]:
-    """Each volume entry of the service, short or long form, whose bind source is under ``/run/workload_access/``, as the folder and the entry as written. A
-    named volume counts by the device that the file declares for it."""
+def volume_source(entry: object) -> str:
+    """The source of a volume entry, short or long form, as written. The short form is cut at its first colon outside a variable."""
+    if isinstance(entry, dict):
+        return str(entry.get("source", ""))
+    depth, text = 0, str(entry)
+    for index, character in enumerate(text):
+        depth += character == "{"
+        depth -= character == "}"
+        if character == ":" and depth == 0:
+            return text[:index]
+    return text
+
+
+def credential_mounts(service: dict[str, Any], document: dict[str, Any], literal: Callable[[str, str], str | None]) -> list[tuple[str, str]]:
+    """Each volume entry of the service whose bind source is under ``/run/workload_access/``, as the folder and the entry as written. A named volume counts by
+    the device that the file declares for it. ``literal`` resolves a field's text, or says it cannot and returns None."""
     declared = document.get("volumes") or {}
     found = []
     for entry in service.get("volumes") or []:
-        source = str(entry.get("source", "")) if isinstance(entry, dict) else re.match(r"\$\{[^}]*\}|[^:]*", str(entry)).group(0)  # type: ignore[union-attr]
+        source = volume_source(entry)
         if source in declared:
             source = str(((declared[source] or {}).get("driver_opts") or {}).get("device", ""))
-        folder = credential_folder(source)
+        resolved = literal(source, "a volume source")
+        folder = credential_folder(resolved) if resolved is not None else None
         if folder is not None:
             found.append((folder, str(entry)))
     return found
 
 
 def access_problems(name: str, document: dict[str, Any]) -> list[str]:
-    """Each way that one service departs from the table of credential readers: a folder or a workload group that is not its own, or its own written wrongly."""
+    """Each way that one service departs from the table of credential readers: a folder or a workload group that is not its own, or its own written wrongly,
+    or a field that the check needs and cannot resolve."""
     service = document["services"][name]
     own = CREDENTIAL_READERS.get(name)
-    found = []
-    mounts = credential_mounts(service, document)
+    found: list[str] = []
+
+    def literal(text: str, field: str, rendered: set[str] = frozenset()) -> str | None:  # type: ignore[assignment]
+        try:
+            return resolve(text, rendered)
+        except Unresolvable:
+            found.append(f"{name}: {field} `{text}`: this field must be a literal or a resolvable default")
+            return None
+
+    mounts = credential_mounts(service, document, literal)
     for folder, entry in mounts:
         if own is None:
             found.append(f"{name}: is not in the table of services that may read a credential folder and mounts {folder or 'the whole folder'}")
@@ -327,8 +380,10 @@ def access_problems(name: str, document: dict[str, Any]) -> list[str]:
             found.append(f"{name}: the credential folder of {folder} must be mounted read-only at /run/workload_access")
     if own is not None and own[0] not in [folder for folder, _ in mounts]:
         found.append(f"{name}: must mount the credential folder of {own[0]}")
-    primary = str(service.get("user", "")).partition(":")[2]
-    supplementary = [str(group) for group in service.get("group_add") or []]
+    rendered = HOST_RENDERED_GROUPS.get(name, set())
+    user = literal(str(service.get("user", "")), "the user", rendered)
+    primary = (user or "").partition(":")[2]
+    supplementary = [group for group in (literal(str(entry), "a group_add entry", rendered) for entry in service.get("group_add") or []) if group is not None]
     workload_groups = {str(group) for group in PROJECT_WORKLOAD_GIDS.values()}
     if own is None:
         if workload_groups & {primary, *supplementary}:
@@ -439,6 +494,108 @@ class WorkloadAccessTest(unittest.TestCase):
         self.assertEqual([], access_problems("replay", document))
         document["services"]["replay"]["volumes"].append("/run/workload_access/replay/:/elsewhere:ro")
         self.assertEqual(1, len(access_problems("replay", document)))
+
+    def test_the_reviewers_two_plants_a_double_slash_source_and_a_primary_group_given_as_a_default_are_named(self) -> None:
+        document = self.replay()
+        document["services"]["replay"]["volumes"].append("//run/workload_access/spark/:/elsewhere:ro")
+        problems = access_problems("replay", document)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("not spark", problems[0])
+        document = self.replay()
+        document["services"]["replay"]["user"] = "10003:${TEST_PRIMARY_GID:-20104}"
+        problems = access_problems("replay", document)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("primary group", problems[0])
+
+    def test_a_bind_source_is_read_as_linux_reads_a_path(self) -> None:
+        for label, source in (
+            ("slashes and a dot", "/run//workload_access/./spark"),
+            ("three slashes", "///run/workload_access///spark//"),
+            ("dots and a parent", "/run/workload_access/replay/../spark/."),
+            ("a parent above the root", "/run/workload_access/../workload_access/spark"),
+            ("a variable default with slashes", "${X:-//run/workload_access//spark}"),
+            ("a default in the middle", "/run/workload_access/${X-spark}"),
+            ("a nested default", "${A:-${B:-/run/workload_access/spark}}"),
+            ("a default followed by a path", "${DIR:-/run/workload_access}/spark"),
+        ):
+            for form in ("short", "long", "named"):
+                with self.subTest(source=label, form=form):
+                    document = self.replay()
+                    if form == "short":
+                        document["services"]["replay"]["volumes"].append(f"{source}:/elsewhere:ro")
+                    elif form == "long":
+                        document["services"]["replay"]["volumes"].append({"type": "bind", "source": source, "target": "/elsewhere"})
+                    else:
+                        document["services"]["replay"]["volumes"].append("other:/elsewhere:ro")
+                        document["volumes"]["other"] = {"driver_opts": {"type": "none", "o": "bind", "device": source}}
+                    problems = access_problems("replay", document)
+                    self.assertEqual(1, len(problems), problems)
+                    self.assertIn("may read only the credential folder of replay, not spark", problems[0])
+
+    def test_the_own_folder_in_these_forms_is_still_its_own_folder_and_a_path_outside_the_root_is_no_folder(self) -> None:
+        for source in (
+            "//run//workload_access/./replay/",
+            "${X:-/run/workload_access/spark/../replay}",
+            "/run/workload_access_other/spark",
+            "/run/workload_accessspark",
+        ):
+            with self.subTest(source=source):
+                document = self.replay()
+                document["volumes"]["workload_access_replay"]["driver_opts"]["device"] = source
+                expected = [] if "replay" in source else ["must mount the credential folder of replay"]
+                self.assertEqual(expected, [problem.split(": ", 1)[1] for problem in access_problems("replay", document)])
+
+    def test_a_group_given_as_a_default_is_read_as_its_default_in_user_and_group_add(self) -> None:
+        for label, field, value, expected in (
+            ("a default in group_add", "group_add", ["20104", "${X-20102}"], "must run in the group 20104"),
+            ("a colon default in group_add", "group_add", ["20104", "${X:-20102}"], "must run in the group 20104"),
+            ("a nested default", "group_add", ["20104", "${X:-${Y:-20102}}"], "must run in the group 20104"),
+            ("the other group in place of its own", "group_add", ["${X-20102}"], "must run in the group 20104"),
+            ("a primary group", "user", "10003:${X-20102}", "must not take a workload group as its primary group"),
+            ("a primary group with a colon default", "user", "${U:-10003}:${G:-20104}", "must not take a workload group as its primary group"),
+        ):
+            with self.subTest(case=label):
+                document = self.replay()
+                document["services"]["replay"][field] = value
+                problems = access_problems("replay", document)
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn(expected, problems[0])
+
+    def test_a_default_that_is_the_own_value_passes_so_the_forms_are_not_refused_for_being_forms(self) -> None:
+        document = self.replay()
+        document["services"]["replay"]["user"] = "${U:-10003}:${G-10003}"
+        document["services"]["replay"]["group_add"] = ["${X:-20104}"]
+        self.assertEqual([], access_problems("replay", document))
+
+    def test_a_variable_with_no_default_in_user_group_add_or_a_bind_source_is_refused_as_not_resolvable(self) -> None:
+        forms = ("${X}", "$X", "${X:?no value}", "${X?no value}", "${X:+20104}", "$${X}", "20${X}")
+        for form in forms:
+            for field in ("user", "group_add", "volume source"):
+                with self.subTest(form=form, field=field):
+                    document = self.replay()
+                    service = document["services"]["replay"]
+                    if field == "user":
+                        service["user"] = f"10003:{form}"
+                    elif field == "group_add":
+                        service["group_add"] = [form]
+                    else:
+                        service["volumes"].append(f"{form}/spark:/elsewhere:ro")
+                    problems = access_problems("replay", document)
+                    unresolvable = [problem for problem in problems if "this field must be a literal or a resolvable default" in problem]
+                    self.assertEqual(1, len(unresolvable), problems)
+
+    def test_only_the_host_rendered_group_variable_of_its_own_service_may_have_no_default(self) -> None:
+        code_location = copy.deepcopy(load(SERVICES / "dagster_code_location.yml"))
+        self.assertEqual([], access_problems("dagster_code_location", code_location))
+        for variable in HOST_RENDERED_GROUPS["dagster_code_location"]:
+            self.assertIn(f"{variable}=", HOST_SETTINGS_RENDERER.read_text())
+        code_location["services"]["dagster_code_location"]["group_add"] = ["${OTHER_GID:?no value}"]
+        self.assertEqual(1, len(access_problems("dagster_code_location", code_location)))
+        document = self.replay()
+        document["services"]["replay"]["group_add"] = ["20104", "${DOCKER_SOCKET_GID:?no value}"]
+        problems = access_problems("replay", document)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("this field must be a literal or a resolvable default", problems[0])
 
     def test_a_service_that_is_not_in_the_table_has_no_credential_folder_and_no_workload_group(self) -> None:
         changes: tuple[tuple[str, Callable[[dict[str, Any]], object]], ...] = (
