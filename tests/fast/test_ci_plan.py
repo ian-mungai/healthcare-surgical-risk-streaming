@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar
@@ -788,16 +789,191 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("--skip-check-update", trivy[0], "without it Trivy downloads the newest checks bundle of a rolling tag")
         self.assertNotIn(".tools/trivy_cache ", trivy[0], "that cache can hold a bundle that an earlier run downloaded")
 
-    def test_only_the_plan_job_may_read_the_actions(self) -> None:
-        self.assertEqual(WORKFLOW_TEXT.count("actions: read"), 1)
-        plan_job = WORKFLOW_TEXT.split("\n  plan:\n", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("actions: read", plan_job)
+    def test_only_the_plan_job_may_read_more_than_the_contents(self) -> None:
+        jobs = workflow_jobs(WORKFLOW_TEXT)
+        self.assertEqual(jobs["plan"].blocks["permissions"], {"contents": "read", "actions": "read", "pull-requests": "read"})
+        self.assertEqual([name for name, job in jobs.items() if "permissions" in job.blocks and name != "plan"], [])
+        self.assertIn("permissions:\n  contents: read\n", WORKFLOW_TEXT.split("\njobs:\n")[0])
         self.assertNotRegex(WORKFLOW_TEXT, r":\s*write\b")
 
-    def test_the_selectable_jobs_read_the_record(self) -> None:
-        self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.record).groups.infra.matrix }}", WORKFLOW_TEXT)
-        self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.record).groups.guards.matrix }}", WORKFLOW_TEXT)
-        self.assertIn('make test-guards SHARD="${SHARD}/${SHARDS}"', WORKFLOW_TEXT)
+    def test_the_workflow_runs_every_required_step_of_each_job(self) -> None:
+        self.assertEqual(contract_problems(WORKFLOW_TEXT, CONFIG), [])
+
+    def test_a_disabled_or_missing_step_fails_the_contract(self) -> None:
+        guards = '      - run: make test-guards SHARD="${SHARD}/${SHARDS}"\n        if: matrix.run\n'
+        terraform = "      - run: make check-terraform\n        if: matrix.run\n"
+        ansible = "      - run: make check-ansible\n        if: matrix.run\n"
+        checkout = "        with:\n          ref: ${{ github.event.pull_request.head.sha || github.sha }}\n          persist-credentials: false\n"
+        planted = {
+            "the guard suite removed": (guards, ""),
+            "the guard suite never run": (guards, guards.replace("if: matrix.run", "if: false")),
+            "the Terraform checks removed": (terraform, ""),
+            "the Ansible check behind another condition": (ansible, ansible.replace("if: matrix.run", "if: matrix.shard != 0")),
+            "the Ansible check before the Terraform checks": (terraform + ansible, ansible + terraform),
+            "a checkout of GitHub's merge commit": (checkout, "        with:\n          persist-credentials: false\n"),
+            "the hooks job skipped": ("      - run: make check\n", "      - run: make check\n        if: matrix.run\n"),
+            "the plan module replaced": ("python -m scripts.quality.ci_plan", "python -m scripts.quality.ci_groups"),
+            "the skip summary removed": ("printf 'Planted faults: %s\\n'", "true # "),
+        }
+        for label, (before, after) in planted.items():
+            with self.subTest(label=label):
+                self.assertIn(before, WORKFLOW_TEXT)
+                self.assertNotEqual(contract_problems(WORKFLOW_TEXT.replace(before, after, 1), CONFIG), [])
+
+
+@dataclass
+class WorkflowJob:
+    """A job of the workflow: its single-line keys, its key-value blocks and its steps."""
+
+    keys: dict[str, str] = field(default_factory=dict)
+    blocks: dict[str, dict[str, str]] = field(default_factory=dict)
+    steps: list[dict[str, Any]] = field(default_factory=list)
+
+
+STEP_KEYS = {"name", "id", "uses", "run", "if", "with", "env"}
+CHECKOUT = "actions/checkout@"
+HEAD_REF = "${{ github.event.pull_request.head.sha || github.sha }}"
+STATES_REASON = re.compile(r"printf '[^']*%s\\n' \"\$\{GROUP_REASON\}\" >> \"\$\{GITHUB_STEP_SUMMARY\}\"")
+
+
+def workflow_jobs(text: str) -> dict[str, WorkflowJob]:
+    """The jobs of the workflow, read from the layout that it uses: two spaces per level, a step's keys four spaces past its dash."""
+    jobs: dict[str, WorkflowJob] = {}
+    job: WorkflowJob | None = None
+    block: dict[str, str] | None = None
+    step: dict[str, Any] | None = None
+    target: dict[str, str] | None = None
+    lines = text.split("\njobs:\n", 1)[1].splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, _, value = line.strip().removeprefix("- ").partition(":")
+        value = value.strip().split(" # ")[0]
+        if indent == 2:
+            job = jobs.setdefault(key, WorkflowJob())
+        elif job is None:
+            raise AssertionError(f"a line outside a job: {line!r}")
+        elif indent == 4:
+            block = None if value else job.blocks.setdefault(key, {})
+            if value:
+                job.keys[key] = value
+        elif indent == 6 and line.strip().startswith("- "):
+            step = {key: value}
+            job.steps.append(step)
+            target = None
+        elif indent == 6 and block is not None:
+            block[key] = value
+        elif indent == 8 and step is not None:
+            if key not in STEP_KEYS:
+                raise AssertionError(f"a step key the contract does not know: {key}")
+            if value == "|":
+                body = []
+                while index < len(lines) and (not lines[index].strip() or lines[index].startswith(" " * 10)):
+                    body.append(lines[index].strip())
+                    index += 1
+                value = "\n".join(part for part in body if part)
+            target = step.setdefault(key, {}) if not value else None
+            if value:
+                step[key] = value
+        elif indent == 10 and target is not None:
+            target[key] = value
+        else:
+            raise AssertionError(f"a line the contract cannot place: {line!r}")
+    return jobs
+
+
+def executed(job: WorkflowJob, entry: dict[str, Any], *, failed: bool = False) -> list[dict[str, Any]]:
+    """The steps that GitHub runs for one matrix entry. A condition other than the gate of the entry is a contract problem."""
+    conditions = {"matrix.run": bool(entry.get("run")), "failure() && matrix.run": failed and bool(entry.get("run"))}
+    steps = []
+    for step in job.steps:
+        condition = step.get("if")
+        if condition is not None and condition not in conditions:
+            raise AssertionError(f"a condition the contract does not know: {condition}")
+        if condition is None or conditions[condition]:
+            steps.append(step)
+    return steps
+
+
+def command_steps(steps: list[dict[str, Any]]) -> list[str]:
+    return [step["run"] for step in steps if str(step.get("run", "")).startswith("make ")]
+
+
+def setup_problems(where: str, steps: list[dict[str, Any]], config: dict[str, Any], first_command: int) -> list[str]:
+    """A checkout of the head commit and the map's Python must come before the first command of a job."""
+    before = steps[:first_command]
+    problems = []
+    if not any(str(step.get("uses", "")).startswith(CHECKOUT) and step.get("with", {}).get("ref") == HEAD_REF for step in before):
+        problems.append(f"{where}: no checkout of the head commit before its first command")
+    if not any(step.get("with", {}).get("python-version") == f'"{config["python"]}"' for step in before):
+        problems.append(f"{where}: no setup of Python {config['python']} before its first command")
+    return problems
+
+
+def contract_problems(text: str, config: dict[str, Any]) -> list[str]:
+    """What the workflow fails to do: run each job's commands when its record entry runs, run none when it does not, and plan first."""
+    problems: list[str] = []
+    try:
+        jobs = workflow_jobs(text)
+        for job in jobs.values():
+            for step in job.steps:
+                if str(step.get("uses", "")).startswith(CHECKOUT) and step.get("with", {}).get("ref") != HEAD_REF:
+                    problems.append(f"a checkout of {step.get('with', {}).get('ref')} instead of the head commit")
+        plan = jobs["plan"]
+        plan_runs = [step["run"] for step in plan.steps if "run" in step]
+        if plan_runs != [f'python -m {config["plan"]["modules"][0]} --event "${{EVENT_NAME}}" --start "${{RANGE_START}}" --head "${{RANGE_END}}"']:
+            problems.append(f"the plan job runs {plan_runs}")
+        if plan.blocks.get("outputs") != {"record": "${{ steps.plan.outputs.record }}"}:
+            problems.append("the plan job does not give its record to the other jobs")
+        hooks = jobs["hooks"]
+        if any("if" in step for step in hooks.steps) or "needs" in hooks.keys:
+            problems.append("the hooks job has a condition or waits for the plan")
+        hook_steps = executed(hooks, {})
+        hook_commands = command_steps(hook_steps)
+        if hook_commands != ["make setup", "make check"] or "repo_checks commit-range" not in " ".join(str(step.get("run", "")) for step in hook_steps):
+            problems.append(f"the hooks job runs {hook_commands} and the commit-message check of the range")
+        else:
+            problems += setup_problems("hooks", hook_steps, config, next(index for index, step in enumerate(hook_steps) if step.get("run") == "make setup"))
+        for name in ci_groups.selectable(config):
+            job = jobs[name]
+            record = "${{ fromJSON(needs.plan.outputs.record).groups." + name
+            if (
+                job.keys.get("name") != "${{ matrix.name }}"
+                or job.keys.get("needs") != "plan"
+                or job.blocks.get("strategy", {}).get("matrix") != record + ".matrix }}"
+            ):
+                problems.append(f"{name}: its name, its wait for the plan or its matrix does not come from the record")
+            for decision in (True, False):
+                entries = ci_plan.group_entry(config, name, ci_groups.Decision(decision, "a reason"))["matrix"]["include"]
+                for entry in entries:
+                    steps = executed(job, entry)
+                    commands = command_steps(steps)
+                    wanted = config["groups"][name]["commands"] if decision else []
+                    if len(commands) != len(wanted) or not all(
+                        command.split(" ")[:2] == want.split(" ") for command, want in zip(commands, wanted, strict=False)
+                    ):
+                        problems.append(f"{name} {'runs' if decision else 'skips'}: it runs {commands}, not {wanted}")
+                    elif decision:
+                        problems += setup_problems(name, steps, config, steps.index(next(step for step in steps if step.get("run") == commands[0])))
+                    stated = [
+                        step
+                        for step in steps
+                        if STATES_REASON.fullmatch(str(step.get("run", ""))) and step.get("env", {}).get("GROUP_REASON") == record + ".reason }}"
+                    ]
+                    if not stated:
+                        problems.append(f"{name} {'runs' if decision else 'skips'}: no step states the group's reason in the run summary")
+                    if not decision and len(steps) != len(stated):
+                        problems.append(f"{name} skips: it runs {len(steps) - len(stated)} steps besides stating its reason")
+            sharded = [step for step in job.steps if str(step.get("run", "")).startswith("make test-guards")]
+            if name == "guards" and (not sharded or sharded[0].get("env") != {"SHARD": "${{ matrix.shard }}", "SHARDS": "${{ matrix.shards }}"}):
+                problems.append("guards: the suite does not run the shard of its matrix entry")
+    except (AssertionError, KeyError, StopIteration, ValueError) as error:
+        problems.append(f"the workflow cannot be read as the contract expects: {type(error).__name__}: {error}")
+    return problems
 
 
 if __name__ == "__main__":

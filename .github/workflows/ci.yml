@@ -110,7 +110,7 @@ jobs:
         if: failure() && matrix.run
         run: tail -n 150 runs/*/log.txt
 
-  infrastructure:
+  infra:
     name: ${{ matrix.name }}
     needs: plan
     runs-on: ubuntu-24.04
