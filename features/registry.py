@@ -23,8 +23,10 @@ A reading or a second flagged invalid may hold any value, a non-finite number or
 latest time.
 
 **Arithmetic.** The mean, median, standard deviation, slope, projection and the pulse pressure and amplitude statistics are exact: each float is taken as the
-rational number that it is, and the result is rounded once. A result that a float cannot hold is a named input error. The row has exactly the keys of this
-registry, in its order, whatever the input holds, and a clinical field of the input that is neither in the registry nor forbidden is refused by name.
+rational number that it is, and the result is rounded once (the standard deviation to the float nearest to the exact one). A result that a float cannot hold
+is a named input error. The row has exactly the keys of this registry, in its order, whatever the input holds, and a clinical field of the input that is
+not in the registry, a forbidden one included, is refused by name. The objects of the JSON entry point and of a window given as a mapping are closed
+(``INPUT_OBJECTS``): every key is required and no other key is accepted.
 """
 
 from __future__ import annotations
@@ -54,6 +56,16 @@ MAX_INVALID_WAVEFORM_SECONDS = 0
 MAX_INVALID_NUMERIC_PERCENT = 10
 WAVEFORM_INVALID_SECOND = "waveform_invalid_second"
 NUMERIC_OVER_10_PERCENT_INVALID = "numeric_over_10_percent_invalid"
+
+# The objects that the JSON entry point and a mapping read, each with its closed key set: every key is required and any other key is refused. The tracks of
+# ``numeric`` and ``waveforms`` and the fields of ``clinical`` are keys of data, checked against this registry.
+INPUT_OBJECTS: dict[str, tuple[str, ...]] = {
+    "file": ("windows",),
+    "window": ("window_id", "cutoff_us", "numeric", "waveforms", "clinical"),
+    "waveform": ("sample_rate", "seconds"),
+    "second": ("second", "samples", "valid", "start_offset_us"),
+    "clinical_value": ("value", "available_us"),
+}
 
 MISSING_NO_VALUE = "missing when the window holds no valid reading"
 MISSING_FEWER_THAN_TWO = "missing when the window holds fewer than 2 valid readings"

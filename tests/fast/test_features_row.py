@@ -61,7 +61,7 @@ LIST_PREOP = [
     "preop_alb", "preop_ast", "preop_alt", "preop_bun", "preop_cr", "preop_ph", "preop_hco3", "preop_be", "preop_pao2", "preop_paco2", "preop_sao2",
 ]  # fmt: skip
 LIST_SENSITIVITY = ["approach", "position", "ane_type"]
-LIST_NEVER = ["opdur", "anedur", "caseend", "opend", "aneend", "dis", "los_postop", "los_icu", "death_inhosp"]
+LIST_NEVER = ["caseend", "opend", "aneend", "dis", "icu_days", "death_inhosp"]
 
 
 def slug(track: str) -> str:
@@ -164,7 +164,7 @@ class Registry(unittest.TestCase):
         self.assertFalse(is_registered("preop_"))
         self.assertTrue(is_registered("approach"))
         self.assertTrue(is_registered(f"{slug(ARTERIAL_MEAN)}__mean"))
-        for name in ("opdur", "intraop_ebl", "mystery", "solar8000_art_mbp__mystery", "solar8000_unknown__mean", ""):
+        for name in ("icu_days", "opdur", "intraop_ebl", "mystery", "solar8000_art_mbp__mystery", "solar8000_unknown__mean", ""):
             with self.subTest(name=name):
                 self.assertFalse(is_registered(name))
 
@@ -362,7 +362,7 @@ class Leakage(unittest.TestCase):
         self.assertIn("unknown", problems[0])
 
     def test_the_check_lists_every_problem_of_a_row(self) -> None:
-        problems = row_problems(self.row(values={"opdur": 1.0, "mystery": 2}, latest_reading_us=CUTOFF_US + 1, latest_clinical_us=CUTOFF_US + 2))
+        problems = row_problems(self.row(values={"icu_days": 1.0, "mystery": 2}, latest_reading_us=CUTOFF_US + 1, latest_clinical_us=CUTOFF_US + 2))
         self.assertEqual(4, len(problems))
 
 

@@ -5,7 +5,11 @@ It checks every input, refuses a track in the wrong input map, and gives every n
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from features.clinical import clinical_group
+from features.document import parse_mapping
 from features.model import FeatureInputError, FeatureRow, FeatureValue, WaveformWindow, WindowInput
 from features.numeric import numeric_group
 from features.registry import NUMERIC_TRACKS, WAVEFORM_TRACKS
@@ -14,8 +18,12 @@ from features.waveform import waveform_group
 EMPTY_WAVEFORM = WaveformWindow(1.0, ())
 
 
-def build_row(window: WindowInput, include_sensitivity: bool = False) -> FeatureRow:
-    """The features of one window: every registry track has its group, present or not, so the columns never depend on the data."""
+def build_row(window: WindowInput | Mapping[str, Any], include_sensitivity: bool = False) -> FeatureRow:
+    """The features of one window: every registry track has its group, present or not, so the columns never depend on the data.
+
+    A mapping is read by the same shared function as the JSON entry point (``features.document``), so both refuse the same shapes.
+    """
+    window = parse_mapping(window)
     for track in window.numeric:
         if track not in NUMERIC_TRACKS:
             raise FeatureInputError(f"unknown track {track} in the numeric input")

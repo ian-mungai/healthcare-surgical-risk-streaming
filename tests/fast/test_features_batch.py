@@ -102,6 +102,7 @@ class Entry(unittest.TestCase):
             "window_id": "w",
             "cutoff_us": CUTOFF_US,
             "numeric": {HEART_RATE: [[CUTOFF_US - 2 * SECOND, 60, True], [CUTOFF_US, 62.0, True]]},
+            "waveforms": {},
             "clinical": {"age": {"value": 73, "available_us": 0}, "preop_hb": {"value": 12.0, "available_us": 0}},
         }
         code, target = self.run_batch([document])
@@ -250,7 +251,7 @@ class Entry(unittest.TestCase):
         bad_rows = {
             "latest reading": FeatureRow(CUTOFF_US, {"age": 63.0}, CUTOFF_US + 1, None),
             "availability": FeatureRow(CUTOFF_US, {"age": 63.0}, None, CUTOFF_US + 1),
-            "forbidden": FeatureRow(CUTOFF_US, {"opdur": 1.0}, None, None),
+            "forbidden": FeatureRow(CUTOFF_US, {"icu_days": 1.0}, None, None),
             "unknown": FeatureRow(CUTOFF_US, {"mystery": 1.0}, None, None),
         }
         for pattern, bad in bad_rows.items():

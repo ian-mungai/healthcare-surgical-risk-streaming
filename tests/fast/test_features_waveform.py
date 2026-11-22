@@ -312,6 +312,28 @@ class Aliasing(unittest.TestCase):
         self.assertAlmostEqual(1.2, get(values_of(ART, rate_window(100, loud_with(1e-3))), "snuadc_art__dominant_freq_hz"), places=9)
 
 
+class BandPower(unittest.TestCase):
+    """The registry says that the frequency is missing when the power of the whole band is at roundoff level, so the test is on the total in the band."""
+
+    def band(self, amplitude: float) -> WaveformWindow:
+        """A loud 10 Hz tone (amplitude 10) and a tone of ``amplitude`` at each of the 61 bins from 0.5 to 3.5 Hz, twice that at 1.2 Hz."""
+        tones = [(0.5 + 0.05 * step, 2 * math.pi * 0.05 * step * 7 / 61, 2.0 if step == 14 else 1.0) for step in range(61)]  # a phase for each bin
+
+        def signal(time: float) -> float:
+            quiet = sum(weight * amplitude * math.sin(2 * math.pi * frequency * time + phase) for frequency, phase, weight in tones)
+            return 50.0 + 10.0 * math.sin(2 * math.pi * 10.0 * time) + quiet
+
+        return rate_window(100, signal)
+
+    def test_a_band_whose_total_power_is_over_the_floor_has_a_frequency_although_no_single_bin_is(self) -> None:
+        # The 1.2 Hz bin holds 7.9e-11 of the total power and the other 60 bins 2e-11 each: no bin reaches 1e-9, and the 61 bins together hold 1.3e-9.
+        self.assertAlmostEqual(1.2, get(values_of(ART, self.band(6.3e-5)), "snuadc_art__dominant_freq_hz"), places=9)
+
+    def test_a_band_whose_total_power_is_under_the_floor_has_no_frequency(self) -> None:
+        # The same band at a third of the amplitude holds 1.4e-10 of the total power.
+        self.assertIsNone(values_of(ART, self.band(2e-5))["snuadc_art__dominant_freq_hz"])
+
+
 class Exact(unittest.TestCase):
     def test_adjacent_floats_give_the_exact_standard_deviation(self) -> None:
         values = [1.0, 1.0 + 2**-52] * 5

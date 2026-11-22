@@ -5,7 +5,10 @@ from __future__ import annotations
 from features.model import FeatureRow
 from features.registry import is_registered
 
-FORBIDDEN_FIELDS = frozenset({"opdur", "anedur", "caseend", "opend", "aneend", "dis", "los_postop", "los_icu", "death_inhosp"})
+# The fields that are never features, by the column names of the pinned release: the end times, the stay in intensive care, the death in hospital and every
+# intraoperative total. A duration or a length of stay derived from them has no name in the release, so it is not a feature of the registry and is refused as
+# unregistered.
+FORBIDDEN_FIELDS = frozenset({"caseend", "opend", "aneend", "dis", "icu_days", "death_inhosp"})
 FORBIDDEN_PREFIXES = ("intraop_",)
 
 

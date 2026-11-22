@@ -41,12 +41,21 @@ def median(values: Sequence[float]) -> float:
 
 
 def square_root(value: Fraction) -> float:
-    """The square root of a non-negative rational number, rounded to a float once: an integer root with at least 65 bits, then the nearest float."""
+    """The float nearest to the square root of a non-negative rational number.
+
+    An integer root with at least 65 bits is never above the true root, and its rounding to a float is therefore never above the nearest float to the true
+    root, and at most one step below it (it is a step low when the true root lies just above the midpoint of two floats). So the candidate is moved up one step
+    when the value is above the squared midpoint to the next float.
+    """
     if value == 0:
         return 0.0
     product = value.numerator * value.denominator
     shift = max(0, (ROOT_BITS - product.bit_length() + 1) // 2)
-    return float(Fraction(math.isqrt(product << (2 * shift)), value.denominator << shift))
+    candidate = float(Fraction(math.isqrt(product << (2 * shift)), value.denominator << shift))
+    upper = math.nextafter(candidate, math.inf)
+    if math.isfinite(upper) and value > ((Fraction(candidate) + Fraction(upper)) / 2) ** 2:
+        return upper
+    return candidate
 
 
 def sample_std(values: Sequence[Number]) -> float | None:
@@ -85,9 +94,9 @@ def dominant_frequency(
     """The lowest frequency whose power is within a relative 1e-9 of the largest, among ``k / window_seconds`` Hz in the band and below the Nyquist frequency.
 
     The bins are at ``low_hz`` or above, at ``high_hz`` or below, and strictly below ``sample_rate / 2``. A sample is at its block's start (block index minus
-    ``first_second``, in seconds) plus its position over the rate. After the mean is removed, the frequency is missing when the largest power in the band is
-    below 1e-9 of the total power (the number of samples times the sum of squared deviations), so a peak that is only roundoff or aliasing is never reported.
-    A flat signal has no power at any frequency and gives no answer.
+    ``first_second``, in seconds) plus its position over the rate. After the mean is removed, the frequency is missing when the total power in the band is
+    below 1e-9 of the total power of the signal (the number of samples times the sum of squared deviations), so a peak that is only roundoff or aliasing is
+    never reported. A flat signal has no power at any frequency and gives no answer.
     """
     times: list[float] = []
     values: list[float] = []
@@ -112,6 +121,6 @@ def dominant_frequency(
         sine = math.fsum(value * math.sin(omega * time) for value, time in zip(centred, times, strict=True))
         powers.append((step / window_seconds, cosine * cosine + sine * sine))
     top = max(power for _, power in powers)
-    if top <= 0 or top < BAND_POWER_FLOOR * len(centred) * math.fsum(value * value for value in centred):
+    if top <= 0 or math.fsum(power for _, power in powers) < BAND_POWER_FLOOR * len(centred) * math.fsum(value * value for value in centred):
         return None
     return next(frequency for frequency, power in powers if power >= top * (1 - TIE_TOLERANCE))

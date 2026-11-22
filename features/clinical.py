@@ -24,14 +24,16 @@ def clinical_value(name: str, value: object) -> FeatureValue:
 def clinical_group(clinical: Mapping[str, ClinicalValue], cutoff_us: int, include_sensitivity: bool) -> GroupResult:
     """Every clinical feature of the registry, in its order: the fixed fields, the pre-operative columns, and the sensitivity fields when asked for.
 
-    The keys come from the registry only. A field that is absent, unavailable at the cutoff or without an availability time is missing, and a field of the input
-    that is neither in the registry nor forbidden is refused by name. A forbidden field is never read. A field of the registry is checked when it is in the
+    The keys come from the registry only. A field that is absent, unavailable at the cutoff or without an availability time is missing. A field of the input
+    that is forbidden, or that is neither in the registry nor forbidden, is refused by name and never read. A field of the registry is checked when it is in the
     output, whether or not it is available.
     """
     whole_microseconds(cutoff_us, "the cutoff")
     names = [*CLINICAL_FIELDS, *PREOP_COLUMNS, *SENSITIVITY_FIELDS]
     for name in clinical:
-        if name not in names and not is_forbidden(name):
+        if is_forbidden(name):
+            raise FeatureInputError(f"{name}: a forbidden clinical field")
+        if name not in names:
             raise FeatureInputError(f"{name}: a clinical field that is neither in the registry nor forbidden")
     values: dict[str, FeatureValue] = {}
     used: list[int] = []

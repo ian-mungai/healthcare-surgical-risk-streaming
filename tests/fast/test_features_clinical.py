@@ -16,7 +16,9 @@ import unittest
 from typing import Any
 
 from features.clinical import clinical_group
+from features.leakage import FORBIDDEN_FIELDS, FORBIDDEN_PREFIXES
 from features.model import ClinicalValue, FeatureInputError
+from features.registry import CLINICAL_FIELDS, PREOP_COLUMNS, SENSITIVITY_FIELDS
 
 CUTOFF = 1_000_000
 MAIN = ("age", "sex", "height", "weight", "bmi", "asa", "emop", "department", "optype")
@@ -26,6 +28,23 @@ PREOP = (
     "preop_alb", "preop_ast", "preop_alt", "preop_bun", "preop_cr", "preop_ph", "preop_hco3", "preop_be", "preop_pao2", "preop_paco2", "preop_sao2",
 )  # fmt: skip
 FIXED = (*MAIN, *PREOP)
+# The header of the pinned clinical_data.csv of the release (tests/fixtures/vitaldb/release.json pins its size and SHA-256), in its order.
+PINNED_HEADER = (
+    "caseid", "subjectid", "casestart", "caseend", "anestart", "aneend", "opstart", "opend", "adm", "dis", "icu_days", "death_inhosp", "age", "sex",
+    "height", "weight", "bmi", "asa", "emop", "department", "optype", "dx", "opname", "approach", "position", "ane_type", "preop_htn", "preop_dm",
+    "preop_ecg", "preop_pft", "preop_hb", "preop_plt", "preop_pt", "preop_aptt", "preop_na", "preop_k", "preop_gluc", "preop_alb", "preop_ast",
+    "preop_alt", "preop_bun", "preop_cr", "preop_ph", "preop_hco3", "preop_be", "preop_pao2", "preop_paco2", "preop_sao2", "cormack", "airway",
+    "tubesize", "dltubesize", "lmasize", "iv1", "iv2", "aline1", "aline2", "cline1", "cline2", "intraop_ebl", "intraop_uo", "intraop_rbc", "intraop_ffp",
+    "intraop_crystalloid", "intraop_colloid", "intraop_ppf", "intraop_mdz", "intraop_ftn", "intraop_rocu", "intraop_vecu", "intraop_eph", "intraop_phe",
+    "intraop_epi", "intraop_ca"
+)  # fmt: skip
+# The columns of the release that are neither features nor forbidden: the caller drops them before the features, and the features refuse them by name.
+DROPPED = (
+    "caseid", "subjectid", "casestart", "anestart", "opstart", "adm", "dx", "opname", "cormack", "airway", "tubesize", "dltubesize", "lmasize",
+    "iv1", "iv2", "aline1", "aline2", "cline1", "cline2",
+)  # fmt: skip
+# The forbidden names that are not columns of the release: quantities derived from forbidden columns. The list holds none.
+DERIVED_NAMES: tuple[str, ...] = ()
 
 
 def known(**values: float | int | str | None) -> dict[str, ClinicalValue]:
@@ -77,10 +96,6 @@ class Types(unittest.TestCase):
         with self.assertRaisesRegex(FeatureInputError, "age"):
             clinical_group({"age": ClinicalValue(math.nan, CUTOFF + 1)}, CUTOFF, include_sensitivity=False)
 
-    def test_a_forbidden_field_is_not_examined(self) -> None:
-        group = clinical_group(known(age=63, opdur=math.nan, intraop_ebl=math.inf, los_icu="x"), CUTOFF, include_sensitivity=False)
-        self.assertEqual(63.0, group.values["age"])
-
     def test_a_number_too_large_for_a_float_is_refused_with_its_field(self) -> None:
         with self.assertRaisesRegex(FeatureInputError, "age"):
             clinical_group(known(age=10**400), CUTOFF, include_sensitivity=False)
@@ -104,16 +119,20 @@ class Fields(unittest.TestCase):
         self.assertIsNone(group.values["preop_gluc"])
         self.assertEqual("Normal Sinus Rhythm", group.values["preop_ecg"])
 
-    def test_a_forbidden_field_in_the_table_is_never_a_feature(self) -> None:
-        forbidden = known(
-            opdur=3.0, anedur=4.0, caseend=100, opend=90, aneend=95, dis=1, los_postop=5, los_icu=2, death_inhosp=0, intraop_ebl=100, intraop_uo=300
-        )
-        group = clinical_group(known(age=63) | forbidden, CUTOFF, include_sensitivity=True)
-        self.assertEqual(set(), set(forbidden) & set(group.values))
-        self.assertEqual(63, group.values["age"])
+    def test_a_forbidden_field_is_refused_as_forbidden_by_name_whatever_its_value_and_availability(self) -> None:
+        for name in (*sorted(FORBIDDEN_FIELDS), "intraop_ebl", "intraop_uo"):
+            for item in (ClinicalValue(1.0, 0), ClinicalValue(math.nan, CUTOFF + 1), ClinicalValue("x", None)):
+                with self.subTest(name=name, item=item), self.assertRaisesRegex(FeatureInputError, f"{name}: a forbidden clinical field"):
+                    clinical_group(known(age=63) | {name: item}, CUTOFF, include_sensitivity=True)
+
+    def test_icu_days_is_refused_as_forbidden_and_not_as_unregistered(self) -> None:
+        with self.assertRaises(FeatureInputError) as caught:
+            clinical_group(known(age=63, icu_days=2), CUTOFF, include_sensitivity=False)
+        self.assertIn("icu_days: a forbidden clinical field", str(caught.exception))
+        self.assertNotIn("neither", str(caught.exception))
 
     def test_a_field_that_is_not_in_the_registry_and_not_forbidden_is_refused_by_name(self) -> None:
-        for name in ("caseid", "subjectid", "opname", "dx", "icu_days", "preop_made_up", "mystery"):
+        for name in ("caseid", "subjectid", "opname", "dx", "preop_made_up", "mystery", "opdur", "los_icu"):
             with self.subTest(name=name), self.assertRaisesRegex(FeatureInputError, name):
                 clinical_group(known(age=63) | known(**{name: 1.0}), CUTOFF, include_sensitivity=False)
 
@@ -137,6 +156,28 @@ class Fields(unittest.TestCase):
     def test_a_sensitivity_field_with_no_availability_time_is_missing(self) -> None:
         group = clinical_group({"approach": ClinicalValue("Open", None)}, CUTOFF, include_sensitivity=True)
         self.assertIsNone(group.values["approach"])
+
+
+class PinnedHeader(unittest.TestCase):
+    def test_every_forbidden_release_field_is_a_column_of_the_pinned_header_and_the_derived_names_are_listed_apart(self) -> None:
+        self.assertEqual(set(DERIVED_NAMES), set(FORBIDDEN_FIELDS) - set(PINNED_HEADER))
+        self.assertEqual({"caseend", "opend", "aneend", "dis", "icu_days", "death_inhosp"}, set(FORBIDDEN_FIELDS))
+        for prefix in FORBIDDEN_PREFIXES:
+            self.assertTrue([column for column in PINNED_HEADER if column.startswith(prefix)], prefix)
+
+    def test_every_registered_clinical_field_is_a_column_of_the_pinned_header(self) -> None:
+        self.assertEqual([], [name for name in (*CLINICAL_FIELDS, *PREOP_COLUMNS, *SENSITIVITY_FIELDS) if name not in PINNED_HEADER])
+
+    def test_every_column_of_the_pinned_header_is_registered_or_forbidden_or_dropped_and_none_is_two_of_these(self) -> None:
+        registered = {*CLINICAL_FIELDS, *PREOP_COLUMNS, *SENSITIVITY_FIELDS}
+        forbidden = {column for column in PINNED_HEADER if column in FORBIDDEN_FIELDS or column.startswith(FORBIDDEN_PREFIXES)}
+        dropped = set(DROPPED)
+        self.assertEqual(len(PINNED_HEADER), len(registered) + len(forbidden) + len(dropped))
+        self.assertEqual(set(PINNED_HEADER), registered | forbidden | dropped)
+        self.assertEqual(set(), registered & forbidden | registered & dropped | forbidden & dropped)
+
+    def test_the_old_names_that_the_release_does_not_have_are_not_forbidden_names(self) -> None:
+        self.assertEqual(set(), {"opdur", "anedur", "los_postop", "los_icu"} & set(FORBIDDEN_FIELDS))
 
 
 if __name__ == "__main__":
