@@ -44,11 +44,11 @@ output "workload_policies" {
 }
 
 output "heavy_memory_mib" {
-  description = "Memory in MiB above which a batch job is heavy: the host's memory less the reserve, the always-on limits and one Spark job's limit. The deploy passes it to the orchestrator."
+  description = "Memory in MiB above which a batch job is heavy: the host's memory less the reserve, the always-on limits and one Spark job's limit. The deploy passes it to the orchestrator. Null for a host that already exists."
   value       = local.heavy_memory_mib
 
   precondition {
-    condition     = local.heavy_memory_mib > 0
+    condition     = local.heavy_memory_mib == null ? true : local.heavy_memory_mib > 0
     error_message = "The host memory, less the reserve, the always-on limits and one Spark job's limit, leaves no memory for a heavy job. Use a larger instance type or lower the limits in compose/limits.yml."
   }
 }

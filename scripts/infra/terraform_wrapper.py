@@ -9,7 +9,8 @@ Run from the repository root under the project profile in ``.env``:
 ``runs/<RUN_ID>/plans/`` with its readable text and its JSON form and binds the plan file's hash to the run's state location. It prints
 the resource changes and a confirmation code. ``apply`` refuses a changed plan file, a wrong code and a plan saved for
 another state location, then applies the exact bytes it checked. Each run has its own copy of the configuration, and
-no Terraform variable of the caller reaches Terraform. ``plan --destroy`` saves a destroy plan the same way; this
+no Terraform variable of the caller reaches Terraform; the three heavy-job inputs come from the limits loader and are staged in the copy.
+A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this
 command never applies one.
 """
 
@@ -31,6 +32,8 @@ from scripts.infra.created import created_entries, merge_created
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
+from scripts.stack.heavy_inputs import heavy_inputs_text
+from scripts.stack.limits import LimitsError, load_limits
 
 INIT_TIMEOUT_SECONDS = 600
 PLAN_TIMEOUT_SECONDS = 900
@@ -71,6 +74,7 @@ class WrapperError(RuntimeError):
 
 
 CONFIGURATION_PARTS = ("modules", "environments")
+HEAVY_INPUTS_FILE = "heavy_inputs.auto.tfvars.json"
 BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
 
 
@@ -126,8 +130,17 @@ def configuration_files(source: Path) -> list[Path]:
     return [*sorted(item for item in source.glob("*.tf") if item.name != "backend_override.tf"), source / ".terraform.lock.hcl"]
 
 
+def heavy_inputs() -> str:
+    """The three numbers of the heavy-job figure, from the limits loader, the one validated reader of the limits file. A refused file stops the run."""
+    try:
+        return heavy_inputs_text(load_limits(ROOT / "compose" / "limits.yml"))
+    except LimitsError as error:
+        raise WrapperError(f"refused before Terraform starts: the limits file cannot give the heavy-job inputs: limits: {error}") from error
+
+
 def prepare_configuration(run: RunBinding) -> Path:
-    """Give the run its own copy of the Terraform configuration with its own backend override, apart from every other run."""
+    """Give the run its own copy of the Terraform configuration with its own backend override and heavy-job inputs, apart from every other run."""
+    inputs = heavy_inputs()
     target = configuration_folder(run)
     target.mkdir(parents=True, exist_ok=True)
     for stale in target.iterdir():
@@ -138,6 +151,7 @@ def prepare_configuration(run: RunBinding) -> Path:
         shutil.copy2(item, target / item.name)
     for part in CONFIGURATION_PARTS:
         shutil.copytree(source / part, target / part, ignore=shutil.ignore_patterns("*.auto.tfvars", "*.auto.tfvars.json"))
+    (target / HEAVY_INPUTS_FILE).write_text(inputs)
     override = backend_override(run)
     if override is not None:
         (target / "backend_override.tf").write_text(override)
@@ -231,8 +245,16 @@ def plan_label(action: str, *, changes: int, reviewed_exists: bool) -> str:
     return f"{action}_check" if action == "apply" and changes == 0 and reviewed_exists else action
 
 
+def plan_changes(plan: dict[str, Any]) -> list[tuple[str, str]]:
+    """Each resource and each root output that the plan changes, as its actions and its address, in plan order. A change of an output alone counts: its new
+    value reaches the deploy only when the plan is applied."""
+    resources = [(change["change"]["actions"], change["address"]) for change in plan.get("resource_changes", [])]
+    outputs = [(change["actions"], f"output.{name}") for name, change in sorted(plan.get("output_changes", {}).items())]
+    return [("/".join(actions), address) for actions, address in [*resources, *outputs] if actions != ["no-op"]]
+
+
 def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> int:
-    """Save the plan with its text, JSON and binding, print its changes and return how many resources change."""
+    """Save the plan with its text, JSON and binding, print its changes and return how many resources and outputs change."""
     if run.status != "verified":
         raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
     folder = ROOT / "runs" / run.run_id / "plans"
@@ -248,11 +270,9 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={candidate}"], PLAN_TIMEOUT_SECONDS)
     plan_json = terraform(run, ["show", "-json", str(candidate)], PLAN_TIMEOUT_SECONDS)
     counts: dict[str, int] = {}
-    for change in json.loads(plan_json).get("resource_changes", []):
-        actions = "/".join(change["change"]["actions"])
-        if actions != "no-op":
-            counts[actions] = counts.get(actions, 0) + 1
-            sys.stdout.write(f"{actions}: {change['address']}\n")
+    for actions, address in plan_changes(json.loads(plan_json)):
+        counts[actions] = counts.get(actions, 0) + 1
+        sys.stdout.write(f"{actions}: {address}\n")
     label = plan_label(action, changes=sum(counts.values()), reviewed_exists=(folder / f"{action}.tfplan").is_file())
     plan_file = folder / f"{label}.tfplan"
     plan = candidate.read_bytes()

@@ -8,6 +8,7 @@ plan saved for another run.
 from __future__ import annotations
 
 import hashlib
+import json
 import stat
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from unittest import mock
 from scripts.infra import terraform_wrapper
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.terraform_wrapper import (
+    WrapperError,
     approved_plan_copy,
     backend_arguments,
     backend_override,
@@ -24,7 +26,9 @@ from scripts.infra.terraform_wrapper import (
     clean_environment,
     configuration_files,
     effective_location_problems,
+    initialise,
     plan_binding,
+    plan_changes,
     plan_label,
     prepare_configuration,
     run_variables,
@@ -135,10 +139,31 @@ class ConfigurationCopyTest(unittest.TestCase):
         self.assertEqual(["main.tf", ".terraform.lock.hcl"], [item.name for item in configuration_files(source)])
 
 
+LIMITS = """\
+host_reserve_mib: 4096
+services:
+  postgres:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024
+  nessie:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 2048
+  spark:
+    runtime: compose
+    group: batch
+    memory_limit_mib: 4096
+"""
+HEAVY_INPUTS = {"host_reserve_mib": 4096, "always_on_limits_mib": 3072, "spark_limit_mib": 4096}
+
+
 class PrivateFilesTest(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+        (self.root / "compose").mkdir()
+        (self.root / "compose" / "limits.yml").write_text(LIMITS)
 
     def test_nested_automatic_variable_files_are_left_out_of_a_runs_copy(self) -> None:
         source = self.root / "infra"
@@ -149,7 +174,37 @@ class PrivateFilesTest(unittest.TestCase):
         (source / "environments" / "other.auto.tfvars.json").write_text("{}")
         copied = prepare_configuration(RUN)
         names = sorted(path.relative_to(copied).as_posix() for path in copied.rglob("*") if path.is_file())
-        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "main.tf", "modules/host/main.tf"], names)
+        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "heavy_inputs.auto.tfvars.json", "main.tf", "modules/host/main.tf"], names)
+
+    def prepare_source(self) -> None:
+        source = self.root / "infra"
+        for folder in ("modules/host", "environments"):
+            (source / folder).mkdir(parents=True)
+        for name in ("main.tf", ".terraform.lock.hcl", "modules/host/main.tf", "environments/dev.tfvars"):
+            (source / name).write_text("")
+
+    def test_a_runs_copy_holds_the_three_numbers_that_the_limits_loader_gives_and_a_changed_file_changes_them(self) -> None:
+        self.prepare_source()
+        copied = prepare_configuration(RUN)
+        self.assertEqual(HEAVY_INPUTS, json.loads((copied / "heavy_inputs.auto.tfvars.json").read_text()))
+        (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("host_reserve_mib: 4096", "host_reserve_mib: 5120"))
+        self.assertEqual(5120, json.loads((prepare_configuration(RUN) / "heavy_inputs.auto.tfvars.json").read_text())["host_reserve_mib"])
+
+    def test_a_stale_numbers_file_of_an_earlier_run_is_replaced_not_kept(self) -> None:
+        self.prepare_source()
+        folder = prepare_configuration(RUN)
+        (folder / "heavy_inputs.auto.tfvars.json").write_text('{"host_reserve_mib": 1}')
+        self.assertEqual(HEAVY_INPUTS, json.loads((prepare_configuration(RUN) / "heavy_inputs.auto.tfvars.json").read_text()))
+
+    def test_a_limits_file_the_loader_refuses_stops_the_run_before_terraform_starts_and_names_the_reason(self) -> None:
+        self.prepare_source()
+        (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("memory_limit_mib: 4096", "memory_limit_mib: 0"))
+        with (
+            mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None),
+            mock.patch.object(terraform_wrapper, "run_command", side_effect=AssertionError("Terraform started")),
+            self.assertRaisesRegex(WrapperError, "limits.*memory_limit_mib"),
+        ):
+            initialise(RUN, {"AWS_PROFILE": "example_project_dev"})
 
     def test_each_invocation_gets_its_own_owner_only_copy_of_the_approved_plan(self) -> None:
         (self.root / ".tools" / "terraform" / RUN.run_id / "config").mkdir(parents=True)
@@ -165,6 +220,35 @@ class PrivateFilesTest(unittest.TestCase):
         target.chmod(0o644)
         write_private(target, "plan text with private values")
         self.assertEqual(("plan text with private values", 0o600), (target.read_text(), stat.S_IMODE(target.stat().st_mode)))
+
+
+def plan_document(*, resources: tuple[str, ...] = (), outputs: dict[str, str] | None = None) -> dict[str, object]:
+    return {
+        "resource_changes": [{"address": f"aws_thing.{name}", "change": {"actions": ["no-op"]}} for name in resources],
+        "output_changes": {name: {"actions": [action]} for name, action in (outputs or {}).items()},
+    }
+
+
+class PlanChangesTest(unittest.TestCase):
+    def test_a_plan_that_changes_only_an_output_counts_as_a_change(self) -> None:
+        self.assertEqual([("update", "output.heavy_memory_mib")], plan_changes(plan_document(resources=("host",), outputs={"heavy_memory_mib": "update"})))
+
+    def test_an_output_added_to_an_existing_state_counts_as_a_change(self) -> None:
+        self.assertEqual([("create", "output.heavy_memory_mib")], plan_changes(plan_document(outputs={"heavy_memory_mib": "create"})))
+
+    def test_a_removed_output_counts_as_a_change(self) -> None:
+        self.assertEqual([("delete", "output.old")], plan_changes(plan_document(outputs={"old": "delete"})))
+
+    def test_a_plan_with_no_action_but_no_op_has_no_change(self) -> None:
+        self.assertEqual([], plan_changes(plan_document(resources=("host",), outputs={"heavy_memory_mib": "no-op"})))
+        self.assertEqual([], plan_changes({}))
+
+    def test_resource_and_output_changes_are_listed_together_with_their_actions(self) -> None:
+        document = {
+            "resource_changes": [{"address": "aws_thing.a", "change": {"actions": ["delete", "create"]}}],
+            "output_changes": {"x": {"actions": ["update"]}},
+        }
+        self.assertEqual([("delete/create", "aws_thing.a"), ("update", "output.x")], plan_changes(document))
 
 
 class EffectiveLocationTest(unittest.TestCase):

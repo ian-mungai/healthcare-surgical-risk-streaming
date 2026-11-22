@@ -271,14 +271,36 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
-def heavy_memory_variables(state: dict[str, Any]) -> dict[str, Any]:
-    """The Ansible variable for the heavy-job figure that Terraform calculated, in MiB. The orchestrator has no default, so a bad figure is refused."""
+def planned_heavy_figure(run_id: str, *, applied: bool) -> object:
+    """The heavy-job figure that the saved plan gave to the output, from the plan's JSON.
+
+    After an apply of the reviewed plan, that plan is ``apply.json``. After a run with no change, it is the newest plan the run saved: ``apply.json`` for a
+    first plan and ``apply_check.json`` for a later one.
+    """
+    folder = ROOT / "runs" / run_id / "plans"
+    found = [folder / name for name in (("apply.json",) if applied else ("apply.json", "apply_check.json")) if (folder / name).is_file()]
+    if not found:
+        raise HostError(f"no saved plan JSON of run {run_id} gives the planned heavy_memory_mib: run make host-up again to plan first")
+    newest = max(found, key=lambda path: path.stat().st_mtime_ns)
+    outputs = json.loads(newest.read_text()).get("planned_values", {}).get("outputs", {})
+    entry = outputs.get("heavy_memory_mib")
+    return entry.get("value") if isinstance(entry, dict) else None
+
+
+def heavy_memory_variables(state: dict[str, Any], planned: object) -> dict[str, Any]:
+    """The Ansible variable for the heavy-job figure that Terraform calculated, in MiB, once the state holds the planned figure.
+
+    The orchestrator has no default, so a missing or bad figure is refused. A state figure that is not the planned one is stale: the plan was not applied,
+    so the deploy would give the host an old figure.
+    """
     outputs = state.get("values", {}).get("outputs", {})
     if "heavy_memory_mib" not in outputs:
         raise HostError("the run's state has no heavy_memory_mib output: it is missing, so run make host-up to plan and apply the current Terraform first")
     figure = outputs["heavy_memory_mib"].get("value")
     if not isinstance(figure, int) or isinstance(figure, bool) or figure <= 0:
         raise HostError(f"the heavy_memory_mib output of the run's state is {figure!r}, not a positive whole number of MiB")
+    if figure != planned or type(planned) is not int:
+        raise HostError(f"the heavy_memory_mib of the run's state is {figure!r} and the plan gave {planned!r}: the state is stale, so the plan was not applied")
     return {"compose_stack_heavy_memory_mib": figure}
 
 
@@ -338,7 +360,7 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         write_inventory(binding)
         return 0
     state = state_json(run, configuration)
-    heavy_memory = heavy_memory_variables(state)
+    heavy_memory = heavy_memory_variables(state, planned_heavy_figure(run.run_id, applied=bool(confirm)))
     peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
     address = peer.address
     record_tailscale_device(run.run_id, host_name, peer.device_id)
