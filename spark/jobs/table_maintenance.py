@@ -1,74 +1,45 @@
-"""The table maintenance job: expire old snapshots and delete orphan files on the trunk, and keep everything that a Nessie tag points to.
+"""The table maintenance job: compact the tables of the trunk and prove that every Nessie tag still reads what it read. It deletes nothing.
 
-``python -m spark.jobs.table_maintenance [--trunk main] [--expire-older-than-minutes 7200] [--retain-last 1] [--orphan-older-than-minutes 4320] [--dry-run]``
+``python -m spark.jobs.table_maintenance [--trunk main] [--table schema.table ...] [--rewrite-all] [--dry-run] [--deadline-seconds 900]``
 
-The defaults are Iceberg's own: snapshots older than 5 days, the newest snapshot kept, orphan files older than 3 days. The job
-refuses to run while a branch other than the trunk exists, because a run that is still writing has files that no metadata names yet. Then it:
+Owner's decision (Nov 22 2026): maintenance deletes nothing before teardown. The job calls Iceberg's ``rewrite_data_files`` and ``rewrite_manifests``
+for each table of the trunk, or for the tables named. Each rewrite writes new files and one commit. The files it replaces stay on disk, because older
+snapshots, and the tags that point to them, still reference them. The job never sets a table property and calls no procedure that deletes a snapshot
+or a file.
 
-1. lists every tag and the snapshot of each table at each tag, and reads each tagged snapshot through a catalog opened on the tag (the rows and a checksum of
-   their values), so a tag that already does not read stops the job before it changes anything;
-2. for each table on the trunk, plans the snapshots to expire with ``spark.maintenance.plan_expiry``, which leaves out every snapshot that a tag points to,
-   checks the plan again with ``guard_expiry`` and expires exactly those snapshot IDs with Iceberg's ``expire_snapshots`` procedure. The Nessie catalog makes
-   every table with ``gc.enabled`` false, so Iceberg's procedures refuse it: the job turns the flag on for a table around its own steps 2 and 3 and puts it
-   back as it was;
-3. finds the orphan files with ``remove_orphan_files`` as a dry run, leaves out every file that a tag needs (its metadata file, its manifest list, its manifests
-   and its data files) and deletes the others itself, through the table's file IO;
-4. reads each tagged snapshot again and refuses to finish with exit 0 unless every one gives the same snapshot, rows and checksum as before.
+Each run:
 
-``--dry-run`` plans the expiry, reports it and changes nothing. It lists no orphan files, because Iceberg lists them only when the table's ``gc.enabled``
-is on. The job prints one line that starts with ``RESULT `` and holds the plan, what it removed and the tagged reads. Settings come from the environment,
-as for the catalog proof, and ``JOB_DEADLINE_SECONDS`` ends the job.
+1. refuses to start while a branch other than the trunk exists, because a run may be writing;
+2. refuses a table whose Iceberg properties could let a commit or a procedure delete a file that a tag needs (``spark.preconditions``), naming
+   the table, before any rewrite;
+3. lists every tag and reads every table at every tag through a catalog opened on the tag, with no table cache: the snapshot, the row count and a
+   checksum over every value;
+4. rewrites, or on ``--dry-run`` only lists, the files and manifests of each table;
+5. lists the tags again and reads every table at every tag again, and exits 1 when a tag vanished or moved or any read differs from the one before.
+   A tag made during the run is reported in ``tags_added`` and is read too, and is not a failure: a compaction adds a commit and removes nothing.
+
+The job prints one line that starts with ``RESULT `` and holds the plan, the rewrites and the reads before and after. It reads ``NESSIE_URI``,
+``WAREHOUSE_LOCATION`` and ``AWS_REGION`` from the environment, like the catalog proof, and ends at ``--deadline-seconds``. With ``--rewrite-all``
+every data file is rewritten, which a small table needs, because Iceberg's size rules leave a few small files as they are.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import sys
-import time
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from datetime import UTC, datetime
+from collections.abc import Sequence
 from typing import Any
 
-from scripts.stack.nessie import NessieClient, NessieError
-from scripts.stack.tags import TableSnapshot, list_references, list_tags, table_snapshots
+from scripts.stack.nessie import NessieError
+from scripts.stack.tags import TableSnapshot, TagClient, list_references, list_tags, table_snapshots
 from spark.catalog import add_catalog, required_environment
-from spark.maintenance import (
-    RetentionError,
-    SnapshotInfo,
-    cut_off_ms,
-    guard_expiry,
-    in_flight_branches,
-    plan_expiry,
-    protected_snapshots,
-    removable_orphans,
-    table_identifier,
-)
+from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, table_identifier
+from spark.preconditions import PROPERTY_KEYS, precondition_problems
 from spark.session import build_session, start_deadline
 from spark.settings import CATALOG, SettingsError
 
 JOB = "table_maintenance"
 RESULT_PREFIX = "RESULT "
-DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
-DEFAULT_JOB_DEADLINE_SECONDS = 900.0
-DEFAULT_EXPIRE_MINUTES = 5 * 24 * 60
-DEFAULT_ORPHAN_MINUTES = 3 * 24 * 60
-MS_PER_SECOND = 1000
-GC_PROPERTY = "gc.enabled"
-
-
-def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog=f"python -m spark.jobs.{JOB}", description="Expire old snapshots and delete orphan files, keeping every tagged snapshot."
-    )
-    command.add_argument("--trunk", default="main", help="the branch whose tables are maintained")
-    command.add_argument("--expire-older-than-minutes", type=int, default=DEFAULT_EXPIRE_MINUTES)
-    command.add_argument("--retain-last", type=int, default=1, help="how many of the newest snapshots of a table are kept whatever their age")
-    command.add_argument("--orphan-older-than-minutes", type=int, default=DEFAULT_ORPHAN_MINUTES)
-    command.add_argument("--dry-run", action="store_true", help="plan and report, change nothing")
-    return command
 
 
 def iceberg_table(session: Any, name: str) -> Any:
@@ -93,80 +64,49 @@ def read_tagged(session: Any, tagged: dict[str, tuple[TableSnapshot, ...]], pins
                 raise RetentionError(f"the tag {tag} no longer reads {item.table}: {type(error).__name__}: {str(error).splitlines()[0][:300]}") from error
             if snapshot != item.snapshot_id:
                 raise RetentionError(f"the tag {tag} reads {item.table} at snapshot {snapshot}, not at {item.snapshot_id}")
-            reads.append(
-                {
-                    "tag": tag,
-                    "table": item.table,
-                    "snapshot_id": snapshot,
-                    "rows": int(row["rows"]),
-                    "checksum": None if row["checksum"] is None else int(row["checksum"]),
-                }
-            )
+            checksum = None if row["checksum"] is None else int(row["checksum"])
+            reads.append({"tag": tag, "table": item.table, "snapshot_id": snapshot, "rows": int(row["rows"]), "checksum": checksum})
     return reads
 
 
-def tagged_files(session: Any, tagged: dict[str, tuple[TableSnapshot, ...]], pins: dict[str, str]) -> set[str]:
-    """Every file that reading a tagged snapshot needs: the metadata file, its older metadata files, the manifest list, the manifests and the data files."""
-    needed: set[str] = set()
-    for tag in sorted(tagged):
-        for item in tagged[tag]:
-            if item.snapshot_id is None:
-                continue
-            name = f"{pins[tag]}.{table_identifier(item.table)}"
-            needed.add(item.metadata_location)
-            files = session.table(f"{name}.all_files").select("file_path")
-            manifests = session.table(f"{name}.all_manifests").select("path")
-            lists = session.table(f"{name}.snapshots").where(f"snapshot_id = {int(item.snapshot_id)}").select("manifest_list")
-            earlier = session.table(f"{name}.metadata_log_entries").select("file")
-            for frame in (files, manifests, lists, earlier):
-                needed.update(str(row[0]) for row in frame.collect() if row[0])
-    return needed
+def open_pins(session: Any, tags: Sequence[str], pins: dict[str, str]) -> None:
+    """Open a catalog on each tag that has none yet. A tag keeps its catalog name for the whole run."""
+    for tag in tags:
+        if tag not in pins:
+            pins[tag] = f"pin{len(pins)}"
+            add_catalog(session, pins[tag], tag)
 
 
-def planned_expiry(session: Any, item: TableSnapshot, protected: dict[int, str], arguments: argparse.Namespace, now_ms: int) -> list[int]:
-    """The snapshot IDs of one trunk table to expire, oldest first. The plan leaves out every tagged snapshot and the guard checks the list again."""
-    table = table_identifier(item.table)
-    rows = session.table(f"{CATALOG}.{table}.snapshots").selectExpr("snapshot_id", "unix_millis(committed_at) AS committed_ms").collect()
-    history = [SnapshotInfo(int(row["snapshot_id"]), int(row["committed_ms"])) for row in rows]
-    planned = plan_expiry(history, item.snapshot_id, protected, cut_off_ms(now_ms, arguments.expire_older_than_minutes), arguments.retain_last)
-    guard_expiry(table, planned, protected)
-    return planned
+def row_dict(row: Any) -> dict[str, int]:
+    return {name: int(row[name]) for name in row.asDict() if row[name] is not None}
 
 
-@contextmanager
-def gc_allowed(session: Any, table: str) -> Iterator[None]:
-    """Allow Iceberg's maintenance procedures on the table for the length of the block, and put its ``gc.enabled`` property back as it was.
+def refuse_unsafe_tables(session: Any, tables: Sequence[str]) -> None:
+    """Read the two properties of each table and refuse every table that could lose a file, before any rewrite."""
+    problems: list[str] = []
+    for table in tables:
+        properties = iceberg_table(session, f"{CATALOG}.{table}").properties()
+        problems += precondition_problems(table, {key: properties.get(key) for key in PROPERTY_KEYS})
+    if problems:
+        raise RetentionError("; ".join(problems))
 
-    The Nessie catalog creates every table with ``gc.enabled`` false, because Iceberg sees only the one reference it works on and the procedures could delete
-    files that another branch or a tag needs. The job knows every tag, so it opens the flag only around its own plan.
-    """
+
+def compact(session: Any, table: str, rewrite_all: bool, dry_run: bool) -> dict[str, Any]:
+    """Rewrite the data files and then the manifests of one table, or on a dry run count what is there. Returns what Iceberg reported."""
     name = f"{CATALOG}.{table}"
-    previous = iceberg_table(session, name).properties().get(GC_PROPERTY)
-    session.sql(f"ALTER TABLE {name} SET TBLPROPERTIES ('{GC_PROPERTY}' = 'true')")
-    try:
-        yield
-    finally:
-        if previous is None:
-            session.sql(f"ALTER TABLE {name} UNSET TBLPROPERTIES ('{GC_PROPERTY}')")
-        else:
-            session.sql(f"ALTER TABLE {name} SET TBLPROPERTIES ('{GC_PROPERTY}' = '{previous}')")
+    if dry_run:
+        files = session.table(f"{name}.files").selectExpr("count(*) AS data_files", "coalesce(sum(file_size_in_bytes), 0) AS bytes").collect()[0]
+        manifests = session.table(f"{name}.manifests").selectExpr("count(*) AS manifests").collect()[0]
+        return {"would_rewrite": {**row_dict(files), **row_dict(manifests)}}
+    options = ", options => map('rewrite-all', 'true')" if rewrite_all else ""
+    data = session.sql(f"CALL {CATALOG}.system.rewrite_data_files(table => '{table}'{options})").collect()[0]
+    manifests = session.sql(f"CALL {CATALOG}.system.rewrite_manifests('{table}')").collect()[0]
+    return {"rewrite_data_files": row_dict(data), "rewrite_manifests": row_dict(manifests)}
 
 
-def remove_orphans(session: Any, table: str, needed: set[str], arguments: argparse.Namespace, now_ms: int) -> dict[str, int]:
-    """Find one table's orphan files, leave out the ones that a tag needs and delete the rest. Returns the counts."""
-    cutoff = datetime.fromtimestamp(cut_off_ms(now_ms, arguments.orphan_older_than_minutes) / MS_PER_SECOND, UTC).strftime("%Y-%m-%d %H:%M:%S")
-    found = session.sql(f"CALL {CATALOG}.system.remove_orphan_files(table => '{table}', older_than => TIMESTAMP '{cutoff}', dry_run => true)").collect()
-    removable, kept = removable_orphans([str(row[0]) for row in found], needed)
-    if removable:
-        files = iceberg_table(session, f"{CATALOG}.{table}").io()
-        for path in removable:
-            files.deleteFile(path)
-    return {"orphans_found": len(found), "orphans_removed": len(removable), "orphans_kept_for_tags": len(kept)}
-
-
-def maintain(arguments: argparse.Namespace) -> dict[str, Any]:
-    """Run the maintenance and return its result, or raise ``RetentionError`` when a tagged snapshot is not as it was."""
-    client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
+def maintain(arguments: Any) -> dict[str, Any]:
+    """Run the maintenance and return its result, or raise ``RetentionError`` when it must not start or a tag does not read as it did."""
+    client = TagClient(required_environment("NESSIE_URI"), arguments.deadline_seconds)
     client.config()
     branches = list_references(client, "BRANCH")
     if arguments.trunk not in branches:
@@ -174,49 +114,45 @@ def maintain(arguments: argparse.Namespace) -> dict[str, Any]:
     waiting = in_flight_branches(branches, arguments.trunk)
     if waiting:
         raise RetentionError(f"the branches {', '.join(waiting)} exist, so a run may be writing: maintenance waits until they are merged or deleted")
-    tagged = {tag: table_snapshots(client, tag) for tag in sorted(list_tags(client))}
-    protected = protected_snapshots(tagged)
-    trunk_tables = table_snapshots(client, arguments.trunk)
+    on_trunk = [item.table for item in table_snapshots(client, arguments.trunk)]
+    missing = sorted(set(arguments.tables) - set(on_trunk))
+    if missing:
+        raise RetentionError(f"the tables {', '.join(missing)} are not on {arguments.trunk}")
+    tables = [table_identifier(table) for table in (arguments.tables or on_trunk)]
+    tags_before = list_tags(client)
+    tagged_before = {tag: table_snapshots(client, tag) for tag in sorted(tags_before)}
     session = build_session(JOB, arguments.trunk)
     try:
-        session.conf.set("spark.sql.session.timeZone", "UTC")
-        pins = {tag: f"pin{number}" for number, tag in enumerate(tagged)}
-        for tag, catalog in pins.items():
-            add_catalog(session, catalog, tag)
-        before = read_tagged(session, tagged, pins)
-        now_ms = int(time.time() * MS_PER_SECOND)
-        needed = tagged_files(session, tagged, pins)
-        expired: dict[str, list[int]] = {}
-        orphans: dict[str, dict[str, int]] = {}
-        for item in trunk_tables:
-            table = table_identifier(item.table)
-            expired[table] = planned_expiry(session, item, protected.get(table, {}), arguments, now_ms)
-            if arguments.dry_run:
-                continue
-            with gc_allowed(session, table):
-                if expired[table]:
-                    ids = ", ".join(str(number) for number in expired[table])
-                    session.sql(f"CALL {CATALOG}.system.expire_snapshots(table => '{table}', snapshot_ids => array({ids}))").collect()
-                orphans[table] = remove_orphans(session, table, needed, arguments, now_ms)
-        after = read_tagged(session, tagged, pins)
+        pins: dict[str, str] = {}
+        open_pins(session, sorted(tagged_before), pins)
+        refuse_unsafe_tables(session, tables)
+        before = read_tagged(session, tagged_before, pins)
+        compacted = {table: compact(session, table, arguments.rewrite_all, arguments.dry_run) for table in tables}
+        tags_after = list_tags(client)
+        tagged_after = {tag: table_snapshots(client, tag) for tag in sorted(tags_after)}
+        open_pins(session, sorted(tagged_after), pins)
+        after = read_tagged(session, tagged_after, pins)
     finally:
         session.stop()
-    if before != after:
-        raise RetentionError(f"a tagged read changed during maintenance: before {before}, after {after}")
+    changed, added = compare_tags(tags_before, tags_after)
+    differences = changed + compare_reads(before, after)
+    if differences:
+        raise RetentionError("a tag does not read as it did: " + "; ".join(differences))
     return {
         "trunk": arguments.trunk,
         "dry_run": arguments.dry_run,
-        "tags": sorted(tagged),
-        "expired_snapshots": expired,
-        "orphans": orphans,
-        "tagged_reads": after,
+        "tags": sorted(tags_before),
+        "tags_added": added,
+        "tables": compacted,
+        "tagged_reads_before": before,
+        "tagged_reads_after": after,
     }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = parser().parse_args(argv)
+    arguments = parse(argv)
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
+        start_deadline(arguments.deadline_seconds, JOB)
         result = maintain(arguments)
     except RetentionError as error:
         sys.stderr.write(f"{JOB}: refused: {error}\n")
