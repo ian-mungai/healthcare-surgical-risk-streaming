@@ -72,10 +72,12 @@ compose_stack_docker_socket: /var/run/docker.sock
 compose_stack_built_images:
   - tag: surgical-risk-dagster:1.13.31
     name: dagster
-    sources: [orchestration, scripts, compose]
+    sources: [orchestration, scripts, compose, spark, tests/fixtures/vitaldb]
     build_contexts:
       stack_scripts: scripts
       stack_compose: compose
+      stack_spark: spark
+      stack_fixtures: vitaldb
   - tag: surgical-risk-spark:4.1.4
     name: spark
     sources: [spark, scripts]

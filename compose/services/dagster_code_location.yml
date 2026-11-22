@@ -34,6 +34,7 @@ services:
       - dagster_data:/opt/dagster/data
       - dagster_runs:/opt/dagster/runs
       - dagster_storage:/opt/dagster/instance/storage
+      - table_check_staging:/opt/dagster/staging
     healthcheck:
       test: [CMD, dagster, api, grpc-health-check, --port, "4266"]
       interval: 10s
@@ -57,3 +58,4 @@ volumes:
   dagster_data:
   dagster_runs:
   dagster_storage:
+  table_check_staging:
