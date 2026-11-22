@@ -142,3 +142,14 @@ variable "host_disk_gib" {
     error_message = "The host disk is at least 200 GiB."
   }
 }
+
+variable "host_memory_reserve_mib" {
+  description = "Memory in MiB that the host keeps free for the system. It is the host_reserve_mib of compose/limits.yml, which the admission check reads, and a test holds the two together."
+  type        = number
+  default     = 4096
+
+  validation {
+    condition     = var.host_memory_reserve_mib > 0
+    error_message = "The host memory reserve is more than 0 MiB."
+  }
+}

@@ -22,6 +22,12 @@ mock_provider "aws" {
       value = "ami-0123456789abcdef0"
     }
   }
+
+  mock_data "aws_ec2_instance_type" {
+    defaults = {
+      memory_size = 32768
+    }
+  }
 }
 
 variables {
@@ -811,4 +817,91 @@ run "malformed_bucket_name_is_refused" {
   }
 
   expect_failures = [var.data_bucket_name]
+}
+
+run "heavy_figure_is_the_memory_free_beside_one_spark_job" {
+  command = plan
+
+  assert {
+    condition     = output.heavy_memory_mib == 11008
+    error_message = "With the 32768 MiB of the mocked host, the 4096 MiB reserve, the 13568 MiB of the supporting group in compose/limits.yml and the 4096 MiB of the spark service, the heavy figure is 11008 MiB. When a limit in the file changes, the figure changes with it: update this number in the same commit."
+  }
+}
+
+run "heavy_figure_follows_the_host_memory" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.host
+    values = {
+      memory_size = 65536
+    }
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 43776
+    error_message = "The figure is read from the instance type's memory: 65536 - 4096 - 13568 - 4096 is 43776 MiB."
+  }
+}
+
+run "heavy_figure_follows_the_reserve" {
+  command = plan
+
+  variables {
+    host_memory_reserve_mib = 5120
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 9984
+    error_message = "A reserve of 5120 MiB leaves 9984 MiB: 32768 - 5120 - 13568 - 4096."
+  }
+}
+
+run "reserve_default_is_the_reserve_of_the_limits_file" {
+  command = plan
+
+  assert {
+    condition     = var.host_memory_reserve_mib == yamldecode(file("${path.module}/../compose/limits.yml")).host_reserve_mib
+    error_message = "The reserve that the heavy figure uses must be the host_reserve_mib that the admission check reads from compose/limits.yml."
+  }
+}
+
+run "heavy_figure_of_zero_is_refused" {
+  command = plan
+
+  variables {
+    host_memory_reserve_mib = 15104
+  }
+
+  expect_failures = [output.heavy_memory_mib]
+}
+
+run "negative_heavy_figure_is_refused" {
+  command = plan
+
+  variables {
+    host_memory_reserve_mib = 30000
+  }
+
+  expect_failures = [output.heavy_memory_mib]
+}
+
+run "zero_reserve_is_refused" {
+  command = plan
+
+  variables {
+    host_memory_reserve_mib = 0
+  }
+
+  expect_failures = [var.host_memory_reserve_mib]
+}
+
+run "negative_reserve_is_refused" {
+  command = plan
+
+  variables {
+    host_memory_reserve_mib = -1
+  }
+
+  expect_failures = [var.host_memory_reserve_mib]
 }
