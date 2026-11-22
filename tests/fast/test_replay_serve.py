@@ -31,8 +31,25 @@ from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
-from replay.service.serve import Outcome, SubmitError, archive, healthy, held, keep, kept_outcome, queued_record, read_submission, serve, submit, submit_command
+from replay.service.serve import (
+    Outcome,
+    SubmitError,
+    archive,
+    healthy,
+    held,
+    keep,
+    kept_outcome,
+    queued_record,
+    read_result,
+    read_submission,
+    result_text,
+    serve,
+    submit,
+    submit_command,
+)
+from scripts.ingestion.gate import GateRefused, Problem
 from scripts.ingestion.manifest import ManifestRef
+from scripts.ingestion.notice import Cause, Code, Notice
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
 OTHER_REFERENCE = ManifestRef("bucket", "manifests/replay/" + "c" * 64 + ".json", "version_2", "d" * 64).to_json()
@@ -130,6 +147,16 @@ def unreadable(path: Path) -> None:
     path.chmod(0)
 
 
+def gate_refusal_text(count: int, cause: Cause = Cause.MISSING) -> str:
+    """The text of a gate refusal that names ``count`` keys: the reviewer's input is 6,389 missing versions."""
+    problems = [Problem(position, cause, False) for position in range(1, count + 1)]
+    return str(GateRefused(Notice(Code.GATE_REFUSED), *[problem.notice for problem in problems], problems=problems))
+
+
+def open_descriptors() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
 def nested(depth: int) -> str:
     return "[" * depth + "]" * depth
 
@@ -159,6 +186,7 @@ class ServeTest(unittest.TestCase):
         self.assertTrue((loop.inbox / "done" / "a.json").is_file())
         result = json.loads((loop.inbox / "results" / "a.json").read_text())
         self.assertEqual({"request": "a", "outcome": "finished", "exit_code": 0, "error": ""}, result)
+        self.assertEqual([], loop.logged, "a request with no result file is not a result to set aside")
         self.assertEqual(3, loop.sleeps)
 
     def test_records_run_one_at_a_time_in_name_order(self) -> None:
@@ -340,6 +368,28 @@ class ServeTest(unittest.TestCase):
         self.assertIsNone(outcome)
         self.assertIn("RecursionError", reason)
 
+    def test_read_result_leaves_no_descriptor_open_on_any_path(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="replay_descriptors_")
+        self.addCleanup(scratch.cleanup)
+        folder = Path(scratch.name)
+        plants: dict[str, Callable[[Path], object]] = {
+            "a directory": lambda path: path.mkdir(),
+            "a fifo": lambda path: os.mkfifo(path),
+            "an unreadable file": unreadable,
+            "a valid result": lambda path: path.write_text(json.dumps({"outcome": "finished"})),
+            "a result that is too large": lambda path: path.write_text(json.dumps({"outcome": "finished", "pad": "x" * 70_000})),
+            "text that is not JSON": lambda path: path.write_text("not json"),
+            "no file": lambda path: None,
+        }
+        for label, plant in plants.items():
+            with self.subTest(case=label):
+                path = folder / label.replace(" ", "_")
+                plant(path)
+                before = open_descriptors()
+                for _ in range(20):
+                    read_result(path)
+                self.assertEqual(before, open_descriptors())
+
     def test_a_fifo_in_place_of_the_result_file_is_set_aside_without_a_wait(self) -> None:
         self.assert_set_aside(self.planted_result(lambda path: os.mkfifo(path)))
 
@@ -373,6 +423,60 @@ class ServeTest(unittest.TestCase):
         loop.put("a.json.writing", json.dumps(RECORD))
         loop.serve()
         self.assertEqual([], loop.ran)
+
+
+class ResultSizeTest(unittest.TestCase):
+    """The writer and the reader of a result file share one limit, so every result the service writes is a result it reads back."""
+
+    def request(self, name: str = "a") -> Path:
+        return Path("/inbox") / f"{name}.json"
+
+    def test_the_reviewers_refusal_of_6389_missing_versions_is_written_under_the_limit_and_read_back(self) -> None:
+        text = gate_refusal_text(6389)
+        self.assertGreater(len(text), serve_module.RESULT_LIMIT_BYTES)
+        written = result_text(self.request(), Outcome("failed", 3, text))
+        self.assertLessEqual(len(written.encode()), serve_module.RESULT_LIMIT_BYTES)
+        document = json.loads(written)
+        self.assertEqual(("failed", 3), (document["outcome"], document["exit_code"]))
+        self.assertTrue(document["error"].startswith(text[:200]))
+        self.assertIn(f"{len(text) - serve_module.ERROR_LIMIT_CHARS} more characters cut", document["error"])
+        scratch = tempfile.TemporaryDirectory(prefix="replay_size_")
+        self.addCleanup(scratch.cleanup)
+        path = Path(scratch.name) / "a.json"
+        path.write_text(written)
+        self.assertEqual(("failed", ""), read_result(path))
+
+    def test_a_result_that_is_short_is_written_as_it_was_and_the_fields_are_the_known_four(self) -> None:
+        written = result_text(self.request(), Outcome("failed", 2, "KafkaStartError: the broker cannot be reached"))
+        self.assertEqual({"request": "a", "outcome": "failed", "exit_code": 2, "error": "KafkaStartError: the broker cannot be reached"}, json.loads(written))
+        self.assertEqual({"request": "a", "outcome": "finished", "exit_code": 0, "error": ""}, json.loads(result_text(self.request(), Outcome("finished", 0))))
+
+    def test_the_largest_result_that_each_failure_kind_can_give_is_under_the_limit_and_valid(self) -> None:
+        long_name = "é" * 120
+        kinds: dict[str, Outcome] = {
+            "a gate refusal of every manifest entry": Outcome("failed", 3, gate_refusal_text(6389)),
+            "a gate refusal far larger": Outcome("failed", 3, gate_refusal_text(60_000, Cause.VERSION_SUBSTITUTED)),
+            "an error with a huge text": Outcome("failed", 2, "ValueError: " + "x" * 5_000_000),
+            "an error whose text escapes to six bytes a character": Outcome("failed", 2, '\x01é"\\' * 3_000_000),
+            "an error of characters outside the plane": Outcome("failed", 2, "\U0001f600" * 1_000_000),
+            "the count of stops": Outcome("failed", 2, f"the service stopped during this request {serve_module.MAX_ATTEMPTS} times"),
+            "a finish": Outcome("finished", 0),
+        }
+        for label, outcome in kinds.items():
+            for name in ("a", long_name):
+                with self.subTest(kind=label, request=name[:3]):
+                    written = result_text(self.request(name), outcome)
+                    self.assertLessEqual(len(written.encode()), serve_module.RESULT_LIMIT_BYTES)
+                    document = json.loads(written)
+                    self.assertIn(document["outcome"], serve_module.TERMINAL_OUTCOMES)
+                    self.assertNotIn("reason", document, "the cut error text was too wide, so the result fell back to the short failure")
+
+    def test_a_result_that_is_still_too_large_is_replaced_by_a_short_failure_with_a_reason_code_and_never_raises(self) -> None:
+        with mock.patch.object(serve_module, "ERROR_LIMIT_CHARS", 10**9):
+            written = result_text(self.request(), Outcome("failed", 3, "x" * 200_000))
+        self.assertLessEqual(len(written.encode()), 1_000)
+        document = json.loads(written)
+        self.assertEqual(("failed", "result_too_large"), (document["outcome"], document["reason"]))
 
 
 class CrashLoopTest(unittest.TestCase):
@@ -892,6 +996,24 @@ class SubmitTest(unittest.TestCase):
                 serve_until_idle(self.inbox, self.inbox.parent / "health.json", lambda path, beat: Outcome("finished", 0))
                 self.assertTrue((self.inbox / folder / f"{self.name}.json").is_file())
                 self.assertFalse((self.inbox / f"{self.name}.json").exists())
+
+    def test_an_interrupted_archival_of_the_reviewers_result_archives_the_request_without_a_second_run_or_result(self) -> None:
+        self.plant("")
+        self.interrupted_archival(Outcome("failed", 3, gate_refusal_text(6389)))
+        written = (self.inbox / "results" / f"{self.name}.json").read_bytes()
+        self.assertLessEqual(len(written), serve_module.RESULT_LIMIT_BYTES)
+        ran: list[str] = []
+
+        def gate_again(path: Path, beat: Callable[[], None]) -> Outcome:
+            ran.append(path.name)
+            return Outcome("failed", 3, "the gate refused again")
+
+        serve_until_idle(self.inbox, self.inbox.parent / "health.json", gate_again)
+        self.assertEqual([], ran)
+        self.assertTrue((self.inbox / "failed" / f"{self.name}.json").is_file())
+        self.assertFalse((self.inbox / f"{self.name}.json").exists())
+        self.assertEqual(written, (self.inbox / "results" / f"{self.name}.json").read_bytes())
+        self.assertFalse((self.inbox / "results" / f"{self.name}.json.invalid").exists())
 
     def test_a_reserved_run_id_is_compared_with_its_reservation_only_whatever_the_files_that_archival_moved_hold(self) -> None:
         text = json.dumps(RECORD)

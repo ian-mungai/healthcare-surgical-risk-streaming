@@ -8,8 +8,9 @@ they arrive at once. An ID that has a reservation is compared with the reservati
 record in the inbox, in ``done/`` or in ``failed/`` and has no reservation (from before reservations existed) is the same submission only when the record
 and its reference have the very same bytes, and then gets its reservation from them; any other bytes are refused. Only after the reservation does ``submit``
 write the queue entry ``<run ID>.json`` with ``<run ID>.reference`` beside it, each whole or not at all, and only when no record of that run ID is held
-anywhere. The whole of a submit and the archival of a request each hold the exclusive lock ``locks/<run ID>``, so a submit never meets a request half
-archived and a delayed submit can never put back a request that was archived meanwhile.
+anywhere. The whole of a submit and the archival of a request each hold the exclusive lock ``locks/<run ID>``, so a delayed submit can never put back a request
+that was archived meanwhile. An archival that a stop or a crash cut off leaves the reference in ``done/`` or ``failed/`` and the record in the inbox until the
+restart finishes it: a submit then finds the reference in the folder that the written result names.
 
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
@@ -42,7 +43,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
@@ -57,7 +58,9 @@ TERMINAL_OUTCOMES = {"finished": "done", "failed": "failed"}
 RESERVED = "reserved"
 LOCKS = "locks"
 INVALID_SUFFIX = ".invalid"
+# The largest result file, for the writer and the reader alike. No result has been written on any host yet, so no older result is larger than this.
 RESULT_LIMIT_BYTES = 64 * 1024
+ERROR_LIMIT_CHARS = 5_000  # a character outside the basic plane takes 12 bytes as an ASCII escape: 60,000 bytes at most
 REFERENCE_SUFFIX = ".reference"
 ATTEMPTS_SUFFIX = ".attempts"
 MAX_ATTEMPTS = 3
@@ -151,8 +154,8 @@ def started_count(request: Path) -> int:
 
 
 def archive(inbox: Path, request: Path, kind: str) -> None:
-    """Move the request and its reference to ``done/`` or ``failed/`` and drop its start count. The reference moves first, so a request in the inbox always
-    has its reference."""
+    """Move the request and its reference to ``done/`` or ``failed/`` and drop its start count. The reference moves first, so a cut-off archival leaves the
+    reference in the folder and the request in the inbox, and the restart finishes it."""
     target = inbox / TERMINAL_OUTCOMES[kind]
     target.mkdir(parents=True, exist_ok=True)
     reference = reference_of(request)
@@ -168,17 +171,13 @@ def read_result(path: Path) -> tuple[str | None, str]:
     when there is one that is not valid. It is read through a handle opened without blocking (a pipe in its place cannot hold the service) and at most
     ``RESULT_LIMIT_BYTES`` of it; a larger one is invalid. Any error of reading, decoding or parsing (a deeply nested document included) is a reason."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None, ""
-    except OSError as error:
-        return None, f"it cannot be opened: {type(error).__name__}"
-    try:
-        with os.fdopen(descriptor, "rb") as handle:
+        with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
             data = handle.read(RESULT_LIMIT_BYTES + 1)
         if len(data) > RESULT_LIMIT_BYTES:
             return None, f"it is larger than {RESULT_LIMIT_BYTES} bytes"
         document = json.loads(data.decode("utf-8"))
+    except FileNotFoundError:
+        return None, ""
     except (OSError, ValueError, RecursionError) as error:
         return None, f"it cannot be read as JSON text: {type(error).__name__}"
     outcome = document.get("outcome") if isinstance(document, dict) else None
@@ -202,12 +201,27 @@ def kept_outcome(inbox: Path, request: Path, log: Callable[..., None]) -> str | 
     return None
 
 
+def result_text(request: Path, outcome: Outcome) -> str:
+    """The text of a result file: JSON of at most ``RESULT_LIMIT_BYTES``, so the reader always accepts what the writer wrote. The only text of unbounded
+    length is ``error`` (the refusal of a gate names every refused key): it is cut to ``ERROR_LIMIT_CHARS`` with the count of the characters cut. A result that
+    is still too large, which no kind of failure gives, is replaced by a short failure with a reason code."""
+    error = outcome.error
+    if len(error) > ERROR_LIMIT_CHARS:
+        error = f"{error[:ERROR_LIMIT_CHARS]} ... ({len(error) - ERROR_LIMIT_CHARS} more characters cut)"
+    text = json.dumps({"request": request.stem, "outcome": outcome.kind, "exit_code": outcome.exit_code, "error": error}, sort_keys=True) + "\n"
+    if len(text) > RESULT_LIMIT_BYTES:  # the JSON is ASCII, so a character is a byte
+        text = (
+            json.dumps({"outcome": "failed", "exit_code": 2, "error": "the result was too large to keep", "reason": "result_too_large"}, sort_keys=True) + "\n"
+        )
+    return text
+
+
 def keep(inbox: Path, request: Path, outcome: Outcome) -> dict[str, Any]:
     """Write the request's result, then move the request to ``done/`` or ``failed/``. A stop between the two leaves the result, and the restart only moves."""
-    result = {"request": request.stem, **asdict(outcome)}
-    result["outcome"] = result.pop("kind")
-    atomic_write(inbox / "results" / request.name, json.dumps(result, sort_keys=True) + "\n")
+    text = result_text(request, outcome)
+    atomic_write(inbox / "results" / request.name, text)
     archive(inbox, request, outcome.kind)
+    result: dict[str, Any] = json.loads(text)
     return result
 
 
