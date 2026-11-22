@@ -166,6 +166,33 @@ class LongNumbers(unittest.TestCase):
                 with self.assertRaisesRegex(PublisherError, "clinical table line 2: a case, patient or time value is not an integer"):
                     publisher.parse_clinical_table(path)
 
+    def test_a_track_list_or_clinical_number_that_is_not_ascii_digits_is_refused_by_its_line(self) -> None:
+        tracks = "caseid,tname,tid\n{},SNUADC/ART,t1\n"
+        clinical = "caseid,subjectid,casestart,caseend\n{}\n"
+        self.assertEqual({12}, self.read("parse_track_list", tracks.format("12"), "SNUADC/ART"))
+        self.assertEqual([(12, 3, 10)], self.read("parse_clinical_table", clinical.format("12,3,-5,5")))
+        for value in ("\u0661\u0662", "+12", " 12", "1_2"):
+            for track in ("SNUADC/ART", "Solar8000/HR"):
+                with (
+                    self.subTest(track_list=value, track=track),
+                    self.assertRaisesRegex(PublisherError, "^track list line 2: the case number is not an integer$"),
+                ):
+                    self.read("parse_track_list", tracks.format(value), track)
+            for column in range(4):
+                values = ["12", "3", "-5", "5"]
+                values[column] = value if column < 2 else f"-{value}" if column == 2 else value
+                with (
+                    self.subTest(clinical=value, column=column),
+                    self.assertRaisesRegex(PublisherError, "^clinical table line 2: a case, patient or time value is not an integer$"),
+                ):
+                    self.read("parse_clinical_table", clinical.format(",".join(values)))
+
+    def read(self, parser: str, text: str, *arguments: str) -> object:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "file"
+            path.write_text(text)
+            return getattr(publisher, parser)(path, *arguments)
+
     def test_a_listing_size_over_the_conversion_limit_is_refused_as_a_listing_not_in_its_form(self) -> None:
         listing = json.dumps({"Contents": [{"Key": "vitaldb/1.0.0/vital_files/0001.vital", "Size": LONG_NUMBER}]})
         with mock.patch.object(publisher, "run_command", mock.Mock(return_value=completed(0, listing))), self.assertRaises(PublisherError) as caught:
