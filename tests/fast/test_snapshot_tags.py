@@ -75,6 +75,7 @@ class StandIn(NessieClient):
         }
         self.blank_history_pages = 0
         self.endless_history = False
+        self.ignore_filter = False
         self.calls: list[tuple[str, str]] = []
 
     def answer(self, status: int, document: dict[str, Any]) -> tuple[int, bytes]:
@@ -92,7 +93,7 @@ class StandIn(NessieClient):
         number = int(query.get("page-token", ["0"])[0])
         if self.endless_history or number < self.blank_history_pages:
             return self.answer(200, {"logEntries": [], "hasMore": True, "token": str(number + 1)})
-        wanted = HISTORY_FILTER.fullmatch(query.get("filter", [""])[0])
+        wanted = None if self.ignore_filter else HISTORY_FILTER.fullmatch(query.get("filter", [""])[0])
         commits = [item for item in self.logs[ref] if wanted is None or item == wanted.group(1)]
         entries = [{"commitMeta": {"hash": item}, "parentCommitHash": None} for item in commits]
         return self.answer(200, {"logEntries": entries, "hasMore": False})
@@ -315,6 +316,13 @@ class TrunkTest(unittest.TestCase):
         self.assertEqual([f"commit.hash == '{HASH_ONE}'"], asked[0]["filter"])
         self.assertEqual([str(tags.PAGE_SIZE)], asked[0]["max-records"])
 
+    def test_a_log_that_ignores_the_filter_is_read_for_the_hash_itself_and_other_commits_do_not_count(self) -> None:
+        nessie = StandIn()
+        nessie.ignore_filter = True
+        with self.assertRaises(tags.NotOnTrunk):
+            tags.tag_run(nessie, RUN_ID, HASH_SIDE)
+        self.assertTrue(tags.tag_run(nessie, RUN_ID, HASH_ONE).created)
+
     def test_a_trunk_that_is_not_a_branch_is_refused(self) -> None:
         nessie = StandIn()
         nessie.references["fake_trunk"] = ("TAG", HASH_TWO)
@@ -365,6 +373,13 @@ class PagingTest(unittest.TestCase):
         for page in forged:
             with self.subTest(page=page), self.assertRaises(NessieError):
                 tags.list_tags(ForgedPages([page]))
+
+    def test_a_has_more_that_is_not_true_or_false_is_an_error_and_not_a_page_to_follow(self) -> None:
+        last = {"references": [], "hasMore": False}
+        forged: list[Any] = [{"references": []}, {"references": [], "hasMore": "yes", "token": "t1"}, {"references": [], "hasMore": 1, "token": "t1"}]
+        for page in forged:
+            with self.subTest(page=page), self.assertRaises(NessieError):
+                tags.list_tags(ForgedPages([page, last]))
 
     def test_pages_are_asked_with_a_bounded_size_and_the_names_of_the_pinned_server(self) -> None:
         nessie = StandIn()
@@ -440,6 +455,19 @@ class TagClientTest(unittest.TestCase):
                 tags.TagClient(url, 0.5).reference("main")
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 2.5)
+
+
+class SharedDeadlineTest(unittest.TestCase):
+    def test_the_calls_of_one_run_share_the_deadline_and_the_second_gets_only_what_the_first_left(self) -> None:
+        with serving(b"{}", delay_seconds=0.7) as (url, seen):
+            client = tags.TagClient(url, 1.0)
+            started = time.monotonic()
+            client.config()
+            with self.assertRaises(NessieError):
+                client.config()
+            elapsed = time.monotonic() - started
+        self.assertEqual(2, len(seen))
+        self.assertLess(elapsed, 1.35)
 
 
 class DeadlineCommandTest(unittest.TestCase):

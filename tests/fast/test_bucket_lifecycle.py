@@ -234,6 +234,26 @@ class HclValueTest(unittest.TestCase):
         text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', r'status = "Dis\u0061bled"', 1)
         self.assertEqual([], declared(text))
 
+    def test_a_status_that_is_a_literal_other_than_disabled_is_read_as_enabled(self) -> None:
+        text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', 'status = "Enabld"', 1)
+        self.assertEqual(1, len(declared(text)))
+
+    def test_the_rules_read_from_terraform_have_no_comment_text_in_their_values(self) -> None:
+        text = (BAD_TERRAFORM % "landing/").replace('status = "Enabled"', 'status = "Enabled" # current objects expire', 1)
+        rules = lifecycle.terraform_rules(text)
+        self.assertEqual("Enabled", rules[0]["Status"])
+        self.assertEqual({"Prefix": "landing/"}, rules[0]["Filter"])
+
+    def test_a_brace_in_a_comment_does_not_cut_a_rule_short_and_hide_its_prefix_and_expiration(self) -> None:
+        text = (BAD_TERRAFORM % "warehouse/").replace('id     = "cleanup"', 'id     = "cleanup" # }', 1)
+        rules = lifecycle.terraform_rules(text)
+        self.assertEqual({"Prefix": "warehouse/"}, rules[0]["Filter"])
+        self.assertEqual({"Days": 30}, rules[0]["Expiration"])
+
+    def test_a_word_in_a_comment_is_not_a_block(self) -> None:
+        text = (BAD_TERRAFORM % "landing/") + '# the old lifecycle_rule form is not used here\n# dynamic "rule" { is not used here either\n'
+        self.assertEqual([], declared(text))
+
     def test_a_dynamic_rule_cannot_be_read_and_is_a_problem(self) -> None:
         lines = ['resource "aws_s3_bucket_lifecycle_configuration" "b" {', '  bucket = "b"', '  dynamic "rule" {', "    for_each = var.rules"]
         text = "\n".join([*lines, "    content {", '      id = "x"', "    }", "  }", "}", ""])

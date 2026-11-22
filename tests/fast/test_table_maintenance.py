@@ -9,6 +9,7 @@ acceptance run proves the rewrites on real tables, with Spark and Trino reading 
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
@@ -179,6 +180,36 @@ class NoDeletionTest(unittest.TestCase):
         for word in ("rewrite_data_files", "rewrite_manifests", "precondition_problems", "compare_reads", "compare_tags"):
             with self.subTest(word=word):
                 self.assertIn(word, text)
+
+
+class JobOrderTest(unittest.TestCase):
+    """The refusals come before any rewrite. A real run proves it on Spark; this keeps the order from being changed in the source."""
+
+    @staticmethod
+    def calls(function: ast.FunctionDef) -> list[tuple[int, str]]:
+        found = []
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call):
+                name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
+                found.append((node.lineno, name))
+        return sorted(found)
+
+    def functions(self) -> dict[str, ast.FunctionDef]:
+        tree = ast.parse(JOB.read_text())
+        return {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+
+    def test_the_job_refuses_unsafe_tables_before_it_reads_or_rewrites_anything(self) -> None:
+        names = [name for _, name in self.calls(self.functions()["maintain"])]
+        self.assertIn("refuse_unsafe_tables", names)
+        self.assertLess(names.index("refuse_unsafe_tables"), names.index("read_tagged"))
+        self.assertLess(names.index("refuse_unsafe_tables"), names.index("compact"))
+
+    def test_the_refusal_uses_the_precondition_check_and_the_job_compares_the_reads_and_the_tags_after_the_rewrite(self) -> None:
+        functions = self.functions()
+        self.assertIn("precondition_problems", [name for _, name in self.calls(functions["refuse_unsafe_tables"])])
+        names = [name for _, name in self.calls(functions["maintain"])]
+        for compare in ("compare_reads", "compare_tags"):
+            self.assertGreater(names.index(compare), names.index("compact"))
 
 
 if __name__ == "__main__":
