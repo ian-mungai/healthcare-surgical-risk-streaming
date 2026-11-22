@@ -21,7 +21,8 @@ from collections.abc import Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
-from spark.session import build_session, required_environment, start_deadline
+from spark.catalog import required_environment
+from spark.session import build_session, start_deadline
 from spark.settings import BYTES_PER_MIB, SettingsError, read_memory_limit_mib
 
 JOB = "catalog_proof"

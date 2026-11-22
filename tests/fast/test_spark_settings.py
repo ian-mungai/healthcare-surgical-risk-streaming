@@ -9,7 +9,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from spark.catalog import add_catalog
 from spark.settings import OVERHEAD_FLOOR_MIB, SettingsError, catalog_options, driver_memory_mib, read_memory_limit_mib
 
 GOOD = {"nessie_uri": "http://nessie:19120/api/v2", "warehouse": "s3://example-bucket/warehouse/", "ref": "proof_ab12cd34", "region": "us-west-2"}
@@ -61,6 +63,25 @@ class MemoryTest(unittest.TestCase):
     def test_a_missing_cgroup_file_is_refused_by_name(self) -> None:
         with self.assertRaisesRegex(SettingsError, "does_not_exist"):
             read_memory_limit_mib(Path("/nonexistent/does_not_exist"))
+
+
+class FakeSession:
+    def __init__(self) -> None:
+        self.settings: dict[str, str] = {}
+        self.conf = self
+
+    def set(self, key: str, value: str) -> None:
+        self.settings[key] = value
+
+
+class AddedCatalogTest(unittest.TestCase):
+    def test_a_catalog_added_beside_the_branch_reads_each_table_from_storage_every_time_and_not_from_the_session_cache(self) -> None:
+        session = FakeSession()
+        with mock.patch.dict("os.environ", {"NESSIE_URI": "http://nessie:19120/api/v2", "WAREHOUSE_LOCATION": "file:///warehouse/"}, clear=True):
+            add_catalog(session, "pin0", "run-a")
+        self.assertEqual("run-a", session.settings["spark.sql.catalog.pin0.ref"])
+        self.assertEqual("false", session.settings["spark.sql.catalog.pin0.cache-enabled"])
+        self.assertFalse([key for key in session.settings if key.startswith("spark.sql.catalog.lake")])
 
 
 class CatalogTest(unittest.TestCase):

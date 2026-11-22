@@ -34,6 +34,7 @@ from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieError
 from scripts.stack.tags import TableSnapshot, list_references, list_tags, table_snapshots
+from spark.catalog import add_catalog, required_environment
 from spark.maintenance import (
     RetentionError,
     SnapshotInfo,
@@ -45,7 +46,7 @@ from spark.maintenance import (
     removable_orphans,
     table_identifier,
 )
-from spark.session import add_catalog, build_session, required_environment, start_deadline
+from spark.session import build_session, start_deadline
 from spark.settings import CATALOG, SettingsError
 
 JOB = "table_maintenance"
