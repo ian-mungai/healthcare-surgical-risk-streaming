@@ -61,6 +61,11 @@ class ColumnTest(unittest.TestCase):
 
 
 class EmptyValueTest(unittest.TestCase):
+    def test_the_expected_form_is_the_empty_string_unless_a_run_says_otherwise(self) -> None:
+        self.assertEqual("empty", rules.EMPTY_FORM)
+        self.assertEqual("", rules.table_text(""))
+        self.assertEqual(rules.NOT_THE_EMPTY_VALUE, rules.table_text(None))
+
     def test_control_the_accepted_form_reads_as_the_published_empty_value(self) -> None:
         self.assertEqual("", rules.table_text(None, "null"))
         self.assertEqual("", rules.table_text("", "empty"))
@@ -95,6 +100,26 @@ class TrackListDigestTest(unittest.TestCase):
         self.assertNotEqual(rules.rows_digest(["a", "b"]), rules.rows_digest(["b", "a"]))
         self.assertNotEqual(rules.rows_digest(["a", "b"]), rules.rows_digest(["a", "c"]))
         self.assertNotEqual(rules.rows_digest(["a\tb"]), rules.rows_digest(["a", "b"]))
+
+
+class RowLineTest(unittest.TestCase):
+    def test_control_fields_without_a_tab_or_a_newline_are_joined_by_a_tab(self) -> None:
+        self.assertEqual("1\tSNUADC/ART\t", rules.row_line(["1", "SNUADC/ART", ""]))
+
+    def test_a_field_with_a_tab_or_a_newline_is_refused_because_the_joined_form_would_be_ambiguous(self) -> None:
+        for field in ("a\tb", "a\nb", "a\rb", "\t"):
+            with self.subTest(field=field), self.assertRaisesRegex(rules.RulesError, "tab or a newline"):
+                rules.row_line(["1", field, "x"])
+
+
+class SeparatorPatternTest(unittest.TestCase):
+    def test_the_pattern_the_job_uses_matches_a_tab_a_newline_and_a_carriage_return_and_nothing_else(self) -> None:
+        import re
+
+        for value in ("a\tb", "a\nb", "a\rb"):
+            self.assertIsNotNone(re.search(rules.SEPARATOR_PATTERN, value))
+        for value in ("", "ab", "a b", "a,b", "t", "n", "\\t"):
+            self.assertIsNone(re.search(rules.SEPARATOR_PATTERN, value))
 
 
 class PinTest(unittest.TestCase):

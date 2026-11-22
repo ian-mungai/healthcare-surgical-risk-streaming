@@ -5,8 +5,9 @@ verified source on four counts: the column list (exact names, order and the stri
 the row count, the key multiset and the row payload. The keys and rows are compared as multisets of strings, unchanged: a value is never trimmed, cast or
 case-folded, so a leading zero, a trailing blank or a changed empty value is a difference.
 
-An empty field of a CSV file is one published value, the empty string. A loaded table holds it in exactly one form, ``EMPTY_FORM``: ``null`` (the
-connector's null) or ``empty`` (the connector's empty string). The other form is a different value and fails the check.
+An empty field of a CSV file is one published value, the empty string. A loaded table holds it in exactly one form, ``EMPTY_FORM``: ``empty`` (the
+empty string, which the record connections are set to write) unless a run declares ``null`` (the connector's null). The other form is a different value and
+fails the check. Which form the connector writes is measured on the host.
 """
 
 from __future__ import annotations
@@ -23,11 +24,13 @@ from typing import Any
 NAMESPACE = "raw_records"
 AIRBYTE_PREFIX = "_airbyte_"
 STRING_TYPE = "string"
-EMPTY_FORM = "null"
+EMPTY_FORM = "empty"
 EMPTY_FORMS = ("null", "empty")
 BYTE_ORDER_MARK = "﻿"
 NOT_THE_EMPTY_VALUE = "\x01not the published empty value\x01"
 SAMPLE_LIMIT = 3
+SEPARATOR_PATTERN = "[\\t\\n\\r]"
+LAB_DATA_NOTE = "lab_data has no unique key (some whole rows repeat), so its key is the whole row: its key check and its payload check are the same comparison"
 HASH = re.compile(r"[0-9a-f]{64}")
 PLAN_FORMAT = "table_check_plan_1"
 RESULT_FORMAT = "table_checks_1"
@@ -97,8 +100,11 @@ def table_text(value: str | None, empty_form: str = EMPTY_FORM) -> str:
 
 
 def row_line(values: Iterable[str]) -> str:
-    """One row of the track list as its digest reads it: the fields joined by a tab."""
-    return "\t".join(values)
+    """One row as its digest reads it: the fields joined by a tab. A field with a tab or a newline is refused, as it makes that form ambiguous."""
+    fields = list(values)
+    if any(mark in field for field in fields for mark in "\t\n\r"):
+        raise RulesError("a field holds a tab or a newline, so the tab-joined row of the digest would be ambiguous")
+    return "\t".join(fields)
 
 
 def rows_digest(lines: Iterable[str]) -> str:

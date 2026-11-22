@@ -16,8 +16,10 @@ environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 wa
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
+import operator
 import os
 import sys
 from collections.abc import Sequence
@@ -164,6 +166,10 @@ def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> Ta
 
     result.rows_source = entry.rows
     result.add("row count", result.rows_table == entry.rows, f"pinned {entry.rows}, table {result.rows_table}")
+    ambiguous = table.filter(functools.reduce(operator.or_, [F.col(f"`{name}`").rlike(rules.SEPARATOR_PATTERN) for name in expected])).count()
+    if ambiguous:
+        result.add("rows digest", False, f"{ambiguous} row(s) hold a tab or a newline in a field, so the digest's tab-joined form is ambiguous")
+        return result
     lines = table.select(F.concat_ws("\t", *[F.col(f"`{name}`") for name in expected]).alias("line")).orderBy("line")
     digest = rules.rows_digest(row.line for row in lines.toLocalIterator())
     result.add("rows digest", digest == entry.rows_sha256, "equal to the pinned digest" if digest == entry.rows_sha256 else "differs from the pinned digest")
