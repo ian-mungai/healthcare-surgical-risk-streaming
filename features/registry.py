@@ -19,13 +19,19 @@ last sample of its newest valid second, ``s * 1_000_000 + round((rate - 1) * 1_0
 per-second series is the end of its newest valid second, which can equal the cutoff and is never after it, and the time since a low second is counted from the
 end of that second.
 
-A reading or a second flagged invalid may hold any number, a non-finite one included, and its value is never used: it changes no feature and no latest time.
+A reading or a second flagged invalid may hold any value, a non-finite number or a null included, and its value is never used: it changes no feature and no
+latest time.
+
+**Arithmetic.** The mean, median, standard deviation, slope, projection and the pulse pressure and amplitude statistics are exact: each float is taken as the
+rational number that it is, and the result is rounded once. A result that a float cannot hold is a named input error. The row has exactly the keys of this
+registry, in its order, whatever the input holds, and a clinical field of the input that is neither in the registry nor forbidden is refused by name.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from fractions import Fraction
 from functools import cache
 
 from features import stats
@@ -42,7 +48,6 @@ LOW_PRESSURE_60 = 60.0
 PROJECTION_MINUTES = 5
 ARTERIAL_SERIES = "Silver/ART_MBP_1S"
 PUBLISHER_UNIT = "the publisher's unit of the track"
-PREOP_PREFIX = "preop_"
 
 # The sample eligibility limits of the analysis plan (project standard, "Analysis decisions and their evidence", row 5).
 MAX_INVALID_WAVEFORM_SECONDS = 0
@@ -98,15 +103,21 @@ def seconds_since_below(window: NumericWindow, limit: float) -> float | None:
     return (window.cutoff_us - times[-1]) / SECOND if times else None
 
 
+def exact_slope_per_minute(window: NumericWindow) -> Fraction | None:
+    """The exact least-squares slope on the actual times of the valid readings, per minute."""
+    slope = stats.slope_exact([time - window.cutoff_us for time in window.times_us], window.values)
+    return None if slope is None else slope * MINUTE
+
+
 def window_slope_per_minute(window: NumericWindow) -> float | None:
-    """The least-squares slope on the actual times of the valid readings, in minutes."""
-    return stats.slope([(time - window.cutoff_us) / MINUTE for time in window.times_us], window.values)
+    slope = exact_slope_per_minute(window)
+    return None if slope is None else float(slope)
 
 
 def projection(window: NumericWindow) -> float | None:
-    """The last valid value plus the window's slope per minute times 5 minutes."""
-    window_slope = window_slope_per_minute(window)
-    return None if window_slope is None else window.values[-1] + PROJECTION_MINUTES * window_slope
+    """The last valid value plus the window's slope per minute times 5 minutes, exact and rounded once."""
+    slope = exact_slope_per_minute(window)
+    return None if slope is None else float(Fraction(window.values[-1]) + PROJECTION_MINUTES * slope)
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,8 +250,9 @@ class WaveformStat:
     count: bool = False
 
 
-def amplitudes(valid: WaveformValid) -> list[float]:
-    return [max(second.samples) - min(second.samples) for second in valid.seconds]
+def amplitudes(valid: WaveformValid) -> list[Fraction]:
+    """The exact largest minus smallest sample of each valid second."""
+    return [Fraction(max(second.samples)) - Fraction(min(second.samples)) for second in valid.seconds]
 
 
 def all_samples(valid: WaveformValid) -> list[float]:
@@ -256,8 +268,10 @@ def dominant(valid: WaveformValid) -> float | None:
 FREQUENCY = WaveformStat(
     "dominant_freq_hz",
     "Hz",
-    f"{MISSING_NO_SECOND}; missing unless all 20 seconds of the window are valid; missing when the signal is flat",
-    "the lowest frequency from 0.5 to 3.5 Hz in steps of 0.05 Hz whose power is within a relative 1e-9 of the largest, from the samples at their block times",
+    f"{MISSING_NO_SECOND}; missing unless all 20 seconds of the window are valid; missing when the signal is flat, when no bin of the band is below the "
+    "Nyquist frequency or when the band holds less than 1e-9 of the power",
+    "the lowest frequency from 0.5 to 3.5 Hz and below the Nyquist frequency, in steps of 0.05 Hz, whose power is within a relative 1e-9 of the largest, from "
+    "the samples at their block times",
     dominant,
 )
 VALID_SECONDS = WaveformStat(
@@ -329,6 +343,12 @@ WAVEFORM_TRACKS: dict[str, tuple[WaveformStat, ...]] = {
 WAVEFORM_STATUS: dict[str, TrackStatus] = {"SNUADC/ART": ARTERIAL_WAVEFORM_STATUS, "SNUADC/ECG_II": TO_CONFIRM, "SNUADC/PLETH": TO_CONFIRM}
 
 CLINICAL_FIELDS = ("age", "sex", "height", "weight", "bmi", "asa", "emop", "department", "optype")
+# The pre-operative columns of the header of the pinned clinical table, in its order.
+PREOP_COLUMNS = (
+    "preop_htn", "preop_dm", "preop_ecg", "preop_pft", "preop_hb", "preop_plt", "preop_pt", "preop_aptt", "preop_na", "preop_k", "preop_gluc",
+    "preop_alb", "preop_ast", "preop_alt", "preop_bun", "preop_cr", "preop_ph", "preop_hco3", "preop_be", "preop_pao2", "preop_paco2", "preop_sao2",
+)  # fmt: skip
+PREOP_NOTE = "to confirm against bronze.clinical_cases before the list is frozen"
 SENSITIVITY_FIELDS = ("approach", "position", "ane_type")
 CLINICAL_MISSING = "missing when the value is not in the table or its availability time is unknown or after the cutoff"
 CLINICAL_UNITS = {"age": "years", "height": "cm", "weight": "kg", "bmi": "kg/m^2"}
@@ -354,7 +374,7 @@ def status_word(confirmed: bool) -> str:
 
 
 def feature_specs() -> tuple[FeatureSpec, ...]:
-    """Every feature with a fixed name. The ``preop_`` family has one name per result or condition of the table and is known by its prefix."""
+    """Every feature, in the order of a row: the numeric tracks, the waveforms, the clinical fields, the pre-operative columns, the sensitivity fields."""
     specs: list[FeatureSpec] = []
     for track, track_spec in NUMERIC_TRACKS.items():
         for stat in NUMERIC_STATS[track_spec.kind]:
@@ -397,6 +417,19 @@ def feature_specs() -> tuple[FeatureSpec, ...]:
     ]
     specs += [
         FeatureSpec(
+            column,
+            "the unit of the table column",
+            "clinical",
+            "clinical",
+            CLINICAL_MISSING,
+            "the pre-operative result or condition in the clinical table",
+            "to_confirm",
+            PREOP_NOTE,
+        )
+        for column in PREOP_COLUMNS
+    ]
+    specs += [
+        FeatureSpec(
             field,
             "category",
             "clinical",
@@ -418,7 +451,5 @@ def registered_names() -> frozenset[str]:
 
 
 def is_registered(name: str) -> bool:
-    """Whether ``name`` is a feature: a fixed name of the registry or a ``preop_`` result or condition."""
-    if name.startswith(PREOP_PREFIX) and len(name) > len(PREOP_PREFIX):
-        return True
+    """Whether ``name`` is a feature of the registry. The keys of a row come from the registry only, never from the input."""
     return name in registered_names()

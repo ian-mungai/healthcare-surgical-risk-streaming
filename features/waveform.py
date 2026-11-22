@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from features.model import FeatureInputError, FeatureValue, GroupResult, WaveformSecond, WaveformValid, WaveformWindow
 from features.registry import WAVEFORM_TRACKS, WAVEFORM_WINDOW_SECONDS, complete_seconds, last_sample_us, slug
@@ -11,8 +12,14 @@ from features.validate import boolean, number, whole_microseconds, whole_number
 
 def whole_rate(track: str, rate: object) -> int:
     """The sample rate as a positive whole number. A float with a fraction, zero, a negative, not a number, a boolean and a text are refused."""
-    if isinstance(rate, bool) or not isinstance(rate, int | float) or not math.isfinite(rate) or rate <= 0 or rate != int(rate):
-        raise FeatureInputError(f"{track}: the sample rate is not a positive whole number")
+    problem = FeatureInputError(f"{track}: the sample rate is not a positive whole number")
+    if isinstance(rate, bool) or not isinstance(rate, int | float) or rate <= 0:
+        raise problem
+    try:
+        if not math.isfinite(rate) or rate != int(rate):
+            raise problem
+    except OverflowError as error:
+        raise problem from error
     return int(rate)
 
 
@@ -37,6 +44,8 @@ def window_seconds(track: str, window: WaveformWindow, cutoff_us: int) -> Wavefo
             continue
         if second.start_offset_us != 0:
             raise FeatureInputError(f"{track}: a valid second does not start on a whole second")
+        if isinstance(second.samples, str | bytes) or not isinstance(second.samples, Sequence):
+            raise FeatureInputError(f"{track}: the samples of a valid second are not an array")
         if len(second.samples) != rate:
             raise FeatureInputError(f"{track}: a valid second holds {len(second.samples)} samples and its sample count must be the rate {rate}")
         samples = tuple(number(sample, f"{track}: a sample") for sample in second.samples)
@@ -57,7 +66,5 @@ def waveform_group(track: str, window: WaveformWindow, cutoff_us: int) -> GroupR
             value = stat.compute(valid) if valid.seconds or not stat.needs_value else None
         except OverflowError as error:
             raise FeatureInputError(f"{name}: the result is outside the range of a float") from error
-        if value is not None and not math.isfinite(value):
-            raise FeatureInputError(f"{name}: the result is outside the range of a float")
         values[name] = value
     return GroupResult(values, last_sample_us(valid.seconds[-1].second, valid.sample_rate) if valid.seconds else None)

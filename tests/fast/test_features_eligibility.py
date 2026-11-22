@@ -12,6 +12,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import unittest
+from typing import Any
 
 from features.eligibility import Eligibility, warning_eligibility
 from features.model import Reading, WaveformSecond, WaveformWindow
@@ -83,6 +84,33 @@ class Numeric(unittest.TestCase):
     def test_the_reasons_are_the_plan_names(self) -> None:
         self.assertEqual("waveform_invalid_second", WAVEFORM_INVALID_SECOND)
         self.assertEqual("numeric_over_10_percent_invalid", NUMERIC_OVER_10_PERCENT_INVALID)
+
+
+class NullValues(unittest.TestCase):
+    def window(self, invalid_with_null: int, absent: int) -> list[Reading]:
+        """900 seconds: ``invalid_with_null`` readings flagged invalid with a null value, ``absent`` seconds left out, the rest valid."""
+        seconds = range(CUTOFF_US // SECOND - 900, CUTOFF_US // SECOND)
+        readings: list[Reading] = []
+        for position, second in enumerate(seconds):
+            if position < absent:
+                continue
+            junk: Any = None
+            readings.append(Reading(second * SECOND, junk, False) if position < absent + invalid_with_null else Reading(second * SECOND, 80.0, True))
+        return readings
+
+    def test_89_absent_seconds_and_one_invalid_second_with_a_null_value_is_exactly_10_percent_and_eligible(self) -> None:
+        self.assertEqual(810, sum(reading.valid for reading in self.window(1, 89)))
+        self.assertTrue(check(self.window(1, 89), waveform_window(alternating)).eligible)
+
+    def test_one_more_invalid_second_is_not_eligible(self) -> None:
+        self.assertEqual((NUMERIC_OVER_10_PERCENT_INVALID,), check(self.window(1, 90), waveform_window(alternating)).reasons)
+        self.assertEqual((NUMERIC_OVER_10_PERCENT_INVALID,), check(self.window(2, 89), waveform_window(alternating)).reasons)
+
+    def test_an_invalid_waveform_second_with_no_samples_is_still_one_invalid_second(self) -> None:
+        window = waveform_window(alternating)
+        empty: Any = None
+        seconds = (WaveformSecond(window.seconds[3].second, empty, False), *window.seconds[:3], *window.seconds[4:])
+        self.assertEqual((WAVEFORM_INVALID_SECOND,), check(series(0), WaveformWindow(window.sample_rate, seconds)).reasons)
 
 
 class Cutoffs(unittest.TestCase):

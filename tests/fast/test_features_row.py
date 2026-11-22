@@ -55,6 +55,11 @@ LIST_WAVEFORM_STATS = {
     "SNUADC/PLETH": ["amplitude_mean", "amplitude_std", "dominant_freq_hz", "valid_seconds", "coverage"],
 }
 LIST_CLINICAL = ["age", "sex", "height", "weight", "bmi", "asa", "emop", "department", "optype"]
+# The pre-operative columns of the header of the pinned clinical table.
+LIST_PREOP = [
+    "preop_htn", "preop_dm", "preop_ecg", "preop_pft", "preop_hb", "preop_plt", "preop_pt", "preop_aptt", "preop_na", "preop_k", "preop_gluc",
+    "preop_alb", "preop_ast", "preop_alt", "preop_bun", "preop_cr", "preop_ph", "preop_hco3", "preop_be", "preop_pao2", "preop_paco2", "preop_sao2",
+]  # fmt: skip
 LIST_SENSITIVITY = ["approach", "position", "ane_type"]
 LIST_NEVER = ["opdur", "anedur", "caseend", "opend", "aneend", "dis", "los_postop", "los_icu", "death_inhosp"]
 
@@ -64,7 +69,7 @@ def slug(track: str) -> str:
 
 
 def expected_names() -> set[str]:
-    names = set(LIST_CLINICAL)
+    names = set(LIST_CLINICAL) | set(LIST_PREOP)
     for tracks in LIST_NUMERIC_TRACKS.values():
         for track in tracks:
             names |= {f"{slug(track)}__{stat}" for stat in LIST_SOURCE_STATS}
@@ -135,6 +140,15 @@ class Registry(unittest.TestCase):
         self.assertEqual("to_confirm", by_name["silver_art_mbp_1s__projection_5min"].status)
         self.assertIn("Jacquet-Lagrèze 2022", by_name["silver_art_mbp_1s__projection_5min"].note)
 
+    def test_every_pre_operative_column_is_in_the_registry_in_the_order_of_the_table_and_to_be_confirmed(self) -> None:
+        specs = [spec for spec in feature_specs() if spec.name.startswith("preop_")]
+        self.assertEqual(LIST_PREOP, [spec.name for spec in specs])
+        for spec in specs:
+            with self.subTest(name=spec.name):
+                self.assertEqual("to_confirm", spec.status)
+                self.assertIn("bronze.clinical_cases", spec.note)
+                self.assertEqual("clinical", spec.input_kind)
+
     def test_every_standard_deviation_says_that_it_divides_by_n_minus_one(self) -> None:
         stds = [spec for spec in feature_specs() if spec.name.endswith(("__std", "__amplitude_std"))]
         self.assertEqual(len(NUMERIC_TRACKS) - 1 + 3, len(stds))
@@ -144,7 +158,10 @@ class Registry(unittest.TestCase):
 
     def test_the_registry_knows_its_names_and_the_pre_operative_family_and_nothing_else(self) -> None:
         self.assertTrue(is_registered("age"))
-        self.assertTrue(is_registered("preop_hb"))
+        for column in LIST_PREOP:
+            self.assertTrue(is_registered(column), column)
+        self.assertFalse(is_registered("preop_made_up"))
+        self.assertFalse(is_registered("preop_"))
         self.assertTrue(is_registered("approach"))
         self.assertTrue(is_registered(f"{slug(ARTERIAL_MEAN)}__mean"))
         for name in ("opdur", "intraop_ebl", "mystery", "solar8000_art_mbp__mystery", "solar8000_unknown__mean", ""):
@@ -171,6 +188,21 @@ class Row(unittest.TestCase):
         self.assertIsNone(row.latest_reading_us)
         self.assertIsNone(row.latest_clinical_us)
         self.assertEqual(CUTOFF_US, row.cutoff_us)
+
+    def test_every_row_has_exactly_the_keys_of_the_registry_in_its_order_whatever_the_input(self) -> None:
+        names = [spec.name for spec in feature_specs() if not spec.sensitivity_only]
+        k = 3600
+        for cutoff in (k * SECOND - 1, k * SECOND, k * SECOND + 1, (k + 1) * SECOND):
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(names, list(build_row(WindowInput(cutoff, {}, {}, {})).values))
+                full = WindowInput(
+                    cutoff,
+                    {ARTERIAL_MEAN: numeric_window(arithmetic(100.0, -0.05), cutoff_us=cutoff)},
+                    {"SNUADC/ART": waveform_window(alternating, cutoff_us=cutoff)},
+                    {"age": ClinicalValue(63, 0), "preop_hb": ClinicalValue(12.1, cutoff + 1)},
+                )
+                self.assertEqual(names, list(build_row(full).values))
+        self.assertEqual([*names, *LIST_SENSITIVITY], list(build_row(WindowInput(CUTOFF_US, {}, {}, {}), include_sensitivity=True).values))
 
     def test_the_sensitivity_fields_are_added_only_when_asked_for(self) -> None:
         self.assertEqual(expected_names() | set(LIST_SENSITIVITY), set(build_row(empty_window(), include_sensitivity=True).values))
@@ -274,6 +306,7 @@ class Leakage(unittest.TestCase):
     def test_data_after_the_cutoff_changes_no_value_and_leaves_no_latest_time_after_it(self) -> None:
         with_future = build_row(self.window_with_future(True))
         without = build_row(self.window_with_future(False))
+        self.assertEqual(list(without.values), list(with_future.values))
         self.assertEqual(
             {k: v for k, v in without.values.items() if k not in ("asa", "weight", "preop_hb")},
             {k: v for k, v in with_future.values.items() if k not in ("asa", "weight", "preop_hb")},

@@ -16,7 +16,9 @@ Failure modes covered here:
 from __future__ import annotations
 
 import math
+import statistics
 import unittest
+from fractions import Fraction
 from typing import Any
 
 from features.model import FeatureInputError, FeatureValue, Reading
@@ -191,6 +193,63 @@ class Range(unittest.TestCase):
     def test_a_slope_of_large_values_keeps_its_value(self) -> None:
         readings = [Reading(CUTOFF_US - 120 * SECOND, 0.0, True), Reading(CUTOFF_US - 60 * SECOND, 1e308, True)]
         self.assertTrue(math.isclose(1e308, get(values_of(readings), "slope_per_min"), rel_tol=1e-12))
+
+
+class InvalidValues(unittest.TestCase):
+    def test_the_value_of_an_invalid_reading_may_be_anything_and_is_never_touched(self) -> None:
+        base = numeric_window(arithmetic(100.0, -0.05, 300))
+        reference = values_of(base)
+        junks: tuple[Any, ...] = (None, "x", [1], {}, math.nan, math.inf, 10**400)
+        for junk in junks:
+            with self.subTest(junk=junk):
+                bad: Any = junk
+                extra = [Reading(CUTOFF_US - 600 * SECOND - 3, bad, False), Reading(CUTOFF_US - 7_500_000, bad, False)]
+                self.assertEqual(reference, values_of(base + extra))
+                self.assertEqual(CUTOFF_US, numeric_group(TRACK, base + extra, CUTOFF_US).latest_us)
+
+    def test_the_value_of_a_valid_reading_must_be_a_number_and_a_number_too_large_for_a_float_is_refused(self) -> None:
+        for junk in (None, "80", [1], 10**400):
+            with self.subTest(junk=junk), self.assertRaisesRegex(FeatureInputError, TRACK):
+                bad: Any = junk
+                values_of([*numeric_window([80.0] * 5), Reading(CUTOFF_US - 7 * SECOND, bad, True)])
+
+
+def exact_slope(readings: list[Reading]) -> float:
+    xs = [Fraction(r.time_us - CUTOFF_US, 60 * SECOND) for r in readings]
+    ys = [Fraction(r.value) for r in readings]
+    x_mean, y_mean = sum(xs) / len(xs), sum(ys) / len(ys)
+    return float(sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / sum((x - x_mean) ** 2 for x in xs))
+
+
+class Exact(unittest.TestCase):
+    def test_adjacent_floats_give_the_exact_standard_deviation(self) -> None:
+        values = [1.0, 1.0 + 2**-52] * 50
+        result = values_of(numeric_window(values))
+        self.assertTrue(math.isclose(statistics.stdev(values), get(result, "std"), rel_tol=1e-14))
+        self.assertTrue(math.isclose(2**-53 * math.sqrt(100 / 99), get(result, "std"), rel_tol=1e-14))  # about 1.1158e-16, not 41% high
+        self.assertTrue(math.isclose(1.0 + 2**-53, get(result, "mean"), rel_tol=1e-15))
+
+    def test_the_standard_deviation_of_ordinary_values_is_the_exact_one_to_the_last_digit(self) -> None:
+        values = [80.0 + 40.0 * math.sin(index * 12.9898) for index in range(900)]
+        self.assertTrue(math.isclose(statistics.stdev(values), get(values_of(numeric_window(values)), "std"), rel_tol=1e-15))
+
+    def test_the_mean_has_one_rounding_only(self) -> None:
+        readings = spaced_window([1e308, -1e308, 1e-100], 300)
+        self.assertEqual(1e-100 / 3, get(values_of(readings), "mean"))
+        self.assertEqual(1e-100, get(values_of(readings), "median"))
+
+    def test_the_slope_is_the_exact_least_squares_slope_rounded_once(self) -> None:
+        readings = [Reading(CUTOFF_US - offset * SECOND, value, True) for offset, value in ((800, 61.3), (611, 70.1), (330, 66.6), (97, 58.2), (3, 64.4))]
+        self.assertEqual(exact_slope(readings), get(values_of(readings), "slope_per_min"))
+        big = [Reading(CUTOFF_US - 600 * SECOND, 1e300, True), Reading(CUTOFF_US - 300 * SECOND, -1e300, True), Reading(CUTOFF_US, 3e300, True)]
+        self.assertEqual(exact_slope(big), get(values_of(big), "slope_per_min"))
+
+    def test_values_of_1e200_and_1e308_have_their_representable_results(self) -> None:
+        result = values_of(spaced_window([1e200, -1e200] * 4, 100))
+        self.assertTrue(math.isclose(1e200 * math.sqrt(8 / 7), get(result, "std"), rel_tol=1e-15))
+        result = values_of(spaced_window([1.7e308, 1.6e308, 1.65e308, 1.65e308], 250))
+        self.assertTrue(math.isclose(1.65e308, get(result, "mean"), rel_tol=1e-15))
+        self.assertTrue(math.isclose(1.65e308, get(result, "median"), rel_tol=1e-15))
 
 
 class Validity(unittest.TestCase):

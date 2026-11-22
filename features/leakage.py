@@ -9,6 +9,10 @@ FORBIDDEN_FIELDS = frozenset({"opdur", "anedur", "caseend", "opend", "aneend", "
 FORBIDDEN_PREFIXES = ("intraop_",)
 
 
+def is_forbidden(name: str) -> bool:
+    return name in FORBIDDEN_FIELDS or name.startswith(FORBIDDEN_PREFIXES)
+
+
 class LeakageError(ValueError):
     """A feature row that breaks the leakage check."""
 
@@ -21,7 +25,7 @@ def row_problems(row: FeatureRow) -> list[str]:
     if row.latest_clinical_us is not None and row.latest_clinical_us > row.cutoff_us:
         problems.append(f"a clinical availability time {row.latest_clinical_us} is after the cutoff {row.cutoff_us}")
     for name in row.values:
-        if name in FORBIDDEN_FIELDS or name.startswith(FORBIDDEN_PREFIXES):
+        if is_forbidden(name):
             problems.append(f"the forbidden field {name} is among the features")
         elif not is_registered(name):
             problems.append(f"the unknown field {name} is among the features")

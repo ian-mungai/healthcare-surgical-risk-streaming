@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from fractions import Fraction
 from typing import Any
 
 from features.model import FeatureInputError, FeatureValue, Reading
@@ -157,6 +158,26 @@ class Range(unittest.TestCase):
             values_of(readings)
 
 
+class InvalidValues(unittest.TestCase):
+    def test_the_value_of_an_invalid_second_may_be_anything_and_is_never_touched(self) -> None:
+        base = series_window(arithmetic(100.0, -0.05, 300))
+        reference = values_of(base)
+        junks: tuple[Any, ...] = (None, "x", [1], {}, math.nan, 10**400)
+        for junk in junks:
+            with self.subTest(junk=junk):
+                bad: Any = junk
+                self.assertEqual(reference, values_of([*base, Reading(CUTOFF_US - 1000 * SECOND, bad, False), Reading(CUTOFF_US - 800 * SECOND, bad, False)]))
+
+    def test_the_projection_is_the_exact_value_rounded_once(self) -> None:
+        values = [64.1, 70.3, 58.8, 61.5, 66.6]
+        readings = [Reading((CUTOFF_US // SECOND - offset) * SECOND, value, True) for offset, value in zip((600, 421, 200, 30, 1), values, strict=True)]
+        xs = [Fraction(r.time_us + SECOND - CUTOFF_US, 60 * SECOND) for r in readings]
+        ys = [Fraction(v) for v in values]
+        x_mean, y_mean = sum(xs) / 5, sum(ys) / 5
+        slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / sum((x - x_mean) ** 2 for x in xs)
+        self.assertEqual(float(ys[-1] + 5 * slope), get(values_of(readings), "projection_5min"))
+
+
 class Refusals(unittest.TestCase):
     def test_a_reading_off_the_one_second_grid_inside_the_window_is_refused(self) -> None:
         for offset in (1, 500_000, 999_999):
@@ -169,14 +190,14 @@ class Refusals(unittest.TestCase):
             values_of(readings + [Reading(readings[5].time_us, 81.0, True)])
 
     def test_a_flag_that_is_not_a_boolean_and_a_time_or_value_of_the_wrong_type_are_refused(self) -> None:
-        base = series_window([80.0] * 900)
+        base = series_window([80.0] * 5)  # the bad reading is at a second that the base does not hold
         bad_flag: Any = "false"
-        bad_time: Any = float(CUTOFF_US - 5 * SECOND) + 0.9
+        bad_time: Any = float(CUTOFF_US - 50 * SECOND) + 0.9
         bad_value: Any = "80"
         for bad, pattern in (
-            (Reading(CUTOFF_US - 5 * SECOND, 1.0, bad_flag), "valid flag"),
+            (Reading(CUTOFF_US - 50 * SECOND, 1.0, bad_flag), "valid flag"),
             (Reading(bad_time, 1.0, True), "time"),
-            (Reading(CUTOFF_US - 5 * SECOND, bad_value, True), "value"),
+            (Reading(CUTOFF_US - 50 * SECOND, bad_value, True), "value"),
         ):
             with self.subTest(pattern=pattern), self.assertRaisesRegex(FeatureInputError, pattern):
                 values_of([*base, bad])

@@ -15,6 +15,7 @@ import io
 import json
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -180,6 +181,84 @@ class Entry(unittest.TestCase):
         bad = FeatureRow(CUTOFF_US, {"age": 63}, CUTOFF_US + 1, None)
         with mock.patch.object(batch, "build_row", return_value=bad), self.assertRaisesRegex(LeakageError, "latest reading"):
             batch.compute_rows([WindowInput(CUTOFF_US, {}, {}, {})])
+
+    def run_text(self, text: str) -> tuple[int, str, Path]:
+        """Run the batch entry point on the text of a windows file, with an earlier result already at the target."""
+        source, target = self.root / "windows.json", self.root / "rows.json"
+        source.write_text(text)
+        target.write_text("OLD")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = batch.main([str(source), str(target)])
+        return code, stderr.getvalue(), target
+
+    def test_a_shape_that_is_not_the_documented_one_is_refused_by_name_and_leaves_the_earlier_result(self) -> None:
+        def edited(change: Callable[[dict[str, Any]], None]) -> str:
+            document = window_document("w")
+            change(document)
+            return json.dumps({"windows": [document]})
+
+        good = window_document("w")
+        cases: dict[str, str] = {
+            "windows": json.dumps({"windows": {}}),
+            "windows ": json.dumps({"windows": []}),
+            "windows  ": json.dumps({"windows": "x"}),
+            "windows   ": json.dumps({}),
+            "top level": json.dumps([good]),
+            "extra": json.dumps({"windows": [good], "extra": 1}),
+            "windows[0]": json.dumps({"windows": [[]]}),
+            "mystery": edited(lambda d: d.update(mystery=1)),
+            "cutoff_us": edited(lambda d: d.pop("cutoff_us")),
+            "numeric": edited(lambda d: d.update(numeric=[])),
+            f"numeric[{HEART_RATE}]": edited(lambda d: d["numeric"].update({HEART_RATE: {}})),
+            f"numeric[{HEART_RATE}] ": edited(lambda d: d["numeric"].update({HEART_RATE: [{"t": 1}]})),
+            f"numeric[{HEART_RATE}]  ": edited(lambda d: d["numeric"].update({HEART_RATE: [[1, 2]]})),
+            "waveforms": edited(lambda d: d.update(waveforms=[])),
+            "waveforms[SNUADC/ART]": edited(lambda d: d["waveforms"].update({"SNUADC/ART": []})),
+            "seconds": edited(lambda d: d["waveforms"]["SNUADC/ART"].update(seconds={})),
+            "seconds ": edited(lambda d: d["waveforms"]["SNUADC/ART"].pop("seconds")),
+            "seconds[0]": edited(lambda d: d["waveforms"]["SNUADC/ART"].update(seconds=[[]])),
+            "valid": edited(lambda d: d["waveforms"]["SNUADC/ART"]["seconds"][0].pop("valid")),
+            "clinical": edited(lambda d: d.update(clinical=[])),
+            "clinical[age]": edited(lambda d: d["clinical"].update(age=5)),
+            "clinical[age] ": edited(lambda d: d["clinical"].update(age={"value": 1})),
+        }
+        for pattern, text in cases.items():
+            with self.subTest(pattern=pattern):
+                code, message, target = self.run_text(text)
+                self.assertEqual(2, code)
+                self.assertIn(pattern.strip(), message)
+                self.assertEqual("OLD", target.read_text())
+
+    def test_a_file_that_is_not_json_is_refused_and_leaves_the_earlier_result(self) -> None:
+        code, message, target = self.run_text("not json")
+        self.assertEqual(2, code)
+        self.assertIn("features.batch", message)
+        self.assertEqual("OLD", target.read_text())
+
+    def test_a_number_too_large_for_a_float_is_a_named_error_and_not_a_traceback(self) -> None:
+        document = window_document("w")
+        document["numeric"][HEART_RATE] = [[CUTOFF_US, 10**400, True]]
+        code, message, target = self.run_text(json.dumps({"windows": [document]}))
+        self.assertEqual(2, code)
+        self.assertIn(HEART_RATE, message)
+        self.assertEqual("OLD", target.read_text())
+
+    def test_a_row_that_breaks_the_leakage_check_never_reaches_the_file_through_the_entry_point(self) -> None:
+        # A run that called build_row and wrote its rows without the check would write the file here, and this test would fail.
+        document = json.dumps({"windows": [window_document("w")]})
+        bad_rows = {
+            "latest reading": FeatureRow(CUTOFF_US, {"age": 63.0}, CUTOFF_US + 1, None),
+            "availability": FeatureRow(CUTOFF_US, {"age": 63.0}, None, CUTOFF_US + 1),
+            "forbidden": FeatureRow(CUTOFF_US, {"opdur": 1.0}, None, None),
+            "unknown": FeatureRow(CUTOFF_US, {"mystery": 1.0}, None, None),
+        }
+        for pattern, bad in bad_rows.items():
+            with self.subTest(pattern=pattern), mock.patch.object(batch, "build_row", return_value=bad):
+                code, message, target = self.run_text(document)
+                self.assertEqual(2, code)
+                self.assertIn(pattern, message)
+                self.assertEqual("OLD", target.read_text())
 
     def test_a_bad_window_stops_the_run_and_leaves_no_output(self) -> None:
         bad = window_document("bad")

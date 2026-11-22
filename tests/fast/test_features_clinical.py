@@ -20,6 +20,12 @@ from features.model import ClinicalValue, FeatureInputError
 
 CUTOFF = 1_000_000
 MAIN = ("age", "sex", "height", "weight", "bmi", "asa", "emop", "department", "optype")
+# The pre-operative columns of the header of the pinned clinical table, in their order.
+PREOP = (
+    "preop_htn", "preop_dm", "preop_ecg", "preop_pft", "preop_hb", "preop_plt", "preop_pt", "preop_aptt", "preop_na", "preop_k", "preop_gluc",
+    "preop_alb", "preop_ast", "preop_alt", "preop_bun", "preop_cr", "preop_ph", "preop_hco3", "preop_be", "preop_pao2", "preop_paco2", "preop_sao2",
+)  # fmt: skip
+FIXED = (*MAIN, *PREOP)
 
 
 def known(**values: float | int | str | None) -> dict[str, ClinicalValue]:
@@ -48,7 +54,7 @@ class Availability(unittest.TestCase):
 
     def test_a_value_that_is_not_there_is_missing_and_the_fixed_fields_are_always_in_the_output(self) -> None:
         group = clinical_group({}, CUTOFF, include_sensitivity=False)
-        self.assertEqual(set(MAIN), set(group.values))
+        self.assertEqual(list(FIXED), list(group.values))
         self.assertEqual({None}, set(group.values.values()))
 
 
@@ -71,9 +77,13 @@ class Types(unittest.TestCase):
         with self.assertRaisesRegex(FeatureInputError, "age"):
             clinical_group({"age": ClinicalValue(math.nan, CUTOFF + 1)}, CUTOFF, include_sensitivity=False)
 
-    def test_a_field_the_plan_does_not_use_is_not_examined(self) -> None:
-        group = clinical_group(known(age=63, opdur=math.nan, caseid=math.inf), CUTOFF, include_sensitivity=False)
+    def test_a_forbidden_field_is_not_examined(self) -> None:
+        group = clinical_group(known(age=63, opdur=math.nan, intraop_ebl=math.inf, los_icu="x"), CUTOFF, include_sensitivity=False)
         self.assertEqual(63.0, group.values["age"])
+
+    def test_a_number_too_large_for_a_float_is_refused_with_its_field(self) -> None:
+        with self.assertRaisesRegex(FeatureInputError, "age"):
+            clinical_group(known(age=10**400), CUTOFF, include_sensitivity=False)
 
     def test_an_availability_time_that_is_not_a_whole_number_of_microseconds_is_refused_with_its_field(self) -> None:
         for bad in (CUTOFF + 0.9, float(CUTOFF), True, "0", math.nan):
@@ -96,21 +106,32 @@ class Fields(unittest.TestCase):
 
     def test_a_forbidden_field_in_the_table_is_never_a_feature(self) -> None:
         forbidden = known(
-            opdur=3.0, anedur=4.0, caseend=100, opend=90, aneend=95, dis=1, los_postop=5, los_icu=2, death_inhosp=0, intraop_ebl=100, intraop_uo=300, caseid=1
+            opdur=3.0, anedur=4.0, caseend=100, opend=90, aneend=95, dis=1, los_postop=5, los_icu=2, death_inhosp=0, intraop_ebl=100, intraop_uo=300
         )
         group = clinical_group(known(age=63) | forbidden, CUTOFF, include_sensitivity=True)
         self.assertEqual(set(), set(forbidden) & set(group.values))
         self.assertEqual(63, group.values["age"])
 
-    def test_a_field_the_plan_does_not_name_is_not_a_feature(self) -> None:
-        group = clinical_group(known(age=63, opname="a name", dx="a diagnosis"), CUTOFF, include_sensitivity=False)
-        self.assertEqual(set(MAIN), set(group.values))
+    def test_a_field_that_is_not_in_the_registry_and_not_forbidden_is_refused_by_name(self) -> None:
+        for name in ("caseid", "subjectid", "opname", "dx", "icu_days", "preop_made_up", "mystery"):
+            with self.subTest(name=name), self.assertRaisesRegex(FeatureInputError, name):
+                clinical_group(known(age=63) | known(**{name: 1.0}), CUTOFF, include_sensitivity=False)
+
+    def test_the_keys_come_from_the_registry_and_not_from_the_input(self) -> None:
+        # A record that becomes available after the cutoff, or is absent, leaves every key where it was, in the same order.
+        without = clinical_group(known(age=63), CUTOFF, include_sensitivity=False)
+        future = clinical_group(
+            known(age=63) | {"preop_hb": ClinicalValue(12.1, CUTOFF + 1), "preop_k": ClinicalValue(4.0, None)}, CUTOFF, include_sensitivity=False
+        )
+        self.assertEqual(list(FIXED), list(without.values))
+        self.assertEqual(list(without.values), list(future.values))
+        self.assertEqual(without, future)
 
     def test_the_sensitivity_fields_are_features_only_when_asked_for(self) -> None:
         table = known(age=63, approach="Open", position="Supine", ane_type="General")
-        self.assertEqual(set(MAIN), set(clinical_group(table, CUTOFF, include_sensitivity=False).values))
+        self.assertEqual(list(FIXED), list(clinical_group(table, CUTOFF, include_sensitivity=False).values))
         with_sensitivity = clinical_group(table, CUTOFF, include_sensitivity=True)
-        self.assertEqual(set(MAIN) | {"approach", "position", "ane_type"}, set(with_sensitivity.values))
+        self.assertEqual([*FIXED, "approach", "position", "ane_type"], list(with_sensitivity.values))
         self.assertEqual("Open", with_sensitivity.values["approach"])
 
     def test_a_sensitivity_field_with_no_availability_time_is_missing(self) -> None:

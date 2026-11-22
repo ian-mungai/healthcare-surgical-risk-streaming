@@ -30,7 +30,10 @@ def number(value: object, what: str) -> float:
     """An integer or a float as a float. A boolean and a text are refused. The value may be not a number: ``finite`` checks that."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise FeatureInputError(f"{what} is not a number")
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError as error:
+        raise FeatureInputError(f"{what} is too large for a float") from error
 
 
 def finite(value: object, what: str) -> float:

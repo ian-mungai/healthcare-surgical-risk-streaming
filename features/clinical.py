@@ -5,31 +5,37 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
+from features.leakage import is_forbidden
 from features.model import ClinicalValue, FeatureInputError, FeatureValue, GroupResult
-from features.registry import CLINICAL_FIELDS, PREOP_PREFIX, SENSITIVITY_FIELDS
-from features.validate import whole_microseconds
+from features.registry import CLINICAL_FIELDS, PREOP_COLUMNS, SENSITIVITY_FIELDS
+from features.validate import number, whole_microseconds
 
 
 def clinical_value(name: str, value: object) -> FeatureValue:
     """A number as a float and a text as a text. A boolean, a list, and a number that is not finite are refused with the field."""
     if isinstance(value, str) or value is None:
         return value
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+    result = number(value, f"{name}: a clinical value")
+    if not math.isfinite(result):
         raise FeatureInputError(f"{name}: a clinical value is not a finite number or a text")
-    return float(value)
+    return result
 
 
 def clinical_group(clinical: Mapping[str, ClinicalValue], cutoff_us: int, include_sensitivity: bool) -> GroupResult:
-    """The fixed fields (and the sensitivity fields when asked for) always appear. A ``preop_`` field appears when the table holds it.
+    """Every clinical feature of the registry, in its order: the fixed fields, the pre-operative columns, and the sensitivity fields when asked for.
 
-    A field that is not on the plan's list, and every forbidden field, is never read. A listed field is checked whether or not it is available.
+    The keys come from the registry only. A field that is absent, unavailable at the cutoff or without an availability time is missing, and a field of the input
+    that is neither in the registry nor forbidden is refused by name. A forbidden field is never read. A field of the registry is checked when it is in the
+    output, whether or not it is available.
     """
     whole_microseconds(cutoff_us, "the cutoff")
-    names = list(CLINICAL_FIELDS) + (list(SENSITIVITY_FIELDS) if include_sensitivity else [])
-    names += sorted(name for name in clinical if name.startswith(PREOP_PREFIX) and len(name) > len(PREOP_PREFIX))
+    names = [*CLINICAL_FIELDS, *PREOP_COLUMNS, *SENSITIVITY_FIELDS]
+    for name in clinical:
+        if name not in names and not is_forbidden(name):
+            raise FeatureInputError(f"{name}: a clinical field that is neither in the registry nor forbidden")
     values: dict[str, FeatureValue] = {}
     used: list[int] = []
-    for name in names:
+    for name in (*CLINICAL_FIELDS, *PREOP_COLUMNS, *(SENSITIVITY_FIELDS if include_sensitivity else ())):
         item = clinical.get(name)
         if item is None:
             values[name] = None

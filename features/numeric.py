@@ -15,13 +15,13 @@ def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, per
 
     A source-time track has ``cutoff - 15 minutes < time <= cutoff`` and keeps its published times. The per-second series has the newest 900 complete seconds
     (``complete_seconds``), each reading at the start of a whole second, and its times in the window are the ends of those seconds. Two readings of one track
-    at one time are refused, and so is a reading with a time, a flag or a value of the wrong type.
+    at one time are refused, and so is a reading with a time or a flag of the wrong type. The value of a reading is read only when the reading is valid and
+    inside the window: it must then be a finite number. The value of any other reading may be anything and is never touched.
     """
     whole_microseconds(cutoff_us, "the cutoff")
     for reading in readings:
         whole_microseconds(reading.time_us, f"{track}: a reading's time")
         boolean(reading.valid, f"{track}: a reading's valid flag")
-        number(reading.value, f"{track}: a reading's value")
     if per_second:
         window = complete_seconds(cutoff_us, NUMERIC_WINDOW_SECONDS)
         lower, upper = window[0] * SECOND, (window[-1] + 1) * SECOND
@@ -36,11 +36,12 @@ def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, per
     for reading in inside:
         if per_second and reading.time_us % SECOND:
             raise FeatureInputError(f"{track}: a reading of the per-second series is not at a whole second")
-        if reading.valid and not math.isfinite(reading.value):
-            raise FeatureInputError(f"{track}: a valid reading is not a finite number")
     valid = [reading for reading in inside if reading.valid]
+    values = [number(reading.value, f"{track}: a valid reading's value") for reading in valid]
+    if not all(math.isfinite(value) for value in values):
+        raise FeatureInputError(f"{track}: a valid reading is not a finite number")
     known = SECOND if per_second else 0
-    return NumericWindow(cutoff_us, [reading.time_us + known for reading in valid], [float(reading.value) for reading in valid])
+    return NumericWindow(cutoff_us, [reading.time_us + known for reading in valid], values)
 
 
 def numeric_group(track: str, readings: Sequence[Reading], cutoff_us: int) -> GroupResult:
@@ -59,7 +60,5 @@ def numeric_group(track: str, readings: Sequence[Reading], cutoff_us: int) -> Gr
             value = stat.compute(window) if window.values or not stat.needs_value else None
         except OverflowError as error:
             raise FeatureInputError(f"{name}: the result is outside the range of a float") from error
-        if value is not None and not math.isfinite(value):
-            raise FeatureInputError(f"{name}: the result is outside the range of a float")
         values[name] = value
     return GroupResult(values, window.times_us[-1] if window.times_us else None)

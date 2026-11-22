@@ -14,6 +14,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import math
+import statistics
 import unittest
 from collections.abc import Callable
 from typing import Any
@@ -266,7 +267,105 @@ class Frequency(unittest.TestCase):
                 self.assertAlmostEqual(2.0, get(values_of(ART, window), "snuadc_art__dominant_freq_hz"), places=9)
 
 
+def rate_window(rate: int, signal: Callable[[float], float]) -> WaveformWindow:
+    """Twenty complete seconds at ``rate`` samples a second, each sample the signal at its time in seconds from the start of the window."""
+    seconds = tuple(second_of(index, [signal(position + k / rate) for k in range(rate)]) for position, index in enumerate(window_seconds(20)))
+    return WaveformWindow(float(rate), seconds)
+
+
+def tone(frequency: float, amplitude: float = 1.0) -> Callable[[float], float]:
+    return lambda time: 50.0 + amplitude * math.sin(2 * math.pi * frequency * time)
+
+
+class Aliasing(unittest.TestCase):
+    def test_a_signal_at_the_nyquist_frequency_has_no_frequency_in_the_band(self) -> None:
+        # The reviewer's input: 112 and 88 alternating at 100 Hz is a 50 Hz wave. Rounding must not report a peak in the band.
+        seconds = tuple(second_of(index, [112.0, 88.0] * 50) for index in window_seconds(20))
+        result = values_of(ART, WaveformWindow(100.0, seconds))
+        self.assertIsNone(result["snuadc_art__dominant_freq_hz"])
+        self.assertEqual(20, result["snuadc_art__valid_seconds"])
+
+    def test_a_frequency_at_or_above_the_nyquist_frequency_is_not_searched(self) -> None:
+        # The reviewer's input: a 0.2 Hz cosine at 1 Hz has its Nyquist frequency at 0.5 Hz, so no bin of the band is below it.
+        result = values_of(ART, rate_window(1, lambda time: 50.0 + math.cos(2 * math.pi * 0.2 * time)))
+        self.assertIsNone(result["snuadc_art__dominant_freq_hz"])
+
+    def test_only_bins_strictly_below_the_nyquist_frequency_and_up_to_3_5_hz_are_searched(self) -> None:
+        self.assertAlmostEqual(0.7, get(values_of(ART, rate_window(2, tone(0.7))), "snuadc_art__dominant_freq_hz"), places=9)
+        self.assertAlmostEqual(3.45, get(values_of(ART, rate_window(7, tone(3.45))), "snuadc_art__dominant_freq_hz"), places=9)
+        self.assertIsNone(
+            values_of(ART, rate_window(7, lambda time: 50.0 + math.cos(2 * math.pi * 3.5 * time)))["snuadc_art__dominant_freq_hz"]
+        )  # an alternating wave at the Nyquist frequency
+
+    def test_a_clean_sine_gives_its_frequency_at_every_rate(self) -> None:
+        for rate in (10, 25, 100):
+            with self.subTest(rate=rate):
+                self.assertAlmostEqual(1.2, get(values_of(ART, rate_window(rate, tone(1.2))), "snuadc_art__dominant_freq_hz"), places=9)
+        self.assertAlmostEqual(3.5, get(values_of(ART, rate_window(100, tone(3.5))), "snuadc_art__dominant_freq_hz"), places=9)
+
+    def test_a_band_with_less_than_1e_minus_9_of_the_power_has_no_frequency(self) -> None:
+        def loud_with(amplitude: float) -> Callable[[float], float]:
+            return lambda time: 50.0 + 10.0 * math.sin(2 * math.pi * 10.0 * time) + amplitude * math.sin(2 * math.pi * 1.2 * time)
+
+        self.assertIsNone(values_of(ART, rate_window(100, loud_with(1e-6)))["snuadc_art__dominant_freq_hz"])
+        self.assertIsNone(values_of(ART, rate_window(100, loud_with(1e-4)))["snuadc_art__dominant_freq_hz"])  # a power ratio of 5e-11 of the total
+        self.assertAlmostEqual(1.2, get(values_of(ART, rate_window(100, loud_with(1e-3))), "snuadc_art__dominant_freq_hz"), places=9)
+
+
+class Exact(unittest.TestCase):
+    def test_adjacent_floats_give_the_exact_standard_deviation(self) -> None:
+        values = [1.0, 1.0 + 2**-52] * 5
+        result = values_of(ART, waveform_window(lambda position: values))
+        self.assertTrue(math.isclose(statistics.stdev(values * 20), get(result, "snuadc_art__std"), rel_tol=1e-14))
+
+    def test_the_mean_has_one_rounding_only(self) -> None:
+        result = values_of(ART, waveform_window(lambda position: [0.8e308, -0.8e308, 1e-100] + [0.0] * 7))
+        self.assertEqual(1e-100 / 10, get(result, "snuadc_art__mean"))
+
+    def test_the_amplitudes_are_exact_differences_even_when_a_float_subtraction_would_round_them_away(self) -> None:
+        tiny = 1e-20
+        window = waveform_window(lambda position: [1.0, tiny] * 5 if position % 2 == 0 else [1.0, 2 * tiny] * 5)
+        result = values_of(PLETH, window)
+        self.assertTrue(math.isclose(tiny / 2 * math.sqrt(20 / 19), get(result, "snuadc_pleth__amplitude_std"), rel_tol=1e-12))
+
+    def test_the_amplitudes_are_exact_differences(self) -> None:
+        low, high = -1e308, 0.5e308
+        result = values_of(PLETH, waveform_window(lambda position: [low, high] * 5))
+        self.assertTrue(math.isclose(1.5e308, get(result, "snuadc_pleth__amplitude_mean"), rel_tol=1e-15))
+        self.assertEqual(0.0, result["snuadc_pleth__amplitude_std"])
+
+
 class Range(unittest.TestCase):
+    def test_a_sample_too_large_for_a_float_is_refused_with_the_track(self) -> None:
+        newest = window_seconds(20)[-1]
+        window = waveform_window(alternating)
+        bad: Any = 10**400
+        seconds = (*window.seconds[:-1], WaveformSecond(newest, (1.0,) * 9 + (bad,), True))
+        with self.assertRaisesRegex(FeatureInputError, "SNUADC/ART"):
+            values_of(ART, WaveformWindow(window.sample_rate, seconds))
+
+    def test_a_sample_rate_too_large_for_a_float_is_refused(self) -> None:
+        with self.assertRaisesRegex(FeatureInputError, "sample rate"):
+            values_of(ART, WaveformWindow(10**400, waveform_window(alternating).seconds))
+
+    def test_the_samples_of_an_invalid_second_may_be_anything(self) -> None:
+        newest = window_seconds(20)[-1]
+        window = waveform_window(alternating)
+        reference = values_of(ART, WaveformWindow(window.sample_rate, window.seconds[:-1]))
+        for junk in (None, "x", 5, 10**400, [math.nan]):
+            with self.subTest(junk=junk):
+                bad: Any = junk
+                seconds = (*window.seconds[:-1], WaveformSecond(newest, bad, False))
+                self.assertEqual(reference, values_of(ART, WaveformWindow(window.sample_rate, seconds)))
+
+    def test_the_samples_of_a_valid_second_must_be_an_array(self) -> None:
+        newest = window_seconds(20)[-1]
+        window = waveform_window(alternating)
+        for junk in (5, "0123456789", {"a": 1}, None):
+            with self.subTest(junk=junk), self.assertRaisesRegex(FeatureInputError, "samples"):
+                bad: Any = junk
+                values_of(ART, WaveformWindow(window.sample_rate, (*window.seconds[:-1], WaveformSecond(newest, bad, True))))
+
     def test_samples_of_1e200_do_not_overflow_the_standard_deviation(self) -> None:
         result = values_of(ART, waveform_window(lambda position: [1e200, -1e200] * 5))
         self.assertAlmostEqual(0.0, get(result, "snuadc_art__mean"), places=9)
