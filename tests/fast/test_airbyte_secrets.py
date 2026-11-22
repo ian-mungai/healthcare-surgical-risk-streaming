@@ -21,7 +21,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from tests.fast.ansible_support import ROLES, run_playbook
+from tests.fast.ansible_support import ROLES, run_playbook, shared_module
 
 ROLE = ROLES / "airbyte"
 MODULE = ROLE / "library" / "airbyte_secrets.py"
@@ -30,9 +30,12 @@ GROUP = grp.getgrgid(os.getgid()).gr_name
 CHANGED_NONE = re.compile(r"changed=0\s")
 DATABASE_VALUE = "database-value-that-must-not-leak"
 KUBECTL = ["k3s", "kubectl"]
+# The root owner of the run: this computer's user and a group of it other than its primary group, so a file left with the primary group is found.
+ROOT_GID = next((group for group in os.getgroups() if group != os.getgid()), os.getgid())
 
 
 def load_module() -> ModuleType:
+    shared_module("secret_files")
     spec = importlib.util.spec_from_file_location("airbyte_secrets", MODULE)
     if spec is None or spec.loader is None:
         raise ImportError(str(MODULE))
@@ -46,7 +49,12 @@ secrets = load_module()
 
 
 def run_files_step(folder: Path) -> tuple[int, str]:
-    variables = {"airbyte_secrets_directory": str(folder / "secrets"), "airbyte_owner": OWNER, "airbyte_group": GROUP}
+    variables = {
+        "airbyte_secrets_directory": str(folder / "secrets"),
+        "airbyte_owner": OWNER,
+        "airbyte_group": GROUP,
+        "secret_files_root_owner": f"{os.getuid()}:{ROOT_GID}",
+    }
     with tempfile.TemporaryDirectory() as scratch:
         playbook = Path(scratch) / "check.yml"
         include = f"    - ansible.builtin.include_role:\n        name: {ROLE}\n        tasks_from: secret_files.yml\n"
@@ -72,18 +80,38 @@ class FilesStepTest(unittest.TestCase):
             code, output = run_files_step(folder)
             directory = folder / "secrets" / "airbyte"
             first = {path.name: path.read_text() for path in directory.iterdir()}
-            modes = {stat.S_IMODE(path.stat().st_mode) for path in directory.iterdir()}
+            modes = {(stat.S_IMODE(path.stat().st_mode), path.stat().st_uid, path.stat().st_gid) for path in directory.iterdir()}
             folder_mode = stat.S_IMODE(directory.stat().st_mode)
             again_code, again = run_files_step(folder)
             second = {path.name: path.read_text() for path in directory.iterdir()}
         self.assertEqual(0, code, output)
         self.assertEqual(["admin.password", "storage_access_key_id", "storage_secret_access_key"], sorted(first))
-        self.assertEqual(({0o600}, 0o700), (modes, folder_mode))
+        self.assertEqual(({(0o400, os.getuid(), ROOT_GID)}, 0o700), (modes, folder_mode))
         self.assertGreaterEqual(min(len(text) for text in first.values()), 16)
         for text in first.values():
             self.assertNotIn(text, output)
         self.assertEqual(0, again_code, again)
         self.assertEqual(first, second)
+        self.assertRegex(again, CHANGED_NONE)
+
+    def test_a_file_that_an_earlier_deploy_left_readable_is_given_mode_0400_and_the_root_owner_with_its_value_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            database_password(folder)
+            run_files_step(folder)
+            target = folder / "secrets" / "airbyte" / "admin.password"
+            value = target.read_text()
+            target.chmod(0o644)
+            os.chown(target, os.getuid(), os.getgid())
+            code, output = run_files_step(folder)
+            status = target.stat()
+            kept = target.read_text() == value
+            again_code, again = run_files_step(folder)
+        self.assertEqual(0, code, output)
+        self.assertNotRegex(output, CHANGED_NONE)
+        self.assertEqual((0o400, os.getuid(), ROOT_GID, True), (stat.S_IMODE(status.st_mode), status.st_uid, status.st_gid, kept))
+        self.assertNotIn(value, output)
+        self.assertEqual(0, again_code, again)
         self.assertRegex(again, CHANGED_NONE)
 
     def test_a_missing_database_password_file_stops_the_step_and_names_the_file(self) -> None:
@@ -118,7 +146,7 @@ class FakeCluster:
 def store_with_files(folder: Path) -> Any:
     database_password(folder)
     store = secrets.SecretFiles(folder / "secrets")
-    store.ensure_generated()
+    store.ensure_generated((os.getuid(), os.getgid()))
     return store
 
 

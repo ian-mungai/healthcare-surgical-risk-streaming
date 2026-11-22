@@ -1,7 +1,8 @@
 """Ansible module: the secret files that Airbyte needs and the Kubernetes secrets made from them.
 
 ``step: files`` creates each missing generated file under ``<secrets_directory>/airbyte`` (the instance admin's password and the object store's two
-keys), readable by its owner only, keeps existing files and requires the database password file that the PostgreSQL step made.
+keys), keeps existing files and requires the database password file that the PostgreSQL step made. No container reads these files, so each one is owned by
+the root owner (``root_owner``) with mode 0400, as every secret file is: an existing file with another mode or owner is given the right ones, its value kept.
 ``step: secrets`` makes three secrets in the namespace match those files: ``airbyte-database``, ``airbyte-storage`` and ``airbyte-auth-secrets``. A secret
 is applied only when a key it holds differs, and keys that Airbyte added to ``airbyte-auth-secrets`` itself are left alone.
 
@@ -13,13 +14,13 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import secrets
 from collections.abc import Callable
 from pathlib import Path
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.secret_files import SecretFileError, access_differs, parse_owner, set_access, write_private_file
 
 ACCOUNT_FOLDER = "airbyte"
 DATABASE_FILE = "postgres/airbyte.password"
@@ -60,23 +61,32 @@ class SecretFiles:
     def missing(self) -> list[str]:
         return [name for name in GENERATED if not self.path(f"{ACCOUNT_FOLDER}/{name}").exists()]
 
-    def ensure_generated(self) -> list[str]:
-        """Create each missing generated file and return their names. An existing file is never replaced."""
+    def unprotected(self, owner: tuple[int, int]) -> list[str]:
+        """The generated files that exist with another mode or owner than the one every secret file has."""
+        return [name for name in GENERATED if self.path(f"{ACCOUNT_FOLDER}/{name}").exists() and access_differs(self.path(f"{ACCOUNT_FOLDER}/{name}"), owner)]
+
+    def ensure_generated(self, owner: tuple[int, int]) -> tuple[list[str], list[str]]:
+        """Create each missing generated file for ``owner``, give each existing one its mode and owner, and return the created and the changed names.
+
+        An existing file is never replaced.
+        """
         self.read(DATABASE_FILE)
         folder = self.directory / ACCOUNT_FOLDER
         folder.mkdir(mode=0o700, exist_ok=True)
         folder.chmod(0o700)
         created: list[str] = []
+        protected: list[str] = []
         for name, generate in GENERATED.items():
-            try:
-                descriptor = os.open(folder / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                self.read(f"{ACCOUNT_FOLDER}/{name}")
+            path = folder / name
+            if not path.exists():
+                write_private_file(path, generate(), replace=False, owner=owner)
+                created.append(name)
                 continue
-            with os.fdopen(descriptor, "w") as handle:
-                handle.write(generate())
-            created.append(name)
-        return created
+            self.read(f"{ACCOUNT_FOLDER}/{name}")
+            if access_differs(path, owner):
+                set_access(path, owner)
+                protected.append(name)
+        return created, protected
 
 
 def wanted_secrets(files: SecretFiles, database_user: str) -> dict[str, dict[str, str]]:
@@ -146,14 +156,16 @@ def main() -> None:
             "namespace": {"type": "str", "default": "airbyte"},
             "kubectl": {"type": "list", "elements": "str", "default": ["k3s", "kubectl"]},
             "database_user": {"type": "str", "default": "airbyte"},
+            "root_owner": {"type": "str", "default": "0:0"},
         },
         supports_check_mode=True,
     )
     files = SecretFiles(Path(module.params["secrets_directory"]))
     try:
         if module.params["step"] == "files":
-            created = files.missing() if module.check_mode else files.ensure_generated()
-            module.exit_json(changed=bool(created), created=created)
+            owner = parse_owner(module.params["root_owner"], allow_root=True)
+            created, protected = (files.missing(), files.unprotected(owner)) if module.check_mode else files.ensure_generated(owner)
+            module.exit_json(changed=bool(created or protected), created=created, protected=protected)
         changed = apply_secrets(
             lambda arguments, data: module.run_command(arguments, data=data, check_rc=False),
             module.params["kubectl"],
@@ -163,7 +175,7 @@ def main() -> None:
             check_only=module.check_mode,
         )
         module.exit_json(changed=bool(changed), secrets=changed)
-    except SecretError as error:
+    except (SecretError, SecretFileError) as error:
         module.fail_json(msg=str(error))
 
 
