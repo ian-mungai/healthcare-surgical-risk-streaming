@@ -301,6 +301,15 @@ class PushReuseTest(PlanRepository):
         self.assertEqual(self.runs(record), ALL)
         self.assertIn("the newest run 60 of pull request 5", record["basis"])
 
+    def test_the_newer_run_of_another_pull_request_or_base_does_not_hide_the_pull_requests_own(self) -> None:
+        for label, fields in (("another pull request into main", {"number": 6}), ("this pull request into another base", {"base": "release"})):
+            with self.subTest(label=label):
+                self.fresh()
+                self.pull_run(60)
+                self.pull_run(61, **fields)
+                record = self.push()
+                self.assertEqual(record.get("reused", {}).get("run_id"), 60, record["basis"])
+
     def test_the_newest_attempt_is_the_one_that_started_last(self) -> None:
         early, late = "2026-11-21T10:00:00Z", "2026-11-21T10:30:00Z"
         self.fresh()
@@ -485,7 +494,7 @@ class PushReuseTest(PlanRepository):
                 self.fresh()
                 self.pull_run(70, skip=skip)
                 for name, fields in extra:
-                    self.github.add_job(70, name, **fields)
+                    self.github.add_proof(self.github.add_job(70, name, **fields), self.proof(70))
                 self.assertEqual(self.runs(self.push()), ALL)
         self.fresh()
         self.pull_run(70)
