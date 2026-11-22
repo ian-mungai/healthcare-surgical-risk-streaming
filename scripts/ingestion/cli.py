@@ -4,6 +4,10 @@
 
 ``.venv/bin/python -m scripts.ingestion.cli check --selection S.json --checksum-list SHA256SUMS.txt --pairings pairings.json --result result.json``
 
+``pairings``: read the metadata records that Airbyte wrote for the copied files and write the pairing records the check takes.
+
+``.venv/bin/python -m scripts.ingestion.cli pairings --pairings pairings.json``
+
 ``publish``: publish the manifest of a complete passed result and write its reference file.
 
 ``.venv/bin/python -m scripts.ingestion.cli publish --selection S.json --result result.json --reference reference.json``
@@ -23,6 +27,8 @@ call's notice says its error text was kept only when the AWS helper's text names
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 import re
 import sys
@@ -32,15 +38,16 @@ from scripts.aws_cli import RAW_ERRORS, Aws, AwsError, AwsTimeout
 from scripts.ingestion.check import CheckResult, run_check
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import verify_before_read
-from scripts.ingestion.landing import load_pairing_records
+from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX, load_pairing_records, pairings_from_metadata
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
-from scripts.ingestion.selection import Selection
+from scripts.ingestion.selection import Selection, pinned_release
 from scripts.ingestion.store import S3Store
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 PROGRAM = "scripts.ingestion.cli"
 PROGRESS_EVERY = 250
+METADATA_LIMIT_BYTES = 256 * 1024 * 1024
 TEST_BUCKET_SUFFIX = re.compile(r"-test-[0-9]{8}[0-9a-f]{6}")
 KEPT_ERROR_TEXT = f"; its full error text is in {RAW_ERRORS.relative_to(ROOT)}/"
 
@@ -110,6 +117,21 @@ def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
     return 0
 
 
+def command_pairings(store: S3Store, arguments: argparse.Namespace) -> int:
+    """Read every current metadata file under the landing prefix, and only those, and write the pairing records sorted by source key."""
+    versions = [item for item in store.list_versions(LANDING_PREFIX) if item.is_latest and not item.is_delete_marker and item.key.endswith(METADATA_SUFFIX)]
+    if not versions:
+        raise InputError(Notice(Code.NO_METADATA))
+    try:
+        texts = [store.get_version_bytes(item, METADATA_LIMIT_BYTES).decode() for item in versions]
+    except UnicodeDecodeError:
+        raise InputError(Notice(Code.METADATA_LINE, position=1)) from None
+    records = sorted(pairings_from_metadata(texts, pinned_release().source_prefix), key=lambda item: (item.source_key, item.landed_key))
+    write_private(arguments.pairings, json.dumps([dataclasses.asdict(item) for item in records], indent=1) + "\n", Subject.PAIRINGS)
+    say(Notice(Code.PAIRINGS_WRITTEN, count=len(records)))
+    return 0
+
+
 def command_publish(store: S3Store, arguments: argparse.Namespace) -> int:
     selection = Selection.from_json(read_input(arguments.selection, Subject.SELECTION))
     reference = publish_manifest(store, selection, CheckResult.from_json(read_input(arguments.result, Subject.RESULT)))
@@ -134,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--checksum-list", type=Path, required=True, help="the publisher's checksum list, pinned in the selection by its SHA-256")
     check.add_argument("--pairings", type=Path, required=True, help="the pairing records: each source key with its landed key and size, as a JSON list")
     check.add_argument("--result", type=Path, required=True, help="where to write the result, also when the check fails")
+    pairings = commands.add_parser("pairings")
+    pairings.add_argument("--pairings", type=Path, required=True, help="where to write the pairing records, each source key with its landed key and size")
     publish = commands.add_parser("publish")
     publish.add_argument("--selection", type=Path, required=True)
     publish.add_argument("--result", type=Path, required=True)
@@ -145,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         configuration = load_configuration()
         store = S3Store(Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"]), bucket_in_use(configuration["S3_BUCKET"], arguments.bucket))
-        return {"check": command_check, "publish": command_publish, "verify": command_verify}[arguments.command](store, arguments)
+        return {"check": command_check, "pairings": command_pairings, "publish": command_publish, "verify": command_verify}[arguments.command](store, arguments)
     except ClosedError as error:
         return refuse(*error.notices)
     except ConfigurationError:

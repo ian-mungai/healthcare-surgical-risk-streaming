@@ -1,0 +1,34 @@
+# Reads airbyte_landing_bucket, workload_access_region, airbyte_source_s3_version, airbyte_destination_s3_version and airbyte_connection_scope, and registers airbyte_connection_document. The bucket and the
+# region come from the deployment's variables, as the host commands pass them, and have no default, so a deployment that forgets one is refused here and not later in Airbyte.
+# The document is built on the computer that runs Ansible, where the repository and its tracked release pin are, and is the pin's two tables and 6,388 case files.
+- name: Refuse a deployment that does not name the project's bucket and its region
+  ansible.builtin.assert:
+    that:
+      - airbyte_landing_bucket | default('') | length > 0
+      - workload_access_region | default('') | length > 0
+    fail_msg: The deployment must give airbyte_landing_bucket, the project's bucket, and workload_access_region, its region.
+
+- name: Refuse a scope that is not the full release or the fixed sample
+  ansible.builtin.assert:
+    that:
+      - airbyte_connection_scope in ['full_release', 'fixed_sample']
+    fail_msg: airbyte_connection_scope must be full_release or fixed_sample.
+
+- name: Render the document of the raw connection from the tracked release pin
+  ansible.builtin.command:
+    argv: >-
+      {{ [ansible_playbook_python, '-m', 'scripts.ingestion.connection', 'render',
+          '--bucket', airbyte_landing_bucket, '--region', workload_access_region,
+          '--source-tag', airbyte_source_s3_version | string, '--destination-tag', airbyte_destination_s3_version | string]
+         + (['--fixed-sample'] if airbyte_connection_scope == 'fixed_sample' else []) }}
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: airbyte_connection_render
+  timeout: 60
+
+- name: Keep the document
+  ansible.builtin.set_fact:
+    airbyte_connection_document: "{{ airbyte_connection_render.stdout | from_json }}"

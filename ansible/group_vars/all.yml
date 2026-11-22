@@ -139,8 +139,23 @@ airbyte_database_user: airbyte
 # Temporal keeps its own two databases, owned by the same account, because the chart's database account cannot create a database.
 airbyte_temporal_database: airbyte_temporal
 airbyte_temporal_visibility_database: airbyte_temporal_visibility
-# The size limit of a file staged on the host's disk during a copy. An estimate until the ingestion phase measures the peak.
+# The size limit of the staging volume of a copy job, which holds each file on the host's disk during the copy. The job's pod is evicted when its volume passes the limit, so a
+# copy stops with Kubernetes's message before the disk fills. It holds the largest file the connector may copy (1.5 GB) and is a small part of the 200 GiB disk. An estimate
+# until the ingestion phase measures the peak staging use and the free space during a copy and a retry.
 airbyte_staging_size: 5G
+# The connectors of the raw connection, each at the newest stable version of the OSS connector registry on Nov 22 2026 that has the delivery method "Copy raw files" (source
+# 4.10.1 and later), a file of up to 1.5 GB (source 4.11.0) and the sub-folders kept (source 4.12.0) and, for the destination, file transfer (1.4.0 and later).
+# Their linux/amd64 image digests on Docker Hub: source sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b, destination
+# sha256:877e299d77182c7cb2c833c9e4fe7ccc6849487fb1b667bc61e53d8cadb22d6f. Change a pin only after reading the connector's changelog.
+airbyte_source_s3_version: 4.17.1
+airbyte_destination_s3_version: 1.9.11
+# The project's bucket that the raw connection lands in. The deployment's variables give it, as for the workload access region; an empty value is refused.
+airbyte_landing_bucket: ""
+# What the connection selects: full_release (the two tables and the 6,388 case files of the pin) or fixed_sample (the tracked candidate cases and the two tables, a part of the
+# release). Changing it repairs the source's selection and nothing else, and the files already copied stay copied.
+airbyte_connection_scope: full_release
+# The deadline of one call to Airbyte's API, in seconds. Creating the connection makes Airbyte read the source's schema, which takes the longest.
+airbyte_connection_deadline_seconds: 600
 # The address that the owner's browser uses, set when Caddy's Tailscale name is known. An empty value leaves the chart's setting alone.
 airbyte_public_url: ""
 # Each deadline is in seconds. The release deadline covers pulling the images and running the chart's database migration.
