@@ -25,14 +25,14 @@ def worker_peak_mib() -> int:
     return -(-resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // KIB_PER_MIB)
 
 
-def case_files(files: Sequence[CaseFile], spec: StoreSpec, *, kind: str) -> Iterator[tuple[Any, ...]]:
+def case_files(files: Sequence[CaseFile], spec: StoreSpec, *, kind: str, mode: str) -> Iterator[tuple[Any, ...]]:
     """The rows of one kind for each case of a partition: one case file at a time in a scratch folder that is removed when its rows have been taken."""
     store = open_store(spec)
     for file in files:
         lineage = Lineage(file.version_id, file.sha256)
         with tempfile.TemporaryDirectory(prefix="bronze_case_", dir=scratch_folder()) as folder:
             path = fetch_case(store, file, Path(folder))
-            yield from case_rows(path, file.case_id, kind, lineage)
+            yield from case_rows(path, file.case_id, kind, lineage, mode)
 
 
 def scratch_folder() -> str | None:
@@ -40,11 +40,11 @@ def scratch_folder() -> str | None:
     return SCRATCH_FOLDER if Path(SCRATCH_FOLDER).is_dir() else None
 
 
-def partition_rows(kind: str, spec: StoreSpec, peaks: Any) -> Any:
+def partition_rows(kind: str, spec: StoreSpec, peaks: Any, mode: str) -> Any:
     """The function that a Spark partition runs: its cases' rows of one kind. It reports the peak memory of the worker to ``peaks`` when it ends."""
 
     def run(files: Iterator[CaseFile]) -> Iterator[tuple[Any, ...]]:
-        yield from case_files(list(files), spec, kind=kind)
+        yield from case_files(list(files), spec, kind=kind, mode=mode)
         peaks.add(worker_peak_mib())
 
     return run

@@ -1,7 +1,7 @@
 """The Bronze decoder job: the verified case files as four Iceberg tables on a private Nessie branch.
 
 ``python -m spark.jobs.bronze_decode --branch <name> --manifest-reference <file> [--base <name>] [--cases <n,n,...>]``
-``    [--parallelism <n>] [--landed-folder <dir>]``
+``    [--parallelism <n>] [--passes grouped|per_track] [--landed-folder <dir>]``
 
 The steps, in order:
 
@@ -10,9 +10,10 @@ The steps, in order:
 2. Each case file is read by its bound version, checked against the manifest's SHA-256 and judged for structural corruption (``spark/bronze/structure.py``).
    One corrupt file ends the job, naming each such case, before the branch exists.
 3. The branch is created from ``--base`` (default ``main``). A branch that exists is refused. The job never writes to the base: the merge is a later step.
-4. Each table is written in one pass over the cases: ``tracks``, ``numeric_observations``, ``string_events`` and ``waveform_seconds``. A worker reads one case
-   file at a time and one track of it at a time, and Spark takes the rows as they are made, so a worker never holds more than its largest track.
-   ``--parallelism`` is the number of cases decoded at once and each of them holds a track in memory.
+4. Each table is written in one pass over the cases: ``tracks``, ``numeric_observations``, ``string_events`` and ``waveform_seconds``. A worker reads
+   one case file at a time, and Spark takes the rows as they are made. ``--passes`` chooses how a case file is read (``spark/bronze/plan.py``):
+   grouped, the default, reads all the numeric tracks of a case in one pass and each waveform track in a pass of its own; ``per_track`` reads every
+   track by itself. ``--parallelism`` is the number of cases decoded at once and each of them holds a pass's records in memory.
 5. Each table's stable key is checked for duplicates, and its row count and a checksum of every row are read back, so a rerun can be compared with this run.
 
 It prints one line that starts with ``RESULT `` and holds the branch, its new hash, for each table its snapshot ID, row count, key-duplicate count and
@@ -38,6 +39,7 @@ from scripts.ingestion.manifest import ManifestError, ManifestRef
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
 from spark.bronze.passes import MaxParameter, partition_problems, partition_rows
+from spark.bronze.plan import GROUPED, MODES
 from spark.bronze.readers import caseend_times, open_store
 from spark.bronze.rows import StructureError
 from spark.bronze.tables import KIND_TABLE, NAMESPACE, TABLES, TableSpec
@@ -61,6 +63,12 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--base", default="main", help="the branch to create the private branch from")
     command.add_argument("--manifest-reference", required=True, type=Path, help="the file that holds the reference of the passed manifest")
     command.add_argument("--cases", default="", help="the case numbers to decode, separated by commas; every case file of the manifest when empty")
+    command.add_argument(
+        "--passes",
+        choices=MODES,
+        default=GROUPED,
+        help="how a case file is read: all numeric tracks in one pass (grouped) or every track in a pass of its own (per_track)",
+    )
     command.add_argument("--parallelism", type=int, default=1, help="how many cases are decoded at once")
     command.add_argument("--landed-folder", default="", help="a folder of object versions that stands in for the bucket, for a local run")
     command.add_argument("--read-log", default="", help="with --landed-folder: a file that gets the key and version of every object read")
@@ -133,7 +141,7 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
         seconds: dict[str, float] = {}
         for kind in PASSES:
             begun = time.monotonic()
-            write_table(session, cases.mapPartitions(partition_rows(kind, spec, peaks)), KIND_TABLE[kind])
+            write_table(session, cases.mapPartitions(partition_rows(kind, spec, peaks, arguments.passes)), KIND_TABLE[kind])
             seconds[kind] = round(time.monotonic() - begun, 1)
         tables = {table.name: table_facts(session, table) for table in TABLES}
         versions = {"spark": str(session.version), "python": platform.python_version()}
@@ -150,6 +158,7 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
         "manifest": {"key": reference.key, "version_id": reference.version_id, "sha256": reference.sha256},
         "tables": tables,
         "parallelism": slices,
+        "passes": arguments.passes,
         "seconds": {"check": round(checked - started, 1), **seconds, "total": round(time.monotonic() - started, 1)},
         "memory_limit_mib": read_memory_limit_mib(),
         "container_peak_mib": peak_memory_mib(),
