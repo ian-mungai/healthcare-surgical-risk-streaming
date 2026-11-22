@@ -14,6 +14,8 @@ import re
 from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
+from scripts.stack.tags import MAX_DEADLINE_SECONDS
+
 TABLE_NAME = re.compile(r"\w+(\.\w+)+", re.ASCII)
 DEFAULT_DEADLINE_SECONDS = 900.0
 
@@ -23,13 +25,13 @@ class RetentionError(RuntimeError):
 
 
 def finite_seconds(text: str) -> float:
-    """A number of seconds above zero that is finite, for an argument."""
+    """A finite number of seconds above zero and at most one day, for an argument."""
     try:
         seconds = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"the deadline {text!r} is not a number of seconds") from None
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise argparse.ArgumentTypeError("the deadline must be a finite number of seconds above 0")
+    if not math.isfinite(seconds) or not 0 < seconds <= MAX_DEADLINE_SECONDS:
+        raise argparse.ArgumentTypeError(f"the deadline must be a finite number of seconds above 0 and at most {MAX_DEADLINE_SECONDS:g}")
     return seconds
 
 
@@ -49,7 +51,7 @@ def table_argument(text: str) -> str:
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="python -m spark.jobs.table_maintenance", description="Compact the tables of the trunk. Nothing is deleted.")
-    command.add_argument("--trunk", default="main", help="the branch whose tables are compacted")
+    command.add_argument("--trunk", default=None, help="an assertion: Nessie's default branch, whose tables are compacted, must be this one")
     command.add_argument(
         "--table", dest="tables", action="append", default=[], type=table_argument, help="a table to compact, such as schema.table; the default is every table"
     )

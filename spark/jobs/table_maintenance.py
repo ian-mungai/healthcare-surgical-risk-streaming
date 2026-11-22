@@ -1,6 +1,6 @@
 """The table maintenance job: compact the tables of the trunk and prove that every Nessie tag still reads what it read. It deletes nothing.
 
-``python -m spark.jobs.table_maintenance [--trunk main] [--table schema.table ...] [--rewrite-all] [--dry-run] [--deadline-seconds 900]``
+``python -m spark.jobs.table_maintenance [--trunk <default branch>] [--table schema.table ...] [--rewrite-all] [--dry-run] [--deadline-seconds 900]``
 
 Owner's decision (Nov 22 2026): maintenance deletes nothing before teardown. The job calls Iceberg's ``rewrite_data_files`` and ``rewrite_manifests``
 for each table of the trunk, or for the tables named. Each rewrite writes new files and one commit. The files it replaces stay on disk, because older
@@ -9,7 +9,8 @@ or a file.
 
 Each run:
 
-1. refuses to start while a branch other than the trunk exists, because a run may be writing;
+1. takes the trunk from Nessie's configuration, which names the default branch (``--trunk`` only asserts it and another branch is refused), and refuses to
+   start while a branch other than the trunk exists, because a run may be writing;
 2. refuses a table whose Iceberg properties could let a commit or a procedure delete a file that a tag needs (``spark.preconditions``), naming
    the table, before any rewrite;
 3. lists every tag and reads every table at every tag through a catalog opened on the tag, with no table cache: the snapshot, the row count and a
@@ -31,7 +32,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieError
-from scripts.stack.tags import TableSnapshot, TagClient, list_references, list_tags, table_snapshots
+from scripts.stack.tags import TableSnapshot, TagClient, default_branch, list_references, list_tags, table_snapshots
 from spark.catalog import add_catalog, required_environment
 from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, table_identifier
 from spark.preconditions import PROPERTY_KEYS, precondition_problems
@@ -54,12 +55,20 @@ def read_tagged(session: Any, tagged: dict[str, tuple[TableSnapshot, ...]], pins
     reads = []
     for tag in sorted(tagged):
         for item in tagged[tag]:
-            if item.snapshot_id is None:
-                continue
             name = f"{pins[tag]}.{table_identifier(item.table)}"
             try:
-                snapshot = int(iceberg_table(session, name).currentSnapshot().snapshotId())
+                current = iceberg_table(session, name).currentSnapshot()
+                if item.snapshot_id is None:
+                    if current is not None:
+                        raise RetentionError(
+                            f"the tag {tag} holds {item.table} with no snapshot in Nessie, and the catalog reads it at snapshot {int(current.snapshotId())}"
+                        )
+                    reads.append({"tag": tag, "table": item.table, "snapshot_id": None, "rows": 0, "checksum": None})
+                    continue
+                snapshot = int(current.snapshotId())
                 row = session.table(name).selectExpr("count(*) AS rows", "sum(hash(*)) AS checksum").collect()[0]
+            except RetentionError:
+                raise
             except Exception as error:
                 raise RetentionError(f"the tag {tag} no longer reads {item.table}: {type(error).__name__}: {str(error).splitlines()[0][:300]}") from error
             if snapshot != item.snapshot_id:
@@ -107,21 +116,23 @@ def compact(session: Any, table: str, rewrite_all: bool, dry_run: bool) -> dict[
 def maintain(arguments: Any) -> dict[str, Any]:
     """Run the maintenance and return its result, or raise ``RetentionError`` when it must not start or a tag does not read as it did."""
     client = TagClient(required_environment("NESSIE_URI"), arguments.deadline_seconds)
-    client.config()
+    trunk = default_branch(client)
+    if arguments.trunk is not None and arguments.trunk != trunk:
+        raise RetentionError(f"{arguments.trunk} is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted")
     branches = list_references(client, "BRANCH")
-    if arguments.trunk not in branches:
-        raise RetentionError(f"the trunk {arguments.trunk} does not exist")
-    waiting = in_flight_branches(branches, arguments.trunk)
+    if trunk not in branches:
+        raise RetentionError(f"the default branch {trunk} does not exist")
+    waiting = in_flight_branches(branches, trunk)
     if waiting:
         raise RetentionError(f"the branches {', '.join(waiting)} exist, so a run may be writing: maintenance waits until they are merged or deleted")
-    on_trunk = [item.table for item in table_snapshots(client, arguments.trunk)]
+    on_trunk = [item.table for item in table_snapshots(client, trunk)]
     missing = sorted(set(arguments.tables) - set(on_trunk))
     if missing:
-        raise RetentionError(f"the tables {', '.join(missing)} are not on {arguments.trunk}")
+        raise RetentionError(f"the tables {', '.join(missing)} are not on {trunk}")
     tables = [table_identifier(table) for table in (arguments.tables or on_trunk)]
     tags_before = list_tags(client)
     tagged_before = {tag: table_snapshots(client, tag) for tag in sorted(tags_before)}
-    session = build_session(JOB, arguments.trunk)
+    session = build_session(JOB, trunk)
     try:
         pins: dict[str, str] = {}
         open_pins(session, sorted(tagged_before), pins)
@@ -139,7 +150,7 @@ def maintain(arguments: Any) -> dict[str, Any]:
     if differences:
         raise RetentionError("a tag does not read as it did: " + "; ".join(differences))
     return {
-        "trunk": arguments.trunk,
+        "trunk": trunk,
         "dry_run": arguments.dry_run,
         "tags": sorted(tags_before),
         "tags_added": added,

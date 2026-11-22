@@ -6,6 +6,7 @@ for an s3 warehouse, ``AWS_REGION``. A job never types an address, a bucket or a
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import threading
@@ -33,8 +34,11 @@ def start_deadline(seconds: float, job: str) -> threading.Timer:
 
 
 def build_session(name: str, ref: str) -> Any:
-    """A local Spark session on the Nessie reference ``ref`` with the memory that the container's limit allows."""
-    from pyspark.sql import SparkSession
+    """A local Spark session on the Nessie reference ``ref`` with the memory that the container's limit allows.
+
+    PySpark is installed in the job image only, so it is imported by name here and the rest of the sources are checked without it.
+    """
+    SparkSession = importlib.import_module("pyspark.sql").SparkSession
 
     heap = f"{driver_memory_mib(read_memory_limit_mib())}m"
     options = environment_catalog_options(ref)
