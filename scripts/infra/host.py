@@ -271,6 +271,17 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
+def heavy_memory_variables(state: dict[str, Any]) -> dict[str, Any]:
+    """The Ansible variable for the heavy-job figure that Terraform calculated, in MiB. The orchestrator has no default, so a bad figure is refused."""
+    outputs = state.get("values", {}).get("outputs", {})
+    if "heavy_memory_mib" not in outputs:
+        raise HostError("the run's state has no heavy_memory_mib output: it is missing, so run make host-up to plan and apply the current Terraform first")
+    figure = outputs["heavy_memory_mib"].get("value")
+    if not isinstance(figure, int) or isinstance(figure, bool) or figure <= 0:
+        raise HostError(f"the heavy_memory_mib output of the run's state is {figure!r}, not a positive whole number of MiB")
+    return {"compose_stack_heavy_memory_mib": figure}
+
+
 def platform_commit() -> str:
     """The commit of the checkout that the deploy places on the host."""
     return run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
@@ -327,10 +338,12 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
         write_inventory(binding)
         return 0
     state = state_json(run, configuration)
+    heavy_memory = heavy_memory_variables(state)
     peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
     address = peer.address
     record_tailscale_device(run.run_id, host_name, peer.device_id)
-    run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]) | deploy_variables(configuration, platform_commit()))
+    variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deploy_variables(configuration, platform_commit())
+    run_ansible(run.run_id, address, variables)
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host {host_name} is up and its inventory is written\n")
     return 0

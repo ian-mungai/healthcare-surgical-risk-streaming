@@ -28,6 +28,7 @@ from scripts.infra import host, state_bootstrap, teardown, terraform_wrapper
 from scripts.infra.host import (
     HostError,
     Peer,
+    heavy_memory_variables,
     host_check,
     instance_id,
     record_tailscale_device,
@@ -513,19 +514,24 @@ def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     return path
 
 
+def heavy_state(value: object) -> dict[str, Any]:
+    return {"values": {"outputs": {"heavy_memory_mib": {"value": value}}}}
+
+
 class HostUpTest(unittest.TestCase):
     """``host_up`` follows the run binding that exists. The calls to Terraform, Ansible and the host are replaced and recorded; the live batch proves them."""
 
-    def run_up(self, path: Path, *, confirm: str = "") -> tuple[int, dict[str, mock.Mock]]:
+    def run_up(self, path: Path, *, confirm: str = "", state: dict[str, Any] | None = None) -> tuple[int, dict[str, mock.Mock]]:
         names = ("save_plan", "apply_plan", "write_inventory", "state_json", "wait_until_reachable", "run_ansible", "instance_id", "platform_commit")
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
-            calls["state_json"].return_value = {"values": {}}
+            calls["state_json"].return_value = heavy_state(11008) if state is None else state
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
             calls["instance_id"].return_value = "i-0123456789abcdef0"
             calls["platform_commit"].return_value = "a" * 40
+            self.calls = calls
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
@@ -568,6 +574,7 @@ class HostUpTest(unittest.TestCase):
             {
                 "workload_access_region": "us-west-2",
                 "workload_access_workloads": [],
+                "compose_stack_heavy_memory_mib": 11008,
                 "compose_stack_platform_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
             },
@@ -575,6 +582,14 @@ class HostUpTest(unittest.TestCase):
         )
         calls["write_inventory"].assert_called_once_with(path)
         self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
+
+    def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "heavy_memory_mib"):
+                self.run_up(path, state={"values": {}})
+        for name in ("wait_until_reachable", "run_ansible", "write_inventory"):
+            self.calls[name].assert_not_called()
 
     def test_the_success_line_of_an_up_run_names_the_host_and_not_its_address(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -628,7 +643,7 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "ROOT", Path(scratch)))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
-            calls["state_json"].return_value = {"values": {}}
+            calls["state_json"].return_value = heavy_state(11008)
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
             calls["instance_id"].return_value = "i-0123456789abcdef0"
             stack.enter_context(mock.patch.object(host, "run_command", return_value=CompletedProcess(["ansible-playbook"], 0, "ok\n", "")))
@@ -711,6 +726,23 @@ class WorkloadVariablesTest(unittest.TestCase):
 
     def test_state_without_workloads_gives_an_empty_list(self) -> None:
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": []}, workload_variables({"values": {}}, "us-west-2"))
+
+
+class HeavyMemoryVariablesTest(unittest.TestCase):
+    def test_the_figure_that_terraform_calculated_is_passed_to_the_deploy_as_it_is(self) -> None:
+        self.assertEqual({"compose_stack_heavy_memory_mib": 11008}, heavy_memory_variables(heavy_state(11008)))
+        self.assertEqual({"compose_stack_heavy_memory_mib": 1}, heavy_memory_variables(heavy_state(1)))
+
+    def test_a_missing_output_is_refused_with_the_output_named(self) -> None:
+        states: tuple[dict[str, Any], ...] = ({}, {"values": {}}, {"values": {"outputs": {}}})
+        for state in states:
+            with self.subTest(state=state), self.assertRaisesRegex(HostError, "heavy_memory_mib.*missing"):
+                heavy_memory_variables(state)
+
+    def test_a_figure_that_is_not_a_positive_whole_number_is_refused_with_the_value_named(self) -> None:
+        for value in (None, 0, -1, -11008, 1.5, 11008.0, "11008", True, [11008]):
+            with self.subTest(value=value), self.assertRaisesRegex(HostError, "heavy_memory_mib.*positive whole number"):
+                heavy_memory_variables(heavy_state(value))
 
 
 class DeployVariablesTest(unittest.TestCase):

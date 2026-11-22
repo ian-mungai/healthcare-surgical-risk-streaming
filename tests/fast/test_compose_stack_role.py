@@ -45,6 +45,7 @@ def variables(folder: Path) -> dict[str, object]:
         "compose_stack_platform_commit": "c" * 40,
         "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
         "workload_access_region": "us-west-2",
+        "compose_stack_heavy_memory_mib": 11008,
         "airbyte_namespace": "airbyte",
         "airbyte_release": "airbyte",
     }
@@ -89,7 +90,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(
             f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n"
             f"DOCKER_SOCKET_GID={socket_gid}\nSTACK_K3S_NAMESPACE=airbyte\nSTACK_K3S_RELEASE=airbyte\nPLATFORM_COMMIT={'c' * 40}\n"
-            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n",
+            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\nHEAVY_MEMORY_MIB=11008\n",
             host,
         )
         self.assertEqual(0, again_code, again)
@@ -114,8 +115,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn(str(folder / "no.sock"), output)
         self.assertFalse(written)
 
-    def test_a_deploy_with_no_commit_or_warehouse_location_stops_before_it_writes_the_host_settings(self) -> None:
-        for missing in ("compose_stack_platform_commit", "compose_stack_warehouse_location"):
+    def test_a_deploy_with_no_commit_warehouse_location_or_heavy_figure_stops_before_it_writes_the_host_settings(self) -> None:
+        for missing in ("compose_stack_platform_commit", "compose_stack_warehouse_location", "compose_stack_heavy_memory_mib"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as scratch:
                 folder = Path(scratch)
                 (folder / "compose").mkdir()
