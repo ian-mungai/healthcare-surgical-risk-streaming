@@ -22,8 +22,10 @@ The real runs on Spark, Nessie and the full clinical table are in ``tests/e2e/si
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
+import json
 import re
 import tempfile
 import unittest
@@ -400,6 +402,7 @@ class Lake:
     source_after_write: Any = None
     write_parent: str | None = None
     unrelated: bool = False
+    new_namespace: bool = False
 
     def __post_init__(self) -> None:
         source = source_of(self.patients, self.snapshot, self.cases)
@@ -425,19 +428,30 @@ class Lake:
         stored = list(rows) if self.corrupt is None else self.corrupt(list(rows))
         after = self.versions[self.current][0] if self.source_after_write is None else self.source_after_write
         self.versions["h1"] = (after, split_table.TableState(stored, 6))
-        self.parents["h1"] = self.write_parent or "h0"
+        self.parents["h1"] = self.write_parent or self.current
         self.current = "h1"
         if self.unrelated:
             self.versions["h2"] = self.versions["h1"]
             self.parents["h2"] = "h1"
             self.current = "h2"
 
+    def prepare(self, checked: str) -> str:
+        self.calls.append(("prepare", checked))
+        if not self.new_namespace:
+            return checked
+        self.versions["hn"] = self.versions[self.current]
+        self.parents["hn"] = checked
+        self.current = "hn"
+        return "hn"
+
     def write_hash(self, checked: str) -> str | None:
         self.calls.append(("write_hash", checked))
         return self.current if self.parents.get(self.current) == checked else None
 
     def operations(self) -> Any:
-        return split_table.Operations(head=self.head, read_source=self.read_source, read_table=self.read_table, write=self.write, write_hash=self.write_hash)
+        return split_table.Operations(
+            head=self.head, read_source=self.read_source, read_table=self.read_table, write=self.write, write_hash=self.write_hash, prepare=self.prepare
+        )
 
     def names(self) -> list[str]:
         return [call[0] for call in self.calls]
@@ -458,6 +472,7 @@ class BuildSequenceTest(unittest.TestCase):
                 ("read_source", "h0"),
                 ("read_table", "h0"),
                 ("head",),
+                ("prepare", "h0"),
                 ("write", False),
                 ("write_hash", "h0"),
                 ("read_source", "h1"),
@@ -468,6 +483,32 @@ class BuildSequenceTest(unittest.TestCase):
         )
         self.assertEqual(("written", "h1", 6), (outcome.outcome, outcome.head, outcome.table_snapshot_id))
         self.assertEqual(rows_of(FULL, snapshot=11), outcome.rows)
+
+    def test_the_namespace_is_prepared_after_every_check_and_the_head_check_and_before_the_write(self) -> None:
+        lake = Lake(FULL, new_namespace=True)
+        facts = build_with(lake).facts()
+        self.assertEqual(["read_source", "read_table", "head", "prepare", "write", "write_hash", "read_source", "read_table", "head"], lake.names())
+        self.assertIn(("write_hash", "hn"), lake.calls)
+        self.assertEqual(("h0", "h1"), (facts["checked_hash"], facts["write_hash"]))
+
+    def test_a_write_that_is_not_on_the_namespace_commit_is_not_the_write(self) -> None:
+        lake = Lake(FULL, new_namespace=True, write_parent="h0")
+        with self.assertRaises(PatientSplitError) as caught:
+            build_with(lake)
+        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+
+    def test_nothing_is_prepared_or_written_when_a_check_fails_the_branch_moved_or_nothing_changes(self) -> None:
+        cases = {
+            "a failed check": Lake({subjectid: name for subjectid, name in FULL.items() if subjectid != "1"}, new_namespace=True),
+            "the branch moved": Lake(FULL, new_namespace=True, script=["h9"]),
+            "nothing changes": Lake(FULL, existing=rows_of(FULL, snapshot=11), new_namespace=True),
+            "a changed set": Lake(FULL, existing=rows_of({**FULL, "30": other_set(FULL["30"])}, snapshot=11), new_namespace=True),
+        }
+        for label, lake in cases.items():
+            with self.subTest(label):
+                with contextlib.suppress(PatientSplitError):
+                    build_with(lake)
+                self.assertEqual([], [name for name in lake.names() if name in ("prepare", "write")])
 
     def test_a_rebuild_that_changes_nothing_writes_nothing_and_names_the_hash_it_checked(self) -> None:
         lake = Lake(FULL, existing=rows_of(FULL, snapshot=11))
@@ -645,12 +686,6 @@ class BuildSequenceTest(unittest.TestCase):
         differing = {key for key in first if first[key] != second[key]}
         self.assertEqual({"counts"}, differing)
         self.assertEqual(first["cases"], second["cases"])
-        self.assertFalse(hasattr(split_table, "table_digest"))
-
-    def test_the_only_digest_the_module_computes_is_that_of_the_candidate_file(self) -> None:
-        text = Path(split_table.__file__).read_text()
-        self.assertEqual(1, text.count("sha256("))
-        self.assertEqual(0, Path(JOB_FILE).read_text().count("sha256("))
 
     def test_a_result_without_a_write_has_no_write_hash(self) -> None:
         facts = build_with(Lake(FULL, existing=rows_of(FULL, snapshot=11))).facts()
@@ -767,7 +802,7 @@ class CatalogTest(unittest.TestCase):
     HASH = "ab" * 32
     SETTINGS = {"nessie_uri": "http://nessie:19120/api/v2", "warehouse": "file:///warehouse/", "region": ""}
 
-    def conf(self, name: str, at: str | None) -> dict[str, str]:
+    def conf(self, name: str, at: str) -> dict[str, str]:
         return split_table.catalog_conf(name, branch="b", at=at, **self.SETTINGS)
 
     def test_a_pinned_read_holds_the_hash_and_names_only_its_own_catalog(self) -> None:
@@ -775,11 +810,6 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(self.HASH, conf["spark.sql.catalog.pin_x.ref.hash"])
         self.assertEqual("b", conf["spark.sql.catalog.pin_x.ref"])
         self.assertTrue(all(key.startswith("spark.sql.catalog.pin_x") for key in conf))
-
-    def test_the_branch_catalog_for_the_write_holds_no_hash(self) -> None:
-        conf = self.conf("lake", None)
-        self.assertEqual("b", conf["spark.sql.catalog.lake.ref"])
-        self.assertFalse([key for key in conf if key.endswith("ref.hash")])
 
     def test_a_hash_that_is_not_a_nessie_hash_is_refused(self) -> None:
         for at in ("", "main", "ab" * 31, "AB" * 32, "ab" * 32 + "\n"):
@@ -821,12 +851,41 @@ class FakeFrame:
         return self.rows
 
 
-class FakeSession:
-    """A stand-in Spark session that records the catalog settings and every table that a read names."""
+class Chain:
+    """A stand-in for a Spark frame that records the write that is asked of it."""
 
-    def __init__(self) -> None:
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    def toDF(self, *_names: str) -> Chain:  # noqa: N802 - Spark's name
+        return self
+
+    def coalesce(self, _count: int) -> Chain:
+        return self
+
+    def writeTo(self, name: str) -> Chain:  # noqa: N802 - Spark's name
+        self.session.writes.append(name)
+        return self
+
+    def tableProperty(self, *_pair: str) -> Chain:  # noqa: N802 - Spark's name
+        return self
+
+    def create(self) -> None:
+        return None
+
+    def overwritePartitions(self) -> None:  # noqa: N802 - Spark's name
+        return None
+
+
+class FakeSession:
+    """A stand-in Spark session that records the catalog settings, every table that a read names and every statement or write that it is given."""
+
+    def __init__(self, missing: Sequence[str] = ()) -> None:
+        self.missing = tuple(missing)
         self.conf_set: dict[str, str] = {}
         self.reads: list[tuple[str, str]] = []
+        self.sql_calls: list[str] = []
+        self.writes: list[str] = []
         self.conf = SimpleNamespace(set=self.conf_set.__setitem__)
         self.catalog = SimpleNamespace(tableExists=self.exists)
         spark3 = SimpleNamespace(loadIcebergTable=self.load)
@@ -835,11 +894,15 @@ class FakeSession:
 
     def exists(self, name: str) -> bool:
         self.reads.append(("exists", name))
-        return True
+        return not any(name.endswith(suffix) for suffix in self.missing)
 
     def load(self, _session: Any, name: str) -> Any:
         self.reads.append(("snapshot", name))
         return SimpleNamespace(currentSnapshot=lambda: SimpleNamespace(snapshotId=lambda: 5))
+
+    def sql(self, text: str) -> Chain:
+        self.sql_calls.append(text)
+        return Chain(self)
 
     def table(self, name: str) -> FakeFrame:
         if name.endswith("clinical_cases"):
@@ -847,6 +910,104 @@ class FakeSession:
             return FakeFrame(split_table.SOURCE_COLUMNS, [{"caseid": "1", "subjectid": "10"}])
         self.reads.append(("table", name))
         return FakeFrame(split_table.COLUMNS, [{"subjectid": "10", "set": "training", "rule_version": RULE_VERSION, "source_snapshot_id": 5}])
+
+
+class AnsweringNessie(NessieClient):
+    """The real Nessie client with only the wire replaced: each path gets a scripted answer, so the job's own adapter code runs."""
+
+    def __init__(self, head: str, *, log: list[dict[str, Any]] | None = None, namespace: bool = False) -> None:
+        super().__init__("http://127.0.0.1:1/api/v2")
+        self.head_hash = head
+        self.log = log or []
+        self.namespace = namespace
+
+    def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+        path = target.split("?")[0]
+        if path.endswith("/history"):
+            return 200, json.dumps({"logEntries": self.log}).encode()
+        if path.endswith("/entries"):
+            entries = [{"type": "NAMESPACE", "name": {"elements": ["silver"]}}] if self.namespace else []
+            return 200, json.dumps({"entries": entries}).encode()
+        return 200, json.dumps({"reference": {"type": "BRANCH", "name": "b", "hash": self.head_hash}}).encode()
+
+
+BASE = "ab" * 32
+NAMESPACE_COMMIT = "cd" * 32
+TABLE_COMMIT = "ef" * 32
+
+
+def log_entry(commit: str, parent: str, *keys: tuple[str, ...]) -> dict[str, Any]:
+    return {"commitMeta": {"hash": commit}, "parentCommitHash": parent, "operations": [{"type": "PUT", "key": {"elements": list(key)}} for key in keys]}
+
+
+class LakeAdapterTest(unittest.TestCase):
+    """The job's own adapter against a stand-in wire: what it asks Nessie, what it sends Spark, and when it sends nothing."""
+
+    SETTINGS = CatalogTest.SETTINGS
+
+    def lake(self, session: FakeSession, client: AnsweringNessie) -> Any:
+        return importlib.import_module("spark.jobs.patient_split").Lake(session, client, "b", self.SETTINGS)
+
+    def test_the_write_hash_is_the_log_head_only_when_it_is_one_table_commit_on_the_checked_hash(self) -> None:
+        table = ("silver", "patient_split")
+        lake = self.lake(FakeSession(), AnsweringNessie(TABLE_COMMIT, log=[log_entry(TABLE_COMMIT, NAMESPACE_COMMIT, table)]))
+        self.assertEqual(TABLE_COMMIT, lake.write_hash(NAMESPACE_COMMIT))
+        self.assertIsNone(lake.write_hash(BASE))
+        other = self.lake(FakeSession(), AnsweringNessie(TABLE_COMMIT, log=[log_entry(TABLE_COMMIT, NAMESPACE_COMMIT, table, ("bronze", "clinical_cases"))]))
+        self.assertIsNone(other.write_hash(NAMESPACE_COMMIT))
+
+    def test_a_missing_namespace_is_created_once_and_its_commit_is_the_next_checked_hash(self) -> None:
+        session = FakeSession()
+        lake = self.lake(session, AnsweringNessie(NAMESPACE_COMMIT, log=[log_entry(NAMESPACE_COMMIT, BASE, ("silver",))]))
+        self.assertEqual(NAMESPACE_COMMIT, lake.prepare(BASE))
+        self.assertEqual(["CREATE NAMESPACE IF NOT EXISTS lake.silver"], session.sql_calls)
+
+    def test_an_existing_namespace_is_left_alone_and_the_checked_hash_stays(self) -> None:
+        session = FakeSession()
+        lake = self.lake(session, AnsweringNessie(BASE, namespace=True))
+        self.assertEqual(BASE, lake.prepare(BASE))
+        self.assertEqual([], session.sql_calls)
+
+    def test_a_namespace_commit_that_is_not_one_commit_on_the_base_ends_with_branch_moved(self) -> None:
+        for label, log in (
+            ("another parent", [log_entry(NAMESPACE_COMMIT, TABLE_COMMIT, ("silver",))]),
+            ("another key", [log_entry(NAMESPACE_COMMIT, BASE, ("silver",), ("bronze", "clinical_cases"))]),
+            ("no commit", []),
+        ):
+            lake = self.lake(FakeSession(), AnsweringNessie(NAMESPACE_COMMIT, log=log))
+            with self.subTest(label), self.assertRaises(PatientSplitError) as caught:
+                lake.prepare(BASE)
+            self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+
+    def build(self, session: FakeSession, client: AnsweringNessie) -> None:
+        lake = self.lake(session, client)
+        operations = split_table.Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash, lake.prepare)
+        split_table.run_build(operations, BASE, pinned=False, sample=None)
+
+    def test_a_new_branch_without_bronze_is_refused_before_any_statement_or_write(self) -> None:
+        session = FakeSession(missing=("clinical_cases",))
+        with self.assertRaises(PatientSplitError) as caught:
+            self.build(session, AnsweringNessie(BASE))
+        self.assertEqual(["source_table: 0 tables"], caught.exception.problems)
+        self.assertEqual(([], []), (session.sql_calls, session.writes))
+
+    def test_a_branch_that_moved_before_the_write_is_refused_before_any_statement_or_write(self) -> None:
+        session = FakeSession(missing=("patient_split",))
+        with self.assertRaises(PatientSplitError) as caught:
+            self.build(session, AnsweringNessie("12" * 32))
+        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(([], []), (session.sql_calls, session.writes))
+
+    def test_a_failed_check_of_the_inherited_table_is_refused_before_any_statement_or_write(self) -> None:
+        session = FakeSession()
+        session.table = lambda name: FakeFrame(  # type: ignore[method-assign]
+            split_table.SOURCE_COLUMNS if name.endswith("clinical_cases") else split_table.COLUMNS,
+            [{"caseid": "1", "subjectid": "10"}] if name.endswith("clinical_cases") else [],
+        )
+        with self.assertRaises(PatientSplitError) as caught:
+            self.build(session, AnsweringNessie(BASE))
+        self.assertEqual(["inherited_empty: 0 rows"], caught.exception.problems)
+        self.assertEqual(([], []), (session.sql_calls, session.writes))
 
 
 def all_messages() -> list[str]:

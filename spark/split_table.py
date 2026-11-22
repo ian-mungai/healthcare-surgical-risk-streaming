@@ -129,13 +129,15 @@ class TableState:
 class Operations:
     """The Spark steps of a build. ``head`` is the hash of the branch now. The reads are at the hash that is given. ``read_table`` gives ``None`` for a hash
     that holds no table. ``write`` writes the whole table to the branch. ``write_hash`` is given the hash that was checked and gives the hash of the write,
-    or ``None`` when the branch head is not the one commit of the write directly on that hash."""
+    or ``None`` when the branch head is not the one commit of the write directly on that hash. ``prepare`` is given the checked hash, creates the table's
+    namespace when the branch has none, as a commit of its own, and gives the hash that the write is made on (the checked hash when nothing was needed)."""
 
     head: Callable[[], str]
     read_source: Callable[[str], Source]
     read_table: Callable[[str], TableState | None]
     write: Callable[..., None]
     write_hash: Callable[[str], str | None]
+    prepare: Callable[[str], str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,8 +405,9 @@ def run_build(ops: Operations, head: str, *, pinned: bool, sample: Sequence[Samp
     """Build the table on the branch whose head is ``head``, or leave it as it is when nothing changes.
 
     The order: read Bronze and the table at ``head``; validate the table that is inherited; freeze (compare with it); check the rows to write; write only
-    while the branch still has ``head``; take the hash of the write from the branch's log (the head, one commit directly on ``head``); read the table and
-    Bronze at that hash and check them against what was written; end only when the branch still has that hash.
+    while the branch still has ``head``, after the namespace of a new table is committed on it; take the hash of the write from the branch's log (the head,
+    one commit directly on the hash that the write was made on); read the table and Bronze at that hash and check them against what was written; end only
+    when the branch still has that hash.
     """
     source = ops.read_source(head)
     assignments = build_assignments(source.patients)
@@ -421,8 +424,9 @@ def run_build(ops: Operations, head: str, *, pinned: bool, sample: Sequence[Samp
     if not unchanged:
         if ops.head() != head:
             raise PatientSplitError(BRANCH_MOVED)
+        on = ops.prepare(head)
         ops.write(rows, exists=state is not None)
-        written = ops.write_hash(head)
+        written = ops.write_hash(on)
         if written is None:
             raise PatientSplitError(BRANCH_MOVED)
         at = written
@@ -503,12 +507,11 @@ def write_commit(entries: Sequence[Mapping[str, Any]], checked: str, allowed: Se
     return commit
 
 
-def catalog_conf(name: str, *, nessie_uri: str, warehouse: str, region: str, branch: str, at: str | None) -> dict[str, str]:
-    """The Spark settings of the catalog ``name`` on ``branch``. With ``at`` it is pinned to that hash and so read-only; without it, it is the branch."""
-    if at is not None and HASH.fullmatch(at) is None:
+def catalog_conf(name: str, *, nessie_uri: str, warehouse: str, region: str, branch: str, at: str) -> dict[str, str]:
+    """The Spark settings of the read-only catalog ``name`` on ``branch``, pinned to the hash ``at``."""
+    if HASH.fullmatch(at) is None:
         raise PatientSplitError("catalog_hash: the hash is not a Nessie hash")
     options = catalog_options(nessie_uri=nessie_uri, warehouse=warehouse, ref=branch, region=region)
     conf = {key.replace(f"spark.sql.catalog.{CATALOG}", f"spark.sql.catalog.{name}", 1): value for key, value in options.items()}
-    if at is not None:
-        conf[f"spark.sql.catalog.{name}.ref.hash"] = at
+    conf[f"spark.sql.catalog.{name}.ref.hash"] = at
     return conf

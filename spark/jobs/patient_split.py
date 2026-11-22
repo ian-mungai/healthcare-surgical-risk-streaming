@@ -10,9 +10,9 @@ from. It never writes to the base: the merge is the caller's step after its chec
 writes nothing.
 
 The branch is resolved to one hash. Every read and check is at that hash (a read-only catalog pinned to it) and the write is made only while the branch
-still has it. The hash of the write is taken from the branch's log: the head, one commit directly on the checked hash, changing only the table (a new
-table's namespace is its own earlier commit). The table is read again at that hash, and the job ends with ``branch_moved`` when the branch no longer has
-the hash that it checked.
+still has it. The hash of the write is taken from the branch's log: the head, one commit directly on the checked hash, changing only the table. A new
+table's namespace is a commit of its own, made only after every check passed and the head was confirmed, so a failed check or a moved branch writes
+nothing. The table is read again at that hash, and the job ends with ``branch_moved`` when the branch no longer has the hash that it checked.
 The result names that hash, the hash of the write and nothing derived from the rows.
 
 The table is frozen. When the branch already holds the table (merged earlier), that table must be valid by itself (rows, no patient twice, one rule
@@ -39,7 +39,7 @@ from urllib.parse import quote
 from scripts.stack.nessie import NessieClient
 from spark.session import build_session, required_environment, start_deadline
 from spark.settings import CATALOG
-from spark.split_cli import run
+from spark.split_cli import number_setting, open_client, run
 from spark.split_table import (
     BRANCH_MOVED,
     COLUMNS,
@@ -98,12 +98,12 @@ class Lake:
         log = self.client.request("GET", f"/trees/{quote(self.branch, safe='')}/history", query={"fetch": "ALL", "max-records": "2"}) or {}
         return write_commit_of(log.get("logEntries", []), checked, allowed)
 
-    def prepare(self, base: str) -> str:
-        """Create the namespace of the table when the branch has none, as a commit of its own on ``base``, and return the hash to check from."""
+    def prepare(self, checked: str) -> str:
+        """Create the namespace of the table when the branch has none, as a commit of its own on ``checked``, and return the hash that the write is made on."""
         if self.client.has_namespace(self.branch, TARGET_NAMESPACE):
-            return base
+            return checked
         self.session.sql(f"CREATE NAMESPACE IF NOT EXISTS {WRITE_CATALOG}.{TARGET_NAMESPACE}")
-        made = self.write_commit(base, ((TARGET_NAMESPACE,),))
+        made = self.write_commit(checked, ((TARGET_NAMESPACE,),))
         if made is None:
             raise PatientSplitError(BRANCH_MOVED)
         return made
@@ -162,9 +162,10 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
     """Run one call: create the branch (build) or find it (verify), resolve its hash once and check or build the table at that hash."""
     session = None
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
+        deadline = number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)
+        client = open_client(required_environment("NESSIE_URI"), number_setting("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS))
+        start_deadline(deadline, JOB)
         sample = None if arguments.fixed_sample is None else read_fixed_sample(arguments.fixed_sample)
-        client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
         client.config()
         building = arguments.mode == "build"
         base = client.create_branch(arguments.branch, arguments.base).hash if building else client.reference(arguments.branch).hash
@@ -175,9 +176,8 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
             "region": os.environ.get("AWS_REGION", ""),
         }
         lake = Lake(session, client, arguments.branch, settings)
-        operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash)
-        head = lake.prepare(base) if building else base
-        outcome = (run_build if building else run_verify)(operations, head, pinned=arguments.pinned_release, sample=sample)
+        operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash, lake.prepare)
+        outcome = (run_build if building else run_verify)(operations, base, pinned=arguments.pinned_release, sample=sample)
         return {
             "mode": arguments.mode,
             "branch": arguments.branch,
