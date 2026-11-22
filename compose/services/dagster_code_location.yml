@@ -18,6 +18,12 @@ services:
     environment:
       PLATFORM_COMMIT: ${PLATFORM_COMMIT:-unknown}
       NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      AIRBYTE_API_URL_FILE: /run/secrets/airbyte_api_url
+      AIRBYTE_NESSIE_URL_FILE: /run/secrets/airbyte_nessie_url
+      AIRBYTE_CLIENT_ID_FILE: /run/secrets/airbyte_client_id
+      AIRBYTE_CLIENT_SECRET_FILE: /run/secrets/airbyte_client_secret
+      AIRBYTE_AWS_ACCESS_KEY_ID_FILE: /run/secrets/airbyte_aws_access_key_id
+      AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/airbyte_aws_secret_access_key
     configs:
       - source: dagster_limits
         target: /opt/dagster/limits.yml
@@ -27,6 +33,12 @@ services:
       - dagster_postgres_password
       - k3s_token
       - k3s_ca
+      - airbyte_api_url
+      - airbyte_nessie_url
+      - airbyte_client_id
+      - airbyte_client_secret
+      - airbyte_aws_access_key_id
+      - airbyte_aws_secret_access_key
     tmpfs:
       - /run/dagster:uid=10001,gid=10001,mode=0700
     volumes:
@@ -52,6 +64,18 @@ secrets:
     file: ${SECRETS_DIR:?render the host settings first}/k3s/dagster.token
   k3s_ca:
     file: ${SECRETS_DIR:?render the host settings first}/k3s/ca.crt
+  airbyte_api_url:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/api_url
+  airbyte_nessie_url:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/nessie_url
+  airbyte_client_id:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/client_id
+  airbyte_client_secret:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/client_secret
+  airbyte_aws_access_key_id:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/aws_access_key_id
+  airbyte_aws_secret_access_key:
+    file: ${SECRETS_DIR:?render the host settings first}/airbyte_api/aws_secret_access_key
 
 volumes:
   dagster_data:

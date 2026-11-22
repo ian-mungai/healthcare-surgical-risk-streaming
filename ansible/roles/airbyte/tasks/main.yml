@@ -38,5 +38,8 @@
 - name: Forward the web service to the local address
   ansible.builtin.include_tasks: web_forward.yml
 
+- name: Make the record load's routes and credential files
+  ansible.builtin.include_tasks: record_routes.yml
+
 - name: Confirm that Airbyte is ready and answers on the local address
   ansible.builtin.include_tasks: verify.yml

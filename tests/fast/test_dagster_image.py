@@ -5,12 +5,13 @@ The text of the Dockerfile is the contract here: the build reads these lines. Th
 
 from __future__ import annotations
 
+import ast
 import re
 import unittest
 from pathlib import Path
 
 DOCKERFILE = Path(__file__).resolve().parents[2] / "orchestration" / "Dockerfile"
-NAMED_CONTEXTS = {"stack_scripts", "stack_compose"}
+NAMED_CONTEXTS = {"stack_scripts", "stack_compose", "stack_fixtures"}
 PINNED = re.compile(r"^[a-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 
 
@@ -67,6 +68,74 @@ class PlantedDefectTest(unittest.TestCase):
         if digest is not None:
             other = text.replace(digest.group(1), "0" * 64, 1)
             self.assertTrue(any("one image digest" in problem for problem in problems(other)))
+
+
+ROOT = DOCKERFILE.parents[1]
+IMAGE_APP = "/opt/dagster/app/"
+ENTRY_MODULES = ("scripts/ingestion/record_run.py", "orchestration/surgical_risk/record_load.py")
+
+
+def module_file(name: str) -> str | None:
+    """The tracked file of a project module, or None for a module of the standard library or of a package."""
+    path = name.replace(".", "/")
+    for candidate in (f"{path}.py", f"{path}/__init__.py"):
+        if (ROOT / candidate).is_file():
+            return candidate
+    return None
+
+
+def imported_files(entry: str) -> set[str]:
+    """Every file of the ``scripts`` package that ``entry`` imports, directly or through another, and the ``__init__.py`` of each package on the way."""
+    found: set[str] = set()
+    pending = [entry]
+    while pending:
+        current = pending.pop()
+        tree = ast.parse((ROOT / current).read_text())
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                names = [node.module, *(f"{node.module}.{alias.name}" for alias in node.names)]
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            for name in names:
+                path = module_file(name) if name.split(".")[0] == "scripts" else None
+                if path is not None and path not in found:
+                    found.add(path)
+                    pending.append(path)
+    for path in list(found):
+        parts = path.split("/")
+        found.update("/".join(parts[:depth]) + "/__init__.py" for depth in range(1, len(parts)))
+    return {path for path in found if (ROOT / path).is_file()}
+
+
+def copied_from(text: str, context: str) -> set[str]:
+    """The files that ``COPY --from=<context>`` takes from the repository's ``scripts`` folder, as paths of the repository."""
+    found: set[str] = set()
+    for line in text.replace("\\\n", " ").splitlines():
+        words = line.split()
+        if len(words) > 3 and words[0] == "COPY" and words[1] == f"--from={context}":
+            found.update(f"scripts/{source}" for source in words[2:-1])
+    return found
+
+
+class RecordLoadImageTest(unittest.TestCase):
+    """The record load runs in this image, so the image holds every module it imports and the release pin that its manifest reader opens."""
+
+    def test_every_module_that_the_record_load_imports_is_copied_into_the_image(self) -> None:
+        needed = set().union(*(imported_files(entry) for entry in ENTRY_MODULES))
+        self.assertIn("scripts/ingestion/record_load.py", needed)
+        self.assertIn("scripts/sample/candidates.py", needed)
+        self.assertIn("scripts/aws_cli.py", needed)
+        self.assertEqual([], sorted(needed - copied_from(DOCKERFILE.read_text(), "stack_scripts")))
+
+    def test_the_release_pin_that_the_manifest_reader_opens_is_copied_to_where_the_code_looks(self) -> None:
+        text = DOCKERFILE.read_text()
+        self.assertIn(f"COPY --from=stack_fixtures release.json {IMAGE_APP}tests/fixtures/vitaldb/release.json", text)
+
+    def test_a_missing_module_is_named_by_the_check(self) -> None:
+        text = DOCKERFILE.read_text().replace("ingestion/record_state.py", "")
+        needed = imported_files("scripts/ingestion/record_run.py")
+        self.assertIn("scripts/ingestion/record_state.py", needed - copied_from(text, "stack_scripts"))
 
 
 if __name__ == "__main__":

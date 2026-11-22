@@ -400,12 +400,13 @@ class BuiltImagesTest(unittest.TestCase):
                 self.assertEqual(from_contexts(ROOT / dockerfile), set(image.get("build_contexts", {})))
                 if context == ".":
                     self.assertEqual(set(), context_sources(ROOT / dockerfile) - set(image["sources"]))
-                self.assertTrue(set(image.get("build_contexts", {}).values()) <= set(image["sources"]))
+                self.assertTrue(set(image.get("build_contexts", {}).values()) <= {source.split("/")[-1] for source in image["sources"]})
 
     def test_the_dagster_image_gets_the_scripts_and_compose_folders_and_the_spark_image_is_built_from_the_folder_above_its_dockerfile(self) -> None:
         images: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
         built = {image["name"]: image for image in images}
-        self.assertEqual({"stack_scripts": "scripts", "stack_compose": "compose"}, built["dagster"]["build_contexts"])
+        self.assertEqual({"stack_scripts": "scripts", "stack_compose": "compose", "stack_fixtures": "vitaldb"}, built["dagster"]["build_contexts"])
+        self.assertIn("tests/fixtures/vitaldb", built["dagster"]["sources"])
         self.assertEqual(("spark/Dockerfile", "."), (built["spark"]["dockerfile"], built["spark"]["context"]))
         self.assertEqual("surgical-risk-spark:4.1.4", built["spark"]["tag"])
 

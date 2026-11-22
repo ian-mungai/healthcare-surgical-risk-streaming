@@ -173,7 +173,7 @@ class ClientFilesTest(unittest.TestCase):
             found[path.name] = (path.read_text(), stat.S_IMODE(status.st_mode), status.st_uid)
         return found
 
-    def test_the_five_files_are_owned_by_the_container_user_with_mode_0400_in_a_folder_only_its_owner_enters(self) -> None:
+    def test_the_six_files_are_owned_by_the_container_user_with_mode_0400_in_a_folder_only_its_owner_enters(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             place_aws_files(folder)
@@ -181,10 +181,11 @@ class ClientFilesTest(unittest.TestCase):
             found = self.files(folder)
             mode = stat.S_IMODE((folder / "secrets" / "airbyte_api").stat().st_mode)
         self.assertEqual(0, code, output)
-        self.assertEqual({"api_url", "client_id", "client_secret", "aws_access_key_id", "aws_secret_access_key"}, set(found))
+        self.assertEqual({"api_url", "nessie_url", "client_id", "client_secret", "aws_access_key_id", "aws_secret_access_key"}, set(found))
         self.assertEqual(
             {
                 "api_url": f"http://{BRIDGE}:8001",
+                "nessie_url": f"http://{BRIDGE}:19120/api/v2",
                 "client_id": CLIENT_ID,
                 "client_secret": CLIENT_VALUE,
                 "aws_access_key_id": KEY_ID,
@@ -203,6 +204,15 @@ class ClientFilesTest(unittest.TestCase):
             self.write(folder, airbyte_bridge_address="10.42.9.1", airbyte_api_route_port=8123)
             found = self.files(folder)
         self.assertEqual("http://10.42.9.1:8123", found["api_url"][0].rstrip("\n"))
+        self.assertEqual("http://10.42.9.1:19120/api/v2", found["nessie_url"][0].rstrip("\n"))
+
+    def test_the_nessie_address_file_follows_the_nessie_route_port(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            place_aws_files(folder)
+            self.write(folder, airbyte_nessie_route_port=19999)
+            found = self.files(folder)
+        self.assertEqual(f"http://{BRIDGE}:19999/api/v2", found["nessie_url"][0].rstrip("\n"))
 
     def test_a_bridge_address_that_is_not_a_private_IPv4_literal_or_a_port_that_is_not_a_port_stops_the_run_before_any_file_is_placed(self) -> None:
         for change in (
@@ -215,6 +225,8 @@ class ClientFilesTest(unittest.TestCase):
             {"airbyte_api_route_port": 0},
             {"airbyte_api_route_port": 70000},
             {"airbyte_api_route_port": "80/x"},
+            {"airbyte_nessie_route_port": 0},
+            {"airbyte_nessie_route_port": "19120/x"},
         ):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as scratch:
                 folder = Path(scratch)
@@ -335,6 +347,21 @@ class ReadWaitTest(unittest.TestCase):
         self.assertEqual(124, result.returncode)
 
 
+class RoleIncludeTest(unittest.TestCase):
+    def test_the_role_includes_the_record_routes_after_the_release_and_the_web_forward_and_before_the_verification(self) -> None:
+        main = (ROLE_TASKS / "main.yml").read_text()
+        self.assertEqual(1, main.count("record_routes.yml"))
+        for earlier in ("release.yml", "web_forward.yml", "network_policy.yml", "secrets.yml"):
+            self.assertLess(main.index(earlier), main.index("record_routes.yml"))
+        self.assertLess(main.index("record_routes.yml"), main.index("verify.yml"))
+
+    def test_the_include_is_one_task_with_a_name(self) -> None:
+        tasks = flatten(load_yaml((ROLE_TASKS / "main.yml").read_text()))
+        include = [task for task in tasks if task.get("ansible.builtin.include_tasks") == "record_routes.yml"]
+        self.assertEqual(1, len(include))
+        self.assertTrue(include[0].get("name"))
+
+
 class StaticRulesTest(unittest.TestCase):
     FILES = ("record_routes.yml", "record_route.yml", "record_route_units.yml", "record_route_policy.yml", "record_client_files.yml", "record_client_read.yml")
 
@@ -383,7 +410,7 @@ class StaticRulesTest(unittest.TestCase):
                         self.assertNotIn("until", task, "a retry loop gives each attempt a fresh bound, so the total is not the deadline")
 
     def test_the_files_are_owned_by_the_container_user_with_mode_0400(self) -> None:
-        place = next(task for task in self.tasks()["record_client_files.yml"] if task.get("name", "").startswith("Place the five files"))
+        place = next(task for task in self.tasks()["record_client_files.yml"] if task.get("name", "").startswith("Place the six files"))
         copy = place["ansible.builtin.copy"]
         self.assertIn("airbyte_record_container_user", copy["owner"])
         self.assertIn("airbyte_record_container_user", copy["group"])

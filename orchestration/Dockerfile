@@ -1,6 +1,7 @@
 # The image of the three Dagster services: the web server, the daemon and the code location server. Build context: this folder.
-# Two more named build contexts hold what the group operations of the code location need: `stack_scripts` is the repository's scripts folder and
-# `stack_compose` is its compose folder. Build with: docker build --build-context stack_scripts=<scripts> --build-context stack_compose=<compose> orchestration
+# Three more named build contexts hold what the code location needs: `stack_scripts` is the repository's scripts folder, `stack_compose` is its compose folder and
+# `stack_fixtures` is the folder of the tracked VitalDB pin. Build with: docker build --build-context stack_scripts=<scripts> --build-context stack_compose=<compose>
+# --build-context stack_fixtures=<tests/fixtures/vitaldb> orchestration
 FROM python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 
 ENV PYTHONUNBUFFERED=1 \
@@ -23,9 +24,16 @@ COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b
 COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d \
     /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
-COPY --from=stack_scripts __init__.py process.py project_config.py /opt/dagster/app/scripts/
+COPY --from=stack_scripts __init__.py aws_cli.py process.py project_config.py /opt/dagster/app/scripts/
 COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/limits.py stack/nessie.py stack/yaml_text.py \
     /opt/dagster/app/scripts/stack/
+# The record load: the ingestion package (the gate, the manifest, the copy, the Airbyte client, the catalog and the load), the pinned publisher files it reads, and the
+# tracked release pin that the manifest reader opens.
+COPY --from=stack_scripts ingestion/__init__.py ingestion/airbyte_api.py ingestion/check.py ingestion/closed.py ingestion/gate.py ingestion/landing.py \
+    ingestion/manifest.py ingestion/notice.py ingestion/record_catalog.py ingestion/record_copy.py ingestion/record_definitions.py ingestion/record_load.py \
+    ingestion/record_run.py ingestion/record_state.py ingestion/selection.py ingestion/store.py ingestion/track_list.py /opt/dagster/app/scripts/ingestion/
+COPY --from=stack_scripts sample/__init__.py sample/candidates.py sample/publisher.py sample/split.py /opt/dagster/app/scripts/sample/
+COPY --from=stack_fixtures release.json /opt/dagster/app/tests/fixtures/vitaldb/release.json
 COPY --from=stack_compose compose.yml limits.yml /opt/dagster/stack/compose/
 COPY --from=stack_compose services /opt/dagster/stack/compose/services
 

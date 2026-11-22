@@ -1,6 +1,6 @@
 # Reads airbyte_secrets_directory, airbyte_record_client_id, airbyte_record_client_secret and, optionally, airbyte_record_container_user and airbyte_record_container_group (default 10001, the user
-# and group of the code location container). The container reads five files and no other: the address of Airbyte's API (the forwarder on the bridge address, which the code takes from this file only and checks before it reads a
-# credential), the client ID and secret of Airbyte's instance, and the access key that the destination needs for the Nessie
+# and group of the code location container). The container reads six files and no other: the address of Airbyte's API (the forwarder on the bridge address, which the code takes from this file only and checks before it reads a
+# credential), the address of Nessie as the pods reach it (the other forwarder), the client ID and secret of Airbyte's instance, and the access key that the destination needs for the Nessie
 # catalog, which the raw connection's placement keeps under airbyte/ as aws_access_key_id and aws_secret_access_key. Every file of a container's own is owned by that numeric
 # user with mode 0400 (the secret-file rule), in a folder that only the role's owner (root on the host) enters. A source that is missing or empty, or an empty client value, stops the run before any file is
 # placed. Nothing shows a value. A rotated value replaces the file; a second run changes nothing.
@@ -19,10 +19,13 @@
       - airbyte_bridge_address is match('^(10\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[01])|192\\.168|169\\.254)\\.[0-9]{1,3}\\.[0-9]{1,3}$')
       - airbyte_record_api_port | string is match('^[1-9][0-9]{0,4}$')
       - airbyte_record_api_port | int <= 65535
+      - airbyte_record_nessie_port | string is match('^[1-9][0-9]{0,4}$')
+      - airbyte_record_nessie_port | int <= 65535
     quiet: true
-    fail_msg: the bridge address must be a private IPv4 literal and the API route port a number from 1 to 65535, because the container sends both credentials to that address
+    fail_msg: the bridge address must be a private IPv4 literal and both route ports numbers from 1 to 65535, because the container sends both credentials to that address
   vars:
     airbyte_record_api_port: "{{ airbyte_api_route_port | default(8001) }}"
+    airbyte_record_nessie_port: "{{ airbyte_nessie_route_port | default(19120) }}"
 
 - name: Read the access key files that the raw connection placed
   ansible.builtin.slurp:
@@ -59,7 +62,7 @@
     group: "{{ airbyte_group }}"
     mode: "0700"
 
-- name: Place the five files for the code-location container's user
+- name: Place the six files for the code-location container's user
   ansible.builtin.copy:
     content: "{{ item.value }}\n"
     dest: "{{ airbyte_secrets_directory }}/airbyte_api/{{ item.name }}"
@@ -69,6 +72,7 @@
   no_log: true
   loop:
     - {name: api_url, value: "http://{{ airbyte_bridge_address }}:{{ airbyte_api_route_port | default(8001) }}"}
+    - {name: nessie_url, value: "http://{{ airbyte_bridge_address }}:{{ airbyte_nessie_route_port | default(19120) }}/api/v2"}
     - {name: client_id, value: "{{ airbyte_record_client_id }}"}
     - {name: client_secret, value: "{{ airbyte_record_client_secret }}"}
     - {name: aws_access_key_id, value: "{{ airbyte_record_aws_files.results[0].content | b64decode | trim }}"}

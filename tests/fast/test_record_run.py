@@ -30,9 +30,8 @@ class EnvironmentCase(unittest.TestCase):
             "AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE": KEY_VALUE,
         }
         self.environment = {
-            "RECORD_BUCKET": "example-bucket",
-            "RECORD_REGION": "us-west-2",
-            "RECORD_AIRBYTE_NESSIE_URI": "http://nessie.example:19120/api/v2",
+            "WAREHOUSE_LOCATION": "s3://example-bucket/warehouse",
+            "AWS_REGION": "us-west-2",
             "NESSIE_URI": "http://nessie:19120/api/v2",
         }
         for name, value in files.items():
@@ -41,6 +40,8 @@ class EnvironmentCase(unittest.TestCase):
             self.environment[name] = str(path)
         (folder / "api_url").write_text("http://10.42.0.1:8001\n")
         self.environment["AIRBYTE_API_URL_FILE"] = str(folder / "api_url")
+        (folder / "nessie_url").write_text("http://10.42.0.1:19120/api/v2\n")
+        self.environment["AIRBYTE_NESSIE_URL_FILE"] = str(folder / "nessie_url")
         self.folder = folder
 
 
@@ -50,7 +51,7 @@ class SettingsTest(EnvironmentCase):
         self.assertEqual(
             ("example-bucket", "us-west-2", "warehouse"), (settings.environment.bucket, settings.environment.region, settings.environment.warehouse_path)
         )
-        self.assertEqual("http://nessie.example:19120/api/v2", settings.environment.nessie_uri)
+        self.assertEqual("http://10.42.0.1:19120/api/v2", settings.environment.nessie_uri)
         self.assertEqual("http://nessie:19120/api/v2", settings.nessie_uri)
         self.assertEqual(
             (CLIENT_ID, CLIENT_VALUE, KEY_ID, KEY_VALUE),
@@ -63,7 +64,7 @@ class SettingsTest(EnvironmentCase):
         )
 
     def test_a_missing_or_blank_setting_is_named(self) -> None:
-        for name in ("RECORD_BUCKET", "RECORD_REGION", "RECORD_AIRBYTE_NESSIE_URI", "NESSIE_URI", "AIRBYTE_API_URL_FILE", "AIRBYTE_CLIENT_ID_FILE"):
+        for name in ("WAREHOUSE_LOCATION", "AWS_REGION", "AIRBYTE_NESSIE_URL_FILE", "NESSIE_URI", "AIRBYTE_API_URL_FILE", "AIRBYTE_CLIENT_ID_FILE"):
             for value in (None, "", "  "):
                 with self.subTest(name=name, value=value), self.assertRaises(SettingsError) as raised:
                     settings_from_environment({key: item for key, item in self.environment.items() if key != name} | ({} if value is None else {name: value}))
@@ -92,10 +93,38 @@ class SettingsTest(EnvironmentCase):
             self.assertIn("RECORD_SYNC_DEADLINE_SECONDS", str(raised.exception))
 
     def test_the_airbyte_address_and_the_catalog_address_must_be_plain_http_urls(self) -> None:
-        for name in ("NESSIE_URI", "RECORD_AIRBYTE_NESSIE_URI"):
-            with self.subTest(name), self.assertRaises(SettingsError) as raised:
-                settings_from_environment({**self.environment, name: "https://elsewhere.example"})
-            self.assertIn(name, str(raised.exception))
+        with self.assertRaises(SettingsError) as raised:
+            settings_from_environment({**self.environment, "NESSIE_URI": "https://elsewhere.example"})
+        self.assertIn("NESSIE_URI", str(raised.exception))
+        for text in ("https://10.42.0.1:19120/api/v2", "10.42.0.1:19120", "", "http://"):
+            with self.subTest(text):
+                (self.folder / "nessie_url").write_text(text + "\n")
+                with self.assertRaises(SettingsError) as raised:
+                    settings_from_environment(self.environment)
+                self.assertIn("AIRBYTE_NESSIE_URL_FILE", str(raised.exception))
+
+    def test_the_bucket_and_the_warehouse_path_come_from_the_warehouse_location_that_the_deploy_already_sets(self) -> None:
+        settings = settings_from_environment({**self.environment, "WAREHOUSE_LOCATION": "s3://other-bucket/lake/warehouse"})
+        self.assertEqual(("other-bucket", "lake/warehouse"), (settings.environment.bucket, settings.environment.warehouse_path))
+
+    def test_a_warehouse_location_that_is_not_an_s3_location_of_the_project_is_refused(self) -> None:
+        for text in (
+            "",
+            "s3://",
+            "s3://example-bucket",
+            "s3://example-bucket/",
+            "http://example-bucket/warehouse",
+            "s3://Example/x",
+            "s3://example-bucket/landing/x",
+            "s3://example-bucket/records_input",
+            "s3://physionet-open/vitaldb",
+            "s3://example-bucket/a b",
+            "s3://example-bucket/../x",
+        ):
+            with self.subTest(text):
+                with self.assertRaises(SettingsError) as raised:
+                    settings_from_environment({**self.environment, "WAREHOUSE_LOCATION": text})
+                self.assertIn("WAREHOUSE_LOCATION", str(raised.exception))
 
 
 class ApiAddressTest(EnvironmentCase):

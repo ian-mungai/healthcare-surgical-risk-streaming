@@ -21,6 +21,7 @@ from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.record_load import LoadResult, result_tags
 from scripts.ingestion.record_run import run_load, settings_from_environment
 
+from .concurrency import job_tags
 from .groups import GroupResource
 
 TAG_PREFIX = "surgical_risk/records"
@@ -46,7 +47,7 @@ def load_record_tables(context: OpExecutionContext, config: RecordLoadConfig, gr
     return load_facts(result)
 
 
-@job(resource_defs={"group": GroupResource(group=GROUP)}, executor_def=in_process_executor)
+@job(resource_defs={"group": GroupResource(group=GROUP)}, executor_def=in_process_executor, tags=job_tags("record_load_job"))
 def record_load_job() -> None:
     load_record_tables()
 

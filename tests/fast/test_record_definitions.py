@@ -126,6 +126,13 @@ class TrackListSourceTest(unittest.TestCase):
         self.assertNotIn("example-bucket", json.dumps(definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT, SHA)))
 
 
+class EnvironmentTest(unittest.TestCase):
+    def test_a_warehouse_path_with_a_dot_segment_or_in_a_prefix_of_the_load_is_refused(self) -> None:
+        for path in ("a/../b", "..", "a/./b", ".", "landing", "landing/x", "records_input", "records_input/x", "a b", "", "/a"):
+            with self.subTest(path), self.assertRaises(definitions.DefinitionError):
+                definitions.destination_configuration(Environment("example-bucket", "us-west-2", path, "http://nessie.example:19120/api/v2"), f"load_{RUN}")
+
+
 class DestinationTest(unittest.TestCase):
     def configuration(self, branch: str = f"load_{RUN}") -> dict[str, Any]:
         return definitions.destination_configuration(ENVIRONMENT, branch)

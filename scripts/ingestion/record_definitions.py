@@ -129,11 +129,13 @@ def check_environment(environment: Environment) -> None:
         raise DefinitionError("the bucket is not a valid bucket name of the project, or it is the publisher's bucket")
     if REGION_NAME.fullmatch(environment.region) is None:
         raise DefinitionError("the region is not an AWS region name")
-    if WAREHOUSE_PATH.fullmatch(environment.warehouse_path) is None or environment.warehouse_path.split("/")[0] in (
-        LANDING_PREFIX.strip("/"),
-        READ_PREFIX.strip("/"),
+    parts = environment.warehouse_path.split("/")
+    if (
+        WAREHOUSE_PATH.fullmatch(environment.warehouse_path) is None
+        or {".", ".."} & set(parts)
+        or parts[0] in (LANDING_PREFIX.strip("/"), READ_PREFIX.strip("/"))
     ):
-        raise DefinitionError("the warehouse path must be a relative path outside the landing and read prefixes")
+        raise DefinitionError("the warehouse path must be a relative path with no dot segment, outside the landing and read prefixes")
     if not environment.nessie_uri.startswith("http://"):
         raise DefinitionError("the Nessie address must be a plain http URL")
 
