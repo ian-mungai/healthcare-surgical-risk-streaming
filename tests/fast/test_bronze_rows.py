@@ -225,12 +225,29 @@ class TrackRows(unittest.TestCase):
         device = SimpleNamespace(name="SNUADC", type="SNUADC-type", port="COM1")
         info = track_info("SNUADC/ECG_II", fake_track(), device)
         self.assertEqual(
-            TrackInfo("SNUADC/ECG_II", "SNUADC", "ECG_II", "SNUADC-type", "COM1", "waveform", 1, 6, "mV", 500.0, 0.01, -5.0, -1.0, 2.0, 7, 3), info
+            TrackInfo("SNUADC/ECG_II", "SNUADC", "ECG_II", "SNUADC-type", "COM1", "waveform", 1, 6, "uint16", "mV", 500.0, 0.01, -5.0, -1.0, 2.0, 7, 3), info
         )
         row = track_row(565, info, LINEAGE)
         self.assertTrue(conforms(TRACKS, row))
         self.assertEqual((565, "SNUADC/ECG_II"), row[:2])
         self.assertEqual(("v0001", "ab" * 32), row[-2:])
+
+    def test_each_sample_format_of_the_file_format_has_its_published_type_name(self) -> None:
+        names = {1: "float32", 2: "float64", 3: "int8", 4: "uint8", 5: "int16", 6: "uint16", 7: "int32", 8: "uint32"}
+        for fmt, name in names.items():
+            info = track_info("X", fake_track(fmt=fmt), None)
+            self.assertEqual((fmt, name), (info.sample_format, info.sample_type))
+
+    def test_a_format_with_no_sample_type_keeps_its_code_and_has_no_name(self) -> None:
+        for fmt in (0, 9, 255):
+            info = track_info("E", fake_track(type=5, fmt=fmt), None)
+            self.assertEqual((fmt, ""), (info.sample_format, info.sample_type))
+            self.assertTrue(conforms(TRACKS, track_row(1, info, LINEAGE)))
+
+    def test_the_rate_the_gain_and_the_offset_of_a_track_are_in_its_row_as_published(self) -> None:
+        info = track_info("X", fake_track(srate=62.5, gain=0.1, offset=-20.0), None)
+        row = dict(zip((name for name, _ in TRACKS.columns), track_row(3, info, LINEAGE), strict=True))
+        self.assertEqual((62.5, 0.1, -20.0, "uint16", 6), (row["sample_rate"], row["gain"], row["value_offset"], row["sample_type"], row["sample_format"]))
 
     def test_a_track_with_no_device_has_empty_device_fields(self) -> None:
         info = track_info("EVENT", fake_track(name="EVENT", type=5, fmt=0, unit="", srate=0.0, dname=""), None)

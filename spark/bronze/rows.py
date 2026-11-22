@@ -21,6 +21,7 @@ from replay.events.stream import discriminators
 from replay.events.waveform import second_samples, second_spans
 
 KIND_OF_TYPE = {1: "waveform", 2: "numeric", 5: "string"}
+SAMPLE_TYPES = {1: "float32", 2: "float64", 3: "int8", 4: "uint8", 5: "int16", 6: "uint16", 7: "int32", 8: "uint32"}
 
 
 class StructureError(RuntimeError):
@@ -51,6 +52,7 @@ class TrackInfo:
     kind: str
     track_type: int
     sample_format: int
+    sample_type: str
     unit: str
     sample_rate: float
     gain: float
@@ -75,6 +77,7 @@ def track_info(dtname: str, track: Any, device: Any | None) -> TrackInfo:
         kind,
         int(track.type),
         int(track.fmt),
+        SAMPLE_TYPES.get(int(track.fmt), ""),
         str(track.unit),
         float(track.srate),
         float(track.gain),
@@ -97,6 +100,7 @@ def track_row(case_id: int, info: TrackInfo, lineage: Lineage) -> tuple[Any, ...
         info.kind,
         info.track_type,
         info.sample_format,
+        info.sample_type,
         info.unit,
         info.sample_rate,
         info.gain,

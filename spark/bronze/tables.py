@@ -6,7 +6,8 @@ Bronze holds what the case files publish and changes no value. The namespace ``b
   the readings of its track that share its case time, in the order of the file.
 - ``waveform_seconds``: one row per case, track and second, holding that second's samples in the order of the file. Key: case, track and second. The samples
   are doubles whatever the track's own sample type is (the types of the format are all held exactly by a double), and the track's type is in ``tracks``.
-- ``tracks``: one row per track of each case with its device, name, unit and the publisher's track metadata. Key: case and track.
+- ``tracks``: one row per track of each case with its device, name, unit and the publisher's track metadata: the sample format code of the file and its type
+  name (``uint16`` for a 16-bit unsigned sample, empty when the file format has none), the sample rate, the gain and the offset. Key: case and track.
 - ``string_events``: one row per published string event, with its original time, text and stable source ID. Key as for numeric readings.
 
 Every row carries its lineage: the object version of the case file it was decoded from and that file's SHA-256 from the manifest of the passed check.
@@ -75,6 +76,7 @@ TRACKS = TableSpec(
         ("kind", "string"),
         ("track_type", "int"),
         ("sample_format", "int"),
+        ("sample_type", "string"),
         ("unit", "string"),
         ("sample_rate", "double"),
         ("gain", "double"),
