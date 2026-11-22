@@ -23,7 +23,7 @@ The real runs on Spark, Nessie and the full clinical table are in ``tests/e2e/si
 from __future__ import annotations
 
 import hashlib
-import json
+import importlib
 import re
 import tempfile
 import unittest
@@ -31,10 +31,12 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, get_args
 
 from scripts.sample.candidates import CANDIDATES_FILE, SLOTS, read_candidates
 from scripts.sample.split import Part, patient_part
+from scripts.stack.nessie import NessieClient
 from spark import split_table
 from spark.split_table import (
     COLUMNS,
@@ -396,12 +398,15 @@ class Lake:
     versions: dict[str, Any] = field(default_factory=dict)
     corrupt: Callable[[list[SplitRow]], list[SplitRow]] | None = None
     source_after_write: Any = None
+    write_parent: str | None = None
+    unrelated: bool = False
 
     def __post_init__(self) -> None:
         source = source_of(self.patients, self.snapshot, self.cases)
         table = None if self.existing is None else split_table.TableState(list(self.existing), 5)
         self.versions = {"h0": (source, table)}
         self.current = "h0"
+        self.parents: dict[str, str] = {}
 
     def head(self) -> str:
         self.calls.append(("head",))
@@ -420,10 +425,19 @@ class Lake:
         stored = list(rows) if self.corrupt is None else self.corrupt(list(rows))
         after = self.versions[self.current][0] if self.source_after_write is None else self.source_after_write
         self.versions["h1"] = (after, split_table.TableState(stored, 6))
+        self.parents["h1"] = self.write_parent or "h0"
         self.current = "h1"
+        if self.unrelated:
+            self.versions["h2"] = self.versions["h1"]
+            self.parents["h2"] = "h1"
+            self.current = "h2"
+
+    def write_hash(self, checked: str) -> str | None:
+        self.calls.append(("write_hash", checked))
+        return self.current if self.parents.get(self.current) == checked else None
 
     def operations(self) -> Any:
-        return split_table.Operations(head=self.head, read_source=self.read_source, read_table=self.read_table, write=self.write)
+        return split_table.Operations(head=self.head, read_source=self.read_source, read_table=self.read_table, write=self.write, write_hash=self.write_hash)
 
     def names(self) -> list[str]:
         return [call[0] for call in self.calls]
@@ -440,7 +454,16 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL)
         outcome = build_with(lake)
         self.assertEqual(
-            [("read_source", "h0"), ("read_table", "h0"), ("head",), ("write", False), ("head",), ("read_source", "h1"), ("read_table", "h1"), ("head",)],
+            [
+                ("read_source", "h0"),
+                ("read_table", "h0"),
+                ("head",),
+                ("write", False),
+                ("write_hash", "h0"),
+                ("read_source", "h1"),
+                ("read_table", "h1"),
+                ("head",),
+            ],
             lake.calls,
         )
         self.assertEqual(("written", "h1", 6), (outcome.outcome, outcome.head, outcome.table_snapshot_id))
@@ -524,8 +547,21 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL, corrupt=lambda rows: list(reversed(rows)))
         self.assertEqual("written", build_with(lake).outcome)
 
+    def test_an_unrelated_commit_after_the_write_is_not_taken_as_the_write_and_nothing_is_read_at_it(self) -> None:
+        lake = Lake(FULL, unrelated=True)
+        with self.assertRaises(PatientSplitError) as caught:
+            build_with(lake)
+        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual([], [call for call in lake.calls[lake.names().index("write_hash") :] if call[0].startswith("read")])
+
+    def test_a_write_whose_commit_is_not_directly_on_the_checked_hash_is_refused(self) -> None:
+        lake = Lake(FULL, write_parent="h7")
+        with self.assertRaises(PatientSplitError) as caught:
+            build_with(lake)
+        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+
     def test_a_branch_that_moves_after_the_write_is_refused_whatever_the_table_holds(self) -> None:
-        lake = Lake(FULL, script=["h0", "h1", "h5"])
+        lake = Lake(FULL, script=["h0", "h5"])
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
         self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
@@ -577,15 +613,48 @@ class BuildSequenceTest(unittest.TestCase):
         self.assertNotIn("pinned_counts", outcome.checks_run)
         self.assertEqual({"training": 7, "validation": 0, "test": 3}, outcome.facts()["counts"])
 
-    def test_the_facts_hold_counts_hashes_and_the_checks_that_ran_and_no_identifier(self) -> None:
+    def test_the_facts_are_exactly_these_keys_and_nothing_derived_from_the_rows(self) -> None:
         facts = build_with(Lake(FULL)).facts()
+        self.assertEqual(
+            {
+                "outcome",
+                "checked_hash",
+                "write_hash",
+                "branch_hash",
+                "snapshot_id",
+                "source_snapshot_id",
+                "rule_version",
+                "patients",
+                "cases",
+                "counts",
+                "checks_run",
+                "fixed_sample_cases_checked",
+            },
+            set(facts),
+        )
         self.assertEqual(PINNED_COUNTS, facts["counts"])
-        self.assertEqual(("h1", 6090, 6090), (facts["branch_hash"], facts["patients"], facts["cases"]))
+        self.assertEqual(("h0", "h1", "h1", 6090, 6090), (facts["checked_hash"], facts["write_hash"], facts["branch_hash"], facts["patients"], facts["cases"]))
         self.assertEqual(["two_sets", "rule_match", "rule_version", "source_snapshot", "source_patients", "shares", "pinned_counts"], facts["checks_run"])
-        self.assertRegex(facts["table_digest"], r"[0-9a-f]{64}")
-        planted = {**FULL, PLANTED_PATIENT: "test"}
-        text = json.dumps(build_with(Lake(planted), pinned=False).facts())
-        self.assertNotIn(PLANTED_PATIENT, text)
+
+    def test_a_result_for_a_one_patient_cohort_holds_nothing_that_tells_the_patients_apart(self) -> None:
+        # Two cohorts of one patient, one patient in test and one in training: every key but the counts must be equal, and the counts say only how many.
+        test_patient = next(subjectid for subjectid, name in FULL.items() if name == "test")
+        training_patient = next(subjectid for subjectid, name in FULL.items() if name == "training")
+        first = build_with(Lake({test_patient: "test"}), pinned=False).facts()
+        second = build_with(Lake({training_patient: "training"}), pinned=False).facts()
+        differing = {key for key in first if first[key] != second[key]}
+        self.assertEqual({"counts"}, differing)
+        self.assertEqual(first["cases"], second["cases"])
+        self.assertFalse(hasattr(split_table, "table_digest"))
+
+    def test_the_only_digest_the_module_computes_is_that_of_the_candidate_file(self) -> None:
+        text = Path(split_table.__file__).read_text()
+        self.assertEqual(1, text.count("sha256("))
+        self.assertEqual(0, Path(JOB_FILE).read_text().count("sha256("))
+
+    def test_a_result_without_a_write_has_no_write_hash(self) -> None:
+        facts = build_with(Lake(FULL, existing=rows_of(FULL, snapshot=11))).facts()
+        self.assertEqual((None, "h0", "h0"), (facts["write_hash"], facts["checked_hash"], facts["branch_hash"]))
 
 
 class VerifySequenceTest(unittest.TestCase):
@@ -626,6 +695,158 @@ class VerifySequenceTest(unittest.TestCase):
         for label, rows in cases.items():
             with self.subTest(label), self.assertRaises(PatientSplitError):
                 self.verify_with(Lake(FULL, existing=rows))
+
+
+class DistinctCountTest(unittest.TestCase):
+    """A message counts distinct patients, cases and subject IDs, never rows that carry the same one."""
+
+    def test_a_bad_subject_id_that_repeats_is_one_subject_id(self) -> None:
+        rows = [*rows_of(FULL), SplitRow("007", "training", RULE_VERSION, SNAPSHOT), SplitRow("007", "training", RULE_VERSION, SNAPSHOT)]
+        self.assertIn("bad_subjectid: 1 subjectid", table_problems(rows, pinned=False))
+        with self.assertRaises(PatientSplitError) as caught:
+            build_assignments(["007", "007", "1"])
+        self.assertEqual(["bad_subjectid: 1 subjectid"], caught.exception.problems)
+
+    def test_a_patient_that_repeats_with_the_wrong_set_is_one_patient_off_the_rule(self) -> None:
+        wrong = other_set(FULL["25"])
+        rows = [row for row in rows_of(FULL) if row.subjectid != "25"] + [SplitRow("25", wrong, RULE_VERSION, SNAPSHOT) for _ in range(3)]
+        self.assertIn("rule_mismatch: 1 patient", table_problems(rows, pinned=False))
+        self.assertIn("repeated_patient: 1 patient", table_problems(rows, pinned=False))
+
+    def test_a_case_under_three_patients_is_one_case_and_a_repeat_of_the_same_pair_is_none(self) -> None:
+        with self.assertRaises(PatientSplitError) as caught:
+            source_cases([("1", "10"), ("1", "11"), ("1", "12")])
+        self.assertEqual(["case_two_patients: 1 case"], caught.exception.problems)
+        self.assertEqual(({1: "10"}, {"10"}), source_cases([("1", "10"), ("1", "10")]))
+
+    def test_a_sample_case_that_repeats_is_one_case(self) -> None:
+        twice = [SampleCase(case=1, patient=1, slot="odd"), SampleCase(case=1, patient=1, slot="odd")]
+        self.assertEqual(["sample_bad_slot: 1 case"], fixed_sample_problems({"1": "training"}, {1: "1"}, twice))
+        missing = [SampleCase(case=1, patient=1, slot="repeat_test"), SampleCase(case=1, patient=1, slot="repeat_test")]
+        self.assertEqual(["sample_missing_case: 1 case"], fixed_sample_problems({}, {}, missing))
+
+
+class WriteCommitTest(unittest.TestCase):
+    """The log decides which commit is the write: the head, directly on the checked hash, changing only the allowed keys."""
+
+    TABLE = (("silver", "patient_split"),)
+
+    @staticmethod
+    def entry(commit: str, parent: str, *keys: tuple[str, ...], kind: str = "PUT") -> dict[str, Any]:
+        return {"commitMeta": {"hash": commit}, "parentCommitHash": parent, "operations": [{"type": kind, "key": {"elements": list(key)}} for key in keys]}
+
+    def test_the_head_on_the_checked_hash_that_changes_only_the_table_is_the_write(self) -> None:
+        entries = [self.entry("h1", "h0", ("silver", "patient_split")), self.entry("h0", "h_1")]
+        self.assertEqual("h1", split_table.write_commit(entries, "h0", self.TABLE))
+
+    def test_anything_else_is_not_the_write(self) -> None:
+        table = ("silver", "patient_split")
+        cases = {
+            "no log": [],
+            "another parent": [self.entry("h1", "h7", table)],
+            "two commits on top": [self.entry("h2", "h1", table), self.entry("h1", "h0", table)],
+            "another key too": [self.entry("h1", "h0", table, ("bronze", "clinical_cases"))],
+            "only another key": [self.entry("h1", "h0", ("bronze", "clinical_cases"))],
+            "a delete": [self.entry("h1", "h0", table, kind="DELETE")],
+            "no operations named": [self.entry("h1", "h0")],
+            "no hash": [{"parentCommitHash": "h0", "operations": [{"type": "PUT", "key": {"elements": list(table)}}]}],
+        }
+        for label, entries in cases.items():
+            with self.subTest(label):
+                self.assertIsNone(split_table.write_commit(entries, "h0", self.TABLE))
+
+    def test_the_namespace_commit_is_its_own_step_with_its_own_key(self) -> None:
+        entries = [self.entry("h1", "h0", ("silver",))]
+        self.assertEqual("h1", split_table.write_commit(entries, "h0", (("silver",),)))
+        self.assertIsNone(split_table.write_commit(entries, "h0", self.TABLE))
+
+
+class CatalogTest(unittest.TestCase):
+    """A read goes through a catalog that is pinned to a hash and cannot write; the write goes through the catalog of the branch."""
+
+    HASH = "ab" * 32
+    SETTINGS = {"nessie_uri": "http://nessie:19120/api/v2", "warehouse": "file:///warehouse/", "region": ""}
+
+    def conf(self, name: str, at: str | None) -> dict[str, str]:
+        return split_table.catalog_conf(name, branch="b", at=at, **self.SETTINGS)
+
+    def test_a_pinned_read_holds_the_hash_and_names_only_its_own_catalog(self) -> None:
+        conf = self.conf("pin_x", self.HASH)
+        self.assertEqual(self.HASH, conf["spark.sql.catalog.pin_x.ref.hash"])
+        self.assertEqual("b", conf["spark.sql.catalog.pin_x.ref"])
+        self.assertTrue(all(key.startswith("spark.sql.catalog.pin_x") for key in conf))
+
+    def test_the_branch_catalog_for_the_write_holds_no_hash(self) -> None:
+        conf = self.conf("lake", None)
+        self.assertEqual("b", conf["spark.sql.catalog.lake.ref"])
+        self.assertFalse([key for key in conf if key.endswith("ref.hash")])
+
+    def test_a_hash_that_is_not_a_nessie_hash_is_refused(self) -> None:
+        for at in ("", "main", "ab" * 31, "AB" * 32, "ab" * 32 + "\n"):
+            with self.subTest(at=at), self.assertRaises(PatientSplitError):
+                self.conf("pin_x", at)
+
+    def test_every_read_of_the_job_goes_through_a_catalog_that_was_pinned_to_the_hash_of_that_read(self) -> None:
+        job = importlib.import_module("spark.jobs.patient_split")
+        session = FakeSession()
+        lake = job.Lake(session, NessieClient("http://127.0.0.1:1/api/v2"), "b", self.SETTINGS)
+        other = "cd" * 32
+        lake.read_source(self.HASH)
+        first = list(session.reads)
+        session.reads.clear()
+        lake.read_table(other)
+        second = list(session.reads)
+        self.assertEqual({"exists", "source", "snapshot"}, {kind for kind, _ in first})
+        self.assertEqual({"exists", "table", "snapshot"}, {kind for kind, _ in second})
+        for reads, at in ((first, self.HASH), (second, other)):
+            for kind, name in reads:
+                catalog = name.split(".")[0]
+                with self.subTest(read=kind, name=name):
+                    self.assertTrue(catalog.startswith("pin_"), name)
+                    self.assertEqual(at, session.conf_set[f"spark.sql.catalog.{catalog}.ref.hash"])
+        self.assertFalse([key for key in session.conf_set if key.startswith("spark.sql.catalog.lake")])
+
+
+class FakeFrame:
+    def __init__(self, fields: Sequence[tuple[str, str]], rows: list[dict[str, Any]]) -> None:
+        self.schema = SimpleNamespace(
+            fields=[SimpleNamespace(name=name, dataType=SimpleNamespace(simpleString=lambda kind=kind: kind)) for name, kind in fields]
+        )
+        self.rows = rows
+
+    def select(self, *_names: str) -> FakeFrame:
+        return self
+
+    def collect(self) -> list[dict[str, Any]]:
+        return self.rows
+
+
+class FakeSession:
+    """A stand-in Spark session that records the catalog settings and every table that a read names."""
+
+    def __init__(self) -> None:
+        self.conf_set: dict[str, str] = {}
+        self.reads: list[tuple[str, str]] = []
+        self.conf = SimpleNamespace(set=self.conf_set.__setitem__)
+        self.catalog = SimpleNamespace(tableExists=self.exists)
+        spark3 = SimpleNamespace(loadIcebergTable=self.load)
+        self._jvm = SimpleNamespace(org=SimpleNamespace(apache=SimpleNamespace(iceberg=SimpleNamespace(spark=SimpleNamespace(Spark3Util=spark3)))))
+        self._jsparkSession = object()
+
+    def exists(self, name: str) -> bool:
+        self.reads.append(("exists", name))
+        return True
+
+    def load(self, _session: Any, name: str) -> Any:
+        self.reads.append(("snapshot", name))
+        return SimpleNamespace(currentSnapshot=lambda: SimpleNamespace(snapshotId=lambda: 5))
+
+    def table(self, name: str) -> FakeFrame:
+        if name.endswith("clinical_cases"):
+            self.reads.append(("source", name))
+            return FakeFrame(split_table.SOURCE_COLUMNS, [{"caseid": "1", "subjectid": "10"}])
+        self.reads.append(("table", name))
+        return FakeFrame(split_table.COLUMNS, [{"subjectid": "10", "set": "training", "rule_version": RULE_VERSION, "source_snapshot_id": 5}])
 
 
 def all_messages() -> list[str]:
@@ -669,6 +890,7 @@ def all_messages() -> list[str]:
     catching(lambda: values_query([SplitRow("0" + patient, "test", RULE_VERSION, 1)]))
     catching(lambda: values_query([SplitRow(patient, "test" + patient, RULE_VERSION, 1)]))
     catching(lambda: values_query([]))
+    catching(lambda: split_table.catalog_conf("pin_x", nessie_uri="http://n:1/api/v2", warehouse="file:///w/", region="", branch="b", at=patient))
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / f"candidates_{patient}.tsv"
         path.write_text(f"case\tpatient\n{case}\t{patient}\n")
@@ -679,7 +901,9 @@ def all_messages() -> list[str]:
         Lake(base, existing=[]),
         Lake(base, existing=[*rows_of(base, snapshot=11), SplitRow(patient, "training", RULE_VERSION, 11)]),
         Lake(base, script=["h9"]),
-        Lake(base, script=["h0", "h1", "h5"]),
+        Lake(base, script=["h0", "h5"]),
+        Lake(base, unrelated=True),
+        Lake(base, write_parent="h7"),
         Lake(base, corrupt=lambda rows: rows[1:]),
     ):
         catching(lambda lake=lake: build_with(lake, pinned=False))  # type: ignore[misc]

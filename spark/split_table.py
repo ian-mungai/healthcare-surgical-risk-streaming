@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.sample.split import BUCKETS, HEX_DIGITS, SEED, TRAIN_BUCKETS, VALIDATION_BUCKETS, Part, patient_part
+from spark.settings import CATALOG, catalog_options
 
 SET_NAMES: Mapping[Part, str] = {"train": "training", "validation": "validation", "test": "test"}
 RULE_VERSION = f"patient_split:seed={SEED}:sha256_hex{HEX_DIGITS}_mod{BUCKETS}:training<{TRAIN_BUCKETS}:validation<{TRAIN_BUCKETS + VALIDATION_BUCKETS}:test"
@@ -30,6 +31,7 @@ PINNED_COUNTS = {"training": 4287, "validation": 594, "test": 1209}
 SHARE_TOLERANCE_POINTS = 1
 COLUMNS = (("subjectid", "string"), ("set", "string"), ("rule_version", "string"), ("source_snapshot_id", "bigint"))
 SOURCE_COLUMNS = (("caseid", "string"), ("subjectid", "string"))
+HASH = re.compile(r"[0-9a-f]{64}")
 PATIENT_NUMBER = re.compile(r"[1-9][0-9]*")
 CASE_NUMBER = re.compile(r"[0-9]+")
 SAFE_VERSION = re.compile(r"[A-Za-z0-9_:=<>.-]+")
@@ -74,6 +76,7 @@ CODES = frozenset(
         "readback_differs",
         "table_missing",
         "branch_moved",
+        "catalog_hash",
         "source_no_snapshot",
         "source_empty",
         "source_table",
@@ -125,12 +128,14 @@ class TableState:
 @dataclass(frozen=True, slots=True)
 class Operations:
     """The Spark steps of a build. ``head`` is the hash of the branch now. The reads are at the hash that is given. ``read_table`` gives ``None`` for a hash
-    that holds no table. ``write`` writes the whole table to the branch."""
+    that holds no table. ``write`` writes the whole table to the branch. ``write_hash`` is given the hash that was checked and gives the hash of the write,
+    or ``None`` when the branch head is not the one commit of the write directly on that hash."""
 
     head: Callable[[], str]
     read_source: Callable[[str], Source]
     read_table: Callable[[str], TableState | None]
     write: Callable[..., None]
+    write_hash: Callable[[str], str | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,11 +147,18 @@ class Outcome:
     table_snapshot_id: int | None
     checks_run: list[str]
     sample_cases: int | None
+    checked_hash: str
+    write_hash: str | None
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: the hash that was checked, snapshot IDs, counts, counts per set, the checks that ran and a digest."""
+        """What the result line may hold: the hash that was checked, the hash of the write, snapshot IDs, counts, counts per set and the checks that ran.
+
+        Nothing in it is a function of individual rows, so nothing in it can tell one patient or one set of patients from another.
+        """
         return {
             "outcome": self.outcome,
+            "checked_hash": self.checked_hash,
+            "write_hash": self.write_hash,
             "branch_hash": self.head,
             "snapshot_id": self.table_snapshot_id,
             "source_snapshot_id": self.source.snapshot_id,
@@ -155,7 +167,6 @@ class Outcome:
             "cases": len(self.source.cases),
             "counts": counts_of(self.rows),
             "checks_run": self.checks_run,
-            "table_digest": table_digest(self.rows),
             "fixed_sample_cases_checked": self.sample_cases,
         }
 
@@ -168,12 +179,6 @@ def row_order(row: SplitRow) -> tuple[int, str]:
     return len(row.subjectid), row.subjectid
 
 
-def table_digest(rows: Sequence[SplitRow]) -> str:
-    """The SHA-256 of the table's patients and sets in patient order, so that two tables compare without either being shown."""
-    text = "".join(f"{row.subjectid},{row.set}\n" for row in sorted(rows, key=row_order))
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
 def patient_number(subjectid: str) -> int:
     """The patient number of a ``subjectid`` in the published form (whole number, no sign, no zero before the first digit), or ``PatientSplitError``."""
     if PATIENT_NUMBER.fullmatch(subjectid) is None or not subjectid.isascii():
@@ -184,14 +189,14 @@ def patient_number(subjectid: str) -> int:
 def build_assignments(subject_ids: Iterable[str]) -> dict[str, str]:
     """The set of each patient, by the one rule of ``scripts/sample/split.py``. A ``subjectid`` that is not in its published form is counted, never named."""
     assignments: dict[str, str] = {}
-    refused = 0
+    refused: set[str] = set()
     for subjectid in subject_ids:
         try:
             assignments[subjectid] = SET_NAMES[patient_part(patient_number(subjectid))]
         except PatientSplitError:
-            refused += 1
+            refused.add(subjectid)
     if refused:
-        raise PatientSplitError(f"bad_subjectid: {unit(refused, 'subjectid')}")
+        raise PatientSplitError(f"bad_subjectid: {unit(len(refused), 'subjectid')}")
     return assignments
 
 
@@ -228,7 +233,9 @@ def table_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
     snapshots = len({row.source_snapshot_id for row in rows})
     if snapshots > 1:
         problems.append(f"mixed_snapshots: {unit(snapshots, 'snapshot')}")
-    unknown = bad = mismatch = 0
+    unknown = 0
+    bad: set[str] = set()
+    mismatch: set[str] = set()
     for row in rows:
         if row.set not in TARGET_PERCENT:
             unknown += 1
@@ -236,10 +243,11 @@ def table_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
         try:
             expected = SET_NAMES[patient_part(patient_number(row.subjectid))]
         except PatientSplitError:
-            bad += 1
+            bad.add(row.subjectid)
             continue
-        mismatch += row.set != expected
-    for code, count, noun in (("unknown_set", unknown, "row"), ("bad_subjectid", bad, "subjectid"), ("rule_mismatch", mismatch, "patient")):
+        if row.set != expected:
+            mismatch.add(row.subjectid)
+    for code, count, noun in (("unknown_set", unknown, "row"), ("bad_subjectid", len(bad), "subjectid"), ("rule_mismatch", len(mismatch), "patient")):
         if count:
             problems.append(f"{code}: {unit(count, noun)}")
     if pinned:
@@ -308,20 +316,23 @@ def fixed_sample_problems(assignments: Mapping[str, str], cases: Mapping[int, st
     """Each fixed-sample case must be in Bronze under its patient, and its patient must be in the set that its slot expects (development or test)."""
     if not sample:
         return [f"sample_empty: {unit(0, 'case')}"]
-    found: Counter[str] = Counter()
+    found: dict[str, set[int]] = {}
     for item in sample:
         kind = item.slot.rsplit("_", 1)[-1]
         if kind not in SLOT_KINDS:
-            found["sample_bad_slot"] += 1
+            code = "sample_bad_slot"
         elif item.case not in cases:
-            found["sample_missing_case"] += 1
+            code = "sample_missing_case"
         elif cases[item.case] != str(item.patient):
-            found["sample_wrong_patient"] += 1
+            code = "sample_wrong_patient"
         elif str(item.patient) not in assignments:
-            found["sample_missing_patient"] += 1
+            code = "sample_missing_patient"
         elif assignments[str(item.patient)] not in SLOT_KINDS[kind]:
-            found["sample_mismatch"] += 1
-    return [f"{code}: {unit(count, 'case')}" for code, count in found.items()]
+            code = "sample_mismatch"
+        else:
+            continue
+        found.setdefault(code, set()).add(item.case)
+    return [f"{code}: {unit(len(numbers), 'case')}" for code, numbers in found.items()]
 
 
 def read_fixed_sample(path: Path) -> list[SampleCase]:
@@ -351,15 +362,16 @@ def source_cases(rows: Iterable[tuple[str | None, str | None]]) -> tuple[dict[in
     """The patient of each case and the distinct patients of the source rows. A missing value or a case under two patients is counted."""
     cases: dict[int, str] = {}
     patients: set[str] = set()
-    bad = twice = 0
+    bad = 0
+    twice: set[int] = set()
     for caseid, subjectid in rows:
         if caseid is None or subjectid is None or not CASE_NUMBER.fullmatch(caseid):
             bad += 1
             continue
         if cases.setdefault(int(caseid), subjectid) != subjectid:
-            twice += 1
+            twice.add(int(caseid))
         patients.add(subjectid)
-    problems = [f"{code}: {unit(count, noun)}" for code, count, noun in (("source_row", bad, "row"), ("case_two_patients", twice, "case")) if count]
+    problems = [f"{code}: {unit(count, noun)}" for code, count, noun in (("source_row", bad, "row"), ("case_two_patients", len(twice), "case")) if count]
     if problems:
         raise PatientSplitError(*problems)
     return cases, patients
@@ -391,8 +403,8 @@ def run_build(ops: Operations, head: str, *, pinned: bool, sample: Sequence[Samp
     """Build the table on the branch whose head is ``head``, or leave it as it is when nothing changes.
 
     The order: read Bronze and the table at ``head``; validate the table that is inherited; freeze (compare with it); check the rows to write; write only
-    while the branch still has ``head``; resolve the head of the write; read the table and Bronze at that hash and check them against what was written; end
-    only when the branch still has that hash.
+    while the branch still has ``head``; take the hash of the write from the branch's log (the head, one commit directly on ``head``); read the table and
+    Bronze at that hash and check them against what was written; end only when the branch still has that hash.
     """
     source = ops.read_source(head)
     assignments = build_assignments(source.patients)
@@ -405,16 +417,23 @@ def run_build(ops: Operations, head: str, *, pinned: bool, sample: Sequence[Samp
         (row.subjectid, row.set, row.source_snapshot_id) for row in rows
     }
     at = head
+    written: str | None = None
     if not unchanged:
         if ops.head() != head:
             raise PatientSplitError(BRANCH_MOVED)
         ops.write(rows, exists=state is not None)
-        at = ops.head()
-    return finish(ops, at, rows, pinned=pinned, sample=sample, outcome="unchanged" if unchanged else "written")
+        written = ops.write_hash(head)
+        if written is None:
+            raise PatientSplitError(BRANCH_MOVED)
+        at = written
+    return finish(ops, (head, written, at), rows, pinned=pinned, sample=sample, outcome="unchanged" if unchanged else "written")
 
 
-def finish(ops: Operations, at: str, rows: Sequence[SplitRow], *, pinned: bool, sample: Sequence[SampleCase] | None, outcome: str) -> Outcome:
-    """Read the table and Bronze at ``at``, check them against ``rows`` and confirm that the branch still has ``at``."""
+def finish(
+    ops: Operations, hashes: tuple[str, str | None, str], rows: Sequence[SplitRow], *, pinned: bool, sample: Sequence[SampleCase] | None, outcome: str
+) -> Outcome:
+    """Read the table and Bronze at the last of ``hashes`` (checked, write, read), check them against ``rows`` and confirm that the branch still has it."""
+    checked, written, at = hashes
     source = ops.read_source(at)
     state = ops.read_table(at)
     if state is None:
@@ -426,15 +445,9 @@ def finish(ops: Operations, at: str, rows: Sequence[SplitRow], *, pinned: bool, 
         raise PatientSplitError(*problems)
     if ops.head() != at:
         raise PatientSplitError(BRANCH_MOVED)
-    return Outcome(
-        outcome,
-        at,
-        sorted(state.rows, key=row_order),
-        source,
-        state.snapshot_id,
-        check_names(pinned=pinned, sample=sample),
-        None if sample is None else len(sample),
-    )
+    names = check_names(pinned=pinned, sample=sample)
+    sample_cases = None if sample is None else len(sample)
+    return Outcome(outcome, at, sorted(state.rows, key=row_order), source, state.snapshot_id, names, sample_cases, checked, written)
 
 
 def run_verify(ops: Operations, head: str, *, pinned: bool, sample: Sequence[SampleCase] | None) -> Outcome:
@@ -448,9 +461,9 @@ def run_verify(ops: Operations, head: str, *, pinned: bool, sample: Sequence[Sam
         raise PatientSplitError(*problems)
     if ops.head() != head:
         raise PatientSplitError(BRANCH_MOVED)
-    return Outcome(
-        "verified", head, list(state.rows), source, state.snapshot_id, check_names(pinned=pinned, sample=sample), None if sample is None else len(sample)
-    )
+    names = check_names(pinned=pinned, sample=sample)
+    sample_cases = None if sample is None else len(sample)
+    return Outcome("verified", head, list(state.rows), source, state.snapshot_id, names, sample_cases, head, None)
 
 
 def values_query(rows: Sequence[SplitRow]) -> str:
@@ -469,3 +482,33 @@ def values_query(rows: Sequence[SplitRow]) -> str:
             raise PatientSplitError(f"unwritable_row: {unit(1, 'row')}")
         tuples.append(f"('{row.subjectid}', '{row.set}', '{row.rule_version}', {row.source_snapshot_id}L)")
     return f"VALUES {', '.join(tuples)}"
+
+
+def write_commit(entries: Sequence[Mapping[str, Any]], checked: str, allowed: Sequence[tuple[str, ...]]) -> str | None:
+    """The hash of the write, from the branch's log (newest first, with each commit's operations), or ``None``.
+
+    The write is the head when it is one commit directly on the checked hash and it only puts the ``allowed`` keys. Any other head, such as a commit by someone
+    else, two commits, or a commit that changes another key, is not the write.
+    """
+    if not entries:
+        return None
+    entry = entries[0]
+    commit = (entry.get("commitMeta") or {}).get("hash")
+    operations = entry.get("operations") or []
+    if not isinstance(commit, str) or entry.get("parentCommitHash") != checked or not operations:
+        return None
+    for operation in operations:
+        if operation.get("type") != "PUT" or tuple((operation.get("key") or {}).get("elements") or ()) not in allowed:
+            return None
+    return commit
+
+
+def catalog_conf(name: str, *, nessie_uri: str, warehouse: str, region: str, branch: str, at: str | None) -> dict[str, str]:
+    """The Spark settings of the catalog ``name`` on ``branch``. With ``at`` it is pinned to that hash and so read-only; without it, it is the branch."""
+    if at is not None and HASH.fullmatch(at) is None:
+        raise PatientSplitError("catalog_hash: the hash is not a Nessie hash")
+    options = catalog_options(nessie_uri=nessie_uri, warehouse=warehouse, ref=branch, region=region)
+    conf = {key.replace(f"spark.sql.catalog.{CATALOG}", f"spark.sql.catalog.{name}", 1): value for key, value in options.items()}
+    if at is not None:
+        conf[f"spark.sql.catalog.{name}.ref.hash"] = at
+    return conf

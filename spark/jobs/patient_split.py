@@ -9,9 +9,11 @@ reads ``bronze.clinical_cases``, gives each distinct ``subjectid`` its set from 
 from. It never writes to the base: the merge is the caller's step after its checks. ``verify`` runs the same checks on the table that a branch holds and
 writes nothing.
 
-The branch is resolved to one hash. Every read and check is at that hash (a read-only catalog pinned to it), the write is made only while the branch still
-has it, the table is read again at the hash of the write, and the job ends with ``branch_moved`` when the branch no longer has the hash that it checked.
-The result names that hash.
+The branch is resolved to one hash. Every read and check is at that hash (a read-only catalog pinned to it) and the write is made only while the branch
+still has it. The hash of the write is taken from the branch's log: the head, one commit directly on the checked hash, changing only the table (a new
+table's namespace is its own earlier commit). The table is read again at that hash, and the job ends with ``branch_moved`` when the branch no longer has
+the hash that it checked.
+The result names that hash, the hash of the write and nothing derived from the rows.
 
 The table is frozen. When the branch already holds the table (merged earlier), that table must be valid by itself (rows, no patient twice, one rule
 version) and a rebuild that would change a set, drop a patient or use another rule version fails before it writes. A rebuild that changes nothing writes
@@ -19,7 +21,8 @@ nothing. ``--pinned-release`` is the full cohort: it requires the shares of 70, 
 refuses a new patient. ``--fixed-sample`` takes the complete tracked candidate file, refuses any other, and requires every case of it in Bronze in the
 set that its slot expects. The result names the checks that ran.
 
-The test set is sealed: a message or the result holds codes, counts, hashes and a digest, and never a patient, a case or a set beside one.
+The test set is sealed: a message or the result holds codes, counts and hashes, and never a patient, a case or a set beside one.
+The command line prints fixed codes only (``usage``, ``branch_missing``, ``catalog_error``, ``settings``) and the codes of a failed check.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
 """
@@ -27,18 +30,18 @@ Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AW
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
 import sys
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
+from scripts.stack.nessie import NessieClient
 from spark.session import build_session, required_environment, start_deadline
-from spark.settings import CATALOG, SettingsError, catalog_options
+from spark.settings import CATALOG
+from spark.split_cli import run
 from spark.split_table import (
+    BRANCH_MOVED,
     COLUMNS,
     SOURCE_COLUMNS,
     Operations,
@@ -46,6 +49,7 @@ from spark.split_table import (
     Source,
     SplitRow,
     TableState,
+    catalog_conf,
     read_fixed_sample,
     run_build,
     run_verify,
@@ -54,48 +58,58 @@ from spark.split_table import (
     unit,
     values_query,
 )
+from spark.split_table import write_commit as write_commit_of
 
 JOB = "patient_split"
 SOURCE_NAME = "bronze.clinical_cases"
 TARGET_NAMESPACE = "silver"
 TARGET_NAME = f"{TARGET_NAMESPACE}.patient_split"
+TABLE_KEY = (TARGET_NAMESPACE, "patient_split")
 WRITE_CATALOG = CATALOG
-RESULT_PREFIX = "RESULT "
-HASH = re.compile(r"[0-9a-f]{64}")
 DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
 DEFAULT_JOB_DEADLINE_SECONDS = 900.0
 
 
 class Lake:
     """The Spark steps of a build, on one branch. A read is made through a catalog that is pinned to a hash and cannot write; the write goes through the
-    catalog of the branch itself."""
+    catalog of the branch itself. ``settings`` holds ``nessie_uri``, ``warehouse`` and ``region``."""
 
-    def __init__(self, session: Any, client: NessieClient, branch: str) -> None:
+    def __init__(self, session: Any, client: NessieClient, branch: str, settings: dict[str, str]) -> None:
         self.session = session
         self.client = client
         self.branch = branch
+        self.settings = settings
         self.pinned: set[str] = set()
 
     def catalog(self, at: str) -> str:
         """The name of a read-only catalog on the branch at the hash ``at``, registered on first use."""
-        if HASH.fullmatch(at) is None:
-            raise NessieError("a hash that is not a Nessie hash was given to a read")
         name = f"pin_{at[:20]}"
         if name not in self.pinned:
-            options = catalog_options(
-                nessie_uri=required_environment("NESSIE_URI"),
-                warehouse=required_environment("WAREHOUSE_LOCATION"),
-                ref=self.branch,
-                region=os.environ.get("AWS_REGION", ""),
-            )
-            for key, value in options.items():
-                self.session.conf.set(key.replace(f"spark.sql.catalog.{WRITE_CATALOG}", f"spark.sql.catalog.{name}", 1), value)
-            self.session.conf.set(f"spark.sql.catalog.{name}.ref.hash", at)
+            for key, value in catalog_conf(name, branch=self.branch, at=at, **self.settings).items():
+                self.session.conf.set(key, value)
             self.pinned.add(name)
         return name
 
     def head(self) -> str:
         return self.client.reference(self.branch).hash
+
+    def write_commit(self, checked: str, allowed: tuple[tuple[str, ...], ...]) -> str | None:
+        """The hash of the commit that the last write made, from the branch's log: the head, one commit directly on ``checked``, changing only ``allowed``."""
+        log = self.client.request("GET", f"/trees/{quote(self.branch, safe='')}/history", query={"fetch": "ALL", "max-records": "2"}) or {}
+        return write_commit_of(log.get("logEntries", []), checked, allowed)
+
+    def prepare(self, base: str) -> str:
+        """Create the namespace of the table when the branch has none, as a commit of its own on ``base``, and return the hash to check from."""
+        if self.client.has_namespace(self.branch, TARGET_NAMESPACE):
+            return base
+        self.session.sql(f"CREATE NAMESPACE IF NOT EXISTS {WRITE_CATALOG}.{TARGET_NAMESPACE}")
+        made = self.write_commit(base, ((TARGET_NAMESPACE,),))
+        if made is None:
+            raise PatientSplitError(BRANCH_MOVED)
+        return made
+
+    def write_hash(self, checked: str) -> str | None:
+        return self.write_commit(checked, (TABLE_KEY,))
 
     def snapshot_id(self, table: str) -> int | None:
         snapshot = self.session._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(self.session._jsparkSession, table).currentSnapshot()
@@ -130,40 +144,22 @@ class Lake:
         return TableState(rows, self.snapshot_id(table))
 
     def write(self, rows: Sequence[SplitRow], *, exists: bool) -> None:
-        """Write the rows as the whole table: create it, or overwrite all of the rows of the table that exists.
+        """Write the rows as the whole table, as one commit: create it, or overwrite all of the rows of the table that exists.
 
         A replace of a table that exists stalls in Spark with the Nessie catalog (it did for minutes, and for good in some runs), so an existing table is
         overwritten in place. One partition gives one data file for a table of a few thousand rows. The overwrite of an unpartitioned table replaces every
-        row, and the read-back check of the build proves it.
+        row, and the read-back check of the build proves it. The rows reach Spark as one ``VALUES`` text, built in the JVM, after each value was checked.
         """
         frame = self.session.sql(values_query(rows)).toDF(*(name for name, _ in COLUMNS)).coalesce(1)
         table = f"{WRITE_CATALOG}.{TARGET_NAME}"
         if exists:
             frame.writeTo(table).overwritePartitions()
             return
-        self.session.sql(f"CREATE NAMESPACE IF NOT EXISTS {WRITE_CATALOG}.{TARGET_NAMESPACE}")
         frame.writeTo(table).tableProperty("format-version", "2").create()
 
 
-def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog=f"python -m spark.jobs.{JOB}", description="Build or verify the patient split table on a private Nessie branch.")
-    modes = command.add_subparsers(dest="mode", required=True)
-    for name, text in (("build", "create the branch from the base and write the table on it"), ("verify", "check the table that the branch holds")):
-        mode = modes.add_parser(name, help=text)
-        mode.add_argument("--branch", required=True, help="the private branch" + (" to create" if name == "build" else " to check"))
-        mode.add_argument("--pinned-release", action="store_true", help="the full cohort: require the shares and the exact counts and refuse a new patient")
-        mode.add_argument("--fixed-sample", type=Path, help="the complete tracked candidate file of the fixed sample, to check each case's set")
-        if name == "build":
-            mode.add_argument("--base", default="main", help="the branch to create the private branch from")
-    return command
-
-
-def report(message: str) -> None:
-    sys.stderr.write(f"{JOB}: {message}\n")
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    arguments = parser().parse_args(argv)
+def execute(arguments: argparse.Namespace) -> dict[str, Any]:
+    """Run one call: create the branch (build) or find it (verify), resolve its hash once and check or build the table at that hash."""
     session = None
     try:
         start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
@@ -171,38 +167,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
         client.config()
         building = arguments.mode == "build"
-        head = client.create_branch(arguments.branch, arguments.base).hash if building else client.reference(arguments.branch).hash
+        base = client.create_branch(arguments.branch, arguments.base).hash if building else client.reference(arguments.branch).hash
         session = build_session(JOB, arguments.branch)
-        lake = Lake(session, client, arguments.branch)
-        operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write)
+        settings = {
+            "nessie_uri": required_environment("NESSIE_URI"),
+            "warehouse": required_environment("WAREHOUSE_LOCATION"),
+            "region": os.environ.get("AWS_REGION", ""),
+        }
+        lake = Lake(session, client, arguments.branch, settings)
+        operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash)
+        head = lake.prepare(base) if building else base
         outcome = (run_build if building else run_verify)(operations, head, pinned=arguments.pinned_release, sample=sample)
-        result = {
+        return {
             "mode": arguments.mode,
             "branch": arguments.branch,
-            "base_hash": head if building else None,
+            "base_hash": base if building else None,
             "pinned_release": arguments.pinned_release,
             "table": TARGET_NAME,
             "source_table": SOURCE_NAME,
             **outcome.facts(),
         }
-    except PatientSplitError as error:
-        for problem in error.problems:
-            report(problem)
-        return 1
-    except NessieConflict as error:
-        report(f"Nessie refused the branch {arguments.branch}: {error}")
-        return 1
-    except NessieError as error:
-        report(f"cannot work with Nessie: {error}")
-        return 1
-    except SettingsError as error:
-        report(str(error))
-        return 2
     finally:
         if session is not None:
             session.stop()
-    sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
-    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    return run(argv, execute)
 
 
 if __name__ == "__main__":

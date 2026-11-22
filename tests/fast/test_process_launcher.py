@@ -17,6 +17,7 @@ Each case runs a real shell that starts a ``sleep`` of its own and records both 
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import signal
 import subprocess
@@ -45,6 +46,8 @@ class LauncherTest(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.pids = Path(folder.name) / "pids"
         self.addCleanup(self.kill_leftovers)
+        # A program that the launcher never reaped warns when it is collected: collect here, not inside a later test's captured error output.
+        self.addCleanup(gc.collect)
 
     def kill_leftovers(self) -> None:
         for pid in self.started():

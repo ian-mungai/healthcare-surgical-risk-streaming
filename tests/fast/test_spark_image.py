@@ -89,6 +89,7 @@ class ImageTest(unittest.TestCase):
         roots = [value for line in lines() if line.startswith("ENV ") for value in re.findall(r"PYTHONPATH=(\S+)", line)]
         self.assertEqual(1, len(roots))
         root = roots[0].split(":")[0]
+        self.assertEqual(f"{root}/spark", copies.get("spark"), "the Spark package is copied to the import root")
         needed: dict[str, set[str]] = {}
         for job in sorted((ROOT / "spark").rglob("*.py")):
             for node in ast.walk(ast.parse(job.read_text())):
