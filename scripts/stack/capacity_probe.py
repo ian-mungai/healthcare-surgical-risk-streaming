@@ -9,8 +9,8 @@ the job's catalog address and the address of its cleanup are one Nessie (resolve
 2. counts each required service's restarts and kills for memory, and checks that the catalog answers,
 3. asks the admission check for the batch group and starts the Spark job as a detached container with a scratch volume of its own,
 4. loops: read the Spark container's state, read its cgroup, take one sample (host figures and every container's memory), read the events with
-   ``docker events --since <cursor> --until <now>`` (the end is in the past, so the command returns at once, and the cursor moves only after a command that
-   succeeded), then wait out the rest of the interval. The loop ends after the Spark container has exited and one more iteration has run,
+   ``docker events --since <cursor less a few seconds> --until <now>`` (the end is in the past, so the command returns at once, and the cursor moves only
+   after a command that succeeded), then wait out the rest of the interval. The loop ends after the Spark container has exited and one more iteration has run,
 5. reads each required service's cgroup, restarts and state,
 6. removes the job container, then its scratch volume, then its Nessie branch, and verifies each is gone, and
 7. judges the evidence (``scripts.stack.probe_record``) and writes ``capacity_probe.json`` into a new folder under ``runs/capacity_probe/``.
@@ -92,6 +92,7 @@ CLEANUP_SECONDS = 60.0
 EVENTS_SECONDS = 15.0
 COMPOSE_RUN_SECONDS = 120.0
 SLEEP_SLICE_SECONDS = 0.2
+EVENT_OVERLAP_NS = 5 * NANOSECONDS
 NOT_FOUND = 404
 RESULT_PREFIX = "RESULT "
 INTERRUPTED_EXIT = 130
@@ -224,11 +225,15 @@ class Monitor:
         self.run_start_ns = self.cursor_ns = self.clock_ns()
 
     def advance_events(self) -> None:
-        """Read the events from the cursor to now. The cursor moves only to the end of a command that succeeded."""
+        """Read the events from the cursor to now. The cursor moves only to the end of a command that succeeded.
+
+        Docker can publish an event a moment after its own time stamp. A command that starts exactly at the cursor would never see such an event, so each
+        command asks from ``EVENT_OVERLAP_NS`` before the cursor (never before the run started) and an event seen twice is kept once. The windows still chain.
+        """
         until = self.clock_ns()
         if until <= self.cursor_ns:
             return
-        found = self.docker.events(self.project, self.cursor_ns, until, seconds=EVENTS_SECONDS)
+        found = self.docker.events(self.project, max(self.run_start_ns, self.cursor_ns - EVENT_OVERLAP_NS), until, seconds=EVENTS_SECONDS)
         for event in found:
             key = (event.nano, event.action, event.name)
             if key not in self.seen:

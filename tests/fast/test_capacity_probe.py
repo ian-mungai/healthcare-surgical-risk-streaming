@@ -21,6 +21,7 @@ from unittest import mock
 
 from scripts.process import CompletedProcess, run_command
 from scripts.stack.capacity_probe import (
+    EVENT_OVERLAP_NS,
     Budget,
     Monitor,
     Options,
@@ -283,8 +284,8 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual([(start, first_end)], loop.windows)
         clock.now += 1
         loop.tick()
-        self.assertEqual(first_end, docker.windows[-1][0], "the next window starts where the last good one ended")
-        self.assertEqual(2, len(loop.windows))
+        self.assertEqual(start, docker.windows[-1][0], "the command asks from the start of the run, because the overlap reaches back before it")
+        self.assertEqual([(start, first_end), (first_end, loop.cursor_ns)], loop.windows, "the recorded windows chain with no overlap")
 
     def test_the_events_of_two_windows_that_share_a_boundary_are_kept_once(self) -> None:
         clock = Clock()
@@ -296,6 +297,21 @@ class MonitorTest(unittest.TestCase):
             clock.now += 1
             loop.tick()
         self.assertEqual(["die", "oom"], [event.action for event in loop.events])
+
+    def test_each_command_asks_from_a_few_seconds_before_the_cursor_so_that_an_event_published_late_is_not_lost(self) -> None:
+        clock = Clock()
+        late = ContainerEvent(clock.ns() + 4_000_000_000, "kill", "postgres", "p-postgres-1", "signal 9")
+        docker = FakeDocker(clock, [running()], answers=[[], [late]])
+        loop = monitor(clock, docker)
+        loop.begin()
+        clock.now += 20
+        loop.tick()
+        first_end = loop.cursor_ns
+        clock.now += 20
+        loop.tick()
+        self.assertEqual(first_end - EVENT_OVERLAP_NS, docker.windows[1][0])
+        self.assertEqual(["kill"], [event.action for event in loop.events])
+        self.assertEqual([(loop.run_start_ns, first_end), (first_end, loop.cursor_ns)], loop.windows)
 
     def test_a_cursor_that_has_not_moved_reads_no_window(self) -> None:
         clock = Clock()
