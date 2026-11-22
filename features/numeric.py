@@ -13,8 +13,9 @@ from features.validate import boolean, number, whole_microseconds
 def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, per_second: bool) -> NumericWindow:
     """The valid readings of the window, oldest first, with their values as floats. A reading after the cutoff is never read.
 
-    A source-time track has ``cutoff - 15 minutes < time <= cutoff``. The per-second series has the newest 900 complete seconds (``complete_seconds``), each
-    reading at a whole second. Two readings of one track at one time are refused, and so is a reading with a time, a flag or a value of the wrong type.
+    A source-time track has ``cutoff - 15 minutes < time <= cutoff`` and keeps its published times. The per-second series has the newest 900 complete seconds
+    (``complete_seconds``), each reading at the start of a whole second, and its times in the window are the ends of those seconds. Two readings of one track
+    at one time are refused, and so is a reading with a time, a flag or a value of the wrong type.
     """
     whole_microseconds(cutoff_us, "the cutoff")
     for reading in readings:
@@ -38,7 +39,8 @@ def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, per
         if reading.valid and not math.isfinite(reading.value):
             raise FeatureInputError(f"{track}: a valid reading is not a finite number")
     valid = [reading for reading in inside if reading.valid]
-    return NumericWindow(cutoff_us, [reading.time_us for reading in valid], [float(reading.value) for reading in valid])
+    known = SECOND if per_second else 0
+    return NumericWindow(cutoff_us, [reading.time_us + known for reading in valid], [float(reading.value) for reading in valid])
 
 
 def numeric_group(track: str, readings: Sequence[Reading], cutoff_us: int) -> GroupResult:

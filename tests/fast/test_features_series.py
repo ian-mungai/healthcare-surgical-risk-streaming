@@ -46,15 +46,15 @@ class KnownAnswers(unittest.TestCase):
         self.assertEqual(1.0, result[PREFIX + "coverage"])
         self.assertAlmostEqual(199 / 60, get(result, "minutes_below_65"), places=9)
         self.assertAlmostEqual(99 / 60, get(result, "minutes_below_60"), places=9)
-        self.assertEqual(1.0, result[PREFIX + "seconds_since_below_65"])  # the newest complete second starts one second before the cutoff
+        self.assertEqual(0.0, result[PREFIX + "seconds_since_below_65"])  # the newest complete second ends at the whole-second cutoff
         self.assertAlmostEqual(55.05 + 5 * -3.0, get(result, "projection_5min"), places=9)
 
     def test_a_second_equal_to_a_limit_is_not_below_it_and_the_time_since_the_last_low_second_counts_back_from_the_cutoff(self) -> None:
-        # The first 300 seconds are 60 (below 65, not below 60), the other 600 are 70. The last low second starts 601 s before the cutoff.
+        # The first 300 seconds are 60 (below 65, not below 60), the other 600 are 70. The last low second ends 600 s before the cutoff.
         result = values_of(series_window([60.0] * 300 + [70.0] * 600))
         self.assertEqual(5.0, result[PREFIX + "minutes_below_65"])
         self.assertEqual(0.0, result[PREFIX + "minutes_below_60"])
-        self.assertEqual(601.0, result[PREFIX + "seconds_since_below_65"])
+        self.assertEqual(600.0, result[PREFIX + "seconds_since_below_65"])
 
     def test_no_second_below_65_leaves_the_time_since_missing_and_the_minutes_zero(self) -> None:
         result = values_of(series_window([80.0] * 900))
@@ -83,10 +83,18 @@ class Window(unittest.TestCase):
                 group = numeric_group(SERIES, readings, cutoff)
                 self.assertEqual(900, group.values[PREFIX + "valid_count"])
                 self.assertEqual(1.0, group.values[PREFIX + "coverage"])
-                self.assertEqual(newest * SECOND, group.latest_us)
-                self.assertLess(group.latest_us or 0, cutoff)
+                self.assertEqual((newest + 1) * SECOND, group.latest_us)  # the end of the newest second, never after the cutoff
+                self.assertLessEqual(group.latest_us or 0, cutoff)
                 # The value of the newest second is last + 5 * slope; with value = second - first the slope is 60 per minute.
                 self.assertAlmostEqual(newest - (k - 1000) + 5 * 60.0, get(group.values, "projection_5min"), places=6)
+
+    def test_the_time_since_the_last_low_second_counts_from_the_end_of_that_second(self) -> None:
+        k = 3600
+        readings = [Reading(second * SECOND, 50.0, True) for second in range(k - 1000, k + 5)]
+        cases = ((k * SECOND - 1, 0.999999), (k * SECOND, 0.0), (k * SECOND + 1, 1e-06), (k * SECOND + 999_999, 0.999999), ((k + 1) * SECOND, 0.0))
+        for cutoff, expected in cases:
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(expected, numeric_group(SERIES, readings, cutoff).values[PREFIX + "seconds_since_below_65"])
 
     def test_a_second_that_is_not_complete_at_the_cutoff_is_not_used(self) -> None:
         base = series_window(arithmetic(100.0, -0.05))
@@ -94,7 +102,7 @@ class Window(unittest.TestCase):
         later = Reading(CUTOFF_US + 100 * SECOND, 500.0, True)
         before = Reading(CUTOFF_US - 901 * SECOND, 0.0, True)
         self.assertEqual(values_of(base), values_of([before, *base, in_progress, later]))
-        self.assertEqual(CUTOFF_US - SECOND, numeric_group(SERIES, [*base, in_progress, later], CUTOFF_US).latest_us)
+        self.assertEqual(CUTOFF_US, numeric_group(SERIES, [*base, in_progress, later], CUTOFF_US).latest_us)
 
     def test_the_first_and_the_last_second_of_the_window_are_used_and_the_neighbours_outside_are_not(self) -> None:
         oldest, newest = CUTOFF_US // SECOND - 900, CUTOFF_US // SECOND - 1
@@ -119,7 +127,7 @@ class Validity(unittest.TestCase):
         result = values_of(series_window([60.0] * 900, valid=lambda index: index < 20))
         self.assertEqual(20, result[PREFIX + "valid_count"])
         self.assertAlmostEqual(20 / 60, get(result, "minutes_below_65"), places=12)
-        self.assertEqual(881.0, result[PREFIX + "seconds_since_below_65"])
+        self.assertEqual(880.0, result[PREFIX + "seconds_since_below_65"])
 
     def test_one_valid_second_has_no_projection_and_every_other_value(self) -> None:
         result = values_of(series_window([72.0, 60.0], valid=lambda index: index == 1))

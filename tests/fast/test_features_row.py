@@ -11,7 +11,9 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import math
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -200,6 +202,26 @@ class Row(unittest.TestCase):
         self.assertEqual(12.1, row.values["preop_hb"])
         self.assertEqual(0, row.values["solar8000_etco2__valid_count"])
         self.assertEqual([], row_problems(row))
+
+    def test_a_value_of_not_a_number_or_infinity_in_an_invalid_reading_or_second_never_changes_any_output(self) -> None:
+        def window(junk: float) -> WindowInput:
+            def readings(build: Callable[..., list[Reading]]) -> list[Reading]:
+                return [Reading(r.time_us, r.value if r.valid else junk, r.valid) for r in build(arithmetic(100.0, -0.05), valid=lambda index: index % 7 != 0)]
+
+            wave = waveform_window(alternating, invalid=frozenset({2, 9}))
+            seconds = tuple(WaveformSecond(s.second, s.samples if s.valid else (junk,) * len(s.samples), s.valid) for s in wave.seconds)
+            return WindowInput(
+                CUTOFF_US,
+                {ARTERIAL_MEAN: readings(numeric_window), SERIES: readings(series_window)},
+                {"SNUADC/ART": WaveformWindow(wave.sample_rate, seconds)},
+                {},
+            )
+
+        reference = build_row(window(5000.0))
+        self.assertEqual(18, reference.values["snuadc_art__valid_seconds"])
+        for junk in (math.nan, math.inf, -math.inf):
+            with self.subTest(junk=junk):
+                self.assertEqual(repr(reference), repr(build_row(window(junk))))
 
     def test_a_track_in_the_map_of_another_input_kind_or_unknown_is_refused_with_its_name(self) -> None:
         wave = waveform_window(alternating)

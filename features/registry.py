@@ -11,11 +11,15 @@ Every track name and unit is ``to_confirm`` until its status says ``confirmed`` 
 
 **Seconds and windows.** A second ``s`` is a block that covers ``[s, s + 1)`` seconds of case time and starts exactly at ``s * 1_000_000``
 microseconds. A waveform block holds exactly ``rate`` samples at ``i / rate`` seconds after its start, and the rate is a positive whole number. A reading of
-the per-second series is at the start of its second. A second is complete at a cutoff when ``(s + 1) * 1_000_000 <= cutoff``. The window of the waveform
-(20 seconds), of the per-second series (900 seconds) and of the sample eligibility limits is the newest ``n`` complete seconds, from ``complete_seconds``: no
-sample of the second that a fractional cutoff falls in is used. A source-time track keeps its published times: its window is
-``cutoff - 15 minutes < time <= cutoff``. The latest reading time of a waveform is the time of the last sample of its newest valid second,
-``s * 1_000_000 + round((rate - 1) * 1_000_000 / rate)``, and never the cutoff.
+the per-second series is given at the start of its second, and its value is known at the end of that second: its time is ``(s + 1) * 1_000_000``. A second is
+complete at a cutoff when ``(s + 1) * 1_000_000 <= cutoff``. The window of the waveform (20 seconds), of the per-second series (900 seconds) and of the sample
+eligibility limits is the newest ``n`` complete seconds, from ``complete_seconds``: no sample of the second that a fractional cutoff falls in is used. A
+source-time track keeps its published times: its window is ``cutoff - 15 minutes < time <= cutoff``. The latest reading time of a waveform is the time of the
+last sample of its newest valid second, ``s * 1_000_000 + round((rate - 1) * 1_000_000 / rate)``, and never the cutoff. The latest reading time of the
+per-second series is the end of its newest valid second, which can equal the cutoff and is never after it, and the time since a low second is counted from the
+end of that second.
+
+A reading or a second flagged invalid may hold any number, a non-finite one included, and its value is never used: it changes no feature and no latest time.
 """
 
 from __future__ import annotations
@@ -208,7 +212,7 @@ SERIES_STATS: tuple[NumericStat, ...] = (
         "seconds_since_below_65",
         "seconds",
         f"{MISSING_NO_VALUE}; missing when no valid second in the window is below 65 mmHg",
-        "the cutoff minus the time of the latest valid second strictly below 65 mmHg",
+        "the cutoff minus the end time of the newest valid second strictly below 65 mmHg, in seconds",
         lambda w: seconds_since_below(w, LOW_PRESSURE_65),
     ),
     NumericStat(
