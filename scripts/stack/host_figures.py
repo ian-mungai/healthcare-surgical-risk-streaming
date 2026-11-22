@@ -15,6 +15,7 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 KIB_PER_MIB = 1024
@@ -22,8 +23,14 @@ BYTES_PER_MIB = 1024 * 1024
 SECTOR_BYTES = 512
 CPU_FIELDS_NEEDED = 8
 DISKSTATS_FIELDS_NEEDED = 10
-SIZE_UNITS_MIB = {"B": 1 / BYTES_PER_MIB, "KiB": 1 / 1024, "MiB": 1.0, "GiB": 1024.0, "TiB": 1024.0 * 1024.0}
+MIN_CPU_SECONDS = 1.0
+CPU_BUSY_FIELDS = (0, 1, 2, 5, 6, 7)
+CPU_IDLE_FIELDS = (3, 4)
+SIZE_UNITS_BYTES = {"B": 1, "KiB": 1024, "MiB": BYTES_PER_MIB, "GiB": 1024**3, "TiB": 1024**4}
 SIZE_TEXT = re.compile(r"(\d+(?:\.\d+)?)(B|KiB|MiB|GiB|TiB)")
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+PROC_ROOT = Path("/proc")
+CGROUP_LINE = re.compile(r"^0::(/\S*)$", re.MULTILINE)
 CPU_LINE = re.compile(r"^(cpu\d*)\s+(.*)$", re.MULTILINE)
 PS_LINE = re.compile(r"([0-9a-f]{12})\|([A-Za-z0-9_.-]+)")
 STATS_LINE = re.compile(r"([0-9a-f]{12})\|(\S+) / (\S+)")
@@ -59,8 +66,9 @@ class Memory:
 
 @dataclass(frozen=True)
 class CpuTimes:
-    busy: int
-    total: int
+    """The first eight counters of a ``cpu`` line in clock ticks: user, nice, system, idle, iowait, irq, softirq and steal."""
+
+    counts: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -96,22 +104,22 @@ def parse_cpu_times(text: str) -> dict[str, CpuTimes]:
         fields = rest.split()
         if len(fields) < CPU_FIELDS_NEEDED or not all(field.isascii() and field.isdigit() for field in fields):
             raise FiguresError(f"the CPU report line {name} holds fewer than {CPU_FIELDS_NEEDED} whole numbers")
-        counts = [int(field) for field in fields[:CPU_FIELDS_NEEDED]]
-        total = sum(counts)
-        found[name] = CpuTimes(total - counts[3] - counts[4], total)
+        found[name] = CpuTimes(tuple(int(field) for field in fields[:CPU_FIELDS_NEEDED]))
     if "cpu" not in found:
         raise FiguresError("the CPU report holds no cpu line")
     return found
 
 
-def cpu_percent(before: CpuTimes, after: CpuTimes) -> float:
-    """The busy share in percent of the ticks between two readings of one line."""
-    total, busy = after.total - before.total, after.busy - before.busy
-    if total < 0 or busy < 0:
-        raise FiguresError("a CPU counter went back between two readings")
-    if total == 0:
-        raise FiguresError("no CPU time passed between two readings")
-    return round(100.0 * busy / total, 1)
+def cpu_percent(before: CpuTimes, after: CpuTimes) -> float | None:
+    """The busy share in percent of the ticks between two readings of one line, or None when no tick passed.
+
+    Each counter's change counts from zero upward, so a counter that went back (``iowait`` can) adds nothing and the share stays from 0 to 100.
+    """
+    changes = [max(0, later - earlier) for earlier, later in zip(before.counts, after.counts, strict=True)]
+    busy, idle = sum(changes[index] for index in CPU_BUSY_FIELDS), sum(changes[index] for index in CPU_IDLE_FIELDS)
+    if busy + idle == 0:
+        return None
+    return round(100.0 * busy / (busy + idle), 1)
 
 
 def parse_diskstats(text: str, major: int, minor: int) -> DiskCounters:
@@ -143,16 +151,16 @@ def free_disk_mib(path: Path) -> float:
     return round(stat.f_bavail * stat.f_frsize / BYTES_PER_MIB, 1)
 
 
-def parse_size_mib(text: str) -> float:
-    """A memory size as Docker prints it (``312.4MiB``) in MiB, to one decimal. Another unit or text is refused."""
+def parse_size_bytes(text: str) -> int:
+    """A memory size as Docker prints it (``64.04MiB``) in whole bytes, from the printed figure. Another unit or text is refused."""
     match = SIZE_TEXT.fullmatch(text)
     if match is None:
         raise FiguresError(f"{text[:24]!r} is not a memory size in B, KiB, MiB, GiB or TiB")
-    return round(float(match.group(1)) * SIZE_UNITS_MIB[match.group(2)], 1)
+    return round(Decimal(match.group(1)) * SIZE_UNITS_BYTES[match.group(2)])
 
 
-def parse_container_memory(listing: str, statistics: str) -> dict[str, float]:
-    """The memory in use in MiB of each Compose service of the project.
+def parse_container_usage(listing: str, statistics: str) -> dict[str, int]:
+    """The memory in use in bytes of each Compose service of the project, as Docker prints it.
 
     ``listing`` has one ``<id>|<service>`` line for each container of the project (``docker ps``). ``statistics`` has one ``<id>|<used> / <limit>`` line for
     each container that runs (``docker stats``). A container of another project has no line in the listing and is left out. A container in the listing
@@ -164,15 +172,62 @@ def parse_container_memory(listing: str, statistics: str) -> dict[str, float]:
         if match is None:
             raise FiguresError(f"docker ps line {number} is not in the form <container>|<service>")
         services[match.group(1)] = match.group(2)
-    used: dict[str, float] = {}
+    used: dict[str, int] = {}
     for number, line in enumerate(statistics.splitlines(), start=1):
         match = STATS_LINE.fullmatch(line.strip())
         if match is None:
             raise FiguresError(f"docker stats line {number} is not in the form <container>|<used> / <limit>")
         service = services.get(match.group(1))
         if service is not None:
-            used[service] = used.get(service, 0.0) + parse_size_mib(match.group(2))
-    return {name: round(value, 1) for name, value in sorted(used.items())}
+            used[service] = used.get(service, 0) + parse_size_bytes(match.group(2))
+    return dict(sorted(used.items()))
+
+
+@dataclass(frozen=True)
+class CgroupMemory:
+    """One container's memory counters from its cgroup (version 2): the peak and the cap in bytes, the kills for memory and the times the cap was hit."""
+
+    peak_bytes: int
+    max_bytes: int | None
+    oom_kills: int
+    max_events: int
+
+
+def parse_cgroup_path(text: str) -> str:
+    """The cgroup (version 2) path of a process, from its ``/proc/<pid>/cgroup`` text. Another form, or a path with ``..``, is refused."""
+    match = CGROUP_LINE.search(text)
+    if match is None or ".." in match.group(1).split("/"):
+        raise FiguresError("the process has no cgroup version 2 path")
+    return match.group(1)
+
+
+def parse_memory_events(text: str) -> dict[str, int]:
+    """The counters of a cgroup's ``memory.events`` file."""
+    found: dict[str, int] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isascii() and parts[1].isdigit():
+            found[parts[0]] = int(parts[1])
+    for name in ("oom_kill", "max"):
+        if name not in found:
+            raise FiguresError(f"the cgroup's memory.events holds no {name} counter")
+    return found
+
+
+def whole_bytes(text: str, label: str) -> int:
+    value = text.strip()
+    if not value.isascii() or not value.isdigit():
+        raise FiguresError(f"the cgroup's {label} is not a whole number")
+    return int(value)
+
+
+def read_cgroup_memory(pid: int, *, proc_root: Path = PROC_ROOT, cgroup_root: Path = CGROUP_ROOT) -> CgroupMemory:
+    """The memory counters of the cgroup that holds the process ``pid``. A file that cannot be read, such as ``memory.peak`` on an old kernel, is named."""
+    folder = cgroup_root / parse_cgroup_path(read_source(proc_root / str(pid) / "cgroup", "cgroup path")).lstrip("/")
+    peak = whole_bytes(read_source(folder / "memory.peak", "memory.peak"), "memory.peak")
+    limit = read_source(folder / "memory.max", "memory.max").strip()
+    events = parse_memory_events(read_source(folder / "memory.events", "memory.events"))
+    return CgroupMemory(peak, None if limit == "max" else whole_bytes(limit, "memory.max"), events["oom_kill"], events["max"])
 
 
 @dataclass(frozen=True)
@@ -199,9 +254,10 @@ class HostReading:
 class HostFigures:
     memory_used_mib: float
     memory_available_mib: float
+    memory_available_kib: int
     swap_used_mib: float
-    cpu_percent: float
-    cpu_core_percent: tuple[float, ...]
+    cpu_percent: float | None
+    cpu_core_percent: tuple[float | None, ...]
     disk_read_mib_s: float
     disk_write_mib_s: float
     free_disk_mib: float
@@ -235,14 +291,16 @@ def host_figures(before: HostReading, after: HostReading) -> HostFigures:
     cores = core_names(after)
     if cores != core_names(before):
         raise FiguresError("the number of cores changed between two readings")
-    percent = cpu_percent(before.cpu["cpu"], after.cpu["cpu"])
-    per_core = tuple(cpu_percent(before.cpu[name], after.cpu[name]) for name in cores)
+    long_enough = seconds >= MIN_CPU_SECONDS
+    percent = cpu_percent(before.cpu["cpu"], after.cpu["cpu"]) if long_enough else None
+    per_core = tuple(cpu_percent(before.cpu[name], after.cpu[name]) if long_enough else None for name in cores)
     read, written = after.disk.read_bytes - before.disk.read_bytes, after.disk.written_bytes - before.disk.written_bytes
     if read < 0 or written < 0:
         raise FiguresError("a disk counter went back between two readings")
     return HostFigures(
         round(after.memory.used_mib, 1),
         round(after.memory.available_mib, 1),
+        after.memory.available_kib,
         round(after.memory.swap_used_mib, 1),
         percent,
         per_core,

@@ -1,40 +1,45 @@
-"""The capacity probe: the always-on group and one Spark job run together while the host's figures are sampled, and the peaks are saved.
+"""The capacity probe: the always-on group and one Spark job run together while the host's figures are measured, and the evidence is saved.
 
-``.venv/bin/python -m scripts.stack.capacity_probe [--output-directory <folder>]`` runs on the Linux host. It
+``.venv/bin/python -m scripts.stack.capacity_probe [--output-directory <folder>]`` runs on the Linux host. Before it starts anything it checks that the output
+folder can take a new record and that no Spark container of the project exists. Then it
 
-1. reads the host's counters once (a host that cannot be read fails here, before anything starts),
-2. starts a sampler that reads, at a fixed interval and under a deadline, the memory in use and available, the swap in use, the CPU of each core, the disk read
-   and write rates and the free space of the data disk, and each Compose container's memory from Docker,
-3. starts the always-on group through the group command (``scripts.stack.groups``, with its admission check) in the phase ``startup``,
-4. asks the admission check for the batch group and runs the Spark job once, with a deadline, in the phase ``overlap``, and
-5. stops the sampler, judges the figures and writes ``capacity_probe.json`` into a new folder under ``runs/capacity_probe/``.
+1. reads the host's counters once (a host that cannot be read fails here),
+2. starts an event reader that follows the project's ``die``, ``oom``, ``kill`` and ``restart`` events in contiguous windows for the whole run,
+3. starts a sampler that reads, at a fixed interval, the memory in use and available, the swap in use, the CPU of each core, the disk read and write rates
+   and the free space of the data disk, and each container's memory from Docker,
+4. starts the always-on group through the group command (``scripts.stack.groups``, with its admission check) in the phase ``startup`` and counts each
+   required service's restarts,
+5. asks the admission check for the batch group, runs the Spark job once as a detached container with a deadline in the phase ``overlap``, takes a sample
+   the moment the container is seen running and reads its cgroup (``memory.peak``, ``memory.max``, ``memory.events``) about once a second until it exits,
+   then reads its state, its exit status, its out-of-memory flag and its output,
+6. reads each required service's cgroup, restarts and state, stops the sampler and the event reader and confirms that each stopped normally,
+7. removes the job container and the job's Nessie branch and verifies that each is gone, also after an error or an interrupt, and
+8. judges the evidence (``scripts.stack.probe_record``) and writes ``capacity_probe.json`` into a new folder under ``runs/capacity_probe/``.
 
-The record holds the peaks of the whole run and of each phase, whether the job completed, whether every container stayed within the limit of
-``compose/limits.yml`` and whether the host kept its reserve (the lowest available memory is at least ``host_reserve_mib``), and the whole series. A failure at
-any step, a sampling failure included, is written into the record and ends the command with exit status 1. The command writes nothing into the limits file:
-the owner reads the measured figures and decides about the reserve.
+The verdict is ``complete``, ``local_only``, ``not_measured`` or ``failed`` (see ``probe_record``). The command exits 0 for the first two only. One monotonic
+deadline for the whole run is cut into every wait and every Docker command. The command writes nothing into the limits file: the owner reads the measured
+figures and decides about the reserve.
 
-The Spark job is ``spark.jobs.catalog_proof`` with a fixed row count on a private Nessie branch of its own, which the command deletes afterwards. The group
-command starts a service with its image's entry point and no arguments, which this job cannot use, so the probe asks the group's admission check
-(``groups.admit``, the function ``start_group`` uses) and then runs the job as a one-off with the group's Compose profile and limits.
+The Spark job is ``spark.jobs.catalog_proof`` with a fixed row count on a private Nessie branch of its own. The group command starts a service with its image's
+entry point and no arguments, which this job cannot use, so the probe asks the group's admission check (``groups.admit``, the function ``start_group`` uses)
+and then runs the job with the group's Compose profile and limits.
 
-``--docker-figures-only`` is for a computer that is not the Linux host (the Docker figures are real and every host figure is marked as not measured). Its record
-never claims the host reserve. Stream lag is not measured: the stream path does not exist in this phase.
+``--docker-figures-only`` is for a computer that is not the Linux host: Docker's figures are real, every host figure is marked as not measured and the verdict
+is at best ``local_only``. Stream lag is not measured: the stream path does not exist in this phase.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import platform
 import secrets
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,87 +48,71 @@ from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ROOT
 from scripts.stack.admission import AdmissionError
 from scripts.stack.groups import GroupError, Settings, admit, compose_arguments, find_group, rendered_environment, settings_from_environment, start_group
-from scripts.stack.host_figures import FiguresError, HostFigures, HostReading, HostSources, host_figures, parse_container_memory, read_host
+from scripts.stack.host_figures import (
+    MIN_CPU_SECONDS,
+    FiguresError,
+    HostReading,
+    HostSources,
+    host_figures,
+    parse_container_usage,
+    read_cgroup_memory,
+    read_host,
+)
 from scripts.stack.limits import Limits, LimitsError, load_limits
 from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.probe_docker import DOCKER_SECONDS, NANOSECONDS, ContainerEvent, Docker, ProbeError, Runner, SamplingError
+from scripts.stack.probe_record import (
+    OVERLAP_PHASE,
+    PASSING_VERDICTS,
+    SPARK_SERVICE,
+    STARTUP_PHASE,
+    CleanupStep,
+    ContainerEvidence,
+    Execution,
+    JobOutcome,
+    Sample,
+    assess,
+    build_document,
+    check_destination,
+    validate_result,
+    write_document,
+)
 
-SCHEMA = 1
-RECORD_NAME = "capacity_probe.json"
 RUNS_FOLDER = ROOT / "runs" / "capacity_probe"
 ALWAYS_ON_GROUP = "supporting"
-SPARK_SERVICE = "spark"
-STARTUP_PHASE = "startup"
-OVERLAP_PHASE = "overlap"
 DEFAULT_INTERVAL_SECONDS = 5.0
 DEFAULT_START_DEADLINE_SECONDS = 300.0
 DEFAULT_JOB_DEADLINE_SECONDS = 1800.0
-DEFAULT_WAIT_SECONDS = 0.0
 DEFAULT_ROWS = 2_000_000
 DEFAULT_NESSIE_PORT = 19120
-SAMPLING_SLACK_SECONDS = 120.0
-DOCKER_SECONDS = 30.0
+RUN_SLACK_SECONDS = 120.0
 CLEANUP_SECONDS = 60.0
+WATCH_SECONDS = 1.0
+EVENTS_SLICE_SECONDS = 5.0
+COMPOSE_RUN_SECONDS = 120.0
 NOT_FOUND = 404
 RESULT_PREFIX = "RESULT "
-STREAM_LAG_NOTE = "not measured: the stream path does not exist in this phase; the live batch of the phase that builds it measures stream lag"
-VERDICT_COMPLETE = "complete"
-VERDICT_DOCKER_ONLY = "docker figures only"
-VERDICT_FAILED = "failed"
-PASSING_VERDICTS = frozenset({VERDICT_COMPLETE, VERDICT_DOCKER_ONLY})
+INTERRUPTED_EXIT = 130
+Pause = Callable[[float], None]
 
 
-class ProbeError(RuntimeError):
-    """A step of the probe failed. The message names the step and holds no text of a container."""
+class Budget:
+    """One monotonic deadline for the whole run. Every wait and every reading asks it for the time that is left."""
 
+    def __init__(self, total_seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self.total_seconds = total_seconds
+        self.clock = clock
+        self.started = clock()
 
-class SamplingError(ProbeError):
-    """The sampling failed or ran past its deadline."""
+    def remaining(self) -> float:
+        return self.total_seconds - (self.clock() - self.started)
 
-
-@dataclass(frozen=True)
-class Sample:
-    seconds: float
-    utc: str
-    phase: str
-    host: HostFigures | None
-    containers_mib: Mapping[str, float]
-
-
-@dataclass(frozen=True)
-class JobOutcome:
-    exit_code: int
-    oom_killed: bool
-    seconds: float
-    result: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
-class Steps:
-    """The three steps of a run, each of which raises ``ProbeError`` when it cannot be done."""
-
-    start_supporting: Callable[[], None]
-    admit_job: Callable[[], None]
-    run_job: Callable[[], JobOutcome]
-
-
-@dataclass(frozen=True)
-class Execution:
-    outcome: JobOutcome | None
-    failure: str
-    samples: Sequence[Sample]
-    error: SamplingError | None
-
-
-@dataclass(frozen=True)
-class Judgement:
-    containers_over: Mapping[str, tuple[float, int]]
-    containers_unlisted: tuple[str, ...]
-    reserve_kept: bool | None
-    lowest_available_mib: float | None
-
-    @property
-    def containers_within_limits(self) -> bool:
-        return not self.containers_over and not self.containers_unlisted
+    def limit(self, seconds: float) -> float:
+        """The shorter of ``seconds`` and the time that is left. A run with no time left raises ``ProbeError``."""
+        left = self.remaining()
+        if left <= 0:
+            raise ProbeError(f"the run's deadline of {self.total_seconds:g} seconds has passed")
+        return min(seconds, left)
 
 
 def collect(
@@ -134,21 +123,29 @@ def collect(
     deadline_seconds: float,
     stopped: Callable[[], bool],
     wait: Callable[[float], bool],
+    first_delay_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Append a sample every ``interval_seconds`` until ``stopped`` is true, and one more after the stop. ``wait`` returns true when the stop came during it.
+    """Append a sample every ``interval_seconds`` until ``stopped`` is true, and one more after the stop.
 
-    The time a sample takes is taken from the wait, so the interval stays fixed. A reading that fails raises ``SamplingError`` with the number of the sample.
-    The deadline passing raises ``SamplingError`` too. The samples taken stay in ``samples`` in both cases.
+    ``wait`` returns true when the stop came during it; any other return ends the wait early and the next sample is taken at once. The first sample follows a
+    wait of ``first_delay_seconds``. The time a sample takes is taken from the wait, so the interval stays fixed. A reading that fails raises ``SamplingError``
+    with the number of the sample. So does a sample that finishes after the deadline, which is not kept. The samples taken stay in ``samples``.
     """
     started = clock()
 
     def take_one() -> None:
         try:
-            samples.append(take())
+            sample = take()
         except (ProbeError, FiguresError) as error:
             raise SamplingError(f"sample {len(samples) + 1} failed: {error}") from error
+        if clock() - started > deadline_seconds:
+            raise SamplingError(f"the sampling deadline of {deadline_seconds:g} seconds passed after {len(samples)} samples")
+        samples.append(sample)
 
+    if first_delay_seconds > 0 and wait(first_delay_seconds):
+        take_one()
+        return
     while True:
         if clock() - started >= deadline_seconds:
             raise SamplingError(f"the sampling deadline of {deadline_seconds:g} seconds passed after {len(samples)} samples")
@@ -161,58 +158,184 @@ def collect(
             return
 
 
-class BackgroundSampler:
-    """``collect`` on a thread of its own. ``phase`` is read by the sampling function when it labels a sample."""
+class Worker:
+    """A thread that runs one function until it returns or fails. Any failure, whatever its type, becomes ``error`` and never ends the thread silently."""
 
-    def __init__(self, take: Callable[[], Sample], *, interval_seconds: float, deadline_seconds: float, join_seconds: float) -> None:
-        self.take = take
-        self.interval_seconds = interval_seconds
-        self.deadline_seconds = deadline_seconds
+    def __init__(self, name: str, join_seconds: float) -> None:
         self.join_seconds = join_seconds
-        self.phase = STARTUP_PHASE
-        self.samples: list[Sample] = []
-        self.error: SamplingError | None = None
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self.work, name="capacity-probe-sampler", daemon=True)
+        self.error = ""
+        self.finished = False
+        self.thread = threading.Thread(target=self.guarded, name=name, daemon=True)
+
+    def guarded(self) -> None:
+        try:
+            self.work()
+            self.finished = True
+        except SamplingError as error:
+            self.error = str(error)
+        except Exception as error:  # a reader that dies for any reason must show it in the verdict
+            self.error = f"the {self.thread.name} stopped with {type(error).__name__}: {error}"
 
     def work(self) -> None:
-        try:
-            collect(
-                self.take,
-                samples=self.samples,
-                interval_seconds=self.interval_seconds,
-                deadline_seconds=self.deadline_seconds,
-                stopped=self.stop_event.is_set,
-                wait=self.stop_event.wait,
-            )
-        except SamplingError as error:
-            self.error = error
+        raise NotImplementedError
 
     @property
     def running(self) -> bool:
         return self.thread.is_alive()
 
+    @property
+    def confirmed(self) -> bool:
+        """The stop was asked for, the thread ended by its own return, and it reported no error."""
+        return self.stop_event.is_set() and not self.running and self.finished and not self.error
+
     def start(self) -> None:
         self.thread.start()
 
-    def stop(self) -> None:
-        """End the sampling and wait for the thread. A thread that is still running after ``join_seconds`` is a sampling failure."""
+    def request_stop(self) -> None:
         self.stop_event.set()
+
+    def stop(self) -> None:
+        """Ask the thread to stop and wait for it. A thread that is still running after ``join_seconds`` is a failure."""
+        self.request_stop()
         if self.thread.is_alive():
             self.thread.join(self.join_seconds)
         if self.thread.is_alive():
-            raise SamplingError(f"the sampling did not stop within {self.join_seconds:g} seconds")
+            raise SamplingError(f"the {self.thread.name} did not stop within {self.join_seconds:g} seconds")
 
 
-def execute(steps: Steps, sampler: BackgroundSampler) -> Execution:
-    """Run the steps in order under the sampler. The first step that fails ends the run, and the sampler is stopped after every outcome."""
-    failure = ""
+class BackgroundSampler(Worker):
+    """``collect`` on a thread of its own. ``phase`` is read by the sampling function when it labels a sample. ``sample_now`` asks for a sample at once."""
+
+    def __init__(
+        self, take: Callable[[], Sample], *, interval_seconds: float, deadline_seconds: float, join_seconds: float, first_delay_seconds: float = 0.0
+    ) -> None:
+        super().__init__("sampler", join_seconds)
+        self.take = take
+        self.interval_seconds = interval_seconds
+        self.deadline_seconds = deadline_seconds
+        self.first_delay_seconds = first_delay_seconds
+        self.phase = STARTUP_PHASE
+        self.samples: list[Sample] = []
+        self.wake = threading.Event()
+
+    def wait(self, seconds: float) -> bool:
+        self.wake.wait(seconds)
+        self.wake.clear()
+        return self.stop_event.is_set()
+
+    def work(self) -> None:
+        collect(
+            self.take,
+            samples=self.samples,
+            interval_seconds=self.interval_seconds,
+            deadline_seconds=self.deadline_seconds,
+            stopped=self.stop_event.is_set,
+            wait=self.wait,
+            first_delay_seconds=self.first_delay_seconds,
+        )
+
+    def sample_now(self) -> None:
+        self.wake.set()
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+
+
+class EventsReader(Worker):
+    """The project's lifecycle events for the whole run, read in contiguous windows so that no window is lost to Docker's short event memory.
+
+    Each window is one ``docker events --since <start> --until <end>`` command, which ends at its end. After the stop, one last window ends at the present.
+    """
+
+    def __init__(
+        self, docker: Docker, project: str, *, join_seconds: float, slice_seconds: float = EVENTS_SLICE_SECONDS, clock_ns: Callable[[], int] = time.time_ns
+    ) -> None:
+        super().__init__("event reader", join_seconds)
+        self.docker = docker
+        self.project = project
+        self.slice_seconds = slice_seconds
+        self.clock_ns = clock_ns
+        self.since = 0
+        self.events: list[ContainerEvent] = []
+        self.windows = 0
+        self.seen: set[tuple[int, str, str]] = set()
+
+    def start(self) -> None:
+        self.since = self.clock_ns()
+        super().start()
+
+    def work(self) -> None:
+        since = self.since
+        while True:
+            stopping = self.stop_event.is_set()
+            until = self.clock_ns() if stopping else since + round(self.slice_seconds * NANOSECONDS)
+            if until > since:
+                for event in self.docker.events(self.project, since, until, seconds=self.slice_seconds + DOCKER_SECONDS):
+                    key = (event.nano, event.action, event.name)
+                    if key not in self.seen:
+                        self.seen.add(key)
+                        self.events.append(event)
+                self.windows += 1
+                since = until
+            if stopping:
+                return
+
+
+class Reader:
+    """The sampling function of a run: one host reading and one Docker reading each time, the host figures being those of the interval since the last."""
+
+    def __init__(self, project: str, sources: HostSources | None, docker: Docker, phase: Callable[[], str]) -> None:
+        self.project = project
+        self.sources = sources
+        self.docker = docker
+        self.phase = phase
+        self.started = time.monotonic()
+        self.previous: HostReading | None = read_host(sources) if sources is not None else None
+
+    def take(self) -> Sample:
+        figures = None
+        if self.sources is not None and self.previous is not None:
+            current = read_host(self.sources)
+            figures = host_figures(self.previous, current)
+            self.previous = current
+        listing, statistics = self.docker.usage_texts(self.project)
+        return Sample(round(time.monotonic() - self.started, 1), utc_text(), self.phase(), figures, parse_container_usage(listing, statistics))
+
+
+@dataclass(frozen=True)
+class Steps:
+    """The steps of a run. Each raises ``ProbeError`` when it cannot be done."""
+
+    start_supporting: Callable[[], None]
+    baseline: Callable[[], Mapping[str, int]]
+    admit_job: Callable[[], None]
+    run_job: Callable[[Callable[[], None]], JobOutcome]
+    final_evidence: Callable[[], Mapping[str, ContainerEvidence]]
+    cleanup: Callable[[], list[CleanupStep]]
+
+
+def stopped_normally(worker: Worker) -> str:
+    """Stop a worker and return the failure text, which is empty when it stopped."""
+    try:
+        worker.stop()
+    except SamplingError as error:
+        return str(error)
+    return ""
+
+
+def run_steps(steps: Steps, sampler: BackgroundSampler) -> tuple[JobOutcome | None, str, Mapping[str, int], Mapping[str, ContainerEvidence], str, bool]:
+    """The outcome, the failure, the restart baseline, the end evidence, the evidence error and whether the run was interrupted."""
     outcome: JobOutcome | None = None
-    sampler.phase = STARTUP_PHASE
-    sampler.start()
+    failure, evidence_error = "", ""
+    baseline: Mapping[str, int] = {}
+    evidence: Mapping[str, ContainerEvidence] = {}
+    interrupted = False
     try:
         try:
             steps.start_supporting()
+            baseline = steps.baseline()
         except ProbeError as error:
             failure = f"starting the always-on group failed: {error}"
         if not failure:
@@ -223,62 +346,53 @@ def execute(steps: Steps, sampler: BackgroundSampler) -> Execution:
                 failure = f"admission of the Spark job refused: {error}"
         if not failure:
             try:
-                outcome = steps.run_job()
+                outcome = steps.run_job(sampler.sample_now)
             except ProbeError as error:
                 failure = f"the Spark job could not run: {error}"
-    finally:
-        stop_error: SamplingError | None = None
         try:
-            sampler.stop()
-        except SamplingError as stop_failure:
-            stop_error = stop_failure
-    sampling_error = sampler.error or stop_error
-    if sampling_error is not None:
-        failure = f"{failure}; sampling failed: {sampling_error}" if failure else f"sampling failed: {sampling_error}"
-    return Execution(outcome, failure, list(sampler.samples), sampling_error)
+            evidence = steps.final_evidence()
+        except (ProbeError, FiguresError) as error:
+            evidence_error = str(error)
+    except KeyboardInterrupt:
+        interrupted, failure = True, failure or "the run was interrupted"
+    return outcome, failure, baseline, evidence, evidence_error, interrupted
 
 
-def rounded(value: float) -> float:
-    return round(value, 1)
-
-
-def peaks_of(samples: Sequence[Sample]) -> dict[str, Any]:
-    """The peaks of a series: the highest use and the lowest available memory and free space of the host, and the highest memory of each service."""
-    if not samples:
-        raise SamplingError("the series holds no sample")
-    hosts = [sample.host for sample in samples if sample.host is not None]
-    containers: dict[str, float] = {}
-    for sample in samples:
-        for name, used in sample.containers_mib.items():
-            containers[name] = max(containers.get(name, 0.0), used)
-    host = (
-        {
-            "memory_used_mib": max(item.memory_used_mib for item in hosts),
-            "memory_available_lowest_mib": min(item.memory_available_mib for item in hosts),
-            "swap_used_mib": max(item.swap_used_mib for item in hosts),
-            "cpu_percent": max(item.cpu_percent for item in hosts),
-            "cpu_core_percent": max(max(item.cpu_core_percent, default=0.0) for item in hosts),
-            "disk_read_mib_s": max(item.disk_read_mib_s for item in hosts),
-            "disk_write_mib_s": max(item.disk_write_mib_s for item in hosts),
-            "free_disk_lowest_mib": min(item.free_disk_mib for item in hosts),
-        }
-        if hosts
-        else None
+def execute(steps: Steps, sampler: BackgroundSampler, events: EventsReader) -> Execution:
+    """Run the steps in order under the sampler and the event reader. Both are stopped and the cleanup runs after every outcome, an interrupt included."""
+    outcome: JobOutcome | None = None
+    failure, evidence_error = "", ""
+    baseline: Mapping[str, int] = {}
+    evidence: Mapping[str, ContainerEvidence] = {}
+    interrupted = False
+    cleanup: list[CleanupStep] = []
+    sampler.phase = STARTUP_PHASE
+    events.start()
+    sampler.start()
+    try:
+        outcome, failure, baseline, evidence, evidence_error, interrupted = run_steps(steps, sampler)
+    finally:
+        sampler_error = stopped_normally(sampler) or sampler.error
+        events_error = stopped_normally(events) or events.error
+        try:
+            cleanup = steps.cleanup()
+        except Exception as error:  # a cleanup that fails in an unforeseen way is a failed cleanup and never a silent one
+            cleanup = [CleanupStep("cleanup", False, f"stopped with {type(error).__name__}")]
+    return Execution(
+        outcome,
+        failure,
+        list(sampler.samples),
+        sampler_error,
+        sampler.confirmed,
+        list(events.events),
+        events_error,
+        events.confirmed,
+        baseline,
+        evidence,
+        cleanup,
+        interrupted,
+        evidence_error,
     )
-    return {"samples": len(samples), "host": host, "containers_mib": {name: rounded(value) for name, value in sorted(containers.items())}}
-
-
-def judge(samples: Sequence[Sample], limits_mib: Mapping[str, int], reserve_mib: int) -> Judgement:
-    """Each service's peak against its limit in the limits file, and the lowest available memory against the reserve."""
-    peaks: dict[str, float] = {}
-    for sample in samples:
-        for name, used in sample.containers_mib.items():
-            peaks[name] = max(peaks.get(name, 0.0), used)
-    over = {name: (rounded(peak), limits_mib[name]) for name, peak in sorted(peaks.items()) if name in limits_mib and peak > limits_mib[name]}
-    unlisted = tuple(sorted(name for name in peaks if name not in limits_mib))
-    available = [sample.host.memory_available_mib for sample in samples if sample.host is not None]
-    lowest = min(available) if available else None
-    return Judgement(over, unlisted, None if lowest is None else lowest >= reserve_mib, lowest)
 
 
 def parse_job_result(output: str) -> dict[str, Any]:
@@ -293,116 +407,8 @@ def parse_job_result(output: str) -> dict[str, Any]:
     return document if isinstance(document, dict) else {}
 
 
-def job_arguments(stamp: str, rows: int) -> list[str]:
-    return ["--branch", f"capacity_probe_{stamp.lower()}", "--rows", str(rows)]
-
-
-def sample_document(sample: Sample) -> dict[str, Any]:
-    host = None if sample.host is None else {**asdict(sample.host), "cpu_core_percent": list(sample.host.cpu_core_percent)}
-    return {"seconds": rounded(sample.seconds), "utc": sample.utc, "phase": sample.phase, "host": host, "containers_mib": dict(sample.containers_mib)}
-
-
-def verdict_of(failure: str, checks: Mapping[str, bool | None], host_measured: bool) -> str:
-    if failure or not all(checks[name] for name in ("completed", "sampling_ok", "containers_within_limits")):
-        return VERDICT_FAILED
-    if host_measured:
-        return VERDICT_COMPLETE if checks["host_reserve_kept"] is True else VERDICT_FAILED
-    return VERDICT_DOCKER_ONLY
-
-
-def build_document(
-    execution: Execution,
-    *,
-    limits_mib: Mapping[str, int],
-    reserve_mib: int,
-    host_measured: bool,
-    interval_seconds: float,
-    deadline_seconds: float,
-    started_utc: str,
-    finished_utc: str,
-    job_arguments: Sequence[str],
-) -> dict[str, Any]:
-    """The record of a run: the checks and the verdict, the peaks of the whole run and of each phase, the workload and the whole series."""
-    samples = execution.samples
-    outcome = execution.outcome
-    judged = judge(samples, limits_mib, reserve_mib)
-    checks: dict[str, bool | None] = {
-        "completed": outcome is not None and outcome.exit_code == 0 and not outcome.oom_killed,
-        "sampling_ok": execution.error is None and bool(samples),
-        "containers_within_limits": bool(samples) and judged.containers_within_limits,
-        "host_reserve_kept": judged.reserve_kept if host_measured else None,
-    }
-    peaks: dict[str, Any] = {}
-    if samples:
-        peaks["all"] = peaks_of(samples)
-        for phase in (STARTUP_PHASE, OVERLAP_PHASE):
-            phase_samples = [sample for sample in samples if sample.phase == phase]
-            if phase_samples:
-                peaks[phase] = peaks_of(phase_samples)
-    return {
-        "schema": SCHEMA,
-        "started_utc": started_utc,
-        "finished_utc": finished_utc,
-        "verdict": verdict_of(execution.failure, checks, host_measured),
-        "failure": execution.failure,
-        "checks": checks,
-        "computer": {"system": platform.system(), "machine": platform.machine()},
-        "host_figures": {
-            "measured": host_measured,
-            "note": "read from the Linux host's /proc and statvfs"
-            if host_measured
-            else "not measured: this computer is not the Linux host; only the Docker figures are real",
-        },
-        "interval_seconds": interval_seconds,
-        "sampling_deadline_seconds": deadline_seconds,
-        "reserve_mib": reserve_mib,
-        "lowest_available_mib": judged.lowest_available_mib,
-        "limits_mib": dict(limits_mib),
-        "containers_over_limit": {name: {"peak_mib": peak, "limit_mib": limit} for name, (peak, limit) in judged.containers_over.items()},
-        "containers_without_limit": list(judged.containers_unlisted),
-        "workload": {
-            "service": SPARK_SERVICE,
-            "arguments": list(job_arguments),
-            "exit_code": None if outcome is None else outcome.exit_code,
-            "oom_killed": None if outcome is None else outcome.oom_killed,
-            "seconds": None if outcome is None else rounded(outcome.seconds),
-            "result": {} if outcome is None else dict(outcome.result),
-        },
-        "peaks": peaks,
-        "stream_lag": STREAM_LAG_NOTE,
-        "series": [sample_document(sample) for sample in samples],
-    }
-
-
-def write_document(folder: Path, document: Mapping[str, Any]) -> Path:
-    """Write the record into ``folder``, which must not hold one. The file appears whole or not at all."""
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / RECORD_NAME
-    handle, name = tempfile.mkstemp(dir=folder, prefix=".record_")
-    temporary = Path(name)
-    try:
-        with os.fdopen(handle, "w") as stream:
-            stream.write(json.dumps(document, indent=2, allow_nan=False) + "\n")
-        try:
-            os.link(temporary, target)
-        except FileExistsError as error:
-            raise ProbeError(f"{folder} already holds a record: a probe run writes a new folder") from error
-    finally:
-        temporary.unlink(missing_ok=True)
-    return target
-
-
-@dataclass(frozen=True)
-class Options:
-    interval_seconds: float = DEFAULT_INTERVAL_SECONDS
-    start_deadline_seconds: float = DEFAULT_START_DEADLINE_SECONDS
-    job_deadline_seconds: float = DEFAULT_JOB_DEADLINE_SECONDS
-    wait_seconds: float = DEFAULT_WAIT_SECONDS
-    rows: int = DEFAULT_ROWS
-    data_path: Path = Path("/var/lib/docker")
-    nessie_port: int = DEFAULT_NESSIE_PORT
-    host_figures: bool = True
-    output_directory: Path | None = None
+def job_arguments(unique: str, rows: int) -> list[str]:
+    return ["--branch", f"capacity_probe_{unique.lower()}", "--rows", str(rows)]
 
 
 def utc_text() -> str:
@@ -413,44 +419,48 @@ def say(message: str) -> None:
     sys.stdout.write(f"probe: {message}\n")
 
 
-def read_containers(project: str) -> dict[str, float]:
-    """The memory in MiB of each service of the Compose project, from Docker."""
-    commands = (
-        ["ps", "--filter", f"label=com.docker.compose.project={project}", "--format", '{{.ID}}|{{.Label "com.docker.compose.service"}}'],
-        ["stats", "--no-stream", "--format", "{{.ID}}|{{.MemUsage}}"],
-    )
-    outputs: list[str] = []
-    for arguments in commands:
-        try:
-            result = run_command("docker", arguments, timeout=DOCKER_SECONDS)
-        except FileNotFoundError as error:
-            raise ProbeError("docker is not installed or not on the path") from error
-        except TimeoutExpired as error:
-            raise ProbeError(timeout_text(f"docker {arguments[0]}", DOCKER_SECONDS)) from error
-        if result.returncode != 0:
-            raise ProbeError(f"docker {arguments[0]} exited {result.returncode}")
-        outputs.append(result.stdout)
-    return parse_container_memory(outputs[0], outputs[1])
+def nessie_detail(error: NessieError) -> str:
+    """What a failed Nessie call says: its status or that it did not answer, and never the answer's text."""
+    return f"Nessie answered with status {error.status}" if error.status is not None else "Nessie did not answer"
 
 
-class Reader:
-    """The sampling function of a run: one host reading and one Docker reading each time, the host figures being those of the interval since the last."""
+def branch_exists(client: Any, branch: str) -> bool:
+    try:
+        client.reference(branch)
+    except NessieError as error:
+        if error.status == NOT_FOUND:
+            return False
+        raise
+    return True
 
-    def __init__(self, project: str, sources: HostSources | None, sampler: Callable[[], BackgroundSampler]) -> None:
-        self.project = project
-        self.sources = sources
-        self.sampler = sampler
-        self.started = time.monotonic()
-        self.previous: HostReading | None = read_host(sources) if sources is not None else None
 
-    def take(self) -> Sample:
-        figures = None
-        if self.sources is not None and self.previous is not None:
-            current = read_host(self.sources)
-            figures = host_figures(self.previous, current)
-            self.previous = current
-        containers = read_containers(self.project)
-        return Sample(round(time.monotonic() - self.started, 1), utc_text(), self.sampler().phase, figures, containers)
+def remove_branch(client: Any, branch: str) -> CleanupStep:
+    """Delete the job's private Nessie branch and verify that it is gone. A branch that never existed is gone. A call that fails leaves the step unverified."""
+    name = "nessie branch"
+    try:
+        if not branch_exists(client, branch):
+            return CleanupStep(name, True, "no branch existed")
+        client.delete_reference(branch, client.reference(branch).hash)
+        if branch_exists(client, branch):
+            return CleanupStep(name, False, "the branch is still present after its deletion")
+    except NessieError as error:
+        return CleanupStep(name, False, nessie_detail(error))
+    return CleanupStep(name, True, "removed and absent")
+
+
+def remove_container(docker: Docker, container: str) -> CleanupStep:
+    """Remove the job container and verify that no container of that name is left."""
+    name = "job container"
+    try:
+        docker.remove(container)
+        present = docker.exists(container)
+    except ProbeError as error:
+        return CleanupStep(name, False, str(error))
+    return CleanupStep(name, not present, "no container remains" if not present else "still present after its removal")
+
+
+def required_services(limits: Limits) -> tuple[str, ...]:
+    return tuple(sorted(name for name, entry in limits.services.items() if entry.group == ALWAYS_ON_GROUP and entry.runtime == "compose"))
 
 
 def spark_group(limits: Limits) -> str:
@@ -459,112 +469,162 @@ def spark_group(limits: Limits) -> str:
     return limits.services[SPARK_SERVICE].group
 
 
-def container_state(name: str) -> tuple[bool, bool]:
-    """Whether the one-off container exists and whether the kernel killed it for memory."""
-    try:
-        result = run_command("docker", ["inspect", "--format", "{{.State.OOMKilled}}", name], timeout=DOCKER_SECONDS)
-    except FileNotFoundError, TimeoutExpired:
-        return False, False
-    return result.returncode == 0, result.returncode == 0 and result.stdout.strip() == "true"
+@dataclass(frozen=True)
+class Options:
+    interval_seconds: float = DEFAULT_INTERVAL_SECONDS
+    start_deadline_seconds: float = DEFAULT_START_DEADLINE_SECONDS
+    job_deadline_seconds: float = DEFAULT_JOB_DEADLINE_SECONDS
+    wait_seconds: float = 0.0
+    rows: int = DEFAULT_ROWS
+    data_path: Path = Path("/var/lib/docker")
+    nessie_port: int = DEFAULT_NESSIE_PORT
+    host_figures: bool = True
+    output_directory: Path | None = None
 
 
-def remove_container(name: str) -> None:
-    try:
-        run_command("docker", ["rm", "--force", name], timeout=CLEANUP_SECONDS)
-    except FileNotFoundError, TimeoutExpired:
-        return
+class Probe:
+    """The steps of one run on one stack."""
 
+    def __init__(
+        self,
+        settings: Settings,
+        limits: Limits,
+        options: Options,
+        *,
+        docker: Docker,
+        budget: Budget,
+        arguments: Sequence[str],
+        container: str,
+        runner: Runner = run_command,
+        pause: Pause = time.sleep,
+    ) -> None:
+        self.settings, self.limits, self.options = settings, limits, options
+        self.docker, self.budget, self.arguments, self.container = docker, budget, list(arguments), container
+        self.runner, self.pause = runner, pause
+        self.required = required_services(limits)
 
-def run_spark_job(settings: Settings, limits: Limits, arguments: Sequence[str], stamp: str, deadline_seconds: float) -> JobOutcome:
-    """Run the Spark job once as a one-off container, wait for it under a deadline, read its exit status and out-of-memory flag and remove the container."""
-    name = f"{settings.project}_capacity_probe_{stamp.lower()}"
-    command = compose_arguments(settings, spark_group(limits), "run", "--no-deps", "--no-TTY", "--name", name, SPARK_SERVICE, *arguments)
-    started = time.monotonic()
-    try:
+    def start_supporting(self) -> None:
         try:
-            result = run_command("docker", command, timeout=deadline_seconds, env=rendered_environment(limits))
-        except FileNotFoundError as error:
-            raise ProbeError("docker is not installed or not on the path") from error
-        except TimeoutExpired as error:
-            raise ProbeError(timeout_text("the Spark job", deadline_seconds)) from error
-        _, killed = container_state(name)
-    finally:
-        remove_container(name)
-    return JobOutcome(result.returncode, killed, time.monotonic() - started, parse_job_result(result.stdout))
-
-
-def remove_branch(port: int, branch: str) -> str:
-    """Delete the job's private Nessie branch and return what happened, in a few words."""
-    client = NessieClient(f"http://127.0.0.1:{port}/api/v2", DOCKER_SECONDS)
-    try:
-        client.delete_reference(branch, client.reference(branch).hash)
-    except NessieError as error:
-        return f"no branch {branch} existed" if error.status == NOT_FOUND else f"the branch {branch} was not removed: {error}"
-    return f"the branch {branch} was removed"
-
-
-def build_steps(settings: Settings, limits: Limits, options: Options, arguments: Sequence[str], stamp: str) -> Steps:
-    def start_supporting() -> None:
-        try:
-            start_group(settings, ALWAYS_ON_GROUP, wait_seconds=options.wait_seconds, deadline_seconds=options.start_deadline_seconds, log=say)
+            wait = min(self.options.wait_seconds, self.budget.remaining())
+            start_group(
+                self.settings,
+                ALWAYS_ON_GROUP,
+                wait_seconds=max(0.0, wait),
+                deadline_seconds=self.budget.limit(self.options.start_deadline_seconds),
+                log=say,
+            )
         except (GroupError, AdmissionError, LimitsError) as error:
             raise ProbeError(str(error)) from error
 
-    def admit_job() -> None:
+    def service_container(self, service: str) -> str:
+        found = self.docker.list_containers(self.settings.project, service=service)
+        if not found:
+            raise ProbeError(f"service {service} is not running")
+        return found[0].name
+
+    def baseline(self) -> dict[str, int]:
+        """Each required service's restart count, which the end of the run is compared with."""
+        return {service: self.docker.state(self.service_container(service)).restarts for service in self.required}
+
+    def admit_job(self) -> None:
         try:
-            decision = admit(settings, limits, find_group(limits, spark_group(limits)), options.wait_seconds, say)
+            wait = max(0.0, min(self.options.wait_seconds, self.budget.remaining()))
+            decision = admit(self.settings, self.limits, find_group(self.limits, spark_group(self.limits)), wait, say)
         except (GroupError, AdmissionError, LimitsError) as error:
             raise ProbeError(str(error)) from error
         say(f"admission of the Spark job: group {decision.group} admitted")
 
-    def run_job() -> JobOutcome:
-        return run_spark_job(settings, limits, arguments, stamp, options.job_deadline_seconds)
+    def final_evidence(self) -> dict[str, ContainerEvidence]:
+        """Each required service's cap, peak, kills and restarts at the end of the run, from its cgroup on the host and from Docker on another computer."""
+        found: dict[str, ContainerEvidence] = {}
+        for service in self.required:
+            containers = self.docker.list_containers(self.settings.project, service=service)
+            if not containers:
+                found[service] = ContainerEvidence(service, False, None, None, None, False, 0, "none")
+                continue
+            state = self.docker.state(containers[0].name)
+            if self.options.host_figures:
+                memory = read_cgroup_memory(state.pid)
+                found[service] = ContainerEvidence(
+                    service, state.status == "running", memory.max_bytes, memory.peak_bytes, memory.oom_kills, state.oom_killed, state.restarts, "cgroup"
+                )
+            else:
+                found[service] = ContainerEvidence(
+                    service, state.status == "running", state.memory_cap_bytes or None, None, None, state.oom_killed, state.restarts, "docker"
+                )
+        return found
 
-    return Steps(start_supporting, admit_job, run_job)
+    def start_job(self) -> None:
+        command = compose_arguments(
+            self.settings, spark_group(self.limits), "run", "--detach", "--no-deps", "--no-TTY", "--name", self.container, SPARK_SERVICE, *self.arguments
+        )
+        timeout = self.budget.limit(COMPOSE_RUN_SECONDS)
+        try:
+            result = self.runner("docker", command, timeout=timeout, env=rendered_environment(self.limits))
+        except FileNotFoundError as error:
+            raise ProbeError("docker is not installed or not on the path") from error
+        except TimeoutExpired as error:
+            raise ProbeError(timeout_text("starting the Spark job", timeout)) from error
+        if result.returncode != 0:
+            raise ProbeError(f"starting the Spark job: docker exited {result.returncode}")
+
+    def run_job(self, on_running: Callable[[], None]) -> JobOutcome:
+        """Start the job as a detached container, watch it until it exits and read its state and output. The container is removed by the cleanup, after this."""
+        self.start_job()
+        began = time.monotonic()
+        peak: int | None = None
+        cap: int | None = None
+        kills: int | None = None
+        seen = False
+        while True:
+            state = self.docker.state(self.container)
+            if state.status == "running":
+                if not seen:
+                    seen = True
+                    on_running()
+                if self.options.host_figures:
+                    try:
+                        memory = read_cgroup_memory(state.pid)
+                    except FiguresError:
+                        memory = None
+                    if memory is not None:
+                        peak, cap, kills = max(peak or 0, memory.peak_bytes), memory.max_bytes, memory.oom_kills
+            elif state.status in ("exited", "dead"):
+                break
+            if time.monotonic() - began >= self.options.job_deadline_seconds:
+                raise ProbeError(timeout_text("the Spark job", self.options.job_deadline_seconds))
+            self.pause(self.budget.limit(WATCH_SECONDS))
+        seconds = time.monotonic() - began
+        result, error = validate_result(
+            parse_job_result(self.docker.logs(self.container)),
+            branch=self.arguments[1],
+            rows=int(self.arguments[3]),
+            memory_limit_mib=self.limits.services[SPARK_SERVICE].memory_limit_mib,
+        )
+        host = self.options.host_figures
+        evidence = ContainerEvidence(
+            SPARK_SERVICE,
+            False,
+            cap if host else (state.memory_cap_bytes or None),
+            peak,
+            kills,
+            state.oom_killed,
+            state.restarts,
+            "cgroup" if host else "docker",
+        )
+        return JobOutcome(state.exit_code, state.oom_killed, seconds, result, error, evidence)
+
+    def cleanup(self, docker: Docker, client: Any) -> list[CleanupStep]:
+        return [remove_container(docker, self.container), remove_branch(client, self.arguments[1])]
 
 
-def run_probe(settings: Settings, options: Options) -> tuple[dict[str, Any], Path]:
-    """Run the probe, write the record and return it with its path. A host that cannot be read raises before anything starts."""
-    limits = load_limits(settings.limits_file)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    unique = f"{stamp}{secrets.token_hex(2)}"
-    arguments = job_arguments(unique, options.rows)
-    sources = HostSources(data_path=options.data_path) if options.host_figures else None
-    holder: list[BackgroundSampler] = []
-    try:
-        reader = Reader(settings.project, sources, lambda: holder[0])
-    except FiguresError as error:
-        raise ProbeError(f"the host's figures cannot be read ({error}); on a computer that is not the Linux host, pass --docker-figures-only") from error
-    deadline = options.wait_seconds * 2 + options.start_deadline_seconds + options.job_deadline_seconds + SAMPLING_SLACK_SECONDS
-    sampler = BackgroundSampler(reader.take, interval_seconds=options.interval_seconds, deadline_seconds=deadline, join_seconds=DOCKER_SECONDS * 3)
-    holder.append(sampler)
-    started_utc = utc_text()
-    execution = execute(build_steps(settings, limits, options, arguments, unique), sampler)
-    cleanup = remove_branch(options.nessie_port, arguments[1])
-    say(cleanup)
-    document = build_document(
-        execution,
-        limits_mib={name: entry.memory_limit_mib for name, entry in limits.services.items() if entry.runtime == "compose"},
-        reserve_mib=limits.host_reserve_mib,
-        host_measured=options.host_figures,
-        interval_seconds=options.interval_seconds,
-        deadline_seconds=deadline,
-        started_utc=started_utc,
-        finished_utc=utc_text(),
-        job_arguments=arguments,
-    )
-    document["cleanup"] = cleanup
-    folder = options.output_directory or RUNS_FOLDER / stamp
-    return document, write_document(folder, document)
-
-
-def positive_seconds(text: str) -> float:
+def positive_finite(text: str) -> float:
     try:
         value = float(text)
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"{text!r} is not a number") from error
-    if not value > 0:
-        raise argparse.ArgumentTypeError("the value must be more than 0")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must be a finite number above 0")
     return value
 
 
@@ -574,15 +634,85 @@ def positive_whole(text: str) -> int:
     return int(text)
 
 
+def preflight(docker: Docker, project: str, folder: Path) -> None:
+    """Refuse before anything starts: a folder that cannot take a record, and any Spark container of the project, running or stopped."""
+    check_destination(folder)
+    existing = docker.list_containers(project, service=SPARK_SERVICE, include_stopped=True)
+    if existing:
+        raise ProbeError(f"a Spark container of this project exists ({', '.join(item.name for item in existing)}): wait for its job to end or remove it")
+
+
+def run_probe(settings: Settings, options: Options, *, runner: Runner = run_command, client: Any = None) -> tuple[dict[str, Any], Path]:
+    """Run the probe, write the record and return it with its path. An interrupt writes the record and is raised again after it."""
+    limits = load_limits(settings.limits_file)
+    spark_group(limits)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    unique = f"{stamp}{secrets.token_hex(2)}"
+    folder = options.output_directory or RUNS_FOLDER / stamp
+    budget = Budget(options.wait_seconds * 2 + options.start_deadline_seconds + options.job_deadline_seconds + RUN_SLACK_SECONDS)
+    docker, plain = Docker(runner=runner, limit=budget.limit), Docker(runner=runner, limit=lambda seconds: min(seconds, CLEANUP_SECONDS))
+    preflight(plain, settings.project, folder)
+    arguments = job_arguments(unique, options.rows)
+    sources = HostSources(data_path=options.data_path) if options.host_figures else None
+    holder: list[BackgroundSampler] = []
+    try:
+        reader = Reader(settings.project, sources, docker, lambda: holder[0].phase)
+    except FiguresError as error:
+        raise ProbeError(f"the host's figures cannot be read ({error}); on a computer that is not the Linux host, pass --docker-figures-only") from error
+    join = DOCKER_SECONDS * 3
+    sampler = BackgroundSampler(
+        reader.take, interval_seconds=options.interval_seconds, deadline_seconds=budget.remaining(), join_seconds=join, first_delay_seconds=MIN_CPU_SECONDS
+    )
+    holder.append(sampler)
+    events = EventsReader(docker, settings.project, join_seconds=join + EVENTS_SLICE_SECONDS)
+    probe = Probe(
+        settings,
+        limits,
+        options,
+        docker=docker,
+        budget=budget,
+        arguments=arguments,
+        container=f"{settings.project}_capacity_probe_{unique.lower()}",
+        runner=runner,
+    )
+    nessie = client or NessieClient(f"http://127.0.0.1:{options.nessie_port}/api/v2", DOCKER_SECONDS)
+    steps = Steps(probe.start_supporting, probe.baseline, probe.admit_job, probe.run_job, probe.final_evidence, lambda: probe.cleanup(plain, nessie))
+    started_utc = utc_text()
+    execution = execute(steps, sampler, events)
+    for step in execution.cleanup:
+        say(f"cleanup {step.name}: {'ok' if step.ok else 'FAILED'}: {step.detail}")
+    limits_mib = {name: entry.memory_limit_mib for name, entry in limits.services.items() if entry.runtime == "compose"}
+    assessment = assess(execution, limits_mib=limits_mib, required=probe.required, reserve_mib=limits.host_reserve_mib, host_measured=options.host_figures)
+    document = build_document(
+        execution,
+        assessment,
+        limits_mib=limits_mib,
+        required=probe.required,
+        reserve_mib=limits.host_reserve_mib,
+        host_measured=options.host_figures,
+        interval_seconds=options.interval_seconds,
+        deadline_seconds=budget.total_seconds,
+        started_utc=started_utc,
+        finished_utc=utc_text(),
+        job_arguments=arguments,
+    )
+    path = write_document(folder, document)
+    if execution.interrupted:
+        raise KeyboardInterrupt
+    return document, path
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="python -m scripts.stack.capacity_probe", description=__doc__.split("\n\n")[0] if __doc__ else None)
     command.add_argument("--output-directory", type=Path, help="a new folder for the record (default: a new folder under runs/capacity_probe)")
-    command.add_argument("--interval-seconds", type=positive_seconds, default=DEFAULT_INTERVAL_SECONDS, help="seconds between two samples")
+    command.add_argument("--interval-seconds", type=positive_finite, default=DEFAULT_INTERVAL_SECONDS, help="seconds between two samples")
     command.add_argument(
-        "--start-deadline-seconds", type=positive_seconds, default=DEFAULT_START_DEADLINE_SECONDS, help="how long the always-on group has to become healthy"
+        "--start-deadline-seconds", type=positive_finite, default=DEFAULT_START_DEADLINE_SECONDS, help="how long the always-on group has to become healthy"
     )
-    command.add_argument("--job-deadline-seconds", type=positive_seconds, default=DEFAULT_JOB_DEADLINE_SECONDS, help="how long the Spark job has to finish")
-    command.add_argument("--wait-seconds", type=float, default=DEFAULT_WAIT_SECONDS, help="how long a group that does not fit waits for memory (default 0)")
+    command.add_argument("--job-deadline-seconds", type=positive_finite, default=DEFAULT_JOB_DEADLINE_SECONDS, help="how long the Spark job has to finish")
+    command.add_argument(
+        "--wait-seconds", type=positive_finite, default=None, help="how long a group that does not fit waits for memory (default: it does not wait)"
+    )
     command.add_argument("--rows", type=positive_whole, default=DEFAULT_ROWS, help="the Spark job's row count: the fixed workload")
     command.add_argument("--data-path", type=Path, default=Path("/var/lib/docker"), help="a folder on the data disk, for its free space and its disk activity")
     command.add_argument(
@@ -594,9 +724,7 @@ def parser() -> argparse.ArgumentParser:
         "--available-mib", type=int, help="test input: the host's available memory for the admission check, in place of the reading of /proc/meminfo"
     )
     command.add_argument(
-        "--docker-figures-only",
-        action="store_true",
-        help="this computer is not the Linux host: record the Docker figures and mark every host figure as not measured",
+        "--docker-figures-only", action="store_true", help="this computer is not the Linux host: Docker's figures only, and the verdict is at best local_only"
     )
     return command
 
@@ -607,7 +735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         interval_seconds=arguments.interval_seconds,
         start_deadline_seconds=arguments.start_deadline_seconds,
         job_deadline_seconds=arguments.job_deadline_seconds,
-        wait_seconds=arguments.wait_seconds,
+        wait_seconds=arguments.wait_seconds or 0.0,
         rows=arguments.rows,
         data_path=arguments.data_path,
         nessie_port=arguments.nessie_port,
@@ -617,10 +745,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         settings = settings_from_environment(arguments.compose_directory, arguments.project, arguments.available_mib)
         document, path = run_probe(settings, options)
+    except KeyboardInterrupt:
+        sys.stderr.write("capacity probe: interrupted: the cleanup ran and the record names each step\n")
+        return INTERRUPTED_EXIT
     except (ProbeError, GroupError, LimitsError) as error:
         sys.stderr.write(f"capacity probe: refused: {error}\n")
         return 1
-    say(f"verdict: {document['verdict']}" + (f" ({document['failure']})" if document["failure"] else ""))
+    findings = document["failures"] + document["gaps"]
+    say(f"verdict: {document['verdict']}" + (f" ({'; '.join(findings)})" if findings else ""))
     say(f"record: {path}")
     return 0 if document["verdict"] in PASSING_VERDICTS else 1
 
