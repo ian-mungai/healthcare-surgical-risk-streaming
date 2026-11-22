@@ -1,23 +1,27 @@
 """The replay as an always-on service: wait for a run record in the inbox, run it, keep it with its result and return to waiting.
 
-The inbox is a folder on the replay's state volume. ``submit`` first reserves the run ID: it creates ``reserved/<run ID>`` with the exact bytes of the run
-record, and ``reserved/<run ID>.reference`` with the bytes of the manifest reference, each by a create that fails when the file exists. Nothing moves or
-deletes ``reserved/``. A submit whose bytes differ from the reservation is refused, so of two different records under one run ID exactly one is accepted,
-even when they arrive at once. A run ID that already holds a record in the inbox, in ``done/`` or in ``failed/`` (from before reservations existed) is the
-same submission only when the record and its reference have the very same bytes, and then gets its reservation from them; any other bytes are refused. Only
-after the reservation does ``submit`` write the queue entry ``<run ID>.json`` with ``<run ID>.reference`` beside it, each whole or not at all, and only when
-no record of that run ID is held anywhere. The check and the writes, and the archival of a request, each hold the exclusive lock of the reservation file, so
-a delayed submit can never put a request back that was archived meanwhile.
+The inbox is a folder on the replay's state volume. ``submit`` reads the record and the manifest reference as bytes, decodes them as strict UTF-8 only to
+parse them, and stores and compares the exact bytes. It first reserves the run ID: it creates ``reserved/<run ID>`` with the bytes of the run record, and
+``reserved/<run ID>.reference`` with the bytes of the manifest reference, each by a create that fails when the file exists. Nothing moves or deletes
+``reserved/``. A submit whose bytes differ from the reservation is refused, so of two different records under one run ID exactly one is accepted, even when
+they arrive at once. An ID that has a reservation is compared with the reservation alone, never with the files that archival moves. A run ID that holds a
+record in the inbox, in ``done/`` or in ``failed/`` and has no reservation (from before reservations existed) is the same submission only when the record
+and its reference have the very same bytes, and then gets its reservation from them; any other bytes are refused. Only after the reservation does ``submit``
+write the queue entry ``<run ID>.json`` with ``<run ID>.reference`` beside it, each whole or not at all, and only when no record of that run ID is held
+anywhere. The whole of a submit and the archival of a request each hold the exclusive lock ``locks/<run ID>``, so a submit never meets a request half
+archived and a delayed submit can never put back a request that was archived meanwhile.
 
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
 reference fails at once with its reason. A request that already has a finished or failed result is only moved: it is never run again and its result is never
-written again. A run that a stop signal ends stays in the inbox, so the restarted service runs it again and the replay resumes from its saved position.
+written again. A result file that is not a valid terminal result (bad JSON, not an object, no ``finished`` or ``failed`` outcome) is logged, kept beside its
+place as ``<name>.json.invalid`` for inspection and treated as no result. A run that a stop signal ends stays in the inbox, so the restarted service runs it
+again and the replay resumes from its saved position.
 
 Before it starts a request, ``serve`` adds one to the count in ``<run ID>.attempts`` beside it. A request that is found with the count at 3 has stopped the
-service three times, whatever the error was, so it fails with that reason and is archived without a replay and the next request runs. A stop by signal puts the
-count back. A planned stop ends every wait of the replay at once (``stopping.py``), so the service stops within the grace period of its container, the
-position is saved and the stop is never counted. An arithmetic or value error of a replay fails that request at once.
+service three times, whatever the error was, so it fails with that reason and is archived without a replay and the next request runs. A planned stop ends
+every wait of the replay at once (``stopping.py``), so the service stops within the grace period of its container, the position is saved and the count is put
+back: only a start that did not end cleanly counts. An arithmetic or value error of a replay fails that request at once.
 
 The health file says whether the service waits, runs or stopped and when it last made progress. ``healthy`` is the container's health check: a waiting or
 running service whose file is fresh and was not written in the future.
@@ -36,7 +40,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, BinaryIO, TextIO
 
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
 from replay.service.state_file import atomic_write
@@ -47,6 +51,8 @@ RUN_ID = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
 LIVE_STATUSES = ("waiting", "running")
 TERMINAL_OUTCOMES = {"finished": "done", "failed": "failed"}
 RESERVED = "reserved"
+LOCKS = "locks"
+INVALID_SUFFIX = ".invalid"
 REFERENCE_SUFFIX = ".reference"
 ATTEMPTS_SUFFIX = ".attempts"
 MAX_ATTEMPTS = 3
@@ -108,13 +114,10 @@ def reference_of(request: Path) -> Path:
 
 @contextlib.contextmanager
 def held(inbox: Path, run_id: str) -> Iterator[None]:
-    """Hold the exclusive lock of the reservation file of this run ID, and fail with a clear message when another holder keeps it past ``LOCK_SECONDS``. A
-    run ID without a reservation has nobody to wait for."""
-    try:
-        descriptor = os.open(inbox / RESERVED / run_id, os.O_RDONLY)
-    except FileNotFoundError:
-        yield
-        return
+    """Hold the exclusive lock of this run ID (the file ``locks/<run ID>``, created when it is missing and never removed), and fail with a clear message when
+    another holder keeps it past ``LOCK_SECONDS``."""
+    (inbox / LOCKS).mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(inbox / LOCKS / run_id, os.O_RDWR | os.O_CREAT, FILE_MODE)
     try:
         deadline = time.monotonic() + LOCK_SECONDS
         while True:
@@ -155,14 +158,31 @@ def archive(inbox: Path, request: Path, kind: str) -> None:
         attempts_of(request).unlink(missing_ok=True)
 
 
-def kept_outcome(inbox: Path, request: Path) -> str | None:
-    """``finished`` or ``failed`` when a terminal result of this request is already written, else None."""
+def kept_outcome(inbox: Path, request: Path, log: Callable[..., None]) -> str | None:
+    """``finished`` or ``failed`` when a terminal result of this request is already written, else None. A result file that is not a valid terminal result is
+    logged with its reason and renamed with the suffix ``.invalid``, and counts as no result."""
+    path = inbox / "results" / request.name
     try:
-        document = json.loads((inbox / "results" / request.name).read_text())
-    except OSError, ValueError:
+        text = path.read_text()
+    except FileNotFoundError:
         return None
-    outcome = document.get("outcome") if isinstance(document, dict) else None
-    return outcome if outcome in TERMINAL_OUTCOMES else None
+    except (OSError, ValueError) as error:
+        reason = f"it cannot be read: {type(error).__name__}"
+    else:
+        reason = ""
+        try:
+            document = json.loads(text)
+        except ValueError:
+            document = None
+            reason = "it is not JSON"
+        if not reason:
+            outcome = document.get("outcome") if isinstance(document, dict) else None
+            if isinstance(outcome, str) and outcome in TERMINAL_OUTCOMES:
+                return outcome
+            reason = "it is not an object with the outcome finished or failed"
+    log("result_invalid", request=request.stem, path=str(path), reason=reason)
+    os.replace(path, path.with_name(path.name + INVALID_SUFFIX))
+    return None
 
 
 def keep(inbox: Path, request: Path, outcome: Outcome) -> dict[str, Any]:
@@ -200,6 +220,7 @@ def serve(
     clock: Callable[[], float],
     sleep: Callable[[float], object],
     poll_seconds: float,
+    log: Callable[..., None] = lambda event, **fields: None,
 ) -> int:
     """Serve the inbox until ``stopped`` says so. ``run_request`` runs one record and calls the beat it is given as the run makes progress. A record that is
     not a valid run record never reaches it."""
@@ -212,7 +233,7 @@ def serve(
             health.beat("waiting")
             sleep(poll_seconds)
             continue
-        if (earlier := kept_outcome(inbox, request)) is not None:
+        if (earlier := kept_outcome(inbox, request, log)) is not None:
             archive(inbox, request, earlier)
             continue
         started = started_count(request)
@@ -277,44 +298,66 @@ def bytes_of(path: Path) -> bytes | None:
         return None
 
 
-def read_submission(reference_file: Path, stream: TextIO) -> tuple[str, str]:
-    """The run record from ``stream`` and the manifest reference from its file. A text that is not valid UTF-8 or a file that cannot be read is refused."""
+def conflicts_with_held(inbox: Path, name: str, record_bytes: bytes, reference_bytes: bytes) -> bool:
+    """Whether a record from before reservations is held under this name with other bytes. An ID whose reference is reserved is judged by its reservation alone,
+    never by the files that archival moves. The caller holds the lock of the ID, so no archival is half done."""
+    if (inbox / RESERVED / (Path(name).stem + REFERENCE_SUFFIX)).exists() or (earlier := record_held(inbox, name)) is None:
+        return False
+    return (bytes_of(earlier), bytes_of(reference_of(earlier))) != (record_bytes, reference_bytes)
+
+
+def read_submission(reference_file: Path, stream: BinaryIO) -> tuple[bytes, bytes]:
+    """The run record from ``stream`` and the manifest reference from its file, each as the exact bytes. A file that cannot be read is refused."""
     try:
-        reference_text = reference_file.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        raise SubmitError("the manifest reference file is not valid UTF-8 text") from None
+        reference = reference_file.read_bytes()
     except OSError:
         raise SubmitError("the manifest reference file cannot be read") from None
+    return stream.read(), reference
+
+
+def text_of(data: bytes, what: str) -> str:
+    """The strict UTF-8 text of ``data``, for parsing only. The bytes stay what is stored and compared."""
     try:
-        return stream.read(), reference_text
+        return data.decode("utf-8")
     except UnicodeDecodeError:
-        raise SubmitError("the run record on standard input is not valid UTF-8 text") from None
+        raise SubmitError(f"the {what} is not valid UTF-8 text") from None
 
 
-def submit(inbox: Path, text: str, reference_text: str) -> str:
+def submit(inbox: Path, record_data: bytes | str, reference_data: bytes | str) -> str:
     """Reserve the run ID of a valid run record and queue the record with its manifest reference, and say so.
 
     The same submission again changes nothing, except that it completes a queue entry that a stop left unwritten. Another record or another reference under
-    that run ID is refused, also when it arrives at the same moment and also when a record of that ID from before reservations is already held.
+    that run ID is refused, also when it arrives at the same moment and also when a record of that ID from before reservations is already held. Bytes that
+    differ in a line end only are other bytes. A text is taken as its UTF-8 bytes.
     """
+    record_bytes = record_data.encode() if isinstance(record_data, str) else record_data
+    reference_bytes = reference_data.encode() if isinstance(reference_data, str) else reference_data
     try:
-        record = parse_run_record(text)
-        ManifestRef.from_json(reference_text)
+        record = parse_run_record(text_of(record_bytes, "run record"))
+        ManifestRef.from_json(text_of(reference_bytes, "manifest reference"))
     except (RunRecordError, ManifestError) as error:
         raise SubmitError(str(error)) from None
     if not RUN_ID.fullmatch(record.run_id):
         raise SubmitError("the run ID must be lower-case letters, digits and underscores, at most 64")
     name = f"{record.run_id}.json"
-    earlier = record_held(inbox, name)
-    if earlier is not None and (bytes_of(earlier), bytes_of(reference_of(earlier))) != (text.encode(), reference_text.encode()):
-        raise SubmitError(f"the run ID {record.run_id} already holds another run record or manifest reference; use a new run ID")
-    reserve(inbox, record.run_id, text.encode(), "run record", record.run_id)
-    reserve(inbox, record.run_id + REFERENCE_SUFFIX, reference_text.encode(), "manifest reference", record.run_id)
-    if earlier is not None:
-        return "already submitted"
     with held(inbox, record.run_id):
+        if conflicts_with_held(inbox, name, record_bytes, reference_bytes):
+            raise SubmitError(f"the run ID {record.run_id} already holds another run record or manifest reference; use a new run ID")
+        reserve(inbox, record.run_id, record_bytes, "run record", record.run_id)
+        reserve(inbox, record.run_id + REFERENCE_SUFFIX, reference_bytes, "manifest reference", record.run_id)
         if record_held(inbox, name) is not None:
             return "already submitted"
-        atomic_write(reference_of(inbox / name), reference_text)
-        atomic_write(inbox / name, text)
+        atomic_write(reference_of(inbox / name), reference_bytes)
+        atomic_write(inbox / name, record_bytes)
     return "submitted"
+
+
+def submit_command(inbox: Path, reference_file: Path, stream: BinaryIO, out: TextIO, log: Callable[..., None]) -> int:
+    """The ``submit`` command: the exit code 0 and what ``submit`` says on ``out``, or 2 with the reason logged when the submission is refused."""
+    try:
+        record, reference = read_submission(reference_file, stream)
+        out.write(submit(inbox, record, reference) + "\n")
+    except SubmitError as error:
+        log("submit_refused", message=str(error))
+        return 2
+    return 0

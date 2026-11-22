@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import threading
 import time
@@ -30,7 +31,7 @@ from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
-from replay.service.serve import Outcome, SubmitError, archive, healthy, held, queued_record, read_submission, serve, submit
+from replay.service.serve import Outcome, SubmitError, archive, healthy, held, queued_record, read_submission, serve, submit, submit_command
 from scripts.ingestion.manifest import ManifestRef
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
@@ -82,6 +83,7 @@ class Loop:
         self.sleeps_before_stop = sleeps_before_stop
         self.stop = False
         self.health_seen: list[dict[str, Any]] = []
+        self.logged: list[str] = []
 
     def run_request(self, path: Path, beat: Callable[[], None]) -> Outcome:
         self.ran.append(path.name)
@@ -100,7 +102,16 @@ class Loop:
             self.stop = True
 
     def serve(self) -> int:
-        return serve(self.inbox, self.health, self.run_request, lambda: self.stop, self.clock, self.sleep, poll_seconds=2.0)
+        return serve(
+            self.inbox,
+            self.health,
+            self.run_request,
+            lambda: self.stop,
+            self.clock,
+            self.sleep,
+            poll_seconds=2.0,
+            log=lambda event, **fields: self.logged.append(json.dumps({"event": event, **fields})),
+        )
 
     def put(self, name: str, text: str, reference: str | None = REFERENCE) -> None:
         (self.inbox / name).write_text(text)
@@ -228,8 +239,21 @@ class ServeTest(unittest.TestCase):
                 self.assertTrue((loop.inbox / target / "a.reference").is_file())
                 self.assertFalse((loop.inbox / "a.json").exists())
 
-    def test_a_result_that_is_not_a_terminal_one_does_not_keep_the_record_from_running(self) -> None:
-        for text in ("not json", "[]", json.dumps({"outcome": "stopped"}), json.dumps({"outcome": "running"}), json.dumps({"request": "a"})):
+    def test_a_result_that_is_not_a_terminal_one_does_not_keep_the_record_from_running_and_is_kept_beside_it_as_invalid(self) -> None:
+        planted = (
+            "not json",
+            "[]",
+            "",
+            json.dumps({"outcome": "stopped"}),
+            json.dumps({"outcome": "running"}),
+            json.dumps({"request": "a"}),
+            json.dumps({"outcome": []}),
+            json.dumps({"outcome": {"finished": 1}}),
+            json.dumps({"outcome": None}),
+            json.dumps({"outcome": 7}),
+            json.dumps({"outcome": ["finished"]}),
+        )
+        for text in planted:
             with self.subTest(text=text):
                 loop = self.loop({"a.json": Outcome("finished", 0)})
                 loop.put("a.json", json.dumps(RECORD))
@@ -238,6 +262,31 @@ class ServeTest(unittest.TestCase):
                 loop.serve()
                 self.assertEqual(["a.json"], loop.ran)
                 self.assertEqual("finished", json.loads((loop.inbox / "results" / "a.json").read_text())["outcome"])
+                self.assertEqual(text, (loop.inbox / "results" / "a.json.invalid").read_text())
+                self.assertTrue(any("result_invalid" in line and "a.json" in line for line in loop.logged), loop.logged)
+                self.assertTrue((loop.inbox / "done" / "a.json").is_file())
+
+    def test_a_valid_terminal_result_is_not_renamed_and_nothing_is_logged(self) -> None:
+        for outcome in ("finished", "failed"):
+            with self.subTest(outcome=outcome):
+                loop = self.loop({})
+                loop.put("a.json", json.dumps(RECORD))
+                (loop.inbox / "results").mkdir()
+                (loop.inbox / "results" / "a.json").write_text(json.dumps({"request": "a", "outcome": outcome, "exit_code": 0, "error": ""}))
+                loop.serve()
+                self.assertEqual([], loop.ran)
+                self.assertFalse((loop.inbox / "results" / "a.json.invalid").exists())
+                self.assertEqual([], loop.logged)
+
+    def test_a_planted_invalid_result_still_counts_the_start_and_three_stops_with_it_fail_the_request(self) -> None:
+        loop = self.loop({"a.json": Outcome("stopped", 2)})
+        loop.put("a.json", json.dumps(RECORD))
+        (loop.inbox / "results").mkdir()
+        (loop.inbox / "results" / "a.json").write_text(json.dumps({"outcome": []}))
+        (loop.inbox / "a.attempts").write_text("3\n")
+        loop.serve()
+        self.assertEqual([], loop.ran)
+        self.assertEqual("failed", json.loads((loop.inbox / "results" / "a.json").read_text())["outcome"])
 
     def test_a_stop_while_waiting_returns_at_once(self) -> None:
         loop = self.loop({}, sleeps_before_stop=1)
@@ -394,7 +443,9 @@ class SubmitTest(unittest.TestCase):
         text = json.dumps(RECORD)
         self.assertEqual("submitted", submit(self.inbox, text, REFERENCE))
         self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
-        self.assertEqual([f"{self.name}.json", f"{self.name}.reference", f"reserved/{self.name}", f"reserved/{self.name}.reference"], self.files())
+        self.assertEqual(
+            [f"locks/{self.name}", f"{self.name}.json", f"{self.name}.reference", f"reserved/{self.name}", f"reserved/{self.name}.reference"], self.files()
+        )
         self.assertEqual(text, (self.inbox / f"{self.name}.json").read_text())
         self.assertEqual(REFERENCE, (self.inbox / f"{self.name}.reference").read_text())
         self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
@@ -613,9 +664,137 @@ class SubmitTest(unittest.TestCase):
         self.assertEqual(1, len(failures))
         self.assertIn(self.name, str(failures[0]))
 
-    def test_a_run_id_without_a_reservation_has_no_lock_to_wait_for(self) -> None:
+    def test_a_run_id_without_a_reservation_has_a_lock_too(self) -> None:
+        results: list[str] = []
+
+        def contend() -> None:
+            with held(self.inbox, "nothing_reserved"):
+                results.append("held")
+
         with held(self.inbox, "nothing_reserved"):
-            pass
+            thread = threading.Thread(target=contend)
+            thread.start()
+            thread.join(timeout=0.5)
+            self.assertTrue(thread.is_alive())
+        thread.join(timeout=30)
+        self.assertEqual(["held"], results)
+
+    def archive_paused_after_its_first_move(self, attempt: Callable[[], str]) -> list[str | SubmitError]:
+        """Archive the queued request of this run ID and, between its two moves (the reference is in ``done/``, the record is still in the inbox), run
+        ``attempt`` in a thread. The attempt gets half a second to finish, so one that waits for the lock is still waiting when the archival goes on."""
+        results: list[str | SubmitError] = []
+        threads: list[threading.Thread] = []
+        real = os.replace
+
+        def work() -> None:
+            try:
+                results.append(attempt())
+            except SubmitError as error:
+                results.append(error)
+
+        def pausing(source: Any, target: Any) -> None:
+            real(source, target)
+            if Path(target).parent.name == "done" and str(target).endswith(".reference"):
+                thread = threading.Thread(target=work)
+                threads.append(thread)
+                thread.start()
+                thread.join(timeout=0.5)
+
+        with mock.patch("os.replace", pausing):
+            archive(self.inbox, self.inbox / f"{self.name}.json", "finished")
+        for thread in threads:
+            thread.join(timeout=30)
+            self.assertFalse(thread.is_alive())
+        return results
+
+    def test_an_identical_submit_during_the_archival_of_a_reserved_request_is_not_refused_and_queues_nothing(self) -> None:
+        text = json.dumps(RECORD)
+        submit(self.inbox, text, REFERENCE)
+        results = self.archive_paused_after_its_first_move(lambda: submit(self.inbox, text, REFERENCE))
+        self.assertEqual(["already submitted"], results)
+        self.assertFalse((self.inbox / f"{self.name}.json").exists())
+        self.assertFalse((self.inbox / f"{self.name}.reference").exists())
+        self.assertTrue((self.inbox / "done" / f"{self.name}.json").is_file())
+
+    def test_an_identical_submit_during_the_archival_of_a_request_without_a_reservation_is_not_refused_and_gets_its_reservation(self) -> None:
+        text = json.dumps(RECORD)
+        self.plant("")
+        results = self.archive_paused_after_its_first_move(lambda: submit(self.inbox, text, REFERENCE))
+        self.assertEqual(["already submitted"], results)
+        self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
+        self.assertFalse((self.inbox / f"{self.name}.json").exists())
+
+    def test_a_different_submit_during_the_archival_is_still_refused_with_and_without_a_reservation(self) -> None:
+        other = json.dumps({**RECORD, "speed": 120.0})
+        for reserved in (True, False):
+            with self.subTest(reserved=reserved):
+                self.setUp()
+                if reserved:
+                    submit(self.inbox, json.dumps(RECORD), REFERENCE)
+                else:
+                    self.plant("")
+                results = self.archive_paused_after_its_first_move(lambda: submit(self.inbox, other, REFERENCE))
+                self.assertEqual(1, len(results))
+                self.assertIsInstance(results[0], SubmitError)
+                self.assertFalse((self.inbox / f"{self.name}.json").exists())
+
+    def test_a_reserved_run_id_is_compared_with_its_reservation_only_whatever_the_files_that_archival_moved_hold(self) -> None:
+        text = json.dumps(RECORD)
+        submit(self.inbox, text, REFERENCE)
+        for suffix in (".json", ".reference"):
+            (self.inbox / f"{self.name}{suffix}").unlink()
+        self.assertEqual("submitted", submit(self.inbox, text, REFERENCE))
+        (self.inbox / f"{self.name}.json").write_text(json.dumps({**RECORD, "speed": 120.0}))
+        self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
+        with self.assertRaises(SubmitError):
+            submit(self.inbox, text, OTHER_REFERENCE)
+
+    def test_a_record_with_crlf_line_ends_is_stored_with_its_exact_bytes_and_the_same_text_with_lf_is_another_record(self) -> None:
+        lf = json.dumps(RECORD, indent=1).encode()
+        crlf = lf.replace(b"\n", b"\r\n")
+        reference_lf = REFERENCE.encode()
+        reference_crlf = reference_lf.replace(b"\n", b"\r\n") if b"\n" in reference_lf else reference_lf + b"\r\n"
+        self.assertNotEqual(lf, crlf)
+        self.assertEqual("submitted", submit(self.inbox, crlf, reference_crlf))
+        self.assertEqual(crlf, (self.inbox / f"{self.name}.json").read_bytes())
+        self.assertEqual(reference_crlf, (self.inbox / f"{self.name}.reference").read_bytes())
+        self.assertEqual(crlf, (self.inbox / "reserved" / self.name).read_bytes())
+        self.assertEqual("already submitted", submit(self.inbox, crlf, reference_crlf))
+        for label, record, reference in (("record", lf, reference_crlf), ("reference", crlf, reference_lf)):
+            with self.subTest(different=label), self.assertRaises(SubmitError):
+                submit(self.inbox, record, reference)
+        self.assertEqual(crlf, (self.inbox / f"{self.name}.json").read_bytes())
+
+    def test_a_record_with_invalid_utf_8_in_either_input_is_refused_with_its_reason_and_nothing_lands(self) -> None:
+        for label, record, reference in (
+            ("record", b'{"run_id": "\xff"}', REFERENCE.encode()),
+            ("reference", json.dumps(RECORD).encode(), b'{"bucket": "\xff"}'),
+        ):
+            with self.subTest(label=label), self.assertRaises(SubmitError) as caught:
+                submit(self.inbox, record, reference)
+            self.assertIn(label, str(caught.exception))
+            self.assertIn("UTF-8", str(caught.exception))
+        self.assertFalse(self.inbox.exists() and any(self.inbox.iterdir()))
+
+    def command(self, record: bytes, reference: bytes) -> int:
+        """The submit command as the container runs it: the record on standard input as bytes and the reference in a file."""
+        scratch = tempfile.TemporaryDirectory(prefix="replay_command_")
+        self.addCleanup(scratch.cleanup)
+        reference_file = Path(scratch.name) / "manifest_reference.json"
+        reference_file.write_bytes(reference)
+        return submit_command(self.inbox, reference_file, io.BytesIO(record), io.StringIO(), lambda event, **fields: None)
+
+    def test_the_submit_command_keeps_exact_bytes_and_exits_2_on_a_different_line_end_or_invalid_utf_8(self) -> None:
+        lf = json.dumps(RECORD, indent=1).encode()
+        crlf = lf.replace(b"\n", b"\r\n")
+        reference = REFERENCE.encode()
+        self.assertEqual(0, self.command(crlf, reference))
+        self.assertEqual(crlf, (self.inbox / f"{self.name}.json").read_bytes())
+        self.assertEqual(0, self.command(crlf, reference))
+        self.assertEqual(2, self.command(lf, reference))
+        self.assertEqual(2, self.command(b'{"run_id": "\xff"}', reference))
+        self.assertEqual(2, self.command(crlf, b'{"bucket": "\xff"}'))
+        self.assertEqual(crlf, (self.inbox / f"{self.name}.json").read_bytes())
 
     def test_a_speed_outside_0_01_to_1000_is_refused_and_the_edges_and_a_normal_speed_are_accepted(self) -> None:
         for value in BAD_SPEEDS:
@@ -629,23 +808,17 @@ class SubmitTest(unittest.TestCase):
                 self.addCleanup(folder.cleanup)
                 self.assertEqual("submitted", submit(Path(folder.name) / "inbox", json.dumps({**RECORD, "speed": value}), REFERENCE))
 
-    def test_a_submission_that_is_not_valid_utf_8_or_a_reference_file_that_is_missing_is_refused_with_its_reason(self) -> None:
+    def test_a_submission_is_read_as_exact_bytes_and_a_reference_file_that_is_missing_is_refused_with_its_reason(self) -> None:
         scratch = tempfile.TemporaryDirectory(prefix="replay_read_")
         self.addCleanup(scratch.cleanup)
         folder = Path(scratch.name)
-        good, bad, missing = folder / "good.reference", folder / "bad.reference", folder / "missing.reference"
-        good.write_text(REFERENCE)
-        bad.write_bytes(b'{"bucket": "\xff"}')
-        text = io.TextIOWrapper(io.BytesIO(json.dumps(RECORD).encode()), encoding="utf-8")
-        self.assertEqual((json.dumps(RECORD), REFERENCE), read_submission(good, text))
-        for label, reference, stream in (
-            ("reference", bad, io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8")),
-            ("reference", missing, io.TextIOWrapper(io.BytesIO(b"{}"), encoding="utf-8")),
-            ("record", good, io.TextIOWrapper(io.BytesIO(b'{"a": "\xff"}'), encoding="utf-8")),
-        ):
-            with self.subTest(label=label, reference=reference.name), self.assertRaises(SubmitError) as caught:
-                read_submission(reference, stream)
-            self.assertIn(label, str(caught.exception))
+        good, missing = folder / "good.reference", folder / "missing.reference"
+        exact = REFERENCE.encode().replace(b"\n", b"\r\n") + b"\r\n\xff"
+        good.write_bytes(exact)
+        self.assertEqual((b'{"a": 1}\r\n', exact), read_submission(good, io.BytesIO(b'{"a": 1}\r\n')))
+        with self.assertRaises(SubmitError) as caught:
+            read_submission(missing, io.BytesIO(b"{}"))
+        self.assertIn("reference", str(caught.exception))
 
 
 if __name__ == "__main__":

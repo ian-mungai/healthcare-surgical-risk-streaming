@@ -15,12 +15,13 @@ from replay.events.run import RunState
 from replay.events.schedule import FrozenSchedule
 
 
-def atomic_write(path: Path, text: str) -> None:
+def atomic_write(path: Path, data: str | bytes) -> None:
+    """Write ``data`` whole or not at all. Text is written as UTF-8 and bytes exactly as given."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{secrets.token_hex(4)}.writing")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(text)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data.encode() if isinstance(data, str) else data)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)

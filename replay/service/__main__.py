@@ -8,8 +8,8 @@
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 ``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
 ``submit``    read a run record on standard input and put it in the inbox under its run ID, with the manifest reference file that ``--manifest-reference``
-              names beside it; the same record and reference again change nothing, another one under that run ID is refused (exit 2), as is a
-              record or reference that is not valid UTF-8 text.
+              names beside it, both as their exact bytes; the same record and reference again change nothing, other bytes under that run ID are
+              refused (exit 2), as is a record or reference that is not valid UTF-8 text.
 ``health``    exit 0 when the service waits or runs and its health file is fresh: the container's health check.
 
 Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. A run that ``serve``
@@ -38,7 +38,7 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import Outcome, SubmitError, healthy, queued_record, read_submission, serve, submit
+from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
@@ -204,17 +204,11 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
 def command_serve(arguments: argparse.Namespace) -> int:
     flag = StopFlag()
     log("serve_start", inbox=str(arguments.inbox))
-    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS)
+    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS, log)
 
 
 def command_submit(arguments: argparse.Namespace) -> int:
-    try:
-        text, reference_text = read_submission(arguments.manifest_reference, sys.stdin)
-        sys.stdout.write(submit(arguments.inbox, text, reference_text) + "\n")
-    except SubmitError as error:
-        log("submit_refused", message=str(error))
-        return 2
-    return 0
+    return submit_command(arguments.inbox, arguments.manifest_reference, sys.stdin.buffer, sys.stdout, log)
 
 
 def command_health(arguments: argparse.Namespace) -> int:
