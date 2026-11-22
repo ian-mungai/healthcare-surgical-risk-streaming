@@ -93,6 +93,7 @@ COMPOSE_RUN_SECONDS = 120.0
 NOT_FOUND = 404
 RESULT_PREFIX = "RESULT "
 INTERRUPTED_EXIT = 130
+START_FAILURE = "starting the always-on group failed"
 Pause = Callable[[float], None]
 
 
@@ -337,7 +338,7 @@ def run_steps(steps: Steps, sampler: BackgroundSampler) -> tuple[JobOutcome | No
             steps.start_supporting()
             baseline = steps.baseline()
         except ProbeError as error:
-            failure = f"starting the always-on group failed: {error}"
+            failure = f"{START_FAILURE}: {error}"
         if not failure:
             sampler.phase = OVERLAP_PHASE
             try:
@@ -349,12 +350,13 @@ def run_steps(steps: Steps, sampler: BackgroundSampler) -> tuple[JobOutcome | No
                 outcome = steps.run_job(sampler.sample_now)
             except ProbeError as error:
                 failure = f"the Spark job could not run: {error}"
-        try:
-            evidence = steps.final_evidence()
-        except (ProbeError, FiguresError) as error:
-            evidence_error = str(error)
+        if not failure.startswith(START_FAILURE):
+            try:
+                evidence = steps.final_evidence()
+            except (ProbeError, FiguresError) as error:
+                evidence_error = str(error)
     except KeyboardInterrupt:
-        interrupted, failure = True, failure or "the run was interrupted"
+        interrupted = True
     return outcome, failure, baseline, evidence, evidence_error, interrupted
 
 
@@ -502,6 +504,7 @@ class Probe:
         self.docker, self.budget, self.arguments, self.container = docker, budget, list(arguments), container
         self.runner, self.pause = runner, pause
         self.required = required_services(limits)
+        self.job_started = False
 
     def start_supporting(self) -> None:
         try:
@@ -555,6 +558,7 @@ class Probe:
         return found
 
     def start_job(self) -> None:
+        self.job_started = True
         command = compose_arguments(
             self.settings, spark_group(self.limits), "run", "--detach", "--no-deps", "--no-TTY", "--name", self.container, SPARK_SERVICE, *self.arguments
         )
@@ -615,7 +619,8 @@ class Probe:
         return JobOutcome(state.exit_code, state.oom_killed, seconds, result, error, evidence)
 
     def cleanup(self, docker: Docker, client: Any) -> list[CleanupStep]:
-        return [remove_container(docker, self.container), remove_branch(client, self.arguments[1])]
+        branch = remove_branch(client, self.arguments[1]) if self.job_started else CleanupStep("nessie branch", True, "the job did not start")
+        return [remove_container(docker, self.container), branch]
 
 
 def positive_finite(text: str) -> float:
@@ -651,14 +656,14 @@ def run_probe(settings: Settings, options: Options, *, runner: Runner = run_comm
     folder = options.output_directory or RUNS_FOLDER / stamp
     budget = Budget(options.wait_seconds * 2 + options.start_deadline_seconds + options.job_deadline_seconds + RUN_SLACK_SECONDS)
     docker, plain = Docker(runner=runner, limit=budget.limit), Docker(runner=runner, limit=lambda seconds: min(seconds, CLEANUP_SECONDS))
-    preflight(plain, settings.project, folder)
-    arguments = job_arguments(unique, options.rows)
     sources = HostSources(data_path=options.data_path) if options.host_figures else None
     holder: list[BackgroundSampler] = []
     try:
         reader = Reader(settings.project, sources, docker, lambda: holder[0].phase)
     except FiguresError as error:
         raise ProbeError(f"the host's figures cannot be read ({error}); on a computer that is not the Linux host, pass --docker-figures-only") from error
+    preflight(plain, settings.project, folder)
+    arguments = job_arguments(unique, options.rows)
     join = DOCKER_SECONDS * 3
     sampler = BackgroundSampler(
         reader.take, interval_seconds=options.interval_seconds, deadline_seconds=budget.remaining(), join_seconds=join, first_delay_seconds=MIN_CPU_SECONDS

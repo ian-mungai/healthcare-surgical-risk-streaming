@@ -465,7 +465,7 @@ class ExecuteTest(unittest.TestCase):
         fake = FakeSteps()
         fake.fail["start"] = ProbeError("group supporting: not healthy after 300 seconds")
         result, _, _ = self.execute(fake)
-        self.assertEqual(["start", "evidence", "cleanup"], fake.calls)
+        self.assertEqual(["start", "cleanup"], fake.calls)
         self.assertIn("starting the always-on group failed: group supporting: not healthy", result.failure)  # type: ignore[attr-defined]
         self.assertIsNone(result.outcome)  # type: ignore[attr-defined]
 
@@ -495,6 +495,7 @@ class ExecuteTest(unittest.TestCase):
         fake.fail["run"] = KeyboardInterrupt()
         result, sampler, reader = self.execute(fake)
         self.assertTrue(result.interrupted)  # type: ignore[attr-defined]
+        self.assertEqual("", result.failure, "the interrupt is named once, by the verdict")  # type: ignore[attr-defined]
         self.assertEqual("cleanup", fake.calls[-1])
         self.assertTrue(sampler.confirmed and reader.confirmed)
 
@@ -762,6 +763,22 @@ class JobTest(unittest.TestCase):
     def test_the_end_evidence_on_another_computer_comes_from_docker(self) -> None:
         found = self.probe(ScriptedDocker([ContainerState("running", 0, False, 7, 0, 1024 * MIB)]), host=False).final_evidence()
         self.assertEqual((1024 * MIB, None, "docker"), (found["postgres"].cap_bytes, found["postgres"].peak_bytes, found["postgres"].source))
+
+    def test_a_job_that_never_started_has_no_branch_to_remove_and_nessie_is_not_asked(self) -> None:
+        class Asked(FakeNessie):
+            def reference(self, name: str) -> Reference:
+                raise AssertionError("Nessie was asked")
+
+        probe = self.probe(ScriptedDocker([exited()]))
+        steps = probe.cleanup(FakeContainers(), Asked())
+        self.assertEqual([CleanupStep("job container", True, "no container remains"), CleanupStep("nessie branch", True, "the job did not start")], steps)
+
+    def test_a_job_that_started_has_its_branch_looked_up_even_when_the_start_failed(self) -> None:
+        probe = self.probe(ScriptedDocker([exited()]), runner=compose_runner(125))
+        with self.assertRaises(ProbeError):
+            probe.run_job(lambda: None)
+        steps = probe.cleanup(FakeContainers(), FakeNessie(exists=False))
+        self.assertEqual("no branch existed", steps[1].detail)
 
     def test_a_cgroup_that_cannot_be_read_at_the_end_is_an_error_for_the_caller_to_keep_apart(self) -> None:
         with (

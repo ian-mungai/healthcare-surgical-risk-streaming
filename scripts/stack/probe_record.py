@@ -394,15 +394,14 @@ def build_document(
 
 
 def check_destination(folder: Path) -> None:
-    """Refuse a folder that already holds a record or cannot be written, before anything starts."""
+    """Refuse a folder that already holds a record or cannot take one, before anything starts. The check creates nothing."""
     if (folder / RECORD_NAME).exists():
         raise ProbeError(f"{folder} already holds a record: a probe run writes a new folder")
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryFile(dir=folder):
-            pass
-    except OSError as error:
-        raise ProbeError(f"cannot write the record into {folder}: {error.strerror}") from error
+    existing = folder
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if not existing.is_dir() or not os.access(existing, os.W_OK | os.X_OK):
+        raise ProbeError(f"cannot write the record into {folder}: {existing} is not a folder that can be written")
 
 
 def write_document(folder: Path, document: Mapping[str, Any]) -> Path:

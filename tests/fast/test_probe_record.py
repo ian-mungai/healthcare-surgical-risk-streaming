@@ -397,8 +397,7 @@ class DocumentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             fresh = Path(folder) / "new" / "run"
             check_destination(fresh)
-            self.assertTrue(fresh.is_dir())
-            self.assertEqual([], list(fresh.iterdir()))
+            self.assertFalse((Path(folder) / "new").exists(), "the check leaves nothing behind")
             write_document(fresh, self.document())
             with self.assertRaisesRegex(ProbeError, "already holds a record"):
                 check_destination(fresh)
@@ -406,6 +405,14 @@ class DocumentTest(unittest.TestCase):
             blocker.write_text("x")
             with self.assertRaisesRegex(ProbeError, "cannot write the record"):
                 check_destination(blocker / "run")
+            readonly = Path(folder) / "readonly"
+            readonly.mkdir()
+            readonly.chmod(0o500)
+            try:
+                with self.assertRaisesRegex(ProbeError, "cannot write the record"):
+                    check_destination(readonly / "run")
+            finally:
+                readonly.chmod(0o700)
 
 
 if __name__ == "__main__":
