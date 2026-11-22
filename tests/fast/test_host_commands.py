@@ -42,6 +42,7 @@ from scripts.infra.host import (
 from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.project_config import ROOT
+from scripts.stack.warehouse import WarehouseError
 
 
 def peer(
@@ -495,7 +496,13 @@ class DeviceNotVerifiedTest(unittest.TestCase):
             self.assertIn("sudo -n tailscale logout", (folder / "ssh.log").read_text().splitlines())
 
 
-CONFIGURATION = {"AWS_REGION": "us-west-2", "AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "PROJECT_NAME": "example_project"}
+CONFIGURATION = {
+    "AWS_REGION": "us-west-2",
+    "AWS_PROFILE": "example_project_dev",
+    "ENVIRONMENT": "dev",
+    "PROJECT_NAME": "example_project",
+    "S3_BUCKET": "example-bucket",
+}
 
 
 def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
@@ -510,7 +517,7 @@ class HostUpTest(unittest.TestCase):
     """``host_up`` follows the run binding that exists. The calls to Terraform, Ansible and the host are replaced and recorded; the live batch proves them."""
 
     def run_up(self, path: Path, *, confirm: str = "") -> tuple[int, dict[str, mock.Mock]]:
-        names = ("save_plan", "apply_plan", "write_inventory", "state_json", "wait_until_reachable", "run_ansible", "instance_id")
+        names = ("save_plan", "apply_plan", "write_inventory", "state_json", "wait_until_reachable", "run_ansible", "instance_id", "platform_commit")
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
@@ -518,6 +525,7 @@ class HostUpTest(unittest.TestCase):
             calls["state_json"].return_value = {"values": {}}
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
             calls["instance_id"].return_value = "i-0123456789abcdef0"
+            calls["platform_commit"].return_value = "a" * 40
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
@@ -556,6 +564,15 @@ class HostUpTest(unittest.TestCase):
         self.assertEqual(("s3", True), create.call_args.args[3:])
         calls["wait_until_reachable"].assert_called_once()
         calls["run_ansible"].assert_called_once()
+        self.assertEqual(
+            {
+                "workload_access_region": "us-west-2",
+                "workload_access_workloads": [],
+                "compose_stack_platform_commit": "a" * 40,
+                "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
+            },
+            calls["run_ansible"].call_args.args[2],
+        )
         calls["write_inventory"].assert_called_once_with(path)
         self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
 
@@ -692,6 +709,21 @@ class WorkloadVariablesTest(unittest.TestCase):
 
     def test_state_without_workloads_gives_an_empty_list(self) -> None:
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": []}, workload_variables({"values": {}}, "us-west-2"))
+
+
+class DeployVariablesTest(unittest.TestCase):
+    def test_the_deploy_gets_the_commit_it_deploys_and_the_warehouse_location_of_the_configured_bucket(self) -> None:
+        self.assertEqual(
+            {"compose_stack_platform_commit": "b" * 40, "compose_stack_warehouse_location": "s3://example-bucket/warehouse/"},
+            host.deploy_variables(CONFIGURATION, "b" * 40),
+        )
+
+    def test_a_bucket_name_that_s3_refuses_stops_the_deploy_before_ansible_runs(self) -> None:
+        with self.assertRaises(WarehouseError):
+            host.deploy_variables(CONFIGURATION | {"S3_BUCKET": "Not_A_Bucket"}, "b" * 40)
+
+    def test_the_commit_is_the_head_of_the_checkout(self) -> None:
+        self.assertRegex(host.platform_commit(), r"^[0-9a-f]{40}$")
 
 
 class HostStateTest(unittest.TestCase):

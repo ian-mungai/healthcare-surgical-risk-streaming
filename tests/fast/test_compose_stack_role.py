@@ -41,6 +41,12 @@ def variables(folder: Path) -> dict[str, object]:
         "openbao_port": 18200,
         "unlock_key_file": str(folder / "unlock.env"),
         "secret_files_root_owner": f"{UID}:{GID}",
+        "compose_stack_docker_socket": str(folder),
+        "compose_stack_platform_commit": "c" * 40,
+        "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
+        "workload_access_region": "us-west-2",
+        "airbyte_namespace": "airbyte",
+        "airbyte_release": "airbyte",
     }
 
 
@@ -76,15 +82,49 @@ class RenderTest(unittest.TestCase):
             code, output = run_tasks(["render_environment.yml"], variables(folder))
             limits = (folder / "compose" / "limits.env").read_text()
             host = (folder / "compose" / "host.env").read_text()
+            socket_gid = folder.stat().st_gid
             again_code, again = run_tasks(["render_environment.yml"], variables(folder))
         self.assertEqual(0, code, output)
         self.assertEqual(render_environment(load_limits()), limits)
         self.assertEqual(
-            f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n",
+            f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n"
+            f"DOCKER_SOCKET_GID={socket_gid}\nSTACK_K3S_NAMESPACE=airbyte\nSTACK_K3S_RELEASE=airbyte\nPLATFORM_COMMIT={'c' * 40}\n"
+            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n",
             host,
         )
         self.assertEqual(0, again_code, again)
         self.assertRegex(again, CHANGED_NONE)
+
+    def test_the_socket_group_that_containers_see_is_taken_when_it_is_given(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "compose").mkdir()
+            code, output = run_tasks(["render_environment.yml"], variables(folder) | {"compose_stack_docker_socket_gid": "991"})
+            host = (folder / "compose" / "host.env").read_text()
+        self.assertEqual(0, code, output)
+        self.assertIn("\nDOCKER_SOCKET_GID=991\n", host)
+
+    def test_a_missing_socket_stops_the_step_with_the_socket_named_and_writes_no_host_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "compose").mkdir()
+            code, output = run_tasks(["render_environment.yml"], variables(folder) | {"compose_stack_docker_socket": str(folder / "no.sock")})
+            written = (folder / "compose" / "host.env").exists()
+        self.assertNotEqual(0, code)
+        self.assertIn(str(folder / "no.sock"), output)
+        self.assertFalse(written)
+
+    def test_a_deploy_with_no_commit_or_warehouse_location_stops_before_it_writes_the_host_settings(self) -> None:
+        for missing in ("compose_stack_platform_commit", "compose_stack_warehouse_location"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                (folder / "compose").mkdir()
+                values = {name: value for name, value in variables(folder).items() if name != missing}
+                code, output = run_tasks(["render_environment.yml"], values)
+                written = (folder / "compose" / "host.env").exists()
+            self.assertNotEqual(0, code)
+            self.assertIn(missing, output)
+            self.assertFalse(written)
 
 
 def service_list(*, tool_group: int) -> str:

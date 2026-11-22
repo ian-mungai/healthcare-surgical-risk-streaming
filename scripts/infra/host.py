@@ -35,6 +35,7 @@ from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, state_json
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
+from scripts.stack.warehouse import WarehouseError, warehouse_location
 
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 HOST_TAG = "tag:surgical-host"
@@ -48,6 +49,7 @@ SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
+GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
 PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103}
@@ -269,6 +271,16 @@ def workload_variables(state: dict[str, Any], region: str) -> dict[str, Any]:
     return {"workload_access_region": region, "workload_access_workloads": workloads}
 
 
+def platform_commit() -> str:
+    """The commit of the checkout that the deploy places on the host."""
+    return run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
+
+
+def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
+    """The Ansible variables of the stack's host settings: the deployed commit and the warehouse location of the configured bucket."""
+    return {"compose_stack_platform_commit": commit, "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"])}
+
+
 def ansible_recap(stdout: str) -> str:
     """The count lines of the playbook's recap for the host group, and nothing else: task output can hold variable values."""
     recap = stdout[stdout.rfind("PLAY RECAP") :].splitlines()[1:] if "PLAY RECAP" in stdout else []
@@ -318,7 +330,7 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
     address = peer.address
     record_tailscale_device(run.run_id, host_name, peer.device_id)
-    run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]))
+    run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]) | deploy_variables(configuration, platform_commit()))
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host {host_name} is up and its inventory is written\n")
     return 0
@@ -376,7 +388,7 @@ def main() -> int:
         if arguments.command == "up":
             return host_up(aws, configuration, arguments.binding, arguments.confirm)
         return (host_stop if arguments.command == "stop" else host_start)(aws, configuration, arguments.binding)
-    except (ConfigurationError, WrapperError, HostError, AwsError) as error:
+    except (ConfigurationError, WrapperError, HostError, AwsError, WarehouseError) as error:
         sys.stderr.write(f"{error}\n")
         return 1
 

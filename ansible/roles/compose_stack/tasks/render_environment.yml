@@ -1,5 +1,6 @@
-# Reads compose_stack_compose_directory, compose_stack_secrets_directory, compose_stack_postgres_port, openbao_port, unlock_key_file, compose_stack_owner and
-# compose_stack_group.
+# Reads compose_stack_compose_directory, compose_stack_secrets_directory, compose_stack_postgres_port, openbao_port, unlock_key_file, compose_stack_owner,
+# compose_stack_group, compose_stack_docker_socket (or compose_stack_docker_socket_gid, the group that containers see on the socket, which wins when it is
+# set), airbyte_namespace, airbyte_release, compose_stack_platform_commit, compose_stack_warehouse_location and workload_access_region.
 # The limits come from the limits file through its loader on the computer that runs Ansible, so no limit is typed in a Compose file or here.
 - name: Render the memory limits from the limits file
   ansible.builtin.command:
@@ -25,6 +26,18 @@
     group: "{{ compose_stack_group }}"
     mode: "0644"
 
+- name: Read the group of the Docker socket
+  ansible.builtin.stat:
+    path: "{{ compose_stack_docker_socket }}"
+  register: compose_stack_socket
+  when: compose_stack_docker_socket_gid is not defined
+
+- name: Stop when the Docker socket is missing
+  ansible.builtin.fail:
+    msg: "the Docker socket {{ compose_stack_docker_socket }} does not exist, so the code location cannot be given its group"
+  when: compose_stack_docker_socket_gid is not defined and not compose_stack_socket.stat.exists
+
+# The commit and the warehouse location come from the host command (scripts/infra/host.py), which reads them from the checkout and the project configuration.
 - name: Write the host settings Compose reads
   ansible.builtin.copy:
     dest: "{{ compose_stack_compose_directory }}/host.env"
@@ -33,6 +46,12 @@
       POSTGRES_HOST_PORT={{ compose_stack_postgres_port }}
       OPENBAO_HOST_PORT={{ openbao_port }}
       OPENBAO_UNLOCK_KEY_FILE={{ unlock_key_file }}
+      DOCKER_SOCKET_GID={{ compose_stack_docker_socket_gid | default(compose_stack_socket.stat.gid) }}
+      STACK_K3S_NAMESPACE={{ airbyte_namespace }}
+      STACK_K3S_RELEASE={{ airbyte_release }}
+      PLATFORM_COMMIT={{ compose_stack_platform_commit }}
+      WAREHOUSE_LOCATION={{ compose_stack_warehouse_location }}
+      AWS_REGION={{ workload_access_region }}
     owner: "{{ compose_stack_owner }}"
     group: "{{ compose_stack_group }}"
     mode: "0644"

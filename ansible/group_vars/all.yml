@@ -63,6 +63,8 @@ compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.
 openbao_port: 8200
+# The Docker socket on the host. The code location reaches it through the socket's group, which the role reads from the socket at each deploy.
+compose_stack_docker_socket: /var/run/docker.sock
 # The images the project makes itself, until it pushes them to a registry: the tag that the Compose files name and the folder of the build context, under the
 # repository's root and under compose_stack_directory. The host builds each one and builds it again only when its context changes.
 compose_stack_built_images:
