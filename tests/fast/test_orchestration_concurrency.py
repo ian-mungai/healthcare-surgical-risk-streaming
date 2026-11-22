@@ -35,6 +35,7 @@ DAGSTER_YAML = ROOT / "orchestration" / "dagster.yaml"
 LIMITS = ROOT / "compose" / "limits.yml"
 CODE_LOCATION = ROOT / "compose" / "services" / "dagster_code_location.yml"
 DEFINITIONS = ROOT / "orchestration" / "surgical_risk" / "definitions.py"
+CODE_FOLDER = DEFINITIONS.parent
 # A figure of these tests only. The real one is calculated by Terraform from the host's memory and the limits file.
 FIGURE = 10000
 ENVIRONMENT = {HEAVY_MEMORY_ENVIRONMENT: str(FIGURE)}
@@ -177,6 +178,53 @@ class HeavyFigureTest(unittest.TestCase):
             alias.name for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "concurrency" and node.level == 1 for alias in node.names
         ]
         self.assertIn("heavy_memory_mib", imported)
+
+
+class GroupJobTagsTest(unittest.TestCase):
+    """Every job that starts a service group has its heavy tag when it is defined. A job with a fixed group takes its tag from that group through ``job_tags``
+    and ``JOB_GROUPS``. The probe job takes its group at launch, so its weight cannot be judged when it is defined: it carries the heavy tag unconditionally and
+    is held like a heavy job. The definitions import Dagster, which the fast tests do not have, so these tests read the modules' own statements."""
+
+    PROBE = "group_probe_job"
+
+    def group_jobs(self) -> dict[str, ast.Call]:
+        """Each ``@job(...)`` function of the code location that names the group resource in its decorator, by function name, with its decorator call."""
+        found: dict[str, ast.Call] = {}
+        for path in sorted(CODE_FOLDER.glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                for decorator in node.decorator_list:
+                    if isinstance(decorator, ast.Call) and getattr(decorator.func, "id", "") == "job" and "GroupResource" in ast.unparse(decorator):
+                        found[node.name] = decorator
+        return found
+
+    def tags_of(self, decorator: ast.Call) -> ast.expr | None:
+        return next((keyword.value for keyword in decorator.keywords if keyword.arg == "tags"), None)
+
+    def test_the_probe_job_is_a_group_job_and_the_scan_sees_it(self) -> None:
+        self.assertIn(self.PROBE, self.group_jobs())
+
+    def test_the_probe_job_carries_the_heavy_tag_unconditionally(self) -> None:
+        tags = self.tags_of(self.group_jobs()[self.PROBE])
+        self.assertIsNotNone(tags)
+        self.assertEqual("{HEAVY_TAG_KEY: HEAVY_TAG_VALUE}", ast.unparse(tags) if tags is not None else "")
+
+    def test_every_other_group_job_takes_its_tag_from_its_fixed_group_through_job_tags(self) -> None:
+        for name, decorator in self.group_jobs().items():
+            if name == self.PROBE:
+                continue
+            tags = self.tags_of(decorator)
+            with self.subTest(job=name):
+                self.assertIsInstance(tags, ast.Call)
+                call = tags if isinstance(tags, ast.Call) else ast.Call(ast.Name("missing"), [ast.Constant("")], [])
+                self.assertEqual("job_tags", getattr(call.func, "id", ""))
+                self.assertIn(ast.unparse(call.args[0]).strip("'\""), JOB_GROUPS)
+
+    def test_the_scan_finds_a_job_that_starts_a_group_with_no_tag(self) -> None:
+        decorator = ast.parse('@job(resource_defs={"group": GroupResource.configure_at_launch()})\ndef untagged(): ...').body[0].decorator_list[0]  # type: ignore[attr-defined]
+        self.assertIsInstance(decorator, ast.Call)
+        self.assertIsNone(self.tags_of(decorator))
 
 
 class InstanceSettingTest(unittest.TestCase):

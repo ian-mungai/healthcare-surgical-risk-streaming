@@ -7,7 +7,9 @@ plan saved for another run.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import stat
 import tempfile
@@ -26,13 +28,15 @@ from scripts.infra.terraform_wrapper import (
     clean_environment,
     configuration_files,
     effective_location_problems,
-    initialise,
+    heavy_inputs,
     plan_binding,
     plan_changes,
     plan_label,
     prepare_configuration,
     run_variables,
     sanitized,
+    save_plan,
+    state_json,
     state_location,
     write_private,
 )
@@ -139,6 +143,10 @@ class ConfigurationCopyTest(unittest.TestCase):
         self.assertEqual(["main.tf", ".terraform.lock.hcl"], [item.name for item in configuration_files(source)])
 
 
+def configuration_folder_of(root: Path) -> Path:
+    return root / ".tools" / "terraform" / RUN.run_id / "config"
+
+
 LIMITS = """\
 host_reserve_mib: 4096
 services:
@@ -174,7 +182,7 @@ class PrivateFilesTest(unittest.TestCase):
         (source / "environments" / "other.auto.tfvars.json").write_text("{}")
         copied = prepare_configuration(RUN)
         names = sorted(path.relative_to(copied).as_posix() for path in copied.rglob("*") if path.is_file())
-        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "heavy_inputs.auto.tfvars.json", "main.tf", "modules/host/main.tf"], names)
+        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "main.tf", "modules/host/main.tf"], names)
 
     def prepare_source(self) -> None:
         source = self.root / "infra"
@@ -183,28 +191,85 @@ class PrivateFilesTest(unittest.TestCase):
         for name in ("main.tf", ".terraform.lock.hcl", "modules/host/main.tf", "environments/dev.tfvars"):
             (source / name).write_text("")
 
+    def refuse_limits(self) -> None:
+        (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("memory_limit_mib: 4096", "memory_limit_mib: 0"))
+
     def test_a_runs_copy_holds_the_three_numbers_that_the_limits_loader_gives_and_a_changed_file_changes_them(self) -> None:
         self.prepare_source()
-        copied = prepare_configuration(RUN)
+        copied = prepare_configuration(RUN, heavy_inputs())
         self.assertEqual(HEAVY_INPUTS, json.loads((copied / "heavy_inputs.auto.tfvars.json").read_text()))
         (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("host_reserve_mib: 4096", "host_reserve_mib: 5120"))
-        self.assertEqual(5120, json.loads((prepare_configuration(RUN) / "heavy_inputs.auto.tfvars.json").read_text())["host_reserve_mib"])
+        self.assertEqual(5120, json.loads((prepare_configuration(RUN, heavy_inputs()) / "heavy_inputs.auto.tfvars.json").read_text())["host_reserve_mib"])
 
-    def test_a_stale_numbers_file_of_an_earlier_run_is_replaced_not_kept(self) -> None:
+    def test_a_stale_numbers_file_of_an_earlier_plan_is_replaced_and_a_copy_without_inputs_holds_none(self) -> None:
         self.prepare_source()
-        folder = prepare_configuration(RUN)
-        (folder / "heavy_inputs.auto.tfvars.json").write_text('{"host_reserve_mib": 1}')
-        self.assertEqual(HEAVY_INPUTS, json.loads((prepare_configuration(RUN) / "heavy_inputs.auto.tfvars.json").read_text()))
+        folder = prepare_configuration(RUN, '{"host_reserve_mib": 1}')
+        self.assertEqual({"host_reserve_mib": 1}, json.loads((folder / "heavy_inputs.auto.tfvars.json").read_text()))
+        self.assertEqual(HEAVY_INPUTS, json.loads((prepare_configuration(RUN, heavy_inputs()) / "heavy_inputs.auto.tfvars.json").read_text()))
+        self.assertFalse((prepare_configuration(RUN) / "heavy_inputs.auto.tfvars.json").exists())
 
-    def test_a_limits_file_the_loader_refuses_stops_the_run_before_terraform_starts_and_names_the_reason(self) -> None:
+    def test_a_copy_for_reading_state_never_reads_the_limits_file(self) -> None:
         self.prepare_source()
-        (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("memory_limit_mib: 4096", "memory_limit_mib: 0"))
+        self.refuse_limits()
+        self.assertFalse((prepare_configuration(RUN) / "heavy_inputs.auto.tfvars.json").exists())
+
+    def test_a_limits_file_the_loader_refuses_stops_the_plan_before_terraform_starts_and_names_the_reason(self) -> None:
+        self.prepare_source()
+        self.refuse_limits()
+        for action in ("apply", "destroy"):
+            with (
+                self.subTest(action=action),
+                mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None),
+                mock.patch.object(terraform_wrapper, "run_command", side_effect=AssertionError("Terraform started")),
+                self.assertRaisesRegex(WrapperError, "limits.*memory_limit_mib"),
+            ):
+                save_plan(RUN, {"AWS_PROFILE": "example_project_dev"}, action)
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_a_plan_runs_in_a_copy_that_holds_the_loaders_numbers_and_a_state_read_in_one_that_holds_none(self) -> None:
+        self.prepare_source()
+        record = configuration_folder_of(self.root) / ".terraform" / "terraform.tfstate"
+        record.parent.mkdir(parents=True)
+        record.write_text(json.dumps(S3_RECORD))
+        staged: dict[str, dict[str, int] | None] = {}
+
+        def fake_terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
+            staged[arguments[0]] = None
+            file = configuration_folder_of(self.root) / "heavy_inputs.auto.tfvars.json"
+            if arguments[0] in ("plan", "show") and file.is_file():
+                staged[arguments[0]] = json.loads(file.read_text())
+            if arguments[0] == "plan":
+                Path(next(item for item in arguments if item.startswith("-out="))[5:]).write_bytes(b"plan")
+            return {"workspace": f"{RUN.workspace}\n", "show": "{}"}.get(arguments[0], "")
+
+        configuration = {
+            "AWS_PROFILE": "example_project_dev",
+            "ENVIRONMENT": "dev",
+            "TAILSCALE_CLIENT_ID": "example-id",
+            "TAILSCALE_AUDIENCE": "example-audience",
+        }
         with (
             mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None),
-            mock.patch.object(terraform_wrapper, "run_command", side_effect=AssertionError("Terraform started")),
-            self.assertRaisesRegex(WrapperError, "limits.*memory_limit_mib"),
+            mock.patch.object(terraform_wrapper, "terraform", side_effect=fake_terraform),
+            contextlib.redirect_stdout(io.StringIO()),
         ):
-            initialise(RUN, {"AWS_PROFILE": "example_project_dev"})
+            save_plan(RUN, configuration, "apply")
+            self.assertEqual(HEAVY_INPUTS, staged["plan"])
+            state_json(RUN, configuration)
+        self.assertIsNone(staged["show"])
+
+    def test_a_state_read_works_with_a_limits_file_the_loader_refuses(self) -> None:
+        self.prepare_source()
+        self.refuse_limits()
+        record = configuration_folder_of(self.root) / ".terraform" / "terraform.tfstate"
+        record.parent.mkdir(parents=True)
+        record.write_text(json.dumps(S3_RECORD))
+        answers = {"init": "", "workspace": f"{RUN.workspace}\n", "show": '{"values": {}}'}
+        with (
+            mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None),
+            mock.patch.object(terraform_wrapper, "terraform", side_effect=lambda run, arguments, timeout: answers[arguments[0]]),
+        ):
+            self.assertEqual({"values": {}}, state_json(RUN, {"AWS_PROFILE": "example_project_dev"}))
 
     def test_each_invocation_gets_its_own_owner_only_copy_of_the_approved_plan(self) -> None:
         (self.root / ".tools" / "terraform" / RUN.run_id / "config").mkdir(parents=True)

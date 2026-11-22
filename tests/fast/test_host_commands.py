@@ -515,6 +515,40 @@ def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     return path
 
 
+class StopAndStartWithRefusedLimitsTest(unittest.TestCase):
+    """Stopping and starting the host read the run's state and never depend on the limits file: a file that the loader refuses stops a plan, not these."""
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / "compose").mkdir()
+        (self.root / "compose" / "limits.yml").write_text(
+            "host_reserve_mib: 4096\nservices:\n  spark:\n    runtime: compose\n    group: batch\n    memory_limit_mib: 0\n"
+        )
+        for folder in ("modules", "environments"):
+            (self.root / "infra" / folder).mkdir(parents=True)
+        (self.root / "infra" / ".terraform.lock.hcl").write_text("")
+        self.binding = binding_file(self.root, backend="s3", provision_host=True)
+        record = self.root / ".tools" / "terraform" / "20260101t0000-abcdef" / "config" / ".terraform" / "terraform.tfstate"
+        record.parent.mkdir(parents=True)
+        record.write_text(json.dumps({"backend": {"type": "s3", "config": {"bucket": "example-project", "key": "terraform.tfstate", "region": "us-west-2"}}}))
+        answers = {"init": "", "workspace": "default\n", "show": json.dumps(STATE)}
+        self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+        self.enterContext(mock.patch.object(host, "ROOT", self.root))
+        self.enterContext(mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None))
+        self.enterContext(mock.patch.object(terraform_wrapper, "terraform", side_effect=lambda run, arguments, timeout: answers[arguments[0]]))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    def test_host_stop_stops_the_instance_whatever_the_limits_file_holds(self) -> None:
+        self.assertEqual(0, host.host_stop(FakeAws("project", "us-west-2", "stopped"), CONFIGURATION, self.binding))
+
+    def test_host_start_starts_the_instance_whatever_the_limits_file_holds(self) -> None:
+        with (
+            mock.patch.object(host, "wait_until_reachable", return_value=Peer("platform-dev.example.ts.net", "nRESTARTEDCNTRL")),
+            mock.patch.object(host, "write_inventory"),
+        ):
+            self.assertEqual(0, host.host_start(FakeAws("project", "us-west-2"), CONFIGURATION, self.binding))
+
+
 def heavy_state(value: object) -> dict[str, Any]:
     return {"values": {"outputs": {"heavy_memory_mib": {"value": value}}}}
 

@@ -9,7 +9,8 @@ Run from the repository root under the project profile in ``.env``:
 ``runs/<RUN_ID>/plans/`` with its readable text and its JSON form and binds the plan file's hash to the run's state location. It prints
 the resource changes and a confirmation code. ``apply`` refuses a changed plan file, a wrong code and a plan saved for
 another state location, then applies the exact bytes it checked. Each run has its own copy of the configuration, and
-no Terraform variable of the caller reaches Terraform; the three heavy-job inputs come from the limits loader and are staged in the copy.
+no Terraform variable of the caller reaches Terraform. The three heavy-job inputs come from the limits loader and are staged in the copy of a call that
+makes a plan, and of no other call, so a limits file that the loader refuses stops a plan and never a read of the state.
 A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this
 command never applies one.
 """
@@ -138,9 +139,12 @@ def heavy_inputs() -> str:
         raise WrapperError(f"refused before Terraform starts: the limits file cannot give the heavy-job inputs: limits: {error}") from error
 
 
-def prepare_configuration(run: RunBinding) -> Path:
-    """Give the run its own copy of the Terraform configuration with its own backend override and heavy-job inputs, apart from every other run."""
-    inputs = heavy_inputs()
+def prepare_configuration(run: RunBinding, inputs: str | None = None) -> Path:
+    """Give the run its own copy of the Terraform configuration with its own backend override, apart from every other run.
+
+    ``inputs`` is the heavy-job inputs text of a call that makes a plan, staged as the copy's automatic variable file. A call that only reads state gets none,
+    so a limits file that the loader refuses never stops it.
+    """
     target = configuration_folder(run)
     target.mkdir(parents=True, exist_ok=True)
     for stale in target.iterdir():
@@ -151,7 +155,8 @@ def prepare_configuration(run: RunBinding) -> Path:
         shutil.copy2(item, target / item.name)
     for part in CONFIGURATION_PARTS:
         shutil.copytree(source / part, target / part, ignore=shutil.ignore_patterns("*.auto.tfvars", "*.auto.tfvars.json"))
-    (target / HEAVY_INPUTS_FILE).write_text(inputs)
+    if inputs is not None:
+        (target / HEAVY_INPUTS_FILE).write_text(inputs)
     override = backend_override(run)
     if override is not None:
         (target / "backend_override.tf").write_text(override)
@@ -200,12 +205,12 @@ def load_run(path: Path) -> RunBinding:
     return RunBinding(**json.loads(path.read_text()))
 
 
-def initialise(run: RunBinding, configuration: dict[str, str]) -> None:
-    """Initialise the run's own configuration copy and refuse when Terraform's backend or workspace is not the bound one."""
+def initialise(run: RunBinding, configuration: dict[str, str], inputs: str | None = None) -> None:
+    """Initialise the run's own configuration copy and refuse when Terraform's backend or workspace is not the bound one. ``inputs`` is for a plan only."""
     mode_problem = bucket_problem(run, configuration)
     if mode_problem:
         raise WrapperError(f"refused before any plan or change: {mode_problem}")
-    folder = prepare_configuration(run)
+    folder = prepare_configuration(run, inputs)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
     record_file = folder / ".terraform" / "terraform.tfstate"
     record = json.loads(record_file.read_text()) if record_file.is_file() else {}
@@ -257,11 +262,12 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     """Save the plan with its text, JSON and binding, print its changes and return how many resources and outputs change."""
     if run.status != "verified":
         raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
+    inputs = heavy_inputs()
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
     folder.chmod(0o700)
     candidate = folder / f"{action}_candidate.tfplan"
-    initialise(run, configuration)
+    initialise(run, configuration, inputs)
     missing = sorted(key for key in TAILSCALE_KEYS if not configuration.get(key))
     if missing:
         raise WrapperError(f".env: missing values for: {', '.join(missing)}")
