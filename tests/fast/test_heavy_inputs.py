@@ -74,6 +74,20 @@ class DocumentTest(unittest.TestCase):
         self.assertTrue(all(isinstance(value, int) and value > 0 for value in expected.values()))
 
 
+class ReviewPromptTest(unittest.TestCase):
+    """The heavy figure of the tracked limits on the 32768 MiB host is a figure that the owner chose. A limit that changes it must be reviewed, not drift."""
+
+    def test_the_tracked_limits_leave_11008_mib_on_the_32768_mib_host(self) -> None:
+        inputs = heavy_inputs_document(load_limits(LIMITS_FILE))
+        figure = 32768 - inputs["host_reserve_mib"] - inputs["always_on_limits_mib"] - inputs["spark_limit_mib"]
+        self.assertEqual(
+            11008,
+            figure,
+            f"the heavy figure of compose/limits.yml is now {figure} MiB, not the 11008 MiB that the owner chose. Review the heavy-job rule in the "
+            "project standard (Service groups and memory) before you change this number: a job above the figure runs alone.",
+        )
+
+
 class CommandTest(unittest.TestCase):
     def run_main(self, text: str | None) -> tuple[int, str, str]:
         with tempfile.TemporaryDirectory() as scratch:

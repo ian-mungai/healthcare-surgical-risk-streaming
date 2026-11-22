@@ -228,11 +228,26 @@ class GroupJobTagsTest(unittest.TestCase):
 
 
 class InstanceSettingTest(unittest.TestCase):
-    def test_the_instance_limits_the_heavy_tag_to_one_run_at_a_time(self) -> None:
+    """Dagster lets the tags of a launch override the tags of a job, so a limit written for the value ``true`` is escaped by a launch that sets the value to
+    ``false``. The limit names the key alone: "if no value is set, the limit is applied across all values of that key" (the ``tag_concurrency_limits``
+    description in Dagster 1.13.31, ``_core/instance/config.py`` and ``_core/run_coordinator/queued_run_coordinator.py``, read Nov 22 2026)."""
+
+    def heavy_limits(self) -> list[dict[str, Any]]:
         document: Any = load_yaml(DAGSTER_YAML.read_text())
-        limits = document["concurrency"]["runs"]["tag_concurrency_limits"]
-        heavy = [entry for entry in limits if entry["key"] == HEAVY_TAG_KEY]
-        self.assertEqual([{"key": HEAVY_TAG_KEY, "value": HEAVY_TAG_VALUE, "limit": 1}], heavy)
+        return [entry for entry in document["concurrency"]["runs"]["tag_concurrency_limits"] if entry["key"] == HEAVY_TAG_KEY]
+
+    def test_the_instance_limits_every_run_that_carries_the_heavy_key_to_one_at_a_time_whatever_its_value(self) -> None:
+        self.assertEqual([{"key": HEAVY_TAG_KEY, "limit": 1}], self.heavy_limits())
+
+    def test_no_value_is_added_to_the_limit_of_the_heavy_key(self) -> None:
+        for entry in self.heavy_limits():
+            self.assertNotIn("value", entry)
+
+    def test_a_light_group_gets_no_heavy_key_at_all(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="concurrency_light_") as scratch:
+            limits = Path(scratch) / "limits.yml"
+            limits.write_text(limits_text({"light_group": [1024]}))
+            self.assertNotIn(HEAVY_TAG_KEY, heavy_job_tags("light_group", limits, ENVIRONMENT))
 
 
 if __name__ == "__main__":

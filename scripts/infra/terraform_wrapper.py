@@ -75,7 +75,9 @@ class WrapperError(RuntimeError):
 
 
 CONFIGURATION_PARTS = ("modules", "environments")
-HEAVY_INPUTS_FILE = "heavy_inputs.auto.tfvars.json"
+HEAVY_INPUTS_FILE = "heavy_inputs.tfvars.json"
+HEAVY_INPUT_NAMES = ("host_reserve_mib", "always_on_limits_mib", "spark_limit_mib")
+ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*)\s*=(?!=)")
 BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
 
 
@@ -139,11 +141,78 @@ def heavy_inputs() -> str:
         raise WrapperError(f"refused before Terraform starts: the limits file cannot give the heavy-job inputs: limits: {error}") from error
 
 
+def stale_inputs_problem(plan: dict[str, Any]) -> str | None:
+    """The refusal for a plan made with other heavy inputs than the limits file gives now, or None.
+
+    A plan without the three variables, or with one that is not a whole number, is refused the same way.
+    """
+    recorded = plan.get("variables", {})
+    planned = {name: recorded.get(name, {}).get("value") if isinstance(recorded.get(name), dict) else None for name in HEAVY_INPUT_NAMES}
+    current = json.loads(heavy_inputs())
+    exact = all(isinstance(value, int) and not isinstance(value, bool) for value in planned.values())
+    if exact and planned == current:
+        return None
+    return f"the limits changed after this plan was saved; save a new plan: the plan was made with {planned} and the limits now give {current}"
+
+
+def tfvars_assignments(text: str) -> set[str]:
+    """The names that a variable file assigns at its top level, read by name only. A line that cannot be classified raises ``WrapperError``: it fails closed."""
+    names: set[str] = set()
+    depth = 0
+    for number, raw in enumerate(text.splitlines(), start=1):
+        code, quoted = "", False
+        index = 0
+        while index < len(raw):
+            char = raw[index]
+            if quoted:
+                if char == "\\":
+                    index += 1
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "#" or raw.startswith("//", index):
+                break
+            elif raw.startswith("/*", index) or raw.startswith("<<", index):
+                raise WrapperError(f"the variable file has a block comment or a heredoc at line {number}, which the check cannot classify")
+            else:
+                code += char
+            index += 1
+        if quoted:
+            raise WrapperError(f"the variable file has an unterminated string at line {number}, which the check cannot classify")
+        if depth == 0 and code.strip():
+            found = ASSIGNMENT.match(code.strip())
+            if found is None:
+                raise WrapperError(f"the variable file has a line {number} that is not an assignment, which the check cannot classify")
+            names.add(found.group(1))
+        depth += sum(code.count(opening) for opening in "{[(") - sum(code.count(closing) for closing in "}])")
+        if depth < 0:
+            raise WrapperError(f"the variable file closes a bracket that it did not open at line {number}, which the check cannot classify")
+    if depth != 0:
+        raise WrapperError("the variable file ends inside a bracket, which the check cannot classify")
+    return names
+
+
+def caller_variable_problems(environment_file: Path, environment: Mapping[str, str]) -> list[str]:
+    """Each place where the caller sets a heavy input: the environment's variable file or a TF_VAR variable. The limits loader alone gives them."""
+    problems = []
+    if environment_file.is_file():
+        problems += [
+            f"{environment_file.name} sets {name}, which only the limits file gives"
+            for name in HEAVY_INPUT_NAMES
+            if name in tfvars_assignments(environment_file.read_text())
+        ]
+    problems += [
+        f"the environment variable TF_VAR_{name} sets {name}, which only the limits file gives" for name in HEAVY_INPUT_NAMES if f"TF_VAR_{name}" in environment
+    ]
+    return problems
+
+
 def prepare_configuration(run: RunBinding, inputs: str | None = None) -> Path:
     """Give the run its own copy of the Terraform configuration with its own backend override, apart from every other run.
 
-    ``inputs`` is the heavy-job inputs text of a call that makes a plan, staged as the copy's automatic variable file. A call that only reads state gets none,
-    so a limits file that the loader refuses never stops it.
+    ``inputs`` is the heavy-job inputs text of a call that makes a plan. It is staged under a name that Terraform does not load unasked, and the plan
+    command passes it as its last variable file. A call that only reads state gets none, so a limits file that the loader refuses never stops it.
     """
     target = configuration_folder(run)
     target.mkdir(parents=True, exist_ok=True)
@@ -263,6 +332,9 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     if run.status != "verified":
         raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
     inputs = heavy_inputs()
+    overrides = caller_variable_problems(ROOT / "infra" / "environments" / f"{configuration.get('ENVIRONMENT', '')}.tfvars", os.environ)
+    if overrides:
+        raise WrapperError("refused before Terraform starts: " + "; ".join(overrides))
     folder = ROOT / "runs" / run.run_id / "plans"
     folder.mkdir(parents=True, exist_ok=True)
     folder.chmod(0o700)
@@ -272,7 +344,12 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     if missing:
         raise WrapperError(f".env: missing values for: {', '.join(missing)}")
     values = run_variables(run, configuration) | {key.lower(): configuration[key] for key in TAILSCALE_KEYS}
-    variables = [f"-var-file=environments/{configuration['ENVIRONMENT']}.tfvars", *[f"-var={name}={value}" for name, value in values.items()]]
+    # The limits loader's file is the last variable file, so no other source of a heavy input can win over it.
+    variables = [
+        f"-var-file=environments/{configuration['ENVIRONMENT']}.tfvars",
+        *[f"-var={name}={value}" for name, value in values.items()],
+        f"-var-file={HEAVY_INPUTS_FILE}",
+    ]
     terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={candidate}"], PLAN_TIMEOUT_SECONDS)
     plan_json = terraform(run, ["show", "-json", str(candidate)], PLAN_TIMEOUT_SECONDS)
     counts: dict[str, int] = {}
@@ -311,6 +388,9 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
     approved = approved_plan_copy(run, plan)
     try:
         applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
+        stale = stale_inputs_problem(applied_plan)
+        if stale:
+            raise WrapperError(f"refused before any change: {stale}")
         output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
         kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
         sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")

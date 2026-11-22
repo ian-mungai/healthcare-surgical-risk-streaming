@@ -17,6 +17,7 @@ Each case runs a real shell that starts a ``sleep`` of its own and records both 
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import signal
 import subprocess
@@ -25,6 +26,7 @@ import threading
 import time
 import traceback
 import unittest
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from subprocess import CalledProcessError
@@ -44,7 +46,16 @@ class LauncherTest(unittest.TestCase):
         folder = tempfile.TemporaryDirectory(prefix="process_launcher_")
         self.addCleanup(folder.cleanup)
         self.pids = Path(folder.name) / "pids"
+        # Cleanups run last in, first out: the leftovers are killed first, then the unreaped process objects of the launcher are collected here. A case
+        # that makes the launcher report a surviving group leaves its process object unreaped, and Python warns when it collects that object. Left to a
+        # later collection, the warning would land in whichever test runs then and fail one that reads standard error.
+        self.addCleanup(self.collect_unreaped)
         self.addCleanup(self.kill_leftovers)
+
+    def collect_unreaped(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            gc.collect()
 
     def kill_leftovers(self) -> None:
         for pid in self.started():
