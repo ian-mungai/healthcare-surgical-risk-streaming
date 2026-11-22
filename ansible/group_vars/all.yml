@@ -161,6 +161,9 @@ airbyte_connection_scope: full_release
 # owner's exception to the short-lived rule); the key never passes through Ansible.
 airbyte_bin_directory: /opt/platform/bin
 airbyte_key_script: "{{ airbyte_bin_directory }}/airbyte_key_install"
+# The sudoers drop-in that turns off sudo's input and output recording for the command line that runs that script, and the program that checks it before it is placed.
+airbyte_key_sudoers: /etc/sudoers.d/airbyte_key_install
+airbyte_visudo: /usr/sbin/visudo
 # The deadline of one exchange with Airbyte's API, in seconds. Creating the connection makes Airbyte read the source's schema, which takes the longest.
 airbyte_connection_deadline_seconds: 600
 # The deadline of the whole connection step, in seconds: no exchange and no kubectl call runs past it.

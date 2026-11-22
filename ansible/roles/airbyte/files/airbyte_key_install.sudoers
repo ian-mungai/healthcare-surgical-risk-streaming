@@ -1,0 +1,6 @@
+# The command that the launcher runs on the host to place the project profile's access key, on standard input of one SSH command: the host's interpreter in isolated mode
+# and the installed script. The key arrives on standard input, so sudo must not record it. These entries turn off every recording of input and output for this command and
+# for no other, whatever the host's global defaults say: command defaults are parsed after global, host, user and runas defaults, and the last matching entry wins
+# (sudoers manual, sudo 1.9.15 of Ubuntu 24.04). A per-command Defaults entry may not hold arguments, so the command is an alias. This file grants no privilege.
+Cmnd_Alias AIRBYTE_KEY_INSTALL = /usr/bin/python3 -I /opt/platform/bin/airbyte_key_install
+Defaults!AIRBYTE_KEY_INSTALL !log_input, !log_output, !log_stdin, !log_stdout, !log_stderr, !log_ttyin, !log_ttyout

@@ -9,6 +9,8 @@ command and in the two files made for it.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import importlib.machinery
 import importlib.util
 import io
 import json
@@ -30,7 +32,7 @@ from scripts.project_config import ROOT
 from tests.fast.ansible_support import ROLES, SHARED_MODULE_UTILS
 from tests.fast.test_airbyte_role import GROUP as ROLE_GROUP
 from tests.fast.test_airbyte_role import OWNER as ROLE_OWNER
-from tests.fast.test_airbyte_role import group_variables, run_tasks
+from tests.fast.test_airbyte_role import group_variables, role_tasks, run_tasks
 
 SCRIPT = ROLES / "airbyte" / "files" / "airbyte_key_install.py"
 OWNER = f"{os.getuid()}:{os.getgid()}"
@@ -52,21 +54,40 @@ def payload(key_id: str = KEY_ID, value: str = KEY_VALUE) -> str:
     return json.dumps({"aws_access_key_id": key_id, "aws_secret_access_key": value})
 
 
-def load_script() -> ModuleType:
-    sys.path.insert(0, str(SHARED_MODULE_UTILS))
-    try:
-        spec = importlib.util.spec_from_file_location("airbyte_key_install", SCRIPT)
-        if spec is None or spec.loader is None:
-            raise ImportError("the script cannot be loaded")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["airbyte_key_install"] = module
-        spec.loader.exec_module(module)
-    finally:
-        sys.path.remove(str(SHARED_MODULE_UTILS))
+INSTALL: Any = None
+INSTALLED = Path()
+SUDOERS = ROLES / "airbyte" / "files" / "airbyte_key_install.sudoers"
+SHEBANG = "#!/usr/bin/python3 -I"
+VISUDO = "/usr/sbin/visudo"
+POLICY_DIGEST = hashlib.sha256(SUDOERS.read_bytes()).hexdigest()
+
+
+def install_form(folder: Path) -> Path:
+    """The script and its helper side by side, as the role installs them, and the path of the script."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "secret_files.py").write_text((SHARED_MODULE_UTILS / "secret_files.py").read_text())
+    script = folder / "airbyte_key_install"
+    script.write_text(SCRIPT.read_text())
+    script.chmod(0o700)
+    return script
+
+
+def load_script(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("airbyte_key_install", path, loader=importlib.machinery.SourceFileLoader("airbyte_key_install", str(path)))
+    if spec is None or spec.loader is None:
+        raise ImportError("the script cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["airbyte_key_install"] = module
+    spec.loader.exec_module(module)
     return module
 
 
-INSTALL = load_script()
+def setUpModule() -> None:
+    global INSTALL, INSTALLED
+    folder = tempfile.TemporaryDirectory(prefix="project_key_installed_")
+    unittest.addModuleCleanup(folder.cleanup)
+    INSTALLED = Path(folder.name)
+    INSTALL = load_script(install_form(INSTALLED / "bin"))
 
 
 class Outcome:
@@ -79,13 +100,14 @@ class Outcome:
 class Launcher:
     """The launcher's two external programs, recorded: every program, argument list and keyword the launcher gave them."""
 
-    def __init__(self, aws: Outcome, ssh: Outcome) -> None:
+    def __init__(self, aws: Outcome, ssh: Outcome, check: Outcome | None = None) -> None:
         self.outcomes = {"aws": aws, "ssh": ssh}
+        self.check = check or Outcome(0, f"{POLICY_DIGEST}  {host.SUDOERS_FILE}\n")
         self.calls: list[tuple[str, list[str], dict[str, Any]]] = []
 
     def __call__(self, program: str, args: list[str], **kwargs: Any) -> CompletedProcess[str]:
         self.calls.append((program, list(args), dict(kwargs)))
-        outcome = self.outcomes[program]
+        outcome = self.check if program == "ssh" and args[-4:] == ["sudo", "-n", "/usr/bin/sha256sum", host.SUDOERS_FILE] else self.outcomes[program]
         if outcome.raises:
             raise outcome.raises
         return CompletedProcess([program], outcome.code, outcome.out, outcome.err)
@@ -97,8 +119,8 @@ class LauncherTest(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.folder = Path(folder.name)
 
-    def run_launcher(self, aws: Outcome, ssh: Outcome | None = None) -> tuple[Launcher, str | None, str]:
-        launcher = Launcher(aws, ssh or Outcome(0, "placed\n", f"banner {KEY_VALUE}"))
+    def run_launcher(self, aws: Outcome, ssh: Outcome | None = None, check: Outcome | None = None) -> tuple[Launcher, str | None, str]:
+        launcher = Launcher(aws, ssh or Outcome(0, "placed\n", f"banner {KEY_VALUE}"), check)
         output, errors = io.StringIO(), io.StringIO()
         message: str | None = None
         with (
@@ -132,12 +154,19 @@ class LauncherTest(unittest.TestCase):
     def test_control_the_key_is_exported_checked_and_piped_to_the_script_and_nowhere_else(self) -> None:
         launcher, message, output = self.run_launcher(Outcome(0, exported()))
         self.assertIsNone(message)
-        self.assertEqual(["aws", "ssh"], [program for program, _, _ in launcher.calls])
-        _, aws_args, aws_kwargs = launcher.calls[0]
+        self.assertEqual(["ssh", "aws", "ssh"], [program for program, _, _ in launcher.calls], "the policy check on the host comes before the export is read")
+        _, check_args, check_kwargs = launcher.calls[0]
+        self.assertEqual(["sudo", "-n", "/usr/bin/sha256sum", host.SUDOERS_FILE], check_args[-4:])
+        self.assertIn(f"ubuntu@{ADDRESS}", check_args)
+        self.assertIsNone(check_kwargs.get("input_text"))
+        self.assertGreater(check_kwargs["timeout"], 0)
+        _, aws_args, aws_kwargs = launcher.calls[1]
         self.assertEqual(["configure", "export-credentials", "--profile", PROFILE, "--format", "process"], aws_args)
         self.assertGreater(aws_kwargs["timeout"], 0)
-        _, ssh_args, ssh_kwargs = launcher.calls[1]
-        self.assertEqual(["sudo", host.KEY_SCRIPT], ssh_args[-2:])
+        _, ssh_args, ssh_kwargs = launcher.calls[2]
+        self.assertEqual(["sudo", "/usr/bin/python3", "-I", "/opt/platform/bin/airbyte_key_install"], ssh_args[-4:])
+        self.assertEqual(["/usr/bin/python3", "-I", host.KEY_SCRIPT], host.KEY_COMMAND)
+        self.assertEqual(["sudo", *host.KEY_COMMAND], ssh_args[-4:], "the remote command is the interpreter in isolated mode and the script, and nothing else")
         self.assertIn(f"ubuntu@{ADDRESS}", ssh_args)
         self.assertEqual({"aws_access_key_id": KEY_ID, "aws_secret_access_key": KEY_VALUE}, json.loads(ssh_kwargs["input_text"]))
         self.assertGreater(ssh_kwargs["timeout"], 0)
@@ -151,7 +180,8 @@ class LauncherTest(unittest.TestCase):
     def refused(self, aws: Outcome, ssh: Outcome | None, expected: str, *, ssh_called: bool) -> None:
         launcher, message, _ = self.run_launcher(aws, ssh)
         self.assertEqual(expected, message)
-        self.assertEqual(ssh_called, any(program == "ssh" for program, _, _ in launcher.calls))
+        sends = [args for program, args, _ in launcher.calls if program == "ssh" and args[-4:] == ["sudo", *host.KEY_COMMAND][-4:]]
+        self.assertEqual(ssh_called, bool(sends))
 
     def test_an_export_that_fails_is_a_fixed_message_with_the_exit_status_and_no_output(self) -> None:
         self.refused(Outcome(253, f"error {KEY_VALUE}", f"error {KEY_ID}"), None, host.KEY_MESSAGES["export_failed"].format(status=253), ssh_called=False)
@@ -207,6 +237,28 @@ class LauncherTest(unittest.TestCase):
     def test_an_answer_of_the_script_that_is_not_a_known_code_is_a_fixed_message_and_is_never_shown(self) -> None:
         self.refused(Outcome(0, exported()), Outcome(0, f"{KEY_VALUE}\n"), host.KEY_MESSAGES["script_unknown"], ssh_called=True)
         self.refused(Outcome(0, exported()), Outcome(3, "placed\n"), host.KEY_MESSAGES["script_unknown"], ssh_called=True)
+
+    def checked(self, check: Outcome, expected: str) -> None:
+        launcher, message, _ = self.run_launcher(Outcome(0, exported()), None, check)
+        self.assertEqual(expected, message)
+        self.assertEqual(["ssh"], [program for program, _, _ in launcher.calls], "a refused policy check reads no export and sends nothing")
+
+    def test_a_host_whose_sudo_policy_file_is_missing_or_unreadable_is_refused_before_the_export_is_read(self) -> None:
+        self.checked(Outcome(1, "", f"sudo: no such file {KEY_VALUE}"), host.KEY_MESSAGES["policy_missing"])
+        self.checked(Outcome(2, f"{POLICY_DIGEST}  {host.SUDOERS_FILE}\n"), host.KEY_MESSAGES["policy_missing"])
+
+    def test_a_host_whose_sudo_policy_file_differs_from_the_repositorys_is_refused_before_the_export_is_read(self) -> None:
+        for text in (f"{'0' * 64}  {host.SUDOERS_FILE}\n", "", "not a digest\n", f"{POLICY_DIGEST[:-1]}  x\n", f"{POLICY_DIGEST.upper()[:63]}\n"):
+            with self.subTest(text=text[:20]):
+                self.checked(Outcome(0, text), host.KEY_MESSAGES["policy_differs"])
+
+    def test_a_policy_check_that_fails_or_times_out_over_ssh_is_a_fixed_message(self) -> None:
+        self.checked(Outcome(255, "", "Permission denied"), host.KEY_MESSAGES["ssh_failed"].format(status=255))
+        self.checked(Outcome(raises=TimeoutExpired("ssh", 60)), host.KEY_MESSAGES["ssh_timeout"].format(seconds=host.KEY_SEND_SECONDS))
+
+    def test_the_digest_is_that_of_the_repositorys_file_and_the_file_names_the_launchers_command(self) -> None:
+        self.assertEqual(SUDOERS.resolve(), host.KEY_POLICY_SOURCE.resolve())
+        self.assertEqual("/etc/sudoers.d/airbyte_key_install", host.SUDOERS_FILE)
 
     def test_the_profile_is_checked_as_a_profile_name_before_the_export(self) -> None:
         launcher = Launcher(Outcome(0, exported()), Outcome(0, "placed\n"))
@@ -318,26 +370,53 @@ class ScriptTest(unittest.TestCase):
             status, output, errors = self.run_main(payload())
         self.assertEqual((3, "cannot_write\n", ""), (status, output, errors))
 
-    def test_the_script_runs_as_a_program_reads_standard_input_and_prints_one_code(self) -> None:
-        shutil_path = self.folder / "bin"
-        shutil_path.mkdir()
-        for name, source in (("airbyte_key_install.py", SCRIPT), ("secret_files.py", SHARED_MODULE_UTILS / "secret_files.py")):
-            (shutil_path / name).write_text(source.read_text())
+    def deployed(self, command: list[str], directory: str) -> tuple[int, str, str]:
         result = run_command(
-            sys.executable,
-            [str(shutil_path / "airbyte_key_install.py"), "--directory", str(self.folder / "s"), "--owner", OWNER],
+            command[0],
+            [*command[1:], "--directory", str(self.folder / directory), "--owner", OWNER],
             input_text=payload(),
             timeout=30,
             env={"PATH": "/usr/bin:/bin"},
         )
-        self.assertEqual((0, "placed\n", ""), (result.returncode, result.stdout, result.stderr))
+        return result.returncode, result.stdout, result.stderr
+
+    def test_the_script_runs_the_way_the_deployed_command_starts_it_through_the_interpreter_in_isolated_mode(self) -> None:
+        script = install_form(self.folder / "bin")
+        self.assertEqual((0, "placed\n", ""), self.deployed([sys.executable, "-I", str(script)], "s"))
         self.assertEqual(KEY_VALUE, (self.folder / "s" / "airbyte" / "aws_secret_access_key").read_text())
+
+    def test_isolated_mode_drops_the_script_folder_from_the_path_yet_the_script_finds_its_helper_beside_it(self) -> None:
+        script = install_form(self.folder / "bin")
+        plain = run_command(sys.executable, ["-I", "-c", "import secret_files"], cwd=script.parent, timeout=30)
+        self.assertNotEqual(0, plain.returncode, "the helper is not importable by name in isolated mode, so the script must load it by its path")
+        self.assertEqual("placed\n", self.deployed([sys.executable, "-I", str(script)], "s")[1])
+
+    def test_the_script_is_an_executable_file_with_an_interpreter_line_so_it_never_fails_to_start(self) -> None:
+        text = SCRIPT.read_text()
+        self.assertEqual(SHEBANG, text.splitlines()[0])
+        script = install_form(self.folder / "bin")
+        script.write_text(text.replace(SHEBANG, f"#!{sys.executable} -I", 1))
+        script.chmod(0o700)
+        self.assertEqual((0, "placed\n", ""), self.deployed([str(script)], "d"))
+
+    def test_the_interpreter_line_names_the_hosts_interpreter_in_isolated_mode_and_runs_where_that_interpreter_exists(self) -> None:
+        interpreter = Path("/usr/bin/python3")
+        if not interpreter.exists():
+            self.skipTest("this computer has no /usr/bin/python3")
+        version = run_command(str(interpreter), ["-c", "import sys; print(sys.version_info >= (3, 12))"], timeout=30)
+        if version.returncode != 0 or version.stdout.strip() != "True":
+            self.skipTest("the interpreter of this computer is older than the host's")
+        script = install_form(self.folder / "bin")
+        self.assertEqual((0, "placed\n", ""), self.deployed([str(script)], "r"))
 
     def test_the_script_reads_no_secret_from_an_argument_or_the_environment(self) -> None:
         text = SCRIPT.read_text()
         self.assertNotIn("os.environ", text)
         self.assertNotIn("getenv", text)
         self.assertEqual({"--directory", "--owner"}, set(re.findall(r'"(--[a-z-]+)"', text)))
+
+    def test_the_command_that_sudo_sees_is_the_one_the_launcher_runs_and_the_script_installed_by_the_role(self) -> None:
+        self.assertEqual(f"/usr/bin/python3 -I {group_variables()['airbyte_bin_directory']}/airbyte_key_install", " ".join(host.KEY_COMMAND))
 
     def test_the_default_folder_is_the_secrets_folder_of_the_role(self) -> None:
         variables = group_variables()
@@ -352,14 +431,20 @@ class RoleTest(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.folder = Path(folder.name)
 
-    def variables(self) -> dict[str, object]:
+    @staticmethod
+    def variables_for(folder: Path) -> dict[str, object]:
         return {
-            "airbyte_bin_directory": str(self.folder / "bin"),
-            "airbyte_key_script": str(self.folder / "bin" / "airbyte_key_install"),
-            "airbyte_secrets_directory": str(self.folder / "secrets"),
+            "airbyte_bin_directory": str(folder / "bin"),
+            "airbyte_key_script": str(folder / "bin" / "airbyte_key_install"),
+            "airbyte_key_sudoers": str(folder / "sudoers.d" / "airbyte_key_install"),
+            "airbyte_visudo": VISUDO,
+            "airbyte_secrets_directory": str(folder / "secrets"),
             "airbyte_owner": ROLE_OWNER,
             "airbyte_group": ROLE_GROUP,
         }
+
+    def variables(self) -> dict[str, object]:
+        return self.variables_for(self.folder)
 
     def test_the_script_and_its_helper_are_installed_for_the_owner_only_and_a_second_run_changes_nothing(self) -> None:
         code, output = run_tasks(["key_script.yml"], self.variables())
@@ -379,13 +464,82 @@ class RoleTest(unittest.TestCase):
         run_tasks(["key_script.yml"], self.variables())
         result = run_command(
             sys.executable,
-            [str(self.folder / "bin" / "airbyte_key_install"), "--directory", str(self.folder / "secrets"), "--owner", OWNER],
+            ["-I", str(self.folder / "bin" / "airbyte_key_install"), "--directory", str(self.folder / "secrets"), "--owner", OWNER],
             input_text=payload(),
             timeout=30,
             env={"PATH": "/usr/bin:/bin"},
         )
         self.assertEqual((0, "placed\n"), (result.returncode, result.stdout))
         self.assertEqual(KEY_ID, (self.folder / "secrets" / "airbyte" / "aws_access_key_id").read_text())
+
+
+class SudoersTest(unittest.TestCase):
+    """The sudoers drop-in turns off every recording of input and output for exactly the command that the launcher runs, so sudo never keeps the key.
+
+    The options are those of the sudoers manual of sudo 1.9.15, the version of Ubuntu 24.04: log_input and log_output, and log_stdin, log_stdout, log_stderr,
+    log_ttyin and log_ttyout, which that manual lists. A per-command Defaults entry may not hold arguments, so the command is a Cmnd_Alias.
+    """
+
+    OPTIONS = "!log_input, !log_output, !log_stdin, !log_stdout, !log_stderr, !log_ttyin, !log_ttyout"
+
+    def lines(self) -> list[str]:
+        return [line for line in SUDOERS.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+    def test_the_drop_in_names_the_exact_command_that_the_launcher_runs_and_turns_every_recording_off_for_it(self) -> None:
+        self.assertEqual(
+            [f"Cmnd_Alias AIRBYTE_KEY_INSTALL = {' '.join(host.KEY_COMMAND)}", f"Defaults!AIRBYTE_KEY_INSTALL {self.OPTIONS}"],
+            self.lines(),
+        )
+
+    def test_the_drop_in_gives_no_one_any_privilege_it_only_sets_defaults_for_the_command(self) -> None:
+        for line in self.lines():
+            self.assertRegex(line, r"^(Cmnd_Alias |Defaults!)")
+        self.assertNotRegex(SUDOERS.read_text(), r"(?m)^[^#\n]*\b(ALL|NOPASSWD)\b")
+
+    @unittest.skipUnless(Path(VISUDO).exists(), "this computer has no visudo")
+    def test_visudo_accepts_the_drop_in_and_refuses_an_unknown_option_or_arguments_in_a_per_command_default(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+
+            def check(text: str) -> int:
+                path = Path(scratch) / "drop_in"
+                path.write_text(text)
+                return run_command(VISUDO, ["-cf", str(path)], timeout=30).returncode
+
+            good = SUDOERS.read_text()
+            self.assertEqual(0, check(good))
+            self.assertNotEqual(0, check(good.replace("!log_ttyout", "!log_no_such_option")))
+            self.assertNotEqual(0, check(good.replace("Defaults!AIRBYTE_KEY_INSTALL", f"Defaults!{' '.join(host.KEY_COMMAND)}")))
+
+    def test_the_role_installs_it_for_root_only_in_mode_0440_and_validates_it_with_visudo_before_it_takes_its_place(self) -> None:
+        task = next(
+            task for task in role_tasks()["key_script.yml"] if "ansible.builtin.copy" in task and "sudoers" in str(task["ansible.builtin.copy"]["dest"])
+        )
+        copy = task["ansible.builtin.copy"]
+        self.assertEqual("0440", copy["mode"])
+        self.assertEqual("{{ airbyte_visudo }} -cf %s", copy["validate"])
+        self.assertEqual("{{ airbyte_key_sudoers }}", copy["dest"])
+        self.assertEqual("{{ role_path }}/files/airbyte_key_install.sudoers", copy["src"])
+        self.assertEqual("/usr/sbin/visudo", group_variables()["airbyte_visudo"])
+        self.assertEqual(host.SUDOERS_FILE, group_variables()["airbyte_key_sudoers"])
+
+    @unittest.skipUnless(Path(VISUDO).exists(), "this computer has no visudo")
+    def test_the_installed_drop_in_is_the_file_with_mode_0440_and_a_second_run_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="project_key_sudoers_") as scratch:
+            variables = RoleTest.variables_for(Path(scratch))
+            code, output = run_tasks(["key_script.yml"], variables)
+            placed = Path(scratch) / "sudoers.d" / "airbyte_key_install"
+            self.assertEqual(0, code, output)
+            self.assertEqual(SUDOERS.read_text(), placed.read_text())
+            self.assertEqual(0o440, stat.S_IMODE(placed.stat().st_mode))
+            again_code, again = run_tasks(["key_script.yml"], variables)
+            self.assertEqual(0, again_code, again)
+            self.assertRegex(again, r"changed=0\s")
+
+    def test_a_drop_in_that_fails_the_validation_leaves_no_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="project_key_sudoers_") as scratch:
+            code, output = run_tasks(["key_script.yml"], RoleTest.variables_for(Path(scratch)) | {"airbyte_visudo": "/usr/bin/false"})
+            self.assertNotEqual(0, code, output)
+            self.assertFalse((Path(scratch) / "sudoers.d" / "airbyte_key_install").exists())
 
 
 class NoKeyInAnsibleTest(unittest.TestCase):

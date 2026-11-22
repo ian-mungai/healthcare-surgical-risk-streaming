@@ -18,6 +18,7 @@ Every wait has a deadline and fails with a message that names what did not happe
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,11 @@ SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
 PLAYBOOKS = {"host.yml": ("host setup", "ansible_output.txt"), "connection.yml": ("connection step", "ansible_connection_output.txt")}
 KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
+# The remote command: the host's interpreter in isolated mode and the installed script. This command line is the one that sudo matches, and the sudoers drop-in
+# (the file named below, which the role installs and this program compares by its SHA-256) turns input recording off for it.
+KEY_COMMAND = ["/usr/bin/python3", "-I", KEY_SCRIPT]
+SUDOERS_FILE = "/etc/sudoers.d/airbyte_key_install"
+KEY_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "airbyte" / "files" / "airbyte_key_install.sudoers"
 KEY_EXPORT_SECONDS = 60
 KEY_SEND_SECONDS = 60
 KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
@@ -63,6 +69,8 @@ KEY_MESSAGES = {
     "not_a_static_key": "the AWS command line answered for the project profile with something that is not the ID and the secret of an AWS access key",
     "session_token": "the project profile yields a session token; Airbyte's connectors need the own access key of an IAM user, not a temporary credential",
     "empty": "the AWS command line answered for the project profile with no access key ID or no secret",
+    "policy_missing": "the sudo policy file for the key script is missing or cannot be read on the host; the host playbook installs it, so run it first",
+    "policy_differs": "the sudo policy file for the key script on the host is not the repository's; the host playbook installs the right one, so run it first",
     "ssh_failed": "the key could not be sent to the host (exit status {status})",
     "ssh_timeout": "sending the key to the host did not finish within {seconds} seconds",
     "script_oversized": "the key script on the host refused the document: it is larger than the script accepts",
@@ -372,18 +380,42 @@ def exported_key(profile: str) -> dict[str, str]:
     return {"aws_access_key_id": key_id, "aws_secret_access_key": value}
 
 
+def check_sudo_policy(run_id: str, address: str) -> None:
+    """Refuse, before the key is read, a host whose sudo policy file for the key script is missing or is not the repository's file.
+
+    The file turns sudo's recording of input and output off for the key script's command line, and the key arrives on standard input. The check reads
+    the file's SHA-256 with one remote call (``sudo -n sha256sum <file>``). It shows that the repository's file is in place unchanged. It does not
+    read sudo's effective settings, whose output format the sudoers manual does not define, so the first host run also proves the effect with a marker
+    test."""
+    expected = hashlib.sha256(KEY_POLICY_SOURCE.read_bytes()).hexdigest()
+    try:
+        result = run_command(
+            "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", SUDOERS_FILE], timeout=KEY_SEND_SECONDS
+        )
+    except TimeoutExpired:
+        raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
+    if result.returncode == 255:
+        raise HostError(KEY_MESSAGES["ssh_failed"].format(status=255))
+    if result.returncode != 0:
+        raise HostError(KEY_MESSAGES["policy_missing"])
+    words = result.stdout.split()
+    if not words or words[0] != expected:
+        raise HostError(KEY_MESSAGES["policy_differs"])
+
+
 def place_project_key(run_id: str, address: str, profile: str) -> None:
     """Read the project profile's access key on this computer and place it on the host through one SSH command.
 
-    The key is exported with the AWS command line (deadline, captured output), checked in memory and written to the standard input of
-    ``ssh <host> sudo <the key script>``, which writes the two root-only files. It is never in an argument list, an environment variable, a file on this
-    computer, an output or an error text. Every failure is a fixed message from ``KEY_MESSAGES``. The script's one-line answer is the only output read.
-    """
+    The key is exported with the AWS command line (deadline, captured output), checked in memory and written to the standard input of ``ssh <host>
+    sudo /usr/bin/python3 -I <the key script>``, which writes the two root-only files. It is never in an argument list, an environment variable, a
+    file on this computer, an output or an error text. Every failure is a fixed message from ``KEY_MESSAGES``. The script's one-line answer is the
+    only output read."""
     if PATTERNS["AWS_PROFILE"].fullmatch(profile) is None:
         raise HostError("AWS_PROFILE is not a profile name")
+    check_sudo_policy(run_id, address)
     document = json.dumps(exported_key(profile))
     try:
-        sent = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", KEY_SCRIPT], input_text=document, timeout=KEY_SEND_SECONDS)
+        sent = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *KEY_COMMAND], input_text=document, timeout=KEY_SEND_SECONDS)
     except TimeoutExpired:
         raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
     code = sent.stdout.strip()

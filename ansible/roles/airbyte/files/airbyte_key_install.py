@@ -1,26 +1,51 @@
+#!/usr/bin/python3 -I
 """Place the project profile's access key for Airbyte's two connectors as two root-only files. Run as root on the host by the launcher.
 
-The launcher reads the key on the owner's computer and sends one JSON document on standard input:
-``{"aws_access_key_id": ..., "aws_secret_access_key": ...}``. The script takes no secret in an argument or the environment, and no Ansible task or module ever
-holds the key. It refuses anything else by a fixed code: input over 4 KiB (``oversized``), text that is not a JSON object (``not_json``), a key whose name
-holds "token" (``session_token``), another set of keys than the two (``bad_keys``), values that are not text or not in the form of an AWS access key
-(``bad_form``) and empty values (``empty``). It writes ``airbyte/aws_access_key_id`` and ``airbyte/aws_secret_access_key`` under the secrets folder with the
-shared atomic helper: each file is written through a fresh temporary file that is flushed and synced before it takes its place, mode 0400, so a file is whole or
-absent and never empty. The leftovers of an interrupted write are removed at the start, an empty or short file is replaced like a changed one (a rotated key),
-a file with another mode or owner is given the right ones, and a second run changes nothing. A file that cannot be written is ``cannot_write``. The script
-prints one code (``placed``, ``unchanged`` or a refusal) and nothing else, and exits 0 for the first two and 3 otherwise. It uses only the standard library and
-the helper that the role installs beside it, and runs on the host's Python.
-"""
+The launcher reads the key on the owner's computer and sends one JSON document on standard input: ``{"aws_access_key_id": ...,
+"aws_secret_access_key": ...}``. The script takes no secret in an argument or the environment, and no Ansible task or module ever holds the key. It
+refuses anything else by a fixed code: input over 4 KiB (``oversized``), text that is not a JSON object (``not_json``), a key whose name holds "token"
+(``session_token``), another set of keys than the two (``bad_keys``), values that are not text or not in the form of an AWS access key (``bad_form``)
+and empty values (``empty``). It writes ``airbyte/aws_access_key_id`` and ``airbyte/aws_secret_access_key`` under the secrets folder with the shared
+atomic helper: each file is written through a fresh temporary file that is flushed and synced before it takes its place, mode 0400, so a file is whole
+or absent and never empty. The leftovers of an interrupted write are removed at the start, an empty or short file is replaced like a changed one (a
+rotated key), a file with another mode or owner is given the right ones, and a second run changes nothing. A file that cannot be written is
+``cannot_write``. The script prints one code (``placed``, ``unchanged`` or a refusal) and nothing else, and exits 0 for the first two and 3 otherwise.
+It uses only the standard library and the helper that the role installs beside it, and runs on the host's Python.
+
+The launcher starts it as ``sudo /usr/bin/python3 -I <this file>``: the host's interpreter in isolated mode (no environment variable, no user site
+folder and no script folder on the import path), so that the command that sudo matches, and the sudoers entry that turns off its input recording, name
+one fixed command line. The interpreter line makes the file a program that starts by itself too, and names the same interpreter. Isolated mode drops
+the script's folder from the import path, so the script loads the helper by its path beside itself."""
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
 
-from secret_files import SecretFileError, access_differs, parse_owner, remove_leftovers, set_access, write_private_file
+
+def load_helper() -> object:
+    """The shared file helper that the role installs beside this script, loaded by its path because isolated mode has no script folder on the import path."""
+    path = Path(__file__).resolve().parent / "secret_files.py"
+    spec = importlib.util.spec_from_file_location("secret_files", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("secret_files")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["secret_files"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+helper = load_helper()
+SecretFileError = helper.SecretFileError  # type: ignore[attr-defined]
+access_differs = helper.access_differs  # type: ignore[attr-defined]
+parse_owner = helper.parse_owner  # type: ignore[attr-defined]
+remove_leftovers = helper.remove_leftovers  # type: ignore[attr-defined]
+set_access = helper.set_access  # type: ignore[attr-defined]
+write_private_file = helper.write_private_file  # type: ignore[attr-defined]
 
 DEFAULT_DIRECTORY = "/opt/platform/secrets"
 DEFAULT_OWNER = "0:0"

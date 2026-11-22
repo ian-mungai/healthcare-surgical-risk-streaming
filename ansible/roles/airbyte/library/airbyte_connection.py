@@ -26,6 +26,9 @@ Every exchange with Airbyte has one elapsed deadline, enforced by a timer that s
 (``Budget``), so no exchange and no kubectl call runs past it. The token, the client credentials, the key and every body of a call stay out of every
 message: a failed call names its method, its path and its status.
 
+Accepted limit (owner decision, Nov 22 2026): for an answer that carries ``Connection: close`` the body read can outlast the exchange deadline, and
+the kill grace of the ``timeout`` program around kubectl is outside the run budget.
+
 The module uses only the standard library and runs on the host's Python.
 """
 
@@ -39,6 +42,7 @@ import http.client
 import json
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -68,6 +72,7 @@ CONNECTOR_KEY_FIELDS: dict[str, dict[str, Any]] = {
         "fields": {"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"},
     },
 }
+ID_FORM = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 DEFINITION_SHAPE: dict[str, type] = {"id": str, "name": str, "dockerRepository": str, "dockerImageTag": str}
 ANSWER_SHAPES: dict[str, dict[str, type]] = {
     "workspace": {"workspaceId": str},
@@ -76,6 +81,14 @@ ANSWER_SHAPES: dict[str, dict[str, type]] = {
     "source": {"sourceId": str, "name": str, "definitionId": str, "configuration": dict},
     "destination": {"destinationId": str, "name": str, "definitionId": str, "configuration": dict},
     "connection": {"connectionId": str, "name": str, "sourceId": str, "destinationId": str, "status": str, "schedule": dict, "configurations": dict},
+}
+ID_KEYS: dict[str, tuple[str, ...]] = {
+    "workspace": ("workspaceId",),
+    "source_definition": ("id",),
+    "destination_definition": ("id",),
+    "source": ("sourceId", "definitionId"),
+    "destination": ("destinationId", "definitionId"),
+    "connection": ("connectionId", "sourceId", "destinationId"),
 }
 KUBECTL_SECONDS = 60
 KUBECTL_KILL_SECONDS = 5
@@ -200,13 +213,24 @@ def covers(actual: Any, wanted: Any) -> bool:
     return type(actual) is type(wanted) and actual == wanted
 
 
+def is_id(value: object) -> bool:
+    """Whether a value is an ID in the documented form: the public API's schema gives every ID as ``format: UUID`` (airbyte-platform, api.yaml)."""
+    return isinstance(value, str) and ID_FORM.fullmatch(value) is not None
+
+
 def checked(item: Any, kind: str) -> dict[str, Any]:
-    """The item of an answer when it is an object that holds each required key of its kind with the required type. Anything else is refused by kind and key."""
+    """The item of an answer when it is an object that holds each required key of its kind with the required type, and each ID in the form of a UUID.
+
+    Anything else is refused by kind and key, so no write is ever planned from an answer with a missing or empty ID.
+    """
     if not isinstance(item, dict):
         raise ApiError(f"an answer holds a {kind} that is not an object")
     for key, expected in ANSWER_SHAPES[kind].items():
         if key not in item or type(item[key]) is not expected:
             raise ApiError(f"a {kind} in an answer lacks {key} or holds it in the wrong form")
+    for key in ID_KEYS[kind]:
+        if not is_id(item[key]):
+            raise ApiError(f"a {kind} in an answer holds {key} that is empty or not an ID")
     return item
 
 
@@ -228,8 +252,8 @@ def listing(api: Api, path: str, kind: str) -> list[dict[str, Any]]:
 def created_id(answer: dict[str, Any], field: str) -> str:
     """The ID in the answer of a create. The write is made, so a missing ID is a named error and not a plan."""
     value = answer.get(field)
-    if not isinstance(value, str) or not value:
-        raise ApiError(f"the answer of a create holds no {field}")
+    if not isinstance(value, str) or not is_id(value):
+        raise ApiError(f"the answer of a create holds no {field} in the form of an ID")
     return value
 
 

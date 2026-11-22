@@ -124,6 +124,10 @@ class FakeAirbyte:
             name = str(key)
             if how == "missing":
                 row.pop(name, None)
+            elif how == "empty":
+                row[name] = ""
+            elif how == "not a uuid":
+                row[name] = "an-id-that-is-text-but-not-a-uuid"
             else:
                 row[name] = "a text" if expected is not str else 5
             out.append(row)
@@ -225,10 +229,10 @@ class CreateAndRepeatTest(unittest.TestCase):
         api = FakeAirbyte()
         apply(api)
         for index in range(5):
-            api.objects["sources"][f"other{index}"] = {
-                "sourceId": f"other{index}",
+            api.objects["sources"][f"4444444{index}-4444-4444-4444-444444444444"] = {
+                "sourceId": f"4444444{index}-4444-4444-4444-444444444444",
                 "name": f"other_{index}",
-                "definitionId": "another",
+                "definitionId": "44444444-4444-4444-4444-444444444444",
                 "workspaceId": WORKSPACE,
                 "configuration": {},
             }
@@ -328,8 +332,8 @@ class RefusalTest(unittest.TestCase):
         api = FakeAirbyte()
         apply(api)
         twin = copy.deepcopy(api.only("sources"))
-        twin["sourceId"] = "twin"
-        api.objects["sources"]["twin"] = twin
+        twin["sourceId"] = "77777777-7777-7777-7777-777777777777"
+        api.objects["sources"]["77777777-7777-7777-7777-777777777777"] = twin
         api.writes.clear()
         with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
             apply(api)
@@ -343,13 +347,13 @@ class RefusalTest(unittest.TestCase):
 
     def test_a_structural_drift_that_no_update_can_repair_is_refused_and_nothing_is_written(self) -> None:
         def move_connection(api: FakeAirbyte) -> None:
-            api.only("connections")["sourceId"] = "other"
+            api.only("connections")["sourceId"] = "66666666-6666-6666-6666-666666666666"
 
         def move_source(api: FakeAirbyte) -> None:
-            api.only("sources")["definitionId"] = "other"
+            api.only("sources")["definitionId"] = "66666666-6666-6666-6666-666666666666"
 
         def move_destination(api: FakeAirbyte) -> None:
-            api.only("destinations")["definitionId"] = "other"
+            api.only("destinations")["definitionId"] = "66666666-6666-6666-6666-666666666666"
 
         def swap_image(api: FakeAirbyte) -> None:
             api.only("source_definitions")["dockerRepository"] = "someone/else"
@@ -627,20 +631,20 @@ class PlanTest(unittest.TestCase):
     def test_a_drifted_version_and_a_wrongly_linked_connection_give_no_write_call(self) -> None:
         api = self.build()
         api.only("source_definitions")["dockerImageTag"] = "latest"
-        api.only("connections")["sourceId"] = "elsewhere"
+        api.only("connections")["sourceId"] = "55555555-5555-5555-5555-555555555555"
         self.refused_without_a_write(api)
         self.assertEqual("latest", api.only("source_definitions")["dockerImageTag"], "the drifted version is not touched when the run is refused")
 
     def test_a_drifted_source_and_a_destination_of_another_definition_give_no_write_call(self) -> None:
         api = self.build()
         api.only("sources")["configuration"]["streams"][0]["globs"].pop()
-        api.only("destinations")["definitionId"] = "other"
+        api.only("destinations")["definitionId"] = "66666666-6666-6666-6666-666666666666"
         self.refused_without_a_write(api)
 
     def test_a_rotated_key_and_a_wrongly_linked_connection_give_no_write_call(self) -> None:
         api = self.build()
         api.keys = {"aws_access_key_id": OTHER_KEY_ID, "aws_secret_access_key": OTHER_KEY_VALUE}
-        api.only("connections")["destinationId"] = "elsewhere"
+        api.only("connections")["destinationId"] = "55555555-5555-5555-5555-555555555555"
         self.refused_without_a_write(api)
 
     def test_a_missing_definition_with_a_connection_that_cannot_follow_gives_no_write_call(self) -> None:
@@ -657,8 +661,8 @@ class PlanTest(unittest.TestCase):
         api = self.build()
         api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
         twin = copy.deepcopy(api.only("destinations"))
-        twin["destinationId"] = "twin"
-        api.objects["destinations"]["twin"] = twin
+        twin["destinationId"] = "77777777-7777-7777-7777-777777777777"
+        api.objects["destinations"]["77777777-7777-7777-7777-777777777777"] = twin
         self.refused_without_a_write(api)
 
     def test_planning_reads_everything_and_writes_nothing_and_the_plan_names_each_step_in_order(self) -> None:
@@ -838,6 +842,45 @@ class AnswerShapeTest(unittest.TestCase):
                             apply(api)
                         self.assertEqual([], api.writes)
                         self.assertNotIn(KEY_VALUE, str(raised.exception))
+
+    def test_the_table_names_the_ids_of_each_kind_and_they_are_documented_as_uuids(self) -> None:
+        """The public API's schema (airbyte-platform, api.yaml) gives every ID of these kinds as ``format: UUID``."""
+        self.assertEqual(
+            {
+                "workspace": {"workspaceId"},
+                "source_definition": {"id"},
+                "destination_definition": {"id"},
+                "source": {"sourceId", "definitionId"},
+                "destination": {"destinationId", "definitionId"},
+                "connection": {"connectionId", "sourceId", "destinationId"},
+            },
+            {kind: set(keys) for kind, keys in MODULE_UNDER_TEST.ID_KEYS.items()},
+        )
+        for kind, keys in MODULE_UNDER_TEST.ID_KEYS.items():
+            self.assertLessEqual(set(keys), set(MODULE_UNDER_TEST.ANSWER_SHAPES[kind]), kind)
+
+    def test_each_id_of_each_kind_empty_or_not_a_uuid_is_refused_and_nothing_is_written(self) -> None:
+        for kind, keys in MODULE_UNDER_TEST.ID_KEYS.items():
+            for key in keys:
+                for damage in ("empty", "not a uuid"):
+                    with self.subTest(kind=kind, key=key, damage=damage):
+                        api = self.drifted()
+                        api.damage = (kind, key, damage, str)
+                        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+                            apply(api)
+                        self.assertEqual([], api.writes)
+                        self.assertIn(key, str(raised.exception))
+
+    def test_an_id_in_the_form_of_a_uuid_in_either_case_is_accepted(self) -> None:
+        self.assertTrue(MODULE_UNDER_TEST.is_id("0b0d1d3a-4d9b-4a5e-8b0c-1f2e3d4c5b6a"))
+        self.assertTrue(MODULE_UNDER_TEST.is_id("0B0D1D3A-4D9B-4A5E-8B0C-1F2E3D4C5B6A"))
+        for text in ("", " ", "x", "0b0d1d3a4d9b4a5e8b0c1f2e3d4c5b6a", "0b0d1d3a-4d9b-4a5e-8b0c-1f2e3d4c5b6", "0b0d1d3a-4d9b-4a5e-8b0c-1f2e3d4c5b6a\n", "../a"):
+            self.assertFalse(MODULE_UNDER_TEST.is_id(text), repr(text))
+
+    def test_the_id_in_the_answer_of_a_create_is_held_to_the_same_form(self) -> None:
+        for answer in ({"sourceId": ""}, {"sourceId": "not-a-uuid"}, {"sourceId": 5}, {}):
+            with self.subTest(answer=answer), self.assertRaises(MODULE_UNDER_TEST.ApiError):
+                MODULE_UNDER_TEST.created_id(answer, "sourceId")
 
     def test_an_item_that_is_not_an_object_is_refused_and_nothing_is_written(self) -> None:
         api = self.drifted()
