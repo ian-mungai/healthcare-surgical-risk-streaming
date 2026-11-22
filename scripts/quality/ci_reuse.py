@@ -154,6 +154,8 @@ def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE
                 shut_down(connection.sock)
             raise ApiError(f"GET {where} failed: {expired}")
         connection.close()
+        if clock() >= deadline:
+            raise ApiError(f"GET {where} answered or failed at or after the deadline of {deadline_seconds:g} seconds, so the outcome is discarded")
         if "error" in outcome:
             raise ApiError(f"GET {where} failed: {type(outcome['error']).__name__}") from outcome["error"]
         status, body = outcome["answer"]

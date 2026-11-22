@@ -656,7 +656,10 @@ class RecordAndSummaryTest(PlanRepository):
 class SlowApi:
     """A stand-in for the API on the loopback interface that waits ``pause`` seconds before each byte of its answer."""
 
-    def __init__(self, test: unittest.TestCase, pause: float, body: bytes = b'{"answer": 1}', before_last_byte: Callable[[], None] = lambda: None) -> None:
+    def __init__(
+        self, test: unittest.TestCase, pause: float, body: bytes = b'{"answer": 1}', before_last_byte: Callable[[], None] = lambda: None, missing: int = 0
+    ) -> None:
+        """``missing`` bytes more than the body are announced, so the reader fails when the stand-in closes the connection."""
         self.requests = 0
         stand_in = self
 
@@ -665,7 +668,7 @@ class SlowApi:
                 stand_in.requests += 1
                 with contextlib.suppress(OSError):
                     self.send_response(200)
-                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Content-Length", str(len(body) + missing))
                     self.end_headers()
                     for index, byte in enumerate(body):
                         time.sleep(pause)
@@ -758,6 +761,16 @@ class ApiDeadlineTest(unittest.TestCase):
                         api("repos/owner/project/actions/runs")
                 else:
                     self.assertEqual(api("repos/owner/project/actions/runs"), {"answer": 1})
+
+    def test_an_error_at_the_deadline_is_named_as_the_deadline(self) -> None:
+        for arrives, reason in ((9.0, "failed at or after the deadline of 5 seconds"), (8.5, "failed: IncompleteRead")):
+            with self.subTest(arrives=arrives):
+                clock = Clock()
+                clock.set(4.0)
+                stand_in = SlowApi(self, pause=0.0, before_last_byte=functools.partial(clock.set, arrives), missing=5)
+                api = ci_reuse.github_api(stand_in.url, "token", deadline_seconds=5.0, clock=clock)
+                with self.assertRaisesRegex(ci_reuse.ApiError, reason):
+                    api("repos/owner/project/actions/runs")
 
     def test_an_answer_within_the_deadline_is_read(self) -> None:
         api = ci_reuse.github_api(SlowApi(self, pause=0.0).url, "token", deadline_seconds=5.0)
