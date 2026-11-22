@@ -154,6 +154,11 @@ class MissingPinnedCopyTest(unittest.TestCase):
             self.assertEqual("out", terraform_wrapper.terraform(run, ["version"], 5))
         self.assertEqual("/pinned/terraform", started.call_args.args[0])
 
+    def test_the_make_target_with_a_missing_copy_names_make_setup(self) -> None:
+        result = run_command("make", ["--no-print-directory", "check-terraform", "TERRAFORM=/no/such/terraform"], cwd=ROOT, timeout=TIMEOUT_SECONDS)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("run: make setup", result.stderr)
+
 
 class HostedJobTest(unittest.TestCase):
     def test_the_hosted_job_installs_the_pinned_tools_before_it_runs_the_terraform_check(self) -> None:
