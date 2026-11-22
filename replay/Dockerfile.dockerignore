@@ -1,6 +1,10 @@
 *
 !replay
 !scripts/__init__.py
+!scripts/process.py
+!scripts/project_config.py
+!scripts/sample
+!tests/fixtures/vitaldb/release.json
 !scripts/ingestion
 scripts/ingestion/cli.py
 **/__pycache__

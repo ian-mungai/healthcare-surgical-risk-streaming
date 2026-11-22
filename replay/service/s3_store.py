@@ -1,8 +1,8 @@
 """The object store of the replay on the host: the landed object versions in the project's bucket, read with boto3.
 
-It implements the ``ObjectStore`` of the ingestion checks, for reads only. The replay reads a version by its ID, so a version that was substituted after the
-gate cannot be read by mistake. The credentials come from the standard AWS credential chain of the container: the replay's own short-lived workload access.
-Nothing in this module writes.
+It implements the ``ObjectStore`` of the ingestion checks, for reads only: its ``create_object`` refuses. The replay reads a version by its ID, so a version
+that was substituted after the gate cannot be read by mistake. The credentials come from the standard AWS credential chain of the container: the replay's
+own short-lived workload access. Nothing in this module writes.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from scripts.ingestion.notice import Code, Notice
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
 RANGE_BYTES = 64 * 1024 * 1024
@@ -34,7 +35,7 @@ class S3ReadStore:
                 for entry in page.get("DeleteMarkers", []):
                     found.append(self.version(entry, marker=True))
         except (BotoCoreError, ClientError) as error:
-            raise StoreError(f"listing the versions under {prefix} failed: {type(error).__name__}") from error
+            raise StoreError(Notice(Code.AWS_FAILED_NOT_KEPT)) from error
         return sorted(found, key=lambda item: (item.key, item.last_modified, not item.is_latest))
 
     @staticmethod
@@ -46,12 +47,12 @@ class S3ReadStore:
         try:
             reply = self.client.get_object(Bucket=self.bucket, Key=version.key, VersionId=version.version_id, Range=f"bytes={start}-{end}")
         except (BotoCoreError, ClientError) as error:
-            raise StoreError(f"{version.key}: reading the version failed: {type(error).__name__}") from error
+            raise StoreError(Notice(Code.AWS_FAILED_NOT_KEPT)) from error
         if reply.get("VersionId") != version.version_id:
-            raise StoreError(f"{version.key}: the reply was for another version than the one asked for")
+            raise StoreError(Notice(Code.OTHER_VERSION))
         data: bytes = reply["Body"].read()
         if len(data) != end - start + 1:
-            raise StoreError(f"{version.key}: the reply held {len(data)} bytes of the {end - start + 1} asked for")
+            raise StoreError(Notice(Code.SHORT_REPLY))
         return data
 
     def iter_version(self, version: ObjectVersion) -> Iterator[bytes]:
@@ -63,8 +64,8 @@ class S3ReadStore:
 
     def get_version_bytes(self, version: ObjectVersion, limit: int) -> bytes:
         if version.size > limit:
-            raise StoreError(f"{version.key}: the object is larger than {limit} bytes")
+            raise StoreError(Notice(Code.TOO_LARGE, count=limit))
         return self.fetch(version, 0, version.size - 1) if version.size else b""
 
-    def put_object(self, key: str, data: bytes) -> ObjectVersion:
-        raise StoreError("the replay's store is read only")
+    def create_object(self, key: str, data: bytes) -> ObjectVersion:
+        raise StoreError(Notice(Code.READ_ONLY_STORE))

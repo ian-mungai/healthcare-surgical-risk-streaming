@@ -210,7 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         record = parse_run_record(arguments.run_record.read_text())
         return COMMANDS[arguments.command](record, arguments)
     except GateRefused as refused:
-        log("gate_refused", reason=str(refused), problems=[{"source_key": problem.source_key, "cause": problem.cause} for problem in refused.problems])
+        problems = [{"position": problem.position, "requested": problem.requested, "cause": problem.cause} for problem in refused.problems]
+        log("gate_refused", reason=str(refused), problems=problems)
         return 3
     except (
         OSError,

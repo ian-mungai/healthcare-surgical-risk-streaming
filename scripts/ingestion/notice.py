@@ -222,6 +222,7 @@ class Code(StrEnum):
     EXISTS_UNLISTED = "the write was refused because the key exists, but no current version is listed"
     NULL_HELD = "the key holds a null version, which versioning does not keep apart from the next write"
     OTHER_CONTENT = "the key already holds other content"
+    READ_ONLY_STORE = "this store is read only, so nothing was written"
     TIMED_OUT = "{subject} timed out after {count} seconds"
     NEEDS_AWS = "{subject} needs aws, which is not installed or not on PATH"
     NEEDS_CURL = "{subject} needs curl, which is not installed or not on PATH"

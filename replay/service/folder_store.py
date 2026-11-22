@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.ingestion.notice import Code, Notice
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
 VERSION_FILE = re.compile(r"v(\d{4})(\.deleted)?")
@@ -56,7 +57,7 @@ class FolderStore:
     def path_of(self, version: ObjectVersion) -> Path:
         path = self.root / version.key / version.version_id
         if not path.is_file():
-            raise StoreError(f"{version.key}: the version does not exist")
+            raise StoreError(Notice(Code.VERSION_MISSING))
         return path
 
     def iter_version(self, version: ObjectVersion) -> Iterator[bytes]:
@@ -69,14 +70,21 @@ class FolderStore:
         self.note_read(version)
         path = self.path_of(version)
         if path.stat().st_size > limit:
-            raise StoreError(f"{version.key}: the object is larger than {limit} bytes")
+            raise StoreError(Notice(Code.TOO_LARGE, count=limit))
         return path.read_bytes()
 
     def next_number(self, key: str) -> int:
         entries = self.entries(key)
         return entries[-1][0] + 1 if entries else 1
 
-    def put_object(self, key: str, data: bytes) -> ObjectVersion:
+    def create_object(self, key: str, data: bytes) -> ObjectVersion:
+        """Create the first version of ``key``, or return its current version when that already holds exactly ``data``; other bytes are refused."""
+        entries = self.entries(key)
+        if entries and not entries[-1][1]:
+            number, _, path = entries[-1]
+            if path.read_bytes() != data:
+                raise StoreError(Notice(Code.OTHER_CONTENT))
+            return self.version_of(key, number, False, path, latest=True)
         number = self.next_number(key)
         folder = self.root / key
         folder.mkdir(parents=True, exist_ok=True)
