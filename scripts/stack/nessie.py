@@ -9,7 +9,9 @@ reaches Nessie on the Compose network at ``NESSIE_URI``:
 
 ``python -m scripts.stack.nessie initialise --namespace surgical_risk``
 
-It commits the namespace only when main's history is empty and says ``initialised``; otherwise it says ``unchanged``, so a second run changes nothing.
+It checks that the configuration answer holds a default branch and a hash of an empty history, and refuses anything else. It commits the namespace when
+main's history is empty or main's head does not hold the namespace, checks that the namespace is there, and says ``initialised``. It says ``unchanged``
+only when the namespace is already at main's head, so a second run changes nothing.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from urllib.parse import quote, urlsplit
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 NAMESPACE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+HASH = re.compile(r"[0-9a-f]{64}")
 CONFLICT_STATUS = 409
 BODY_LIMIT_BYTES = 1_000_000
 
@@ -123,6 +126,14 @@ class NessieClient:
             raise NessieError("Nessie's configuration answer is not an object")
         return document
 
+    def has_namespace(self, branch: str, namespace: str) -> bool:
+        """Whether the head of ``branch`` holds a content of the type namespace under this one name."""
+        document = self.request("GET", f"/trees/{quote(branch, safe='')}/entries") or {}
+        entries = document.get("entries", []) if isinstance(document, dict) else []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "NAMESPACE" and (entry.get("name") or {}).get("elements") == [namespace] for entry in entries
+        )
+
     def entries(self, name: str) -> list[str]:
         """The content keys of the branch or tag ``name``, as dotted names in order."""
         document = self.request("GET", f"/trees/{quote(name, safe='')}/entries") or {}
@@ -138,14 +149,25 @@ class NessieClient:
         return reference_from((document or {}).get("targetBranch"))
 
     def initialise(self, branch: str, namespace: str) -> bool:
-        """Give ``branch`` its first commit, a namespace, when its history is empty, and return whether it did.
+        """Make sure the head of ``branch`` holds ``namespace`` and return whether a commit was needed.
 
-        Nessie cannot merge into a branch that has no commit, and an empty commit is refused, so a repository needs one commit before the first merge.
+        Nessie cannot merge into a branch that has no commit, and an empty commit is refused, so a repository needs one commit before the first merge. The
+        configuration answer must name a default branch and give the hash of an empty history, else the call is refused. A commit is checked by reading the
+        namespace back at the new head.
         """
+        config = self.config()
+        default_branch = config.get("defaultBranch")
+        empty = config.get("noAncestorHash")
+        if not isinstance(default_branch, str) or not default_branch or not isinstance(empty, str) or not HASH.fullmatch(empty):
+            raise NessieError("Nessie's configuration answer holds no default branch and no hash of an empty history")
         head = self.reference(branch)
-        if head.hash != self.config().get("noAncestorHash"):
+        if not HASH.fullmatch(head.hash):
+            raise NessieError(f"Nessie's hash for {branch} is not of the expected form")
+        if head.hash != empty and self.has_namespace(branch, namespace):
             return False
         self.commit(branch, head.hash, f"create namespace {namespace}", [put_namespace(namespace)])
+        if not self.has_namespace(branch, namespace):
+            raise NessieError(f"the namespace {namespace} is not at the head of {branch} after its commit")
         return True
 
     def create_branch(self, name: str, from_name: str = "main") -> Reference:
@@ -182,7 +204,7 @@ class NessieClient:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Give main its first commit when its history is empty. Exit 0 when main has its first commit, 1 when Nessie fails or refuses, 2 for bad input."""
+    """Give main the project namespace when its head lacks it. Exit 0 when main holds the namespace, 1 when Nessie fails or refuses, 2 for bad input."""
     parser = argparse.ArgumentParser(prog="scripts.stack.nessie", description="Give Nessie's main branch its first commit, a namespace, once.")
     commands = parser.add_subparsers(dest="command", required=True)
     initialise = commands.add_parser("initialise")
@@ -202,9 +224,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"{error}\n")
         return 1
     if created:
-        sys.stdout.write(f"initialised: {arguments.branch} has its first commit, the namespace {arguments.namespace}\n")
+        sys.stdout.write(f"initialised: {arguments.branch} holds the namespace {arguments.namespace}, committed now\n")
     else:
-        sys.stdout.write(f"unchanged: {arguments.branch} already has a commit\n")
+        sys.stdout.write(f"unchanged: {arguments.branch} already holds the namespace {arguments.namespace}\n")
     return 0
 
 

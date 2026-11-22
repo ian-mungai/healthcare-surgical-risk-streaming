@@ -25,12 +25,16 @@ DOCKERFILE = Path(__file__).resolve().parents[2] / "orchestration" / "Dockerfile
 
 
 class StandIn:
-    """Main's hash, the commits received and an optional refusal status for every call."""
+    """Main's hash, the namespaces it holds, the commits received, the answer to the configuration call and an optional refusal status for every call."""
 
     def __init__(self, refuse: int = 0) -> None:
         self.hash = EMPTY
         self.commits: list[dict[str, Any]] = []
         self.refuse = refuse
+        self.config: dict[str, Any] = {"noAncestorHash": EMPTY, "defaultBranch": "main"}
+        self.namespaces: list[str] = []
+        self.entry_type = "NAMESPACE"
+        self.keep_commits = True
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
         state = self
@@ -48,13 +52,17 @@ class StandIn:
                 if state.refuse:
                     self.answer(state.refuse, {"errorCode": "UNKNOWN", "message": "refused"})
                 elif self.path.endswith("/config"):
-                    self.answer(200, {"noAncestorHash": EMPTY, "defaultBranch": "main"})
+                    self.answer(200, state.config)
+                elif self.path.endswith("/entries"):
+                    self.answer(200, {"entries": [{"type": state.entry_type, "name": {"elements": [name]}} for name in state.namespaces]})
                 else:
                     self.answer(200, {"reference": {"type": "BRANCH", "name": "main", "hash": state.hash}})
 
             def do_POST(self) -> None:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
                 state.commits.append(body)
+                if state.keep_commits:
+                    state.namespaces += [operation["key"]["elements"][0] for operation in body["operations"]]
                 state.hash = "b" * 64
                 self.answer(200, {"targetBranch": {"type": "BRANCH", "name": "main", "hash": state.hash}})
 
@@ -98,12 +106,71 @@ class InitialiseCommandTest(unittest.TestCase):
         self.assertEqual(1, len(state.commits))
         self.assertEqual([{"elements": ["surgical_risk"]}], [operation["key"] for operation in state.commits[0]["operations"]])
 
+    def test_a_configuration_answer_without_a_default_branch_and_a_hash_is_refused_and_nothing_is_committed(self) -> None:
+        for config in (
+            {},
+            {"defaultBranch": "main"},
+            {"noAncestorHash": EMPTY},
+            {"defaultBranch": "", "noAncestorHash": EMPTY},
+            {"defaultBranch": "main", "noAncestorHash": "abc"},
+        ):
+            with self.subTest(config=config):
+                state = StandIn()
+                state.config = config
+                with serving(state) as uri:
+                    code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
+                self.assertEqual(1, code)
+                self.assertIn("configuration", err)
+                self.assertNotIn("unchanged", out)
+                self.assertEqual([], state.commits)
+
+    def test_a_head_past_the_empty_history_without_the_namespace_is_not_unchanged_and_gets_the_namespace_once(self) -> None:
+        state = StandIn()
+        state.hash = "c" * 64
+        with serving(state) as uri:
+            first = run(["initialise", "--namespace", "surgical_risk"], uri)
+            second = run(["initialise", "--namespace", "surgical_risk"], uri)
+        self.assertEqual((0, 0), (first[0], second[0]))
+        self.assertIn("initialised", first[1])
+        self.assertNotIn("unchanged", first[1])
+        self.assertIn("unchanged", second[1])
+        self.assertEqual(1, len(state.commits))
+
+    def test_a_head_past_the_empty_history_with_the_namespace_is_unchanged(self) -> None:
+        state = StandIn()
+        state.hash = "c" * 64
+        state.namespaces = ["surgical_risk"]
+        with serving(state) as uri:
+            code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
+        self.assertEqual(0, code)
+        self.assertIn("unchanged", out)
+        self.assertEqual([], state.commits)
+
+    def test_a_content_of_the_namespace_name_that_is_not_a_namespace_does_not_count(self) -> None:
+        state = StandIn()
+        state.hash = "c" * 64
+        state.namespaces = ["surgical_risk"]
+        state.entry_type = "ICEBERG_TABLE"
+        with serving(state) as uri:
+            code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
+        self.assertEqual(1, len(state.commits))
+        self.assertNotIn("unchanged", out)
+
+    def test_a_commit_that_leaves_the_namespace_missing_is_refused(self) -> None:
+        state = StandIn()
+        state.keep_commits = False
+        with serving(state) as uri:
+            code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
+        self.assertEqual(1, code)
+        self.assertIn("surgical_risk", err)
+        self.assertNotIn("initialised", out)
+
     def test_a_refusal_exits_1_and_names_the_call_and_nothing_is_committed(self) -> None:
         state = StandIn(refuse=500)
         with serving(state) as uri:
             code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
         self.assertEqual(1, code)
-        self.assertIn("GET /api/v2/trees/main", err)
+        self.assertIn("GET /api/v2/config was refused with status 500", err)
         self.assertEqual([], state.commits)
 
     def test_no_address_or_a_bad_namespace_exits_2_before_any_call(self) -> None:
