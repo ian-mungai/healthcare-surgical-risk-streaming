@@ -14,7 +14,7 @@ from pathlib import Path
 
 from scripts.stack.capacity_probe import Budget, Monitor, Reader, Steps, StopFlag, execute
 from scripts.stack.probe_docker import ContainerState, Docker
-from scripts.stack.probe_record import CleanupStep, JobOutcome, Sample
+from scripts.stack.probe_record import CleanupStep, JobFacts, Sample, ServiceSnapshot
 
 CLEANUP_SECONDS = 2.0
 
@@ -31,9 +31,9 @@ class NoReader(Reader):
     def __init__(self, folder: Path) -> None:
         self.folder = folder
 
-    def take(self, *, spark_running: bool) -> Sample:
+    def take(self, *, spark_running: bool) -> tuple[Sample, int]:
         (self.folder / "ready").write_text("1")
-        return Sample(0.0, "t", None, {}, spark_running)
+        return Sample(0, "t", 0, 0, (), spark_running, {}, None, {}), 0
 
 
 def main(folder: Path) -> int:
@@ -51,13 +51,16 @@ def main(folder: Path) -> int:
         (folder / "cleanup_done").write_text("1")
         return [CleanupStep("job container", True, "no container remains")]
 
-    def finish(state: ContainerState, watch: object) -> JobOutcome:
+    def finish(state: ContainerState) -> JobFacts:
         raise AssertionError("the job never ends")
 
+    def snapshot() -> dict[str, ServiceSnapshot]:
+        return {}
+
     started: Callable[[Callable[[], None]], None] = lambda hook: None  # noqa: E731
-    steps = Steps(started, dict, nothing, nothing, nothing, "job", 15.0, finish, dict, cleanup)
-    execution = execute(steps, monitor)
-    (folder / "record_written").write_text(f"{stop.count} {execution.interrupted}")
+    steps = Steps(started, snapshot, nothing, nothing, "job", 15.0, finish, cleanup, "scratch")
+    run = execute(steps, monitor, "host")
+    (folder / "record_written").write_text(f"{stop.count} {run.run_state} {run.cause}")
     stop.restore()
     return 130 if stop.requested else 0
 

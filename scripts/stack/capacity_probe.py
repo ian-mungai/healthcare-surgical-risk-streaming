@@ -1,38 +1,32 @@
-"""The capacity probe: the always-on group and one Spark job run together while the host's figures are measured, and the evidence is saved.
+"""The capacity probe: the always-on group and one Spark job run together while the host's figures are read, and what was read is saved.
 
-``.venv/bin/python -m scripts.stack.capacity_probe [--output-directory <folder>]`` runs on the Linux host. It is one process with one thread and one absolute
-monotonic deadline. Before it starts anything it checks that the output folder can take a new record, that no Spark container of the project exists and that
-the job's catalog address and the address of its cleanup are one Nessie (resolved from the Compose files and ``host.env``, recorded in the record). Then it
+``.venv/bin/python -m scripts.stack.capacity_probe [--output-directory <folder>]`` runs on the Linux host. It judges nothing: it never compares a figure with a
+limit, a cap or a reserve, never calls the admission check and never says that a run passed. The owner reads the record and decides. It is one process with one
+thread and one absolute monotonic deadline. Before it starts anything it checks that the output folder can take a new record, that no Spark container of
+the project exists and that the job's catalog address and the address of its cleanup are one Nessie (resolved from the Compose files and ``host.env``). Then it
 
-1. starts the always-on group through the group command (``scripts.stack.groups``, with its admission check). Each time the group command reports progress,
-   the probe takes a sample and reads the events that came since its cursor,
-2. counts each required service's restarts and kills for memory, and checks that the catalog answers,
-3. asks the admission check for the batch group and starts the Spark job as a detached container with a scratch volume of its own,
-4. loops: read the Spark container's state, read its cgroup, take one sample (host figures and every container's memory), read the events with
+1. starts the always-on group (Compose ``up`` and the wait for health share one deadline). Each time the wait reports progress, the probe takes a sample and
+   reads the events that came since its cursor,
+2. reads each required service's state and cgroup files, checks that the catalog answers and starts the Spark job as a detached container with a scratch
+   volume of its own,
+3. loops: read the Spark container's state and cgroup files, take one sample (host figures and every container's memory), read the events with
    ``docker events --since <cursor less a few seconds> --until <now>`` (the end is in the past, so the command returns at once, and the cursor moves only
-   after a command that succeeded), then wait out the rest of the interval. The loop ends after the Spark container has exited and one more iteration has run,
-5. reads each required service's cgroup, restarts and state,
-6. removes the job container, then its scratch volume, then its Nessie branch, and verifies each is gone, and
-7. judges the evidence (``scripts.stack.probe_record``) and writes ``capacity_probe.json`` into a new folder under ``runs/capacity_probe/``.
+   after a command that succeeded), then wait out the rest of the interval. A reading that fails is named in its sample and counted, and the loop goes on.
+   The loop ends after the Spark container has exited and one more iteration has run,
+4. reads each required service again, removes the job container, then its scratch volume, then its Nessie branch, and looks each one up again, and
+5. writes ``capacity_probe.json`` into a new folder under ``runs/capacity_probe/`` (see ``scripts.stack.probe_record``).
 
-A SIGINT or SIGTERM only sets a flag. The loop leaves at its next check, every step after it runs in full and the command exits 130 once the record is written.
-A second signal during the end is ignored. No wait or reading is accepted after the deadline.
+A SIGINT or SIGTERM only sets a flag. The loop leaves at its next check, every step after it runs in full and the record is written. No wait or reading is taken
+after the deadline. A run that did not reach the end of the Spark job writes ``run_state: interrupted`` with a fixed cause and step.
 
-The verdict is ``complete``, ``local_only``, ``not_measured`` or ``failed`` (see ``probe_record``). The command exits 0 for the first two only. The command
-writes nothing into the limits file: the owner reads the measured figures and decides about the reserve.
-
-The Spark job is ``spark.jobs.catalog_proof`` with a fixed row count on a private Nessie branch of its own. The group command starts a service with its image's
-entry point and no arguments, which this job cannot use, so the probe asks the group's admission check (``groups.admit``, the function ``start_group`` uses)
-and then runs the job with the group's Compose profile and limits. Its ``/scratch`` is a named volume of this run, which replaces the service's shared one for
-this container through ``compose run --volume`` and is removed in the cleanup.
-
-``--docker-figures-only`` is for a computer that is not the Linux host: Docker's figures are real, every host figure is marked as not measured and the verdict
-is at best ``local_only``. Stream lag is not measured: the stream path does not exist in this phase.
+``--docker-figures-only`` is for a computer that is not the Linux host: the record's mode is ``local``, Docker's figures are real and each sample names the host
+figures as missing. Stream lag is not measured: the stream path does not exist in this phase.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -49,12 +43,23 @@ from typing import Any
 
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ROOT
-from scripts.stack.admission import AdmissionError
-from scripts.stack.groups import GroupError, Settings, admit, compose_arguments, find_group, rendered_environment, settings_from_environment, start_group
+from scripts.stack.groups import (
+    COMPOSE_DIRECTORY_VARIABLE,
+    HOST_SETTINGS_FILE,
+    PROJECT_VARIABLE,
+    GroupError,
+    Settings,
+    compose_arguments,
+    find_group,
+    project_name,
+    read_states,
+    rendered_environment,
+    up_arguments,
+    wait_ready,
+)
+from scripts.stack.groups import docker as run_group_docker
 from scripts.stack.host_figures import (
-    CgroupMemory,
     FiguresError,
-    HostFigures,
     HostReading,
     HostSources,
     host_figures,
@@ -66,18 +71,18 @@ from scripts.stack.limits import Limits, LimitsError, load_limits
 from scripts.stack.nessie import NessieClient, NessieError
 from scripts.stack.probe_docker import NANOSECONDS, ContainerEvent, ContainerState, Docker, ProbeError, Runner
 from scripts.stack.probe_record import (
-    PASSING_VERDICTS,
+    RUN_INTERRUPTED,
+    RUN_RECORDED,
     SPARK_SERVICE,
+    CgroupRead,
     CleanupStep,
-    ContainerEvidence,
-    Execution,
-    JobOutcome,
+    Collected,
+    JobFacts,
     Sample,
-    ServiceBaseline,
-    assess,
-    build_document,
+    ServiceSnapshot,
+    build_record,
     check_destination,
-    validate_result,
+    read_result,
     write_document,
 )
 
@@ -96,11 +101,15 @@ EVENT_OVERLAP_NS = 5 * NANOSECONDS
 NOT_FOUND = 404
 RESULT_PREFIX = "RESULT "
 INTERRUPTED_EXIT = 130
-START_FAILURE = "starting the always-on group failed"
 SCRATCH_MOUNT = "/scratch"
 SPARK_URI_DEFAULT = re.compile(r"NESSIE_URI: \$\{NESSIE_URI:-([^}]+)\}")
 NESSIE_PORT_DEFAULT = re.compile(r"127\.0\.0\.1:\$\{NESSIE_HOST_PORT:-(\d+)\}:(\d+)")
+EXIT_NOTE = "The exit status says that the tool ran and nothing about capacity."
 Pause = Callable[[float], None]
+
+
+class Deadline(ProbeError):
+    """The run's deadline or the job's own deadline has passed."""
 
 
 class Stopped(ProbeError):
@@ -141,7 +150,7 @@ class StopFlag:
 
 
 class Budget:
-    """One monotonic deadline for the whole run. Every wait and every reading asks it for the time that is left, and no result is accepted after it."""
+    """One monotonic deadline for the whole run. Every wait and every reading asks it for the time that is left, and no result is taken after it."""
 
     def __init__(self, total_seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
         self.total_seconds = total_seconds
@@ -152,46 +161,77 @@ class Budget:
         return self.total_seconds - (self.clock() - self.started)
 
     def limit(self, seconds: float) -> float:
-        """The shorter of ``seconds`` and the time that is left. A run with no time left raises ``ProbeError``."""
+        """The shorter of ``seconds`` and the time that is left. A run with no time left raises ``Deadline``."""
         left = self.remaining()
         if left <= 0:
-            raise ProbeError(f"the run's deadline of {self.total_seconds:g} seconds has passed")
+            raise Deadline(f"the run's deadline of {self.total_seconds:g} seconds has passed")
         return min(seconds, left)
 
     def accept(self, label: str) -> None:
         """Refuse a result that arrived after the deadline."""
         if self.remaining() <= 0:
-            raise ProbeError(f"{label} finished after the deadline of {self.total_seconds:g} seconds")
+            raise Deadline(f"{label} finished after the deadline of {self.total_seconds:g} seconds")
+
+
+def utc_text() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def say(message: str) -> None:
+    sys.stdout.write(f"probe: {message}\n")
 
 
 class Reader:
-    """One host reading and one Docker reading, the host figures being those of the interval since the last reading."""
+    """One host reading and one Docker reading. A reading that fails is named in the sample's ``missing`` list and counted, and never ends the run."""
 
-    def __init__(self, project: str, sources: HostSources | None, docker: Docker, *, now: Callable[[], float] = time.monotonic) -> None:
-        self.project = project
-        self.sources = sources
-        self.docker = docker
-        self.now = now
-        self.started = now()
-        self.previous: HostReading | None = read_host(sources) if sources is not None else None
+    def __init__(
+        self,
+        project: str,
+        sources: HostSources | None,
+        docker: Docker,
+        required: Sequence[str],
+        *,
+        clock_ns: Callable[[], int] = time.time_ns,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.project, self.sources, self.docker, self.required = project, sources, docker, tuple(required)
+        self.clock_ns, self.now = clock_ns, now
+        self.previous: HostReading | None = read_host(sources, now) if sources is not None else None
+        self.last_end_ns = clock_ns()
 
-    def take(self, *, spark_running: bool) -> Sample:
-        figures: HostFigures | None = None
-        if self.sources is not None and self.previous is not None:
-            current = read_host(self.sources)
-            figures = host_figures(self.previous, current)
-            self.previous = current
-        listing, statistics = self.docker.usage_texts(self.project)
-        return Sample(round(self.now() - self.started, 1), utc_text(), figures, parse_container_usage(listing, statistics), spark_running)
+    def take(self, *, spark_running: bool) -> tuple[Sample, int]:
+        """The sample and the number of readings that failed. Host figures that this mode does not have are named as missing and are not failures."""
+        missing: list[str] = []
+        errors = 0
+        figures = None
+        if self.sources is None or self.previous is None:
+            missing.append("host_figures")
+        else:
+            try:
+                current = read_host(self.sources, self.now)
+                figures = host_figures(self.previous, current)
+                self.previous = current
+            except FiguresError:
+                missing.append("host_figures")
+                errors += 1
+        usage: dict[str, int] = {}
+        try:
+            listing, statistics = self.docker.usage_texts(self.project)
+            usage = parse_container_usage(listing, statistics)
+        except ProbeError, FiguresError:
+            missing.append("container_memory")
+            errors += 1
+        taken = self.clock_ns()
+        started, running = self.last_end_ns, {name: name in usage for name in (*self.required, SPARK_SERVICE)}
+        if figures is not None or self.sources is None:
+            self.last_end_ns = taken
+        return Sample(taken, utc_text(), started, taken, tuple(missing), spark_running, running, figures, usage), errors
 
 
 @dataclass
 class SparkWatch:
-    """What the loop saw of the Spark container: the highest cgroup reading, its cap and kill count, and when it was seen to have exited."""
+    """What the loop saw of the Spark container: whether it ran and its state at the exit."""
 
-    peak_bytes: int | None = None
-    cap_bytes: int | None = None
-    oom_kills: int | None = None
     seen_running: bool = False
     exit_state: ContainerState | None = None
     exit_ns: int | None = None
@@ -207,14 +247,17 @@ class Monitor:
     budget: Budget
     stop: StopFlag
     interval_seconds: float
-    read_cgroup: Callable[[int], CgroupMemory] | None = None
+    read_cgroup: Callable[[int], Any] | None = None
     clock_ns: Callable[[], int] = time.time_ns
     monotonic: Callable[[], float] = time.monotonic
     pause: Pause = time.sleep
     samples: list[Sample] = field(default_factory=list)
     events: list[ContainerEvent] = field(default_factory=list)
     windows: list[tuple[int, int]] = field(default_factory=list)
+    spark_reads: list[CgroupRead] = field(default_factory=list)
     spark: SparkWatch = field(default_factory=SparkWatch)
+    sample_errors: int = 0
+    cgroup_unreadable: int = 0
     run_start_ns: int = 0
     cursor_ns: int = 0
     last_tick: float = float("-inf")
@@ -249,19 +292,28 @@ class Monitor:
         if self.read_cgroup is None or state.pid <= 0:
             return
         try:
-            memory = self.read_cgroup(state.pid)
+            self.spark_reads.append(CgroupRead(self.clock_ns(), self.read_cgroup(state.pid)))
         except FiguresError:
-            return
-        self.spark.peak_bytes = max(self.spark.peak_bytes or 0, memory.peak_bytes)
-        self.spark.cap_bytes, self.spark.oom_kills = memory.max_bytes, memory.oom_kills
+            self.cgroup_unreadable += 1
 
     def tick(self, container: str | None = None) -> ContainerState | None:
-        """One iteration: the Spark state (when a container is named), one sample, the events since the cursor. No step is accepted after the deadline."""
-        state = self.docker.state(container) if container else None
-        if state is not None:
-            self.watch(state)
-        self.samples.append(self.reader.take(spark_running=state is not None and state.status == "running"))
-        self.advance_events()
+        """One iteration: the Spark state (when a container is named), one sample, the events since the cursor. A reading that fails is named in the sample."""
+        state, failed = None, []
+        if container:
+            try:
+                state = self.docker.state(container)
+                self.watch(state)
+            except ProbeError:
+                failed.append("spark_state")
+        sample, read_errors = self.reader.take(spark_running=state is not None and state.status == "running")
+        try:
+            self.advance_events()
+        except ProbeError:
+            failed.append("events")
+        if failed or read_errors:
+            self.sample_errors += 1
+            sample = dataclasses.replace(sample, missing=(*sample.missing, *failed))
+        self.samples.append(sample)
         self.last_tick = self.monotonic()
         self.budget.accept("a sample")
         return state
@@ -281,14 +333,12 @@ class Monitor:
                 raise Stopped("a signal came while the job ran")
             self.budget.limit(self.interval_seconds)
             if self.monotonic() >= job_deadline:
-                raise ProbeError(timeout_text("the Spark job", job_seconds))
+                raise Deadline(timeout_text("the Spark job", job_seconds))
             began = self.monotonic()
             state = self.tick(container)
-            if state is None:
-                raise ProbeError("the Spark container's state was not read")
             if self.spark.exit_state is not None:
                 return self.spark.exit_state
-            if state.status in ("exited", "dead"):
+            if state is not None and state.status in ("exited", "dead"):
                 self.spark.exit_state, self.spark.exit_ns = state, self.clock_ns()
                 self.budget.accept("the Spark job's exit")
                 continue
@@ -300,95 +350,78 @@ class Steps:
     """The steps of a run. Each raises ``ProbeError`` when it cannot be done."""
 
     start_supporting: Callable[[Callable[[], None]], None]
-    baseline: Callable[[], Mapping[str, ServiceBaseline]]
+    snapshot: Callable[[], Mapping[str, ServiceSnapshot]]
     check_catalog: Callable[[], None]
-    admit_job: Callable[[], None]
     start_job: Callable[[], None]
     container: str
     job_seconds: float
-    finish_job: Callable[[ContainerState, SparkWatch], JobOutcome]
-    final_evidence: Callable[[], Mapping[str, ContainerEvidence]]
+    finish_job: Callable[[ContainerState], JobFacts]
     cleanup: Callable[[], list[CleanupStep]]
-    addresses: Mapping[str, str] = field(default_factory=dict)
     scratch: str = ""
 
 
-def run_to_end(
-    steps: Steps, monitor: Monitor
-) -> tuple[JobOutcome | None, str, Mapping[str, ServiceBaseline], Mapping[str, ContainerEvidence], str, bool, bool]:
-    """The outcome, the failure, the baseline, the end evidence, the evidence error, whether the loop ran to its end and whether a signal stopped the run."""
-    outcome: JobOutcome | None = None
-    failure, evidence_error = "", ""
-    baseline: Mapping[str, ServiceBaseline] = {}
-    evidence: Mapping[str, ContainerEvidence] = {}
-    complete = interrupted = False
+def run_to_end(steps: Steps, monitor: Monitor) -> tuple[str, str, Mapping[str, ServiceSnapshot], Mapping[str, ServiceSnapshot], JobFacts | None]:
+    """The cause (empty when the loop ran to the end of the job), the step it ended in, the two snapshots and the job."""
+    stage, cause, job = "always_on_start", "", None
+    start: Mapping[str, ServiceSnapshot] = {}
+    end: Mapping[str, ServiceSnapshot] = {}
     try:
-        try:
-            steps.start_supporting(monitor.hook)
-            monitor.budget.accept("the start of the always-on group")
-            baseline = steps.baseline()
-        except Stopped:
-            raise
-        except ProbeError as error:
-            failure = f"{START_FAILURE}: {error}"
-        before_job = (
-            ("the catalog check failed", steps.check_catalog),
-            ("admission of the Spark job refused", steps.admit_job),
-            ("the Spark job could not start", steps.start_job),
-        )
-        for label, step in before_job:
-            if failure:
-                break
-            try:
-                step()
-            except Stopped:
-                raise
-            except ProbeError as error:
-                failure = f"{label}: {error}"
-        if not failure:
-            try:
-                outcome = steps.finish_job(monitor.watch_job(steps.container, steps.job_seconds), monitor.spark)
-                complete = True
-            except Stopped:
-                raise
-            except ProbeError as error:
-                failure = f"the Spark job could not run: {error}"
-        if not failure.startswith(START_FAILURE):
-            try:
-                evidence = steps.final_evidence()
-            except (ProbeError, FiguresError) as error:
-                evidence_error = str(error)
+        steps.start_supporting(monitor.hook)
+        monitor.budget.accept("the start of the always-on group")
+        stage = "snapshot_start"
+        start = steps.snapshot()
+        stage = "catalog_check"
+        steps.check_catalog()
+        stage = "job_start"
+        steps.start_job()
+        stage = "job_watch"
+        job = steps.finish_job(monitor.watch_job(steps.container, steps.job_seconds))
     except Stopped:
-        interrupted = True
-    return outcome, failure, baseline, evidence, evidence_error, complete, interrupted
+        cause = "stop_flag"
+    except Deadline:
+        cause = "deadline"
+    except ProbeError:
+        cause = "error"
+    if start:
+        end = guarded_snapshot(steps)
+    return cause, stage if cause else "", start, end, job
 
 
-def execute(steps: Steps, monitor: Monitor) -> Execution:
-    """Run the steps in order under the loop. The cleanup runs after every outcome, a signal included, and a signal that comes during it changes nothing."""
+def guarded_snapshot(steps: Steps) -> Mapping[str, ServiceSnapshot]:
+    try:
+        return steps.snapshot()
+    except ProbeError:
+        return {}
+
+
+def execute(steps: Steps, monitor: Monitor, mode: str) -> Collected:
+    """Run the steps in order under the loop and collect what was read. The cleanup runs after every outcome, a signal included."""
     monitor.begin()
     cleanup: list[CleanupStep] = []
     try:
-        outcome, failure, baseline, evidence, evidence_error, complete, interrupted = run_to_end(steps, monitor)
+        cause, step, start, end, job = run_to_end(steps, monitor)
     finally:
         try:
             cleanup = steps.cleanup()
-        except Exception as error:  # a cleanup that fails in an unforeseen way is a failed cleanup and never a silent one
+        except Exception as error:  # a cleanup that fails in an unforeseen way is a step that was not verified, never a silent one
             cleanup = [CleanupStep("cleanup", False, f"stopped with {type(error).__name__}")]
-    return Execution(
-        outcome,
-        failure,
+    return Collected(
+        RUN_INTERRUPTED if cause else RUN_RECORDED,
+        cause,
+        step,
+        mode,
         list(monitor.samples),
-        complete,
+        list(monitor.spark_reads),
         list(monitor.events),
         list(monitor.windows),
         monitor.run_start_ns,
         monitor.spark.exit_ns,
-        baseline,
-        evidence,
+        start,
+        end,
+        job,
         cleanup,
-        interrupted,
-        evidence_error,
-        dict(steps.addresses),
+        monitor.sample_errors,
+        monitor.cgroup_unreadable,
         steps.scratch,
     )
 
@@ -409,16 +442,8 @@ def job_arguments(unique: str, rows: int) -> list[str]:
     return ["--branch", f"capacity_probe_{unique.lower()}", "--rows", str(rows)]
 
 
-def utc_text() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def say(message: str) -> None:
-    sys.stdout.write(f"probe: {message}\n")
-
-
 def nessie_detail(error: NessieError) -> str:
-    """What a failed Nessie call says: its status or that it did not answer, and never the answer's text."""
+    """What a failed Nessie call says: its status or that it did not answer, and never the answer's text or an address."""
     return f"Nessie answered with status {error.status}" if error.status is not None else "Nessie did not answer"
 
 
@@ -433,7 +458,7 @@ def branch_exists(client: Any, branch: str) -> bool:
 
 
 def remove_branch(client: Any, branch: str) -> CleanupStep:
-    """Delete the job's private Nessie branch and verify that it is gone. A branch that never existed is gone. A call that fails leaves the step unverified."""
+    """Delete the job's private Nessie branch and look it up again. A branch that never existed is absent. A call that fails leaves the step not verified."""
     name = "nessie branch"
     try:
         if not branch_exists(client, branch):
@@ -447,7 +472,7 @@ def remove_branch(client: Any, branch: str) -> CleanupStep:
 
 
 def remove_container(docker: Docker, container: str) -> CleanupStep:
-    """Stop and remove the job container and verify that no container of that name is left."""
+    """Stop and remove the job container and look for a container of that name again."""
     name = "job container"
     try:
         docker.remove(container)
@@ -458,7 +483,7 @@ def remove_container(docker: Docker, container: str) -> CleanupStep:
 
 
 def remove_scratch(docker: Docker, volume: str) -> CleanupStep:
-    """Remove the run's scratch volume and verify that it is gone."""
+    """Remove the run's scratch volume by its recorded name and look for it again."""
     name = "scratch volume"
     try:
         docker.remove_volume(volume)
@@ -508,7 +533,8 @@ def resolve_nessie(settings: Settings, environ: Mapping[str, str]) -> NessieTarg
     """The address the job uses for its catalog and the address that the cleanup and the catalog check use on this computer, which must be one Nessie.
 
     Both come from the same Compose settings the job runs with: the process environment, then ``host.env``, then the defaults of the service files. The job's
-    address must be the project's Nessie service, whose published port on this computer is then the cleanup's address. Anything else cannot be resolved.
+    address must be the project's Nessie service, whose published port on this computer is then the cleanup's address. Anything else cannot be resolved, and the
+    message never holds an address.
     """
     files = settings.compose_directory / "services"
     try:
@@ -522,10 +548,21 @@ def resolve_nessie(settings: Settings, environ: Mapping[str, str]) -> NessieTarg
     job_uri = environ.get("NESSIE_URI") or values.get("NESSIE_URI") or job_default.group(1)
     port = environ.get("NESSIE_HOST_PORT") or values.get("NESSIE_HOST_PORT") or published.group(1)
     if job_uri != f"http://nessie:{published.group(2)}/api/v2":
-        raise ProbeError(f"the job's catalog address {job_uri} is not the project's Nessie service, so the address of its cleanup cannot be resolved")
+        raise ProbeError("the job's catalog address is not the project's Nessie service, so the address of its cleanup cannot be resolved")
     if not port.isascii() or not port.isdigit() or not 0 < int(port) < 65536:
         raise ProbeError("the published port of Nessie is not a port number")
     return NessieTarget(job_uri, f"http://127.0.0.1:{int(port)}/api/v2")
+
+
+def probe_settings(compose_directory: Path | None, project: str | None) -> Settings:
+    """The Compose settings from the arguments, then the environment, then the repository. No admission figure is read: this probe has no admission."""
+    directory = compose_directory or Path(os.environ.get(COMPOSE_DIRECTORY_VARIABLE) or ROOT / "compose")
+    host_env = directory / HOST_SETTINGS_FILE
+    return Settings(
+        compose_directory=directory,
+        project=project or os.environ.get(PROJECT_VARIABLE) or project_name(directory),
+        host_env=host_env if host_env.is_file() else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -533,7 +570,6 @@ class Options:
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS
     start_deadline_seconds: float = DEFAULT_START_DEADLINE_SECONDS
     job_deadline_seconds: float = DEFAULT_JOB_DEADLINE_SECONDS
-    wait_seconds: float = 0.0
     rows: int = DEFAULT_ROWS
     data_path: Path = Path("/var/lib/docker")
     host_figures: bool = True
@@ -551,78 +587,78 @@ class Probe:
         *,
         docker: Docker,
         budget: Budget,
-        monitor: Monitor,
         arguments: Sequence[str],
         container: str,
         scratch: str,
         client: Any,
         runner: Runner = run_command,
+        clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         self.settings, self.limits, self.options = settings, limits, options
-        self.docker, self.budget, self.monitor, self.arguments = docker, budget, monitor, list(arguments)
-        self.container, self.scratch, self.client, self.runner = container, scratch, client, runner
+        self.docker, self.budget, self.arguments = docker, budget, list(arguments)
+        self.container, self.scratch, self.client, self.runner, self.clock_ns = container, scratch, client, runner, clock_ns
         self.required = required_services(limits)
         self.job_started = False
-        self.scratch_made = False
+        self.scratch_named = False
         self.job_began = 0.0
 
     def start_supporting(self, hook: Callable[[], None]) -> None:
+        """Start the always-on group, with no admission check. Compose ``up`` and the wait for health share one deadline."""
+        started, allowed = self.budget.clock(), self.budget.limit(self.options.start_deadline_seconds)
+
         def progress(message: str) -> None:
             say(message)
             hook()
 
         try:
-            start_group(
-                self.settings,
-                ALWAYS_ON_GROUP,
-                wait_seconds=max(0.0, min(self.options.wait_seconds, self.budget.remaining())),
-                deadline_seconds=self.budget.limit(self.options.start_deadline_seconds),
-                log=progress,
-            )
-        except (GroupError, AdmissionError, LimitsError) as error:
+            group = find_group(self.limits, ALWAYS_ON_GROUP)
+            states = read_states(self.settings)
+            if not all(name in states and states[name].state == "running" for name in group.compose):
+                run_group_docker(
+                    up_arguments(self.settings, group), timeout=allowed, label="starting the always-on group", env=rendered_environment(self.limits)
+                )
+            left = allowed - (self.budget.clock() - started)
+            if left <= 0:
+                raise Deadline("the start of the always-on group finished after its deadline")
+            wait_ready(self.settings, group, left, progress)
+        except GroupError as error:
             raise ProbeError(str(error)) from error
 
-    def service_state(self, service: str) -> ContainerState:
-        found = self.docker.list_containers(self.settings.project, service=service)
-        if not found:
-            raise ProbeError(f"service {service} is not running")
-        return self.docker.state(found[0].name)
-
-    def baseline(self) -> dict[str, ServiceBaseline]:
-        """Each required service's restart count and kills for memory, and whether it started before the run. The end of the run is compared with them."""
-        found = {}
+    def snapshot(self) -> dict[str, ServiceSnapshot]:
+        """What each required service shows now: its state and, on the host, its cgroup files with the read time. A figure not read is ``None``."""
+        found: dict[str, ServiceSnapshot] = {}
         for service in self.required:
-            state = self.service_state(service)
-            kills = None
+            containers = self.docker.list_containers(self.settings.project, service=service)
+            if not containers:
+                found[service] = ServiceSnapshot(False, None, None, None, None, None)
+                continue
+            state = self.docker.state(containers[0].name)
+            cgroup = None
             if self.options.host_figures:
                 try:
-                    kills = read_cgroup_memory(state.pid).oom_kills
-                except FiguresError as error:
-                    raise ProbeError(str(error)) from error
-            started_before = state.started_at < self.monitor.run_start_ns / NANOSECONDS if state.started_at else None
-            found[service] = ServiceBaseline(state.restarts, kills, started_before)
+                    cgroup = CgroupRead(self.clock_ns(), read_cgroup_memory(state.pid))
+                except FiguresError:
+                    cgroup = None
+            found[service] = ServiceSnapshot(
+                state.status == "running", state.restarts, state.started_at, state.oom_killed, state.memory_cap_bytes or None, cgroup
+            )
         return found
 
     def check_catalog(self) -> None:
-        """Check that the catalog answers at the address that the cleanup will use, so a cleanup that cannot be verified is known before the job starts."""
+        """Check that the catalog answers at the address that the cleanup will use, so a cleanup that cannot be checked is known before the job starts."""
         try:
             self.client.config()
         except NessieError as error:
             raise ProbeError(nessie_detail(error)) from error
 
-    def admit_job(self) -> None:
-        try:
-            wait = max(0.0, min(self.options.wait_seconds, self.budget.remaining()))
-            decision = admit(self.settings, self.limits, find_group(self.limits, spark_group(self.limits)), wait, say)
-        except (GroupError, AdmissionError, LimitsError) as error:
-            raise ProbeError(str(error)) from error
-        say(f"admission of the Spark job: group {decision.group} admitted")
-
     def start_job(self) -> None:
-        """Create the run's scratch volume and start the job as a detached container that mounts it at ``/scratch``."""
+        """Name the run's scratch volume, create it and start the job as a detached container that mounts it at ``/scratch``.
+
+        The volume is named before it is created, so the cleanup removes it by its name even when the creation timed out.
+        """
         self.job_started = True
+        self.scratch_named = True
         self.docker.create_volume(self.scratch, self.settings.project)
-        self.scratch_made = True
         spark_arguments = ("--name", self.container, "--volume", f"{self.scratch}:{SCRATCH_MOUNT}", SPARK_SERVICE, *self.arguments)
         command = compose_arguments(self.settings, spark_group(self.limits), "run", "--detach", "--no-deps", "--no-TTY", *spark_arguments)
         timeout = self.budget.limit(COMPOSE_RUN_SECONDS)
@@ -637,50 +673,21 @@ class Probe:
         self.budget.accept("starting the Spark job")
         self.job_began = time.monotonic()
 
-    def finish_job(self, state: ContainerState, watch: SparkWatch) -> JobOutcome:
-        """Read the job's output and build its outcome and evidence from its exit state and the loop's cgroup readings."""
-        result, error = validate_result(
-            parse_job_result(self.docker.logs(self.container)),
-            branch=self.arguments[1],
-            rows=int(self.arguments[3]),
-            memory_limit_mib=self.limits.services[SPARK_SERVICE].memory_limit_mib,
-        )
-        host = self.options.host_figures
-        cap = watch.cap_bytes if host else (state.memory_cap_bytes or None)
-        evidence = ContainerEvidence(
-            SPARK_SERVICE, False, cap, watch.peak_bytes, watch.oom_kills, state.oom_killed, state.restarts, "cgroup" if host else "docker"
-        )
-        return JobOutcome(state.exit_code, state.oom_killed, time.monotonic() - self.job_began, result, error, evidence)
-
-    def final_evidence(self) -> dict[str, ContainerEvidence]:
-        """Each required service's cap, peak, kills and restarts at the end of the run, from its cgroup on the host and from Docker on another computer."""
-        found: dict[str, ContainerEvidence] = {}
-        for service in self.required:
-            containers = self.docker.list_containers(self.settings.project, service=service)
-            if not containers:
-                found[service] = ContainerEvidence(service, False, None, None, None, False, 0, "none")
-                continue
-            state = self.docker.state(containers[0].name)
-            running = state.status == "running"
-            if self.options.host_figures:
-                memory = read_cgroup_memory(state.pid)
-                found[service] = ContainerEvidence(
-                    service, running, memory.max_bytes, memory.peak_bytes, memory.oom_kills, state.oom_killed, state.restarts, "cgroup"
-                )
-            else:
-                found[service] = ContainerEvidence(service, running, state.memory_cap_bytes or None, None, None, state.oom_killed, state.restarts, "docker")
-        return found
+    def finish_job(self, state: ContainerState) -> JobFacts:
+        """The job as it ended: its exit status, its out-of-memory flag, its time and the documented fields of its result as read."""
+        read = read_result(parse_job_result(self.docker.logs(self.container)))
+        return JobFacts(state.exit_code, state.oom_killed, time.monotonic() - self.job_began, read or {}, read is not None)
 
     def cleanup(self, docker: Docker) -> list[CleanupStep]:
-        """Remove and verify the job container, then its scratch volume, then its branch. A step after a failed container step is not tried."""
+        """Remove and look up again the job container, then its scratch volume, then its branch. A step after a container that is still there is not tried."""
         container = guarded("job container", lambda: remove_container(docker, self.container))
-        blocked = "" if container.ok else "not tried: the job container is still present"
+        blocked = "" if container.verified_absent else "not tried: the job container is still present"
         steps = [container]
-        for name, made, action in (
-            ("scratch volume", self.scratch_made, lambda: remove_scratch(docker, self.scratch)),
+        for name, wanted, action in (
+            ("scratch volume", self.scratch_named, lambda: remove_scratch(docker, self.scratch)),
             ("nessie branch", self.job_started, lambda: remove_branch(self.client, self.arguments[1])),
         ):
-            if not made:
+            if not wanted:
                 steps.append(CleanupStep(name, True, "the job did not start"))
             elif blocked:
                 steps.append(CleanupStep(name, False, blocked))
@@ -729,11 +736,12 @@ def run_probe(
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     unique = f"{stamp}{secrets.token_hex(2)}"
     folder = options.output_directory or RUNS_FOLDER / stamp
-    budget = Budget(options.wait_seconds * 2 + options.start_deadline_seconds + options.job_deadline_seconds + RUN_SLACK_SECONDS)
+    budget = Budget(options.start_deadline_seconds + options.job_deadline_seconds + RUN_SLACK_SECONDS)
     docker, plain = Docker(runner=runner, limit=budget.limit), Docker(runner=runner, limit=lambda seconds: min(seconds, CLEANUP_SECONDS))
     sources = HostSources(data_path=options.data_path) if options.host_figures else None
+    required = required_services(limits)
     try:
-        reader = Reader(settings.project, sources, docker)
+        reader = Reader(settings.project, sources, docker, required)
     except FiguresError as error:
         raise ProbeError(f"the host's figures cannot be read ({error}); on a computer that is not the Linux host, pass --docker-figures-only") from error
     preflight(plain, settings.project, folder)
@@ -744,88 +752,73 @@ def run_probe(
     scratch = f"{settings.project}_capacity_probe_scratch_{unique.lower()}"
     nessie = client or NessieClient(target.cleanup_uri, 30.0)
     probe = Probe(
-        settings,
-        limits,
-        options,
-        docker=docker,
-        budget=budget,
-        monitor=monitor,
-        arguments=arguments,
-        container=container,
-        scratch=scratch,
-        client=nessie,
-        runner=runner,
+        settings, limits, options, docker=docker, budget=budget, arguments=arguments, container=container, scratch=scratch, client=nessie, runner=runner
     )
     steps = Steps(
         probe.start_supporting,
-        probe.baseline,
+        probe.snapshot,
         probe.check_catalog,
-        probe.admit_job,
         probe.start_job,
         container,
         options.job_deadline_seconds,
         probe.finish_job,
-        probe.final_evidence,
         lambda: probe.cleanup(plain),
-        {"job_catalog": target.job_uri, "cleanup_catalog": target.cleanup_uri},
         scratch,
     )
     started_utc = utc_text()
-    execution = execute(steps, monitor)
-    for step in execution.cleanup:
-        say(f"cleanup {step.name}: {'ok' if step.ok else 'FAILED'}: {step.detail}")
+    run = execute(steps, monitor, "host" if options.host_figures else "local")
+    for step in run.cleanup:
+        say(f"cleanup {step.name}: {'verified' if step.verified_absent else 'NOT verified'}: {step.detail}")
     limits_mib = {name: entry.memory_limit_mib for name, entry in limits.services.items() if entry.runtime == "compose"}
-    assessment = assess(execution, limits_mib=limits_mib, required=probe.required, reserve_mib=limits.host_reserve_mib, host_measured=options.host_figures)
-    document = build_document(
-        execution,
-        assessment,
+    record = build_record(
+        run,
         limits_mib=limits_mib,
-        required=probe.required,
         reserve_mib=limits.host_reserve_mib,
-        host_measured=options.host_figures,
+        required=required,
         interval_seconds=options.interval_seconds,
         deadline_seconds=budget.total_seconds,
         started_utc=started_utc,
         finished_utc=utc_text(),
         job_arguments=arguments,
     )
-    return document, write_document(folder, document)
+    return record, write_document(folder, record)
+
+
+def exit_status(document: Mapping[str, Any], stop_requested: bool) -> int:
+    """0 when the record says the loop ran to the end of the Spark job, else 130 after a signal and 1 otherwise. It says nothing about capacity."""
+    if document["run_state"] == RUN_RECORDED:
+        return 0
+    return INTERRUPTED_EXIT if stop_requested else 1
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog="python -m scripts.stack.capacity_probe", description=__doc__.split("\n\n")[0] if __doc__ else None)
+    command = argparse.ArgumentParser(
+        prog="python -m scripts.stack.capacity_probe", description=__doc__.split("\n\n")[0] if __doc__ else None, epilog=EXIT_NOTE
+    )
     command.add_argument("--output-directory", type=Path, help="a new folder for the record (default: a new folder under runs/capacity_probe)")
     command.add_argument("--interval-seconds", type=positive_finite, default=DEFAULT_INTERVAL_SECONDS, help="seconds between two samples")
     command.add_argument(
         "--start-deadline-seconds", type=positive_finite, default=DEFAULT_START_DEADLINE_SECONDS, help="how long the always-on group has to become healthy"
     )
     command.add_argument("--job-deadline-seconds", type=positive_finite, default=DEFAULT_JOB_DEADLINE_SECONDS, help="how long the Spark job has to finish")
-    command.add_argument(
-        "--wait-seconds", type=positive_finite, default=None, help="how long a group that does not fit waits for memory (default: it does not wait)"
-    )
     command.add_argument("--rows", type=positive_whole, default=DEFAULT_ROWS, help="the Spark job's row count: the fixed workload")
     command.add_argument("--data-path", type=Path, default=Path("/var/lib/docker"), help="a folder on the data disk, for its free space and its disk activity")
     command.add_argument("--compose-directory", type=Path, help="the compose folder, in place of STACK_COMPOSE_DIRECTORY or the repository's compose folder")
     command.add_argument("--project", help="the Compose project name, in place of COMPOSE_PROJECT_NAME or the name in compose.yml")
     command.add_argument(
-        "--available-mib", type=int, help="test input, with --docker-figures-only: the available memory for the admission check, in place of /proc/meminfo"
-    )
-    command.add_argument(
-        "--docker-figures-only", action="store_true", help="this computer is not the Linux host: Docker's figures only, and the verdict is at best local_only"
+        "--docker-figures-only",
+        action="store_true",
+        help="this computer is not the Linux host: the record's mode is local and the host figures are named as missing",
     )
     return command
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    command = parser()
-    arguments = command.parse_args(argv)
-    if arguments.available_mib is not None and not arguments.docker_figures_only:
-        command.error("--available-mib replaces the host's memory reading and needs --docker-figures-only")
+    arguments = parser().parse_args(argv)
     options = Options(
         interval_seconds=arguments.interval_seconds,
         start_deadline_seconds=arguments.start_deadline_seconds,
         job_deadline_seconds=arguments.job_deadline_seconds,
-        wait_seconds=arguments.wait_seconds or 0.0,
         rows=arguments.rows,
         data_path=arguments.data_path,
         host_figures=not arguments.docker_figures_only,
@@ -834,19 +827,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     stop = StopFlag()
     stop.install()
     try:
-        settings = settings_from_environment(arguments.compose_directory, arguments.project, arguments.available_mib)
-        document, path = run_probe(settings, options, stop=stop)
+        document, path = run_probe(probe_settings(arguments.compose_directory, arguments.project), options, stop=stop)
     except (ProbeError, GroupError, LimitsError) as error:
         sys.stderr.write(f"capacity probe: refused: {error}\n")
         return 1
     finally:
         stop.restore()
-    findings = document["failures"] + document["gaps"]
-    say(f"verdict: {document['verdict']}" + (f" ({'; '.join(findings)})" if findings else ""))
+    gaps = ", ".join(
+        f"{gap['code']}{':' + str(gap['count']) if 'count' in gap else ''}{':' + gap['step'] if 'step' in gap else ''}" for gap in document["gaps"]
+    )
+    say(
+        f"run state: {document['run_state']}"
+        + (f" ({document['interruption']['cause']} in {document['interruption']['step']})" if document["interruption"]["cause"] else "")
+    )
+    say(f"gaps: {gaps or 'none'}")
     say(f"record: {path}")
-    if stop.requested:
-        return INTERRUPTED_EXIT
-    return 0 if document["verdict"] in PASSING_VERDICTS else 1
+    return exit_status(document, stop.requested)
 
 
 if __name__ == "__main__":

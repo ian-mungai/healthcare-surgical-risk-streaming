@@ -35,10 +35,6 @@ class ProbeError(RuntimeError):
     """A step of the probe failed. The message names the step and holds no text of a container."""
 
 
-class SamplingError(ProbeError):
-    """The sampling or the event reading failed or ran past its deadline."""
-
-
 @dataclass(frozen=True)
 class ContainerInfo:
     id: str

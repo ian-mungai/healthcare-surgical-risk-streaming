@@ -185,12 +185,11 @@ def parse_container_usage(listing: str, statistics: str) -> dict[str, int]:
 
 @dataclass(frozen=True)
 class CgroupMemory:
-    """One container's memory counters from its cgroup (version 2): the peak and the cap in bytes, the kills for memory and the times the cap was hit."""
+    """One container's memory files from its cgroup (version 2), as read: ``memory.peak`` and ``memory.max`` in bytes and every counter of ``memory.events``."""
 
     peak_bytes: int
     max_bytes: int | None
-    oom_kills: int
-    max_events: int
+    events: Mapping[str, int]
 
 
 def parse_cgroup_path(text: str) -> str:
@@ -227,7 +226,7 @@ def read_cgroup_memory(pid: int, *, proc_root: Path = PROC_ROOT, cgroup_root: Pa
     peak = whole_bytes(read_source(folder / "memory.peak", "memory.peak"), "memory.peak")
     limit = read_source(folder / "memory.max", "memory.max").strip()
     events = parse_memory_events(read_source(folder / "memory.events", "memory.events"))
-    return CgroupMemory(peak, None if limit == "max" else whole_bytes(limit, "memory.max"), events["oom_kill"], events["max"])
+    return CgroupMemory(peak, None if limit == "max" else whole_bytes(limit, "memory.max"), events)
 
 
 @dataclass(frozen=True)

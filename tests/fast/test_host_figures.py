@@ -189,11 +189,12 @@ class CgroupTest(unittest.TestCase):
             (scope / "memory.peak").write_text(peak)
         return proc, cgroup
 
-    def test_the_peak_the_cap_the_kills_and_the_times_the_cap_was_hit_come_from_the_container_s_cgroup(self) -> None:
+    def test_the_peak_the_cap_and_every_counter_of_memory_events_come_from_the_container_s_cgroup(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             proc, cgroup = self.tree(Path(folder))
             memory = read_cgroup_memory(42, proc_root=proc, cgroup_root=cgroup)
-        self.assertEqual((123456789, 4294967296, 1, 3), (memory.peak_bytes, memory.max_bytes, memory.oom_kills, memory.max_events))
+        self.assertEqual((123456789, 4294967296), (memory.peak_bytes, memory.max_bytes))
+        self.assertEqual({"low": 0, "high": 0, "max": 3, "oom": 1, "oom_kill": 1, "oom_group_kill": 0}, memory.events)
 
     def test_a_cgroup_with_no_cap_has_no_cap_figure(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
