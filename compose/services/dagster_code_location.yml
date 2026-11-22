@@ -18,6 +18,7 @@ services:
     environment:
       PLATFORM_COMMIT: ${PLATFORM_COMMIT:-unknown}
       NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      HEAVY_MEMORY_MIB: ${HEAVY_MEMORY_MIB:?write the host settings first}
     configs:
       - source: dagster_limits
         target: /opt/dagster/limits.yml
