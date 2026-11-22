@@ -10,9 +10,10 @@ Run from the repository root under the project profile in ``.env``:
 the resource changes and a confirmation code. ``apply`` refuses a changed plan file, a wrong code and a plan saved for
 another state location, then applies the exact bytes it checked. Each run has its own copy of the configuration, and
 no Terraform variable of the caller reaches Terraform. The three heavy-job inputs come from the limits loader and are staged in the copy of a call that
-makes a plan, and of no other call, so a limits file that the loader refuses stops a plan and never a read of the state.
-A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this
-command never applies one.
+makes a plan, and of no other call, so a limits file that the loader refuses stops a plan and never a read of the state. The wrapper reads no
+variable file: right after it saves a plan it reads the plan's JSON, and a plan made with other heavy inputs than the loader gives, whatever overrode
+them, is kept, marked as refused and given no confirmation code.
+A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this command never applies one.
 """
 
 from __future__ import annotations
@@ -141,71 +142,44 @@ def heavy_inputs() -> str:
         raise WrapperError(f"refused before Terraform starts: the limits file cannot give the heavy-job inputs: limits: {error}") from error
 
 
-def stale_inputs_problem(plan: dict[str, Any]) -> str | None:
-    """The refusal for a plan made with other heavy inputs than the limits file gives now, or None.
+def inputs_difference(plan: dict[str, Any]) -> tuple[dict[str, object], dict[str, Any]] | None:
+    """The heavy inputs that a plan's JSON records and the loader's current ones, or None when they are equal.
 
-    A plan without the three variables, or with one that is not a whole number, is refused the same way.
+    A plan without the three variables, or with one that is not a whole number, differs.
     """
     recorded = plan.get("variables", {})
     planned = {name: recorded.get(name, {}).get("value") if isinstance(recorded.get(name), dict) else None for name in HEAVY_INPUT_NAMES}
     current = json.loads(heavy_inputs())
     exact = all(isinstance(value, int) and not isinstance(value, bool) for value in planned.values())
-    if exact and planned == current:
+    return None if exact and planned == current else (planned, current)
+
+
+def stale_inputs_problem(plan: dict[str, Any]) -> str | None:
+    """The refusal for a plan made with other heavy inputs than the limits file gives now, or None."""
+    difference = inputs_difference(plan)
+    if difference is None:
         return None
+    planned, current = difference
     return f"the limits changed after this plan was saved; save a new plan: the plan was made with {planned} and the limits now give {current}"
 
 
-def tfvars_assignments(text: str) -> set[str]:
-    """The names that a variable file assigns at its top level, read by name only. A line that cannot be classified raises ``WrapperError``: it fails closed."""
-    names: set[str] = set()
-    depth = 0
-    for number, raw in enumerate(text.splitlines(), start=1):
-        code, quoted = "", False
-        index = 0
-        while index < len(raw):
-            char = raw[index]
-            if quoted:
-                if char == "\\":
-                    index += 1
-                elif char == '"':
-                    quoted = False
-            elif char == '"':
-                quoted = True
-            elif char == "#" or raw.startswith("//", index):
-                break
-            elif raw.startswith("/*", index) or raw.startswith("<<", index):
-                raise WrapperError(f"the variable file has a block comment or a heredoc at line {number}, which the check cannot classify")
-            else:
-                code += char
-            index += 1
-        if quoted:
-            raise WrapperError(f"the variable file has an unterminated string at line {number}, which the check cannot classify")
-        if depth == 0 and code.strip():
-            found = ASSIGNMENT.match(code.strip())
-            if found is None:
-                raise WrapperError(f"the variable file has a line {number} that is not an assignment, which the check cannot classify")
-            names.add(found.group(1))
-        depth += sum(code.count(opening) for opening in "{[(") - sum(code.count(closing) for closing in "}])")
-        if depth < 0:
-            raise WrapperError(f"the variable file closes a bracket that it did not open at line {number}, which the check cannot classify")
-    if depth != 0:
-        raise WrapperError("the variable file ends inside a bracket, which the check cannot classify")
-    return names
-
-
-def caller_variable_problems(environment_file: Path, environment: Mapping[str, str]) -> list[str]:
-    """Each place where the caller sets a heavy input: the environment's variable file or a TF_VAR variable. The limits loader alone gives them."""
-    problems = []
-    if environment_file.is_file():
-        problems += [
-            f"{environment_file.name} sets {name}, which only the limits file gives"
-            for name in HEAVY_INPUT_NAMES
-            if name in tfvars_assignments(environment_file.read_text())
-        ]
-    problems += [
+def environment_override_problems(environment: Mapping[str, str]) -> list[str]:
+    """Each TF_VAR variable that names a heavy input, found by its name alone. The limits loader alone gives them."""
+    return [
         f"the environment variable TF_VAR_{name} sets {name}, which only the limits file gives" for name in HEAVY_INPUT_NAMES if f"TF_VAR_{name}" in environment
     ]
-    return problems
+
+
+def overridden_inputs_problem(plan: dict[str, Any]) -> str | None:
+    """The refusal for a saved plan that Terraform made with other heavy inputs than the loader gives, whatever overrode them, or None."""
+    difference = inputs_difference(plan)
+    if difference is None:
+        return None
+    planned, current = difference
+    return (
+        "a variable file, a TF_VAR variable or a -var overrode a heavy input: "
+        f"the plan was made with {planned} and the limits file gives {current}; the plan is refused"
+    )
 
 
 def prepare_configuration(run: RunBinding, inputs: str | None = None) -> Path:
@@ -332,7 +306,7 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     if run.status != "verified":
         raise WrapperError("the run's bucket is not verified: run the state bootstrap step")
     inputs = heavy_inputs()
-    overrides = caller_variable_problems(ROOT / "infra" / "environments" / f"{configuration.get('ENVIRONMENT', '')}.tfvars", os.environ)
+    overrides = environment_override_problems(os.environ)
     if overrides:
         raise WrapperError("refused before Terraform starts: " + "; ".join(overrides))
     folder = ROOT / "runs" / run.run_id / "plans"
@@ -352,8 +326,16 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
     ]
     terraform(run, ["plan", "-input=false", "-no-color", *(["-destroy"] if action == "destroy" else []), *variables, f"-out={candidate}"], PLAN_TIMEOUT_SECONDS)
     plan_json = terraform(run, ["show", "-json", str(candidate)], PLAN_TIMEOUT_SECONDS)
+    plan_document = json.loads(plan_json)
+    refused = folder / f"{action}_refused.json"
+    overridden = overridden_inputs_problem(plan_document)
+    if overridden:
+        # The plan is kept, not deleted. The mark keeps it from being confirmed, and no confirmation code is given.
+        refused.write_text(json.dumps({"reason": overridden, "plan_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()}, indent=2) + "\n")
+        raise WrapperError(f"refused: {overridden}")
+    refused.unlink(missing_ok=True)
     counts: dict[str, int] = {}
-    for actions, address in plan_changes(json.loads(plan_json)):
+    for actions, address in plan_changes(plan_document):
         counts[actions] = counts.get(actions, 0) + 1
         sys.stdout.write(f"{actions}: {address}\n")
     label = plan_label(action, changes=sum(counts.values()), reviewed_exists=(folder / f"{action}.tfplan").is_file())
@@ -379,6 +361,8 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
     folder = ROOT / "runs" / run.run_id / "plans"
     plan_file = folder / "apply.tfplan"
     binding_file = folder / "apply_binding.json"
+    if (folder / "apply_refused.json").is_file():
+        raise WrapperError("refused before any change: the last apply plan was refused because a heavy input was overridden; save a new plan")
     if not plan_file.is_file() or not binding_file.is_file():
         raise WrapperError("no saved apply plan for this run: run plan first")
     plan = plan_file.read_bytes()

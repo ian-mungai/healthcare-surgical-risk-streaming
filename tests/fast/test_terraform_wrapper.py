@@ -7,16 +7,19 @@ plan saved for another run.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import hashlib
 import io
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from scripts.infra import terraform_wrapper
@@ -43,7 +46,6 @@ from scripts.infra.terraform_wrapper import (
     stale_inputs_problem,
     state_json,
     state_location,
-    tfvars_assignments,
     write_private,
 )
 
@@ -248,6 +250,8 @@ class PrivateFilesTest(unittest.TestCase):
             if arguments[0] == "plan":
                 plan_arguments.extend(arguments)
                 Path(next(item for item in arguments if item.startswith("-out="))[5:]).write_bytes(b"plan")
+            if arguments[0] == "show" and len(arguments) == 3 and arguments[1] == "-json":
+                return json.dumps(plan_with(HEAVY_INPUTS))
             return {"workspace": f"{RUN.workspace}\n", "show": "{}"}.get(arguments[0], "")
 
         configuration = {
@@ -409,48 +413,17 @@ class ConfirmedPlanTest(unittest.TestCase):
 
 
 class CallerVariableTest(unittest.TestCase):
-    """The limits loader alone gives the three heavy inputs. A variable file, a ``-var`` or an environment variable that sets one is refused."""
-
-    def test_the_names_that_a_variable_file_sets_at_the_top_level_are_found_and_nothing_nested(self) -> None:
-        text = 'a = 1\nb_name = "x # not a comment"\n# host_reserve_mib = 1\nworkloads = {\n  host_reserve_mib = { access = {} }\n}\nc = [\n  1,\n]\n'
-        self.assertEqual({"a", "b_name", "workloads", "c"}, tfvars_assignments(text))
-
-    def test_a_line_that_cannot_be_classified_is_refused(self) -> None:
-        for text in ("just some words\n", "x = <<EOT\nhost_reserve_mib = 1\nEOT\n", 'x = "unterminated\n', "x = {\n"):
-            with self.subTest(text=text), self.assertRaises(WrapperError):
-                tfvars_assignments(text)
-
-    def test_the_tracked_environment_file_sets_none_of_the_three(self) -> None:
-        names = tfvars_assignments((Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars").read_text())
-        self.assertEqual(set(), names & set(HEAVY_INPUT_NAMES))
-        self.assertIn("workloads", names)
+    """The limits loader alone gives the three heavy inputs. An environment variable that names one is refused by its name, with no parsing."""
 
     def test_no_variable_that_the_wrapper_passes_names_a_heavy_input(self) -> None:
         names = set(run_variables(RUN, {"AWS_PROFILE": "example_project_dev"})) | {key.lower() for key in terraform_wrapper.TAILSCALE_KEYS}
         self.assertEqual(set(), names & set(HEAVY_INPUT_NAMES))
-
-    def test_a_plan_is_refused_before_terraform_starts_when_the_variable_file_sets_a_heavy_input(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            root = Path(scratch)
-            (root / "compose").mkdir()
-            (root / "compose" / "limits.yml").write_text(LIMITS)
-            (root / "infra" / "environments").mkdir(parents=True)
-            (root / "infra" / "environments" / "dev.tfvars").write_text('aws_region = "us-west-2"\nhost_reserve_mib = 1024\n')
-            with (
-                mock.patch.object(terraform_wrapper, "ROOT", root),
-                mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None),
-                mock.patch.object(terraform_wrapper, "run_command", side_effect=AssertionError("Terraform started")),
-                self.assertRaisesRegex(WrapperError, "dev.tfvars.*host_reserve_mib|host_reserve_mib.*dev.tfvars"),
-            ):
-                save_plan(RUN, {"AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev"}, "apply")
 
     def test_a_plan_is_refused_before_terraform_starts_when_the_environment_sets_a_heavy_input(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             (root / "compose").mkdir()
             (root / "compose" / "limits.yml").write_text(LIMITS)
-            (root / "infra" / "environments").mkdir(parents=True)
-            (root / "infra" / "environments" / "dev.tfvars").write_text('aws_region = "us-west-2"\n')
             for name in HEAVY_INPUT_NAMES:
                 with (
                     self.subTest(name=name),
@@ -461,6 +434,133 @@ class CallerVariableTest(unittest.TestCase):
                     self.assertRaisesRegex(WrapperError, f"TF_VAR_{name}"),
                 ):
                     save_plan(RUN, {"AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev"}, "apply")
+
+
+class SavedPlanTest(unittest.TestCase):
+    """Right after a plan is saved, the wrapper reads what Terraform decided. A plan made with other heavy inputs than the loader gives is refused, whatever
+    overrode them: a variable file, a TF_VAR variable or a ``-var``. The refused plan is kept and marked, and no confirmation code is given."""
+
+    CONFIGURATION = {"AWS_PROFILE": "example_project_dev", "ENVIRONMENT": "dev", "TAILSCALE_CLIENT_ID": "example-id", "TAILSCALE_AUDIENCE": "example-audience"}
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+        (self.root / "compose").mkdir()
+        (self.root / "compose" / "limits.yml").write_text(LIMITS)
+        for folder in ("modules", "environments"):
+            (self.root / "infra" / folder).mkdir(parents=True)
+        (self.root / "infra" / ".terraform.lock.hcl").write_text("")
+        (self.root / "infra" / "environments" / "dev.tfvars").write_text(
+            (Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars").read_text()
+        )
+        record = configuration_folder_of(self.root) / ".terraform" / "terraform.tfstate"
+        record.parent.mkdir(parents=True)
+        record.write_text(json.dumps(S3_RECORD))
+        self.plan_inputs: Mapping[str, object] = dict(HEAVY_INPUTS)
+        self.plans = self.root / "runs" / RUN.run_id / "plans"
+        self.output = io.StringIO()
+        self.enterContext(mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None))
+        self.enterContext(mock.patch.object(terraform_wrapper, "terraform", side_effect=self.fake_terraform))
+        self.enterContext(contextlib.redirect_stdout(self.output))
+
+    def fake_terraform(self, run: RunBinding, arguments: list[str], timeout: float) -> str:
+        if arguments[0] == "plan":
+            Path(next(item for item in arguments if item.startswith("-out="))[5:]).write_bytes(b"plan bytes")
+        if arguments[0] == "show" and arguments[1] == "-json" and len(arguments) == 3:
+            document = plan_with(self.plan_inputs) | {"resource_changes": [{"address": "aws_thing.a", "change": {"actions": ["create"]}}]}
+            return json.dumps(document)
+        return {"workspace": f"{RUN.workspace}\n", "show": "text"}.get(arguments[0], "")
+
+    def test_a_plan_made_with_the_loaders_numbers_is_saved_and_gives_its_confirmation_code(self) -> None:
+        self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "apply"))
+        self.assertIn("apply --confirm", self.output.getvalue())
+        self.assertTrue((self.plans / "apply.tfplan").is_file())
+        self.assertFalse((self.plans / "apply_refused.json").exists())
+
+    def test_a_plan_whose_json_carries_another_number_is_refused_with_both_sets_and_no_confirmation_code(self) -> None:
+        for name in HEAVY_INPUT_NAMES:
+            with self.subTest(name=name):
+                self.plan_inputs = HEAVY_INPUTS | {name: HEAVY_INPUTS[name] + 1}
+                self.output.truncate(0)
+                with self.assertRaises(WrapperError) as caught:
+                    save_plan(RUN, self.CONFIGURATION, "apply")
+                for text in ("overrode", str(HEAVY_INPUTS[name]), str(HEAVY_INPUTS[name] + 1)):
+                    self.assertIn(text, str(caught.exception))
+                self.assertNotIn("--confirm", self.output.getvalue())
+                self.assertFalse((self.plans / "apply.tfplan").exists())
+                self.assertTrue((self.plans / "apply_candidate.tfplan").is_file())
+                self.assertTrue((self.plans / "apply_refused.json").is_file())
+
+    def test_a_plan_without_the_variables_or_with_a_string_number_is_refused_too(self) -> None:
+        for inputs in ({}, {name: str(value) for name, value in HEAVY_INPUTS.items()}):
+            with self.subTest(inputs=inputs):
+                self.plan_inputs = inputs
+                with self.assertRaisesRegex(WrapperError, "overrode"):
+                    save_plan(RUN, self.CONFIGURATION, "apply")
+
+    def test_the_teardown_plan_is_refused_the_same_way_and_marked_under_its_own_name(self) -> None:
+        self.plan_inputs = HEAVY_INPUTS | {"host_reserve_mib": 1}
+        with self.assertRaisesRegex(WrapperError, "overrode"):
+            save_plan(RUN, self.CONFIGURATION, "destroy")
+        self.assertTrue((self.plans / "destroy_refused.json").is_file())
+        self.assertFalse((self.plans / "destroy.tfplan").exists())
+        self.assertNotIn("--confirm", self.output.getvalue())
+
+    def test_a_refused_plan_cannot_be_confirmed_even_when_an_earlier_reviewed_plan_is_still_there_and_the_inputs_are_good_again(self) -> None:
+        self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "apply"))
+        code = hashlib.sha256((self.plans / "apply.tfplan").read_bytes()).hexdigest()[:12]
+        self.plan_inputs = HEAVY_INPUTS | {"host_reserve_mib": 1}
+        with self.assertRaises(WrapperError):
+            save_plan(RUN, self.CONFIGURATION, "apply")
+        self.plan_inputs = dict(HEAVY_INPUTS)
+        with mock.patch.object(terraform_wrapper, "record_created"), self.assertRaisesRegex(WrapperError, "the last apply plan was refused"):
+            apply_plan(RUN, code, self.CONFIGURATION)
+
+    def test_a_later_good_plan_lifts_the_mark(self) -> None:
+        self.plan_inputs = HEAVY_INPUTS | {"host_reserve_mib": 1}
+        with self.assertRaises(WrapperError):
+            save_plan(RUN, self.CONFIGURATION, "apply")
+        self.plan_inputs = dict(HEAVY_INPUTS)
+        self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "apply"))
+        self.assertFalse((self.plans / "apply_refused.json").exists())
+        self.assertFalse((self.plans / "apply_candidate.tfplan").exists())
+
+    def test_the_wrapper_never_reads_a_variable_file_it_only_passes_its_path_to_terraform(self) -> None:
+        """Terraform alone reads ``.tfvars`` text. A reader of its own cannot match Terraform's language, so the check is on what Terraform decided."""
+        seen: list[str] = []
+        real_open, real_read_text, real_read_bytes, real_path_open = builtins.open, Path.read_text, Path.read_bytes, Path.open
+
+        def from_the_wrapper() -> bool:
+            return sys._getframe(3).f_globals.get("__name__") == terraform_wrapper.__name__
+
+        def note(path: object) -> None:
+            if str(path).endswith((".tfvars", ".tfvars.json")) and from_the_wrapper():
+                seen.append(str(path))
+
+        def spy_open(file: Any, *arguments: Any, **keywords: Any) -> Any:
+            note(file)
+            return real_open(file, *arguments, **keywords)
+
+        def spy_read_text(self: Path, *arguments: Any, **keywords: Any) -> str:
+            note(self)
+            return real_read_text(self, *arguments, **keywords)
+
+        def spy_read_bytes(self: Path, *arguments: Any, **keywords: Any) -> bytes:
+            note(self)
+            return real_read_bytes(self, *arguments, **keywords)
+
+        def spy_path_open(self: Path, *arguments: Any, **keywords: Any) -> Any:
+            note(self)
+            return real_path_open(self, *arguments, **keywords)
+
+        with (
+            mock.patch.object(builtins, "open", spy_open),
+            mock.patch.object(Path, "read_text", spy_read_text),
+            mock.patch.object(Path, "read_bytes", spy_read_bytes),
+            mock.patch.object(Path, "open", spy_path_open),
+        ):
+            self.assertEqual(1, save_plan(RUN, self.CONFIGURATION, "apply"))
+        self.assertEqual([], seen)
 
 
 class EffectiveLocationTest(unittest.TestCase):
