@@ -94,7 +94,7 @@ def variables(folder: Path, stand_in: Path, context: Path, **more: object) -> di
         "compose_stack_owner": pwd.getpwuid(os.getuid()).pw_name,
         "compose_stack_group": grp.getgrgid(os.getgid()).gr_name,
         "compose_stack_docker": [str(stand_in), "compose", "--project-name", "sample"],
-        "compose_stack_built_images": [{"tag": TAG, "context": str(context)}],
+        "compose_stack_built_images": [{"tag": TAG, "name": "sample", "sources": [str(context)]}],
         "compose_stack_build_deadline_seconds": 60,
         "compose_stack_start_deadline_seconds": 60,
         "compose_stack_health_deadline_seconds": 30,
@@ -228,7 +228,7 @@ class BuildTest(unittest.TestCase):
             folder = Path(scratch)
             stand_in, context = prepare(folder)
             code, output = self.build((folder, stand_in, context))
-            placed = folder / "platform" / "sample"
+            placed = folder / "platform" / "images" / "sample" / "sample"
             mode = stat.S_IMODE((placed / "run.sh").stat().st_mode)
             logged = self.builds(stand_in)
             files = sorted(path.name for path in placed.iterdir())
@@ -319,8 +319,61 @@ class BuildTest(unittest.TestCase):
         return True
 
 
+class ExtraContextBuildTest(unittest.TestCase):
+    """An image whose Dockerfile reads named build contexts, or that is built from the folder above its Dockerfile, like the Dagster and Spark images."""
+
+    def prepare(self, folder: Path) -> tuple[Path, Path, Path, dict[str, object]]:
+        stand_in, context = prepare(folder)
+        extra = folder / "source" / "extra"
+        extra.mkdir()
+        (extra / "module.py").write_text("VALUE = 1\n")
+        image = {"tag": TAG, "name": "sample", "sources": [str(context), str(extra)], "context": ".", "dockerfile": "sample/Dockerfile"}
+        return stand_in, context, extra, image | {"build_contexts": {"more": "extra"}}
+
+    def build(self, folder: Path, stand_in: Path, context: Path, image: dict[str, object]) -> tuple[int, str]:
+        return run_tasks("build_images.yml", variables(folder, stand_in, context, compose_stack_built_images=[image]))
+
+    def test_each_source_is_placed_in_the_images_folder_and_the_build_names_the_dockerfile_the_named_contexts_and_the_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, context, extra, image = self.prepare(folder)
+            code, output = self.build(folder, stand_in, context, image)
+            placed = folder / "platform" / "images" / "sample"
+            files = sorted(str(path.relative_to(placed)) for path in placed.rglob("*") if path.is_file())
+            logged = [line for line in calls(stand_in) if line.startswith("build ")]
+        self.assertEqual(0, code, output)
+        self.assertEqual(["extra/module.py", "sample/Dockerfile", "sample/run.sh"], files)
+        self.assertEqual(1, len(logged), logged)
+        self.assertRegex(
+            logged[0],
+            rf"^build --platform linux/amd64 --tag {re.escape(TAG)} --label {LABEL.pattern} --file={re.escape(str(placed / 'sample' / 'Dockerfile'))} "
+            rf"--build-context=more={re.escape(str(placed / 'extra'))} {re.escape(str(placed))}$",
+        )
+
+    def test_a_change_in_a_named_context_builds_again_and_an_unchanged_one_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, context, extra, image = self.prepare(folder)
+            self.build(folder, stand_in, context, image)
+            code, output = self.build(folder, stand_in, context, image)
+            unchanged = len([line for line in calls(stand_in) if line.startswith("build ")])
+            (extra / "module.py").write_text("VALUE = 2\n")
+            changed_code, changed_output = self.build(folder, stand_in, context, image)
+            changed = len([line for line in calls(stand_in) if line.startswith("build ")])
+        self.assertEqual((0, 0), (code, changed_code), output + changed_output)
+        self.assertRegex(output, CHANGED_NONE)
+        self.assertEqual((1, 2), (unchanged, changed))
+
+
+def from_contexts(dockerfile: Path) -> set[str]:
+    """The named build contexts that a Dockerfile copies from: every ``COPY --from=<name>`` whose name is neither an image nor a stage of the file."""
+    text = dockerfile.read_text()
+    stages = set(re.findall(r"(?im)^FROM\s.*\sAS\s+(\S+)\s*$", text))
+    return {name for name in re.findall(r"--from=(\S+)", text) if ":" not in name and "@" not in name and name not in stages}
+
+
 class BuiltImagesTest(unittest.TestCase):
-    def test_the_images_the_role_builds_are_the_project_images_that_the_service_files_name_and_each_has_a_context_with_a_dockerfile(self) -> None:
+    def test_the_images_the_role_builds_are_the_project_images_that_the_service_files_name_and_each_dockerfile_is_in_its_sources(self) -> None:
         built: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
         named = set()
         for service_file in sorted((ROOT / "compose" / "services").glob("*.yml")):
@@ -331,7 +384,21 @@ class BuiltImagesTest(unittest.TestCase):
         self.assertTrue(named)
         self.assertEqual(named, {image["tag"] for image in built})
         for image in built:
-            self.assertTrue((ROOT / image["context"] / "Dockerfile").is_file(), image)
+            context = image.get("context", image["sources"][0])
+            dockerfile = image.get("dockerfile", f"{context}/Dockerfile")
+            with self.subTest(image=image["tag"]):
+                self.assertIn(dockerfile.split("/")[0], image["sources"])
+                self.assertTrue((ROOT / dockerfile).is_file())
+                self.assertTrue(context == "." or context in image["sources"])
+                self.assertEqual(from_contexts(ROOT / dockerfile), set(image.get("build_contexts", {})))
+                self.assertTrue(set(image.get("build_contexts", {}).values()) <= set(image["sources"]))
+
+    def test_the_dagster_image_gets_the_scripts_and_compose_folders_and_the_spark_image_is_built_from_the_folder_above_its_dockerfile(self) -> None:
+        images: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
+        built = {image["name"]: image for image in images}
+        self.assertEqual({"stack_scripts": "scripts", "stack_compose": "compose"}, built["dagster"]["build_contexts"])
+        self.assertEqual(("spark/Dockerfile", "."), (built["spark"]["dockerfile"], built["spark"]["context"]))
+        self.assertEqual("surgical-risk-spark:4.1.4", built["spark"]["tag"])
 
 
 if __name__ == "__main__":

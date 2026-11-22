@@ -93,8 +93,8 @@ class BatchExceptionTest(unittest.TestCase):
     def test_a_batch_job_with_no_dockerfile_or_a_moving_tag_is_named(self) -> None:
         for mutate in (
             lambda _d, s: s.pop("build"),
-            lambda _d, s: s.update(image="surgical_risk_spark:latest"),
-            lambda _d, s: s.update(image="surgical_risk_spark"),
+            lambda _d, s: s.update(image="surgical-risk-spark:latest"),
+            lambda _d, s: s.update(image="surgical-risk-spark"),
         ):
             problems = self.defect(mutate)
             self.assertEqual(1, len(problems))
@@ -104,7 +104,8 @@ class BatchExceptionTest(unittest.TestCase):
         for profiles in (["debug"], ["batch", "debug"], []):
             with self.subTest(profiles=profiles):
                 problems = self.defect(lambda _d, s, profiles=profiles: s.update(profiles=profiles))
-                self.assertTrue([problem for problem in problems if "image" in problem], problems)
+                self.assertTrue([problem for problem in problems if "healthcheck" in problem], problems)
+                self.assertTrue([problem for problem in problems if "restart" in problem], problems)
 
     def test_a_batch_job_still_needs_its_limit_platform_and_named_volumes(self) -> None:
         self.assertIn("mem_limit", self.defect(lambda _d, s: s.pop("mem_limit"))[0])

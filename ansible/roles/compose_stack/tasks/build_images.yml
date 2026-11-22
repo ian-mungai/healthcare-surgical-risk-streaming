@@ -1,21 +1,34 @@
 # Reads compose_stack_directory, compose_stack_built_images, compose_stack_docker (its first word is the docker command), compose_stack_build_deadline_seconds,
-# compose_stack_owner and compose_stack_group. Until the project pushes its images to a registry, the host builds them. The build context is placed on the host,
-# and an image is built only when the context differs from the one the image was built from: the image carries the hash of its context as a label.
-- name: Place the build context of each image the project makes itself
-  ansible.builtin.copy:
-    src: "{{ [role_path ~ '/../../..', item.context] | path_join }}/"
-    dest: "{{ compose_stack_directory }}/{{ item.context | basename }}/"
+# compose_stack_owner and compose_stack_group. Until the project pushes its images to a registry, the host builds them. Each image has its own folder under
+# images/ on the host, which holds a copy of each of its source folders. The build context is that folder or one source in it, the Dockerfile and the named
+# build contexts are sources in it too, and an image is built only when the folder differs from the one the image was built from: the image carries the hash
+# of the whole folder as a label, so a change in a named context builds the image again.
+- name: Create the folder of each image the project makes itself
+  ansible.builtin.file:
+    path: "{{ compose_stack_directory }}/images/{{ item.name }}"
+    state: directory
     owner: "{{ compose_stack_owner }}"
     group: "{{ compose_stack_group }}"
-    mode: preserve
-    directory_mode: "0755"
+    mode: "0755"
   loop: "{{ compose_stack_built_images }}"
   loop_control:
     label: "{{ item.tag }}"
 
-- name: List the files of each build context
+- name: Place each source folder of each image
+  ansible.builtin.copy:
+    src: "{{ [role_path ~ '/../../..', item.1] | path_join }}"
+    dest: "{{ compose_stack_directory }}/images/{{ item.0.name }}/"
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: preserve
+    directory_mode: "0755"
+  loop: "{{ compose_stack_built_images | subelements('sources') }}"
+  loop_control:
+    label: "{{ item.0.tag }}: {{ item.1 | basename }}"
+
+- name: List the files of each image's folder
   ansible.builtin.find:
-    paths: "{{ compose_stack_directory }}/{{ item.context | basename }}"
+    paths: "{{ compose_stack_directory }}/images/{{ item.name }}"
     recurse: true
     hidden: true
     file_type: file
@@ -25,7 +38,7 @@
   loop_control:
     label: "{{ item.tag }}"
 
-- name: Read the hash of the context that each image was built from
+- name: Read the hash of the folder that each image was built from
   ansible.builtin.command:
     argv: "{{ [compose_stack_docker[0], 'image', 'inspect', '--format', '{{ index .Config.Labels \"surgical-risk.context\" }}', item.tag] }}"
   register: compose_stack_image_labels
@@ -37,21 +50,21 @@
     label: "{{ item.tag }}"
   timeout: 60
 
-- name: Build each image whose context differs from the one it was built from, or that does not exist
+- name: Build each image whose folder differs from the one it was built from, or that does not exist
   ansible.builtin.command:
-    argv:
-      - "{{ compose_stack_docker[0] }}"
-      - build
-      - --platform
-      - linux/amd64
-      - --tag
-      - "{{ item.item.tag }}"
-      - --label
-      - "surgical-risk.context={{ context_hash }}"
-      - "{{ compose_stack_directory }}/{{ item.item.context | basename }}"
+    argv: "{{ build_start + file_arguments + context_arguments + [image_folder ~ ('' if context == '.' else '/' ~ context)] }}"
   vars:
+    image: "{{ item.item }}"
+    image_folder: "{{ compose_stack_directory }}/images/{{ image.name }}"
+    context: "{{ image.context | default(image.sources[0] | basename) }}"
+    contexts: "{{ image.build_contexts | default({}) | dict2items }}"
     context_files: "{{ item.files | sort(attribute='path') }}"
     context_hash: "{{ (context_files | map(attribute='path') | zip(context_files | map(attribute='checksum'), context_files | map(attribute='mode')) | list | to_json) | hash('sha256') }}"
+    build_start: "{{ [compose_stack_docker[0], 'build', '--platform', 'linux/amd64', '--tag', image.tag, '--label', 'surgical-risk.context=' ~ context_hash] }}"
+    file_arguments: "{{ ['--file=' ~ image_folder ~ '/' ~ image.dockerfile] if image.dockerfile is defined else [] }}"
+    context_arguments: >-
+      {{ contexts | map(attribute='key') | zip(contexts | map(attribute='value')) | map('join', '=' ~ image_folder ~ '/') | map('regex_replace', '^', '--build-context=')
+      | list }}
     image_label: "{{ compose_stack_image_labels.results[ansible_loop.index0].stdout | default('') | trim }}"
   when: compose_stack_image_labels.results[ansible_loop.index0].rc != 0 or image_label != context_hash
   loop: "{{ compose_stack_context_files.results }}"

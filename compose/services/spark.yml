@@ -1,6 +1,6 @@
 services:
   spark:
-    image: surgical_risk_spark:4.1.4
+    image: surgical-risk-spark:4.1.4
     build:
       context: ../..
       dockerfile: spark/Dockerfile

@@ -65,11 +65,22 @@ compose_stack_postgres_port: 5432
 openbao_port: 8200
 # The Docker socket on the host. The code location reaches it through the socket's group, which the role reads from the socket at each deploy.
 compose_stack_docker_socket: /var/run/docker.sock
-# The images the project makes itself, until it pushes them to a registry: the tag that the Compose files name and the folder of the build context, under the
-# repository's root and under compose_stack_directory. The host builds each one and builds it again only when its context changes.
+# The images the project makes itself, until it pushes them to a registry: the tag that the Compose files name, the name of the image's folder under
+# compose_stack_directory/images, the repository's folders that the folder holds, the build context (a source, or "." for the whole folder; the first source
+# when unset), the Dockerfile (in the context when unset) and the named build contexts that the Dockerfile copies from. The host builds each image and builds
+# it again only when its folder changes.
 compose_stack_built_images:
   - tag: surgical-risk-dagster:1.13.31
-    context: orchestration
+    name: dagster
+    sources: [orchestration, scripts, compose]
+    build_contexts:
+      stack_scripts: scripts
+      stack_compose: compose
+  - tag: surgical-risk-spark:4.1.4
+    name: spark
+    sources: [spark, scripts]
+    context: "."
+    dockerfile: spark/Dockerfile
 # An empty project name keeps the one fixed name in compose.yml.
 compose_stack_project: ""
 # Each deadline is in seconds. The start deadline covers pulling the images and the health deadline each service's health check.
