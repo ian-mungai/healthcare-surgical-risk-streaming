@@ -181,7 +181,10 @@ def kept_outcome(inbox: Path, request: Path, log: Callable[..., None]) -> str | 
                 return outcome
             reason = "it is not an object with the outcome finished or failed"
     log("result_invalid", request=request.stem, path=str(path), reason=reason)
-    os.replace(path, path.with_name(path.name + INVALID_SUFFIX))
+    try:
+        os.replace(path, path.with_name(path.name + INVALID_SUFFIX))
+    except OSError as error:
+        log("result_invalid_not_kept", request=request.stem, path=str(path), reason=f"it cannot be renamed: {type(error).__name__}")
     return None
 
 

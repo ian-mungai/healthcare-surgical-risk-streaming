@@ -31,7 +31,7 @@ from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
-from replay.service.serve import Outcome, SubmitError, archive, healthy, held, queued_record, read_submission, serve, submit, submit_command
+from replay.service.serve import Outcome, SubmitError, archive, healthy, held, kept_outcome, queued_record, read_submission, serve, submit, submit_command
 from scripts.ingestion.manifest import ManifestRef
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
@@ -277,6 +277,14 @@ class ServeTest(unittest.TestCase):
                 self.assertEqual([], loop.ran)
                 self.assertFalse((loop.inbox / "results" / "a.json.invalid").exists())
                 self.assertEqual([], loop.logged)
+
+    def test_an_invalid_result_that_cannot_be_renamed_is_logged_and_still_counts_as_no_result(self) -> None:
+        loop = self.loop({})
+        (loop.inbox / "results").mkdir()
+        (loop.inbox / "results" / "a.json").write_text("not json")
+        with mock.patch("os.replace", side_effect=PermissionError("read-only")):
+            self.assertIsNone(kept_outcome(loop.inbox, loop.inbox / "a.json", lambda event, **fields: loop.logged.append(event)))
+        self.assertEqual(["result_invalid", "result_invalid_not_kept"], loop.logged)
 
     def test_a_planted_invalid_result_still_counts_the_start_and_three_stops_with_it_fail_the_request(self) -> None:
         loop = self.loop({"a.json": Outcome("stopped", 2)})

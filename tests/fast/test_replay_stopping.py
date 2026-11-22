@@ -29,6 +29,7 @@ from tests.fast.test_replay_serve import RECORD, REFERENCE, Clock
 
 ROOT = Path(__file__).resolve().parents[2]
 GRACE_SECONDS = 5.0
+WATCHDOG_SECONDS = 20.0
 CHILD = """
 import os, signal, sys, threading, time
 from replay.service.stopping import StopFlag, SystemClock
@@ -56,6 +57,13 @@ class StopFlagTest(unittest.TestCase):
         self.assertTrue(flag.wait(60))
         self.assertTrue(flag.wait(60))
         self.assertLess(time.monotonic() - started, 1)
+
+    def test_a_stop_from_another_thread_ends_a_long_wait_of_the_flag_at_once(self) -> None:
+        flag = self.flag()
+        threading.Timer(0.2, flag.request).start()
+        started = time.monotonic()
+        self.assertTrue(flag.wait(30))
+        self.assertLess(time.monotonic() - started, 0.9)
 
     def test_a_stop_from_another_thread_ends_a_long_wait_of_the_system_clock_within_a_second(self) -> None:
         flag = self.flag()
@@ -118,8 +126,12 @@ class StoppedWaitLoopTest(unittest.TestCase):
                 flag.request()
             return outcome
 
-        if stop_after is not None:
-            threading.Timer(stop_after, flag.request).start()
+        for seconds in (stop_after, WATCHDOG_SECONDS):
+            if seconds is not None:
+                timer = threading.Timer(seconds, flag.request)
+                timer.daemon = True
+                self.addCleanup(timer.cancel)
+                timer.start()
         started = time.monotonic()
         serve(self.inbox, self.health, run_request, flag.is_set, Clock(), flag.wait, 1.0 if stop_after is None else 60.0)
         return time.monotonic() - started, len(results)
