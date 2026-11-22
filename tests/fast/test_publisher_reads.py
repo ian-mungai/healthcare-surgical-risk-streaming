@@ -23,10 +23,12 @@ import os
 import tempfile
 import unittest
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from scripts.ingestion.notice import Code, Notice, Subject, render
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.sample import candidates, publisher
 from scripts.sample.candidates import CANDIDATES_FILE, RELEASE_FILE, read_candidates, release_problems
@@ -34,6 +36,10 @@ from scripts.sample.publisher import PublisherError
 
 TRACK_HEADER = "caseid,tname,tid\n"
 CLINICAL_HEADER = "﻿caseid,subjectid,casestart,caseend,age\n"
+
+
+def texts(notices: list[Notice]) -> list[str]:
+    return [render(notice) for notice in notices]
 
 
 def completed(returncode: int, stdout: str = "") -> CompletedProcess[str]:
@@ -50,13 +56,13 @@ class ReadFailures(unittest.TestCase):
         error = self.raised(publisher.list_release, mock.Mock(side_effect=TimeoutExpired("aws", 300)))
         self.assertEqual("listing the release timed out after 300 seconds", str(error))
 
-    def test_a_key_read_past_its_deadline_names_the_key_and_no_argument(self) -> None:
+    def test_a_key_read_past_its_deadline_names_the_file_by_its_role_and_no_argument(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / "file"
             error = self.raised(
                 lambda: publisher.download_key(publisher.RELEASE_PREFIX + "clinical_data.csv", target), mock.Mock(side_effect=TimeoutExpired("aws", 300))
             )
-        self.assertEqual("reading vitaldb/1.0.0/clinical_data.csv timed out after 300 seconds", str(error))
+        self.assertEqual("reading the clinical table timed out after 300 seconds", str(error))
 
     def test_a_url_read_past_its_deadline_names_the_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -161,9 +167,9 @@ class PinnedFiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "file"
             path.write_bytes(b"abc")
-            publisher.read_pinned("the track list", path, 3, publisher.file_sha256(path))
+            publisher.read_pinned(Subject.TRACK_LIST, path, 3, publisher.file_sha256(path))
             with self.assertRaisesRegex(PublisherError, "SHA-256"):
-                publisher.read_pinned("the track list", path, 3, "0" * 64)
+                publisher.read_pinned(Subject.TRACK_LIST, path, 3, "0" * 64)
 
     def test_a_checksum_list_that_names_a_key_twice_is_refused_by_its_line(self) -> None:
         good = "0" * 64
@@ -194,22 +200,25 @@ class CaseFactsBinding(unittest.TestCase):
         self.assertEqual([item.size_bytes for item in self.tracked], [item.size_bytes for item in facts])
         self.assertEqual([True, False], [item.arterial_waveform for item in facts])
 
-    def test_a_case_missing_from_the_checksum_list_is_refused_by_number(self) -> None:
+    def test_a_case_missing_from_the_checksum_list_is_refused_by_its_place_in_the_table(self) -> None:
         del self.sums[self.tracked[1].key]
         with self.assertRaises(PublisherError) as caught:
             candidates.case_facts(self.rows, self.sums, self.sizes, set())
-        self.assertIn(f"case {self.tracked[1].case}", str(caught.exception))
+        self.assertIn("case 2 of the clinical table is missing", str(caught.exception))
+        self.assertNotIn(str(self.tracked[1].case), str(caught.exception))
 
-    def test_a_case_missing_from_the_listing_is_refused_by_number(self) -> None:
+    def test_a_case_missing_from_the_listing_is_refused_by_its_place_in_the_table(self) -> None:
         del self.sizes[self.tracked[0].key]
         with self.assertRaises(PublisherError) as caught:
             candidates.case_facts(self.rows, self.sums, self.sizes, set())
-        self.assertIn(f"case {self.tracked[0].case}", str(caught.exception))
+        self.assertIn("case 1 of the clinical table is missing", str(caught.exception))
+        self.assertNotIn(str(self.tracked[0].case), str(caught.exception))
 
-    def test_a_waveform_case_the_clinical_table_lacks_is_refused(self) -> None:
+    def test_a_waveform_case_the_clinical_table_lacks_is_refused_without_its_number(self) -> None:
         with self.assertRaises(PublisherError) as caught:
             candidates.case_facts(self.rows, self.sums, self.sizes, {99999})
-        self.assertIn("case 99999", str(caught.exception))
+        self.assertIn("names a case that the clinical table does not list", str(caught.exception))
+        self.assertNotIn("99999", str(caught.exception))
 
 
 class TemporaryFolder(unittest.TestCase):
@@ -219,7 +228,7 @@ class TemporaryFolder(unittest.TestCase):
         def failing(release: dict[str, object], workdir: Path) -> None:
             (workdir / "partial").write_text("partial download")
             seen.append(workdir)
-            raise PublisherError("reading failed")
+            raise PublisherError(Notice(Code.EXIT_STATUS, subject=Subject.READING_LIST, count=1))
 
         with mock.patch.object(candidates, "read_inputs", failing), self.assertRaises(PublisherError):
             candidates.rebuild(RELEASE_FILE)
@@ -233,48 +242,48 @@ class ClosedPin(unittest.TestCase):
         return loaded
 
     def test_the_tracked_pin_names_the_addresses_the_code_reads(self) -> None:
-        self.assertEqual([], release_problems(self.pin()))
+        self.assertEqual([], texts(release_problems(self.pin())))
 
     def test_another_track_list_address_is_refused(self) -> None:
         pin = self.pin()
         pin["track_list"] = pin["track_list"] | {"url": "https://example.invalid/trks"}  # type: ignore[operator]
-        self.assertTrue(any("address" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("address" in problem for problem in texts(release_problems(pin))))
 
     def test_another_checksum_list_key_inside_the_release_is_refused(self) -> None:
         pin = self.pin()
         pin["checksum_list"] = pin["checksum_list"] | {"key": publisher.RELEASE_PREFIX + "clinical_data.csv"}  # type: ignore[operator]
-        self.assertTrue(any("SHA256SUMS.txt" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("SHA256SUMS.txt" in problem for problem in texts(release_problems(pin))))
 
     def test_a_table_listed_twice_is_refused(self) -> None:
         pin = self.pin()
         tables = list(pin["tables"])  # type: ignore[call-overload]
         pin["tables"] = [*tables, tables[0]]
-        self.assertTrue(any("tables" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("tables" in problem for problem in texts(release_problems(pin))))
 
     def test_a_pin_that_is_no_object_is_refused(self) -> None:
-        self.assertTrue(release_problems([]))  # type: ignore[arg-type]
+        self.assertTrue(texts(release_problems([])))
 
     def test_a_pin_for_another_bucket_region_or_release_path_than_the_reads_use_is_refused(self) -> None:
         for field, other in (("bucket", "another-bucket"), ("region", "eu-west-1"), ("release_path", "vitaldb/2.0.0/")):
             pin = self.pin()
             pin["source"] = pin["source"] | {field: other}  # type: ignore[operator]
             with self.subTest(field=field):
-                self.assertTrue(any(problem.startswith(f"source: the {field}") for problem in release_problems(pin)), release_problems(pin))
+                self.assertTrue(any(problem.startswith(f"source: the {field}") for problem in texts(release_problems(pin))), texts(release_problems(pin)))
         pin = self.pin()
         del pin["source"]
-        self.assertTrue(any(problem.startswith("source") for problem in release_problems(pin)))
+        self.assertTrue(any(problem.startswith("source") for problem in texts(release_problems(pin))))
 
     def test_a_pin_with_a_table_list_of_another_type_is_refused_and_not_raised(self) -> None:
         for tables in (None, 5, "ab", {"a": 1}):
             pin = self.pin()
             pin["tables"] = tables
             with self.subTest(tables=tables):
-                self.assertTrue(any(problem.startswith("tables") for problem in release_problems(pin)))
+                self.assertTrue(any(problem.startswith("tables") for problem in texts(release_problems(pin))))
 
     def test_a_size_that_is_a_boolean_is_refused(self) -> None:
         pin = self.pin()
         pin["track_list"] = pin["track_list"] | {"size_bytes": True}  # type: ignore[operator]
-        self.assertTrue(any("size" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("size" in problem for problem in texts(release_problems(pin))))
 
 
 class QuietMessages(unittest.TestCase):
@@ -287,20 +296,20 @@ class QuietMessages(unittest.TestCase):
         pin["tables"][1]["sha256"] = self.MARKER
         pin["track_list"]["url"] = f"https://{self.MARKER}.invalid/trks"
         pin["source"]["bucket"] = self.MARKER
-        problems = release_problems(pin)
+        problems = texts(release_problems(pin))
         self.assertTrue(problems)
         self.assertNotIn(self.MARKER, " ".join(problems))
 
     def test_no_problem_of_a_candidate_names_its_key(self) -> None:
         item = read_candidates(CANDIDATES_FILE)[0]
         for key in (f"{self.MARKER}/vital_files/0001.vital", f"{publisher.RELEASE_PREFIX}vital_files/{self.MARKER}.vital"):
-            problems = candidates.candidate_problems([candidates.Candidate(**(vars(item) | {"key": key}))])
+            problems = texts(candidates.candidate_problems([candidates.Candidate(**(asdict(item) | {"key": key}))]))
             self.assertTrue(problems)
             self.assertNotIn(self.MARKER, " ".join(problems))
 
     def test_no_problem_against_the_publisher_names_the_key_of_a_candidate(self) -> None:
-        item = candidates.Candidate(**(vars(read_candidates(CANDIDATES_FILE)[0]) | {"key": f"{self.MARKER}/vital_files/0001.vital"}))
-        problems = candidates.listing_problems([item], {}, {})
+        item = candidates.Candidate(**(asdict(read_candidates(CANDIDATES_FILE)[0]) | {"key": f"{self.MARKER}/vital_files/0001.vital"}))
+        problems = texts(candidates.listing_problems([item], {}, {}))
         self.assertEqual(2, len(problems))
         self.assertNotIn(self.MARKER, " ".join(problems))
 
@@ -316,15 +325,15 @@ class QuietMessages(unittest.TestCase):
         self.assertNotIn(self.MARKER, str(caught.exception))
 
     def test_no_size_problem_shows_the_size(self) -> None:
-        item = candidates.Candidate(**(vars(read_candidates(CANDIDATES_FILE)[0]) | {"size_bytes": -987654}))
-        problems = candidates.candidate_problems([item])
+        item = candidates.Candidate(**(asdict(read_candidates(CANDIDATES_FILE)[0]) | {"size_bytes": -987654}))
+        problems = texts(candidates.candidate_problems([item]))
         self.assertTrue(any("size" in problem for problem in problems), problems)
         self.assertNotIn("987654", " ".join(problems))
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "file"
             path.write_bytes(b"abc")
             with self.assertRaises(PublisherError) as caught:
-                publisher.read_pinned("the track list", path, 987654, "0" * 64)
+                publisher.read_pinned(Subject.TRACK_LIST, path, 987654, "0" * 64)
         self.assertIn("size", str(caught.exception))
         self.assertNotIn("987654", str(caught.exception))
 
@@ -475,6 +484,21 @@ class TrackedFileForms(unittest.TestCase):
                 self.read(text)
 
 
+class ClosedCandidateMessages(unittest.TestCase):
+    def test_a_candidate_is_named_by_its_line_and_a_rebuilt_one_by_its_place_never_by_its_case(self) -> None:
+        tracked = read_candidates(CANDIDATES_FILE)
+        other = candidates.Candidate(**(asdict(tracked[1]) | {"key": candidates.case_key(tracked[1].case + 1)}))
+        self.assertEqual(["candidate file line 3: the key names another case"], texts(candidates.candidate_problems([tracked[0], other])))
+        self.assertEqual(
+            ["rebuilt candidate 2: the key names another case"], texts(candidates.candidate_problems([tracked[0], other], Subject.REBUILT_CANDIDATE))
+        )
+
+    def test_a_release_with_no_development_case_for_the_three_last_rules_is_refused_with_its_rule(self) -> None:
+        facts = [candidates.CaseFacts(1, patient, 600, 10, "0" * 64, False) for patient in range(1, 5)]
+        with self.assertRaisesRegex(PublisherError, "no development patient with one case and the arterial waveform"):
+            candidates.select_candidates(facts)
+
+
 class RebuildChecks(unittest.TestCase):
     def setUp(self) -> None:
         self.tracked = read_candidates(CANDIDATES_FILE)
@@ -487,18 +511,18 @@ class RebuildChecks(unittest.TestCase):
         self.assertEqual((self.tracked, {}, {}), self.rebuilt(self.tracked))
 
     def test_a_rebuild_over_the_size_limit_or_with_a_bad_candidate_is_refused(self) -> None:
-        huge = [candidates.Candidate(**(vars(self.tracked[0]) | {"size_bytes": candidates.TOTAL_SIZE_LIMIT_BYTES})), *self.tracked[1:]]
+        huge = [candidates.Candidate(**(asdict(self.tracked[0]) | {"size_bytes": candidates.TOTAL_SIZE_LIMIT_BYTES})), *self.tracked[1:]]
         with self.assertRaisesRegex(PublisherError, "over the limit"):
             self.rebuilt(huge)
-        bad = [candidates.Candidate(**(vars(self.tracked[0]) | {"sha256": "x"})), *self.tracked[1:]]
+        bad = [candidates.Candidate(**(asdict(self.tracked[0]) | {"sha256": "x"})), *self.tracked[1:]]
         with self.assertRaisesRegex(PublisherError, "64 hex"):
             self.rebuilt(bad)
 
     def test_a_tracked_line_that_differs_from_the_rebuild_is_found(self) -> None:
-        changed = [candidates.Candidate(**(vars(self.tracked[0]) | {"slot": "arterial_test_other"})), *self.tracked[1:]]
-        self.assertEqual([], candidates.difference_problems(self.tracked, self.tracked))
+        changed = [candidates.Candidate(**(asdict(self.tracked[0]) | {"slot": "arterial_test_other"})), *self.tracked[1:]]
+        self.assertEqual([], texts(candidates.difference_problems(self.tracked, self.tracked)))
         self.assertEqual(
-            [f"case {self.tracked[0].case}: the tracked line differs from the rebuilt line"], candidates.difference_problems(changed, self.tracked)
+            ["candidate file line 2: the tracked line differs from the rebuilt line"], texts(candidates.difference_problems(changed, self.tracked))
         )
 
     def test_a_pinned_table_whose_checksum_is_not_the_lists_is_refused_before_the_table_is_read(self) -> None:
@@ -525,7 +549,7 @@ class ClosedPinFields(unittest.TestCase):
     def changed(self, change: Callable[[dict[str, Any]], None]) -> list[str]:
         pin: dict[str, Any] = json.loads(Path(RELEASE_FILE).read_text())
         change(pin)
-        return release_problems(pin)
+        return texts(release_problems(pin))
 
     def test_control_the_tracked_pin_is_closed(self) -> None:
         self.assertEqual([], self.changed(lambda pin: None))

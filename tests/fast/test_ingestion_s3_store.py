@@ -132,6 +132,14 @@ class ListingTest(unittest.TestCase):
     def test_an_empty_listing_has_no_versions(self) -> None:
         self.assertEqual([], S3Store(StubAws({}, {}), "example-bucket").list_versions("landing/"))
 
+    def test_a_listing_part_that_is_present_and_not_a_list_is_refused_and_only_an_absent_part_reads_as_empty(self) -> None:
+        values: tuple[Any, ...] = ("", 0, {}, None, False)
+        for value in values:
+            for part in ("Versions", "DeleteMarkers"):
+                with self.subTest(part=part, value=value), self.assertRaisesRegex(StoreError, "version listing is not in the documented form"):
+                    S3Store(StubAws({part: value}, {}), "example-bucket").list_versions("landing/")
+        self.assertEqual([], S3Store(StubAws({"Versions": [], "DeleteMarkers": []}, {}), "example-bucket").list_versions("landing/"))
+
     def test_a_key_only_matching_by_prefix_is_not_the_key(self) -> None:
         aws = StubAws(VERSIONS, {})
         S3Store(aws, "example-bucket").list_versions("landing/a")

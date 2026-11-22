@@ -6,13 +6,14 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from scripts.ingestion.check import CheckResult, run_check
+from scripts.ingestion.check import CheckResult, Finding, run_check
 from scripts.ingestion.landing import PairingRecord
 from scripts.ingestion.selection import Selection
 from scripts.ingestion.store import ObjectVersion
 from tests.fast.memory_store import MemoryStore
 
 SOURCE_PREFIX = "vitaldb/1.0.0/"
+PUBLISHER_BUCKET = "physionet-open"
 SOURCE = {
     "vital_files/0001.vital": b"recording one, with enough bytes to need several blocks",
     "vital_files/0002.vital": b"recording two, also longer than one block of the stand-in",
@@ -33,7 +34,7 @@ def selection_for(paths: list[str], list_bytes: bytes, name: str = "probe_set") 
     return Selection(
         name=name,
         release="1.0.0",
-        source_bucket="example-publisher",
+        source_bucket=PUBLISHER_BUCKET,
         source_prefix=SOURCE_PREFIX,
         measurement_period="2016-08 to 2017-06",
         checksum_list_key=f"{SOURCE_PREFIX}SHA256SUMS.txt",
@@ -78,3 +79,8 @@ def landed_set(source: Mapping[str, bytes] = SOURCE, *, landed: Mapping[str, byt
         if path not in skip:
             result.land(path, (landed or {}).get(path, data))
     return result
+
+
+def finding_label(finding: Finding) -> str:
+    """How a message names the file of a finding: its source key when the pinned list names it, its place in the selection otherwise."""
+    return finding.source_key or f"selected file {finding.position}"

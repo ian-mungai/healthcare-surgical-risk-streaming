@@ -10,8 +10,10 @@ A selection file is JSON::
 ``files`` and ``case_files`` are paths relative to ``source_prefix``; either may be absent, and ``case_files`` expands to one path for each number from
 ``first`` to ``last``. The pattern is one known form: a path with one ``{:0Nd}`` place for the number. The checksum list is pinned by its key and its SHA-256.
 
-A selection named ``full_release`` is the whole release and is not an input to shorten: its files are exactly the two tables and the 6,388 case files, and its
-source, release and checksum list are the tracked pin's (``tests/fixtures/vitaldb/release.json``), so its list digest never comes from the caller.
+Every selection is of the one release that the tracked pin (``tests/fixtures/vitaldb/release.json``) names: its release, source bucket, source prefix
+and checksum list key are the pin's, so a source key that a check reports is the pin's release path and a path of the pinned checksum list. The case
+numbers of ``case_files`` are within the release's 1 to 6,388. A selection named ``full_release`` is the whole release and is not an input to shorten: its
+files are exactly the two tables and the 6,388 case files, and its checksum list digest is the pin's too, so it never comes from the caller.
 """
 
 from __future__ import annotations
@@ -20,12 +22,14 @@ import functools
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import Any
 
 from scripts.ingestion.closed import ClosedInputError, closed_object, parse_json
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
 from scripts.sample.candidates import RELEASE_FILE, release_problems
 
 NAME = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
@@ -36,9 +40,16 @@ FULL_RELEASE = "full_release"
 FULL_RELEASE_TABLES = ("clinical_data.csv", "lab_data.csv")
 FULL_RELEASE_CASES = 6388
 FULL_RELEASE_CASE_FORMAT = "vital_files/{:04d}.vital"
+SOURCE_FIELDS = ("release", "source_bucket", "source_prefix", "checksum_list_key")
+SELECTION_FIELDS: Mapping[str, type] = MappingProxyType(
+    {"name": str, "release": str, "source_bucket": str, "source_prefix": str, "measurement_period": str, "checksum_list": dict}
+)
+SELECTION_OPTIONAL: Mapping[str, type] = MappingProxyType({"files": list, "case_files": dict})
+LIST_PIN_FIELDS: Mapping[str, type] = MappingProxyType({"key": str, "sha256": str})
+CASE_FILES_FIELDS: Mapping[str, type] = MappingProxyType({"pattern": str, "first": int, "last": int})
 
 
-class SelectionError(ValueError):
+class SelectionError(ClosedError, ValueError):
     """The selection cannot name one set of files."""
 
 
@@ -48,12 +59,12 @@ def relative_path(text: str) -> bool:
 
 
 def case_paths(pattern: str, first: int, last: int) -> list[str]:
-    """One path for each number from ``first`` to ``last``. Raise ``SelectionError`` unless the pattern is the known form and ``0 <= first <= last``."""
+    """One path for each number from ``first`` to ``last``. Raise ``SelectionError`` unless the pattern is the known form and the range is in the release."""
     form = CASE_FORMAT.fullmatch(pattern)
     if form is None:
-        raise SelectionError("the selection's case_files pattern is not a path with one {:0Nd} place for the number")
-    if not 0 <= first <= last:
-        raise SelectionError("the selection's case_files must have 0 <= first <= last")
+        raise SelectionError(Notice(Code.CASE_PATTERN))
+    if not 1 <= first <= last <= FULL_RELEASE_CASES:
+        raise SelectionError(Notice(Code.CASE_RANGE, total=FULL_RELEASE_CASES))
     head, width, tail = form.groups()
     return [f"{head}{number:0{width}d}{tail}" for number in range(first, last + 1)]
 
@@ -79,9 +90,12 @@ def selection_digest(
     return hashlib.sha256((json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PinnedRelease:
-    """The fields of a full release that the tracked pin fixes, under the names of the selection's fields. Frozen, so no caller can change the cached pin."""
+    """The fields of the release that the tracked pin fixes, under the names of the selection's fields.
+
+    Frozen with slots, so neither an assignment nor ``vars()`` can change the cached pin.
+    """
 
     release: str
     source_bucket: str
@@ -90,18 +104,25 @@ class PinnedRelease:
     checksum_list_sha256: str
 
 
-@functools.cache
 def pinned_release() -> PinnedRelease:
-    """The tracked release pin, checked for its form. Raise ``SelectionError`` when it is not valid."""
+    """The tracked release pin, checked for its form, as a new frozen record for each caller. Raise ``SelectionError`` when it is not valid.
+
+    The cache holds a tuple of text, which nothing can change, so not even ``object.__setattr__`` on a returned record reaches the next caller.
+    """
+    return PinnedRelease(*pinned_values())
+
+
+@functools.cache
+def pinned_values() -> tuple[str, str, str, str, str]:
     try:
-        pin = parse_json(RELEASE_FILE.read_text(), "the tracked release pin")
-    except (ClosedInputError, OSError, UnicodeDecodeError) as error:
-        raise SelectionError(f"the tracked release pin cannot be read: {type(error).__name__}") from None
+        pin = parse_json(RELEASE_FILE.read_text(), Subject.TRACKED_PIN)
+    except ClosedInputError, OSError, UnicodeDecodeError:
+        raise SelectionError(Notice(Code.PIN_UNREADABLE)) from None
     problems = release_problems(pin)
     if problems:
-        raise SelectionError("the tracked release pin is not valid: " + "; ".join(problems))
+        raise SelectionError(Notice(Code.PIN_INVALID), *problems)
     source, listed = pin["source"], pin["checksum_list"]
-    return PinnedRelease(PurePosixPath(source["release_path"]).name, source["bucket"], source["release_path"], listed["key"], listed["sha256"])
+    return PurePosixPath(source["release_path"]).name, source["bucket"], source["release_path"], listed["key"], listed["sha256"]
 
 
 @functools.cache
@@ -109,7 +130,7 @@ def full_release_files() -> tuple[str, ...]:
     return tuple(sorted([*FULL_RELEASE_TABLES, *case_paths(FULL_RELEASE_CASE_FORMAT, 1, FULL_RELEASE_CASES)]))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Selection:
     name: str
     release: str
@@ -123,29 +144,29 @@ class Selection:
     def __post_init__(self) -> None:
         problems = []
         if not NAME.fullmatch(self.name):
-            problems.append("name must be lower-case letters, digits and underscores")
-        if not (self.release and self.source_bucket and self.measurement_period and self.checksum_list_key):
-            problems.append("release, source_bucket, measurement_period and the checksum list key must not be empty")
-        if not (self.source_prefix.endswith("/") and relative_path(self.source_prefix[:-1])):
-            problems.append("source_prefix must be a relative path that ends with a slash")
+            problems.append(Notice(Code.NAME_FORM))
+        if not self.measurement_period:
+            problems.append(Notice(Code.PERIOD_EMPTY))
+        pin = pinned_release()
+        problems += [Notice(Code.SOURCE_NOT_PIN, fields=(name,)) for name in SOURCE_FIELDS if getattr(self, name) != getattr(pin, name)]
         if not SHA256.fullmatch(self.checksum_list_sha256):
-            problems.append("the checksum list's sha256 must be 64 lower-case hex digits")
+            problems.append(Notice(Code.LIST_DIGEST_FORM))
         if not self.files:
-            problems.append("the selection names no file")
+            problems.append(Notice(Code.NO_FILES))
         if len(set(self.files)) != len(self.files):
-            problems.append("a file is named twice")
-        problems += [f"files[{position}] is not a relative path" for position, path in enumerate(self.files, 1) if not relative_path(path)]
+            problems.append(Notice(Code.FILE_TWICE))
+        problems += [Notice(Code.FILE_NOT_RELATIVE, position=position) for position, path in enumerate(self.files, 1) if not relative_path(path)]
         object.__setattr__(self, "files", tuple(sorted(self.files)))
         if self.name == FULL_RELEASE and not problems:
-            problems += self.full_release_problems()
+            problems += self.full_release_problems(pin)
         if problems:
-            raise SelectionError("; ".join(problems))
+            raise SelectionError(*problems)
 
-    def full_release_problems(self) -> list[str]:
+    def full_release_problems(self, pin: PinnedRelease) -> list[Notice]:
         """What differs from the whole release as the tracked pin and the 6,390 keys define it. Field names only."""
-        problems = [f"the full release's {name} is not the tracked pin's" for name, value in asdict(pinned_release()).items() if getattr(self, name) != value]
+        problems = [Notice(Code.FULL_RELEASE_NOT_PIN, fields=(name,)) for name, value in asdict(pin).items() if getattr(self, name) != value]
         if self.files != full_release_files():
-            problems.append(f"the full release's files are not exactly {', '.join(FULL_RELEASE_TABLES)} and {FULL_RELEASE_CASES} case files")
+            problems.append(Notice(Code.FULL_RELEASE_FILES, total=FULL_RELEASE_CASES))
         return problems
 
     @property
@@ -184,18 +205,13 @@ class Selection:
     @classmethod
     def from_json(cls, text: str) -> Selection:
         try:
-            values = closed_object(
-                parse_json(text, "the selection"),
-                {"name": str, "release": str, "source_bucket": str, "source_prefix": str, "measurement_period": str, "checksum_list": dict},
-                "the selection",
-                {"files": list, "case_files": dict},
-            )
-            listed = closed_object(values["checksum_list"], {"key": str, "sha256": str}, "the selection's checksum_list")
+            values = closed_object(parse_json(text, Subject.SELECTION), SELECTION_FIELDS, Subject.SELECTION, SELECTION_OPTIONAL)
+            listed = closed_object(values["checksum_list"], LIST_PIN_FIELDS, Subject.SELECTION_LIST)
             files = list(values.get("files", []))
             if any(type(path) is not str for path in files):
-                raise SelectionError("the selection's files must all be text")
+                raise SelectionError(Notice(Code.FILES_NOT_TEXT))
             if "case_files" in values:
-                cases = closed_object(values["case_files"], {"pattern": str, "first": int, "last": int}, "the selection's case_files")
+                cases = closed_object(values["case_files"], CASE_FILES_FIELDS, Subject.SELECTION_CASES)
                 files += case_paths(cases["pattern"], cases["first"], cases["last"])
             return cls(
                 name=values["name"],
@@ -208,4 +224,4 @@ class Selection:
                 files=tuple(files),
             )
         except ClosedInputError as error:
-            raise SelectionError(str(error)) from None
+            raise SelectionError(*error.notices) from None

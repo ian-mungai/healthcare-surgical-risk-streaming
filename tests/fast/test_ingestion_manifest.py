@@ -24,6 +24,8 @@ from scripts.ingestion.manifest import (
     publish_manifest,
     read_manifest,
 )
+from scripts.ingestion.notice import Cause
+from scripts.ingestion.selection import SelectionError
 from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set
 
@@ -58,7 +60,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(
             {
                 "name": "probe_set",
-                "source_bucket": "example-publisher",
+                "source_bucket": "physionet-open",
                 "source_prefix": SOURCE_PREFIX,
                 "file_count": len(SOURCE),
                 "keys_sha256": landed.selection.keys_sha256,
@@ -129,27 +131,27 @@ class PublishTest(unittest.TestCase):
     def test_a_selection_that_differs_from_the_checked_one_in_any_field_publishes_nothing(self) -> None:
         landed = landed_set()
         result = checked(landed)
-        for field, other in (
-            ("source_bucket", "another-publisher"),
-            ("checksum_list_key", f"{SOURCE_PREFIX}OTHER_SUMS.txt"),
-            ("measurement_period", "2020-01 to 2020-02"),
-            ("release", "2.0.0"),
-            ("source_prefix", "vitaldb/2.0.0/"),
-        ):
+        for field, other in (("measurement_period", "2020-01 to 2020-02"), ("name", "other_set")):
             changed: dict[str, Any] = {field: other}
             with self.subTest(field=field), self.assertRaisesRegex(PublishRefused, "not for this selection"):
                 publish_manifest(landed.store, replace(landed.selection, **changed), result)
             self.assertEqual([], manifest_objects(landed))
+        for field, other in (
+            ("source_bucket", "another-publisher"),
+            ("checksum_list_key", f"{SOURCE_PREFIX}OTHER_SUMS.txt"),
+            ("release", "2.0.0"),
+            ("source_prefix", "vitaldb/2.0.0/"),
+        ):
+            changes: dict[str, Any] = {field: other}
+            with self.subTest(field=field), self.assertRaisesRegex(SelectionError, f"{field} is not the tracked pin's"):
+                replace(landed.selection, **changes)
         self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
 
-    def test_a_selection_whose_prefix_moved_into_its_paths_publishes_nothing_although_every_absolute_key_is_the_same(self) -> None:
+    def test_a_selection_whose_prefix_moved_into_its_paths_is_refused_before_it_can_publish(self) -> None:
         landed = landed_set()
         result = checked(landed)
-        moved = replace(landed.selection, source_prefix="vitaldb/", files=tuple(f"1.0.0/{path}" for path in landed.selection.files))
-        self.assertEqual(landed.selection.source_keys, moved.source_keys)
-        self.assertEqual(landed.selection.keys_sha256, moved.keys_sha256)
-        with self.assertRaisesRegex(PublishRefused, "not for this selection"):
-            publish_manifest(landed.store, moved, result)
+        with self.assertRaisesRegex(SelectionError, "source_prefix is not the tracked pin's"):
+            replace(landed.selection, source_prefix="vitaldb/", files=tuple(f"1.0.0/{path}" for path in landed.selection.files))
         self.assertEqual([], manifest_objects(landed))
         self.assertTrue(publish_manifest(landed.store, landed.selection, result).key)
 
@@ -179,7 +181,7 @@ class PublishTest(unittest.TestCase):
         for name, changed in (
             ("a file count of zero", replace(result, file_count=0)),
             ("a file count above the files", replace(result, file_count=len(result.files) + 1)),
-            ("a finding", replace(result, findings=(Finding("x", "missing"),), claimed_sha256=result.claimed_sha256)),
+            ("a finding", replace(result, findings=(Finding(1, Cause.MISSING),), claimed_sha256=result.claimed_sha256)),
         ):
             with self.subTest(name), self.assertRaisesRegex(PublishRefused, "did not pass"):
                 publish_manifest(landed.store, landed.selection, changed)
@@ -214,7 +216,7 @@ class PublishTest(unittest.TestCase):
         landed = landed_set()
         result = checked(landed)
         landed.land("vital_files/0001.vital", SOURCE["vital_files/0001.vital"])
-        with self.assertRaisesRegex(PublishRefused, "vital_files/0001.vital.*new version landed after the check"):
+        with self.assertRaisesRegex(PublishRefused, "checked file 2: a new version landed after the check"):
             publish_manifest(landed.store, landed.selection, result)
         self.assertEqual([], manifest_objects(landed))
         self.assertTrue(publish_manifest(landed.store, landed.selection, checked(landed)).key)
@@ -223,7 +225,7 @@ class PublishTest(unittest.TestCase):
         landed = landed_set()
         result = checked(landed)
         landed.store.put_delete_marker(landed.key_for(SOURCE_PREFIX + "clinical_data.csv"))
-        with self.assertRaisesRegex(PublishRefused, "clinical_data.csv: no longer present after the check"):
+        with self.assertRaisesRegex(PublishRefused, "checked file 1: no longer present after the check"):
             publish_manifest(landed.store, landed.selection, result)
         self.assertEqual([], manifest_objects(landed))
 

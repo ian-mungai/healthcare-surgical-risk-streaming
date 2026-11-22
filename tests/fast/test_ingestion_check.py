@@ -14,13 +14,14 @@ from typing import Any
 
 from scripts.ingestion.check import ChecksumListError, PinnedListError, parse_checksum_list, run_check
 from scripts.ingestion.landing import LANDING_PREFIX, PairingError, PairingRecord, load_pairing_records
-from scripts.ingestion.selection import Selection, SelectionError
-from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, landed_set, list_text_for, selection_for
+from scripts.ingestion.notice import render
+from scripts.ingestion.selection import Selection, SelectionError, selection_digest
+from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, digest, finding_label, landed_set, list_text_for, selection_for
 from tests.fast.memory_store import BLOCK_SIZE
 
 
 def causes(landed: Landed) -> dict[str, str]:
-    return {finding.source_key: finding.cause for finding in landed.check().findings}
+    return {finding_label(finding): finding.cause for finding in landed.check().findings}
 
 
 class CheckCausesTest(unittest.TestCase):
@@ -43,7 +44,7 @@ class CheckCausesTest(unittest.TestCase):
         landed = landed_set(landed={changed: SOURCE[changed] + b" truncated or extended"})
         result = landed.check()
         self.assertFalse(result.passed)
-        self.assertEqual({SOURCE_PREFIX + changed: "checksum_differs"}, {finding.source_key: finding.cause for finding in result.findings})
+        self.assertEqual({SOURCE_PREFIX + changed: "checksum_differs"}, {finding_label(finding): finding.cause for finding in result.findings})
         self.assertEqual({SOURCE_PREFIX + path for path in SOURCE if path != changed}, {file.source_key for file in result.files})
 
     def test_a_planted_missing_file_fails_for_missing_and_names_only_that_file(self) -> None:
@@ -61,7 +62,7 @@ class CheckCausesTest(unittest.TestCase):
         list_bytes = list_text_for(listed).encode()
         selection = replace(landed.selection, checksum_list_sha256=digest(list_bytes))
         result = run_check(landed.store, selection, list_bytes, landed.pairings())
-        self.assertEqual({"selected file 1": "not_in_checksum_list"}, {finding.source_key: finding.cause for finding in result.findings})
+        self.assertEqual({"selected file 1": "not_in_checksum_list"}, {finding_label(finding): finding.cause for finding in result.findings})
         self.assertEqual([], landed.store.payload_reads(landed.key_for(SOURCE_PREFIX + "clinical_data.csv")))
 
     def test_an_object_with_a_null_version_id_fails_for_that_cause(self) -> None:
@@ -84,15 +85,14 @@ class CheckCausesTest(unittest.TestCase):
     def test_a_message_names_the_key_and_the_cause(self) -> None:
         landed = landed_set(skip=("clinical_data.csv",))
         (finding,) = landed.check().findings
-        self.assertIn(SOURCE_PREFIX + "clinical_data.csv", finding.message)
-        self.assertIn("missing", finding.message)
+        self.assertEqual(f"{SOURCE_PREFIX}clinical_data.csv: missing", render(finding.notice))
 
 
 class PairingTest(unittest.TestCase):
     """The landed key of a file is not a function of its source key: a record of the test states each pairing, and the records' form is the rule here."""
 
     def check_with(self, landed: Landed, records: list[PairingRecord]) -> dict[str, str]:
-        return {finding.source_key: finding.cause for finding in run_check(landed.store, landed.selection, landed.list_bytes, records).findings}
+        return {finding_label(finding): finding.cause for finding in run_check(landed.store, landed.selection, landed.list_bytes, records).findings}
 
     def test_control_each_file_is_found_at_the_key_its_record_names(self) -> None:
         landed = landed_set()
@@ -236,7 +236,7 @@ class SelectionTest(unittest.TestCase):
         values: dict[str, object] = {
             "name": "probe_set",
             "release": "1.0.0",
-            "source_bucket": "example-publisher",
+            "source_bucket": "physionet-open",
             "source_prefix": SOURCE_PREFIX,
             "measurement_period": "2016-08 to 2017-06",
             "checksum_list": {"key": f"{SOURCE_PREFIX}SHA256SUMS.txt", "sha256": digest(b"list")},
@@ -267,6 +267,17 @@ class SelectionTest(unittest.TestCase):
         for changes in refused:
             with self.subTest(changes=changes), self.assertRaises(SelectionError):
                 Selection.from_json(self.text(**changes))
+
+    def test_an_empty_period_and_a_case_range_outside_the_release_are_refused_by_their_rule(self) -> None:
+        with self.assertRaisesRegex(SelectionError, "^measurement_period must not be empty$"):
+            Selection.from_json(self.text(measurement_period=""))
+        for first, last in ((0, 2), (1, 6389), (6389, 6389)):
+            cases = {"pattern": "vital_files/{:04d}.vital", "first": first, "last": last}
+            with self.subTest(first=first, last=last), self.assertRaisesRegex(SelectionError, "1 <= first <= last <= 6388"):
+                Selection.from_json(self.text(case_files=cases))
+        self.assertEqual(
+            6388, len(Selection.from_json(self.text(files=[], case_files={"pattern": "vital_files/{:04d}.vital", "first": 1, "last": 6388})).files)
+        )
 
 
 class CurrentVersionTest(unittest.TestCase):
@@ -307,17 +318,30 @@ class SelectionHelperTest(unittest.TestCase):
         one = selection_for(["a.csv", "b.csv"], b"list")
         changes: dict[str, dict[str, Any]] = {
             "name": {"name": "other_set"},
-            "release": {"release": "2.0.0"},
-            "source_bucket": {"source_bucket": "another-publisher"},
-            "source_prefix": {"source_prefix": "vitaldb/2.0.0/"},
             "measurement_period": {"measurement_period": "2020"},
-            "checksum_list_key": {"checksum_list_key": "vitaldb/1.0.0/OTHER.txt"},
             "checksum_list_sha256": {"checksum_list_sha256": "0" * 64},
             "files": {"files": ("a.csv",)},
         }
         for name, change in changes.items():
             with self.subTest(name):
                 self.assertNotEqual(one.selection_sha256, replace(one, **change).selection_sha256)
+        fields = (one.name, one.release, one.source_bucket, one.source_prefix, one.measurement_period, one.checksum_list_key, one.checksum_list_sha256)
+        self.assertEqual(one.selection_sha256, selection_digest(*fields, one.keys_sha256))
+        for position, name in ((1, "release"), (2, "source_bucket"), (3, "source_prefix"), (5, "checksum_list_key")):
+            with self.subTest(name):
+                other = list(fields)
+                other[position] = f"other {name}"
+                self.assertNotEqual(
+                    one.selection_sha256, selection_digest(other[0], other[1], other[2], other[3], other[4], other[5], other[6], one.keys_sha256)
+                )
+
+    def test_every_selection_is_held_to_the_source_of_the_tracked_pin(self) -> None:
+        one = selection_for(["a.csv", "b.csv"], b"list")
+        for name, other in (("release", "2.0.0"), ("source_bucket", "another-publisher"), ("source_prefix", "vitaldb/2.0.0/"), ("checksum_list_key", "k")):
+            changes: dict[str, Any] = {name: other}
+            with self.subTest(name), self.assertRaises(SelectionError) as caught:
+                replace(one, **changes)
+            self.assertEqual(f"the selection's {name} is not the tracked pin's", str(caught.exception))
 
     def test_the_digest_of_the_keys_does_not_depend_on_their_order(self) -> None:
         one = selection_for(["a.csv", "b.csv"], b"list")

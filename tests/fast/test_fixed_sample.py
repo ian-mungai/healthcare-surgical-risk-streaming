@@ -20,8 +20,10 @@ import json
 import unittest
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
+from scripts.ingestion.notice import Notice, render
 from scripts.sample.candidates import (
     CANDIDATES_FILE,
     RELEASE_FILE,
@@ -38,6 +40,10 @@ from scripts.sample.split import BUCKETS, SEED, is_development, patient_bucket, 
 FROZEN_BUCKETS = {1: 92, 2: 92, 3: 48, 4: 24, 5: 13, 6: 6, 7: 61, 8: 83, 9: 46, 10: 90, 14: 69, 17: 75, 25: 70, 107: 79, 130: 80, 6090: 4, 10000: 67}
 FROZEN_PARTS = {1: "test", 3: "train", 14: "train", 25: "validation", 17: "validation", 107: "validation", 130: "test", 6090: "train"}
 SHARE_SAMPLE = range(1, 100_001)
+
+
+def texts(notices: list[Notice]) -> list[str]:
+    return [render(notice) for notice in notices]
 
 
 class AssignmentRule(unittest.TestCase):
@@ -96,10 +102,10 @@ class TrackedFiles(unittest.TestCase):
         cls.release = json.loads(Path(RELEASE_FILE).read_text())
 
     def test_the_tracked_candidates_have_no_problem(self) -> None:
-        self.assertEqual([], candidate_problems(self.candidates))
+        self.assertEqual([], texts(candidate_problems(self.candidates)))
 
     def test_the_tracked_release_pin_has_no_problem(self) -> None:
-        self.assertEqual([], release_problems(self.release))
+        self.assertEqual([], texts(release_problems(self.release)))
 
     def test_the_number_of_candidates_and_their_total_size(self) -> None:
         self.assertTrue(12 <= len(self.candidates) <= 20, len(self.candidates))
@@ -121,53 +127,53 @@ class PlantedFaults(unittest.TestCase):
         self.candidates = read_candidates(CANDIDATES_FILE)
 
     def replaced(self, index: int, **changes: object) -> list[Candidate]:
-        return [Candidate(**(vars(candidate) | changes)) if position == index else candidate for position, candidate in enumerate(self.candidates)]
+        return [Candidate(**(asdict(candidate) | changes)) if position == index else candidate for position, candidate in enumerate(self.candidates)]
 
     def test_a_key_outside_the_release_is_found(self) -> None:
-        problems = candidate_problems(self.replaced(0, key="other/1.0.0/vital_files/0001.vital"))
+        problems = texts(candidate_problems(self.replaced(0, key="other/1.0.0/vital_files/0001.vital")))
         self.assertTrue(any("outside the release" in problem for problem in problems), problems)
 
     def test_a_key_that_names_another_case_is_found(self) -> None:
         wrong = f"{RELEASE_PREFIX}vital_files/{self.candidates[0].case + 1:04d}.vital"
-        problems = candidate_problems(self.replaced(0, key=wrong))
+        problems = texts(candidate_problems(self.replaced(0, key=wrong)))
         self.assertTrue(any("names another case" in problem for problem in problems), problems)
 
     def test_a_checksum_that_is_not_64_hex_characters_is_found(self) -> None:
         for bad in ("abc", "g" * 64, "A" * 64, "a" * 65):
-            problems = candidate_problems(self.replaced(0, sha256=bad))
+            problems = texts(candidate_problems(self.replaced(0, sha256=bad)))
             self.assertTrue(any("64 hex" in problem for problem in problems), f"{bad}: {problems}")
 
     def test_a_case_listed_twice_is_found(self) -> None:
-        problems = candidate_problems([*self.candidates, self.candidates[0]])
+        problems = texts(candidate_problems([*self.candidates, self.candidates[0]]))
         self.assertTrue(any("listed twice" in problem for problem in problems), problems)
 
     def test_a_malformed_pin_is_found(self) -> None:
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["checksum_list"]["sha256"] = "z" * 64
-        self.assertTrue(any("64 hex" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("64 hex" in problem for problem in texts(release_problems(pin))))
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["checksum_list"]["key"] = "elsewhere/SHA256SUMS.txt"
-        self.assertTrue(any("outside the release" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("outside the release" in problem for problem in texts(release_problems(pin))))
 
     def test_a_malformed_table_or_track_list_pin_is_found(self) -> None:
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["tables"][0]["sha256"] = "abc"
-        self.assertTrue(any(problem.startswith("tables[0]") and "64 hex" in problem for problem in release_problems(pin)))
+        self.assertTrue(any(problem.startswith("tables[0]") and "64 hex" in problem for problem in texts(release_problems(pin))))
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["tables"][1]["key"] = "elsewhere/lab_data.csv"
-        self.assertTrue(any("outside the release" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("outside the release" in problem for problem in texts(release_problems(pin))))
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["tables"][1]["key"] = f"{RELEASE_PREFIX}track_names.csv"
-        self.assertTrue(any("must name clinical_data.csv and lab_data.csv" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("must name clinical_data.csv and lab_data.csv" in problem for problem in texts(release_problems(pin))))
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["tables"].pop()
-        self.assertTrue(any("must name clinical_data.csv and lab_data.csv" in problem for problem in release_problems(pin)))
+        self.assertTrue(any("must name clinical_data.csv and lab_data.csv" in problem for problem in texts(release_problems(pin))))
         pin = json.loads(Path(RELEASE_FILE).read_text())
         pin["track_list"]["sha256"] = "abc"
-        self.assertTrue(any(problem.startswith("track_list") and "64 hex" in problem for problem in release_problems(pin)))
+        self.assertTrue(any(problem.startswith("track_list") and "64 hex" in problem for problem in texts(release_problems(pin))))
         pin = json.loads(Path(RELEASE_FILE).read_text())
         del pin["track_list"]
-        self.assertTrue(any(problem.startswith("track_list") for problem in release_problems(pin)))
+        self.assertTrue(any(problem.startswith("track_list") for problem in texts(release_problems(pin))))
 
 
 if __name__ == "__main__":

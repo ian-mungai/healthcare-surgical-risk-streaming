@@ -39,7 +39,7 @@ def problems(landed: Landed, reference: ManifestRef, wanted: list[str] | None = 
     try:
         verify_before_read(landed.store, reference, wanted)
     except GateRefused as refused:
-        return {problem.source_key: problem.cause for problem in refused.problems}
+        return {f"{'requested key' if problem.requested else 'manifest entry'} {problem.position}": problem.cause for problem in refused.problems}
     raise AssertionError("the gate did not refuse")
 
 
@@ -67,7 +67,7 @@ class GateTest(unittest.TestCase):
         reference = published(landed)
         landed.store.reads.clear()
         landed.land("vital_files/0001.vital", b"a substituted copy of the recording")
-        self.assertEqual({WANTED[0]: "version_substituted"}, problems(landed, reference, WANTED))
+        self.assertEqual({"requested key 1": "version_substituted"}, problems(landed, reference, WANTED))
         self.assertEqual([], landed.store.payload_reads(LANDING_PREFIX))
 
     def test_a_substitute_of_a_key_the_reader_does_not_need_does_not_stop_the_reader(self) -> None:
@@ -80,13 +80,13 @@ class GateTest(unittest.TestCase):
         landed = landed_set()
         reference = published(landed)
         landed.store.remove_version(landed.key_for(WANTED[1]), landed.versions["clinical_data.csv"].version_id)
-        self.assertEqual({WANTED[1]: "missing"}, problems(landed, reference, WANTED))
+        self.assertEqual({"requested key 2": "missing"}, problems(landed, reference, WANTED))
 
     def test_a_delete_marker_on_top_of_the_bound_version_is_refused(self) -> None:
         landed = landed_set()
         reference = published(landed)
         landed.store.put_delete_marker(landed.key_for(WANTED[1]))
-        self.assertEqual({WANTED[1]: "missing"}, problems(landed, reference, WANTED))
+        self.assertEqual({"requested key 2": "missing"}, problems(landed, reference, WANTED))
 
     def test_a_key_that_the_manifest_does_not_bind_is_refused(self) -> None:
         landed = landed_set()
@@ -95,7 +95,7 @@ class GateTest(unittest.TestCase):
         unbound = SOURCE_PREFIX + "vital_files/9999.vital"
         self.assertEqual({"requested key 2": "not_in_manifest"}, problems(landed, reference, [WANTED[0], unbound]))
 
-    def test_every_refusal_is_listed_with_its_key_and_cause(self) -> None:
+    def test_every_refusal_is_listed_with_its_place_and_cause_and_never_with_a_key(self) -> None:
         landed = landed_set()
         reference = published(landed)
         landed.land("vital_files/0001.vital", b"substituted")
@@ -103,9 +103,14 @@ class GateTest(unittest.TestCase):
         with self.assertRaises(GateRefused) as raised:
             verify_before_read(landed.store, reference, [*WANTED, SOURCE_PREFIX + "other.csv"])
         message = str(raised.exception)
-        for key, cause in ((WANTED[0], "version_substituted"), (WANTED[1], "missing"), ("requested key 3", "not_in_manifest")):
-            self.assertIn(f"{key}: {cause}", message)
-        self.assertNotIn("other.csv", message)
+        for place, cause in (("requested key 1", "version_substituted"), ("requested key 2", "missing"), ("requested key 3", "not_in_manifest")):
+            self.assertIn(f"{place}: {cause}", message)
+        self.assertNotIn(SOURCE_PREFIX, message)
+        with self.assertRaises(GateRefused) as raised:
+            verify_before_read(landed.store, reference)
+        self.assertIn("manifest entry 1: missing", str(raised.exception))
+        self.assertIn("manifest entry 2: version_substituted", str(raised.exception))
+        self.assertNotIn(SOURCE_PREFIX, str(raised.exception))
 
     def test_a_bound_key_requested_twice_is_returned_once(self) -> None:
         landed = landed_set()
@@ -123,7 +128,7 @@ class GateTest(unittest.TestCase):
         with self.assertRaises(GateRefused) as raised:
             verify_before_read(landed.store, reference, ["private-value-key"])
         self.assertNotIn("private-value", str(raised.exception))
-        self.assertEqual(["requested key 1"], [problem.source_key for problem in raised.exception.problems])
+        self.assertEqual([(1, "not_in_manifest", True)], [(problem.position, problem.cause, problem.requested) for problem in raised.exception.problems])
 
     def test_a_manifest_that_does_not_match_its_reference_is_refused(self) -> None:
         landed = landed_set()
@@ -180,6 +185,23 @@ class GateTest(unittest.TestCase):
             "the last entry's release": lambda document: document["entries"][-1].update(release="2.0.0"),
             "every entry's release": every_release,
             "an entry removed": lambda document: document["entries"].pop(),
+        }
+        for name, change in changes.items():
+            with self.subTest(name), self.assertRaisesRegex(GateRefused, "selection digest"):
+                verify_before_read(landed.store, forged(landed, reference, change, consistent=True))
+        self.assertTrue(verify_before_read(landed.store, reference))
+
+    def test_a_manifest_whose_selection_digest_cannot_be_recomputed_is_refused_even_when_it_declares_an_empty_digest(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        changes: dict[str, Callable[[dict[str, Any]], None]] = {
+            "file count": lambda document: document["selection"].update(file_count=2, selection_sha256=""),
+            "keys digest": lambda document: document["selection"].update(keys_sha256="0" * 64, selection_sha256=""),
+            "the last entry's release": lambda document: document.update(
+                entries=[*document["entries"][:-1], {**document["entries"][-1], "release": "2.0.0"}],
+                selection={**document["selection"], "selection_sha256": ""},
+            ),
+            "no entry": lambda document: document.update(entries=[], selection={**document["selection"], "file_count": 0, "selection_sha256": ""}),
         }
         for name, change in changes.items():
             with self.subTest(name), self.assertRaisesRegex(GateRefused, "selection digest"):
@@ -244,14 +266,14 @@ class GateTest(unittest.TestCase):
         bound = landed.versions["clinical_data.csv"].version_id
         landed.land("clinical_data.csv", b"caseid,age\n1,61\n")
         landed.store.remove_version(landed.key_for(WANTED[1]), bound)
-        self.assertEqual({WANTED[1]: "missing"}, problems(landed, reference, WANTED))
+        self.assertEqual({"requested key 2": "missing"}, problems(landed, reference, WANTED))
 
     def test_a_size_that_differs_from_the_bound_size_is_refused(self) -> None:
         landed = landed_set()
         reference = published(landed)
         version = landed.store.history[landed.key_for(WANTED[1])][0]
         landed.store.history[landed.key_for(WANTED[1])][0] = replace(version, version=replace(version.version, size=version.version.size + 1))
-        self.assertEqual({WANTED[1]: "size_differs"}, problems(landed, reference, WANTED))
+        self.assertEqual({"requested key 2": "size_differs"}, problems(landed, reference, WANTED))
 
 
 if __name__ == "__main__":

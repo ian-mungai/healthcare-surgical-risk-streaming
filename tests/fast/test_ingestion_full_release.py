@@ -87,7 +87,7 @@ class FullReleaseTest(unittest.TestCase):
         self.assertEqual(3, len(selection.files))
 
     def test_a_caller_that_edits_the_returned_pin_does_not_change_the_pin_the_full_release_is_held_to(self) -> None:
-        self.addCleanup(selection.pinned_release.cache_clear)
+        self.addCleanup(selection.pinned_values.cache_clear)
         other = "0" * 64
         pin: Any = selection.pinned_release()
         edits: tuple[Callable[[], object], ...] = (
@@ -98,6 +98,23 @@ class FullReleaseTest(unittest.TestCase):
         for edit in edits:
             with contextlib.suppress(TypeError, AttributeError):
                 edit()
+        with self.assertRaises(SelectionError):
+            load(lambda document: document["checksum_list"].update(sha256=other))
+        self.assertEqual(6390, len(load().files))
+
+    def test_the_pin_refuses_a_change_through_vars_assignment_and_object_setattr_and_the_tracked_pin_holds(self) -> None:
+        self.addCleanup(selection.pinned_values.cache_clear)
+        other = "0" * 64
+        pin: Any = selection.pinned_release()
+        with self.assertRaises(TypeError):
+            vars(pin)["checksum_list_sha256"] = other
+        with self.assertRaises(AttributeError):
+            pin.checksum_list_sha256 = other
+        with self.assertRaises(AttributeError):
+            del pin.checksum_list_sha256
+        with contextlib.suppress(AttributeError, TypeError):
+            object.__setattr__(pin, "checksum_list_sha256", other)
+        self.assertEqual(PIN["checksum_list"]["sha256"], selection.pinned_release().checksum_list_sha256)
         with self.assertRaises(SelectionError):
             load(lambda document: document["checksum_list"].update(sha256=other))
         self.assertEqual(6390, len(load().files))

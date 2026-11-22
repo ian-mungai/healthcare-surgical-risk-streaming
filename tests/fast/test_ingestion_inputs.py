@@ -18,19 +18,42 @@ from typing import Any
 from unittest import mock
 
 from scripts.ingestion import selection
-from scripts.ingestion.check import CHECKED_FILE_FIELDS, CheckResult, ResultFormatError
-from scripts.ingestion.cli import CLI_ERRORS, InputError, read_input, write_private
-from scripts.ingestion.landing import PairingError, load_pairing_records
-from scripts.ingestion.manifest import ManifestError, ManifestRef, publish_manifest, read_manifest
-from scripts.ingestion.selection import Selection, SelectionError
-from scripts.sample.candidates import CREDIT_FIELDS, FILE_PIN_FIELDS, RELEASE_FIELDS, RELEASE_FILE, SOURCE_FIELDS, TRACK_LIST_FIELDS
-from scripts.sample.publisher import TRACK_LIST_COLUMNS
+from scripts.ingestion.check import (
+    CHECKED_FILE_FIELDS,
+    FINDING_FIELDS,
+    RESULT_FIELDS,
+    CheckResult,
+    ChecksumListError,
+    PinnedListError,
+    ResultFormatError,
+)
+from scripts.ingestion.cli import InputError, read_input, write_private
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.gate import GateRefused
+from scripts.ingestion.landing import PAIRING_FIELDS, PairingError, load_pairing_records
+from scripts.ingestion.manifest import (
+    MANIFEST_FIELDS,
+    MANIFEST_LIST_FIELDS,
+    MANIFEST_SELECTION_FIELDS,
+    REFERENCE_FIELDS,
+    ManifestError,
+    ManifestRef,
+    PublishRefused,
+    publish_manifest,
+    read_manifest,
+)
+from scripts.ingestion.notice import FIELD_NAMES, Cause, ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.selection import CASE_FILES_FIELDS, LIST_PIN_FIELDS, SELECTION_FIELDS, SELECTION_OPTIONAL, Selection, SelectionError
+from scripts.ingestion.store import StoreError
+from scripts.sample import candidates, publisher
+from scripts.sample.candidates import CREDIT_FIELDS, FILE_PIN_FIELDS, RELEASE_FIELDS, RELEASE_FILE, SOURCE_FIELDS, TRACK_LIST_FIELDS, CandidateError
+from scripts.sample.publisher import TRACK_LIST_COLUMNS, PublisherError
 from tests.fast.ingestion_support import SOURCE_PREFIX, digest, landed_set
 
 SELECTION: dict[str, Any] = {
     "name": "probe_set",
     "release": "1.0.0",
-    "source_bucket": "example-publisher",
+    "source_bucket": "physionet-open",
     "source_prefix": SOURCE_PREFIX,
     "measurement_period": "2016-08 to 2017-06",
     "checksum_list": {"key": f"{SOURCE_PREFIX}SHA256SUMS.txt", "sha256": digest(b"list")},
@@ -180,7 +203,9 @@ class ResultInputTest(unittest.TestCase):
             lambda document: document["files"][0].update(size=True),
             lambda document: document["files"][0].update(version_id=7),
             lambda document: document.update(file_count="3"),
-            lambda document: document.update(findings=[{"source_key": "a", "cause": "missing", "detail": "", "extra": 1}]),
+            lambda document: document.update(findings=[{"position": 1, "cause": "missing", "source_key": "", "extra": 1}]),
+            lambda document: document.update(findings=[{"position": 1, "cause": "private-value", "source_key": ""}]),
+            lambda document: document.update(findings=[{"position": "1", "cause": "missing", "source_key": ""}]),
             lambda document: document.update(files={}),
         ]
         for number, change in enumerate(changes):
@@ -188,13 +213,15 @@ class ResultInputTest(unittest.TestCase):
                 CheckResult.from_json(edited(self.document(), change))
 
     def test_a_result_names_its_format_and_one_of_an_earlier_check_is_refused_with_the_advice_to_rerun_check(self) -> None:
-        self.assertEqual("check_result_2", self.document().get("format"))
+        self.assertEqual("check_result_3", self.document().get("format"))
         earlier = self.document()
         earlier.pop("format", None)
         with self.assertRaisesRegex(ResultFormatError, "rerun check"):
             CheckResult.from_json(json.dumps(earlier))
         with self.assertRaisesRegex(ResultFormatError, "rerun check"):
             CheckResult.from_json(json.dumps(earlier | {"format": "check_result_1"}))
+        with self.assertRaisesRegex(ResultFormatError, "rerun check"):
+            CheckResult.from_json(json.dumps(earlier | {"format": "check_result_2"}))
 
     def test_text_that_is_not_json_is_refused_without_echoing_it(self) -> None:
         with self.assertRaises(ResultFormatError) as raised:
@@ -218,19 +245,41 @@ class ReferenceInputTest(unittest.TestCase):
 
 class CommandErrorTest(unittest.TestCase):
     def test_every_error_that_an_input_can_raise_is_reported_and_none_is_a_traceback(self) -> None:
-        raised = (SelectionError, PairingError, ResultFormatError, ManifestError, InputError)
-        self.assertEqual([], [error.__name__ for error in raised if not issubclass(error, CLI_ERRORS)])
+        raised: tuple[type[Exception], ...] = (SelectionError, PairingError, ResultFormatError, ManifestError, InputError, ChecksumListError, PinnedListError)
+        raised += (PublishRefused, GateRefused, StoreError, ClosedInputError, PublisherError, CandidateError)
+        self.assertEqual([], [error.__name__ for error in raised if not issubclass(error, ClosedError)])
+        with self.assertRaises(TypeError):
+            SelectionError("private-value")  # type: ignore[arg-type]
+
+
+class NoticeTest(unittest.TestCase):
+    def test_a_notice_takes_only_the_closed_values_its_text_names(self) -> None:
+        self.assertEqual("vitaldb/1.0.0/a.csv: missing", render(Notice(Code.FINDING_KEY, key="vitaldb/1.0.0/a.csv", cause=Cause.MISSING)))
+        wrong: list[Callable[[], object]] = [
+            lambda: Notice(Code.FINDING_KEY, key="private value", cause=Cause.MISSING),
+            lambda: Notice(Code.FINDING_KEY, key="private-value", cause=Cause.MISSING),
+            lambda: Notice(Code.FINDING_POSITION, position="1", cause=Cause.MISSING),  # type: ignore[arg-type]
+            lambda: Notice(Code.FINDING_POSITION, position=True, cause=Cause.MISSING),
+            lambda: Notice(Code.OBJECT_FIELDS, subject=Subject.SELECTION, fields=("private_value",)),
+            lambda: Notice(Code.CHECK_PASSED, count=1, total=1, digest="private-value"),
+            lambda: Notice(Code.NOT_PASSED, count=1),
+            lambda: Notice(Code.CANNOT_READ),
+            lambda: Notice("private-value"),  # type: ignore[arg-type]
+        ]
+        for number, make in enumerate(wrong):
+            with self.subTest(number), self.assertRaises(TypeError):
+                make()
 
 
 class TrackedPinTest(unittest.TestCase):
     def test_a_tracked_pin_that_is_not_valid_stops_every_full_release(self) -> None:
-        self.addCleanup(selection.pinned_release.cache_clear)
+        self.addCleanup(selection.pinned_values.cache_clear)
         with tempfile.TemporaryDirectory(prefix="ingestion_pin_") as folder:
             pin = json.loads(RELEASE_FILE.read_text())
             pin["checksum_list"]["key"] = f"{SOURCE_PREFIX}OTHER.txt"
             broken = Path(folder) / "release.json"
             broken.write_text(json.dumps(pin))
-            selection.pinned_release.cache_clear()
+            selection.pinned_values.cache_clear()
             with mock.patch.object(selection, "RELEASE_FILE", broken), self.assertRaisesRegex(SelectionError, "tracked release pin is not valid"):
                 selection.pinned_release()
 
@@ -247,6 +296,43 @@ class FrozenAuthorityTest(unittest.TestCase):
             with self.subTest(edit=number), self.assertRaises((TypeError, AttributeError)):
                 edit()
 
+    def test_every_other_module_level_authority_value_cannot_be_changed(self) -> None:
+        mappings: tuple[Any, ...] = (
+            SELECTION_FIELDS,
+            SELECTION_OPTIONAL,
+            LIST_PIN_FIELDS,
+            CASE_FILES_FIELDS,
+            PAIRING_FIELDS,
+            RESULT_FIELDS,
+            FINDING_FIELDS,
+            REFERENCE_FIELDS,
+            MANIFEST_FIELDS,
+            MANIFEST_SELECTION_FIELDS,
+            MANIFEST_LIST_FIELDS,
+            candidates.SOURCE_VALUES,
+            candidates.TABLE_SUBJECTS,
+            publisher.KEY_READS,
+            publisher.URL_READS,
+            publisher.MISSING_PROGRAM,
+        )
+        edits: list[Callable[[], object]] = [functools.partial(operator.setitem, mapping, "size_bytes", object) for mapping in mappings]
+        slot: Any = candidates.SLOTS[0]
+        names: Any = FIELD_NAMES
+        files: Any = selection.full_release_files()
+        edits += [
+            lambda: vars(slot).update(rule="another rule"),
+            lambda: setattr(slot, "rule", "another rule"),
+            lambda: names.add("private_value"),
+            lambda: files.append("private-value.csv"),
+            lambda: setattr(Code, "NOT_JSON", "private-value"),
+            lambda: setattr(Cause, "MISSING", "private-value"),
+        ]
+        for number, edit in enumerate(edits):
+            with self.subTest(edit=number), self.assertRaises((TypeError, AttributeError)):
+                edit()
+        self.assertNotIn("private_value", FIELD_NAMES)
+        self.assertNotIn("another rule", [item.rule for item in candidates.SLOTS])
+
     def test_the_selection_and_list_of_a_read_manifest_cannot_be_changed(self) -> None:
         landed = landed_set()
         manifest = read_manifest(landed.store, publish_manifest(landed.store, landed.selection, landed.check()))
@@ -261,24 +347,24 @@ class FileHelperTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ingestion_inputs_") as folder:
             readable = Path(folder) / "present.json"
             readable.write_text("{}")
-            self.assertEqual("{}", read_input(readable, "the selection"))
+            self.assertEqual("{}", read_input(readable, Subject.SELECTION))
             missing = Path(folder) / "private-folder" / "private-value.json"
             with self.assertRaises(InputError) as raised:
-                read_input(missing, "the selection")
+                read_input(missing, Subject.SELECTION)
             self.assertEqual("cannot read the selection", str(raised.exception))
             self.assertNotIn(folder, str(raised.exception))
 
     def test_a_result_or_reference_is_written_for_its_owner_only_and_a_failed_write_names_no_path(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ingestion_inputs_") as folder:
             target = Path(folder) / "made" / "reference.json"
-            write_private(target, "one\n", "the reference")
-            write_private(target, "two\n", "the reference")
+            write_private(target, "one\n", Subject.REFERENCE)
+            write_private(target, "two\n", Subject.REFERENCE)
             self.assertEqual("two\n", target.read_text())
             self.assertEqual(0o600, stat.S_IMODE(os.stat(target).st_mode))
             blocked = target / "inside" / "x.json"
             with self.assertRaises(InputError) as raised:
-                write_private(blocked, "x", "the reference")
-            self.assertEqual("cannot write the reference", str(raised.exception))
+                write_private(blocked, "x", Subject.REFERENCE)
+            self.assertEqual("cannot write the manifest reference", str(raised.exception))
 
 
 if __name__ == "__main__":

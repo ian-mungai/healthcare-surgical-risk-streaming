@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
+
 RANGE_BYTES = 64 * 1024 * 1024
 BLOCK_BYTES = 1024 * 1024
 LIST_TIMEOUT_SECONDS = 300
@@ -23,11 +25,11 @@ NO_SUCH_VERSION = ("NoSuchVersion", "NoSuchKey", "(404)")
 NULL_VERSION_IDS = ("", "null")
 
 
-class StoreError(RuntimeError):
+class StoreError(ClosedError, RuntimeError):
     """A read or write of the object store failed or returned something other than what was asked for."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ObjectVersion:
     key: str
     version_id: str
@@ -69,10 +71,10 @@ def utc_text(stamp: str) -> str:
     return datetime.fromisoformat(stamp).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def reply_object(reply: Any, call: str) -> dict[str, Any]:
+def reply_object(reply: Any, call: Subject) -> dict[str, Any]:
     """The reply of an AWS call as the JSON object it documents. Raise ``StoreError``, which names the call only, for any other reply."""
     if type(reply) is not dict:
-        raise StoreError(f"the reply of {call} is not in the documented form")
+        raise StoreError(Notice(Code.REPLY_FORM, subject=call))
     return reply
 
 
@@ -82,16 +84,17 @@ def listed_version(entry: Any, *, marker: bool) -> ObjectVersion:
         key, version_id, latest, stamp = entry["Key"], entry["VersionId"], entry["IsLatest"], utc_text(entry["LastModified"])
         size = 0 if marker else entry["Size"]
     except KeyError, TypeError, ValueError:
-        raise StoreError("an entry of the version listing is not in the documented form") from None
+        raise StoreError(Notice(Code.LISTING_ENTRY_FORM)) from None
     if type(key) is not str or type(version_id) is not str or type(latest) is not bool or type(size) is not int:
-        raise StoreError("an entry of the version listing is not in the documented form")
+        raise StoreError(Notice(Code.LISTING_ENTRY_FORM))
     return ObjectVersion(key, version_id, size, stamp, latest, marker)
 
 
 def listed_entries(listing: dict[str, Any], name: str) -> list[Any]:
-    entries = listing.get(name) or []
+    """The entries of one part of a listing. An absent part has none; a part that is present and not a list is refused."""
+    entries = listing.get(name, [])
     if type(entries) is not list:
-        raise StoreError("the version listing is not in the documented form")
+        raise StoreError(Notice(Code.LISTING_FORM))
     return entries
 
 
@@ -104,7 +107,7 @@ class S3Store:
 
     def list_versions(self, prefix: str) -> list[ObjectVersion]:
         reply = self.aws.call("s3api", "list-object-versions", "--bucket", self.bucket, "--prefix", prefix, timeout=LIST_TIMEOUT_SECONDS)
-        listing = reply_object(reply, "list-object-versions")
+        listing = reply_object(reply, Subject.LIST_CALL)
         found = [listed_version(entry, marker=False) for entry in listed_entries(listing, "Versions")]
         found += [listed_version(entry, marker=True) for entry in listed_entries(listing, "DeleteMarkers")]
         return sorted(found, key=lambda item: (item.key, item.last_modified, not item.is_latest))
@@ -116,12 +119,12 @@ class S3Store:
             arguments += ["--range", f"bytes={byte_range[0]}-{byte_range[1]}"]
         reply = self.aws.call(*arguments, str(target), missing=NO_SUCH_VERSION, timeout=READ_TIMEOUT_SECONDS)
         if reply is None:
-            raise StoreError(f"{version.key}: the version does not exist")
-        if reply_object(reply, "get-object").get("VersionId") != version.version_id:
-            raise StoreError(f"{version.key}: the reply was for another version than the one asked for")
+            raise StoreError(Notice(Code.VERSION_MISSING))
+        if reply_object(reply, Subject.GET_CALL).get("VersionId") != version.version_id:
+            raise StoreError(Notice(Code.OTHER_VERSION))
         length = reply.get("ContentLength")
         if type(length) is not int:
-            raise StoreError(f"{version.key}: the reply gave no byte count")
+            raise StoreError(Notice(Code.NO_BYTE_COUNT))
         return length
 
     def iter_version(self, version: ObjectVersion) -> Generator[bytes]:
@@ -131,7 +134,7 @@ class S3Store:
                 end = min(start + self.range_bytes, version.size) - 1
                 length = self.fetch(version, target, (start, end))
                 if not target.is_file() or length != end - start + 1 or target.stat().st_size != length:
-                    raise StoreError(f"{version.key}: the reply held {length} bytes of the {end - start + 1} asked for")
+                    raise StoreError(Notice(Code.SHORT_REPLY))
                 with target.open("rb") as handle:
                     while block := handle.read(self.block_bytes):
                         yield block
@@ -139,20 +142,20 @@ class S3Store:
 
     def get_version_bytes(self, version: ObjectVersion, limit: int) -> bytes:
         if version.size > limit:
-            raise StoreError(f"{version.key}: the object is larger than {limit} bytes")
+            raise StoreError(Notice(Code.TOO_LARGE, count=limit))
         with tempfile.TemporaryDirectory(prefix="ingestion_object_") as scratch:
             target = Path(scratch) / "object"
             self.fetch(version, target, None)
             if not target.is_file():
-                raise StoreError(f"{version.key}: the reply wrote no data")
+                raise StoreError(Notice(Code.NO_DATA))
             return target.read_bytes()
 
     def create_object(self, key: str, data: bytes) -> ObjectVersion:
         status = reply_object(
-            self.aws.call("s3api", "get-bucket-versioning", "--bucket", self.bucket, timeout=LIST_TIMEOUT_SECONDS), "get-bucket-versioning"
+            self.aws.call("s3api", "get-bucket-versioning", "--bucket", self.bucket, timeout=LIST_TIMEOUT_SECONDS), Subject.VERSIONING_CALL
         ).get("Status")
         if status != "Enabled":
-            raise StoreError(f"{key}: versioning is not enabled on the bucket, so nothing was written")
+            raise StoreError(Notice(Code.VERSIONING_OFF))
         with tempfile.TemporaryDirectory(prefix="ingestion_put_") as scratch:
             source = Path(scratch) / "object"
             source.write_bytes(data)
@@ -174,21 +177,21 @@ class S3Store:
             )
         if reply is None:
             return self.existing_version(key, data)
-        version_id = reply_object(reply, "put-object").get("VersionId")
+        version_id = reply_object(reply, Subject.PUT_CALL).get("VersionId")
         if type(version_id) is not str or version_id in NULL_VERSION_IDS:
-            raise StoreError(f"{key}: the write returned no version ID; versioning is not enabled on the bucket")
+            raise StoreError(Notice(Code.NO_VERSION_ID))
         for version in self.list_versions(key):
             if version.key == key and version.version_id == version_id:
                 return version
-        raise StoreError(f"{key}: the written version is not in the listing")
+        raise StoreError(Notice(Code.NOT_LISTED))
 
     def existing_version(self, key: str, data: bytes) -> ObjectVersion:
         """The current version of a key that refused the conditional write, once its bytes are confirmed to be ``data``: the write of an earlier try."""
         current = [version for version in self.list_versions(key) if version.key == key and version.is_latest and not version.is_delete_marker]
         if not current:
-            raise StoreError(f"{key}: the write was refused because the key exists, but no current version is listed")
+            raise StoreError(Notice(Code.EXISTS_UNLISTED))
         if current[0].version_id in NULL_VERSION_IDS:
-            raise StoreError(f"{key}: the key holds a null version, which versioning does not keep apart from the next write")
+            raise StoreError(Notice(Code.NULL_HELD))
         if current[0].size != len(data) or self.get_version_bytes(current[0], len(data)) != data:
-            raise StoreError(f"{key}: the key already holds other content")
+            raise StoreError(Notice(Code.OTHER_CONTENT))
         return current[0]

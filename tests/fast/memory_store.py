@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from scripts.ingestion.notice import Code, Notice
 from scripts.ingestion.store import NULL_VERSION_IDS, ObjectVersion, StoreError
 
 BLOCK_SIZE = 8
@@ -63,13 +64,13 @@ class MemoryStore:
     def create_object(self, key: str, data: bytes) -> ObjectVersion:
         """The store's rule for a write of the ingestion code: versioning must be on, the first version is created and a key that holds ``data`` is returned."""
         if not self.versioned:
-            raise StoreError(f"{key}: versioning is not enabled on the bucket, so nothing was written")
+            raise StoreError(Notice(Code.VERSIONING_OFF))
         current = [item for item in self.history.get(key, []) if item.version.is_latest and not item.version.is_delete_marker]
         if current:
             if current[0].version.version_id in NULL_VERSION_IDS:
-                raise StoreError(f"{key}: the key holds a null version, which versioning does not keep apart from the next write")
+                raise StoreError(Notice(Code.NULL_HELD))
             if current[0].data != data:
-                raise StoreError(f"{key}: the key already holds other content")
+                raise StoreError(Notice(Code.OTHER_CONTENT))
             return current[0].version
         return self.put_object(key, data)
 
@@ -89,7 +90,7 @@ class MemoryStore:
         for item in self.history.get(version.key, []):
             if item.version.version_id == version.version_id and not item.version.is_delete_marker:
                 return item
-        raise StoreError(f"{version.key}: the version does not exist")
+        raise StoreError(Notice(Code.VERSION_MISSING))
 
     def iter_version(self, version: ObjectVersion) -> Iterator[bytes]:
         self.reads.append(Read("iter_version", version.key, version.version_id))
@@ -103,7 +104,7 @@ class MemoryStore:
         self.reads.append(Read("get_version_bytes", version.key, version.version_id))
         data = self.find(version).data
         if len(data) > limit:
-            raise StoreError(f"{version.key}: the object is larger than {limit} bytes")
+            raise StoreError(Notice(Code.TOO_LARGE, count=limit))
         return data
 
     def payload_reads(self, prefix: str) -> list[Read]:

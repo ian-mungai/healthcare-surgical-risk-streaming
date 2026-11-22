@@ -22,6 +22,7 @@ from tests.fast.ingestion_support import Landed, landed_set
 from tests.fast.memory_store import MemoryStore
 
 MARKER = "private-value"
+PIN_LIST_KEY = "vitaldb/1.0.0/SHA256SUMS.txt"
 CONFIGURATION = {"AWS_PROFILE": "example_profile", "AWS_REGION": "us-west-2", "S3_BUCKET": "example-bucket"}
 
 
@@ -148,7 +149,8 @@ class CommandTest(unittest.TestCase):
         for change, cause in (
             (reversed_range, "case_files"),
             (one_case_short, "the full release's files"),
-            ({"checksum_list": {"key": "k", "sha256": "0" * 64}}, "full release"),
+            ({"checksum_list": {"key": "k", "sha256": "0" * 64}}, "checksum_list_key is not the tracked pin's"),
+            ({"checksum_list": {"key": PIN_LIST_KEY, "sha256": "0" * 64}}, "the full release's checksum_list_sha256 is not the tracked pin's"),
         ):
             self.work.write("selection.json", json.dumps(self.full_release(change)))
             with self.subTest(cause=cause):
