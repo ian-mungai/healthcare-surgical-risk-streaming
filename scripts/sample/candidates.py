@@ -64,7 +64,7 @@ INTEGER = re.compile(r"[0-9]+")
 RELEASE_FIELDS: Mapping[str, type] = MappingProxyType({"source": dict, "checksum_list": dict, "tables": list, "track_list": dict, "credit": dict})
 SOURCE_FIELDS: Mapping[str, type] = MappingProxyType({"bucket": str, "region": str, "release_path": str, "page": str})
 FILE_PIN_FIELDS: Mapping[str, type] = MappingProxyType({"key": str, "size_bytes": int, "sha256": str})
-TRACK_LIST_FIELDS: Mapping[str, type] = MappingProxyType({"url": str, "size_bytes": int, "sha256": str})
+TRACK_LIST_FIELDS: Mapping[str, type] = MappingProxyType({"url": str, "size_bytes": int, "sha256": str, "rows": int, "rows_sha256": str})
 CREDIT_FIELDS: Mapping[str, type] = MappingProxyType({"citation": str, "source": str, "licence": str, "changes": str})
 SOURCE_VALUES: Mapping[str, str] = MappingProxyType({"bucket": BUCKET, "region": REGION, "release_path": RELEASE_PREFIX})
 TABLE_SUBJECTS: Mapping[str, Subject] = MappingProxyType({CLINICAL_KEY: Subject.CLINICAL_TABLE, LAB_KEY: Subject.LAB_TABLE})
@@ -231,8 +231,12 @@ def release_problems(release: Any) -> list[Notice]:
     if len(tables) != 2 or keys != sorted(TABLE_SUBJECTS):
         problems.append(Notice(Code.TABLES_NAMES))
     problems += pin_problems(Subject.PIN_TRACKS, release.get("track_list"), TRACK_LIST_FIELDS)
-    if not shape_problems(Subject.PIN_TRACKS, release.get("track_list"), TRACK_LIST_FIELDS) and release["track_list"]["url"] != TRACK_LIST_URL:
-        problems.append(Notice(Code.TRACK_URL))
+    if not shape_problems(Subject.PIN_TRACKS, release.get("track_list"), TRACK_LIST_FIELDS):
+        track_list = release["track_list"]
+        if track_list["url"] != TRACK_LIST_URL:
+            problems.append(Notice(Code.TRACK_URL))
+        if track_list["rows"] <= 0 or SHA256.fullmatch(track_list["rows_sha256"]) is None:
+            problems.append(Notice(Code.PIN_ROWS, subject=Subject.PIN_TRACKS))
     return problems + shape_problems(Subject.PIN_CREDIT, release.get("credit"), CREDIT_FIELDS)
 
 
