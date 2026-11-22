@@ -12,11 +12,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# The plan job decides which groups of scripts/quality/ci_groups.json run (scripts/quality/ci_plan.py): a pull request selects the groups that
-# its range changes, the push to main after a merge reuses the pull request's passed run of the same tree, and every other run runs every group.
-# The selectable jobs take their names, decisions and reasons from its record. A job that does not run still starts, states its reason in its
-# summary and succeeds. The hooks job always runs. Every checkout takes the pull request's head commit, not GitHub's merge of it into the base,
-# so a pull request run checks the tree that the push after the merge compares.
+# A pull request runs every job. The plan job (scripts/quality/ci_plan.py) lets the push to main after a merge reuse the merged pull
+# request's passed run of the same tree; the group jobs then still start, state the reason in their summary and succeed. The hooks job
+# always runs. The last job waits for every other job and is the one required check. Every checkout takes the pull request's head commit,
+# not GitHub's merge of it into the base, so a pull request run checks the tree that the push after the merge compares.
 jobs:
   plan:
     name: Plan the job groups of this run
@@ -27,7 +26,8 @@ jobs:
       actions: read
       pull-requests: read
     outputs:
-      record: ${{ steps.plan.outputs.record }}
+      run: ${{ steps.plan.outputs.run }}
+      reason: ${{ steps.plan.outputs.reason }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,14 +37,11 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14.8"
-      - name: Choose the groups and the reused run
+      - name: Choose whether the groups run or reuse a passed run
         id: plan
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          RANGE_START: ${{ github.event.pull_request.base.sha }}
-          RANGE_END: ${{ github.event.pull_request.head.sha || github.sha }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python -m scripts.quality.ci_plan --event "${EVENT_NAME}" --start "${RANGE_START}" --head "${RANGE_END}"
+        run: python -m scripts.quality.ci_plan
 
   hooks:
     name: Hooks on every file and the commit messages
@@ -74,74 +71,86 @@ jobs:
             .venv/bin/python -m scripts.quality.repo_checks commit-range "${HEAD}"
           fi
 
-  guards:
-    name: ${{ matrix.name }}
-    needs: plan
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.record).groups.guards.matrix }}
-    steps:
-      - name: State the group's decision and its reason
-        env:
-          GROUP_REASON: ${{ fromJSON(needs.plan.outputs.record).groups.guards.reason }}
-        run: |
-          printf 'Planted faults: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: matrix.run
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: matrix.run
-        with:
-          python-version: "3.14.8"
-          cache: pip
-          cache-dependency-path: requirements.txt
-      - run: make setup
-        if: matrix.run
-      - run: make test-guards SHARD="${SHARD}/${SHARDS}"
-        if: matrix.run
-        env:
-          SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ matrix.shards }}
-      - name: Show the end of the run's log after a failure
-        if: failure() && matrix.run
-        run: tail -n 150 runs/*/log.txt
-
   infra:
-    name: ${{ matrix.name }}
+    name: Static checks of the Terraform and Ansible code
     needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    strategy:
-      matrix: ${{ fromJSON(needs.plan.outputs.record).groups.infra.matrix }}
     steps:
       - name: State the group's decision and its reason
         env:
-          GROUP_REASON: ${{ fromJSON(needs.plan.outputs.record).groups.infra.reason }}
+          GROUP_REASON: ${{ needs.plan.outputs.reason }}
         run: |
           printf 'Terraform and Ansible checks: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: matrix.run
+        if: needs.plan.outputs.run == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: matrix.run
+        if: needs.plan.outputs.run == 'true'
         with:
           python-version: "3.14.8"
           cache: pip
           cache-dependency-path: requirements.txt
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        if: matrix.run
+        if: needs.plan.outputs.run == 'true'
         with:
           terraform_version: "1.16.4"
           terraform_wrapper: false
       - run: make setup
-        if: matrix.run
+        if: needs.plan.outputs.run == 'true'
       - run: make check-terraform
-        if: matrix.run
+        if: needs.plan.outputs.run == 'true'
       - run: make check-ansible
-        if: matrix.run
+        if: needs.plan.outputs.run == 'true'
+
+  guards:
+    name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15 # measured hosted wall time of one shard: 5 to 11 minutes
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: State the group's decision and its reason
+        env:
+          GROUP_REASON: ${{ needs.plan.outputs.reason }}
+        run: |
+          printf 'Planted faults: %s\n' "${GROUP_REASON}" >> "${GITHUB_STEP_SUMMARY}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.plan.outputs.run == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: needs.plan.outputs.run == 'true'
+        with:
+          python-version: "3.14.8"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: make setup
+        if: needs.plan.outputs.run == 'true'
+      - run: make test-guards SHARD="${SHARD}/8"
+        if: needs.plan.outputs.run == 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
+      - name: Show the end of the run's log after a failure
+        if: failure() && needs.plan.outputs.run == 'true'
+        run: tail -n 150 runs/*/log.txt
+
+  required:
+    name: Every job of this run passed
+    needs: [plan, hooks, infra, guards]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check that every needed job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          printf 'Results of the needed jobs: %s\n' "${RESULTS}" >> "${GITHUB_STEP_SUMMARY}"
+          test "${RESULTS}" = "success success success success"

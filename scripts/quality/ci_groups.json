@@ -1,16 +1,8 @@
 {
   "runner": "ubuntu-24.04",
   "python": "3.14.8",
-  "plan": {
-    "job": "Plan the job groups of this run",
-    "modules": ["scripts.quality.ci_plan"],
-    "paths": [
-      {"pattern": ".github/workflows/ci.yml", "reason": "defines the jobs, their runner, Python and tool setup, and the plan command"},
-      {"pattern": "scripts/quality/ci_groups.json", "reason": "this map decides what runs"},
-      {"pattern": "Makefile", "reason": "the plan reads the recipes of each group's commands to find the modules they start"},
-      {"pattern": ".pre-commit-config.yaml", "reason": "the plan reads the hooks that the guard suite's commits run to find the modules they start"}
-    ]
-  },
+  "plan": {"job": "Plan the job groups of this run"},
+  "required": {"job": "Every job of this run passed"},
   "groups": {
     "hooks": {
       "always": true,
@@ -19,40 +11,12 @@
     },
     "infra": {
       "job": "Static checks of the Terraform and Ansible code",
-      "commands": ["make setup", "make check-terraform", "make check-ansible"],
-      "paths": [
-        {"pattern": "infra/*", "reason": "the Terraform code, its lock file, tests and lint configuration that the checks read, and the folder that Trivy scans"},
-        {"pattern": "ansible/*", "reason": "the playbook and roles that the syntax check reads"},
-        {"pattern": "requirements.txt", "reason": "make setup installs it: it pins ansible-core, which runs the syntax check"}
-      ]
+      "commands": ["make setup", "make check-terraform", "make check-ansible"]
     },
     "guards": {
-      "job": "Planted faults through the real commit path",
-      "shard_name": ", shard {shard} of {shards}",
+      "job": "Planted faults through the real commit path, shard {shard} of {shards}",
       "shards": 8,
-      "commands": ["make setup", "make test-guards"],
-      "commits_through_hooks": true,
-      "paths": [
-        {"pattern": "requirements.txt", "reason": "make setup installs it: it pins pre-commit, Ruff and MyPy, whose messages the cases match"},
-        {"pattern": "pyproject.toml", "reason": "the Ruff and MyPy settings that the hooks of every planted commit apply"},
-        {"pattern": ".privacy_allowlist", "reason": "the privacy hook reads it, and an entry could allow a planted privacy marker"},
-        {"pattern": ".gitignore", "reason": "decides which files the suite copies and that its planted files are visible to Git"},
-        {"pattern": "tests/fast/*", "reason": "the fast-tests hook discovers and runs every test module of this folder on each planted commit"},
-        {"pattern": "ansible/*", "reason": "the fast tests that the hooks run start its task files with ansible-playbook and load its Python helper by path"}
-      ]
+      "commands": ["make setup", "make test-guards"]
     }
-  },
-  "loads_by_path": [
-    {"file": "tests/fast/test_workload_credentials.py", "loads": "ansible/roles/workload_access/files/workload_credentials.py", "reason": "the helper runs on the host, outside the scripts package"}
-  ],
-  "none": [
-    {"pattern": ".github/workflows/deploy.yml", "reason": "the deploy workflow: no CI job runs it; a fast test reads it as text, and the hooks job runs that test"},
-    {"pattern": ".env.example", "reason": "documentation of the variables: the hooks scan it"},
-    {"pattern": "LICENSE", "reason": "the licence text: the hooks scan it"},
-    {"pattern": "README.md", "reason": "the readme: the hooks scan it"},
-    {"pattern": "requirements.in", "reason": "the source of requirements.txt: make setup installs requirements.txt only"},
-    {"pattern": "compose/*", "reason": "the Compose stack: the fast tests read its files as data, and the hooks job runs those tests"},
-    {"pattern": "scripts/evidence/export.py", "reason": "the evidence export: no job's entry modules reach it, and the hooks lint and type-check it"},
-    {"pattern": "tests/e2e/*", "reason": "the temporary acceptance tests of a phase, which stay off main; the guard suite's own modules are reached from its entry"}
-  ]
+  }
 }

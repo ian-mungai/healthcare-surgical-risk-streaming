@@ -1,5 +1,4 @@
-"""The GitHub API facts that let a CI run do less: the proof that a pull request's base passed on main, and the passed pull request run
-that the push to main after a merge reuses.
+"""The GitHub API facts that let a CI run do less: the passed pull request run that the push to main after a merge reuses.
 
 Every answer comes from GitHub's API about this repository's own runs of ``.github/workflows/ci.yml``, read with the workflow's read-only
 token. A run counts only when its workflow file is that path and its repository and head repository are this repository, so a run of
@@ -9,8 +8,8 @@ never stands in for a newer one.
 
 A push to main reuses a pull request's result only when exactly one pull request of this repository was merged into main with the pushed
 commit as its merge commit, the tree of the checkout equals the tree that the API gives for the pushed commit and for the pull request's
-head commit, and the newest pull request run of that head commit on that head branch passed with every required job: the plan job, the
-hooks job and, for each selectable group, either all its jobs or its one job that did not run. Any answer that cannot be read reuses nothing.
+head commit, and the newest pull request run of that head commit on that head branch passed with every job of the map, each once and
+no other. Any answer that cannot be read reuses nothing.
 """
 
 from __future__ import annotations
@@ -52,17 +51,10 @@ class Context:
 
 
 @dataclass(frozen=True)
-class JobSet:
-    """The jobs that a passed run must hold: ``always`` each once, and for each group all of its ``runs`` names or its ``idle`` name."""
-
-    always: frozenset[str]
-    groups: Mapping[str, tuple[frozenset[str], str]]
-
-
-@dataclass(frozen=True)
 class Reused:
     """The pull request run that a push to main reuses."""
 
+    commit: str
     pull_request: int
     head: str
     tree: str
@@ -155,12 +147,6 @@ def newest_passed(runs: list[dict[str, Any]], what: str) -> dict[str, Any]:
     return latest
 
 
-def prove_start(api: Api, context: Context, start: str) -> None:
-    """Raise ``NoReuse`` unless the newest push run of ``start`` on main passed."""
-    runs = own_runs(api, context, "push", f"head_sha={start}&event=push&branch={MAIN}&per_page=100")
-    newest_passed([run for run in runs if run["head_sha"] == start and run["head_branch"] == MAIN], f"the base commit {start} on {MAIN}")
-
-
 def tree_of(api: Api, context: Context, commit: str) -> str:
     tree = api(f"repos/{context.repository}/git/commits/{commit}")["tree"]["sha"]
     if not isinstance(tree, str) or not SHA.fullmatch(tree):
@@ -182,8 +168,8 @@ def merged_pull_request(api: Api, context: Context, commit: str) -> dict[str, An
     return pull
 
 
-def passed_jobs(api: Api, context: Context, run: dict[str, Any], head: str, required: JobSet) -> list[str]:
-    """The names of the jobs of ``run`` in their latest attempt, each of which passed for ``head``, holding every required job."""
+def passed_jobs(api: Api, context: Context, run: dict[str, Any], head: str, required: frozenset[str]) -> list[str]:
+    """The names of the jobs of ``run`` in their latest attempt, each of which passed for ``head``: exactly the ``required`` jobs."""
     answer = api(f"repos/{context.repository}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
     jobs = answer["jobs"]
     if answer["total_count"] != len(jobs):
@@ -195,16 +181,12 @@ def passed_jobs(api: Api, context: Context, run: dict[str, Any], head: str, requ
         if job["status"] != "completed" or job["conclusion"] != "success" or job["head_sha"] != head:
             raise NoReuse(f"the job {job['name']} of the run {run['id']} is {job['status']} and concluded {job['conclusion']} for {job['head_sha']}")
     held = set(names)
-    known = set(required.always).union(*(runs | {idle} for runs, idle in required.groups.values()))
-    if required.always - held or held - known:
-        raise NoReuse(f"the run {run['id']} lacks {sorted(required.always - held)} or holds jobs the map does not name {sorted(held - known)}")
-    for group, (runs, idle) in required.groups.items():
-        if not ((runs <= held and idle not in held) or (idle in held and not runs & held)):
-            raise NoReuse(f"the run {run['id']} holds neither all the jobs of {group} nor only its job that did not run")
+    if held != required:
+        raise NoReuse(f"the run {run['id']} lacks {sorted(required - held)} or holds jobs the map does not name {sorted(held - required)}")
     return sorted(names)
 
 
-def reusable_run(api: Api, context: Context, commit: str, tree: str, required: JobSet) -> Reused:
+def reusable_run(api: Api, context: Context, commit: str, tree: str, required: frozenset[str]) -> Reused:
     """The passed pull request run that the push of ``commit``, whose checkout has ``tree``, reuses; ``NoReuse`` names why there is none."""
     pull = merged_pull_request(api, context, commit)
     head, branch = str(pull["head"]["sha"]), str(pull["head"]["ref"])
@@ -215,4 +197,4 @@ def reusable_run(api: Api, context: Context, commit: str, tree: str, required: J
         raise NoReuse(f"the merged tree {tree} differs from the tree {head_tree} of the head {head} of pull request {pull['number']}")
     runs = own_runs(api, context, "pull_request", f"head_sha={head}&event=pull_request&per_page=100")
     run = newest_passed([run for run in runs if run["head_sha"] == head and run["head_branch"] == branch], f"the head {head} of pull request {pull['number']}")
-    return Reused(int(pull["number"]), head, tree, int(run["id"]), str(run["html_url"]), passed_jobs(api, context, run, head, required))
+    return Reused(commit, int(pull["number"]), head, tree, int(run["id"]), str(run["html_url"]), passed_jobs(api, context, run, head, required))

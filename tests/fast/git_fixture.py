@@ -14,28 +14,23 @@ ROOT = Path(__file__).resolve().parents[2]
 TIMEOUT_SECONDS = 60
 
 
-def fixture_environment(home: str) -> dict[str, str]:
-    """The environment of a fixture's Git and Python commands: no global or system Git configuration and a fixed author."""
-    return {
-        "PATH": os.environ["PATH"],
-        "HOME": home,
-        "PYTHONPATH": str(ROOT),
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_AUTHOR_NAME": "Fixture",
-        "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-        "GIT_COMMITTER_NAME": "Fixture",
-        "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-    }
-
-
 class TemporaryRepository(unittest.TestCase):
     def setUp(self) -> None:
         home = tempfile.TemporaryDirectory(prefix="repo_check_cli_")
         self.addCleanup(home.cleanup)
         self.repo = Path(home.name) / "repo"
         self.repo.mkdir()
-        self.env = fixture_environment(home.name)
+        self.env = {
+            "PATH": os.environ["PATH"],
+            "HOME": home.name,
+            "PYTHONPATH": str(ROOT),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "Fixture",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "Fixture",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+        }
         self.git("init", "--quiet", "--initial-branch", "main")
 
     def other_repository(self) -> Path:
