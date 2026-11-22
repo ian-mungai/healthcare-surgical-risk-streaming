@@ -110,11 +110,14 @@ def context_of(environment: Mapping[str, str]) -> Context:
         raise NoReuse(f"the run's environment does not name the repository ({type(error).__name__}: {error})") from error
 
 
-def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE_SECONDS) -> Api:
+def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE_SECONDS, clock: Callable[[], float] = time.monotonic) -> Api:
     """A reader of the API at ``base_url``: HTTPS, or HTTP on the loopback address for a local stand-in.
 
-    Every request of the reader shares one deadline, ``deadline_seconds`` from now. A request that would start after it is refused, and at
-    the deadline the open connection is shut, so an answer that arrives slowly cannot keep the plan waiting.
+    Every request of the reader shares one deadline, ``deadline_seconds`` after the reader is made, measured by ``clock``. A request
+    that would start after it is refused. Each request runs in a worker thread, from the name lookup to the last byte of the answer,
+    and the caller waits for it only until the deadline: then it shuts the connection's socket, leaves the worker (a daemon thread,
+    which a blocked name lookup may keep until the process ends) and raises. An answer that is read or decoded at or after the deadline
+    is discarded.
     """
     address = urlsplit(base_url)
     if address.scheme == "https":
@@ -124,41 +127,53 @@ def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE
     else:
         raise ApiError("the API address must use HTTPS, or HTTP on the loopback address")
     headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "ci-plan"}
-    deadline = time.monotonic() + deadline_seconds
+    deadline = clock() + deadline_seconds
     expired = f"the API reads passed their deadline of {deadline_seconds:g} seconds"
 
     def get(path: str) -> Any:
         where = path.split("?")[0]
-        left = deadline - time.monotonic()
+        left = deadline - clock()
         if left <= 0:
             raise ApiError(f"GET {where} not sent: {expired}")
         connection = connection_type(address.netloc, timeout=min(API_TIMEOUT_SECONDS, left))
-        shut: threading.Timer | None = None
+        outcome: dict[str, Any] = {}
+
+        def fetch() -> None:
+            try:
+                connection.request("GET", f"{address.path.rstrip('/')}/{path}", headers=headers)
+                response = connection.getresponse()
+                outcome["answer"] = (response.status, response.read())
+            except (OSError, http.client.HTTPException) as error:
+                outcome["error"] = error
+
+        worker = threading.Thread(target=fetch, name=f"api {where}", daemon=True)
+        worker.start()
+        worker.join(left)
+        if worker.is_alive():
+            if connection.sock is not None:
+                shut_down(connection.sock)
+            raise ApiError(f"GET {where} failed: {expired}")
+        connection.close()
+        if clock() >= deadline:
+            raise ApiError(f"GET {where} answered at or after the deadline of {deadline_seconds:g} seconds, so the answer is discarded")
+        if "error" in outcome:
+            raise ApiError(f"GET {where} failed: {type(outcome['error']).__name__}") from outcome["error"]
+        status, body = outcome["answer"]
+        if status != 200:
+            raise ApiError(f"GET {where} answered {status}")
         try:
-            connection.connect()
-            shut = threading.Timer(deadline - time.monotonic(), shut_down, args=(connection.sock,))
-            shut.start()
-            connection.request("GET", f"{address.path.rstrip('/')}/{path}", headers=headers)
-            response = connection.getresponse()
-            body = response.read()
-        except (OSError, http.client.HTTPException) as error:
-            raise ApiError(f"GET {where} failed: {expired if time.monotonic() >= deadline else type(error).__name__}") from error
-        finally:
-            if shut is not None:
-                shut.cancel()
-            connection.close()
-        if response.status != 200:
-            raise ApiError(f"GET {where} answered {response.status}")
-        try:
-            return json.loads(body)
+            answer = json.loads(body)
         except ValueError as error:
             raise ApiError(f"GET {where} answered with text that is not JSON") from error
+        if clock() >= deadline:
+            raise ApiError(f"GET {where} answered at or after the deadline of {deadline_seconds:g} seconds, so the answer is discarded")
+        return answer
 
     return get
 
 
 def shut_down(sock: socket.socket) -> None:
-    """End a blocked read on ``sock`` from the deadline's timer thread; the response may hold the socket after the connection let it go."""
+    """End a blocked read on ``sock`` of a worker that passed the deadline."""
     with contextlib.suppress(OSError):
         sock.shutdown(socket.SHUT_RDWR)
 

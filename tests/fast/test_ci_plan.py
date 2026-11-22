@@ -13,6 +13,7 @@ Failure modes covered here, each with a planted case and a control:
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import platform
 import re
@@ -24,6 +25,7 @@ import unittest
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.process import run_command
@@ -645,7 +647,7 @@ class RecordAndSummaryTest(PlanRepository):
 class SlowApi:
     """A stand-in for the API on the loopback interface that waits ``pause`` seconds before each byte of its answer."""
 
-    def __init__(self, test: unittest.TestCase, pause: float, body: bytes = b'{"answer": 1}') -> None:
+    def __init__(self, test: unittest.TestCase, pause: float, body: bytes = b'{"answer": 1}', before_last_byte: Callable[[], None] = lambda: None) -> None:
         self.requests = 0
         stand_in = self
 
@@ -656,8 +658,10 @@ class SlowApi:
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
-                    for byte in body:
+                    for index, byte in enumerate(body):
                         time.sleep(pause)
+                        if index == len(body) - 1:
+                            before_last_byte()
                         self.wfile.write(bytes([byte]))
                         self.wfile.flush()
 
@@ -671,6 +675,19 @@ class SlowApi:
         test.addCleanup(server.server_close)
         test.addCleanup(server.shutdown)
         self.url = f"http://127.0.0.1:{server.server_address[1]}"
+
+
+class Clock:
+    """A clock that stands still until a test moves it, for the moment that an answer arrives."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def set(self, now: float) -> None:
+        self.now = now
 
 
 class ApiDeadlineTest(unittest.TestCase):
@@ -701,6 +718,37 @@ class ApiDeadlineTest(unittest.TestCase):
         with self.assertRaisesRegex(ci_reuse.ApiError, "not sent: the API reads passed their deadline of 0.3 seconds"):
             api("repos/owner/project/actions/runs")
         self.assertEqual(slow.requests, 1)
+
+    def test_a_slow_name_lookup_ends_at_the_deadline(self) -> None:
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        def slow_lookup(*args: Any, **kwargs: Any) -> Any:
+            released.wait(5)
+            raise OSError("the name lookup was released")
+
+        api = ci_reuse.github_api("https://api.example.invalid", "token", deadline_seconds=0.3)
+        started = time.monotonic()
+        with mock.patch("socket.getaddrinfo", slow_lookup), self.assertRaisesRegex(ci_reuse.ApiError, "deadline of 0.3 seconds"):
+            api("repos/owner/project/actions/runs")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_an_answer_that_arrives_at_the_deadline_is_discarded(self) -> None:
+        clock = Clock()
+        api = ci_reuse.github_api(SlowApi(self, pause=0.0, before_last_byte=lambda: clock.set(5.0)).url, "token", deadline_seconds=5.0, clock=clock)
+        with self.assertRaisesRegex(ci_reuse.ApiError, "at or after the deadline of 5 seconds"):
+            api("repos/owner/project/actions/runs")
+        for arrives, discarded in ((9.0, True), (8.5, False)):
+            with self.subTest(arrives=arrives):
+                clock.set(4.0)
+                api = ci_reuse.github_api(
+                    SlowApi(self, pause=0.0, before_last_byte=functools.partial(clock.set, arrives)).url, "token", deadline_seconds=5.0, clock=clock
+                )
+                if discarded:
+                    with self.assertRaisesRegex(ci_reuse.ApiError, "at or after the deadline of 5 seconds"):
+                        api("repos/owner/project/actions/runs")
+                else:
+                    self.assertEqual(api("repos/owner/project/actions/runs"), {"answer": 1})
 
     def test_an_answer_within_the_deadline_is_read(self) -> None:
         api = ci_reuse.github_api(SlowApi(self, pause=0.0).url, "token", deadline_seconds=5.0)
