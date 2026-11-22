@@ -255,6 +255,41 @@ class Restart(unittest.TestCase):
         self.assertEqual(len(manifest.events) - 7, second.sent)
         self.assertTrue(compare(manifest, observed_from(sink, store.state)).ok)
 
+    def test_a_stop_asked_for_during_a_wait_sends_no_event_after_it_saves_the_position_and_the_restart_sends_nothing_twice(self) -> None:
+        class StopsDuringWait(FakeClock):
+            """The stop arrives while the loop waits for the event that is due next: the wait ends at once, as the service's clock does on a signal."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.stopped = False
+                self.waiting = 0
+                self.sent_at_stop = -1
+
+            def wait_until(self, wall_us: int) -> None:
+                if wall_us > self.now:
+                    self.waiting += 1
+                    if self.waiting == 3:
+                        self.stopped = True
+                        self.sent_at_stop = len(sink.sent)
+                        return
+                super().wait_until(wall_us)
+
+        frozen = boundary_schedule(**self.OPTIONS)
+        slow = RunSettings(speed=1.0, checkpoint_every=1000, idle_checkpoint_us=10**12)
+        sink, store, clock = MemorySink(), MemoryStore(), StopsDuringWait()
+        first = Replayer(frozen, slow, RecordingSource(boundary_recordings()), sink, store, clock, lambda: clock.stopped).run()
+        self.assertFalse(first.finished)
+        self.assertEqual(clock.sent_at_stop, len(sink.sent), "an event was sent after the stop was asked for")
+        self.assertEqual(first.sent, len(sink.sent))
+        self.assertEqual(len(sink.sent), sink.acknowledged)
+        self.assertFalse(saved_state(store).finished)
+        sent_before = len(sink.sent)
+        second = Replayer(frozen, slow, RecordingSource(boundary_recordings()), sink, store, FakeClock(clock.now), lambda: False).run()
+        manifest = build_manifest(frozen, boundary_recordings())
+        self.assertEqual(len(manifest.events) - sent_before, second.sent)
+        self.assertEqual(len(manifest.events), len(sink.sent))
+        self.assertTrue(compare(manifest, observed_from(sink, store.state)).ok)
+
     def test_a_finished_run_started_again_sends_nothing(self) -> None:
         frozen = boundary_schedule(**self.OPTIONS)
         sink, store, clock = MemorySink(), MemoryStore(), FakeClock()

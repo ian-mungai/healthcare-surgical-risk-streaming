@@ -16,7 +16,8 @@ written again. A run that a stop signal ends stays in the inbox, so the restarte
 
 Before it starts a request, ``serve`` adds one to the count in ``<run ID>.attempts`` beside it. A request that is found with the count at 3 has stopped the
 service three times, whatever the error was, so it fails with that reason and is archived without a replay and the next request runs. A stop by signal puts the
-count back. An arithmetic or value error of a replay fails that request at once.
+count back. A planned stop ends every wait of the replay at once (``stopping.py``), so the service stops within the grace period of its container, the
+position is saved and the stop is never counted. An arithmetic or value error of a replay fails that request at once.
 
 The health file says whether the service waits, runs or stopped and when it last made progress. ``healthy`` is the container's health check: a waiting or
 running service whose file is fresh and was not written in the future.
@@ -197,7 +198,7 @@ def serve(
     run_request: Callable[[Path, Callable[[], None]], Outcome],
     stopped: Callable[[], bool],
     clock: Callable[[], float],
-    sleep: Callable[[float], None],
+    sleep: Callable[[float], object],
     poll_seconds: float,
 ) -> int:
     """Serve the inbox until ``stopped`` says so. ``run_request`` runs one record and calls the beat it is given as the run makes progress. A record that is

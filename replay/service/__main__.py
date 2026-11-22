@@ -21,12 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import signal
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
-from types import FrameType
 from typing import Any
 
 from replay.events.formats import COMPATIBILITY_RULE, FORMATS, INPUT_TOPIC, REGISTRY_GROUP, schema_text
@@ -42,6 +40,7 @@ from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
 from replay.service.serve import Outcome, SubmitError, healthy, queued_record, read_submission, serve, submit
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
+from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
@@ -56,22 +55,6 @@ HEALTH_MAX_AGE_SECONDS = 600.0
 
 def log(event: str, **fields: Any) -> None:
     sys.stderr.write(json.dumps({"event": event, **fields}, sort_keys=True) + "\n")
-
-
-class SystemClock:
-    """The wall clock in microseconds. A wait is cut into slices of at most a second, so the process stays responsive and every wait ends at its target."""
-
-    def __init__(self, poll: Any = None) -> None:
-        self.poll = poll
-
-    def now_us(self) -> int:
-        return time.time_ns() // 1000
-
-    def wait_until(self, wall_us: int) -> None:
-        while (remaining := wall_us - self.now_us()) > 0:
-            time.sleep(min(remaining / 1_000_000, 1.0))
-            if self.poll is not None:
-                self.poll()
 
 
 class Frozen:
@@ -117,20 +100,9 @@ def command_freeze(record: RunRecord, _: argparse.Namespace) -> int:
     return 0
 
 
-class StopFlag:
-    """Set by SIGTERM or SIGINT, so a run stops at its next event after saving its position."""
-
-    def __init__(self) -> None:
-        self.set = False
-        signal.signal(signal.SIGTERM, self.request)
-        signal.signal(signal.SIGINT, self.request)
-
-    def request(self, signum: int, frame: FrameType | None) -> None:
-        self.set = True
-
-
-def replay_record(record: RunRecord, stopped: Callable[[], bool], beat: Callable[[], None]) -> int:
-    """Replay one run record into Kafka from its saved position. ``beat`` is called as the run makes progress. Return 0 when every occurrence is done."""
+def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -> int:
+    """Replay one run record into Kafka from its saved position. ``beat`` is called as the run makes progress and ``flag`` ends every wait of the run when a
+    stop is asked for. Return 0 when every occurrence is done."""
     partitions = partition_count(record.kafka_bootstrap, INPUT_TOPIC)
     partition_of(record.rooms - 1, partitions)
     inputs = verify_inputs(record)
@@ -153,10 +125,10 @@ def replay_record(record: RunRecord, stopped: Callable[[], bool], beat: Callable
 
     def stop_requested() -> bool:
         beat()
-        return stopped()
+        return flag.is_set()
 
     settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000))
-    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(record.state_path), SystemClock(poll), stop_requested)
+    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(record.state_path), SystemClock(flag, poll), stop_requested)
     log("replay_start", run_id=record.run_id, speed=record.speed, schedule_sha256=frozen.schedule.sha256)
     result = replayer.run()
     log("replay_end", sent=result.sent, finished=result.finished)
@@ -166,7 +138,7 @@ def replay_record(record: RunRecord, stopped: Callable[[], bool], beat: Callable
 
 def command_run(record: RunRecord, _: argparse.Namespace) -> int:
     flag = StopFlag()
-    return replay_record(record, lambda: flag.set, lambda: None)
+    return replay_record(record, flag, lambda: None)
 
 
 def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
@@ -219,8 +191,8 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
     """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text."""
     log("request_start", request=path.stem)
     try:
-        code = replay_record(queued_record(path), lambda: flag.set, beat)
-        outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.set else "failed", code)
+        code = replay_record(queued_record(path), flag, beat)
+        outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.is_set() else "failed", code)
     except GateRefused as refused:
         outcome = Outcome("failed", 3, str(refused))
     except STOPPING_ERRORS as error:
@@ -232,7 +204,7 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
 def command_serve(arguments: argparse.Namespace) -> int:
     flag = StopFlag()
     log("serve_start", inbox=str(arguments.inbox))
-    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), lambda: flag.set, time.time, time.sleep, POLL_SECONDS)
+    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS)
 
 
 def command_submit(arguments: argparse.Namespace) -> int:
