@@ -275,6 +275,11 @@ class DockerSocketExceptionTest(unittest.TestCase):
                 self.assertIn("named volumes", service_problems("dagster_code_location", document)[0])
 
 
+CREDENTIAL_READERS = {"spark": ("spark", 20102), "trino": ("trino", 20103), "replay": ("replay", 20104)}
+"""The services that read a credential folder, each bound to its folder and its workload group. The table is fixed here, not derived from the mount, so a
+change of folder and group together is still a change this test names."""
+
+
 class WorkloadAccessTest(unittest.TestCase):
     """A service that reads a workload's short-lived AWS credentials mounts that workload's folder read-only and runs in its group: the helper writes the
     folder for root and the workload's group, mode 0750, and the credentials 0640, so a container outside the group cannot read them."""
@@ -282,16 +287,23 @@ class WorkloadAccessTest(unittest.TestCase):
     def problems(self, name: str, document: dict[str, Any]) -> list[str]:
         service = document["services"][name]
         found = []
+        folders = []
         for volume_name, volume in (document.get("volumes") or {}).items():
             device = str(((volume or {}).get("driver_opts") or {}).get("device", ""))
             match = re.search(r"/run/workload_access/([a-z_]+)\}?$", device)
             if not match:
                 continue
             workload = match.group(1)
+            folders.append(workload)
             if f"{volume_name}:/run/workload_access:ro" not in [str(entry) for entry in service.get("volumes") or []]:
                 found.append(f"{name}: the credential folder of {workload} must be mounted read-only at /run/workload_access")
-            if [str(PROJECT_WORKLOAD_GIDS.get(workload))] != [str(group) for group in service.get("group_add") or []]:
-                found.append(f"{name}: must run in the group {PROJECT_WORKLOAD_GIDS.get(workload)} of the workload {workload} and in no other group")
+        if folders and name not in CREDENTIAL_READERS:
+            found.append(f"{name}: is not in the table of services that may read a credential folder")
+        for workload in folders:
+            if name in CREDENTIAL_READERS and workload != CREDENTIAL_READERS[name][0]:
+                found.append(f"{name}: may read only the credential folder of {CREDENTIAL_READERS[name][0]}, not {workload}")
+        if folders and name in CREDENTIAL_READERS and [str(CREDENTIAL_READERS[name][1])] != [str(group) for group in service.get("group_add") or []]:
+            found.append(f"{name}: must run in the group {CREDENTIAL_READERS[name][1]} of the workload {CREDENTIAL_READERS[name][0]} and in no other group")
         return found
 
     def test_every_service_with_a_credential_folder_mounts_it_read_only_and_runs_in_its_group(self) -> None:
@@ -301,7 +313,21 @@ class WorkloadAccessTest(unittest.TestCase):
                 self.assertEqual([], self.problems(path.stem, load(path)))
             if "/run/workload_access/" in path.read_text():
                 readers.append(path.stem)
-        self.assertEqual(["replay", "spark", "trino"], readers)
+        self.assertEqual(sorted(CREDENTIAL_READERS), readers)
+
+    def test_the_fixed_table_agrees_with_the_project_workload_groups(self) -> None:
+        for name, (workload, group) in CREDENTIAL_READERS.items():
+            self.assertEqual(group, PROJECT_WORKLOAD_GIDS[workload], name)
+
+    def test_a_folder_and_group_changed_together_is_named(self) -> None:
+        document = copy.deepcopy(load(SERVICES / "replay.yml"))
+        service = document["services"]["replay"]
+        service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["spark"])]
+        document["services"]["replay"]["volumes"] = [str(entry).replace("workload_access_replay", "workload_access_spark") for entry in service["volumes"]]
+        document["volumes"] = {"workload_access_spark": {"driver_opts": {"device": "${SPARK_ACCESS_DIR:-/run/workload_access/spark}"}}}
+        problems = self.problems("replay", document)
+        self.assertEqual(2, len(problems), problems)
+        self.assertIn("may read only the credential folder of replay", problems[0])
 
     def test_a_missing_group_another_group_or_a_writable_mount_is_named(self) -> None:
         for change in ("no group", "other group", "writable"):
