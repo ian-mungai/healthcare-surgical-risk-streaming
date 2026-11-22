@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import importlib.util
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -140,38 +139,79 @@ class TopicListTest(unittest.TestCase):
                 topics_module.parse_budget(text)
 
 
+WANTED_OVERRIDES = {
+    "cleanup.policy": "delete",
+    "retention.ms": "129600000",
+    "retention.bytes": "2147483648",
+    "segment.bytes": "134217728",
+    "flush.messages": "1",
+}
+
+
+def overrides_output(topic: str, overrides: dict[str, str]) -> str:
+    """What ``kafka-configs --describe`` prints for a topic on Kafka 4.4: the explicit overrides only, each with its synonyms."""
+    lines = [f"Dynamic configs for topic {topic} are:"]
+    for key, value in overrides.items():
+        lines.append(f"  {key}={value} sensitive=false synonyms={{DYNAMIC_TOPIC_CONFIG:{key}={value}, DEFAULT_CONFIG:log.{key}=unset}}")
+    return "\n".join(lines) + "\n"
+
+
+class FakeBroker:
+    """The two Kafka tools of the broker's image, with a canned answer for each: the topics' description and each topic's explicit overrides."""
+
+    def __init__(self, describe: str, overrides: dict[str, str], raw: dict[str, str] | None = None) -> None:
+        self.describe = describe
+        self.overrides = overrides
+        self.raw = raw or {}
+        self.commands: list[list[str]] = []
+
+    def run(self, command: list[str]) -> tuple[int, str, str]:
+        self.commands.append(command)
+        if command[5].endswith("kafka-topics.sh"):
+            return 0, self.describe, ""
+        name = command[command.index("--entity-name") + 1]
+        if name in self.raw:
+            return 0, self.raw[name], ""
+        return 0, overrides_output(name, self.overrides), ""
+
+    def broker(self) -> Any:
+        return topics_module.Broker(self.run, ["docker", "compose"])
+
+
 class TopicPlanTest(unittest.TestCase):
     wanted = topics_module.parse_topics("replay_events 10 36 2048 128 delete\n")
 
-    def state(self, text: str = DESCRIBE) -> Any:
-        return topics_module.parse_state(text)
+    def state(self, overrides: dict[str, str] | None = None, describe: str = DESCRIBE, raw: dict[str, str] | None = None) -> Any:
+        fake = FakeBroker(describe, WANTED_OVERRIDES if overrides is None else overrides, raw)
+        return topics_module.read_state(fake.broker(), self.wanted)
 
-    def test_the_state_reads_each_topic_with_its_partitions_and_overrides_and_skips_the_partition_lines(self) -> None:
+    def test_the_state_reads_each_topic_with_its_partitions_and_explicit_overrides_and_skips_the_partition_lines(self) -> None:
         state = self.state()
         self.assertEqual({"replay_events", "__consumer_offsets"}, set(state))
         self.assertEqual(10, state["replay_events"].partitions)
-        self.assertEqual("129600000", state["replay_events"].configs["retention.ms"])
+        self.assertEqual(WANTED_OVERRIDES, state["replay_events"].configs)
+
+    def test_the_overrides_come_from_kafka_configs_without_all_and_only_for_the_listed_topics(self) -> None:
+        fake = FakeBroker(DESCRIBE, WANTED_OVERRIDES)
+        topics_module.read_state(fake.broker(), self.wanted)
+        described = [command for command in fake.commands if "kafka-configs.sh" in command[5]]
+        self.assertEqual(1, len(described))
+        self.assertIn("--describe", described[0])
+        self.assertNotIn("--all", described[0])
+        self.assertEqual(["--entity-type", "topics", "--entity-name", "replay_events"], described[0][described[0].index("--entity-type") :][:4])
 
     def test_a_topic_that_matches_needs_no_action(self) -> None:
         self.assertEqual([], topics_module.plan(self.wanted, self.state()))
 
-    def test_a_missing_topic_is_created_with_every_setting(self) -> None:
+    def test_a_missing_topic_is_created_with_every_setting_each_as_a_config_flag_and_value(self) -> None:
         actions = topics_module.plan(self.wanted, {})
         self.assertEqual(1, len(actions))
-        arguments = " ".join(actions[0].arguments)
+        arguments = actions[0].arguments
         self.assertEqual("kafka-topics", actions[0].tool)
-        for part in (
-            "--create",
-            "--topic replay_events",
-            "--partitions 10",
-            "--replication-factor 1",
-            "retention.ms=129600000",
-            "retention.bytes=2147483648",
-            "segment.bytes=134217728",
-            "cleanup.policy=delete",
-            "flush.messages=1",
-        ):
-            self.assertIn(part, arguments)
+        self.assertEqual(["--create", "--topic", "replay_events", "--partitions", "10", "--replication-factor", "1"], arguments[:7])
+        pairs = [arguments[index : index + 2] for index, argument in enumerate(arguments) if argument == "--config"]
+        self.assertEqual(sorted(f"{key}={value}" for key, value in WANTED_OVERRIDES.items()), sorted(pair[1] for pair in pairs))
+        self.assertEqual(len(WANTED_OVERRIDES) * 2 + 7, len(arguments))
 
     def test_a_setting_that_drifted_is_corrected_and_only_that_one(self) -> None:
         for key, value in (
@@ -182,38 +222,80 @@ class TopicPlanTest(unittest.TestCase):
             ("flush.messages", "9223372036854775807"),
         ):
             with self.subTest(key=key):
-                drifted = re.sub(rf"{re.escape(key)}=[^,\n]*", f"{key}={value}", DESCRIBE, count=1)
-                actions = topics_module.plan(self.wanted, self.state(drifted))
+                actions = topics_module.plan(self.wanted, self.state(WANTED_OVERRIDES | {key: value}))
                 self.assertEqual(1, len(actions), actions)
                 self.assertEqual("kafka-configs", actions[0].tool)
                 self.assertEqual(f"{key}={self.wanted[0].configs()[key]}", actions[0].arguments[-1])
 
-    def test_a_topic_without_the_flush_setting_gets_it_set_and_nothing_else(self) -> None:
-        unflushed = DESCRIBE.replace("flush.messages=1,", "")
-        actions = topics_module.plan(self.wanted, self.state(unflushed))
-        self.assertEqual(1, len(actions))
-        self.assertEqual(("kafka-configs", "flush.messages=1"), (actions[0].tool, actions[0].arguments[-1]))
-
     def test_a_setting_that_is_missing_from_the_overrides_is_set(self) -> None:
-        missing = DESCRIBE.replace(",retention.bytes=2147483648", "")
-        actions = topics_module.plan(self.wanted, self.state(missing))
-        self.assertEqual(["retention.bytes=2147483648"], [actions[0].arguments[-1]])
+        for key in WANTED_OVERRIDES:
+            with self.subTest(key=key):
+                actions = topics_module.plan(self.wanted, self.state({name: value for name, value in WANTED_OVERRIDES.items() if name != key}))
+                self.assertEqual([f"{key}={WANTED_OVERRIDES[key]}"], [action.arguments[-1] for action in actions])
+
+    def test_a_value_that_the_topic_only_inherits_from_the_broker_default_is_set_as_an_override(self) -> None:
+        inherited = DESCRIBE
+        self.assertIn("flush.messages=1", inherited)
+        without = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        actions = topics_module.plan(self.wanted, self.state(without, describe=inherited))
+        self.assertEqual(["flush.messages=1"], [action.arguments[-1] for action in actions])
+        self.assertEqual(["set flush.messages of topic replay_events"], [action.description for action in actions])
+        bare = topics_module.plan(self.wanted, self.state({}, describe=inherited))
+        self.assertEqual(sorted(f"{key}={value}" for key, value in WANTED_OVERRIDES.items()), sorted(action.arguments[-1] for action in bare))
+
+    def test_a_list_value_that_kafka_prints_with_a_comma_is_read_whole_and_corrected(self) -> None:
+        both = {"cleanup.policy": "compact,delete"}
+        described = overrides_output("replay_events", WANTED_OVERRIDES | both)
+        self.assertEqual("compact,delete", topics_module.parse_overrides("replay_events", described)["cleanup.policy"])
+        actions = topics_module.plan(self.wanted, self.state(WANTED_OVERRIDES | both))
+        self.assertEqual(["cleanup.policy=delete"], [action.arguments[-1] for action in actions])
+        comma_describe = DESCRIBE.replace("cleanup.policy=delete", "cleanup.policy=compact,delete", 1)
+        self.assertEqual(10, self.state(describe=comma_describe)["replay_events"].partitions)
+
+    def test_a_comma_in_the_value_of_a_setting_that_is_not_a_list_is_refused(self) -> None:
+        with self.assertRaisesRegex(topics_module.TopicError, "unexpected shape"):
+            topics_module.parse_overrides("replay_events", overrides_output("replay_events", {"retention.ms": "1,2"}))
+
+    def test_an_override_output_that_the_parser_does_not_understand_fails_and_never_reads_as_no_override(self) -> None:
+        good = overrides_output("replay_events", WANTED_OVERRIDES)
+        for name, text in (
+            ("empty", ""),
+            ("unknown topic", "The topic 'replay_events' doesn't exist and doesn't have dynamic config.\n"),
+            ("another topic", overrides_output("warnings", WANTED_OVERRIDES)),
+            ("no header", "\n".join(good.splitlines()[1:]) + "\n"),
+            ("a line without the sensitive field", good + "  min.insync.replicas=1\n"),
+            ("a line of another shape", good + "unexpected text\n"),
+            ("a repeated setting", good + good.splitlines()[1] + "\n"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(topics_module.TopicError, "unexpected shape"):
+                topics_module.parse_overrides("replay_events", text)
+        with self.assertRaisesRegex(topics_module.TopicError, "unexpected shape"):
+            self.state(raw={"replay_events": "garbage\n"})
+
+    def test_a_listed_topic_that_the_broker_does_not_have_yet_is_not_asked_for_its_overrides(self) -> None:
+        describe = "Topic: other\tTopicId: x\tPartitionCount: 1\tReplicationFactor: 1\tConfigs: \n"
+        fake = FakeBroker(describe, WANTED_OVERRIDES, raw={"replay_events": "The topic 'replay_events' doesn't exist and doesn't have dynamic config.\n"})
+        state = topics_module.read_state(fake.broker(), self.wanted)
+        self.assertEqual({"other"}, set(state))
+        self.assertEqual(1, len(fake.commands))
+        self.assertEqual(["create topic replay_events"], [action.description for action in topics_module.plan(self.wanted, state)])
+
+    def test_a_topic_with_no_override_at_all_has_an_empty_set_and_gets_every_setting(self) -> None:
+        self.assertEqual({}, topics_module.parse_overrides("replay_events", "Dynamic configs for topic replay_events are:\n"))
 
     def test_fewer_partitions_than_the_list_are_added_and_more_are_refused_because_kafka_cannot_remove_them(self) -> None:
         fewer = DESCRIBE.replace("PartitionCount: 10", "PartitionCount: 4", 1)
-        actions = topics_module.plan(self.wanted, self.state(fewer))
+        actions = topics_module.plan(self.wanted, self.state(describe=fewer))
         self.assertEqual(["--alter", "--topic", "replay_events", "--partitions", "10"], actions[0].arguments)
         more = DESCRIBE.replace("PartitionCount: 10", "PartitionCount: 12", 1)
         with self.assertRaisesRegex(topics_module.TopicError, "cannot remove partitions"):
-            topics_module.plan(self.wanted, self.state(more))
+            topics_module.plan(self.wanted, self.state(describe=more))
 
     def test_a_topic_that_the_list_does_not_name_is_reported_and_never_removed(self) -> None:
         self.assertEqual(["__consumer_offsets"], [name for name in self.state() if name not in {topic.name for topic in self.wanted}])
         self.assertEqual([], topics_module.unlisted(self.wanted, self.state()))
-        self.assertEqual(
-            ["extra"],
-            topics_module.unlisted(self.wanted, self.state(DESCRIBE + "Topic: extra\tTopicId: x\tPartitionCount: 1\tReplicationFactor: 1\tConfigs: \n")),
-        )
+        extra = DESCRIBE + "Topic: extra\tTopicId: x\tPartitionCount: 1\tReplicationFactor: 1\tConfigs: \n"
+        self.assertEqual(["extra"], topics_module.unlisted(self.wanted, self.state(describe=extra)))
 
 
 class ListenerTest(unittest.TestCase):

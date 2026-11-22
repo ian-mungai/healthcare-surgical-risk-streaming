@@ -3,7 +3,8 @@
 The step makes the running broker match ``compose/kafka/topics.txt``: it creates a missing topic with its partitions and settings, corrects a topic whose
 retention limits, segment size, cleanup policy or flush setting differ and adds partitions when the list asks for more. Kafka cannot remove partitions, so a
 topic with more partitions than the list stops the step with a message that names it. A topic that the list does not name is reported and never removed.
-A broker that already matches needs no change and the step reports none.
+A broker that already matches needs no change and the step reports none. A setting counts as matching only when it is set on the topic itself: a value that
+the topic inherits from the broker's default is set on the topic too, because removing the default would otherwise change the topic.
 
 Every topic in the list carries events that the platform acknowledges, so every topic gets ``flush.messages=1``: the broker writes each record to disk before it
 acknowledges it. The single broker has no replica to restore a record that a power loss took from the operating system's cache. Kafka applies the setting
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ansible.module_utils.basic import AnsibleModule
 
@@ -32,6 +33,9 @@ BOOTSTRAP = "127.0.0.1:9092"
 REPLICATION_FACTOR = 1
 FLUSH_MESSAGES = 1
 MANAGED = ("cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes", "flush.messages")
+LIST_SETTINGS = ("cleanup.policy",)
+OVERRIDES_HEADER = re.compile(r"Dynamic configs for topic (\S+) are:")
+OVERRIDE_LINE = re.compile(r"  ([a-z][a-z0-9._]*)=(\S*) sensitive=(?:true|false) synonyms=\{.*\}")
 ERROR_CHARACTERS = 400
 
 
@@ -64,6 +68,8 @@ class Topic:
 
 @dataclass(frozen=True)
 class TopicState:
+    """A topic of the broker: its partitions and the settings set on the topic itself. A value that it only inherits from the broker is not in ``configs``."""
+
     partitions: int
     configs: dict[str, str]
 
@@ -132,17 +138,47 @@ def parse_budget(text: str) -> int:
 
 
 def parse_state(output: str) -> dict[str, TopicState]:
-    """Each topic of the broker's ``--describe`` output with its partition count and its overrides. The partition lines are skipped."""
+    """Each topic of the broker's ``--describe`` output with its partition count. The partition lines are skipped.
+
+    The ``Configs`` field of that output joins the effective values, the inherited ones too, with commas, and a list value has commas too, so it is not read.
+    """
     state: dict[str, TopicState] = {}
     for line in output.splitlines():
         if not line.startswith("Topic: "):
             continue
         fields = dict(part.split(": ", 1) for part in line.split("\t") if ": " in part)
         try:
-            overrides = dict(item.split("=", 1) for item in fields["Configs"].split(",") if item) if "Configs" in fields else {}
-            state[fields["Topic"]] = TopicState(int(fields["PartitionCount"]), overrides)
+            state[fields["Topic"]] = TopicState(int(fields["PartitionCount"]), {})
         except (KeyError, ValueError) as error:
             raise TopicError("the broker's description of a topic has an unexpected shape") from error
+    return state
+
+
+def parse_overrides(topic: str, output: str) -> dict[str, str]:
+    """The settings set on the topic itself, from ``kafka-configs --describe`` without ``--all``. Any other shape of output stops the step.
+
+    Each line holds the setting, its value up to the space before ``sensitive=`` and its synonyms. A comma is part of the value only for a list setting.
+    """
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    header = OVERRIDES_HEADER.fullmatch(lines[0]) if lines else None
+    if header is None or header[1] != topic:
+        raise TopicError(f"the broker's configuration of topic {topic} has an unexpected shape")
+    overrides: dict[str, str] = {}
+    for line in lines[1:]:
+        found = OVERRIDE_LINE.fullmatch(line)
+        if found is None or found[1] in overrides or ("," in found[2] and found[1] not in LIST_SETTINGS):
+            raise TopicError(f"the broker's configuration of topic {topic} has an unexpected shape")
+        overrides[found[1]] = found[2]
+    return overrides
+
+
+def read_state(broker: Broker, topics: list[Topic]) -> dict[str, TopicState]:
+    """The broker's topics, and for each listed topic that exists the settings set on it. Only these decide whether a setting needs setting."""
+    state = parse_state(broker.tool("kafka-topics", ["--describe"]))
+    for topic in topics:
+        if topic.name in state:
+            described = broker.tool("kafka-configs", ["--entity-type", "topics", "--entity-name", topic.name, "--describe"])
+            state[topic.name] = replace(state[topic.name], configs=parse_overrides(topic.name, described))
     return state
 
 
@@ -201,7 +237,7 @@ def main() -> None:
         with open(module.params["topics_file"]) as handle:
             topics = parse_topics(handle.read())
         broker = Broker(lambda args: module.run_command(args, check_rc=False), module.params["compose_command"])
-        state = parse_state(broker.tool("kafka-topics", ["--describe"]))
+        state = read_state(broker, topics)
         actions = plan(topics, state)
         if not module.check_mode:
             for action in actions:
