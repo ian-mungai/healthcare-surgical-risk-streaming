@@ -367,6 +367,9 @@ class WriterTest(unittest.TestCase):
             def flush(self) -> None:
                 raise BrokenPipeError(errno.EPIPE, "broken pipe")
 
+            def close(self) -> None:
+                return
+
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(sys, "stdout", Broken()):
             clock = Clock()
             output = Path(folder) / "s.jsonl"
