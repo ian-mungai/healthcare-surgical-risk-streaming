@@ -161,10 +161,11 @@ def overrides_output(topic: str, overrides: dict[str, str]) -> str:
 class FakeBroker:
     """The two Kafka tools of the broker's image, with a canned answer for each: the topics' description and each topic's explicit overrides."""
 
-    def __init__(self, describe: str, overrides: dict[str, str], raw: dict[str, str] | None = None) -> None:
+    def __init__(self, describe: str, overrides: dict[str, str], raw: dict[str, str] | None = None, alter_exit: int = 0) -> None:
         self.describe = describe
         self.overrides = overrides
         self.raw = raw or {}
+        self.alter_exit = alter_exit
         self.commands: list[list[str]] = []
 
     def run(self, command: list[str]) -> tuple[int, str, str]:
@@ -172,7 +173,7 @@ class FakeBroker:
         if command[5].endswith("kafka-topics.sh"):
             return (0, self.describe, "") if "--describe" in command else (0, "", "")
         if "--alter" in command:
-            return 0, "", ""
+            return self.alter_exit, "", "the broker refused the change" if self.alter_exit else ""
         name = command[command.index("--entity-name") + 1]
         if name in self.raw:
             return 0, self.raw[name], ""
@@ -359,9 +360,9 @@ class StepTest(unittest.TestCase):
     """``main`` with a stand-in command runner: what the step decides and sends, from what the two Kafka tools print."""
 
     def step(
-        self, overrides: dict[str, str], *, describe: str = DESCRIBE, raw: dict[str, str] | None = None, check_mode: bool = False
+        self, overrides: dict[str, str], *, describe: str = DESCRIBE, raw: dict[str, str] | None = None, check_mode: bool = False, alter_exit: int = 0
     ) -> tuple[Any, FakeBroker]:
-        broker = FakeBroker(describe, overrides, raw)
+        broker = FakeBroker(describe, overrides, raw, alter_exit)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "topics.txt"
             path.write_text("replay_events 10 36 2048 128 delete\n")
@@ -413,6 +414,23 @@ class StepTest(unittest.TestCase):
         self.assertEqual(["set flush.messages of topic replay_events"], module.result["actions"])
         self.assertEqual(1, len(self.alters(broker)))
         self.assertNotIn("throttled", " ".join(self.alters(broker)[0]))
+
+    def test_a_listed_topic_that_the_broker_lacks_is_created_by_one_create_command_with_every_setting(self) -> None:
+        module, broker = self.step(WANTED_OVERRIDES, describe="")
+        self.assertIsNone(module.failure)
+        self.assertEqual(True, module.result["changed"])
+        creates = [command[5:] for command in broker.commands if "--create" in command]
+        self.assertEqual(1, len(creates))
+        self.assertEqual(["--topic", "replay_events"], creates[0][creates[0].index("--topic") :][:2])
+        self.assertIn("flush.messages=1", creates[0])
+        self.assertEqual("--config", creates[0][creates[0].index("flush.messages=1") - 1])
+
+    def test_a_repair_that_the_broker_refuses_fails_the_task_and_reports_no_change(self) -> None:
+        without = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        module, broker = self.step(without, alter_exit=1)
+        self.assertIsNone(module.result)
+        self.assertIsNotNone(module.failure)
+        self.assertEqual(1, len(self.alters(broker)))
 
     def test_an_override_description_that_the_step_cannot_read_fails_the_task_and_alters_nothing(self) -> None:
         module, broker = self.step(WANTED_OVERRIDES, raw={"replay_events": "garbage\n"})
