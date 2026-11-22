@@ -7,8 +7,10 @@ the PostgreSQL service and expects the checker to name that defect, so a check t
 from __future__ import annotations
 
 import copy
+import posixpath
 import re
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -277,40 +279,80 @@ class DockerSocketExceptionTest(unittest.TestCase):
 
 CREDENTIAL_READERS = {"spark": ("spark", 20102), "trino": ("trino", 20103), "replay": ("replay", 20104)}
 """The services that read a credential folder, each bound to its folder and its workload group. The table is fixed here, not derived from the mount, so a
-change of folder and group together is still a change this test names."""
+change of folder and group together is still a change this test names. A service has exactly its own entry and nothing else; a service that is not in the
+table has no credential folder and no workload group."""
+ACCESS_ROOT = "/run/workload_access"
+OWN_MOUNT = re.compile(r"[a-z][a-z0-9_]*:/run/workload_access:ro")
+
+
+def credential_folder(source: str) -> str | None:
+    """The folder under ``/run/workload_access/`` that a bind source names, with a variable default, trailing slashes and dots resolved: the empty text for the
+    root itself and None for a path outside it."""
+    text = source.strip()
+    if default := re.fullmatch(r"\$\{[A-Za-z0-9_]+:-(.*)\}", text):
+        text = default.group(1)
+    normal = posixpath.normpath(text)
+    if normal == ACCESS_ROOT:
+        return ""
+    return normal.removeprefix(f"{ACCESS_ROOT}/") if normal.startswith(f"{ACCESS_ROOT}/") else None
+
+
+def credential_mounts(service: dict[str, Any], document: dict[str, Any]) -> list[tuple[str, str]]:
+    """Each volume entry of the service, short or long form, whose bind source is under ``/run/workload_access/``, as the folder and the entry as written. A
+    named volume counts by the device that the file declares for it."""
+    declared = document.get("volumes") or {}
+    found = []
+    for entry in service.get("volumes") or []:
+        source = str(entry.get("source", "")) if isinstance(entry, dict) else re.match(r"\$\{[^}]*\}|[^:]*", str(entry)).group(0)  # type: ignore[union-attr]
+        if source in declared:
+            source = str(((declared[source] or {}).get("driver_opts") or {}).get("device", ""))
+        folder = credential_folder(source)
+        if folder is not None:
+            found.append((folder, str(entry)))
+    return found
+
+
+def access_problems(name: str, document: dict[str, Any]) -> list[str]:
+    """Each way that one service departs from the table of credential readers: a folder or a workload group that is not its own, or its own written wrongly."""
+    service = document["services"][name]
+    own = CREDENTIAL_READERS.get(name)
+    found = []
+    mounts = credential_mounts(service, document)
+    for folder, entry in mounts:
+        if own is None:
+            found.append(f"{name}: is not in the table of services that may read a credential folder and mounts {folder or 'the whole folder'}")
+        elif folder != own[0]:
+            found.append(f"{name}: may read only the credential folder of {own[0]}, not {folder or 'the whole folder'}")
+        elif not OWN_MOUNT.fullmatch(entry):
+            found.append(f"{name}: the credential folder of {folder} must be mounted read-only at /run/workload_access")
+    if own is not None and own[0] not in [folder for folder, _ in mounts]:
+        found.append(f"{name}: must mount the credential folder of {own[0]}")
+    primary = str(service.get("user", "")).partition(":")[2]
+    supplementary = [str(group) for group in service.get("group_add") or []]
+    workload_groups = {str(group) for group in PROJECT_WORKLOAD_GIDS.values()}
+    if own is None:
+        if workload_groups & {primary, *supplementary}:
+            found.append(f"{name}: is not in the table of services that may read a credential folder and runs in a workload group")
+    else:
+        if supplementary != [str(own[1])]:
+            found.append(f"{name}: must run in the group {own[1]} of the workload {own[0]} and in no other group")
+        if primary in workload_groups:
+            found.append(f"{name}: must not take a workload group as its primary group")
+    return found
 
 
 class WorkloadAccessTest(unittest.TestCase):
     """A service that reads a workload's short-lived AWS credentials mounts that workload's folder read-only and runs in its group: the helper writes the
     folder for root and the workload's group, mode 0750, and the credentials 0640, so a container outside the group cannot read them."""
 
-    def problems(self, name: str, document: dict[str, Any]) -> list[str]:
-        service = document["services"][name]
-        found = []
-        folders = []
-        for volume_name, volume in (document.get("volumes") or {}).items():
-            device = str(((volume or {}).get("driver_opts") or {}).get("device", ""))
-            match = re.search(r"/run/workload_access/([a-z_]+)\}?$", device)
-            if not match:
-                continue
-            workload = match.group(1)
-            folders.append(workload)
-            if f"{volume_name}:/run/workload_access:ro" not in [str(entry) for entry in service.get("volumes") or []]:
-                found.append(f"{name}: the credential folder of {workload} must be mounted read-only at /run/workload_access")
-        if folders and name not in CREDENTIAL_READERS:
-            found.append(f"{name}: is not in the table of services that may read a credential folder")
-        for workload in folders:
-            if name in CREDENTIAL_READERS and workload != CREDENTIAL_READERS[name][0]:
-                found.append(f"{name}: may read only the credential folder of {CREDENTIAL_READERS[name][0]}, not {workload}")
-        if folders and name in CREDENTIAL_READERS and [str(CREDENTIAL_READERS[name][1])] != [str(group) for group in service.get("group_add") or []]:
-            found.append(f"{name}: must run in the group {CREDENTIAL_READERS[name][1]} of the workload {CREDENTIAL_READERS[name][0]} and in no other group")
-        return found
+    def replay(self) -> dict[str, Any]:
+        return copy.deepcopy(load(SERVICES / "replay.yml"))
 
-    def test_every_service_with_a_credential_folder_mounts_it_read_only_and_runs_in_its_group(self) -> None:
+    def test_every_service_with_a_credential_folder_mounts_it_read_only_and_runs_in_its_group_and_no_other_does_either(self) -> None:
         readers = []
         for path in sorted(SERVICES.glob("*.yml")):
             with self.subTest(service=path.stem):
-                self.assertEqual([], self.problems(path.stem, load(path)))
+                self.assertEqual([], access_problems(path.stem, load(path)))
             if "/run/workload_access/" in path.read_text():
                 readers.append(path.stem)
         self.assertEqual(sorted(CREDENTIAL_READERS), readers)
@@ -320,27 +362,99 @@ class WorkloadAccessTest(unittest.TestCase):
             self.assertEqual(group, PROJECT_WORKLOAD_GIDS[workload], name)
 
     def test_a_folder_and_group_changed_together_is_named(self) -> None:
-        document = copy.deepcopy(load(SERVICES / "replay.yml"))
+        document = self.replay()
         service = document["services"]["replay"]
         service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["spark"])]
-        document["services"]["replay"]["volumes"] = [str(entry).replace("workload_access_replay", "workload_access_spark") for entry in service["volumes"]]
+        service["volumes"] = [str(entry).replace("workload_access_replay", "workload_access_spark") for entry in service["volumes"]]
         document["volumes"] = {"workload_access_spark": {"driver_opts": {"device": "${SPARK_ACCESS_DIR:-/run/workload_access/spark}"}}}
-        problems = self.problems("replay", document)
-        self.assertEqual(2, len(problems), problems)
-        self.assertIn("may read only the credential folder of replay", problems[0])
+        problems = access_problems("replay", document)
+        self.assertEqual(3, len(problems), problems)
+        self.assertIn("may read only the credential folder of replay, not spark", problems[0])
 
     def test_a_missing_group_another_group_or_a_writable_mount_is_named(self) -> None:
-        for change in ("no group", "other group", "writable"):
-            document = copy.deepcopy(load(SERVICES / "replay.yml"))
+        for change in ("no group", "other group", "extra group", "writable", "no mount"):
+            document = self.replay()
             service = document["services"]["replay"]
             if change == "no group":
                 del service["group_add"]
             elif change == "other group":
                 service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["spark"])]
-            else:
+            elif change == "extra group":
+                service["group_add"] = [*service["group_add"], str(PROJECT_WORKLOAD_GIDS["spark"])]
+            elif change == "writable":
                 service["volumes"] = [str(entry).removesuffix(":ro") for entry in service["volumes"]]
+            else:
+                service["volumes"] = [entry for entry in service["volumes"] if "workload_access" not in entry]
             with self.subTest(change=change):
-                self.assertEqual(1, len(self.problems("replay", document)))
+                self.assertEqual(1, len(access_problems("replay", document)))
+
+    def test_the_reviewers_case_a_second_credential_folder_and_another_workload_group_as_the_primary_group_is_named(self) -> None:
+        document = self.replay()
+        service = document["services"]["replay"]
+        service["user"] = f"10003:{PROJECT_WORKLOAD_GIDS['spark']}"
+        service["volumes"] = [*service["volumes"], "/run/workload_access/spark/:/run/workload_access/spark:ro"]
+        problems = access_problems("replay", document)
+        self.assertEqual(2, len(problems), problems)
+        self.assertIn("not spark", problems[0])
+        self.assertIn("primary group", problems[1])
+
+    def test_a_second_credential_folder_in_any_written_form_is_named(self) -> None:
+        long_form = {"type": "bind", "source": "/run/workload_access/spark/", "target": "/elsewhere", "read_only": True}
+        for label, entry in (
+            ("short form", "/run/workload_access/spark:/elsewhere:ro"),
+            ("trailing slash", "/run/workload_access/spark/:/elsewhere:ro"),
+            ("two trailing slashes", "/run/workload_access/spark//:/elsewhere:ro"),
+            ("dots", "/run/workload_access/replay/../spark:/elsewhere:ro"),
+            ("variable default", "${SPARK_ACCESS_DIR:-/run/workload_access/spark/}:/elsewhere:ro"),
+            ("long form", long_form),
+            ("the whole folder", "/run/workload_access:/elsewhere:ro"),
+            ("the whole folder with a slash", "/run/workload_access/:/elsewhere"),
+        ):
+            with self.subTest(form=label):
+                document = self.replay()
+                document["services"]["replay"]["volumes"].append(entry)
+                problems = access_problems("replay", document)
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn("may read only the credential folder of replay", problems[0])
+
+    def test_a_second_credential_folder_as_a_named_volume_with_a_trailing_slash_is_named(self) -> None:
+        document = self.replay()
+        document["services"]["replay"]["volumes"].append("workload_access_other:/elsewhere:ro")
+        document["volumes"]["workload_access_other"] = {
+            "driver_opts": {"type": "none", "o": "bind", "device": "${OTHER_ACCESS_DIR:-/run/workload_access/trino/}"}
+        }
+        problems = access_problems("replay", document)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("not trino", problems[0])
+
+    def test_the_own_folder_written_with_a_trailing_slash_or_dots_is_still_its_own_folder(self) -> None:
+        for device in ("${REPLAY_ACCESS_DIR:-/run/workload_access/replay/}", "/run/workload_access/replay//", "/run/workload_access/spark/../replay"):
+            with self.subTest(device=device):
+                document = self.replay()
+                document["volumes"]["workload_access_replay"]["driver_opts"]["device"] = device
+                self.assertEqual([], access_problems("replay", document))
+
+    def test_the_own_folder_mounted_a_second_time_is_named_and_the_control_passes(self) -> None:
+        document = self.replay()
+        self.assertEqual([], access_problems("replay", document))
+        document["services"]["replay"]["volumes"].append("/run/workload_access/replay/:/elsewhere:ro")
+        self.assertEqual(1, len(access_problems("replay", document)))
+
+    def test_a_service_that_is_not_in_the_table_has_no_credential_folder_and_no_workload_group(self) -> None:
+        changes: tuple[tuple[str, Callable[[dict[str, Any]], object]], ...] = (
+            ("a bind of a folder", lambda service: service["volumes"].append("/run/workload_access/replay/:/elsewhere:ro")),
+            ("the whole folder", lambda service: service["volumes"].append({"type": "bind", "source": "/run/workload_access", "target": "/elsewhere"})),
+            ("a supplementary group", lambda service: service.update(group_add=[str(PROJECT_WORKLOAD_GIDS["replay"])])),
+            ("a primary group", lambda service: service.update(user=f"999:{PROJECT_WORKLOAD_GIDS['trino']}")),
+        )
+        for label, change in changes:
+            with self.subTest(change=label):
+                document = copy.deepcopy(load(SERVICES / "postgres.yml"))
+                self.assertEqual([], access_problems("postgres", document))
+                change(document["services"]["postgres"])
+                problems = access_problems("postgres", document)
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn("not in the table", problems[0])
 
 
 class PlantedDefectTest(unittest.TestCase):
