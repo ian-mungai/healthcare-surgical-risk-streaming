@@ -22,6 +22,12 @@ mock_provider "aws" {
       value = "ami-0123456789abcdef0"
     }
   }
+
+  mock_data "aws_ec2_instance_type" {
+    defaults = {
+      memory_size = 32768
+    }
+  }
 }
 
 variables {
@@ -37,6 +43,10 @@ variables {
   github_repository_id = "7654321"
   tailscale_client_id  = "example-client-id"
   tailscale_audience   = "example-audience"
+
+  host_reserve_mib     = 4096
+  always_on_limits_mib = 13568
+  spark_limit_mib      = 4096
 }
 
 run "environment_uses_the_one_bucket_it_is_given" {
@@ -811,4 +821,183 @@ run "malformed_bucket_name_is_refused" {
   }
 
   expect_failures = [var.data_bucket_name]
+}
+
+run "heavy_figure_is_the_memory_free_beside_one_spark_job" {
+  command = plan
+
+  assert {
+    condition     = output.heavy_memory_mib == 11008
+    error_message = "With the 32768 MiB of the mocked host, a reserve of 4096 MiB, 13568 MiB of always-on limits and a Spark limit of 4096 MiB, the heavy figure is 11008 MiB."
+  }
+}
+
+run "heavy_figure_follows_the_host_memory" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.host[0]
+    values = {
+      memory_size = 65536
+    }
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 43776
+    error_message = "The figure is read from the instance type's memory: 65536 - 4096 - 13568 - 4096 is 43776 MiB."
+  }
+}
+
+run "heavy_figure_follows_each_of_the_three_inputs" {
+  command = plan
+
+  variables {
+    host_reserve_mib     = 5120
+    always_on_limits_mib = 10000
+    spark_limit_mib      = 2000
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 32768 - 5120 - 10000 - 2000
+    error_message = "The figure is the host memory less the three inputs, each of them as given. No input is typed in the Terraform."
+  }
+}
+
+run "reserve_alone_changes_the_figure" {
+  command = plan
+
+  variables {
+    host_reserve_mib = 5120
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 9984
+    error_message = "A reserve of 5120 MiB leaves 9984 MiB: 32768 - 5120 - 13568 - 4096."
+  }
+}
+
+run "always_on_limits_alone_change_the_figure" {
+  command = plan
+
+  variables {
+    always_on_limits_mib = 12544
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 12032
+    error_message = "Always-on limits of 12544 MiB leave 12032 MiB: 32768 - 4096 - 12544 - 4096."
+  }
+}
+
+run "spark_limit_alone_changes_the_figure" {
+  command = plan
+
+  variables {
+    spark_limit_mib = 2048
+  }
+
+  assert {
+    condition     = output.heavy_memory_mib == 13056
+    error_message = "A Spark limit of 2048 MiB leaves 13056 MiB: 32768 - 4096 - 13568 - 2048."
+  }
+}
+
+run "heavy_figure_of_zero_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.host[0]
+    values = {
+      memory_size = 21760
+    }
+  }
+
+  expect_failures = [output.heavy_memory_mib]
+}
+
+run "negative_heavy_figure_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.host[0]
+    values = {
+      memory_size = 16384
+    }
+  }
+
+  expect_failures = [output.heavy_memory_mib]
+}
+
+run "heavy_inputs_that_are_zero_negative_or_fractional_are_refused" {
+  command = plan
+
+  variables {
+    host_reserve_mib     = 0
+    always_on_limits_mib = -1
+    spark_limit_mib      = 4096.5
+  }
+
+  expect_failures = [var.host_reserve_mib, var.always_on_limits_mib, var.spark_limit_mib]
+}
+
+run "a_fractional_reserve_alone_is_refused" {
+  command = plan
+
+  variables {
+    host_reserve_mib = 4096.5
+  }
+
+  expect_failures = [var.host_reserve_mib]
+}
+
+run "a_fractional_always_on_sum_alone_is_refused" {
+  command = plan
+
+  variables {
+    always_on_limits_mib = 13568.5
+  }
+
+  expect_failures = [var.always_on_limits_mib]
+}
+
+run "a_zero_spark_limit_alone_is_refused" {
+  command = plan
+
+  variables {
+    spark_limit_mib = 0
+  }
+
+  expect_failures = [var.spark_limit_mib]
+}
+
+run "a_given_host_looks_up_no_instance_type_and_has_no_figure" {
+  command = plan
+
+  variables {
+    provision_host     = false
+    host_instance_type = "t3.nano"
+  }
+
+  assert {
+    condition     = length(data.aws_ec2_instance_type.host) == 0 && output.heavy_memory_mib == null
+    error_message = "A plan that creates no host looks up no instance type and has no heavy figure, so a small instance type cannot fail it."
+  }
+}
+
+run "a_host_that_terraform_creates_needs_room_for_a_heavy_job" {
+  command = plan
+
+  variables {
+    provision_host     = true
+    host_instance_type = "t3.nano"
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.host[0]
+    values = {
+      memory_size = 512
+    }
+  }
+
+  expect_failures = [output.heavy_memory_mib]
 }

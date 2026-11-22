@@ -18,8 +18,12 @@ from dagster import (
 )
 
 from . import housekeeping, lineage_sample
+from .concurrency import HEAVY_TAG_KEY, HEAVY_TAG_VALUE, heavy_memory_mib
 from .groups import GroupResource
 from .run_records import run_folder_sensors
+
+# The figure above which a job is heavy is read when the code location loads: a missing or invalid one fails the load with its reason, not a later launch.
+heavy_memory_mib()
 
 INBOX = Path(os.environ.get("DAGSTER_INBOX", "/opt/dagster/data/inbox"))
 MARKER_SUFFIX = ".marker"
@@ -55,7 +59,9 @@ def group_probe(context: OpExecutionContext, config: GroupProbeConfig, group: Gr
         raise RuntimeError("group_probe was asked to fail")
 
 
-@job(resource_defs={"group": GroupResource.configure_at_launch()}, executor_def=in_process_executor)
+# The probe takes its service group when it is launched, so its weight cannot be judged when it is defined: it carries the heavy tag unconditionally and is
+# held like a heavy job, one at a time. A job with a fixed group takes its tag from that group instead: ``tags=job_tags("<job>")``, with the job in JOB_GROUPS.
+@job(resource_defs={"group": GroupResource.configure_at_launch()}, executor_def=in_process_executor, tags={HEAVY_TAG_KEY: HEAVY_TAG_VALUE})
 def group_probe_job() -> None:
     group_probe()
 

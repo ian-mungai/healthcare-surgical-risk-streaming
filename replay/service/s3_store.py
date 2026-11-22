@@ -8,7 +8,7 @@ own short-lived workload access. Nothing in this module writes.
 from __future__ import annotations
 
 import io
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC
 from typing import Any
 
@@ -39,7 +39,7 @@ class S3ReadStore:
         return sorted(found, key=lambda item: (item.key, item.last_modified, not item.is_latest))
 
     @staticmethod
-    def version(entry: dict[str, Any], *, marker: bool) -> ObjectVersion:
+    def version(entry: Mapping[str, Any], *, marker: bool) -> ObjectVersion:
         stamp = entry["LastModified"].astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return ObjectVersion(entry["Key"], entry["VersionId"], 0 if marker else int(entry["Size"]), stamp, bool(entry["IsLatest"]), marker)
 

@@ -12,11 +12,13 @@ import functools
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
+import time
 import unittest
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +30,7 @@ from scripts.infra import host, state_bootstrap, teardown, terraform_wrapper
 from scripts.infra.host import (
     HostError,
     Peer,
+    heavy_memory_variables,
     host_check,
     instance_id,
     record_tailscale_device,
@@ -513,19 +516,88 @@ def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     return path
 
 
+class StopAndStartWithRefusedLimitsTest(unittest.TestCase):
+    """Stopping and starting the host read the run's state and never depend on the limits file: a file that the loader refuses stops a plan, not these."""
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / "compose").mkdir()
+        (self.root / "compose" / "limits.yml").write_text(
+            "host_reserve_mib: 4096\nservices:\n  spark:\n    runtime: compose\n    group: batch\n    memory_limit_mib: 0\n"
+        )
+        for folder in ("modules", "environments"):
+            (self.root / "infra" / folder).mkdir(parents=True)
+        (self.root / "infra" / ".terraform.lock.hcl").write_text("")
+        self.binding = binding_file(self.root, backend="s3", provision_host=True)
+        record = self.root / ".tools" / "terraform" / "20260101t0000-abcdef" / "config" / ".terraform" / "terraform.tfstate"
+        record.parent.mkdir(parents=True)
+        record.write_text(json.dumps({"backend": {"type": "s3", "config": {"bucket": "example-project", "key": "terraform.tfstate", "region": "us-west-2"}}}))
+        answers = {"init": "", "workspace": "default\n", "show": json.dumps(STATE)}
+        self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+        self.enterContext(mock.patch.object(host, "ROOT", self.root))
+        self.enterContext(mock.patch.object(terraform_wrapper, "bucket_problem", return_value=None))
+        self.enterContext(mock.patch.object(terraform_wrapper, "terraform", side_effect=lambda run, arguments, timeout: answers[arguments[0]]))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    def test_host_stop_stops_the_instance_whatever_the_limits_file_holds(self) -> None:
+        self.assertEqual(0, host.host_stop(FakeAws("project", "us-west-2", "stopped"), CONFIGURATION, self.binding))
+
+    def test_host_start_starts_the_instance_whatever_the_limits_file_holds(self) -> None:
+        with (
+            mock.patch.object(host, "wait_until_reachable", return_value=Peer("platform-dev.example.ts.net", "nRESTARTEDCNTRL")),
+            mock.patch.object(host, "write_inventory"),
+        ):
+            self.assertEqual(0, host.host_start(FakeAws("project", "us-west-2"), CONFIGURATION, self.binding))
+
+
+def heavy_state(value: object) -> dict[str, Any]:
+    return {"values": {"outputs": {"heavy_memory_mib": {"value": value}}}}
+
+
+def current_inputs() -> dict[str, int]:
+    """The heavy inputs that the limits loader gives from the tracked file now."""
+    return dict(json.loads(terraform_wrapper.heavy_inputs()))
+
+
+def write_plan_json(root: Path, name: str, figure: object, *, age_seconds: int = 0, inputs: dict[str, int] | None = None) -> None:
+    """A saved plan's JSON in the run's plans folder, with the planned value of the heavy figure, the heavy inputs it was made with (the current ones by
+    default) and a modification time of ``age_seconds`` ago."""
+    folder = root / "runs" / "20260101t0000-abcdef" / "plans"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / name
+    variables = {name: {"value": value} for name, value in (current_inputs() if inputs is None else inputs).items()}
+    target.write_text(json.dumps({"planned_values": {"outputs": {"heavy_memory_mib": {"value": figure}}}, "variables": variables}))
+    moment = time.time() - age_seconds
+    os.utime(target, (moment, moment))
+
+
 class HostUpTest(unittest.TestCase):
     """``host_up`` follows the run binding that exists. The calls to Terraform, Ansible and the host are replaced and recorded; the live batch proves them."""
 
-    def run_up(self, path: Path, *, confirm: str = "") -> tuple[int, dict[str, mock.Mock]]:
+    def run_up(
+        self,
+        path: Path,
+        *,
+        confirm: str = "",
+        state: dict[str, Any] | None = None,
+        planned: dict[str, tuple[object, int]] | None = None,
+        on_wait: Callable[..., object] | None = None,
+    ) -> tuple[int, dict[str, mock.Mock]]:
+        """``planned`` gives the saved plan files by name as the planned figure and its age in seconds. The default is one apply plan with 11008."""
+        for name, (figure, age) in ({"apply.json": (11008, 0)} if planned is None else planned).items():
+            write_plan_json(path.parent, name, figure, age_seconds=age)
         names = ("save_plan", "apply_plan", "write_inventory", "state_json", "wait_until_reachable", "run_ansible", "instance_id", "platform_commit")
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
-            calls["state_json"].return_value = {"values": {}}
+            calls["state_json"].return_value = heavy_state(11008) if state is None else state
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
+            if on_wait is not None:
+                calls["wait_until_reachable"].side_effect = on_wait
             calls["instance_id"].return_value = "i-0123456789abcdef0"
             calls["platform_commit"].return_value = "a" * 40
+            self.calls = calls
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
@@ -568,6 +640,7 @@ class HostUpTest(unittest.TestCase):
             {
                 "workload_access_region": "us-west-2",
                 "workload_access_workloads": [],
+                "compose_stack_heavy_memory_mib": 11008,
                 "compose_stack_platform_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
             },
@@ -575,6 +648,80 @@ class HostUpTest(unittest.TestCase):
         )
         calls["write_inventory"].assert_called_once_with(path)
         self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
+
+    def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "heavy_memory_mib"):
+                self.run_up(path, state={"values": {}})
+        for name in ("wait_until_reachable", "run_ansible", "write_inventory"):
+            self.calls[name].assert_not_called()
+
+    def test_a_state_figure_that_differs_from_the_planned_one_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "12544.*11008|11008.*12544"):
+                self.run_up(path, planned={"apply.json": (12544, 0)})
+        for name in ("wait_until_reachable", "run_ansible", "write_inventory"):
+            self.calls[name].assert_not_called()
+
+    def test_a_confirmed_run_compares_the_state_with_the_plan_that_it_applied_and_not_with_a_newer_check_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0):
+                code, calls = self.run_up(path, confirm="abc", planned={"apply.json": (11008, 60), "apply_check.json": (9999, 0)})
+        self.assertEqual(0, code)
+        calls["apply_plan"].assert_called_once()
+        self.assertEqual(11008, calls["run_ansible"].call_args.args[2]["compose_stack_heavy_memory_mib"])
+
+    def test_an_unconfirmed_run_with_no_change_compares_the_state_with_the_newest_plan_it_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0):
+                code, calls = self.run_up(path, planned={"apply.json": (9999, 60), "apply_check.json": (11008, 0)})
+            self.assertEqual(0, code)
+            calls["run_ansible"].assert_called_once()
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "9999"):
+                self.run_up(path, planned={"apply.json": (11008, 60), "apply_check.json": (9999, 0)})
+
+    def test_a_saved_plan_made_with_other_inputs_than_the_limits_give_now_stops_the_up_run_before_it_waits_for_the_host(self) -> None:
+        stale = current_inputs() | {"host_reserve_mib": 1}
+        for confirm in ("", "abc"):
+            with self.subTest(confirm=confirm), tempfile.TemporaryDirectory() as scratch:
+                path = binding_file(Path(scratch), backend="s3", provision_host=True)
+                write_plan_json(path.parent, "apply.json", 11008, inputs=stale)
+                with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "save a new plan"):
+                    self.run_up(path, confirm=confirm, planned={})
+                for name in ("wait_until_reachable", "run_ansible", "write_inventory"):
+                    self.calls[name].assert_not_called()
+
+    def test_a_saved_plan_without_the_heavy_inputs_stops_the_up_run(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            write_plan_json(path.parent, "apply.json", 11008, inputs={})
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "save a new plan"):
+                self.run_up(path, planned={})
+        self.calls["run_ansible"].assert_not_called()
+
+    def test_a_limits_change_between_the_apply_and_the_deploy_is_refused_before_ansible(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            changed = json.dumps(current_inputs() | {"host_reserve_mib": 9})
+
+            def limits_change_while_the_host_starts(*arguments: object, **keywords: object) -> Peer:
+                self.enterContext(mock.patch.object(terraform_wrapper, "heavy_inputs", return_value=changed))
+                return Peer("platform-dev.example.ts.net", "nNEWCNTRL")
+
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "save a new plan"):
+                self.run_up(path, confirm="abc", on_wait=limits_change_while_the_host_starts)
+        self.calls["run_ansible"].assert_not_called()
+
+    def test_a_run_with_no_saved_plan_stops_before_it_waits_for_the_host(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "no saved plan"):
+                self.run_up(path, planned={})
+        self.calls["wait_until_reachable"].assert_not_called()
 
     def test_the_success_line_of_an_up_run_names_the_host_and_not_its_address(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -628,12 +775,14 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "ROOT", Path(scratch)))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
-            calls["state_json"].return_value = {"values": {}}
+            calls["state_json"].return_value = heavy_state(11008)
+            write_plan_json(Path(scratch), "apply.json", 11008)
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
             calls["instance_id"].return_value = "i-0123456789abcdef0"
             stack.enter_context(mock.patch.object(host, "run_command", return_value=CompletedProcess(["ansible-playbook"], 0, "ok\n", "")))
             blocked = Path(scratch) / "blocked"
-            blocked.mkdir()
+            (blocked / "compose").mkdir(parents=True)
+            shutil.copy(ROOT / "compose" / "limits.yml", blocked / "compose" / "limits.yml")
             (blocked / "runs").write_text("a file where the folder of the raw output should be")
             stack.enter_context(mock.patch.object(terraform_wrapper, "ROOT", blocked))
             output = io.StringIO()
@@ -711,6 +860,28 @@ class WorkloadVariablesTest(unittest.TestCase):
 
     def test_state_without_workloads_gives_an_empty_list(self) -> None:
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": []}, workload_variables({"values": {}}, "us-west-2"))
+
+
+class HeavyMemoryVariablesTest(unittest.TestCase):
+    def test_the_figure_that_terraform_calculated_is_passed_to_the_deploy_as_it_is(self) -> None:
+        self.assertEqual({"compose_stack_heavy_memory_mib": 11008}, heavy_memory_variables(heavy_state(11008), 11008))
+        self.assertEqual({"compose_stack_heavy_memory_mib": 1}, heavy_memory_variables(heavy_state(1), 1))
+
+    def test_a_state_figure_that_is_not_the_planned_one_is_refused_with_both_named(self) -> None:
+        for planned in (12544, None, "11008", 11008.5):
+            with self.subTest(planned=planned), self.assertRaisesRegex(HostError, r"state.*11008.*plan"):
+                heavy_memory_variables(heavy_state(11008), planned)
+
+    def test_a_missing_output_is_refused_with_the_output_named(self) -> None:
+        states: tuple[dict[str, Any], ...] = ({}, {"values": {}}, {"values": {"outputs": {}}})
+        for state in states:
+            with self.subTest(state=state), self.assertRaisesRegex(HostError, "heavy_memory_mib.*missing"):
+                heavy_memory_variables(state, 11008)
+
+    def test_a_figure_that_is_not_a_positive_whole_number_is_refused_with_the_value_named(self) -> None:
+        for value in (None, 0, -1, -11008, 1.5, 11008.0, "11008", True, [11008]):
+            with self.subTest(value=value), self.assertRaisesRegex(HostError, "heavy_memory_mib.*positive whole number"):
+                heavy_memory_variables(heavy_state(value), value)
 
 
 class DeployVariablesTest(unittest.TestCase):

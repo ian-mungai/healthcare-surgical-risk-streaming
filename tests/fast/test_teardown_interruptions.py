@@ -124,6 +124,7 @@ class ApplyRecordTest(unittest.TestCase):
             tempfile.TemporaryDirectory() as scratch,
             mock.patch.object(terraform_wrapper, "ROOT", Path(scratch)),
             mock.patch.object(terraform_wrapper, "binding_problems", return_value=[]),
+            mock.patch.object(terraform_wrapper, "stale_inputs_problem", return_value=None),
             mock.patch.object(terraform_wrapper, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
             mock.patch.object(terraform_wrapper, "terraform", side_effect=["{}", "Apply complete! Resources: 1 added"]),
             mock.patch.object(terraform_wrapper, "save_raw", side_effect=OSError("disk full")),

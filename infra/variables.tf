@@ -142,3 +142,33 @@ variable "host_disk_gib" {
     error_message = "The host disk is at least 200 GiB."
   }
 }
+
+variable "host_reserve_mib" {
+  description = "Memory in MiB that the host keeps free for the system: the host_reserve_mib of compose/limits.yml. The Terraform wrapper stages it from the limits loader in heavy_inputs.tfvars.json, so it has no default."
+  type        = number
+
+  validation {
+    condition     = var.host_reserve_mib > 0 && floor(var.host_reserve_mib) == var.host_reserve_mib
+    error_message = "host_reserve_mib is a whole number of MiB above 0."
+  }
+}
+
+variable "always_on_limits_mib" {
+  description = "Sum in MiB of the memory limits of the always-on services in compose/limits.yml. The Terraform wrapper stages it from the limits loader in heavy_inputs.tfvars.json, so it has no default."
+  type        = number
+
+  validation {
+    condition     = var.always_on_limits_mib > 0 && floor(var.always_on_limits_mib) == var.always_on_limits_mib
+    error_message = "always_on_limits_mib is a whole number of MiB above 0."
+  }
+}
+
+variable "spark_limit_mib" {
+  description = "Memory limit in MiB of the Spark job's service in compose/limits.yml. The Terraform wrapper stages it from the limits loader in heavy_inputs.tfvars.json, so it has no default."
+  type        = number
+
+  validation {
+    condition     = var.spark_limit_mib > 0 && floor(var.spark_limit_mib) == var.spark_limit_mib
+    error_message = "spark_limit_mib is a whole number of MiB above 0."
+  }
+}
