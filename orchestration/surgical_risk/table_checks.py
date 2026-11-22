@@ -1,0 +1,77 @@
+"""The Dagster job of the table checks: it runs after the load step and merges the load branch only when every loaded table matches its verified source.
+
+The job's one op reads the load record that the load step wrote and calls ``scripts.ingestion.table_checks.run_table_checks``, which holds the order (the gate,
+the Nessie branch at its recorded hash, the staged verified bytes, the Spark job, the merge) and saves ``table_checks.json`` against the manifest's SHA-256
+under ``results_root``. A failed check fails the run and merges nothing. The environment names what differs between hosts: ``S3_BUCKET``, ``AWS_PROFILE`` and
+``AWS_REGION`` for the landing prefix, ``NESSIE_URI``, and ``TABLE_CHECKS_STAGING_DIRECTORY`` with ``TABLE_CHECKS_STAGING_VOLUME`` for the folder, and the
+Docker volume under it, that this process and the Spark job share. The job uses the in-process executor, so it runs one Spark job at a time.
+"""
+
+import os
+from pathlib import Path
+
+from dagster import Config, Definitions, Failure, OpExecutionContext, in_process_executor, job, op
+
+from scripts.aws_cli import Aws
+from scripts.ingestion import table_checks as checks
+from scripts.ingestion.store import S3Store
+from scripts.stack.groups import settings_from_environment
+from scripts.stack.nessie import NessieClient
+from spark.table_checks import EMPTY_FORM
+
+JOB = "table_checks_job"
+DEFAULT_DEADLINE_SECONDS = 2400.0
+NESSIE_TIMEOUT_SECONDS = 60.0
+
+
+class TableChecksConfig(Config):
+    load_record: str
+    release_file: str
+    results_root: str
+    empty_form: str = EMPTY_FORM
+    deadline_seconds: float = DEFAULT_DEADLINE_SECONDS
+
+
+def required(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise Failure(description=f"the environment variable {name} is not set")
+    return value
+
+
+@op
+def table_checks_step(context: OpExecutionContext, config: TableChecksConfig) -> None:
+    try:
+        record = checks.parse_load_record(Path(config.load_record).read_text())
+        pin = checks.read_track_pin(Path(config.release_file))
+        store = S3Store(Aws(required("AWS_PROFILE"), required("AWS_REGION")), required("S3_BUCKET"))
+        runner = checks.compose_runner(
+            settings_from_environment(),
+            volume=required("TABLE_CHECKS_STAGING_VOLUME"),
+            directory=required("TABLE_CHECKS_STAGING_DIRECTORY"),
+            deadline_seconds=config.deadline_seconds,
+        )
+        outcome = checks.run_table_checks(
+            store=store,
+            nessie=NessieClient(required("NESSIE_URI"), NESSIE_TIMEOUT_SECONDS),
+            record=record,
+            track_pin=pin,
+            staging=Path(required("TABLE_CHECKS_STAGING_DIRECTORY")) / context.run_id,
+            run_folder=Path(config.results_root) / record.manifest.sha256,
+            runner=runner,
+            empty_form=config.empty_form,
+        )
+    except (OSError, checks.TableChecksError) as error:
+        raise Failure(description=f"the table checks could not run: {error}") from None
+    failed = [f"{table['table']}: {check['name']}" for table in outcome.document["checked"]["tables"] for check in table["checks"] if not check["passed"]]
+    if not outcome.passed:
+        raise Failure(description=f"a table check failed and nothing was merged: {', '.join(failed)}", metadata={"manifest_sha256": record.manifest.sha256})
+    context.log.info(f"every check passed; {record.branch} merged into {outcome.document['merged_into']} at {outcome.document['merged_hash']}")
+
+
+@job(executor_def=in_process_executor)
+def table_checks_job() -> None:
+    table_checks_step()
+
+
+defs = Definitions(jobs=[table_checks_job])
