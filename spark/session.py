@@ -38,8 +38,8 @@ def start_deadline(seconds: float, job: str) -> threading.Timer:
     return timer
 
 
-def build_session(name: str, ref: str) -> Any:
-    """A local Spark session on the Nessie reference ``ref`` with the memory that the container's limit allows."""
+def build_session(name: str, ref: str, ref_hash: str | None = None) -> Any:
+    """A local Spark session on the Nessie reference ``ref`` (as of ``ref_hash`` when given) with the memory that the container's limit allows."""
     from pyspark.sql import SparkSession
 
     heap = f"{driver_memory_mib(read_memory_limit_mib())}m"
@@ -47,6 +47,7 @@ def build_session(name: str, ref: str) -> Any:
         nessie_uri=required_environment("NESSIE_URI"),
         warehouse=required_environment("WAREHOUSE_LOCATION"),
         ref=ref,
+        ref_hash=ref_hash,
         region=os.environ.get("AWS_REGION", ""),
     )
     builder = SparkSession.builder.appName(name).master("local[*]")
