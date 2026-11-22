@@ -1,0 +1,33 @@
+# The tasks of the record load on the host, after the release and the network policies: Airbyte's API and Nessie each get a forwarder on the k3s bridge address in the form of the
+# PostgreSQL route, Airbyte's pods are admitted to the Nessie forwarder by one more network policy, and the code-location container gets the files it reads. Reads
+# airbyte_api_route_port (default 8001), airbyte_nessie_route_port (default 19120), compose_stack_nessie_port (default 19120), airbyte_web_port, airbyte_namespace,
+# airbyte_directory, airbyte_bridge_address and what the included files read.
+- name: Forward Airbyte's API from the bridge address to the local address
+  ansible.builtin.include_tasks: record_route.yml
+  vars:
+    airbyte_route_unit: airbyte-api-route
+    airbyte_route_listen_port: "{{ airbyte_api_route_port | default(8001) }}"
+    airbyte_route_target_port: "{{ airbyte_web_port }}"
+
+- name: Forward Nessie from the bridge address to the local address
+  ansible.builtin.include_tasks: record_route.yml
+  vars:
+    airbyte_route_unit: airbyte-nessie-route
+    airbyte_route_listen_port: "{{ airbyte_nessie_route_port | default(19120) }}"
+    airbyte_route_target_port: "{{ compose_stack_nessie_port | default(19120) }}"
+
+- name: Write the policy that admits Airbyte's pods to the Nessie forwarder
+  ansible.builtin.include_tasks: record_route_policy.yml
+
+- name: Apply the policy
+  ansible.builtin.command:
+    argv: [k3s, kubectl, apply, --filename, "{{ airbyte_directory }}/record_route_policy.yaml"]
+  register: airbyte_record_route_policy
+  changed_when: "'created' in airbyte_record_route_policy.stdout or 'configured' in airbyte_record_route_policy.stdout"
+  timeout: 60
+
+- name: Read the instance's client credentials
+  ansible.builtin.include_tasks: record_client_read.yml
+
+- name: Place the files that the code-location container reads
+  ansible.builtin.include_tasks: record_client_files.yml

@@ -1,0 +1,64 @@
+# Reads airbyte_secrets_directory, airbyte_record_client_id, airbyte_record_client_secret and, optionally, airbyte_record_container_user and airbyte_record_container_group (default 10001, the user
+# and group of the code location container). The container reads four files and no other: the client ID and secret of Airbyte's instance, and the access key that the destination needs for the Nessie
+# catalog, which the raw connection's placement keeps under airbyte/ as aws_access_key_id and aws_secret_access_key. Every file of a container's own is owned by that numeric
+# user with mode 0400 (the secret-file rule), in a folder that only the role's owner (root on the host) enters. A source that is missing or empty, or an empty client value, stops the run before any file is
+# placed. Nothing shows a value. A rotated value replaces the file; a second run changes nothing.
+- name: Check the two client values
+  ansible.builtin.assert:
+    that:
+      - airbyte_record_client_id | default('') | length > 0
+      - airbyte_record_client_secret | default('') | length > 0
+    quiet: true
+    fail_msg: the client ID and secret of Airbyte's instance are not both set
+  no_log: true
+
+- name: Read the access key files that the raw connection placed
+  ansible.builtin.slurp:
+    src: "{{ airbyte_secrets_directory }}/airbyte/{{ item }}"
+  register: airbyte_record_aws_files
+  loop:
+    - aws_access_key_id
+    - aws_secret_access_key
+  failed_when: false
+  no_log: true
+
+- name: Note which key files are present and not empty, without their content
+  ansible.builtin.set_fact:
+    airbyte_record_aws_status: "{{ airbyte_record_aws_status | default([]) + [{'name': item.item, 'ok': (not (item.failed | default(false))) and ((item.content | default('') | b64decode | trim | length) > 0)}] }}"
+  loop: "{{ airbyte_record_aws_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  no_log: true
+
+- name: Stop with the name of a key file that is missing or empty
+  ansible.builtin.assert:
+    that: item.ok
+    quiet: true
+    fail_msg: "the file airbyte/{{ item.name }} is missing or empty: the raw connection's placement makes it"
+  loop: "{{ airbyte_record_aws_status }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create the folder of the container's files
+  ansible.builtin.file:
+    path: "{{ airbyte_secrets_directory }}/airbyte_api"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0700"
+
+- name: Place the four files for the code-location container's user
+  ansible.builtin.copy:
+    content: "{{ item.value }}\n"
+    dest: "{{ airbyte_secrets_directory }}/airbyte_api/{{ item.name }}"
+    owner: "{{ airbyte_record_container_user | default('10001') }}"
+    group: "{{ airbyte_record_container_group | default(airbyte_record_container_user | default('10001')) }}"
+    mode: "0400"
+  no_log: true
+  loop:
+    - {name: client_id, value: "{{ airbyte_record_client_id }}"}
+    - {name: client_secret, value: "{{ airbyte_record_client_secret }}"}
+    - {name: aws_access_key_id, value: "{{ airbyte_record_aws_files.results[0].content | b64decode | trim }}"}
+    - {name: aws_secret_access_key, value: "{{ airbyte_record_aws_files.results[1].content | b64decode | trim }}"}
+  loop_control:
+    label: "{{ item.name }}"
