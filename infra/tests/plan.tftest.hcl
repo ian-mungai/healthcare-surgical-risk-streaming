@@ -500,6 +500,33 @@ run "warehouse_workloads_reach_only_the_warehouse_prefix" {
   }
 }
 
+run "replay_workload_lists_and_reads_only_landing_and_manifests" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads = {
+      replay = { access = { landing = ["read"], manifests = ["read"] } }
+    }
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["replay"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["landing/*", "manifests/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/landing/*", "arn:aws:s3:::example-project/manifests/*"] },
+    ]
+    error_message = "The replay workload lists and reads landing and manifests in the bound bucket and does nothing else: no write, no delete, no warehouse and no publisher's bucket."
+  }
+}
+
 run "delete_covers_only_the_prefix_that_names_it" {
   command = plan
 

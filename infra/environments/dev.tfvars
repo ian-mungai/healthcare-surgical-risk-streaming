@@ -19,4 +19,7 @@ workloads = {
   trino = {
     access = { warehouse = ["read"] }
   }
+  replay = {
+    access = { landing = ["read"], manifests = ["read"] }
+  }
 }
