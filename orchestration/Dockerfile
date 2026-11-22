@@ -24,6 +24,11 @@ COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b
 COPY --from=docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d \
     /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
+# The AWS command line, which the S3 store of the record load runs as the program aws: the bundle of the official image, pinned by version and by the digest of its
+# multi-platform index (linux/amd64 manifest sha256:7a878f76b10d19718cc25851a92a8eef6e0d5105569071e51b0480694776a8c9), linked into the path.
+COPY --from=amazon/aws-cli:2.42.1@sha256:b0102d2269f87d8531d931c1a59e248101ace586886e6c077058d94c1c37b846 /usr/local/aws-cli /usr/local/aws-cli
+RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
+
 COPY --from=stack_scripts __init__.py aws_cli.py process.py project_config.py /opt/dagster/app/scripts/
 COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/limits.py stack/nessie.py stack/yaml_text.py \
     /opt/dagster/app/scripts/stack/

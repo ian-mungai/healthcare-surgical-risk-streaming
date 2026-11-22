@@ -118,6 +118,76 @@ def copied_from(text: str, context: str) -> set[str]:
     return found
 
 
+AWS_CLI_REFERENCE = "amazon/aws-cli:2.42.1@sha256:b0102d2269f87d8531d931c1a59e248101ace586886e6c077058d94c1c37b846"
+AWS_COPY = f"COPY --from={AWS_CLI_REFERENCE} /usr/local/aws-cli /usr/local/aws-cli"
+AWS_LINK = "ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws"
+# The subcommands and options that the S3 store calls, each read on Nov 22 2026 in the help of the AWS CLI 2.42.1: ``aws s3api <subcommand> help`` run in
+# amazon/aws-cli:2.42.1. ``--range`` of get-object is added by the store to a list and is in the help too.
+AWS_2_42_S3API = {
+    "list-object-versions": {"--bucket", "--prefix"},
+    "get-object": {"--bucket", "--key", "--version-id", "--range"},
+    "put-object": {"--bucket", "--key", "--body", "--content-type", "--if-none-match"},
+    "get-bucket-versioning": {"--bucket"},
+    "copy-object": {"--bucket", "--key", "--copy-source"},
+    "delete-object": {"--bucket", "--key", "--version-id"},
+}
+
+
+def s3api_calls(path: str) -> dict[str, set[str]]:
+    """The ``s3api`` subcommands that a module gives the AWS caller, as call arguments or as a list that starts with ``s3api``, each with the options that are
+    string constants in that call or list. An option that the module adds to a list later (``--range``) is not found, and is not asserted either."""
+    found: dict[str, set[str]] = {}
+    tree = ast.parse((ROOT / path).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "call":
+            elements: list[ast.expr] = list(node.args)
+        elif isinstance(node, ast.List):
+            elements = list(node.elts)
+        else:
+            continue
+        words = [item.value for item in elements if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+        if words[:1] == ["s3api"] and len(words) > 1:
+            found.setdefault(words[1], set()).update(word for word in words[2:] if word.startswith("--"))
+    return found
+
+
+class AwsCliTest(unittest.TestCase):
+    """The S3 store runs the ``aws`` program, so the image holds it: the bundle comes from the official image by digest and is linked into the path."""
+
+    def test_the_bundle_is_copied_from_a_digest_pinned_image_and_linked_as_aws(self) -> None:
+        text = DOCKERFILE.read_text()
+        self.assertIn(AWS_COPY, text)
+        self.assertIn(AWS_LINK, text)
+        self.assertIn(AWS_CLI_REFERENCE, image_references(text))
+        self.assertEqual([], problems(text))
+
+    def test_the_link_is_made_as_root_before_the_user_is_dropped_and_in_a_folder_of_the_path(self) -> None:
+        text = DOCKERFILE.read_text()
+        self.assertLess(text.index(AWS_LINK), text.index("USER 10001:10001"))
+        self.assertLess(text.index(AWS_COPY), text.index(AWS_LINK))
+
+    def test_a_reference_without_a_digest_or_with_another_tag_form_is_named(self) -> None:
+        text = DOCKERFILE.read_text()
+        for new in ("amazon/aws-cli:2.42.1", "amazon/aws-cli:latest", "amazon/aws-cli"):
+            with self.subTest(new=new):
+                self.assertTrue(any("must be pinned" in problem for problem in problems(text.replace(AWS_CLI_REFERENCE, new, 1))))
+
+    def test_the_program_that_the_caller_starts_is_aws_and_the_store_uses_only_subcommands_and_options_of_the_pinned_cli(self) -> None:
+        self.assertIn('run_command("aws"', (ROOT / "scripts" / "aws_cli.py").read_text())
+        used: dict[str, set[str]] = {}
+        for path in ("scripts/ingestion/store.py", "scripts/ingestion/record_copy.py"):
+            for name, options in s3api_calls(path).items():
+                used.setdefault(name, set()).update(options)
+        self.assertEqual({"list-object-versions", "get-object", "put-object", "get-bucket-versioning", "copy-object", "delete-object"}, set(used))
+        for name, options in used.items():
+            with self.subTest(subcommand=name):
+                self.assertIn(name, AWS_2_42_S3API)
+                self.assertEqual(set(), options - AWS_2_42_S3API[name])
+
+    def test_a_planted_subcommand_that_the_pinned_cli_does_not_have_is_named(self) -> None:
+        self.assertNotIn("get-object-version", AWS_2_42_S3API)
+
+
 class RecordLoadImageTest(unittest.TestCase):
     """The record load runs in this image, so the image holds every module it imports and the release pin that its manifest reader opens."""
 
