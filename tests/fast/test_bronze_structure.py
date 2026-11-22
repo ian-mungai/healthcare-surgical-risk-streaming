@@ -16,44 +16,18 @@ The library's own reading is proved against the published recordings by the acce
 from __future__ import annotations
 
 import gzip
-import struct
 import tempfile
 import unittest
 from pathlib import Path
 
 from spark.bronze.structure import END_TOLERANCE_SECONDS, file_problem, recording_problem
-
-START = 4102444800.0
+from tests.fast.vital_support import START, packet, record_packet, track_packet, vital
 
 
 def written(folder: Path, name: str, data: bytes) -> Path:
     path = folder / name
     path.write_bytes(data)
     return path
-
-
-def text(value: str) -> bytes:
-    data = value.encode()
-    return struct.pack("<I", len(data)) + data
-
-
-def packet(kind: int, body: bytes) -> bytes:
-    return bytes([kind]) + struct.pack("<I", len(body)) + body
-
-
-def track_packet(tid: int, reclen: int | None = None) -> bytes:
-    """A track-information packet of a numeric track; ``reclen`` None leaves the field out, as the files of the fixed sample do."""
-    body = struct.pack("<HBB", tid, 2, 1) + text(f"T{tid}") + text("unit") + struct.pack("<ffIfddBI", 0.0, 1.0, 0, 0.0, 1.0, 0.0, 0, 0)
-    return packet(0, body if reclen is None else body + struct.pack("<I", reclen))
-
-
-def record_packet(tid: int, value: float = 1.0) -> bytes:
-    return packet(1, struct.pack("<HdH", 10, START, tid) + struct.pack("<f", value))
-
-
-def vital(*packets: bytes, header: bytes = bytes(10)) -> bytes:
-    """The uncompressed payload of a case file: the mark, the version, the header and the packets."""
-    return b"VITA" + struct.pack("<IH", 3, len(header)) + header + b"".join(packets)
 
 
 class Container(unittest.TestCase):

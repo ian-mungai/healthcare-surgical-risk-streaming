@@ -7,8 +7,9 @@ The steps, in order:
 
 1. The gate (``scripts/ingestion/gate.py``) confirms that the object version of the clinical table and of each wanted case file is the version of the passed
    manifest, before any payload is read. A refusal ends the job with nothing written.
-2. Each case file is read by its bound version, checked against the manifest's SHA-256 and judged for structural corruption (``spark/bronze/structure.py``).
-   One corrupt file ends the job, naming each such case, before the branch exists.
+2. Each case file is read by its bound version, checked against the manifest's SHA-256 and judged for structural corruption (``spark/bronze/structure.py``):
+   the packet walk, the library's header, and the library's records of every track against the walk's counts. The records are read by the passes of the
+   decode and dropped, so no row is written. One refused case ends the job, naming each such case, before the branch exists.
 3. The branch is created from ``--base`` (default ``main``). A branch that exists is refused. The job never writes to the base: the merge is a later step.
 4. Each table is written in one pass over the cases: ``tracks``, ``numeric_observations``, ``string_events`` and ``waveform_seconds``. A worker reads
    one case file at a time, and Spark takes the rows as they are made. ``--passes`` chooses how a case file is read (``spark/bronze/plan.py``):
@@ -126,7 +127,7 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
     try:
         slices = max(1, min(arguments.parallelism, len(inputs.cases)))
         cases = session.sparkContext.parallelize(inputs.cases, slices)
-        verdicts = cases.mapPartitions(partition_problems(spec, caseends)).collect()
+        verdicts = cases.mapPartitions(partition_problems(spec, caseends, arguments.passes)).collect()
         problems = sorted((case, problem) for case, problem in verdicts if problem is not None)
         if problems:
             raise StructureError("; ".join(problem for _, problem in problems if problem))

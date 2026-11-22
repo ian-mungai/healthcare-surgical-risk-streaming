@@ -53,7 +53,7 @@ def partition_rows(kind: str, spec: StoreSpec, peaks: Any, reads: Any, mode: str
     return run
 
 
-def partition_problems(spec: StoreSpec, caseends: dict[int, int]) -> Any:
+def partition_problems(spec: StoreSpec, caseends: dict[int, int], mode: str) -> Any:
     """The function that a Spark partition runs for the structural check: ``(case, problem)`` for each case, where ``problem`` is ``None`` for a whole file."""
 
     def run(files: Iterator[CaseFile]) -> Iterator[tuple[int, str | None]]:
@@ -61,7 +61,7 @@ def partition_problems(spec: StoreSpec, caseends: dict[int, int]) -> Any:
         for file in files:
             with tempfile.TemporaryDirectory(prefix="bronze_check_", dir=scratch_folder()) as folder:
                 path = fetch_case(store, file, Path(folder))
-                yield (file.case_id, case_problem(path, file.case_id, caseends[file.case_id]))
+                yield (file.case_id, case_problem(path, file.case_id, caseends[file.case_id], mode))
 
     return run
 

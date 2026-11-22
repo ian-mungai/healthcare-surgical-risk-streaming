@@ -24,7 +24,6 @@ from collections import Counter
 from types import SimpleNamespace
 
 from replay.events.manifest import reference_seconds
-from replay.events.recording import WaveformRecord, WaveformTrack
 from spark.bronze.rows import (
     Lineage,
     StructureError,
@@ -146,60 +145,82 @@ class StringRows(unittest.TestCase):
             self.assertEqual([f"9001/{track.name}/{position}" for position in range(len(track.readings))], [row[6] for row in rows])
 
 
-def waveform(rate: float, records: list[tuple[int, list[int]]]) -> WaveformTrack:
-    return WaveformTrack("Test/WAVE", "mV", rate, 0.5, -1.0, tuple(WaveformRecord(start, array("H", samples)) for start, samples in records))
+ORIGIN = 4102444800.0
+RATE_ERRORS = (0.0, -1.0, math.nan, math.inf)
+
+
+def rows_of(rate: float, records: list[tuple[float, list[float]]], case: int = 1) -> list[tuple[object, ...]]:
+    """The rows of a waveform track whose records start at the given seconds from the anonymised start and whose samples are the given values."""
+    return list(waveform_rows(case, "Test/WAVE", rate, [(ORIGIN + start, array("d", samples)) for start, samples in records], ORIGIN, LINEAGE))
 
 
 class WaveformRows(unittest.TestCase):
     def test_a_record_that_straddles_a_second_is_cut_at_the_boundary(self) -> None:
-        rows = list(waveform_rows(1, waveform(4.0, [(750_000, [1, 2, 3, 4, 5])]), LINEAGE))
+        rows = rows_of(4.0, [(0.75, [1, 2, 3, 4, 5])])
         self.assertEqual([(0, 750_000, [1.0]), (1, 0, [2.0, 3.0, 4.0, 5.0])], [(row[2], row[3], row[4]) for row in rows])
 
     def test_a_sample_on_a_second_boundary_opens_the_next_second(self) -> None:
-        rows = list(waveform_rows(1, waveform(4.0, [(0, [1, 2, 3, 4, 5])]), LINEAGE))
+        rows = rows_of(4.0, [(0.0, [1, 2, 3, 4, 5])])
         self.assertEqual([(0, [1.0, 2.0, 3.0, 4.0]), (1, [5.0])], [(row[2], row[4]) for row in rows])
 
+    def test_a_sample_that_lies_before_a_boundary_by_less_than_half_a_microsecond_stays_in_the_second_before(self) -> None:
+        samples = [float(number) for number in range(1000)]
+        rows = rows_of(500.0, [(0.9999996, samples)])
+        self.assertEqual([1, 500, 499], [len(row[4]) for row in rows])  # type: ignore[arg-type]
+        self.assertEqual([(0, 999_999), (1, 1999), (2, 1999)], [(row[2], row[3]) for row in rows])
+
     def test_a_second_with_no_sample_has_no_row(self) -> None:
-        rows = list(waveform_rows(1, waveform(2.0, [(0, [1, 2]), (3_000_000, [3, 4])]), LINEAGE))
+        rows = rows_of(2.0, [(0.0, [1, 2]), (3.0, [3, 4])])
         self.assertEqual([0, 3], [row[2] for row in rows])
 
     def test_the_samples_of_one_second_follow_the_order_of_the_records(self) -> None:
-        rows = list(waveform_rows(1, waveform(4.0, [(0, [1, 2]), (500_000, [3, 4]), (1_000_000, [5])]), LINEAGE))
+        rows = rows_of(4.0, [(0.0, [1, 2]), (0.5, [3, 4]), (1.0, [5])])
         self.assertEqual([[1.0, 2.0, 3.0, 4.0], [5.0]], [row[4] for row in rows])
 
+    def test_the_offset_of_a_second_is_that_of_its_first_sample_in_the_order_of_the_records(self) -> None:
+        rows = rows_of(4.0, [(0.5, [1]), (0.25, [2])])
+        self.assertEqual([(0, 500_000, [1.0, 2.0])], [(row[2], row[3], row[4]) for row in rows])
+
     def test_a_row_has_the_columns_and_types_of_its_table(self) -> None:
-        rows = list(waveform_rows(7, waveform(4.0, [(0, [65535, 0, 7])]), LINEAGE))
+        rows = rows_of(4.0, [(0.0, [65535, 0, 7])], case=7)
         self.assertTrue(all(conforms(WAVEFORM, row) for row in rows))
         self.assertEqual((7, "Test/WAVE", 0, 0, [65535.0, 0.0, 7.0], "v0001", "ab" * 32), rows[0])
 
     def test_a_double_and_a_float_sample_are_kept_exactly(self) -> None:
-        track = WaveformTrack("T", "", 2.0, 1.0, 0.0, (WaveformRecord(0, array("f", [0.1, -0.0])), WaveformRecord(1_000_000, array("d", [0.1, math.nan]))))
-        rows = list(waveform_rows(1, track, LINEAGE))
+        records = [(ORIGIN, array("f", [0.1, -0.0])), (ORIGIN + 1.0, array("d", [0.1, math.nan]))]
+        rows = list(waveform_rows(1, "T", 2.0, records, ORIGIN, LINEAGE))
         self.assertEqual(array("f", [0.1])[0], rows[0][4][0])
         self.assertEqual(math.copysign(1.0, -0.0), math.copysign(1.0, rows[0][4][1]))
         self.assertEqual(0.1, rows[1][4][0])
         self.assertTrue(math.isnan(rows[1][4][1]))
 
-    def test_the_boundary_cases_equal_the_manifest_derivation(self) -> None:
+    def test_the_boundary_cases_equal_the_manifest_derivation_in_seconds_and_samples_and_within_a_microsecond_in_offsets(self) -> None:
         checked = 0
         for case, recording in boundary_recordings().items():
             for track in recording.waveforms:
                 reference = reference_seconds(track)
-                rows = list(waveform_rows(case, track, LINEAGE))
+                records = [(ORIGIN + record.start_us / 1_000_000, record.samples) for record in track.records]
+                rows = list(waveform_rows(case, track.name, track.sample_rate, records, ORIGIN, LINEAGE))
                 self.assertEqual(sorted(reference), [row[2] for row in rows])
                 for row in rows:
                     offset, samples = reference[row[2]]
-                    self.assertEqual((offset, samples), (row[3], row[4]))
+                    self.assertEqual(samples, row[4])
+                    self.assertLessEqual(abs(offset - row[3]), 1)
                 self.assertEqual(len(rows), len(set(keys_of(WAVEFORM, rows))))
                 checked += 1
         self.assertGreaterEqual(checked, 2)
 
-    def test_a_rate_that_is_not_a_positive_number_is_refused_by_name(self) -> None:
-        for rate in (0.0, -1.0, math.nan, math.inf):
+    def test_a_rate_that_is_not_a_positive_number_is_refused_by_case_and_track(self) -> None:
+        for rate in RATE_ERRORS:
             with self.assertRaises(StructureError) as caught:
-                list(waveform_rows(5, waveform(rate, [(0, [1])]), LINEAGE))
+                rows_of(rate, [(0.0, [1])], case=5)
             self.assertIn("case 5", str(caught.exception))
             self.assertIn("Test/WAVE", str(caught.exception))
+
+    def test_a_start_that_is_not_a_number_is_refused_by_case_and_track(self) -> None:
+        with self.assertRaises(StructureError) as caught:
+            list(waveform_rows(5, "Test/WAVE", 4.0, [(math.nan, array("d", [1.0]))], ORIGIN, LINEAGE))
+        self.assertIn("case 5", str(caught.exception))
 
 
 def fake_track(**fields: object) -> SimpleNamespace:
@@ -240,9 +261,15 @@ class TrackRows(unittest.TestCase):
 
     def test_a_format_with_no_sample_type_keeps_its_code_and_has_no_name(self) -> None:
         for fmt in (0, 9, 255):
-            info = track_info("E", fake_track(type=5, fmt=fmt), None)
+            info = track_info("N", fake_track(type=2, fmt=fmt), None)
             self.assertEqual((fmt, ""), (info.sample_format, info.sample_type))
             self.assertTrue(conforms(TRACKS, track_row(1, info, LINEAGE)))
+
+    def test_a_text_track_is_text_whatever_its_format_code_is(self) -> None:
+        for fmt in (0, 1, 6, 9):
+            info = track_info("Solar8000/GAS2_AGENT", fake_track(type=5, fmt=fmt), None)
+            self.assertEqual(("string", fmt, "text"), (info.kind, info.sample_format, info.sample_type), fmt)
+            self.assertEqual(fmt, track_row(565, info, LINEAGE)[8])
 
     def test_the_rate_the_gain_and_the_offset_of_a_track_are_in_its_row_as_published(self) -> None:
         info = track_info("X", fake_track(srate=62.5, gain=0.1, offset=-20.0), None)
