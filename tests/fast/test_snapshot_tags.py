@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import signal
 import tempfile
 import threading
 import time
@@ -76,6 +77,7 @@ class StandIn(NessieClient):
         self.blank_history_pages = 0
         self.endless_history = False
         self.ignore_filter = False
+        self.default_branch: Any = "main"
         self.calls: list[tuple[str, str]] = []
 
     def answer(self, status: int, document: dict[str, Any]) -> tuple[int, bytes]:
@@ -106,6 +108,8 @@ class StandIn(NessieClient):
         kind = "/trees" if path == "/trees" else "entries" if path.endswith("/entries") else "history" if path.endswith("/history") else ""
         if method == "GET" and kind and not set(query) <= ALLOWED_QUERY[kind]:
             return self.answer(400, {"errorCode": "BAD_REQUEST", "message": f"unknown query parameters {sorted(set(query) - ALLOWED_QUERY[kind])}"})
+        if method == "GET" and path == "/config":
+            return self.answer(200, {"defaultBranch": self.default_branch, "noAncestorHash": "0" * 64})
         if method == "GET" and path == "/trees":
             refs = [{"type": kind, "name": name, "hash": value} for name, (kind, value) in sorted(self.references.items())]
             return self.answer(200, self.page(refs, query, "references"))
@@ -165,7 +169,7 @@ class ReadTest(unittest.TestCase):
             NAMESPACE_ENTRY,
             table_entry(["catalog_proof", "numbers"], 222, METADATA),
             table_entry(["catalog_proof", "other"], 333, "file:/warehouse/o/metadata/1.metadata.json"),
-            table_entry(["catalog_proof", "empty"], None, "file:/warehouse/e/metadata/1.metadata.json"),
+            table_entry(["catalog_proof", "empty"], -1, "file:/warehouse/e/metadata/1.metadata.json"),
         ]
         found = tags.table_snapshots(nessie, "main")
         self.assertEqual(
@@ -327,8 +331,182 @@ class TrunkTest(unittest.TestCase):
         nessie = StandIn()
         nessie.references["fake_trunk"] = ("TAG", HASH_TWO)
         nessie.logs["fake_trunk"] = [HASH_TWO, HASH_ONE]
+        nessie.default_branch = "fake_trunk"
         with self.assertRaises(tags.NotOnTrunk):
-            tags.tag_run(nessie, RUN_ID, HASH_ONE, "fake_trunk")
+            tags.tag_run(nessie, RUN_ID, HASH_ONE)
+
+
+class DefaultBranchTest(unittest.TestCase):
+    """The trunk is the default branch that Nessie names. ``--trunk`` only asserts it."""
+
+    def test_a_commit_that_exists_only_on_a_side_branch_is_refused_when_that_branch_is_named_as_the_trunk(self) -> None:
+        nessie = StandIn()
+        with self.assertRaises(tags.NotOnTrunk) as caught:
+            tags.tag_run(nessie, RUN_ID, HASH_SIDE, "side")
+        self.assertIn("default branch", str(caught.exception))
+        self.assertIn("main", str(caught.exception))
+        self.assertEqual([], nessie.writes())
+        self.assertEqual(["/api/v2/config"], [target for _, target in nessie.calls])
+
+    def test_the_trunk_is_the_default_branch_that_nessie_names_when_none_is_given(self) -> None:
+        nessie = StandIn()
+        nessie.default_branch = "side"
+        self.assertTrue(tags.tag_run(nessie, RUN_ID, HASH_SIDE).created)
+        with self.assertRaises(tags.NotOnTrunk):
+            tags.tag_run(nessie, f"{RUN_ID}x", HASH_TWO)
+
+    def test_a_trunk_that_is_the_default_branch_is_accepted_as_an_assertion(self) -> None:
+        self.assertEqual("main", tags.tag_run(StandIn(), RUN_ID, HASH_ONE, "main").trunk)
+        self.assertEqual("main", tags.tag_run(StandIn(), RUN_ID, HASH_ONE).trunk)
+
+    def test_a_configuration_without_a_default_branch_is_an_error_and_nothing_is_written(self) -> None:
+        for name in (None, "", 7, ["main"]):
+            with self.subTest(name=name):
+                nessie = StandIn()
+                nessie.default_branch = name
+                with self.assertRaises(NessieError):
+                    tags.tag_run(nessie, RUN_ID, HASH_ONE)
+                self.assertEqual([], nessie.writes())
+
+    def test_the_command_refuses_a_trunk_that_is_not_the_default_branch_before_any_other_call(self) -> None:
+        nessie = StandIn()
+        with tempfile.TemporaryDirectory() as directory:
+            folder = str(Path(directory) / "run")
+            code, out, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_SIDE, "--run-folder", folder, "--trunk", "side"], nessie)
+            written = Path(folder).exists()
+        self.assertEqual(1, code)
+        self.assertIn("default branch", err)
+        self.assertEqual([], nessie.writes())
+        self.assertNotIn(f"run-{RUN_ID}", nessie.references)
+        self.assertFalse(written)
+        self.assertEqual(1, len(nessie.calls))
+
+
+class EntriesTest(unittest.TestCase):
+    """Every table entry carries its content: a metadata location and a snapshot ID. Nothing incomplete is recorded as verified."""
+
+    def entries(self, *entries: dict[str, Any]) -> StandIn:
+        nessie = StandIn()
+        nessie.entries_at[HASH_ONE] = [NAMESPACE_ENTRY, *entries]
+        return nessie
+
+    def test_an_entry_without_content_is_an_error_naming_the_table_and_the_tag_step_exits_1_with_no_record(self) -> None:
+        bare = {"type": "ICEBERG_TABLE", "name": {"elements": ["catalog_proof", "numbers"]}}
+        nessie = self.entries(bare)
+        with self.assertRaises(NessieError) as caught:
+            tags.tag_run(nessie, RUN_ID, HASH_ONE)
+        self.assertIn("catalog_proof.numbers", str(caught.exception))
+        with tempfile.TemporaryDirectory() as directory:
+            code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(Path(directory) / "run")], nessie)
+            self.assertFalse((Path(directory) / "run").exists())
+        self.assertEqual(1, code)
+        self.assertIn("catalog_proof.numbers", err)
+
+    def test_content_with_no_metadata_location_or_an_empty_one_or_one_that_is_not_text_is_an_error(self) -> None:
+        for location in (None, "", 5, ["x"]):
+            with self.subTest(location=location):
+                entry = table_entry(["catalog_proof", "numbers"], 111, "x")
+                entry["content"]["metadataLocation"] = location
+                with self.assertRaises(NessieError) as caught:
+                    tags.tag_run(self.entries(entry), RUN_ID, HASH_ONE)
+                self.assertIn("catalog_proof.numbers", str(caught.exception))
+        entry = table_entry(["catalog_proof", "numbers"], 111, "x")
+        del entry["content"]["metadataLocation"]
+        with self.assertRaises(NessieError):
+            tags.tag_run(self.entries(entry), RUN_ID, HASH_ONE)
+
+    def test_a_snapshot_id_that_is_missing_or_not_an_integer_or_below_the_no_snapshot_value_is_an_error(self) -> None:
+        for snapshot in ("5", 5.0, True, None, -2, [1]):
+            with self.subTest(snapshot=snapshot):
+                entry = table_entry(["catalog_proof", "numbers"], 111, METADATA)
+                entry["content"]["snapshotId"] = snapshot
+                with self.assertRaises(NessieError) as caught:
+                    tags.tag_run(self.entries(entry), RUN_ID, HASH_ONE)
+                self.assertIn("catalog_proof.numbers", str(caught.exception))
+        entry = table_entry(["catalog_proof", "numbers"], None, METADATA)
+        with self.assertRaises(NessieError):
+            tags.tag_run(self.entries(entry), RUN_ID, HASH_ONE)
+
+    def test_the_explicit_no_snapshot_value_is_recorded_as_none_and_a_table_with_a_snapshot_is_recorded_with_it(self) -> None:
+        empty = table_entry(["catalog_proof", "empty"], -1, "file:/w/e/metadata/1.metadata.json")
+        full = table_entry(["catalog_proof", "numbers"], 111, METADATA)
+        found = tags.tag_run(self.entries(empty, full), RUN_ID, HASH_ONE).tables
+        self.assertEqual([None, 111], [item.snapshot_id for item in found])
+
+    def test_an_entry_with_no_name_or_a_name_that_is_not_a_list_of_text_is_an_error(self) -> None:
+        names: list[Any] = [None, {}, {"elements": []}, {"elements": "x"}, {"elements": [1]}]
+        for name in names:
+            with self.subTest(name=name):
+                entry = table_entry(["catalog_proof", "numbers"], 111, METADATA)
+                entry["name"] = name
+                with self.assertRaises(NessieError):
+                    tags.tag_run(self.entries(entry), RUN_ID, HASH_ONE)
+
+    def test_entries_that_are_not_tables_are_still_left_out(self) -> None:
+        view = {"type": "ICEBERG_VIEW", "name": {"elements": ["catalog_proof", "v"]}, "content": {"type": "ICEBERG_VIEW"}}
+        found = tags.tag_run(self.entries(view, table_entry(["catalog_proof", "numbers"], 111, METADATA)), RUN_ID, HASH_ONE).tables
+        self.assertEqual(["catalog_proof.numbers"], [item.table for item in found])
+
+
+class RecordFirstTest(unittest.TestCase):
+    """A record of another hash in the run folder refuses before any write to Nessie."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.folder = Path(self.directory.name) / "run"
+
+    def restore_record(self, value: str) -> None:
+        self.folder.mkdir()
+        record = tags.version_record(tags.tag_run(StandIn(), RUN_ID, value))
+        (self.folder / "data_version.json").write_text(json.dumps(record, indent=2) + "\n")
+
+    def arguments(self, value: str) -> list[str]:
+        return ["tag", "--run-id", RUN_ID, "--hash", value, "--run-folder", str(self.folder)]
+
+    def test_a_restored_record_at_one_hash_and_no_tag_refuses_a_request_for_another_hash_and_creates_no_tag(self) -> None:
+        self.restore_record(HASH_ONE)
+        nessie = StandIn()
+        code, _, err = run_command(self.arguments(HASH_TWO), nessie)
+        self.assertEqual(1, code)
+        self.assertIn(HASH_ONE, err)
+        self.assertEqual([], nessie.writes())
+        self.assertNotIn(f"run-{RUN_ID}", nessie.references)
+        self.assertEqual(HASH_ONE, json.loads((self.folder / "data_version.json").read_text())["hash"])
+
+    def test_the_refusal_comes_before_any_call_to_nessie(self) -> None:
+        self.restore_record(HASH_ONE)
+        nessie = StandIn()
+        run_command(self.arguments(HASH_TWO), nessie)
+        self.assertEqual([], nessie.calls)
+
+    def test_a_record_that_cannot_be_read_or_is_not_a_record_of_this_run_refuses_before_any_write(self) -> None:
+        for text in ("not json", "[]", "{}", json.dumps({"hash": HASH_ONE}), json.dumps({"hash": HASH_ONE, "tag": "run-other", "run_id": "other"})):
+            with self.subTest(text=text[:30]):
+                self.folder.mkdir(exist_ok=True)
+                (self.folder / "data_version.json").write_text(text)
+                nessie = StandIn()
+                code, _, _ = run_command(self.arguments(HASH_ONE), nessie)
+                self.assertEqual(1, code)
+                self.assertEqual([], nessie.writes())
+                self.assertNotIn(f"run-{RUN_ID}", nessie.references)
+
+    def test_a_restored_record_at_the_same_hash_and_no_tag_makes_the_tag_and_leaves_the_record(self) -> None:
+        self.restore_record(HASH_ONE)
+        before = (self.folder / "data_version.json").read_bytes()
+        nessie = StandIn()
+        code, out, _ = run_command(self.arguments(HASH_ONE), nessie)
+        self.assertEqual(0, code)
+        self.assertIn("tagged", out)
+        self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
+        self.assertEqual(before, (self.folder / "data_version.json").read_bytes())
+
+    def test_the_library_call_judges_the_record_first_too(self) -> None:
+        self.restore_record(HASH_ONE)
+        nessie = StandIn()
+        with self.assertRaises(tags.TagConflict):
+            tags.tag_and_record(nessie, RUN_ID, HASH_TWO, self.folder)
+        self.assertEqual([], nessie.calls)
 
 
 class ForgedPages(StandIn):
@@ -477,13 +655,19 @@ class DeadlineCommandTest(unittest.TestCase):
         self.folder = str(Path(self.directory.name) / "run")
 
     def test_a_deadline_that_is_not_finite_or_not_positive_exits_2_before_any_call(self) -> None:
-        for value in ("inf", "-inf", "nan", "0", "-5", "1e999"):
+        for value in ("inf", "-inf", "nan", "0", "-5", "1e999", "1e20", "86400.5", "86401"):
             nessie = StandIn()
             with self.subTest(value=value):
                 code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", self.folder, f"--deadline-seconds={value}"], nessie)
                 self.assertEqual(2, code)
                 self.assertIn("deadline", err)
                 self.assertEqual([], nessie.calls)
+
+    def test_a_deadline_of_exactly_one_day_is_accepted_and_the_timer_is_cleared_afterwards(self) -> None:
+        nessie = StandIn()
+        code, _, _ = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", self.folder, "--deadline-seconds=86400"], nessie)
+        self.assertEqual(0, code)
+        self.assertEqual(0.0, signal.getitimer(signal.ITIMER_REAL)[0])
 
     def test_a_run_that_outlasts_its_deadline_exits_1_and_says_so_and_leaves_nothing(self) -> None:
         nessie = StandIn()

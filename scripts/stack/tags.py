@@ -2,12 +2,12 @@
 
 After a run's branch is merged, the merged hash gets a Nessie tag whose name holds the run ID, and the tag, the hash and the snapshot ID of each table at that
 hash go into a record in the run's folder. The step is idempotent: a rerun with the same run ID and hash changes nothing, and the same tag name on another hash
-is refused, in Nessie and in the folder, so a run's pin never moves. Table maintenance keeps every snapshot that a tag points to, and it finds them with
-``list_tags`` and ``table_snapshots``.
+is refused, in Nessie and in the folder, so a run's pin never moves. Table maintenance finds the tags and what each reads with ``list_tags`` and
+``table_snapshots``.
 
 The command line runs in a container that reaches Nessie at ``NESSIE_URI``:
 
-``python -m scripts.stack.tags tag --run-id <id> --hash <merged hash> --run-folder <folder> [--trunk main] [--deadline-seconds 120]``
+``python -m scripts.stack.tags tag --run-id <id> --hash <merged hash> --run-folder <folder> [--trunk <default branch>] [--deadline-seconds 120]``
 
 It says ``tagged`` when it made the tag or wrote the record, and ``unchanged`` when both were already as asked. Exit 0 is success, 1 is a refusal by Nessie
 or by a record that holds another hash, and 2 is a bad argument. The step writes ``data_version.json`` into the folder it is given and makes the folder when
@@ -40,6 +40,8 @@ RECORD_NAME = "data_version.json"
 PAGE_SIZE = 100
 MAX_PAGES = 1000
 DEFAULT_DEADLINE_SECONDS = 120.0
+MAX_DEADLINE_SECONDS = 86_400.0
+NO_SNAPSHOT = -1
 CALL_SECONDS = 30.0
 TABLE_TYPE = "ICEBERG_TABLE"
 
@@ -151,22 +153,44 @@ def list_tags(client: NessieClient) -> dict[str, str]:
     return list_references(client, "TAG")
 
 
+def table_name(entry: dict[str, Any]) -> str:
+    """The dotted name of a table entry, or ``NessieError`` when the entry names no table."""
+    elements = (entry.get("name") or {}).get("elements") if isinstance(entry.get("name"), dict) else None
+    if not isinstance(elements, list) or not elements or not all(isinstance(item, str) and item for item in elements):
+        raise NessieError("Nessie answered with a table entry that has no name made of text elements")
+    return ".".join(elements)
+
+
 def table_snapshots(client: NessieClient, reference: str) -> tuple[TableSnapshot, ...]:
-    """The Iceberg tables at the head of ``reference`` with the snapshot ID and metadata file that Nessie holds for each, in the order of their names."""
+    """The Iceberg tables at the head of ``reference`` with the snapshot ID and metadata file that Nessie holds for each, in the order of their names.
+
+    Every table entry must carry its content, with a metadata location that is non-empty text and a snapshot ID that is an integer. Nessie's explicit
+    no-snapshot value, ``-1``, is recorded as None. Anything else is a ``NessieError`` that names the table: no incomplete entry is passed on as a verified one.
+    """
     found = []
     for entry in paged(client, f"/trees/{quote(reference, safe='')}/entries", "entries", {"content": "true"}):
-        content = entry.get("content") or {}
-        if entry.get("type") != TABLE_TYPE or not isinstance(content, dict):
+        if entry.get("type") != TABLE_TYPE:
             continue
+        table = table_name(entry)
+        content = entry.get("content")
+        if not isinstance(content, dict):
+            raise NessieError(f"the table {table} at {reference} has no content in Nessie's answer")
+        location = content.get("metadataLocation")
+        if not isinstance(location, str) or not location:
+            raise NessieError(f"the table {table} at {reference} has no metadata location in Nessie's answer")
         snapshot = content.get("snapshotId")
-        found.append(
-            TableSnapshot(
-                ".".join((entry.get("name") or {}).get("elements") or []),
-                int(snapshot) if isinstance(snapshot, int) and snapshot >= 0 else None,
-                str(content.get("metadataLocation") or ""),
-            )
-        )
+        if isinstance(snapshot, bool) or not isinstance(snapshot, int) or snapshot < NO_SNAPSHOT:
+            raise NessieError(f"the table {table} at {reference} has the snapshot ID {snapshot!r}, which is not an integer or Nessie's no-snapshot value")
+        found.append(TableSnapshot(table, None if snapshot == NO_SNAPSHOT else snapshot, location))
     return tuple(sorted(found, key=lambda item: item.table))
+
+
+def default_branch(client: NessieClient) -> str:
+    """The default branch that Nessie's configuration names. It is the trunk of every tag, and a command never takes another one from its arguments."""
+    name = client.config().get("defaultBranch")
+    if not isinstance(name, str) or not name:
+        raise NessieError("Nessie's configuration answer names no default branch")
+    return name
 
 
 def require_on_trunk(client: NessieClient, trunk: str, merged_hash: str) -> None:
@@ -183,12 +207,19 @@ def require_on_trunk(client: NessieClient, trunk: str, merged_hash: str) -> None
         raise NotOnTrunk(f"{merged_hash} is not in the history of {trunk}: only a hash that was merged into {trunk} is tagged")
 
 
-def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str = "main") -> TagResult:
-    """Tag ``merged_hash``, a hash in the history of ``trunk``, for ``run_id``. A tag of that name at that hash stays, and one at another hash is refused."""
+def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | None = None) -> TagResult:
+    """Tag ``merged_hash``, a hash in the history of Nessie's default branch, for ``run_id``.
+
+    A tag of that name at that hash stays, and one at another hash is refused. The trunk is the default branch that Nessie's configuration names, read first.
+    ``trunk``, when given, only asserts it: another branch is refused before any other call.
+    """
     name = tag_name(run_id)
     if HASH.fullmatch(merged_hash) is None:
         raise TagError("the hash must be 64 lower-case hexadecimal digits")
-    require_on_trunk(client, trunk, merged_hash)
+    default = default_branch(client)
+    if trunk is not None and trunk != default:
+        raise NotOnTrunk(f"{trunk} is not Nessie's default branch {default}: a run's tag is made on a hash of the default branch")
+    require_on_trunk(client, default, merged_hash)
     created = False
     try:
         existing = client.reference(name)
@@ -198,7 +229,7 @@ def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str = "m
         existing = None
     if existing is None:
         try:
-            client.create_tag(name, merged_hash, trunk)
+            client.create_tag(name, merged_hash, default)
             created = True
         except NessieConflict:
             existing = client.reference(name)
@@ -207,7 +238,28 @@ def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str = "m
     pinned = client.reference(name)
     if pinned.kind != "TAG" or pinned.hash != merged_hash:
         raise NessieError(f"{name} reads back as a {pinned.kind.lower()} at {pinned.hash}, not as a tag at {merged_hash}")
-    return TagResult(run_id, name, merged_hash, trunk, created, table_snapshots(client, name))
+    return TagResult(run_id, name, merged_hash, default, created, table_snapshots(client, name))
+
+
+def judge_record(folder: Path, run_id: str, tag: str, merged_hash: str) -> None:
+    """Refuse a record in ``folder`` that is not this run's at this hash. A folder with no record is fine. This runs before any write to Nessie."""
+    target = folder / RECORD_NAME
+    if not target.exists():
+        return
+    try:
+        held = json.loads(target.read_text())
+    except (OSError, ValueError) as error:
+        raise TagConflict(f"{target} exists and cannot be read as JSON ({type(error).__name__}): no tag was made") from error
+    if not isinstance(held, dict) or (held.get("run_id"), held.get("tag"), held.get("hash")) != (run_id, tag, merged_hash):
+        recorded = held.get("hash") if isinstance(held, dict) else None
+        raise TagConflict(f"{target} records {held.get('tag') if isinstance(held, dict) else None} at {recorded}, not {tag} at {merged_hash}: no tag was made")
+
+
+def tag_and_record(client: NessieClient, run_id: str, merged_hash: str, folder: Path, trunk: str | None = None) -> tuple[TagResult, bool]:
+    """Judge the folder's record, then tag, then publish the record. Returns the result and whether the record was written now."""
+    judge_record(folder, run_id, tag_name(run_id), merged_hash)
+    result = tag_run(client, run_id, merged_hash, trunk)
+    return result, write_version_record(folder, result)
 
 
 def version_record(result: TagResult) -> dict[str, Any]:
@@ -264,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     tag.add_argument("--run-id", required=True)
     tag.add_argument("--hash", required=True, help="the hash that the merge of the run's branch returned")
     tag.add_argument("--run-folder", required=True, type=Path)
-    tag.add_argument("--trunk", default="main")
+    tag.add_argument("--trunk", default=None, help="an assertion: Nessie's default branch, which is always the trunk, must be this one")
     tag.add_argument("--deadline-seconds", type=float, default=DEFAULT_DEADLINE_SECONDS, help="one finite deadline for the whole run")
     arguments = parser.parse_args(argv)
     uri = os.environ.get("NESSIE_URI", "")
@@ -275,8 +327,8 @@ def main(argv: list[str] | None = None) -> int:
         tag_name(arguments.run_id)
         if HASH.fullmatch(arguments.hash) is None:
             raise TagError("the hash must be 64 lower-case hexadecimal digits")
-        if not math.isfinite(arguments.deadline_seconds) or arguments.deadline_seconds <= 0:
-            raise TagError("the deadline must be a finite number of seconds above 0")
+        if not math.isfinite(arguments.deadline_seconds) or not 0 < arguments.deadline_seconds <= MAX_DEADLINE_SECONDS:
+            raise TagError(f"the deadline must be a finite number of seconds above 0 and at most {MAX_DEADLINE_SECONDS:g}")
     except TagError as error:
         sys.stderr.write(f"{error}\n")
         return 2
@@ -287,8 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     previous = signal.signal(signal.SIGALRM, expire)
     signal.setitimer(signal.ITIMER_REAL, arguments.deadline_seconds)
     try:
-        result = tag_run(TagClient(uri, arguments.deadline_seconds), arguments.run_id, arguments.hash, arguments.trunk)
-        written = write_version_record(arguments.run_folder, result)
+        result, written = tag_and_record(TagClient(uri, arguments.deadline_seconds), arguments.run_id, arguments.hash, arguments.run_folder, arguments.trunk)
     except NessieError as error:
         sys.stderr.write(f"{error}\n")
         return 1
