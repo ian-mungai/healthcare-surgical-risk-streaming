@@ -14,7 +14,7 @@ archived and a delayed submit can never put back a request that was archived mea
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
 reference fails at once with its reason. A request that already has a finished or failed result is only moved: it is never run again and its result is never
-written again. A result file that is not a valid terminal result (larger than 64 KiB, not a regular file, not UTF-8 or JSON, too deeply nested, not an
+written again. A result file that is not a valid terminal result (larger than 64 KiB, not a file that can be read, not UTF-8 or JSON, too deeply nested, not an
 object, no ``finished`` or ``failed`` outcome) is logged, kept beside its place as ``<name>.json.invalid`` for inspection and treated as no result; judging it
 can never raise. A run that a stop signal ends stays in the inbox, so the restarted service runs it
 again and the replay resumes from its saved position.
@@ -40,7 +40,6 @@ import json
 import os
 import re
 import secrets
-import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
@@ -166,7 +165,7 @@ def archive(inbox: Path, request: Path, kind: str) -> None:
 
 def read_result(path: Path) -> tuple[str | None, str]:
     """Judge a result file without ever raising: ``(outcome, "")`` for a valid terminal result, ``(None, "")`` when there is no file and ``(None, reason)``
-    when there is one that is not valid. It is read through a handle opened without blocking, only when it is a regular file, and at most
+    when there is one that is not valid. It is read through a handle opened without blocking (a pipe in its place cannot hold the service) and at most
     ``RESULT_LIMIT_BYTES`` of it; a larger one is invalid. Any error of reading, decoding or parsing (a deeply nested document included) is a reason."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -176,8 +175,6 @@ def read_result(path: Path) -> tuple[str | None, str]:
         return None, f"it cannot be opened: {type(error).__name__}"
     try:
         with os.fdopen(descriptor, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None, "it is not a regular file"
             data = handle.read(RESULT_LIMIT_BYTES + 1)
         if len(data) > RESULT_LIMIT_BYTES:
             return None, f"it is larger than {RESULT_LIMIT_BYTES} bytes"

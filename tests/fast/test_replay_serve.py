@@ -125,6 +125,11 @@ class Loop:
             (self.inbox / name).with_suffix(".reference").write_text(reference)
 
 
+def unreadable(path: Path) -> None:
+    path.write_text("{}")
+    path.chmod(0)
+
+
 def nested(depth: int) -> str:
     return "[" * depth + "]" * depth
 
@@ -316,6 +321,7 @@ class ServeTest(unittest.TestCase):
         cases: dict[str, Callable[[Path], object]] = {
             "the reviewers deeply nested array of 256 KB": lambda path: path.write_text(nested(128_000)),
             "a nested array under the size cap": lambda path: path.write_text(nested(30_000)),
+            "a file that cannot be opened": unreadable,
             "a result that is too large": lambda path: path.write_text(padded),
             "bytes that are not UTF-8": lambda path: path.write_bytes(b'{"outcome": "\xff"}'),
             "a directory in place of the file": lambda path: path.mkdir(),
@@ -323,6 +329,16 @@ class ServeTest(unittest.TestCase):
         for label, plant in cases.items():
             with self.subTest(case=label):
                 self.assert_set_aside(self.planted_result(plant))
+
+    def test_a_result_that_raises_a_recursion_error_while_it_is_parsed_is_invalid_and_does_not_raise(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="replay_result_")
+        self.addCleanup(scratch.cleanup)
+        path = Path(scratch.name) / "a.json"
+        path.write_text(nested(100))
+        with mock.patch("json.loads", side_effect=RecursionError("maximum recursion depth exceeded")):
+            outcome, reason = serve_module.read_result(path)
+        self.assertIsNone(outcome)
+        self.assertIn("RecursionError", reason)
 
     def test_a_fifo_in_place_of_the_result_file_is_set_aside_without_a_wait(self) -> None:
         self.assert_set_aside(self.planted_result(lambda path: os.mkfifo(path)))
