@@ -4,13 +4,18 @@ A job runs one service group. It is heavy when the memory limits of that group's
 A heavy job carries the tag ``HEAVY_TAG_KEY``. The instance setting ``concurrency.runs.tag_concurrency_limits`` in ``dagster.yaml`` lets one run with that tag
 be in progress, so a second heavy job stays queued until the first ends. A job below the figure has no tag and is never held.
 
+Each job that runs a service group is declared in ``JOB_GROUPS`` with its group, and takes its tags from ``job_tags``. A fast test holds every group named
+there to the limits file. The list is empty until the first group job.
+
 The limits file is read when the code location starts. After the file changes, restart the code location so that the tags follow it.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import yaml
 
@@ -19,6 +24,8 @@ HEAVY_MEMORY_MIB = 12544
 HEAVY_TAG_KEY = "surgical_risk/heavy"
 HEAVY_TAG_VALUE = "true"
 LIMITS_FILE = Path(os.environ.get("LIMITS_FILE", "/opt/dagster/limits.yml"))
+# Each job that runs a service group, by job name, with the group of the limits file that it runs.
+JOB_GROUPS: Mapping[str, str] = MappingProxyType({})
 
 
 class ConcurrencyError(ValueError):
@@ -50,3 +57,21 @@ def group_memory_mib(group: str, limits_file: Path = LIMITS_FILE) -> int:
 def heavy_job_tags(group: str, limits_file: Path = LIMITS_FILE) -> dict[str, str]:
     """The run tags for a job that runs ``group``: the heavy tag above the figure, none at or below it."""
     return {HEAVY_TAG_KEY: HEAVY_TAG_VALUE} if group_memory_mib(group, limits_file) > HEAVY_MEMORY_MIB else {}
+
+
+def unknown_groups(job_groups: Mapping[str, str], limits_file: Path = LIMITS_FILE) -> list[str]:
+    """Each declared job, as ``job: group``, whose group the limits file does not hold, in job order."""
+    unknown = []
+    for job, group in sorted(job_groups.items()):
+        try:
+            group_memory_mib(group, limits_file)
+        except ConcurrencyError:
+            unknown.append(f"{job}: {group}")
+    return unknown
+
+
+def job_tags(job: str, limits_file: Path = LIMITS_FILE, job_groups: Mapping[str, str] = JOB_GROUPS) -> dict[str, str]:
+    """The run tags of a declared group job. Raise ``ConcurrencyError`` for a job that ``job_groups`` does not declare."""
+    if job not in job_groups:
+        raise ConcurrencyError(f"the job {job} is not declared in JOB_GROUPS, so its group and weight are unknown")
+    return heavy_job_tags(job_groups[job], limits_file)

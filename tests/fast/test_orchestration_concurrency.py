@@ -15,9 +15,12 @@ from orchestration.surgical_risk.concurrency import (
     HEAVY_MEMORY_MIB,
     HEAVY_TAG_KEY,
     HEAVY_TAG_VALUE,
+    JOB_GROUPS,
     ConcurrencyError,
     group_memory_mib,
     heavy_job_tags,
+    job_tags,
+    unknown_groups,
 )
 from scripts.stack.yaml_text import load_yaml
 
@@ -32,6 +35,28 @@ def limits_text(group_mib: dict[str, list[int]]) -> str:
         for number, figure in enumerate(figures):
             lines += [f"  {group}_{number}:", "    runtime: compose", f"    group: {group}", f"    memory_limit_mib: {figure}"]
     return "\n".join(lines) + "\n"
+
+
+class DeclaredJobGroupsTest(unittest.TestCase):
+    """Every job that runs a service group names it in ``JOB_GROUPS``, and each group named there exists in the limits file, so a job's heavy tag can
+    always be judged when the code location starts. The list is empty until the first group job; the planted entries prove the rule holds for one."""
+
+    def test_every_group_that_the_declared_jobs_name_is_in_the_limits_file(self) -> None:
+        self.assertEqual([], unknown_groups(JOB_GROUPS, LIMITS))
+
+    def test_a_planted_job_of_a_real_group_passes_and_one_of_an_unknown_group_is_named(self) -> None:
+        self.assertEqual([], unknown_groups({"bronze": "batch"}, LIMITS))
+        self.assertEqual(["bronze: no_such_group"], unknown_groups({"bronze": "no_such_group", "silver": "batch"}, LIMITS))
+
+    def test_a_declared_job_gets_the_tags_of_its_group_and_an_undeclared_job_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="concurrency_jobs_") as scratch:
+            limits = Path(scratch) / "limits.yml"
+            limits.write_text(limits_text({"heavy_group": [HEAVY_MEMORY_MIB + 1], "light_group": [1024]}))
+            jobs = {"big": "heavy_group", "small": "light_group"}
+            self.assertEqual({HEAVY_TAG_KEY: HEAVY_TAG_VALUE}, job_tags("big", limits, jobs))
+            self.assertEqual({}, job_tags("small", limits, jobs))
+            with self.assertRaises(ConcurrencyError):
+                job_tags("undeclared", limits, jobs)
 
 
 class GroupMemoryTest(unittest.TestCase):
