@@ -1,4 +1,5 @@
-# Accepted limits: a pull request that edits the workflow to skip the required job passes the merge gate; the Makefile's recipes are not checked here.
+# Accepted limits: a pull request that edits the workflow to skip the required job passes the merge gate; the Makefile's recipes are not checked here;
+# the contract does not prove that GitHub accepts the workflow file: a hosted run does, and a file GitHub rejects starts no job, so the merge is blocked.
 """The CI workflow contract: every pull request and every push to main runs every job group, and one job requires them all.
 
 The contract reads the workflow as PyYAML parses it and compares parsed keys and values only, never text, so a spaced key, a quoted key, a
@@ -127,6 +128,8 @@ exit "${failed}"
 
 
 # The fields that GitHub's create-ruleset API requires, for the rule types that the ruleset file uses.
+TOP_LEVEL_KEYS = ["name", "on", "permissions", "concurrency", "jobs"]
+BOOLEAN_RULE_PARAMETERS = {"required_status_checks": ("strict_required_status_checks_policy",)}
 REQUIRED_RULESET_FIELDS = ("name", "enforcement")
 REQUIRED_RULE_PARAMETERS = {
     "pull_request": (
@@ -170,6 +173,10 @@ def source_problems(text: str) -> list[str]:
         problems.append(
             f"the top-level mapping has no key spelled on (its keys are {keys}): GitHub does not read a Boolean key such as true or yes as the trigger"
         )
+    if keys != TOP_LEVEL_KEYS:
+        problems.append(
+            f"the top-level keys are spelled {keys}, not {TOP_LEVEL_KEYS}: PyYAML can merge a key such as true into on before the contract reads it"
+        )
     return problems
 
 
@@ -189,6 +196,11 @@ def ruleset_problems(ruleset: dict[str, Any]) -> list[str]:
             problems.append(f"rule {kind}: it lacks parameters")
             continue
         problems += [f"rule {kind}: its parameters lack {field}" for field in required if field not in parameters]
+        problems += [
+            f"rule {kind}: its {field} is not true or false"
+            for field in BOOLEAN_RULE_PARAMETERS.get(kind, ())
+            if field in parameters and not isinstance(parameters[field], bool)
+        ]
         for position, check in enumerate(parameters.get("required_status_checks", []) if kind == "required_status_checks" else [], 1):
             if "context" not in check:
                 problems.append(f"rule {kind}: check {position} lacks context")
@@ -784,6 +796,8 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the trigger spelled true (the reviewer's first plant)": ("\non:\n", "\ntrue:\n", "has no key spelled on"),
     "the trigger spelled True": ("\non:\n", "\nTrue:\n", "has no key spelled on"),
     "the trigger spelled yes": ("\non:\n", "\nyes:\n", "has no key spelled on"),
+    "a Boolean key before the trigger (the reviewer's plant)": ("\non:\n", "\ntrue: false\non:\n", "top-level keys are spelled"),
+    "an unknown top-level key": ("\non:\n", "\nenv_extra: {}\non:\n", "top-level keys are spelled"),
     "the trigger spelled ON": ("\non:\n", "\nON:\n", "has no key spelled on"),
     "the trigger spelled On, quoted": ("\non:\n", '\n"On":\n', "has no key spelled on"),
     "the trigger missing": ("\non:\n  pull_request:\n  push:\n    branches: [main]\n", "", "has no key spelled on"),
@@ -900,6 +914,16 @@ class RulesetRequiredFieldsTest(unittest.TestCase):
             with self.subTest(label=label):
                 problems = ruleset_problems(without(path))
                 self.assertTrue(any(diagnostic in problem for problem in problems), f"no problem names {diagnostic!r}: {problems}")
+
+    def test_a_required_setting_that_is_not_true_or_false_is_named(self) -> None:
+        ruleset = json.loads((ROOT / ".github/rulesets/main.json").read_text())
+        for field in ("strict_required_status_checks_policy",):
+            for value in (None, "true", 1):
+                with self.subTest(field=field, value=value):
+                    planted = copy.deepcopy(ruleset)
+                    planted["rules"][1]["parameters"][field] = value
+                    self.assertIn(f"rule required_status_checks: its {field} is not true or false", ruleset_problems(planted))
+        self.assertEqual([], ruleset_problems(ruleset))
 
 
 class RulesetTest(unittest.TestCase):
