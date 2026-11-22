@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import time
 import unittest
 from fractions import Fraction
 
@@ -105,6 +106,13 @@ class Rates(unittest.TestCase):
         self.assertEqual(
             [(1, 0, 1, 500_000), (3, 1, 2, 500_000), (5, 2, 3, 500_000), (7, 3, 4, 500_000)], [(p.second, p.first, p.end, p.offset_us) for p in pieces]
         )
+
+    def test_a_very_slow_rate_is_placed_sample_by_sample_in_bounded_time(self) -> None:
+        started = time.monotonic()
+        pieces = packet_pieces(ORIGIN, 3, 1e-6, ORIGIN)
+        self.assertEqual([0, 1_000_000, 2_000_000], [piece.second for piece in pieces])
+        self.assertEqual([(0, 1), (1, 2), (2, 3)], [(piece.first, piece.end) for piece in pieces])
+        self.assertLess(time.monotonic() - started, 2.0, "a loop over every second between the samples would take far longer")
 
     def test_a_rate_that_is_not_a_positive_number_or_a_start_that_is_not_finite_is_refused(self) -> None:
         for rate in (0.0, -1.0, math.nan, math.inf):
