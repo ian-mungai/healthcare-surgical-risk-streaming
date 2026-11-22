@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.stack.groups import (
     ALWAYS_ON_GROUPS,
@@ -23,6 +24,7 @@ from scripts.stack.groups import (
     profile_of,
     stop_arguments,
     up_arguments,
+    wait_ready,
 )
 from scripts.stack.limits import LIMITS_FILE, load_limits, parse_limits
 
@@ -139,6 +141,33 @@ LINE = "{service}|{state}|{health}|{exit_code}|{oom}|{restarts}"
 def inspect_text(*rows: dict[str, str]) -> str:
     defaults = {"service": "batch_worker", "state": "running", "health": "healthy", "exit_code": "0", "oom": "false", "restarts": "0"}
     return "\n".join(LINE.format(**(defaults | row)) for row in rows) + "\n"
+
+
+class ReadinessTest(unittest.TestCase):
+    def ready_states(self) -> dict[str, ServiceState]:
+        return {
+            "batch_worker": ServiceState("batch_worker", "running", "healthy", 0, False, 0),
+            "batch_helper": ServiceState("batch_helper", "running", "none", 0, False, 0),
+        }
+
+    def wait(self, clock: list[float]) -> None:
+        group = find_group(parse_limits(GOOD), "batch")
+        with (
+            mock.patch("scripts.stack.groups.read_states", return_value=self.ready_states()),
+            mock.patch("scripts.stack.groups.time.monotonic", side_effect=clock),
+        ):
+            wait_ready(settings(), group, 300.0, lambda message: None)
+
+    def test_services_that_are_ready_inside_the_deadline_are_accepted(self) -> None:
+        self.wait([0.0, 299.0])
+
+    def test_services_that_are_ready_only_after_the_deadline_are_not_accepted(self) -> None:
+        with self.assertRaisesRegex(GroupError, "group batch: ready after the deadline of 300 seconds"):
+            self.wait([0.0, 301.0])
+
+    def test_services_that_are_ready_exactly_at_the_deadline_are_not_accepted(self) -> None:
+        with self.assertRaisesRegex(GroupError, "ready after the deadline"):
+            self.wait([0.0, 300.0])
 
 
 class StateReportTest(unittest.TestCase):

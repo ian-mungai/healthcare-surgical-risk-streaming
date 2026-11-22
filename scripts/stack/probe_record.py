@@ -3,8 +3,9 @@
 A run is ``complete`` only when every measurement that the card asks for was made and every figure is inside its limit. The verdict has four values:
 
 - ``failed``: a figure is outside its limit or an event, a cleanup step or the job itself failed. Each finding is listed with its service or step.
-- ``not_measured``: nothing failed, but a measurement is missing: a sampler or an event reader that did not stop normally, fewer than ``MIN_OVERLAP_SAMPLES``
-  samples that hold the Spark container and every required service, or a container with no cap or peak figure.
+- ``not_measured``: nothing failed, but a measurement is missing: a loop that did not finish, event windows that do not chain from before the group start to
+  after the Spark job's exit, fewer than ``MIN_OVERLAP_SAMPLES`` samples that hold the running Spark container and every required service (each with a CPU
+  figure on the host), or a container with no cap, peak or kill count.
 - ``local_only``: the same on a computer that is not the Linux host (only Docker's figures exist). It is never ``complete``.
 - ``complete``: the Linux host, nothing failed and nothing missing.
 
@@ -26,7 +27,7 @@ from typing import Any
 from scripts.stack.host_figures import BYTES_PER_MIB, KIB_PER_MIB, HostFigures
 from scripts.stack.probe_docker import ContainerEvent, ProbeError, SamplingError
 
-SCHEMA = 2
+SCHEMA = 3
 RECORD_NAME = "capacity_probe.json"
 SPARK_SERVICE = "spark"
 STARTUP_PHASE = "startup"
@@ -59,11 +60,22 @@ LIMIT_NOTES = (
 
 @dataclass(frozen=True)
 class Sample:
+    """One reading of the host and of the containers. ``spark_running`` is the state of the named Spark container at the same iteration."""
+
     seconds: float
     utc: str
-    phase: str
     host: HostFigures | None
     containers_bytes: Mapping[str, int]
+    spark_running: bool = False
+
+
+@dataclass(frozen=True)
+class ServiceBaseline:
+    """What a required service showed when the always-on group was up and before the Spark job started."""
+
+    restarts: int
+    oom_kills: int | None
+    started_before_run: bool | None
 
 
 @dataclass(frozen=True)
@@ -102,16 +114,18 @@ class Execution:
     outcome: JobOutcome | None
     failure: str
     samples: Sequence[Sample]
-    sampler_error: str
-    sampler_confirmed: bool
+    loop_complete: bool
     events: Sequence[ContainerEvent]
-    events_error: str
-    events_confirmed: bool
-    baseline_restarts: Mapping[str, int]
+    windows: Sequence[tuple[int, int]]
+    run_start_ns: int
+    job_exit_ns: int | None
+    baseline: Mapping[str, ServiceBaseline]
     evidence: Mapping[str, ContainerEvidence]
     cleanup: Sequence[CleanupStep]
     interrupted: bool = False
     evidence_error: str = ""
+    addresses: Mapping[str, str] | None = None
+    scratch: str = ""
 
 
 @dataclass(frozen=True)
@@ -120,7 +134,7 @@ class Assessment:
     gaps: tuple[str, ...]
     checks: Mapping[str, bool | None]
     lowest_available_kib: int | None
-    overlap_samples: int
+    overlap: tuple[Sample, ...]
     polled_peak_bytes: Mapping[str, int]
 
     def verdict(self, host_measured: bool) -> str:
@@ -168,9 +182,39 @@ def peaks_of(samples: Sequence[Sample]) -> dict[str, Any]:
     return {"samples": len(samples), "host": host, "containers_mib": {name: mib(value) for name, value in polled_peaks(samples).items()}}
 
 
-def overlap_sample_count(samples: Sequence[Sample], services: Sequence[str]) -> int:
-    """The samples that hold a memory figure for every one of ``services``."""
-    return sum(1 for sample in samples if all(name in sample.containers_bytes for name in services))
+def startup_samples(samples: Sequence[Sample]) -> list[Sample]:
+    """The samples before the Spark container was first seen running."""
+    found: list[Sample] = []
+    for sample in samples:
+        if sample.spark_running:
+            break
+        found.append(sample)
+    return found
+
+
+def overlap_samples(samples: Sequence[Sample], required: Sequence[str], *, host_measured: bool) -> list[Sample]:
+    """Exactly the samples that hold the named Spark container running and a memory figure for every required service, each with a CPU figure on the host."""
+    found = []
+    for sample in samples:
+        holds = sample.spark_running and SPARK_SERVICE in sample.containers_bytes and all(name in sample.containers_bytes for name in required)
+        has_cpu = not host_measured or (sample.host is not None and sample.host.cpu_percent is not None)
+        if holds and has_cpu:
+            found.append(sample)
+    return found
+
+
+def coverage_gaps(windows: Sequence[tuple[int, int]], run_start_ns: int, job_exit_ns: int | None) -> list[str]:
+    """Why the event windows are not one chain from before the group start to after the Spark job's exit. Empty means they are."""
+    if not windows:
+        return ["no event window was read"]
+    gaps = []
+    if windows[0][0] > run_start_ns:
+        gaps.append("the first event window starts after the run started")
+    if any(later[0] != earlier[1] for earlier, later in zip(windows, windows[1:], strict=False)):
+        gaps.append("the event windows are not contiguous")
+    if job_exit_ns is not None and windows[-1][1] < job_exit_ns:
+        gaps.append("the last event window ends before the Spark job's exit")
+    return gaps
 
 
 def validate_result(result: Mapping[str, Any], *, branch: str, rows: int, memory_limit_mib: int) -> tuple[dict[str, Any], str]:
@@ -195,9 +239,15 @@ def validate_result(result: Mapping[str, Any], *, branch: str, rows: int, memory
 
 
 def container_findings(
-    service: str, evidence: ContainerEvidence | None, configured_bytes: int, polled_peak: int | None, baseline_restarts: int | None, *, required: bool
+    service: str,
+    evidence: ContainerEvidence | None,
+    configured_bytes: int,
+    polled_peak: int | None,
+    baseline: ServiceBaseline | None,
+    *,
+    required: bool,
 ) -> tuple[list[str], list[str]]:
-    """The failures and the gaps of one container: its cap against the configured limit, its peak against the cap, its kills and its restarts."""
+    """The failures and the gaps of one container: its cap, its peak, its kills since the start and its restarts."""
     if evidence is None:
         return [], [f"service {service}: no evidence was collected"]
     failures: list[str] = []
@@ -213,14 +263,20 @@ def container_findings(
         gaps.append(f"service {service}: its peak memory was not measured")
     elif peak > configured_bytes:
         failures.append(f"service {service}: the peak memory is {peak} bytes, above the limit of {configured_bytes} bytes")
-    if evidence.oom_kills:
-        failures.append(f"service {service}: the kernel killed a process for memory {evidence.oom_kills} time(s)")
     if evidence.oom_killed:
         failures.append(f"service {service}: its container was killed for memory")
-    if required and baseline_restarts is not None and evidence.restarts != baseline_restarts:
-        failures.append(f"service {service}: restarted {evidence.restarts - baseline_restarts} time(s) during the run")
-    if required and baseline_restarts is None:
-        gaps.append(f"service {service}: its restarts were not counted at the start")
+    if required:
+        if baseline is None:
+            gaps.append(f"service {service}: its restarts and kills were not counted at the start")
+        else:
+            if evidence.restarts != baseline.restarts:
+                failures.append(f"service {service}: restarted {evidence.restarts - baseline.restarts} time(s) during the run")
+            if evidence.oom_kills is not None and baseline.oom_kills is not None and evidence.oom_kills > baseline.oom_kills:
+                failures.append(f"service {service}: the kernel killed a process for memory {evidence.oom_kills - baseline.oom_kills} time(s) during the run")
+            if evidence.oom_kills is not None and baseline.oom_kills is None:
+                gaps.append(f"service {service}: its kills for memory were not counted at the start")
+    elif evidence.oom_kills:
+        failures.append(f"service {service}: the kernel killed a process for memory {evidence.oom_kills} time(s)")
     return failures, gaps
 
 
@@ -235,11 +291,11 @@ def assess(execution: Execution, *, limits_mib: Mapping[str, int], required: Seq
     container_failures: list[str] = []
     for service in (*required, SPARK_SERVICE):
         is_required = service != SPARK_SERVICE
-        evidence = execution.evidence.get(service) if is_required else (outcome.evidence if outcome is not None else None)
         if service == SPARK_SERVICE and outcome is None:
             continue
+        evidence = execution.evidence.get(service) if is_required else outcome.evidence if outcome is not None else None
         found, missing = container_findings(
-            service, evidence, limits_mib[service] * BYTES_PER_MIB, polled.get(service), execution.baseline_restarts.get(service), required=is_required
+            service, evidence, limits_mib[service] * BYTES_PER_MIB, polled.get(service), execution.baseline.get(service), required=is_required
         )
         container_failures += found
         gaps += missing
@@ -261,13 +317,13 @@ def assess(execution: Execution, *, limits_mib: Mapping[str, int], required: Seq
         failures.append("the run was interrupted")
     if execution.evidence_error:
         gaps.append(f"the end-of-run evidence could not be read: {execution.evidence_error}")
-    if execution.sampler_error or not execution.sampler_confirmed:
-        gaps.append(f"the sampler did not stop normally{': ' + execution.sampler_error if execution.sampler_error else ''}")
-    if execution.events_error or not execution.events_confirmed:
-        gaps.append(f"the event reader did not stop normally{': ' + execution.events_error if execution.events_error else ''}")
-    overlap = overlap_sample_count(samples, (*required, SPARK_SERVICE))
-    if overlap < MIN_OVERLAP_SAMPLES:
-        gaps.append(f"{overlap} samples hold the Spark container and every required service, and {MIN_OVERLAP_SAMPLES} are needed")
+    if not execution.loop_complete:
+        gaps.append("the sampling loop did not run to its end")
+    chain = coverage_gaps(execution.windows, execution.run_start_ns, execution.job_exit_ns)
+    gaps += chain
+    overlap = overlap_samples(samples, required, host_measured=host_measured)
+    if len(overlap) < MIN_OVERLAP_SAMPLES:
+        gaps.append(f"{len(overlap)} samples hold the running Spark container and every required service, and {MIN_OVERLAP_SAMPLES} are needed")
     available = [sample.host.memory_available_kib for sample in samples if sample.host is not None]
     lowest = min(available) if available else None
     reserve_kept: bool | None = None
@@ -280,15 +336,15 @@ def assess(execution: Execution, *, limits_mib: Mapping[str, int], required: Seq
                 failures.append(f"the host lost its reserve: the lowest available memory was {lowest} KiB and the reserve is {reserve_mib * KIB_PER_MIB} KiB")
     checks: dict[str, bool | None] = {
         "completed": completed,
-        "sampling_confirmed": execution.sampler_confirmed and not execution.sampler_error,
-        "events_confirmed": execution.events_confirmed and not execution.events_error,
-        "overlap_samples_enough": overlap >= MIN_OVERLAP_SAMPLES,
+        "loop_complete": execution.loop_complete,
+        "events_covered": not chain,
+        "overlap_samples_enough": len(overlap) >= MIN_OVERLAP_SAMPLES,
         "containers_within_limits": not container_failures and not unlisted,
         "no_lifecycle_events": not lifecycle,
         "host_reserve_kept": reserve_kept,
         "cleanup_ok": all(step.ok for step in execution.cleanup),
     }
-    return Assessment(tuple(failures), tuple(gaps), checks, lowest, overlap, polled)
+    return Assessment(tuple(failures), tuple(gaps), checks, lowest, tuple(overlap), polled)
 
 
 def sample_document(sample: Sample) -> dict[str, Any]:
@@ -305,19 +361,41 @@ def sample_document(sample: Sample) -> dict[str, Any]:
             "disk_write_mib_s": sample.host.disk_write_mib_s,
             "free_disk_mib": sample.host.free_disk_mib,
         }
-    return {"seconds": round(sample.seconds, 1), "utc": sample.utc, "phase": sample.phase, "host": host, "containers_bytes": dict(sample.containers_bytes)}
+    return {
+        "seconds": round(sample.seconds, 1),
+        "utc": sample.utc,
+        "spark_running": sample.spark_running,
+        "host": host,
+        "containers_bytes": dict(sample.containers_bytes),
+    }
 
 
-def container_document(service: str, evidence: ContainerEvidence | None, configured_mib: int, polled: int | None, baseline: int | None) -> dict[str, Any]:
+def peak_scope(service: str, baseline: ServiceBaseline | None, source: str | None) -> str:
+    """What a container's peak covers, so a reader does not take a long-running service's peak for the run's."""
+    if service == SPARK_SERVICE:
+        return "the job container's whole life"
+    if source != "cgroup":
+        return "the highest figure of the samples taken during the run"
+    if baseline is None or baseline.started_before_run is None:
+        return "since the container started (when it started is not known)"
+    return "since the container started, which was before the run" if baseline.started_before_run else "since the container started, which was during the run"
+
+
+def container_document(
+    service: str, evidence: ContainerEvidence | None, configured_mib: int, polled: int | None, baseline: ServiceBaseline | None
+) -> dict[str, Any]:
     return {
         "configured_bytes": configured_mib * BYTES_PER_MIB,
         "cap_bytes": None if evidence is None else evidence.cap_bytes,
         "peak_bytes": None if evidence is None else evidence.peak_bytes,
         "peak_source": None if evidence is None else evidence.source,
+        "peak_scope": peak_scope(service, baseline, None if evidence is None else evidence.source),
         "polled_peak_bytes": polled,
-        "oom_kills": None if evidence is None else evidence.oom_kills,
-        "restarts_before": baseline,
+        "oom_kills_before": None if baseline is None else baseline.oom_kills,
+        "oom_kills_after": None if evidence is None else evidence.oom_kills,
+        "restarts_before": None if baseline is None else baseline.restarts,
         "restarts_after": None if evidence is None else evidence.restarts,
+        "started_before_run": None if baseline is None else baseline.started_before_run,
         "running_at_end": None if evidence is None else evidence.running,
     }
 
@@ -336,22 +414,23 @@ def build_document(
     finished_utc: str,
     job_arguments: Sequence[str],
 ) -> dict[str, Any]:
-    """The record of a run: the verdict with its findings, the checks, the peaks of the whole run and of each phase, the workload and the whole series."""
+    """The record of a run: the verdict with its findings, the checks, the peaks of the whole run, of its start-up and of its overlap, and the series."""
     samples, outcome = execution.samples, execution.outcome
     peaks: dict[str, Any] = {}
     if samples:
         peaks["all"] = peaks_of(samples)
-        for phase in (STARTUP_PHASE, OVERLAP_PHASE):
-            phase_samples = [sample for sample in samples if sample.phase == phase]
-            if phase_samples:
-                peaks[phase] = peaks_of(phase_samples)
+        before = startup_samples(samples)
+        if before:
+            peaks["startup"] = peaks_of(before)
+        if assessment.overlap:
+            peaks["overlap"] = peaks_of(assessment.overlap)
     containers = {
         service: container_document(
             service,
             execution.evidence.get(service) if service != SPARK_SERVICE else (outcome.evidence if outcome else None),
             limits_mib[service],
             assessment.polled_peak_bytes.get(service),
-            execution.baseline_restarts.get(service),
+            execution.baseline.get(service),
         )
         for service in (*required, SPARK_SERVICE)
     }
@@ -360,6 +439,7 @@ def build_document(
         "started_utc": started_utc,
         "finished_utc": finished_utc,
         "verdict": assessment.verdict(host_measured),
+        "interrupted": execution.interrupted,
         "failures": list(assessment.failures),
         "gaps": list(assessment.gaps),
         "checks": dict(assessment.checks),
@@ -374,9 +454,18 @@ def build_document(
         "run_deadline_seconds": deadline_seconds,
         "reserve_mib": reserve_mib,
         "lowest_available_kib": assessment.lowest_available_kib,
-        "overlap_samples": assessment.overlap_samples,
+        "overlap_samples": len(assessment.overlap),
+        "addresses": dict(execution.addresses or {}),
+        "scratch_volume": execution.scratch,
         "containers": containers,
         "events": [{"action": event.action, "service": event.service, "detail": event.detail} for event in execution.events],
+        "event_windows": {
+            "count": len(execution.windows),
+            "first_since_ns": execution.windows[0][0] if execution.windows else None,
+            "last_until_ns": execution.windows[-1][1] if execution.windows else None,
+            "run_start_ns": execution.run_start_ns,
+            "job_exit_ns": execution.job_exit_ns,
+        },
         "workload": {
             "service": SPARK_SERVICE,
             "arguments": list(job_arguments),
@@ -395,7 +484,7 @@ def build_document(
 
 def check_destination(folder: Path) -> None:
     """Refuse a folder that already holds a record or cannot take one, before anything starts. The check creates nothing."""
-    if (folder / RECORD_NAME).exists():
+    if os.path.lexists(folder / RECORD_NAME):
         raise ProbeError(f"{folder} already holds a record: a probe run writes a new folder")
     existing = folder
     while not existing.exists() and existing != existing.parent:

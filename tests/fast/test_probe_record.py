@@ -22,11 +22,14 @@ from scripts.stack.probe_record import (
     Execution,
     JobOutcome,
     Sample,
+    ServiceBaseline,
     assess,
     build_document,
     check_destination,
-    overlap_sample_count,
+    coverage_gaps,
+    overlap_samples,
     peaks_of,
+    startup_samples,
     validate_result,
     write_document,
 )
@@ -42,9 +45,9 @@ def figures(*, available_kib: int = 9_000_000, cpu: float | None = 10.0) -> Host
     return HostFigures(10000.0, round(available_kib / 1024, 1), available_kib, 0.0, cpu, (cpu, cpu), 1.0, 1.0, 100000.0)
 
 
-def sample(seconds: float, *, host: HostFigures | None = None, spark: bool = True, phase: str = "overlap", **extra: int) -> Sample:
+def sample(seconds: float, *, host: HostFigures | None = None, spark: bool = True, running: bool | None = None, **extra: int) -> Sample:
     usage = {"postgres": 300 * MIB, "nessie": 400 * MIB, **({"spark": 900 * MIB} if spark else {}), **extra}
-    return Sample(seconds, f"2026-11-22T10:00:{int(seconds):02d}Z", phase, host, usage)
+    return Sample(seconds, f"2026-11-22T10:00:{int(seconds):02d}Z", host, usage, spark if running is None else running)
 
 
 def evidence(
@@ -73,12 +76,12 @@ def good_execution(**changes: Any) -> Execution:
         outcome=JobOutcome(0, False, 20.0, GOOD_RESULT, "", evidence("spark", peak_mib=3000.0)),
         failure="",
         samples=[sample(5, host=figures()), sample(10, host=figures()), sample(15, host=figures())],
-        sampler_error="",
-        sampler_confirmed=True,
+        loop_complete=True,
         events=[],
-        events_error="",
-        events_confirmed=True,
-        baseline_restarts={"postgres": 0, "nessie": 0},
+        windows=[(100, 200), (200, 300)],
+        run_start_ns=100,
+        job_exit_ns=250,
+        baseline={"postgres": ServiceBaseline(0, 0, True), "nessie": ServiceBaseline(0, 0, True)},
         evidence={"postgres": evidence("postgres"), "nessie": evidence("nessie")},
         cleanup=[CleanupStep("job container", True, "removed and absent"), CleanupStep("nessie branch", True, "no branch existed")],
     )
@@ -175,7 +178,7 @@ class ContainerTest(unittest.TestCase):
 
     def test_a_restart_between_the_start_and_the_end_fails_and_no_start_count_is_a_gap(self) -> None:
         self.assertEqual("failed", verdict(self.with_required(nessie=evidence("nessie", restarts=1))))
-        self.assertEqual("not_measured", verdict(good_execution(baseline_restarts={"postgres": 0})))
+        self.assertEqual("not_measured", verdict(good_execution(baseline={"postgres": ServiceBaseline(0, 0, True)})))
 
     def test_a_required_service_that_is_not_running_at_the_end_fails(self) -> None:
         self.assertEqual("failed", verdict(self.with_required(nessie=evidence("nessie", running=False))))
@@ -188,7 +191,7 @@ class ContainerTest(unittest.TestCase):
             samples=[sample(5, host=figures()), sample(10, host=figures()), sample(15, host=figures())],
         )
         self.assertEqual("complete", verdict(no_peak_anywhere), "a polled peak stands in for a missing cgroup peak")
-        bare = dataclasses.replace(no_peak_anywhere, samples=[Sample(5, "t", "overlap", figures(), {"nessie": 1, "spark": 1})] * 3)
+        bare = dataclasses.replace(no_peak_anywhere, samples=[Sample(5, "t", figures(), {"nessie": 1, "spark": 1}, True)] * 3)
         self.assertEqual("not_measured", verdict(bare))
 
     def test_a_service_with_no_evidence_is_a_gap(self) -> None:
@@ -231,25 +234,17 @@ class MeasurementTest(unittest.TestCase):
         series = [sample(5, host=figures(), spark=False), sample(10, host=figures()), sample(15, host=figures())]
         result = run(good_execution(samples=series))
         self.assertEqual("not_measured", result.verdict(True))
-        self.assertEqual(2, result.overlap_samples)
-        self.assertEqual(2, overlap_sample_count(series, (*REQUIRED, "spark")))
+        self.assertEqual(2, len(result.overlap))
+        self.assertEqual(2, len(overlap_samples(series, REQUIRED, host_measured=True)))
 
     def test_three_samples_are_enough(self) -> None:
         self.assertEqual("complete", verdict(good_execution()))
 
-    def test_a_sampler_or_an_event_reader_that_did_not_stop_normally_is_not_measured(self) -> None:
-        for changes in (
-            {"sampler_confirmed": False},
-            {"sampler_error": "sample 4 failed: no MemAvailable line"},
-            {"events_confirmed": False},
-            {"events_error": "docker events line 1 is not in the expected form"},
-        ):
-            with self.subTest(changes=changes):
-                result = run(good_execution(**changes))
-                self.assertEqual("not_measured", result.verdict(True))
+    def test_a_loop_that_did_not_run_to_its_end_is_not_measured(self) -> None:
+        self.assertEqual("not_measured", verdict(good_execution(loop_complete=False)))
 
     def test_a_failure_wins_over_a_gap(self) -> None:
-        self.assertEqual("failed", verdict(good_execution(sampler_confirmed=False, events=[event("die", "postgres")])))
+        self.assertEqual("failed", verdict(good_execution(loop_complete=False, events=[event("die", "postgres")])))
 
     def test_a_job_that_did_not_run_has_the_failure_text_and_is_not_completed(self) -> None:
         result = run(good_execution(outcome=None, failure="starting the always-on group failed: x"))
@@ -305,6 +300,105 @@ class JobTest(unittest.TestCase):
         missing = {key: value for key, value in GOOD_RESULT.items() if key != "uid"}
         self.assertIn("no valid uid", validate_result(missing, branch="capacity_probe_x", rows=10, memory_limit_mib=4096)[1])
         self.assertIn("no valid branch", validate_result({}, branch="capacity_probe_x", rows=10, memory_limit_mib=4096)[1])
+
+
+class OverlapTest(unittest.TestCase):
+    def test_a_sample_is_in_the_overlap_only_when_the_spark_container_runs_and_every_required_service_is_in_it(self) -> None:
+        series = [
+            sample(1, host=figures(), spark=True),
+            sample(2, host=figures(), spark=True, running=False),
+            sample(3, host=figures(), spark=False),
+            Sample(4, "t", figures(), {"nessie": MIB, "spark": MIB}, True),
+            sample(5, host=figures(), spark=True),
+        ]
+        self.assertEqual([1, 5], [item.seconds for item in overlap_samples(series, REQUIRED, host_measured=True)])
+
+    def test_on_the_host_a_sample_without_a_cpu_figure_is_not_in_the_overlap_and_elsewhere_it_needs_none(self) -> None:
+        series = [sample(1, host=figures(cpu=None)), sample(2, host=figures()), sample(3)]
+        self.assertEqual([2], [item.seconds for item in overlap_samples(series, REQUIRED, host_measured=True)])
+        self.assertEqual([1, 2, 3], [item.seconds for item in overlap_samples(series, REQUIRED, host_measured=False)])
+
+    def test_three_samples_that_lack_the_cpu_figure_are_not_enough_on_the_host(self) -> None:
+        series = [sample(5, host=figures(cpu=None)), sample(10, host=figures(cpu=None)), sample(15, host=figures())]
+        self.assertEqual("not_measured", verdict(good_execution(samples=series)))
+
+    def test_the_start_up_samples_are_those_before_the_spark_container_was_first_seen_running(self) -> None:
+        series = [sample(1, spark=False), sample(2, spark=False), sample(3), sample(4, spark=False)]
+        self.assertEqual([1, 2], [item.seconds for item in startup_samples(series)])
+
+    def test_the_overlap_peaks_come_from_the_overlap_set_only(self) -> None:
+        series = [
+            sample(1, host=figures(available_kib=9_000_000), spark=False, postgres=900 * MIB),
+            sample(2, host=figures(), postgres=100 * MIB),
+            sample(3, host=figures(), postgres=200 * MIB),
+            sample(4, host=figures(), postgres=150 * MIB),
+            sample(5, host=figures(), spark=False, postgres=1000 * MIB),
+        ]
+        document = DocumentTest().document(good_execution(samples=series))
+        self.assertEqual(900.0, document["peaks"]["startup"]["containers_mib"]["postgres"])
+        self.assertEqual(200.0, document["peaks"]["overlap"]["containers_mib"]["postgres"])
+        self.assertEqual(1000.0, document["peaks"]["all"]["containers_mib"]["postgres"])
+        self.assertEqual(3, document["peaks"]["overlap"]["samples"])
+
+
+class CoverageTest(unittest.TestCase):
+    def test_windows_that_chain_from_before_the_start_to_after_the_exit_leave_no_gap(self) -> None:
+        self.assertEqual([], coverage_gaps([(100, 200), (200, 300)], 100, 250))
+        self.assertEqual([], coverage_gaps([(90, 200), (200, 300)], 100, None))
+
+    def test_no_window_is_a_gap(self) -> None:
+        self.assertEqual(["no event window was read"], coverage_gaps([], 100, 250))
+
+    def test_a_first_window_that_starts_after_the_run_started_is_a_gap(self) -> None:
+        self.assertEqual(["the first event window starts after the run started"], coverage_gaps([(101, 300)], 100, 250))
+
+    def test_windows_with_a_hole_between_them_are_a_gap(self) -> None:
+        self.assertEqual(["the event windows are not contiguous"], coverage_gaps([(100, 200), (201, 300)], 100, 250))
+
+    def test_a_last_window_that_ends_before_the_exit_is_a_gap(self) -> None:
+        self.assertEqual(["the last event window ends before the Spark job's exit"], coverage_gaps([(100, 200)], 100, 250))
+
+    def test_a_chain_that_does_not_cover_the_run_makes_the_verdict_not_measured(self) -> None:
+        for windows in ([], [(150, 300)], [(100, 150), (160, 300)], [(100, 200)]):
+            with self.subTest(windows=windows):
+                result = run(good_execution(windows=windows))
+                self.assertEqual("not_measured", result.verdict(True))
+                self.assertIs(False, result.checks["events_covered"])
+
+
+class KillCountTest(unittest.TestCase):
+    def test_only_the_kills_since_the_start_count_and_a_service_with_old_kills_is_not_failed(self) -> None:
+        old = good_execution(
+            evidence={"postgres": evidence("postgres", kills=3), "nessie": evidence("nessie")},
+            baseline={"postgres": ServiceBaseline(0, 3, True), "nessie": ServiceBaseline(0, 0, True)},
+        )
+        self.assertEqual("complete", verdict(old))
+        more = dataclasses.replace(old, evidence={"postgres": evidence("postgres", kills=4), "nessie": evidence("nessie")})
+        result = run(more)
+        self.assertEqual("failed", result.verdict(True))
+        self.assertTrue(any("service postgres: the kernel killed a process for memory 1 time(s) during the run" in text for text in result.failures))
+
+    def test_a_kill_count_that_was_not_taken_at_the_start_is_a_gap(self) -> None:
+        execution = good_execution(baseline={"postgres": ServiceBaseline(0, None, True), "nessie": ServiceBaseline(0, 0, True)})
+        self.assertEqual("not_measured", verdict(execution))
+
+    def test_the_peak_of_a_required_service_is_labelled_by_when_its_container_started(self) -> None:
+        for started, text in (
+            (True, "since the container started, which was before the run"),
+            (False, "which was during the run"),
+            (None, "when it started is not known"),
+        ):
+            with self.subTest(started=started):
+                baseline = {"postgres": ServiceBaseline(0, 0, started), "nessie": ServiceBaseline(0, 0, True)}
+                document = DocumentTest().document(good_execution(baseline=baseline))
+                self.assertIn(text, document["containers"]["postgres"]["peak_scope"])
+                self.assertEqual(started, document["containers"]["postgres"]["started_before_run"])
+        self.assertEqual("the job container's whole life", DocumentTest().document()["containers"]["spark"]["peak_scope"])
+
+    def test_without_cgroup_figures_the_peak_is_labelled_as_the_samples_highest_figure(self) -> None:
+        polled = dataclasses.replace(evidence("postgres"), source="docker")
+        document = DocumentTest().document(good_execution(evidence={"postgres": polled, "nessie": evidence("nessie")}))
+        self.assertIn("highest figure of the samples", document["containers"]["postgres"]["peak_scope"])
 
 
 class PeaksTest(unittest.TestCase):
@@ -381,6 +475,18 @@ class DocumentTest(unittest.TestCase):
         self.assertIsNone(document["workload"]["exit_code"])
         self.assertIsNone(document["containers"]["spark"]["cap_bytes"])
 
+    def test_the_record_names_the_catalog_addresses_the_scratch_volume_and_whether_the_run_was_interrupted(self) -> None:
+        execution = good_execution(
+            addresses={"job_catalog": "http://nessie:19120/api/v2", "cleanup_catalog": "http://127.0.0.1:19120/api/v2"},
+            scratch="p_capacity_probe_scratch_x",
+            interrupted=True,
+        )
+        document = self.document(execution)
+        self.assertEqual("http://127.0.0.1:19120/api/v2", document["addresses"]["cleanup_catalog"])
+        self.assertEqual("p_capacity_probe_scratch_x", document["scratch_volume"])
+        self.assertIs(True, document["interrupted"])
+        self.assertEqual({"count": 2, "first_since_ns": 100, "last_until_ns": 300, "run_start_ns": 100, "job_exit_ns": 250}, document["event_windows"])
+
     def test_the_record_holds_no_value_that_json_cannot_carry(self) -> None:
         json.dumps(self.document(), allow_nan=False)
 
@@ -405,6 +511,11 @@ class DocumentTest(unittest.TestCase):
             blocker.write_text("x")
             with self.assertRaisesRegex(ProbeError, "cannot write the record"):
                 check_destination(blocker / "run")
+            dangling = Path(folder) / "dangling"
+            dangling.mkdir()
+            (dangling / "capacity_probe.json").symlink_to(Path(folder) / "nowhere")
+            with self.assertRaisesRegex(ProbeError, "already holds a record"):
+                check_destination(dangling)
             readonly = Path(folder) / "readonly"
             readonly.mkdir()
             readonly.chmod(0o500)

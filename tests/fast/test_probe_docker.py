@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.stack.probe_docker import (
@@ -16,6 +17,8 @@ from scripts.stack.probe_docker import (
     parse_state,
     timestamp,
 )
+
+NOON = datetime(2026, 11, 22, 10, 0, 0, tzinfo=UTC).timestamp()
 
 
 def event(action: str, *, service: str = "nessie", nano: int = 1_763_800_000_000_000_001, **attributes: str) -> str:
@@ -51,15 +54,19 @@ class ParseTest(unittest.TestCase):
             parse_listing("a1b2c3d4e5f6|p-spark-1|spark\nbroken\n")
 
     def test_the_state_of_a_container_is_read_with_its_exit_status_kill_flag_restarts_and_memory_cap(self) -> None:
-        state = parse_state("exited|137|true|0|2|4294967296\n")
+        state = parse_state("exited|137|true|0|2|4294967296|2026-11-22T10:00:00.5Z\n")
         self.assertEqual(
             ("exited", 137, True, 0, 2, 4294967296), (state.status, state.exit_code, state.oom_killed, state.pid, state.restarts, state.memory_cap_bytes)
         )
 
     def test_a_state_in_another_form_is_refused_and_never_echoed(self) -> None:
         with self.assertRaisesRegex(ProbeError, "did not answer in the expected form") as caught:
-            parse_state("running|0|maybe|1|0|0 SECRET")
+            parse_state("running|0|maybe|1|0|0|2026-11-22T10:00:00Z SECRET")
         self.assertNotIn("SECRET", str(caught.exception))
+
+    def test_a_container_that_never_started_has_start_time_zero_and_nanoseconds_are_read(self) -> None:
+        self.assertEqual(0.0, parse_state("created|0|false|0|0|0|0001-01-01T00:00:00Z").started_at)
+        self.assertAlmostEqual(NOON + 0.123456789, parse_state("running|0|false|9|0|0|2026-11-22T10:00:00.123456789Z").started_at, places=5)
 
     def test_the_events_give_the_action_the_service_and_the_detail(self) -> None:
         text = event("die", exitCode="137") + "\n" + event("kill", signal="9", service="postgres") + "\n" + event("oom") + "\n"
@@ -132,7 +139,7 @@ class DockerTest(unittest.TestCase):
             Docker(runner=Fake((1, ""))).exists("job")
 
     def test_a_name_with_a_character_that_a_filter_would_read_as_a_pattern_is_refused(self) -> None:
-        with self.assertRaisesRegex(ProbeError, "container name"):
+        with self.assertRaisesRegex(ProbeError, "character that a name may not"):
             Docker(runner=Fake()).exists("job$|.*")
 
     def test_a_removal_of_a_container_that_is_already_gone_is_not_an_error_and_another_failure_is(self) -> None:
@@ -151,6 +158,24 @@ class DockerTest(unittest.TestCase):
             self.assertIn(f"event={action}", call)
         self.assertIn("label=com.docker.compose.project=p", call)
         self.assertEqual([12.0], fake.timeouts)
+
+    def test_the_scratch_volume_is_created_with_the_project_label_looked_up_by_its_exact_name_and_removed(self) -> None:
+        fake = Fake((0, "vol\n"), (0, "vol\n"), (0, ""), (1, ""))
+        docker = Docker(runner=fake)
+        docker.create_volume("p_scratch_1", "p")
+        self.assertTrue(docker.volume_exists("p_scratch_1"))
+        docker.remove_volume("p_scratch_1")
+        docker.remove_volume("p_scratch_1")
+        self.assertEqual(["docker", "volume", "create"], fake.calls[0][:3])
+        self.assertIn("com.docker.compose.project=p", fake.calls[0])
+        self.assertIn("name=^p_scratch_1$", fake.calls[1])
+        self.assertEqual(["docker", "volume", "rm", "--force", "p_scratch_1"], fake.calls[2])
+
+    def test_a_volume_name_with_a_pattern_character_is_refused(self) -> None:
+        docker = Docker(runner=Fake())
+        for call in (lambda: docker.create_volume("v$", "p"), lambda: docker.volume_exists("v|x"), lambda: docker.remove_volume("v*")):
+            with self.assertRaisesRegex(ProbeError, "character that a name may not"):
+                call()
 
     def test_the_memory_statistics_are_the_listing_and_the_statistics_text(self) -> None:
         listing, stats = Docker(runner=Fake((0, "a1b2c3d4e5f6|spark\n"), (0, "a1b2c3d4e5f6|1MiB / 2MiB\n"))).usage_texts("p")

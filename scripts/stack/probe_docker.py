@@ -11,6 +11,7 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from scripts.process import CompletedProcess, TimeoutExpired, run_command, timeout_text
@@ -20,11 +21,12 @@ DOCKER_SECONDS = 30.0
 NANOSECONDS = 10**9
 LIST_FORMAT = '{{.ID}}|{{.Names}}|{{.Label "com.docker.compose.service"}}'
 STATS_FORMAT = "{{.ID}}|{{.MemUsage}}"
-INSPECT_FORMAT = "{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.Pid}}|{{.RestartCount}}|{{.HostConfig.Memory}}"
+INSPECT_FORMAT = "{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.Pid}}|{{.RestartCount}}|{{.HostConfig.Memory}}|{{.State.StartedAt}}"
 LIFECYCLE_ACTIONS = ("die", "oom", "kill", "restart")
 LIST_LINE = re.compile(r"([0-9a-f]{12})\|([A-Za-z0-9_.-]+)\|([A-Za-z0-9_.-]*)")
-STATE_LINE = re.compile(r"([a-z]+)\|(-?\d+)\|(true|false)\|(\d+)\|(\d+)\|(\d+)")
+STATE_LINE = re.compile(r"([a-z]+)\|(-?\d+)\|(true|false)\|(\d+)\|(\d+)\|(\d+)\|(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z")
 NAME_TEXT = re.compile(r"[A-Za-z0-9_.-]+")
+VOLUME_LABELS = ("com.docker.compose.project", "surgical_risk.capacity_probe")
 Runner = Callable[..., CompletedProcess[str]]
 Limiter = Callable[[float], float]
 
@@ -52,6 +54,7 @@ class ContainerState:
     pid: int
     restarts: int
     memory_cap_bytes: int
+    started_at: float
 
 
 @dataclass(frozen=True)
@@ -76,13 +79,20 @@ def parse_listing(text: str) -> list[ContainerInfo]:
     return found
 
 
+def started_seconds(stamp: str, fraction: str | None) -> float:
+    """The Unix time of a container's start, from the time Docker prints. A container that never started has 0."""
+    if stamp.startswith("0001"):
+        return 0.0
+    return datetime.fromisoformat(stamp + "+00:00").timestamp() + (float(f"0.{fraction}") if fraction else 0.0)
+
+
 def parse_state(text: str) -> ContainerState:
     """The state of a container from ``docker inspect`` with ``INSPECT_FORMAT``."""
     match = STATE_LINE.fullmatch(text.strip())
     if match is None:
         raise ProbeError("docker inspect did not answer in the expected form")
-    status, exit_code, oom, pid, restarts, memory = match.groups()
-    return ContainerState(status, int(exit_code), oom == "true", int(pid), int(restarts), int(memory))
+    status, exit_code, oom, pid, restarts, memory, started, fraction = match.groups()
+    return ContainerState(status, int(exit_code), oom == "true", int(pid), int(restarts), int(memory), started_seconds(started, fraction))
 
 
 def event_detail(attributes: dict[str, Any], action: str) -> str:
@@ -158,10 +168,28 @@ class Docker:
 
     def exists(self, container: str) -> bool:
         """Whether a container of this exact name exists, stopped or not. A command that fails is an error and never an answer."""
-        if not NAME_TEXT.fullmatch(container):
-            raise ProbeError("a container name holds a character that a name may not")
+        self.check_name(container)
         result = self.run(["ps", "--all", "--filter", f"name=^/{container}$", "--format", "{{.ID}}"], label="looking for a container")
         return bool(result.stdout.strip())
+
+    def create_volume(self, name: str, project: str) -> None:
+        """Create the run's own named volume, labelled with the project so that the project's removal finds it."""
+        self.check_name(name)
+        labels = [item for label in VOLUME_LABELS for item in ("--label", f"{label}={project if label.endswith('project') else 'run'}")]
+        self.run(["volume", "create", *labels, name], label="creating the job's scratch volume")
+
+    def volume_exists(self, name: str) -> bool:
+        self.check_name(name)
+        return bool(self.run(["volume", "ls", "--quiet", "--filter", f"name=^{name}$"], label="looking for the job's scratch volume").stdout.strip())
+
+    def remove_volume(self, name: str) -> None:
+        self.check_name(name)
+        self.run(["volume", "rm", "--force", name], label="removing the job's scratch volume", accepted=(0, 1))
+
+    @staticmethod
+    def check_name(name: str) -> None:
+        if not NAME_TEXT.fullmatch(name):
+            raise ProbeError("a name holds a character that a name may not")
 
     def events(self, project: str, since_nano: int, until_nano: int, *, seconds: float) -> list[ContainerEvent]:
         """The lifecycle events (die, oom, kill, restart) of the project's containers between two instants. The command ends at ``until_nano``."""
