@@ -29,9 +29,15 @@ from spark.bronze.plan import GROUPED, track_passes
 from spark.bronze.rows import Lineage, StructureError, numeric_rows, string_rows, track_info, track_row, waveform_rows
 from spark.bronze.structure import END_TOLERANCE_SECONDS, file_problem, recording_problem
 
+READS = {"header": 0, "load": 0}
+
 
 def load(path: Path, names: list[str] | None = None, *, header_only: bool = False) -> Any:
-    """The library's reading of the file: all tracks (``names`` None) or the named ones, records included unless ``header_only``. A failed read is refused."""
+    """The library's reading of the file: all tracks (``names`` None) or the named ones, records included unless ``header_only``. A failed read is refused.
+
+    ``READS`` counts the reads of this process, a read of the header alone and a read with records, so that a run can say how many times it read its files.
+    """
+    READS["header" if header_only else "load"] += 1
     library = vitaldb.VitalFile()
     library.dtstart = 0
     library.dgmt = 0

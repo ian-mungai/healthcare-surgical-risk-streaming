@@ -17,9 +17,10 @@ The steps, in order:
 5. Each table's stable key is checked for duplicates, and its row count and a checksum of every row are read back, so a rerun can be compared with this run.
 
 It prints one line that starts with ``RESULT `` and holds the branch, its new hash, for each table its snapshot ID, row count, key-duplicate count and
-checksum, and the facts of the run: the memory limit, the peak memory of the container and the peak memory of the largest worker. Settings come from the
-environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse and the bucket's reads, ``NESSIE_TIMEOUT_SECONDS`` and
-``JOB_DEADLINE_SECONDS``. Without ``--landed-folder`` the case files are read from the bucket that the manifest reference names, with boto3.
+checksum, and the facts of the run: the memory limit, the peak memory of the container and the peak memory of the largest worker, and how many times
+the library read the files for each table (``library_reads``). Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``,
+``AWS_REGION`` for an s3 warehouse and the bucket's reads, ``NESSIE_TIMEOUT_SECONDS`` and ``JOB_DEADLINE_SECONDS``. Without ``--landed-folder`` the
+case files are read from the bucket that the manifest reference names, with boto3.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError, ManifestRef
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
-from spark.bronze.passes import MaxParameter, partition_problems, partition_rows
+from spark.bronze.passes import MaxParameter, SumByName, partition_problems, partition_rows
 from spark.bronze.plan import GROUPED, MODES
 from spark.bronze.readers import caseend_times, open_store
 from spark.bronze.rows import StructureError
@@ -136,12 +137,13 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
     session = build_session(JOB, arguments.branch)
     try:
         peaks = session.sparkContext.accumulator(0, MaxParameter())
+        reads = session.sparkContext.accumulator({}, SumByName())
         cases = session.sparkContext.parallelize(inputs.cases, slices)
         session.sql(f"CREATE NAMESPACE IF NOT EXISTS lake.{NAMESPACE}")
         seconds: dict[str, float] = {}
         for kind in PASSES:
             begun = time.monotonic()
-            write_table(session, cases.mapPartitions(partition_rows(kind, spec, peaks, arguments.passes)), KIND_TABLE[kind])
+            write_table(session, cases.mapPartitions(partition_rows(kind, spec, peaks, reads, arguments.passes)), KIND_TABLE[kind])
             seconds[kind] = round(time.monotonic() - begun, 1)
         tables = {table.name: table_facts(session, table) for table in TABLES}
         versions = {"spark": str(session.version), "python": platform.python_version()}
@@ -163,6 +165,7 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
         "memory_limit_mib": read_memory_limit_mib(),
         "container_peak_mib": peak_memory_mib(),
         "largest_worker_peak_mib": int(peaks.value),
+        "library_reads": dict(sorted(reads.value.items())),
         "versions": versions,
         "uid": os.getuid(),
     }

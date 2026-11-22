@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from spark.bronze.inputs import CaseFile, StoreSpec, fetch_case
-from spark.bronze.library import case_problem, case_rows
+from spark.bronze.library import READS, case_problem, case_rows
 from spark.bronze.readers import open_store
 from spark.bronze.rows import Lineage
 from spark.session import SCRATCH_FOLDER
@@ -40,12 +40,14 @@ def scratch_folder() -> str | None:
     return SCRATCH_FOLDER if Path(SCRATCH_FOLDER).is_dir() else None
 
 
-def partition_rows(kind: str, spec: StoreSpec, peaks: Any, mode: str) -> Any:
-    """The function that a Spark partition runs: its cases' rows of one kind. It reports the peak memory of the worker to ``peaks`` when it ends."""
+def partition_rows(kind: str, spec: StoreSpec, peaks: Any, reads: Any, mode: str) -> Any:
+    """The function that a Spark partition runs: its cases' rows of one kind. At its end it reports the peak memory to ``peaks`` and the reads to ``reads``."""
 
     def run(files: Iterator[CaseFile]) -> Iterator[tuple[Any, ...]]:
+        before = dict(READS)
         yield from case_files(list(files), spec, kind=kind, mode=mode)
         peaks.add(worker_peak_mib())
+        reads.add({f"{kind}_{name}": READS[name] - before[name] for name in READS})
 
     return run
 
@@ -71,3 +73,13 @@ class MaxParameter:
 
     def addInPlace(self, first: int, second: int) -> int:
         return max(first, second)
+
+
+class SumByName:
+    """A Spark accumulator parameter for a mapping of names to counts: it adds the counts of each name."""
+
+    def zero(self, value: dict[str, int]) -> dict[str, int]:
+        return {}
+
+    def addInPlace(self, first: dict[str, int], second: dict[str, int]) -> dict[str, int]:
+        return {name: first.get(name, 0) + second.get(name, 0) for name in first.keys() | second.keys()}
