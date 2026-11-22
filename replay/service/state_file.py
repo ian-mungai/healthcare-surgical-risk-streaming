@@ -1,12 +1,14 @@
 """The replay's files on its named volume: the frozen schedule and the saved state.
 
-A file is written to a temporary name in the same folder, flushed to disk, renamed over the target and the folder is flushed, so a stop at any instant leaves
+A file is written to a temporary name of its own in the same folder (so two writers never share one), flushed to disk, renamed over the target and the
+folder is flushed, so a stop at any instant leaves
 either the whole old file or the whole new file. The frozen schedule is created once and never overwritten.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 
 from replay.events.run import RunState
@@ -15,7 +17,7 @@ from replay.events.schedule import FrozenSchedule
 
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".writing")
+    temporary = path.with_name(f"{path.name}.{secrets.token_hex(4)}.writing")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
     with os.fdopen(descriptor, "w") as handle:
         handle.write(text)

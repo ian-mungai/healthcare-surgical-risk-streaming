@@ -2,12 +2,14 @@
 
 It holds what the run is told and nothing the run decides: the run ID, the rooms, the speed, the stagger, the turnover and the window, the cases (all case
 files of the manifest when absent), where the manifest reference and the object store are, and where Kafka, the registry and the saved files are. The speed
-is here, so a run's record says how fast it was played. A missing, extra or mistyped field refuses the file.
+is here, so a run's record says how fast it was played. A missing, extra or mistyped field refuses the file, and so does a timing that is not a finite
+number from 0 to 86,400 seconds (a day) or a speed that is not a positive finite number.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,8 @@ REQUIRED: dict[str, type | tuple[type, ...]] = {
     "state_dir": str,
 }
 OPTIONAL: dict[str, type | tuple[type, ...]] = {"cases": list, "checkpoint_every": int, "idle_checkpoint_seconds": (int, float)}
+TIMING_FIELDS = ("stagger_seconds", "turnover_seconds", "window_seconds", "idle_checkpoint_seconds")
+MAX_TIMING_SECONDS = 86_400
 
 
 def closed(document: Any, required: dict[str, Any], optional: dict[str, Any], what: str) -> dict[str, Any]:
@@ -89,6 +93,15 @@ def parse_run_record(text: str) -> RunRecord:
         if isinstance(error, RunRecordError):
             raise
         raise RunRecordError("the run record is not valid JSON") from None
+    for field in TIMING_FIELDS:
+        if field in document and not 0 <= document[field] <= MAX_TIMING_SECONDS:
+            raise RunRecordError(f"{field} must be a finite number from 0 to {MAX_TIMING_SECONDS:,}")
+    try:
+        speed = float(document["speed"])
+    except OverflowError:
+        speed = math.inf
+    if not math.isfinite(speed) or speed <= 0:
+        raise RunRecordError("speed must be a positive finite number")
     store = closed(document["object_store"], {"kind": str}, {"root": str, "region": str, "read_log": str}, "the run record's object_store")
     if store["kind"] not in ("folder", "s3") or (store["kind"] == "folder" and "root" not in store) or (store["kind"] == "s3" and "region" not in store):
         raise RunRecordError("object_store is a folder with a root or an s3 store with a region")
@@ -98,7 +111,7 @@ def parse_run_record(text: str) -> RunRecord:
     return RunRecord(
         document["run_id"],
         document["rooms"],
-        float(document["speed"]),
+        speed,
         document["stagger_seconds"],
         document["turnover_seconds"],
         document["window_seconds"],

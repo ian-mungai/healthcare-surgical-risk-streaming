@@ -7,10 +7,12 @@
 ``compare``   compare the observed file and the saved state with the manifest. Exit 0 only when every expected ID is there with its payload.
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 ``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
-``submit``    read a run record on standard input and put it in the inbox under its run ID; the same record again changes nothing.
+``submit``    read a run record on standard input and put it in the inbox under its run ID, with the manifest reference file that ``--manifest-reference``
+              names beside it; the same record and reference again change nothing, another one under that run ID is refused (exit 2).
 ``health``    exit 0 when the service waits or runs and its health file is fresh: the container's health check.
 
-Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. Exit codes: 0 done,
+Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. A run that ``serve``
+takes reads its manifest reference from beside its record in the inbox, not from the record's ``manifest_reference`` field. Exit codes: 0 done,
 1 the check failed or the service is not healthy, 3 the gate refused an object version, 2 anything else that stopped the command.
 """
 
@@ -37,7 +39,7 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import Outcome, SubmitError, healthy, serve, submit
+from replay.service.serve import Outcome, SubmitError, healthy, queued_record, serve, submit
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.gate import GateRefused
@@ -216,7 +218,7 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
     """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text."""
     log("request_start", request=path.stem)
     try:
-        code = replay_record(parse_run_record(path.read_text()), lambda: flag.set, beat)
+        code = replay_record(queued_record(path), lambda: flag.set, beat)
         outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.set else "failed", code)
     except GateRefused as refused:
         outcome = Outcome("failed", 3, str(refused))
@@ -234,7 +236,12 @@ def command_serve(arguments: argparse.Namespace) -> int:
 
 def command_submit(arguments: argparse.Namespace) -> int:
     try:
-        sys.stdout.write(submit(arguments.inbox, sys.stdin.read()) + "\n")
+        reference_text = arguments.manifest_reference.read_text()
+    except OSError:
+        log("submit_refused", message="the manifest reference file cannot be read")
+        return 2
+    try:
+        sys.stdout.write(submit(arguments.inbox, sys.stdin.read(), reference_text) + "\n")
     except SubmitError as error:
         log("submit_refused", message=str(error))
         return 2
@@ -278,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--inbox", type=Path, default=INBOX)
         if name == "serve":
             command.add_argument("--health", type=Path, default=HEALTH_FILE)
+        else:
+            command.add_argument("--manifest-reference", type=Path, required=True, help="the file that holds the manifest reference of the run")
     health = commands.add_parser("health")
     health.add_argument("--health", type=Path, default=HEALTH_FILE)
     health.add_argument("--max-age", type=float, default=HEALTH_MAX_AGE_SECONDS, help="the age in seconds above which the health file is stale")

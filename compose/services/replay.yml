@@ -1,4 +1,4 @@
-# The replay as an always-on service: it waits for a run record in the inbox on its state volume (python -m replay.service submit puts one there), plays
+# The replay as an always-on service: it waits for a run record in the inbox on its state volume (python -m replay.service submit puts one there with its manifest reference), plays
 # it into Kafka and returns to waiting. Its health check reads the health file that the waiting or running service keeps fresh.
 services:
   replay:
