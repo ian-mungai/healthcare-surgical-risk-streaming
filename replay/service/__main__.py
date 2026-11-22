@@ -50,6 +50,7 @@ READ_DEADLINE_SECONDS = 600.0
 INBOX = Path("/opt/replay/state/inbox")
 HEALTH_FILE = Path("/opt/replay/state/health.json")
 POLL_SECONDS = 1.0
+STOPPED_CODE = 2
 HEALTH_MAX_AGE_SECONDS = 600.0
 
 
@@ -107,8 +108,12 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
     partition_of(record.rooms - 1, partitions)
     inputs = verify_inputs(record)
     beat()
+    if flag.is_set():
+        return STOPPED_CODE
     frozen = freeze_run(record, inputs)
     beat()
+    if flag.is_set():
+        return STOPPED_CODE
     times = inputs.times()
     writer = Writer(RegistryClient(record.registry_url))
     sink = KafkaSink(record.kafka_bootstrap, writer, partitions)
@@ -133,7 +138,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
     result = replayer.run()
     log("replay_end", sent=result.sent, finished=result.finished)
     sys.stdout.write(json.dumps({"sent": result.sent, "finished": result.finished}) + "\n")
-    return 0 if result.finished else 2
+    return 0 if result.finished else STOPPED_CODE
 
 
 def command_run(record: RunRecord, _: argparse.Namespace) -> int:

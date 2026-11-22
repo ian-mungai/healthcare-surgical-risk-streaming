@@ -10,7 +10,8 @@ all rooms. The replay time of a send therefore never goes backwards, and the eve
 speed only moves the wall clock. A restart keeps the wall time of the first send, so a late event is sent at once and the pacing then continues.
 
 **Stop.** When a stop is requested, the loop flushes, writes the position at the last event sent and returns, so a restart sends no event twice. The stop is
-checked before each event and again after each wait, so a stop that ends a wait stops the loop before the event that the wait was for.
+checked before each event and again after each wait, so a stop that ends a wait stops the loop before the event that the wait was for. It is also checked
+before each room's case is decoded at the start, and a stop there returns at once: nothing was sent, so the saved state stays as it was.
 
 **Position.** For each room, the number of its admitted occurrences that are complete and the ordinal of the next event of the current one. It is written only
 after a flush, so it never covers a message that Kafka did not acknowledge. A stop between the acknowledgment and the write leaves the position behind: the
@@ -193,7 +194,11 @@ class Replayer:
         positions = dict(state.positions)
         admissions = dict(state.admissions)
         anchor, first_send = state.anchor_wall_us, state.first_send
-        cursors = {room: self.cursor_at(room, positions[room].completed, positions[room].ordinal) for room in self.rooms}
+        cursors: dict[int, Cursor | None] = {}
+        for room in self.rooms:
+            if self.stop_requested():
+                return RunResult(0, False)
+            cursors[room] = self.cursor_at(room, positions[room].completed, positions[room].ordinal)
         sent = unsaved = 0
 
         def checkpoint(*, finished: bool) -> None:

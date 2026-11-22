@@ -290,6 +290,18 @@ class Restart(unittest.TestCase):
         self.assertEqual(len(manifest.events), len(sink.sent))
         self.assertTrue(compare(manifest, observed_from(sink, store.state)).ok)
 
+    def test_a_stop_asked_for_while_the_cases_of_the_rooms_are_decoded_reads_no_further_case_and_sends_nothing(self) -> None:
+        frozen = boundary_schedule(**self.OPTIONS)
+        source = RecordingSource(boundary_recordings())
+        sink, store = MemorySink(), MemoryStore()
+        result = Replayer(frozen, FAST, source, sink, store, FakeClock(), lambda: len(source.reads) >= 1).run()
+        self.assertEqual((0, False), (result.sent, result.finished))
+        self.assertEqual(1, len(source.reads))
+        self.assertEqual([], sink.sent)
+        resumed = Replayer(frozen, FAST, RecordingSource(boundary_recordings()), sink, store, FakeClock(), lambda: False).run()
+        self.assertEqual(len(build_manifest(frozen, boundary_recordings()).events), resumed.sent)
+        self.assertTrue(resumed.finished)
+
     def test_a_finished_run_started_again_sends_nothing(self) -> None:
         frozen = boundary_schedule(**self.OPTIONS)
         sink, store, clock = MemorySink(), MemoryStore(), FakeClock()
