@@ -329,6 +329,12 @@ class PostgresRouteTest(unittest.TestCase):
                 self.assertLess(main.index(earlier), main.index(later))
         self.assertLess(main.index("network_policy.yml"), main.index("release.yml"))
 
+    def test_the_group_commands_get_their_access_after_the_secrets_and_before_the_release(self) -> None:
+        main = (ROLE / "tasks" / "main.yml").read_text()
+        self.assertIn("ansible.builtin.include_tasks: group_access.yml", main)
+        self.assertLess(main.index("secrets.yml"), main.index("group_access.yml"))
+        self.assertLess(main.index("group_access.yml"), main.index("release.yml"))
+
 
 def policies(text: str) -> list[dict[str, Any]]:
     return [mapping(load_yaml(part)) for part in text.split("\n---\n") if part.strip()]
