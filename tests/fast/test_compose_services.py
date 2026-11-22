@@ -318,13 +318,25 @@ def resolve(text: str, rendered: frozenset[str] | set[str] = frozenset()) -> str
     return text
 
 
-def credential_folder(source: str) -> str | None:
-    """The folder under ``/run/workload_access/`` that a resolved bind source names, as Linux reads the path: any run of slashes is one, ``.`` segments and a
-    trailing slash are dropped and ``..`` is resolved lexically. The empty text is the root itself and None is a path outside it."""
+def normal_path(source: str) -> str:
+    """A bind source as Linux reads it: any run of slashes is one, ``.`` segments and a trailing slash are dropped, ``..`` is resolved lexically and
+    ``/var/run`` is ``/run`` (the first is a link to the second on the host)."""
     normal = posixpath.normpath(re.sub(r"/+", "/", source.strip()))
+    return "/run" + normal.removeprefix("/var/run") if normal == "/var/run" or normal.startswith("/var/run/") else normal
+
+
+def credential_folder(source: str) -> str | None:
+    """The folder under ``/run/workload_access/`` that a resolved bind source names: the empty text for the root itself and None for a path outside it."""
+    normal = normal_path(source)
     if normal == ACCESS_ROOT:
         return ""
     return normal.removeprefix(f"{ACCESS_ROOT}/") if normal.startswith(f"{ACCESS_ROOT}/") else None
+
+
+def includes_credential_root(source: str) -> bool:
+    """Whether a resolved bind source is a folder above ``/run/workload_access``, such as ``/run`` or ``/``, which holds the credential root inside it."""
+    normal = normal_path(source)
+    return ACCESS_ROOT.startswith(normal.rstrip("/") + "/")
 
 
 def volume_source(entry: object) -> str:
@@ -340,20 +352,26 @@ def volume_source(entry: object) -> str:
     return text
 
 
-def credential_mounts(service: dict[str, Any], document: dict[str, Any], literal: Callable[[str, str], str | None]) -> list[tuple[str, str]]:
-    """Each volume entry of the service whose bind source is under ``/run/workload_access/``, as the folder and the entry as written. A named volume counts by
-    the device that the file declares for it. ``literal`` resolves a field's text, or says it cannot and returns None."""
+def credential_mounts(
+    service: dict[str, Any], document: dict[str, Any], literal: Callable[[str, str], str | None]
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Each volume entry of the service whose bind source is at or under ``/run/workload_access/``, as the folder and the entry as written, and each whose
+    source is a folder above it, as the path and the entry. A named volume counts by the device that the file declares for it. ``literal`` resolves a field's
+    text, or says it cannot and returns None."""
     declared = document.get("volumes") or {}
-    found = []
+    inside, above = [], []
     for entry in service.get("volumes") or []:
         source = volume_source(entry)
         if source in declared:
             source = str(((declared[source] or {}).get("driver_opts") or {}).get("device", ""))
         resolved = literal(source, "a volume source")
-        folder = credential_folder(resolved) if resolved is not None else None
-        if folder is not None:
-            found.append((folder, str(entry)))
-    return found
+        if resolved is None:
+            continue
+        if (folder := credential_folder(resolved)) is not None:
+            inside.append((folder, str(entry)))
+        elif includes_credential_root(resolved):
+            above.append((normal_path(resolved), str(entry)))
+    return inside, above
 
 
 def access_problems(name: str, document: dict[str, Any]) -> list[str]:
@@ -370,7 +388,8 @@ def access_problems(name: str, document: dict[str, Any]) -> list[str]:
             found.append(f"{name}: {field} `{text}`: this field must be a literal or a resolvable default")
             return None
 
-    mounts = credential_mounts(service, document, literal)
+    mounts, above = credential_mounts(service, document, literal)
+    found.extend(f"{name}: mounts {path}, which includes the credential root {ACCESS_ROOT}" for path, _ in above)
     for folder, entry in mounts:
         if own is None:
             found.append(f"{name}: is not in the table of services that may read a credential folder and mounts {folder or 'the whole folder'}")
@@ -599,6 +618,60 @@ class WorkloadAccessTest(unittest.TestCase):
         problems = access_problems("replay", document)
         self.assertEqual(1, len(problems), problems)
         self.assertIn("this field must be a literal or a resolvable default", problems[0])
+
+    def test_a_bind_of_a_folder_that_includes_the_credential_root_is_named_for_every_service_in_every_form(self) -> None:
+        for source in (
+            "/run",
+            "/run/",
+            "//run//",
+            "/",
+            "//",
+            "/run/.",
+            "/run/workload_access/..",
+            "/run/workload_access/replay/../..",
+            "${X:-/run}",
+            "/var/run",
+            "/var/run/",
+        ):
+            for name, form in (("replay", "short"), ("replay", "long"), ("replay", "named"), ("postgres", "short"), ("postgres", "long")):
+                with self.subTest(source=source, service=name, form=form):
+                    document = copy.deepcopy(load(SERVICES / f"{name}.yml"))
+                    if form == "short":
+                        document["services"][name]["volumes"].append(f"{source}:/elsewhere:ro")
+                    elif form == "long":
+                        document["services"][name]["volumes"].append({"type": "bind", "source": source, "target": "/elsewhere", "read_only": True})
+                    else:
+                        document["services"][name]["volumes"].append("other:/elsewhere:ro")
+                        document["volumes"]["other"] = {"driver_opts": {"type": "none", "o": "bind", "device": source}}
+                    problems = access_problems(name, document)
+                    self.assertEqual(1, len(problems), problems)
+                    self.assertIn("includes the credential root", problems[0])
+
+    def test_var_run_is_the_same_folder_as_run_so_a_credential_folder_under_it_is_named(self) -> None:
+        document = self.replay()
+        document["services"]["replay"]["volumes"].append("/var/run/workload_access/spark:/elsewhere:ro")
+        problems = access_problems("replay", document)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("not spark", problems[0])
+        document = self.replay()
+        document["volumes"]["workload_access_replay"]["driver_opts"]["device"] = "/var/run/workload_access/replay"
+        self.assertEqual([], access_problems("replay", document))
+
+    def test_a_bind_beside_the_credential_root_or_elsewhere_under_run_is_not_named(self) -> None:
+        for source in (
+            "/runner",
+            "/run/workload_accessible",
+            "/run/containerd/containerd.sock",
+            "/var/run/docker.sock",
+            "/var/run/tailscale",
+            "/proc",
+            "/etc",
+            "./run",
+        ):
+            with self.subTest(source=source):
+                document = copy.deepcopy(load(SERVICES / "postgres.yml"))
+                document["services"]["postgres"]["volumes"].append(f"{source}:/elsewhere:ro")
+                self.assertEqual([], access_problems("postgres", document))
 
     def test_a_service_that_is_not_in_the_table_has_no_credential_folder_and_no_workload_group(self) -> None:
         changes: tuple[tuple[str, Callable[[dict[str, Any]], object]], ...] = (
