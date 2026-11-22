@@ -121,26 +121,15 @@ class SourceAndDestinationTest(unittest.TestCase):
         self.assertEqual("JSONL", destination["format"]["format_type"])
         self.assertEqual("No Compression", destination["format"]["compression"]["compression_type"])
 
-    def test_the_document_on_the_owners_computer_holds_no_key_and_only_names_the_fields_that_the_host_fills(self) -> None:
+    def test_the_document_on_the_owners_computer_holds_no_key_and_names_no_field_for_one(self) -> None:
         document = state()
         self.assertEqual(
             set(), SECRET_FIELDS & set(keys_of({"source": document["source"]["configuration"], "destination": document["destination"]["configuration"]}))
         )
         self.assertEqual("iam_user", document["source"]["configuration"]["credentials"]["auth_type"])
-        self.assertEqual(
-            {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"},
-            document["source"]["secret_fields"],
-        )
-        self.assertEqual({"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"}, document["destination"]["secret_fields"])
-
-    def test_the_secret_fields_are_the_connectors_own_field_names(self) -> None:
-        """The source's IAM user form and the destination's access key form, from the connectors' published specifications of the pinned versions."""
-        document = state()
-        self.assertEqual(
-            {"credentials.aws_access_key_id", "credentials.aws_secret_access_key"},
-            set(document["source"]["secret_fields"]),
-        )
-        self.assertEqual({"access_key_id", "secret_access_key"}, set(document["destination"]["secret_fields"]))
+        for part in ("source", "destination"):
+            self.assertNotIn("secret_fields", document[part], "the module holds the one table of the fields that take the key; the document names none")
+        self.assertNotIn("secret_fields", json.dumps(document))
 
     def test_the_source_definition_is_one_shared_pinned_definition_that_another_connection_can_reuse(self) -> None:
         shared = connection.source_definition(SOURCE_TAG)

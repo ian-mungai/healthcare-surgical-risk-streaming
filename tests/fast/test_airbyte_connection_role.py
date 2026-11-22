@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 
+from scripts.process import run_command
+from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
+from tests.fast.ansible_support import PLAYBOOK_SECONDS, environment
 from tests.fast.test_airbyte_role import ROLE, flatten, group_variables, role_tasks, run_tasks
 
 BUCKET = "imungai-example-project"
@@ -24,6 +29,7 @@ VARIABLES: dict[str, object] = {
     "airbyte_web_port": 8000,
     "airbyte_namespace": "airbyte",
     "airbyte_connection_deadline_seconds": 600,
+    "airbyte_connection_run_seconds": 1800,
     "airbyte_connection_scope": "full_release",
 }
 
@@ -44,23 +50,47 @@ class PinsTest(unittest.TestCase):
         template = (ROLE / "templates" / "host.values.yaml.j2").read_text()
         self.assertEqual(2, template.count("{{ airbyte_staging_size | to_json }}"))
 
-    def test_the_profile_has_no_default_so_a_deployment_without_one_is_refused_and_the_cli_defaults_to_aws(self) -> None:
+    def test_the_key_has_no_variable_in_ansible_and_the_script_has_a_place_on_the_host(self) -> None:
         variables = group_variables()
-        self.assertEqual("", variables["airbyte_aws_profile"])
-        self.assertEqual("aws", variables["airbyte_aws_cli"])
+        for gone in ("airbyte_aws_profile", "airbyte_aws_cli"):
+            self.assertNotIn(gone, variables)
+        self.assertEqual("/opt/platform/bin", variables["airbyte_bin_directory"])
+        self.assertEqual("{{ airbyte_bin_directory }}/airbyte_key_install", variables["airbyte_key_script"])
 
     def test_the_landing_bucket_has_no_default_so_a_deployment_without_one_is_refused(self) -> None:
         self.assertEqual("", group_variables().get("airbyte_landing_bucket", ""))
 
 
 class PlacementTest(unittest.TestCase):
-    def test_the_connection_is_applied_last_after_airbyte_answers(self) -> None:
+    def test_the_host_playbook_installs_the_key_script_and_leaves_the_connection_to_its_own_playbook(self) -> None:
         tasks = load_yaml((ROLE / "tasks" / "main.yml").read_text())
         if not isinstance(tasks, list):
             self.fail("the task list must be a list")
         names = [str(task.get("ansible.builtin.include_tasks")) for task in tasks if isinstance(task, dict)]
-        self.assertEqual("connection.yml", names[-1])
-        self.assertLess(names.index("verify.yml"), names.index("connection.yml"))
+        self.assertIn("key_script.yml", names)
+        self.assertNotIn("connection.yml", names)
+        self.assertNotIn("aws_key.yml", names)
+
+    def test_the_connection_playbook_runs_the_connection_tasks_of_the_role_as_root_on_the_host_and_has_a_valid_syntax(self) -> None:
+        playbook = load_yaml((ROOT / "ansible" / "connection.yml").read_text())
+        if not isinstance(playbook, list):
+            self.fail("the playbook must be a list")
+        (play,) = playbook
+        self.assertEqual(("platform", True), (play["hosts"], play["become"]))
+        (task,) = play["tasks"]
+        self.assertEqual({"name": "airbyte", "tasks_from": "connection.yml"}, task["ansible.builtin.include_role"])
+        result = run_command(
+            str(ROOT / ".venv" / "bin" / "ansible-playbook"),
+            ["--syntax-check", "connection.yml"],
+            cwd=ROOT / "ansible",
+            env=environment(Path(tempfile.mkdtemp(prefix="connection_syntax_"))) | {"ANSIBLE_CONFIG": "ansible.cfg"},
+            timeout=PLAYBOOK_SECONDS,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_the_connection_tasks_do_not_place_a_key(self) -> None:
+        names = [str(task.get("ansible.builtin.include_tasks")) for task in role_tasks()["connection.yml"]]
+        self.assertEqual(["connection_document.yml"], [name for name in names if name != "None"])
 
     def test_the_module_gets_the_document_the_local_address_the_namespace_and_a_deadline(self) -> None:
         module = next(task for task in role_tasks()["connection.yml"] if "airbyte_connection" in task)
@@ -70,7 +100,9 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual("{{ airbyte_namespace }}", arguments["namespace"])
         self.assertEqual("{{ airbyte_secrets_directory }}", arguments["secrets_directory"])
         self.assertEqual("{{ airbyte_directory }}/connection_key.json", arguments["record_file"])
-        self.assertIn("timeout", module)
+        self.assertEqual("{{ airbyte_connection_deadline_seconds }}", arguments["timeout_seconds"])
+        self.assertEqual("{{ airbyte_connection_run_seconds }}", arguments["run_seconds"])
+        self.assertEqual('"{{ airbyte_connection_run_seconds | int + 60 }}"', f'"{module["timeout"]}"')
 
     def test_every_command_of_the_new_files_has_a_deadline_and_runs_on_this_computer_for_the_repository(self) -> None:
         for task in role_tasks()["connection_document.yml"]:

@@ -41,7 +41,7 @@ class HostSyntaxTest(unittest.TestCase):
 
     def test_the_test_finds_the_airbyte_modules_and_the_shared_helper(self) -> None:
         names = {path.name for path in host_files()}
-        self.assertLessEqual({"airbyte_connection.py", "airbyte_aws_key.py", "secret_files.py", "workload_credentials.py"}, names)
+        self.assertLessEqual({"airbyte_connection.py", "airbyte_key_install.py", "secret_files.py", "workload_credentials.py"}, names)
 
 
 if __name__ == "__main__":

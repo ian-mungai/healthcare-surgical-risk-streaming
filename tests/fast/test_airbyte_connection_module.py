@@ -14,9 +14,14 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import os
 import re
+import socket
+import socketserver
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -76,6 +81,7 @@ class FakeAirbyte:
         self.calls: list[str] = []
         self.counter = 0
         self.fail_on: str | None = None
+        self.damage: tuple[str, str | None, str, Any] | None = None
         self.bodies: list[tuple[str, str, dict[str, Any]]] = []
         self.keys: dict[str, str] = dict(KEYS)
         self.recorded: dict[str, str] = {}
@@ -97,14 +103,41 @@ class FakeAirbyte:
         self.bodies.append((method, url.path, copy.deepcopy(body or {})))
         return self.write(method, parts, copy.deepcopy(body or {}))
 
+    KIND_NAMES = {
+        "source_definitions": "source_definition",
+        "destination_definitions": "destination_definition",
+        "sources": "source",
+        "destinations": "destination",
+        "connections": "connection",
+    }
+
+    def damaged(self, kind: str, rows: list[Any]) -> list[Any]:
+        """The rows of one kind as a faulty server would answer them, when a test has planted a fault for that kind."""
+        if self.damage is None or self.damage[0] != kind:
+            return rows
+        _, key, how, expected = self.damage
+        out: list[Any] = []
+        for row in rows:
+            if how == "not an object":
+                out.append("not an object")
+                continue
+            name = str(key)
+            if how == "missing":
+                row.pop(name, None)
+            else:
+                row[name] = "a text" if expected is not str else 5
+            out.append(row)
+        return out
+
     def listing(self, kind: str, offset: int) -> dict[str, Any]:
-        rows = [self.masked(copy.deepcopy(row)) for row in self.objects[kind].values()]
+        rows = self.damaged(self.KIND_NAMES[kind], [self.masked(copy.deepcopy(row)) for row in self.objects[kind].values()])
         page = rows[offset : offset + 2]
         return {"data": page, "next": "more" if offset + 2 < len(rows) else None}
 
     def read(self, parts: list[str], offset: int) -> dict[str, Any]:
         if parts == ["workspaces"]:
-            return {"data": [{"workspaceId": identifier, "name": "w", "dataResidency": "auto"} for identifier in self.workspaces]}
+            rows = [{"workspaceId": identifier, "name": "w", "dataResidency": "auto"} for identifier in self.workspaces]
+            return {"data": self.damaged("workspace", rows)}
         if parts[0] == "workspaces" and parts[2:3] == ["definitions"]:
             return self.listing(f"{parts[3][:-1]}_definitions", offset)
         return self.listing(parts[0], offset)
@@ -192,7 +225,13 @@ class CreateAndRepeatTest(unittest.TestCase):
         api = FakeAirbyte()
         apply(api)
         for index in range(5):
-            api.objects["sources"][f"other{index}"] = {"sourceId": f"other{index}", "name": f"other_{index}", "workspaceId": WORKSPACE, "configuration": {}}
+            api.objects["sources"][f"other{index}"] = {
+                "sourceId": f"other{index}",
+                "name": f"other_{index}",
+                "definitionId": "another",
+                "workspaceId": WORKSPACE,
+                "configuration": {},
+            }
         api.writes.clear()
         self.assertEqual([], apply(api))
         self.assertEqual([], api.writes)
@@ -437,34 +476,79 @@ class KeyInjectionTest(unittest.TestCase):
         self.assertEqual(["source", "destination"], apply(api))
         self.assertEqual([], apply(api))
 
-    def test_a_document_that_names_another_secret_a_missing_path_or_a_missing_value_is_refused_before_any_call(self) -> None:
-        damages: dict[str, Callable[[dict[str, Any]], object]] = {
-            "another secret name": lambda doc: doc["source"]["secret_fields"].update({"credentials.aws_access_key_id": "etc_passwd"}),
-            "a path with no parent": lambda doc: doc["source"]["secret_fields"].update({"nowhere.aws_access_key_id": "aws_access_key_id"}),
-            "an empty path": lambda doc: doc["source"].update(secret_fields={"": "aws_access_key_id"}),
-        }
-        for name, damage in damages.items():
-            with self.subTest(name):
-                api = FakeAirbyte()
-                wanted = document()
-                damage(wanted)
-                with self.assertRaises(MODULE_UNDER_TEST.ApiError):
-                    apply(api, wanted)
-                self.assertEqual([], api.calls)
-        api = FakeAirbyte()
-        api.keys = {"aws_access_key_id": KEY_ID}
+    def refused_before_any_call(self, wanted: dict[str, Any], api: FakeAirbyte | None = None) -> None:
+        api = api or FakeAirbyte()
         with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            apply(api, wanted)
+        self.assertEqual([], api.calls)
+        for value in (KEY_ID, KEY_VALUE):
+            self.assertNotIn(value, str(raised.exception))
+
+    def test_a_document_that_maps_the_secret_to_an_ordinary_field_is_refused_before_any_call(self) -> None:
+        wanted = document()
+        wanted["destination"]["secret_fields"] = {"s3_bucket_path": "aws_secret_access_key"}
+        self.refused_before_any_call(wanted)
+
+    def test_a_document_with_secret_fields_in_any_form_is_refused_before_any_call(self) -> None:
+        for part in ("source", "destination"):
+            for fields in ({}, {"credentials.aws_access_key_id": "aws_access_key_id"}, {"": "aws_access_key_id"}, "x", None):
+                with self.subTest(part=part, fields=fields):
+                    wanted = document()
+                    wanted[part]["secret_fields"] = fields
+                    self.refused_before_any_call(wanted)
+
+    def test_a_configuration_that_already_has_a_value_where_the_key_goes_is_refused_before_any_call(self) -> None:
+        for part, parent, name in (("source", "credentials", "aws_access_key_id"), ("source", "credentials", "aws_secret_access_key")):
+            with self.subTest(part=part, name=name):
+                wanted = document()
+                wanted[part]["configuration"][parent][name] = "a value that the document must not hold"
+                self.refused_before_any_call(wanted)
+        for name in ("access_key_id", "secret_access_key"):
+            with self.subTest(part="destination", name=name):
+                wanted = document()
+                wanted["destination"]["configuration"][name] = "a value that the document must not hold"
+                self.refused_before_any_call(wanted)
+
+    def test_a_source_without_its_credentials_object_is_refused_before_any_call(self) -> None:
+        wanted = document()
+        del wanted["source"]["configuration"]["credentials"]
+        self.refused_before_any_call(wanted)
+
+    def test_a_connector_that_is_not_one_of_the_two_pinned_images_is_refused_before_any_call(self) -> None:
+        for part, image in (("source", "someone/else"), ("source", "airbyte/destination-s3"), ("destination", "airbyte/source-s3"), ("destination", "")):
+            with self.subTest(part=part, image=image):
+                wanted = document()
+                wanted[part]["definition"]["dockerRepository"] = image
+                self.refused_before_any_call(wanted)
+
+    def test_the_outgoing_configuration_may_differ_from_the_document_at_the_table_paths_only(self) -> None:
+        def evil(configuration: dict[str, Any], fields: Any, secrets: Any) -> dict[str, Any]:
+            filled = copy.deepcopy(configuration)
+            filled["s3_bucket_path"] = secrets["aws_secret_access_key"]
+            return filled
+
+        api = FakeAirbyte()
+        with mock.patch.object(MODULE_UNDER_TEST, "inject", evil), self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
             apply(api)
         self.assertEqual([], api.calls)
-        self.assertNotIn(KEY_ID, str(raised.exception))
+        self.assertNotIn(KEY_VALUE, str(raised.exception))
 
-    def test_the_declared_secret_fields_are_the_two_of_each_connector(self) -> None:
-        wanted = document()
+    def test_the_table_names_for_each_pinned_connector_exactly_the_two_paths_that_take_the_key(self) -> None:
+        table = MODULE_UNDER_TEST.CONNECTOR_KEY_FIELDS
+        self.assertEqual({"source", "destination"}, set(table))
         self.assertEqual(
-            {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"},
-            wanted["source"]["secret_fields"],
+            ("airbyte/source-s3", {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"}),
+            (table["source"]["image"], table["source"]["fields"]),
         )
-        self.assertEqual({"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"}, wanted["destination"]["secret_fields"])
+        self.assertEqual(
+            ("airbyte/destination-s3", {"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"}),
+            (table["destination"]["image"], table["destination"]["fields"]),
+        )
+
+    def test_a_missing_key_value_is_refused_before_any_call(self) -> None:
+        api = FakeAirbyte()
+        api.keys = {"aws_access_key_id": KEY_ID}
+        self.refused_before_any_call(document(), api)
 
 
 class KeyFilesTest(unittest.TestCase):
@@ -664,39 +748,261 @@ class RecordFileTest(unittest.TestCase):
 
 
 class DeadlineTest(unittest.TestCase):
-    def call(self, code: int, output: str = "", error: str = "") -> list[list[str]]:
+    def call(self, code: int, *, budget: Any = None) -> tuple[list[list[str]], str]:
         calls: list[list[str]] = []
 
         def run(arguments: list[str]) -> tuple[int, str, str]:
             calls.append(arguments)
-            return code, output, error
+            return code, "", "text of the program"
 
-        with contextlib.suppress(MODULE_UNDER_TEST.ApiError):
-            MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte")
-        return calls
+        message = ""
+        try:
+            MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte", budget or MODULE_UNDER_TEST.Budget(1000))
+        except MODULE_UNDER_TEST.ApiError as error:
+            message = str(error)
+        return calls, message
 
-    def test_the_kubectl_call_carries_its_own_deadline(self) -> None:
-        (arguments,) = self.call(1)
+    def test_the_kubectl_call_runs_under_a_timeout_program_with_the_time_left_and_its_own_request_timeout(self) -> None:
+        (arguments,), _ = self.call(1)
+        self.assertEqual("timeout", arguments[0])
+        self.assertEqual(f"{MODULE_UNDER_TEST.KUBECTL_SECONDS}s", arguments[2])
         self.assertIn(f"--request-timeout={MODULE_UNDER_TEST.KUBECTL_SECONDS}s", arguments)
-        self.assertGreater(MODULE_UNDER_TEST.KUBECTL_SECONDS, 0)
 
-    def test_a_kubectl_that_times_out_or_fails_is_a_named_error_without_its_text(self) -> None:
-        def run(arguments: list[str]) -> tuple[int, str, str]:
-            return 1, "", f"Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded) {HIDDEN_TWO}"
+    def test_the_timeout_is_the_smaller_of_its_own_limit_and_the_time_left_in_the_run(self) -> None:
+        (arguments,), _ = self.call(1, budget=MODULE_UNDER_TEST.Budget(7.2))
+        self.assertEqual("8s", arguments[2], "the time left rounds up to whole seconds")
+        self.assertIn("--request-timeout=8s", arguments)
 
-        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
-            MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte")
-        self.assertIn("airbyte-auth-secrets", str(raised.exception))
-        self.assertIn("airbyte", str(raised.exception))
-        self.assertNotIn(HIDDEN_TWO, str(raised.exception))
-        self.assertNotIn("Timeout", str(raised.exception))
+    def test_a_run_with_no_time_left_makes_no_call(self) -> None:
+        calls, message = self.call(1, budget=MODULE_UNDER_TEST.Budget(0))
+        self.assertEqual([], calls)
+        self.assertIn("run deadline", message)
 
-    def test_the_module_reads_the_credentials_through_that_call_and_the_task_has_a_deadline_too(self) -> None:
+    def test_a_call_that_the_timeout_program_stopped_is_a_named_error_without_text(self) -> None:
+        for code in (124, 137):
+            with self.subTest(code=code):
+                _, message = self.call(code)
+                self.assertIn("did not finish within", message)
+                self.assertIn("airbyte-auth-secrets", message)
+                self.assertNotIn("text of the program", message)
+
+    def test_any_other_failure_is_a_named_error_without_the_programs_text(self) -> None:
+        _, message = self.call(1)
+        self.assertIn("airbyte-auth-secrets", message)
+        self.assertNotIn("text of the program", message)
+
+    def test_the_module_reads_the_credentials_through_that_call_with_its_run_budget_and_the_task_has_a_deadline_too(self) -> None:
         text = MODULE.read_text()
-        self.assertIn("client_credentials(lambda arguments: module.run_command(arguments, check_rc=False)", text)
-        self.assertIn("--request-timeout=", text)
+        self.assertIn("client_credentials(", text)
+        self.assertNotIn("subprocess", text)
         tasks = (ROLES / "airbyte" / "tasks" / "connection.yml").read_text()
-        self.assertIn('timeout: "{{ airbyte_connection_deadline_seconds | int + 60 }}"', tasks)
+        self.assertIn("airbyte_connection_run_seconds | int + 60", tasks)
+
+
+class AnswerShapeTest(unittest.TestCase):
+    """Every item of every answer is checked on read against a closed table of required keys and types, so a write never meets a missing ID."""
+
+    KINDS = ("workspace", "source_definition", "destination_definition", "source", "destination", "connection")
+
+    def drifted(self) -> FakeAirbyte:
+        api = FakeAirbyte()
+        apply(api)
+        api.only("source_definitions")["dockerImageTag"] = "latest"
+        api.only("sources")["configuration"]["streams"][0]["globs"].pop()
+        api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
+        api.keys = {"aws_access_key_id": OTHER_KEY_ID, "aws_secret_access_key": OTHER_KEY_VALUE}
+        api.writes.clear()
+        return api
+
+    def test_the_table_names_every_kind_and_the_keys_that_a_write_needs(self) -> None:
+        shapes = MODULE_UNDER_TEST.ANSWER_SHAPES
+        self.assertEqual(set(self.KINDS), set(shapes))
+        for kind, needed in {
+            "workspace": {"workspaceId"},
+            "source_definition": {"id", "name", "dockerRepository", "dockerImageTag"},
+            "destination_definition": {"id", "name", "dockerRepository", "dockerImageTag"},
+            "source": {"sourceId", "name", "definitionId", "configuration"},
+            "destination": {"destinationId", "name", "definitionId", "configuration"},
+            "connection": {"connectionId", "name", "sourceId", "destinationId", "status", "schedule", "configurations"},
+        }.items():
+            self.assertLessEqual(needed, set(shapes[kind]), kind)
+
+    def test_each_required_key_of_each_kind_missing_or_mistyped_is_refused_and_nothing_is_written(self) -> None:
+        for kind in self.KINDS:
+            for key, expected in MODULE_UNDER_TEST.ANSWER_SHAPES[kind].items():
+                for damage in ("missing", "mistyped"):
+                    with self.subTest(kind=kind, key=key, damage=damage):
+                        api = self.drifted()
+                        api.damage = (kind, key, damage, expected)
+                        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+                            apply(api)
+                        self.assertEqual([], api.writes)
+                        self.assertNotIn(KEY_VALUE, str(raised.exception))
+
+    def test_an_item_that_is_not_an_object_is_refused_and_nothing_is_written(self) -> None:
+        api = self.drifted()
+        api.damage = ("connection", None, "not an object", None)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError):
+            apply(api)
+        self.assertEqual([], api.writes)
+
+    def test_the_refusal_names_the_kind_and_the_key_and_no_value(self) -> None:
+        api = self.drifted()
+        api.damage = ("connection", "connectionId", "missing", str)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            apply(api)
+        self.assertIn("connection", str(raised.exception))
+        self.assertIn("connectionId", str(raised.exception))
+
+    def test_an_answer_of_a_create_without_its_id_is_a_named_error(self) -> None:
+        api = FakeAirbyte()
+        real = api.write
+
+        def without_id(method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
+            record = real(method, parts, body)
+            return {name: value for name, value in record.items() if name not in ("sourceId", "id")}
+
+        with mock.patch.object(api, "write", without_id), self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            apply(api)
+        self.assertIn("answer", str(raised.exception))
+
+
+class RecordPermissionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        folder = tempfile.TemporaryDirectory(prefix="airbyte_record_permission_")
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "record.json"
+
+    def test_an_unchanged_run_repairs_a_record_with_broader_permissions_and_reports_it_once(self) -> None:
+        api = FakeAirbyte()
+        MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path)
+        self.path.chmod(0o666)
+        api.writes.clear()
+        self.assertEqual(["record file"], MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path))
+        self.assertEqual(0o400, self.path.stat().st_mode & 0o777)
+        self.assertEqual([], api.writes)
+        self.assertEqual([], MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path))
+
+    def test_a_record_with_another_owner_group_is_repaired_too(self) -> None:
+        other = [group for group in os.getgroups() if group != os.getgid()]
+        if not other:
+            self.skipTest("the test user belongs to one group only")
+        api = FakeAirbyte()
+        MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path)
+        os.chown(self.path, -1, other[0])
+        self.assertEqual(["record file"], MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path))
+        self.assertEqual(os.getgid(), self.path.stat().st_gid)
+
+    def test_a_run_that_writes_the_record_anew_reports_no_extra_change(self) -> None:
+        api = FakeAirbyte()
+        self.assertEqual(
+            ["source definition", "destination definition", "source", "destination", "connection"],
+            MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path),
+        )
+
+
+class SocketDeadlineTest(unittest.TestCase):
+    """The deadline of an exchange holds on real local sockets: a timer shuts the socket down at the deadline, whatever the server does."""
+
+    MARGIN = 0.25
+
+    def serve(self, behave: Callable[[socket.socket], None]) -> str:
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.recv(65536)
+                with contextlib.suppress(OSError):
+                    behave(self.request)
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+
+        def stop() -> None:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_address[1]}/api"
+
+    @staticmethod
+    def answer(body: bytes = b"{}") -> bytes:
+        return b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+
+    def timed(self, base: str, deadline: float) -> tuple[float, str]:
+        client = MODULE_UNDER_TEST.HttpApi(base, lambda: "t", timeout_seconds=deadline)
+        started = time.monotonic()
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            client.request("GET", "/workspaces")
+        return time.monotonic() - started, str(raised.exception)
+
+    def test_control_a_quick_answer_comes_back(self) -> None:
+        base = self.serve(lambda sock: sock.sendall(self.answer(b'{"data": []}')))
+        self.assertEqual({"data": []}, MODULE_UNDER_TEST.HttpApi(base, lambda: "t", timeout_seconds=1).request("GET", "/workspaces"))
+
+    def test_slow_headers_end_at_the_deadline(self) -> None:
+        def slow(sock: socket.socket) -> None:
+            time.sleep(1.2)
+            sock.sendall(self.answer())
+
+        elapsed, message = self.timed(self.serve(slow), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+        self.assertIn("did not answer within 0.25 seconds", message)
+
+    def test_a_slow_body_ends_at_the_deadline(self) -> None:
+        def slow(sock: socket.socket) -> None:
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n" + b"x" * 10)
+            time.sleep(1.5)
+
+        elapsed, message = self.timed(self.serve(slow), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+        self.assertIn("did not answer within 0.25 seconds", message)
+
+    def test_a_trickle_of_one_byte_at_a_time_ends_at_the_deadline(self) -> None:
+        def trickle(sock: socket.socket) -> None:
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+            for _ in range(200):
+                sock.sendall(b"x")
+                time.sleep(0.02)
+
+        elapsed, message = self.timed(self.serve(trickle), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+        self.assertIn("did not answer within", message)
+
+    def test_a_server_that_sends_the_headers_slowly_a_byte_at_a_time_ends_at_the_deadline(self) -> None:
+        def trickle(sock: socket.socket) -> None:
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}":
+                sock.sendall(bytes([byte]))
+                time.sleep(0.03)
+
+        elapsed, _ = self.timed(self.serve(trickle), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+
+    def test_a_server_that_accepts_and_never_answers_ends_at_the_deadline(self) -> None:
+        elapsed, _ = self.timed(self.serve(lambda sock: time.sleep(2)), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+
+    def test_the_total_of_all_exchanges_is_bounded_by_the_run_budget(self) -> None:
+        base = self.serve(lambda sock: sock.sendall(self.answer()))
+        budget = MODULE_UNDER_TEST.Budget(0.4)
+        client = MODULE_UNDER_TEST.HttpApi(base, lambda: "t", timeout_seconds=5, budget=budget)
+        client.request("GET", "/a")
+        time.sleep(0.5)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            client.request("GET", "/b")
+        self.assertIn("run deadline", str(raised.exception))
+
+    def test_an_exchange_gets_the_smaller_of_its_own_deadline_and_the_time_left_in_the_run(self) -> None:
+        def slow(sock: socket.socket) -> None:
+            time.sleep(2)
+
+        base = self.serve(slow)
+        client = MODULE_UNDER_TEST.HttpApi(base, lambda: "t", timeout_seconds=5, budget=MODULE_UNDER_TEST.Budget(0.3))
+        started = time.monotonic()
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError):
+            client.request("GET", "/a")
+        self.assertLess(time.monotonic() - started, 0.3 + self.MARGIN)
 
 
 class CoverTest(unittest.TestCase):
@@ -722,8 +1028,8 @@ class CredentialsTest(unittest.TestCase):
             calls.append(arguments)
             return code, output, error
 
-        result: tuple[str, str] = MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte")
-        self.assertEqual("get", calls[0][2])
+        result: tuple[str, str] = MODULE_UNDER_TEST.client_credentials(run, ["k3s", "kubectl"], "airbyte", MODULE_UNDER_TEST.Budget(1000))
+        self.assertEqual("get", calls[0][calls[0].index("kubectl") + 1])
         return result
 
     def test_the_client_id_and_secret_are_read_from_the_namespaces_auth_secret(self) -> None:
@@ -812,26 +1118,8 @@ class HttpTest(unittest.TestCase):
         client.log, client.made = log, made
         return client
 
-    def test_a_reply_that_trickles_in_pieces_past_the_deadline_is_a_timeout_even_though_each_piece_is_quick(self) -> None:
-        client = self.api(text="x" * 100_000, read_seconds=0.11, limit=0.25)
-        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
-            client.request("GET", "/workspaces")
-        self.assertIn("GET /workspaces did not answer within 0.25 seconds", str(raised.exception))
-        self.assertTrue(client.made[0].closed)
-        self.assertLessEqual(len(client.made[0].sock.timeouts), 4, "the read stops at the deadline and does not read on")
-
-    def test_each_read_gets_the_time_that_is_left_as_its_socket_timeout(self) -> None:
-        client = self.api(text="y" * 150_000, read_seconds=0.5, limit=1.2)
-        with self.assertRaises(MODULE_UNDER_TEST.ApiError):
-            client.request("GET", "/workspaces")
-        timeouts = client.made[0].sock.timeouts
-        self.assertGreaterEqual(len(timeouts), 2)
-        self.assertEqual(sorted(timeouts, reverse=True), timeouts)
-        self.assertTrue(all(0 < value <= 1.2 for value in timeouts))
-        self.assertLess(timeouts[1], timeouts[0])
-
-    def test_a_slow_start_of_the_reply_that_uses_the_whole_deadline_is_a_timeout(self) -> None:
-        client = self.api(text='{"data": []}', header_seconds=1.0, limit=0.5)
+    def test_an_exchange_that_ended_after_its_deadline_is_a_timeout_even_if_the_answer_came(self) -> None:
+        client = self.api(text='{"data": []}', read_seconds=1.0, limit=0.5)
         with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
             client.request("GET", "/workspaces")
         self.assertIn("did not answer within 0.5 seconds", str(raised.exception))

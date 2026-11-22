@@ -1,21 +1,30 @@
 """Ansible module: make the raw connection in a running Airbyte match a document, and change nothing when it already does.
 
-The document is what ``scripts.ingestion.connection render`` prints: a pinned definition, a source and a destination, and one connection. The module reads
-the instance administrator's client credentials from the namespace's secret, asks Airbyte's public API for a token and then, in this order, makes the
-definition of each connector (the pinned version), the source, the destination and the connection match. An object is found by its name, created when it is
-missing, and updated when its answer does not hold every value of the document. The platform adds fields of its own to an answer, so only the document's
-values are compared. A drifted setting, a schedule that was switched on, a changed connector version and a dropped selected file are repaired.
+The document is what ``scripts.ingestion.connection render`` prints: a pinned definition, a source and a destination, and one connection. The module
+reads the instance administrator's client credentials from the namespace's secret, asks Airbyte's public API for a token and then makes the definition
+of each connector (the pinned version), the source, the destination and the connection match. An object is found by its name, created when it is
+missing, and updated when its answer does not hold every value of the document. The platform adds fields of its own to an answer, so only the
+document's values are compared. A drifted setting, a schedule that was switched on, a changed connector version and a dropped selected file are
+repaired.
 
-The access key of the project profile is never in the document: the host reads it from two root-only files and the module puts it into the source and
-the destination at the fields the document names (``secret_fields``). Airbyte answers every secret field as the mask ``**********``, so a secret cannot be
-compared. The module compares the document's other values and keeps a record file with, for each object, a SHA-256 fingerprint of the key's ID, which
-changes when the key is rotated. A key whose fingerprint differs from the record is sent again, and the record is written after the call succeeds. A secret
-changed by hand in Airbyte is not seen; the next rotation or a deleted record sends the key again.
+The run has two phases. It first reads every object, checks every item of every answer against a closed table of required keys and types
+(``ANSWER_SHAPES``), and decides the whole plan: identities, definitions, links and drift. Anything that no update can repair (an object that belongs
+to another definition, source or destination, a name that two objects hold, a workspace count other than one, an answer of the wrong form) is refused
+there, before any write. Deleting a connection would delete its sync state, so such a drift is refused and never repaired. Only then are the writes
+made, in order.
 
-A structural drift that no update can repair (an object that belongs to another definition, source or destination) is refused with its name and changed
-nowhere: deleting a connection would delete its sync state, and the next sync would copy every file again. A name that two objects hold, or a workspace
-count other than one, stops the run before any write. The token, the client credentials, the key and every body of a call stay out of every message: a
-failed call names its method, its path and its status.
+The access key of the project profile is never in the document, which holds no ``secret_fields`` and no value at a key field. The launcher placed the
+key as two root-only files on the host, outside Ansible. The module holds one closed table (``CONNECTOR_KEY_FIELDS``): for each of the two pinned
+connectors the image and the exact two field paths that receive the key ID and the secret. Before any call it checks that the outgoing configuration
+differs from the document at exactly those paths and nowhere else. Airbyte answers every secret field as the mask ``**********``, so a secret cannot
+be compared. The module compares the document's other values and keeps a record file with, for each object, a SHA-256 fingerprint of the actor's ID
+and the key's ID, which changes when the key is rotated or the actor is replaced. A key whose fingerprint differs from the record is sent again, and
+the record is written after the call succeeds. On every successful run the record's mode and owner are repaired, and that is reported as a change. A
+secret changed by hand in Airbyte is not seen.
+
+Every exchange with Airbyte has one elapsed deadline, enforced by a timer that shuts the socket down at the deadline, and the whole run has one
+(``Budget``), so no exchange and no kubectl call runs past it. The token, the client credentials, the key and every body of a call stay out of every
+message: a failed call names its method, its path and its status.
 
 The module uses only the standard library and runs on the host's Python.
 """
@@ -23,11 +32,15 @@ The module uses only the standard library and runs on the host's Python.
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import http.client
 import json
+import math
 import os
+import socket
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping
@@ -36,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.secret_files import SecretFileError, write_private_file
+from ansible.module_utils.secret_files import SecretFileError, access_differs, set_access, write_private_file
 
 AUTH_OBJECT = "airbyte-auth-secrets"
 ID_FIELD = "instance-admin-client-id"
@@ -45,8 +58,28 @@ LOCAL_ADDRESSES = ("127.0.0.1", "localhost")
 KEY_FOLDER = "airbyte"
 KEY_FILES = {"aws_access_key_id": "aws_access_key_id", "aws_secret_access_key": "aws_secret_access_key"}
 FINGERPRINT_OF = "aws_access_key_id"
-READ_BYTES = 65536
+CONNECTOR_KEY_FIELDS: dict[str, dict[str, Any]] = {
+    "source": {
+        "image": "airbyte/source-s3",
+        "fields": {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"},
+    },
+    "destination": {
+        "image": "airbyte/destination-s3",
+        "fields": {"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"},
+    },
+}
+DEFINITION_SHAPE: dict[str, type] = {"id": str, "name": str, "dockerRepository": str, "dockerImageTag": str}
+ANSWER_SHAPES: dict[str, dict[str, type]] = {
+    "workspace": {"workspaceId": str},
+    "source_definition": DEFINITION_SHAPE,
+    "destination_definition": DEFINITION_SHAPE,
+    "source": {"sourceId": str, "name": str, "definitionId": str, "configuration": dict},
+    "destination": {"destinationId": str, "name": str, "definitionId": str, "configuration": dict},
+    "connection": {"connectionId": str, "name": str, "sourceId": str, "destinationId": str, "status": str, "schedule": dict, "configurations": dict},
+}
 KUBECTL_SECONDS = 60
+KUBECTL_KILL_SECONDS = 5
+TIMED_OUT = (124, 137)
 PAGE_SIZE = 100
 MAX_PAGES = 1000
 DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
@@ -58,8 +91,19 @@ class ApiError(RuntimeError):
     """A call or an object is not usable. The message holds a method, a path, a status or an object's name, and never a token, a secret or a body."""
 
 
+class Budget:
+    """The time left in the run. Every exchange and every call of another program takes its deadline from it."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self.deadline = clock() + seconds
+
+    def remaining(self) -> float:
+        return self.deadline - self.clock()
+
+
 class Api:
-    """What the reconcile step needs: one call that returns the JSON object of the reply."""
+    """What the plan and the steps need: one call that returns the JSON object of the reply."""
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         raise NotImplementedError
@@ -68,9 +112,9 @@ class Api:
 class HttpApi(Api):
     """Calls over plain HTTP to Airbyte's local address only, so the bearer token never leaves the host.
 
-    A call has one deadline of ``timeout_seconds`` from its start. The reply is read in pieces, each with the time that is left as its socket timeout, and the
-    read stops at the deadline, so a reply that trickles in cannot take longer than the deadline however many pieces it has.
-    """
+    One exchange (connect, send, read the whole answer) has one deadline: the smaller of ``timeout_seconds`` and the time left in the run's budget. A
+    timer shuts the socket down when it expires, so any read that is pending fails at once, however slowly the server sends its headers or its body,
+    and an exchange that ended after the deadline is a timeout too."""
 
     def __init__(
         self,
@@ -78,6 +122,7 @@ class HttpApi(Api):
         token: Callable[[], str] | None,
         *,
         timeout_seconds: float,
+        budget: Budget | None = None,
         connect: Callable[..., Any] = http.client.HTTPConnection,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -87,42 +132,54 @@ class HttpApi(Api):
         self.host, self.port, self.prefix = address.hostname, address.port, address.path.rstrip("/")
         self.token = token
         self.timeout_seconds = timeout_seconds
+        self.budget = budget
         self.connect = connect
         self.clock = clock
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        allowed = self.timeout_seconds
+        if self.budget is not None:
+            left = self.budget.remaining()
+            if left <= 0:
+                raise ApiError(f"{method} {path} was not made: the run deadline has passed")
+            allowed = min(allowed, left)
         headers = {"Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
         if self.token is not None:
             headers["Authorization"] = f"Bearer {self.token()}"
         data = None if body is None else json.dumps(body).encode()
-        deadline = self.clock() + self.timeout_seconds
-        connection = self.connect(self.host, self.port, timeout=self.timeout_seconds)
+        started = self.clock()
+        expired = threading.Event()
+        connection = self.connect(self.host, self.port, timeout=allowed)
+
+        def stop() -> None:
+            expired.set()
+            with contextlib.suppress(OSError, AttributeError):
+                connection.sock.shutdown(socket.SHUT_RDWR)
+
+        timer = threading.Timer(allowed, stop)
+        timer.daemon = True
+        timer.start()
+        late = ApiError(f"{method} {path} did not answer within {allowed:g} seconds")
         try:
             connection.request(method, f"{self.prefix}{path}", body=data, headers=headers)
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                sock.settimeout(max(allowed - (self.clock() - started), 0.001))
             reply = connection.getresponse()
-            status, pieces = reply.status, []
-            while True:
-                remaining = deadline - self.clock()
-                if remaining <= 0:
-                    raise TimeoutError
-                sock = getattr(connection, "sock", None)
-                if sock is not None:
-                    sock.settimeout(remaining)
-                piece = reply.read(READ_BYTES)
-                if not piece:
-                    break
-                pieces.append(piece)
-            if self.clock() > deadline:
-                raise TimeoutError
-            text = b"".join(pieces).decode()
+            status, text = reply.status, reply.read().decode()
         except TimeoutError:
-            raise ApiError(f"{method} {path} did not answer within {self.timeout_seconds:g} seconds") from None
+            raise late from None
         except (http.client.HTTPException, OSError, UnicodeDecodeError):
+            if expired.is_set():
+                raise late from None
             raise ApiError(f"{method} {path} could not reach Airbyte") from None
         finally:
+            timer.cancel()
             connection.close()
+        if expired.is_set() or self.clock() - started > allowed:
+            raise late
         if status != http.client.OK:
             raise ApiError(f"{method} {path} answered {status}")
         try:
@@ -143,8 +200,18 @@ def covers(actual: Any, wanted: Any) -> bool:
     return type(actual) is type(wanted) and actual == wanted
 
 
-def listing(api: Api, path: str) -> list[dict[str, Any]]:
-    """Every object of a list call, page by page."""
+def checked(item: Any, kind: str) -> dict[str, Any]:
+    """The item of an answer when it is an object that holds each required key of its kind with the required type. Anything else is refused by kind and key."""
+    if not isinstance(item, dict):
+        raise ApiError(f"an answer holds a {kind} that is not an object")
+    for key, expected in ANSWER_SHAPES[kind].items():
+        if key not in item or type(item[key]) is not expected:
+            raise ApiError(f"a {kind} in an answer lacks {key} or holds it in the wrong form")
+    return item
+
+
+def listing(api: Api, path: str, kind: str) -> list[dict[str, Any]]:
+    """Every object of a list call, page by page, each checked against the table of its kind."""
     found: list[dict[str, Any]] = []
     separator = "&" if "?" in path else "?"
     for page in range(MAX_PAGES):
@@ -152,35 +219,59 @@ def listing(api: Api, path: str) -> list[dict[str, Any]]:
         data = reply.get("data")
         if not isinstance(data, list):
             raise ApiError(f"GET {path} answered with no list of objects")
-        found += [item for item in data if isinstance(item, dict)]
+        found += [checked(item, kind) for item in data]
         if not reply.get("next"):
             return found
     raise ApiError(f"GET {path} has more pages than {MAX_PAGES}")
 
 
+def created_id(answer: dict[str, Any], field: str) -> str:
+    """The ID in the answer of a create. The write is made, so a missing ID is a named error and not a plan."""
+    value = answer.get(field)
+    if not isinstance(value, str) or not value:
+        raise ApiError(f"the answer of a create holds no {field}")
+    return value
+
+
 def named(objects: list[dict[str, Any]], name: str, what: str) -> dict[str, Any] | None:
-    matches = [item for item in objects if item.get("name") == name]
+    matches = [item for item in objects if item["name"] == name]
     if len(matches) > 1:
         raise ApiError(f"{len(matches)} {what} objects are named {name}; Airbyte must hold one")
     return matches[0] if matches else None
 
 
 def check_document(wanted: dict[str, Any]) -> None:
+    """Refuse a document that is not in the documented form, that names a key field, or whose configuration already holds a value at a key field."""
     try:
         for part in ("source", "destination"):
             if not all(isinstance(wanted[part][field], dict if field != "name" else str) for field in ("name", "definition", "configuration")):
                 raise KeyError(part)
-            if any(not isinstance(wanted[part]["definition"].get(field), str) for field in DEFINITION_FIELDS[:3]):
+            if any(not isinstance(wanted[part]["definition"].get(field), str) for field in DEFINITION_FIELDS):
                 raise KeyError(part)
         if any(field not in wanted["connection"] for field in CONNECTION_FIELDS):
             raise KeyError("connection")
     except (KeyError, TypeError, AttributeError) as error:
         raise ApiError(f"the document does not hold its {error.args[0] if error.args else 'parts'} in the documented form") from None
+    for part in ("source", "destination"):
+        if "secret_fields" in wanted[part]:
+            raise ApiError(f"the {part} names secret_fields; the module holds the one table of the fields that take the key")
+        table = CONNECTOR_KEY_FIELDS[part]
+        if wanted[part]["definition"]["dockerRepository"] != table["image"]:
+            raise ApiError(f"the {part} is not the pinned connector image that the module knows")
+        for path in table["fields"]:
+            *parents, last = path.split(".")
+            node: Any = wanted[part]["configuration"]
+            for step in parents:
+                node = node.get(step) if isinstance(node, dict) else None
+            if not isinstance(node, dict):
+                raise ApiError(f"the {part}'s configuration lacks the object that holds a key field")
+            if last in node:
+                raise ApiError(f"the {part}'s configuration already holds a value at a key field")
 
 
 def one_workspace(api: Api) -> str:
-    workspaces = listing(api, "/workspaces")
-    if len(workspaces) != 1 or not isinstance(workspaces[0].get("workspaceId"), str):
+    workspaces = listing(api, "/workspaces", "workspace")
+    if len(workspaces) != 1:
         raise ApiError(f"Airbyte holds {len(workspaces)} workspaces, and the connection needs exactly one")
     return str(workspaces[0]["workspaceId"])
 
@@ -192,7 +283,7 @@ def read_key_files(directory: Path) -> dict[str, str]:
         try:
             text = (directory / KEY_FOLDER / file_name).read_text().strip()
         except OSError:
-            raise ApiError(f"the key file {file_name} cannot be read; the deployment places it before the connection is applied") from None
+            raise ApiError(f"the key file {file_name} cannot be read; the launcher places it before the connection is applied") from None
         if not text:
             raise ApiError(f"the key file {file_name} is empty")
         values[name] = text
@@ -210,12 +301,27 @@ def read_record(path: Path) -> dict[str, str]:
     return dict(record)
 
 
+def record_owner() -> tuple[int, int]:
+    return os.getuid(), os.getgid()
+
+
 def write_record(path: Path, record: Mapping[str, str]) -> None:
     """Write the record for its owner only, through a fresh temporary file, so it never inherits the permissions of a file that was already there."""
     try:
-        write_private_file(path, json.dumps(dict(record), sort_keys=True) + "\n", replace=True, owner=(os.getuid(), os.getgid()))
+        write_private_file(path, json.dumps(dict(record), sort_keys=True) + "\n", replace=True, owner=record_owner())
     except SecretFileError:
         raise ApiError("the record of applied keys cannot be written") from None
+
+
+def repair_record(path: Path) -> bool:
+    """Give an existing record the expected mode and owner and return whether that changed anything."""
+    try:
+        if path.exists() and access_differs(path, record_owner()):
+            set_access(path, record_owner())
+            return True
+    except (OSError, SecretFileError):
+        raise ApiError("the record of applied keys cannot be given its mode and owner") from None
+    return False
 
 
 def fingerprint(actor_id: str, secrets: Mapping[str, str]) -> str:
@@ -223,7 +329,7 @@ def fingerprint(actor_id: str, secrets: Mapping[str, str]) -> str:
     return hashlib.sha256(f"{actor_id}\n{secrets[FINGERPRINT_OF]}".encode()).hexdigest()
 
 
-def inject(configuration: dict[str, Any], fields: dict[str, str], secrets: Mapping[str, str]) -> dict[str, Any]:
+def inject(configuration: dict[str, Any], fields: Mapping[str, str], secrets: Mapping[str, str]) -> dict[str, Any]:
     """A copy of the configuration with each secret put at its path. The document's own configuration is not changed."""
     filled = copy.deepcopy(configuration)
     for path, name in fields.items():
@@ -235,20 +341,27 @@ def inject(configuration: dict[str, Any], fields: dict[str, str], secrets: Mappi
     return filled
 
 
-def check_secret_fields(part: dict[str, Any], what: str) -> dict[str, str]:
-    fields = part.get("secret_fields", {})
-    if not isinstance(fields, dict):
-        raise ApiError(f"the {what}'s secret_fields are not in the documented form")
-    for path, name in fields.items():
-        if not isinstance(path, str) or not path or not isinstance(name, str) or name not in KEY_FILES:
-            raise ApiError(f"the {what}'s secret_fields name a secret that the module does not read")
-        *parents, _ = path.split(".")
-        node: Any = part["configuration"]
-        for step in parents:
-            node = node.get(step) if isinstance(node, dict) else None
-        if not isinstance(node, dict):
-            raise ApiError(f"the {what}'s secret_fields name a field whose parent is not in its configuration")
-    return {str(path): str(name) for path, name in fields.items()}
+def differences(left: Any, right: Any, prefix: str = "") -> set[str]:
+    """The dotted paths at which two configurations differ: a value that differs, and a key that only one of them holds. A list is one value."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        found: set[str] = set()
+        for name in set(left) | set(right):
+            path = f"{prefix}.{name}" if prefix else str(name)
+            if name not in left or name not in right:
+                found.add(path)
+            else:
+                found |= differences(left[name], right[name], path)
+        return found
+    return set() if type(left) is type(right) and left == right else {prefix}
+
+
+def outgoing_configuration(kind: str, wanted: dict[str, Any], secrets: Mapping[str, str]) -> dict[str, Any]:
+    """The configuration that is sent for the source or the destination, once it is shown to differ from the document at exactly the key fields of its table."""
+    fields = CONNECTOR_KEY_FIELDS[kind]["fields"]
+    sent = inject(wanted["configuration"], fields, secrets)
+    if differences(wanted["configuration"], sent) != set(fields):
+        raise ApiError(f"the outgoing {kind} configuration differs from the document outside the key fields")
+    return sent
 
 
 @dataclass
@@ -262,28 +375,29 @@ class Step:
 def plan(api: Api, wanted: dict[str, Any], secrets: Mapping[str, str], recorded: dict[str, str]) -> list[Step]:
     """Read every object and decide the whole plan, with no write. Raise ``ApiError`` for anything that no update can repair, before any step is made.
 
-    The plan covers the identities (a name that two objects hold, a workspace count other than one), the definitions, the objects' links and the drift. A
-    step runs after the steps before it and takes the IDs that they made. ``recorded`` is updated by a step after its call succeeds.
-    """
+    The plan covers the document, the outgoing configurations, the shape of every answer, the identities (a name that two objects hold, a workspace
+    count other than one), the definitions, the objects' links and the drift. Every ID that a write needs is read here. A step runs after the steps
+    before it and takes the IDs that they made. ``recorded`` is updated by a step after its call succeeds."""
     check_document(wanted)
     if any(name not in secrets or not secrets[name] for name in KEY_FILES):
         raise ApiError("the access key is not available to the module")
-    for part in ("source", "destination"):
-        wanted[part]["secret_fields"] = check_secret_fields(wanted[part], part)
+    sent = {kind: outgoing_configuration(kind, wanted[kind], secrets) for kind in ("source", "destination")}
     workspace = one_workspace(api)
     definitions = {
-        kind: named(listing(api, f"/workspaces/{workspace}/definitions/{kind}s"), wanted[kind]["definition"]["name"], f"{kind} definition")
+        kind: named(
+            listing(api, f"/workspaces/{workspace}/definitions/{kind}s", f"{kind}_definition"), wanted[kind]["definition"]["name"], f"{kind} definition"
+        )
         for kind in ("source", "destination")
     }
-    actors = {kind: named(listing(api, f"/{kind}s?workspaceIds={workspace}"), wanted[kind]["name"], kind) for kind in ("source", "destination")}
-    connection = named(listing(api, f"/connections?workspaceIds={workspace}"), wanted["connection"]["name"], "connection")
+    actors = {kind: named(listing(api, f"/{kind}s?workspaceIds={workspace}", kind), wanted[kind]["name"], kind) for kind in ("source", "destination")}
+    connection = named(listing(api, f"/connections?workspaceIds={workspace}", "connection"), wanted["connection"]["name"], "connection")
     steps: list[Step] = []
     ids: dict[str, str] = {}
     for kind in ("source", "destination"):
         steps += plan_definition(workspace, kind, wanted[kind]["definition"], definitions[kind], ids)
     for kind in ("source", "destination"):
-        steps += plan_actor(workspace, kind, wanted[kind], actors[kind], ids, secrets, recorded)
-    steps += plan_connection(workspace, wanted["connection"], connection, ids)
+        steps += plan_actor(workspace, kind, wanted[kind], sent[kind], actors[kind], ids, secrets, recorded)
+    steps += plan_connection(wanted["connection"], connection, ids)
     return steps
 
 
@@ -292,39 +406,45 @@ def plan_definition(workspace: str, kind: str, wanted: dict[str, Any], current: 
     if current is None:
 
         def create(api: Api) -> None:
-            ids[f"{kind}_definition"] = str(api.request("POST", path, {field: wanted[field] for field in DEFINITION_FIELDS})["id"])
+            ids[f"{kind}_definition"] = created_id(api.request("POST", path, {field: wanted[field] for field in DEFINITION_FIELDS}), "id")
 
         return [Step(f"{kind} definition", create)]
-    if current.get("dockerRepository") != wanted["dockerRepository"]:
+    if current["dockerRepository"] != wanted["dockerRepository"]:
         raise ApiError(f"the {kind} definition {wanted['name']} runs another image than the document's")
-    ids[f"{kind}_definition"] = str(current["id"])
-    if current.get("dockerImageTag") == wanted["dockerImageTag"]:
+    ids[f"{kind}_definition"] = current["id"]
+    if current["dockerImageTag"] == wanted["dockerImageTag"]:
         return []
     body = {"name": wanted["name"], "dockerImageTag": wanted["dockerImageTag"]}
     return [Step(f"{kind} definition", lambda api: api.request("PUT", f"{path}/{current['id']}", body))]
 
 
 def plan_actor(
-    workspace: str, kind: str, wanted: dict[str, Any], current: dict[str, Any] | None, ids: dict[str, str], secrets: Mapping[str, str], recorded: dict[str, str]
+    workspace: str,
+    kind: str,
+    wanted: dict[str, Any],
+    sent: dict[str, Any],
+    current: dict[str, Any] | None,
+    ids: dict[str, str],
+    secrets: Mapping[str, str],
+    recorded: dict[str, str],
 ) -> list[Step]:
-    """The step that makes the source or the destination, or none. The key is put into the configuration that is sent; Airbyte answers its secrets as the mask,
-    so the answer is compared with the document, which holds none, and the key is sent again when the record's fingerprint of this actor's ID differs."""
+    """The step that makes the source or the destination, or none. ``sent`` is the configuration with the key in it. Airbyte answers its secrets as the mask, so
+    the answer is compared with the document, which holds none, and the key is sent again when the record's fingerprint of this actor's ID differs."""
     path, id_field = f"/{kind}s", f"{kind}Id"
-    sent = inject(wanted["configuration"], wanted.get("secret_fields", {}), secrets)
     if current is None:
 
         def create(api: Api) -> None:
             body = {"name": wanted["name"], "workspaceId": workspace, "definitionId": ids[f"{kind}_definition"], "configuration": sent}
-            ids[kind] = str(api.request("POST", path, body)[id_field])
+            ids[kind] = created_id(api.request("POST", path, body), id_field)
             recorded[kind] = fingerprint(ids[kind], secrets)
 
         return [Step(kind, create)]
-    if f"{kind}_definition" not in ids or current.get("definitionId") != ids[f"{kind}_definition"]:
+    if f"{kind}_definition" not in ids or current["definitionId"] != ids[f"{kind}_definition"]:
         raise ApiError(f"the {kind} {wanted['name']} belongs to another definition than the pinned one; delete it in Airbyte and run again")
-    actor_id = str(current[id_field])
+    actor_id = current[id_field]
     ids[kind] = actor_id
     applied = fingerprint(actor_id, secrets)
-    if covers(current.get("configuration"), wanted["configuration"]) and recorded.get(kind) == applied:
+    if covers(current["configuration"], wanted["configuration"]) and recorded.get(kind) == applied:
         return []
 
     def update(api: Api) -> None:
@@ -334,7 +454,7 @@ def plan_actor(
     return [Step(kind, update)]
 
 
-def plan_connection(workspace: str, wanted: dict[str, Any], current: dict[str, Any] | None, ids: dict[str, str]) -> list[Step]:
+def plan_connection(wanted: dict[str, Any], current: dict[str, Any] | None, ids: dict[str, str]) -> list[Step]:
     fields = {field: wanted[field] for field in CONNECTION_FIELDS}
     if current is None:
 
@@ -342,15 +462,15 @@ def plan_connection(workspace: str, wanted: dict[str, Any], current: dict[str, A
             api.request("POST", "/connections", {**fields, "sourceId": ids["source"], "destinationId": ids["destination"]})
 
         return [Step("connection", create)]
-    known = ("source" in ids and "destination" in ids) and (current.get("sourceId"), current.get("destinationId")) == (ids["source"], ids["destination"])
-    created_now = any(kind not in ids for kind in ("source", "destination"))
-    if created_now or not known:
+    known = ("source" in ids and "destination" in ids) and (current["sourceId"], current["destinationId"]) == (ids["source"], ids["destination"])
+    if not known:
         raise ApiError(
             f"the connection {wanted['name']} joins other objects than the pinned ones; Airbyte cannot move it, and deleting it would lose its sync state"
         )
     if covers(current, fields):
         return []
-    return [Step("connection", lambda api: api.request("PATCH", f"/connections/{current['connectionId']}", fields))]
+    connection_id = current["connectionId"]
+    return [Step("connection", lambda api: api.request("PATCH", f"/connections/{connection_id}", fields))]
 
 
 def execute(api: Api, steps: list[Step]) -> list[str]:
@@ -370,23 +490,35 @@ def reconcile(api: Api, wanted: dict[str, Any], secrets: Mapping[str, str], reco
 
 
 def apply_document(api: Api, wanted: dict[str, Any], secrets: Mapping[str, str], record_file: Path) -> list[str]:
-    """Reconcile and keep the record of applied keys. The record is written after a failed run too, so a source that was given its key is not sent it again."""
+    """Reconcile and keep the record of applied keys, and return what changed.
+
+    The record is written after a failed run too, so a source that was given its key is not sent it again. After a successful run the record's mode
+    and owner are repaired, and that is reported as ``record file``."""
     recorded = read_record(record_file)
     before = dict(recorded)
     try:
-        return reconcile(api, wanted, secrets, recorded)
+        changes = reconcile(api, wanted, secrets, recorded)
     finally:
         if recorded != before:
             write_record(record_file, recorded)
+    if repair_record(record_file):
+        changes = [*changes, "record file"]
+    return changes
 
 
-def client_credentials(run: Runner, kubectl: list[str], namespace: str) -> tuple[str, str]:
+def client_credentials(run: Runner, kubectl: list[str], namespace: str, budget: Budget) -> tuple[str, str]:
     """The administrator's client id and secret from the namespace's auth secret.
 
-    The call has kubectl's own deadline (``--request-timeout``), and the module's task has a deadline too. A failure of any kind, a timeout included, names the
-    secret and the namespace and never shows kubectl's text or a value.
-    """
-    code, output, _ = run([*kubectl, "get", "secret", AUTH_OBJECT, "--namespace", namespace, "--output", "json", f"--request-timeout={KUBECTL_SECONDS}s"])
+    The call runs under the ``timeout`` program with the smaller of its own limit and the time left in the run, and carries kubectl's own request
+    timeout. A failure of any kind, a timeout included, names the secret and the namespace and never shows the program's text or a value."""
+    left = budget.remaining()
+    if left <= 0:
+        raise ApiError(f"the secret {AUTH_OBJECT} was not read: the run deadline has passed")
+    seconds = max(1, math.ceil(min(KUBECTL_SECONDS, left)))
+    arguments = ["timeout", f"--kill-after={KUBECTL_KILL_SECONDS}s", f"{seconds}s", *kubectl]
+    code, output, _ = run([*arguments, "get", "secret", AUTH_OBJECT, "--namespace", namespace, "--output", "json", f"--request-timeout={seconds}s"])
+    if code in TIMED_OUT:
+        raise ApiError(f"reading the secret {AUTH_OBJECT} in {namespace} did not finish within {seconds} seconds")
     if code != 0:
         raise ApiError(f"the secret {AUTH_OBJECT} cannot be read in {namespace}")
     try:
@@ -396,8 +528,8 @@ def client_credentials(run: Runner, kubectl: list[str], namespace: str) -> tuple
         raise ApiError(f"the secret {AUTH_OBJECT} holds no {ID_FIELD} and {KEY_FIELD} yet; Airbyte writes them when it first starts") from None
 
 
-def access_token(base_url: str, client_id: str, client_secret: str, timeout_seconds: float) -> str:
-    reply = HttpApi(base_url, None, timeout_seconds=timeout_seconds).request(
+def access_token(base_url: str, client_id: str, client_secret: str, timeout_seconds: float, budget: Budget | None = None) -> str:
+    reply = HttpApi(base_url, None, timeout_seconds=timeout_seconds, budget=budget).request(
         "POST", "/applications/token", {"clientId": client_id, "clientSecret": client_secret}
     )
     token = reply.get("access_token")
@@ -414,17 +546,21 @@ def main() -> None:
             "namespace": {"type": "str", "default": "airbyte"},
             "kubectl": {"type": "list", "elements": "str", "default": ["k3s", "kubectl"]},
             "timeout_seconds": {"type": "int", "default": 600},
+            "run_seconds": {"type": "int", "default": 1800},
             "secrets_directory": {"type": "path", "required": True},
             "record_file": {"type": "path", "required": True},
         },
         supports_check_mode=False,
     )
     params = module.params
+    budget = Budget(params["run_seconds"])
     try:
-        client_id, client_secret = client_credentials(lambda arguments: module.run_command(arguments, check_rc=False), params["kubectl"], params["namespace"])
-        token = access_token(params["base_url"], client_id, client_secret, params["timeout_seconds"])
+        client_id, client_secret = client_credentials(
+            lambda arguments: module.run_command(arguments, check_rc=False), params["kubectl"], params["namespace"], budget
+        )
+        token = access_token(params["base_url"], client_id, client_secret, params["timeout_seconds"], budget)
         changes = apply_document(
-            HttpApi(params["base_url"], lambda: token, timeout_seconds=params["timeout_seconds"]),
+            HttpApi(params["base_url"], lambda: token, timeout_seconds=params["timeout_seconds"], budget=budget),
             params["document"],
             read_key_files(Path(params["secrets_directory"])),
             Path(params["record_file"]),

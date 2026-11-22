@@ -4,9 +4,9 @@
 of the selection, so the selection is the tracked release pin's two tables and 6,388 case files and nothing a wildcard could add. It copies raw files,
 with their folders, through the delivery method "Copy raw files". The destination writes the ``landing`` prefix of the project's bucket and the
 metadata record of each file as JSON lines. The connection has no schedule, so only the orchestrator starts it. It syncs incrementally, so a rerun
-copies only a file that is new. The document holds no key and no secret. It names, for each connector, the fields that take the project profile's access
-key (``secret_fields``, a path in the configuration and the name of a secret), and the host fills them when the document is applied, from two root-only files.
-The document is built on the owner's computer, where no key is.
+copies only a file that is new. The document holds no key, no secret and no name of a field that takes one: the apply module holds one closed table of
+the two field paths of each pinned connector and fills them from two root-only files on the host. The document is built on the owner's computer, where
+no key is.
 
 ``render`` prints the document for the Ansible role, which hands it to the module that applies it to a running Airbyte.
 
@@ -158,13 +158,11 @@ def desired_state(selection: Selection, *, bucket: str, region: str, source_tag:
             "name": SOURCE_NAME,
             "definition": source_definition(source_tag),
             "configuration": source_configuration(selection),
-            "secret_fields": {"credentials.aws_access_key_id": "aws_access_key_id", "credentials.aws_secret_access_key": "aws_secret_access_key"},
         },
         "destination": {
             "name": DESTINATION_NAME,
             "definition": destination_definition(destination_tag),
             "configuration": destination_configuration(bucket, region),
-            "secret_fields": {"access_key_id": "aws_access_key_id", "secret_access_key": "aws_secret_access_key"},
         },
         "connection": {
             "name": CONNECTION_NAME,

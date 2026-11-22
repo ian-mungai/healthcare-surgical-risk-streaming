@@ -49,8 +49,31 @@ SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 ANSIBLE_TIMEOUT_SECONDS = 2400
-UNSAFE_ANSIBLE_SETTINGS = ("ANSIBLE_DEBUG", "ANSIBLE_KEEP_REMOTE_FILES")
-FALSE_SETTING_VALUES = frozenset({"", "0", "false", "no", "off", "n", "f"})
+PLAYBOOKS = {"host.yml": ("host setup", "ansible_output.txt"), "connection.yml": ("connection step", "ansible_connection_output.txt")}
+KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
+KEY_EXPORT_SECONDS = 60
+KEY_SEND_SECONDS = 60
+KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
+KEY_VALUE_FORM = re.compile(r"[A-Za-z0-9/+=]{20,128}")
+SCRIPT_REFUSALS = ("oversized", "not_json", "bad_keys", "session_token", "empty", "bad_form", "cannot_write")
+KEY_MESSAGES = {
+    "export_failed": "the AWS command line could not export the credentials of the project profile (exit status {status}); run it by hand to see why",
+    "export_timeout": "the AWS command line did not finish within {seconds} seconds",
+    "no_aws": "the AWS command line is not installed or not on PATH",
+    "not_a_static_key": "the AWS command line answered for the project profile with something that is not the ID and the secret of an AWS access key",
+    "session_token": "the project profile yields a session token; Airbyte's connectors need the own access key of an IAM user, not a temporary credential",
+    "empty": "the AWS command line answered for the project profile with no access key ID or no secret",
+    "ssh_failed": "the key could not be sent to the host (exit status {status})",
+    "ssh_timeout": "sending the key to the host did not finish within {seconds} seconds",
+    "script_oversized": "the key script on the host refused the document: it is larger than the script accepts",
+    "script_not_json": "the key script on the host refused the document: it is not a JSON object",
+    "script_bad_keys": "the key script on the host refused the document: it does not hold exactly the two key values",
+    "script_session_token": "the key script on the host refused the document: it holds a session token",
+    "script_empty": "the key script on the host refused the document: a value is empty",
+    "script_bad_form": "the key script on the host refused the document: a value is not in the form of an AWS access key",
+    "script_cannot_write": "the key script on the host could not write the key files under the secrets folder; check the folder's owner and free space",
+    "script_unknown": "the key script on the host answered with something that this program does not know",
+}
 GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
@@ -279,15 +302,12 @@ def platform_commit() -> str:
 
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
-    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, and the bucket and the AWS
-    profile that Airbyte's connection copies into and with. The profile is checked as a profile name, so no other text reaches the playbook."""
-    if PATTERNS["AWS_PROFILE"].fullmatch(configuration["AWS_PROFILE"]) is None:
-        raise HostError("AWS_PROFILE is not a profile name")
+    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, and the bucket that Airbyte's
+    connection copies into. No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host without Ansible."""
     return {
         "compose_stack_platform_commit": commit,
         "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
         "airbyte_landing_bucket": configuration["S3_BUCKET"],
-        "airbyte_aws_profile": configuration["AWS_PROFILE"],
     }
 
 
@@ -297,40 +317,88 @@ def ansible_recap(stdout: str) -> str:
     return "".join(f"{line.strip()}\n" for line in recap if RECAP_LINE.fullmatch(line.strip()))
 
 
-def refuse_unsafe_ansible_settings() -> None:
-    """Stop before the playbook runs when Ansible's debug or keep-remote-files setting is on in the environment.
-
-    Either setting prints or keeps the project profile's access key that the Airbyte role places, and the launcher saves the whole output. The playbook's
-    first key task refuses the same settings in every other form (the configuration file).
-    """
-    for name in UNSAFE_ANSIBLE_SETTINGS:
-        value = os.environ.get(name)
-        if value is not None and value.strip().lower() not in FALSE_SETTING_VALUES:
-            raise HostError(f"{name} is set, and it can print or keep the project profile's access key; unset it and run the command again")
-
-
-def run_ansible(run_id: str, address: str, variables: dict[str, Any]) -> None:
-    refuse_unsafe_ansible_settings()
+def run_ansible(run_id: str, address: str, variables: dict[str, Any], playbook: str = "host.yml") -> None:
+    """Run one playbook on the host and keep its whole output privately. Only the recap counts are printed, because task output can hold variable values."""
+    label, output_name = PLAYBOOKS[playbook]
     home = ROOT / ".tools" / "ansible"
     settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
     environment = os.environ | settings | {"PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
     try:
         result = run_command(
             str(ROOT / ".venv" / "bin" / "ansible-playbook"),
-            ["host.yml", "--extra-vars", json.dumps(variables)],
+            [playbook, "--extra-vars", json.dumps(variables)],
             cwd=ROOT / "ansible",
             env=environment,
             timeout=ANSIBLE_TIMEOUT_SECONDS,
         )
     except TimeoutExpired as error:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
-        note = f"; {kept_note(run_id, 'ansible_output.txt', partial, 'partial output')}" if partial else ""
-        raise HostError(timeout_text("ansible-playbook host.yml", ANSIBLE_TIMEOUT_SECONDS) + note) from None
-    kept = kept_note(run_id, "ansible_output.txt", result.stdout + result.stderr, "full output")
+        note = f"; {kept_note(run_id, output_name, partial, 'partial output')}" if partial else ""
+        raise HostError(timeout_text(f"ansible-playbook {playbook}", ANSIBLE_TIMEOUT_SECONDS) + note) from None
+    kept = kept_note(run_id, output_name, result.stdout + result.stderr, "full output")
     sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:
-        raise HostError(f"the Ansible host setup failed; {kept}")
-    sys.stdout.write(f"the Ansible host setup passed; {kept}\n")
+        raise HostError(f"the Ansible {label} failed; {kept}")
+    sys.stdout.write(f"the Ansible {label} passed; {kept}\n")
+
+
+def exported_key(profile: str) -> dict[str, str]:
+    """The project profile's static access key from the AWS command line, checked in memory. A refusal is a fixed message with no output of the command."""
+    try:
+        result = run_command("aws", ["configure", "export-credentials", "--profile", profile, "--format", "process"], timeout=KEY_EXPORT_SECONDS)
+    except TimeoutExpired:
+        raise HostError(KEY_MESSAGES["export_timeout"].format(seconds=KEY_EXPORT_SECONDS)) from None
+    except FileNotFoundError:
+        raise HostError(KEY_MESSAGES["no_aws"]) from None
+    if result.returncode != 0:
+        raise HostError(KEY_MESSAGES["export_failed"].format(status=result.returncode))
+    if not result.stdout.strip():
+        raise HostError(KEY_MESSAGES["empty"])
+    try:
+        document = json.loads(result.stdout)
+    except ValueError:
+        document = None
+    if not isinstance(document, dict):
+        raise HostError(KEY_MESSAGES["not_a_static_key"])
+    if any("token" in str(name).lower() for name in document):
+        raise HostError(KEY_MESSAGES["session_token"])
+    key_id, value = document.get("AccessKeyId"), document.get("SecretAccessKey")
+    if not isinstance(key_id, str) or not isinstance(value, str):
+        raise HostError(KEY_MESSAGES["not_a_static_key"])
+    if not key_id or not value:
+        raise HostError(KEY_MESSAGES["empty"])
+    if KEY_ID_FORM.fullmatch(key_id) is None or KEY_VALUE_FORM.fullmatch(value) is None:
+        raise HostError(KEY_MESSAGES["not_a_static_key"])
+    return {"aws_access_key_id": key_id, "aws_secret_access_key": value}
+
+
+def place_project_key(run_id: str, address: str, profile: str) -> None:
+    """Read the project profile's access key on this computer and place it on the host through one SSH command.
+
+    The key is exported with the AWS command line (deadline, captured output), checked in memory and written to the standard input of
+    ``ssh <host> sudo <the key script>``, which writes the two root-only files. It is never in an argument list, an environment variable, a file on this
+    computer, an output or an error text. Every failure is a fixed message from ``KEY_MESSAGES``. The script's one-line answer is the only output read.
+    """
+    if PATTERNS["AWS_PROFILE"].fullmatch(profile) is None:
+        raise HostError("AWS_PROFILE is not a profile name")
+    document = json.dumps(exported_key(profile))
+    try:
+        sent = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", KEY_SCRIPT], input_text=document, timeout=KEY_SEND_SECONDS)
+    except TimeoutExpired:
+        raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
+    code = sent.stdout.strip()
+    if sent.returncode == 0 and code in ("placed", "unchanged"):
+        sys.stdout.write(
+            "the project profile's access key is placed on the host\n"
+            if code == "placed"
+            else "the project profile's access key is in place on the host and unchanged\n"
+        )
+        return
+    if sent.returncode == 3 and code in SCRIPT_REFUSALS:
+        raise HostError(KEY_MESSAGES[f"script_{code}"])
+    if sent.returncode not in (0, 3):
+        raise HostError(KEY_MESSAGES["ssh_failed"].format(status=sent.returncode))
+    raise HostError(KEY_MESSAGES["script_unknown"])
 
 
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
@@ -353,7 +421,10 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
     address = peer.address
     record_tailscale_device(run.run_id, host_name, peer.device_id)
-    run_ansible(run.run_id, address, workload_variables(state, configuration["AWS_REGION"]) | deploy_variables(configuration, platform_commit()))
+    variables = workload_variables(state, configuration["AWS_REGION"]) | deploy_variables(configuration, platform_commit())
+    run_ansible(run.run_id, address, variables)
+    place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
+    run_ansible(run.run_id, address, variables, "connection.yml")
     write_inventory(binding)
     sys.stdout.write(f"run {run.run_id}: the host {host_name} is up and its inventory is written\n")
     return 0
