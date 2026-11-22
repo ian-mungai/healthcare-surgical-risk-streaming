@@ -33,6 +33,7 @@ from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.track_list import pinned_track_list
 
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 BRANCH = re.compile(r"load_[a-z0-9][a-z0-9_]{0,63}")
 BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]")
 REGION_NAME = re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]")
@@ -104,9 +105,19 @@ def read_prefix(run_id: str) -> str:
     return f"{READ_PREFIX}{check_run(run_id)}/"
 
 
-def read_key(run_id: str, table: Table) -> str:
-    """The key of the run's copy of a CSV table, which is where the source reads it."""
-    return f"{read_prefix(run_id)}{table.name}.csv"
+def check_sha256(sha256: str) -> str:
+    if SHA256.fullmatch(sha256) is None:
+        raise DefinitionError("the content hash of a read key is 64 lower case hexadecimal digits")
+    return sha256
+
+
+def read_key(run_id: str, table: Table, sha256: str) -> str:
+    """The key of the run's copy of a CSV table, which is where the source reads it: the run, the verified content hash and the file name.
+
+    The hash in the key makes the key unique to its content as well as to its run, so a version at this key that is not the verified one is never a version that
+    the run meant to read.
+    """
+    return f"{read_prefix(run_id)}{check_sha256(sha256)}/{table.name}.csv"
 
 
 def branch_name(run_id: str) -> str:
@@ -135,8 +146,8 @@ def source_name(table: Table) -> str:
     return f"vitaldb_{table.name}_source"
 
 
-def source_configuration(table: Table, run_id: str, environment: Environment) -> dict[str, Any]:
-    """The configuration of the table's source for this run."""
+def source_configuration(table: Table, run_id: str, environment: Environment, sha256: str = "") -> dict[str, Any]:
+    """The configuration of the table's source for this run. A CSV table needs the SHA-256 that the manifest binds, which is in its read key."""
     check_run(run_id)
     if table.source_key is None:
         return {
@@ -155,7 +166,7 @@ def source_configuration(table: Table, run_id: str, environment: Environment) ->
         "streams": [
             {
                 "name": table.name,
-                "globs": [read_key(run_id, table)],
+                "globs": [read_key(run_id, table, sha256)],
                 "schemaless": False,
                 "format": {
                     "filetype": "csv",

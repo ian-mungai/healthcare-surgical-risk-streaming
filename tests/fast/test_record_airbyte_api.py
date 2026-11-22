@@ -161,7 +161,7 @@ def ensure_everything(api: Api, run: str = RUN) -> dict[str, str]:
     api.ensure_destination(definitions.destination_configuration(ENVIRONMENT, definitions.branch_name(run)))
     ids = {}
     for table in definitions.TABLES:
-        api.ensure_source(table.name, definitions.source_configuration(table, run, ENVIRONMENT))
+        api.ensure_source(table.name, definitions.source_configuration(table, run, ENVIRONMENT, "ab" * 32))
         ids[table.name] = api.ensure_connection(table.name, definitions.connection_configuration(table))
     return ids
 
@@ -319,6 +319,31 @@ class TokenTest(unittest.TestCase):
         stand_in.failures["GET jobs"] = (401, b"{}")
         with self.assertRaises(AirbyteError):
             api.running_jobs("connection1")
+
+
+class FindConnectionsTest(unittest.TestCase):
+    def test_before_anything_exists_none_is_found_and_nothing_is_written(self) -> None:
+        api, stand_in = prepared()
+        self.assertEqual({}, api.find_connection_ids())
+        self.assertEqual([], writes(stand_in))
+
+    def test_after_the_first_load_each_table_s_connection_is_found_by_its_name_and_nothing_is_written(self) -> None:
+        api, stand_in = prepared()
+        ids = ensure_everything(api)
+        stand_in.log.clear()
+        other, _ = prepared()
+        other.stand_in = stand_in
+        self.assertEqual(ids, other.find_connection_ids())
+        self.assertEqual([], writes(stand_in))
+
+    def test_a_connection_that_is_not_one_of_the_three_is_not_listed_and_a_duplicate_name_is_refused(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.connections["connection9"] = {"connectionId": "connection9", "name": "someone else's connection"}
+        self.assertEqual(3, len(api.find_connection_ids()))
+        stand_in.connections["connection8"] = {**stand_in.connections["connection1"], "connectionId": "connection8"}
+        with self.assertRaises(AirbyteError):
+            api.find_connection_ids()
 
 
 class SyncTest(unittest.TestCase):

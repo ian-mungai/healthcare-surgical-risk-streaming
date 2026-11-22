@@ -11,8 +11,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from scripts.ingestion.airbyte_api import AirbyteError
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import Code, Notice
+from scripts.ingestion.record_load import LoadError
 from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE_PREFIX, Landed, list_text_for, selection_for
 from tests.fast.memory_store import MemoryStore
@@ -33,11 +35,16 @@ class CopyingMemoryStore(MemoryStore):
         self.corrupt: set[str] = set()
         self.deletes: list[tuple[str, str]] = []
         self.fail_deletes = False
+        self.corrupt_same_length: set[str] = set()
 
     def copy_version(self, version: ObjectVersion, key: str) -> ObjectVersion:
         self.copies.append((version.key, version.version_id, key))
         data = self.find(version).data
-        return self.put_object(key, data + b"!" if version.key in self.corrupt else data)
+        if version.key in self.corrupt:
+            data += b"!"
+        if version.key in self.corrupt_same_length:
+            data = data[:-1] + bytes([data[-1] ^ 1])
+        return self.put_object(key, data)
 
     def delete_version(self, version: ObjectVersion) -> None:
         if self.fail_deletes:
@@ -51,6 +58,25 @@ class RecordLanded(Landed):
     """A landed set whose store also copies an exact version."""
 
     store: CopyingMemoryStore
+
+
+class MemoryLedger:
+    """The run's record of the object versions it wrote, in memory: what ``RunState`` keeps in a file."""
+
+    def __init__(self) -> None:
+        self.recorded: dict[str, set[str]] = {}
+
+    def versions(self, key: str) -> frozenset[str]:
+        return frozenset(self.recorded.get(key, set()))
+
+    def keys(self) -> frozenset[str]:
+        return frozenset(key for key, versions in self.recorded.items() if versions)
+
+    def add(self, key: str, version_id: str) -> None:
+        self.recorded.setdefault(key, set()).add(version_id)
+
+    def discard(self, key: str, version_id: str) -> None:
+        self.recorded.get(key, set()).discard(version_id)
 
 
 def landed_records(source: Mapping[str, bytes] = RELEASE_FILES) -> tuple[RecordLanded, ManifestRef]:
@@ -75,11 +101,16 @@ class FakeCatalog:
         self.heads: dict[str, str] = {"main": BASE_HASH}
         self.tables: dict[str, dict[str, int]] = {"main": {}}
         self.counter = 0
-        self.recorded: str | None = None
+        self.recorded: set[str] = set()
+        self.cannot_establish_absence = False
 
-    def newest_recorded_manifest(self) -> str | None:
-        self.calls.append("newest_recorded_manifest")
-        return self.recorded
+    def has_recorded_manifest(self, sha256: str) -> bool:
+        self.calls.append("has_recorded_manifest")
+        if sha256 in self.recorded:
+            return True
+        if self.cannot_establish_absence:
+            raise LoadError("cannot establish absence: the history is longer than the scan")
+        return False
 
     def head(self, branch: str) -> str:
         self.calls.append(f"head {branch}")
@@ -121,8 +152,9 @@ class CommitsTables(Protocol):
 class FakeAirbyte:
     """The Airbyte calls of the load. A sync commits its table to the branch that the destination named when the sync started.
 
-    ``outcomes`` maps a table to the final status of its job (``succeeded`` by default); ``stuck`` is a job that never ends. ``polls`` is how many status
-    reads answer ``running`` before the job ends.
+    ``outcomes`` maps a table to the final status of its job (``succeeded`` by default). ``stuck`` is a job that ends as ``cancelled`` once it is cancelled, and
+    ``unkillable`` is a job that acknowledges a cancellation and still reports ``running``. ``polls`` is how many status reads answer ``running`` before the job
+    ends. With a ``clock``, each status read takes ``latency`` seconds of it, so a job can end after its deadline although it is read at once.
     """
 
     def __init__(self, catalog: CommitsTables) -> None:
@@ -132,6 +164,7 @@ class FakeAirbyte:
         self.read_from: dict[str, str] = {}
         self.outcomes: dict[str, str] = {}
         self.running: list[int] = []
+        self.running_for: dict[str, list[int]] = {}
         self.jobs: dict[int, dict[str, Any]] = {}
         self.polls = 1
         self.cancelled: list[int] = []
@@ -141,6 +174,14 @@ class FakeAirbyte:
         self.on_ensure_connection: Callable[[str], None] | None = None
         self.on_first_call: Callable[[], None] | None = None
         self.report_branch: str | None = None
+        self.known: dict[str, str] = {}
+        self.clock: Any = None
+        self.latency = 0.0
+        self.cancel_fails = False
+
+    def find_connection_ids(self) -> dict[str, str]:
+        self.calls.append("find_connection_ids")
+        return dict(self.known)
 
     def ensure_destination(self, configuration: Mapping[str, Any]) -> None:
         if self.on_first_call is not None:
@@ -157,6 +198,7 @@ class FakeAirbyte:
         self.calls.append(f"ensure_connection {table}")
         if self.on_ensure_connection is not None:
             self.on_ensure_connection(table)
+        self.known[table] = f"connection_{table}"
         return f"connection_{table}"
 
     def destination_branch_now(self) -> str:
@@ -165,7 +207,7 @@ class FakeAirbyte:
 
     def running_jobs(self, connection_id: str) -> list[int]:
         self.calls.append(f"running_jobs {connection_id}")
-        return list(self.running)
+        return list(self.running_for.get(connection_id, self.running))
 
     def start_sync(self, connection_id: str) -> int:
         table = connection_id.removeprefix("connection_")
@@ -183,7 +225,11 @@ class FakeAirbyte:
             raise AssertionError("the status of a job was read 500 times: the wait has no deadline")
         outcome = self.outcomes.get(state["table"], "succeeded")
         self.calls.append(f"job_status {state['table']}")
-        if outcome == "stuck" or state["polls"] <= self.polls:
+        if self.clock is not None:
+            self.clock.now += self.latency
+        if outcome == "stuck" and state.get("cancelled"):
+            return "cancelled"
+        if outcome in ("stuck", "unkillable") or state["polls"] <= self.polls:
             return "running"
         if outcome == "succeeded" and self.commits and state["table"] not in self.skip_tables:
             self.catalog.commit_table(state["branch"], state["table"])
@@ -191,6 +237,9 @@ class FakeAirbyte:
 
     def cancel_job(self, job: int) -> None:
         self.calls.append(f"cancel_job {self.jobs[job]['table']}")
+        if self.cancel_fails:
+            raise AirbyteError("DELETE jobs could not reach Airbyte")
+        self.jobs[job]["cancelled"] = True
         self.cancelled.append(job)
 
 

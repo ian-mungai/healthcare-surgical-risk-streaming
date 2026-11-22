@@ -6,6 +6,7 @@ no record, and a second call of a finished run changes nothing. The stand-ins re
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -19,10 +20,11 @@ from unittest import mock
 from orchestration.surgical_risk.run_folder import SECRET_KEY
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.record_copy import CopyError
+from scripts.ingestion.record_copy import CopyChanged, CopyError
 from scripts.ingestion.record_definitions import Environment
 from scripts.ingestion.record_load import (
     Deadlines,
+    JobStillActive,
     LoadError,
     LoadResult,
     SyncDeadline,
@@ -33,6 +35,7 @@ from scripts.ingestion.record_load import (
     result_tags,
     write_record,
 )
+from scripts.ingestion.record_state import RunState, StateError
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
 from tests.fast.record_support import BASE_HASH, RELEASE_FILES, RUN, FakeAirbyte, FakeCatalog, FakeClock, landed_records
 
@@ -40,7 +43,9 @@ ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://ne
 BRANCH = f"load_{RUN}"
 PREFIX = f"records_input/{RUN}/"
 TABLES = ["clinical_data", "lab_data", "track_list"]
-RECORD_FILES = sorted([f"{RUN}.json", f"{RUN}.load_record.json"])
+RECORD_FILES = sorted([f"{RUN}.json", f"{RUN}.load_record.json", f"{RUN}.state.json"])
+CLINICAL_KEY = f"records_input/{RUN}/{hashlib.sha256(RELEASE_FILES['clinical_data.csv']).hexdigest()}/clinical_data.csv"
+LAB_KEY = f"records_input/{RUN}/{hashlib.sha256(RELEASE_FILES['lab_data.csv']).hexdigest()}/lab_data.csv"
 TAG_VALUE_LIMIT = 250  # the limit of orchestration/surgical_risk/groups.py, which needs Dagster to import
 
 
@@ -54,6 +59,7 @@ class Setup:
         self.catalog = FakeCatalog()
         self.airbyte = FakeAirbyte(self.catalog)
         self.clock = FakeClock()
+        self.airbyte.clock = self.clock
         self.folder = Path(test.enterContext(tempfile.TemporaryDirectory(prefix="record_load_test_")))
         self.deadlines = Deadlines(sync_seconds=100.0, poll_seconds=10.0)
 
@@ -75,12 +81,16 @@ class Setup:
             sleep=self.clock.sleep,
         )
 
+    def records(self) -> list[str]:
+        """The files of the run's records, not its state file: a load that did not finish has none."""
+        return sorted(path.name for path in self.folder.iterdir() if not path.name.endswith(".state.json"))
+
     def untouched(self, test: unittest.TestCase) -> None:
         """Nothing was copied, no Airbyte call was made and the catalog was not asked for a branch or a head."""
         test.assertEqual([], self.store.copies)
         test.assertEqual([], self.airbyte.calls)
         test.assertEqual([], self.catalog.calls)
-        test.assertEqual([], list(self.folder.iterdir()))
+        test.assertEqual([], sorted(path.name for path in self.folder.iterdir()))
 
 
 class OrderTest(unittest.TestCase):
@@ -94,7 +104,7 @@ class OrderTest(unittest.TestCase):
         self.assertEqual(TABLES, sorted(result.snapshots))
         self.assertEqual(TABLES, [call.removeprefix("start_sync ") for call in setup.airbyte.calls if call.startswith("start_sync")])
         self.assertEqual(
-            {"clinical_data": PREFIX + "clinical_data.csv", "lab_data": PREFIX + "lab_data.csv", "track_list": "https://api.vitaldb.net/trks"},
+            {"clinical_data": CLINICAL_KEY, "lab_data": LAB_KEY, "track_list": "https://api.vitaldb.net/trks"},
             setup.airbyte.read_from,
         )
         self.assertEqual(BRANCH, setup.airbyte.destination_branch)
@@ -107,11 +117,14 @@ class OrderTest(unittest.TestCase):
         self.assertEqual([2], seen)
         self.assertLess(setup.airbyte.calls.index("ensure_connection track_list"), setup.airbyte.calls.index("start_sync clinical_data"))
 
-    def test_each_sync_is_started_only_after_no_job_of_its_connection_is_running(self) -> None:
+    def test_every_connection_that_exists_is_checked_for_a_running_job_before_anything_is_configured_or_started(self) -> None:
         setup = Setup(self)
+        setup.airbyte.known = {table: f"connection_{table}" for table in TABLES}
         setup.load()
+        first_change = min(setup.airbyte.calls.index(call) for call in ("ensure_destination", "start_sync clinical_data"))
         for table in TABLES:
-            self.assertLess(setup.airbyte.calls.index(f"running_jobs connection_{table}"), setup.airbyte.calls.index(f"start_sync {table}"))
+            self.assertLess(setup.airbyte.calls.index(f"running_jobs connection_{table}"), first_change)
+        self.assertLess(setup.airbyte.calls.index("find_connection_ids"), first_change)
 
 
 class FaultBeforeTheCopyTest(unittest.TestCase):
@@ -141,9 +154,9 @@ class FaultBeforeTheCopyTest(unittest.TestCase):
         setup.store.corrupt.add(setup.landed.keys["clinical_data.csv"])
         with self.assertRaises(CopyError):
             setup.load()
-        self.assertEqual([], setup.airbyte.calls)
-        self.assertEqual(["newest_recorded_manifest"], setup.catalog.calls, "the catalog was asked a question and made no branch")
-        self.assertEqual([], list(setup.folder.iterdir()))
+        self.assertEqual(["find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked which connections exist")
+        self.assertEqual(["has_recorded_manifest"], setup.catalog.calls, "the catalog was asked a question and made no branch")
+        self.assertEqual([], setup.records())
 
     def test_a_run_ID_that_is_not_a_plain_name_leaves_everything_untouched(self) -> None:
         setup = Setup(self)
@@ -155,7 +168,7 @@ class FaultBeforeTheCopyTest(unittest.TestCase):
 class FaultInTheLoadTest(unittest.TestCase):
     def test_a_copy_replaced_after_the_confirmation_stops_the_load_before_the_first_sync(self) -> None:
         setup = Setup(self)
-        setup.airbyte.on_ensure_connection = lambda table: setup.store.put_object(PREFIX + "clinical_data.csv", b"caseid\n9\n")
+        setup.airbyte.on_ensure_connection = lambda table: setup.store.put_object(CLINICAL_KEY, b"caseid\n9\n")
         with self.assertRaises(CopyError):
             setup.load()
         self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith("start_sync")])
@@ -163,10 +176,10 @@ class FaultInTheLoadTest(unittest.TestCase):
 
     def test_a_copy_replaced_while_a_sync_runs_fails_the_load_and_writes_no_record(self) -> None:
         setup = Setup(self)
-        setup.airbyte.after_start["lab_data"] = lambda: setup.store.put_object(PREFIX + "lab_data.csv", b"caseid\n9\n")
+        setup.airbyte.after_start["lab_data"] = lambda: setup.store.put_object(LAB_KEY, b"caseid\n9\n")
         with self.assertRaises(CopyError):
             setup.load()
-        self.assertEqual([], list(setup.folder.iterdir()))
+        self.assertEqual([], setup.records())
 
     def test_a_destination_that_does_not_write_to_the_load_branch_stops_the_load_before_any_sync(self) -> None:
         setup = Setup(self)
@@ -179,10 +192,12 @@ class FaultInTheLoadTest(unittest.TestCase):
 
     def test_a_job_that_is_already_running_stops_the_load_before_the_branch_is_made(self) -> None:
         setup = Setup(self)
+        setup.airbyte.known = {table: f"connection_{table}" for table in TABLES}
         setup.airbyte.running = [7]
         with self.assertRaises(LoadError):
             setup.load()
-        self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith("start_sync")])
+        self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith(("start_sync", "ensure_"))], "no configuration was changed")
+        self.assertEqual([], setup.store.copies)
         self.assertNotIn(f"create_branch {BRANCH}", setup.catalog.calls)
 
     def test_a_failed_sync_stops_the_later_syncs_names_the_table_and_writes_no_record(self) -> None:
@@ -194,7 +209,7 @@ class FaultInTheLoadTest(unittest.TestCase):
         self.assertIn("failed", str(raised.exception))
         self.assertNotIsInstance(raised.exception, SyncDeadline)
         self.assertEqual(["clinical_data", "lab_data"], [call.removeprefix("start_sync ") for call in setup.airbyte.calls if call.startswith("start_sync")])
-        self.assertEqual([], list(setup.folder.iterdir()))
+        self.assertEqual([], setup.records())
 
     def test_a_cancelled_or_incomplete_sync_is_a_failure_too(self) -> None:
         for outcome in ("cancelled", "incomplete"):
@@ -216,7 +231,7 @@ class FaultInTheLoadTest(unittest.TestCase):
         self.assertGreaterEqual(setup.clock.now, 100.0)
         self.assertLess(setup.clock.now, 200.0, "the wait ended at the deadline")
         self.assertNotIn("start_sync track_list", setup.airbyte.calls)
-        self.assertEqual([], list(setup.folder.iterdir()))
+        self.assertEqual([], setup.records())
 
     def test_control_a_sync_that_ends_before_its_deadline_is_not_cancelled(self) -> None:
         setup = Setup(self)
@@ -230,7 +245,7 @@ class FaultInTheLoadTest(unittest.TestCase):
         with self.assertRaises(LoadError) as raised:
             setup.load()
         self.assertIn("did not move", str(raised.exception))
-        self.assertEqual([], list(setup.folder.iterdir()))
+        self.assertEqual([], setup.records())
 
     def test_a_table_whose_snapshot_did_not_change_is_a_failure_even_when_main_already_held_one(self) -> None:
         setup = Setup(self)
@@ -247,7 +262,7 @@ class FaultInTheLoadTest(unittest.TestCase):
         with self.assertRaises(LoadError) as raised:
             setup.load()
         self.assertIn("track_list", str(raised.exception))
-        self.assertEqual([], list(setup.folder.iterdir()))
+        self.assertEqual([], setup.records())
 
 
 class SecondCallTest(unittest.TestCase):
@@ -412,7 +427,7 @@ class LoadRecordShapeTest(unittest.TestCase):
         setup = Setup(self)
         with mock.patch("scripts.ingestion.record_load.os.link", side_effect=OSError("stopped")), self.assertRaises(OSError):
             setup.load()
-        self.assertEqual([f"{RUN}.load_record.json"], sorted(path.name for path in setup.folder.iterdir() if not path.name.startswith(".")))
+        self.assertEqual([f"{RUN}.load_record.json"], setup.records())
         result = setup.load()
         self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
         self.assertEqual(RUN, result.run_id)
@@ -473,7 +488,7 @@ class CleanupTest(unittest.TestCase):
         result = setup.load()
         self.assertEqual([], self.prefix_versions(setup))
         self.assertEqual(2, len(setup.store.deletes))
-        self.assertEqual({PREFIX + "clinical_data.csv", PREFIX + "lab_data.csv"}, {key for key, _ in setup.store.deletes})
+        self.assertEqual({CLINICAL_KEY, LAB_KEY}, {key for key, _ in setup.store.deletes})
         self.assertEqual({copy.version_id for copy in result.copies}, {version for _, version in setup.store.deletes})
         self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
 
@@ -482,7 +497,7 @@ class CleanupTest(unittest.TestCase):
         setup.airbyte.outcomes["lab_data"] = "failed"
         with self.assertRaises(LoadError):
             setup.load()
-        self.assertEqual([PREFIX + "clinical_data.csv", PREFIX + "lab_data.csv"], sorted(key for key, _ in self.prefix_versions(setup)))
+        self.assertEqual(sorted([CLINICAL_KEY, LAB_KEY]), sorted(key for key, _ in self.prefix_versions(setup)))
         self.assertEqual([], setup.store.deletes)
 
     def test_a_late_sync_keeps_the_copies_too(self) -> None:
@@ -559,37 +574,42 @@ class ManifestConventionTest(unittest.TestCase):
                 manifest_line(digest)
 
 
+def write_earlier(setup: Setup, run: str = "run_earlier", age: float = 0.0) -> LoadResult:
+    """The record of an earlier run of the same manifest, written to the record folder with a file time that is ``age`` seconds after the epoch's start."""
+    earlier = LoadResult(
+        run,
+        setup.reference,
+        f"load_{run}",
+        BASE_HASH,
+        "c" * 64,
+        {"clinical_data": 1, "lab_data": 2, "track_list": 3},
+        {"clinical_data": 4, "lab_data": 5, "track_list": 6},
+        (),
+        ("x",),
+    )
+    path = write_record(setup.folder, earlier)
+    os.utime(path, (1_000_000 + age, 1_000_000 + age))
+    return earlier
+
+
 class SameManifestTest(unittest.TestCase):
     """A load whose manifest the default branch's newest recorded merge already holds returns that earlier run's record and starts nothing."""
 
     def earlier(self, setup: Setup, run: str = "run_earlier", age: float = 0.0) -> LoadResult:
-        earlier = LoadResult(
-            run,
-            setup.reference,
-            f"load_{run}",
-            BASE_HASH,
-            "c" * 64,
-            {"clinical_data": 1, "lab_data": 2, "track_list": 3},
-            {"clinical_data": 4, "lab_data": 5, "track_list": 6},
-            (),
-            ("x",),
-        )
-        path = write_record(setup.folder, earlier)
-        os.utime(path, (1_000_000 + age, 1_000_000 + age))
-        return earlier
+        return write_earlier(setup, run, age)
 
     def test_the_earlier_runs_record_is_returned_and_nothing_is_copied_started_or_branched(self) -> None:
         setup = Setup(self)
         earlier = self.earlier(setup)
-        setup.catalog.recorded = setup.reference.sha256
+        setup.catalog.recorded = {setup.reference.sha256}
         self.assertEqual(earlier, setup.load())
         self.assertEqual([], setup.store.copies)
         self.assertEqual([], setup.airbyte.calls)
-        self.assertEqual(["newest_recorded_manifest"], setup.catalog.calls)
+        self.assertEqual(["has_recorded_manifest"], setup.catalog.calls)
         self.assertEqual(["run_earlier.json", "run_earlier.load_record.json"], sorted(path.name for path in setup.folder.iterdir()))
 
     def test_control_another_manifest_on_main_or_none_loads_as_usual(self) -> None:
-        for recorded in (None, "0" * 64):
+        for recorded in (set(), {"0" * 64}):
             with self.subTest(recorded=recorded):
                 setup = Setup(self)
                 self.earlier(setup)
@@ -600,7 +620,7 @@ class SameManifestTest(unittest.TestCase):
     def test_the_gate_still_runs_first_so_a_substituted_version_is_refused_even_when_main_records_the_manifest(self) -> None:
         setup = Setup(self)
         self.earlier(setup)
-        setup.catalog.recorded = setup.reference.sha256
+        setup.catalog.recorded = {setup.reference.sha256}
         setup.store.put_object(setup.landed.keys["lab_data.csv"], b"caseid\n9\n")
         with self.assertRaises(GateRefused):
             setup.load()
@@ -608,7 +628,7 @@ class SameManifestTest(unittest.TestCase):
 
     def test_a_manifest_that_main_records_with_no_record_of_its_load_here_is_refused_and_starts_nothing(self) -> None:
         setup = Setup(self)
-        setup.catalog.recorded = setup.reference.sha256
+        setup.catalog.recorded = {setup.reference.sha256}
         with self.assertRaises(LoadError) as raised:
             setup.load()
         self.assertIn("no record", str(raised.exception))
@@ -620,7 +640,7 @@ class SameManifestTest(unittest.TestCase):
         self.earlier(setup, "run_old", age=0.0)
         newest = self.earlier(setup, "run_new", age=50.0)
         self.earlier(setup, "run_middle", age=10.0)
-        setup.catalog.recorded = setup.reference.sha256
+        setup.catalog.recorded = {setup.reference.sha256}
         self.assertEqual(newest, setup.load())
 
     def test_a_record_of_another_manifest_is_not_returned(self) -> None:
@@ -628,17 +648,250 @@ class SameManifestTest(unittest.TestCase):
         absent = ManifestRef("example-bucket", f"manifests/probe_set/{'0' * 64}.json", "v1", "0" * 64)
         other = LoadResult("run_other", absent, "load_run_other", BASE_HASH, "c" * 64, {"clinical_data": 1}, {"clinical_data": 4}, (), ("x",))
         write_record(setup.folder, other)
-        setup.catalog.recorded = setup.reference.sha256
+        setup.catalog.recorded = {setup.reference.sha256}
         with self.assertRaises(LoadError):
             setup.load()
 
     def test_the_run_that_has_its_own_record_is_returned_before_the_catalog_is_asked_about_the_manifest(self) -> None:
         setup = Setup(self)
         setup.load()
-        setup.catalog.recorded = setup.reference.sha256
+        setup.catalog.recorded = {setup.reference.sha256}
         setup.catalog.calls.clear()
         self.assertEqual(RUN, setup.load().run_id)
-        self.assertNotIn("newest_recorded_manifest", setup.catalog.calls)
+        self.assertNotIn("has_recorded_manifest", setup.catalog.calls)
+
+
+class ReadKeyVerificationTest(unittest.TestCase):
+    """After the last sync every read key holds exactly the one version the run wrote, or the load fails as ``copy_changed`` and records nothing."""
+
+    def finished_nothing(self, setup: Setup) -> None:
+        self.assertEqual([], setup.records())
+        self.assertIn(BRANCH, setup.catalog.heads, "the load branch is left, unmerged, for inspection")
+        self.assertEqual(BASE_HASH, setup.catalog.heads["main"])
+        self.assertEqual([], setup.store.deletes, "the copies are kept for inspection")
+
+    def test_a_version_substituted_during_the_last_sync_and_still_current_fails_the_load_as_copy_changed(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.after_start["track_list"] = lambda: setup.store.put_object(CLINICAL_KEY, b"substituted")
+        with self.assertRaises(CopyChanged) as raised:
+            setup.load()
+        self.assertIn("copy_changed", str(raised.exception))
+        self.finished_nothing(setup)
+
+    def test_a_version_substituted_and_then_the_original_bytes_written_again_fails_the_load_although_the_current_bytes_are_right(self) -> None:
+        setup = Setup(self)
+
+        def substitute_then_restore() -> None:
+            setup.store.put_object(LAB_KEY, b"substituted")
+            setup.store.put_object(LAB_KEY, RELEASE_FILES["lab_data.csv"])
+
+        setup.airbyte.after_start["track_list"] = substitute_then_restore
+        with self.assertRaises(CopyChanged):
+            setup.load()
+        self.finished_nothing(setup)
+
+    def test_a_delete_marker_after_the_last_sync_fails_the_load(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.after_start["track_list"] = lambda: setup.store.put_delete_marker(CLINICAL_KEY)
+        with self.assertRaises(CopyChanged):
+            setup.load()
+        self.finished_nothing(setup)
+
+    def test_control_when_nothing_else_is_written_the_load_finishes_and_the_run_record_is_written(self) -> None:
+        setup = Setup(self)
+        setup.load()
+        self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
+
+    def test_the_check_runs_before_the_head_and_the_snapshots_are_judged_and_before_the_record(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.after_start["track_list"] = lambda: setup.store.put_object(CLINICAL_KEY, b"substituted")
+        setup.airbyte.commits = False
+        with self.assertRaises(CopyChanged):
+            setup.load()
+
+
+class RunStateTest(unittest.TestCase):
+    """A retry deletes only what the run's state file names, and refuses a version or a branch it does not name."""
+
+    def test_the_state_names_each_copy_the_branch_with_its_base_hash_and_each_job_the_run_started(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.outcomes["track_list"] = "failed"
+        with self.assertRaises(LoadError):
+            setup.load()
+        state = RunState(setup.folder, RUN)
+        self.assertEqual({CLINICAL_KEY, LAB_KEY}, set(state.keys()))
+        self.assertEqual((BRANCH, BASE_HASH), state.branch)
+        self.assertEqual({"clinical_data": 1, "lab_data": 2, "track_list": 3}, state.jobs)
+
+    def test_a_version_at_a_read_key_that_the_state_does_not_name_is_refused_on_a_retry_and_never_deleted(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.outcomes["lab_data"] = "failed"
+        with self.assertRaises(LoadError):
+            setup.load()
+        stranger = setup.store.put_object(CLINICAL_KEY, b"stranger")
+        setup.airbyte.outcomes.clear()
+        with self.assertRaises(CopyError) as raised:
+            setup.load()
+        self.assertIn("not recorded", str(raised.exception))
+        self.assertEqual([], setup.store.deletes)
+        self.assertIn((stranger.key, stranger.version_id), [(version.key, version.version_id) for version in setup.store.list_versions(CLINICAL_KEY)])
+
+    def test_a_branch_of_the_run_s_name_that_the_state_does_not_record_is_refused_and_never_deleted(self) -> None:
+        setup = Setup(self)
+        setup.catalog.create_branch(BRANCH)
+        setup.catalog.calls.clear()
+        with self.assertRaises(LoadError) as raised:
+            setup.load()
+        self.assertIn("no record that this run created it", str(raised.exception))
+        self.assertNotIn(f"delete_branch {BRANCH}", setup.catalog.calls)
+        self.assertIn(BRANCH, setup.catalog.heads)
+        self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith("start_sync")])
+
+    def test_a_branch_that_the_state_records_is_deleted_at_its_current_head_and_made_again(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.outcomes["lab_data"] = "failed"
+        with self.assertRaises(LoadError):
+            setup.load()
+        setup.airbyte.outcomes.clear()
+        setup.catalog.calls.clear()
+        result = setup.load()
+        self.assertEqual(RUN, result.run_id)
+        self.assertIn(f"delete_branch {BRANCH}", setup.catalog.calls)
+        self.assertEqual((BRANCH, BASE_HASH), RunState(setup.folder, RUN).branch)
+
+    def test_a_recorded_branch_that_is_gone_is_made_again_without_a_delete(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.outcomes["lab_data"] = "failed"
+        with self.assertRaises(LoadError):
+            setup.load()
+        del setup.catalog.heads[BRANCH], setup.catalog.tables[BRANCH]
+        setup.airbyte.outcomes.clear()
+        setup.catalog.calls.clear()
+        setup.load()
+        self.assertNotIn(f"delete_branch {BRANCH}", setup.catalog.calls)
+
+    def test_a_state_file_that_is_not_of_its_form_stops_the_load_before_anything_is_touched(self) -> None:
+        setup = Setup(self)
+        (setup.folder / f"{RUN}.state.json").write_text("{}")
+        with self.assertRaises(StateError):
+            setup.load()
+        self.assertEqual([], setup.store.copies)
+        self.assertEqual([], setup.airbyte.calls)
+
+    def test_the_removal_after_a_finished_load_deletes_exactly_the_recorded_versions_and_leaves_a_stranger(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        stranger = setup.store.put_object(CLINICAL_KEY, b"stranger")
+        setup.load()
+        self.assertEqual({(copy.key, copy.version_id) for copy in result.copies}, set(setup.store.deletes))
+        self.assertEqual([(stranger.key, stranger.version_id)], [(version.key, version.version_id) for version in setup.store.list_versions(CLINICAL_KEY)])
+
+
+class JobWaitTest(unittest.TestCase):
+    def test_a_sync_that_succeeds_after_its_deadline_is_not_accepted_and_nothing_is_recorded(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=5.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.latency = 10.0
+        setup.airbyte.polls = 0
+        with self.assertRaises(SyncDeadline) as raised:
+            setup.load()
+        self.assertIn("after its deadline", str(raised.exception))
+        self.assertEqual([], setup.records())
+        self.assertEqual(["start_sync clinical_data"], [call for call in setup.airbyte.calls if call.startswith("start_sync")])
+        self.assertEqual([], setup.airbyte.cancelled, "a job that has ended is not cancelled")
+
+    def test_control_a_sync_that_succeeds_inside_its_deadline_is_accepted(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=50.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.latency = 1.0
+        setup.airbyte.polls = 0
+        self.assertEqual(RUN, setup.load().run_id)
+
+    def test_a_wait_never_sleeps_past_the_deadline(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=5.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        with self.assertRaises(SyncDeadline):
+            setup.load()
+        self.assertEqual(5.0, setup.clock.sleeps[0])
+
+    def test_a_job_that_acknowledges_the_cancellation_and_keeps_running_fails_as_job_still_active_with_its_ID_recorded(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.outcomes["lab_data"] = "unkillable"
+        with self.assertRaises(JobStillActive) as raised:
+            setup.load()
+        self.assertIn("job_still_active", str(raised.exception))
+        self.assertIn("job 2", str(raised.exception))
+        self.assertNotIn("was cancelled", str(raised.exception))
+        self.assertEqual(2, RunState(setup.folder, RUN).jobs["lab_data"])
+        self.assertNotIn("start_sync track_list", setup.airbyte.calls)
+        self.assertLessEqual(setup.clock.now, 20.0 + 10.0 + 30.0 + 10.0, "the confirmation is bounded")
+        self.assertEqual([], setup.records())
+
+    def test_a_cancellation_that_cannot_be_asked_for_fails_as_job_still_active(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        setup.airbyte.cancel_fails = True
+        with self.assertRaises(JobStillActive) as raised:
+            setup.load()
+        self.assertIn("job 1", str(raised.exception))
+
+    def test_a_job_that_is_cancelled_is_a_sync_deadline_that_says_so(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        with self.assertRaises(SyncDeadline) as raised:
+            setup.load()
+        self.assertIn("was cancelled", str(raised.exception))
+        self.assertNotIsInstance(raised.exception, JobStillActive)
+
+
+class ActiveJobAtStartTest(unittest.TestCase):
+    def test_a_job_on_any_of_the_three_connections_stops_the_load_before_any_configuration_change(self) -> None:
+        for table in TABLES:
+            with self.subTest(table):
+                setup = Setup(self)
+                setup.airbyte.known = {name: f"connection_{name}" for name in TABLES}
+                setup.airbyte.running_for = {f"connection_{table}": [9]}
+                with self.assertRaises(LoadError):
+                    setup.load()
+                self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith("ensure_")])
+                self.assertEqual([], setup.store.copies)
+
+    def test_the_check_runs_after_the_gate_and_the_manifest_skip_and_before_the_copy(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.known = {name: f"connection_{name}" for name in TABLES}
+        setup.airbyte.running = [9]
+        setup.store.put_object(setup.landed.keys["lab_data.csv"], b"caseid\n9\n")
+        with self.assertRaises(GateRefused):
+            setup.load()
+        self.assertEqual([], setup.airbyte.calls)
+
+
+class AbsenceTest(unittest.TestCase):
+    def test_an_older_merged_manifest_is_found_among_all_the_markers_and_returns_the_earlier_record(self) -> None:
+        setup = Setup(self)
+        earlier = write_earlier(setup)
+        setup.catalog.recorded = {"0" * 64, setup.reference.sha256}
+        self.assertEqual(earlier, setup.load())
+
+    def test_a_history_that_cannot_prove_absence_refuses_the_load_before_anything_is_copied_or_started(self) -> None:
+        setup = Setup(self)
+        setup.catalog.cannot_establish_absence = True
+        with self.assertRaises(LoadError) as raised:
+            setup.load()
+        self.assertIn("cannot establish absence", str(raised.exception))
+        self.assertEqual([], setup.store.copies)
+        self.assertEqual([], setup.airbyte.calls)
+
+    def test_a_manifest_that_is_found_is_returned_even_when_the_rest_of_the_history_is_too_long(self) -> None:
+        setup = Setup(self)
+        earlier = write_earlier(setup)
+        setup.catalog.cannot_establish_absence = True
+        setup.catalog.recorded = {setup.reference.sha256}
+        self.assertEqual(earlier, setup.load())
 
 
 if __name__ == "__main__":

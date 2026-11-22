@@ -4,22 +4,29 @@ The order is the contract, and each step stops the load before the next one star
 
 1. The gate (``verify_before_read``) confirms the manifest and that each CSV table's current landed version is the bound one. A failed or missing check (no
    manifest), a missing version and a substituted version are refused here, before anything is copied, started or branched.
-2. A run that has its record is finished: its branch must still be at the recorded head with the recorded snapshots, its copies are removed if they are still
-   there, and the call returns the record and changes nothing else. A run ID that was loaded from another manifest is refused.
-3. The same manifest on another run: when the newest commit on the default branch that carries the line ``records-manifest: <SHA-256>`` (the convention below)
-   names this manifest, the earlier run's record is returned and nothing is copied, started or branched. The gate has already run.
-4. The exact-version copy of the two CSV tables (``record_copy``). A copy whose hash differs fails here, before Airbyte or the catalog is called.
-5. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again, and no
-   job may be running on any of the connections.
-6. The load branch ``load_<run ID>`` is created from the head of main. A branch of that name with no record is the leftover of an unfinished try and is deleted
-   first. Airbyte is asked which branch its destination writes to, and the load stops unless it is the load branch.
-7. Each table is synced in turn: ``clinical_data``, ``lab_data``, then ``track_list``. The copies are confirmed before each sync, so one replaced while an
-   earlier sync read it is found. Each wait ends at its deadline, cancels the job and fails. A sync that ends in any status but success fails the load and the
-   later syncs do not start.
-8. The branch head must have moved, and every table must have a new snapshot on the branch.
-9. The record (``<run ID>.json``) is written once and whole: the branch, its head before and after, each table's snapshot and job, the manifest, the copies and
-   the pinned connectors. Then the copies are removed from the read prefix by key and version ID. A load that fails keeps its copies for inspection. A removal
-   that fails leaves the record, and a second call removes them.
+2. A run that has its record is finished: its branch must still be at the recorded head with the recorded snapshots, the versions that its state file names are
+   removed if they are still there, and the call returns the record and changes nothing else. A run ID that was loaded from another manifest is refused.
+3. The same manifest on another run: when any commit on the default branch carries the line ``records-manifest: <SHA-256>`` (the convention below) for this
+   manifest, the earlier run's record is returned and nothing is copied, started or branched. A history that is longer than the scan and does not hold the
+   line cannot prove that the manifest is new, so the load is refused (``cannot establish absence``).
+4. No job of the three connections may be active. This is checked before any configuration, copy or branch.
+5. The exact-version copy of the two CSV tables (``record_copy``) to ``records_input/<run ID>/<SHA-256>/<table>.csv``. A copy whose hash differs fails here,
+   and a version at a read key that the run's state file does not name is refused and never deleted.
+6. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again.
+7. The load branch ``load_<run ID>`` is created from the head of main and recorded in the state file. A branch of that name that the state file does not record
+   is refused and never deleted; one that it records is the leftover of an unfinished try and is deleted at its current head first. Airbyte is asked which
+   branch its destination writes to, and the load stops unless it is the load branch.
+8. Each table is synced in turn: ``clinical_data``, ``lab_data``, then ``track_list``. The copies are confirmed before each sync, so one replaced while an
+   earlier sync read it is found. A sync that succeeds after its deadline is not accepted. A wait that passes its deadline cancels the job and polls, for a
+   bounded time, until it is terminal: a job that is still active then fails the load as ``job_still_active`` with its ID, which the state file records. A sync
+   that ends in any status but success fails the load and the later syncs do not start.
+9. After the last sync every read key must hold exactly the one version that the run wrote, current or not (``copy_changed`` otherwise): the connector reads
+   by key, so a version that was current while it read, or one restored afterwards, shows as a second entry. The branch is then left unmerged and nothing is
+   recorded as finished.
+10. The branch head must have moved, and every table must have a new snapshot on the branch.
+11. The record (``<run ID>.json``) is written once and whole: the branch, its head before and after, each table's snapshot and job, the manifest, the copies and
+    the pinned connectors. Then the versions that the state file names are deleted by key and version ID. A load that fails keeps its copies for inspection. A
+    removal that fails leaves the record, and a second call removes them.
 
 The load never merges. The table checks run on the branch, and the merge follows only when they pass.
 
@@ -42,7 +49,7 @@ from typing import Any, Protocol
 from scripts.ingestion.airbyte_api import AirbyteError
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.record_copy import Copied, CopyError, CopyingStore, confirm_copies, copy_bound_versions, remove_copies
+from scripts.ingestion.record_copy import Copied, CopyError, CopyingStore, confirm_copies, copy_bound_versions, remove_copies, verify_read_keys
 from scripts.ingestion.record_definitions import (
     DESTINATION,
     RECORD_SOURCE_KEYS,
@@ -55,10 +62,12 @@ from scripts.ingestion.record_definitions import (
     destination_configuration,
     source_configuration,
 )
+from scripts.ingestion.record_state import RunState
 from scripts.ingestion.store import StoreError
 
 SUCCEEDED = "succeeded"
 ENDED_WITHOUT_SUCCESS = ("failed", "cancelled", "incomplete")
+TERMINAL = (SUCCEEDED, *ENDED_WITHOUT_SUCCESS)
 LOAD_RECORD_FORMAT = "load_record_1"
 LOAD_RECORD_FILE = "{run_id}.load_record.json"
 OWN_FIELDS = ("run_id", "manifest_sha256", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
@@ -74,14 +83,19 @@ class LoadError(RuntimeError):
 
 
 class SyncDeadline(LoadError):
-    """A sync did not end within its deadline."""
+    """A sync did not end within its deadline, or succeeded after it and is not accepted."""
+
+
+class JobStillActive(LoadError):
+    """A job is still active after its cancellation was asked for, or the cancellation could not be asked for. The message starts with ``job_still_active``."""
 
 
 class Catalog(Protocol):
     def head(self, branch: str) -> str: ...
 
-    def newest_recorded_manifest(self) -> str | None:
-        """The manifest SHA-256 of the newest commit on the default branch whose message has the ``records-manifest`` line, or None."""
+    def has_recorded_manifest(self, sha256: str) -> bool:
+        """Whether any commit of the default branch's history carries the ``records-manifest`` line for this manifest. Raise ``LoadError`` when the history is
+        longer than the scan and the line was not found: absence cannot then be established."""
         ...
 
     def has_branch(self, branch: str) -> bool: ...
@@ -98,6 +112,10 @@ class Catalog(Protocol):
 
 
 class RecordAirbyte(Protocol):
+    def find_connection_ids(self) -> dict[str, str]:
+        """The connections of the three tables that exist now, by table name. Nothing is created or changed."""
+        ...
+
     def ensure_destination(self, configuration: Mapping[str, Any]) -> None: ...
 
     def ensure_source(self, table: str, configuration: Mapping[str, Any]) -> None: ...
@@ -117,10 +135,11 @@ class RecordAirbyte(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Deadlines:
-    """Seconds: how long one sync may run, and how long to wait between two reads of its status."""
+    """Seconds: how long one sync may run, how long to wait between two reads of its status, and how long to wait for a cancelled job to become terminal."""
 
     sync_seconds: float = 3600.0
     poll_seconds: float = 10.0
+    cancel_confirm_seconds: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,22 +306,44 @@ def confirm_finished(record: LoadResult, reference: ManifestRef, catalog: Catalo
 
 
 def wait_for_job(airbyte: RecordAirbyte, job: int, table: str, deadlines: Deadlines, clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
-    """Wait for the sync to succeed. Raise ``LoadError`` for any other end, and ``SyncDeadline`` after the job is cancelled when the deadline passes."""
+    """Wait for the sync to succeed inside its deadline. Raise ``LoadError`` for any other end.
+
+    A success that is read after the deadline is not accepted. When the deadline passes the job is cancelled and its status is read until it is terminal within
+    ``cancel_confirm_seconds``: ``SyncDeadline`` when it is, ``JobStillActive`` when it is not or when the cancellation cannot be asked for.
+    """
     deadline = clock() + deadlines.sync_seconds
     while True:
         status = airbyte.job_status(job)
+        now = clock()
         if status == SUCCEEDED:
+            if now > deadline:
+                raise SyncDeadline(f"the sync of {table} succeeded after its deadline of {deadlines.sync_seconds:g} seconds and is not accepted")
             return
         if status in ENDED_WITHOUT_SUCCESS:
             raise LoadError(f"the sync of {table} ended with the status {status}")
-        if clock() >= deadline:
-            try:
-                airbyte.cancel_job(job)
-                cancelled = "and was cancelled"
-            except AirbyteError:
-                cancelled = "and could not be cancelled: cancel it in Airbyte"
-            raise SyncDeadline(f"the sync of {table} did not end within {deadlines.sync_seconds:g} seconds {cancelled}")
-        sleep(deadlines.poll_seconds)
+        if now >= deadline:
+            cancel_and_confirm(airbyte, job, table, deadlines, clock, sleep)
+        sleep(min(deadlines.poll_seconds, deadline - now))
+
+
+def cancel_and_confirm(airbyte: RecordAirbyte, job: int, table: str, deadlines: Deadlines, clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
+    """Ask for the cancellation of a late job and wait for it to be terminal. Always raises: ``SyncDeadline`` or ``JobStillActive``."""
+    try:
+        airbyte.cancel_job(job)
+    except AirbyteError:
+        raise JobStillActive(f"job_still_active: the cancellation of job {job} ({table}) could not be asked for: cancel it in Airbyte") from None
+    confirm_until = clock() + deadlines.cancel_confirm_seconds
+    while True:
+        status = airbyte.job_status(job)
+        if status in TERMINAL:
+            ended = "was cancelled" if status == "cancelled" else f"ended as {status} after the cancellation was asked for"
+            raise SyncDeadline(f"the sync of {table} did not end within {deadlines.sync_seconds:g} seconds and {ended}")
+        now = clock()
+        if now >= confirm_until:
+            raise JobStillActive(
+                f"job_still_active: job {job} ({table}) is still {status} {deadlines.cancel_confirm_seconds:g} seconds after its cancellation was asked for"
+            )
+        sleep(min(deadlines.poll_seconds, confirm_until - now))
 
 
 def result_tags(result: LoadResult, prefix: str) -> dict[str, str]:
@@ -317,9 +358,9 @@ def result_tags(result: LoadResult, prefix: str) -> dict[str, str]:
     return tags
 
 
-def remove_all(store: CopyingStore, run_id: str) -> None:
+def remove_all(store: CopyingStore, run_id: str, state: RunState) -> None:
     try:
-        remove_copies(store, run_id)
+        remove_copies(store, run_id, state)
     except CopyError, StoreError:
         raise LoadError("the load is recorded but its copies in the read prefix could not be removed; call again to remove them") from None
 
@@ -344,29 +385,35 @@ def load_records(
     """Run the load of the module text and return its record. Raise ``GateRefused``, ``CopyError`` or ``LoadError``, and ``ValueError`` for a run ID."""
     branch = branch_name(run_id)
     entries = verify_before_read(store, reference, RECORD_SOURCE_KEYS)
+    state = RunState(record_dir, run_id)
     finished = read_record(record_dir, run_id)
     if finished is not None:
         result = confirm_finished(finished, reference, catalog)
-        remove_all(store, run_id)
+        remove_all(store, run_id, state)
         return result
-    if catalog.newest_recorded_manifest() == reference.sha256:
+    if catalog.has_recorded_manifest(reference.sha256):
         earlier = earlier_record(record_dir, reference.sha256)
         if earlier is None:
             raise LoadError("the default branch records this manifest but this host keeps no record of its load")
         return earlier
-    copies = copy_bound_versions(store, reference, run_id, entries)
+    if any(airbyte.running_jobs(identity) for identity in airbyte.find_connection_ids().values()):
+        raise LoadError("a sync of a record connection is already running")
+    copies = copy_bound_versions(store, reference, run_id, state, entries)
     confirm_copies(store, run_id, copies)
+    hashes = {copy.table: copy.sha256 for copy in copies}
     airbyte.ensure_destination(destination_configuration(environment, branch))
     connection_ids: dict[str, str] = {}
     for table in TABLES:
-        airbyte.ensure_source(table.name, source_configuration(table, run_id, environment))
+        airbyte.ensure_source(table.name, source_configuration(table, run_id, environment, hashes.get(table.name, "")))
         connection_ids[table.name] = airbyte.ensure_connection(table.name, connection_configuration(table))
     confirm_copies(store, run_id, copies)
-    if any(airbyte.running_jobs(identity) for identity in connection_ids.values()):
-        raise LoadError("a sync of a record connection is already running")
     if catalog.has_branch(branch):
+        if state.branch is None or state.branch[0] != branch:
+            raise LoadError(f"the branch {branch} exists and this host has no record that this run created it: it is refused and not deleted")
         catalog.delete_branch(branch, catalog.head(branch))
+        state.forget_branch()
     base_hash = catalog.create_branch(branch)
+    state.record_branch(branch, base_hash)
     before = catalog.snapshot_ids(branch)
     if airbyte.destination_branch_now() != branch:
         raise LoadError(f"the destination of Airbyte does not write to the branch {branch}")
@@ -374,7 +421,9 @@ def load_records(
     for table in TABLES:
         confirm_copies(store, run_id, copies)
         jobs[table.name] = airbyte.start_sync(connection_ids[table.name])
+        state.record_job(table.name, jobs[table.name])
         wait_for_job(airbyte, jobs[table.name], table.name, deadlines, clock, sleep)
+    verify_read_keys(store, copies)
     head_hash = catalog.head(branch)
     if head_hash == base_hash:
         raise LoadError(f"the head of {branch} did not move: the syncs wrote nothing")
@@ -385,5 +434,5 @@ def load_records(
     loaded = {table.name: snapshots[table.name] for table in TABLES}
     result = LoadResult(run_id, reference, branch, base_hash, head_hash, loaded, jobs, copies, connectors())
     write_record(record_dir, result)
-    remove_all(store, run_id)
+    remove_all(store, run_id, state)
     return result

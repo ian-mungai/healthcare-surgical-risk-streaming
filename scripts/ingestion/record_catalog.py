@@ -9,12 +9,12 @@ from __future__ import annotations
 from urllib.parse import quote
 
 from scripts.ingestion.record_definitions import MAIN_BRANCH, NAMESPACE
-from scripts.ingestion.record_load import recorded_manifest
+from scripts.ingestion.record_load import LoadError, manifest_line, recorded_manifest
 from scripts.stack.nessie import NessieClient, NessieError
 
 NOT_FOUND = 404
 HISTORY_PAGE = 100
-HISTORY_LIMIT = 500
+HISTORY_LIMIT = 5000
 
 
 class NessieCatalog:
@@ -40,11 +40,13 @@ class NessieCatalog:
     def delete_branch(self, branch: str, head: str) -> None:
         self.client.delete_reference(branch, head)
 
-    def newest_recorded_manifest(self) -> str | None:
-        """The manifest SHA-256 that the newest commit on main with the ``records-manifest`` line records, or None.
+    def has_recorded_manifest(self, sha256: str) -> bool:
+        """Whether any commit on main carries the ``records-manifest`` line for this manifest.
 
-        The history is read newest first, in pages, for at most ``HISTORY_LIMIT`` commits.
+        The history is read newest first, in pages, for at most ``HISTORY_LIMIT`` commits. A history that ends inside the scan without the line is an
+        absence. One that is longer than the scan and does not hold the line inside it cannot prove an absence, and raises ``LoadError``.
         """
+        manifest_line(sha256)
         seen = 0
         token: str | None = None
         while seen < HISTORY_LIMIT:
@@ -55,14 +57,13 @@ class NessieCatalog:
                 raise NessieError("Nessie's history answer holds no list of log entries")
             for entry in entries:
                 message = (entry.get("commitMeta") or {}).get("message") if isinstance(entry, dict) else None
-                found = recorded_manifest(message) if isinstance(message, str) else None
-                if found is not None:
-                    return found
+                if isinstance(message, str) and recorded_manifest(message) == sha256:
+                    return True
             seen += len(entries)
             token = answer.get("token") if answer.get("hasMore") else None
             if token is None or not entries:
-                return None
-        return None
+                return False
+        raise LoadError(f"cannot establish absence: the history of {MAIN_BRANCH} is longer than the {HISTORY_LIMIT} commits that are scanned")
 
     def snapshot_ids(self, branch: str) -> dict[str, int]:
         """The snapshot of each Iceberg table of the raw namespace at the head of the branch, by table name. A key with no snapshot is not listed."""

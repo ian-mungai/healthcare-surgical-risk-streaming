@@ -8,9 +8,12 @@ from __future__ import annotations
 import json
 import unittest
 from typing import Any
+from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from scripts.ingestion import record_catalog
 from scripts.ingestion.record_catalog import NessieCatalog
+from scripts.ingestion.record_load import LoadError
 from scripts.stack.nessie import NessieClient, NessieError
 
 MAIN = "a" * 64
@@ -130,29 +133,54 @@ class RecordedManifestTest(unittest.TestCase):
         self.server = Server()
         self.catalog = NessieCatalog(Client(self.server))
 
-    def test_the_newest_commit_with_the_line_gives_the_manifest_and_older_ones_are_not_read_for_it(self) -> None:
-        self.server.history = ["merge something else", f"merge raw\n\nrecords-manifest: {'b' * 64}", f"merge raw\n\nrecords-manifest: {'a' * 64}"]
-        self.assertEqual("b" * 64, self.catalog.newest_recorded_manifest())
+    def line(self, digit: str) -> str:
+        return f"merge raw\n\nrecords-manifest: {digit * 64}"
 
-    def test_a_history_with_no_line_has_no_recorded_manifest(self) -> None:
-        self.server.history = ["initial", "merge raw_records", f"records-manifest:{'a' * 64}"]
-        self.assertIsNone(self.catalog.newest_recorded_manifest())
+    def test_a_manifest_is_found_among_all_the_markers_not_only_the_newest(self) -> None:
+        self.server.history = ["merge something else", self.line("b"), "later merge", self.line("a")]
+        self.assertTrue(self.catalog.has_recorded_manifest("a" * 64))
+        self.assertTrue(self.catalog.has_recorded_manifest("b" * 64))
 
-    def test_pages_are_followed_until_a_line_is_found_or_the_history_ends(self) -> None:
+    def test_a_manifest_that_no_marker_names_is_absent_when_the_whole_history_was_read(self) -> None:
+        self.server.history = ["initial", self.line("b"), f"records-manifest:{'a' * 64}", f"x records-manifest: {'a' * 64}"]
+        self.assertFalse(self.catalog.has_recorded_manifest("a" * 64))
+
+    def test_pages_are_followed_until_the_manifest_is_found_or_the_history_ends(self) -> None:
         self.server.page = 2
-        self.server.history = ["one", "two", "three", "four", f"records-manifest: {'c' * 64}", "six"]
-        self.assertEqual("c" * 64, self.catalog.newest_recorded_manifest())
+        self.server.history = ["one", "two", "three", "four", self.line("c"), "six"]
+        self.assertTrue(self.catalog.has_recorded_manifest("c" * 64))
         self.assertEqual(3, len([call for call in self.server.calls if call.endswith("/history")]))
+        self.server.calls.clear()
+        self.assertFalse(self.catalog.has_recorded_manifest("d" * 64))
+        self.assertEqual(3, len([call for call in self.server.calls if call.endswith("/history")]), "the history ends after three pages of two")
 
-    def test_the_scan_stops_after_its_limit_of_commits(self) -> None:
-        self.server.history = ["x"] * 600 + [f"records-manifest: {'d' * 64}"]
-        self.assertIsNone(self.catalog.newest_recorded_manifest())
+    def test_reaching_the_cap_without_finding_the_manifest_is_a_refusal_not_an_absence(self) -> None:
+        self.server.history = ["x"] * 600 + [self.line("d")]
+        with mock.patch.object(record_catalog, "HISTORY_LIMIT", 500), self.assertRaises(LoadError) as raised:
+            self.catalog.has_recorded_manifest("e" * 64)
+        self.assertIn("cannot establish absence", str(raised.exception))
         self.assertEqual(5, len([call for call in self.server.calls if call.endswith("/history")]), "500 commits in pages of 100, and no more")
 
-    def test_a_failing_history_call_is_an_error_not_no_manifest(self) -> None:
+    def test_a_manifest_found_inside_the_cap_is_found_although_more_history_follows(self) -> None:
+        self.server.history = ["x"] * 10 + [self.line("d")] + ["y"] * 600
+        with mock.patch.object(record_catalog, "HISTORY_LIMIT", 500):
+            self.assertTrue(self.catalog.has_recorded_manifest("d" * 64))
+
+    def test_a_history_that_is_exactly_as_long_as_the_cap_and_ends_is_an_absence(self) -> None:
+        self.server.history = ["x"] * 200
+        with mock.patch.object(record_catalog, "HISTORY_LIMIT", 200):
+            self.assertFalse(self.catalog.has_recorded_manifest("e" * 64))
+
+    def test_a_failing_history_call_is_an_error_not_an_absence(self) -> None:
         self.server.fail = ("/trees/main/history", 500)
         with self.assertRaises(NessieError):
-            self.catalog.newest_recorded_manifest()
+            self.catalog.has_recorded_manifest("a" * 64)
+
+    def test_a_digest_that_is_not_64_lower_case_hex_digits_is_refused_before_any_call(self) -> None:
+        for digest in ("", "ab", "A" * 64):
+            with self.subTest(digest), self.assertRaises(ValueError):
+                self.catalog.has_recorded_manifest(digest)
+        self.assertEqual([], self.server.calls)
 
 
 if __name__ == "__main__":

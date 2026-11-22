@@ -236,6 +236,16 @@ class HttpAirbyteApi:
         self.connection_ids[table] = str(current["connectionId"])
         return self.connection_ids[table]
 
+    def find_connection_ids(self) -> dict[str, str]:
+        """The connections of the three tables that exist now, by table name. Nothing is created or changed. A name that two connections hold is refused."""
+        listed = self.listing(f"/connections?workspaceIds={quote(self.workspace_id(), safe='')}")
+        found: dict[str, str] = {}
+        for table in definitions.TABLES:
+            current = named(listed, definitions.connection_name(table), "connection")
+            if current is not None:
+                found[table.name] = str(current["connectionId"])
+        return found
+
     def running_jobs(self, connection_id: str) -> list[int]:
         """The IDs of the sync jobs of the connection that have not ended."""
         jobs = self.listing(f"/jobs?connectionId={quote(connection_id, safe='')}&jobType=sync")

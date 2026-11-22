@@ -18,6 +18,7 @@ from scripts.ingestion.track_list import pinned_track_list
 from scripts.sample.candidates import RELEASE_FILE
 
 RUN = "run_20261122_ab12cd34"
+SHA = "ab" * 32
 ENVIRONMENT = Environment(bucket="example-bucket", region="us-west-2", warehouse_path="warehouse", nessie_uri="http://nessie.example:19120/api/v2")
 
 
@@ -34,7 +35,7 @@ class TableTest(unittest.TestCase):
     def test_the_table_name_is_the_stream_name_of_each_source(self) -> None:
         for table in TABLES:
             with self.subTest(table.name):
-                configuration = definitions.source_configuration(table, RUN, ENVIRONMENT)
+                configuration = definitions.source_configuration(table, RUN, ENVIRONMENT, SHA)
                 names = [stream["name"] for stream in configuration["streams"]] if "streams" in configuration else [configuration["dataset_name"]]
                 self.assertEqual([table.name], names)
 
@@ -42,14 +43,14 @@ class TableTest(unittest.TestCase):
 class CsvSourceTest(unittest.TestCase):
     def configuration(self, name: str = "clinical_data") -> dict[str, Any]:
         table = next(table for table in CSV_TABLES if table.name == name)
-        return definitions.source_configuration(table, RUN, ENVIRONMENT)
+        return definitions.source_configuration(table, RUN, ENVIRONMENT, SHA)
 
     def test_a_csv_source_reads_exactly_the_one_copy_of_this_run(self) -> None:
         for table in CSV_TABLES:
             with self.subTest(table.name):
-                configuration = definitions.source_configuration(table, RUN, ENVIRONMENT)
+                configuration = definitions.source_configuration(table, RUN, ENVIRONMENT, SHA)
                 self.assertEqual("example-bucket", configuration["bucket"])
-                self.assertEqual([f"records_input/{RUN}/{table.name}.csv"], configuration["streams"][0]["globs"])
+                self.assertEqual([f"records_input/{RUN}/{SHA}/{table.name}.csv"], configuration["streams"][0]["globs"])
 
     def test_every_column_is_a_string_and_an_empty_cell_stays_an_empty_string(self) -> None:
         csv_format = self.configuration()["streams"][0]["format"]
@@ -84,12 +85,34 @@ class CsvSourceTest(unittest.TestCase):
     def test_a_run_ID_that_is_not_a_plain_name_is_refused_before_it_reaches_a_key(self) -> None:
         for run in ("", "Run1", "../x", "a/b", "a b", "x" * 65, "run*"):
             with self.subTest(run), self.assertRaises(definitions.DefinitionError):
-                definitions.source_configuration(CSV_TABLES[0], run, ENVIRONMENT)
+                definitions.source_configuration(CSV_TABLES[0], run, ENVIRONMENT, SHA)
+
+
+class ReadKeyTest(unittest.TestCase):
+    def test_the_read_key_holds_the_run_the_verified_hash_and_the_file_name(self) -> None:
+        for table in CSV_TABLES:
+            self.assertEqual(f"records_input/{RUN}/{SHA}/{table.name}.csv", definitions.read_key(RUN, table, SHA))
+
+    def test_a_source_without_the_hash_or_with_a_value_that_is_not_a_hash_is_refused(self) -> None:
+        for sha in ("", "ab", "AB" * 32, "../" + "a" * 61, "g" * 64, "a" * 63 + "/"):
+            with self.subTest(sha=sha), self.assertRaises(definitions.DefinitionError):
+                definitions.source_configuration(CSV_TABLES[0], RUN, ENVIRONMENT, sha)
+            with self.subTest(read_key=sha), self.assertRaises(definitions.DefinitionError):
+                definitions.read_key(RUN, CSV_TABLES[0], sha)
+
+    def test_two_contents_or_two_runs_never_share_a_read_key(self) -> None:
+        keys = {definitions.read_key(run, CSV_TABLES[0], sha) for run in (RUN, "run_other") for sha in ("a" * 64, "b" * 64)}
+        self.assertEqual(4, len(keys))
+
+    def test_the_track_list_needs_no_hash(self) -> None:
+        self.assertEqual(
+            definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT, ""), definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT, SHA)
+        )
 
 
 class TrackListSourceTest(unittest.TestCase):
     def test_the_file_source_reads_the_pinned_address_and_keeps_every_column_a_string(self) -> None:
-        configuration = definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT)
+        configuration = definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT, SHA)
         self.assertEqual(pinned_track_list().url, configuration["url"])
         self.assertEqual({"storage": "HTTPS"}, configuration["provider"])
         self.assertEqual("csv", configuration["format"])
@@ -100,7 +123,7 @@ class TrackListSourceTest(unittest.TestCase):
         self.assertEqual({"dtype", "keep_default_na", "na_filter"}, set(options), "only options of pandas.read_csv that this load means to set")
 
     def test_the_track_list_source_reads_nothing_from_the_projects_bucket(self) -> None:
-        self.assertNotIn("example-bucket", json.dumps(definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT)))
+        self.assertNotIn("example-bucket", json.dumps(definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT, SHA)))
 
 
 class DestinationTest(unittest.TestCase):
