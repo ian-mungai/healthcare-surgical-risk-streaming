@@ -1,7 +1,8 @@
-"""The deploy's Nessie step gives main its first commit, the project's namespace, once: a second run changes nothing.
+"""The deploy's Nessie step gives the default branch its first commit, the project's namespace, once: a second run changes nothing.
 
-A small server on the loopback address stands in for Nessie and keeps the one state that matters here, main's hash and the commits it was sent, so the
-cases prove the command's decision and its messages. The calls against a real Nessie, from the code location container, are proved by the acceptance test
+A small server on the loopback address stands in for Nessie and keeps the one state that matters here, the default branch's hash and the commits it was sent,
+and a second branch ``main`` that is not the default when the default is ``trunk``, so the cases prove the command's decision, the branch it reads, the hash
+at which it reads the entries and its messages. The calls against a real Nessie, from the code location container, are proved by the acceptance test
 of the joined stack.
 """
 
@@ -17,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from unittest import mock
+from urllib.parse import unquote
 
 from scripts.stack import nessie
 
@@ -25,16 +27,21 @@ DOCKERFILE = Path(__file__).resolve().parents[2] / "orchestration" / "Dockerfile
 
 
 class StandIn:
-    """Main's hash, the namespaces it holds, the commits received, the answer to the configuration call and an optional refusal status for every call."""
+    """The default branch's name, hash and namespaces, the commits received, the answer to the configuration call and an optional refusal status for every
+    call. A default other than ``main`` leaves ``main`` as a branch of its own, with its own hash and namespace. ``entries_hash`` is the hash that every entries
+    answer names as its own, when it differs from the one asked for."""
 
-    def __init__(self, refuse: int = 0) -> None:
+    def __init__(self, refuse: int = 0, default: str = "main") -> None:
+        self.default = default
         self.hash = EMPTY
         self.commits: list[dict[str, Any]] = []
         self.refuse = refuse
-        self.config: dict[str, Any] = {"noAncestorHash": EMPTY, "defaultBranch": "main"}
+        self.config: dict[str, Any] = {"noAncestorHash": EMPTY, "defaultBranch": default}
         self.namespaces: list[str] = []
         self.entry_type = "NAMESPACE"
         self.keep_commits = True
+        self.entries_hash: str | None = None
+        self.asked: list[str] = []
 
     def handler(self) -> type[BaseHTTPRequestHandler]:
         state = self
@@ -48,15 +55,26 @@ class StandIn:
                 self.end_headers()
                 self.wfile.write(payload)
 
+            def held(self, name: str) -> tuple[str, list[str]]:
+                """The hash and the namespaces of a branch: the default branch's own, or those of ``main`` when that is another branch."""
+                return (state.hash, state.namespaces) if name == state.default else ("d" * 64, ["surgical_risk"])
+
             def do_GET(self) -> None:
+                target = unquote(self.path.removeprefix("/api/v2"))
+                state.asked.append(target)
                 if state.refuse:
                     self.answer(state.refuse, {"errorCode": "UNKNOWN", "message": "refused"})
-                elif self.path.endswith("/config"):
+                elif target.endswith("/config"):
                     self.answer(200, state.config)
-                elif self.path.endswith("/entries"):
-                    self.answer(200, {"entries": [{"type": state.entry_type, "name": {"elements": [name]}} for name in state.namespaces]})
+                elif target.endswith("/entries"):
+                    name, _, asked_hash = target.removeprefix("/trees/").removesuffix("/entries").partition("@")
+                    hash_, namespaces = self.held(name)
+                    reference = {"type": "BRANCH", "name": name, "hash": state.entries_hash or asked_hash or hash_}
+                    entries = [{"type": state.entry_type, "name": {"elements": [namespace]}} for namespace in namespaces]
+                    self.answer(200, {"entries": entries, "effectiveReference": reference})
                 else:
-                    self.answer(200, {"reference": {"type": "BRANCH", "name": "main", "hash": state.hash}})
+                    name = target.removeprefix("/trees/")
+                    self.answer(200, {"reference": {"type": "BRANCH", "name": name, "hash": self.held(name)[0]}})
 
             def do_POST(self) -> None:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
@@ -64,7 +82,7 @@ class StandIn:
                 if state.keep_commits:
                     state.namespaces += [operation["key"]["elements"][0] for operation in body["operations"]]
                 state.hash = "b" * 64
-                self.answer(200, {"targetBranch": {"type": "BRANCH", "name": "main", "hash": state.hash}})
+                self.answer(200, {"targetBranch": {"type": "BRANCH", "name": state.default, "hash": state.hash}})
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -155,6 +173,57 @@ class InitialiseCommandTest(unittest.TestCase):
             code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
         self.assertEqual(1, len(state.commits))
         self.assertNotIn("unchanged", out)
+
+    def test_the_branch_is_the_default_branch_of_the_configuration_and_the_namespace_on_another_branch_does_not_count(self) -> None:
+        state = StandIn(default="trunk")
+        state.hash = "c" * 64
+        with serving(state) as uri:
+            first = run(["initialise", "--namespace", "surgical_risk"], uri)
+            second = run(["initialise", "--namespace", "surgical_risk"], uri)
+        self.assertEqual((0, 0), (first[0], second[0]))
+        self.assertIn("initialised: trunk holds", first[1])
+        self.assertNotIn("unchanged", first[1])
+        self.assertIn("unchanged: trunk already holds", second[1])
+        self.assertEqual(1, len(state.commits))
+        self.assertTrue(all("/trees/main" not in asked for asked in state.asked), state.asked)
+
+    def test_a_branch_that_is_not_the_default_is_refused_with_both_names_and_nothing_is_committed(self) -> None:
+        for default, given in (("trunk", "main"), ("main", "trunk")):
+            with self.subTest(default=default, given=given):
+                state = StandIn(default=default)
+                with serving(state) as uri:
+                    code, out, err = run(["initialise", "--namespace", "surgical_risk", "--branch", given], uri)
+                self.assertEqual(1, code)
+                self.assertIn(default, err)
+                self.assertIn(given, err)
+                self.assertEqual("", out)
+                self.assertEqual([], state.commits)
+        with serving(StandIn(default="trunk")) as uri:
+            code, out, err = run(["initialise", "--namespace", "surgical_risk", "--branch", "trunk"], uri)
+        self.assertEqual(0, code)
+
+    def test_every_namespace_lookup_reads_the_entries_at_the_exact_hash_that_was_observed(self) -> None:
+        state = StandIn(default="trunk")
+        state.hash = "c" * 64
+        with serving(state) as uri:
+            run(["initialise", "--namespace", "surgical_risk"], uri)
+        lookups = [asked for asked in state.asked if asked.endswith("/entries")]
+        self.assertEqual(["/trees/trunk@" + "c" * 64 + "/entries", "/trees/trunk@" + "b" * 64 + "/entries"], lookups)
+
+    def test_an_entries_answer_for_another_hash_is_refused_in_the_check_and_in_the_read_after_the_commit(self) -> None:
+        for label, head, commits in (("check", "c" * 64, 0), ("after the commit", EMPTY, 1)):
+            with self.subTest(read=label):
+                state = StandIn()
+                state.hash = head
+                state.entries_hash = "e" * 64
+                state.namespaces = ["surgical_risk"] if label == "check" else []
+                with serving(state) as uri:
+                    code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
+                self.assertEqual(1, code)
+                self.assertIn("hash", err)
+                self.assertNotIn("unchanged", out)
+                self.assertNotIn("initialised", out)
+                self.assertEqual(commits, len(state.commits))
 
     def test_a_commit_that_leaves_the_namespace_missing_is_refused(self) -> None:
         state = StandIn()
