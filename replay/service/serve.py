@@ -9,8 +9,9 @@ record in the inbox, in ``done/`` or in ``failed/`` and has no reservation (from
 and its reference have the very same bytes, and then gets its reservation from them; any other bytes are refused. Only after the reservation does ``submit``
 write the queue entry ``<run ID>.json`` with ``<run ID>.reference`` beside it, each whole or not at all, and only when no record of that run ID is held
 anywhere. The whole of a submit and the archival of a request each hold the exclusive lock ``locks/<run ID>``, so a delayed submit can never put back a request
-that was archived meanwhile. An archival that a stop or a crash cut off leaves the reference in ``done/`` or ``failed/`` and the record in the inbox until the
-restart finishes it: a submit then finds the reference in the folder that the written result names.
+that was archived meanwhile. An archival that a stop or a crash cut off between its two moves leaves the reference in ``done/`` or ``failed/`` and the record in
+the inbox until the restart finishes it: a submit then finds the reference in the folder that the written result names. Cut off before the first move, both
+are still in the inbox.
 
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
@@ -154,8 +155,8 @@ def started_count(request: Path) -> int:
 
 
 def archive(inbox: Path, request: Path, kind: str) -> None:
-    """Move the request and its reference to ``done/`` or ``failed/`` and drop its start count. The reference moves first, so a cut-off archival leaves the
-    reference in the folder and the request in the inbox, and the restart finishes it."""
+    """Move the request and its reference to ``done/`` or ``failed/`` and drop its start count. The reference moves first, so an archival cut off between the
+    two moves leaves the reference in the folder and the request in the inbox, and the restart finishes it."""
     target = inbox / TERMINAL_OUTCOMES[kind]
     target.mkdir(parents=True, exist_ok=True)
     reference = reference_of(request)
