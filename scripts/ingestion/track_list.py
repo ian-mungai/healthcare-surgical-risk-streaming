@@ -3,7 +3,7 @@
 The track list is the publisher's table of every track of every case (``caseid``, ``tname``, ``tid``). Airbyte's File source loads its rows as the table
 ``track_list``. The pin in ``tests/fixtures/vitaldb/release.json`` holds the row count and the digest that the loaded rows must equal. The digest is the
 SHA-256 over the rows sorted by their full text, each row as its fields joined by a tab, the lines joined by a newline with none after the last line. The
-header is not a row.
+header is not a row. A field with a tab or a line break is refused, because the joiners would make the text ambiguous.
 
 ``.venv/bin/python -m scripts.ingestion.track_list check --file track_list.csv`` checks a downloaded file against the pin and exits 1 on any difference.
 """
@@ -36,13 +36,25 @@ class TrackListPinError(ValueError):
     """The tracked release pin is not valid, so it holds no usable row count and digest."""
 
 
+class TrackListRowError(ValueError):
+    """A row holds a field with a tab or a line break, which the digest's joiners would make ambiguous. The message names the row and never a value."""
+
+
 def row_text(fields: Sequence[str]) -> str:
     return "\t".join(fields)
 
 
 def rows_digest(rows: Iterable[Sequence[str]]) -> tuple[int, str]:
-    """The number of rows and the digest of the rows. Rows are compared as a multiset: the order they come in does not matter."""
-    lines = sorted(row_text(fields) for fields in rows)
+    """The number of rows and the digest of the rows. Rows are compared as a multiset: the order they come in does not matter.
+
+    Raise ``TrackListRowError`` for a field with a tab or a line break (a newline or a carriage return): the tab joins a row's fields and the newline
+    joins the lines, so such a field would make the text ambiguous.
+    """
+    checked = list(rows)
+    for number, fields in enumerate(checked, 1):
+        if any(character in field for field in fields for character in ("\t", "\n", "\r")):
+            raise TrackListRowError(f"row {number} holds a field with a tab or a line break")
+    lines = sorted(row_text(fields) for fields in checked)
     return len(lines), hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
@@ -73,7 +85,10 @@ def file_problems(path: Path, pin: PinnedTrackList) -> list[str]:
                 rows.append(row)
     except OSError, UnicodeDecodeError, csv.Error:
         return ["the file cannot be read as CSV text"]
-    count, digest = rows_digest(rows)
+    try:
+        count, digest = rows_digest(rows)
+    except TrackListRowError as error:
+        return [str(error)]
     problems = []
     if count != pin.rows:
         problems.append(f"the file has {count} rows, the pin {pin.rows}")

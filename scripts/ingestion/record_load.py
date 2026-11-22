@@ -59,7 +59,11 @@ from scripts.ingestion.store import StoreError
 
 SUCCEEDED = "succeeded"
 ENDED_WITHOUT_SUCCESS = ("failed", "cancelled", "incomplete")
-RECORD_FIELDS = ("run_id", "manifest_sha256", "branch", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
+LOAD_RECORD_FORMAT = "load_record_1"
+LOAD_RECORD_FILE = "{run_id}.load_record.json"
+OWN_FIELDS = ("run_id", "manifest_sha256", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
+LOAD_RECORD_FIELDS = ("format", "branch", "branch_hash", "manifest", "tables")
+RECORD_FIELDS = (*OWN_FIELDS, *LOAD_RECORD_FIELDS)
 COPY_FIELDS = ("table", "source_key", "key", "version_id", "sha256", "size")
 SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 MANIFEST_LINE = re.compile(r"^records-manifest: ([0-9a-f]{64})$", re.MULTILINE)
@@ -122,7 +126,7 @@ class Deadlines:
 @dataclass(frozen=True, slots=True)
 class LoadResult:
     run_id: str
-    manifest_sha256: str
+    manifest: ManifestRef
     branch: str
     base_hash: str
     head_hash: str
@@ -131,11 +135,38 @@ class LoadResult:
     copies: tuple[Copied, ...]
     connectors: tuple[str, ...]
 
+    @property
+    def manifest_sha256(self) -> str:
+        return self.manifest.sha256
+
+    def load_record(self) -> dict[str, Any]:
+        """The five fields that the table checks read as ``load_record_1``: format, branch, the branch head after the last sync, manifest, table snapshots."""
+        return {
+            "format": LOAD_RECORD_FORMAT,
+            "branch": self.branch,
+            "branch_hash": self.head_hash,
+            "manifest": asdict(self.manifest),
+            "tables": dict(self.snapshots),
+        }
+
     def to_json(self) -> str:
-        document = asdict(self)
-        document["copies"] = [asdict(copy) for copy in self.copies]
-        document["connectors"] = list(self.connectors)
+        """The run record: this tool's own fields beside the five of ``load_record``."""
+        document = {
+            "run_id": self.run_id,
+            "manifest_sha256": self.manifest.sha256,
+            "base_hash": self.base_hash,
+            "head_hash": self.head_hash,
+            "snapshots": dict(self.snapshots),
+            "jobs": dict(self.jobs),
+            "copies": [asdict(copy) for copy in self.copies],
+            "connectors": list(self.connectors),
+            **self.load_record(),
+        }
         return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+    def load_record_json(self) -> str:
+        """Exactly the five fields and no other, because the table checks' parser refuses a record with any other field."""
+        return json.dumps(self.load_record(), indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def from_json(cls, text: str) -> LoadResult:
@@ -147,9 +178,9 @@ class LoadResult:
             snapshots, jobs = document["snapshots"], document["jobs"]
             if len(copies) != len(document["copies"]) or not all(isinstance(value, int) for value in (*snapshots.values(), *jobs.values())):
                 raise ValueError
-            return cls(
+            result = cls(
                 str(document["run_id"]),
-                str(document["manifest_sha256"]),
+                ManifestRef(**document["manifest"]),
                 str(document["branch"]),
                 str(document["base_hash"]),
                 str(document["head_hash"]),
@@ -158,6 +189,9 @@ class LoadResult:
                 copies,
                 tuple(str(image) for image in document["connectors"]),
             )
+            if json.loads(result.to_json()) != document:
+                raise ValueError
+            return result
         except ValueError, TypeError, AttributeError:
             raise LoadError("the record of this run is not a record of this form") from None
 
@@ -190,9 +224,28 @@ def read_record(record_dir: Path, run_id: str) -> LoadResult | None:
     return LoadResult.from_json(text)
 
 
+def write_load_record(record_dir: Path, result: LoadResult) -> Path:
+    """Write the file for the table checks whole under its final name. It is replaced by the same content when a retry writes it again."""
+    final = record_dir / LOAD_RECORD_FILE.format(run_id=result.run_id)
+    descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=record_dir)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(result.load_record_json())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, final)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return final
+
+
 def write_record(record_dir: Path, result: LoadResult) -> Path:
-    """Write the record whole under its final name, or not at all. A record that exists is not replaced."""
+    """Write the file for the table checks, then the run record whole under its final name, or not at all. A run record that exists is not replaced.
+
+    The run record is the mark of a finished load, so it is written last: a stop between the two files leaves a run that a retry loads again.
+    """
     record_dir.mkdir(parents=True, exist_ok=True)
+    write_load_record(record_dir, result)
     final = record_path(record_dir, result.run_id)
     descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=record_dir)
     try:
@@ -330,7 +383,7 @@ def load_records(
     if unchanged:
         raise LoadError(f"no new snapshot of {', '.join(unchanged)} on the branch {branch}")
     loaded = {table.name: snapshots[table.name] for table in TABLES}
-    result = LoadResult(run_id, reference.sha256, branch, base_hash, head_hash, loaded, jobs, copies, connectors())
+    result = LoadResult(run_id, reference, branch, base_hash, head_hash, loaded, jobs, copies, connectors())
     write_record(record_dir, result)
     remove_all(store, run_id)
     return result

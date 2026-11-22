@@ -5,9 +5,11 @@ publisher's two CSV tables, and ``track_list`` from the publisher's track list. 
 
 - The two CSV tables are read by Airbyte's S3 source from the run's own read prefix of the project's bucket, ``records_input/<run ID>/``, where the Dagster step
   copied exactly the object versions that the passed manifest binds. The source cannot name an object version, so a copy of the bound version under a key that
-  holds one version is how it reads only those. Every column is a string (``inference_type`` None) and an empty cell stays an empty string, so an identifier
-  keeps its published form.
-- The track list is read by Airbyte's File source from the publisher's address, with every column a string.
+  holds one version is how it reads only those. Every column is a string (``inference_type`` None), an empty cell stays an empty string
+  (``strings_can_be_null`` false and no null markers), and the encoding ``utf-8-sig`` drops the byte order mark that ``clinical_data.csv`` starts with, so an
+  identifier keeps its published form and the first column is named ``caseid``.
+- The track list is read by Airbyte's File source from the publisher's address, with every column a string and an empty field an empty string: the pandas
+  options ``dtype`` ``str``, ``keep_default_na`` false and ``na_filter`` false, which the File source's ``reader_options`` hands to ``pandas.read_csv``.
 - The destination is the S3 Data Lake with the Nessie catalog. Its Main Branch Name is the run's load branch ``load_<run ID>``, so a sync commits to that branch
   and never to ``main``. Column names stay as the CSV header has them. The project's Nessie has no sign-in, so the destination has no access token.
 - Each connection has no schedule and syncs as a full refresh that overwrites, so only the orchestrator starts it and a second sync of a run leaves one
@@ -160,6 +162,7 @@ def source_configuration(table: Table, run_id: str, environment: Environment) ->
                     "header_definition": {"header_definition_type": "From CSV"},
                     "inference_type": "None",
                     "strings_can_be_null": False,
+                    "encoding": "utf-8-sig",
                 },
             }
         ],

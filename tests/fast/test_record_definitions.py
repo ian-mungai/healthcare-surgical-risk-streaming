@@ -6,6 +6,7 @@ catalog on the run's load branch, each sync is a full refresh with no schedule, 
 
 from __future__ import annotations
 
+import codecs
 import json
 import unittest
 from typing import Any
@@ -57,6 +58,19 @@ class CsvSourceTest(unittest.TestCase):
         self.assertIs(False, csv_format["strings_can_be_null"])
         self.assertEqual({"header_definition_type": "From CSV"}, csv_format["header_definition"])
 
+    def test_a_byte_order_mark_is_not_kept_in_the_first_column_name(self) -> None:
+        encoding = self.configuration()["streams"][0]["format"]["encoding"]
+        self.assertEqual("utf-8-sig", encoding)
+        self.assertEqual("utf-8-sig", codecs.lookup(encoding).name, "a name that the connector's own check, codecs.lookup, accepts")
+        published = codecs.BOM_UTF8 + b"caseid,subjectid\r\n1,2\r\n"
+        self.assertEqual("caseid", published.decode(encoding).split(",")[0])
+        self.assertEqual("\ufeffcaseid", published.decode("utf-8").split(",")[0], "without it the mark would be part of the name")
+
+    def test_no_value_is_read_as_null_so_an_empty_cell_is_an_empty_string(self) -> None:
+        csv_format = self.configuration()["streams"][0]["format"]
+        self.assertIs(False, csv_format["strings_can_be_null"])
+        self.assertNotIn("null_values", csv_format, "the connector's default set of null markers is empty")
+
     def test_the_source_has_no_schema_override_and_is_not_schemaless(self) -> None:
         stream = self.configuration()["streams"][0]
         self.assertNotIn("input_schema", stream)
@@ -83,6 +97,7 @@ class TrackListSourceTest(unittest.TestCase):
         self.assertEqual("str", options["dtype"])
         self.assertIs(False, options["keep_default_na"])
         self.assertIs(False, options["na_filter"])
+        self.assertEqual({"dtype", "keep_default_na", "na_filter"}, set(options), "only options of pandas.read_csv that this load means to set")
 
     def test_the_track_list_source_reads_nothing_from_the_projects_bucket(self) -> None:
         self.assertNotIn("example-bucket", json.dumps(definitions.source_configuration(TRACK_LIST, RUN, ENVIRONMENT)))

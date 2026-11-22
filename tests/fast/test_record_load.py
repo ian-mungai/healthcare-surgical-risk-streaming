@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from orchestration.surgical_risk.run_folder import SECRET_KEY
 from scripts.ingestion.gate import GateRefused
@@ -23,6 +26,7 @@ from scripts.ingestion.record_load import (
     LoadError,
     LoadResult,
     SyncDeadline,
+    earlier_record,
     load_records,
     manifest_line,
     recorded_manifest,
@@ -36,6 +40,7 @@ ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://ne
 BRANCH = f"load_{RUN}"
 PREFIX = f"records_input/{RUN}/"
 TABLES = ["clinical_data", "lab_data", "track_list"]
+RECORD_FILES = sorted([f"{RUN}.json", f"{RUN}.load_record.json"])
 TAG_VALUE_LIMIT = 250  # the limit of orchestration/surgical_risk/groups.py, which needs Dagster to import
 
 
@@ -282,9 +287,10 @@ class SecondCallTest(unittest.TestCase):
     def test_a_run_ID_that_was_loaded_from_another_manifest_is_refused(self) -> None:
         setup = Setup(self)
         setup.load()
-        record = next(setup.folder.iterdir())
+        record = setup.folder / f"{RUN}.json"
         document = json.loads(record.read_text())
         document["manifest_sha256"] = "0" * 64
+        document["manifest"]["sha256"] = "0" * 64
         record.write_text(json.dumps(document))
         with self.assertRaises(LoadError):
             setup.load()
@@ -306,7 +312,7 @@ class RecordTest(unittest.TestCase):
     def test_the_record_names_the_branch_the_hashes_the_snapshots_the_manifest_and_the_pinned_connectors(self) -> None:
         setup = Setup(self)
         result = setup.load()
-        document = json.loads(next(setup.folder.iterdir()).read_text())
+        document = json.loads((setup.folder / f"{RUN}.json").read_text())
         self.assertEqual(
             (RUN, BRANCH, BASE_HASH, result.head_hash, setup.reference.sha256),
             (document["run_id"], document["branch"], document["base_hash"], document["head_hash"], document["manifest_sha256"]),
@@ -319,14 +325,122 @@ class RecordTest(unittest.TestCase):
     def test_the_record_holds_no_secret_and_no_object_key_outside_the_read_prefix(self) -> None:
         setup = Setup(self)
         setup.load()
-        text = next(setup.folder.iterdir()).read_text()
+        text = "".join(path.read_text() for path in setup.folder.iterdir())
         for word in ("access_key", "secret", "password", "token"):
             self.assertNotIn(word, text)
 
     def test_the_record_is_written_once_and_whole(self) -> None:
         setup = Setup(self)
         setup.load()
-        self.assertEqual([f"{RUN}.json"], [path.name for path in setup.folder.iterdir()])
+        self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
+
+
+LOAD_RECORD_FIELDS = {"format", "branch", "branch_hash", "manifest", "tables"}
+HASH = re.compile(r"[0-9a-f]{64}")
+
+
+def table_checks_accept(text: str) -> bool:
+    """The rules of the table checks' parser for a load record, as read in ``parse_load_record`` of ``scripts/ingestion/table_checks.py`` on
+    ``feat/p4-table-checks``: exactly the five fields, each of its type, the format ``load_record_1``, a branch that is not main, 64 lower case hex digits for
+    the hashes and an integer for each of the three tables."""
+    document = json.loads(text)
+    manifest = document.get("manifest")
+    tables = document.get("tables")
+    return (
+        type(document) is dict
+        and set(document) == LOAD_RECORD_FIELDS
+        and document["format"] == "load_record_1"
+        and type(document["branch"]) is str
+        and document["branch"] not in ("", "main")
+        and HASH.fullmatch(str(document["branch_hash"])) is not None
+        and type(manifest) is dict
+        and set(manifest) == {"bucket", "key", "version_id", "sha256"}
+        and all(type(value) is str for value in manifest.values())
+        and HASH.fullmatch(manifest["sha256"]) is not None
+        and type(tables) is dict
+        and sorted(tables) == sorted(TABLES)
+        and all(type(snapshot) is int for snapshot in tables.values())
+    )
+
+
+class LoadRecordShapeTest(unittest.TestCase):
+    """The shape that the table checks read: ``load_record_1``."""
+
+    EXTRA = {"format", "branch_hash", "manifest", "tables"}
+
+    def test_the_run_record_holds_the_load_record_fields_beside_its_own(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        document = json.loads((setup.folder / f"{RUN}.json").read_text())
+        self.assertEqual(
+            {"run_id", "manifest_sha256", "branch", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors"} | self.EXTRA, set(document)
+        )
+        self.assertEqual("load_record_1", document["format"])
+        self.assertEqual((BRANCH, result.head_hash), (document["branch"], document["branch_hash"]))
+        self.assertEqual(
+            {"bucket": setup.reference.bucket, "key": setup.reference.key, "version_id": setup.reference.version_id, "sha256": setup.reference.sha256},
+            document["manifest"],
+        )
+        self.assertEqual(document["snapshots"], document["tables"])
+        self.assertEqual(TABLES, sorted(document["tables"]))
+        self.assertTrue(all(type(snapshot) is int for snapshot in document["tables"].values()))
+
+    def test_a_second_file_holds_exactly_the_five_fields_that_the_table_checks_accept_and_no_others(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        text = (setup.folder / f"{RUN}.load_record.json").read_text()
+        document = json.loads(text)
+        self.assertEqual(LOAD_RECORD_FIELDS, set(document))
+        self.assertTrue(table_checks_accept(text))
+        self.assertEqual((BRANCH, result.head_hash, result.snapshots), (document["branch"], document["branch_hash"], document["tables"]))
+        self.assertEqual(setup.reference.sha256, document["manifest"]["sha256"])
+
+    def test_the_run_record_alone_is_refused_by_the_table_checks_rules_because_of_its_other_fields_which_is_why_the_second_file_exists(self) -> None:
+        setup = Setup(self)
+        setup.load()
+        self.assertFalse(table_checks_accept((setup.folder / f"{RUN}.json").read_text()))
+
+    def test_the_load_record_file_is_not_read_as_a_run_record(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        other = ManifestRef(setup.reference.bucket, setup.reference.key, setup.reference.version_id, "0" * 64)
+        self.assertIsNone(earlier_record(setup.folder, "0" * 64), "no record holds another manifest")
+        self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256))
+        self.assertEqual("0" * 64, other.sha256)
+
+    def test_the_run_record_is_written_last_so_a_stop_between_the_two_files_is_an_unfinished_load_that_a_retry_completes(self) -> None:
+        setup = Setup(self)
+        with mock.patch("scripts.ingestion.record_load.os.link", side_effect=OSError("stopped")), self.assertRaises(OSError):
+            setup.load()
+        self.assertEqual([f"{RUN}.load_record.json"], sorted(path.name for path in setup.folder.iterdir() if not path.name.startswith(".")))
+        result = setup.load()
+        self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
+        self.assertEqual(RUN, result.run_id)
+        self.assertTrue(table_checks_accept((setup.folder / f"{RUN}.load_record.json").read_text()))
+
+    def test_a_run_record_whose_load_record_fields_disagree_with_its_own_is_refused(self) -> None:
+        setup = Setup(self)
+        setup.load()
+        path = setup.folder / f"{RUN}.json"
+        original = json.loads(path.read_text())
+        edits: tuple[tuple[str, Callable[[dict[str, Any]], object]], ...] = (
+            ("another format", lambda document: document.update(format="load_record_0")),
+            ("another branch hash", lambda document: document.update(branch_hash="f" * 64)),
+            ("another table snapshot", lambda document: document["tables"].update(lab_data=1)),
+            ("another manifest", lambda document: document["manifest"].update(sha256="f" * 64)),
+            ("manifest without a field", lambda document: document["manifest"].pop("key")),
+            ("a field missing", lambda document: document.pop("tables")),
+            ("a field added", lambda document: document.update(extra=1)),
+        )
+        for name, edit in edits:
+            with self.subTest(name):
+                document = json.loads(json.dumps(original))
+                edit(document)
+                path.write_text(json.dumps(document))
+                with self.assertRaises(LoadError):
+                    setup.load()
+        path.write_text(json.dumps(original))
+        self.assertEqual(RUN, setup.load().run_id)
 
 
 class TagTest(unittest.TestCase):
@@ -361,7 +475,7 @@ class CleanupTest(unittest.TestCase):
         self.assertEqual(2, len(setup.store.deletes))
         self.assertEqual({PREFIX + "clinical_data.csv", PREFIX + "lab_data.csv"}, {key for key, _ in setup.store.deletes})
         self.assertEqual({copy.version_id for copy in result.copies}, {version for _, version in setup.store.deletes})
-        self.assertEqual([f"{RUN}.json"], [path.name for path in setup.folder.iterdir()])
+        self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
 
     def test_a_failed_load_keeps_the_copies_for_inspection(self) -> None:
         setup = Setup(self)
@@ -384,7 +498,7 @@ class CleanupTest(unittest.TestCase):
         with self.assertRaises(LoadError) as raised:
             setup.load()
         self.assertIn("call again", str(raised.exception))
-        self.assertEqual([f"{RUN}.json"], [path.name for path in setup.folder.iterdir()])
+        self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
         self.assertEqual(2, len(self.prefix_versions(setup)))
         setup.store.fail_deletes = False
         starts = [call for call in setup.airbyte.calls if call.startswith("start_sync")]
@@ -451,7 +565,7 @@ class SameManifestTest(unittest.TestCase):
     def earlier(self, setup: Setup, run: str = "run_earlier", age: float = 0.0) -> LoadResult:
         earlier = LoadResult(
             run,
-            setup.reference.sha256,
+            setup.reference,
             f"load_{run}",
             BASE_HASH,
             "c" * 64,
@@ -472,7 +586,7 @@ class SameManifestTest(unittest.TestCase):
         self.assertEqual([], setup.store.copies)
         self.assertEqual([], setup.airbyte.calls)
         self.assertEqual(["newest_recorded_manifest"], setup.catalog.calls)
-        self.assertEqual(["run_earlier.json"], [path.name for path in setup.folder.iterdir()])
+        self.assertEqual(["run_earlier.json", "run_earlier.load_record.json"], sorted(path.name for path in setup.folder.iterdir()))
 
     def test_control_another_manifest_on_main_or_none_loads_as_usual(self) -> None:
         for recorded in (None, "0" * 64):
@@ -511,7 +625,8 @@ class SameManifestTest(unittest.TestCase):
 
     def test_a_record_of_another_manifest_is_not_returned(self) -> None:
         setup = Setup(self)
-        other = LoadResult("run_other", "0" * 64, "load_run_other", BASE_HASH, "c" * 64, {"clinical_data": 1}, {"clinical_data": 4}, (), ("x",))
+        absent = ManifestRef("example-bucket", f"manifests/probe_set/{'0' * 64}.json", "v1", "0" * 64)
+        other = LoadResult("run_other", absent, "load_run_other", BASE_HASH, "c" * 64, {"clinical_data": 1}, {"clinical_data": 4}, (), ("x",))
         write_record(setup.folder, other)
         setup.catalog.recorded = setup.reference.sha256
         with self.assertRaises(LoadError):

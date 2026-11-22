@@ -45,6 +45,24 @@ class DigestTest(unittest.TestCase):
                 self.assertNotEqual(wanted, track_list.rows_digest(rows))
 
 
+class RefusedFieldTest(unittest.TestCase):
+    def test_a_field_with_a_tab_or_a_line_break_is_refused_by_its_row_and_the_message_shows_no_value(self) -> None:
+        for name, field in (("tab", "a\tb"), ("newline", "a\nb"), ("carriage return", "a\rb"), ("only a tab", "\t")):
+            with self.subTest(name), self.assertRaises(track_list.TrackListRowError) as raised:
+                track_list.rows_digest([("1", "x", "y"), ("2", field, "z")])
+            self.assertIn("row 2", str(raised.exception))
+            self.assertIn("tab or a line break", str(raised.exception))
+
+    def test_it_is_a_value_error_and_a_clean_row_is_accepted(self) -> None:
+        self.assertTrue(issubclass(track_list.TrackListRowError, ValueError))
+        self.assertEqual(2, track_list.rows_digest([("1", "a b", "c,d"), ("2", "e", "f")])[0])
+
+    def test_the_message_does_not_contain_the_field(self) -> None:
+        with self.assertRaises(track_list.TrackListRowError) as raised:
+            track_list.rows_digest([("1", "SECRETWORD\tx", "y")])
+        self.assertNotIn("SECRETWORD", str(raised.exception))
+
+
 class PinTest(unittest.TestCase):
     def test_the_tracked_pin_holds_the_row_count_and_the_digest_and_is_valid(self) -> None:
         pin = json.loads(RELEASE_FILE.read_text())
@@ -98,6 +116,13 @@ class FileCheckTest(unittest.TestCase):
 
     def test_a_dropped_row_is_reported_with_both_counts(self) -> None:
         self.assertIn("the file has 2 rows, the pin 3", track_list.file_problems(self.file_with(ROWS[:-1]), self.pin()))
+
+    def test_a_file_with_a_field_that_holds_a_line_break_or_a_tab_is_a_problem_naming_the_row_not_a_crash(self) -> None:
+        path = self.folder / "quoted.csv"
+        path.write_text('caseid,tname,tid\r\n1,a,b\r\n2,"x\ny",z\r\n3,"p\tq",r\r\n', newline="")
+        problems = track_list.file_problems(path, self.pin())
+        self.assertEqual(1, len(problems))
+        self.assertIn("row 2", problems[0])
 
     def test_a_row_with_the_wrong_number_of_fields_is_refused_by_its_line(self) -> None:
         path = self.folder / "track_list.csv"
