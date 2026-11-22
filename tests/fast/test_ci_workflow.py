@@ -38,7 +38,7 @@ from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS
 
 WORKFLOW_TEXT = (ROOT / ".github/workflows/ci.yml").read_text()
 RUNNER = "ubuntu-24.04"
-PYTHON = "3.14.8"
+PYTHON = "3.14.10"
 SHARDS = 8
 REQUIRED_NAME = "Every job of this run passed"
 GROUPS = ("hooks", "infrastructure", "guards")
@@ -724,7 +724,7 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         "guards: it runs ['make test-guards",
     ),
     "another Python in one job": (
-        'python-version: "3.14.8"\n          cache',
+        'python-version: "3.14.10"\n          cache',
         'python-version: "3.14"\n          cache',
         "hooks: step 2 differs from the pinned one",
     ),
