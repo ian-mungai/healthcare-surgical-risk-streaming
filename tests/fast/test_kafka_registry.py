@@ -29,7 +29,7 @@ ALLOWED_ADVERTISED = {"INTERNAL://kafka:9092", "HOST://127.0.0.1:${KAFKA_HOST_PO
 KAFKA_PORT = "127.0.0.1:${KAFKA_HOST_PORT:-9094}:9094"
 DESCRIBE = (
     "Topic: replay_events\tTopicId: 3A6tywHzSt2_Bdwmlp733A\tPartitionCount: 10\tReplicationFactor: 1\t"
-    "Configs: min.insync.replicas=1,cleanup.policy=delete,segment.bytes=134217728,retention.ms=129600000,retention.bytes=2147483648\n"
+    "Configs: min.insync.replicas=1,cleanup.policy=delete,flush.messages=1,segment.bytes=134217728,retention.ms=129600000,retention.bytes=2147483648\n"
     "\tTopic: replay_events\tPartition: 0\tLeader: 1\tReplicas: 1\tIsr: 1\tElr: \tLastKnownElr: \n"
     "\tTopic: replay_events\tPartition: 1\tLeader: 1\tReplicas: 1\tIsr: 1\tElr: \tLastKnownElr: \n"
     "Topic: __consumer_offsets\tTopicId: Zq5Y0y6mRn-9sQy4Zo0pFA\tPartitionCount: 10\tReplicationFactor: 1\t"
@@ -90,8 +90,14 @@ class TopicListTest(unittest.TestCase):
             with self.subTest(topic=topic.name):
                 self.assertGreater(topic.retention_hours, 0)
                 self.assertGreater(topic.retention_mib, topic.segment_mib)
-                self.assertEqual({"cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes"}, set(topic.configs()))
+                self.assertEqual({"cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes", "flush.messages"}, set(topic.configs()))
                 self.assertEqual("delete", topic.configs()["cleanup.policy"])
+
+    def test_every_event_topic_is_written_to_disk_before_the_broker_acknowledges_a_record(self) -> None:
+        self.assertEqual({"replay_events", "feature_ready", "warnings", "risk_scores"}, {topic.name for topic in self.topics})
+        for topic in self.topics:
+            with self.subTest(topic=topic.name):
+                self.assertEqual("1", topic.configs()["flush.messages"])
 
     def test_the_worst_cases_of_the_topics_add_up_to_no_more_than_the_storage_budget(self) -> None:
         budget = topics_module.parse_budget((COMPOSE / "kafka" / "storage_budget_gib.txt").read_text())
@@ -163,17 +169,30 @@ class TopicPlanTest(unittest.TestCase):
             "retention.bytes=2147483648",
             "segment.bytes=134217728",
             "cleanup.policy=delete",
+            "flush.messages=1",
         ):
             self.assertIn(part, arguments)
 
     def test_a_setting_that_drifted_is_corrected_and_only_that_one(self) -> None:
-        for key, value in (("retention.bytes", "9999"), ("retention.ms", "1"), ("segment.bytes", "1048576"), ("cleanup.policy", "compact")):
+        for key, value in (
+            ("retention.bytes", "9999"),
+            ("retention.ms", "1"),
+            ("segment.bytes", "1048576"),
+            ("cleanup.policy", "compact"),
+            ("flush.messages", "9223372036854775807"),
+        ):
             with self.subTest(key=key):
                 drifted = re.sub(rf"{re.escape(key)}=[^,\n]*", f"{key}={value}", DESCRIBE, count=1)
                 actions = topics_module.plan(self.wanted, self.state(drifted))
                 self.assertEqual(1, len(actions), actions)
                 self.assertEqual("kafka-configs", actions[0].tool)
                 self.assertEqual(f"{key}={self.wanted[0].configs()[key]}", actions[0].arguments[-1])
+
+    def test_a_topic_without_the_flush_setting_gets_it_set_and_nothing_else(self) -> None:
+        unflushed = DESCRIBE.replace("flush.messages=1,", "")
+        actions = topics_module.plan(self.wanted, self.state(unflushed))
+        self.assertEqual(1, len(actions))
+        self.assertEqual(("kafka-configs", "flush.messages=1"), (actions[0].tool, actions[0].arguments[-1]))
 
     def test_a_setting_that_is_missing_from_the_overrides_is_set(self) -> None:
         missing = DESCRIBE.replace(",retention.bytes=2147483648", "")

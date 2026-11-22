@@ -1,9 +1,13 @@
 """Ansible module: the Kafka topics, from the tracked list.
 
 The step makes the running broker match ``compose/kafka/topics.txt``: it creates a missing topic with its partitions and settings, corrects a topic whose
-retention limits, segment size or cleanup policy differ and adds partitions when the list asks for more. Kafka cannot remove partitions, so a topic with
-more partitions than the list stops the step with a message that names it. A topic that the list does not name is reported and never removed.
+retention limits, segment size, cleanup policy or flush setting differ and adds partitions when the list asks for more. Kafka cannot remove partitions, so a
+topic with more partitions than the list stops the step with a message that names it. A topic that the list does not name is reported and never removed.
 A broker that already matches needs no change and the step reports none.
+
+Every topic in the list carries events that the platform acknowledges, so every topic gets ``flush.messages=1``: the broker writes each record to disk before it
+acknowledges it. The single broker has no replica to restore a record that a power loss took from the operating system's cache. Kafka applies the setting
+to each partition.
 
 It reaches the broker through ``docker compose exec`` and the tools that ship in the image. It uses only the standard library and runs on the host's Python.
 """
@@ -26,7 +30,8 @@ SERVICE = "kafka"
 TOOLS_FOLDER = "/opt/kafka/bin"
 BOOTSTRAP = "127.0.0.1:9092"
 REPLICATION_FACTOR = 1
-MANAGED = ("cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes")
+FLUSH_MESSAGES = 1
+MANAGED = ("cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes", "flush.messages")
 ERROR_CHARACTERS = 400
 
 
@@ -49,6 +54,7 @@ class Topic:
             "retention.ms": str(self.retention_hours * HOUR_MS),
             "retention.bytes": str(self.retention_mib * MIB),
             "segment.bytes": str(self.segment_mib * MIB),
+            "flush.messages": str(FLUSH_MESSAGES),
         }
 
     def worst_case_bytes(self) -> int:
