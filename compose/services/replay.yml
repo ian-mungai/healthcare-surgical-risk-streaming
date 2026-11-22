@@ -1,0 +1,51 @@
+# The replay as an always-on service: it waits for a run record in the inbox on its state volume (python -m replay.service submit puts one there), plays
+# it into Kafka and returns to waiting. Its health check reads the health file that the waiting or running service keeps fresh.
+services:
+  replay:
+    image: surgical-risk-replay:1.7.2
+    build:
+      context: ../..
+      dockerfile: replay/Dockerfile
+    platform: linux/amd64
+    mem_limit: ${MEM_LIMIT_REPLAY:?render the limits first}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    user: "10003:10003"
+    group_add: ["20104"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      apicurio:
+        condition: service_healthy
+    command: [serve]
+    environment:
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
+    configs:
+      - source: replay_aws_client_config
+        target: /etc/workload_access/client_config
+    volumes:
+      - replay_state:/opt/replay/state
+      - workload_access_replay:/run/workload_access:ro
+    healthcheck:
+      test: [CMD, python, -m, replay.service, health]
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 60s
+
+configs:
+  replay_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
+
+volumes:
+  replay_state:
+  workload_access_replay:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${REPLAY_ACCESS_DIR:-/run/workload_access/replay}

@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/opt/replay/app
 
-RUN useradd --uid 10002 --user-group --no-create-home --shell /usr/sbin/nologin replay \
+RUN useradd --uid 10003 --user-group --no-create-home --shell /usr/sbin/nologin replay \
     && mkdir -p /opt/replay/app /opt/replay/state /opt/replay/run \
     && chown -R replay:replay /opt/replay
 
@@ -23,6 +23,6 @@ COPY scripts/ingestion /opt/replay/app/scripts/ingestion
 COPY scripts/sample /opt/replay/app/scripts/sample
 COPY tests/fixtures/vitaldb/release.json /opt/replay/app/tests/fixtures/vitaldb/release.json
 
-USER 10002:10002
+USER 10003:10003
 WORKDIR /opt/replay
 ENTRYPOINT ["python", "-m", "replay.service"]

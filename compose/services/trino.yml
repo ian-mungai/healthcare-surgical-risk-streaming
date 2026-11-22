@@ -5,6 +5,7 @@ services:
     mem_limit: ${MEM_LIMIT_TRINO:?render the limits first}
     restart: unless-stopped
     user: "1000:1000"
+    group_add: ["20103"]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     depends_on:

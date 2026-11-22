@@ -81,6 +81,11 @@ compose_stack_built_images:
     sources: [spark, scripts]
     context: "."
     dockerfile: spark/Dockerfile
+  - tag: surgical-risk-replay:1.7.2
+    name: replay
+    sources: [replay, scripts, tests]
+    context: "."
+    dockerfile: replay/Dockerfile
 # An empty project name keeps the one fixed name in compose.yml.
 compose_stack_project: ""
 # Each deadline is in seconds. The start deadline covers pulling the images and the health deadline each service's health check.

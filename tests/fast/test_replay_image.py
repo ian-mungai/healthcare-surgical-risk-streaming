@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import re
 import unittest
 from pathlib import Path
 
@@ -107,6 +108,39 @@ class RealImageTest(unittest.TestCase):
         self.assertIn("scripts/ingestion/gate.py", needed)
         self.assertIn("scripts/sample/candidates.py", needed)
         self.assertEqual([], problems(DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text()), needed))
+
+
+def service_users() -> dict[str, str]:
+    """The numeric user of each Compose service file that names one."""
+    users = {}
+    for path in sorted((ROOT / "compose" / "services").glob("*.yml")):
+        match = re.search(r'^\s+user: "([0-9]+:[0-9]+)"', path.read_text(), re.MULTILINE)
+        if match:
+            users[path.stem] = match.group(1)
+    return users
+
+
+def user_problems(dockerfile: str, users: dict[str, str]) -> list[str]:
+    """The image's last user must be the replay service's user, and no other service may run as that user ID."""
+    found = []
+    last = [line.split()[1] for line in dockerfile.splitlines() if line.startswith("USER ")][-1:]
+    if last != [users.get("replay")]:
+        found.append(f"the image's last USER {last} is not the replay service's user {users.get('replay')}")
+    uid = (users.get("replay") or ":").split(":")[0]
+    found += [f"{name} runs as the replay's user ID {uid}" for name, user in users.items() if name != "replay" and user.split(":")[0] == uid]
+    return found
+
+
+class UserTest(unittest.TestCase):
+    def test_the_image_runs_as_the_replay_service_user_that_no_other_service_has(self) -> None:
+        users = service_users()
+        self.assertEqual("10003:10003", users.get("replay"))
+        self.assertEqual([], user_problems(DOCKERFILE.read_text(), users))
+
+    def test_another_user_in_the_image_or_a_shared_user_is_named(self) -> None:
+        users, text = service_users(), DOCKERFILE.read_text()
+        self.assertEqual(1, len(user_problems(text.replace("USER 10003:10003", "USER 10002:10002"), users)))
+        self.assertEqual(["apicurio runs as the replay's user ID 10003"], user_problems(text, {**users, "apicurio": "10003:10003"}))
 
 
 class PlantedDefectTest(unittest.TestCase):

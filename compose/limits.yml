@@ -125,3 +125,7 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 768
+  replay:
+    runtime: compose
+    group: supporting
+    memory_limit_mib: 1024

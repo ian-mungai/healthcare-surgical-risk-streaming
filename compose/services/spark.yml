@@ -9,6 +9,7 @@ services:
     mem_limit: ${MEM_LIMIT_SPARK:?render the limits first}
     restart: "no"
     user: "10100:10100"
+    group_add: ["20102"]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     depends_on:

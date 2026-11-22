@@ -6,9 +6,12 @@
 ``observe``   read every message of the topics and write the digest of each payload under its event ID.
 ``compare``   compare the observed file and the saved state with the manifest. Exit 0 only when every expected ID is there with its payload.
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
+``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
+``submit``    read a run record on standard input and put it in the inbox under its run ID; the same record again changes nothing.
+``health``    exit 0 when the service waits or runs and its health file is fresh: the container's health check.
 
-Every command takes the run record (``--run-record``), which holds the settings of the run, the speed among them. Exit codes: 0 done, 1 the check failed,
-3 the gate refused an object version, 2 anything else that stopped the command.
+Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. Exit codes: 0 done,
+1 the check failed or the service is not healthy, 3 the gate refused an object version, 2 anything else that stopped the command.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import json
 import signal
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -33,6 +37,7 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
+from replay.service.serve import Outcome, SubmitError, healthy, serve, submit
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.gate import GateRefused
@@ -40,6 +45,10 @@ from scripts.ingestion.manifest import ManifestError
 from scripts.ingestion.store import StoreError
 
 READ_DEADLINE_SECONDS = 600.0
+INBOX = Path("/opt/replay/state/inbox")
+HEALTH_FILE = Path("/opt/replay/state/health.json")
+POLL_SECONDS = 1.0
+HEALTH_MAX_AGE_SECONDS = 600.0
 
 
 def log(event: str, **fields: Any) -> None:
@@ -105,34 +114,56 @@ def command_freeze(record: RunRecord, _: argparse.Namespace) -> int:
     return 0
 
 
-def command_run(record: RunRecord, _: argparse.Namespace) -> int:
+class StopFlag:
+    """Set by SIGTERM or SIGINT, so a run stops at its next event after saving its position."""
+
+    def __init__(self) -> None:
+        self.set = False
+        signal.signal(signal.SIGTERM, self.request)
+        signal.signal(signal.SIGINT, self.request)
+
+    def request(self, signum: int, frame: FrameType | None) -> None:
+        self.set = True
+
+
+def replay_record(record: RunRecord, stopped: Callable[[], bool], beat: Callable[[], None]) -> int:
+    """Replay one run record into Kafka from its saved position. ``beat`` is called as the run makes progress. Return 0 when every occurrence is done."""
     partitions = partition_count(record.kafka_bootstrap, INPUT_TOPIC)
     partition_of(record.rooms - 1, partitions)
     inputs = verify_inputs(record)
+    beat()
     frozen = freeze_run(record, inputs)
+    beat()
     times = inputs.times()
     writer = Writer(RegistryClient(record.registry_url))
     sink = KafkaSink(record.kafka_bootstrap, writer, partitions)
-    stopped = False
-
-    def request_stop(signum: int, frame: FrameType | None) -> None:
-        nonlocal stopped
-        stopped = True
-
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
     prefetched = dict(frozen.decoded)
 
     def source(case_id: int) -> Any:
-        return prefetched.pop(case_id) if case_id in prefetched else inputs.decode(times[case_id])
+        recording = prefetched.pop(case_id) if case_id in prefetched else inputs.decode(times[case_id])
+        beat()
+        return recording
+
+    def poll() -> None:
+        sink.producer.poll(0)
+        beat()
+
+    def stop_requested() -> bool:
+        beat()
+        return stopped()
 
     settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000))
-    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(record.state_path), SystemClock(lambda: sink.producer.poll(0)), lambda: stopped)
+    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(record.state_path), SystemClock(poll), stop_requested)
     log("replay_start", run_id=record.run_id, speed=record.speed, schedule_sha256=frozen.schedule.sha256)
     result = replayer.run()
     log("replay_end", sent=result.sent, finished=result.finished)
     sys.stdout.write(json.dumps({"sent": result.sent, "finished": result.finished}) + "\n")
     return 0 if result.finished else 2
+
+
+def command_run(record: RunRecord, _: argparse.Namespace) -> int:
+    flag = StopFlag()
+    return replay_record(record, lambda: flag.set, lambda: None)
 
 
 def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
@@ -181,6 +212,39 @@ def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
     return 0
 
 
+def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome:
+    """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text."""
+    log("request_start", request=path.stem)
+    try:
+        code = replay_record(parse_run_record(path.read_text()), lambda: flag.set, beat)
+        outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.set else "failed", code)
+    except GateRefused as refused:
+        outcome = Outcome("failed", 3, str(refused))
+    except STOPPING_ERRORS as error:
+        outcome = Outcome("failed", 2, f"{type(error).__name__}: {error}")
+    log("request_end", request=path.stem, outcome=outcome.kind, exit_code=outcome.exit_code, error=outcome.error)
+    return outcome
+
+
+def command_serve(arguments: argparse.Namespace) -> int:
+    flag = StopFlag()
+    log("serve_start", inbox=str(arguments.inbox))
+    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), lambda: flag.set, time.time, time.sleep, POLL_SECONDS)
+
+
+def command_submit(arguments: argparse.Namespace) -> int:
+    try:
+        sys.stdout.write(submit(arguments.inbox, sys.stdin.read()) + "\n")
+    except SubmitError as error:
+        log("submit_refused", message=str(error))
+        return 2
+    return 0
+
+
+def command_health(arguments: argparse.Namespace) -> int:
+    return 0 if healthy(arguments.health, time.time(), arguments.max_age) else 1
+
+
 COMMANDS = {
     "freeze": command_freeze,
     "run": command_run,
@@ -191,9 +255,32 @@ COMMANDS = {
 }
 
 
+STOPPING_ERRORS = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    ManifestError,
+    StoreError,
+    InputError,
+    RunRecordError,
+    RegistryError,
+    FormatMismatch,
+    KafkaStartError,
+    DeliveryError,
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("serve", "submit"):
+        command = commands.add_parser(name)
+        command.add_argument("--inbox", type=Path, default=INBOX)
+        if name == "serve":
+            command.add_argument("--health", type=Path, default=HEALTH_FILE)
+    health = commands.add_parser("health")
+    health.add_argument("--health", type=Path, default=HEALTH_FILE)
+    health.add_argument("--max-age", type=float, default=HEALTH_MAX_AGE_SECONDS, help="the age in seconds above which the health file is stale")
     for name in COMMANDS:
         command = commands.add_parser(name)
         command.add_argument("--run-record", type=Path, required=True)
@@ -206,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--observed", type=Path, required=True)
             command.add_argument("--window-only", action="store_true")
     arguments = parser.parse_args(argv)
+    service_commands = {"serve": command_serve, "submit": command_submit, "health": command_health}
+    if arguments.command in service_commands:
+        return service_commands[arguments.command](arguments)
     try:
         record = parse_run_record(arguments.run_record.read_text())
         return COMMANDS[arguments.command](record, arguments)
@@ -213,19 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         problems = [{"position": problem.position, "requested": problem.requested, "cause": problem.cause} for problem in refused.problems]
         log("gate_refused", reason=str(refused), problems=problems)
         return 3
-    except (
-        OSError,
-        ValueError,
-        RuntimeError,
-        ManifestError,
-        StoreError,
-        InputError,
-        RunRecordError,
-        RegistryError,
-        FormatMismatch,
-        KafkaStartError,
-        DeliveryError,
-    ) as error:
+    except STOPPING_ERRORS as error:
         log("stopped", error=type(error).__name__, message=str(error))
         return 2
 

@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from scripts.infra.host import PROJECT_WORKLOAD_GIDS
 from scripts.stack.limits import load_limits, variable_name
 from scripts.stack.yaml_text import load_yaml
 
@@ -272,6 +273,48 @@ class DockerSocketExceptionTest(unittest.TestCase):
                 document = self.code_location()
                 document["services"]["dagster_code_location"]["volumes"].append(mount)
                 self.assertIn("named volumes", service_problems("dagster_code_location", document)[0])
+
+
+class WorkloadAccessTest(unittest.TestCase):
+    """A service that reads a workload's short-lived AWS credentials mounts that workload's folder read-only and runs in its group: the helper writes the
+    folder for root and the workload's group, mode 0750, and the credentials 0640, so a container outside the group cannot read them."""
+
+    def problems(self, name: str, document: dict[str, Any]) -> list[str]:
+        service = document["services"][name]
+        found = []
+        for volume_name, volume in (document.get("volumes") or {}).items():
+            device = str(((volume or {}).get("driver_opts") or {}).get("device", ""))
+            match = re.search(r"/run/workload_access/([a-z_]+)\}?$", device)
+            if not match:
+                continue
+            workload = match.group(1)
+            if f"{volume_name}:/run/workload_access:ro" not in [str(entry) for entry in service.get("volumes") or []]:
+                found.append(f"{name}: the credential folder of {workload} must be mounted read-only at /run/workload_access")
+            if [str(PROJECT_WORKLOAD_GIDS.get(workload))] != [str(group) for group in service.get("group_add") or []]:
+                found.append(f"{name}: must run in the group {PROJECT_WORKLOAD_GIDS.get(workload)} of the workload {workload} and in no other group")
+        return found
+
+    def test_every_service_with_a_credential_folder_mounts_it_read_only_and_runs_in_its_group(self) -> None:
+        readers = []
+        for path in sorted(SERVICES.glob("*.yml")):
+            with self.subTest(service=path.stem):
+                self.assertEqual([], self.problems(path.stem, load(path)))
+            if "/run/workload_access/" in path.read_text():
+                readers.append(path.stem)
+        self.assertEqual(["replay", "spark", "trino"], readers)
+
+    def test_a_missing_group_another_group_or_a_writable_mount_is_named(self) -> None:
+        for change in ("no group", "other group", "writable"):
+            document = copy.deepcopy(load(SERVICES / "replay.yml"))
+            service = document["services"]["replay"]
+            if change == "no group":
+                del service["group_add"]
+            elif change == "other group":
+                service["group_add"] = [str(PROJECT_WORKLOAD_GIDS["spark"])]
+            else:
+                service["volumes"] = [str(entry).removesuffix(":ro") for entry in service["volumes"]]
+            with self.subTest(change=change):
+                self.assertEqual(1, len(self.problems("replay", document)))
 
 
 class PlantedDefectTest(unittest.TestCase):

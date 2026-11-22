@@ -372,6 +372,13 @@ def from_contexts(dockerfile: Path) -> set[str]:
     return {name for name in re.findall(r"--from=(\S+)", text) if ":" not in name and "@" not in name and name not in stages}
 
 
+def context_sources(dockerfile: Path) -> set[str]:
+    """The first folder of each path that a Dockerfile copies from its build context: each must be a source of the image on the host."""
+    lines = dockerfile.read_text().replace("\\\n", " ").splitlines()
+    copied = [line.split()[1:-1] for line in lines if line.startswith("COPY ") and "--from=" not in line]
+    return {source.split("/")[0] for sources in copied for source in sources}
+
+
 class BuiltImagesTest(unittest.TestCase):
     def test_the_images_the_role_builds_are_the_project_images_that_the_service_files_name_and_each_dockerfile_is_in_its_sources(self) -> None:
         built: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
@@ -391,6 +398,8 @@ class BuiltImagesTest(unittest.TestCase):
                 self.assertTrue((ROOT / dockerfile).is_file())
                 self.assertTrue(context == "." or context in image["sources"])
                 self.assertEqual(from_contexts(ROOT / dockerfile), set(image.get("build_contexts", {})))
+                if context == ".":
+                    self.assertEqual(set(), context_sources(ROOT / dockerfile) - set(image["sources"]))
                 self.assertTrue(set(image.get("build_contexts", {}).values()) <= set(image["sources"]))
 
     def test_the_dagster_image_gets_the_scripts_and_compose_folders_and_the_spark_image_is_built_from_the_folder_above_its_dockerfile(self) -> None:
