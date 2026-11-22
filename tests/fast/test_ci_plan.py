@@ -239,9 +239,21 @@ class DerivedInputsTest(PlanRepository):
         guards = ci_groups.group_inputs(self.repo, CONFIG)["guards"]
         self.assertEqual([path for path in sorted(written) if guards.reason(path) is None], [])
 
-    def test_a_file_where_the_guard_suite_writes_a_folder_selects_the_guards(self) -> None:
-        record = self.changed("notes", "a file where the suite makes its notes folder\n")
-        self.assertTrue(record["groups"]["guards"]["run"], record["groups"]["guards"]["reason"])
+    def test_a_file_where_the_guard_suite_writes_a_folder_is_an_input_of_the_guards(self) -> None:
+        guards = ci_groups.group_inputs(self.repo, CONFIG)["guards"]
+        self.assertRegex(guards.reason("notes") or "", r"^the guard suite writes notes/\S+ in its copy of the tree$")
+        self.assertEqual(guards.reason("scripts/planted/__init__.py"), "the guard suite writes scripts/planted.py in its copy of the tree")
+        self.assertIsNone(guards.reason("notes.txt"))
+
+    def test_a_module_that_a_command_string_names_is_an_input(self) -> None:
+        self.passed(self.base)
+        self.commit({"tests/fast/test_started.py": 'MODULE = "scripts.quality.only_started"\n', "scripts/quality/only_started.py": "VALUE = 1\n"})
+        start = self.head()
+        self.github.add_run(2, start)
+        self.commit({"scripts/quality/only_started.py": "VALUE = 2\n"})
+        record = self.plan(start)
+        self.assertEqual(self.runs(record), GUARDS)
+        self.assertIn("scripts/quality/only_started.py is an input", record["groups"]["guards"]["reason"])
 
     def test_a_module_that_the_fast_tests_import_selects_the_guards(self) -> None:
         for path in ("scripts/infra/host.py", "scripts/evidence/receipt.py", "infra/iam/scripts/render_policy.py"):
@@ -302,6 +314,16 @@ class ImportMapTest(unittest.TestCase):
             self.assertTrue(groups)
             for name in groups:
                 self.assertIsNotNone(self.inputs[name].reason(target), f"{name} imports {file}, which loads {target}")
+
+    def test_a_hook_whose_entry_is_not_on_one_line_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci_plan_hooks_") as folder:
+            root = Path(folder)
+            for path in (ci_groups.MAKEFILE, ci_groups.HOOKS):
+                shutil.copy2(ROOT / path, root / path)
+            hooks = (root / ci_groups.HOOKS).read_text()
+            (root / ci_groups.HOOKS).write_text(hooks.replace("        entry: .venv/bin/mypy\n", "        entry: >\n          .venv/bin/mypy\n", 1))
+            with self.assertRaisesRegex(ci_groups.Unverified, "has no entry on one line"):
+                ci_groups.hook_modules(root)
 
     def test_a_command_that_names_no_make_target_is_refused(self) -> None:
         config = json.loads(json.dumps(CONFIG))
@@ -766,6 +788,15 @@ class ApiDeadlineTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
         self.assertGreater(slow.requests, 1)
 
+    def test_no_request_is_sent_after_the_deadline(self) -> None:
+        slow = SlowApi(self, pause=0.0)
+        api = ci_reuse.github_api(slow.url, "token", deadline_seconds=0.3)
+        self.assertEqual(api("repos/owner/project/actions/runs"), {"answer": 1})
+        time.sleep(0.4)
+        with self.assertRaisesRegex(ci_reuse.ApiError, "not sent: the API reads passed their deadline of 0.3 seconds"):
+            api("repos/owner/project/actions/runs")
+        self.assertEqual(slow.requests, 1)
+
     def test_an_answer_within_the_deadline_is_read(self) -> None:
         api = ci_reuse.github_api(SlowApi(self, pause=0.0).url, "token", deadline_seconds=5.0)
         self.assertEqual(api("repos/owner/project/actions/runs"), {"answer": 1})
@@ -813,6 +844,14 @@ class WorkflowContractTest(unittest.TestCase):
             "a checkout of GitHub's merge commit": (checkout, "        with:\n          persist-credentials: false\n"),
             "the hooks job skipped": ("      - run: make check\n", "      - run: make check\n        if: matrix.run\n"),
             "the plan module replaced": ("python -m scripts.quality.ci_plan", "python -m scripts.quality.ci_groups"),
+            "the Terraform setup behind another condition": (
+                "        if: matrix.run\n        with:\n          terraform_version",
+                "        if: always()\n        with:\n          terraform_version",
+            ),
+            "a skipped job that still checks out": (
+                "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        if: matrix.run\n",
+                "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
+            ),
             "the skip summary removed": ("printf 'Planted faults: %s\\n'", "true # "),
         }
         for label, (before, after) in planted.items():
@@ -887,16 +926,9 @@ def workflow_jobs(text: str) -> dict[str, WorkflowJob]:
 
 
 def executed(job: WorkflowJob, entry: dict[str, Any], *, failed: bool = False) -> list[dict[str, Any]]:
-    """The steps that GitHub runs for one matrix entry. A condition other than the gate of the entry is a contract problem."""
+    """The steps that GitHub runs for one matrix entry. A step behind a condition the contract does not know counts as not run."""
     conditions = {"matrix.run": bool(entry.get("run")), "failure() && matrix.run": failed and bool(entry.get("run"))}
-    steps = []
-    for step in job.steps:
-        condition = step.get("if")
-        if condition is not None and condition not in conditions:
-            raise AssertionError(f"a condition the contract does not know: {condition}")
-        if condition is None or conditions[condition]:
-            steps.append(step)
-    return steps
+    return [step for step in job.steps if "if" not in step or conditions.get(step["if"], False)]
 
 
 def command_steps(steps: list[dict[str, Any]]) -> list[str]:
@@ -968,6 +1000,9 @@ def contract_problems(text: str, config: dict[str, Any]) -> list[str]:
                         problems.append(f"{name} {'runs' if decision else 'skips'}: no step states the group's reason in the run summary")
                     if not decision and len(steps) != len(stated):
                         problems.append(f"{name} skips: it runs {len(steps) - len(stated)} steps besides stating its reason")
+                    tail = [step for step in job.steps if step.get("if") == "failure() && matrix.run"]
+                    if decision and len(steps) != len(job.steps) - len(tail):
+                        problems.append(f"{name} runs: it leaves out {len(job.steps) - len(tail) - len(steps)} of its steps")
             sharded = [step for step in job.steps if str(step.get("run", "")).startswith("make test-guards")]
             if name == "guards" and (not sharded or sharded[0].get("env") != {"SHARD": "${{ matrix.shard }}", "SHARDS": "${{ matrix.shards }}"}):
                 problems.append("guards: the suite does not run the shard of its matrix entry")

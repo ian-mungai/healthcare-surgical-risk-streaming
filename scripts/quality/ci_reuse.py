@@ -116,8 +116,6 @@ def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE
             if shut is not None:
                 shut.cancel()
             connection.close()
-        if time.monotonic() >= deadline:
-            raise ApiError(f"GET {where} answered too late: {expired}")
         if response.status != 200:
             raise ApiError(f"GET {where} answered {response.status}")
         try:
