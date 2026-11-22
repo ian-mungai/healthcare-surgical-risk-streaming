@@ -1,42 +1,38 @@
-"""Reuse of passed job groups for an identical tree, and the proof that a range's start commit passed, read from the GitHub API.
+"""The GitHub API facts that let a CI run do less: the proof that a pull request's base passed on main, and the passed pull request run
+that the push to main after a merge reuses.
 
-Every answer comes from GitHub's API about runs of this repository's own workflow file on GitHub, read with the workflow's read-only token
-(``actions: read``). Only push runs of ``.github/workflows/ci.yml`` on ``main`` count, whose repository and head repository are this
-repository, so a run of another workflow, another branch, a pull request or a fork never counts.
+Every answer comes from GitHub's API about this repository's own runs of ``.github/workflows/ci.yml``, read with the workflow's read-only
+token. A run counts only when its workflow file is that path and its repository and head repository are this repository, so a run of
+another workflow or of a fork never counts. Of the runs that count, only the newest execution decides: the newest run by creation time,
+run number and attempt, and its jobs as the latest attempt left them. It must have completed with success; an older passed run or attempt
+never stands in for a newer one.
 
-A group's reuse key covers everything that decides its outcome: the tree of the checkout, the workflow file, ``requirements.txt``, the tool
-pins in ``scripts/quality/install_tools.py``, the runner label, the Python version and the group's own definition in the map. The files are
-read as blobs of the checked-out commit. Each job of a group that runs carries the first 16 characters of its key in its name, so a later
-run finds a passed job by its exact name. A job is reused when an earlier run (or an earlier attempt of this run) with the same tree has
-it completed with success, for the same commit, on the runner label of the key. A key input that cannot be read, or any answer of the API
-that cannot be read, reuses nothing.
+A push to main reuses a pull request's result only when exactly one pull request of this repository was merged into main with the pushed
+commit as its merge commit, the tree of the checkout equals the tree that the API gives for the pushed commit and for the pull request's
+head commit, and the newest pull request run of that head commit on that head branch passed with every required job: the plan job, the
+hooks job and, for each selectable group, either all its jobs or its one job that did not run. Any answer that cannot be read reuses nothing.
 """
 
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import http.client
 import json
+import re
 import socket
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
-from subprocess import CalledProcessError
 from typing import Any
 from urllib.parse import urlsplit
 
-from scripts.quality.repo_checks import git
-
 WORKFLOW = ".github/workflows/ci.yml"
-KEY_FILES = {"workflow": WORKFLOW, "requirements": "requirements.txt", "tools": "scripts/quality/install_tools.py"}
-KEY_LENGTH = 16
 API_TIMEOUT_SECONDS = 30
 API_DEADLINE_SECONDS = 120  # every API read of one plan together; the plan job's own limit is 5 minutes
 LOOPBACK = ("127.0.0.1", "localhost")
-CANDIDATE_RUNS = 20
+SHA = re.compile(r"[0-9a-f]{40}")
+MAIN = "main"
 
 Api = Callable[[str], Any]
 
@@ -53,21 +49,34 @@ class ApiError(Exception):
 class Context:
     repository: str
     repository_id: int
+
+
+@dataclass(frozen=True)
+class JobSet:
+    """The jobs that a passed run must hold: ``always`` each once, and for each group all of its ``runs`` names or its ``idle`` name."""
+
+    always: frozenset[str]
+    groups: Mapping[str, tuple[frozenset[str], str]]
+
+
+@dataclass(frozen=True)
+class Reused:
+    """The pull request run that a push to main reuses."""
+
+    pull_request: int
+    head: str
+    tree: str
     run_id: int
-    run_attempt: int
+    run_url: str
+    jobs: list[str]
 
 
 def context_of(environment: Mapping[str, str]) -> Context:
-    """The repository and run that GitHub names in the job's environment."""
+    """The repository that GitHub names in the job's environment."""
     try:
-        return Context(
-            environment["GITHUB_REPOSITORY"],
-            int(environment["GITHUB_REPOSITORY_ID"]),
-            int(environment["GITHUB_RUN_ID"]),
-            int(environment["GITHUB_RUN_ATTEMPT"]),
-        )
+        return Context(environment["GITHUB_REPOSITORY"], int(environment["GITHUB_REPOSITORY_ID"]))
     except (KeyError, ValueError) as error:
-        raise NoReuse(f"the run's environment does not name the repository and run ({type(error).__name__}: {error})") from error
+        raise NoReuse(f"the run's environment does not name the repository ({type(error).__name__}: {error})") from error
 
 
 def github_api(base_url: str, token: str, deadline_seconds: float = API_DEADLINE_SECONDS) -> Api:
@@ -125,77 +134,87 @@ def shut_down(sock: socket.socket) -> None:
         sock.shutdown(socket.SHUT_RDWR)
 
 
-def key_parts(root: Path, config: dict[str, Any], group: str) -> dict[str, Any]:
-    """The inputs of the reuse key of ``group`` for the checkout at ``root``."""
-    try:
-        parts: dict[str, Any] = {"runner": config["runner"], "python": config["python"], "group": {group: config["groups"][group]}}
-    except KeyError as error:
-        raise NoReuse(f"the map names no {error}, so the reuse key cannot be read") from error
-    try:
-        parts["tree"] = git("rev-parse", "HEAD^{tree}", cwd=root).strip()
-    except CalledProcessError as error:
-        raise NoReuse("the tree of the checkout cannot be read") from error
-    for name, path in KEY_FILES.items():
-        try:
-            parts[name] = git("rev-parse", f"HEAD:{path}", cwd=root).strip()
-        except CalledProcessError as error:
-            raise NoReuse(f"{path} is not in the checked-out commit, so the reuse key cannot be read") from error
-    return parts
-
-
-def reuse_key(root: Path, config: dict[str, Any], group: str) -> str:
-    """The SHA-256 of the reuse key inputs of ``group``."""
-    text = json.dumps(key_parts(root, config, group), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-def job_names(config: dict[str, Any], group: str, key: str | None) -> dict[int, str]:
-    """The name of each job of ``group`` that runs, by shard (1 for a group without shards), with the key when it could be read."""
-    definition = config["groups"][group]
-    suffix = f" (key {key[:KEY_LENGTH]})" if key else ""
-    shards = definition.get("shards")
-    if not shards:
-        return {1: definition["job"] + suffix}
-    return {shard: definition["job"] + definition["shard_name"].format(shard=shard, shards=shards) + suffix for shard in range(1, shards + 1)}
-
-
-def own_runs(api: Api, context: Context, query: str) -> list[dict[str, Any]]:
-    """The push runs of this repository's own workflow on main among the answer for ``query``."""
+def own_runs(api: Api, context: Context, event: str, query: str) -> list[dict[str, Any]]:
+    """The runs of this repository's own workflow file for ``event`` among the answer for ``query``."""
     answer = api(f"repos/{context.repository}/actions/workflows/ci.yml/runs?{query}")
     return [
         run
         for run in answer["workflow_runs"]
         if run["path"] == WORKFLOW
-        and run["event"] == "push"
-        and run["head_branch"] == "main"
+        and run["event"] == event
         and run["repository"]["id"] == context.repository_id
         and run["head_repository"]["id"] == context.repository_id
     ]
 
 
-def prove_start(api: Api, context: Context, start: str) -> None:
-    """Raise ``NoReuse`` unless the latest push run of ``start`` concluded success."""
-    runs = [run for run in own_runs(api, context, f"head_sha={start}&event=push&branch=main&per_page=100") if run["head_sha"] == start]
+def newest_passed(runs: list[dict[str, Any]], what: str) -> dict[str, Any]:
+    """The newest of ``runs``, which must have completed with success."""
     if not runs:
-        raise NoReuse(f"the start commit {start} has no push run of {WORKFLOW} on main")
-    latest = max(runs, key=lambda run: (str(run["created_at"]), int(run["run_number"])))
+        raise NoReuse(f"{what} has no run of {WORKFLOW}")
+    latest = max(runs, key=lambda run: (str(run["created_at"]), int(run["run_number"]), int(run["run_attempt"])))
     if latest["status"] != "completed" or latest["conclusion"] != "success":
-        raise NoReuse(f"the run {latest['id']} of the start commit {start} is {latest['status']} and concluded {latest['conclusion']}")
+        raise NoReuse(f"the newest run {latest['id']} of {what} is {latest['status']} and concluded {latest['conclusion']}")
+    return latest
 
 
-def passed_jobs(api: Api, context: Context, tree: str, runner: str) -> dict[str, str]:
-    """The names of the jobs that passed in earlier runs with ``tree``, each with the run that proves it."""
-    runs = [run for run in own_runs(api, context, "branch=main&event=push&per_page=100") if run["head_commit"]["tree_id"] == tree]
-    passed: dict[str, str] = {}
-    for run in runs[:CANDIDATE_RUNS]:
-        answer = api(f"repos/{context.repository}/actions/runs/{run['id']}/jobs?filter=all&per_page=100")
-        jobs = answer["jobs"]
-        if answer["total_count"] != len(jobs):
-            continue
-        for job in jobs:
-            current = run["id"] == context.run_id and job["run_attempt"] == context.run_attempt
-            if current or job["name"] in passed:
-                continue
-            if job["status"] == "completed" and job["conclusion"] == "success" and job["head_sha"] == run["head_sha"] and runner in job["labels"]:
-                passed[job["name"]] = f"{run['html_url']} (attempt {job['run_attempt']})"
-    return passed
+def prove_start(api: Api, context: Context, start: str) -> None:
+    """Raise ``NoReuse`` unless the newest push run of ``start`` on main passed."""
+    runs = own_runs(api, context, "push", f"head_sha={start}&event=push&branch={MAIN}&per_page=100")
+    newest_passed([run for run in runs if run["head_sha"] == start and run["head_branch"] == MAIN], f"the base commit {start} on {MAIN}")
+
+
+def tree_of(api: Api, context: Context, commit: str) -> str:
+    tree = api(f"repos/{context.repository}/git/commits/{commit}")["tree"]["sha"]
+    if not isinstance(tree, str) or not SHA.fullmatch(tree):
+        raise NoReuse(f"the API names no tree for the commit {commit}")
+    return tree
+
+
+def merged_pull_request(api: Api, context: Context, commit: str) -> dict[str, Any]:
+    """The one pull request of this repository that was merged into main with ``commit`` as its merge commit."""
+    found = api(f"repos/{context.repository}/commits/{commit}/pulls?per_page=100")
+    merged = [pull for pull in found if pull["merged_at"] and pull["merge_commit_sha"] == commit and pull["base"]["ref"] == MAIN]
+    if not merged:
+        raise NoReuse(f"no pull request was merged into {MAIN} with the commit {commit} (a push without a pull request runs every job)")
+    if len(merged) > 1:
+        raise NoReuse(f"{len(merged)} pull requests name the commit {commit} as their merge commit")
+    pull: dict[str, Any] = merged[0]
+    if (pull["head"]["repo"] or {}).get("id") != context.repository_id:
+        raise NoReuse(f"pull request {pull['number']} comes from another repository")
+    return pull
+
+
+def passed_jobs(api: Api, context: Context, run: dict[str, Any], head: str, required: JobSet) -> list[str]:
+    """The names of the jobs of ``run`` in their latest attempt, each of which passed for ``head``, holding every required job."""
+    answer = api(f"repos/{context.repository}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
+    jobs = answer["jobs"]
+    if answer["total_count"] != len(jobs):
+        raise NoReuse(f"the run {run['id']} has {answer['total_count']} jobs and the answer holds {len(jobs)}")
+    names = [str(job["name"]) for job in jobs]
+    if len(set(names)) != len(names):
+        raise NoReuse(f"the run {run['id']} has two jobs with one name")
+    for job in jobs:
+        if job["status"] != "completed" or job["conclusion"] != "success" or job["head_sha"] != head:
+            raise NoReuse(f"the job {job['name']} of the run {run['id']} is {job['status']} and concluded {job['conclusion']} for {job['head_sha']}")
+    held = set(names)
+    known = set(required.always).union(*(runs | {idle} for runs, idle in required.groups.values()))
+    if required.always - held or held - known:
+        raise NoReuse(f"the run {run['id']} lacks {sorted(required.always - held)} or holds jobs the map does not name {sorted(held - known)}")
+    for group, (runs, idle) in required.groups.items():
+        if not ((runs <= held and idle not in held) or (idle in held and not runs & held)):
+            raise NoReuse(f"the run {run['id']} holds neither all the jobs of {group} nor only its job that did not run")
+    return sorted(names)
+
+
+def reusable_run(api: Api, context: Context, commit: str, tree: str, required: JobSet) -> Reused:
+    """The passed pull request run that the push of ``commit``, whose checkout has ``tree``, reuses; ``NoReuse`` names why there is none."""
+    pull = merged_pull_request(api, context, commit)
+    head, branch = str(pull["head"]["sha"]), str(pull["head"]["ref"])
+    if tree_of(api, context, commit) != tree:
+        raise NoReuse(f"the tree of the checkout differs from the tree that the API gives for the commit {commit}")
+    head_tree = tree_of(api, context, head)
+    if head_tree != tree:
+        raise NoReuse(f"the merged tree {tree} differs from the tree {head_tree} of the head {head} of pull request {pull['number']}")
+    runs = own_runs(api, context, "pull_request", f"head_sha={head}&event=pull_request&per_page=100")
+    run = newest_passed([run for run in runs if run["head_sha"] == head and run["head_branch"] == branch], f"the head {head} of pull request {pull['number']}")
+    return Reused(int(pull["number"]), head, tree, int(run["id"]), str(run["html_url"]), passed_jobs(api, context, run, head, required))

@@ -16,9 +16,9 @@ A file that the hooks job alone checks is on ``none``, with its reason. A file o
 changed path on no list selects every group. A changed input of the plan selects every group. The map's patterns are ``fnmatch``
 patterns matched against the whole path, and their ``*`` also matches ``/``.
 
-The changed paths are the two-dot difference of the trees of the start commit and the checkout, without rename detection, so a rename
-counts with both names, a deleted file counts and a rollback lists the files it restores. A range that cannot be verified, a map or a
-Makefile that cannot be read and an entry module that is missing all select every group.
+The changed paths of a pull request are the two-dot difference of the trees of its base commit and its head commit, without rename
+detection, so a rename counts with both names, a deleted file counts and a change that the base has and the head lacks counts too. A
+range that cannot be verified, a map or a Makefile that cannot be read and an entry module that is missing all select every group.
 
 The derivation reads Python imports. A data file that a fast test reads is not an input of the guards: the hooks job runs the same test
 on the same file in every run, and its result decides the run.
@@ -44,8 +44,8 @@ CONFIG = Path("scripts/quality/ci_groups.json")
 MAKEFILE = "Makefile"
 HOOKS = ".pre-commit-config.yaml"
 COMMIT = re.compile(r"[0-9a-f]{40}")
-EVENTS = ("push", "pull_request")
 GIT_TIMEOUT_SECONDS = 60
+NOT_RUN = ": not run"
 COMMAND = re.compile(r"make ([A-Za-z0-9_-]+)")
 TARGET = re.compile(r"([A-Za-z0-9_-]+):(?:\s|$)")
 MODULE_FLAG = re.compile(r"(?:^|\s)-m\s+([A-Za-z_][\w.]*)")
@@ -255,23 +255,22 @@ def exit_code(root: Path, *args: str) -> int:
     return run_command("git", args, cwd=root, env=env, timeout=GIT_TIMEOUT_SECONDS).returncode
 
 
-def verify_range(root: Path, event: str, start: str, run_commit: str) -> None:
-    """Raise ``Unverified`` unless ``start`` to the checkout is a range the plan can compare for ``event``."""
-    if event not in EVENTS:
-        raise Unverified(f"the event {event} has no range to compare")
+def verify_head(root: Path, head: str) -> None:
+    """Raise ``Unverified`` unless the checkout is ``head``, the commit that the run checks."""
+    if not COMMIT.fullmatch(head):
+        raise Unverified("the event names no head commit")
+    checkout = git("rev-parse", "HEAD", cwd=root).strip()
+    if checkout != head:
+        raise Unverified(f"the checkout {checkout} is not the commit of the run {head}")
+
+
+def verify_range(root: Path, start: str, head: str) -> None:
+    """Raise ``Unverified`` unless ``start`` is a commit of the checkout and the checkout is ``head``."""
     if not COMMIT.fullmatch(start) or set(start) == {"0"}:
-        raise Unverified("the push has no earlier commit (a first push) or the event names no start commit")
+        raise Unverified("the event names no base commit")
     if exit_code(root, "cat-file", "-e", f"{start}^{{commit}}") != 0:
-        raise Unverified(f"the start commit {start} is not in this checkout")
-    head = git("rev-parse", "HEAD", cwd=root).strip()
-    if head != run_commit:
-        raise Unverified(f"the checkout {head} is not the commit of the run {run_commit or 'none'}")
-    if event == "push":
-        ancestor = exit_code(root, "merge-base", "--is-ancestor", start, head)
-        if ancestor == 1:
-            raise Unverified(f"the start commit {start} is not an ancestor of {head} (a force push)")
-        if ancestor != 0:
-            raise Unverified(f"Git could not compare {start} with {head}")
+        raise Unverified(f"the base commit {start} is not in this checkout")
+    verify_head(root, head)
 
 
 def changed_paths(root: Path, start: str, end: str) -> list[str]:
@@ -288,6 +287,24 @@ def widening(config: dict[str, Any], inputs: dict[str, Inputs], changed: list[st
             return f"{path} changes what the plan runs ({reason})"
     missing = unmapped(changed, config, inputs)
     return f"{missing[0]} is on no list of {CONFIG}" if missing else None
+
+
+def job_names(config: dict[str, Any], group: str) -> dict[int, str]:
+    """The name of each job of ``group`` when it runs, by shard (1 for a group without shards)."""
+    definition = config["groups"][group]
+    shards = definition.get("shards")
+    if not shards:
+        return {1: definition["job"]}
+    return {shard: definition["job"] + definition["shard_name"].format(shard=shard, shards=shards) for shard in range(1, shards + 1)}
+
+
+def idle_name(config: dict[str, Any], group: str) -> str:
+    """The name of the one job of ``group`` when it does not run."""
+    return str(config["groups"][group]["job"]) + NOT_RUN
+
+
+def selectable(config: dict[str, Any]) -> list[str]:
+    return [name for name, group in config["groups"].items() if not group.get("always")]
 
 
 def select(config: dict[str, Any], inputs: dict[str, Inputs], changed: list[str] | None, everything: str) -> dict[str, Decision]:

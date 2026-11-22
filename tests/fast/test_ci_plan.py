@@ -1,14 +1,15 @@
-"""The CI plan: which job groups a change selects, which passed groups an identical tree reuses, and what the run's summary says.
+"""The CI plan: which job groups a pull request selects, which passed pull request run a push to main reuses, and what the run says.
 
 Failure modes covered here, each with a planted case and a control:
 
-- A tracked file maps to no group, so a change to it is judged by a list that does not know it.
-- The changed paths miss a file: the old name of a rename, a deleted file, or the files a rollback restores (a three-dot range drops them).
-- A range the plan cannot verify selects fewer groups: a first push, an unknown commit, a force push, a checkout that is not the run's commit,
-  a start commit whose own run did not pass or an answer of the API that cannot be read.
+- A tracked file is an input of no job and on no list, so a change to it is judged by a map that does not know it.
+- A group's inputs miss a module that its commands start or import, or a path that the guard suite writes in its copy of the tree.
+- The changed paths miss a file: the old name of a rename, a deleted file, or a change that the base has and the head lacks.
+- A pull request skips a group although its range cannot be verified: no base, an unknown base, a checkout that is not its head, a base
+  whose newest run on main did not pass, or an answer of the API that cannot be read or comes too late.
 - A path on no list, or a change to the plan or the workflow, selects fewer than every group.
-- The reuse key ignores one of its inputs, or a missing input still yields a key.
-- A passed group is reused from a run that is not this repository's own push run on main with the same key, tree, runner and success.
+- A push to main reuses a run that is not the newest passed pull request run of the merged head with the pushed tree and every required
+  job, or reuses anything when the checkout is not the pushed commit; a push without a pull request runs fewer than every group.
 - A skipped or reused group is shown without its reason, or the record that the jobs read names the wrong jobs.
 """
 
@@ -37,34 +38,33 @@ from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository, f
 
 REPOSITORY = "owner/project"
 REPOSITORY_ID = 7
-RUN_ID = 900
 ZERO = "0" * 40
 WORKFLOW_TEXT = (ROOT / ci_reuse.WORKFLOW).read_text()
 CONFIG = ci_groups.load(ROOT)
-RUNNER = CONFIG["runner"]
 
 
 class FakeGitHub:
-    """The answers of the GitHub API for the workflow runs and their jobs, with every requested path kept."""
+    """The answers of the GitHub API for workflow runs, their jobs, the pull requests of a commit and commit trees, with every path kept."""
 
     def __init__(self) -> None:
         self.runs: list[dict[str, Any]] = []
         self.jobs: dict[int, list[dict[str, Any]]] = {}
+        self.pulls: dict[str, list[dict[str, Any]]] = {}
+        self.trees: dict[str, str] = {}
         self.paths: list[str] = []
         self.broken = False
         self.short_job_pages: set[int] = set()
 
-    def add_run(self, run_id: int, head: str, tree: str, *, conclusion: str = "success", **fields: Any) -> None:
+    def add_run(self, run_id: int, head: str, *, event: str = "push", branch: str = "main", conclusion: str | None = "success", **fields: Any) -> None:
         run = {
             "id": run_id,
             "run_number": run_id,
             "run_attempt": 1,
             "created_at": f"2026-11-21T10:{run_id % 60:02d}:00Z",
             "path": ci_reuse.WORKFLOW,
-            "event": "push",
-            "head_branch": "main",
+            "event": event,
+            "head_branch": branch,
             "head_sha": head,
-            "head_commit": {"id": head, "tree_id": tree},
             "status": "completed",
             "conclusion": conclusion,
             "html_url": f"https://github.example.invalid/runs/{run_id}",
@@ -75,10 +75,19 @@ class FakeGitHub:
         self.runs.append(run)
         self.jobs.setdefault(run_id, [])
 
-    def add_job(self, run_id: int, name: str, *, conclusion: str = "success", attempt: int = 1, label: str = RUNNER, head: str | None = None) -> None:
+    def add_job(self, run_id: int, name: str, *, conclusion: str = "success", status: str = "completed", head: str | None = None) -> None:
         run = next(run for run in self.runs if run["id"] == run_id)
-        job = {"name": name, "status": "completed", "conclusion": conclusion, "run_attempt": attempt, "labels": [label], "head_sha": head or run["head_sha"]}
-        self.jobs[run_id].append(job)
+        self.jobs[run_id].append({"name": name, "status": status, "conclusion": conclusion, "head_sha": head or run["head_sha"]})
+
+    def add_pull(self, commit: str, number: int, head: str, *, branch: str = "feature") -> None:
+        pull = {
+            "number": number,
+            "merged_at": "2026-11-21T11:00:00Z",
+            "merge_commit_sha": commit,
+            "base": {"ref": "main"},
+            "head": {"sha": head, "ref": branch, "repo": {"id": REPOSITORY_ID}},
+        }
+        self.pulls.setdefault(commit, []).append(pull)
 
     def __call__(self, path: str) -> Any:
         self.paths.append(path)
@@ -90,10 +99,14 @@ class FakeGitHub:
         if url.path == f"repos/{REPOSITORY}/actions/workflows/ci.yml/runs":
             runs = [run for run in self.runs if "head_sha" not in query or run["head_sha"] == query["head_sha"][0]]
             return {"total_count": len(runs), "workflow_runs": runs}
-        if url.path.startswith(f"repos/{REPOSITORY}/actions/runs/") and parts[-1] == "jobs":
+        if url.path.startswith(f"repos/{REPOSITORY}/actions/runs/") and parts[-1] == "jobs" and query.get("filter") == ["latest"]:
             jobs = self.jobs[int(parts[-2])]
             return {"total_count": len(jobs) + (1 if int(parts[-2]) in self.short_job_pages else 0), "jobs": jobs}
-        raise ci_reuse.ApiError(f"no answer for {url.path}")
+        if url.path.startswith(f"repos/{REPOSITORY}/commits/") and parts[-1] == "pulls":
+            return self.pulls.get(parts[-2], [])
+        if url.path.startswith(f"repos/{REPOSITORY}/git/commits/") and parts[-1] in self.trees:
+            return {"sha": parts[-1], "tree": {"sha": self.trees[parts[-1]]}}
+        raise ci_reuse.ApiError(f"GET {url.path} answered 404")
 
 
 class PlanRepository(TemporaryRepository):
@@ -142,27 +155,31 @@ class PlanRepository(TemporaryRepository):
     def head(self) -> str:
         return self.git("rev-parse", "HEAD").stdout.strip()
 
-    def tree(self) -> str:
-        return self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+    def tree(self, commit: str = "HEAD") -> str:
+        return self.git("rev-parse", f"{commit}^{{tree}}").stdout.strip()
 
     def passed(self, *commits: str) -> None:
+        """A passed push run on main for each of ``commits``."""
         for number, commit in enumerate(commits, 1):
-            self.github.add_run(number, commit, git("rev-parse", f"{commit}^{{tree}}", cwd=self.repo).strip())
+            self.github.add_run(number, commit)
 
-    def environment(self, head: str | None = None) -> dict[str, str]:
-        return {
-            "GITHUB_SHA": head or self.head(),
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "GITHUB_REPOSITORY_ID": str(REPOSITORY_ID),
-            "GITHUB_RUN_ID": str(RUN_ID),
-            "GITHUB_RUN_ATTEMPT": "1",
-        }
+    def environment(self, sha: str | None = None, ref: str = "refs/heads/main") -> dict[str, str]:
+        return {"GITHUB_SHA": sha or self.head(), "GITHUB_REF": ref, "GITHUB_REPOSITORY": REPOSITORY, "GITHUB_REPOSITORY_ID": str(REPOSITORY_ID)}
 
-    def plan(self, start: str, *, event: str = "push", head: str | None = None) -> dict[str, Any]:
-        return ci_plan.plan(self.repo, event, start, self.environment(head), self.github)
+    def plan(self, start: str, *, event: str = "pull_request", head: str | None = None) -> dict[str, Any]:
+        """The plan of a pull request from ``start`` to ``head`` (the checkout by default), or of another event with that range."""
+        return ci_plan.plan(self.repo, event, start, head or self.head(), self.environment(), self.github)
+
+    def push(self, *, sha: str | None = None, head: str | None = None, ref: str = "refs/heads/main") -> dict[str, Any]:
+        """The plan of a push of ``sha`` (the checkout by default) to ``ref``, as the workflow passes it."""
+        sha = sha or self.head()
+        return ci_plan.plan(self.repo, "push", "", head or sha, self.environment(sha, ref), self.github)
 
     def runs(self, record: dict[str, Any]) -> dict[str, bool]:
         return {group: decision["run"] for group, decision in record["groups"].items()}
+
+    def shards(self, record: dict[str, Any]) -> list[int]:
+        return [entry["shard"] for entry in record["groups"]["guards"]["matrix"]["include"] if entry["run"]]
 
 
 ALL = {"hooks": True, "infra": True, "guards": True}
@@ -203,7 +220,7 @@ class DerivedInputsTest(PlanRepository):
         self.passed(self.base)
         target = self.repo / path
         self.commit({path: content if content is not None else (target.read_text() if target.is_file() else "") + "# changed\n"})
-        return self.plan(self.base, event="pull_request")
+        return self.plan(self.base)
 
     def test_a_module_that_the_setup_imports_selects_the_infrastructure(self) -> None:
         for path in ("scripts/process.py", "scripts/quality/worktree_scan_hook.py", "scripts/quality/install_tools.py"):
@@ -292,25 +309,32 @@ class ImportMapTest(unittest.TestCase):
             ci_groups.group_inputs(ROOT, config)
 
 
-class SelectionTest(PlanRepository):
-    def test_a_push_that_changes_a_guarded_path_selects_the_guards(self) -> None:
+class PullRequestSelectionTest(PlanRepository):
+    """A pull request runs the groups whose inputs its range changes, and every group when the range or its base cannot be trusted."""
+
+    def test_a_change_to_a_guard_input_selects_the_guards(self) -> None:
         self.passed(self.base)
         self.commit({"tests/fast/test_new.py": "NEW = 1\n"})
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), GUARDS)
         self.assertIn("tests/fast/test_new.py", record["groups"]["guards"]["reason"])
 
-    def test_a_push_that_changes_only_unguarded_paths_skips_both_groups(self) -> None:
+    def test_a_change_that_no_job_reads_skips_both_groups(self) -> None:
         self.passed(self.base)
         self.commit({"README.md": "changed\n"})
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), HOOKS_ONLY)
         self.assertIn("none of the 1 changed paths", record["groups"]["guards"]["reason"])
 
+    def test_a_change_to_the_terraform_code_selects_its_checks_alone(self) -> None:
+        self.passed(self.base)
+        self.commit({"infra/main.tf": "# changed\n"})
+        self.assertEqual(self.runs(self.plan(self.base)), {"hooks": True, "infra": True, "guards": False})
+
     def test_a_rename_counts_its_old_name(self) -> None:
         self.passed(self.base)
         self.git("mv", "tests/fast/test_repo_checks.py", "tests/e2e/test_repo_checks.py")
-        self.git("commit", "--quiet", "-m", "chore: move the check")
+        self.git("commit", "--quiet", "-m", "chore: move the test")
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), GUARDS)
         self.assertIn("tests/fast/test_repo_checks.py", record["groups"]["guards"]["reason"])
@@ -318,73 +342,94 @@ class SelectionTest(PlanRepository):
     def test_a_rename_counts_its_new_name(self) -> None:
         self.passed(self.base)
         self.git("mv", "tests/e2e/ci_plan.py", "tests/fast/ci_plan.py")
-        self.git("commit", "--quiet", "-m", "chore: move the host code")
+        self.git("commit", "--quiet", "-m", "chore: move the acceptance test")
         self.assertEqual(self.runs(self.plan(self.base)), GUARDS)
 
-    def test_a_rename_between_unguarded_paths_skips_the_guards(self) -> None:
+    def test_a_rename_between_paths_that_no_job_reads_skips_the_guards(self) -> None:
         self.passed(self.base)
         self.git("mv", "tests/e2e/ci_plan.py", "tests/e2e/ci_plan_moved.py")
-        self.git("commit", "--quiet", "-m", "chore: rename the host code")
+        self.git("commit", "--quiet", "-m", "chore: rename the acceptance test")
         self.assertEqual(self.runs(self.plan(self.base)), HOOKS_ONLY)
 
-    def test_a_deleted_guarded_file_selects_the_guards(self) -> None:
+    def test_a_deleted_guard_input_selects_the_guards(self) -> None:
         self.passed(self.base)
         self.commit({"tests/fast/test_tool_boundaries.py": None})
         self.assertEqual(self.runs(self.plan(self.base)), GUARDS)
 
-    def test_a_deleted_unguarded_file_skips_the_guards(self) -> None:
+    def test_a_deleted_file_that_no_job_reads_skips_the_guards(self) -> None:
         self.passed(self.base)
         self.commit({"scripts/evidence/export.py": None})
         self.assertEqual(self.runs(self.plan(self.base)), HOOKS_ONLY)
 
-    def test_a_rollback_lists_the_files_it_restores(self) -> None:
-        older = self.commit({"README.md": "one\n"})
-        newer = self.commit({"tests/fast/test_repo_checks.py": "CHANGED = 1\n"})
-        self.assertIn("tests/fast/test_repo_checks.py", ci_groups.changed_paths(self.repo, newer, older))
+    def test_a_change_that_the_base_has_and_the_head_lacks_counts(self) -> None:
+        head = self.commit({"README.md": "head\n"})
+        self.git("checkout", "--quiet", "--detach", self.base)
+        newer_base = self.commit({"tests/fast/test_repo_checks.py": "CHANGED = 1\n"})
+        self.passed(newer_base)
+        self.git("checkout", "--quiet", head)
+        record = self.plan(newer_base)
+        self.assertEqual(self.runs(record), GUARDS)
+        self.assertIn("tests/fast/test_repo_checks.py", record["groups"]["guards"]["reason"])
 
-    def test_a_first_push_selects_every_group(self) -> None:
-        record = self.plan(ZERO)
-        self.assertEqual(self.runs(record), ALL)
-        self.assertIn("no earlier commit", record["range"])
+    def test_no_base_commit_selects_every_group(self) -> None:
+        self.commit({"README.md": "changed\n"})
+        for start in ("", ZERO):
+            with self.subTest(start=start):
+                record = self.plan(start)
+                self.assertEqual(self.runs(record), ALL)
+                self.assertIn("names no base commit", record["basis"])
 
-    def test_an_unknown_start_commit_selects_every_group(self) -> None:
+    def test_a_base_that_is_not_in_the_checkout_selects_every_group(self) -> None:
         record = self.plan("1" * 40)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn("not in this checkout", record["range"])
+        self.assertIn("not in this checkout", record["basis"])
 
-    def test_a_force_push_selects_every_group(self) -> None:
-        newer = self.commit({"README.md": "newer\n"})
-        self.passed(self.base, newer)
-        self.git("reset", "--quiet", "--hard", self.base)
-        self.commit({"scripts/infra/host.py": "HOST = 2\n"})
-        record = self.plan(newer)
-        self.assertEqual(self.runs(record), ALL)
-        self.assertIn("not an ancestor", record["range"])
-
-    def test_a_checkout_that_is_not_the_run_commit_selects_every_group(self) -> None:
+    def test_a_checkout_that_is_not_the_head_selects_every_group(self) -> None:
         self.passed(self.base)
-        self.commit({"README.md": "changed\n"})
-        record = self.plan(self.base, head=self.base)
+        head = self.commit({"README.md": "changed\n"})
+        self.git("checkout", "--quiet", "--detach", self.base)
+        record = self.plan(self.base, head=head)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn("is not the commit of the run", record["range"])
+        self.assertIn("is not the commit of the run", record["basis"])
 
-    def test_a_start_commit_whose_run_failed_selects_every_group(self) -> None:
-        self.github.add_run(1, self.base, "tree", conclusion="failure")
-        self.commit({"README.md": "changed\n"})
-        record = self.plan(self.base)
-        self.assertEqual(self.runs(record), ALL)
-        self.assertIn("concluded failure", record["range"])
-
-    def test_a_start_commit_with_no_run_selects_every_group(self) -> None:
+    def test_a_base_whose_newest_run_failed_selects_every_group(self) -> None:
+        self.github.add_run(1, self.base)
+        self.github.add_run(2, self.base, conclusion="failure")
         self.commit({"README.md": "changed\n"})
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn("no push run", record["range"])
+        self.assertIn("the newest run 2 of the base commit", record["basis"])
 
-    def test_a_start_run_of_another_repository_does_not_prove_the_start(self) -> None:
-        self.github.add_run(1, self.base, "tree", head_repository={"id": REPOSITORY_ID + 1})
+    def test_a_base_whose_newest_attempt_failed_selects_every_group(self) -> None:
+        self.github.add_run(1, self.base, run_attempt=2, conclusion="failure")
         self.commit({"README.md": "changed\n"})
         self.assertEqual(self.runs(self.plan(self.base)), ALL)
+
+    def test_a_base_whose_newest_run_is_in_progress_selects_every_group(self) -> None:
+        self.github.add_run(1, self.base)
+        self.github.add_run(2, self.base, status="in_progress", conclusion=None)
+        self.commit({"README.md": "changed\n"})
+        self.assertEqual(self.runs(self.plan(self.base)), ALL)
+
+    def test_a_base_with_no_trusted_run_on_main_selects_every_group(self) -> None:
+        planted: dict[str, dict[str, Any]] = {
+            "no run": {},
+            "a pull request run of the base": {"event": "pull_request"},
+            "a run on another branch": {"branch": "feature"},
+            "a run of another repository": {"repository": {"id": REPOSITORY_ID + 1}},
+            "a run of a fork": {"head_repository": {"id": REPOSITORY_ID + 1}},
+            "a run of another workflow": {"path": ".github/workflows/deploy.yml"},
+        }
+        self.commit({"README.md": "changed\n"})
+        for label, fields in planted.items():
+            with self.subTest(label=label):
+                self.github = FakeGitHub()
+                if fields:
+                    self.github.add_run(1, self.base, **fields)
+                self.assertEqual(self.runs(self.plan(self.base)), ALL)
+        self.github = FakeGitHub()
+        self.passed(self.base)
+        self.assertEqual(self.runs(self.plan(self.base)), HOOKS_ONLY)
 
     def test_an_api_error_selects_every_group(self) -> None:
         self.passed(self.base)
@@ -392,19 +437,18 @@ class SelectionTest(PlanRepository):
         self.commit({"README.md": "changed\n"})
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn("502", record["range"])
+        self.assertIn("502", record["basis"])
 
     def test_an_api_past_its_deadline_selects_every_group(self) -> None:
-        self.passed(self.base)
         self.commit({"README.md": "changed\n"})
         api = ci_reuse.github_api(SlowApi(self, pause=0.2).url, "token", deadline_seconds=0.5)
-        record = ci_plan.plan(self.repo, "push", self.base, self.environment(), api)
+        record = ci_plan.plan(self.repo, "pull_request", self.base, self.head(), self.environment(), api)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn("deadline of 0.5 seconds", record["range"])
+        self.assertIn("deadline of 0.5 seconds", record["basis"])
 
     def test_no_api_selects_every_group(self) -> None:
         self.commit({"README.md": "changed\n"})
-        record = ci_plan.plan(self.repo, "push", self.base, self.environment(), None)
+        record = ci_plan.plan(self.repo, "pull_request", self.base, self.head(), self.environment(), None)
         self.assertEqual(self.runs(record), ALL)
 
     def test_a_path_on_no_list_selects_every_group(self) -> None:
@@ -412,176 +456,210 @@ class SelectionTest(PlanRepository):
         self.commit({"planned/new.txt": "new\n"})
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn("planned/new.txt is on no list", record["range"])
+        self.assertIn("planned/new.txt is on no list", record["basis"])
 
     def test_a_change_to_the_workflow_selects_every_group(self) -> None:
         self.passed(self.base)
-        self.commit({ci_reuse.WORKFLOW: "name: ci changed\n"})
+        self.commit({ci_reuse.WORKFLOW: (self.repo / ci_reuse.WORKFLOW).read_text() + "# changed\n"})
         record = self.plan(self.base)
         self.assertEqual(self.runs(record), ALL)
-        self.assertIn(ci_reuse.WORKFLOW, record["range"])
+        self.assertIn(ci_reuse.WORKFLOW, record["basis"])
 
     def test_another_event_selects_every_group(self) -> None:
         self.passed(self.base)
         self.commit({"README.md": "changed\n"})
-        self.assertEqual(self.runs(self.plan(self.base, event="workflow_dispatch")), ALL)
-
-    def test_a_pull_request_compares_its_base_with_the_checkout(self) -> None:
-        self.passed(self.base)
-        self.commit({"infra/main.tf": "# changed\n"})
-        self.assertEqual(self.runs(self.plan(self.base, event="pull_request")), {"hooks": True, "infra": True, "guards": False})
-
-    def test_a_pull_request_that_changes_only_unguarded_paths_skips_both_groups(self) -> None:
-        self.passed(self.base)
-        self.commit({"README.md": "changed\n"})
-        self.assertEqual(self.runs(self.plan(self.base, event="pull_request")), HOOKS_ONLY)
+        record = self.plan(self.base, event="workflow_dispatch")
+        self.assertEqual(self.runs(record), ALL)
+        self.assertNotIn("reused", record)
 
 
-class ReuseKeyTest(PlanRepository):
-    def key(self, config: dict[str, Any] | None = None, group: str = "guards") -> str:
-        return ci_reuse.reuse_key(self.repo, config or ci_groups.load(self.repo), group)
+class PushReuseTest(PlanRepository):
+    """A push to main reuses only the newest passed run of the merged pull request's head, and only for the same tree."""
 
-    def test_the_key_is_the_same_for_the_same_inputs(self) -> None:
-        self.assertEqual(self.key(), self.key())
-        self.assertNotEqual(self.key(group="guards"), self.key(group="infra"))
-
-    def test_each_file_input_changes_the_key(self) -> None:
-        for path in (ci_reuse.WORKFLOW, "requirements.txt", "scripts/quality/install_tools.py", "README.md"):
-            with self.subTest(path=path):
-                before = self.key()
-                self.commit({path: (self.repo / path).read_text() + "# changed\n"})
-                self.assertNotEqual(self.key(), before)
-
-    def test_each_file_input_is_a_part_of_the_key(self) -> None:
-        parts = ci_reuse.key_parts(self.repo, ci_groups.load(self.repo), "guards")
-        self.assertEqual(parts["tree"], self.tree())
-        for name, path in (("workflow", ci_reuse.WORKFLOW), ("requirements", "requirements.txt"), ("tools", "scripts/quality/install_tools.py")):
-            before = parts[name]
-            self.commit({path: (self.repo / path).read_text() + "# changed\n"})
-            self.assertNotEqual(ci_reuse.key_parts(self.repo, ci_groups.load(self.repo), "guards")[name], before, name)
-
-    def test_the_runner_the_python_and_the_group_definition_change_the_key(self) -> None:
-        before = self.key()
-        for change in ({"runner": "ubuntu-26.04"}, {"python": "3.15"}):
-            with self.subTest(change=change):
-                self.assertNotEqual(self.key({**ci_groups.load(self.repo), **change}), before)
-        config = ci_groups.load(self.repo)
-        config["groups"]["guards"]["shards"] = 9
-        self.assertNotEqual(self.key(config), before)
-
-    def test_a_missing_input_refuses_a_key(self) -> None:
-        for path in (ci_reuse.WORKFLOW, "requirements.txt", "scripts/quality/install_tools.py"):
-            with self.subTest(path=path):
-                kept = (self.repo / path).read_text()
-                self.commit({path: None})
-                with self.assertRaisesRegex(ci_reuse.NoReuse, re.escape(path)):
-                    self.key()
-                self.commit({path: kept})
-
-    def test_an_unknown_group_or_runner_refuses_a_key(self) -> None:
-        with self.assertRaises(ci_reuse.NoReuse):
-            self.key(group="unknown")
-        config = ci_groups.load(self.repo)
-        del config["runner"]
-        with self.assertRaises(ci_reuse.NoReuse):
-            self.key(config)
-
-
-class ReuseTest(PlanRepository):
     def setUp(self) -> None:
         super().setUp()
         self.passed(self.base)
-        self.commit({"tests/fast/test_new.py": "NEW = 1\n"})
-        self.key = ci_reuse.reuse_key(self.repo, ci_groups.load(self.repo), "guards")
-        self.names = ci_reuse.job_names(ci_groups.load(self.repo), "guards", self.key)
+        self.pull_head = self.commit({"tests/fast/test_new.py": "NEW = 1\n", "infra/main.tf": "# changed\n"})
+        self.merged = self.merge(self.pull_head)
+        self.pull_run(60)
 
-    def earlier_run(self, run_id: int = 50, *, skip: tuple[int, ...] = (), **fields: Any) -> None:
-        self.github.add_run(run_id, self.head(), self.tree(), **fields)
-        for shard, name in self.names.items():
-            if shard not in skip:
+    def merge(self, head: str, number: int = 5) -> str:
+        """A squash merge of ``head`` onto the first commit, checked out as main, with its pull request and both trees known to the API."""
+        merged = self.git("commit-tree", self.tree(head), "-p", self.base, "-m", "feat: merge the pull request").stdout.strip()
+        self.git("checkout", "--quiet", "--detach", merged)
+        self.github.add_pull(merged, number, head)
+        self.github.trees |= {merged: self.tree(merged), head: self.tree(head)}
+        return merged
+
+    def pull_run(self, run_id: int, *, idle: tuple[str, ...] = (), skip: tuple[str, ...] = (), **fields: Any) -> list[str]:
+        """A pull request run of the head with every required job passed: the plan, the hooks and each group, ``idle`` ones as not run."""
+        self.github.add_run(run_id, self.pull_head, **({"event": "pull_request", "branch": "feature"} | fields))
+        names = [CONFIG["plan"]["job"], CONFIG["groups"]["hooks"]["job"]]
+        for group in ("infra", "guards"):
+            names += [ci_groups.idle_name(CONFIG, group)] if group in idle else list(ci_groups.job_names(CONFIG, group).values())
+        for name in names:
+            if name not in skip:
                 self.github.add_job(run_id, name)
+        return names
 
-    def guards(self, record: dict[str, Any]) -> list[int]:
-        return [entry["shard"] for entry in record["groups"]["guards"]["matrix"]["include"]]
+    def test_a_merge_with_the_pull_requests_tree_reuses_its_passed_run(self) -> None:
+        record = self.push()
+        self.assertEqual(self.runs(record), HOOKS_ONLY)
+        self.assertEqual(self.shards(record), [])
+        self.assertEqual(record["reused"]["run_url"], "https://github.example.invalid/runs/60")
+        self.assertEqual((record["reused"]["pull_request"], record["reused"]["head"], record["reused"]["tree"]), (5, self.pull_head, self.tree()))
+        self.assertIn("reused: every required job passed on this tree in https://github.example.invalid/runs/60", record["groups"]["guards"]["reason"])
+        self.assertEqual(record["groups"]["hooks"]["run"], True)
 
-    def test_an_earlier_passed_run_with_the_same_key_is_reused(self) -> None:
-        self.earlier_run()
-        record = self.plan(self.base)
-        self.assertFalse(record["groups"]["guards"]["run"])
-        self.assertEqual(self.guards(record), [0])
-        self.assertIn("https://github.example.invalid/runs/50", record["groups"]["guards"]["reason"])
+    def test_a_pull_request_run_that_skipped_a_group_is_reused(self) -> None:
+        self.github = FakeGitHub()
+        self.merge(self.pull_head)
+        self.pull_run(61, idle=("infra",))
+        self.assertEqual(self.runs(self.push()), HOOKS_ONLY)
 
-    def test_without_an_earlier_run_every_shard_runs(self) -> None:
-        record = self.plan(self.base)
-        self.assertEqual(self.guards(record), list(range(1, 9)))
+    def test_a_merge_with_another_tree_runs_every_group(self) -> None:
+        other = self.commit({"README.md": "a change that main had and the pull request lacked\n"})
+        self.github.add_pull(other, 6, self.pull_head)
+        self.github.trees[other] = self.tree(other)
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertEqual(self.shards(record), list(range(1, 9)))
+        self.assertIn("differs from the tree", record["basis"])
+        self.assertNotIn("reused", record)
 
-    def test_shards_that_passed_in_two_runs_are_reused_together(self) -> None:
-        self.earlier_run(50, skip=(8,))
-        self.earlier_run(51, skip=(1, 2, 3, 4, 5, 6, 7))
-        self.assertEqual(self.guards(self.plan(self.base)), [0])
+    def test_a_push_without_a_pull_request_runs_every_group(self) -> None:
+        self.commit({"README.md": "a direct push\n"})
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("no pull request was merged", record["basis"])
 
-    def test_only_the_shards_that_did_not_pass_run(self) -> None:
-        self.earlier_run(50, skip=(3,))
-        record = self.plan(self.base)
-        self.assertEqual(self.guards(record), [3])
-        self.assertIn("reused", record["groups"]["guards"]["reason"])
+    def test_a_newer_failed_run_is_not_overridden_by_an_older_pass(self) -> None:
+        self.github.add_run(62, self.pull_head, event="pull_request", branch="feature", conclusion="failure")
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("the newest run 62", record["basis"])
 
-    def test_a_run_that_cannot_be_trusted_is_not_reused(self) -> None:
-        planted: dict[str, dict[str, Any]] = {
-            "a failed job": {"job": {"conclusion": "failure"}},
-            "another runner": {"job": {"label": "ubuntu-22.04"}},
-            "another commit in the job": {"job": {"head": "2" * 40}},
-            "the current attempt": {"run": {"id": RUN_ID, "run_attempt": 1}},
-            "another workflow": {"run": {"path": ".github/workflows/deploy.yml"}},
-            "a pull request run": {"run": {"event": "pull_request"}},
-            "another branch": {"run": {"head_branch": "feature"}},
-            "a fork": {"run": {"head_repository": {"id": REPOSITORY_ID + 1}}},
-            "another tree": {"run": {"head_commit": {"id": "x", "tree_id": "3" * 40}}},
-            "another key": {"names": "other"},
+    def test_a_newer_failed_attempt_is_not_overridden_by_an_older_pass(self) -> None:
+        self.github = FakeGitHub()
+        self.merge(self.pull_head)
+        third = ci_groups.job_names(CONFIG, "guards")[3]
+        self.pull_run(63, skip=(third,), run_attempt=2, conclusion="failure")
+        self.github.add_job(63, third, conclusion="failure")
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("concluded failure", record["basis"])
+
+    def test_a_failed_job_of_the_latest_attempt_refuses_reuse(self) -> None:
+        self.github = FakeGitHub()
+        self.merge(self.pull_head)
+        third = ci_groups.job_names(CONFIG, "guards")[3]
+        self.pull_run(64, skip=(third,))
+        self.github.add_job(64, third, conclusion="failure")
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("shard 3 of 8 of the run 64", record["basis"])
+
+    def test_a_run_without_every_required_job_is_not_reused(self) -> None:
+        guards = ci_groups.job_names(CONFIG, "guards")
+        planted: dict[str, tuple[tuple[str, ...], list[tuple[str, dict[str, Any]]]]] = {
+            "no hooks job": ((CONFIG["groups"]["hooks"]["job"],), []),
+            "no plan job": ((CONFIG["plan"]["job"],), []),
+            "seven of eight shards": ((guards[8],), []),
+            "a group both run and not run": ((), [(ci_groups.idle_name(CONFIG, "guards"), {})]),
+            "a job the map does not name": ((), [("Another job", {})]),
+            "two jobs with one name": ((), [(guards[1], {})]),
+            "a job of another commit": ((guards[2],), [(guards[2], {"head": "2" * 40})]),
+            "a job still running": ((guards[2],), [(guards[2], {"status": "in_progress"})]),
         }
-        for label, change in planted.items():
+        for label, (skip, extra) in planted.items():
             with self.subTest(label=label):
                 self.github = FakeGitHub()
-                self.passed(self.base)
-                run_id = change.get("run", {}).get("id", 50)
-                self.github.add_run(run_id, self.head(), self.tree(), **{name: value for name, value in change.get("run", {}).items() if name != "id"})
-                names = ci_reuse.job_names(ci_groups.load(self.repo), "guards", "f" * 64) if "names" in change else self.names
-                for name in names.values():
-                    self.github.add_job(run_id, name, **change.get("job", {}))
-                self.assertEqual(self.guards(self.plan(self.base)), list(range(1, 9)))
+                self.merge(self.pull_head)
+                self.pull_run(70, skip=skip)
+                for name, fields in extra:
+                    self.github.add_job(70, name, **fields)
+                self.assertEqual(self.runs(self.push()), ALL)
+        self.github = FakeGitHub()
+        self.merge(self.pull_head)
+        self.pull_run(70)
+        self.github.short_job_pages.add(70)
+        self.assertIn("the answer holds", self.push()["basis"])
 
-    def test_an_earlier_attempt_of_the_same_run_is_reused(self) -> None:
-        self.github.add_run(RUN_ID, self.head(), self.tree(), run_attempt=2)
-        for name in self.names.values():
-            self.github.add_job(RUN_ID, name, attempt=1)
-        record = ci_plan.plan(self.repo, "push", self.base, {**self.environment(), "GITHUB_RUN_ATTEMPT": "2"}, self.github)
-        self.assertEqual(self.guards(record), [0])
+    def test_a_run_that_is_not_the_pull_requests_own_is_not_reused(self) -> None:
+        planted: dict[str, dict[str, Any]] = {
+            "a push run": {"event": "push"},
+            "another head branch": {"head_branch": "other"},
+            "another workflow": {"path": ".github/workflows/deploy.yml"},
+            "a fork": {"head_repository": {"id": REPOSITORY_ID + 1}},
+            "another repository": {"repository": {"id": REPOSITORY_ID + 1}},
+            "a run still in progress": {"status": "in_progress", "conclusion": None},
+        }
+        for label, fields in planted.items():
+            with self.subTest(label=label):
+                self.github = FakeGitHub()
+                self.merge(self.pull_head)
+                self.pull_run(71, **fields)
+                self.assertEqual(self.runs(self.push()), ALL)
 
-    def test_an_incomplete_job_list_is_not_reused(self) -> None:
-        self.earlier_run()
-        self.github.short_job_pages.add(50)
-        self.assertEqual(self.guards(self.plan(self.base)), list(range(1, 9)))
+    def test_a_pull_request_that_cannot_be_trusted_is_not_reused(self) -> None:
+        planted: dict[str, dict[str, Any]] = {
+            "from a fork": {"head": {"sha": self.pull_head, "ref": "feature", "repo": {"id": REPOSITORY_ID + 1}}},
+            "from a deleted fork": {"head": {"sha": self.pull_head, "ref": "feature", "repo": None}},
+            "into another branch": {"base": {"ref": "release"}},
+            "not merged": {"merged_at": None},
+            "merged as another commit": {"merge_commit_sha": "5" * 40},
+        }
+        for label, fields in planted.items():
+            with self.subTest(label=label):
+                self.github = FakeGitHub()
+                self.merge(self.pull_head)
+                self.pull_run(72)
+                self.github.pulls[self.merged][0].update(fields)
+                self.assertEqual(self.runs(self.push()), ALL)
 
-    def test_an_api_error_during_reuse_runs_every_shard(self) -> None:
-        self.earlier_run()
-        answer = self.github
+    def test_two_merged_pull_requests_of_one_commit_refuse_reuse(self) -> None:
+        self.github.add_pull(self.merged, 9, self.pull_head)
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("2 pull requests", record["basis"])
 
-        def broken_after_the_start_check(path: str) -> Any:
-            if "head_sha=" not in path:
-                raise ci_reuse.ApiError("the API answered 502")
-            return answer(path)
+    def test_a_checkout_that_is_not_the_pushed_commit_reuses_nothing(self) -> None:
+        pushed = self.commit({"tests/fast/test_other.py": "OTHER = 1\n"})
+        self.github.add_pull(pushed, 7, self.pull_head)
+        self.github.trees[pushed] = self.tree(pushed)
+        self.git("checkout", "--quiet", "--detach", self.merged)
+        record = self.push(sha=pushed)
+        self.assertEqual(self.runs(record), ALL)
+        self.assertEqual(self.shards(record), list(range(1, 9)))
+        self.assertIn("is not the commit of the run", record["basis"])
+        self.assertNotIn("reused", record)
 
-        record = ci_plan.plan(self.repo, "push", self.base, self.environment(), broken_after_the_start_check)
-        self.assertEqual(self.guards(record), list(range(1, 9)))
-        self.assertIn("502", record["groups"]["guards"]["reason"])
+    def test_a_head_that_is_not_the_pushed_commit_reuses_nothing(self) -> None:
+        record = self.push(head=self.pull_head)
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("is not the pushed commit", record["basis"])
 
-    def test_the_hooks_are_never_reused(self) -> None:
-        self.earlier_run()
-        config = ci_groups.load(self.repo)
-        for key in (None, ci_reuse.reuse_key(self.repo, config, "hooks")):
-            self.github.add_job(50, ci_reuse.job_names(config, "hooks", key)[1])
-        hooks = self.plan(self.base)["groups"]["hooks"]
-        self.assertEqual(hooks, {"run": True, "reason": CONFIG["groups"]["hooks"]["reason"], "name": CONFIG["groups"]["hooks"]["job"]})
+    def test_a_tree_from_the_api_that_differs_from_the_checkout_refuses_reuse(self) -> None:
+        self.github.trees[self.merged] = "4" * 40
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("differs from the tree that the API gives", record["basis"])
+
+    def test_a_push_to_another_branch_runs_every_group(self) -> None:
+        record = self.push(ref="refs/heads/feature")
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("not to refs/heads/main", record["basis"])
+
+    def test_an_api_error_during_reuse_runs_every_group(self) -> None:
+        self.github.broken = True
+        record = self.push()
+        self.assertEqual(self.runs(record), ALL)
+        self.assertIn("502", record["basis"])
+
+    def test_no_api_reuses_nothing(self) -> None:
+        sha = self.head()
+        record = ci_plan.plan(self.repo, "push", "", sha, self.environment(sha), None)
+        self.assertEqual(self.runs(record), ALL)
 
 
 class RecordAndSummaryTest(PlanRepository):
@@ -589,19 +667,18 @@ class RecordAndSummaryTest(PlanRepository):
         self.passed(self.base)
         self.commit({"infra/main.tf": "# changed\n", "tests/fast/test_new.py": "NEW = 1\n"})
         record = self.plan(self.base)
-        key = ci_reuse.reuse_key(self.repo, ci_groups.load(self.repo), "guards")
         include = record["groups"]["guards"]["matrix"]["include"]
         self.assertEqual([entry["shard"] for entry in include], list(range(1, 9)))
-        self.assertEqual(include[0], {"shard": 1, "shards": 8, "name": f"Planted faults through the real commit path, shard 1 of 8 (key {key[:16]})"})
-        self.assertTrue(record["groups"]["infra"]["name"].startswith("Static checks of the Terraform and Ansible code (key "))
+        self.assertEqual(include[0], {"shard": 1, "shards": 8, "name": "Planted faults through the real commit path, shard 1 of 8", "run": True})
+        self.assertEqual(record["groups"]["infra"]["matrix"]["include"], [{"name": "Static checks of the Terraform and Ansible code", "run": True}])
 
     def test_a_skipped_group_is_named_as_not_run_with_its_reason(self) -> None:
         self.passed(self.base)
         self.commit({"README.md": "changed\n"})
         record = self.plan(self.base)
         guards = record["groups"]["guards"]
-        self.assertEqual(guards["matrix"]["include"], [{"shard": 0, "shards": 8, "name": "Planted faults through the real commit path: not run"}])
-        self.assertEqual(record["groups"]["infra"]["name"], "Static checks of the Terraform and Ansible code: not run")
+        self.assertEqual(guards["matrix"]["include"], [{"shard": 0, "shards": 8, "name": "Planted faults through the real commit path: not run", "run": False}])
+        self.assertEqual(record["groups"]["infra"]["matrix"]["include"], [{"name": "Static checks of the Terraform and Ansible code: not run", "run": False}])
         self.assertTrue(guards["reason"].startswith("skipped: "))
 
     def test_the_summary_gives_each_group_its_decision_and_reason(self) -> None:
@@ -609,9 +686,26 @@ class RecordAndSummaryTest(PlanRepository):
         self.commit({"tests/fast/test_new.py": "NEW = 1\n"})
         record = self.plan(self.base)
         text = ci_plan.summary(record)
-        self.assertIn(record["range"], text)
+        self.assertIn(record["basis"], text)
         for group, decision in record["groups"].items():
             self.assertIn(f"| {group} | {'runs' if decision['run'] else 'does not run'} | {decision['reason']} |", text)
+
+    def test_the_summary_names_the_reused_run_and_its_jobs(self) -> None:
+        record = {
+            "basis": "push",
+            "reused": {
+                "pull_request": 5,
+                "head": "h" * 40,
+                "tree": "t" * 40,
+                "run_id": 60,
+                "run_url": "https://github.example.invalid/runs/60",
+                "jobs": ["A job"],
+            },
+            "groups": {},
+        }
+        text = ci_plan.summary(record)
+        self.assertIn(f"Reused run: https://github.example.invalid/runs/60 (id 60), head {'h' * 40}, tree {'t' * 40}.", text)
+        self.assertIn("| A job | success |", text)
 
     def test_the_output_is_one_line_of_json(self) -> None:
         record = self.plan(ZERO)
@@ -702,7 +796,7 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotRegex(WORKFLOW_TEXT, r":\s*write\b")
 
     def test_the_selectable_jobs_read_the_record(self) -> None:
-        self.assertIn("name: ${{ fromJSON(needs.plan.outputs.record).groups.infra.name }}", WORKFLOW_TEXT)
+        self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.record).groups.infra.matrix }}", WORKFLOW_TEXT)
         self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.record).groups.guards.matrix }}", WORKFLOW_TEXT)
         self.assertIn('make test-guards SHARD="${SHARD}/${SHARDS}"', WORKFLOW_TEXT)
 
