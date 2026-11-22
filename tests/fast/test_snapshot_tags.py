@@ -10,20 +10,27 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import re
 import tempfile
+import threading
+import time
 import unittest
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.stack import tags
-from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.nessie import BODY_LIMIT_BYTES, NessieClient, NessieError
 
 HASH_ONE = "1" * 64
 HASH_TWO = "2" * 64
 HASH_UNKNOWN = "9" * 64
+HASH_SIDE = "5" * 64
 RUN_ID = "20261122t0925-4f2a9c"
 TABLE = "catalog_proof.numbers"
 METADATA = "file:/warehouse/catalog_proof/numbers_x/metadata/00002-y.metadata.json"
@@ -40,35 +47,69 @@ def table_entry(key: Sequence[str], snapshot_id: int | None, location: str) -> d
 NAMESPACE_ENTRY = {"type": "NAMESPACE", "name": {"elements": ["catalog_proof"]}, "content": {"type": "NAMESPACE", "id": "n1", "elements": ["catalog_proof"]}}
 
 
+ALLOWED_QUERY = {
+    "/trees": {"max-records", "page-token", "filter"},
+    "entries": {"content", "max-records", "page-token", "filter"},
+    "history": {"filter", "max-records", "page-token", "limit-hash", "fetch"},
+}
+HISTORY_FILTER = re.compile(r"commit\.hash == '([0-9a-f]{64})'")
+
+
 class StandIn(NessieClient):
-    """Nessie's references and the entries at each hash. Lists are paged two at a time, as a long list would be."""
+    """Nessie 0.110.1's API version 2: the references, the entries at each hash and the commit log of each branch.
+
+    Lists are paged two at a time with the parameters that the server's OpenAPI file names (``max-records`` and ``page-token``), and a parameter that the server
+    does not name is refused as it is there. Like the real server, a tag is made at any commit that exists, on any branch: the log of ``main`` holds only the
+    commits that were merged into it.
+    """
 
     def __init__(self) -> None:
         super().__init__("http://nessie.invalid:19120/api/v2", 5)
-        self.references: dict[str, tuple[str, str]] = {"main": ("BRANCH", HASH_TWO)}
-        self.history = {HASH_ONE, HASH_TWO}
+        self.references: dict[str, tuple[str, str]] = {"main": ("BRANCH", HASH_TWO), "side": ("BRANCH", HASH_SIDE)}
+        self.logs: dict[str, list[str]] = {"main": [HASH_TWO, HASH_ONE], "side": [HASH_SIDE, HASH_ONE]}
+        self.history = {HASH_ONE, HASH_TWO, HASH_SIDE}
         self.entries_at: dict[str, list[dict[str, Any]]] = {
             HASH_ONE: [NAMESPACE_ENTRY, table_entry(["catalog_proof", "numbers"], 111, METADATA)],
             HASH_TWO: [NAMESPACE_ENTRY, table_entry(["catalog_proof", "numbers"], 222, METADATA)],
+            HASH_SIDE: [NAMESPACE_ENTRY, table_entry(["catalog_proof", "numbers"], 333, METADATA)],
         }
+        self.blank_history_pages = 0
+        self.endless_history = False
         self.calls: list[tuple[str, str]] = []
 
     def answer(self, status: int, document: dict[str, Any]) -> tuple[int, bytes]:
         return status, json.dumps(document).encode()
 
     def page(self, items: list[Any], query: dict[str, list[str]], name: str) -> dict[str, Any]:
-        start = int(query.get("pageToken", ["0"])[0])
-        more = start + PAGE < len(items)
-        return {name: items[start : start + PAGE], "hasMore": more, "token": str(start + PAGE) if more else None}
+        start = int(query.get("page-token", ["0"])[0])
+        size = min(PAGE, int(query.get("max-records", [str(PAGE)])[0]))
+        more = start + size < len(items)
+        return {name: items[start : start + size], "hasMore": more, "token": str(start + size) if more else None}
+
+    def history_page(self, ref: str, query: dict[str, list[str]]) -> tuple[int, bytes]:
+        if ref not in self.logs:
+            return self.answer(404, {"errorCode": "REFERENCE_NOT_FOUND", "message": f"{ref} not found"})
+        number = int(query.get("page-token", ["0"])[0])
+        if self.endless_history or number < self.blank_history_pages:
+            return self.answer(200, {"logEntries": [], "hasMore": True, "token": str(number + 1)})
+        wanted = HISTORY_FILTER.fullmatch(query.get("filter", [""])[0])
+        commits = [item for item in self.logs[ref] if wanted is None or item == wanted.group(1)]
+        entries = [{"commitMeta": {"hash": item}, "parentCommitHash": None} for item in commits]
+        return self.answer(200, {"logEntries": entries, "hasMore": False})
 
     def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
         self.calls.append((method, target))
         parts = urlsplit(target)
         query = parse_qs(parts.query)
         path = unquote(parts.path).removeprefix("/api/v2")
+        kind = "/trees" if path == "/trees" else "entries" if path.endswith("/entries") else "history" if path.endswith("/history") else ""
+        if method == "GET" and kind and not set(query) <= ALLOWED_QUERY[kind]:
+            return self.answer(400, {"errorCode": "BAD_REQUEST", "message": f"unknown query parameters {sorted(set(query) - ALLOWED_QUERY[kind])}"})
         if method == "GET" and path == "/trees":
             refs = [{"type": kind, "name": name, "hash": value} for name, (kind, value) in sorted(self.references.items())]
             return self.answer(200, self.page(refs, query, "references"))
+        if method == "GET" and path.startswith("/trees/") and path.endswith("/history"):
+            return self.history_page(path[len("/trees/") : -len("/history")], query)
         if method == "GET" and path.startswith("/trees/") and path.endswith("/entries"):
             name = path[len("/trees/") : -len("/entries")]
             if name not in self.references:
@@ -78,8 +119,8 @@ class StandIn(NessieClient):
             name = path[len("/trees/") :]
             if name not in self.references:
                 return self.answer(404, {"errorCode": "REFERENCE_NOT_FOUND", "message": f"Named reference '{name}' not found"})
-            kind, value = self.references[name]
-            return self.answer(200, {"reference": {"type": kind, "name": name, "hash": value}})
+            reference_kind, value = self.references[name]
+            return self.answer(200, {"reference": {"type": reference_kind, "name": name, "hash": value}})
         if method == "POST" and path == "/trees":
             body = json.loads(payload or b"{}")
             name = query["name"][0]
@@ -236,6 +277,204 @@ class TagRunTest(unittest.TestCase):
         self.assertIn(HASH_ONE, str(caught.exception))
 
 
+class TrunkTest(unittest.TestCase):
+    def test_a_commit_that_is_only_on_another_branch_is_refused_and_no_tag_is_made(self) -> None:
+        nessie = StandIn()
+        with self.assertRaises(tags.NotOnTrunk) as caught:
+            tags.tag_run(nessie, RUN_ID, HASH_SIDE)
+        self.assertIn(HASH_SIDE, str(caught.exception))
+        self.assertIn("main", str(caught.exception))
+        self.assertNotIn(f"run-{RUN_ID}", nessie.references)
+        self.assertEqual([], nessie.writes())
+
+    def test_a_tag_that_already_sits_on_such_a_commit_is_refused_and_not_called_unchanged(self) -> None:
+        nessie = StandIn()
+        nessie.references[f"run-{RUN_ID}"] = ("TAG", HASH_SIDE)
+        with self.assertRaises(tags.NotOnTrunk):
+            tags.tag_run(nessie, RUN_ID, HASH_SIDE)
+
+    def test_a_commit_that_the_log_of_main_reaches_on_a_later_page_is_accepted(self) -> None:
+        nessie = StandIn()
+        nessie.blank_history_pages = 3
+        self.assertTrue(tags.tag_run(nessie, RUN_ID, HASH_ONE).created)
+
+    def test_a_log_that_never_ends_is_an_error_after_the_page_limit_and_no_tag_is_made(self) -> None:
+        nessie = StandIn()
+        nessie.endless_history = True
+        with mock.patch.object(tags, "MAX_PAGES", 5), self.assertRaises(NessieError) as caught:
+            tags.tag_run(nessie, RUN_ID, HASH_ONE)
+        self.assertIn("pages", str(caught.exception))
+        self.assertEqual(5, len([call for call in nessie.calls if "/history" in call[1]]))
+        self.assertEqual([], nessie.writes())
+
+    def test_the_log_is_asked_in_the_form_of_the_pinned_server_for_this_hash_in_pages_of_bounded_size(self) -> None:
+        nessie = StandIn()
+        tags.tag_run(nessie, RUN_ID, HASH_ONE)
+        asked = [parse_qs(urlsplit(target).query) for _, target in nessie.calls if "/trees/main/history" in target]
+        self.assertEqual(1, len(asked))
+        self.assertEqual([f"commit.hash == '{HASH_ONE}'"], asked[0]["filter"])
+        self.assertEqual([str(tags.PAGE_SIZE)], asked[0]["max-records"])
+
+    def test_a_trunk_that_is_not_a_branch_is_refused(self) -> None:
+        nessie = StandIn()
+        nessie.references["fake_trunk"] = ("TAG", HASH_TWO)
+        nessie.logs["fake_trunk"] = [HASH_TWO, HASH_ONE]
+        with self.assertRaises(tags.NotOnTrunk):
+            tags.tag_run(nessie, RUN_ID, HASH_ONE, "fake_trunk")
+
+
+class ForgedPages(StandIn):
+    """A server that answers the list of references with pages that a client must not trust."""
+
+    def __init__(self, pages: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.pages = pages
+
+    def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+        self.calls.append((method, target))
+        number = len([call for call in self.calls if call[1].startswith("/api/v2/trees?")]) - 1
+        return self.answer(200, self.pages[min(number, len(self.pages) - 1)])
+
+
+class PagingTest(unittest.TestCase):
+    def test_a_token_that_comes_back_is_an_error_and_not_a_loop(self) -> None:
+        forged = ForgedPages(
+            [
+                {"references": [], "hasMore": True, "token": "t1"},
+                {"references": [], "hasMore": True, "token": "t2"},
+                {"references": [], "hasMore": True, "token": "t1"},
+            ]
+        )
+        with self.assertRaises(NessieError) as caught:
+            tags.list_tags(forged)
+        self.assertIn("token", str(caught.exception))
+        self.assertLessEqual(len(forged.calls), 4)
+
+    def test_a_token_that_does_not_move_on_is_an_error(self) -> None:
+        forged = ForgedPages([{"references": [], "hasMore": True, "token": "t1"}, {"references": [], "hasMore": True, "token": "t1"}])
+        with self.assertRaises(NessieError):
+            tags.list_tags(forged)
+
+    def test_more_pages_with_no_token_is_an_error_and_not_the_end_of_the_list(self) -> None:
+        for page in ({"references": [], "hasMore": True}, {"references": [], "hasMore": True, "token": ""}, {"references": [], "hasMore": True, "token": 7}):
+            with self.subTest(page=page), self.assertRaises(NessieError):
+                tags.list_tags(ForgedPages([page]))
+
+    def test_a_page_without_its_list_or_with_items_that_are_not_objects_is_an_error_and_not_an_empty_list(self) -> None:
+        forged: list[Any] = [{}, {"hasMore": False}, {"references": "x"}, {"references": [1, 2]}, {"references": None}, []]
+        for page in forged:
+            with self.subTest(page=page), self.assertRaises(NessieError):
+                tags.list_tags(ForgedPages([page]))
+
+    def test_pages_are_asked_with_a_bounded_size_and_the_names_of_the_pinned_server(self) -> None:
+        nessie = StandIn()
+        tags.list_tags(nessie)
+        tags.table_snapshots(nessie, "main")
+        for _, target in nessie.calls:
+            self.assertEqual([str(tags.PAGE_SIZE)], parse_qs(urlsplit(target).query)["max-records"])
+
+    def test_a_chain_of_pages_that_passes_the_page_limit_is_an_error(self) -> None:
+        nessie = StandIn()
+        nessie.references.update({f"run-{number}": ("TAG", HASH_ONE) for number in range(10)})
+        with mock.patch.object(tags, "MAX_PAGES", 3), self.assertRaises(NessieError) as caught:
+            tags.list_tags(nessie)
+        self.assertIn("pages", str(caught.exception))
+
+
+@contextmanager
+def serving(body: bytes, delay_seconds: float = 0.0) -> Iterator[tuple[str, list[str]]]:
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            seen.append(self.path)
+            time.sleep(delay_seconds)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                return
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/api/v2", seen
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+
+class TagClientTest(unittest.TestCase):
+    def test_an_answer_over_the_byte_cap_is_an_error_and_not_an_empty_inventory(self) -> None:
+        padding = "x" * (BODY_LIMIT_BYTES + 100)
+        body = json.dumps({"references": [{"type": "TAG", "name": "run-a", "hash": HASH_ONE, "note": padding}], "hasMore": False}).encode()
+        with serving(body) as (url, _), self.assertRaises(NessieError) as caught:
+            tags.list_tags(tags.TagClient(url, 30))
+        self.assertIn("larger", str(caught.exception))
+
+    def test_an_answer_just_inside_the_cap_is_read_whole(self) -> None:
+        body = json.dumps({"references": [{"type": "TAG", "name": "run-a", "hash": HASH_ONE}], "hasMore": False}).encode()
+        with serving(body) as (url, _):
+            self.assertEqual({"run-a": HASH_ONE}, tags.list_tags(tags.TagClient(url, 30)))
+
+    def test_a_deadline_that_has_passed_stops_a_call_before_it_is_sent(self) -> None:
+        with serving(b"{}") as (url, seen):
+            client = tags.TagClient(url, 0.5)
+            with mock.patch("scripts.stack.tags.time.monotonic", return_value=time.monotonic() + 10), self.assertRaises(NessieError) as caught:
+                client.reference("main")
+        self.assertIn("deadline", str(caught.exception))
+        self.assertEqual([], seen)
+
+    def test_a_call_gets_only_the_time_that_is_left_of_the_deadline(self) -> None:
+        with serving(b"{}", delay_seconds=3) as (url, _):
+            started = time.monotonic()
+            with self.assertRaises(NessieError):
+                tags.TagClient(url, 0.5).reference("main")
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.5)
+
+
+class DeadlineCommandTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.folder = str(Path(self.directory.name) / "run")
+
+    def test_a_deadline_that_is_not_finite_or_not_positive_exits_2_before_any_call(self) -> None:
+        for value in ("inf", "-inf", "nan", "0", "-5", "1e999"):
+            nessie = StandIn()
+            with self.subTest(value=value):
+                code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", self.folder, f"--deadline-seconds={value}"], nessie)
+                self.assertEqual(2, code)
+                self.assertIn("deadline", err)
+                self.assertEqual([], nessie.calls)
+
+    def test_a_run_that_outlasts_its_deadline_exits_1_and_says_so_and_leaves_nothing(self) -> None:
+        nessie = StandIn()
+        real_send = nessie.send
+
+        def slow(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+            time.sleep(4)
+            return real_send(method, target, payload)
+
+        started = time.monotonic()
+        with mock.patch.object(nessie, "send", slow):
+            code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", self.folder, "--deadline-seconds", "0.5"], nessie)
+        self.assertEqual(1, code)
+        self.assertIn("deadline", err)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual([], nessie.writes())
+        self.assertFalse(Path(self.folder).exists())
+
+
 class RunFolderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -271,6 +510,37 @@ class RunFolderTest(unittest.TestCase):
         self.assertIn(HASH_ONE, str(caught.exception))
         self.assertEqual(HASH_ONE, json.loads((self.folder / "data_version.json").read_text())["hash"])
 
+    def test_two_writers_that_both_passed_their_checks_leave_the_record_of_the_first_and_refuse_the_second(self) -> None:
+        other = tags.tag_run(StandIn(), RUN_ID, HASH_TWO)
+        real_link = os.link
+        raced = {"done": False}
+
+        def second_writer_first(source: Any, target: Any) -> None:
+            if not raced["done"]:
+                raced["done"] = True
+                tags.write_version_record(self.folder, other)
+            real_link(source, target)
+
+        with mock.patch("scripts.stack.tags.os.link", second_writer_first), self.assertRaises(tags.TagConflict):
+            tags.write_version_record(self.folder, self.result)
+        self.assertEqual(HASH_TWO, json.loads((self.folder / "data_version.json").read_text())["hash"])
+        self.assertEqual(["data_version.json"], sorted(path.name for path in self.folder.iterdir()))
+
+    def test_two_writers_of_the_same_record_both_succeed_and_the_second_changes_nothing(self) -> None:
+        real_link = os.link
+        results: list[bool] = []
+
+        def second_writer_first(source: Any, target: Any) -> None:
+            if not results:
+                results.append(False)
+                results[0] = tags.write_version_record(self.folder, self.result)
+            real_link(source, target)
+
+        with mock.patch("scripts.stack.tags.os.link", second_writer_first):
+            results.append(tags.write_version_record(self.folder, self.result))
+        self.assertEqual([True, False], [results[0], results[1]])
+        self.assertEqual(["data_version.json"], sorted(path.name for path in self.folder.iterdir()))
+
     def test_no_partial_file_is_left_beside_the_record(self) -> None:
         tags.write_version_record(self.folder, self.result)
         self.assertEqual(["data_version.json"], sorted(path.name for path in self.folder.iterdir()))
@@ -278,7 +548,7 @@ class RunFolderTest(unittest.TestCase):
 
 def run_command(arguments: list[str], nessie: StandIn | None, environment: bool = True) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
-    patched = mock.patch.object(tags, "NessieClient", lambda *_: nessie)
+    patched = mock.patch.object(tags, "TagClient", lambda *_: nessie)
     variables = {"NESSIE_URI": "http://nessie.invalid:19120/api/v2"} if environment else {}
     with patched, mock.patch.dict("os.environ", variables, clear=True), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = tags.main(arguments)
