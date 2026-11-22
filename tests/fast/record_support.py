@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
-from scripts.ingestion.store import ObjectVersion
+from scripts.ingestion.notice import Code, Notice
+from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE_PREFIX, Landed, list_text_for, selection_for
 from tests.fast.memory_store import MemoryStore
 
@@ -30,11 +31,19 @@ class CopyingMemoryStore(MemoryStore):
         super().__init__(bucket, versioned=versioned)
         self.copies: list[tuple[str, str, str]] = []
         self.corrupt: set[str] = set()
+        self.deletes: list[tuple[str, str]] = []
+        self.fail_deletes = False
 
     def copy_version(self, version: ObjectVersion, key: str) -> ObjectVersion:
         self.copies.append((version.key, version.version_id, key))
         data = self.find(version).data
         return self.put_object(key, data + b"!" if version.key in self.corrupt else data)
+
+    def delete_version(self, version: ObjectVersion) -> None:
+        if self.fail_deletes:
+            raise StoreError(Notice(Code.VERSION_MISSING))
+        self.deletes.append((version.key, version.version_id))
+        self.remove_version(version.key, version.version_id)
 
 
 @dataclass
@@ -66,6 +75,11 @@ class FakeCatalog:
         self.heads: dict[str, str] = {"main": BASE_HASH}
         self.tables: dict[str, dict[str, int]] = {"main": {}}
         self.counter = 0
+        self.recorded: str | None = None
+
+    def newest_recorded_manifest(self) -> str | None:
+        self.calls.append("newest_recorded_manifest")
+        return self.recorded
 
     def head(self, branch: str) -> str:
         self.calls.append(f"head {branch}")

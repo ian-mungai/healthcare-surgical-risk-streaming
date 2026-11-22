@@ -10,6 +10,9 @@ version of one object, and the source reads only that prefix. The order is fixed
    before it returns anything that a sync could read.
 3. A second call finds each copy already equal to the manifest and writes nothing, so a retry adds no version.
 
+``remove_copies`` deletes, by key and version ID, every version of each table's copy in the run's read prefix. The load step calls it once the run's record is
+written, so the prefix is empty after a load, and keeps the copies when the load fails, for inspection. It touches no other key.
+
 ``confirm_copies`` lists the read prefix again and refuses it unless it holds exactly the recorded versions. The step calls it before it starts a sync
 and after the sync ends, so a copy replaced while Airbyte read it is found.
 """
@@ -20,7 +23,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from scripts.ingestion.check import stream_sha256
+from scripts.ingestion.check import CheckedFile, stream_sha256
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.record_definitions import CSV_TABLES, RECORD_SOURCE_KEYS, read_key, read_prefix
@@ -36,6 +39,10 @@ class CopyError(RuntimeError):
 class CopyingStore(ObjectStore, Protocol):
     def copy_version(self, version: ObjectVersion, key: str) -> ObjectVersion:
         """Copy exactly ``version`` to ``key``, which gets a new version, and return it. Raise ``CopyError`` unless the store copied that source version."""
+        ...
+
+    def delete_version(self, version: ObjectVersion) -> None:
+        """Delete exactly this version or delete marker. A version that is already gone is not an error."""
         ...
 
 
@@ -79,20 +86,38 @@ class S3CopyStore(S3Store):
                 return listed
         raise CopyError("the copy is not in the listing of its key")
 
+    def delete_version(self, version: ObjectVersion) -> None:
+        reply = self.aws.call(
+            "s3api",
+            "delete-object",
+            "--bucket",
+            self.bucket,
+            "--key",
+            version.key,
+            "--version-id",
+            version.version_id,
+            missing=NO_SUCH_VERSION,
+            timeout=COPY_TIMEOUT_SECONDS,
+        )
+        if reply is None:
+            return
+        if type(reply) is not dict or reply.get("VersionId") != version.version_id:
+            raise CopyError("the delete call did not name the version that was asked for")
+
 
 def current_object(versions: Sequence[ObjectVersion], key: str) -> ObjectVersion | None:
     found = [version for version in versions if version.key == key and version.is_latest and not version.is_delete_marker]
     return found[0] if found else None
 
 
-def copy_bound_versions(store: CopyingStore, reference: ManifestRef, run_id: str) -> tuple[Copied, ...]:
+def copy_bound_versions(store: CopyingStore, reference: ManifestRef, run_id: str, entries: Sequence[CheckedFile] | None = None) -> tuple[Copied, ...]:
     """Copy the version of each CSV table that the manifest binds to the run's read prefix and return the confirmed copies.
 
     Raise ``GateRefused`` before any copy when the manifest or a bound version is not as the passed check left it, ``ValueError`` for a run ID that is not a
     plain name, and ``CopyError`` for an object in the prefix that is not a table or a copy whose SHA-256 or size differs from the manifest's.
     """
     prefix = read_prefix(run_id)
-    bound = {entry.source_key: entry for entry in verify_before_read(store, reference, RECORD_SOURCE_KEYS)}
+    bound = {entry.source_key: entry for entry in (verify_before_read(store, reference, RECORD_SOURCE_KEYS) if entries is None else entries)}
     wanted = {read_key(run_id, table): (table, bound[table.source_key]) for table in CSV_TABLES if table.source_key}
     listed = store.list_versions(prefix)
     if {version.key for version in listed} - set(wanted):
@@ -123,3 +148,12 @@ def confirm_copies(store: ObjectStore, run_id: str, copies: Sequence[Copied]) ->
     changed = any(now is None or now.version_id != copy.version_id for copy in copies for now in [current_object(listed, copy.key)])
     if extra or changed:
         raise CopyError("the read prefix of the run is no longer exactly the copies that were confirmed")
+
+
+def remove_copies(store: CopyingStore, run_id: str) -> int:
+    """Delete every version and delete marker of each table's copy in the run's read prefix and return how many. Another key in the prefix is left alone."""
+    keys = {read_key(run_id, table) for table in CSV_TABLES}
+    found = [version for version in store.list_versions(read_prefix(run_id)) if version.key in keys]
+    for version in found:
+        store.delete_version(version)
+    return len(found)

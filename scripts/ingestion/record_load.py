@@ -2,27 +2,36 @@
 
 The order is the contract, and each step stops the load before the next one starts:
 
-1. The gate and the exact-version copy of the two CSV tables (``record_copy``). A failed or missing check (no manifest), a missing or substituted version
-   and a copy whose hash differs fail here, before Airbyte or the catalog is called. The gate also runs for a run that already has its record.
-2. A run that has its record is finished: its branch must still be at the recorded head with the recorded snapshots, and the call returns the record and
-   changes nothing. A run ID that was loaded from another manifest is refused.
-3. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again,
-   and no job may be running on any of the connections. The copies are confirmed before each sync, so one replaced while an earlier sync read it is found.
-4. The load branch ``load_<run ID>`` is created from the head of main. A branch of that name with no record is the leftover of an unfinished try and is
-   deleted first. Airbyte is asked which branch its destination writes to, and the load stops unless it is the load branch.
-5. Each table is synced in turn: ``clinical_data``, ``lab_data``, then ``track_list``. Each wait ends at its deadline, cancels the job and fails. A sync
-   that ends in any status but success fails the load and the later syncs do not start.
-6. The branch head must have moved, and every table must have a new snapshot on the branch.
-7. The record (``<run ID>.json``) is written once and whole: the branch, its head before and after, each table's snapshot and job, the manifest, the
-   copies and the pinned connectors.
+1. The gate (``verify_before_read``) confirms the manifest and that each CSV table's current landed version is the bound one. A failed or missing check (no
+   manifest), a missing version and a substituted version are refused here, before anything is copied, started or branched.
+2. A run that has its record is finished: its branch must still be at the recorded head with the recorded snapshots, its copies are removed if they are still
+   there, and the call returns the record and changes nothing else. A run ID that was loaded from another manifest is refused.
+3. The same manifest on another run: when the newest commit on the default branch that carries the line ``records-manifest: <SHA-256>`` (the convention below)
+   names this manifest, the earlier run's record is returned and nothing is copied, started or branched. The gate has already run.
+4. The exact-version copy of the two CSV tables (``record_copy``). A copy whose hash differs fails here, before Airbyte or the catalog is called.
+5. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again, and no
+   job may be running on any of the connections.
+6. The load branch ``load_<run ID>`` is created from the head of main. A branch of that name with no record is the leftover of an unfinished try and is deleted
+   first. Airbyte is asked which branch its destination writes to, and the load stops unless it is the load branch.
+7. Each table is synced in turn: ``clinical_data``, ``lab_data``, then ``track_list``. The copies are confirmed before each sync, so one replaced while an
+   earlier sync read it is found. Each wait ends at its deadline, cancels the job and fails. A sync that ends in any status but success fails the load and the
+   later syncs do not start.
+8. The branch head must have moved, and every table must have a new snapshot on the branch.
+9. The record (``<run ID>.json``) is written once and whole: the branch, its head before and after, each table's snapshot and job, the manifest, the copies and
+   the pinned connectors. Then the copies are removed from the read prefix by key and version ID. A load that fails keeps its copies for inspection. A removal
+   that fails leaves the record, and a second call removes them.
 
 The load never merges. The table checks run on the branch, and the merge follows only when they pass.
+
+The convention that the merge step follows: the message of the merge commit on the default branch holds one line ``records-manifest: <SHA-256 of the manifest
+that the load read>``, 64 lower case hex digits, as the load's record names it (``manifest_sha256``).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -31,10 +40,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from scripts.ingestion.airbyte_api import AirbyteError
+from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.record_copy import Copied, CopyingStore, confirm_copies, copy_bound_versions
+from scripts.ingestion.record_copy import Copied, CopyError, CopyingStore, confirm_copies, copy_bound_versions, remove_copies
 from scripts.ingestion.record_definitions import (
     DESTINATION,
+    RECORD_SOURCE_KEYS,
     SOURCE_FILE,
     SOURCE_S3,
     TABLES,
@@ -44,11 +55,14 @@ from scripts.ingestion.record_definitions import (
     destination_configuration,
     source_configuration,
 )
+from scripts.ingestion.store import StoreError
 
 SUCCEEDED = "succeeded"
 ENDED_WITHOUT_SUCCESS = ("failed", "cancelled", "incomplete")
 RECORD_FIELDS = ("run_id", "manifest_sha256", "branch", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
 COPY_FIELDS = ("table", "source_key", "key", "version_id", "sha256", "size")
+SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
+MANIFEST_LINE = re.compile(r"^records-manifest: ([0-9a-f]{64})$", re.MULTILINE)
 
 
 class LoadError(RuntimeError):
@@ -61,6 +75,10 @@ class SyncDeadline(LoadError):
 
 class Catalog(Protocol):
     def head(self, branch: str) -> str: ...
+
+    def newest_recorded_manifest(self) -> str | None:
+        """The manifest SHA-256 of the newest commit on the default branch whose message has the ``records-manifest`` line, or None."""
+        ...
 
     def has_branch(self, branch: str) -> bool: ...
 
@@ -144,6 +162,19 @@ class LoadResult:
             raise LoadError("the record of this run is not a record of this form") from None
 
 
+def manifest_line(sha256: str) -> str:
+    """The line that a merge commit's message holds to say which manifest the merged load read. Raise ``ValueError`` unless it is 64 lower case hex digits."""
+    if SHA256_TEXT.fullmatch(sha256) is None:
+        raise ValueError("a manifest SHA-256 is 64 lower case hexadecimal digits")
+    return f"records-manifest: {sha256}"
+
+
+def recorded_manifest(message: str) -> str | None:
+    """The manifest SHA-256 that a commit message records, or None when it has no well-formed line."""
+    found = MANIFEST_LINE.search(message)
+    return found.group(1) if found else None
+
+
 def record_path(record_dir: Path, run_id: str) -> Path:
     return record_dir / f"{run_id}.json"
 
@@ -174,6 +205,20 @@ def write_record(record_dir: Path, result: LoadResult) -> Path:
     finally:
         os.unlink(temporary)
     return final
+
+
+def earlier_record(record_dir: Path, sha256: str) -> LoadResult | None:
+    """The record of the newest file in ``record_dir`` whose manifest is ``sha256``, or None. A file that is not a record is not one."""
+    found: list[tuple[float, str, LoadResult]] = []
+    for path in sorted(record_dir.glob("*.json")) if record_dir.is_dir() else []:
+        try:
+            record = LoadResult.from_json(path.read_text())
+            modified = path.stat().st_mtime
+        except LoadError, OSError:
+            continue
+        if record.manifest_sha256 == sha256:
+            found.append((modified, path.name, record))
+    return max(found, key=lambda item: item[:2])[2] if found else None
 
 
 def confirm_finished(record: LoadResult, reference: ManifestRef, catalog: Catalog) -> LoadResult:
@@ -219,6 +264,13 @@ def result_tags(result: LoadResult, prefix: str) -> dict[str, str]:
     return tags
 
 
+def remove_all(store: CopyingStore, run_id: str) -> None:
+    try:
+        remove_copies(store, run_id)
+    except CopyError, StoreError:
+        raise LoadError("the load is recorded but its copies in the read prefix could not be removed; call again to remove them") from None
+
+
 def connectors() -> tuple[str, ...]:
     return tuple(sorted(connector.image for connector in (SOURCE_S3, SOURCE_FILE, DESTINATION)))
 
@@ -238,10 +290,18 @@ def load_records(
 ) -> LoadResult:
     """Run the load of the module text and return its record. Raise ``GateRefused``, ``CopyError`` or ``LoadError``, and ``ValueError`` for a run ID."""
     branch = branch_name(run_id)
-    copies = copy_bound_versions(store, reference, run_id)
+    entries = verify_before_read(store, reference, RECORD_SOURCE_KEYS)
     finished = read_record(record_dir, run_id)
     if finished is not None:
-        return confirm_finished(finished, reference, catalog)
+        result = confirm_finished(finished, reference, catalog)
+        remove_all(store, run_id)
+        return result
+    if catalog.newest_recorded_manifest() == reference.sha256:
+        earlier = earlier_record(record_dir, reference.sha256)
+        if earlier is None:
+            raise LoadError("the default branch records this manifest but this host keeps no record of its load")
+        return earlier
+    copies = copy_bound_versions(store, reference, run_id, entries)
     confirm_copies(store, run_id, copies)
     airbyte.ensure_destination(destination_configuration(environment, branch))
     connection_ids: dict[str, str] = {}
@@ -272,4 +332,5 @@ def load_records(
     loaded = {table.name: snapshots[table.name] for table in TABLES}
     result = LoadResult(run_id, reference.sha256, branch, base_hash, head_hash, loaded, jobs, copies, connectors())
     write_record(record_dir, result)
+    remove_all(store, run_id)
     return result

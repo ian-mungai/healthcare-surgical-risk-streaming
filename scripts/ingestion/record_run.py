@@ -7,6 +7,10 @@ Settings: ``RECORD_BUCKET`` and ``RECORD_REGION`` (the project's bucket), ``RECO
 container reaches it), ``RECORD_AIRBYTE_NESSIE_URI`` (Nessie as Airbyte's pods reach it), ``AIRBYTE_API_URL`` (Airbyte's server), ``RECORD_AWS_PROFILE``
 (default ``default``, the profile whose ``credential_process`` gives this workload its short-lived access), ``RECORD_LOAD_DIR`` (default
 ``/opt/dagster/runs/record_loads``), ``RECORD_SYNC_DEADLINE_SECONDS`` (default 3600) and ``RECORD_POLL_SECONDS`` (default 10).
+``AIRBYTE_API_URL`` is the forwarder on the k3s bridge address (``http://<bridge address>:<airbyte_api_route_port>``). ``RECORD_AIRBYTE_NESSIE_URI`` is the
+Nessie forwarder (``http://<bridge address>:<airbyte_nessie_route_port>/api/v2``). ``record_routes.yml`` of the Airbyte role makes both. The four files are
+placed by ``record_client_files.yml`` in ``<secrets folder>/airbyte_api/`` (``client_id``, ``client_secret``, ``aws_access_key_id``,
+``aws_secret_access_key``), owned by the container's user with mode 0400, and the code location mounts each as a Compose secret file at ``/run/secrets/<name>``.
 Secret files: ``AIRBYTE_CLIENT_ID_FILE`` and ``AIRBYTE_CLIENT_SECRET_FILE`` (the instance's client credentials) and ``AIRBYTE_AWS_ACCESS_KEY_ID_FILE`` and
 ``AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE`` (the access key that the S3 Data Lake destination needs for the Nessie catalog).
 

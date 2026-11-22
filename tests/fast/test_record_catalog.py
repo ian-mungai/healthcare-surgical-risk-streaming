@@ -22,6 +22,8 @@ class Server:
         self.contents: dict[str, dict[str, dict[str, Any]]] = {"main": {}}
         self.calls: list[str] = []
         self.fail: tuple[str, int] | None = None
+        self.history: list[str] = []
+        self.page = 100
 
     def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
         parts = urlsplit(target)
@@ -40,6 +42,21 @@ class Server:
                 return 409, b'{"errorCode":"REFERENCE_CONFLICT","message":"x"}'
             del self.refs[name]
             return 200, b"{}"
+        if method == "GET" and path == "/trees/main/history":
+            query = parse_qs(parts.query)
+            start = int(query.get("page-token", ["0"])[0])
+            asked = int(query["max-records"][0])
+            if not 1 <= asked <= 100:
+                return 400, b'{"message":"max-records out of range"}'
+            size = min(asked, self.page)
+            chunk = self.history[start : start + size]
+            more = start + size < len(self.history)
+            document = {
+                "hasMore": more,
+                "token": str(start + size) if more else None,
+                "logEntries": [{"commitMeta": {"message": message}} for message in chunk],
+            }
+            return 200, json.dumps(document).encode()
         if path.endswith("/entries"):
             name = path.removeprefix("/trees/").removesuffix("/entries")
             return 200, json.dumps(
@@ -106,6 +123,36 @@ class CatalogTest(unittest.TestCase):
 
     def test_a_branch_without_tables_has_no_snapshots(self) -> None:
         self.assertEqual({}, self.catalog.snapshot_ids("main"))
+
+
+class RecordedManifestTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = Server()
+        self.catalog = NessieCatalog(Client(self.server))
+
+    def test_the_newest_commit_with_the_line_gives_the_manifest_and_older_ones_are_not_read_for_it(self) -> None:
+        self.server.history = ["merge something else", f"merge raw\n\nrecords-manifest: {'b' * 64}", f"merge raw\n\nrecords-manifest: {'a' * 64}"]
+        self.assertEqual("b" * 64, self.catalog.newest_recorded_manifest())
+
+    def test_a_history_with_no_line_has_no_recorded_manifest(self) -> None:
+        self.server.history = ["initial", "merge raw_records", f"records-manifest:{'a' * 64}"]
+        self.assertIsNone(self.catalog.newest_recorded_manifest())
+
+    def test_pages_are_followed_until_a_line_is_found_or_the_history_ends(self) -> None:
+        self.server.page = 2
+        self.server.history = ["one", "two", "three", "four", f"records-manifest: {'c' * 64}", "six"]
+        self.assertEqual("c" * 64, self.catalog.newest_recorded_manifest())
+        self.assertEqual(3, len([call for call in self.server.calls if call.endswith("/history")]))
+
+    def test_the_scan_stops_after_its_limit_of_commits(self) -> None:
+        self.server.history = ["x"] * 600 + [f"records-manifest: {'d' * 64}"]
+        self.assertIsNone(self.catalog.newest_recorded_manifest())
+        self.assertEqual(5, len([call for call in self.server.calls if call.endswith("/history")]), "500 commits in pages of 100, and no more")
+
+    def test_a_failing_history_call_is_an_error_not_no_manifest(self) -> None:
+        self.server.fail = ("/trees/main/history", 500)
+        with self.assertRaises(NessieError):
+            self.catalog.newest_recorded_manifest()
 
 
 if __name__ == "__main__":

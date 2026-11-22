@@ -38,8 +38,9 @@ WAREHOUSE_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
 NAMESPACE = "raw_records"
 READ_PREFIX = "records_input/"
 MAIN_BRANCH = "main"
-# Read on Nov 22 2026 (PST) from each connector's metadata.yaml on the master branch of github.com/airbytehq/airbyte and from the S3 Data Lake page of
-# docs.airbyte.com/integrations/destinations/s3-data-lake: source-s3 4.17.2, source-file 0.6.2, destination-s3-data-lake 0.4.2.
+# Read on Nov 22 2026 (PST): the destination from the S3 Data Lake page of docs.airbyte.com and from its metadata.yaml and Kotlin specification on the master
+# branch of github.com/airbytehq/airbyte, the file source from its metadata.yaml and spec.json there, and the three linux/amd64 image digests from Docker Hub
+# (``docker buildx imagetools inspect <image> --raw``, the manifest of platform linux/amd64). source-s3 is the raw connection's pin, one shared definition.
 PINNED_ON = "2026-11-22"
 
 
@@ -51,15 +52,16 @@ class DefinitionError(ValueError):
 class Connector:
     repository: str
     tag: str
+    digest: str
 
     @property
     def image(self) -> str:
         return f"{self.repository}:{self.tag}"
 
 
-SOURCE_S3 = Connector("airbyte/source-s3", "4.17.2")
-SOURCE_FILE = Connector("airbyte/source-file", "0.6.2")
-DESTINATION = Connector("airbyte/destination-s3-data-lake", "0.4.2")
+SOURCE_S3 = Connector("airbyte/source-s3", "4.17.1", "sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b")
+SOURCE_FILE = Connector("airbyte/source-file", "0.6.2", "sha256:61a0a57dcc3a7e2cef473a094e765afe8ed606788042279e04297a0f71fb054a")
+DESTINATION = Connector("airbyte/destination-s3-data-lake", "0.4.2", "sha256:6d48ee57e2b43e27ed4b05892bedcbbf85d672e485cdba704c77156ff48fd4bc")
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +189,12 @@ def connection_name(table: Table) -> str:
 
 
 def connection_configuration(table: Table) -> dict[str, Any]:
-    """The connection of one table: no schedule, a full refresh that overwrites, in the raw namespace."""
+    """The connection of one table, in the form of Airbyte's API: no schedule, a full refresh that overwrites, in the raw namespace."""
     return {
         "name": connection_name(table),
         "status": "active",
-        "scheduleType": "manual",
-        "namespaceDefinition": "customformat",
+        "schedule": {"scheduleType": "manual"},
+        "namespaceDefinition": "custom_format",
         "namespaceFormat": NAMESPACE,
-        "streams": [{"stream": table.name, "syncMode": "full_refresh", "destinationSyncMode": "overwrite"}],
+        "configurations": {"streams": [{"name": table.name, "syncMode": "full_refresh_overwrite"}]},
     }

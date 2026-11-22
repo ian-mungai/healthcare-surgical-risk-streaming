@@ -126,13 +126,10 @@ class ConnectionTest(unittest.TestCase):
         for table in TABLES:
             with self.subTest(table.name):
                 connection = definitions.connection_configuration(table)
-                self.assertEqual("manual", connection["scheduleType"])
-                self.assertEqual(("customformat", "raw_records"), (connection["namespaceDefinition"], connection["namespaceFormat"]))
+                self.assertEqual({"scheduleType": "manual"}, connection["schedule"])
+                self.assertEqual(("custom_format", "raw_records"), (connection["namespaceDefinition"], connection["namespaceFormat"]))
                 self.assertEqual("active", connection["status"])
-                self.assertEqual(
-                    [{"stream": table.name, "syncMode": "full_refresh", "destinationSyncMode": "overwrite"}],
-                    connection["streams"],
-                )
+                self.assertEqual({"streams": [{"name": table.name, "syncMode": "full_refresh_overwrite"}]}, connection["configurations"])
                 self.assertEqual(f"vitaldb_{table.name}_records", connection["name"])
 
     def test_the_connection_names_are_distinct(self) -> None:
@@ -140,15 +137,19 @@ class ConnectionTest(unittest.TestCase):
 
 
 class PinTest(unittest.TestCase):
-    def test_each_connector_is_pinned_by_a_full_version_and_the_date_it_was_read_is_recorded(self) -> None:
+    def test_each_connector_is_pinned_by_a_full_version_and_a_linux_amd64_digest_and_the_date_it_was_read_is_recorded(self) -> None:
         for connector in (SOURCE_S3, SOURCE_FILE, DESTINATION):
             with self.subTest(connector.repository):
                 self.assertRegex(connector.tag, r"[0-9]+\.[0-9]+\.[0-9]+")
+                self.assertRegex(connector.digest, r"sha256:[0-9a-f]{64}")
         self.assertEqual(
             ("airbyte/source-s3", "airbyte/source-file", "airbyte/destination-s3-data-lake"),
             (SOURCE_S3.repository, SOURCE_FILE.repository, DESTINATION.repository),
         )
         self.assertRegex(definitions.PINNED_ON, r"2026-11-22")
+
+    def test_the_two_s3_connectors_share_the_versions_and_digests_of_the_raw_connection(self) -> None:
+        self.assertEqual(("4.17.1", "sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b"), (SOURCE_S3.tag, SOURCE_S3.digest))
 
     def test_the_csv_tables_come_from_the_release_path_of_the_pin(self) -> None:
         for table in CSV_TABLES:

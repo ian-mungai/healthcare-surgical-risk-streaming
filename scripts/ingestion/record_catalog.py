@@ -9,9 +9,12 @@ from __future__ import annotations
 from urllib.parse import quote
 
 from scripts.ingestion.record_definitions import MAIN_BRANCH, NAMESPACE
+from scripts.ingestion.record_load import recorded_manifest
 from scripts.stack.nessie import NessieClient, NessieError
 
 NOT_FOUND = 404
+HISTORY_PAGE = 100
+HISTORY_LIMIT = 500
 
 
 class NessieCatalog:
@@ -36,6 +39,30 @@ class NessieCatalog:
 
     def delete_branch(self, branch: str, head: str) -> None:
         self.client.delete_reference(branch, head)
+
+    def newest_recorded_manifest(self) -> str | None:
+        """The manifest SHA-256 that the newest commit on main with the ``records-manifest`` line records, or None.
+
+        The history is read newest first, in pages, for at most ``HISTORY_LIMIT`` commits.
+        """
+        seen = 0
+        token: str | None = None
+        while seen < HISTORY_LIMIT:
+            query = {"max-records": str(min(HISTORY_PAGE, HISTORY_LIMIT - seen))} | ({} if token is None else {"page-token": token})
+            answer = self.client.request("GET", f"/trees/{quote(MAIN_BRANCH, safe='')}/history", None, query)
+            entries = answer.get("logEntries") if isinstance(answer, dict) else None
+            if not isinstance(entries, list):
+                raise NessieError("Nessie's history answer holds no list of log entries")
+            for entry in entries:
+                message = (entry.get("commitMeta") or {}).get("message") if isinstance(entry, dict) else None
+                found = recorded_manifest(message) if isinstance(message, str) else None
+                if found is not None:
+                    return found
+            seen += len(entries)
+            token = answer.get("token") if answer.get("hasMore") else None
+            if token is None or not entries:
+                return None
+        return None
 
     def snapshot_ids(self, branch: str) -> dict[str, int]:
         """The snapshot of each Iceberg table of the raw namespace at the head of the branch, by table name. A key with no snapshot is not listed."""

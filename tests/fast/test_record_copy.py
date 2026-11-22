@@ -12,7 +12,7 @@ from typing import Any
 
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.record_copy import Copied, CopyError, S3CopyStore, confirm_copies, copy_bound_versions
+from scripts.ingestion.record_copy import Copied, CopyError, S3CopyStore, confirm_copies, copy_bound_versions, remove_copies
 from tests.fast.ingestion_support import SOURCE_PREFIX, list_text_for, pin_the_synthetic_list, synthetic_pin
 from tests.fast.record_support import CLINICAL, LAB, RELEASE_FILES, RUN, CopyingMemoryStore, RecordLanded, landed_records, source_key
 
@@ -172,6 +172,47 @@ class ConfirmTest(unittest.TestCase):
             confirm_copies(landed.store, RUN, [])
 
 
+class RemoveTest(unittest.TestCase):
+    def test_every_version_of_each_table_copy_is_removed_by_its_version_ID_and_nothing_else(self) -> None:
+        landed, reference = landed_records()
+        landed.store.corrupt.add(landed.keys["lab_data.csv"])
+        with self.assertRaises(CopyError):
+            copy_bound_versions(landed.store, reference, RUN)
+        landed.store.corrupt.clear()
+        copy_bound_versions(landed.store, reference, RUN)
+        landed.store.put_delete_marker(PREFIX + "clinical_data.csv")
+        copy_bound_versions(landed.store, reference, RUN)
+        other = landed.store.put_object(PREFIX + "other.csv", b"x")
+        before = [(version.key, version.version_id) for version in landed.store.list_versions(PREFIX) if version.key != other.key]
+        self.assertEqual(len(before), remove_copies(landed.store, RUN))
+        self.assertEqual([(other.key, other.version_id)], [(version.key, version.version_id) for version in landed.store.list_versions(PREFIX)])
+        self.assertEqual(sorted(before), sorted(landed.store.deletes))
+        self.assertTrue(all(key.startswith(PREFIX) for key, _ in landed.store.deletes))
+        self.assertEqual([], [key for key in landed.store.history if not key.startswith(("records_input/", "landing/", "manifests/"))])
+
+    def test_a_second_call_removes_nothing_and_a_prefix_that_never_existed_is_not_an_error(self) -> None:
+        landed, reference = landed_records()
+        copy_bound_versions(landed.store, reference, RUN)
+        remove_copies(landed.store, RUN)
+        deletes = list(landed.store.deletes)
+        self.assertEqual(0, remove_copies(landed.store, RUN))
+        self.assertEqual(0, remove_copies(landed.store, "run_never"))
+        self.assertEqual(deletes, landed.store.deletes)
+
+    def test_the_landed_payloads_and_the_manifest_are_never_touched(self) -> None:
+        landed, reference = landed_records()
+        copy_bound_versions(landed.store, reference, RUN)
+        remove_copies(landed.store, RUN)
+        for path, key in landed.keys.items():
+            self.assertEqual(RELEASE_FILES[path], current(landed.store, key))
+        self.assertEqual(1, len(landed.store.list_versions(reference.key)))
+
+    def test_a_run_ID_that_is_not_a_plain_name_is_refused(self) -> None:
+        landed, _ = landed_records()
+        with self.assertRaises(ValueError):
+            remove_copies(landed.store, "../x")
+
+
 class FakeAws:
     def __init__(self, replies: list[Any]) -> None:
         self.replies = replies
@@ -223,6 +264,22 @@ class S3CopyTest(unittest.TestCase):
         landed, _ = landed_records()
         with self.assertRaises(CopyError):
             self.store([None])[0].copy_version(self.version(landed), PREFIX + "clinical_data.csv")
+
+    def test_the_removal_names_the_version_and_the_reply_must_name_the_same_version(self) -> None:
+        landed, _ = landed_records()
+        version = self.version(landed)
+        store, aws = self.store([{"VersionId": version.version_id}])
+        store.delete_version(version)
+        arguments = aws.calls[0]
+        self.assertEqual(("s3api", "delete-object"), arguments[:2])
+        self.assertEqual((version.key, version.version_id), (arguments[arguments.index("--key") + 1], arguments[arguments.index("--version-id") + 1]))
+        for name, reply in (("other version", {"VersionId": "other"}), ("no version", {}), ("not an object", ["x"])):
+            with self.subTest(name), self.assertRaises(CopyError):
+                self.store([reply])[0].delete_version(version)
+
+    def test_a_version_that_is_already_gone_is_not_an_error(self) -> None:
+        landed, _ = landed_records()
+        self.store([None])[0].delete_version(self.version(landed))
 
 
 class ReleasePrefixTest(unittest.TestCase):
