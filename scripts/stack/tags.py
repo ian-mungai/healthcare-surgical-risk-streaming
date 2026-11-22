@@ -23,10 +23,11 @@ import math
 import os
 import re
 import signal
+import stat
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -52,6 +53,10 @@ class TagError(ValueError):
 
 class NotOnTrunk(NessieError):
     """The hash is not in the history of the trunk, or the trunk is not a branch. No tag is made or accepted."""
+
+
+class RecordNotPublished(NessieError):
+    """The tag was made and the run folder's record could not be published. The tag is left in place."""
 
 
 class TagConflict(NessieError):
@@ -207,11 +212,10 @@ def require_on_trunk(client: NessieClient, trunk: str, merged_hash: str) -> None
         raise NotOnTrunk(f"{merged_hash} is not in the history of {trunk}: only a hash that was merged into {trunk} is tagged")
 
 
-def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | None = None) -> TagResult:
-    """Tag ``merged_hash``, a hash in the history of Nessie's default branch, for ``run_id``.
+def prepare_tag(client: NessieClient, run_id: str, merged_hash: str, trunk: str | None = None) -> TagResult:
+    """Make every Nessie read that the tag needs, and create nothing: the names, the default branch, the proof that the hash is in its log and the tables.
 
-    A tag of that name at that hash stays, and one at another hash is refused. The trunk is the default branch that Nessie's configuration names, read first.
-    ``trunk``, when given, only asserts it: another branch is refused before any other call.
+    The result holds the tables read at the exact merged hash, so the record that will be published is known before the tag is created. ``created`` is False.
     """
     name = tag_name(run_id)
     if HASH.fullmatch(merged_hash) is None:
@@ -220,6 +224,12 @@ def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | No
     if trunk is not None and trunk != default:
         raise NotOnTrunk(f"{trunk} is not Nessie's default branch {default}: a run's tag is made on a hash of the default branch")
     require_on_trunk(client, default, merged_hash)
+    return TagResult(run_id, name, merged_hash, default, False, table_snapshots(client, f"{default}@{merged_hash}"))
+
+
+def create_tag(client: NessieClient, prepared: TagResult) -> TagResult:
+    """Make the prepared tag, or find it where it must be. A tag of that name at that hash stays, and one at another hash is refused."""
+    name, merged_hash = prepared.tag, prepared.hash
     created = False
     try:
         existing = client.reference(name)
@@ -229,7 +239,7 @@ def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | No
         existing = None
     if existing is None:
         try:
-            client.create_tag(name, merged_hash, default)
+            client.create_tag(name, merged_hash, prepared.trunk)
             created = True
         except NessieConflict:
             existing = client.reference(name)
@@ -238,28 +248,64 @@ def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | No
     pinned = client.reference(name)
     if pinned.kind != "TAG" or pinned.hash != merged_hash:
         raise NessieError(f"{name} reads back as a {pinned.kind.lower()} at {pinned.hash}, not as a tag at {merged_hash}")
-    return TagResult(run_id, name, merged_hash, default, created, table_snapshots(client, name))
+    return replace(prepared, created=created)
 
 
-def judge_record(folder: Path, run_id: str, tag: str, merged_hash: str) -> None:
-    """Refuse a record in ``folder`` that is not this run's at this hash. A folder with no record is fine. This runs before any write to Nessie."""
+def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | None = None) -> TagResult:
+    """Tag ``merged_hash``, a hash in the history of Nessie's default branch, for ``run_id``: every read first, then the tag.
+
+    A tag of that name at that hash stays, and one at another hash is refused. The trunk is the default branch that Nessie's configuration names, read first.
+    ``trunk``, when given, only asserts it: another branch is refused before any other call.
+    """
+    return create_tag(client, prepare_tag(client, run_id, merged_hash, trunk))
+
+
+def read_record(folder: Path) -> dict[str, Any] | None:
+    """The record in ``folder``, or None when there is none. Anything at the record's path that is not a regular file, a link included, is refused.
+
+    The path is examined with ``lstat``, which does not follow a link, so a dangling link or a link to a good record is not taken for an absent or good one.
+    """
     target = folder / RECORD_NAME
-    if not target.exists():
-        return
+    try:
+        mode = os.lstat(target).st_mode
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(mode):
+        raise TagConflict(f"{target} is not a regular file (it is a link, a folder or another kind of file): no tag was made")
     try:
         held = json.loads(target.read_text())
     except (OSError, ValueError) as error:
         raise TagConflict(f"{target} exists and cannot be read as JSON ({type(error).__name__}): no tag was made") from error
-    if not isinstance(held, dict) or (held.get("run_id"), held.get("tag"), held.get("hash")) != (run_id, tag, merged_hash):
-        recorded = held.get("hash") if isinstance(held, dict) else None
-        raise TagConflict(f"{target} records {held.get('tag') if isinstance(held, dict) else None} at {recorded}, not {tag} at {merged_hash}: no tag was made")
+    if not isinstance(held, dict):
+        raise TagConflict(f"{target} does not hold a JSON object: no tag was made")
+    return held
+
+
+def judge_record(held: dict[str, Any] | None, folder: Path, run_id: str, tag: str, merged_hash: str) -> None:
+    """Refuse a record that is not this run's at this hash. This is the cheap check that runs before any call to Nessie."""
+    if held is not None and (held.get("run_id"), held.get("tag"), held.get("hash")) != (run_id, tag, merged_hash):
+        raise TagConflict(f"{folder / RECORD_NAME} records {held.get('tag')} at {held.get('hash')}, not {tag} at {merged_hash}: no tag was made")
 
 
 def tag_and_record(client: NessieClient, run_id: str, merged_hash: str, folder: Path, trunk: str | None = None) -> tuple[TagResult, bool]:
-    """Judge the folder's record, then tag, then publish the record. Returns the result and whether the record was written now."""
-    judge_record(folder, run_id, tag_name(run_id), merged_hash)
-    result = tag_run(client, run_id, merged_hash, trunk)
-    return result, write_version_record(folder, result)
+    """Check everything, then tag, then publish the record. Returns the result and whether the record was written now.
+
+    The order: the record's path and its run, tag and hash (no call to Nessie yet); every Nessie read, including the tables at the exact merged hash; the whole
+    record that would be published against an existing one, which must be equal in every field; and only then the tag, as the last step before the record is
+    published. When the publish fails after the tag was made, the error names the tag and says it is left in place.
+    """
+    held = read_record(folder)
+    judge_record(held, folder, run_id, tag_name(run_id), merged_hash)
+    prepared = prepare_tag(client, run_id, merged_hash, trunk)
+    record = version_record(prepared)
+    if held is not None and held != record:
+        raise TagConflict(f"{folder / RECORD_NAME} does not equal the record of {prepared.tag} at {merged_hash} that Nessie's tables give: no tag was made")
+    result = create_tag(client, prepared)
+    try:
+        return result, write_version_record(folder, result)
+    except (TagConflict, OSError) as error:
+        left = f"the tag {result.tag} was made at {merged_hash} and is left in place" if result.created else f"the tag {result.tag} was already in place"
+        raise RecordNotPublished(f"the record could not be published ({error}); {left}") from error
 
 
 def version_record(result: TagResult) -> dict[str, Any]:
