@@ -9,9 +9,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# A push to main has a concurrency group of its own (its commit), so no push cancels or replaces another run; a newer commit of the same pull
+# request cancels the older run.
 # Every pull request and every push to main runs every job: no job has a condition, no step tolerates a failure and no run takes the
 # result of an earlier run. The last job waits for all the others and is the one required check: it fails unless each of them succeeded, so a failed,
 # cancelled or skipped job fails the run. tests/fast/test_ci_workflow.py holds the workflow to this.
