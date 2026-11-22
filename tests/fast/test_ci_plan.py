@@ -231,7 +231,7 @@ class DerivedInputsTest(PlanRepository):
                 self.assertIn(path, record["groups"]["infra"]["reason"])
 
     def test_a_path_that_the_guard_suite_writes_selects_the_guards(self) -> None:
-        record = self.changed("notes/planted.txt", "A planted note.\n")
+        record = self.changed("notes/planted.txt")
         self.assertTrue(record["groups"]["guards"]["run"], record["groups"]["guards"]["reason"])
         self.assertIn("the guard suite writes notes/planted.txt", record["groups"]["guards"]["reason"])
         written = {commit_guards.TRACKED_NOTE, *commit_guards.LINKED_FOLDERS}
