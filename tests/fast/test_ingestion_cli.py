@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from scripts import aws_cli
 from scripts.ingestion import cli
+from scripts.process import CompletedProcess
 from scripts.project_config import ConfigurationError
 from tests.fast.ingestion_support import Landed, landed_set, pin_the_synthetic_list, tracked_pin
 from tests.fast.memory_store import MemoryStore
@@ -205,6 +207,34 @@ class CommandTest(unittest.TestCase):
         with mock.patch.object(cli, "load_configuration", side_effect=ConfigurationError(".env is missing")), contextlib.redirect_stderr(errors):
             self.assertEqual(1, cli.main(["verify", "--reference", str(self.work.reference)]))
         self.assertIn(".env is missing", errors.getvalue())
+
+
+class AwsFailureTest(unittest.TestCase):
+    """A failed AWS call is reported through the real AWS helper: its notice says the error text was kept only when the helper kept it."""
+
+    def verify(self, keep: mock.Mock) -> tuple[int, str]:
+        failed = CompletedProcess(["aws"], 255, "", "An error occurred (AccessDenied) when calling the ListObjectVersions operation: denied\n")
+        with tempfile.TemporaryDirectory(prefix="ingestion_cli_aws_") as folder:
+            reference = Path(folder) / "reference.json"
+            sha256 = "0" * 64
+            reference.write_text(json.dumps({"bucket": "example-bucket", "key": f"manifests/probe_set/{sha256}.json", "version_id": "v1", "sha256": sha256}))
+            errors = io.StringIO()
+            with (
+                mock.patch.object(cli, "load_configuration", return_value=CONFIGURATION),
+                mock.patch.object(aws_cli, "run_command", return_value=failed),
+                mock.patch.object(aws_cli, "keep_raw_error", keep),
+                contextlib.redirect_stderr(errors),
+            ):
+                code = cli.main(["verify", "--reference", str(reference)])
+        return code, errors.getvalue()
+
+    def test_control_a_kept_error_text_is_named_as_kept(self) -> None:
+        code, errors = self.verify(mock.Mock(return_value=aws_cli.RAW_ERRORS / "1_s3api_list-object-versions.txt"))
+        self.assertEqual((1, "an AWS call failed; its full error text is kept in an owner-only file under runs/raw_errors\n"), (code, errors))
+
+    def test_an_error_text_that_could_not_be_kept_is_not_named_as_kept(self) -> None:
+        code, errors = self.verify(mock.Mock(side_effect=OSError("no space left on the device")))
+        self.assertEqual((1, "an AWS call failed; its full error text could not be kept\n"), (code, errors))
 
 
 if __name__ == "__main__":

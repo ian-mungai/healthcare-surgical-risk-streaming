@@ -149,6 +149,7 @@ class Code(StrEnum):
     CANNOT_WRITE = "cannot write {subject}"
     CONFIGURATION_INVALID = "the configuration in .env is missing or holds a value that is not valid; .env.example lists every key"
     AWS_FAILED = "an AWS call failed; its full error text is kept in an owner-only file under runs/raw_errors"
+    AWS_FAILED_NOT_KEPT = "an AWS call failed; its full error text could not be kept"
     AWS_TIMED_OUT = "an AWS call passed its deadline"
     BUCKET_FORM = "--bucket must be S3_BUCKET of .env or a test bucket of the form <S3_BUCKET>-test-<8 digits><6 hex digits>"
     CASE_PATTERN = "the selection's case_files pattern is not a path with one {{:0Nd}} place for the number"

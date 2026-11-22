@@ -16,7 +16,8 @@
 command is safe to run again.
 
 Every line a command writes is a ``Notice`` rendered by ``say`` or ``refuse``: an error of another module (the configuration, an AWS call) becomes the
-notice of its kind, and its own text is never written, so no value of an input or of a reply reaches standard error or standard output.
+notice of its kind, and its own text is never written, so no value of an input or of a reply reaches standard error or standard output. A failed AWS
+call's notice says its error text was kept only when the AWS helper's text names the kept file.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import re
 import sys
 from pathlib import Path
 
-from scripts.aws_cli import Aws, AwsError, AwsTimeout
+from scripts.aws_cli import RAW_ERRORS, Aws, AwsError, AwsTimeout
 from scripts.ingestion.check import CheckResult, run_check
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import verify_before_read
@@ -36,11 +37,12 @@ from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
 from scripts.ingestion.selection import Selection
 from scripts.ingestion.store import S3Store
-from scripts.project_config import ConfigurationError, load_configuration
+from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 PROGRAM = "scripts.ingestion.cli"
 PROGRESS_EVERY = 250
 TEST_BUCKET_SUFFIX = re.compile(r"-test-[0-9]{8}[0-9a-f]{6}")
+KEPT_ERROR_TEXT = f"; its full error text is in {RAW_ERRORS.relative_to(ROOT)}/"
 
 
 class InputError(ClosedError, RuntimeError):
@@ -150,8 +152,8 @@ def main(argv: list[str] | None = None) -> int:
         return refuse(Notice(Code.CONFIGURATION_INVALID))
     except AwsTimeout:
         return refuse(Notice(Code.AWS_TIMED_OUT))
-    except AwsError:
-        return refuse(Notice(Code.AWS_FAILED))
+    except AwsError as error:
+        return refuse(Notice(Code.AWS_FAILED if KEPT_ERROR_TEXT in str(error) else Code.AWS_FAILED_NOT_KEPT))
 
 
 if __name__ == "__main__":
