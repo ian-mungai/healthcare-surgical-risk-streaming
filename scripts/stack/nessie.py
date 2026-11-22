@@ -187,9 +187,14 @@ class NessieClient:
         """Delete the branch or tag ``name`` when it is still at ``hash_value``."""
         self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}")
 
-    def merge(self, source: str, target: str, expected_target_hash: str, message: str) -> str:
-        """Merge the branch ``source`` as it is now into ``target``, which must still be at ``expected_target_hash``. Returns the new hash of ``target``."""
-        source_hash = self.reference(source).hash
+    def merge(self, source: str, target: str, expected_target_hash: str, message: str, *, source_hash: str) -> str:
+        """Merge ``source`` as it was at ``source_hash`` into ``target``, which must still be at ``expected_target_hash``. Returns the new hash of ``target``.
+
+        The caller names the source hash, usually the one it checked, and the client never looks the head of ``source`` up. Nessie merges the commits of
+        ``source`` up to ``source_hash`` and no later one, so a branch that has moved since is merged at the named hash only.
+        """
+        if not HASH.fullmatch(source_hash):
+            raise ValueError("the source hash must be 64 lower-case hex digits")
         document = self.request(
             "POST",
             f"/trees/{quote(f'{target}@{expected_target_hash}', safe='@')}/history/merge",

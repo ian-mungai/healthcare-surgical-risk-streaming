@@ -19,14 +19,17 @@ data value.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import tempfile
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
@@ -44,6 +47,9 @@ RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
 JOB_OUTPUT_FILE = "job_output.txt"
+LOCK_FILE = ".table_checks.lock"
+HISTORY_PAGE_SIZE = 100
+HISTORY_PAGE_LIMIT = 50
 TRACKED_RELEASE_FILE = RELEASE_FILE
 MANIFEST_LINE_PREFIX = "records-manifest: "
 MANIFEST_FIELDS: Mapping[str, type] = {"bucket": str, "key": str, "version_id": str, "sha256": str}
@@ -164,8 +170,6 @@ def read_track_pin(path: Path = TRACKED_RELEASE_FILE) -> rules.TrackPin:
 
 def table_snapshot(nessie: NessieClient, branch: str, branch_hash: str, table: str) -> int | None:
     """The snapshot ID that Nessie holds for the table on the branch at exactly that hash, or None when the table is not there."""
-    from urllib.parse import quote
-
     try:
         document = nessie.request("GET", f"/trees/{quote(f'{branch}@{branch_hash}', safe='@')}/contents/{rules.NAMESPACE}.{table}") or {}
     except NessieError as error:
@@ -299,9 +303,65 @@ def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple
     return result, checked
 
 
+@contextlib.contextmanager
+def load_lock(run_folder: Path) -> Iterator[None]:
+    """Hold the one lock of a load: a second run of the same load fails at once with a clear message. The lock ends with the process, so a crash leaves none."""
+    run_folder.mkdir(parents=True, exist_ok=True)
+    handle = (run_folder / LOCK_FILE).open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise TableChecksError("another run of this load holds its lock, so this run did nothing") from None
+    try:
+        yield
+    finally:
+        handle.close()
+
+
+def default_branch(nessie: NessieClient) -> str:
+    name = str(nessie.config().get("defaultBranch") or "")
+    if not name:
+        raise TableChecksError("Nessie names no default branch to merge into")
+    return name
+
+
+def merged_commit(nessie: NessieClient, record: LoadRecord) -> str | None:
+    """The hash of the commit on the default branch whose message ends with this load's ``records-manifest`` line, or None.
+
+    The log is read newest first, page by page. A log too long to read within ``HISTORY_PAGE_LIMIT`` pages is refused, never taken for a log with no merge.
+    """
+    line = manifest_line(record.manifest.sha256)
+    default = quote(default_branch(nessie), safe="")
+    token = ""
+    for _ in range(HISTORY_PAGE_LIMIT):
+        query = {"max-records": str(HISTORY_PAGE_SIZE), **({"page-token": token} if token else {})}
+        document = nessie.request("GET", f"/trees/{default}/history", query=query) or {}
+        for entry in document.get("logEntries", []):
+            meta = entry.get("commitMeta") or {}
+            message, commit = meta.get("message"), meta.get("hash")
+            if isinstance(message, str) and isinstance(commit, str) and message.rstrip().splitlines()[-1:] == [line]:
+                return commit
+        if not document.get("hasMore"):
+            return None
+        following = document.get("token")
+        if not isinstance(following, str) or not following:
+            raise TableChecksError("the log of the default branch has more pages but names no token for the next")
+        token = following
+    raise TableChecksError("the log of the default branch is too long to search for an earlier merge of this load")
+
+
 def write_result(run_folder: Path, document: Mapping[str, Any]) -> None:
     """Save the result in the run folder in one step, so a reader never sees half of it."""
     run_folder.mkdir(parents=True, exist_ok=True)
+    existing = run_folder / RESULT_FILE
+    if existing.is_file() and document.get("merged") is not True:
+        try:
+            was_merged = json.loads(existing.read_text()).get("merged") is True
+        except ValueError, AttributeError:
+            was_merged = False
+        if was_merged:
+            raise TableChecksError("the receipt of this load says merged, and a receipt that says merged is never replaced by one that says it is not")
     fd, partial = tempfile.mkstemp(dir=run_folder, prefix=".table_checks.")
     try:
         with os.fdopen(fd, "w") as handle:
@@ -329,18 +389,30 @@ def saved_result(run_folder: Path, record: LoadRecord) -> dict[str, Any] | None:
     return held
 
 
+def confirm_main(nessie: NessieClient, record: LoadRecord, default: str, merged: str) -> None:
+    """The default branch at the merge commit holds each table at the recorded snapshot."""
+    for table, snapshot in record.tables.items():
+        if table_snapshot(nessie, default, merged, table) != snapshot:
+            raise TableChecksError(f"the default branch at the merge commit does not hold {table} at the recorded snapshot")
+
+
 def merge_branch(nessie: NessieClient, record: LoadRecord) -> tuple[str, str]:
-    """Merge the checked branch into the default branch and return the default branch's hash before and after. Refuse when the branch moved."""
+    """Merge the branch at the checked hash into the default branch and return the default branch's hash before and after the merge.
+
+    The request carries the recorded hash, the one Spark read, so what is merged is what was checked. A branch that has moved since is refused here (Nessie
+    would merge it at that hash only). When the log of the default branch already holds a merge of this load, nothing is sent and that commit is returned.
+    """
     if nessie.reference(record.branch).hash != record.branch_hash:
         raise TableChecksError("the load branch moved after the checks, so what was checked is not what would be merged")
-    default = str(nessie.config().get("defaultBranch") or "")
-    if not default:
-        raise TableChecksError("Nessie names no default branch to merge into")
+    default = default_branch(nessie)
+    earlier = merged_commit(nessie, record)
+    if earlier is not None:
+        confirm_main(nessie, record, default, earlier)
+        return "", earlier
     before = nessie.reference(default).hash
-    after = nessie.merge(record.branch, default, before, f"merge {record.branch}: table checks passed\n\n{manifest_line(record.manifest.sha256)}")
-    for table, snapshot in record.tables.items():
-        if table_snapshot(nessie, default, after, table) != snapshot:
-            raise TableChecksError(f"after the merge the default branch does not hold {table} at the recorded snapshot")
+    message = f"merge {record.branch}: table checks passed\n\n{manifest_line(record.manifest.sha256)}"
+    after = nessie.merge(record.branch, default, before, message, source_hash=record.branch_hash)
+    confirm_main(nessie, record, default, after)
     return before, after
 
 
@@ -358,9 +430,49 @@ def run_table_checks(
     """Run the table checks for one load in the order of the module's description. Raise ``TableChecksError`` for a step that cannot go on."""
     if empty_form not in rules.EMPTY_FORMS:
         raise TableChecksError(f"the empty form must be one of {', '.join(rules.EMPTY_FORMS)}")
+    with load_lock(run_folder):
+        return run_locked(store, nessie, record, track_pin, staging, run_folder, runner, empty_form)
+
+
+def receipt(record: LoadRecord, empty_form: str, checked: dict[str, Any] | None, *, passed: bool) -> dict[str, Any]:
+    return {
+        "format": RUN_FORMAT,
+        "manifest": asdict(record.manifest),
+        "load": record.document,
+        "empty_form": empty_form,
+        "passed": passed,
+        "merged": False,
+        "merged_into": "",
+        "main_hash_before": "",
+        "merged_hash": "",
+        "notes": [rules.LAB_DATA_NOTE],
+        "checked": checked,
+    }
+
+
+def run_locked(
+    store: ObjectStore,
+    nessie: NessieClient,
+    record: LoadRecord,
+    track_pin: rules.TrackPin,
+    staging: Path,
+    run_folder: Path,
+    runner: Runner,
+    empty_form: str,
+) -> Outcome:
     held = saved_result(run_folder, record)
     if held is not None and held["merged"] is True:
         return Outcome(True, True, held)
+    earlier = merged_commit(nessie, record)
+    if earlier is not None:
+        default = default_branch(nessie)
+        confirm_main(nessie, record, default, earlier)
+        document = held if held is not None else receipt(record, empty_form, None, passed=True)
+        if held is None:
+            document["notes"].append("the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch")
+        document.update(passed=True, merged=True, merged_into=default, merged_hash=earlier)
+        write_result(run_folder, document)
+        return Outcome(True, True, document)
     confirm_load(nessie, record)
     staged = stage_verified_files(store, record.manifest, staging)
     plan_document = build_plan(record, staged, track_pin, empty_form, uuid.uuid4().hex)
@@ -371,22 +483,10 @@ def run_table_checks(
     finally:
         remove_staged(staging)
     result, checked = read_result(reply, plan, run_folder)
-    document: dict[str, Any] = {
-        "format": RUN_FORMAT,
-        "manifest": asdict(record.manifest),
-        "load": record.document,
-        "empty_form": empty_form,
-        "passed": result.passed,
-        "merged": False,
-        "merged_into": "",
-        "main_hash_before": "",
-        "merged_hash": "",
-        "notes": [rules.LAB_DATA_NOTE],
-        "checked": checked,
-    }
+    document = receipt(record, empty_form, checked, passed=result.passed)
     write_result(run_folder, document)
     if result.passed:
         before, after = merge_branch(nessie, record)
-        document.update(merged=True, merged_into=str(nessie.config().get("defaultBranch")), main_hash_before=before, merged_hash=after)
+        document.update(merged=True, merged_into=default_branch(nessie), main_hash_before=before, merged_hash=after)
         write_result(run_folder, document)
     return Outcome(result.passed, document["merged"], document)

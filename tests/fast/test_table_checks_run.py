@@ -8,6 +8,7 @@ job did not run and that nothing was merged.
 from __future__ import annotations
 
 import ast
+import fcntl
 import hashlib
 import inspect
 import json
@@ -17,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest import mock
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.ingestion import table_checks as run
 from scripts.ingestion.gate import GateRefused
@@ -55,11 +56,22 @@ class FakeNessie(NessieClient):
         self.calls: list[tuple[str, str]] = []
         self.merges: list[tuple[str, str, str]] = []
         self.merge_messages: list[str] = []
+        self.commits: list[tuple[str, str]] = []
+        self.lose_next_merge_reply = False
+        self.on_branch_read: Callable[[], None] | None = None
+        self.history_page_size = 100
 
     def load_branch(self, name: str, snapshots: dict[str, int]) -> str:
         self.heads[name] = fake_hash(name, "load")
         self.tables[(name, self.heads[name])] = dict(snapshots)
         return self.heads[name]
+
+    def add_main_commit(self, message: str) -> str:
+        """A commit on main that is not a merge of this step, as another tool would write it."""
+        self.heads["main"] = fake_hash("main", "other", message, str(len(self.commits)))
+        self.tables[("main", self.heads["main"])] = {}
+        self.commits.append((self.heads["main"], message))
+        return self.heads["main"]
 
     def move_branch(self, name: str) -> str:
         self.heads[name] = fake_hash(name, "moved", self.heads[name])
@@ -76,7 +88,19 @@ class FakeNessie(NessieClient):
         if name not in self.heads:
             return 404, json.dumps({"errorCode": "REFERENCE_NOT_FOUND", "message": "no such reference"}).encode()
         if method == "GET" and len(parts) == 1:
+            if name == BRANCH and self.on_branch_read is not None:
+                self.on_branch_read()
             return 200, json.dumps({"reference": {"type": "BRANCH", "name": name, "hash": self.heads[name]}}).encode()
+        if method == "GET" and parts[1] == "history":
+            start = int(parse_qs(urlsplit(target).query).get("page-token", ["0"])[0])
+            entries = list(reversed(self.commits))[start : start + self.history_page_size]
+            more = start + self.history_page_size < len(self.commits)
+            document = {
+                "logEntries": [{"commitMeta": {"hash": hash_value, "message": message}} for hash_value, message in entries],
+                "hasMore": more,
+                "token": str(start + len(entries)),
+            }
+            return 200, json.dumps(document).encode()
         if method == "GET" and parts[1] == "contents":
             table = parts[2].removeprefix(f"{rules.NAMESPACE}.")
             held = self.tables.get((name, pinned or self.heads[name]), {})
@@ -92,6 +116,10 @@ class FakeNessie(NessieClient):
             merged = {**self.tables[(name, self.heads[name])], **self.tables[(body["fromRefName"], body["fromHash"])]}
             self.heads[name] = fake_hash(name, "merged", body["fromHash"])
             self.tables[(name, self.heads[name])] = merged
+            self.commits.append((self.heads[name], body["message"]))
+            if self.lose_next_merge_reply:
+                self.lose_next_merge_reply = False
+                raise TimeoutError
             return 200, json.dumps({"wasApplied": True, "wasSuccessful": True, "resultantTargetHash": self.heads[name]}).encode()
         raise AssertionError(f"the stand-in has no answer for {method} {path}")
 
@@ -253,6 +281,100 @@ class GrainNoteTest(unittest.TestCase):
                 case.go(Runner(self.line_for(passed)))
                 notes = case.saved()["notes"]
                 self.assertEqual(1, len([note for note in notes if "lab_data" in note and "same comparison" in note]))
+
+
+class MergeOnceTest(unittest.TestCase):
+    """A merge of one load happens once: the request carries the checked hash, a lost reply is found in main's log, and two runs of one load cannot overlap."""
+
+    def merge_commit(self, case: Case) -> str:
+        return case.nessie.heads["main"]
+
+    def test_a_branch_that_moves_while_the_merge_is_sent_is_merged_at_the_checked_hash_only(self) -> None:
+        case = Case(self)
+        reads: list[int] = []
+
+        def count_and_move() -> None:
+            reads.append(1)
+            if len(reads) > 2:
+                case.nessie.move_branch(BRANCH)
+
+        case.nessie.on_branch_read = count_and_move
+        outcome = case.go(Runner())
+        self.assertTrue(outcome.merged)
+        self.assertEqual([(BRANCH, case.branch_hash, "main")], case.nessie.merges)
+        self.assertEqual(2, len(reads))
+
+    def test_a_lost_reply_is_found_in_the_log_of_main_so_the_retry_sends_no_second_merge(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.lose_next_merge_reply = True
+        with self.assertRaises(NessieError):
+            case.go(runner)
+        self.assertEqual(1, len(case.nessie.merges))
+        self.assertEqual((True, False), (case.saved()["passed"], case.saved()["merged"]))
+        again = case.go(runner)
+        self.assertEqual((1, 1), (runner.calls, len(case.nessie.merges)))
+        self.assertTrue(again.passed and again.merged)
+        saved = case.saved()
+        self.assertEqual((True, True, self.merge_commit(case)), (saved["passed"], saved["merged"], saved["merged_hash"]))
+        self.assertEqual(1, len([message for message in case.nessie.merge_messages if run.manifest_line(case.reference.sha256) in message]))
+
+    def test_a_receipt_that_was_lost_is_rebuilt_from_the_log_and_nothing_is_run_or_merged(self) -> None:
+        case, runner = Case(self), Runner()
+        case.go(runner)
+        (case.run_folder / run.RESULT_FILE).unlink()
+        again = case.go(runner)
+        self.assertEqual((1, 1), (runner.calls, len(case.nessie.merges)))
+        self.assertTrue(again.merged)
+        self.assertEqual(self.merge_commit(case), case.saved()["merged_hash"])
+
+    def test_the_log_is_searched_page_by_page_and_only_a_last_line_that_is_the_manifest_line_counts(self) -> None:
+        case = Case(self)
+        line = run.manifest_line(case.reference.sha256)
+        case.nessie.history_page_size = 1
+        self.assertIsNone(run.merged_commit(case.nessie, case.record))
+        case.nessie.add_main_commit(f"note: {line} is mentioned\n\nin the middle")
+        case.nessie.add_main_commit(f"{line}\n\nand then more text")
+        case.nessie.add_main_commit(f"merge of another load\n\n{run.manifest_line('b' * 64)}")
+        self.assertIsNone(run.merged_commit(case.nessie, case.record))
+        found = case.nessie.add_main_commit(f"merge of this load\n\n{line}\n")
+        for number in range(3):
+            case.nessie.add_main_commit(f"later commit {number}")
+        self.assertEqual(found, run.merged_commit(case.nessie, case.record))
+
+    def test_a_log_too_long_to_search_is_refused_not_taken_for_unmerged(self) -> None:
+        case = Case(self)
+        case.nessie.history_page_size = 1
+        for number in range(run.HISTORY_PAGE_LIMIT + 1):
+            case.nessie.add_main_commit(f"commit {number}")
+        with self.assertRaisesRegex(run.TableChecksError, "log"):
+            run.merged_commit(case.nessie, case.record)
+
+    def test_a_second_run_of_one_load_while_the_first_holds_the_lock_fails_with_a_clear_message_and_does_nothing(self) -> None:
+        case, runner = Case(self), Runner()
+        case.run_folder.mkdir(exist_ok=True)
+        with (case.run_folder / run.LOCK_FILE).open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(run.TableChecksError, "another run of this load"):
+                case.go(runner)
+        self.assertEqual(0, runner.calls)
+        self.assertTrue(case.main_untouched())
+
+    def test_the_lock_is_released_after_a_run_and_after_a_failed_run(self) -> None:
+        case = Case(self)
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner(lambda plan: "no result here\n", exit_code=1))
+        runner = Runner()
+        case.go(runner)
+        self.assertEqual(1, runner.calls)
+
+    def test_a_receipt_that_says_merged_is_never_replaced_by_one_that_says_not_merged(self) -> None:
+        case = Case(self)
+        outcome = case.go(Runner())
+        with self.assertRaisesRegex(run.TableChecksError, "merged"):
+            run.write_result(case.run_folder, {**outcome.document, "merged": False, "merged_hash": ""})
+        self.assertTrue(case.saved()["merged"])
+        run.write_result(case.run_folder, {**outcome.document, "notes": ["still merged"]})
+        self.assertEqual(["still merged"], case.saved()["notes"])
 
 
 class RefusalTest(unittest.TestCase):
