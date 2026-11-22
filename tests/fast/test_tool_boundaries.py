@@ -177,8 +177,9 @@ class TerraformCallTest(Boundary):
             ),
             mock.patch.object(terraform_wrapper, "save_raw", **({"side_effect": saved} if saved else {})),
             mock.patch.object(terraform_wrapper, "configuration_folder", return_value=Path("configuration")),
+            mock.patch.object(terraform_wrapper, "pinned_terraform", return_value=Path("/pinned/terraform")),
         )
-        with patches[0], patches[1] as save, patches[2]:
+        with patches[0], patches[1] as save, patches[2], patches[3]:
             error = raised(lambda: terraform_wrapper.terraform(RUN, ["apply", "-input=false", f"-var=bucket={BUCKET}", f"-var=role={ROLE}"], 30))
         self.save = save
         return error

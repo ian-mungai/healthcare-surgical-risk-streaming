@@ -70,6 +70,17 @@ class WrapperError(RuntimeError):
     """The wrapper refused to continue or a Terraform call failed."""
 
 
+PINNED_TERRAFORM = ".tools/bin/terraform"
+
+
+def pinned_terraform() -> Path:
+    """The project's own pinned Terraform, the only Terraform this project runs. A missing copy is never replaced by the computer's."""
+    path = ROOT / PINNED_TERRAFORM
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise WrapperError(f"the pinned Terraform is missing at {PINNED_TERRAFORM}; run `make setup` to install it")
+    return path
+
+
 CONFIGURATION_PARTS = ("modules", "environments")
 BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
 
@@ -168,8 +179,9 @@ def binding_problems(run: RunBinding, saved: dict[str, Any], plan: bytes, code: 
 def terraform(run: RunBinding, arguments: list[str], timeout: float) -> str:
     command = [f"-chdir={configuration_folder(run)}", *arguments]
     name = f"terraform_{arguments[0]}_failure.txt"
+    program = pinned_terraform()
     try:
-        result = run_command("terraform", command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
+        result = run_command(str(program), command, cwd=ROOT, env=clean_environment(os.environ), timeout=timeout)
     except TimeoutExpired as error:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
         note = f"; {kept_note(run.run_id, name, partial, 'partial output')}" if partial else ""

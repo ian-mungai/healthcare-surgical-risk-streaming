@@ -1,4 +1,4 @@
-"""Install the pinned command-line tools into ``.tools``: gitleaks, tflint, the tflint AWS ruleset and Trivy, and the working-tree privacy hook.
+"""Install the pinned command-line tools into ``.tools``: gitleaks, Terraform, tflint, the tflint AWS ruleset and Trivy, and the working-tree privacy hook.
 
 Run from the repository root: ``.venv/bin/python -m scripts.quality.install_tools``. ``--check`` verifies each installed
 binary against its pinned archive without downloading or writing anything. Each archive is checked against its pinned
@@ -51,6 +51,17 @@ GITLEAKS = Tool(
         ("Linux", "x86_64"): ("gitleaks_8.30.1_linux_x64.tar.gz", "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"),
     },
 )
+TERRAFORM = Tool(
+    name="terraform",
+    version="1.16.4",
+    url="https://releases.hashicorp.com/terraform/1.16.4",
+    member="terraform",
+    target="bin/terraform",
+    assets={
+        ("Darwin", "arm64"): ("terraform_1.16.4_darwin_arm64.zip", "42cfdf97ad722f79085fe2279b06d4b8680172de3534b22eeddd9a0fbbe7b8f1"),
+        ("Linux", "x86_64"): ("terraform_1.16.4_linux_amd64.zip", "dc94af0eef1147718ad7c8daea792ed199e3e0492eec180d0adafa2a65a879df"),
+    },
+)
 TFLINT = Tool(
     name="tflint",
     version="0.66.0",
@@ -84,7 +95,7 @@ TRIVY = Tool(
         ("Linux", "x86_64"): ("trivy_0.76.2_Linux-64bit.tar.gz", "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"),
     },
 )
-TOOL_LIST = (GITLEAKS, TFLINT, TFLINT_AWS, TRIVY)
+TOOL_LIST = (GITLEAKS, TERRAFORM, TFLINT, TFLINT_AWS, TRIVY)
 
 
 def pinned_asset(tool: Tool) -> tuple[str, str]:

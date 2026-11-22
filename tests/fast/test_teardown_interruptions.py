@@ -496,6 +496,7 @@ class ErrorTextTest(unittest.TestCase):
             mock.patch.object(terraform_wrapper, "run_command", return_value=failed),
             mock.patch.object(terraform_wrapper, "save_raw") as saved,
             mock.patch.object(terraform_wrapper, "configuration_folder", return_value=Path("configuration")),
+            mock.patch.object(terraform_wrapper, "pinned_terraform", return_value=Path("/pinned/terraform")),
             self.assertRaises(WrapperError) as raised,
         ):
             terraform_wrapper.terraform(RUN, ["apply", "-input=false"], 10)

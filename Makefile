@@ -1,4 +1,5 @@
 PYTHON := .venv/bin/python
+TERRAFORM ?= .tools/bin/terraform
 
 .PHONY: setup lock check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy
 
@@ -15,10 +16,11 @@ check:
 	.venv/bin/pre-commit run --all-files --hook-stage manual
 
 check-terraform:
-	terraform fmt -check -recursive infra
-	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra init -backend=false -input=false
-	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra validate
-	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static terraform -chdir=infra test
+	@test -x $(TERRAFORM) || { echo "the pinned Terraform $(TERRAFORM) is missing; run: make setup" >&2; exit 1; }
+	$(TERRAFORM) fmt -check -recursive infra
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra init -backend=false -input=false
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra validate
+	TF_DATA_DIR=$(CURDIR)/.tools/terraform/static $(TERRAFORM) -chdir=infra test
 	TFLINT_PLUGIN_DIR=$(CURDIR)/.tools/tflint_plugins .tools/bin/tflint --chdir=infra --recursive --config=$(CURDIR)/infra/.tflint.hcl
 	.tools/bin/trivy config --cache-dir $(CURDIR)/.tools/trivy_cache --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .terraform --quiet infra
 
