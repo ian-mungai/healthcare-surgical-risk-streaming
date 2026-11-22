@@ -1,15 +1,18 @@
 """No S3 lifecycle rule may expire the live table paths: the warehouse prefix of the project's bucket.
 
-Iceberg tables are live while Nessie names their metadata, and an object that a lifecycle rule expires is gone with no Iceberg or Nessie step. The check reads a
-lifecycle configuration in the form that S3 returns it, reads the rules that Terraform declares in the repository and reads the live bucket. The cases cover the
-forms of a rule's scope (the whole bucket, a prefix above, equal to or below the warehouse, a tag or size filter, the old top-level prefix), the actions that
-expire a live object and the ones that do not, and a rule that is off. The runs for the lead on the host read the live bucket, because a build reaches no cloud.
+Iceberg tables are live while Nessie names their metadata, and an object that a lifecycle rule expires is gone with no Iceberg or Nessie step. The project
+declares no lifecycle configuration, so the check fails when the text of one appears in a Terraform file under ``infra/``, with no parsing of Terraform. It
+reads the live bucket's rules in the form that S3 returns them. The cases cover the forms of a rule's scope (the whole bucket, a prefix above, equal to or below
+the warehouse, a tag or size filter, the old top-level prefix), the actions that expire a live object and the ones that do not, a rule that is off, a status
+that is neither Enabled nor Disabled, and what counts as no configuration. The runs for the lead on the host read the live bucket, because a build reaches
+no cloud.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +81,21 @@ class ScopeTest(unittest.TestCase):
     def test_a_rule_that_is_off_passes(self) -> None:
         self.assertEqual([], problems(rule("cleanup", {"Prefix": ""}, expiration={"Days": 30}, status="Disabled")))
 
+    def test_a_status_that_is_not_exactly_enabled_or_disabled_is_a_problem_whatever_the_rule_does(self) -> None:
+        for status in ("enabled", "ENABLED", "Enabld", "", "On", 1, None):
+            with self.subTest(status=status):
+                for actions in ({"Expiration": {"Days": 30}}, {"NoncurrentVersionExpiration": {"NoncurrentDays": 30}}, {}):
+                    found = problems({"ID": "cleanup", "Status": status, "Filter": {"Prefix": "warehouse/"}, **actions})
+                    self.assertEqual(1, len(found))
+                    self.assertIn("cleanup", found[0])
+                    self.assertIn("Status", found[0])
+
+    def test_a_rule_with_no_status_at_all_and_an_expiration_of_the_warehouse_is_a_problem(self) -> None:
+        document = {"ID": "nostatus", "Filter": {"Prefix": "warehouse/"}, "Expiration": {"Days": 30}}
+        found = lifecycle.expiring_rule_problems({"Rules": [document]}, PROTECTED)
+        self.assertEqual(1, len(found))
+        self.assertIn("nostatus", found[0])
+
 
 class ActionTest(unittest.TestCase):
     def test_an_expiration_by_date_expires_a_live_object_too(self) -> None:
@@ -109,192 +127,128 @@ class ActionTest(unittest.TestCase):
                 lifecycle.expiring_rule_problems(document, PROTECTED)
 
 
-BAD_TERRAFORM = """
-resource "aws_s3_bucket_lifecycle_configuration" "project" {
+BAD_NAMES = ("aws_s3_bucket_lifecycle_configuration", "lifecycle_rule")
+REVIEWER_TF = """
+resource "aws_s3_bucket_lifecycle_configuration" "b" {
   bucket = "b"
   rule {
-    id     = "cleanup"
+    id     = "cleanup \\"}"
     status = "Enabled"
     filter {
-      prefix = "%s"
+      prefix = "warehouse/"
     }
     expiration {
       days = 30
     }
   }
-  rule {
-    id     = "uploads"
-    status = "Enabled"
-    filter {}
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
+}
+"""
+REVIEWER_JSON = """{
+  "resource": {
+    "aws_s3_bucket_lifecycle_configuration": {
+      "b": {
+        "bucket": "b",
+        "rule": [{"id": "cleanup", "status": "Enabled", "filter": {"prefix": "warehouse/"}, "expiration": {"days": 30}}]
+      }
     }
   }
 }
 """
 
 
-class TerraformTest(unittest.TestCase):
-    def test_a_declared_rule_is_read_in_the_form_of_s3(self) -> None:
-        rules = lifecycle.terraform_rules(BAD_TERRAFORM % "landing/")
-        self.assertEqual(["cleanup", "uploads"], [item["ID"] for item in rules])
-        self.assertEqual({"Prefix": "landing/"}, rules[0]["Filter"])
-        self.assertEqual({"Days": 30}, rules[0]["Expiration"])
-        self.assertEqual("Enabled", rules[0]["Status"])
-        self.assertNotIn("Expiration", rules[1])
-
-    def test_a_declared_rule_that_expires_the_warehouse_is_a_problem_and_a_clear_one_is_not(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "bucket.tf").write_text(BAD_TERRAFORM % "warehouse/")
-            found = lifecycle.declared_problems(directory, PROTECTED)
-            Path(directory, "bucket.tf").write_text(BAD_TERRAFORM % "landing/")
-            clear = lifecycle.declared_problems(directory, PROTECTED)
-        self.assertEqual(1, len(found))
-        self.assertIn("bucket.tf", found[0])
-        self.assertIn("cleanup", found[0])
-        self.assertEqual([], clear)
-
-    def test_a_prefix_that_is_not_a_literal_and_a_block_of_the_old_form_cannot_be_judged_and_are_problems(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "bucket.tf").write_text(BAD_TERRAFORM.replace('"%s"', "var.prefix"))
-            variable = lifecycle.declared_problems(directory, PROTECTED)
-            Path(directory, "bucket.tf").write_text('resource "aws_s3_bucket" "b" {\n  lifecycle_rule {\n    enabled = true\n  }\n}\n')
-            old = lifecycle.declared_problems(directory, PROTECTED)
-        self.assertEqual(1, len(variable))
-        self.assertEqual(1, len(old))
-        self.assertIn("lifecycle_rule", old[0])
-
-    def test_a_rule_that_is_not_enabled_in_terraform_passes(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "bucket.tf").write_text((BAD_TERRAFORM % "warehouse/").replace('"Enabled"', '"Disabled"'))
-            self.assertEqual([], lifecycle.declared_problems(directory, PROTECTED))
-
-    def test_the_repository_declares_no_rule_that_expires_the_warehouse(self) -> None:
-        self.assertEqual([], lifecycle.declared_problems(str(INFRA), PROTECTED))
-
-
-def declared(text: str) -> list[str]:
+def declared(files: dict[str, str]) -> list[str]:
+    """The problems that ``declared_problems`` finds in a temporary ``infra`` folder holding ``files`` (a name with folders in it makes them)."""
     with tempfile.TemporaryDirectory() as directory:
-        Path(directory, "bucket.tf").write_text(text)
-        return lifecycle.declared_problems(directory, PROTECTED)
+        for name, text in files.items():
+            path = Path(directory, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return lifecycle.declared_problems(directory)
 
 
-class HclValueTest(unittest.TestCase):
-    """The rule's values are read as Terraform reads them: comments and escapes are decoded first, and a value that cannot be read as a literal fails closed."""
+class DeclaredPresenceTest(unittest.TestCase):
+    """The project declares no lifecycle configuration: the words of one anywhere in a Terraform file are a problem. Nothing is parsed."""
 
-    def test_a_comment_after_a_value_does_not_turn_an_enabled_rule_off(self) -> None:
-        for comment in ("# current objects expire", "// current objects expire", "/* current objects expire */", '# "quoted" } { braces'):
-            with self.subTest(comment=comment):
-                text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', f'status = "Enabled" {comment}', 1)
-                found = declared(text)
-                self.assertEqual(1, len(found))
-                self.assertIn("cleanup", found[0])
-
-    def test_a_comment_after_the_prefix_the_days_or_the_block_does_not_hide_the_rule(self) -> None:
-        text = (
-            (BAD_TERRAFORM % "warehouse/")
-            .replace('prefix = "warehouse/"', 'prefix = "warehouse/" # the live tables')
-            .replace("days = 30", "days = 30 // thirty")
-        )
-        text = text.replace("expiration {", "expiration { # expires")
-        self.assertEqual(1, len(declared(text)))
-
-    def test_a_commented_out_assignment_or_block_is_not_a_rule(self) -> None:
-        text = (BAD_TERRAFORM % "landing/").replace('    status = "Enabled"\n', '    # status = "Disabled"\n    status = "Enabled"\n', 1)
-        self.assertEqual([], declared(text))
-        commented = "# " + (BAD_TERRAFORM % "warehouse/").replace("\n", "\n# ")
-        self.assertEqual([], declared(commented))
-
-    def test_a_hash_sign_or_two_slashes_inside_a_string_are_part_of_the_string(self) -> None:
-        self.assertEqual(1, len(declared(BAD_TERRAFORM % "warehouse/#raw")))
-        self.assertEqual(1, len(declared(BAD_TERRAFORM % "warehouse//raw")))
-        self.assertEqual([], declared(BAD_TERRAFORM % "landing/#warehouse/"))
-
-    def test_an_escaped_spelling_of_the_warehouse_prefix_is_the_warehouse_prefix(self) -> None:
-        for spelled in (r"ware\u0068ouse/", r"\u0077arehouse/", r"\U00000077arehouse/", r"warehouse\u002f"):
-            with self.subTest(spelled=spelled):
-                self.assertEqual(1, len(declared(BAD_TERRAFORM % spelled)))
-
-    def test_an_escape_that_is_not_understood_or_an_interpolation_fails_closed_as_a_problem(self) -> None:
-        for spelled in (r"\x77arehouse/", r"landing\/", "${var.prefix}", "%{ if true }warehouse/%{ endif }"):
-            with self.subTest(spelled=spelled):
-                self.assertEqual(1, len(declared(BAD_TERRAFORM % spelled)))
-
-    def test_an_escaped_dollar_is_a_plain_dollar_and_a_clear_prefix_stays_clear(self) -> None:
-        self.assertEqual([], declared(BAD_TERRAFORM % "landing/$${not_a_variable}"))
-        self.assertEqual([], declared(BAD_TERRAFORM % r"landing\u002f"))
-
-    def test_a_status_that_is_not_a_literal_fails_closed_as_enabled(self) -> None:
-        for status in ("var.enabled", '"${var.state}"', r'"Enab\x6ced"'):
-            with self.subTest(status=status):
-                text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', f"status = {status}", 1)
-                self.assertEqual(1, len(declared(text)), status)
-
-    def test_an_escaped_spelling_of_disabled_is_disabled(self) -> None:
-        text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', r'status = "Dis\u0061bled"', 1)
-        self.assertEqual([], declared(text))
-
-    def test_a_status_that_is_a_literal_other_than_disabled_is_read_as_enabled(self) -> None:
-        text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', 'status = "Enabld"', 1)
-        self.assertEqual(1, len(declared(text)))
-
-    def test_the_rules_read_from_terraform_have_no_comment_text_in_their_values(self) -> None:
-        text = (BAD_TERRAFORM % "landing/").replace('status = "Enabled"', 'status = "Enabled" # current objects expire', 1)
-        rules = lifecycle.terraform_rules(text)
-        self.assertEqual("Enabled", rules[0]["Status"])
-        self.assertEqual({"Prefix": "landing/"}, rules[0]["Filter"])
-
-    def test_a_brace_in_a_comment_does_not_cut_a_rule_short_and_hide_its_prefix_and_expiration(self) -> None:
-        text = (BAD_TERRAFORM % "warehouse/").replace('id     = "cleanup"', 'id     = "cleanup" # }', 1)
-        rules = lifecycle.terraform_rules(text)
-        self.assertEqual({"Prefix": "warehouse/"}, rules[0]["Filter"])
-        self.assertEqual({"Days": 30}, rules[0]["Expiration"])
-
-    def test_a_word_in_a_comment_is_not_a_block(self) -> None:
-        text = (BAD_TERRAFORM % "landing/") + '# the old lifecycle_rule form is not used here\n# dynamic "rule" { is not used here either\n'
-        self.assertEqual([], declared(text))
-
-    def test_a_dynamic_rule_cannot_be_read_and_is_a_problem(self) -> None:
-        lines = ['resource "aws_s3_bucket_lifecycle_configuration" "b" {', '  bucket = "b"', '  dynamic "rule" {', "    for_each = var.rules"]
-        text = "\n".join([*lines, "    content {", '      id = "x"', "    }", "  }", "}", ""])
-        found = declared(text)
+    def test_the_reviewers_block_with_an_escaped_quote_and_brace_in_its_id_is_found(self) -> None:
+        found = declared({"bucket.tf": REVIEWER_TF})
         self.assertEqual(1, len(found))
-        self.assertIn("dynamic", found[0])
+        self.assertIn("bucket.tf:2", found[0])
+        self.assertIn("aws_s3_bucket_lifecycle_configuration", found[0])
 
-    def test_rules_that_only_abort_uploads_or_expire_old_versions_are_allowed_in_terraform(self) -> None:
-        text = """resource "aws_s3_bucket_lifecycle_configuration" "b" {
-  bucket = "b"
-  rule {
-    id     = "old versions"
-    status = "Enabled"
-    filter {}
-    noncurrent_version_expiration {
-      noncurrent_days = 30
-    }
-  }
-  rule {
-    id     = "uploads"
-    status = "Enabled"
-    filter {
-      prefix = ""
-    }
-    abort_incomplete_multipart_upload {
-      days_after_initiation = 7
-    }
-  }
-}
-"""
-        self.assertEqual([], declared(text))
+    def test_the_same_rule_in_the_json_form_of_terraform_is_found(self) -> None:
+        found = declared({"bucket.tf.json": REVIEWER_JSON})
+        self.assertEqual(1, len(found))
+        self.assertIn("bucket.tf.json:3", found[0])
+
+    def test_a_comment_that_only_mentions_the_resource_type_is_refused_too_by_design(self) -> None:
+        for text in ("# aws_s3_bucket_lifecycle_configuration\n", "// see aws_s3_bucket_lifecycle_configuration\n", "/* lifecycle_rule */\n"):
+            with self.subTest(text=text):
+                self.assertEqual(1, len(declared({"notes.tf": text})))
+
+    def test_the_old_lifecycle_rule_block_is_found_and_each_line_of_each_word_is_named(self) -> None:
+        text = 'resource "aws_s3_bucket" "b" {\n  lifecycle_rule {\n    enabled = true\n  }\n}\nresource "aws_s3_bucket_lifecycle_configuration" "c" {}\n'
+        found = declared({"main.tf": text})
+        self.assertEqual(2, len(found))
+        self.assertIn("main.tf:2", found[0])
+        self.assertIn("main.tf:6", found[1])
+
+    def test_a_word_on_two_lines_of_one_file_names_both_lines(self) -> None:
+        found = declared({"main.tf": "lifecycle_rule\n\nlifecycle_rule\n"})
+        self.assertEqual(["main.tf:1", "main.tf:3"], [item.split(":")[0] + ":" + item.split(":")[1] for item in found])
+
+    def test_the_message_says_that_a_lifecycle_rule_needs_a_deliberate_change_of_this_check(self) -> None:
+        self.assertIn("deliberate change of this check", declared({"main.tf": "lifecycle_rule"})[0])
+
+    def test_the_search_is_case_sensitive_and_only_the_two_file_endings_are_searched(self) -> None:
+        self.assertEqual([], declared({"main.tf": "AWS_S3_BUCKET_LIFECYCLE_CONFIGURATION Lifecycle_Rule\n"}))
+        for name in ("notes.md", "vars.tfvars", "main.tf.bak", "main.hcl", "tf", "x.tf.txt"):
+            with self.subTest(name=name):
+                self.assertEqual([], declared({name: "aws_s3_bucket_lifecycle_configuration lifecycle_rule\n"}))
+
+    def test_a_file_in_a_nested_folder_is_found_with_its_path(self) -> None:
+        found = declared({"modules/data/main.tf": "lifecycle_rule\n"})
+        self.assertEqual(1, len(found))
+        self.assertIn("modules/data/main.tf:1", found[0])
+
+    def test_a_folder_that_is_a_symbolic_link_is_not_followed_and_a_file_that_is_one_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as outer:
+            infra, elsewhere = Path(outer, "infra"), Path(outer, "elsewhere")
+            infra.mkdir()
+            elsewhere.mkdir()
+            (elsewhere / "bad.tf").write_text("lifecycle_rule\n")
+            os.symlink(elsewhere, infra / "linked_folder")
+            self.assertEqual([], lifecycle.declared_problems(infra))
+            os.symlink(elsewhere / "bad.tf", infra / "linked_file.tf")
+            found = lifecycle.declared_problems(infra)
+        self.assertEqual(1, len(found))
+        self.assertIn("linked_file.tf:1", found[0])
+
+    def test_a_folder_that_holds_no_such_word_is_clear_and_a_file_that_is_not_utf8_is_still_searched(self) -> None:
+        self.assertEqual([], declared({"main.tf": 'resource "aws_s3_bucket" "b" {}\n'}))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "odd.tf").write_bytes(b"\xff\xfe lifecycle_rule\n")
+            self.assertEqual(1, len(lifecycle.declared_problems(directory)))
+
+    def test_the_repository_declares_no_lifecycle_configuration(self) -> None:
+        self.assertEqual([], lifecycle.declared_problems(INFRA))
+        self.assertTrue(list(INFRA.rglob("*.tf")))
+
+
+def aws_error(code: str, *, trailing: str = "") -> AwsError:
+    """An error as ``Aws.call`` words it: the code that it parsed from the CLI's error line, then where the full text was kept."""
+    return AwsError(f"aws s3api get-bucket-lifecycle-configuration failed: {code}; its full error text is in runs/raw_errors/x.txt{trailing}")
 
 
 def run_check(document: Any, *, error: Exception | None = None) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
+    given: list[dict[str, Any]] = []
 
     class FakeAws:
         def __init__(self, *_: str) -> None:
-            self.calls: list[tuple[str, ...]] = []
+            return
 
-        def call(self, *arguments: str, missing: tuple[str, ...] = ()) -> Any:
+        def call(self, *arguments: str, **keywords: Any) -> Any:
+            given.append(keywords)
             if error is not None:
                 raise error
             return document
@@ -306,6 +260,8 @@ def run_check(document: Any, *, error: Exception | None = None) -> tuple[int, st
         contextlib.redirect_stderr(err),
     ):
         code = lifecycle.main(["check"])
+    if any("missing" in keywords for keywords in given):
+        raise AssertionError("the check must not let the shared client find the error by a substring")
     return code, out.getvalue(), err.getvalue()
 
 
@@ -316,20 +272,43 @@ class CommandTest(unittest.TestCase):
         self.assertIn("cleanup", err)
         self.assertNotIn("ok", out)
 
-    def test_a_bucket_with_a_clear_rule_or_no_configuration_exits_0(self) -> None:
-        clear = run_check({"Rules": [rule("cleanup", {"Prefix": "landing/"}, expiration={"Days": 30})]})
-        none = run_check(None)
-        self.assertEqual((0, 0), (clear[0], none[0]))
-        self.assertIn("no rule", none[1])
+    def test_a_bucket_with_a_clear_rule_exits_0(self) -> None:
+        self.assertEqual(0, run_check({"Rules": [rule("cleanup", {"Prefix": "landing/"}, expiration={"Days": 30})]})[0])
 
-    def test_a_successful_answer_that_is_not_a_document_of_rules_exits_1_and_is_never_taken_for_no_rules(self) -> None:
-        documents: list[Any] = [{}, {"Rules": []}, {"Rules": "x"}, {"Rules": [1]}, {"Other": 1}, [], "", 0]
+    def test_a_bucket_with_no_lifecycle_configuration_is_the_error_code_and_nothing_else_exits_0(self) -> None:
+        code, out, _ = run_check(None, error=aws_error("NoSuchLifecycleConfiguration"))
+        self.assertEqual(0, code)
+        self.assertIn("no lifecycle configuration", out)
+
+    def test_an_error_that_only_mentions_the_missing_configuration_in_its_text_exits_1(self) -> None:
+        for error in (
+            aws_error("AccessDenied", trailing=" NoSuchLifecycleConfiguration"),
+            aws_error("AccessDenied; NoSuchLifecycleConfiguration"),
+            AwsError("aws s3api get-bucket-lifecycle-configuration failed: exit status 255; NoSuchLifecycleConfiguration"),
+            AwsError("An error occurred (NoSuchLifecycleConfiguration) but not in the form of the client's words"),
+            AwsError("aws s3api get-bucket-lifecycle-configuration failed: NoSuchLifecycleConfigurationX; text"),
+            AwsError("aws s3api get-bucket-lifecycle-configuration failed: AccessDenied"),
+        ):
+            with self.subTest(error=str(error)[:80]):
+                code, out, err = run_check(None, error=error)
+                self.assertEqual(1, code)
+                self.assertNotIn("no lifecycle configuration", out)
+                self.assertTrue(err.strip())
+
+    def test_a_successful_answer_that_is_not_a_json_object_with_a_list_of_rules_exits_1_and_is_never_taken_for_no_rules(self) -> None:
+        documents: list[Any] = [None, {}, {"Rules": []}, {"Rules": "x"}, {"Rules": [1]}, {"Rules": None}, {"Other": 1}, [], "", 0, "null"]
         for document in documents:
             with self.subTest(document=document):
                 code, out, err = run_check(document)
                 self.assertEqual(1, code)
+                self.assertNotIn("no lifecycle configuration", out)
                 self.assertNotIn("no rule", out)
                 self.assertIn("lifecycle", err)
+
+    def test_a_rule_whose_status_is_missing_or_not_exact_exits_1(self) -> None:
+        missing = {"ID": "x", "Filter": {"Prefix": "warehouse/"}, "Expiration": {"Days": 30}}
+        self.assertEqual(1, run_check({"Rules": [missing]})[0])
+        self.assertEqual(1, run_check({"Rules": [rule("x", {"Prefix": "landing/"}, expiration={"Days": 30}, status="enabled")]})[0])
 
     def test_rules_that_expire_no_current_object_exit_0_on_the_whole_bucket(self) -> None:
         document = {
@@ -341,7 +320,7 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(0, run_check(document)[0])
 
     def test_a_failed_read_exits_1_and_is_never_taken_for_no_rules(self) -> None:
-        code, out, err = run_check(None, error=AwsError("aws s3api failed: AccessDenied"))
+        code, out, err = run_check(None, error=AwsError("aws s3api get-bucket-lifecycle-configuration failed: AccessDenied; its full error text is in x"))
         self.assertEqual(1, code)
         self.assertIn("AccessDenied", err)
         self.assertNotIn("no rule", out)
