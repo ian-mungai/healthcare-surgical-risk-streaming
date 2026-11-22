@@ -412,6 +412,9 @@ class WorkloadAccessTest(unittest.TestCase):
                 readers.append(path.stem)
         self.assertEqual(sorted(CREDENTIAL_READERS), readers)
 
+    def test_the_replay_runs_under_an_init_process_so_a_stop_before_its_handler_is_set_ends_it_at_once(self) -> None:
+        self.assertIs(True, load(SERVICES / "replay.yml")["services"]["replay"].get("init"))
+
     def test_the_fixed_table_agrees_with_the_project_workload_groups(self) -> None:
         for name, (workload, group) in CREDENTIAL_READERS.items():
             self.assertEqual(group, PROJECT_WORKLOAD_GIDS[workload], name)

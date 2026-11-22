@@ -10,6 +10,8 @@ services:
     mem_limit: ${MEM_LIMIT_REPLAY:?render the limits first}
     restart: unless-stopped
     stop_grace_period: 60s
+    # An init process is process 1, so a stop that arrives before the replay has set its own handler ends it at once instead of at the end of the grace period.
+    init: true
     user: "10003:10003"
     group_add: ["20104"]
     cap_drop: [ALL]
