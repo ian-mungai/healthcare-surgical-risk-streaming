@@ -173,6 +173,100 @@ class TerraformTest(unittest.TestCase):
         self.assertEqual([], lifecycle.declared_problems(str(INFRA), PROTECTED))
 
 
+def declared(text: str) -> list[str]:
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, "bucket.tf").write_text(text)
+        return lifecycle.declared_problems(directory, PROTECTED)
+
+
+class HclValueTest(unittest.TestCase):
+    """The rule's values are read as Terraform reads them: comments and escapes are decoded first, and a value that cannot be read as a literal fails closed."""
+
+    def test_a_comment_after_a_value_does_not_turn_an_enabled_rule_off(self) -> None:
+        for comment in ("# current objects expire", "// current objects expire", "/* current objects expire */", '# "quoted" } { braces'):
+            with self.subTest(comment=comment):
+                text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', f'status = "Enabled" {comment}', 1)
+                found = declared(text)
+                self.assertEqual(1, len(found))
+                self.assertIn("cleanup", found[0])
+
+    def test_a_comment_after_the_prefix_the_days_or_the_block_does_not_hide_the_rule(self) -> None:
+        text = (
+            (BAD_TERRAFORM % "warehouse/")
+            .replace('prefix = "warehouse/"', 'prefix = "warehouse/" # the live tables')
+            .replace("days = 30", "days = 30 // thirty")
+        )
+        text = text.replace("expiration {", "expiration { # expires")
+        self.assertEqual(1, len(declared(text)))
+
+    def test_a_commented_out_assignment_or_block_is_not_a_rule(self) -> None:
+        text = (BAD_TERRAFORM % "landing/").replace('    status = "Enabled"\n', '    # status = "Disabled"\n    status = "Enabled"\n', 1)
+        self.assertEqual([], declared(text))
+        commented = "# " + (BAD_TERRAFORM % "warehouse/").replace("\n", "\n# ")
+        self.assertEqual([], declared(commented))
+
+    def test_a_hash_sign_or_two_slashes_inside_a_string_are_part_of_the_string(self) -> None:
+        self.assertEqual(1, len(declared(BAD_TERRAFORM % "warehouse/#raw")))
+        self.assertEqual(1, len(declared(BAD_TERRAFORM % "warehouse//raw")))
+        self.assertEqual([], declared(BAD_TERRAFORM % "landing/#warehouse/"))
+
+    def test_an_escaped_spelling_of_the_warehouse_prefix_is_the_warehouse_prefix(self) -> None:
+        for spelled in (r"ware\u0068ouse/", r"\u0077arehouse/", r"\U00000077arehouse/", r"warehouse\u002f"):
+            with self.subTest(spelled=spelled):
+                self.assertEqual(1, len(declared(BAD_TERRAFORM % spelled)))
+
+    def test_an_escape_that_is_not_understood_or_an_interpolation_fails_closed_as_a_problem(self) -> None:
+        for spelled in (r"\x77arehouse/", r"landing\/", "${var.prefix}", "%{ if true }warehouse/%{ endif }"):
+            with self.subTest(spelled=spelled):
+                self.assertEqual(1, len(declared(BAD_TERRAFORM % spelled)))
+
+    def test_an_escaped_dollar_is_a_plain_dollar_and_a_clear_prefix_stays_clear(self) -> None:
+        self.assertEqual([], declared(BAD_TERRAFORM % "landing/$${not_a_variable}"))
+        self.assertEqual([], declared(BAD_TERRAFORM % r"landing\u002f"))
+
+    def test_a_status_that_is_not_a_literal_fails_closed_as_enabled(self) -> None:
+        for status in ("var.enabled", '"${var.state}"', r'"Enab\x6ced"'):
+            with self.subTest(status=status):
+                text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', f"status = {status}", 1)
+                self.assertEqual(1, len(declared(text)), status)
+
+    def test_an_escaped_spelling_of_disabled_is_disabled(self) -> None:
+        text = (BAD_TERRAFORM % "warehouse/").replace('status = "Enabled"', r'status = "Dis\u0061bled"', 1)
+        self.assertEqual([], declared(text))
+
+    def test_a_dynamic_rule_cannot_be_read_and_is_a_problem(self) -> None:
+        lines = ['resource "aws_s3_bucket_lifecycle_configuration" "b" {', '  bucket = "b"', '  dynamic "rule" {', "    for_each = var.rules"]
+        text = "\n".join([*lines, "    content {", '      id = "x"', "    }", "  }", "}", ""])
+        found = declared(text)
+        self.assertEqual(1, len(found))
+        self.assertIn("dynamic", found[0])
+
+    def test_rules_that_only_abort_uploads_or_expire_old_versions_are_allowed_in_terraform(self) -> None:
+        text = """resource "aws_s3_bucket_lifecycle_configuration" "b" {
+  bucket = "b"
+  rule {
+    id     = "old versions"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+  }
+  rule {
+    id     = "uploads"
+    status = "Enabled"
+    filter {
+      prefix = ""
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+"""
+        self.assertEqual([], declared(text))
+
+
 def run_check(document: Any, *, error: Exception | None = None) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
 
@@ -207,6 +301,24 @@ class CommandTest(unittest.TestCase):
         none = run_check(None)
         self.assertEqual((0, 0), (clear[0], none[0]))
         self.assertIn("no rule", none[1])
+
+    def test_a_successful_answer_that_is_not_a_document_of_rules_exits_1_and_is_never_taken_for_no_rules(self) -> None:
+        documents: list[Any] = [{}, {"Rules": []}, {"Rules": "x"}, {"Rules": [1]}, {"Other": 1}, [], "", 0]
+        for document in documents:
+            with self.subTest(document=document):
+                code, out, err = run_check(document)
+                self.assertEqual(1, code)
+                self.assertNotIn("no rule", out)
+                self.assertIn("lifecycle", err)
+
+    def test_rules_that_expire_no_current_object_exit_0_on_the_whole_bucket(self) -> None:
+        document = {
+            "Rules": [
+                rule("old versions", {"Prefix": ""}, NoncurrentVersionExpiration={"NoncurrentDays": 30}),
+                rule("uploads", {"Prefix": ""}, AbortIncompleteMultipartUpload={"DaysAfterInitiation": 7}),
+            ]
+        }
+        self.assertEqual(0, run_check(document)[0])
 
     def test_a_failed_read_exits_1_and_is_never_taken_for_no_rules(self) -> None:
         code, out, err = run_check(None, error=AwsError("aws s3api failed: AccessDenied"))

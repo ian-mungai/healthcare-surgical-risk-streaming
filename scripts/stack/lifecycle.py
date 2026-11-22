@@ -33,6 +33,9 @@ FILTER_OPENER = re.compile(r"\bfilter\s*\{")
 EXPIRATION_OPENER = re.compile(r"\bexpiration\s*\{")
 OLD_FORM = re.compile(r"\blifecycle_rule\b")
 ASSIGNMENT = r"\b{name}\s*=\s*(.+)"
+DYNAMIC_BLOCK = re.compile(r"\bdynamic\s+\"")
+SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+UNICODE_ESCAPE = re.compile(r"u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})")
 
 
 def rule_prefix(rule: Mapping[str, Any]) -> str:
@@ -62,6 +65,76 @@ def expiring_rule_problems(configuration: Mapping[str, Any], protected_prefix: s
     return found
 
 
+def strip_comments(text: str) -> str:
+    """``text`` without its ``#`` and ``//`` line comments and ``/* */`` block comments. A comment mark inside a quoted string is part of the string."""
+    kept: list[str] = []
+    index, quoted = 0, False
+    while index < len(text):
+        character, following = text[index], text[index + 1 : index + 2]
+        if quoted:
+            kept.append(character)
+            if character == "\\" and following:
+                kept.append(following)
+                index += 1
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+            kept.append(character)
+        elif character == "#" or (character == "/" and following == "/"):
+            while index < len(text) and text[index] != "\n":
+                index += 1
+            continue
+        elif character == "/" and following == "*":
+            end = text.find("*/", index + 2)
+            index = len(text) if end < 0 else end + 2
+            kept.append(" ")
+            continue
+        else:
+            kept.append(character)
+        index += 1
+    return "".join(kept)
+
+
+def string_literal(value: str | None) -> str | None:
+    """The text of a Terraform string literal with its escapes decoded, or None when ``value`` is not a plain literal that this module can evaluate.
+
+    The escapes for a newline, a carriage return, a tab, a quote, a backslash and four- and eight-digit Unicode code points are decoded, and so are the doubled
+    dollar and percent signs before a brace. An interpolation, any other escape and anything that is not one whole quoted string is None, which a caller
+    reads as a value that can be anything.
+    """
+    if value is None or len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return None
+    inner, decoded, index = value[1:-1], [], 0
+    while index < len(inner):
+        character = inner[index]
+        if character == '"':
+            return None
+        if character in "$%" and inner[index + 1 : index + 3] == f"{character}{{":
+            decoded.append(f"{character}{{")
+            index += 3
+        elif character in "$%" and inner[index + 1 : index + 2] == "{":
+            return None
+        elif character == "\\":
+            escaped = inner[index + 1 : index + 2]
+            numeric = UNICODE_ESCAPE.match(inner, index + 1)
+            if escaped in SIMPLE_ESCAPES:
+                decoded.append(SIMPLE_ESCAPES[escaped])
+                index += 2
+            elif numeric:
+                try:
+                    decoded.append(chr(int(numeric.group(1) or numeric.group(2), 16)))
+                except ValueError, OverflowError:
+                    return None
+                index += 1 + len(numeric.group(0))
+            else:
+                return None
+        else:
+            decoded.append(character)
+            index += 1
+    return "".join(decoded)
+
+
 def block_bodies(text: str, opener: re.Pattern[str]) -> list[str]:
     """The text inside each block that ``opener`` starts, up to its matching closing brace. Braces inside a quoted string do not count."""
     bodies = []
@@ -87,39 +160,62 @@ def assigned(body: str, name: str) -> str | None:
 
 
 def terraform_rules(text: str) -> list[dict[str, Any]]:
-    """The rules of every ``aws_s3_bucket_lifecycle_configuration`` resource in ``text``, in the form of S3, with only the fields that decide the check."""
+    """The rules of every ``aws_s3_bucket_lifecycle_configuration`` resource in ``text``, in the form of S3, with only the fields that decide the check.
+
+    Comments are removed and string escapes are decoded first. A value that cannot be read as a literal fails closed: a status that is not literally
+    ``Disabled`` is ``Enabled``, and a prefix that is not a literal leaves the rule's scope as wide as the whole bucket.
+    """
     rules: list[dict[str, Any]] = []
-    for resource in block_bodies(text, CONFIGURATION_RESOURCE):
+    for resource in block_bodies(strip_comments(text), CONFIGURATION_RESOURCE):
         for body in block_bodies(resource, RULE_OPENER):
-            status = (assigned(body, "status") or '"Enabled"').strip('"')
-            rule: dict[str, Any] = {"ID": (assigned(body, "id") or f"rule {len(rules) + 1}").strip('"'), "Status": status}
+            status = string_literal(assigned(body, "status"))
+            rule: dict[str, Any] = {
+                "ID": string_literal(assigned(body, "id")) or f"rule {len(rules) + 1}",
+                "Status": "Disabled" if status == "Disabled" else "Enabled",
+            }
             prefix = assigned(body, "prefix")
             if FILTER_OPENER.search(body) or prefix is not None:
-                literal = re.fullmatch(r'"([^"]*)"', prefix) if prefix is not None else None
-                rule["Filter"] = {"Prefix": literal.group(1)} if literal else {}
+                literal = string_literal(prefix)
+                rule["Filter"] = {"Prefix": literal} if literal is not None else {}
             for expiration in block_bodies(body, EXPIRATION_OPENER):
                 days, date = assigned(expiration, "days"), assigned(expiration, "date")
                 if days is not None:
                     rule["Expiration"] = {"Days": int(days) if days.isdigit() else days}
                 elif date is not None:
-                    rule["Expiration"] = {"Date": date.strip('"')}
+                    rule["Expiration"] = {"Date": string_literal(date) or date}
             rules.append(rule)
     return rules
 
 
 def declared_problems(infra: str | Path, protected_prefix: str) -> list[str]:
-    """The problems of the rules that Terraform files under ``infra`` declare. A block of the old ``lifecycle_rule`` form cannot be read: it is one."""
+    """The problems of the rules that Terraform files under ``infra`` declare.
+
+    A block of the old ``lifecycle_rule`` form and a ``dynamic`` block in a lifecycle configuration cannot be read, so each is a problem.
+    """
     root = Path(infra)
     found = []
     for path in sorted(root.rglob("*.tf")):
         if ".terraform" in path.parts:
             continue
-        text = path.read_text()
+        text = strip_comments(path.read_text())
         name = str(path.relative_to(root))
         if OLD_FORM.search(text):
             found.append(f"{name}: a lifecycle_rule block cannot be checked: declare rules with aws_s3_bucket_lifecycle_configuration")
+        if any(DYNAMIC_BLOCK.search(resource) for resource in block_bodies(text, CONFIGURATION_RESOURCE)):
+            found.append(f"{name}: a dynamic block in a lifecycle configuration cannot be checked: write each rule out")
         found += [f"{name}: {problem}" for problem in expiring_rule_problems({"Rules": terraform_rules(text)}, protected_prefix)]
     return found
+
+
+def live_rules(document: Any) -> dict[str, Any]:
+    """The answer of a successful read of the bucket's lifecycle configuration, or ``ValueError`` when it is not a document that holds at least one rule.
+
+    S3 answers with at least one rule or with the error ``NoSuchLifecycleConfiguration``, so an empty answer is not read as no rules.
+    """
+    rules = document.get("Rules") if isinstance(document, dict) else None
+    if not isinstance(rules, list) or not rules or not all(isinstance(item, dict) for item in rules):
+        raise ValueError("the bucket's lifecycle configuration came back as something that is not a document of rules, and is not read as no rules")
+    return dict(document)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -131,7 +227,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         live = aws.call("s3api", "get-bucket-lifecycle-configuration", "--bucket", configuration["S3_BUCKET"], missing=NO_CONFIGURATION)
-        found = declared_problems(INFRA_FOLDER, PROTECTED_PREFIX) + [f"bucket: {problem}" for problem in expiring_rule_problems(live or {}, PROTECTED_PREFIX)]
+        bucket_problems = [] if live is None else expiring_rule_problems(live_rules(live), PROTECTED_PREFIX)
+        found = declared_problems(INFRA_FOLDER, PROTECTED_PREFIX) + [f"bucket: {problem}" for problem in bucket_problems]
     except (ConfigurationError, AwsError, ValueError) as error:
         sys.stderr.write(f"{error}\n")
         return 1
