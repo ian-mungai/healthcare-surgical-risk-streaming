@@ -105,6 +105,57 @@ class ReadFailures(unittest.TestCase):
             self.assertEqual({item.key: item.size_bytes}, publisher.list_release())
 
 
+LONG_NUMBER = "7" * 4301
+
+
+class LongNumbers(unittest.TestCase):
+    """A number longer than Python's limit for converting text to an integer is refused by its line, as any other value that is no number."""
+
+    def test_a_candidate_line_with_a_number_over_the_conversion_limit_is_refused_by_its_line(self) -> None:
+        tracked = CANDIDATES_FILE.read_text().splitlines()
+        for column in (0, 1, 3):
+            fields = tracked[1].split("\t")
+            fields[column] = LONG_NUMBER
+            with tempfile.TemporaryDirectory() as folder, self.subTest(column=candidates.HEADER[column]):
+                path = Path(folder) / "candidates.tsv"
+                path.write_text("\n".join([tracked[0], "\t".join(fields), *tracked[2:]]) + "\n")
+                errors = io.StringIO()
+                with (
+                    mock.patch.object(candidates, "rebuild", side_effect=AssertionError("a read started")),
+                    mock.patch("sys.argv", ["candidates", "check", "--candidates", str(path)]),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(1, candidates.main())
+                self.assertEqual("fixed sample: the candidate file, line 2: not a candidate line\n", errors.getvalue())
+
+    def test_a_track_list_or_clinical_line_with_a_number_over_the_conversion_limit_is_refused_by_its_line(self) -> None:
+        cases = (
+            ("parse_track_list", f"caseid,tname,tid\n{LONG_NUMBER},SNUADC/ART,t1\n", ("SNUADC/ART",), "track list line 2: the case number is not an integer"),
+            *(
+                (
+                    "parse_clinical_table",
+                    "caseid,subjectid,casestart,caseend\n" + ",".join(values) + "\n",
+                    (),
+                    "clinical table line 2: a case, patient or time value",
+                )
+                for values in ((LONG_NUMBER, "1", "0", "5"), ("1", LONG_NUMBER, "0", "5"), ("1", "1", LONG_NUMBER, "5"), ("1", "1", "0", LONG_NUMBER))
+            ),
+        )
+        for parser, text, arguments, cause in cases:
+            with tempfile.TemporaryDirectory() as folder, self.subTest(parser=parser, text=text[:60]):
+                path = Path(folder) / "file"
+                path.write_text(text)
+                with self.assertRaises(PublisherError) as caught:
+                    getattr(publisher, parser)(path, *arguments)
+                self.assertIn(cause, str(caught.exception))
+
+    def test_a_listing_size_over_the_conversion_limit_is_refused_as_a_listing_not_in_its_form(self) -> None:
+        listing = json.dumps({"Contents": [{"Key": "vitaldb/1.0.0/vital_files/0001.vital", "Size": LONG_NUMBER}]})
+        with mock.patch.object(publisher, "run_command", mock.Mock(return_value=completed(0, listing))), self.assertRaises(PublisherError) as caught:
+            publisher.list_release()
+        self.assertEqual(render(Notice(Code.RELEASE_LISTING_FORM)), str(caught.exception))
+
+
 class Parsers(unittest.TestCase):
     def parsed(self, parser: str, text: str, *arguments: str) -> object:
         with tempfile.TemporaryDirectory() as folder:

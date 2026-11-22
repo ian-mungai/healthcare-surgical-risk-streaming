@@ -141,7 +141,10 @@ def parse_track_list(path: Path, track: str) -> set[int]:
         if CASE_NUMBER.fullmatch(row[0]) is None:
             raise PublisherError(Notice(Code.TRACK_CASE, position=number))
         if row[1] == track:
-            cases.add(int(row[0]))
+            try:
+                cases.add(int(row[0]))
+            except ValueError:
+                raise PublisherError(Notice(Code.TRACK_CASE, position=number)) from None
     return cases
 
 
@@ -166,7 +169,10 @@ def parse_clinical_table(path: Path) -> list[tuple[int, int, int]]:
             for name, pattern in (("caseid", CASE_NUMBER), ("subjectid", CASE_NUMBER), ("casestart", TIME_SECONDS), ("caseend", TIME_SECONDS))
         ):
             raise PublisherError(Notice(Code.CLINICAL_INTEGERS, position=number))
-        case, patient, start, end = (int(values[name]) for name in CLINICAL_COLUMNS)
+        try:
+            case, patient, start, end = (int(values[name]) for name in CLINICAL_COLUMNS)
+        except ValueError:
+            raise PublisherError(Notice(Code.CLINICAL_INTEGERS, position=number)) from None
         if end < start:
             raise PublisherError(Notice(Code.CLINICAL_ORDER, position=number))
         if case in seen:

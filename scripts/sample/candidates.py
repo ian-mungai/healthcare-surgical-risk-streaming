@@ -155,7 +155,11 @@ def read_candidates(path: Path) -> list[Candidate]:
         fields = line.split("\t")
         if len(fields) != len(HEADER) or fields[5] not in ("true", "false") or not all(INTEGER.fullmatch(fields[position]) for position in (0, 1, 3)):
             raise CandidateError(Notice(Code.CANDIDATE_LINE, position=number))
-        candidates.append(Candidate(int(fields[0]), int(fields[1]), fields[2], int(fields[3]), fields[4], fields[5] == "true", fields[6]))
+        try:
+            case, patient, size = int(fields[0]), int(fields[1]), int(fields[3])
+        except ValueError:
+            raise CandidateError(Notice(Code.CANDIDATE_LINE, position=number)) from None
+        candidates.append(Candidate(case, patient, fields[2], size, fields[4], fields[5] == "true", fields[6]))
     return candidates
 
 
