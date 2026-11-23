@@ -280,7 +280,6 @@ class MissingTables(unittest.TestCase):
             run_verify(fake.operations(), HEAD)
         return caught.exception.problems, fake.calls
 
-    @unittest.expectedFailure
     def test_only_the_series_missing_is_one_table_and_the_events_are_found_without_their_facts(self) -> None:
         problems, calls = self.missing(series=True, events=False)
         self.assertEqual(["table_missing: 1 table"], problems)

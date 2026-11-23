@@ -113,10 +113,11 @@ def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRe
 
 def read_checked(ops: Operations, at: str, source: InputRead) -> dict[str, TableRead | None]:
     """Both tables with the counts of their checks. The events are recomputed from the stored series, so the series is read and checked first: a series that
-    fails its checks is reported with its own codes and the event table is not read, and a series that is not there is named by ``table_problems``."""
+    fails its checks is reported with its own codes and the event table is not read. A series that is not there is named by ``table_problems`` beside the event
+    table if that is missing too: the event table is then only looked for, without its facts."""
     series = ops.read_table(at, SERIES, True)
     if series is None or series.series is None:
-        return {SERIES: series, EVENTS: None}
+        return {SERIES: series, EVENTS: ops.read_table(at, EVENTS, False)}
     problems = series_problems(series.series, source.facts.art_seconds)
     if problems:
         raise SilverSignalsError(*problems)
