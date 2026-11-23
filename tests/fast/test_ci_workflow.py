@@ -227,7 +227,7 @@ PINNED_JOBS: dict[str, dict[str, Any]] = {
 # that it measures, whatever their results.
 HEADROOM_JOB: dict[str, Any] = {
     "name": HEADROOM_NAME,
-    "needs": list(GROUPS),
+    "needs": [*GROUPS, "required"],
     "if": "always()",
     "runs-on": RUNNER,
     "timeout-minutes": 10,
@@ -907,7 +907,7 @@ LEG_YAML = (
 )
 GUARD_NAME = "    name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8\n"
 GUARD_RUNS = "    runs-on: ubuntu-24.04\n    timeout-minutes: 25"
-HEADROOM_TOP = "    needs: [hooks, infrastructure, slow, guards, deadline]\n    if: always()\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10"
+HEADROOM_TOP = "    needs: [hooks, infrastructure, slow, guards, deadline, required]\n    if: always()\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10"
 HEADROOM_RUN = "      - run: make headroom\n"
 LEG_FUNCTION_END = "              failed=1\n            fi\n          }\n          check_leg 1"
 GUARD_UPLOAD = UPLOAD_ACTION + "        with:\n          name: guard-record-shard-${{ matrix.shard }}\n" + UPLOAD_FILES
@@ -1574,8 +1574,8 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the headroom job skipped after a failure": (HEADROOM_TOP, HEADROOM_TOP.replace("    if: always()\n", ""), "headroom: its if is None, not 'always()'"),
     "the headroom job waiting for fewer jobs": (
         HEADROOM_TOP,
-        HEADROOM_TOP.replace("[hooks, infrastructure, slow, guards, deadline]", "[hooks]"),
-        "headroom: its needs is ['hooks']",
+        HEADROOM_TOP.replace("[hooks, infrastructure, slow, guards, deadline, required]", "[hooks, infrastructure, slow, guards, deadline]"),
+        "headroom: its needs is ['hooks', 'infrastructure', 'slow', 'guards', 'deadline']",
     ),
     "the headroom job's timeout changed": (HEADROOM_TOP, HEADROOM_TOP.replace("minutes: 10", "minutes: 6"), "headroom: its timeout-minutes is 6, not 10"),
     "the headroom job's failure tolerated": (HEADROOM_TOP, HEADROOM_TOP + "\n    continue-on-error: true", "headroom: it has the key 'continue-on-error'"),

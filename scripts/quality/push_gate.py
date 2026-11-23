@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import functools
 import os
+import re
 import sys
 import time
 import tomllib
@@ -40,7 +41,10 @@ MYPY = "mypy"
 TERRAFORM = "terraform fmt"
 QUICK = "quick tests"
 DEPENDENCIES = "dependency scan"
-LOCK_FILES = ("requirements.txt", "uv.lock")
+HEAD = "checked-out head"
+LOCK_FILES = ("requirements.txt", "uv.lock", ".terraform.lock.hcl")
+REFS_FILE = "push_gate_refs"
+ZERO_SHA = re.compile(r"0+")
 CHECK_TIMEOUT_SECONDS = 120
 QUICK_TIMEOUT_SECONDS = 300
 GIT_TIMEOUT_SECONDS = 60
@@ -58,6 +62,25 @@ class Check:
     program: str
     arguments: tuple[str, ...]
     timeout: int = CHECK_TIMEOUT_SECONDS
+    input_text: str | None = None
+
+
+@dataclass(frozen=True)
+class Update:
+    """One line that Git writes to a pre-push hook: ``<local ref> <local sha> <remote ref> <remote sha>``."""
+
+    local_ref: str
+    local_sha: str
+    remote_ref: str
+    remote_sha: str
+
+    @property
+    def deletes(self) -> bool:
+        return bool(ZERO_SHA.fullmatch(self.local_sha))
+
+    @property
+    def creates(self) -> bool:
+        return bool(ZERO_SHA.fullmatch(self.remote_sha))
 
 
 def git(*arguments: str) -> str:
@@ -70,15 +93,46 @@ def tracked_changes() -> list[str]:
     return [line[3:] for line in lines]
 
 
+def read_pushed_updates(path: Path) -> tuple[str, list[Update]] | None:
+    """The remote name and the ref updates that the push guard saved from Git's input to the hook, or None when there is no file. The file is removed."""
+    if not path.is_file():
+        return None
+    lines = path.read_text().splitlines()
+    path.unlink()
+    remote = lines[0].removeprefix("remote ").strip() if lines else ""
+    updates = [Update(*parts) for line in lines[1:] if len(parts := line.split()) == 4]
+    return remote, updates
+
+
+def commit_exists(sha: str) -> bool:
+    return run_command("git", ["cat-file", "-e", f"{sha}^{{commit}}"], timeout=GIT_TIMEOUT_SECONDS).returncode == 0
+
+
+def pushed_commits(remote: str, updates: list[Update]) -> list[str]:
+    """Every commit that the push sends, newest first and each once: for each update that is not a delete, the local sha without what the remote holds.
+
+    An existing remote ref holds its own sha, so the range starts there, whatever the local tracking refs say. A new ref excludes only the refs that
+    this remote is known to hold (``--remotes=<remote>``), so another remote's refs hide nothing and a first push to a second remote sends its whole history.
+    """
+    commits: dict[str, None] = {}
+    for update in updates:
+        if update.deletes:
+            continue
+        exclude = update.remote_sha if not update.creates and commit_exists(update.remote_sha) else f"--remotes={remote}"
+        commits.update(dict.fromkeys(git("rev-list", update.local_sha, "--not", exclude).split()))
+    return list(commits)
+
+
 def unpushed_commits() -> list[str]:
-    """The commits that no remote branch holds, newest first, as ``git rev-list HEAD --not --remotes`` lists them."""
+    """Without Git's input (a manual run): the commits that no remote branch holds, as ``git rev-list HEAD --not --remotes`` lists them."""
     return git("rev-list", *UNPUSHED).split()
 
 
-def changed_files(root: Path) -> list[str]:
-    """The files that the unpushed commits add, copy, modify or rename (each merge against each parent) and that still exist, sorted."""
-    listed = repo_checks.git("log", "-m", "--name-only", "--diff-filter=ACMR", "--format=", "-z", *UNPUSHED, keep_newlines=True)
-    return sorted(name for name in set(listed.split("\0")) - {""} if (root / name).is_file())
+def changed_files(root: Path, commits: list[str]) -> tuple[list[str], list[str]]:
+    """The files that the commits add, copy, modify, rename or delete (each merge against each parent): those that still exist and those that do not."""
+    listed = repo_checks.git("log", "-m", "--name-only", "--diff-filter=ACMRD", "--format=", "-z", "--no-walk=unsorted", *commits, keep_newlines=True)
+    names = sorted(set(listed.split("\0")) - {""})
+    return [name for name in names if (root / name).is_file()], [name for name in names if not (root / name).exists()]
 
 
 def python_files(changed: list[str]) -> list[str]:
@@ -180,9 +234,9 @@ def select_tests(root: Path, changed: list[str]) -> list[str]:
     return sorted(selected)
 
 
-def changed_file_checks(repo: Path, changed: list[str], tools: Path = ROOT) -> list[Check]:
+def changed_file_checks(repo: Path, changed: list[str], tools: Path = ROOT, deleted: tuple[str, ...] = ()) -> list[Check]:
     """The checks of the changed files' own tools, run in ``repo`` with the pinned tools of ``tools``. Python gets Ruff and, in the folders that the
-    repository's MyPy configuration checks, MyPy; Terraform gets its formatter; the quick test modules that cover the files run together."""
+    repository's MyPy configuration checks, MyPy; Terraform gets its formatter; the quick test modules that cover the changed and deleted files run together."""
     checks: list[Check] = []
     python = python_files(changed)
     if python:
@@ -194,7 +248,7 @@ def changed_file_checks(repo: Path, changed: list[str], tools: Path = ROOT) -> l
     terraform = [name for name in changed if name.endswith(".tf")]
     if terraform:
         checks.append(Check(TERRAFORM, str(tools / ".tools/bin/terraform"), ("fmt", "-check", "-diff", "--", *terraform)))
-    modules = select_tests(repo, changed) if (repo / QUICK_FOLDER).is_dir() else []
+    modules = select_tests(repo, [*changed, *deleted]) if (repo / QUICK_FOLDER).is_dir() else []
     if modules:
         checks.append(Check(QUICK, str(tools / ".venv/bin/python"), ("-m", "unittest", *modules), QUICK_TIMEOUT_SECONDS))
     return checks
@@ -208,15 +262,22 @@ def dependency_checks(changed: list[str], tools: Path = ROOT) -> list[Check]:
     return [Check(DEPENDENCIES, str(tools / ".tools/bin/trivy"), (*scan, lock)) for lock in locks]
 
 
-def secret_check(tools: Path = ROOT) -> Check:
-    """The pinned gitleaks over the unpushed commits, with each merge's diff against each parent (``-m``): the default log shows none."""
-    return Check(SECRETS, str(tools / ".tools/bin/gitleaks"), ("git", "--redact", "--no-banner", f"--log-opts=-m {' '.join(UNPUSHED)}", "."))
+def secret_checks(commits: list[str], tools: Path = ROOT) -> list[Check]:
+    """The pinned gitleaks over the pushed commits: their diffs, with each merge's diff against each parent (``-m``; the default log shows none), and
+    their whole messages, which the diff scan does not read. A finding prints its rule with the value redacted."""
+    gitleaks = str(tools / ".tools/bin/gitleaks")
+    common = ("--redact", "--no-banner", "--no-color", "--verbose")
+    messages = "\n\n".join(git("show", "-s", "--format=%B", commit) for commit in commits)
+    return [
+        Check(SECRETS, gitleaks, ("git", *common, f"--log-opts=-m --no-walk=unsorted {' '.join(commits)}", ".")),
+        Check(SECRETS, gitleaks, ("stdin", *common), input_text=messages),
+    ]
 
 
 def run_check(check: Check) -> str | None:
     """Run one command in the current folder. Return None when it passed, or what went wrong, at its deadline too."""
     try:
-        run = run_command(check.program, list(check.arguments), timeout=check.timeout)
+        run = run_command(check.program, list(check.arguments), timeout=check.timeout, input_text=check.input_text)
     except TimeoutExpired:
         return f"it did not finish in {check.timeout} seconds"
     except OSError as error:
@@ -248,18 +309,58 @@ def tracked_problems() -> str | None:
     )
 
 
+def head_problems(updates: list[Update], remote: str) -> str | None:
+    """The working-tree checks read the checked-out HEAD, so every pushed commit that sends something must be HEAD."""
+    head = git("rev-parse", "HEAD").strip()
+    for update in updates:
+        if update.deletes or not pushed_commits(remote, [update]):
+            continue
+        if git("rev-parse", f"{update.local_sha}^{{commit}}").strip() != head:
+            return f"{update.local_ref} is not the checked-out HEAD, so the checks that read the working tree cannot vouch for it: check it out and push again"
+    return None
+
+
+def tracked_lock_files() -> list[str]:
+    """Every lock file that Git tracks, for the hosted dependency scan of the whole repository."""
+    listed = repo_checks.git("ls-files", "-z", keep_newlines=True).split("\0")
+    return sorted(name for name in listed if Path(name).name in LOCK_FILES)
+
+
+def scan_all_dependencies() -> int:
+    """The hosted dependency scan: every tracked lock file, not only the ones that a push changes. Return 1 and name each lock file that fails."""
+    failed = 0
+    for check in dependency_checks(tracked_lock_files()):
+        problem = run_check(check)
+        sys.stdout.write(f"{check.arguments[-1]}: {'clean' if problem is None else 'FAILED'}\n")
+        if problem is not None:
+            sys.stderr.write(f"{DEPENDENCIES} failed for {check.arguments[-1]}: {problem}\n")
+            failed = 1
+    return failed
+
+
 def main() -> int:
-    """Run the gate in the current repository and return 1 at the first check that fails."""
+    """Run the gate in the current repository and return 1 at the first check that fails.
+
+    The pushed commits come from the ref updates that the push guard saved from Git's input; a manual run has none and uses the unpushed commits of HEAD.
+    """
     started = time.monotonic()
     repo = Path.cwd()
-    commits = unpushed_commits()
+    saved = read_pushed_updates(Path(git("rev-parse", "--git-path", REFS_FILE).strip()))
+    remote, updates = saved if saved is not None else ("", [])
+    commits = pushed_commits(remote, updates) if saved is not None else unpushed_commits()
+    if not commits:
+        sys.stdout.write("push gate: the push sends no commit, so no check runs\n")
+        return 0
     steps: list[tuple[str, Callable[[], str | None]]] = [(TRACKED, tracked_problems)]
-    if commits:
-        steps += [(SECRETS, lambda: run_check(secret_check())), (MESSAGES, lambda: commit_message_problems(commits))]
+    steps += [(check.name, functools.partial(run_check, check)) for check in secret_checks(commits)]
+    steps += [(MESSAGES, lambda: commit_message_problems(commits))]
+    steps += [(HEAD, lambda: head_problems(updates, remote))] if saved is not None else []
     steps.append((PRIVACY, privacy_problems))
-    if commits:
-        changed = changed_files(repo)
-        steps += [(check.name, functools.partial(run_check, check)) for check in [*changed_file_checks(repo, changed), *dependency_checks(changed)]]
+    changed, deleted = changed_files(repo, commits)
+    steps += [
+        (check.name, functools.partial(run_check, check))
+        for check in [*changed_file_checks(repo, changed, deleted=tuple(deleted)), *dependency_checks(changed)]
+    ]
     durations = []
     for name, step in steps:
         began = time.monotonic()
@@ -273,4 +374,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main())

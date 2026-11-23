@@ -24,6 +24,7 @@ from tests.fast.git_fixture import ROOT
 START = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
 EXPECTED = headroom.expected_limits(WORKFLOW)
+HEADROOM_NAME = "No job of this run is near its time limit"
 GUARDS_LEG = "Planted faults through the real commit path, shard 3 of 8"
 
 
@@ -91,10 +92,17 @@ class ProblemsTest(unittest.TestCase):
         problems = headroom.problems(limits, run_of())
         self.assertEqual(problems, ["Hooks on every file and the commit messages: the workflow gives it no timeout"])
 
-    def test_a_job_still_running_is_not_measured_and_is_not_missing(self) -> None:
-        """The headroom job reads the run while it runs itself: its own time is not known yet."""
-        jobs = [api_job(job["name"], None, status="in_progress") if job["name"].startswith("No job") else job for job in run_of()]
-        self.assertEqual(headroom.problems(EXPECTED, jobs), [])
+    def test_the_headroom_job_itself_is_still_running_and_is_not_measured(self) -> None:
+        """The headroom job reads the run while it runs itself: its own time is not known yet, and it is not missing."""
+        jobs = [api_job(job["name"], None, status="in_progress") if job["name"] == HEADROOM_NAME else job for job in run_of()]
+        self.assertEqual(headroom.problems(EXPECTED, jobs, HEADROOM_NAME), [])
+
+    def test_another_job_still_running_is_named_because_its_whole_time_is_not_known(self) -> None:
+        """Finding 2: the required job can still run when the headroom job reads the run; it is judged only once it has ended."""
+        jobs = [api_job(job["name"], None, status="in_progress") if job["name"] == "Every job of this run passed" else job for job in run_of()]
+        problems = headroom.problems(EXPECTED, jobs, HEADROOM_NAME)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("Every job of this run passed: it was still running", problems[0])
 
     def test_every_problem_is_named_in_one_report(self) -> None:
         jobs = [job for job in run_of({GUARDS_LEG: 24.0}) if not job["name"].endswith("shard 5 of 8")]

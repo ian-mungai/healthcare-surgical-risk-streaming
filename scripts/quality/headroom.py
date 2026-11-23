@@ -55,8 +55,9 @@ def minutes_of(job: dict[str, Any]) -> float | None:
     return (datetime.fromisoformat(job["completed_at"]) - datetime.fromisoformat(job["started_at"])).total_seconds() / 60
 
 
-def problems(limits: dict[str, int | None], jobs: list[dict[str, Any]]) -> list[str]:
-    """Name each expected job that the run does not list, each job without a limit and each job over its share of its limit."""
+def problems(limits: dict[str, int | None], jobs: list[dict[str, Any]], own: str | None = None) -> list[str]:
+    """Name each expected job that the run does not list, each job without a limit, each job over its share of its limit and each job but ``own``
+    that is still running, because its whole time is not known yet."""
     found = []
     listed = {str(job["name"]) for job in jobs}
     found += [f"{name}: it is not among the jobs of the run" for name in limits if name not in listed]
@@ -67,6 +68,8 @@ def problems(limits: dict[str, int | None], jobs: list[dict[str, Any]]) -> list[
             found.append(f"{name}: the workflow gives it no timeout")
             continue
         used = minutes_of(job)
+        if used is None and name != own:
+            found.append(f"{name}: it was still running when the headroom job read the run, so its whole time is not known")
         if used is not None and used > SHARE * limit:
             found.append(f"{name}: took {used:.1f} minutes, over {SHARE:.0%} of its {limit} minutes limit")
     return found
@@ -120,7 +123,9 @@ def main() -> int:
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as handle:
             handle.write(table)
-    found = problems(limits, jobs)
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    own = workflow["jobs"].get(os.environ.get("GITHUB_JOB", ""), {}).get("name")
+    found = problems(limits, jobs, own)
     for line in found:
         sys.stderr.write(f"{line}\n")
     return 1 if found else 0

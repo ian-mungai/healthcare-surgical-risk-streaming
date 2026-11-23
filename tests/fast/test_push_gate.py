@@ -14,6 +14,7 @@ scans the dependencies when a lock file changes. Failure modes covered here, eac
 from __future__ import annotations
 
 import hashlib
+import os
 import stat
 import tempfile
 import unittest
@@ -21,10 +22,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from scripts.process import run_command
-from scripts.quality import install_tools, push_gate, push_guard_hook, worktree_scan_hook
+from scripts.process import CompletedProcess, run_command
+from scripts.quality import install_tools, push_gate, push_guard_hook, repo_checks, worktree_scan_hook
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository
+from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository, git_in
 
 PYPROJECT = '[tool.ruff]\nline-length = 160\n\n[tool.mypy]\nstrict = true\nfiles = ["app", "tests"]\n'
 GOOD_CODE = "def double(value: int) -> int:\n    return value * 2\n"
@@ -33,6 +34,7 @@ GOOD_TEST = (
     "    def test_double(self) -> None:\n        self.assertEqual(double(2), 4)\n"
 )
 HOOK = "pre-push"
+ZERO = "0" * 40
 # A path that no file of the repository names: built here so that this file does not name it.
 UNLISTED = "docs/" + "unlisted" + "_note.md"
 
@@ -128,6 +130,17 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(push_gate.select_tests(root, ["app/unrelated.py"]), ["tests.fast.test_other"])
             self.assertEqual(push_gate.select_tests(root, ["app/a.py", "app/unrelated.py"]), ["tests.fast.test_a", "tests.fast.test_other"])
 
+    def test_a_deleted_file_selects_the_tests_that_name_it_and_a_terraform_lock_file_the_dependency_scan(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="push_gate_deleted_") as folder:
+            root = Path(folder)
+            for name, text in {"tests/__init__.py": "", "tests/fast/__init__.py": "", "tests/fast/test_a.py": "from app.gone import value\n"}.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            names = [check.name for check in push_gate.changed_file_checks(root, [], deleted=("app/gone.py",))]
+            self.assertEqual(names, [push_gate.QUICK])
+            self.assertEqual(push_gate.changed_file_checks(root, [], deleted=("app/other.py",)), [])
+        self.assertEqual([check.name for check in push_gate.dependency_checks(["infra/.terraform.lock.hcl"])], [push_gate.DEPENDENCIES])
+
     def test_a_file_that_no_test_imports_or_names_selects_no_module(self) -> None:
         self.assertEqual(push_gate.select_tests(ROOT, [UNLISTED]), [])
 
@@ -155,8 +168,45 @@ class ConfigurationTest(unittest.TestCase):
         """``make check`` runs the manual stage in the hosted run: the gate reads the unpushed commits, which a hosted checkout has none of."""
         self.assertNotIn("manual", self.hooks["push-gate"]["stages"])
 
-    def test_the_makefile_runs_the_headroom_program(self) -> None:
-        self.assertIn("\nheadroom:\n\t$(PYTHON) -m scripts.quality.headroom\n", (ROOT / "Makefile").read_text())
+    def test_the_hosted_history_scan_reads_merge_diffs_as_the_push_scan_does(self) -> None:
+        self.assertIn('"--log-opts=-m --all"', self.hooks["gitleaks-history"]["entry"])
+        self.assertEqual(self.hooks["gitleaks-history"]["stages"], ["manual"])
+
+    def test_the_hosted_hooks_job_scans_every_lock_file_and_no_commit_runs_that_scan(self) -> None:
+        hook = self.hooks["dependency-scan"]
+        self.assertEqual((hook["stages"], hook["entry"]), (["manual"], ".venv/bin/python -m scripts.quality.push_gate --all-locks"))
+
+    def test_every_tracked_lock_file_is_scanned_and_a_file_of_another_name_is_not(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="push_gate_locks_") as folder:
+            repo = Path(folder)
+            git_in(repo, "init", "--quiet")
+            for name in ("requirements.txt", "spark/requirements.txt", "infra/.terraform.lock.hcl", "requirements.in", "notes.txt"):
+                (repo / name).parent.mkdir(parents=True, exist_ok=True)
+                (repo / name).write_text("x\n")
+            git_in(repo, "add", "--", ".")
+            with mock.patch.object(repo_checks, "git", lambda *args, **kwargs: git_in(repo, *args, keep_newlines=True).stdout):
+                self.assertEqual(push_gate.tracked_lock_files(), ["infra/.terraform.lock.hcl", "requirements.txt", "spark/requirements.txt"])
+
+
+class HookEnvironmentTest(unittest.TestCase):
+    """A commit hook runs the tests with ``GIT_DIR`` and ``GIT_INDEX_FILE`` set to the real repository (Nov 23 2026: a test that ran ``git init`` and
+    ``git add`` without clearing them made the shared repository bare and replaced its index)."""
+
+    def test_a_repository_made_by_a_test_ignores_the_git_variables_of_the_callers_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hook_env_") as folder:
+            decoy, other = Path(folder) / "decoy", Path(folder) / "other"
+            for path in (decoy, other):
+                path.mkdir()
+            git_in(decoy, "init", "--quiet")
+            before = (shared_config := (decoy / ".git" / "config").read_text(), (decoy / ".git" / "index").exists())
+            polluted = {"GIT_DIR": str(decoy / ".git"), "GIT_INDEX_FILE": str(decoy / ".git" / "index"), "GIT_WORK_TREE": str(decoy)}
+            with mock.patch.dict(os.environ, polluted):
+                git_in(other, "init", "--quiet")
+                (other / "file.txt").write_text("x\n")
+                git_in(other, "add", "--", ".")
+            self.assertEqual((decoy / ".git" / "config").read_text(), shared_config)
+            self.assertEqual((shared_config, (decoy / ".git" / "index").exists()), before, "the caller's repository is untouched")
+            self.assertTrue((other / ".git" / "index").is_file(), "the new repository got the files")
 
 
 class PushGuardHookTest(TemporaryRepository):
@@ -200,19 +250,44 @@ class PushGuardHookTest(TemporaryRepository):
         (self.repo / "tracked.txt").write_text("one\n")
         self.git("add", "--", "tracked.txt")
         self.git("commit", "--quiet", "-m", "chore: add a file")
+        sends = f"refs/heads/main {self.git('rev-parse', 'HEAD').stdout.strip()} refs/heads/main {ZERO}\n"
         for label, change in (
             ("working tree", lambda: (self.repo / "tracked.txt").write_text("two\n")),
             ("index", lambda: self.git("add", "--", "tracked.txt")),
         ):
             with self.subTest(label=label):
                 change()
-                run = run_command("sh", [str(self.hook())], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS)
+                run = self.run_hook(sends)
                 self.assertEqual(run.returncode, 1)
                 self.assertIn(f"push gate stopped by {push_gate.TRACKED}", run.stderr)
                 self.assertIn("tracked.txt", run.stderr)
+        deletes = f"(delete) {ZERO} refs/heads/extra {'1' * 40}\n"
+        self.assertEqual(self.run_hook(deletes).returncode, 0, "a push of deletes sends nothing")
         self.git("checkout", "--quiet", "HEAD", "--", "tracked.txt")
         (self.repo / "untracked.txt").write_text("new\n")
-        self.assertEqual(run_command("sh", [str(self.hook())], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS).returncode, 0)
+        self.assertEqual(self.run_hook(sends).returncode, 0)
+
+    def run_hook(self, sends: str) -> CompletedProcess[str]:
+        return run_command("sh", [str(self.hook()), "origin", "url"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS, input_text=sends)
+
+    def test_the_hook_saves_the_remote_and_the_updates_for_the_gate_and_the_gate_reads_them_once(self) -> None:
+        push_guard_hook.install(self.repo)
+        sends = f"refs/heads/main {'a' * 40} refs/heads/main {'b' * 40}\n(delete) {ZERO} refs/heads/old {'c' * 40}\n"
+        self.assertEqual(self.run_hook(sends).returncode, 0)
+        saved = self.repo / ".git" / push_gate.REFS_FILE
+        read = push_gate.read_pushed_updates(saved)
+        self.assertEqual(
+            read,
+            (
+                "origin",
+                [push_gate.Update("refs/heads/main", "a" * 40, "refs/heads/main", "b" * 40), push_gate.Update("(delete)", ZERO, "refs/heads/old", "c" * 40)],
+            ),
+        )
+        if read is None:
+            self.fail("the gate read no saved updates")
+        self.assertTrue(read[1][1].deletes and not read[1][0].deletes and not read[1][0].creates)
+        self.assertFalse(saved.exists())
+        self.assertIsNone(push_gate.read_pushed_updates(saved))
 
     def test_the_installer_program_installs_and_checks_the_guard(self) -> None:
         with mock.patch.object(install_tools, "ROOT", self.repo):

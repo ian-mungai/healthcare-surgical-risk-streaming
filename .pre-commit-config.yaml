@@ -1,11 +1,11 @@
 # Check-first checks: each check runs at the cheapest layer that can do its job, and hosted CI runs every check in full.
 # 1. Commit hooks, about 90 seconds (measured 83 s on Nov 23 2026, the quick tests 75 s of it): the commit and commit-msg stages below (secrets in the staged changes, credential and data files, privacy, Ruff, MyPy,
 #    the quick tests and the commit message). `make check` runs the manual stage on every file; the hosted hooks job runs it.
-# 2. Push gate, about 40 seconds for one commit (measured 39 s on Nov 23 2026, 37 s of it the quick tests of 12 changed files; 2 minutes at most), before every push to any branch: the pre-push stage below (scripts/quality/push_gate.py) runs the secret scan (merge diffs
+# 2. Push gate, about 40 seconds for one commit (measured 39 s on Nov 23 2026, 37 s of it the quick tests of 12 changed files; 2 minutes at most), before every push to any branch: the pre-push stage below (scripts/quality/push_gate.py) runs, for the commits that Git sends (the ref updates on its input, not HEAD), the secret scan of the diffs (merge diffs
 #    included) and the commit messages of the unpushed commits of HEAD, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the
 #    quick test modules that cover them) and the dependency scan when a lock file changes. A push guard (scripts/quality/push_guard_hook.py, the pre-push.legacy
 #    hook) first refuses a push while tracked files have uncommitted changes, because pre-commit hides unstaged changes from the hooks it runs.
-# 3. Hosted CI (.github/workflows/ci.yml): every check in full on each push of a work branch, each pull request, the squash-merge commit on main, every Monday and on demand.
+# 3. Hosted CI (.github/workflows/ci.yml): every check in full, the manual stage included (the whole-history secret scan that reads merge diffs and the dependency scan of every lock file), on each push of a work branch, each pull request, the squash-merge commit on main, every Monday and on demand.
 # Every hook is local and pinned: pre-commit, Ruff and MyPy come from requirements.txt in .venv, and gitleaks from scripts/quality/install_tools.py in .tools.
 # Run `make setup` once: it installs the commit, commit-msg and pre-push hooks and the push guard. The slow tests (tests/slow: Ansible playbook runs, local servers,
 # stand-in programs and the planted workflow faults) are no hook: they run in their own hosted job, and `make test-slow` runs them on demand.
@@ -26,7 +26,14 @@ repos:
         stages: [pre-commit]
       - id: gitleaks-history
         name: Scan every commit for secrets
-        entry: .tools/bin/gitleaks git --redact --no-banner
+        entry: .tools/bin/gitleaks git --redact --no-banner "--log-opts=-m --all"
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+      - id: dependency-scan
+        name: No HIGH or CRITICAL vulnerability in any tracked lock file (Trivy)
+        entry: .venv/bin/python -m scripts.quality.push_gate --all-locks
         language: system
         pass_filenames: false
         always_run: true

@@ -1,8 +1,10 @@
-"""The Git hook that refuses a push while tracked files have uncommitted changes, before pre-commit hides them.
+"""The Git hook that refuses a push while tracked files have uncommitted changes, before pre-commit hides them, and that saves what Git sends.
 
-Pre-commit stashes every unstaged change while its pre-push hooks run, so the push gate cannot see one. Pre-commit runs a file named ``pre-push.legacy`` in the
-Git hooks folder first, before it stashes anything. That file is this hook. It refuses the push when ``git status`` lists a tracked file as changed, in the
-index or in the working tree, because the checks of the gate read the working tree and the pushed commit must be the one that they read.
+Pre-commit stashes every unstaged change while its pre-push hooks run, so the push gate cannot see one. Pre-commit also gives its hooks no standard input.
+Pre-commit runs a file named ``pre-push.legacy`` in the Git hooks folder first, before it stashes anything. That file is this hook. It saves the remote's name
+and the ``<local ref> <local sha> <remote ref> <remote sha>`` lines that Git writes to the hook in ``push_gate_refs`` in the Git folder, which the gate reads,
+so that the gate checks what Git sends and not what HEAD holds. It refuses the push when ``git status`` lists a tracked file as changed, in the index or in
+the working tree, and the push sends something (a push of deletes only is not refused), because the checks of the gate read the working tree.
 
 ``pre-commit install`` moves an older pre-push hook that it does not own to that same name. The installer keeps such a hook as ``pre-push.legacy.previous``
 and this hook runs it after its own check, with the arguments and the standard input that Git gave. It refuses, and overwrites nothing, when a kept hook already
@@ -21,14 +23,17 @@ KEPT_NAME = "pre-push.legacy.previous"
 MESSAGE = "tracked files have uncommitted changes, so the checks would not read the pushed commit: commit or restore them"
 HOOK_TEXT = (
     "#!/bin/sh\n"
+    'refs="$(git rev-parse --git-path push_gate_refs)"\n'
+    '{ echo "remote $1"; cat; } > "$refs"\n'
+    'sent="$(sed 1d "$refs" | awk \'$2 !~ /^0+$/\')"\n'
     'changed="$(git status --porcelain --untracked-files=no)"\n'
-    'if [ -n "$changed" ]; then\n'
+    'if [ -n "$changed" ] && [ -n "$sent" ]; then\n'
     f'  echo "push gate stopped by {TRACKED}: {MESSAGE}" >&2\n'
     '  echo "$changed" >&2\n'
     "  exit 1\n"
     "fi\n"
     f'previous="$(dirname "$0")/{KEPT_NAME}"\n'
-    'if [ -x "$previous" ]; then exec "$previous" "$@"; fi\n'
+    'if [ -x "$previous" ]; then sed 1d "$refs" | "$previous" "$@"; exit $?; fi\n'
 )
 PUSH_GUARD = worktree_scan_hook.LegacyHook(HOOK_NAME, KEPT_NAME, HOOK_TEXT)
 

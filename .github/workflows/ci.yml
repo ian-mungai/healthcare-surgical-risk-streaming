@@ -21,7 +21,7 @@ concurrency:
 # the older run of its ref; a run on main, a scheduled run and a manual run have a group of their own (their run) and are never cancelled or replaced.
 # The job "required" waits for all the gating jobs and is the one required check: it fails unless each of them succeeded, so a failed, cancelled or
 # skipped job fails the run, and unless every guard shard set its own success output, because GitHub can report success for a leg that never ran.
-# The job "headroom" is outside the required check: it reads the run's jobs and fails any job over 80% of its timeout. Each timeout is at least twice the
+# The job "headroom" is outside the required check and waits for it: it reads the run's jobs, the required job included, and fails any job over 80% of its timeout. Each timeout is at least twice the
 # duration recorded beside it. tests/fast/test_ci_workflow.py holds the workflow to all of this.
 jobs:
   hooks:
@@ -255,7 +255,7 @@ jobs:
 
   headroom:
     name: No job of this run is near its time limit
-    needs: [hooks, infrastructure, slow, guards, deadline]
+    needs: [hooks, infrastructure, slow, guards, deadline, required]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10 # measured 2.5 min: make setup about 2 minutes (estimate), the check a few seconds; the first hosted run replaces it
