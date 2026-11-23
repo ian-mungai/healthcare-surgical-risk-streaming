@@ -12,7 +12,8 @@ from features.clinical import clinical_group
 from features.document import parse_mapping
 from features.model import FeatureInputError, FeatureRow, FeatureValue, WaveformWindow, WindowInput
 from features.numeric import numeric_group
-from features.registry import NUMERIC_TRACKS, WAVEFORM_TRACKS
+from features.registry import ARTERIAL_SERIES, NUMERIC_TRACKS, WAVEFORM_TRACKS
+from features.series_input import SeriesReadings, check_window
 from features.waveform import waveform_group
 
 EMPTY_WAVEFORM = WaveformWindow(1.0, ())
@@ -27,6 +28,11 @@ def build_row(window: WindowInput | Mapping[str, Any], include_sensitivity: bool
     for track in window.numeric:
         if track not in NUMERIC_TRACKS:
             raise FeatureInputError(f"unknown track {track} in the numeric input")
+    series = window.numeric.get(ARTERIAL_SERIES)
+    if series and not isinstance(series, SeriesReadings):
+        raise FeatureInputError(f"{ARTERIAL_SERIES}: the readings were not made by features.pressure_series (use features.series_input.series_readings)")
+    if series:
+        check_window(series, window.cutoff_us)
     for track in window.waveforms:
         if track not in WAVEFORM_TRACKS:
             raise FeatureInputError(f"unknown track {track} in the waveform input")

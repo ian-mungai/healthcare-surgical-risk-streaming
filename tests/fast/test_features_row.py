@@ -29,6 +29,7 @@ from tests.fast.features_support import (
     SERIES,
     alternating,
     arithmetic,
+    exact_series,
     numeric_window,
     series_window,
     waveform_window,
@@ -244,7 +245,7 @@ class Row(unittest.TestCase):
             seconds = tuple(WaveformSecond(s.second, s.samples if s.valid else (junk,) * len(s.samples), s.valid) for s in wave.seconds)
             return WindowInput(
                 CUTOFF_US,
-                {ARTERIAL_MEAN: readings(numeric_window), SERIES: readings(series_window)},
+                {ARTERIAL_MEAN: readings(numeric_window), SERIES: exact_series([(r.time_us, r.value, r.valid) for r in readings(series_window)])},
                 {"SNUADC/ART": WaveformWindow(wave.sample_rate, seconds)},
                 {},
             )
