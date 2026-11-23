@@ -1001,3 +1001,170 @@ run "a_host_that_terraform_creates_needs_room_for_a_heavy_job" {
 
   expect_failures = [output.heavy_memory_mib]
 }
+
+run "orchestrator_workload_lists_reads_copies_and_deletes_only_what_the_record_load_calls" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads = {
+      orchestrator = { access = { landing = ["read"], manifests = ["read"], records_input = ["read", "write", "delete"] } }
+    }
+  }
+
+  assert {
+    condition     = { for name, role in aws_iam_role.workload : name => role.name } == { orchestrator = "example_project_workload_orchestrator_dev" }
+    error_message = "The orchestrator has its own role, named for the project, the workload and the environment."
+  }
+
+  assert {
+    condition = alltrue([
+      for role in aws_iam_role.workload :
+      jsondecode(role.assume_role_policy).Statement[0].Principal == { AWS = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev" } && role.max_session_duration == 3600 && endswith(role.permissions_boundary, ":policy/example_project_role_boundary")
+    ])
+    error_message = "Only the host role may assume the orchestrator's role, for at most an hour, under the permissions boundary."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.workload["orchestrator"].policy).Statement == [
+      { Sid = "ListPrefixes", Effect = "Allow", Action = ["s3:ListBucket", "s3:ListBucketVersions"], Resource = "arn:aws:s3:::example-project", Condition = { StringLike = { "s3:prefix" = ["landing/*", "manifests/*", "records_input/*"] } } },
+      { Sid = "ReadObjects", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = ["arn:aws:s3:::example-project/landing/*", "arn:aws:s3:::example-project/manifests/*", "arn:aws:s3:::example-project/records_input/*"] },
+      { Sid = "WriteRecordCopies", Effect = "Allow", Action = ["s3:PutObject"], Resource = ["arn:aws:s3:::example-project/records_input/*"] },
+      { Sid = "DeleteRecordCopyVersions", Effect = "Allow", Action = ["s3:DeleteObjectVersion"], Resource = ["arn:aws:s3:::example-project/records_input/*"] },
+    ]
+    error_message = "The orchestrator lists and reads landing, manifests and records_input, puts and deletes object versions under records_input only, and does nothing else: no write or delete on landing, manifests or warehouse, no publisher's bucket."
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "\"*\"") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "s3:*") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "s3:DeleteObject\"") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "AbortMultipartUpload") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "ListBucketMultipartUploads")
+    error_message = "The orchestrator's policy holds no wildcard action or resource, no delete of a whole object and no multipart action, listing included."
+  }
+}
+
+run "a_workload_without_the_records_mode_gets_no_records_statement" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads = {
+      spark = { access = { warehouse = ["read", "write", "delete"] } }
+      trino = { access = { warehouse = ["read"] } }
+    }
+  }
+
+  assert {
+    condition     = alltrue([for policy in values(aws_iam_role_policy.workload) : !strcontains(policy.policy, "records_input")])
+    error_message = "No workload that does not name records_input reaches it."
+  }
+}
+
+run "records_input_may_not_be_written_by_a_workload_that_is_not_the_records_writer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { spark = { access = { records_input = ["read", "write"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "records_input_may_not_be_deleted_by_a_workload_that_is_not_the_records_writer" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { replay = { access = { records_input = ["delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "the_orchestrator_may_not_delete_on_landing_or_manifests" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { orchestrator = { access = { landing = ["read", "delete"], records_input = ["read", "write", "delete"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "the_orchestrator_may_not_write_manifests" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { orchestrator = { access = { manifests = ["read", "write"], records_input = ["read"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}
+
+run "a_wildcard_prefix_or_mode_is_refused_for_the_orchestrator" {
+  command = plan
+
+  module {
+    source = "./modules/workload_roles"
+  }
+
+  variables {
+    name_prefix   = "example_project_workload"
+    environment   = "dev"
+    boundary_name = "example_project_role_boundary"
+    host_role_arn = "arn:aws:iam::<ACCOUNT>:role/example_project_host_dev"
+    bucket_name   = "example-project"
+    workloads     = { orchestrator = { access = { "*" = ["read"], records_input = ["*"] } } }
+  }
+
+  expect_failures = [var.workloads]
+}

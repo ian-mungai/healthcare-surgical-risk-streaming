@@ -85,7 +85,7 @@ KEY_MESSAGES = {
 GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
-PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103, "replay": 20104}
+PROJECT_WORKLOAD_GIDS = {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103, "replay": 20104, "orchestrator": 20105}
 STOPPED_BILLING = "still billed while stopped: the host's 200 GiB disk and the objects in the project's buckets; not billed: the instance's hours"
 
 

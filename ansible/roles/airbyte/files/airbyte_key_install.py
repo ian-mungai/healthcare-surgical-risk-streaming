@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -I
-"""Place the project profile's access key for Airbyte's two connectors as two root-only files. Run as root on the host by the launcher.
+"""Place the project profile's access key for Airbyte's two connectors as two root-only files, and for the code location's record load as two more files for
+the container's user. Run as root on the host by the launcher.
 
 The launcher reads the key on the owner's computer and sends one JSON document on standard input: ``{"aws_access_key_id": ...,
 "aws_secret_access_key": ...}``. The script takes no secret in an argument or the environment, and no Ansible task or module ever holds the key. It
@@ -7,9 +8,13 @@ refuses anything else by a fixed code: input over 4 KiB (``oversized``), text th
 (``session_token``), another set of keys than the two (``bad_keys``), values that are not text or not in the form of an AWS access key (``bad_form``)
 and empty values (``empty``). It writes ``airbyte/aws_access_key_id`` and ``airbyte/aws_secret_access_key`` under the secrets folder with the shared
 atomic helper: each file is written through a fresh temporary file that is flushed and synced before it takes its place, mode 0400, so a file is whole
-or absent and never empty. The leftovers of an interrupted write are removed at the start, an empty or short file is replaced like a changed one (a
-rotated key), a file with another mode or owner is given the right ones, and a second run changes nothing. A file that cannot be written is
-``cannot_write``. The script prints one code (``placed``, ``unchanged`` or a refusal) and nothing else, and exits 0 for the first two and 3 otherwise.
+or absent and never empty. It writes the same two files again as ``airbyte_api/aws_access_key_id`` and ``airbyte_api/aws_secret_access_key``, owned by the
+code location container's user and group (``--container-owner``, by default 10001:10001, the user that ``compose/services/dagster_code_location.yml`` runs
+as), in the folder that the Airbyte role makes for the other four files of that container. The script is the only writer of the key, so no Ansible task,
+variable or result holds it. A folder that is missing is made for root with mode 0700, as the role makes it. The leftovers of an interrupted write are removed
+at the start, an empty or short file is replaced like a changed one (a rotated key), a file with another mode or owner is given the right ones, and a second
+run changes nothing. A file that cannot be written is ``cannot_write``. The script prints one code (``placed``, ``unchanged`` or a refusal) and nothing
+else, and exits 0 for the first two and 3 otherwise.
 It uses only the standard library and the helper that the role installs beside it, and runs on the host's Python.
 
 The launcher starts it as ``sudo /usr/bin/python3 -I <this file>``: the host's interpreter in isolated mode (no environment variable, no user site
@@ -49,8 +54,10 @@ write_private_file = helper.write_private_file  # type: ignore[attr-defined]
 
 DEFAULT_DIRECTORY = "/opt/platform/secrets"
 DEFAULT_OWNER = "0:0"
+DEFAULT_CONTAINER_OWNER = "10001:10001"
 MAX_INPUT_BYTES = 4096
 FOLDER = "airbyte"
+CONTAINER_FOLDER = "airbyte_api"
 ID_FILE = "aws_access_key_id"
 VALUE_FILE = "aws_secret_access_key"
 KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
@@ -100,18 +107,23 @@ def current_value(path: Path) -> str | None:
         raise Refusal("cannot_write") from None
 
 
-def place(directory: Path, owner: tuple[int, int], key_id: str, value: str) -> str:
-    """Make the two files hold the key and return ``placed`` or ``unchanged``. The secret goes first, so the ID changes last."""
+def place(directory: Path, owner: tuple[int, int], container_owner: tuple[int, int], key_id: str, value: str) -> str:
+    """Make the four files hold the key and return ``placed`` or ``unchanged``. The root files go first, and in each folder the secret goes before the ID."""
     changed = False
-    for name, wanted in ((VALUE_FILE, value), (ID_FILE, key_id)):
-        path = directory / FOLDER / name
+    for folder, holder, name, wanted in (
+        (FOLDER, owner, VALUE_FILE, value),
+        (FOLDER, owner, ID_FILE, key_id),
+        (CONTAINER_FOLDER, container_owner, VALUE_FILE, value),
+        (CONTAINER_FOLDER, container_owner, ID_FILE, key_id),
+    ):
+        path = directory / folder / name
         try:
             if path.parent.exists():
                 remove_leftovers(path)
             if current_value(path) != wanted:
-                write_private_file(path, wanted, replace=True, owner=owner)
-            elif access_differs(path, owner):
-                set_access(path, owner)
+                write_private_file(path, wanted, replace=True, owner=holder)
+            elif access_differs(path, holder):
+                set_access(path, holder)
             else:
                 continue
         except (SecretFileError, OSError):
@@ -123,11 +135,12 @@ def place(directory: Path, owner: tuple[int, int], key_id: str, value: str) -> s
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Place the project profile's access key from standard input.")
     parser.add_argument("--directory", default=DEFAULT_DIRECTORY, help="the secrets folder")
-    parser.add_argument("--owner", default=DEFAULT_OWNER, help="the numeric user and group of the files, uid:gid")
+    parser.add_argument("--owner", default=DEFAULT_OWNER, help="the numeric user and group of the root-only files, uid:gid")
+    parser.add_argument("--container-owner", default=DEFAULT_CONTAINER_OWNER, help="the numeric user and group of the code location's two copies, uid:gid")
     arguments = parser.parse_args(argv)
     try:
         key_id, value = parse_document(sys.stdin.buffer.read(MAX_INPUT_BYTES + 1))
-        code = place(Path(arguments.directory), parse_owner(arguments.owner, allow_root=True), key_id, value)
+        code = place(Path(arguments.directory), parse_owner(arguments.owner, allow_root=True), parse_owner(arguments.container_owner), key_id, value)
     except Refusal as error:
         code = error.code
     except SecretFileError:

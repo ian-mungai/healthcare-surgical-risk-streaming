@@ -107,6 +107,31 @@ class ClientTest(unittest.TestCase):
                 NessieClient(url, timeout_seconds=1)
 
 
+class AnswerObject(NessieClient):
+    """A client whose server answers 200 with a body of its own, to show what a reply that is not a JSON object does."""
+
+    def __init__(self, body: bytes) -> None:
+        super().__init__("http://nessie.example:19120/api/v2")
+        self.body = body
+
+    def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+        return 200, self.body
+
+
+class NotAnObjectTest(unittest.TestCase):
+    def test_a_reference_answer_or_a_creation_answer_that_is_not_a_json_object_is_a_nessie_error_and_not_an_attribute_error(self) -> None:
+        for body in (b"[1]", b'"text"', b"7", b"true", b"plain text that is not json"):
+            with self.subTest(body=body):
+                with self.assertRaises(NessieError):
+                    AnswerObject(body).reference("main")
+                with self.assertRaises(NessieError):
+                    AnswerObject(body).create_reference("BRANCH", "load_x", Reference("BRANCH", "main", "a" * 64))
+
+    def test_an_empty_answer_is_a_nessie_error_for_a_reference_too(self) -> None:
+        with self.assertRaises(NessieError):
+            AnswerObject(b"").reference("main")
+
+
 class WarehouseTest(unittest.TestCase):
     def test_the_location_is_the_projects_bucket_with_the_warehouse_prefix(self) -> None:
         self.assertEqual("s3://example-project-bucket/warehouse/", warehouse_location("example-project-bucket"))

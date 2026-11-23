@@ -87,7 +87,10 @@ class ImageTest(unittest.TestCase):
             ("ingestion/table_checks.py", ""),
             ("COPY --from=stack_spark __init__.py table_checks.py", "COPY --from=stack_spark __init__.py"),
             ("ingestion/gate.py", ""),
-            ("COPY --from=stack_scripts aws_cli.py /opt/dagster/app/scripts/", ""),
+            (
+                "COPY --from=stack_scripts __init__.py aws_cli.py process.py project_config.py",
+                "COPY --from=stack_scripts __init__.py process.py project_config.py",
+            ),
         ):
             text = DOCKERFILE.read_text()
             self.assertIn(old, text)

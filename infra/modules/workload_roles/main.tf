@@ -9,6 +9,10 @@ locals {
   delete_prefixes = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "delete")]) }
   write_prefixes  = { for name, workload in var.workloads : name => sort([for prefix, modes in workload.access : prefix if contains(modes, "write")]) }
 
+  # The read copies of the record load are put and deleted by exact version, so their prefix has its own statements with the fewest actions: no multipart
+  # upload and no delete of a whole object. Every other prefix keeps the statements below.
+  records_prefix = "records_input"
+
   statements = { for name, workload in var.workloads : name => [
     for statement in [
       {
@@ -31,21 +35,39 @@ locals {
         }
       },
       {
-        present = length(local.write_prefixes[name]) > 0
+        present = length([for prefix in local.write_prefixes[name] : prefix if prefix != local.records_prefix]) > 0
         value = {
           Sid      = "WriteObjects"
           Effect   = "Allow"
           Action   = ["s3:AbortMultipartUpload", "s3:PutObject"]
-          Resource = [for prefix in local.write_prefixes[name] : "${local.bucket_arn}/${prefix}/*"]
+          Resource = [for prefix in local.write_prefixes[name] : "${local.bucket_arn}/${prefix}/*" if prefix != local.records_prefix]
         }
       },
       {
-        present = length(local.delete_prefixes[name]) > 0
+        present = contains(local.write_prefixes[name], local.records_prefix)
+        value = {
+          Sid      = "WriteRecordCopies"
+          Effect   = "Allow"
+          Action   = ["s3:PutObject"]
+          Resource = ["${local.bucket_arn}/${local.records_prefix}/*"]
+        }
+      },
+      {
+        present = length([for prefix in local.delete_prefixes[name] : prefix if prefix != local.records_prefix]) > 0
         value = {
           Sid      = "DeleteObjects"
           Effect   = "Allow"
           Action   = ["s3:DeleteObject"]
-          Resource = [for prefix in local.delete_prefixes[name] : "${local.bucket_arn}/${prefix}/*"]
+          Resource = [for prefix in local.delete_prefixes[name] : "${local.bucket_arn}/${prefix}/*" if prefix != local.records_prefix]
+        }
+      },
+      {
+        present = contains(local.delete_prefixes[name], local.records_prefix)
+        value = {
+          Sid      = "DeleteRecordCopyVersions"
+          Effect   = "Allow"
+          Action   = ["s3:DeleteObjectVersion"]
+          Resource = ["${local.bucket_arn}/${local.records_prefix}/*"]
         }
       },
       {

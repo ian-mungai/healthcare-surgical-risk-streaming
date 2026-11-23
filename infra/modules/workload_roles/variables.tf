@@ -34,6 +34,12 @@ variable "manifest_writer" {
   default     = "ingestion_check"
 }
 
+variable "records_writer" {
+  description = "Name of the one workload that may write and delete the records_input prefix, which holds the record load's read copies."
+  type        = string
+  default     = "orchestrator"
+}
+
 variable "workloads" {
   description = "Workloads that get their own role. Each names the prefixes it reaches, with the modes read, write and delete for each, and whether it reads the publisher's dataset. The variable file gives no bucket and no resource pattern."
   type = map(object({
@@ -42,8 +48,8 @@ variable "workloads" {
   }))
 
   validation {
-    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix in keys(workload.access) : contains(["landing", "manifests", "warehouse"], prefix)])])
-    error_message = "A workload may name only the landing, manifests and warehouse prefixes. The state prefix, the airbyte prefix, another bucket and a wildcard are refused."
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix in keys(workload.access) : contains(["landing", "manifests", "warehouse", "records_input"], prefix)])])
+    error_message = "A workload may name only the landing, manifests, warehouse and records_input prefixes. The state prefix, the airbyte prefix, another bucket and a wildcard are refused."
   }
 
   validation {
@@ -52,8 +58,13 @@ variable "workloads" {
   }
 
   validation {
-    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix, modes in workload.access : prefix == "warehouse" || !contains(modes, "delete")])])
-    error_message = "Only the warehouse prefix may have the delete mode."
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix, modes in workload.access : prefix == "warehouse" || prefix == "records_input" || !contains(modes, "delete")])])
+    error_message = "Only the warehouse and records_input prefixes may have the delete mode."
+  }
+
+  validation {
+    condition     = alltrue([for name, workload in var.workloads : name == var.records_writer || length(setintersection(lookup(workload.access, "records_input", []), ["write", "delete"])) == 0])
+    error_message = "Only the workload named in records_writer may write or delete the records_input prefix."
   }
 
   validation {

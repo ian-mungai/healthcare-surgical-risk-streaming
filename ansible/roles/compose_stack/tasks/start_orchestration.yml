@@ -1,0 +1,12 @@
+# Reads compose_stack_orchestration_services and what start.yml reads. The code location and the services that wait for it start only now, in the connection
+# playbook, after the Airbyte role made four of the six files that the code location mounts as Compose secrets and the launcher's key step made the other two,
+# so a clean host deploys in one pass. A file that a run replaced is a new file for the host, and a running container keeps the file it was started with: the
+# stale check of start.yml (stale_services) finds a service whose configuration or secret file is newer than its container and recreates it.
+# The code location then gives Nessie's main branch its first commit, which it can only do once it runs.
+- name: Start the orchestration services and wait for their health
+  ansible.builtin.include_tasks: start.yml
+  vars:
+    compose_stack_start_services: "{{ compose_stack_orchestration_services }}"
+
+- name: Give Nessie's main branch its first commit
+  ansible.builtin.include_tasks: nessie.yml

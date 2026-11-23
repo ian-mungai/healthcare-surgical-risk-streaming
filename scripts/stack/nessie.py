@@ -136,8 +136,11 @@ class NessieClient:
             return PlainText(raw[:200].decode(errors="replace"))
 
     def reference(self, name: str) -> Reference:
-        """The branch or tag ``name`` with the hash it points to now."""
-        return reference_from((self.request("GET", f"/trees/{quote(name, safe='')}") or {}).get("reference"))
+        """The branch or tag ``name`` with the hash it points to now. An answer that is not a JSON object is a ``NessieError``."""
+        document = self.request("GET", f"/trees/{quote(name, safe='')}")
+        if not isinstance(document, dict):
+            raise NessieError("Nessie's reference answer is not an object")
+        return reference_from(document.get("reference"))
 
     def config(self) -> dict[str, Any]:
         """The server's configuration: the API versions it serves, its default branch and the hash of an empty history."""
@@ -208,11 +211,16 @@ class NessieClient:
 
     def create_reference(self, kind: str, name: str, source: Reference) -> Reference:
         document = self.request("POST", "/trees", {"type": source.kind, "name": source.name, "hash": source.hash}, {"name": name, "type": kind})
-        return reference_from((document or {}).get("reference", document))
+        if not isinstance(document, dict):
+            raise NessieError("Nessie's answer to a reference creation is not an object")
+        return reference_from(document.get("reference", document))
 
-    def delete_reference(self, name: str, hash_value: str) -> None:
-        """Delete the branch or tag ``name`` when it is still at ``hash_value``."""
-        self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}")
+    def delete_reference(self, name: str, hash_value: str, kind: str | None = None) -> None:
+        """Delete the branch or tag ``name`` when it is still at ``hash_value``.
+
+        With ``kind`` (``BRANCH`` or ``TAG``) a reference of the other kind is refused with status 400 and nothing is deleted.
+        """
+        self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}", None, None if kind is None else {"type": kind})
 
     def merge(self, source: str, target: str, expected_target_hash: str, message: str, *, source_hash: str) -> str:
         """Merge ``source`` as it was at ``source_hash`` into ``target``, which the caller expects at ``expected_target_hash``. Returns ``target``'s new hash.

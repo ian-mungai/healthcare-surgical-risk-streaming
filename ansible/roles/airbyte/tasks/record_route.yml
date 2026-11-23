@@ -1,0 +1,18 @@
+# Reads what record_route_units.yml reads. The route is up before the first record load, which needs it.
+- name: Install the route's units
+  ansible.builtin.include_tasks: record_route_units.yml
+
+- name: Start the route's socket now and at boot
+  ansible.builtin.systemd_service:
+    name: "{{ airbyte_route_unit }}.socket"
+    state: started
+    enabled: true
+    daemon_reload: "{{ airbyte_route_socket_file is changed or airbyte_route_service_file is changed }}"
+  timeout: 120
+
+- name: Restart the socket when a unit changed, which also stops the proxy so that its next start reads the new unit
+  ansible.builtin.systemd_service:
+    name: "{{ airbyte_route_unit }}.socket"
+    state: restarted
+  timeout: 120
+  when: airbyte_route_socket_file is changed or airbyte_route_service_file is changed

@@ -1,0 +1,18 @@
+# Reads airbyte_directory, airbyte_owner, airbyte_group, airbyte_namespace, airbyte_bridge_address and airbyte_nessie_route_port (default 19120). The policy adds to the PostgreSQL route's: Kubernetes
+# unions the allowances of the policies of a pod, so Airbyte's pods may also reach the bridge address on Nessie's forwarder port. No pod is admitted to the forwarder of Airbyte's
+# API, and every other namespace that exists at a deploy is already refused the whole bridge address by network_policy.yml.
+- name: Create Airbyte's folder
+  ansible.builtin.file:
+    path: "{{ airbyte_directory }}"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0755"
+
+- name: Write the policy that admits Airbyte's pods to the Nessie forwarder
+  ansible.builtin.template:
+    src: record_route_policy.yaml.j2
+    dest: "{{ airbyte_directory }}/record_route_policy.yaml"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"

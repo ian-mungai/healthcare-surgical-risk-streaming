@@ -1,0 +1,68 @@
+# Reads airbyte_secrets_directory, airbyte_record_client_id, airbyte_record_client_secret and, optionally, airbyte_record_container_user and airbyte_record_container_group
+# (default 10001, the user and group of the code location container). It places four of the six files that the container reads: the address of Airbyte's API (the
+# forwarder on the bridge address, which the code takes from this file only and checks before it reads a credential; the deploy runs that same check,
+# ``python -m scripts.ingestion.airbyte_api check``, so the allowed ranges have one definition), the address of Nessie as the pods reach it (the other forwarder)
+# and the instance's client ID and secret. The other two, the access key that the destination needs for the Nessie catalog, are copies of the project profile's key
+# that the launcher's one key script writes beside the root-only ones (airbyte_key_install), so this role never reads, holds or copies the key. Every file of a
+# container's own is owned by that numeric user with mode 0400 (the secret-file rule), in a folder that only the role's owner (root on the host) enters, which this
+# role makes and the key script writes into. An empty client value stops the run before any file is placed. Nothing shows a value. A rotated value replaces the
+# file; a second run changes nothing. The code location starts after the key script has run, in the connection playbook, and the start finds a replaced file by
+# its time (stale_services).
+- name: Check the two client values
+  ansible.builtin.assert:
+    that:
+      - airbyte_record_client_id | default('') | length > 0
+      - airbyte_record_client_secret | default('') | length > 0
+    quiet: true
+    fail_msg: the client ID and secret of Airbyte's instance are not both set
+  no_log: true
+
+- name: Check the address of Airbyte's API with the check that the container makes, so that one definition of the allowed addresses holds for both
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -m
+      - scripts.ingestion.airbyte_api
+      - check
+      - --address
+      - "http://{{ airbyte_bridge_address }}:{{ airbyte_api_route_port | default(8001) }}"
+    chdir: "{{ role_path }}/../../.."
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Check the Nessie route port that the address file holds
+  ansible.builtin.assert:
+    that:
+      - airbyte_record_nessie_port | string is match('^[1-9][0-9]{0,4}$')
+      - airbyte_record_nessie_port | int <= 65535
+    quiet: true
+    fail_msg: the Nessie route port must be a number from 1 to 65535
+  vars:
+    airbyte_record_nessie_port: "{{ airbyte_nessie_route_port | default(19120) }}"
+
+- name: Create the folder of the container's files
+  ansible.builtin.file:
+    path: "{{ airbyte_secrets_directory }}/airbyte_api"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0700"
+
+- name: Place the four files for the code-location container's user
+  ansible.builtin.copy:
+    content: "{{ item.value }}\n"
+    dest: "{{ airbyte_secrets_directory }}/airbyte_api/{{ item.name }}"
+    owner: "{{ airbyte_record_container_user | default('10001') }}"
+    group: "{{ airbyte_record_container_group | default(airbyte_record_container_user | default('10001')) }}"
+    mode: "0400"
+  no_log: true
+  loop:
+    - {name: api_url, value: "http://{{ airbyte_bridge_address }}:{{ airbyte_api_route_port | default(8001) }}"}
+    - {name: nessie_url, value: "http://{{ airbyte_bridge_address }}:{{ airbyte_nessie_route_port | default(19120) }}/api/v2"}
+    - {name: client_id, value: "{{ airbyte_record_client_id }}"}
+    - {name: client_secret, value: "{{ airbyte_record_client_secret }}"}
+  loop_control:
+    label: "{{ item.name }}"

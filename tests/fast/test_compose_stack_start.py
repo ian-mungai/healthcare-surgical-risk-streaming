@@ -43,8 +43,10 @@ for word in "$@"; do
   esac
 done
 case " $* " in *" config "*) verb=config ;; esac
+case " $* " in *" --services "*) verb=config_services ;; esac
 case " $* " in *" --format json "*) case "$verb" in ps) verb=ps_json ;; esac ;; esac
 case "$verb" in
+  config_services) cat "$here/services.txt" ;;
   config) if [ -f "$here/config.json" ]; then cat "$here/config.json"; else echo '{"services": {}}'; fi ;;
   ps_json) if [ -f "$here/ps.json" ]; then cat "$here/ps.json"; fi ;;
   image_inspect) if [ -f "$here/label" ]; then cat "$here/label"; else echo "Error: No such image" >&2; exit 1; fi ;;
@@ -124,6 +126,42 @@ class StartTest(unittest.TestCase):
         logged, code, output = self.start([])
         self.assertEqual(0, code, output)
         self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30"], [line for line in logged if " up " in f" {line} "])
+
+    def start_except(
+        self, left_out: list[str], names: str = "postgres\nnessie\ndagster_code_location\ndagster_daemon\ndagster_webserver\n"
+    ) -> tuple[list[str], int, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, context = prepare(folder)
+            (stand_in.parent / "services.txt").write_text(names)
+            values = variables(folder, stand_in, context, compose_stack_start_services=[], compose_stack_start_except=left_out)
+            code, output = run_tasks("start.yml", values)
+            return calls(stand_in), code, output
+
+    def test_an_empty_start_with_services_left_out_starts_every_other_service_by_name(self) -> None:
+        logged, code, output = self.start_except(["dagster_code_location", "dagster_daemon", "dagster_webserver"])
+        self.assertEqual(0, code, output)
+        self.assertEqual(
+            ["compose --project-name sample up --detach --wait --wait-timeout 30 nessie postgres"], [line for line in logged if " up " in f" {line} "]
+        )
+        self.assertIn("compose --project-name sample config --services", logged)
+
+    def test_nothing_is_left_out_when_the_list_is_empty_and_the_service_names_are_not_read(self) -> None:
+        logged, code, output = self.start_except([])
+        self.assertEqual(0, code, output)
+        self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30"], [line for line in logged if " up " in f" {line} "])
+        self.assertNotIn("compose --project-name sample config --services", logged)
+
+    def test_a_start_that_names_services_ignores_the_ones_left_out(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, context = prepare(folder)
+            values = variables(folder, stand_in, context, compose_stack_start_services=["postgres"], compose_stack_start_except=["postgres"])
+            code, output = run_tasks("start.yml", values)
+            self.assertEqual(0, code, output)
+            self.assertEqual(
+                ["compose --project-name sample up --detach --wait --wait-timeout 30 postgres"], [line for line in calls(stand_in) if " up " in f" {line} "]
+            )
 
     def test_the_containers_are_read_through_the_same_docker_command_as_the_start(self) -> None:
         logged, code, output = self.start(["postgres"])

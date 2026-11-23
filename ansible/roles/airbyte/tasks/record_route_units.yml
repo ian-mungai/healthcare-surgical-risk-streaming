@@ -1,0 +1,51 @@
+# Reads airbyte_route_unit, airbyte_route_listen_port, airbyte_route_target_port, airbyte_postgres_unit_directory, airbyte_owner, airbyte_group and airbyte_bridge_address. One route
+# in the form of the PostgreSQL route: the socket listens on the k3s bridge address only and may bind before the bridge exists, and the service is the proxy that ships in Ubuntu's
+# systemd package, which connects each client to the server's local address. A unit name or a port that is not valid stops the run before any unit is written.
+- name: Check the unit name and the two ports
+  ansible.builtin.assert:
+    that:
+      - airbyte_route_unit is match('^[a-z][a-z0-9-]{0,40}$')
+      - airbyte_route_listen_port | string is match('^[1-9][0-9]{0,4}$')
+      - airbyte_route_target_port | string is match('^[1-9][0-9]{0,4}$')
+      - airbyte_route_listen_port | int <= 65535
+      - airbyte_route_target_port | int <= 65535
+    quiet: true
+    fail_msg: the route's unit name must be lower case letters, digits and dashes, and both ports must be numbers from 1 to 65535
+
+- name: Install the socket that listens on the bridge address
+  ansible.builtin.copy:
+    dest: "{{ airbyte_postgres_unit_directory }}/{{ airbyte_route_unit }}.socket"
+    content: |
+      [Unit]
+      Description=Listen on the k3s bridge address for connections to {{ airbyte_route_unit }}
+
+      [Socket]
+      ListenStream={{ airbyte_bridge_address }}:{{ airbyte_route_listen_port }}
+      FreeBind=true
+
+      [Install]
+      WantedBy=sockets.target
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+  register: airbyte_route_socket_file
+
+- name: Install the service that forwards those connections to the server's local address
+  ansible.builtin.copy:
+    dest: "{{ airbyte_postgres_unit_directory }}/{{ airbyte_route_unit }}.service"
+    content: |
+      [Unit]
+      Description=Forward connections on the bridge address to the local address for {{ airbyte_route_unit }}
+      Requires={{ airbyte_route_unit }}.socket
+      After={{ airbyte_route_unit }}.socket
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:{{ airbyte_route_target_port }}
+      DynamicUser=yes
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0644"
+  register: airbyte_route_service_file

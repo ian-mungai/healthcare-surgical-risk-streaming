@@ -29,6 +29,7 @@ from scripts.infra import host
 from scripts.infra.host import HostError, place_project_key
 from scripts.process import CompletedProcess, TimeoutExpired, run_command
 from scripts.project_config import ROOT
+from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_support import ROLES, SHARED_MODULE_UTILS
 from tests.fast.test_airbyte_role import GROUP as ROLE_GROUP
 from tests.fast.test_airbyte_role import OWNER as ROLE_OWNER
@@ -293,7 +294,7 @@ class ScriptTest(unittest.TestCase):
             contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(errors),
         ):
-            code = INSTALL.main(["--directory", str(self.folder), "--owner", OWNER])
+            code = INSTALL.main(["--directory", str(self.folder), "--owner", OWNER, "--container-owner", OWNER])
         return code, output.getvalue(), errors.getvalue()
 
     def test_control_a_static_key_is_placed_in_two_files_for_their_owner_only_and_the_one_line_is_the_code(self) -> None:
@@ -304,6 +305,75 @@ class ScriptTest(unittest.TestCase):
             self.assertEqual(0o400, stat.S_IMODE(self.path(name).stat().st_mode))
             self.assertEqual(self.owner, (self.path(name).stat().st_uid, self.path(name).stat().st_gid))
         self.assertEqual(0o700, stat.S_IMODE(self.path("aws_access_key_id").parent.stat().st_mode))
+
+    def copy(self, name: str) -> Path:
+        return self.folder / "airbyte_api" / name
+
+    def test_the_key_is_also_placed_as_the_two_copies_that_the_code_location_mounts_for_the_container_user_only(self) -> None:
+        self.assertEqual((0, "placed\n", ""), self.run_main(payload()))
+        for name, value in (("aws_access_key_id", KEY_ID), ("aws_secret_access_key", KEY_VALUE)):
+            self.assertEqual(value, self.copy(name).read_text(), name)
+            self.assertEqual(0o400, stat.S_IMODE(self.copy(name).stat().st_mode))
+            self.assertEqual(self.owner, (self.copy(name).stat().st_uid, self.copy(name).stat().st_gid))
+        self.assertEqual(0o700, stat.S_IMODE(self.copy("aws_access_key_id").parent.stat().st_mode))
+        self.assertEqual({"aws_access_key_id", "aws_secret_access_key"}, {item.name for item in self.copy("x").parent.iterdir()}, "no file but the two copies")
+
+    def test_the_root_files_are_given_to_the_owner_and_the_copies_to_the_container_owner(self) -> None:
+        given: list[tuple[int, int]] = []
+        real = os.fchown
+
+        def record(descriptor: int, user: int, group: int) -> None:
+            given.append((user, group))
+            real(descriptor, self.owner[0], self.owner[1])
+
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload().encode()))),
+            mock.patch("secret_files.os.fchown", side_effect=record),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            code = INSTALL.main(["--directory", str(self.folder), "--owner", "0:0", "--container-owner", "10001:10001"])
+        self.assertEqual((0, "placed\n"), (code, output.getvalue()))
+        self.assertEqual([(0, 0), (0, 0), (10001, 10001), (10001, 10001)], given)
+
+    def test_without_the_option_the_copies_belong_to_the_code_locations_user_and_group_the_compose_service_runs_as(self) -> None:
+        self.assertEqual("10001:10001", INSTALL.DEFAULT_CONTAINER_OWNER)
+        document: Any = load_yaml((ROOT / "compose" / "services" / "dagster_code_location.yml").read_text())
+        service = document["services"]["dagster_code_location"]
+        self.assertEqual(INSTALL.DEFAULT_CONTAINER_OWNER, service["user"])
+        defaults = re.findall(
+            r"airbyte_record_container_(?:user|group) \| default\('([0-9]+)'", (ROLES / "airbyte" / "tasks" / "record_client_files.yml").read_text()
+        )
+        self.assertEqual(["10001", "10001"], defaults, "the role's defaults for the four files it places are the same user and group")
+
+    def test_a_copy_that_is_missing_changed_or_given_another_mode_is_repaired_and_the_run_says_placed(self) -> None:
+        self.run_main(payload())
+        self.copy("aws_secret_access_key").unlink()
+        self.assertEqual((0, "placed\n"), self.run_main(payload())[:2])
+        self.assertEqual(KEY_VALUE, self.copy("aws_secret_access_key").read_text())
+        self.copy("aws_access_key_id").chmod(0o640)
+        self.assertEqual((0, "placed\n"), self.run_main(payload())[:2])
+        self.assertEqual(0o400, stat.S_IMODE(self.copy("aws_access_key_id").stat().st_mode))
+        self.copy("aws_access_key_id").chmod(0o600)
+        self.copy("aws_access_key_id").write_text(OTHER_ID)
+        self.copy("aws_access_key_id").chmod(0o400)
+        self.assertEqual((0, "placed\n"), self.run_main(payload())[:2])
+        self.assertEqual(KEY_ID, self.copy("aws_access_key_id").read_text())
+        self.assertEqual((0, "unchanged\n"), self.run_main(payload())[:2])
+
+    def test_a_rotated_key_replaces_the_copies_too_and_the_leftover_of_an_interrupted_copy_is_removed(self) -> None:
+        self.run_main(payload())
+        leftover = self.copy(".aws_secret_access_key.0badf00d.new")
+        leftover.write_text(OTHER_VALUE)
+        self.assertEqual((0, "placed\n"), self.run_main(payload(OTHER_ID, OTHER_VALUE))[:2])
+        self.assertEqual((OTHER_ID, OTHER_VALUE), (self.copy("aws_access_key_id").read_text(), self.copy("aws_secret_access_key").read_text()))
+        self.assertFalse(leftover.exists())
+
+    def test_the_four_files_hold_the_one_key_and_no_other_text(self) -> None:
+        self.run_main(payload())
+        held = {path.read_text() for path in (*self.folder.joinpath("airbyte").iterdir(), *self.folder.joinpath("airbyte_api").iterdir())}
+        self.assertEqual({KEY_ID, KEY_VALUE}, held)
 
     def test_a_second_run_changes_nothing_and_a_rotated_key_is_replaced(self) -> None:
         self.run_main(payload())
@@ -342,6 +412,7 @@ class ScriptTest(unittest.TestCase):
         for marker in MARKERS:
             self.assertNotIn(marker, output + errors)
         self.assertFalse((self.folder / "airbyte").exists(), "a refused document writes nothing")
+        self.assertFalse((self.folder / "airbyte_api").exists(), "a refused document writes no copy either")
 
     def test_a_document_that_is_not_two_text_values_is_refused_by_code_and_writes_nothing(self) -> None:
         self.refused("x" * 5000, "oversized")
@@ -373,7 +444,7 @@ class ScriptTest(unittest.TestCase):
     def deployed(self, command: list[str], directory: str) -> tuple[int, str, str]:
         result = run_command(
             command[0],
-            [*command[1:], "--directory", str(self.folder / directory), "--owner", OWNER],
+            [*command[1:], "--directory", str(self.folder / directory), "--owner", OWNER, "--container-owner", OWNER],
             input_text=payload(),
             timeout=30,
             env={"PATH": "/usr/bin:/bin"},
@@ -413,7 +484,7 @@ class ScriptTest(unittest.TestCase):
         text = SCRIPT.read_text()
         self.assertNotIn("os.environ", text)
         self.assertNotIn("getenv", text)
-        self.assertEqual({"--directory", "--owner"}, set(re.findall(r'"(--[a-z-]+)"', text)))
+        self.assertEqual({"--directory", "--owner", "--container-owner"}, set(re.findall(r'"(--[a-z-]+)"', text)))
 
     def test_the_command_that_sudo_sees_is_the_one_the_launcher_runs_and_the_script_installed_by_the_role(self) -> None:
         self.assertEqual(f"/usr/bin/python3 -I {group_variables()['airbyte_bin_directory']}/airbyte_key_install", " ".join(host.KEY_COMMAND))
@@ -464,7 +535,7 @@ class RoleTest(unittest.TestCase):
         run_tasks(["key_script.yml"], self.variables())
         result = run_command(
             sys.executable,
-            ["-I", str(self.folder / "bin" / "airbyte_key_install"), "--directory", str(self.folder / "secrets"), "--owner", OWNER],
+            ["-I", str(self.folder / "bin" / "airbyte_key_install"), "--directory", str(self.folder / "secrets"), "--owner", OWNER, "--container-owner", OWNER],
             input_text=payload(),
             timeout=30,
             env={"PATH": "/usr/bin:/bin"},

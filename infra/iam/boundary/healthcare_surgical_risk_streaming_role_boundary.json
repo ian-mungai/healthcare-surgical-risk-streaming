@@ -33,6 +33,25 @@
       }
     },
     {
+      "Sid": "ProjectRecordCopyListing",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "records_input/*"
+          ]
+        }
+      }
+    },
+    {
       "Sid": "ProjectDataObjects",
       "Effect": "Allow",
       "Action": [
@@ -62,6 +81,20 @@
       "Resource": [
         "arn:aws:s3:::${S3_BUCKET}/manifests/*",
         "arn:aws:s3:::${S3_BUCKET}-test-*/manifests/*"
+      ]
+    },
+    {
+      "Sid": "ProjectRecordCopyObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObjectVersion",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}/records_input/*",
+        "arn:aws:s3:::${S3_BUCKET}-test-*/records_input/*"
       ]
     },
     {

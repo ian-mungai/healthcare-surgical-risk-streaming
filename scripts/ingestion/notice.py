@@ -57,6 +57,8 @@ FIELD_NAMES = frozenset(
         "release_path",
         "result_sha256",
         "retrieved_utc",
+        "rows",
+        "rows_sha256",
         "selection",
         "selection_name",
         "selection_sha256",
@@ -260,6 +262,7 @@ class Code(StrEnum):
     TABLES_NOT_LIST = "tables: not a list"
     TABLES_NAMES = "tables: the pin must name clinical_data.csv and lab_data.csv of the release once each"
     TRACK_URL = "track_list: the address must be https://api.vitaldb.net/trks"
+    PIN_ROWS = "{subject}{index}: rows is not a positive number or rows_sha256 is not 64 hex characters in lower case"
     CANDIDATE_HEADER = "the candidate file: the first line is not the header case, patient, key, size_bytes, sha256, arterial_waveform, slot"
     CANDIDATE_LINE = "the candidate file, line {position}: not a candidate line"
     CANDIDATE_KEY_OUTSIDE = "{subject} {position}: the key is outside the release path vitaldb/1.0.0/"

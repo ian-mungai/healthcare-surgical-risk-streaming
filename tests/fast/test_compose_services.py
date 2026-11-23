@@ -253,7 +253,7 @@ class DockerSocketExceptionTest(unittest.TestCase):
     def test_the_code_location_reaches_the_socket_through_its_group_by_number_and_never_runs_as_root(self) -> None:
         service = self.code_location()["services"]["dagster_code_location"]
         self.assertEqual("10001:10001", service["user"])
-        self.assertEqual(["${DOCKER_SOCKET_GID:?write the host settings first}"], service["group_add"])
+        self.assertEqual(["${DOCKER_SOCKET_GID:?write the host settings first}", "20105"], service["group_add"])
         self.assertEqual([{"path": "../host.env", "required": False}, {"path": "../heavy.env", "required": True}], service["env_file"])
 
     def test_the_code_location_reaches_the_k3s_api_on_the_host_with_the_service_account_files_as_secrets(self) -> None:
@@ -277,10 +277,17 @@ class DockerSocketExceptionTest(unittest.TestCase):
                 self.assertIn("named volumes", service_problems("dagster_code_location", document)[0])
 
 
-CREDENTIAL_READERS = {"spark": ("spark", 20102), "trino": ("trino", 20103), "replay": ("replay", 20104)}
+CREDENTIAL_READERS = {
+    "spark": ("spark", 20102),
+    "trino": ("trino", 20103),
+    "replay": ("replay", 20104),
+    "dagster_code_location": ("orchestrator", 20105),
+}
+EXTRA_GROUPS = {"dagster_code_location": ["<DOCKER_SOCKET_GID>"]}
 """The services that read a credential folder, each bound to its folder and its workload group. The table is fixed here, not derived from the mount, so a
 change of folder and group together is still a change this test names. A service has exactly its own entry and nothing else; a service that is not in the
-table has no credential folder and no workload group."""
+table has no credential folder and no workload group. ``EXTRA_GROUPS`` is the one group, as the check resolves it, that a reader may have besides its
+workload's: the code location also reaches the Docker socket through the socket's group (project standard)."""
 ACCESS_ROOT = "/run/workload_access"
 OWN_MOUNT = re.compile(r"[a-z][a-z0-9_]*:/run/workload_access:ro")
 
@@ -408,8 +415,8 @@ def access_problems(name: str, document: dict[str, Any]) -> list[str]:
         if workload_groups & {primary, *supplementary}:
             found.append(f"{name}: is not in the table of services that may read a credential folder and runs in a workload group")
     else:
-        if supplementary != [str(own[1])]:
-            found.append(f"{name}: must run in the group {own[1]} of the workload {own[0]} and in no other group")
+        if sorted(supplementary) != sorted([str(own[1]), *EXTRA_GROUPS.get(name, [])]):
+            found.append(f"{name}: must run in the group {own[1]} of the workload {own[0]} and in no other group but {EXTRA_GROUPS.get(name, 'none')}")
         if primary in workload_groups:
             found.append(f"{name}: must not take a workload group as its primary group")
     return found
@@ -437,6 +444,26 @@ class WorkloadAccessTest(unittest.TestCase):
     def test_the_fixed_table_agrees_with_the_project_workload_groups(self) -> None:
         for name, (workload, group) in CREDENTIAL_READERS.items():
             self.assertEqual(group, PROJECT_WORKLOAD_GIDS[workload], name)
+
+    def test_the_code_location_reads_the_orchestrator_credentials_through_the_same_interface_as_the_other_readers(self) -> None:
+        document = load(SERVICES / "dagster_code_location.yml")
+        service = document["services"]["dagster_code_location"]
+        self.assertEqual("/etc/workload_access/client_config", service["environment"]["AWS_CONFIG_FILE"])
+        self.assertEqual("true", service["environment"]["AWS_EC2_METADATA_DISABLED"])
+        self.assertIn("workload_access_orchestrator:/run/workload_access:ro", service["volumes"])
+        self.assertEqual({"source": "dagster_aws_client_config", "target": "/etc/workload_access/client_config"}, service["configs"][-1])
+        self.assertEqual("${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}", document["configs"]["dagster_aws_client_config"]["file"])
+        self.assertEqual(
+            "${ORCHESTRATOR_ACCESS_DIR:-/run/workload_access/orchestrator}", document["volumes"]["workload_access_orchestrator"]["driver_opts"]["device"]
+        )
+
+    def test_the_socket_group_is_the_only_group_besides_the_workload_s_that_a_reader_may_have(self) -> None:
+        document = copy.deepcopy(load(SERVICES / "dagster_code_location.yml"))
+        service = document["services"]["dagster_code_location"]
+        service["group_add"] = [*service["group_add"], "20102"]
+        self.assertEqual(1, len(access_problems("dagster_code_location", document)))
+        service["group_add"] = ["${DOCKER_SOCKET_GID:?write the host settings first}"]
+        self.assertEqual(1, len(access_problems("dagster_code_location", document)))
 
     def test_a_folder_and_group_changed_together_is_named(self) -> None:
         document = self.replay()
@@ -611,8 +638,9 @@ class WorkloadAccessTest(unittest.TestCase):
         self.assertEqual([], access_problems("dagster_code_location", code_location))
         for variable in HOST_RENDERED_GROUPS["dagster_code_location"]:
             self.assertIn(f"{variable}=", HOST_SETTINGS_RENDERER.read_text())
-        code_location["services"]["dagster_code_location"]["group_add"] = ["${OTHER_GID:?no value}"]
-        self.assertEqual(1, len(access_problems("dagster_code_location", code_location)))
+        code_location["services"]["dagster_code_location"]["group_add"] = ["20105", "${OTHER_GID:?no value}"]
+        problems = access_problems("dagster_code_location", code_location)
+        self.assertEqual(1, len([problem for problem in problems if "this field must be a literal or a resolvable default" in problem]), problems)
         document = self.replay()
         document["services"]["replay"]["group_add"] = ["20104", "${DOCKER_SOCKET_GID:?no value}"]
         problems = access_problems("replay", document)

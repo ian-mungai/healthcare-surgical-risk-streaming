@@ -25,7 +25,9 @@
   "track_list": {
     "url": "https://api.vitaldb.net/trks",
     "size_bytes": 30565770,
-    "sha256": "82b31333be20ca912ded93f46bf3ae42db281da40515a9945acc57749da9ffd0"
+    "sha256": "82b31333be20ca912ded93f46bf3ae42db281da40515a9945acc57749da9ffd0",
+    "rows": 486449,
+    "rows_sha256": "cd1f3bea66e3d59e0da19612a43c56d8d5a5430dc60707ad576fdfd53bb73588"
   },
   "credit": {
     "citation": "Lee, H., & Jung, C. (2022). VitalDB, a high-fidelity multi-parameter vital signs database in surgical patients (version 1.0.0). PhysioNet. https://doi.org/10.13026/czw8-9p62",

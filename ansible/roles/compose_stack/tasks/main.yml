@@ -2,8 +2,9 @@
 # Compose files, write the gateway's settings, render the limits and host settings, create the password files and check them, create the Grafana password
 # file, build the images the project makes itself, create Airbyte's namespace on k3s and write the k3s token and certificate authority that the code
 # location reads as Compose secrets, so a new host deploys in one pass, start PostgreSQL alone and wait for it, make the PostgreSQL accounts match the tool
-# list, prepare the secret store's first start, start the remaining services and wait for them, give Nessie's main branch its first commit, make the Kafka
-# topics and the registry's rules match their lists, and make the secret store match the service list. A second run changes nothing.
+# list, prepare the secret store's first start, start the remaining services but the orchestration services and wait for them, make the Kafka
+# topics and the registry's rules match their lists, and make the secret store match the service list. The orchestration services (the code location and what waits for it) start last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
+# code location mounts files that only they can make, and it gives Nessie's main branch its first commit. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
 
@@ -48,13 +49,11 @@
     name: openbao
     tasks_from: prepare.yml
 
-- name: Start the remaining services and wait for their health
+- name: Start the remaining services, except the orchestration services, and wait for their health
   ansible.builtin.include_tasks: start.yml
   vars:
     compose_stack_start_services: []
-
-- name: Give Nessie's main branch its first commit
-  ansible.builtin.include_tasks: nessie.yml
+    compose_stack_start_except: "{{ compose_stack_orchestration_services }}"
 
 - name: Make the Kafka topics match the topic list
   ansible.builtin.include_tasks: kafka.yml

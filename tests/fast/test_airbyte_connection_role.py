@@ -77,8 +77,11 @@ class PlacementTest(unittest.TestCase):
             self.fail("the playbook must be a list")
         (play,) = playbook
         self.assertEqual(("platform", True), (play["hosts"], play["become"]))
-        (task,) = play["tasks"]
+        task, start = play["tasks"]
         self.assertEqual({"name": "airbyte", "tasks_from": "connection.yml"}, task["ansible.builtin.include_role"])
+        self.assertEqual(
+            {"name": "compose_stack", "tasks_from": "start_orchestration.yml"}, start["ansible.builtin.include_role"], "the code location starts last"
+        )
         result = run_command(
             str(ROOT / ".venv" / "bin" / "ansible-playbook"),
             ["--syntax-check", "connection.yml"],

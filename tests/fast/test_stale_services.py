@@ -74,6 +74,56 @@ class FilesOfServicesTest(unittest.TestCase):
                 stale.service_files(bad)
 
 
+class SecretsOfServicesTest(unittest.TestCase):
+    """A secret that a service mounts from a file is a file to watch as well: a replaced file is a new file, and a running container keeps the old one."""
+
+    DOCUMENT = {
+        "services": {
+            "dagster_code_location": {
+                "secrets": [{"source": "airbyte_client_id", "target": "airbyte_client_id"}, "airbyte_client_secret"],
+                "configs": ["limits"],
+            },
+            "postgres": {"secrets": ["postgres_password"]},
+            "alloy": {},
+        },
+        "configs": {"limits": {"file": "/p/limits.yml"}},
+        "secrets": {
+            "airbyte_client_id": {"file": "/s/airbyte_api/client_id"},
+            "airbyte_client_secret": {"file": "/s/airbyte_api/client_secret"},
+            "postgres_password": {"file": "/s/postgres/password"},
+            "from_environment": {"environment": "SOME_VALUE"},
+        },
+    }
+
+    def test_the_files_of_the_secrets_of_each_service_are_watched_in_both_forms_beside_its_config_files(self) -> None:
+        self.assertEqual(
+            {
+                "dagster_code_location": [Path("/p/limits.yml"), Path("/s/airbyte_api/client_id"), Path("/s/airbyte_api/client_secret")],
+                "postgres": [Path("/s/postgres/password")],
+                "alloy": [],
+            },
+            stale.service_files(self.DOCUMENT),
+        )
+
+    def test_a_secret_that_has_no_file_is_not_a_file_to_watch_and_an_undefined_secret_is_refused(self) -> None:
+        document: dict[str, Any] = {"services": {"a": {"secrets": ["from_environment"]}}, "secrets": {"from_environment": {"environment": "X"}}}
+        self.assertEqual({"a": []}, stale.service_files(document))
+        bad_documents: list[Any] = [
+            {"services": {"a": {"secrets": ["missing"]}}, "secrets": {}},
+            {"services": {"a": {"secrets": ["missing"]}}},
+            {"services": {"a": {"secrets": [5]}}, "secrets": {}},
+        ]
+        for bad in bad_documents:
+            with self.subTest(bad=bad), self.assertRaises(stale.StaleError):
+                stale.service_files(bad)
+
+    def test_a_service_whose_secret_file_is_newer_than_its_container_is_stale_and_one_whose_secret_is_older_is_not(self) -> None:
+        files = stale.service_files(self.DOCUMENT)
+        modified = {Path("/s/airbyte_api/client_secret"): 200.0}
+        names = stale.stale_services(files, {"dagster_code_location": 100.0, "postgres": 100.0}, lambda path: modified.get(path, 50.0))
+        self.assertEqual(["dagster_code_location"], names)
+
+
 class StartTimeTest(unittest.TestCase):
     def test_a_start_time_with_nanoseconds_and_a_zone_is_read_to_the_second_fraction_that_python_keeps(self) -> None:
         self.assertEqual(1767225600.123456, stale.parse_started("2026-01-01T00:00:00.123456789Z"))

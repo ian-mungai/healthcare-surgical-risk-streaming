@@ -22,4 +22,7 @@ workloads = {
   replay = {
     access = { landing = ["read"], manifests = ["read"] }
   }
+  orchestrator = {
+    access = { landing = ["read"], manifests = ["read"], records_input = ["read", "write", "delete"] }
+  }
 }

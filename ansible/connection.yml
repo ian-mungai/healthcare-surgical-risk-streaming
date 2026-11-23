@@ -1,5 +1,7 @@
 # The second run of the host deployment, after the host playbook and the placement of the project profile's access key (scripts.infra.host). It makes the raw
-# connection of the release copy in Airbyte. The module reads the two key files on the host; no Ansible variable, fact or argument holds the key.
+# connection of the release copy in Airbyte. The module reads the two key files on the host; no Ansible variable, fact or argument holds the key. It then starts
+# the orchestration services (the code location and what waits for it), because the code location mounts the two copies of the key that the same placement made
+# for it, and Compose cannot start a service whose secret file is not there.
 - name: Make the raw connection of the release copy
   hosts: platform
   become: true
@@ -10,3 +12,8 @@
       ansible.builtin.include_role:
         name: airbyte
         tasks_from: connection.yml
+
+    - name: Start the orchestration services, which mount files that the Airbyte role and the key placement made
+      ansible.builtin.include_role:
+        name: compose_stack
+        tasks_from: start_orchestration.yml

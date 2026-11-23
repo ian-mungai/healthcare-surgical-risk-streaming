@@ -1,9 +1,9 @@
-"""Ansible module: the services that run with an older copy of a configuration file than the one placed on the host.
+"""Ansible module: the services that run with an older copy of a configuration or secret file than the one placed on the host.
 
-Compose compares a service's definition when it starts the stack, not the content of the files that its ``configs`` name, so a changed file leaves the
-running container on the old copy. The module reads the files that each service mounts from ``docker compose config`` and the start time of each
-container, and names the services that have a container and a file newer than that container's start. A service with no container yet is not named,
-because its first start reads the file. The module changes nothing. It uses only the standard library and runs on the host's Python.
+Compose compares a service's definition when it starts the stack, not the content of the files that its ``configs`` and its ``secrets`` name, so a changed or
+replaced file leaves the running container on the old copy. The module reads the files that each service mounts from ``docker compose config`` and the start
+time of each container, and names the services that have a container and a file newer than that container's start. A service with no container yet is not
+named, because its first start reads the file. The module changes nothing. It uses only the standard library and runs on the host's Python.
 """
 
 from __future__ import annotations
@@ -25,20 +25,21 @@ class StaleError(RuntimeError):
 
 
 def service_files(config: Any) -> dict[str, list[Path]]:
-    """The files of the ``configs`` of each service in a ``docker compose config`` document. A config with no file is not a file to watch."""
+    """The files of the ``configs`` and then of the ``secrets`` of each service in a ``docker compose config`` document. One with no file is not watched."""
     if not isinstance(config, dict) or not isinstance(config.get("services"), dict):
         raise StaleError("the compose configuration holds no services")
-    defined = config.get("configs") or {}
     files: dict[str, list[Path]] = {}
     for name, service in config["services"].items():
         files[name] = []
-        for entry in (service or {}).get("configs") or []:
-            source = entry if isinstance(entry, str) else entry.get("source") if isinstance(entry, dict) else None
-            if not isinstance(source, str) or source not in defined:
-                raise StaleError(f"service {name} names a config that the configuration does not define")
-            file = defined[source].get("file")
-            if file:
-                files[name].append(Path(file))
+        for kind in ("configs", "secrets"):
+            defined = config.get(kind) or {}
+            for entry in (service or {}).get(kind) or []:
+                source = entry if isinstance(entry, str) else entry.get("source") if isinstance(entry, dict) else None
+                if not isinstance(source, str) or source not in defined:
+                    raise StaleError(f"service {name} names a {kind[:-1]} that the configuration does not define")
+                file = defined[source].get("file")
+                if file:
+                    files[name].append(Path(file))
     return files
 
 
