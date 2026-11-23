@@ -2,8 +2,8 @@
 
 ``pathlib``'s ``glob``, ``rglob`` and ``iterdir`` return nothing for a folder that is not readable, and ``Path.is_file`` says no for a file that it cannot
 examine. A reader of a run, inbox or input folder then takes a folder or a file that it cannot see for an empty one. The rule here is one for both modes:
-a folder that does not exist holds nothing, and every other failure, at the folder or at any folder above or below it, raises ``OSError``. That includes a
-link to nothing and a file in place of the folder.
+only a missing final component of the path holds nothing, and every other failure, at the folder or at any folder above or below it, raises
+``OSError``. That includes a link to nothing and a file in place of the folder.
 """
 
 from __future__ import annotations
@@ -19,7 +19,11 @@ def raise_error(error: OSError) -> None:
 
 
 def exists(folder: Path) -> bool:
-    """Whether anything is at ``folder``, a link to nothing included. A missing path, or one below a missing folder, says no. Any other failure raises."""
+    """Whether anything is at ``folder``, a link to nothing included. Only a missing final component says no, and only when its parent is a real folder
+    or a link to one that exists and can be searched. A missing or dangling ancestor, a file in its place and any other failure raise ``OSError``."""
+    parent = folder.parent
+    if parent != folder and not stat.S_ISDIR(os.stat(parent).st_mode):
+        raise NotADirectoryError(f"{parent.name} is not a folder")
     try:
         os.lstat(folder)
     except FileNotFoundError:
@@ -30,8 +34,8 @@ def exists(folder: Path) -> bool:
 def list_folder(folder: Path, pattern: str = "*", *, recursive: bool = False) -> list[Path]:
     """The entries of ``folder`` (files and folders) whose name matches ``pattern``, sorted, and at any depth when ``recursive``.
 
-    A folder that does not exist holds nothing. Anything else that stops the listing raises ``OSError`` (``PermissionError``, ``NotADirectoryError``, or
-    ``FileNotFoundError`` for a link to nothing).
+    A final component that does not exist, below an ancestor that does, holds nothing. Anything else that stops the listing raises ``OSError``:
+    ``PermissionError``, ``NotADirectoryError``, or ``FileNotFoundError`` for a missing ancestor or a link to nothing.
     """
     if not exists(folder):
         return []

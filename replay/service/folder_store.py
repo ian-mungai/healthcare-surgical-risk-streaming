@@ -9,13 +9,14 @@ credentials and the role that reach the bucket, and the latency of a real networ
 
 from __future__ import annotations
 
+import glob
 import re
 import shutil
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts.ingestion.folder import list_files
+from scripts.ingestion.folder import list_files, list_folder
 from scripts.ingestion.notice import Code, Notice
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
@@ -35,7 +36,11 @@ class FolderStore:
                 handle.write(f"{version.key} {version.version_id}\n")
 
     def entries(self, key: str) -> list[tuple[int, bool, Path]]:
-        folder = self.root / key
+        folder = self.root
+        for part in key.split("/"):
+            if not list_folder(folder, glob.escape(part)):
+                return []
+            folder = folder / part
         found = []
         for path in list_files(folder):
             match = VERSION_FILE.fullmatch(path.name)

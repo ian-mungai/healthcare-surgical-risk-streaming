@@ -104,11 +104,36 @@ class ListFolderTests(unittest.TestCase):
             with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
                 list_folder(ancestor / "runs", "*", recursive=recursive)
 
-    def test_a_missing_folder_and_a_missing_ancestor_hold_nothing_in_both_modes(self) -> None:
+    def test_only_a_missing_final_component_holds_nothing_in_both_modes(self) -> None:
         for recursive in (False, True):
             with self.subTest(recursive=recursive):
                 self.assertEqual([], list_folder(self.root / "absent", recursive=recursive))
-                self.assertEqual([], list_folder(self.root / "absent" / "deeper", recursive=recursive))
+
+    def test_a_missing_ancestor_is_an_error_in_both_modes(self) -> None:
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(FileNotFoundError):
+                list_folder(self.root / "absent" / "deeper", recursive=recursive)
+
+    def test_a_link_to_nothing_as_an_ancestor_is_an_error_in_both_modes(self) -> None:
+        (self.root / "dangling").symlink_to(self.root / "nowhere")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(OSError):
+                list_folder(self.root / "dangling" / "runs", recursive=recursive)
+
+    def test_a_link_to_a_folder_as_an_ancestor_or_as_the_folder_is_read(self) -> None:
+        (self.root / "real" / "runs").mkdir(parents=True)
+        (self.root / "real" / "runs" / "a_run").touch()
+        (self.root / "link").symlink_to(self.root / "real")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive):
+                self.assertEqual([self.root / "link" / "runs" / "a_run"], list_folder(self.root / "link" / "runs", recursive=recursive))
+                self.assertEqual([self.root / "link" / "runs"], list_folder(self.root / "link", "runs", recursive=False))
+
+    def test_a_file_as_an_ancestor_is_an_error_in_both_modes(self) -> None:
+        (self.root / "file").touch()
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(NotADirectoryError):
+                list_folder(self.root / "file" / "runs", recursive=recursive)
 
     def test_a_link_to_nothing_in_place_of_the_folder_is_an_error_in_both_modes(self) -> None:
         (self.root / "dangling").symlink_to(self.root / "nowhere")
