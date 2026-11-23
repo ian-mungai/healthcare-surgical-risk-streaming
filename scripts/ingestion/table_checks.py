@@ -11,17 +11,21 @@ this order, each step only when the one before it passed:
 4. the Spark job (``spark/jobs/table_checks.py``, started by ``runner``) checks every table and prints its result;
 5. the result is read and held to the plan: the same branch, hash, tables and snapshots, every check's verdict derived from its counts, and an exit code that
    agrees with it;
-6. only when every check passed, and the branch is still at the checked hash, a pending record is written and the branch is merged into the default branch.
+6. only when every check passed, and the branch is still at the checked hash, a pending record is written and the branch is merged into the default branch
+   with one request.
 
 The catalog's history is the one source of the merge. The receipt (``table_checks.json``, saved in the run folder against the manifest's reference) takes its
-merge commit and that commit's parent from the commit in the history whose last three lines are this load's, never from what was sent or answered. A merge
-request is sent once: after a failure the history is searched, and a run that finds a pending record younger than the settle time sends nothing.
+merge commit and that commit's parent from the commit in the history whose last three lines are this load's, never from what was sent or answered.
 
-A duplicate merge request to Nessie 0.110.1 is a no-op that its client reports as an error, but a request that timed out can still be applied later and Nessie
-can accept an older expected hash. The design does not rely on the no-op: it never sends while the outcome can be open.
+A merge request is sent at most once for a load, by this step or any later run of it. A duplicate request to Nessie 0.110.1 is a no-op that its client reports
+as an error, but a request that timed out can still be applied later, so the design never relies on that. Before the request a pending record is written in the
+fixed state directory (``STATE_DIRECTORY``, in the volume ``dagster_data``, so it survives a restart). While it exists and the history does not hold the load,
+every run ends as ``merge_outcome_open`` and sends nothing. The operator checks the history of main: if the commit is there, a run writes the receipt; if it
+is not and no request can still be in flight, the operator removes the pending file by hand and the next run sends one new request.
 
-A failed run merges nothing: the load branch stays for inspection. A rerun after a merge runs nothing and merges nothing more. A rerun after a failed run checks
-again and replaces the result. Messages name no data value.
+A run in which a check fails merges nothing and leaves the load branch for inspection. A run in which the merge request fails or times out may still have
+merged, and ends as ``merge_outcome_open`` or ``merge_not_found``: the history of main is then the only record of whether it did. A rerun after a merge runs
+nothing and merges nothing more. A rerun after a failed check checks again and replaces the result. Messages name no data value.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import tempfile
@@ -57,8 +62,9 @@ RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
 JOB_OUTPUT_FILE = "job_output.txt"
-# One fixed place for the locks of every load, on the tmpfs the code location already has. A lock ends with its process, so a crash leaves none.
-LOCK_DIRECTORY = Path("/run/dagster/table_check_locks")
+# One fixed directory for the lock and the pending merge record of every load: a folder of ``dagster_data``, the named volume that the code location already
+# mounts at ``/opt/dagster/data``, so a pending record survives a restart of the code location. (``/run/dagster`` is a tmpfs and does not.)
+STATE_DIRECTORY = Path("/opt/dagster/data/table_checks")
 # The job runs as the Spark user of the Spark image, with the launcher's own group as its primary group. The staged folder is 0750 and each staged file 0640
 # in that group, set by the launcher, so the job reads them and no other user does.
 SPARK_UID = 10100
@@ -68,12 +74,7 @@ STAGING_FILE_MODE = 0o640
 BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 STAGING_DIRECTORY = "/opt/dagster/staging"
 STAGING_VOLUME = "table_check_staging"
-PENDING_FILE = "merge_pending.json"
 PENDING_FORMAT = "merge_pending_1"
-# A merge request that the client gave up on can still be applied by Nessie. A retry sends a new request only when the pending record is older than this: the
-# client's own deadline is the Dagster job's 60 seconds, so 300 seconds is five deadlines, far beyond what a request that timed out can still take in Nessie. It
-# must be at least twice the deadline of the client in use, which ``run_table_checks`` checks.
-MERGE_SETTLE_SECONDS = 300.0
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGE_LIMIT = 50
 TRACKED_RELEASE_FILE = RELEASE_FILE
@@ -90,20 +91,27 @@ class TableChecksError(RuntimeError):
 
 
 class MergeOutcomeOpen(TableChecksError):
-    """``merge_outcome_open``: a merge request may still be applied and is not in the history yet. Nothing was sent again; the pending record stays."""
+    """``merge_outcome_open``: a merge request may still be applied and is not in the history yet. Nothing is sent again, by this run or any later one."""
 
 
 class MergeNotFound(TableChecksError):
     """``merge_not_found``: Nessie answered that the merge succeeded and the history holds no commit of this load. No receipt is written."""
 
 
+class SearchTimeout(TableChecksError):
+    """The search of the history of the default branch ran past its deadline."""
+
+
 @dataclass(frozen=True, slots=True)
 class Timing:
-    """The clock and the waits of the merge step, so that a test can run them without waiting."""
+    """The clocks and the waits of the merge step, so that a test can run them without waiting.
 
-    clock: Callable[[], float] = time.time
+    Every deadline and wait uses ``clock``, which is monotonic. ``wall`` only dates the pending record, for the operator to read, and no logic depends on it.
+    """
+
+    clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
-    settle_seconds: float = MERGE_SETTLE_SECONDS
+    wall: Callable[[], float] = time.time
     wait_seconds: float = 10.0
     poll_seconds: float = 2.0
 
@@ -402,13 +410,18 @@ def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple
     return result, result.document()
 
 
-def lock_path(manifest_sha256: str, directory: Path = LOCK_DIRECTORY) -> Path:
-    """The lock file of a load: in ``directory``, named by the manifest's SHA-256 only, so it does not depend on where the results are kept."""
+def lock_path(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Path:
+    """The lock file of a load: in the fixed state directory, named by the manifest's SHA-256 only, so it does not depend on where the results are kept."""
     return directory / f"{manifest_sha256}.lock"
 
 
+def pending_path(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Path:
+    """The pending merge record of a load: beside its lock, named the same way."""
+    return directory / f"{manifest_sha256}.pending.json"
+
+
 @contextlib.contextmanager
-def load_lock(manifest_sha256: str, directory: Path = LOCK_DIRECTORY) -> Iterator[None]:
+def load_lock(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Iterator[None]:
     """Hold the one lock of a load: a second run of the same load fails at once with a clear message. The lock ends with the process, so a crash leaves none."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     handle = lock_path(manifest_sha256, directory).open("w")
@@ -452,18 +465,21 @@ def history_page(document: Any) -> tuple[list[tuple[str, str, str]], str]:
     return entries, token if document["hasMore"] and isinstance(token, str) else ""
 
 
-def merged_commit(nessie: NessieClient, record: LoadRecord, at: str) -> MergeCommit | None:
+def merged_commit(nessie: NessieClient, record: LoadRecord, at: str, until: tuple[Callable[[], float], float] | None = None) -> MergeCommit | None:
     """The merge commit of this load in the log of the default branch, read from exactly the commit ``at``, with its parent, or None when none merged it.
 
     Only the final three lines of a commit's message identify a load, compared as one ordered unit: this load's ``records-branch`` line, ``records-source``
     line and ``records-manifest`` line. A commit whose last line is this load's manifest line and whose three lines are anything else is the merge of another
     load of this manifest, or one written in an older form: it is refused. The log is read newest first, page by page, and a log too long to read within
-    ``HISTORY_PAGE_LIMIT`` pages is refused, never taken for a log with no merge.
+    ``HISTORY_PAGE_LIMIT`` pages is refused, never taken for a log with no merge. With ``until`` (a clock and a deadline on it) the whole search, every page
+    of it, ends by ``SearchTimeout`` at the deadline.
     """
     wanted = [branch_line(record.branch), source_line(record.branch_hash), manifest_line(record.manifest.sha256)]
     default = quote(default_branch(nessie), safe="")
     token = ""
     for _ in range(HISTORY_PAGE_LIMIT):
+        if until is not None and until[0]() >= until[1]:
+            raise SearchTimeout("the search of the history of main ran past its deadline")
         query = {"max-records": str(HISTORY_PAGE_SIZE), **({"page-token": token} if token else {})}
         entries, token = history_page(nessie.request("GET", f"/trees/{default}@{at}/history", query=query))
         for commit, message, parent in entries:
@@ -478,9 +494,12 @@ def merged_commit(nessie: NessieClient, record: LoadRecord, at: str) -> MergeCom
     raise TableChecksError("the log of the default branch is too long to search for an earlier merge of this load")
 
 
-def read_pending(run_folder: Path, record: LoadRecord) -> float | None:
-    """The time the pending merge record of this load was written, or None when there is none. A record of another load or of another form is refused."""
-    path = run_folder / PENDING_FILE
+def read_pending(state_directory: Path, record: LoadRecord) -> float | None:
+    """The time (for the operator to read) that the pending merge record of this load was written, or None when there is none.
+
+    A record of another load, of another form or with a time that is not a finite number is refused.
+    """
+    path = pending_path(record.manifest.sha256, state_directory)
     if not path.is_file():
         return None
     try:
@@ -489,24 +508,34 @@ def read_pending(run_folder: Path, record: LoadRecord) -> float | None:
         )
     except ValueError:
         raise TableChecksError("the pending merge record is not JSON") from None
-    if pending["format"] != PENDING_FORMAT:
-        raise TableChecksError("the pending merge record has another format")
+    if pending["format"] != PENDING_FORMAT or not math.isfinite(pending["started"]):
+        raise TableChecksError("the pending merge record has another format or a time that is not a finite number")
     if (pending["manifest"], pending["branch"], pending["source"]) != (record.manifest.sha256, record.branch, record.branch_hash):
-        raise TableChecksError("the run folder holds a pending merge record of another load")
+        raise TableChecksError("the state directory holds a pending merge record of another load")
     return float(pending["started"])
 
 
-def write_pending(run_folder: Path, record: LoadRecord, started: float) -> None:
+def write_pending(state_directory: Path, record: LoadRecord, started: float) -> None:
     """Write the pending merge record in one step, before the merge request is sent."""
     document = {"format": PENDING_FORMAT, "manifest": record.manifest.sha256, "branch": record.branch, "source": record.branch_hash, "started": started}
-    fd, partial = tempfile.mkstemp(dir=run_folder, prefix=".merge_pending.")
+    fd, partial = tempfile.mkstemp(dir=state_directory, prefix=".pending.")
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        os.replace(partial, run_folder / PENDING_FILE)
+        os.replace(partial, pending_path(record.manifest.sha256, state_directory))
     except BaseException:
         Path(partial).unlink(missing_ok=True)
         raise
+
+
+def open_message(record: LoadRecord, state_directory: Path) -> str:
+    """The text of ``merge_outcome_open``: what the operator checks, and the one file that the operator removes by hand."""
+    return (
+        "merge_outcome_open: a merge request of this load was sent and the history of main does not hold its merge commit; this step never sends it again. "
+        f"Check the history of main for a commit whose last three lines are {branch_line(record.branch)}, {source_line(record.branch_hash)} and "
+        f"{manifest_line(record.manifest.sha256)}. If it is there, run the step again and it writes the receipt. If it is not there and you are sure that no "
+        f"request is still in flight, remove {pending_path(record.manifest.sha256, state_directory)}: the next run then sends one new request"
+    )
 
 
 def write_result(run_folder: Path, document: Mapping[str, Any]) -> None:
@@ -562,54 +591,58 @@ def main_head(nessie: NessieClient, default: str) -> str:
     return head.hash
 
 
-def wait_for_merge(nessie: NessieClient, record: LoadRecord, default: str, started: float, timing: Timing) -> MergeCommit | None:
-    """Search the history of the default branch until the request's own deadline and a short wait have passed. Return the merge commit or None."""
-    deadline = started + nessie.timeout_seconds + timing.wait_seconds
-    while True:
-        found = merged_commit(nessie, record, main_head(nessie, default))
-        if found is not None or timing.clock() >= deadline:
-            return found
-        timing.sleep(timing.poll_seconds)
+def deadline_for(nessie: NessieClient, timing: Timing) -> tuple[Callable[[], float], float]:
+    """One deadline on the monotonic clock for a search of the history: the client's own request deadline and a short wait from now."""
+    return timing.clock, timing.clock() + nessie.timeout_seconds + timing.wait_seconds
 
 
-def merge_branch(nessie: NessieClient, record: LoadRecord, run_folder: Path, timing: Timing) -> MergeCommit:
-    """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it.
+def wait_for_merge(nessie: NessieClient, record: LoadRecord, default: str, timing: Timing) -> MergeCommit | None:
+    """Search the history of the default branch, again and again, until one deadline has passed. Return the merge commit or None."""
+    until = deadline_for(nessie, timing)
+    try:
+        while True:
+            found = merged_commit(nessie, record, main_head(nessie, default), until)
+            if found is not None or timing.clock() >= until[1]:
+                return found
+            timing.sleep(timing.poll_seconds)
+    except SearchTimeout:
+        return None
+
+
+def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing) -> MergeCommit:
+    """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it. A request is never sent twice.
 
     The request carries the recorded hash, the one Spark read, so what is merged is what was checked, and the head of the default branch that the log was
-    searched from as its expected target hash. A branch that has moved since is refused here (Nessie would merge it at that hash only). The pending record is
-    written before the request. The request is sent once: after a failure of it, whatever the failure, the history is searched until the request's deadline and
-    a short wait have passed, and a merge not found by then ends as ``merge_outcome_open``, with nothing sent again and the pending record kept. After a success
-    answer the merge commit must be in the history (``merge_not_found`` otherwise). The caller builds the receipt from the commit and its parent, never from
-    what was sent or answered.
+    searched from as its expected target hash. Nessie 0.110.1 can also accept an older expected hash after a compatible commit on the target, so that hash is a
+    guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record is written before the request. The request is sent
+    once: after a failure of it, whatever the failure, the history is searched until one deadline has passed, and a merge not found by then ends as
+    ``merge_outcome_open`` with the pending record kept. After a success answer the merge commit must be in the history (``merge_not_found`` otherwise). The
+    caller builds the receipt from the commit and its parent, never from what was sent or answered.
 
     A second request for the same source is a no-op in Nessie 0.110.1: it answers that nothing was applied, which ``NessieClient.merge`` raises as an error.
-    The design does not rely on it, because a request that timed out can still be applied later and Nessie can accept an older expected hash after a
-    compatible commit on main, so only the history says what happened.
+    The design does not rely on it, because a request that timed out can still be applied later: only the history says what happened.
     """
     if nessie.reference(record.branch).hash != record.branch_hash:
         raise TableChecksError("the load branch moved after the checks, so what was checked is not what would be merged")
     default = default_branch(nessie)
     head = main_head(nessie, default)
-    earlier = merged_commit(nessie, record, head)
+    earlier = merged_commit(nessie, record, head, deadline_for(nessie, timing))
     if earlier is not None:
         confirm_main(nessie, record, default, earlier.hash)
         return earlier
     message = "\n".join(
         [f"merge {record.branch}: table checks passed", "", branch_line(record.branch), source_line(record.branch_hash), manifest_line(record.manifest.sha256)]
     )
-    started = timing.clock()
-    write_pending(run_folder, record, started)
+    write_pending(state_directory, record, timing.wall())
     try:
         nessie.merge(record.branch, default, head, message, source_hash=record.branch_hash)
     except NessieError:
-        found = wait_for_merge(nessie, record, default, started, timing)
+        found = wait_for_merge(nessie, record, default, timing)
         if found is None:
-            raise MergeOutcomeOpen(
-                "merge_outcome_open: the merge request failed or timed out and the load is not in the history of main yet; nothing was sent again, run it later"
-            ) from None
+            raise MergeOutcomeOpen(open_message(record, state_directory)) from None
         confirm_main(nessie, record, default, found.hash)
         return found
-    found = merged_commit(nessie, record, main_head(nessie, default))
+    found = merged_commit(nessie, record, main_head(nessie, default), deadline_for(nessie, timing))
     if found is None:
         raise MergeNotFound(
             "merge_not_found: Nessie answered that the merge succeeded and the history of main holds no merge of this load; no receipt was written"
@@ -635,17 +668,15 @@ def run_table_checks(
     runner: Runner,
     empty_form: str = rules.EMPTY_FORM,
     staging_gid: int = STAGING_GID,
-    lock_directory: Path = LOCK_DIRECTORY,
+    state_directory: Path = STATE_DIRECTORY,
     timing: Timing = Timing(),
 ) -> Outcome:
     """Run the table checks for one load in the order of the module's description. Raise ``TableChecksError`` for a step that cannot go on."""
     if empty_form not in rules.EMPTY_FORMS:
         raise TableChecksError(f"the empty form must be one of {', '.join(rules.EMPTY_FORMS)}")
-    if 2 * nessie.timeout_seconds > timing.settle_seconds:
-        raise TableChecksError("the settle time of the merge step must be at least twice the request deadline of the Nessie client")
     check_pin(track_pin)
-    with load_lock(record.manifest.sha256, lock_directory):
-        return run_locked(store, nessie, record, track_pin, staging, run_folder, runner, empty_form, staging_gid, timing)
+    with load_lock(record.manifest.sha256, state_directory):
+        return run_locked(store, nessie, record, track_pin, staging, run_folder, runner, empty_form, staging_gid, state_directory, timing)
 
 
 def receipt(record: LoadRecord, empty_form: str, checked: dict[str, Any] | None, *, passed: bool) -> dict[str, Any]:
@@ -664,11 +695,11 @@ def receipt(record: LoadRecord, empty_form: str, checked: dict[str, Any] | None,
     }
 
 
-def record_merge(run_folder: Path, document: dict[str, Any], default: str, commit: MergeCommit) -> Outcome:
+def record_merge(run_folder: Path, state_directory: Path, record: LoadRecord, document: dict[str, Any], default: str, commit: MergeCommit) -> Outcome:
     """Write the receipt of a merge from the commit that the history holds and its parent, then remove the pending record."""
     document.update(passed=True, merged=True, merged_into=default, main_hash_before=commit.parent, merged_hash=commit.hash)
     write_result(run_folder, document)
-    (run_folder / PENDING_FILE).unlink(missing_ok=True)
+    pending_path(record.manifest.sha256, state_directory).unlink(missing_ok=True)
     return Outcome(True, True, document)
 
 
@@ -682,24 +713,31 @@ def run_locked(
     runner: Runner,
     empty_form: str,
     staging_gid: int,
+    state_directory: Path,
     timing: Timing,
 ) -> Outcome:
+    """Under the load's lock: the history decides.
+
+    A receipt that says merged ends the run (and removes a pending record left over). If the history holds this load's merge commit, the receipt is written
+    from it and nothing is sent. If a pending record of this load exists and the history does not hold the commit, the run ends as ``merge_outcome_open``,
+    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``.
+    """
     held = saved_result(run_folder, record)
     if held is not None and held["merged"] is True:
+        pending_path(record.manifest.sha256, state_directory).unlink(missing_ok=True)
         return Outcome(True, True, held)
     default = default_branch(nessie)
-    pending = read_pending(run_folder, record)
-    found = merged_commit(nessie, record, main_head(nessie, default))
+    pending = read_pending(state_directory, record)
+    found = merged_commit(nessie, record, main_head(nessie, default), deadline_for(nessie, timing))
     if found is not None:
         confirm_main(nessie, record, default, found.hash)
-        document = held if held is not None else receipt(record, empty_form, None, passed=True)
-        if held is None:
+        evidence = held if held is not None and held["passed"] is True else None
+        document = evidence if evidence is not None else receipt(record, empty_form, None, passed=True)
+        if evidence is None:
             document["notes"].append("the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch")
-        return record_merge(run_folder, document, default, found)
-    if pending is not None and timing.clock() - pending < timing.settle_seconds:
-        raise MergeOutcomeOpen(
-            "merge_outcome_open: a merge request of this load was sent less than the settle time ago and is not in the history of main yet; nothing was sent"
-        )
+        return record_merge(run_folder, state_directory, record, document, default, found)
+    if pending is not None:
+        raise MergeOutcomeOpen(open_message(record, state_directory))
     confirm_load(nessie, record)
     try:
         staged = stage_verified_files(store, record.manifest, staging, staging_gid)
@@ -717,4 +755,4 @@ def run_locked(
     write_result(run_folder, document)
     if not result.passed:
         return Outcome(False, False, document)
-    return record_merge(run_folder, document, default, merge_branch(nessie, record, run_folder, timing))
+    return record_merge(run_folder, state_directory, record, document, default, merge_branch(nessie, record, state_directory, timing))

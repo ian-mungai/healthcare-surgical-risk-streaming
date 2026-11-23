@@ -47,11 +47,11 @@ DETAIL_RULES: Mapping[str, tuple[tuple[str, ...], Callable[[Mapping[str, int]], 
     "bytes_differ": ((), lambda counts: False),
     "table_missing": ((), lambda counts: False),
     "snapshot_differs": ((), lambda counts: False),
-    "digest_differs": ((), lambda counts: False),
+    "digest_compared": (("equal",), lambda counts: counts["equal"] == 1),
     "columns_differ": (("missing", "extra", "repeated", "order", "not_string"), lambda counts: not any(counts.values())),
     "row_count": (("source", "table"), lambda counts: counts["source"] == counts["table"]),
     "rows_differ": (("only_file", "only_table"), lambda counts: not any(counts.values())),
-    "separator_in_field": (("rows",), lambda counts: counts["rows"] == 0),
+    "separator_in_field": (("rows",), lambda counts: False),
 }
 DETAIL_CODES: Mapping[str, tuple[str, ...]] = {code: fields for code, (fields, _) in DETAIL_RULES.items()}
 # The codes that each check may hold.
@@ -62,7 +62,7 @@ CHECK_CODES: Mapping[str, tuple[str, ...]] = {
     "row count": ("row_count",),
     "key multiset": ("rows_differ",),
     "row payload": ("rows_differ",),
-    "rows digest": ("ok", "digest_differs", "separator_in_field"),
+    "rows digest": ("digest_compared", "separator_in_field"),
 }
 
 
@@ -393,13 +393,22 @@ def bounded(
     if code == "row_count":
         return rows_source is not None and rows_table is not None and (counts["source"], counts["table"]) == (rows_source, rows_table)
     if code == "rows_differ":
-        return rows_source is not None and rows_table is not None and counts["only_file"] <= rows_source and counts["only_table"] <= rows_table
+        return (
+            rows_source is not None
+            and rows_table is not None
+            and counts["only_file"] <= rows_source
+            and counts["only_table"] <= rows_table
+            and rows_source - counts["only_file"] == rows_table - counts["only_table"]
+        )
     if code == "separator_in_field":
-        return rows_table is not None and counts["rows"] <= rows_table
+        return rows_table is not None and 1 <= counts["rows"] <= rows_table
+    if code == "digest_compared":
+        return counts["equal"] <= 1
     if code == "columns_differ":
         return (
             columns_source is not None
             and columns_table is not None
+            and (any(counts.values()) or columns_source == columns_table)
             and counts["order"] <= 1
             and counts["missing"] <= columns_source
             and all(counts[name] <= columns_table for name in ("extra", "repeated", "not_string"))

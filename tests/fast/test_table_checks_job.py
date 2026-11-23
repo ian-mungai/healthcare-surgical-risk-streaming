@@ -170,6 +170,7 @@ class MainTest(unittest.TestCase):
         result = rules.TableResult(entry.name, entry.snapshot_id, rows_table=rows, rows_source=rows, columns_source=3, columns_table=3)
         details = {
             "columns": rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0),
+            "rows digest": rules.detail("digest_compared", equal=1),
             "row count": rules.detail("row_count", source=rows, table=rows),
             "key multiset": rules.detail("rows_differ", only_file=0, only_table=0),
             "row payload": rules.detail("rows_differ", only_file=0, only_table=0),

@@ -135,6 +135,13 @@ class StagingVolumeTest(unittest.TestCase):
         self.assertIn(f"{run.STAGING_VOLUME}:{run.STAGING_DIRECTORY}", document["services"]["dagster_code_location"]["volumes"])
         self.assertIn(run.STAGING_VOLUME, document["volumes"])
 
+    def test_the_state_directory_is_a_folder_of_a_named_volume_that_the_code_location_mounts_so_it_survives_a_restart(self) -> None:
+        document = self.document()
+        mounts = {entry.split(":")[0]: entry.split(":")[1] for entry in document["services"]["dagster_code_location"]["volumes"] if not entry.startswith("/")}
+        self.assertIn(run.STATE_DIRECTORY, [Path(mounts["dagster_data"]) / "table_checks"])
+        self.assertIn("dagster_data", document["volumes"])
+        self.assertNotIn("/run/", str(run.STATE_DIRECTORY))
+
     def test_the_staging_folder_is_a_folder_of_the_image_and_of_the_mount(self) -> None:
         self.assertEqual("/opt/dagster/staging", run.STAGING_DIRECTORY)
         self.assertTrue(run.STAGING_DIRECTORY.startswith("/opt/dagster/"))

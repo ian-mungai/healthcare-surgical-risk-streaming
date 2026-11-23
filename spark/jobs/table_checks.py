@@ -167,7 +167,7 @@ def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> Ta
         return result
     lines = table.select(F.concat_ws("\t", *[F.col(f"`{name}`") for name in expected]).alias("line")).orderBy("line")
     digest = rules.rows_digest(row.line for row in lines.toLocalIterator())
-    result.add("rows digest", rules.detail("ok" if digest == entry.rows_sha256 else "digest_differs"))
+    result.add("rows digest", rules.detail("digest_compared", equal=int(digest == entry.rows_sha256)))
     return result
 
 

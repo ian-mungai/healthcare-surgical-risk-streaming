@@ -199,10 +199,12 @@ class NessieClient:
         self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}")
 
     def merge(self, source: str, target: str, expected_target_hash: str, message: str, *, source_hash: str) -> str:
-        """Merge ``source`` as it was at ``source_hash`` into ``target``, which must still be at ``expected_target_hash``. Returns the new hash of ``target``.
+        """Merge ``source`` as it was at ``source_hash`` into ``target``, which the caller expects at ``expected_target_hash``. Returns ``target``'s new hash.
 
         The caller names the source hash, usually the one it checked, and the client never looks the head of ``source`` up. Nessie merges the commits of
-        ``source`` up to ``source_hash`` and no later one, so a branch that has moved since is merged at the named hash only.
+        ``source`` up to ``source_hash`` and no later one, so a branch that has moved since is merged at the named hash only. The expected target hash is a
+        guard and not a guarantee: Nessie 0.110.1 can accept an older expected hash after a compatible commit on ``target``, so a caller that must know what
+        happened reads the history of ``target``.
         """
         if not HASH.fullmatch(source_hash):
             raise ValueError("the source hash must be 64 lower-case hex digits")
