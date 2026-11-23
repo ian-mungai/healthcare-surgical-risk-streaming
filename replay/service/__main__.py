@@ -45,6 +45,8 @@ from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
+from scripts.ingestion.notice import ClosedError, render
+from scripts.ingestion.output_path import refuse_output_over_input
 from scripts.ingestion.store import StoreError
 
 READ_DEADLINE_SECONDS = 600.0
@@ -287,8 +289,12 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command in service_commands:
         return service_commands[arguments.command](arguments)
     try:
+        refuse_output_over_input([getattr(arguments, "out", None)], [arguments.run_record])
         record = parse_run_record(arguments.run_record.read_text())
         return COMMANDS[arguments.command](record, arguments)
+    except ClosedError as error:
+        sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
+        return 2
     except GateRefused as refused:
         problems = [{"position": problem.position, "requested": problem.requested, "cause": problem.cause} for problem in refused.problems]
         log("gate_refused", reason=str(refused), problems=problems)

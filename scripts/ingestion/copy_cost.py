@@ -50,6 +50,7 @@ from typing import Any
 from scripts.ingestion.check import CheckResult
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import ClosedError, Code, Notice, render
+from scripts.ingestion.output_path import refuse_output_over_input
 from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
 COST_FORMAT = "copy_cost_1"
@@ -190,6 +191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     command.add_argument("--output", type=Path, required=True, help="a new file for the record")
     arguments = command.parse_args(argv)
     try:
+        refuse_output_over_input([arguments.output], [arguments.result])
         try:
             text = arguments.result.read_text()
         except OSError, UnicodeDecodeError:

@@ -31,6 +31,7 @@ from typing import Any
 
 from scripts.ingestion.closed import QuietParser, parse_json
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.output_path import refuse_output_over_input
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
     BUCKET,
@@ -388,17 +389,19 @@ def report(notices: Sequence[Notice]) -> int:
     return 1 if notices else 0
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run ``build`` or ``check`` and return 1 on any problem, with its cause on standard error."""
     parser = QuietParser(prog=PROGRAM, description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["build", "check"])
     parser.add_argument("--release", type=Path, default=RELEASE_FILE, help="the release pin")
     parser.add_argument("--candidates", type=Path, default=CANDIDATES_FILE, help="check: the tracked candidate file")
     parser.add_argument("--output", type=Path, help="build: where to write the candidate file")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "build" and args.output is None:
         raise SystemExit(render(Notice(Code.BUILD_NEEDS_OUTPUT)))
     try:
+        if args.command == "build":
+            refuse_output_over_input([args.output], [args.release])
         tracked = read_candidates(args.candidates) if args.command == "check" else []
         candidates, sums, sizes = rebuild(args.release)
         if args.command == "build":

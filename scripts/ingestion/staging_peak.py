@@ -30,6 +30,7 @@ from typing import Any
 from scripts.ingestion.cli import read_input, say, write_private
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.output_path import refuse_output_over_input
 from scripts.process import run_command
 from scripts.stack.capacity_sampler import (
     DEFAULT_INTERVAL_SECONDS,
@@ -285,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "sample":
         return command_sample(arguments)
     try:
+        refuse_output_over_input([arguments.output], [arguments.samples])
         return command_peak(arguments)
     except ClosedError as error:
         for notice in error.notices:

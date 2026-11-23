@@ -41,6 +41,7 @@ from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX
 from scripts.ingestion.manifest import ManifestRef, read_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
+from scripts.ingestion.output_path import refuse_output_over_input
 from scripts.ingestion.selection import FULL_RELEASE_TABLES, Selection, SelectionError, pinned_release
 from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, S3Store
 from scripts.project_config import ConfigurationError, load_configuration
@@ -340,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
     sample.add_argument("--output", type=Path, default=SAMPLE_FILE, help="where to write the Platform sample pin")
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "sample":
+            refuse_output_over_input([arguments.output], [arguments.reference])
         return {"selection": command_selection, "landed": command_landed, "job": command_job, "sample": command_sample}[arguments.command](arguments)
     except ClosedError as error:
         return refuse(*error.notices)

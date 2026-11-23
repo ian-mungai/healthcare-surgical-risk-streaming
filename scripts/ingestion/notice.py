@@ -157,6 +157,7 @@ class Code(StrEnum):
     USAGE = "the command line is not valid; run it with --help for its commands and options"
     CANNOT_READ = "cannot read {subject}"
     CANNOT_WRITE = "cannot write {subject}"
+    OUTPUT_IS_INPUT = "an output file of the command is also one of its input files; name another file for the output"
     CONFIGURATION_INVALID = "the configuration in .env is missing or holds a value that is not valid; .env.example lists every key"
     AWS_FAILED = "an AWS call failed; its full error text is kept in an owner-only file under runs/raw_errors"
     AWS_FAILED_NOT_KEPT = "an AWS call failed; its full error text could not be kept"

@@ -42,6 +42,7 @@ from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX, load_pairing_records, pairings_from_metadata
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.output_path import refuse_output_over_input
 from scripts.ingestion.selection import Selection, pinned_release
 from scripts.ingestion.store import S3Store
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
@@ -155,6 +156,15 @@ def command_verify(store: S3Store, arguments: argparse.Namespace) -> int:
     return 0
 
 
+def command_files(arguments: argparse.Namespace) -> tuple[list[Path], list[Path]]:
+    """The output paths and the input paths of the command, which must be different files."""
+    if arguments.command == "check":
+        return [arguments.result], [arguments.selection, arguments.checksum_list, arguments.pairings]
+    if arguments.command == "publish":
+        return [arguments.reference], [arguments.selection, arguments.result]
+    return [], []
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one command and return 0 when it holds, 1 for a fault, a refusal or a failed call."""
     parser = QuietParser(prog=PROGRAM, description=(__doc__ or "").splitlines()[0])
@@ -176,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--source-key", action="append", help="a source key the reader needs; repeat for each; every entry when none")
     arguments = parser.parse_args(argv)
     try:
+        refuse_output_over_input(*command_files(arguments))
         configuration = load_configuration()
         store = S3Store(Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"]), bucket_in_use(configuration["S3_BUCKET"], arguments.bucket))
         return {"check": command_check, "pairings": command_pairings, "publish": command_publish, "verify": command_verify}[arguments.command](store, arguments)
