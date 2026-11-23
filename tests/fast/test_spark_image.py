@@ -106,6 +106,36 @@ class ImageTest(unittest.TestCase):
                 self.assertIsNotNone(source, f"{sorted(importers)} import it and the image does not copy it")
                 self.assertEqual(f"{root}/{source}", copies[str(source)], f"{sorted(importers)} import it from {root} and the image copies it elsewhere")
 
+    def test_every_name_a_spark_job_imports_from_the_project_exists_in_its_module(self) -> None:
+        """A join can move a function to another module; the jobs run only in the image, so a stale import shows only there unless this catches it."""
+        for job in sorted((ROOT / "spark").rglob("*.py")):
+            for node in ast.walk(ast.parse(job.read_text())):
+                if not (isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] in ("spark", "scripts", "replay")):
+                    continue
+                folder = ROOT / Path(*(node.module or "").split("."))
+                source = folder.with_suffix(".py") if folder.with_suffix(".py").is_file() else folder / "__init__.py"
+                with self.subTest(job=str(job.relative_to(ROOT)), module=node.module):
+                    self.assertTrue(source.is_file(), f"{node.module} does not exist")
+                    defined = module_names(ast.parse(source.read_text()))
+                    for alias in node.names:
+                        self.assertTrue(alias.name in defined or (folder / f"{alias.name}.py").is_file(), f"{node.module} defines no {alias.name}")
+
+
+def module_names(tree: ast.Module) -> set[str]:
+    """The names a module defines or imports at its top level, the ones another module can import from it."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        names.add(name.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+    return names
+
 
 if __name__ == "__main__":
     unittest.main()

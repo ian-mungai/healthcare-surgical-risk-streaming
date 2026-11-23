@@ -40,7 +40,8 @@ from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_run import JOB, NessieAdapter, SparkOps, finish, parser, run_job
 from spark.bronze_clinical_lab_spark import SparkAdapter, job_session_settings
-from spark.session import SCRATCH_FOLDER, required_environment, start_deadline
+from spark.catalog import required_environment
+from spark.session import SCRATCH_FOLDER, start_deadline
 from spark.settings import SettingsError, driver_memory_mib, read_memory_limit_mib
 
 DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0

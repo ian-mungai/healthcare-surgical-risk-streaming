@@ -45,7 +45,8 @@ from spark.bronze.plan import GROUPED, MODES
 from spark.bronze.readers import caseend_times, open_store
 from spark.bronze.rows import StructureError
 from spark.bronze.tables import KIND_TABLE, NAMESPACE, TABLES, TableSpec
-from spark.session import build_session, required_environment, start_deadline
+from spark.catalog import required_environment
+from spark.session import build_session, start_deadline
 from spark.settings import BYTES_PER_MIB, SettingsError, read_memory_limit_mib
 
 JOB = "bronze_decode"
