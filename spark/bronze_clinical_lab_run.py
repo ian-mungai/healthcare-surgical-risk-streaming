@@ -22,7 +22,6 @@ from spark.bronze_clinical_lab import (
     SOURCE_NAMESPACE,
     TABLES,
     BronzeRulesError,
-    KeyStatistics,
     TableContent,
     occurrence_differences,
     payload_columns,
@@ -72,7 +71,7 @@ class SparkOps(Protocol):
 
     def null_keys(self, kind: str, columns: list[str]) -> tuple[int, int]: ...
 
-    def key_statistics(self, kind: str) -> KeyStatistics: ...
+    def key_duplicates(self, kind: str) -> int: ...
 
     def occurrence_gaps(self) -> int: ...
 
@@ -131,6 +130,7 @@ def parser() -> argparse.ArgumentParser:
     for name, text in (
         ("write", "create the branch from the source hash, write both Bronze tables and verify them"),
         ("verify", "check the Bronze tables of a branch"),
+        ("publish", "check the Bronze tables of a branch and merge it into Nessie's default branch only when every check passed"),
     ):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--branch", required=True, help="the private branch that holds (write: will hold) the Bronze tables")
@@ -176,8 +176,8 @@ def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, k
     report.add(
         "no value changed", missing == 0 and extra == 0, f"rows of the loaded table not in bronze {missing}, rows of bronze not in the loaded table {extra}"
     )
-    statistics = spark.key_statistics(kind)
-    report.add("key unique", statistics.rows == statistics.distinct, f"rows {statistics.rows}, distinct keys {statistics.distinct}")
+    duplicates = spark.key_duplicates(kind)
+    report.add("key unique", duplicates == 0, f"{duplicates} row(s) of bronze share their key with another row")
     if kind == "lab":
         gaps = spark.occurrence_gaps()
         report.add("occurrence numbers from 1 without a gap", gaps == 0, f"{gaps} group(s) of case, time and test name with a gap or a start above 1")
@@ -224,13 +224,21 @@ def finish(result: dict[str, Any], branch: str, stdout: TextIO, stderr: TextIO) 
     return 1
 
 
-def run_job(command: str, branch: str, source_hash: str, nessie: NessieOps, open_spark: Callable[[str, str, str], SparkOps]) -> dict[str, Any]:
+def run_job(
+    command: str, branch: str, source_hash: str, nessie: NessieOps, open_spark: Callable[[str, str, str, str | None], SparkOps], branch_hash: str | None = None
+) -> dict[str, Any]:
     """The whole sequence of the job, with its Nessie and Spark operations as parameters.
 
     ``write``: the hash is checked, Nessie's default branch is asked for its history, each loaded table must exist at the hash, the run branch is
     created from that hash, the Spark session opens on the run branch and on the pinned reference, the columns are checked, both tables are written
     and then every check runs. ``verify``: the same up to the branch, which must exist, and the same checks without a write.
+
+    ``verify`` reads the branch at one hash for everything it does: ``branch_hash``, or the head that it resolves once, after it has found that the branch is
+    a branch, when none is given. With it every read of the branch is at that hash: Nessie's metadata through ``branch@hash`` and the Spark catalog of the run
+    branch pinned to it, so the checks judge exactly the commit that a publication will merge, whatever the branch's head is by then.
     """
+    if branch_hash is not None and (command != "verify" or not HASH.fullmatch(branch_hash)):
+        raise SettingsError("only verify takes a branch hash, and it is 64 lowercase hexadecimal digits")
     if not HASH.fullmatch(source_hash):
         raise SettingsError("the source hash must be 64 lowercase hexadecimal digits")
     default_branch = nessie.default_branch()
@@ -244,17 +252,20 @@ def run_job(command: str, branch: str, source_hash: str, nessie: NessieOps, open
         nessie.create_branch(branch, default_branch, source_hash)
     elif not nessie.is_branch(branch):
         raise NessieError(f"{branch} is not a branch")
-    spark = open_spark(branch, default_branch, source_hash)
+    if command == "verify" and branch_hash is None:
+        branch_hash = nessie.head(branch)
+    reference = branch if branch_hash is None else f"{branch}@{branch_hash}"
+    spark = open_spark(branch, default_branch, source_hash, branch_hash)
     try:
         columns = {kind: payload_columns(kind, spark.source_columns(kind)) for kind in TABLES}
         if command == "write":
             spark.prepare()
             for kind in TABLES:
                 spark.write(kind, columns[kind])
-        reports = [verify_table(nessie, spark, branch, pinned, kind, columns[kind]) for kind in TABLES]
+        reports = [verify_table(nessie, spark, reference, pinned, kind, columns[kind]) for kind in TABLES]
     finally:
         spark.close()
-    return result_document(command, branch, nessie.head(branch), default_branch, source_hash, reports)
+    return result_document(command, branch, branch_hash or nessie.head(branch), default_branch, source_hash, reports)
 
 
 class NessieAdapter:

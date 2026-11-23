@@ -12,9 +12,11 @@ import contextlib
 import io
 import json
 import unittest
+from collections.abc import Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieError
+from spark.bronze.checks import Check, CheckResult
 from spark.bronze_clinical_lab import BronzeRulesError, TableContent
 from spark.bronze_clinical_lab_run import HISTORY_PAGE_SIZE, NessieAdapter
 from spark.bronze_clinical_lab_spark import SparkAdapter, job_session_settings
@@ -291,8 +293,28 @@ class RecordingSession:
         self.stopped = True
 
 
-def adapter(session: RecordingSession) -> SparkAdapter:
-    return SparkAdapter(session, RecordingFunctions(), RecordingWindow, MissingTable)
+class RecordingColumnChecks:
+    """The column checks that production runs in Great Expectations: each call is recorded with the table's text and the names of the checks.
+
+    The unexpected count of each check is answered from a script by check name (zero when it has none).
+    """
+
+    def __init__(self, unexpected: dict[str, list[int]] | None = None) -> None:
+        self.unexpected = unexpected or {}
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def __call__(self, frame: RecordingFrame, checks: Sequence[Check]) -> list[CheckResult]:
+        self.calls.append((frame.text, [check.name for check in checks]))
+        results = []
+        for check in checks:
+            scripted = self.unexpected.get(check.name, [])
+            count = scripted.pop(0) if scripted else 0
+            results.append(CheckResult(check, count == 0, count))
+        return results
+
+
+def adapter(session: RecordingSession, column_checks: RecordingColumnChecks | None = None) -> SparkAdapter:
+    return SparkAdapter(session, RecordingFunctions(), RecordingWindow, MissingTable, column_checks or RecordingColumnChecks())
 
 
 RANK = "row_number() over (partitionBy(caseid, dt, name).orderBy(col(result) asc_nulls_first))"
@@ -311,6 +333,13 @@ class SessionSettingsTest(unittest.TestCase):
         settings = self.settings()
         self.assertEqual("run", settings["spark.sql.catalog.lake.ref"])
         self.assertEqual("trunk", settings["spark.sql.catalog.source.ref"])
+        self.assertEqual(HASH, settings["spark.sql.catalog.source.ref.hash"])
+
+    def test_a_branch_hash_pins_the_run_catalog_to_it_and_leaves_the_source_pin_alone(self) -> None:
+        settings = job_session_settings(
+            **self.ENVIRONMENT, branch="run", default_branch="trunk", source_hash=HASH, heap="2925m", scratch="/scratch", branch_hash=OTHER_HASH
+        )
+        self.assertEqual(OTHER_HASH, settings["spark.sql.catalog.lake.ref.hash"])
         self.assertEqual(HASH, settings["spark.sql.catalog.source.ref.hash"])
 
     def test_the_run_catalog_has_no_hash_pin_and_no_source_option_names_the_run_branch(self) -> None:
@@ -448,33 +477,40 @@ class RepeatedRowsTest(QuietCase):
 
 
 class KeyChecksTest(QuietCase):
-    def test_the_null_keys_of_the_loaded_table_and_of_bronze_are_counted_on_their_own_key_columns(self) -> None:
+    def test_the_null_keys_of_the_loaded_table_and_of_bronze_are_judged_by_the_column_checks_on_their_own_key_columns(self) -> None:
         session = RecordingSession()
-        session.queue = [[Row(null_caseid=1, null_dt=None, null_name=0)], [Row(null_caseid=0, null_dt=0, null_name=0, null_source_occurrence=2)]]
-        self.assertEqual((1, 2), adapter(session).null_keys("lab", LAB_COLUMNS))
-        loaded = (
-            "table(source.raw_records.lab_data).agg(sum(isnull(col(caseid))::int) as null_caseid, "
-            "sum(isnull(col(dt))::int) as null_dt, sum(isnull(col(name))::int) as null_name)"
+        runner = RecordingColumnChecks({"caseid not null": [1, 0], "dt not null": [0, 0], "name not null": [0, 0], "source_occurrence not null": [2]})
+        self.assertEqual((1, 2), adapter(session, runner).null_keys("lab", LAB_COLUMNS))
+        self.assertEqual(
+            [
+                ("table(source.raw_records.lab_data)", ["caseid not null", "dt not null", "name not null"]),
+                (BRONZE_LAB, ["caseid not null", "dt not null", "name not null", "source_occurrence not null"]),
+            ],
+            runner.calls,
         )
-        bronze = (
-            f"{BRONZE_LAB}.agg(sum(isnull(col(caseid))::int) as null_caseid, sum(isnull(col(dt))::int) as null_dt, "
-            "sum(isnull(col(name))::int) as null_name, sum(isnull(col(source_occurrence))::int) as null_source_occurrence)"
-        )
-        self.assertEqual([f"{loaded}.collect()", f"{bronze}.collect()"], session.executed)
+        self.assertEqual([], session.executed)
 
     def test_the_clinical_key_is_the_case_only(self) -> None:
-        session = RecordingSession()
-        session.queue = [[Row(null_caseid=0)], [Row(null_caseid=3)]]
-        self.assertEqual((0, 3), adapter(session).null_keys("clinical", CLINICAL_COLUMNS))
-        self.assertTrue(all("null_caseid" in text and "null_subjectid" not in text for text in session.executed))
+        runner = RecordingColumnChecks({"caseid not null": [0, 3]})
+        self.assertEqual((0, 3), adapter(RecordingSession(), runner).null_keys("clinical", CLINICAL_COLUMNS))
+        self.assertEqual(["caseid not null"], [name for _, names in runner.calls for name in names][:1])
+        self.assertTrue(all(names == ["caseid not null"] for _, names in runner.calls))
 
-    def test_the_key_statistics_are_the_rows_and_the_distinct_keys_of_bronze(self) -> None:
+    def test_the_duplicate_keys_are_the_unexpected_rows_of_the_unique_check_over_the_whole_key_of_bronze(self) -> None:
         session = RecordingSession()
-        session.queue = [[Row(rows=6, distinct=5)]]
-        self.assertEqual((6, 5), tuple(vars(adapter(session).key_statistics("lab")).values()))
-        self.assertEqual(
-            [f"{BRONZE_LAB}.agg(count(lit(1)) as rows, countDistinct(caseid, dt, name, source_occurrence) as distinct).collect()"], session.executed
-        )
+        runner = RecordingColumnChecks({"key unique": [5]})
+        self.assertEqual(5, adapter(session, runner).key_duplicates("lab"))
+        self.assertEqual([(BRONZE_LAB, ["key unique"])], runner.calls)
+
+    def test_the_unique_check_is_over_the_key_columns_that_bronze_holds(self) -> None:
+        seen: list[dict[str, object]] = []
+
+        def runner(frame: RecordingFrame, checks: Sequence[Check]) -> list[CheckResult]:
+            seen.extend(check.kwargs for check in checks)
+            return [CheckResult(check, True, 0) for check in checks]
+
+        adapter(RecordingSession(), runner).key_duplicates("lab")  # type: ignore[arg-type]
+        self.assertEqual([{"column_list": ["caseid", "dt", "name", "source_occurrence"]}], seen)
 
     def test_the_groups_with_a_gap_are_counted_from_the_minimum_and_the_maximum_of_each_group(self) -> None:
         session = RecordingSession()

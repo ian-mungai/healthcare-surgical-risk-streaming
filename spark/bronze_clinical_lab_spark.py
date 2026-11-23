@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from spark.bronze.checks import Check, CheckResult, key_checks
 from spark.bronze_clinical_lab import (
     BRONZE_NAMESPACE,
     GROUP_COLUMNS,
@@ -20,7 +21,6 @@ from spark.bronze_clinical_lab import (
     SOURCE_NAMESPACE,
     TABLES,
     BronzeRulesError,
-    KeyStatistics,
 )
 from spark.bronze_clinical_lab_run import JOB, Row
 from spark.settings import CATALOG, catalog_options
@@ -34,15 +34,18 @@ GROUP_ROWS = "group_rows"
 
 
 def job_session_settings(
-    *, nessie_uri: str, warehouse: str, region: str, branch: str, default_branch: str, source_hash: str, heap: str, scratch: str
+    *, nessie_uri: str, warehouse: str, region: str, branch: str, default_branch: str, source_hash: str, heap: str, scratch: str, branch_hash: str | None = None
 ) -> dict[str, str]:
-    """The settings of the job's session: the catalog ``lake`` on the run branch and the catalog ``source`` on the default branch pinned to the source hash."""
+    """The settings of the job's session: the catalog ``lake`` on the run branch and the catalog ``source`` on the default branch pinned to the source hash.
+
+    With ``branch_hash`` the catalog ``lake`` is pinned to that commit of the run branch too, so a read never sees a later commit.
+    """
     arguments = {"nessie_uri": nessie_uri, "warehouse": warehouse, "region": region}
     prefix = f"spark.sql.catalog.{RUN_CATALOG}"
     pinned = {f"spark.sql.catalog.{SOURCE_CATALOG}{key.removeprefix(prefix)}": value for key, value in catalog_options(**arguments, ref=default_branch).items()}
     pinned[f"spark.sql.catalog.{SOURCE_CATALOG}.ref.hash"] = source_hash
     return {
-        **catalog_options(**arguments, ref=branch),
+        **catalog_options(**arguments, ref=branch, ref_hash=branch_hash),
         **pinned,
         "spark.driver.memory": heap,
         "spark.executor.memory": heap,
@@ -95,8 +98,11 @@ class SparkAdapter:
     Every operation that runs a Spark job reports its seconds on stderr.
     """
 
-    def __init__(self, session: Any, functions: Any, window: Any, analysis_error: type[Exception]) -> None:
+    def __init__(
+        self, session: Any, functions: Any, window: Any, analysis_error: type[Exception], column_checks: Callable[[Any, Sequence[Check]], list[CheckResult]]
+    ) -> None:
         self.session = session
+        self.column_checks = column_checks
         self.functions = functions
         self.window = window
         self.analysis_error = analysis_error
@@ -146,24 +152,22 @@ class SparkAdapter:
         expected, bronze = self.expected(kind, columns), self.bronze(kind)
         return int(expected.exceptAll(bronze).count()), int(bronze.exceptAll(expected).count())
 
-    def count_nulls(self, frame: Any, key: Sequence[str]) -> int:
-        functions = self.functions
-        row = frame.agg(*[functions.sum(functions.col(name).isNull().cast("int")).alias(f"null_{name}") for name in key]).collect()[0]
-        return sum(int(row[f"null_{name}"] or 0) for name in key)
+    def not_null_count(self, frame: Any, table: str, key: Sequence[str]) -> int:
+        """The values that the column checks find null in the key columns of ``frame``."""
+        return sum(result.unexpected for result in self.column_checks(frame, key_checks(table, key)[:-1]))
 
     @timed
     def null_keys(self, kind: str, columns: list[str]) -> tuple[int, int]:
         """The null values in the key columns of the loaded table (``source_occurrence`` is Bronze's own) and in the key columns of Bronze."""
         key = TABLES[kind][2]
         loaded_key = tuple(name for name in key if name != OCCURRENCE_COLUMN)
-        return self.count_nulls(self.source(kind), loaded_key), self.count_nulls(self.bronze(kind), key)
+        return self.not_null_count(self.source(kind), TABLES[kind][0], loaded_key), self.not_null_count(self.bronze(kind), TABLES[kind][1], key)
 
     @timed
-    def key_statistics(self, kind: str) -> KeyStatistics:
-        functions = self.functions
-        key = TABLES[kind][2]
-        stats = self.bronze(kind).agg(functions.count(functions.lit(1)).alias("rows"), functions.countDistinct(*key).alias("distinct")).collect()[0]
-        return KeyStatistics(int(stats["rows"]), int(stats["distinct"]))
+    def key_duplicates(self, kind: str) -> int:
+        """The rows of Bronze that share their key with another row: the unexpected rows of the unique check over the whole key."""
+        (unique,) = [check for check in key_checks(TABLES[kind][1], TABLES[kind][2]) if check.name == "key unique"]
+        return self.column_checks(self.bronze(kind), [unique])[0].unexpected
 
     @timed
     def occurrence_gaps(self) -> int:
