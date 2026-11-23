@@ -1,7 +1,7 @@
 """The sequence of the Bronze clinical and laboratory job, with its Nessie and Spark operations as parameters, and the Nessie operations over HTTP.
 
-``spark/jobs/bronze_clinical_lab.py`` is the command line and the Spark side. This module imports no Spark, so the whole sequence runs on fakes
-in the fast tests.
+``spark/jobs/bronze_clinical_lab.py`` is the command line and ``spark/bronze_clinical_lab_spark.py`` is the Spark side. This module imports no
+Spark, so the whole sequence runs on fakes in the fast tests.
 """
 
 from __future__ import annotations
@@ -162,7 +162,6 @@ def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, k
     report.add("columns", [name for name, _ in found] == wanted and dict(found) == wanted_types, f"expected {len(wanted)} columns, found {len(found)}")
     if [name for name, _ in found] != wanted:
         return report
-    key = TABLES[kind][2]
     loaded_nulls, bronze_nulls = spark.null_keys(kind, columns)
     report.add(
         "key not null",

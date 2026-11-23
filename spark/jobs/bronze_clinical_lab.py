@@ -15,9 +15,10 @@ reads a branch and runs the same checks, so any later step can run it again.
 Each Bronze table holds the loaded table's published columns, every one a string, with no value changed (``spark/bronze_clinical_lab.py``
 has the rules). The laboratory table adds the integer column ``source_occurrence``. The checks of one table are, in this order:
 ``source_changed`` (the run branch's view of the loaded table has the metadata location and the snapshot that Nessie reports for it at the
-source hash), the column list, the row count, row equality with the loaded table in both directions as a multiset (a missing value stays
-missing: ``exceptAll`` treats two nulls as equal and a null and an empty string as different), the key (not null, unique) and, for the
-laboratory table, the occurrence numbers (from 1 without a gap) and the independent occurrence rule: the rows of the repeated groups are
+source hash), the column list, the key columns not null in the loaded table and in Bronze (a null ends that table's checks there), the row
+count, row equality with the loaded table in both directions as a multiset (a missing value stays missing: ``exceptAll`` treats two nulls as
+equal and a null and an empty string as different), the key unique and, for the laboratory table, the occurrence numbers
+(from 1 without a gap) and the independent occurrence rule: the rows of the repeated groups are
 collected to the driver, numbered again by the pure Python rule and compared with the numbers that Spark wrote. More than 100,000 such rows
 are refused.
 
