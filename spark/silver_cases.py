@@ -1,0 +1,343 @@
+"""The rules of ``silver.cases`` and ``silver.lab_results`` that need no Spark: the columns and their types, how a published value becomes a typed one, the
+columns that are never features, the measured length of an operation with the score cutoffs that come from it, and what each check refuses.
+
+The Spark job ``spark/jobs/silver_cases.py`` reads ``bronze.clinical_cases`` and ``bronze.lab_results`` (every column a string) and ``silver.patient_split``.
+Silver does the standard steps only: it enforces types, keeps a missing value missing, deduplicates and checks. It fills nothing, converts no unit and
+builds no join that Gold does not need. A value keeps the unit that the publisher gave it, and a time is in seconds from the start of its case.
+
+The test set is sealed: nothing here names a case or a patient. Every failure is a code and a count, and the operation lengths that set the cutoffs come
+from development patients only.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+from spark.split_table import COLUMNS as SPLIT_COLUMNS
+
+NAMESPACE = "silver"
+BRONZE_CASES = "bronze.clinical_cases"
+BRONZE_LAB = "bronze.lab_results"
+SPLIT_TABLE = "silver.patient_split"
+CASES_TABLE = "silver.cases"
+LAB_TABLE = "silver.lab_results"
+MEASURE_TABLE = "silver.operation_length_measure"
+CUTOFFS_TABLE = "silver.score_cutoffs"
+DEVELOPMENT_SETS = ("training", "validation")
+PINNED_CASES = 6388
+PINNED_LAB_ROWS = 928448
+INT_PATTERN = "-?[0-9]+"
+NUMBER_PATTERN = "-?[0-9]+(\\.[0-9]+)?"
+INT_FORMAT = re.compile(INT_PATTERN, re.ASCII)
+NUMBER_FORMAT = re.compile(NUMBER_PATTERN, re.ASCII)
+BIGINT_LIMIT = 2**63
+TOP_CODED_AGE = ">89"
+SECONDS_PER_MINUTE = 60
+BIGINT = "bigint"
+DOUBLE = "double"
+STRING = "string"
+PERCENTILES = (5, 10, 25, 50, 75, 90, 95)
+CUTOFF_FRACTIONS = (25, 50, 75)
+CUTOFF_RULE_VERSION = f"operation_cutoffs:fractions_of_median={','.join(str(percent) for percent in CUTOFF_FRACTIONS)}:whole_minutes:nearest_rank"
+FLAG_COLUMNS = ("emop", "preop_htn", "preop_dm", "death_inhosp")
+SEX_VALUES = ("F", "M")
+ASA_VALUES = (1, 2, 3, 4, 5, 6)
+
+# The 74 columns of the pinned release's clinical_data.csv, in the publisher's order, each with the type of its published form: a whole number, a number
+# with a decimal part, or text. `age` is a number except for the publisher's top-coded value ">89", which is kept apart (see ``age_over_89``).
+CLINICAL_HEADER = (
+    "caseid,subjectid,casestart,caseend,anestart,aneend,opstart,opend,adm,dis,icu_days,death_inhosp,age,sex,height,weight,bmi,asa,emop,department,optype,dx,"
+    "opname,approach,position,ane_type,preop_htn,preop_dm,preop_ecg,preop_pft,preop_hb,preop_plt,preop_pt,preop_aptt,preop_na,preop_k,preop_gluc,preop_alb,"
+    "preop_ast,preop_alt,preop_bun,preop_cr,preop_ph,preop_hco3,preop_be,preop_pao2,preop_paco2,preop_sao2,cormack,airway,tubesize,dltubesize,lmasize,iv1,"
+    "iv2,aline1,aline2,cline1,cline2,intraop_ebl,intraop_uo,intraop_rbc,intraop_ffp,intraop_crystalloid,intraop_colloid,intraop_ppf,intraop_mdz,intraop_ftn,"
+    "intraop_rocu,intraop_vecu,intraop_eph,intraop_phe,intraop_epi,intraop_ca"
+)
+PUBLISHED_CLINICAL_COLUMNS = tuple(CLINICAL_HEADER.split(","))
+WHOLE_NUMBER_TEXT = (
+    "caseid casestart caseend anestart opstart opend adm dis icu_days death_inhosp asa emop preop_htn preop_dm preop_plt "
+    "preop_pt preop_na preop_gluc preop_ast preop_alt preop_bun lmasize intraop_ebl intraop_uo intraop_rbc intraop_ffp "
+    "intraop_crystalloid intraop_colloid intraop_ppf intraop_ftn intraop_rocu intraop_vecu intraop_eph intraop_phe "
+    "intraop_epi intraop_ca"
+)
+WHOLE_NUMBER_COLUMNS = frozenset(WHOLE_NUMBER_TEXT.split())
+DECIMAL_TEXT = (
+    "aneend age height weight bmi preop_hb preop_aptt preop_k preop_alb preop_cr preop_ph preop_hco3 preop_be preop_pao2 preop_paco2 preop_sao2 tubesize "
+    "intraop_mdz"
+)
+DECIMAL_COLUMNS = frozenset(DECIMAL_TEXT.split())
+AGE_COLUMN = "age"
+AGE_OVER_COLUMN = "age_over_89"
+OCCURRENCE_COLUMN = "source_occurrence"
+COPIES_COLUMN = "source_copies"
+LAB_PUBLISHED_COLUMNS = ("caseid", "dt", "name", "result")
+LAB_GROUP = ("caseid", "dt", "name")
+NEVER_FEATURE_PREFIXES = ("intraop_",)
+NEVER_FEATURE_NAMES = ("caseend", "opend", "aneend", "dis", "icu_days", "death_inhosp")
+
+
+@dataclass(frozen=True, slots=True)
+class Column:
+    name: str
+    type: str
+
+
+def column_type(name: str) -> str:
+    if name in WHOLE_NUMBER_COLUMNS:
+        return BIGINT
+    return DOUBLE if name in DECIMAL_COLUMNS else STRING
+
+
+def case_columns() -> tuple[Column, ...]:
+    """Every published column with its type, and ``age_over_89`` (a boolean) right after ``age``."""
+    columns: list[Column] = []
+    for name in PUBLISHED_CLINICAL_COLUMNS:
+        columns.append(Column(name, column_type(name)))
+        if name == AGE_COLUMN:
+            columns.append(Column(AGE_OVER_COLUMN, "boolean"))
+    return tuple(columns)
+
+
+CASE_COLUMNS = case_columns()
+LAB_COLUMNS = (
+    Column("caseid", BIGINT),
+    Column("dt", BIGINT),
+    Column("name", STRING),
+    Column("result", DOUBLE),
+    Column(COPIES_COLUMN, "int"),
+    Column(OCCURRENCE_COLUMN, "int"),
+)
+# The fields that are never features: the end times, the stay in intensive care, the death in hospital and every intraoperative total. They stay in Silver,
+# marked in the table's property `never_feature_columns`; a fast test holds this list to the feature code's own refusal list, so the two cannot differ.
+NEVER_FEATURE_COLUMNS = tuple(column.name for column in CASE_COLUMNS if column.name in NEVER_FEATURE_NAMES or column.name.startswith(NEVER_FEATURE_PREFIXES))
+NEVER_FEATURE_PROPERTY = "never_feature_columns"
+
+
+LAB_BRONZE_COLUMNS = (*((name, STRING) for name in LAB_PUBLISHED_COLUMNS), (OCCURRENCE_COLUMN, "int"))
+# The columns and types of the three tables that the job reads, as Bronze and the patient split write them.
+SOURCE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
+    BRONZE_CASES: [(name, STRING) for name in PUBLISHED_CLINICAL_COLUMNS],
+    BRONZE_LAB: list(LAB_BRONZE_COLUMNS),
+    SPLIT_TABLE: list(SPLIT_COLUMNS),
+}
+
+
+class SilverCasesError(ValueError):
+    """A rule was broken or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
+
+    def __init__(self, *problems: str) -> None:
+        super().__init__("; ".join(problems))
+        self.problems = list(problems)
+
+
+def unit(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def typed_value(kind: str, raw: str | None) -> int | float | str | None:
+    """The typed value of a published text, by the one rule that the Spark expressions of ``silver_cases_sql.py`` follow.
+
+    A missing value (no value, or an empty text) stays missing; any other text is a value, a blank one included, and is never trimmed. A whole number is
+    an optional minus and ASCII digits within 64 bits. A decimal number is an optional minus, digits, and digits after a point. Nothing else is a number
+    (no plus, no exponent, no space, no ``NaN``), and such a value is a ``SilverCasesError`` here and a counted failure in the job. A text is returned as it is.
+    """
+    if raw is None or raw == "":
+        return None
+    if kind == STRING:
+        return raw
+    if kind == BIGINT and INT_FORMAT.fullmatch(raw) and abs(int(raw)) < BIGINT_LIMIT:
+        return int(raw)
+    if kind == DOUBLE and NUMBER_FORMAT.fullmatch(raw):
+        return float(raw)
+    raise SilverCasesError(f"unparsed: a value is not a {kind} in its published form")
+
+
+def age_over_89_value(raw: str | None) -> bool | None:
+    """Whether the published age is the top-coded text ``>89``: unknown when the age is missing. The number column ``age`` is missing for that text."""
+    if raw is None or raw == "":
+        return None
+    return raw == TOP_CODED_AGE
+
+
+def nearest_rank(values: Sequence[int], percent: int) -> int:
+    """The value of the sorted ``values`` at rank ``ceil(percent * n / 100)`` (counting from 1)."""
+    rank = -(-percent * len(values) // 100)
+    return sorted(values)[max(rank, 1) - 1]
+
+
+@dataclass(frozen=True, slots=True)
+class MeasureRow:
+    statistic: str
+    unit: str
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class CutoffRow:
+    cutoff: str
+    anchor: str
+    elapsed_seconds: int | None
+    basis: str
+    rule_version: str
+    development_cases: int
+    median_length_seconds: int
+
+
+def check_lengths(lengths: Sequence[int]) -> None:
+    if not lengths:
+        raise SilverCasesError(f"no_development_cases: {unit(0, 'case')}")
+    if any(length < 0 for length in lengths):
+        raise SilverCasesError(f"bad_length: {unit(sum(1 for length in lengths if length < 0), 'length')} below zero")
+
+
+def measure_rows(lengths: Sequence[int]) -> list[MeasureRow]:
+    """The measured distribution of the operation lengths (``opend`` minus ``opstart``, in seconds) of the development cases: their count, the least and
+    the greatest length and the percentiles by nearest rank. The order of ``lengths`` does not matter."""
+    check_lengths(lengths)
+    ordered = sorted(lengths)
+    rows = [MeasureRow("cases", "cases", len(ordered)), MeasureRow("min", "seconds", ordered[0])]
+    rows += [MeasureRow(f"p{percent}", "seconds", nearest_rank(ordered, percent)) for percent in PERCENTILES]
+    return [*rows, MeasureRow("max", "seconds", ordered[-1])]
+
+
+def cutoff_rows(lengths: Sequence[int]) -> list[CutoffRow]:
+    """The score cutoffs: the start (``opstart``), a quarter, a half and three quarters of the median development operation length after the start, each
+    rounded down to a whole minute, and the final (``opend``). The times must be strictly increasing, or the median is too short to set them."""
+    check_lengths(lengths)
+    median = nearest_rank(lengths, 50)
+    elapsed = [median * percent // 100 // SECONDS_PER_MINUTE * SECONDS_PER_MINUTE for percent in CUTOFF_FRACTIONS]
+    if [0, *elapsed] != sorted({0, *elapsed}):
+        raise SilverCasesError(f"cutoffs_not_increasing: {unit(len(CUTOFF_FRACTIONS), 'cutoff')} that are not after one another")
+    common = (CUTOFF_RULE_VERSION, len(lengths), median)
+    rows = [CutoffRow("start", "opstart", 0, "fixed", *common)]
+    rows += [
+        CutoffRow(f"p{percent}_of_median", "opstart", seconds, f"{percent} percent of the median", *common)
+        for percent, seconds in zip(CUTOFF_FRACTIONS, elapsed, strict=True)
+    ]
+    return [*rows, CutoffRow("final", "opend", None, "fixed", *common)]
+
+
+def cutoff_identity(row: CutoffRow) -> tuple[str, str, int | None, str, str]:
+    return (row.cutoff, row.anchor, row.elapsed_seconds, row.basis, row.rule_version)
+
+
+def frozen_problems(
+    existing_measure: Sequence[MeasureRow] | None, existing_cutoffs: Sequence[CutoffRow] | None, measure: Sequence[MeasureRow], cutoffs: Sequence[CutoffRow]
+) -> list[str]:
+    """How a rebuild would change the measure and the cutoffs that the branch already holds. ``None`` for both is a first build and has nothing to freeze."""
+    if existing_measure is None and existing_cutoffs is None:
+        return []
+    if existing_measure is None or existing_cutoffs is None:
+        return ["inherited_incomplete: the measure and the cutoffs are not both there"]
+    if not existing_measure or not existing_cutoffs:
+        return [f"inherited_empty: {unit(0, 'row')}"]
+    held = {row.cutoff: cutoff_identity(row) for row in existing_cutoffs}
+    wanted = {row.cutoff: cutoff_identity(row) for row in cutoffs}
+    changed_cutoffs = sum(1 for name in held.keys() | wanted.keys() if held.get(name) != wanted.get(name))
+    held_measure = {row.statistic: row for row in existing_measure}
+    wanted_measure = {row.statistic: row for row in measure}
+    changed_measure = sum(1 for name in held_measure.keys() | wanted_measure.keys() if held_measure.get(name) != wanted_measure.get(name))
+    problems = []
+    if changed_cutoffs:
+        problems.append(f"changed_cutoff: {unit(changed_cutoffs, 'cutoff')}")
+    if changed_measure:
+        problems.append(f"changed_measure: {unit(changed_measure, 'statistic')}")
+    return problems
+
+
+def source_schema_problems(found: Mapping[str, Sequence[tuple[str, str]] | None]) -> list[str]:
+    """The tables that are missing and the tables whose columns or types are not the expected ones, each as a code and a count. ``found`` maps a table to its
+    columns, or to ``None`` when the table is not there."""
+    missing = sum(1 for table in SOURCE_SCHEMAS if found.get(table) is None)
+    wrong = sum(1 for table, fields in SOURCE_SCHEMAS.items() if found.get(table) is not None and list(found[table] or ()) != fields)
+    return [f"{code}: {unit(count, 'table')}" for code, count in (("source_missing", missing), ("source_schema", wrong)) if count]
+
+
+def columns_text(counts: Mapping[str, int]) -> str:
+    total = sum(counts.values())
+    return f"{unit(total, 'value')} in {unit(len(counts), 'column')} ({', '.join(sorted(counts))})"
+
+
+def input_problems(
+    *,
+    bronze_case_rows: int,
+    case_key_null: int,
+    case_key_duplicates: int,
+    subjectid_form: int,
+    unparsed: Mapping[str, int],
+    domain: Mapping[str, int],
+    operation_ends_before_it_starts: int,
+    cases_without_one_split_row: int,
+    split_patients_without_case: int,
+    bronze_lab_rows: int,
+    lab_key_null: int,
+    lab_unparsed: Mapping[str, int],
+    lab_rows_without_case: int,
+    development_cases: int,
+    pinned: bool,
+) -> list[str]:
+    """What is wrong with the inputs, found before anything is written. Each cause is one code and a count, and no value or identifier is named."""
+    problems: list[str] = []
+    if bronze_case_rows == 0:
+        problems.append(f"empty_cases: {unit(0, 'row')}")
+    if bronze_lab_rows == 0:
+        problems.append(f"empty_lab: {unit(0, 'row')}")
+    for code, count, noun in (
+        ("key_null", case_key_null, "row"),
+        ("key_duplicate", case_key_duplicates, "key"),
+        ("subjectid_form", subjectid_form, "row"),
+        ("operation_order", operation_ends_before_it_starts, "row"),
+        ("split_join", cases_without_one_split_row, "case"),
+        ("split_patient_without_case", split_patients_without_case, "patient"),
+        ("lab_key_null", lab_key_null, "row"),
+        ("lab_case_missing", lab_rows_without_case, "row"),
+    ):
+        if count:
+            problems.append(f"{code}: {unit(count, noun)}")
+    for code, counts in (("unparsed", unparsed), ("domain", domain), ("lab_unparsed", lab_unparsed)):
+        counted = {name: count for name, count in counts.items() if count}
+        if counted:
+            problems.append(f"{code}: {columns_text(counted)}")
+    if development_cases == 0:
+        problems.append(f"no_development_cases: {unit(0, 'case')}")
+    if pinned and (bronze_case_rows, bronze_lab_rows) != (PINNED_CASES, PINNED_LAB_ROWS):
+        problems.append(
+            f"pinned_counts: {unit(bronze_case_rows, 'case')} and {unit(bronze_lab_rows, 'laboratory row')}, not {PINNED_CASES} and {PINNED_LAB_ROWS}"
+        )
+    return problems
+
+
+def output_problems(
+    *,
+    case_rows: int,
+    bronze_case_rows: int,
+    case_value_differences: int,
+    case_key_duplicates: int,
+    lab_rows: int,
+    lab_copies: int,
+    bronze_lab_rows: int,
+    lab_value_differences: int,
+    lab_key_duplicates: int,
+    lab_occurrence_gaps: int,
+    never_feature_marking_wrong: int,
+) -> list[str]:
+    """What is wrong with the tables that were written, against Bronze: a row count that differs, a changed value, a repeated key or a gap in the occurrence."""
+    problems: list[str] = []
+    if case_rows != bronze_case_rows:
+        problems.append(f"case_rows: silver {case_rows}, bronze {bronze_case_rows}")
+    if lab_copies != bronze_lab_rows:
+        problems.append(f"lab_rows: the copies add up to {lab_copies}, bronze {bronze_lab_rows}")
+    if lab_rows > lab_copies:
+        problems.append(f"lab_rows: {lab_rows} rows from {lab_copies} copies")
+    for code, count, noun in (
+        ("case_value_differences", case_value_differences, "row"),
+        ("case_key_duplicate", case_key_duplicates, "key"),
+        ("lab_value_differences", lab_value_differences, "row"),
+        ("lab_key_duplicate", lab_key_duplicates, "key"),
+        ("lab_occurrence_gap", lab_occurrence_gaps, "group"),
+        ("never_feature_marking", never_feature_marking_wrong, "table"),
+    ):
+        if count:
+            problems.append(f"{code}: {unit(count, noun)}")
+    return problems
