@@ -82,11 +82,11 @@ from scripts.ingestion.store import StoreError
 
 SUCCEEDED = "succeeded"
 ENDED_WITHOUT_SUCCESS = tuple(status for status in TERMINAL_STATUSES if status != SUCCEEDED)
-LOAD_RECORD_FORMAT = "load_record_1"
+LOAD_RECORD_FORMAT = "load_record_2"
 LOAD_RECORD_FILE = "{run_id}.load_record.json"
 OWN_FIELDS = ("run_id", "manifest_sha256", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
-LOAD_RECORD_FIELDS = ("format", "branch", "branch_hash", "manifest", "tables")
-RECORD_FIELDS = (*OWN_FIELDS, *LOAD_RECORD_FIELDS)
+LOAD_RECORD_FIELDS = ("format", "branch", "branch_hash", "base_hash", "manifest", "tables")
+RECORD_FIELDS = (*OWN_FIELDS, *(name for name in LOAD_RECORD_FIELDS if name not in OWN_FIELDS))
 COPY_FIELDS = ("table", "source_key", "key", "version_id", "sha256", "size")
 SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 MANIFEST_LINE = re.compile(r"^records-manifest: ([0-9a-f]{64})$", re.MULTILINE)
@@ -206,11 +206,12 @@ class LoadResult:
         return self.manifest.sha256
 
     def load_record(self) -> dict[str, Any]:
-        """The five fields that the table checks read as ``load_record_1``: format, branch, the branch head after the last sync, manifest, table snapshots."""
+        """The six fields that the table checks read as ``load_record_2``: format, branch, branch head, base head, manifest, snapshots."""
         return {
             "format": LOAD_RECORD_FORMAT,
             "branch": self.branch,
             "branch_hash": self.head_hash,
+            "base_hash": self.base_hash,
             "manifest": asdict(self.manifest),
             "tables": dict(self.snapshots),
         }
@@ -231,7 +232,7 @@ class LoadResult:
         return json.dumps(document, indent=2, sort_keys=True) + "\n"
 
     def load_record_json(self) -> str:
-        """Exactly the five fields and no other, because the table checks' parser refuses a record with any other field."""
+        """Exactly the six fields and no other, because the table checks' parser refuses a record with any other field."""
         return json.dumps(self.load_record(), indent=2, sort_keys=True) + "\n"
 
     @classmethod

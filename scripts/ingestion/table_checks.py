@@ -11,9 +11,11 @@ this order, each step only when the one before it passed:
 4. the Spark job (``spark/jobs/table_checks.py``, started by ``runner``) checks every table and prints its result;
 5. the result is read and held to the plan: the same branch, hash, tables and snapshots, every check's verdict derived from its counts, and an exit code that
    agrees with it;
-6. only when every check passed, and the branch is still at the checked hash, the contents of the default branch's head and of the branch are compared in
-   full: every key that differs must be one of this load's tables, or a namespace that holds them and the default branch lacks (``output_problem``), so
-   another changed table, or an edited or removed namespace, is never merged along with the load;
+6. only when every check passed, and the branch is still at the checked hash, the default branch must be at the base head that the load record names (the head
+   that the branch was made from), so a head that moved, even one that came back with the same contents, is refused and the load is rerun; then the contents
+   of that head and of the branch are compared in full, each key by its name parts: every key that differs must be one of this load's tables, or a namespace
+   that holds them and the default branch lacks (``output_problem``), so another changed table, or an edited or removed namespace, is never merged with the
+   load, and a listing that leaves a content out is an error;
 7. then a pending record is written and the branch is merged into the default branch with one request.
 
 The catalog's history is the one source of the merge. The receipt (``table_checks.json``, saved in the run folder against the manifest's reference) takes its
@@ -66,7 +68,7 @@ from scripts.stack.nessie import NessieClient, NessieError
 from scripts.stack.tags import paged
 from spark import table_checks as rules
 
-LOAD_RECORD_FORMAT = "load_record_1"
+LOAD_RECORD_FORMAT = "load_record_2"
 RUN_FORMAT = "table_checks_run_1"
 RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
@@ -92,7 +94,7 @@ MANIFEST_LINE_PREFIX = "records-manifest: "
 SOURCE_LINE_PREFIX = "records-source: "
 BRANCH_LINE_PREFIX = "records-branch: "
 MANIFEST_FIELDS: Mapping[str, type] = {"bucket": str, "key": str, "version_id": str, "sha256": str}
-LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "manifest": dict, "tables": dict}
+LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "base_hash": str, "manifest": dict, "tables": dict}
 FILE_TABLES = tuple(spec.name for spec in rules.TABLES if spec.source == "file")
 
 
@@ -144,12 +146,14 @@ class MergeCommit:
 
 @dataclass(frozen=True, slots=True)
 class LoadRecord:
-    """What the load step recorded: the branch it wrote, that branch's head hash, the manifest it loaded from and each table's snapshot ID."""
+    """What the load step recorded: the branch it wrote, that branch's head hash, the manifest it loaded from, each table's snapshot ID and the hash of the
+    default branch that the load branch was made from, which is the only head the branch may be merged onto."""
 
     branch: str
     branch_hash: str
     manifest: ManifestRef
     tables: dict[str, int]
+    base_hash: str
 
     @property
     def document(self) -> dict[str, Any]:
@@ -214,7 +218,7 @@ def closed(value: Any, fields: Mapping[str, type], what: str) -> dict[str, Any]:
 
 
 def parse_load_record(text: str) -> LoadRecord:
-    """The load record from the text of the ``<run ID>.load_record.json`` file, which holds exactly its five fields.
+    """The load record from the text of the ``<run ID>.load_record.json`` file, which holds exactly its six fields.
 
     Refuse an unknown, missing or mistyped field, a hash that is not 64 hex digits and any table list but ours.
     """
@@ -230,11 +234,11 @@ def parse_load_record(text: str) -> LoadRecord:
     names = [spec.name for spec in rules.TABLES]
     if fields["format"] != LOAD_RECORD_FORMAT or not BRANCH_NAME.fullmatch(fields["branch"]) or fields["branch"] == "main":
         raise TableChecksError("the load record has another format or names no load branch")
-    if not rules.HASH.fullmatch(fields["branch_hash"]) or not rules.HASH.fullmatch(manifest["sha256"]):
+    if not all(rules.HASH.fullmatch(fields[name]) for name in ("branch_hash", "base_hash")) or not rules.HASH.fullmatch(manifest["sha256"]):
         raise TableChecksError("the load record holds a hash that is not 64 lower-case hex digits")
     if sorted(tables) != sorted(names) or any(type(snapshot) is not int for snapshot in tables.values()):
         raise TableChecksError(f"the load record must give an integer snapshot ID for exactly the tables {', '.join(names)}")
-    return LoadRecord(fields["branch"], fields["branch_hash"], ManifestRef(**manifest), {name: tables[name] for name in names})
+    return LoadRecord(fields["branch"], fields["branch_hash"], ManifestRef(**manifest), {name: tables[name] for name in names}, fields["base_hash"])
 
 
 def manifest_line(sha256: str) -> str:
@@ -643,40 +647,55 @@ def wait_for_merge(nessie: NessieClient, record: LoadRecord, default: str, timin
         return None
 
 
-def reference_contents(nessie: NessieClient, reference: str) -> dict[str, str]:
-    """Every content of ``reference`` (a name or ``name@hash``) by its dotted key, each as its type and whole content in canonical JSON."""
-    found: dict[str, str] = {}
+Key = tuple[str, ...]
+
+
+def reference_contents(nessie: NessieClient, reference: str) -> dict[Key, str]:
+    """Every content of ``reference`` (a name or ``name@hash``) by the name parts that Nessie gave, each as its type and whole content in canonical JSON.
+
+    An entry with no name parts of text, no type or no content object is an error and never an empty content: two listings that both leave the content out
+    would otherwise look equal.
+    """
+    found: dict[Key, str] = {}
     for item in paged(nessie, f"/trees/{quote(reference, safe='@')}/entries", "entries", {"content": "true"}):
         name = item.get("name")
         elements = name.get("elements") if isinstance(name, dict) else None
-        kind = item.get("type")
-        if not isinstance(elements, list) or not elements or not all(isinstance(part, str) and part for part in elements) or not isinstance(kind, str):
+        kind, content = item.get("type"), item.get("content")
+        if not isinstance(elements, list) or not elements or not all(isinstance(part, str) and part for part in elements):
             raise TableChecksError("Nessie's answer for the contents is not in the expected form")
-        found[".".join(elements)] = json.dumps({"type": kind, "content": item.get("content")}, sort_keys=True)
+        if not isinstance(kind, str) or not isinstance(content, dict) or tuple(elements) in found:
+            raise TableChecksError("Nessie's answer for the contents is not in the expected form")
+        found[tuple(elements)] = json.dumps({"type": kind, "content": content}, sort_keys=True)
     return found
 
 
-def parent_namespaces(keys: Iterable[str]) -> set[str]:
-    """The dotted names of the namespaces that hold the tables ``keys``: every proper prefix of a table's name."""
-    return {".".join(parts[:length]) for parts in (key.split(".") for key in keys) for length in range(1, len(parts))}
+def parent_namespaces(keys: Iterable[Key]) -> set[Key]:
+    """The namespaces that hold the tables ``keys``: every proper prefix of a table's name parts."""
+    return {key[:length] for key in keys for length in range(1, len(key))}
 
 
-def output_problem(base: Mapping[str, str], branch: Mapping[str, str], written: Iterable[str]) -> str | None:
+def shown(key: Key) -> str:
+    return ".".join(key)
+
+
+def output_problem(base: Mapping[Key, str], branch: Mapping[Key, str], written: Iterable[Key]) -> str | None:
     """Why the change from the default branch to the load branch is not exactly the output of this load, or ``None``.
 
     The keys whose content differs, or that only one side holds, must be the tables that the load wrote and the namespaces that hold them and the default
     branch lacks. An edit or a removal of an existing namespace is a change like any other. A table of the load that the default branch already holds as the
-    branch has it was not written by this load. The rule is the one of ``spark.bronze.publication.output_problem``, over contents given as text.
+    branch has it was not written by this load. The rule is the one of ``spark.bronze.publication.output_problem``, over contents given as text and keys
+    given as name parts.
     """
     expected = set(written)
     changed = {key for key in base.keys() | branch.keys() if base.get(key) != branch.get(key)}
     created = {key for key in parent_namespaces(expected) if key not in base and key in branch}
     other = sorted(key for key in changed if key not in expected and key not in created)
     if other:
-        return f"the load branch changes {', '.join(other[:5])} against the default branch, which this load did not write: nothing was merged"
+        names = ", ".join(shown(key) for key in other[:5])
+        return f"the load branch changes {names} against the default branch, which this load did not write: nothing was merged"
     unchanged = sorted(key for key in expected if key not in changed)
     if unchanged:
-        return f"the table {unchanged[0]} is on the default branch as the load branch holds it, so this load did not write it: nothing was merged"
+        return f"the table {shown(unchanged[0])} is on the default branch as the load branch holds it, so this load did not write it: nothing was merged"
     return None
 
 
@@ -701,10 +720,14 @@ def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path
     if earlier is not None:
         confirm_main(nessie, record, default, earlier.hash)
         return earlier
+    if head != record.base_hash:
+        raise TableChecksError(
+            "the default branch is not at the recorded base head that the load branch was made from, so a merge could carry another change: rerun the load"
+        )
     problem = output_problem(
         reference_contents(nessie, f"{default}@{head}"),
         reference_contents(nessie, f"{record.branch}@{record.branch_hash}"),
-        (f"{rules.NAMESPACE}.{table}" for table in record.tables),
+        ((rules.NAMESPACE, table) for table in record.tables),
     )
     if problem is not None:
         raise TableChecksError(problem)

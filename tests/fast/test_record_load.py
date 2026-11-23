@@ -10,7 +10,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import tempfile
 import unittest
 from collections.abc import Callable, Iterator
@@ -39,6 +38,7 @@ from scripts.ingestion.record_load import (
     write_record,
 )
 from scripts.ingestion.record_state import RunState, StateError
+from scripts.ingestion.table_checks import TableChecksError, parse_load_record
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
 from tests.fast.record_support import BASE_HASH, RELEASE_FILES, RUN, FakeAirbyte, FakeCatalog, FakeClock, Stopped, landed_records
 
@@ -354,36 +354,20 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
 
 
-LOAD_RECORD_FIELDS = {"format", "branch", "branch_hash", "manifest", "tables"}
-HASH = re.compile(r"[0-9a-f]{64}")
+LOAD_RECORD_FIELDS = {"format", "branch", "branch_hash", "base_hash", "manifest", "tables"}
 
 
 def table_checks_accept(text: str) -> bool:
-    """The rules of the table checks' parser for a load record, as read in ``parse_load_record`` of ``scripts/ingestion/table_checks.py`` on
-    ``feat/p4-table-checks``: exactly the five fields, each of its type, the format ``load_record_1``, a branch that is not main, 64 lower case hex digits for
-    the hashes and an integer for each of the three tables."""
-    document = json.loads(text)
-    manifest = document.get("manifest")
-    tables = document.get("tables")
-    return (
-        type(document) is dict
-        and set(document) == LOAD_RECORD_FIELDS
-        and document["format"] == "load_record_1"
-        and type(document["branch"]) is str
-        and document["branch"] not in ("", "main")
-        and HASH.fullmatch(str(document["branch_hash"])) is not None
-        and type(manifest) is dict
-        and set(manifest) == {"bucket", "key", "version_id", "sha256"}
-        and all(type(value) is str for value in manifest.values())
-        and HASH.fullmatch(manifest["sha256"]) is not None
-        and type(tables) is dict
-        and sorted(tables) == sorted(TABLES)
-        and all(type(snapshot) is int for snapshot in tables.values())
-    )
+    """Whether the table checks' own parser (``parse_load_record``) accepts the text as a load record."""
+    try:
+        parse_load_record(text)
+    except TableChecksError:
+        return False
+    return True
 
 
 class LoadRecordShapeTest(unittest.TestCase):
-    """The shape that the table checks read: ``load_record_1``."""
+    """The shape that the table checks read: ``load_record_2``."""
 
     EXTRA = {"format", "branch_hash", "manifest", "tables"}
 
@@ -394,7 +378,7 @@ class LoadRecordShapeTest(unittest.TestCase):
         self.assertEqual(
             {"run_id", "manifest_sha256", "branch", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors"} | self.EXTRA, set(document)
         )
-        self.assertEqual("load_record_1", document["format"])
+        self.assertEqual("load_record_2", document["format"])
         self.assertEqual((BRANCH, result.head_hash), (document["branch"], document["branch_hash"]))
         self.assertEqual(
             {"bucket": setup.reference.bucket, "key": setup.reference.key, "version_id": setup.reference.version_id, "sha256": setup.reference.sha256},
@@ -404,14 +388,16 @@ class LoadRecordShapeTest(unittest.TestCase):
         self.assertEqual(TABLES, sorted(document["tables"]))
         self.assertTrue(all(type(snapshot) is int for snapshot in document["tables"].values()))
 
-    def test_a_second_file_holds_exactly_the_five_fields_that_the_table_checks_accept_and_no_others(self) -> None:
+    def test_a_second_file_holds_exactly_the_six_fields_that_the_table_checks_accept_and_no_others(self) -> None:
         setup = Setup(self)
         result = setup.load()
         text = (setup.folder / f"{RUN}.load_record.json").read_text()
         document = json.loads(text)
         self.assertEqual(LOAD_RECORD_FIELDS, set(document))
         self.assertTrue(table_checks_accept(text))
-        self.assertEqual((BRANCH, result.head_hash, result.snapshots), (document["branch"], document["branch_hash"], document["tables"]))
+        self.assertEqual(
+            (BRANCH, result.head_hash, BASE_HASH, result.snapshots), (document["branch"], document["branch_hash"], document["base_hash"], document["tables"])
+        )
         self.assertEqual(setup.reference.sha256, document["manifest"]["sha256"])
 
     def test_the_run_record_alone_is_refused_by_the_table_checks_rules_because_of_its_other_fields_which_is_why_the_second_file_exists(self) -> None:
