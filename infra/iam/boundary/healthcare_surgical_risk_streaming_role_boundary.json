@@ -27,7 +27,8 @@
           "s3:prefix": [
             "landing/*",
             "warehouse/*",
-            "manifests/*"
+            "manifests/*",
+            "records_input/*"
           ]
         }
       }
@@ -62,6 +63,20 @@
       "Resource": [
         "arn:aws:s3:::${S3_BUCKET}/manifests/*",
         "arn:aws:s3:::${S3_BUCKET}-test-*/manifests/*"
+      ]
+    },
+    {
+      "Sid": "ProjectRecordCopyObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObjectVersion",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}/records_input/*",
+        "arn:aws:s3:::${S3_BUCKET}-test-*/records_input/*"
       ]
     },
     {

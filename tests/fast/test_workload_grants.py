@@ -13,15 +13,19 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from scripts.infra.host import PROJECT_WORKLOAD_GIDS
+
 TFVARS = Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars"
 # The design's grants: Airbyte lands the copy and reads the publisher; the checksum check reads the copy and writes the manifests; Spark builds and maintains
-# the tables; Trino reads them; the replay reads the copy and the manifests.
+# the tables; Trino reads them; the replay reads the copy and the manifests; the orchestrator's record load reads the copy and the manifests and makes, reads
+# and deletes the versions of its own read copies under records_input.
 DECLARED: dict[str, dict[str, Any]] = {
     "airbyte": {"access": {"landing": {"write"}}, "publisher_read": True},
     "ingestion_check": {"access": {"landing": {"read"}, "manifests": {"read", "write"}}, "publisher_read": False},
     "spark": {"access": {"warehouse": {"read", "write", "delete"}}, "publisher_read": False},
     "trino": {"access": {"warehouse": {"read"}}, "publisher_read": False},
     "replay": {"access": {"landing": {"read"}, "manifests": {"read"}}, "publisher_read": False},
+    "orchestrator": {"access": {"landing": {"read"}, "manifests": {"read"}, "records_input": {"read", "write", "delete"}}, "publisher_read": False},
 }
 TOKEN = re.compile(r'\s*(?:(?P<name>[a-z_][a-z0-9_]*)|(?P<text>"[^"\\\n]*")|(?P<mark>[{}\[\]=,]))')
 
@@ -112,6 +116,14 @@ class RealFileTest(unittest.TestCase):
         self.assertEqual([], excess(workloads))
 
 
+class HostFolderTest(unittest.TestCase):
+    def test_every_declared_workload_has_its_own_fixed_group_so_the_host_makes_its_credential_folder(self) -> None:
+        """The host makes ``/run/workload_access/<name>/`` for each workload that Terraform gives a role, with the workload's own group."""
+        workloads = read_workloads(TFVARS.read_text())
+        self.assertEqual(sorted(workloads), sorted(PROJECT_WORKLOAD_GIDS))
+        self.assertEqual(len(PROJECT_WORKLOAD_GIDS), len(set(PROJECT_WORKLOAD_GIDS.values())))
+
+
 class PlantedGrantTest(unittest.TestCase):
     def planted(self, old: str, new: str) -> list[str]:
         text = TFVARS.read_text()
@@ -129,6 +141,21 @@ class PlantedGrantTest(unittest.TestCase):
         for label, (old, new, named) in cases.items():
             with self.subTest(label):
                 found = self.planted(old, new)
+                self.assertEqual(1, len(found), found)
+                self.assertTrue(found[0].startswith(named), found)
+
+    def test_a_wider_grant_of_the_orchestrator_is_named(self) -> None:
+        block = 'orchestrator = {\n    access = { landing = ["read"], manifests = ["read"], records_input = ["read", "write", "delete"] }\n  }'
+        cases = {
+            "a write mode on landing": (block.replace('landing = ["read"]', 'landing = ["read", "write"]'), "orchestrator: landing ['write']"),
+            "a delete mode on landing": (block.replace('landing = ["read"]', 'landing = ["read", "delete"]'), "orchestrator: landing ['delete']"),
+            "a write mode on manifests": (block.replace('manifests = ["read"]', 'manifests = ["read", "write"]'), "orchestrator: manifests ['write']"),
+            "the warehouse": (block.replace("records_input =", 'warehouse = ["read"], records_input ='), "orchestrator: warehouse ['read']"),
+            "the publisher": (block.replace("}\n  }", "}\n    publisher_read = true\n  }"), "orchestrator: reads the publisher's"),
+        }
+        for label, (new, named) in cases.items():
+            with self.subTest(label):
+                found = self.planted(block, new)
                 self.assertEqual(1, len(found), found)
                 self.assertTrue(found[0].startswith(named), found)
 

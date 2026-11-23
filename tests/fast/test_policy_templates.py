@@ -131,6 +131,21 @@ class BucketScopeTest(unittest.TestCase):
                 self.assertEqual(sorted(f"{bucket}/{prefix}/*" for bucket in self.BUCKETS), resources(document, sid))
                 self.assertNotIn("Condition", statements[sid])
 
+    def test_the_read_copies_of_the_record_load_have_their_own_statement_with_no_whole_object_delete_and_no_multipart_action(self) -> None:
+        document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        statements = {statement["Sid"]: statement for statement in document["Statement"]}
+        statement = statements["ProjectRecordCopyObjects"]
+        self.assertEqual("Allow", statement["Effect"])
+        self.assertEqual(["s3:DeleteObjectVersion", "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], sorted(as_list(statement["Action"])))
+        self.assertEqual(sorted(f"{bucket}/records_input/*" for bucket in self.BUCKETS), resources(document, "ProjectRecordCopyObjects"))
+        self.assertNotIn("Condition", statement)
+        self.assertNotIn("records_input", json.dumps(statements["ProjectDataObjects"]))
+
+    def test_no_other_statement_of_the_boundary_reaches_records_input(self) -> None:
+        document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
+        reaching = [statement["Sid"] for statement in document["Statement"] if "records_input" in json.dumps(statement)]
+        self.assertEqual(["ProjectBucketListing", "ProjectRecordCopyObjects"], sorted(reaching))
+
     def test_no_statement_of_the_boundary_names_the_airbyte_prefix(self) -> None:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
         self.assertNotIn("airbyte", json.dumps(document).lower())
@@ -156,7 +171,7 @@ class BucketScopeTest(unittest.TestCase):
 class RoleListingTest(unittest.TestCase):
     BUCKETS = ["arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-*"]
     LISTING = ["s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:ListBucketVersions"]
-    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*", "manifests/*"]}}
+    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*", "manifests/*", "records_input/*"]}}
 
     def boundary(self) -> dict[str, dict[str, Any]]:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]

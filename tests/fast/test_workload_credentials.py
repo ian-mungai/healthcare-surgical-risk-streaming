@@ -8,10 +8,12 @@ in AWS's Signature Version 4 documentation and a response that carries no creden
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
+from unittest import mock
 
 HELPER = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "workload_access" / "files" / "workload_credentials.py"
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -31,6 +33,17 @@ helper = load_helper()
 
 def document(expires_in: timedelta) -> dict[str, object]:
     return {"Version": 1, "AccessKeyId": "A", "SecretAccessKey": "B", "SessionToken": "C", "Expiration": (NOW + expires_in).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+class FolderTest(unittest.TestCase):
+    def test_the_folder_of_a_workload_is_made_under_its_name_for_its_group_and_holds_the_credentials(self) -> None:
+        """The compose service mounts ``/run/workload_access/orchestrator``, so the helper must make a folder of exactly the workload's name."""
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(helper, "TARGET", Path(scratch)), mock.patch.object(helper.os, "chown") as chown:
+            helper.write_credentials("orchestrator", 20105, {"Version": 1})
+            folder = Path(scratch) / "orchestrator"
+            self.assertEqual(["credentials.json"], sorted(path.name for path in folder.iterdir()))
+            self.assertEqual(0o750, folder.stat().st_mode & 0o777)
+            self.assertEqual(20105, chown.call_args_list[0].args[2])
 
 
 class RenewalTest(unittest.TestCase):
