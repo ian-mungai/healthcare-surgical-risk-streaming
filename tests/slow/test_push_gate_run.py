@@ -8,17 +8,21 @@ would reformat, a type error and a failing quick test of the changed file. The s
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import shlex
 import shutil
 import sys
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scripts.process import CompletedProcess, run_command
-from scripts.quality import push_gate, push_hook
+from scripts.quality import push_gate, push_hook, repo_checks
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository
+from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository, clean_git_env, git_in
 from tests.fast.test_push_gate import GOOD_CODE, GOOD_TEST, PYPROJECT, planted_address, planted_token
 
 
@@ -353,6 +357,54 @@ class PushGateTest(TemporaryRepository):
         (self.repo / "notes.txt").write_text("changed in the tree only\n")
         (self.repo / ".privacy_allowlist").write_text("")
         self.assertEqual(run_command(scan[0], scan[1:], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS).returncode, 0, "the working tree does not count")
+
+    def run_gate_in_process(self, stdin: str, *, move_head_after_the_head_check: bool = False) -> tuple[int, str]:
+        """``push_gate.main`` in this repository, as the hook runs it, with Git's variables cleared; optionally a soft reset right after the head check."""
+        original = push_gate.head_problems
+
+        def head_check_then_reset(*arguments: Any) -> str | None:
+            result = original(*arguments)
+            git_in(self.repo, "reset", "--soft", "HEAD~1")
+            return result
+
+        errors = io.StringIO()
+        patched = mock.patch.object(push_gate, "head_problems", head_check_then_reset) if move_head_after_the_head_check else contextlib.nullcontext()
+        with mock.patch.dict(os.environ, clean_git_env(), clear=True), contextlib.chdir(self.repo), patched, contextlib.redirect_stderr(errors):
+            return push_gate.main(stdin, by_hook=True), errors.getvalue()
+
+    def test_a_soft_reset_after_the_head_check_does_not_change_the_commit_that_the_privacy_scan_reads(self) -> None:
+        """Round 5, finding 1: the scan reads the sha that the head check verified and never reads HEAD again."""
+        self.write("notes.txt", f"contact {planted_address()}\n")
+        self.commit("chore: add a contact")
+        tip = self.git("rev-parse", "HEAD").stdout.strip()
+        remote = self.git("rev-parse", "origin/main").stdout.strip()
+        line = f"refs/heads/main {tip} refs/heads/main {remote}\n"
+        code, errors = self.run_gate_in_process(line, move_head_after_the_head_check=True)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), remote, "the probe moved HEAD to the clean parent")
+        self.assertEqual(code, 1, errors)
+        self.assertIn(f"push gate stopped by {push_gate.PRIVACY}", errors)
+        self.assertIn("notes.txt:1", errors)
+
+    def test_a_committed_allowlist_is_read_from_the_same_listing_and_batch_as_the_other_blobs(self) -> None:
+        """Round 5, finding 2: one tree listing and one batch read for the whole scan."""
+        self.write(".privacy_allowlist", "email notes.txt -- a public address of the test\n")
+        self.write("notes.txt", f"contact {planted_address()}\n")
+        self.commit("chore: add an allowed contact")
+        calls: list[str] = []
+        real_run = run_command
+
+        def counting_run(program: str, arguments: Any, **keywords: Any) -> Any:
+            calls.append(arguments[0])
+            return real_run(program, arguments, **keywords)
+
+        with (
+            mock.patch.dict(os.environ, clean_git_env(), clear=True),
+            contextlib.chdir(self.repo),
+            mock.patch("scripts.quality.repo_checks.run_command", counting_run),
+        ):
+            findings, unreviewed = repo_checks.privacy_scan(commit="HEAD")
+        self.assertEqual((findings, unreviewed), ([], []), "the allowlist of the commit allows the address")
+        self.assertEqual((calls.count("ls-tree"), calls.count("cat-file")), (1, 1))
 
     def test_a_message_that_is_not_a_conventional_commit_stops_the_push(self) -> None:
         self.write("notes.txt", "second\n")

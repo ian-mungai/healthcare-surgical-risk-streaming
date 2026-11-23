@@ -159,15 +159,15 @@ def commit_range(revisions: str) -> list[Finding]:
     return [*findings, *message_secret_findings("\n\n".join(messages))] if messages else findings
 
 
-def read_allowlist(commit: str | None = None) -> tuple[list[tuple[str, str]], list[Finding]]:
-    """The reasoned allowlist of the working tree, or of ``commit`` when one is given."""
+def read_allowlist(committed: list[tuple[str, bytes]] | None = None) -> tuple[list[tuple[str, str]], list[Finding]]:
+    """The reasoned allowlist of the working tree, or, given the blobs of a commit that ``committed_files`` has read, the one that the commit holds."""
     entries: list[tuple[str, str]] = []
     findings: list[Finding] = []
     kinds = [*PRIVACY_PATTERNS, "env-value"]
-    if commit is None:
+    if committed is None:
         source = Path(ALLOWLIST).read_text() if Path(ALLOWLIST).exists() else None
     else:
-        source = next((data.decode("utf-8", "replace") for path, data in committed_files(commit, [ALLOWLIST])), None)
+        source = next((data.decode("utf-8", "replace") for path, data in committed if path == ALLOWLIST), None)
     if source is None:
         return entries, findings
     for number, line in enumerate(source.splitlines(), 1):
@@ -241,7 +241,8 @@ def committed_files(commit: str, only: list[str] | None = None) -> list[tuple[st
 
 def privacy_scan(commit: str | None = None) -> tuple[list[Finding], list[str]]:
     """Scan every file that Git does not ignore, or, with ``commit``, every tracked blob of that commit and its own allowlist: what a push publishes."""
-    allowed, findings = read_allowlist(commit)
+    committed = committed_files(commit) if commit is not None else None
+    allowed, findings = read_allowlist(committed)
     values = env_values()
     unreviewed = []
     descriptions = {kind: description for kind, (description, _) in PRIVACY_PATTERNS.items()} | {"env-value": "value declared in .env"}
@@ -249,7 +250,7 @@ def privacy_scan(commit: str | None = None) -> tuple[list[Finding], list[str]]:
     if commit is None:
         sources = [(path, Path(path).read_bytes()) for path in visible_files() if not os.path.islink(path) and os.path.isfile(path)]
     else:
-        sources = committed_files(commit)
+        sources = committed or []
     for path, data in sources:
         if b"\0" in data[:8192]:
             unreviewed.append(f"{on_one_line(path)}: unreviewed: cannot be read as text; inspect it before publishing")

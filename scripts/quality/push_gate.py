@@ -37,7 +37,7 @@ from scripts.quality import repo_checks
 
 ROOT = Path(__file__).resolve().parents[2]
 # The version of this gate. ``make setup`` installs the shared pre-push hook for it, and the hook refuses a worktree whose gate is older or missing.
-GATE_VERSION = 4
+GATE_VERSION = 5
 TRACKED = "tracked changes"
 SECRETS = "secret scan"
 MESSAGES = "commit messages"
@@ -342,10 +342,10 @@ def commit_message_problems(commits: list[str]) -> str | None:
     return "\n".join(f"{finding.location}: {finding.problem}\n  fix: {finding.fix}" for finding in findings) or None
 
 
-def privacy_problems() -> str | None:
-    """The privacy scan of the tracked blobs of HEAD, which the head check has bound to the pushed commit. The working tree does not count: a sparse checkout
-    leaves tracked files out of it."""
-    findings, unreviewed = repo_checks.privacy_scan(commit=git("rev-parse", "HEAD").strip())
+def privacy_problems(commit: str) -> str | None:
+    """The privacy scan of the tracked blobs of ``commit``, the sha that the head check verified as the pushed one. Neither the working tree (a sparse checkout
+    leaves tracked files out of it) nor HEAD (a reset can move it after the check) counts."""
+    findings, unreviewed = repo_checks.privacy_scan(commit=commit)
     lines = [*unreviewed, *(f"{repo_checks.on_one_line(finding.location)}: {finding.problem}\n  fix: {finding.fix}" for finding in findings)]
     return "\n".join(lines) or None
 
@@ -359,10 +359,9 @@ def tracked_problems() -> str | None:
     )
 
 
-def head_problems(updates: list[Update]) -> str | None:
+def head_problems(updates: list[Update], head: str) -> str | None:
     """The working-tree checks (and the privacy scan of the outgoing tree) read the checked-out HEAD, so every ref that sends a commit must be at HEAD,
     whatever the tracking refs say."""
-    head = git("rev-parse", "HEAD").strip()
     for update in updates:
         if update.deletes or not commits_of(pushed_ranges([update])):
             continue
@@ -396,11 +395,12 @@ def main(stdin: str, *, by_hook: bool = False) -> int:
     """
     started = time.monotonic()
     repo = Path.cwd()
+    head = git("rev-parse", "HEAD").strip()  # read once: the head check verifies it and the privacy scan reads exactly it
     if stdin.strip() or by_hook:
         updates = parse_updates(stdin)
         ranges = pushed_ranges(updates)
     else:
-        updates = [Update("HEAD", git("rev-parse", "HEAD").strip(), "", "0" * 40)]
+        updates = [Update("HEAD", head, "", "0" * 40)]
         ranges = [unpushed_range()]
     commits = commits_of(ranges)
     if not commits:
@@ -408,8 +408,8 @@ def main(stdin: str, *, by_hook: bool = False) -> int:
         return 0
     steps: list[tuple[str, Callable[[], str | None]]] = [(TRACKED, tracked_problems)]
     steps += [(check.name, functools.partial(run_check, check)) for check in secret_checks(ranges, commits)]
-    steps += [(MESSAGES, lambda: commit_message_problems(commits)), (HEAD, lambda: head_problems(updates))]
-    steps.append((PRIVACY, privacy_problems))
+    steps += [(MESSAGES, lambda: commit_message_problems(commits)), (HEAD, lambda: head_problems(updates, head))]
+    steps.append((PRIVACY, lambda: privacy_problems(head)))
     changed, deleted = changed_files(repo, commits_of(checked_ranges(ranges)))
     steps += [
         (check.name, functools.partial(run_check, check))
