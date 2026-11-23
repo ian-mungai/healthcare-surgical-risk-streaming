@@ -130,13 +130,30 @@ def commit_message(path: str) -> list[Finding]:
     return message_findings(path, Path(path).read_text(), comments=True)
 
 
+GITLEAKS = Path(__file__).resolve().parents[2] / ".tools" / "bin" / "gitleaks"
+BODY_RULE = "no credential value is in a commit message"
+
+
+def message_secret_findings(messages: str) -> list[Finding]:
+    """Scan whole commit messages with the pinned gitleaks, which the scan of the diffs does not read. A finding does not print the value."""
+    if not GITLEAKS.is_file():
+        return [Finding("commit messages", f"the secret scanner {GITLEAKS.name} is missing", BODY_RULE, "run: make setup")]
+    run = run_command(str(GITLEAKS), ["stdin", "--redact", "--no-banner", "--no-color"], timeout=GIT_TIMEOUT_SECONDS, input_text=messages)
+    if run.returncode == 0:
+        return []
+    return [Finding("commit messages", "a secret is in a commit message body (the value is not shown)", BODY_RULE, "rewrite the commit message without it")]
+
+
 def commit_range(revisions: str) -> list[Finding]:
     if revisions.startswith("-"):
         raise SystemExit(f"commit-range takes a revision or a range, not an option: {revisions!r}")
     findings = []
+    messages = []
     for commit in git("rev-list", revisions, "--").splitlines():
-        findings.extend(message_findings(f"commit {commit}", git("show", "-s", "--format=%B", commit)))
-    return findings
+        message = git("show", "-s", "--format=%B", commit)
+        messages.append(message)
+        findings.extend(message_findings(f"commit {commit}", message))
+    return [*findings, *message_secret_findings("\n\n".join(messages))] if messages else findings
 
 
 def read_allowlist() -> tuple[list[tuple[str, str]], list[Finding]]:

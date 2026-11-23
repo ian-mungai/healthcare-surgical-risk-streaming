@@ -9,7 +9,7 @@ In development. The first phase builds the host and its lifecycle. It adds the r
 You need macOS on Apple silicon or Linux on x86-64, the two platforms that `scripts/quality/install_tools.py` pins tools for, with Python 3.14, Git, GNU Make and curl. The host commands also need the AWS CLI, OpenSSH and the Tailscale client.
 
 ```sh
-make setup  # create .venv, install the pinned tools (gitleaks, Terraform 1.16.4, tflint, Trivy), the commit, commit message and push hooks, the working-tree privacy hook and the push guard
+make setup  # create .venv, install the pinned tools (gitleaks, Terraform 1.16.4, tflint, Trivy), the commit and commit message hooks, the working-tree privacy hook and the pre-push hook
 ```
 
 `infra/versions.tf` requires Terraform 1.16.4 or a later 1.16 release, and the hosted CI job installs 1.16.4.
@@ -21,8 +21,10 @@ The host commands read their settings from `.env`. Copy `.env.example` to `.env`
 Each check runs at the cheapest layer that can do its job, and hosted CI runs every check in full.
 
 1. **Commit hooks, about 90 seconds:** secrets in the staged changes, credential and data files, privacy, Ruff, MyPy, the quick tests (`tests/fast`) and the commit message.
-2. **Push gate, about 40 seconds for one commit (2 minutes at most), before every push to any branch** (`scripts/quality/push_gate.py`, installed by `make setup`): the secret scan (merge diffs included) and the commit messages of the unpushed commits of HEAD, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the quick test modules that cover the changed files) and the dependency scan when a lock file changes. A push guard first refuses a push while tracked files have uncommitted changes. There is no full local run before a push.
-3. **Hosted CI** (`.github/workflows/ci.yml`): every check in full on each push of a work branch, each pull request, the commit that a squash merge creates on `main`, every Monday and on demand. A separate headroom job, outside the required check, fails any job that used over 80% of its timeout, is missing from the run or has no limit. `main` moves only through a pull request that is up to date with `main` and squash-merged after the required check passes (a recorded exception to the check-first default).
+2. **Push gate, about 40 seconds for one commit (2 minutes at most), before every push to any branch** (a plain Git `pre-push` hook that `make setup` installs, `scripts/quality/push_gate.py`): it reads what Git sends and checks every commit that the remote ref in Git's input does not hold, and the whole history for a new ref, because the receiver's history is not known. It refuses a push while tracked files have uncommitted changes, then runs the secret scan of the diffs (merge diffs included) and of whole commit messages, the commit messages, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the quick test modules that cover the changed files; a rename or delete of a Python file runs the whole quick group) and the dependency scan when a lock file changes. A push that sends only deletes runs nothing. There is no full local run before a push.
+3. **Hosted CI** (`.github/workflows/ci.yml`): every check in full on each push of a work branch, each pull request, the commit that a squash merge creates on `main`, every Monday and on demand. The manual-stage hooks also scan every lock file (Trivy) and every commit message of the history for secrets. A separate headroom job, outside the required check, waits for the required job and fails any job that used over 80% of its timeout, is missing from the run or has no limit. `main` moves only through a pull request that is up to date with `main` and squash-merged after the required check passes (a recorded exception to the check-first default).
+
+Terraform providers are pinned by hash in `infra/.terraform.lock.hcl` and are not vulnerability-scanned: Trivy 0.76.2 detects no package in a Terraform lock file.
 
 Run the checks from the repository root.
 

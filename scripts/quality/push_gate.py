@@ -1,17 +1,22 @@
 """The push gate: the pre-push hook of about 2 minutes that runs before every push to any branch.
 
-Run by pre-commit at the pre-push stage (``.venv/bin/python -m scripts.quality.push_gate``) from the repository root. It stops at the first check that fails
-and names it: ``push gate stopped by <check>``. In order:
+Run by the plain Git ``pre-push`` hook (``scripts/quality/push_hook.py``) from the repository root, with Git's standard input: one line
+``<local ref> <local sha> <remote ref> <remote sha>`` for each ref that the push updates. A run by hand has no such line and checks the commits that no remote
+branch holds. It stops at the first check that fails and names it: ``push gate stopped by <check>``. In order, when the push sends something:
 
 1. Tracked files have no uncommitted change, so the checks read the pushed commit.
-2. The secret scan (the pinned gitleaks) of the unpushed commits of HEAD, merge diffs included.
-3. The commit message of every unpushed commit of HEAD.
-4. The privacy scan of every file that Git does not ignore.
-5. The changed files' own checks: Ruff's formatter and linter, MyPy, Terraform's formatter and the quick test modules that cover the changed files.
-6. The dependency scan (the pinned Trivy) of each lock file that changed.
+2. The secret scan (the pinned gitleaks) of the pushed commits' diffs, merge diffs included, and of their whole messages.
+3. The commit message of every pushed commit.
+4. Every pushed commit that has working-tree checks to run is the checked-out HEAD.
+5. The privacy scan of every file that Git does not ignore.
+6. The changed files' own checks: Ruff's formatter and linter, MyPy, Terraform's formatter and the quick test modules that cover the changed files.
+   A rename or a delete of a Python file runs the whole quick group.
+7. The dependency scan (the pinned Trivy) of each lock file that changed.
 
-The unpushed commits are the ones that ``git rev-list HEAD --not --remotes`` lists, the whole history for a first push. Pre-commit starts the gate only when
-the push sends commits. The full test groups, the Terraform and Ansible checks and every other check run in the hosted CI run of the pushed branch.
+The pushed commits are what Git's lines send, read conservatively because the receiver's history is not known: every commit of the local sha that is
+not reachable from the remote sha that the line names, and the whole history when the line names none (a new ref) or names one that this clone lacks.
+The tracking refs of a remote are never trusted for that range, since a changed push URL or a stale ref would hide commits. They only narrow the
+changed-file checks, which are quality checks that the hosted run repeats in full. A push that sends only deletes runs no check.
 """
 
 from __future__ import annotations
@@ -42,8 +47,8 @@ TERRAFORM = "terraform fmt"
 QUICK = "quick tests"
 DEPENDENCIES = "dependency scan"
 HEAD = "checked-out head"
-LOCK_FILES = ("requirements.txt", "uv.lock", ".terraform.lock.hcl")
-REFS_FILE = "push_gate_refs"
+# A Terraform lock file pins each provider by hash. Trivy 0.76.2 detects no package in it, so providers are not vulnerability-scanned.
+LOCK_FILES = ("requirements.txt", "uv.lock")
 ZERO_SHA = re.compile(r"0+")
 CHECK_TIMEOUT_SECONDS = 120
 QUICK_TIMEOUT_SECONDS = 300
@@ -93,46 +98,85 @@ def tracked_changes() -> list[str]:
     return [line[3:] for line in lines]
 
 
-def read_pushed_updates(path: Path) -> tuple[str, list[Update]] | None:
-    """The remote name and the ref updates that the push guard saved from Git's input to the hook, or None when there is no file. The file is removed."""
-    if not path.is_file():
-        return None
-    lines = path.read_text().splitlines()
-    path.unlink()
-    remote = lines[0].removeprefix("remote ").strip() if lines else ""
-    updates = [Update(*parts) for line in lines[1:] if len(parts := line.split()) == 4]
-    return remote, updates
+def parse_updates(text: str) -> list[Update]:
+    """The updates in Git's input to a pre-push hook. The last three fields are fixed (a local ref can hold spaces, as ``HEAD@{2 days ago}`` does)."""
+    updates = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.rstrip("\n").rsplit(" ", 3)
+        if len(parts) != 4:
+            raise ValueError(f"cannot read the pushed ref line {line!r}: it is not <local ref> <local sha> <remote ref> <remote sha>")
+        updates.append(Update(*parts))
+    return updates
 
 
 def commit_exists(sha: str) -> bool:
     return run_command("git", ["cat-file", "-e", f"{sha}^{{commit}}"], timeout=GIT_TIMEOUT_SECONDS).returncode == 0
 
 
-def pushed_commits(remote: str, updates: list[Update]) -> list[str]:
-    """Every commit that the push sends, newest first and each once: for each update that is not a delete, the local sha without what the remote holds.
+@dataclass(frozen=True)
+class Range:
+    """The commits of ``tip`` that none of the ``excludes`` reaches; no exclude means the whole history of the tip."""
 
-    An existing remote ref holds its own sha, so the range starts there, whatever the local tracking refs say. A new ref excludes only the refs that
-    this remote is known to hold (``--remotes=<remote>``), so another remote's refs hide nothing and a first push to a second remote sends its whole history.
-    """
-    commits: dict[str, None] = {}
-    for update in updates:
-        if update.deletes:
-            continue
-        exclude = update.remote_sha if not update.creates and commit_exists(update.remote_sha) else f"--remotes={remote}"
-        commits.update(dict.fromkeys(git("rev-list", update.local_sha, "--not", exclude).split()))
-    return list(commits)
+    tip: str
+    excludes: tuple[str, ...] = ()
+
+    def arguments(self) -> list[str]:
+        return [self.tip, "--not", *self.excludes] if self.excludes else [self.tip]
+
+    def commits(self) -> list[str]:
+        return git("rev-list", *self.arguments()).split()
 
 
-def unpushed_commits() -> list[str]:
-    """Without Git's input (a manual run): the commits that no remote branch holds, as ``git rev-list HEAD --not --remotes`` lists them."""
-    return git("rev-list", *UNPUSHED).split()
+def pushed_ranges(updates: list[Update]) -> list[Range]:
+    """What the push sends, read conservatively: for each update that is not a delete, the local sha without the remote sha that the line names, if this clone
+    has it, and otherwise the whole history. Tracking refs are not used: a changed push URL or a stale ref would hide commits."""
+    return [
+        Range(update.local_sha, (update.remote_sha,) if not update.creates and commit_exists(update.remote_sha) else ())
+        for update in updates
+        if not update.deletes
+    ]
+
+
+def checked_ranges(ranges: list[Range]) -> list[Range]:
+    """The same ranges without anything that a tracking ref holds, for the changed-file checks, which the hosted run repeats in full."""
+    return [Range(each.tip, (*each.excludes, "--remotes")) for each in ranges]
+
+
+def unpushed_range() -> Range:
+    """Without Git's input (a run by hand): the commits that no remote branch holds, as ``git rev-list HEAD --not --remotes`` lists them."""
+    return Range("HEAD", ("--remotes",))
+
+
+def commits_of(ranges: list[Range]) -> list[str]:
+    """Every commit of the ranges, newest first and each once."""
+    return list(dict.fromkeys(commit for each in ranges for commit in each.commits()))
 
 
 def changed_files(root: Path, commits: list[str]) -> tuple[list[str], list[str]]:
-    """The files that the commits add, copy, modify, rename or delete (each merge against each parent): those that still exist and those that do not."""
-    listed = repo_checks.git("log", "-m", "--name-only", "--diff-filter=ACMRD", "--format=", "-z", "--no-walk=unsorted", *commits, keep_newlines=True)
-    names = sorted(set(listed.split("\0")) - {""})
-    return [name for name in names if (root / name).is_file()], [name for name in names if not (root / name).exists()]
+    """The files that the commits add, copy, modify or rename to (each merge against each parent) and that still exist, and the paths that they delete or rename
+    away from, which no longer exist."""
+    if not commits:
+        return [], []
+    listed = repo_checks.git("log", "-m", "--name-status", "--diff-filter=ACMRD", "--format=", "-z", "--no-walk=unsorted", *commits, keep_newlines=True)
+    tokens = [token.strip("\n") for token in listed.split("\0") if token.strip("\n")]
+    present: set[str] = set()
+    removed: set[str] = set()
+    position = 0
+    while position < len(tokens):
+        status = tokens[position][:1]
+        count = 3 if status in ("R", "C") else 2
+        paths = tokens[position + 1 : position + count]
+        if status == "D":
+            removed.update(paths)
+        elif status == "R":
+            removed.add(paths[0])
+            present.add(paths[1])
+        else:
+            present.add(paths[-1])
+        position += count
+    return sorted(name for name in present if (root / name).is_file()), sorted(name for name in removed if not (root / name).exists())
 
 
 def python_files(changed: list[str]) -> list[str]:
@@ -236,7 +280,8 @@ def select_tests(root: Path, changed: list[str]) -> list[str]:
 
 def changed_file_checks(repo: Path, changed: list[str], tools: Path = ROOT, deleted: tuple[str, ...] = ()) -> list[Check]:
     """The checks of the changed files' own tools, run in ``repo`` with the pinned tools of ``tools``. Python gets Ruff and, in the folders that the
-    repository's MyPy configuration checks, MyPy; Terraform gets its formatter; the quick test modules that cover the changed and deleted files run together."""
+    repository's MyPy configuration checks, MyPy; Terraform gets its formatter; the quick test modules that cover the changed and deleted files run together,
+    all of them when a Python file was renamed or deleted."""
     checks: list[Check] = []
     python = python_files(changed)
     if python:
@@ -248,7 +293,9 @@ def changed_file_checks(repo: Path, changed: list[str], tools: Path = ROOT, dele
     terraform = [name for name in changed if name.endswith(".tf")]
     if terraform:
         checks.append(Check(TERRAFORM, str(tools / ".tools/bin/terraform"), ("fmt", "-check", "-diff", "--", *terraform)))
-    modules = select_tests(repo, [*changed, *deleted]) if (repo / QUICK_FOLDER).is_dir() else []
+    modules: list[str] = []
+    if (repo / QUICK_FOLDER).is_dir():
+        modules = sorted(import_graph(repo)) if python_files(list(deleted)) else select_tests(repo, [*changed, *deleted])
     if modules:
         checks.append(Check(QUICK, str(tools / ".venv/bin/python"), ("-m", "unittest", *modules), QUICK_TIMEOUT_SECONDS))
     return checks
@@ -262,16 +309,14 @@ def dependency_checks(changed: list[str], tools: Path = ROOT) -> list[Check]:
     return [Check(DEPENDENCIES, str(tools / ".tools/bin/trivy"), (*scan, lock)) for lock in locks]
 
 
-def secret_checks(commits: list[str], tools: Path = ROOT) -> list[Check]:
+def secret_checks(ranges: list[Range], commits: list[str], tools: Path = ROOT) -> list[Check]:
     """The pinned gitleaks over the pushed commits: their diffs, with each merge's diff against each parent (``-m``; the default log shows none), and
     their whole messages, which the diff scan does not read. A finding prints its rule with the value redacted."""
     gitleaks = str(tools / ".tools/bin/gitleaks")
     common = ("--redact", "--no-banner", "--no-color", "--verbose")
     messages = "\n\n".join(git("show", "-s", "--format=%B", commit) for commit in commits)
-    return [
-        Check(SECRETS, gitleaks, ("git", *common, f"--log-opts=-m --no-walk=unsorted {' '.join(commits)}", ".")),
-        Check(SECRETS, gitleaks, ("stdin", *common), input_text=messages),
-    ]
+    diffs = [Check(SECRETS, gitleaks, ("git", *common, f"--log-opts=-m {' '.join(each.arguments())}", ".")) for each in ranges]
+    return [*diffs, Check(SECRETS, gitleaks, ("stdin", *common), input_text=messages)]
 
 
 def run_check(check: Check) -> str | None:
@@ -309,11 +354,11 @@ def tracked_problems() -> str | None:
     )
 
 
-def head_problems(updates: list[Update], remote: str) -> str | None:
-    """The working-tree checks read the checked-out HEAD, so every pushed commit that sends something must be HEAD."""
+def head_problems(updates: list[Update]) -> str | None:
+    """The working-tree checks read the checked-out HEAD, so every pushed commit that they have to check must be HEAD."""
     head = git("rev-parse", "HEAD").strip()
     for update in updates:
-        if update.deletes or not pushed_commits(remote, [update]):
+        if update.deletes or not commits_of(checked_ranges(pushed_ranges([update]))):
             continue
         if git("rev-parse", f"{update.local_sha}^{{commit}}").strip() != head:
             return f"{update.local_ref} is not the checked-out HEAD, so the checks that read the working tree cannot vouch for it: check it out and push again"
@@ -338,25 +383,25 @@ def scan_all_dependencies() -> int:
     return failed
 
 
-def main() -> int:
-    """Run the gate in the current repository and return 1 at the first check that fails.
-
-    The pushed commits come from the ref updates that the push guard saved from Git's input; a manual run has none and uses the unpushed commits of HEAD.
-    """
+def main(stdin: str) -> int:
+    """Run the gate in the current repository on Git's input ``stdin`` and return 1 at the first check that fails."""
     started = time.monotonic()
     repo = Path.cwd()
-    saved = read_pushed_updates(Path(git("rev-parse", "--git-path", REFS_FILE).strip()))
-    remote, updates = saved if saved is not None else ("", [])
-    commits = pushed_commits(remote, updates) if saved is not None else unpushed_commits()
+    if stdin.strip():
+        updates = parse_updates(stdin)
+        ranges = pushed_ranges(updates)
+    else:
+        updates = [Update("HEAD", git("rev-parse", "HEAD").strip(), "", "0" * 40)]
+        ranges = [unpushed_range()]
+    commits = commits_of(ranges)
     if not commits:
         sys.stdout.write("push gate: the push sends no commit, so no check runs\n")
         return 0
     steps: list[tuple[str, Callable[[], str | None]]] = [(TRACKED, tracked_problems)]
-    steps += [(check.name, functools.partial(run_check, check)) for check in secret_checks(commits)]
-    steps += [(MESSAGES, lambda: commit_message_problems(commits))]
-    steps += [(HEAD, lambda: head_problems(updates, remote))] if saved is not None else []
+    steps += [(check.name, functools.partial(run_check, check)) for check in secret_checks(ranges, commits)]
+    steps += [(MESSAGES, lambda: commit_message_problems(commits)), (HEAD, lambda: head_problems(updates))]
     steps.append((PRIVACY, privacy_problems))
-    changed, deleted = changed_files(repo, commits)
+    changed, deleted = changed_files(repo, commits_of(checked_ranges(ranges)))
     steps += [
         (check.name, functools.partial(run_check, check))
         for check in [*changed_file_checks(repo, changed, deleted=tuple(deleted)), *dependency_checks(changed)]
@@ -374,4 +419,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main())
+    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main("" if sys.stdin.isatty() else sys.stdin.read()))

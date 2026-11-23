@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from scripts.process import CompletedProcess, run_command
-from scripts.quality import push_gate, push_guard_hook
+from scripts.quality import push_gate, push_hook
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository
-from tests.fast.test_push_gate import GOOD_CODE, GOOD_TEST, HOOK, PYPROJECT, planted_address, planted_token
+from tests.fast.test_push_gate import GOOD_CODE, GOOD_TEST, PYPROJECT, planted_address, planted_token
 
 
 class PushGateTest(TemporaryRepository):
@@ -43,8 +43,7 @@ class PushGateTest(TemporaryRepository):
         self.write("notes.txt", "start\n")
         self.commit("chore: baseline")
         self.git("push", "--quiet", "origin", "main")
-        run_command(sys.executable, ["-m", "pre_commit", "install", "--hook-type", HOOK], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS, check=True)
-        push_guard_hook.install(self.repo)
+        push_hook.install(self.repo)
 
     def write(self, path: str, text: str) -> None:
         (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
@@ -153,11 +152,11 @@ class PushGateTest(TemporaryRepository):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertFalse(self.remote_has(self.remote, "refs/heads/extra"))
 
-    def test_a_tag_on_a_commit_that_the_remote_holds_runs_no_check(self) -> None:
+    def test_a_tag_on_a_commit_that_the_remote_holds_passes(self) -> None:
+        """A new tag names no remote ref, so the history is scanned conservatively; it is clean, so the push passes."""
         self.git("tag", "v1")
         run = self.push_to("origin", "v1")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertNotIn("push gate", run.stdout + run.stderr)
 
     def test_a_secret_in_the_body_of_a_valid_commit_message_stops_the_push(self) -> None:
         self.write("notes.txt", "second\n")
@@ -201,6 +200,62 @@ class PushGateTest(TemporaryRepository):
         program, *arguments = shlex.split(entry)
         run = run_command(str(ROOT / program), [*arguments, "."], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS)
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+
+    def run_gate(self, stdin: str = "") -> CompletedProcess[str]:
+        """The gate run by hand, as a person would: nothing on its standard input."""
+        return run_command(sys.executable, ["-m", "scripts.quality.push_gate"], cwd=self.repo, env=self.env, timeout=300, input_text=stdin)
+
+    def test_a_delete_only_push_leaves_nothing_behind_for_a_later_manual_run(self) -> None:
+        """Round 2, finding 1: the saved ref lines of a push that sent only a delete must not stand for a later run of the gate."""
+        self.assertEqual(self.push_to("origin", "main:extra").returncode, 0)
+        self.assertEqual(self.push_to("origin", ":extra").returncode, 0)
+        self.write("notes.txt", f"token {planted_token()}\n")
+        self.commit("chore: add a note")
+        run = self.run_gate()
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn(f"push gate stopped by {push_gate.SECRETS}", run.stderr)
+        self.assertFalse(list((self.repo / ".git").glob("push_gate_*")), "no file of saved ref lines is left in the Git folder")
+
+    def test_two_refs_in_one_push_that_share_a_secret_commit_are_both_refused(self) -> None:
+        self.write("notes.txt", f"token {planted_token()}\n")
+        self.commit("chore: add a note")
+        self.git("checkout", "--quiet", "-b", "side")
+        self.write("other.txt", "side\n")
+        self.commit("chore: side note")
+        self.git("checkout", "--quiet", "main")
+        run = self.push_to("origin", "main", "side")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"push gate stopped by {push_gate.SECRETS}", run.stdout + run.stderr)
+        self.assertFalse(self.remote_has(self.remote, "refs/heads/side"))
+        self.assertNotEqual(self.remote_head(), self.git("rev-parse", "HEAD").stdout.strip())
+
+    def test_a_source_expression_with_a_space_is_scanned(self) -> None:
+        """The local ref of a pushed line may hold spaces: the last three fields are the fixed ones."""
+        self.write("notes.txt", f"token {planted_token()}\n")
+        self.commit("chore: add a note")
+        run = self.push_to("origin", "HEAD@{0 seconds ago}:refs/heads/viaspace")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"push gate stopped by {push_gate.SECRETS}", run.stdout + run.stderr)
+        self.assertFalse(self.remote_has(self.remote, "refs/heads/viaspace"))
+
+    def test_a_changed_push_url_does_not_let_the_old_tracking_refs_hide_the_history(self) -> None:
+        self.write("notes.txt", f"token {planted_token()}\n")
+        self.commit("chore: add a note")
+        self.assertEqual(self.push_to("--no-verify", "origin", "main").returncode, 0, "the secret reached the first receiver without the gate")
+        other = self.make_remote("elsewhere")
+        self.git("remote", "set-url", "origin", str(other))
+        run = self.push_to("origin", "main")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"push gate stopped by {push_gate.SECRETS}", run.stdout + run.stderr)
+        self.assertFalse(self.remote_has(other, "refs/heads/main"))
+
+    def test_the_hosted_commit_range_check_finds_a_secret_in_the_body_of_a_valid_message(self) -> None:
+        self.write("notes.txt", "second\n")
+        self.commit(f"chore: add a note\n\ntoken {planted_token()}")
+        run = run_command(sys.executable, ["-m", "scripts.quality.repo_checks", "commit-range", "HEAD"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("secret", run.stderr)
+        self.assertNotIn(planted_token(), run.stdout + run.stderr)
 
     def test_a_message_that_is_not_a_conventional_commit_stops_the_push(self) -> None:
         self.write("notes.txt", "second\n")
@@ -247,10 +302,10 @@ class PushGateTest(TemporaryRepository):
         self.assert_refused_by(push_gate.QUICK)
 
     def test_a_push_that_sends_no_commit_runs_no_check(self) -> None:
-        """Pre-commit starts the gate only when the push sends commits: the push of the commit that the remote already holds prints no gate result."""
+        """The push of the commit that the remote already holds sends nothing: the gate says so and runs no check."""
         run = self.push()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertNotIn("push gate", run.stdout + run.stderr)
+        self.assertIn("the push sends no commit", run.stdout + run.stderr)
 
 
 if __name__ == "__main__":

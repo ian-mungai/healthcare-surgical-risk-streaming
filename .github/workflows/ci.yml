@@ -23,6 +23,8 @@ concurrency:
 # skipped job fails the run, and unless every guard shard set its own success output, because GitHub can report success for a leg that never ran.
 # The job "headroom" is outside the required check and waits for it: it reads the run's jobs, the required job included, and fails any job over 80% of its timeout. Each timeout is at least twice the
 # duration recorded beside it. tests/fast/test_ci_workflow.py holds the workflow to all of this.
+# The manual stage that the hooks job runs also scans every lock file for vulnerabilities (Trivy) and every commit message of the history for secrets. Terraform providers
+# are pinned by hash in infra/.terraform.lock.hcl and are not vulnerability-scanned: Trivy 0.76.2 detects no package in a Terraform lock file.
 jobs:
   hooks:
     name: Hooks on every file and the commit messages

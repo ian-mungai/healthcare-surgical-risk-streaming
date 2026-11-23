@@ -23,7 +23,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.process import CompletedProcess, run_command
-from scripts.quality import install_tools, push_gate, push_guard_hook, repo_checks, worktree_scan_hook
+from scripts.quality import install_tools, push_gate, push_hook, repo_checks, worktree_scan_hook
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository, git_in
 
@@ -130,7 +130,7 @@ class SelectionTest(unittest.TestCase):
             self.assertEqual(push_gate.select_tests(root, ["app/unrelated.py"]), ["tests.fast.test_other"])
             self.assertEqual(push_gate.select_tests(root, ["app/a.py", "app/unrelated.py"]), ["tests.fast.test_a", "tests.fast.test_other"])
 
-    def test_a_deleted_file_selects_the_tests_that_name_it_and_a_terraform_lock_file_the_dependency_scan(self) -> None:
+    def test_a_deleted_file_selects_the_tests_that_name_it_and_a_terraform_lock_file_is_not_scanned(self) -> None:
         with tempfile.TemporaryDirectory(prefix="push_gate_deleted_") as folder:
             root = Path(folder)
             for name, text in {"tests/__init__.py": "", "tests/fast/__init__.py": "", "tests/fast/test_a.py": "from app.gone import value\n"}.items():
@@ -138,35 +138,70 @@ class SelectionTest(unittest.TestCase):
                 (root / name).write_text(text)
             names = [check.name for check in push_gate.changed_file_checks(root, [], deleted=("app/gone.py",))]
             self.assertEqual(names, [push_gate.QUICK])
-            self.assertEqual(push_gate.changed_file_checks(root, [], deleted=("app/other.py",)), [])
-        self.assertEqual([check.name for check in push_gate.dependency_checks(["infra/.terraform.lock.hcl"])], [push_gate.DEPENDENCIES])
+            self.assertEqual(push_gate.changed_file_checks(root, [], deleted=("docs/other.md",)), [])
+        self.assertEqual(push_gate.dependency_checks(["infra/.terraform.lock.hcl"]), [], "Trivy finds no package in a Terraform lock file")
+
+    def test_a_rename_or_a_delete_of_a_python_file_selects_the_whole_quick_group(self) -> None:
+        """Round 2, finding 3: the tests that imported the old path cannot be found from the new graph, so the whole group runs."""
+        with tempfile.TemporaryDirectory(prefix="push_gate_removed_") as folder:
+            root = Path(folder)
+            files = {
+                "tests/__init__.py": "",
+                "tests/fast/__init__.py": "",
+                "tests/fast/test_a.py": "def test() -> None:\n    pass\n",
+                "tests/fast/test_b.py": "def test() -> None:\n    pass\n",
+                "app/new.py": "VALUE = 1\n",
+            }
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            both = ("-m", "unittest", "tests.fast.test_a", "tests.fast.test_b")
+            for label, changed, removed in (("a rename", ["app/new.py"], ("app/old.py",)), ("a delete", [], ("app/old.py",))):
+                with self.subTest(label=label):
+                    quick = [check for check in push_gate.changed_file_checks(root, changed, deleted=removed) if check.name == push_gate.QUICK]
+                    self.assertEqual([check.arguments for check in quick], [both])
+            self.assertEqual(push_gate.changed_file_checks(root, [], deleted=("docs/old.md",)), [], "a removed file that is not Python selects only by name")
+
+    def test_the_changed_files_of_a_rename_name_the_new_path_and_list_the_old_one_as_removed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="push_gate_rename_") as folder:
+            repo = Path(folder)
+            git_in(repo, "init", "--quiet")
+            (repo / "old.py").write_text("VALUE = 1\n" * 20)
+            git_in(repo, "add", "--", ".")
+            git_in(repo, "-c", "user.name=T", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "chore: add")
+            git_in(repo, "mv", "old.py", "new.py")
+            git_in(repo, "-c", "user.name=T", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "refactor: rename")
+            commits = git_in(repo, "rev-list", "HEAD").stdout.split()
+            with mock.patch.object(repo_checks, "git", lambda *args, **kwargs: git_in(repo, *args, keep_newlines=kwargs.get("keep_newlines", False)).stdout):
+                self.assertEqual(push_gate.changed_files(repo, commits[:1]), (["new.py"], ["old.py"]))
 
     def test_a_file_that_no_test_imports_or_names_selects_no_module(self) -> None:
         self.assertEqual(push_gate.select_tests(ROOT, [UNLISTED]), [])
 
 
 class ConfigurationTest(unittest.TestCase):
-    """Setup installs the push gate with the other hooks, and only the push gate runs at the push."""
+    """The hooks that pre-commit installs, and the manual stage that the hosted run adds."""
 
     def setUp(self) -> None:
         config: Any = load_yaml((ROOT / ".pre-commit-config.yaml").read_text())
         self.config = config
         self.hooks: dict[str, Any] = {hook["id"]: hook for repo in config["repos"] for hook in repo["hooks"]}
 
-    def test_setup_installs_the_commit_the_commit_message_and_the_push_hooks(self) -> None:
-        self.assertEqual(self.config["default_install_hook_types"], ["pre-commit", "commit-msg", "pre-push"])
+    def test_pre_commit_installs_the_commit_and_commit_message_hooks_and_no_push_hook(self) -> None:
+        self.assertEqual(self.config["default_install_hook_types"], ["pre-commit", "commit-msg"])
 
-    def test_the_push_gate_runs_at_the_push_and_nowhere_else(self) -> None:
-        hook = self.hooks["push-gate"]
-        self.assertEqual(
-            (hook["stages"], hook["entry"], hook["pass_filenames"], hook["always_run"]),
-            (["pre-push"], ".venv/bin/python -m scripts.quality.push_gate", False, True),
-        )
-        self.assertEqual([name for name, each in self.hooks.items() if "pre-push" in each.get("stages", ())], ["push-gate"])
+    def test_the_push_gate_is_no_pre_commit_hook_because_pre_commit_gives_its_hooks_no_input(self) -> None:
+        self.assertNotIn("push-gate", self.hooks)
+        self.assertEqual([name for name, each in self.hooks.items() if "pre-push" in each.get("stages", ())], [])
 
-    def test_the_full_check_stage_does_not_run_the_push_gate(self) -> None:
-        """``make check`` runs the manual stage in the hosted run: the gate reads the unpushed commits, which a hosted checkout has none of."""
-        self.assertNotIn("manual", self.hooks["push-gate"]["stages"])
+    def test_the_hosted_manual_stage_scans_the_messages_of_the_whole_history(self) -> None:
+        hook = self.hooks["commit-message-history"]
+        self.assertEqual((hook["stages"], hook["entry"]), (["manual"], ".venv/bin/python -m scripts.quality.repo_checks commit-range HEAD"))
+
+    def test_the_hook_text_runs_the_gate_with_the_arguments_and_the_input_of_git(self) -> None:
+        self.assertIn('.venv/bin/python -m scripts.quality.push_gate "$@"', push_hook.HOOK_TEXT)
+        self.assertIn('refs="$(cat)"', push_hook.HOOK_TEXT)
+        self.assertNotIn("push_gate_refs", push_hook.HOOK_TEXT)
 
     def test_the_hosted_history_scan_reads_merge_diffs_as_the_push_scan_does(self) -> None:
         self.assertIn('"--log-opts=-m --all"', self.hooks["gitleaks-history"]["entry"])
@@ -185,7 +220,7 @@ class ConfigurationTest(unittest.TestCase):
                 (repo / name).write_text("x\n")
             git_in(repo, "add", "--", ".")
             with mock.patch.object(repo_checks, "git", lambda *args, **kwargs: git_in(repo, *args, keep_newlines=True).stdout):
-                self.assertEqual(push_gate.tracked_lock_files(), ["infra/.terraform.lock.hcl", "requirements.txt", "spark/requirements.txt"])
+                self.assertEqual(push_gate.tracked_lock_files(), ["requirements.txt", "spark/requirements.txt"])
 
 
 class HookEnvironmentTest(unittest.TestCase):
@@ -209,85 +244,96 @@ class HookEnvironmentTest(unittest.TestCase):
             self.assertTrue((other / ".git" / "index").is_file(), "the new repository got the files")
 
 
-class PushGuardHookTest(TemporaryRepository):
-    """The guard hook that runs before pre-commit stashes the unstaged changes, and its installer."""
+class PredecessorGuardTest(TemporaryRepository):
+    """Round 2, finding 4: the guards of earlier versions sit in ``pre-push.legacy`` and refuse a push that sends only deletes; the installer removes them."""
+
+    def test_the_installer_removes_a_shipped_predecessor_guard_and_keeps_an_older_hook_of_the_owner(self) -> None:
+        legacy = self.repo / ".git" / "hooks" / "pre-push.legacy"
+        for text in push_hook.PREDECESSOR_TEXTS:
+            legacy.write_text(text)
+            legacy.chmod(0o755)
+            with mock.patch.object(install_tools, "ROOT", self.repo):
+                self.assertTrue(install_tools.settle_push_guard(check=False))
+            self.assertFalse(legacy.exists(), "the predecessor guard is gone")
+        legacy.write_text("#!/bin/sh\necho the owner's own hook\n")
+        with mock.patch.object(install_tools, "ROOT", self.repo):
+            install_tools.settle_push_guard(check=False)
+        self.assertTrue(legacy.exists(), "a hook that the project never shipped stays")
+
+
+class PushHookTest(TemporaryRepository):
+    """The plain pre-push hook that runs the gate with Git's input, and its installer."""
 
     def hook(self) -> Path:
-        return self.repo / ".git" / "hooks" / push_guard_hook.HOOK_NAME
+        return self.repo / ".git" / "hooks" / push_hook.HOOK_NAME
 
     def test_the_installer_writes_the_executable_hook_and_a_rerun_changes_nothing(self) -> None:
-        self.assertFalse(push_guard_hook.installed(self.repo))
-        self.assertTrue(push_guard_hook.install(self.repo))
-        self.assertTrue(push_guard_hook.installed(self.repo))
+        self.assertFalse(push_hook.installed(self.repo))
+        self.assertTrue(push_hook.install(self.repo))
+        self.assertTrue(push_hook.installed(self.repo))
         self.assertTrue(self.hook().stat().st_mode & stat.S_IXUSR)
-        self.assertFalse(push_guard_hook.install(self.repo))
+        self.assertFalse(push_hook.install(self.repo))
 
     def test_it_is_a_hook_of_its_own_and_leaves_the_scan_hook_alone(self) -> None:
-        push_guard_hook.install(self.repo)
+        push_hook.install(self.repo)
         self.assertFalse(worktree_scan_hook.installed(self.repo))
         worktree_scan_hook.install(self.repo)
-        self.assertTrue(push_guard_hook.installed(self.repo))
+        self.assertTrue(push_hook.installed(self.repo))
         self.assertTrue(worktree_scan_hook.installed(self.repo))
 
-    def test_an_older_pre_push_hook_is_kept_and_still_runs_after_the_guard(self) -> None:
-        older = '#!/bin/sh\necho older hook ran with "$@" >&2\nexit 7\n'
+    def stub_gate(self, exit_code: int) -> None:
+        """A gate that records its arguments and input and exits as told, where the hook looks for it."""
+        stub = self.repo / ".venv" / "bin" / "python"
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(f'#!/bin/sh\necho "gate $@" > "{self.repo}/gate_args"\ncat > "{self.repo}/gate_input"\nexit {exit_code}\n')
+        stub.chmod(0o755)
+
+    def test_an_older_pre_push_hook_is_kept_and_runs_after_the_gate_with_the_same_arguments_and_input(self) -> None:
+        older = f'#!/bin/sh\necho "older $@" > "{self.repo}/older_args"\ncat > "{self.repo}/older_input"\nexit 7\n'
         self.hook().write_text(older)
         self.hook().chmod(0o755)
-        push_guard_hook.install(self.repo)
-        self.assertEqual((self.hook().with_name(push_guard_hook.KEPT_NAME)).read_text(), older)
-        run = run_command("sh", [str(self.hook()), "origin", "url"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS)
-        self.assertEqual(run.returncode, 7)
-        self.assertIn("older hook ran with origin url", run.stderr)
+        push_hook.install(self.repo)
+        self.assertEqual(self.hook().with_name(push_hook.KEPT_NAME).read_text(), older)
+        self.stub_gate(0)
+        lines = f"HEAD@{{2 days ago}} {'a' * 40} refs/heads/main {'b' * 40}\n"
+        run = self.run_hook(lines)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertEqual((self.repo / "gate_input").read_text(), lines, "the gate reads Git's input, spaces and all")
+        self.assertEqual((self.repo / "older_input").read_text(), lines)
+        self.assertEqual((self.repo / "gate_args").read_text(), "gate -m scripts.quality.push_gate origin url\n")
+        self.assertEqual((self.repo / "older_args").read_text(), "older origin url\n")
+
+    def test_a_failed_gate_stops_the_hook_and_the_older_hook_does_not_run(self) -> None:
+        self.hook().write_text(f'#!/bin/sh\necho ran > "{self.repo}/older_ran"\n')
+        self.hook().chmod(0o755)
+        push_hook.install(self.repo)
+        self.stub_gate(3)
+        self.assertEqual(self.run_hook("x\n").returncode, 3)
+        self.assertFalse((self.repo / "older_ran").exists())
+
+    def test_the_hook_saves_no_file_of_the_input(self) -> None:
+        push_hook.install(self.repo)
+        self.stub_gate(0)
+        before = sorted(path.name for path in (self.repo / ".git").iterdir())
+        self.run_hook(f"refs/heads/main {'a' * 40} refs/heads/main {ZERO}\n")
+        self.assertEqual(sorted(path.name for path in (self.repo / ".git").iterdir()), before)
 
     def test_a_second_older_hook_is_refused_and_nothing_is_overwritten(self) -> None:
-        for name in (push_guard_hook.HOOK_NAME, push_guard_hook.KEPT_NAME):
+        for name in (push_hook.HOOK_NAME, push_hook.KEPT_NAME):
             (self.repo / ".git" / "hooks" / name).write_text("#!/bin/sh\n")
         with self.assertRaises(worktree_scan_hook.KeptHookError):
-            push_guard_hook.install(self.repo)
+            push_hook.install(self.repo)
 
-    def test_the_hook_refuses_a_changed_tracked_file_in_the_index_or_the_working_tree_and_passes_an_untracked_one(self) -> None:
-        push_guard_hook.install(self.repo)
-        (self.repo / "tracked.txt").write_text("one\n")
-        self.git("add", "--", "tracked.txt")
-        self.git("commit", "--quiet", "-m", "chore: add a file")
-        sends = f"refs/heads/main {self.git('rev-parse', 'HEAD').stdout.strip()} refs/heads/main {ZERO}\n"
-        for label, change in (
-            ("working tree", lambda: (self.repo / "tracked.txt").write_text("two\n")),
-            ("index", lambda: self.git("add", "--", "tracked.txt")),
-        ):
-            with self.subTest(label=label):
-                change()
-                run = self.run_hook(sends)
-                self.assertEqual(run.returncode, 1)
-                self.assertIn(f"push gate stopped by {push_gate.TRACKED}", run.stderr)
-                self.assertIn("tracked.txt", run.stderr)
-        deletes = f"(delete) {ZERO} refs/heads/extra {'1' * 40}\n"
-        self.assertEqual(self.run_hook(deletes).returncode, 0, "a push of deletes sends nothing")
-        self.git("checkout", "--quiet", "HEAD", "--", "tracked.txt")
-        (self.repo / "untracked.txt").write_text("new\n")
-        self.assertEqual(self.run_hook(sends).returncode, 0)
+    def test_a_pre_push_script_that_pre_commit_wrote_is_replaced_and_not_kept(self) -> None:
+        self.hook().write_text("#!/usr/bin/env python3\n# File generated by pre-commit: https://pre-commit.com\n")
+        self.hook().chmod(0o755)
+        self.assertFalse(push_hook.installed(self.repo))
+        push_hook.install(self.repo)
+        self.assertTrue(push_hook.installed(self.repo))
+        self.assertFalse(self.hook().with_name(push_hook.KEPT_NAME).exists())
 
     def run_hook(self, sends: str) -> CompletedProcess[str]:
         return run_command("sh", [str(self.hook()), "origin", "url"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS, input_text=sends)
-
-    def test_the_hook_saves_the_remote_and_the_updates_for_the_gate_and_the_gate_reads_them_once(self) -> None:
-        push_guard_hook.install(self.repo)
-        sends = f"refs/heads/main {'a' * 40} refs/heads/main {'b' * 40}\n(delete) {ZERO} refs/heads/old {'c' * 40}\n"
-        self.assertEqual(self.run_hook(sends).returncode, 0)
-        saved = self.repo / ".git" / push_gate.REFS_FILE
-        read = push_gate.read_pushed_updates(saved)
-        self.assertEqual(
-            read,
-            (
-                "origin",
-                [push_gate.Update("refs/heads/main", "a" * 40, "refs/heads/main", "b" * 40), push_gate.Update("(delete)", ZERO, "refs/heads/old", "c" * 40)],
-            ),
-        )
-        if read is None:
-            self.fail("the gate read no saved updates")
-        self.assertTrue(read[1][1].deletes and not read[1][0].deletes and not read[1][0].creates)
-        self.assertFalse(saved.exists())
-        self.assertIsNone(push_gate.read_pushed_updates(saved))
 
     def test_the_installer_program_installs_and_checks_the_guard(self) -> None:
         with mock.patch.object(install_tools, "ROOT", self.repo):
