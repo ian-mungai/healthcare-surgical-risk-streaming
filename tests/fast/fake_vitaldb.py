@@ -1,13 +1,24 @@
 """A stand-in for the publisher's library (``vitaldb`` 1.7.2) at the boundary of the decoder, for fast tests that drive the decoder's own functions.
 
 ``FakeVitalFile.load_vital`` is a port of ``VitalFile.load_vital`` of the installed library (``vitaldb/utils.py``, lines 1879 to 2210), reduced to the parts
-that decide what the decoder sees: the match of a requested name against a track's name (lines 2059 to 2066: a name matches a track when it is the track's whole
-name, or when the track's name ends with it), the packet limit of non-packed files (line 1932), the skip of a record that does not fit its packet and of a
-record of a track that was not selected, the decode of a numeric value with the platform's native format code (line 2159: ``l`` and ``L`` are eight bytes on a
-64-bit Linux, so a four-byte value fails to unpack, the read stops and ``False`` is returned), the text decode that drops invalid bytes (lines 34 to 44) and the
-end of a read at an error. numpy is not in the tools environment, so a waveform record's samples are a small object with the attributes that the decoder reads.
+that decide what the decoder sees. Each part names the lines it follows:
 
-Its limit: it is a port made by reading the library, so a difference that the port misses is caught only by the acceptance test, which runs the real library.
+- the packet limit of a file that is not packed (line 1932);
+- the description of a track, which is registered for its declared length and its place in the file order before it is matched (lines 2077 and 2078);
+- the match of a requested name against a track's name (lines 2059 to 2066): a name matches a track when it is the track's whole name, or when the track's name
+  ends with it;
+- the early end of a read of a packed file once the last wanted track's records are consumed (lines 2089 to 2099 and 2184 to 2187);
+- the record of a track that was not selected: it is skipped, and when its track declared a length the reader seeks over the rest of that length without
+  reading it (lines 2112 to 2119), so the records of other tracks that lie inside that length are lost;
+- the skip of a record that does not fit its packet, and the decode of a numeric value with the platform's native format code (line 2159: ``l`` and ``L`` are
+  eight bytes on a 64-bit Linux, so a four-byte value fails to unpack, the read stops and ``False`` is returned);
+- the reset command, after which the records of the track named ``EVENT`` that were read before it are gone (lines 2169 to 2173);
+- the text decode that drops invalid bytes (lines 34 to 44) and the end of a read at an error.
+
+numpy is not in the tools environment, so a waveform record's samples are a small object with the attributes that the decoder reads.
+
+Its limit: it is a port made by reading the library. ``tests/fast/test_fake_vitaldb_parity.py`` runs the same synthetic files through the real library, where
+it is installed (the Spark image), and requires the same records, so a difference that the port misses fails there. It is skipped where it is not installed.
 """
 
 from __future__ import annotations
@@ -21,6 +32,7 @@ from contextlib import contextmanager
 from typing import Any
 
 FMT_TYPE_LEN = {1: ("f", 4), 2: ("d", 8), 3: ("b", 1), 4: ("B", 1), 5: ("h", 2), 6: ("H", 2), 7: ("l", 4), 8: ("L", 4)}
+OPTIONAL_TRACK_FIELDS = (("<f", 4), ("<f", 4), ("<I", 4), ("<f", 4), ("<d", 8), ("<d", 8), ("<B", 1), ("<I", 4), ("<I", 4), ("<d", 8), ("<d", 8))
 
 
 class FakeDtype:
@@ -44,23 +56,10 @@ class FakeSamples:
 
 
 class FakeTrack:
-    def __init__(
-        self,
-        name: str,
-        type: int,
-        fmt: int,
-        unit: str,
-        srate: float,
-        mindisp: float,
-        maxdisp: float,
-        col: int,
-        montype: int,
-        gain: float,
-        offset: float,
-        dname: str,
-    ) -> None:
-        self.name, self.type, self.fmt, self.unit, self.srate = name, type, fmt, unit, srate
-        self.mindisp, self.maxdisp, self.col, self.montype, self.gain, self.offset, self.dname = mindisp, maxdisp, col, montype, gain, offset, dname
+    def __init__(self, name: str, type: int, fmt: int, unit: str, fields: list[Any], dname: str) -> None:
+        self.name, self.type, self.fmt, self.unit, self.dname = name, type, fmt, unit, dname
+        mindisp, maxdisp, col, srate, gain, offset, montype = fields[:7]
+        self.mindisp, self.maxdisp, self.col, self.srate, self.gain, self.offset, self.montype = mindisp, maxdisp, col, srate, gain, offset, montype
         self.recs: list[dict[str, Any]] = []
 
 
@@ -76,9 +75,7 @@ def unpack_text(buf: bytes, pos: int) -> tuple[str, int]:
 
 class FakeVitalFile:
     drop_records: dict[str, int] = {}  # a test sets it to make the stand-in skip the nth record of a track, as the real library skips a record it cannot place
-    shift_times: dict[
-        str, int
-    ] = {}  # a test sets it to give the nth record of a track another time than the file holds, as a record that is read wrongly would
+    shift_times: dict[str, int] = {}  # a test sets it to give the nth record of a track another time than the file holds
     hidden_tracks: set[str] = set()  # a test sets it to make the stand-in not register a track that the file declares
     errors: list[str] = []  # the messages that the real library prints when a read ends at an error
     loads: list[tuple[str, list[str] | None, bool]] = []  # each read: the path, the names asked for, and whether it was a header-only read
@@ -107,7 +104,11 @@ class FakeVitalFile:
         position = 10 + headerlen
         tid_dtnames: dict[int, str] = {}
         did_dnames: dict[int, str] = {}
+        tid_reclens: dict[int, int] = {}
+        trk_order_tids: list[int] = []
         seen: dict[str, int] = {}
+        rec_consumed = 0
+        stop_offset: int | None = None
         try:
             while position + 5 <= len(raw):
                 kind, packet_len = raw[position], struct.unpack_from("<I", raw, position + 1)[0]
@@ -127,43 +128,62 @@ class FakeVitalFile:
                     self.devs[name] = FakeDevice(name, devtype, port)
                     did_dnames[did] = name
                 elif kind == 0:
-                    self.read_track(buf, track_names, exclude, tid_dtnames, did_dnames)
+                    self.read_track(buf, track_names, exclude, tid_dtnames, did_dnames, tid_reclens, trk_order_tids)
                 elif kind == 1:
-                    self.read_record(buf, tid_dtnames, header_only, seen)
+                    if stop_offset is None:
+                        stop_offset = -1
+                        if self.packed and track_names:
+                            wanted = [index for index, tid in enumerate(trk_order_tids) if tid in tid_dtnames]
+                            if wanted and all(tid_reclens.get(tid, 0) > 0 for tid in trk_order_tids):
+                                stop_offset = sum(tid_reclens[tid] for tid in trk_order_tids[: wanted[-1] + 1])
+                    rec_consumed += 5 + packet_len
+                    if len(buf) < 12:
+                        continue
+                    tid = struct.unpack_from("<H", buf, 10)[0]
+                    if tid not in tid_dtnames:
+                        if tid in tid_reclens and tid_reclens[tid] > 5 + packet_len:
+                            skipped = tid_reclens[tid] - (5 + packet_len)
+                            position += skipped
+                            rec_consumed += skipped
+                        if stop_offset > 0 and rec_consumed >= stop_offset:
+                            break
+                        continue
+                    if self.read_record(buf, tid_dtnames[tid], header_only, seen):
+                        continue
+                elif kind == 6 and buf[0] == 6 and "EVENT" in self.trks:
+                    self.trks["EVENT"].recs = []
+                if stop_offset is not None and stop_offset > 0 and rec_consumed >= stop_offset:
+                    break
         except Exception as error:  # the library's own catch-all, which prints the message and returns False
             FakeVitalFile.errors.append(str(error))
             return False
         return True
 
-    def read_track(self, buf: bytes, track_names: Any, exclude: Any, tid_dtnames: dict[int, str], did_dnames: dict[int, str]) -> None:
+    def read_track(
+        self,
+        buf: bytes,
+        track_names: Any,
+        exclude: Any,
+        tid_dtnames: dict[int, str],
+        did_dnames: dict[int, str],
+        tid_reclens: dict[int, int],
+        trk_order_tids: list[int],
+    ) -> None:
         tid, trktype, fmt = struct.unpack_from("<HBB", buf, 0)
         if trktype in (1, 2) and fmt not in FMT_TYPE_LEN:
             return
         tname, pos = unpack_text(buf, 4)
-        unit, mindisp, maxdisp, col, srate, gain, offset, montype, did = "", 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0, 0
+        unit = ""
         if len(buf) > pos:
             unit, pos = unpack_text(buf, pos)
-        for width, name in ((4, "mindisp"), (4, "maxdisp"), (4, "col"), (4, "srate"), (8, "gain"), (8, "offset"), (1, "montype"), (4, "did")):
+        fields: list[Any] = []
+        for code, width in OPTIONAL_TRACK_FIELDS:
             if len(buf) > pos:
-                code = {"mindisp": "<f", "maxdisp": "<f", "col": "<I", "srate": "<f", "gain": "<d", "offset": "<d", "montype": "<B", "did": "<I"}[name]
-                value = struct.unpack_from(code, buf, pos)[0]
+                fields.append(struct.unpack_from(code, buf, pos)[0])
                 pos += width
-                if name == "mindisp":
-                    mindisp = value
-                elif name == "maxdisp":
-                    maxdisp = value
-                elif name == "col":
-                    col = value
-                elif name == "srate":
-                    srate = value
-                elif name == "gain":
-                    gain = value
-                elif name == "offset":
-                    offset = value
-                elif name == "montype":
-                    montype = value
-                else:
-                    did = value
+            else:
+                fields.append(0)
+        mindisp, maxdisp, col, srate, gain, offset, montype, did, reclen = fields[:9]
         dname = did_dnames.get(did, "") if did and did in did_dnames else ""
         dtname = f"{dname}/{tname}" if dname else tname
         matched = False
@@ -175,54 +195,51 @@ class FakeVitalFile:
                     matched = True
         if exclude and matched:
             matched = dtname not in exclude
+        tid_reclens[tid] = reclen
+        trk_order_tids.append(tid)
         if not matched or dtname in FakeVitalFile.hidden_tracks:
             return
         tid_dtnames[tid] = dtname
-        self.trks[dtname] = FakeTrack(tname, trktype, fmt, unit, srate, mindisp, maxdisp, col, montype, gain, offset, dname)
+        self.trks[dtname] = FakeTrack(tname, trktype, fmt, unit, [mindisp, maxdisp, col, srate, gain, offset, montype], dname)
 
-    def read_record(self, buf: bytes, tid_dtnames: dict[int, str], header_only: bool, seen: dict[str, int]) -> None:
-        if len(buf) < 12:
-            return
+    def read_record(self, buf: bytes, dtname: str, header_only: bool, seen: dict[str, int]) -> bool:
+        """Decode one record of a selected track. True when the record is skipped, as the real loop's ``continue`` skips it."""
         infolen = struct.unpack_from("<H", buf, 0)[0]
         dt = struct.unpack_from("<d", buf, 2)[0]
-        tid = struct.unpack_from("<H", buf, 10)[0]
         pos = 2 + infolen
-        if tid not in tid_dtnames:
-            return
-        dtname = tid_dtnames[tid]
         trk = self.trks[dtname]
         if self.dtstart == 0 or (dt > 0 and dt < self.dtstart):
             self.dtstart = dt
         if dt > self.dtend:
             self.dtend = dt
         if header_only:
-            return
+            return True
         seen[dtname] = seen.get(dtname, 0) + 1
         if FakeVitalFile.drop_records.get(dtname) == seen[dtname]:
-            return
+            return True
         if FakeVitalFile.shift_times.get(dtname) == seen[dtname]:
             dt += 1.0
         if trk.type == 1:
             fmtcode, fmtlen = FMT_TYPE_LEN[trk.fmt]
             if len(buf) < pos + 4:
-                return
+                return True
             (nsamp,) = struct.unpack_from("<I", buf, pos)
             pos += 4
             if len(buf) < pos + nsamp * fmtlen:
-                return
+                return True
             trk.recs.append({"dt": dt, "val": FakeSamples(buf[pos : pos + nsamp * fmtlen], fmtcode, fmtlen)})
         elif trk.type == 2:
             fmtcode, fmtlen = FMT_TYPE_LEN[trk.fmt]
             if len(buf) < pos + fmtlen:
-                return
+                return True
             code = ("<q" if fmtcode == "l" else "<Q") if fmtcode in "lL" else "<" + fmtcode  # the native long is eight bytes: a four-byte value fails here
-            value = struct.unpack_from(code, buf, pos)[0]
-            trk.recs.append({"dt": dt, "val": value})
+            trk.recs.append({"dt": dt, "val": struct.unpack_from(code, buf, pos)[0]})
         elif trk.type == 5:
             pos += 4
             if len(buf) < pos + 4:
-                return
+                return True
             trk.recs.append({"dt": dt, "val": unpack_text(buf, pos)[0]})
+        return False
 
 
 @contextmanager

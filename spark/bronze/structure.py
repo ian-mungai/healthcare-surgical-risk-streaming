@@ -41,6 +41,7 @@ RECORD_TIME_START, RECORD_TRACK_START, RECORD_FIXED_BYTES = 2, 10, 12
 INFO_FIXED_BYTES = 10
 MAX_PACKET_BYTES = 1_000_000
 PACKED_FLAG_AT = 26
+BAD_NAME = "a name is not valid UTF-8, and the library would drop the bytes that are not"
 SAMPLE_BYTES = {1: 4, 2: 8, 3: 1, 4: 1, 5: 2, 6: 2, 7: 4, 8: 4}
 OWN_FORMATS = {7: "<i", 8: "<I"}
 
@@ -149,8 +150,9 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
 
     The stream must be whole, start with the mark ``VITA``, have its header and end on the end of a packet, and no packet may be over the library's limit
     (a non-packed file). A track ID that declares the length of its records must have exactly that many bytes of record packets, each ID by its own declaration
-    even when two share a name. A track that declares none is not checked. A file that
-    is cut at the end of a packet and declares no lengths cannot be told from a shorter recording by this check: the publisher's checksum is what stops it.
+    even when two share a name. A later declaration of an ID that omits the length keeps the earlier length (the library takes the last declaration as it is,
+    so the walk is the stricter reader). A track that declares none is not checked. A file that is cut at the end of a packet and declares no lengths cannot
+    be told from a shorter recording by this check: the publisher's checksum is what stops it.
     The tracks in ``values_for`` have the value of each record read here, which only the numeric formats that the library cannot read allow.
     """
     walk = Walk()
@@ -183,10 +185,18 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
                     walk.problem = CUT_SHORT
                     return walk
                 if kind == DEVICE_PACKET:
-                    did, name = device_name(body)
+                    try:
+                        did, name = device_name(body)
+                    except UnicodeDecodeError:
+                        walk.problem = f"{BAD_NAME} (the device with ID {struct.unpack_from('<I', body)[0]})"
+                        return walk
                     devices[did] = name
                 elif kind == TRACK_PACKET:
-                    track = parse_track(body)
+                    try:
+                        track = parse_track(body)
+                    except UnicodeDecodeError:
+                        walk.problem = f"{BAD_NAME} (the track with ID {struct.unpack_from('<H', body)[0]})"
+                        return walk
                     walk.problem = head_problem(track)
                     if walk.problem:
                         return walk
@@ -199,7 +209,8 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
                         name, WalkedTrack(track.track_type, track.fmt, values=[] if name in values_for and track.fmt in OWN_FORMATS else None)
                     )
                     by_tid[track.tid] = name
-                    declared[track.tid] = track.declared
+                    if track.declared or track.tid not in declared:
+                        declared[track.tid] = track.declared
                 elif kind == RECORD_PACKET:
                     if len(body) < RECORD_FIXED_BYTES:
                         walk.problem = "a record packet is too short to name its track"
@@ -210,8 +221,9 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
                         walk.problem = "a record names a track that the file does not declare before it"
                         return walk
                     track_walked = walk.tracks[name]
-                    walk.problem = record_problem(track_walked, body)
-                    if walk.problem:
+                    found = record_problem(track_walked, body)
+                    if found:
+                        walk.problem = f"{found} (the track {name})"
                         return walk
                     held[tid] += PACKET_HEAD_BYTES + length
                     track_walked.count += 1
@@ -226,9 +238,6 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
         return walk
     except struct.error:
         walk.problem = "a packet is too short for the fields that its type holds"
-        return walk
-    except UnicodeDecodeError:
-        walk.problem = "a device or track name is not valid UTF-8, and the library would drop the bytes that are not"
         return walk
     if any(size and held[tid] != size for tid, size in declared.items()):
         walk.problem = "a track has records of another length than it declares"

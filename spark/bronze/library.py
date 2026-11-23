@@ -1,14 +1,15 @@
 """The reading of a case file with the publisher's library (``vitaldb``), in passes that hold few tracks.
 
 ``VitalFile.load_vital`` streams the gzip file packet by packet but keeps every decoded record of the selected tracks in memory. So the file is read
-in passes: a read of the header alone lists the tracks, then the passes of ``spark/bronze/plan.py`` read the tracks with ``track_names=[...]``. The
+in passes: a read of the header alone lists the tracks, then the passes of ``spark/bronze/plan.py`` read the tracks by whole name. The
 default reads the numeric tracks of a case in one pass and each waveform track in a pass of its own, and the other mode reads every track by itself.
 The records of a track are turned into rows as Spark takes them and freed before the next track's rows are made. The most that one worker holds is a
 pass's records: the largest waveform track of the largest file, or all the numeric tracks of the case.
 
-The library can select more tracks than the one named (it matches a name by its ending). Only the exact track is used, and the others are dropped with the
-library object. The library never says that it stopped at an error: ``load_vital`` returns ``False`` and a cut file returns what it had read. That is why
-``case_problem`` judges a file before any row is made (``spark/bronze/structure.py``) and why every pass checks the library's answer.
+The library takes a requested name as the whole name of a track or as the ending of one (``vitaldb/utils.py`` 1.7.2, lines 2059 to 2066), so a read with
+records passes ``ExactNames``, which holds whole names only, and a track that a read took without being asked for is refused. A read for the header alone
+asks for no name. The library never says that it stopped at an error: ``load_vital`` returns ``False`` and a cut file returns what it had read. That is
+why ``case_problem`` judges a file before any row is made (``spark/bronze/structure.py``) and why every pass checks the library's answer.
 
 A numeric or text reading's case time is the record time minus the anonymised start, in whole microseconds, as the replay's decoder
 (``replay/service/decode.py``) makes it, so a row and the replay's event for the same reading have the same key. A waveform sample's second is placed
