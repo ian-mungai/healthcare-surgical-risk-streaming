@@ -649,19 +649,23 @@ class FieldTest(unittest.TestCase):
         with self.assertRaises(AirbyteError):
             api.job_status(job)
 
-    def test_a_list_page_with_an_entry_that_is_not_an_object_or_a_next_that_is_not_text_refuses_the_list(self) -> None:
-        for name, corrupt in (
-            ("an entry that is a text", lambda answer: answer["data"].append(MARKER)),
-            ("a next that is a number", lambda answer: answer.__setitem__("next", 7)),
-            ("data that is an object", lambda answer: answer.__setitem__("data", {MARKER: MARKER})),
-            ("data that is missing", lambda answer: answer.pop("data")),
-        ):
-            with self.subTest(name):
-                api, stand_in = prepared()
-                stand_in.mutations["GET workspaces"] = corrupt
-                with self.assertRaises(AirbyteError) as raised:
-                    ensure_everything(api)
-                self.assertNotIn(MARKER, str(raised.exception))
+    def test_a_list_page_with_an_entry_that_is_not_an_object_or_a_next_that_is_not_text_refuses_the_list_of_every_kind(self) -> None:
+        labels = ("GET workspaces", f"GET {DEFINITIONS}/sources", f"GET {DEFINITIONS}/destinations", "GET sources", "GET destinations", "GET connections")
+        for label in labels:
+            for name, corrupt in (
+                ("an entry that is a text", lambda answer: answer["data"].append(MARKER)),
+                ("a next that is a number", lambda answer: answer.__setitem__("next", 7)),
+                ("data that is an object", lambda answer: answer.__setitem__("data", {MARKER: MARKER})),
+                ("data that is missing", lambda answer: answer.pop("data")),
+            ):
+                with self.subTest(f"{label}: {name}"):
+                    api, stand_in = prepared()
+                    if label != "GET workspaces":
+                        ensure_everything(api)
+                    stand_in.mutations[label] = corrupt
+                    with self.assertRaises(AirbyteError) as raised:
+                        ensure_everything(api)
+                    self.assertNotIn(MARKER, str(raised.exception))
 
 
 class DeadlineTest(unittest.TestCase):

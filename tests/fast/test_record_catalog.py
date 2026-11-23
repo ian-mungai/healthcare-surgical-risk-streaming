@@ -307,6 +307,12 @@ class IncompletePageTest(unittest.TestCase):
             self.catalog.has_recorded_manifest("a" * 64)
         self.assertIn("cannot establish absence", str(raised.exception))
 
+    def test_a_token_that_comes_back_ends_the_scan_at_the_second_request_and_not_at_the_cap(self) -> None:
+        self.server.fault = more_and({"token": "0"})
+        with self.assertRaises(LoadError):
+            self.catalog.has_recorded_manifest("a" * 64)
+        self.assertLessEqual(len([call for call in self.server.calls if call.endswith("/history")]), 2)
+
     def test_the_last_page_may_carry_no_token_when_it_says_there_is_no_more(self) -> None:
         self.assertFalse(self.catalog.has_recorded_manifest("a" * 64))
 

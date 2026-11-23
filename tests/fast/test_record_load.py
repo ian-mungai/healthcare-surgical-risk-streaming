@@ -1061,7 +1061,7 @@ class OwnershipFirstTest(unittest.TestCase):
         self.assertEqual([], setup.catalog.deleted)
         self.assertEqual([], [call for call in setup.airbyte.calls[calls:] if call.startswith(("ensure_", "start_sync"))])
 
-    def test_the_read_keys_are_checked_before_the_branch_when_both_are_foreign_and_nothing_is_written(self) -> None:
+    def test_when_both_a_read_key_and_the_branch_are_foreign_nothing_is_written(self) -> None:
         setup = Setup(self)
         setup.store.put_object(CLINICAL_KEY, b"stranger")
         setup.catalog.make_branch(BRANCH)
@@ -1166,6 +1166,9 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn(self.MARKER, str(raised.exception))
         self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
         self.assertEqual([], setup.records())
+        cancelled_at = next(at for name, _, at in setup.airbyte.timeouts if name == "cancel_job")
+        self.assertEqual(0.0, cancelled_at, "the job was cancelled at once, not after the sync's whole deadline")
+        self.assertLessEqual(setup.clock.now, 30.0 + 10.0 + 1e-9)
 
     def test_a_job_that_is_pending_or_queued_is_waited_for_like_a_running_one(self) -> None:
         for status in ("pending", "queued", "running"):

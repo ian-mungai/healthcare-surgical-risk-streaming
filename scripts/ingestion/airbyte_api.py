@@ -90,14 +90,7 @@ def check_api_origin(address: str) -> tuple[str, int]:
         port = int(found.group(2)) if found else 0
     except ValueError:
         ip, port = None, 0
-    if (
-        found is None
-        or ip is None
-        or str(ip) != found.group(1)
-        or not 1 <= port <= 65535
-        or str(port) != found.group(2)
-        or not any(ip in network for network in PRIVATE_NETWORKS)
-    ):
+    if found is None or ip is None or not 1 <= port <= 65535 or str(port) != found.group(2) or not any(ip in network for network in PRIVATE_NETWORKS):
         raise AirbyteError("the Airbyte address must be exactly http://<a private IPv4 address>:<port>, with nothing after the port")
     return str(ip), port
 

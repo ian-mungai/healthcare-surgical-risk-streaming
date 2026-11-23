@@ -10,8 +10,8 @@ The order is the contract, and each step stops the load before the next one star
    manifest, the earlier run's record is returned and nothing is copied, started or branched. A history that is longer than the scan and does not hold the
    line cannot prove that the manifest is new, so the load is refused (``cannot establish absence``).
 4. Everything that the run would touch and may not own is found first, before any copy, settings change or sync, and nothing is deleted: a branch of the
-   run's name is refused unless the state file names it and its history holds the hash that it was made at; a version at a read key that the state file does
-   not name is refused; no job of the three connections may be active (the job list must be in the documented shape).
+   run's name is refused unless the state file names it and its history holds the hash that it was made at; no job of the three connections may be active (the
+   job list must be in the documented shape). A version at a read key that the state file does not name is refused by the copy's first look, before any copy.
 5. The exact-version copy of the two CSV tables (``record_copy``) to ``records_input/<run ID>/<SHA-256>/<table>.csv``. A copy whose hash differs fails here.
 6. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again.
 7. The load branch ``load_<run ID>`` is made at the head of main. A branch that the state file records and that the first look found is the leftover of an
@@ -57,7 +57,6 @@ from scripts.ingestion.record_copy import (
     Copied,
     CopyError,
     CopyingStore,
-    check_read_keys_owned,
     confirm_copies,
     copy_bound_versions,
     remove_copies,
@@ -497,7 +496,6 @@ def load_records(
             raise LoadError("the default branch records this manifest but this host keeps no record of its load")
         return earlier
     leftover = owned_leftover(catalog, state, branch)
-    check_read_keys_owned(store, run_id, state)
     if any(airbyte.running_jobs(identity) for identity in airbyte.find_connection_ids().values()):
         raise LoadError("a sync of a record connection is already running")
     copies = copy_bound_versions(store, reference, run_id, state, entries)

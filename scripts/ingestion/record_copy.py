@@ -15,8 +15,6 @@ is unique to the run and to the verified content, and the source reads only that
 it before each sync. ``verify_read_keys`` is the check after the last sync: every read key must hold exactly the one version the run wrote, current or not,
 because a version that was current while Airbyte read, or one restored afterwards, leaves an entry (``copy_changed``).
 
-``check_read_keys_owned`` is the first look at the read prefix, before anything is copied or changed: a version that the ledger does not name is refused.
-
 ``remove_copies`` deletes, by key and version ID, each version that the ledger names. A version leaves the ledger only after the delete of exactly that
 version succeeded (a version that is already gone is not an error for the store's delete), never because a listing did not show it: a listing can stop early
 or be behind. The load step calls it once the run's record is written, so the copies are gone after a load, and keeps them when the load fails, for inspection.
@@ -131,16 +129,6 @@ def current_object(versions: Sequence[ObjectVersion], key: str) -> ObjectVersion
     return found[0] if found else None
 
 
-def refuse_unrecorded(listed: Sequence[ObjectVersion], ledger: CopyLedger) -> None:
-    if any(version.version_id not in ledger.versions(version.key) for version in listed):
-        raise CopyError("a version in the read prefix of the run is not recorded by this run: it is refused and not deleted")
-
-
-def check_read_keys_owned(store: ObjectStore, run_id: str, ledger: CopyLedger) -> None:
-    """Raise ``CopyError`` when the run's read prefix holds an object version or a delete marker that the ledger does not name. Nothing is deleted."""
-    refuse_unrecorded(store.list_versions(read_prefix(run_id)), ledger)
-
-
 def copy_bound_versions(
     store: CopyingStore, reference: ManifestRef, run_id: str, ledger: CopyLedger, entries: Sequence[CheckedFile] | None = None
 ) -> tuple[Copied, ...]:
@@ -156,7 +144,8 @@ def copy_bound_versions(
     listed = store.list_versions(prefix)
     if {version.key for version in listed} - set(wanted):
         raise CopyError("the read prefix of the run holds an object that is not one of its tables")
-    refuse_unrecorded(listed, ledger)
+    if any(version.version_id not in ledger.versions(version.key) for version in listed):
+        raise CopyError("a version in the read prefix of the run is not recorded by this run: it is refused and not deleted")
     copied: list[Copied] = []
     for key, (table, entry) in wanted.items():
         here = [version for version in listed if version.key == key]

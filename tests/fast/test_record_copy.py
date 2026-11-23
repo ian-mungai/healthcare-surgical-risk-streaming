@@ -21,7 +21,6 @@ from scripts.ingestion.record_copy import (
     CopyChanged,
     CopyError,
     S3CopyStore,
-    check_read_keys_owned,
     confirm_copies,
     copy_bound_versions,
     remove_copies,
@@ -423,38 +422,6 @@ class ExactDeleteTest(unittest.TestCase):
         self.assertEqual(0, remove_copies(landed.store, RUN, ledger))
         self.assertEqual([], landed.store.deletes)
         self.assertEqual(frozenset({"v1"}), ledger.versions("somewhere/else.csv"))
-
-
-class OwnedReadKeysTest(unittest.TestCase):
-    """Before anything is copied the run finds a version in its read prefix that it did not record, and deletes nothing."""
-
-    def test_control_a_prefix_that_holds_only_recorded_versions_or_nothing_passes(self) -> None:
-        landed, reference = landed_records()
-        ledger = MemoryLedger()
-        check_read_keys_owned(landed.store, RUN, ledger)
-        copy(landed, reference, ledger)
-        check_read_keys_owned(landed.store, RUN, ledger)
-
-    def test_a_version_that_the_ledger_does_not_name_is_refused_with_a_message_that_names_no_key_and_nothing_is_deleted(self) -> None:
-        landed, reference = landed_records()
-        ledger = MemoryLedger()
-        copy(landed, reference, ledger)
-        landed.store.put_object(CLINICAL_KEY, b"stranger")
-        with self.assertRaises(CopyError) as raised:
-            check_read_keys_owned(landed.store, RUN, ledger)
-        self.assertIn("not recorded", str(raised.exception))
-        self.assertNotIn("clinical_data", str(raised.exception))
-        self.assertEqual([], landed.store.deletes)
-
-    def test_an_object_of_another_name_in_the_prefix_and_a_delete_marker_are_refused_too(self) -> None:
-        landed, _ = landed_records()
-        landed.store.put_object(PREFIX + "other.csv", b"x")
-        with self.assertRaises(CopyError):
-            check_read_keys_owned(landed.store, RUN, MemoryLedger())
-        other, _ = landed_records()
-        other.store.put_delete_marker(CLINICAL_KEY)
-        with self.assertRaises(CopyError):
-            check_read_keys_owned(other.store, RUN, MemoryLedger())
 
 
 class FakeAws:
