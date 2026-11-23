@@ -36,6 +36,8 @@ from scripts.process import TimeoutExpired, run_command
 from scripts.quality import repo_checks
 
 ROOT = Path(__file__).resolve().parents[2]
+# The version of this gate. ``make setup`` installs the shared pre-push hook for it, and the hook refuses a worktree whose gate is older or missing.
+GATE_VERSION = 3
 TRACKED = "tracked changes"
 SECRETS = "secret scan"
 MESSAGES = "commit messages"
@@ -162,21 +164,22 @@ def changed_files(root: Path, commits: list[str]) -> tuple[list[str], list[str]]
     listed = repo_checks.git("log", "-m", "--name-status", "--diff-filter=ACMRD", "--format=", "-z", "--no-walk=unsorted", *commits, keep_newlines=True)
     tokens = [token.strip("\n") for token in listed.split("\0") if token.strip("\n")]
     present: set[str] = set()
-    removed: set[str] = set()
+    deleted: set[str] = set()
+    renamed_from: set[str] = set()
     position = 0
     while position < len(tokens):
         status = tokens[position][:1]
         count = 3 if status in ("R", "C") else 2
         paths = tokens[position + 1 : position + count]
         if status == "D":
-            removed.update(paths)
+            deleted.update(paths)
         elif status == "R":
-            removed.add(paths[0])
+            renamed_from.add(paths[0])
             present.add(paths[1])
         else:
             present.add(paths[-1])
         position += count
-    return sorted(name for name in present if (root / name).is_file()), sorted(name for name in removed if not (root / name).exists())
+    return sorted(name for name in present if (root / name).is_file()), sorted(renamed_from | {name for name in deleted if not (root / name).exists()})
 
 
 def python_files(changed: list[str]) -> list[str]:
@@ -335,7 +338,7 @@ def run_check(check: Check) -> str | None:
 def commit_message_problems(commits: list[str]) -> str | None:
     findings = []
     for commit in commits:
-        findings += repo_checks.message_findings(f"commit {commit}", git("show", "-s", "--format=%B", commit))
+        findings += repo_checks.message_findings(f"commit {commit[: repo_checks.SHORT_SHA]}", git("show", "-s", "--format=%B", commit))
     return "\n".join(f"{finding.location}: {finding.problem}\n  fix: {finding.fix}" for finding in findings) or None
 
 
@@ -355,10 +358,11 @@ def tracked_problems() -> str | None:
 
 
 def head_problems(updates: list[Update]) -> str | None:
-    """The working-tree checks read the checked-out HEAD, so every pushed commit that they have to check must be HEAD."""
+    """The working-tree checks (and the privacy scan of the outgoing tree) read the checked-out HEAD, so every ref that sends a commit must be at HEAD,
+    whatever the tracking refs say."""
     head = git("rev-parse", "HEAD").strip()
     for update in updates:
-        if update.deletes or not commits_of(checked_ranges(pushed_ranges([update]))):
+        if update.deletes or not commits_of(pushed_ranges([update])):
             continue
         if git("rev-parse", f"{update.local_sha}^{{commit}}").strip() != head:
             return f"{update.local_ref} is not the checked-out HEAD, so the checks that read the working tree cannot vouch for it: check it out and push again"
@@ -383,11 +387,14 @@ def scan_all_dependencies() -> int:
     return failed
 
 
-def main(stdin: str) -> int:
-    """Run the gate in the current repository on Git's input ``stdin`` and return 1 at the first check that fails."""
+def main(stdin: str, *, by_hook: bool = False) -> int:
+    """Run the gate in the current repository on Git's input ``stdin`` and return 1 at the first check that fails.
+
+    The hook passes Git's arguments, so ``by_hook`` is true: no input line then means that the push sends nothing. A run by hand has neither.
+    """
     started = time.monotonic()
     repo = Path.cwd()
-    if stdin.strip():
+    if stdin.strip() or by_hook:
         updates = parse_updates(stdin)
         ranges = pushed_ranges(updates)
     else:
@@ -419,4 +426,4 @@ def main(stdin: str) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main("" if sys.stdin.isatty() else sys.stdin.read()))
+    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main("" if sys.stdin.isatty() else sys.stdin.read(), by_hook=len(sys.argv) > 1))

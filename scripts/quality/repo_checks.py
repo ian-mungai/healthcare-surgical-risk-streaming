@@ -110,13 +110,15 @@ def data_files(paths: list[str]) -> list[Finding]:
     return findings
 
 
-def message_findings(location: str, message: str, *, comments: bool = False) -> list[Finding]:
+def message_findings(location: str, message: str, *, comments: bool = False, reveal_subject: bool = False) -> list[Finding]:
+    """Findings for one message. The subject text is shown only to the person writing it: a history check names the commit and the rule."""
     lines = [line for line in message.splitlines() if not (comments and line.startswith("#"))]
     subject = lines[0] if lines else ""
     findings = []
     if CONVENTIONAL_SUBJECT.fullmatch(subject) is None:
         fix = "reword as <type>(<scope>): <description>, for example ci: pin the hook versions"
-        findings.append(Finding(location, f"not a Conventional Commit: {subject!r}", MESSAGE_RULE, fix))
+        shown = f": {subject!r}" if reveal_subject else ""
+        findings.append(Finding(location, f"not a Conventional Commit{shown}", MESSAGE_RULE, fix))
     for number, line in enumerate(lines, 1):
         credit = CREDIT_TRAILER.match(line) or GENERATED_LINE.match(line)
         if SESSION_TRAILER.match(line) or (credit and ASSISTANT_NAMES.search(credit.group(1))):
@@ -127,9 +129,10 @@ def message_findings(location: str, message: str, *, comments: bool = False) -> 
 
 
 def commit_message(path: str) -> list[Finding]:
-    return message_findings(path, Path(path).read_text(), comments=True)
+    return message_findings(path, Path(path).read_text(), comments=True, reveal_subject=True)
 
 
+SHORT_SHA = 12
 GITLEAKS = Path(__file__).resolve().parents[2] / ".tools" / "bin" / "gitleaks"
 BODY_RULE = "no credential value is in a commit message"
 
@@ -152,7 +155,7 @@ def commit_range(revisions: str) -> list[Finding]:
     for commit in git("rev-list", revisions, "--").splitlines():
         message = git("show", "-s", "--format=%B", commit)
         messages.append(message)
-        findings.extend(message_findings(f"commit {commit}", message))
+        findings.extend(message_findings(f"commit {commit[:SHORT_SHA]}", message))
     return [*findings, *message_secret_findings("\n\n".join(messages))] if messages else findings
 
 

@@ -30,8 +30,9 @@ class PushGateTest(TemporaryRepository):
         self.remote = self.repo.parent / "remote.git"
         run_command("git", ["init", "--quiet", "--bare", str(self.remote)], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS, check=True)
         self.git("remote", "add", "origin", str(self.remote))
-        for folder in (".venv", ".tools"):
+        for folder in (".venv", ".tools", "scripts"):
             (self.repo / folder).symlink_to(ROOT / folder)
+        (self.repo / ".git" / "info" / "exclude").write_text("scripts\n")
         for name in (".gitignore", ".pre-commit-config.yaml"):
             shutil.copy(ROOT / name, self.repo / name)
         self.write("pyproject.toml", PYPROJECT)
@@ -256,6 +257,79 @@ class PushGateTest(TemporaryRepository):
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
         self.assertIn("secret", run.stderr)
         self.assertNotIn(planted_token(), run.stdout + run.stderr)
+
+    def own_gate(self, version: int | None) -> None:
+        """This worktree's own gate module in place of the project's: at ``version``, or with no version constant, or none at all."""
+        (self.repo / "scripts").unlink()
+        folder = self.repo / "scripts" / "quality"
+        folder.mkdir(parents=True)
+        if version is not None:
+            (folder / "push_gate.py").write_text(f"GATE_VERSION = {version}\n")
+
+    def test_a_push_from_a_worktree_with_an_older_gate_is_refused_and_names_the_fix(self) -> None:
+        """Round 3, finding 1: every worktree shares one hook, which must not run a gate older than the one that the setup installed it for."""
+        self.own_gate(push_hook.REQUIRED_GATE_VERSION - 1)
+        self.write("notes.txt", "second\n")
+        self.commit("chore: second note")
+        before = self.remote_head()
+        run = self.push()
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("push gate stopped by gate version", run.stdout + run.stderr)
+        self.assertIn("make setup", run.stdout + run.stderr)
+        self.assertIn("rebase", run.stdout + run.stderr)
+        self.assertEqual(self.remote_head(), before)
+
+    def test_a_push_from_a_worktree_with_no_gate_or_no_gate_version_is_refused(self) -> None:
+        for label, version in (("no module", None), ("a module without the constant", -1)):
+            with self.subTest(label=label):
+                self.own_gate(version)
+                if version is not None:
+                    (self.repo / "scripts" / "quality" / "push_gate.py").write_text("VALUE = 1\n")
+                run = self.push_to("origin", "main:refs/heads/probe")
+                self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertIn("push gate stopped by gate version", run.stdout + run.stderr)
+                self.assertFalse(self.remote_has(self.remote, "refs/heads/probe"))
+                shutil.rmtree(self.repo / "scripts")
+                (self.repo / "scripts").symlink_to(ROOT / "scripts")
+
+    def test_a_worktree_with_a_newer_gate_pushes(self) -> None:
+        self.own_gate(push_hook.REQUIRED_GATE_VERSION + 1)
+        shutil.rmtree(self.repo / "scripts")
+        (self.repo / "scripts").symlink_to(ROOT / "scripts")
+        self.assertEqual(self.push_to("origin", "main:refs/heads/probe").returncode, 0)
+
+    def test_the_tip_check_binds_a_push_to_an_empty_replacement_remote_whatever_the_tracking_refs_say(self) -> None:
+        """Round 3, finding 2: the remote branches that this clone tracks hold the tip, but the receiver is a new empty remote."""
+        self.git("checkout", "--quiet", "-b", "side")
+        self.write("notes.txt", "side\n")
+        self.commit("chore: side note")
+        self.git("checkout", "--quiet", "main")
+        self.assertEqual(self.push_to("--no-verify", "origin", "side").returncode, 0, "the tracking ref origin/side now holds the tip")
+        fresh = self.make_remote("fresh")
+        run = self.push_to("fresh", "side")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn(f"push gate stopped by {push_gate.HEAD}", run.stdout + run.stderr)
+        self.assertFalse(self.remote_has(fresh, "refs/heads/side"))
+
+    def test_the_hosted_history_check_names_an_invalid_commit_by_its_short_sha_and_never_prints_its_subject(self) -> None:
+        self.write("notes.txt", "second\n")
+        self.commit(f"added the note {planted_token()}")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        run = run_command(sys.executable, ["-m", "scripts.quality.repo_checks", "commit-range", "HEAD"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn(sha[:12], run.stderr)
+        self.assertNotIn(sha, run.stderr, "the commit is named by its short sha")
+        self.assertNotIn(planted_token(), run.stdout + run.stderr)
+        self.assertNotIn("added the note", run.stdout + run.stderr)
+        self.assertIn("Conventional Commit", run.stderr)
+
+    def test_a_push_that_sends_nothing_runs_nothing_although_head_holds_an_unpushed_secret(self) -> None:
+        """Round 3, finding 5: Git calls the hook with no input when it sends nothing; that is not a run by hand."""
+        self.write("notes.txt", f"token {planted_token()}\n")
+        self.commit("chore: add a note")
+        run = self.push_to("origin", "--tags")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("push gate stopped", run.stdout + run.stderr)
 
     def test_a_message_that_is_not_a_conventional_commit_stops_the_push(self) -> None:
         self.write("notes.txt", "second\n")
