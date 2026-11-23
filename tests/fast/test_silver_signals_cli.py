@@ -4,6 +4,8 @@ Failure modes covered here:
 
 - An extra or a malformed argument, or a branch name that Nessie would refuse, is echoed by the argument parser.
 - A failed check, a missing branch, a settings error or any other error carries text of its own into the output.
+- The namespace commit of a branch that moved ends the job with the exception of the patient split, which the command line maps to an internal error
+  and not to the refusal ``branch_moved``.
 - The watchdog that stops a job that runs too long names another job, or holds a duration.
 - A failed check prints no line, or prints a line that is not a code and a count, or the exit code does not tell a failed check from a bad call.
 """
@@ -18,6 +20,7 @@ from argparse import Namespace
 from typing import Any
 
 from scripts.stack.nessie import NessieError
+from spark.jobs.silver_signals import SignalsLake
 from spark.settings import SettingsError
 from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
@@ -100,6 +103,27 @@ class Watchdog(unittest.TestCase):
             timer = start_deadline(0.0517, exit_with=stops.append)
             timer.join(5)
         self.assertEqual(([124], "patient_split: timeout\n"), (stops, err.getvalue()))
+
+
+class NamespaceCommit(unittest.TestCase):
+    def test_a_branch_that_moved_during_the_namespace_commit_is_the_refusal_branch_moved(self) -> None:
+        class Client:
+            def has_namespace(self, branch: str, hash_value: str, namespace: str) -> bool:
+                return False
+
+            def request(self, method: str, path: str, **_options: Any) -> dict[str, Any]:
+                return {"logEntries": []}
+
+        class Session:
+            def sql(self, text: str) -> None:
+                return None
+
+        lake = SignalsLake(Session(), Client(), "branch", {})  # type: ignore[arg-type]
+        with self.assertRaises(SilverSignalsError) as caught:
+            lake.prepare("a" * 64)
+        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        code, out, err = invoke(["build", "--branch", "b"], raising(caught.exception))
+        self.assertEqual((1, "", "silver_signals: branch_moved: the branch head is not the one that was checked\n"), (code, out, err))
 
 
 if __name__ == "__main__":

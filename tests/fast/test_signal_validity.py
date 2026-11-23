@@ -39,7 +39,7 @@ from features.signal_validity import (
     is_duplicate,
     numeric_verdict,
     physical_samples,
-    valid_extent,
+    second_extent,
     waveform_verdict,
 )
 
@@ -59,8 +59,8 @@ def arterial(
 
 
 def full_prior(low: float, high: float, missing: int = 0) -> Extent:
-    """The valid samples of the 19 seconds before a second of ``RATE`` samples, less ``missing`` of them."""
-    return Extent((FLAT_WINDOW_SECONDS - 1) * RATE - missing, low, high)
+    """The extent of the 19 complete seconds before a second, less ``missing`` of them that are absent or not complete."""
+    return Extent(FLAT_WINDOW_SECONDS - 1 - missing, low, high)
 
 
 class Numeric(unittest.TestCase):
@@ -114,12 +114,25 @@ class Boundaries(unittest.TestCase):
         self.assertEqual(VALID, arterial(constant))
         self.assertEqual(VALID, arterial(constant, prior=full_prior(100.0, 100.0, missing=1)))
         self.assertEqual(Verdict(False, FLAT), arterial(constant, prior=full_prior(100.0, 100.0)))
-        self.assertEqual(VALID, arterial(constant, prior=Extent(0, None, None)))
+        self.assertEqual(VALID, arterial(constant, prior=EMPTY_EXTENT))
 
-    def test_the_length_of_a_segment_is_20_seconds_of_the_rate(self) -> None:
+    def test_the_segment_is_20_complete_seconds_whatever_the_rate(self) -> None:
         constant = second(100.0, 100.0)
-        self.assertEqual(VALID, arterial(constant, rate=2, prior=Extent(37, 100.0, 100.0)))
-        self.assertEqual(Verdict(False, FLAT), arterial(constant, rate=2, prior=Extent(38, 100.0, 100.0)))
+        self.assertEqual(VALID, arterial(constant, rate=2, prior=full_prior(100.0, 100.0, missing=1)))
+        self.assertEqual(Verdict(False, FLAT), arterial(constant, rate=2, prior=full_prior(100.0, 100.0)))
+
+    def test_a_second_that_is_overfull_late_or_missing_does_not_make_the_segment_complete(self) -> None:
+        constant = second(100.0, 100.0, 100.0, 100.0)
+        overfull = second_extent((100.0,) * 8, RATE, 0)
+        self.assertEqual(Verdict(False, FLAT), arterial(constant, prior=full_prior(100.0, 100.0)))
+        self.assertEqual(VALID, arterial(constant, prior=combine_extents([full_prior(100.0, 100.0, missing=1), overfull])))
+        late = second_extent((100.0,) * 4, RATE, 7)
+        self.assertEqual(VALID, arterial(constant, prior=combine_extents([full_prior(100.0, 100.0, missing=1), late])))
+
+    def test_an_out_of_range_sample_in_a_complete_second_is_not_counted_in_the_range_but_the_second_is_(self) -> None:
+        constant = second(100.0, 100.0, 100.0, 100.0)
+        spiked = second_extent((300.0, 100.0, 100.0, 100.0), RATE, 0)
+        self.assertEqual(Verdict(False, FLAT), arterial(constant, prior=combine_extents([full_prior(100.0, 100.0, missing=1), spiked])))
 
     def test_a_jump_of_exactly_the_limit_is_valid_and_any_more_is_a_jump(self) -> None:
         self.assertEqual(VALID, arterial(second(80.0, 110.0, 90.0, 120.0)))
@@ -199,14 +212,30 @@ class Causes(unittest.TestCase):
 
 
 class Extents(unittest.TestCase):
-    def test_the_extent_of_a_second_counts_the_samples_that_are_present_and_inside_the_pressure_limits(self) -> None:
-        self.assertEqual(Extent(4, 20.0, 200.0), valid_extent((20.0, 200.0, 100.0, 150.0)))
-        self.assertEqual(Extent(2, 50.0, 60.0), valid_extent((50.0, None, 60.0, math.nan, math.inf, 19.999999999999996, 200.00000000000003, 4.5e9)))
-        self.assertEqual(EMPTY_EXTENT, valid_extent(()))
-        self.assertEqual(EMPTY_EXTENT, valid_extent((None, math.nan, 0.0)))
+    def test_a_complete_second_is_one_second_with_the_least_and_the_most_of_its_samples_inside_the_pressure_limits(self) -> None:
+        self.assertEqual(Extent(1, 20.0, 200.0), second_extent((20.0, 200.0, 100.0, 150.0), RATE, 0))
+        self.assertEqual(Extent(1, 50.0, 70.0), second_extent((50.0, 300.0, 60.0, 70.0), RATE, 0))
+        self.assertEqual(Extent(1, 50.0, 70.0), second_extent((50.0, 19.999999999999996, 200.00000000000003, 70.0), RATE, 0))
+        self.assertEqual(Extent(1, None, None), second_extent((0.0, 0.0, 0.0, 0.0), RATE, 0))
 
-    def test_extents_combine_by_adding_counts_and_taking_the_least_and_the_most(self) -> None:
+    def test_a_second_that_is_missing_or_not_complete_is_no_second_at_all(self) -> None:
+        for samples, rate, offset in (
+            ((), RATE, 0),
+            ((None, 100.0, 100.0, 100.0), RATE, 0),
+            ((math.nan, 100.0, 100.0, 100.0), RATE, 0),
+            ((100.0,) * 8, RATE, 0),
+            ((100.0,) * 3, RATE, 0),
+            ((100.0,) * 4, RATE, 7),
+            ((100.0,) * 4, 4.5, 0),
+            ((100.0,) * 4, 0.0, 0),
+        ):
+            with self.subTest(samples=samples, rate=rate, offset=offset):
+                self.assertEqual(EMPTY_EXTENT, second_extent(samples, rate, offset))
+
+    def test_extents_combine_by_adding_seconds_and_taking_the_least_and_the_most(self) -> None:
         self.assertEqual(Extent(7, 30.0, 90.0), combine_extents([Extent(4, 30.0, 80.0), EMPTY_EXTENT, Extent(3, 40.0, 90.0)]))
+        self.assertEqual(Extent(2, 40.0, 50.0), combine_extents([Extent(1, None, None), Extent(1, 40.0, 50.0)]))
+        self.assertEqual(Extent(1, None, None), combine_extents([Extent(1, None, None)]))
         self.assertEqual(EMPTY_EXTENT, combine_extents([]))
         self.assertEqual(EMPTY_EXTENT, combine_extents([EMPTY_EXTENT, EMPTY_EXTENT]))
 

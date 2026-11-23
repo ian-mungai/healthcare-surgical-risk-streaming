@@ -29,10 +29,10 @@ from spark.session import build_session
 from spark.silver import frames
 from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
-from spark.silver.run import NUMERIC, WAVEFORM, InputRead, Operations, TableRead, run_build, run_verify
+from spark.silver.run import BRANCH_MOVED, NUMERIC, WAVEFORM, InputRead, Operations, TableRead, run_build, run_verify
 from spark.silver.tables import NAMESPACE, SILVER_TABLES
 from spark.split_cli import open_client, read_settings, start_deadline
-from spark.split_table import schema_problems, unit
+from spark.split_table import PatientSplitError, schema_problems, unit
 
 SOURCES = (bronze.NUMERIC, bronze.WAVEFORM, bronze.TRACKS)
 
@@ -43,6 +43,13 @@ class SignalsLake(Lake):
     def __init__(self, session: Any, client: NessieClient, branch: str, settings: dict[str, str]) -> None:
         super().__init__(session, client, branch, settings)
         self.planned: dict[str, Any] = {}
+
+    def prepare(self, checked: str) -> str:
+        """The namespace commit of the patient split's ``Lake``, whose refusal for a branch that moved is this job's refusal ``branch_moved``."""
+        try:
+            return super().prepare(checked)
+        except PatientSplitError:
+            raise SilverSignalsError(BRANCH_MOVED) from None
 
     def fields_of(self, frame: Any) -> list[tuple[str, str]]:
         return [(field.name, field.dataType.simpleString()) for field in frame.schema.fields]
