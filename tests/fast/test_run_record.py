@@ -60,5 +60,30 @@ class RetentionLabelTest(unittest.TestCase):
         self.assertEqual(FAILED, self.close(blocked="interrupted")["end_condition"])
 
 
+class ClosedOutputTest(unittest.TestCase):
+    """A record that is written while stdout is closed must say fail, so it never claims a pass that the run could not print."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        closed = io.StringIO()
+        closed.close()
+        for patcher in (mock.patch.object(run_record, "ROOT", self.root), mock.patch.object(sys, "stdout", closed)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_closed_stdout_gives_a_record_that_says_fail_and_exit_status_1(self) -> None:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        code = record.close([])
+        (folder,) = (self.root / "runs").iterdir()
+        written = json.loads((folder / "record.json").read_text())
+        self.assertEqual(1, code)
+        self.assertEqual("fail", written["outcome"])
+        self.assertEqual(FAILED, json.loads((folder / "retention.json").read_text())["end_condition"])
+        self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+
 if __name__ == "__main__":
     unittest.main()
