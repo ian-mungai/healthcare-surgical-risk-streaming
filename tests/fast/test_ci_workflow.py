@@ -199,7 +199,7 @@ PINNED_JOBS: dict[str, dict[str, Any]] = {
     },
     "slow": {
         "name": "The slow tests: Ansible roles, local servers and stand-ins, and planted workflow faults",
-        "timeout-minutes": 25,
+        "timeout-minutes": 45,
         "steps": [CHECKOUT_STEP, PYTHON_STEP, {"run": "make setup"}, {"run": "make test-slow"}],
     },
     "guards": {

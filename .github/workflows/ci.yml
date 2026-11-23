@@ -75,7 +75,7 @@ jobs:
   slow:
     name: "The slow tests: Ansible roles, local servers and stand-ins, and planted workflow faults"
     runs-on: ubuntu-24.04
-    timeout-minutes: 25 # measured 12.5 min: make setup about 2 minutes (estimate), the slow group about 10.5 minutes locally; the first hosted run replaces it
+    timeout-minutes: 45 # measured 20.5 min: make setup about 2 minutes (estimate), the slow group 18.5 minutes locally on an idle machine; the first hosted run replaces it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

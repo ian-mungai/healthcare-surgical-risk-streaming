@@ -1,7 +1,7 @@
 # Check-first checks: each check runs at the cheapest layer that can do its job, and hosted CI runs every check in full.
-# 1. Commit hooks, about COMMIT_TIME: the commit and commit-msg stages below (secrets in the staged changes, credential and data files, privacy, Ruff, MyPy,
+# 1. Commit hooks, about 90 seconds (measured 83 s on Nov 23 2026, the quick tests 75 s of it): the commit and commit-msg stages below (secrets in the staged changes, credential and data files, privacy, Ruff, MyPy,
 #    the quick tests and the commit message). `make check` runs the manual stage on every file; the hosted hooks job runs it.
-# 2. Push gate, about PUSH_TIME, before every push to any branch: the pre-push stage below (scripts/quality/push_gate.py) runs the secret scan (merge diffs
+# 2. Push gate, about 40 seconds for one commit (measured 39 s on Nov 23 2026, 37 s of it the quick tests of 12 changed files; 2 minutes at most), before every push to any branch: the pre-push stage below (scripts/quality/push_gate.py) runs the secret scan (merge diffs
 #    included) and the commit messages of the unpushed commits of HEAD, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the
 #    quick test modules that cover them) and the dependency scan when a lock file changes. A push guard (scripts/quality/push_guard_hook.py, the pre-push.legacy
 #    hook) first refuses a push while tracked files have uncommitted changes, because pre-commit hides unstaged changes from the hooks it runs.

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import stat
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,28 @@ class SelectionTest(unittest.TestCase):
                     self.assertIn(module, push_gate.select_tests(ROOT, [file]))
                     checked += 1
         self.assertGreater(checked, 100)
+
+    def test_a_file_three_imports_away_selects_the_module_and_a_lazy_or_relative_import_counts(self) -> None:
+        """A small repository: the test imports ``app.a``, which imports ``app.b`` inside a function, which imports ``app.c`` relatively."""
+        with tempfile.TemporaryDirectory(prefix="push_gate_selection_") as folder:
+            root = Path(folder)
+            files = {
+                "app/__init__.py": "",
+                "app/a.py": "def run() -> None:\n    from app import b\n\n    b.go()\n",
+                "app/b.py": "from .c import go\n",
+                "app/c.py": "def go() -> None:\n    pass\n",
+                "app/unrelated.py": "VALUE = 1\n",
+                "tests/__init__.py": "",
+                "tests/fast/__init__.py": "",
+                "tests/fast/test_a.py": "from app.a import run\n",
+                "tests/fast/test_other.py": "from app.unrelated import VALUE\n",
+            }
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            self.assertEqual(push_gate.select_tests(root, ["app/c.py"]), ["tests.fast.test_a"])
+            self.assertEqual(push_gate.select_tests(root, ["app/unrelated.py"]), ["tests.fast.test_other"])
+            self.assertEqual(push_gate.select_tests(root, ["app/a.py", "app/unrelated.py"]), ["tests.fast.test_a", "tests.fast.test_other"])
 
     def test_a_file_that_no_test_imports_or_names_selects_no_module(self) -> None:
         self.assertEqual(push_gate.select_tests(ROOT, [UNLISTED]), [])
