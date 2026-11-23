@@ -94,6 +94,13 @@ class Development(unittest.TestCase):
                 with self.subTest(name=name, part=part):
                     self.assertIn(part, query)
 
+    def test_the_held_out_flag_adds_up_every_defect_of_the_development_counts(self) -> None:
+        for name in BY_NAME:
+            with self.subTest(name=name):
+                flag = select_items(held_out_query(name))[0]
+                for term in ("bf.`bronze_repeats`", "kf.`unaccounted`", "kf.`claimed_twice`", "kf.`silver_unbacked`", "kf.`disp__unrecorded`"):
+                    self.assertIn(term, flag)
+
     def test_a_key_is_compared_in_both_directions_by_one_full_outer_join_and_every_key_part_is_joined(self) -> None:
         keys = {
             "numeric_observations": ("case_id", "track", "case_time_us", "occurrence"),
@@ -133,7 +140,8 @@ class Development(unittest.TestCase):
                 query = key_facts_query(name)
                 self.assertIn(f"`invalid_cause` IN ({', '.join(repr(cause) for cause in INVALID_CAUSES)})", query)
                 self.assertIn("THEN 'valid'", query)
-                self.assertIn("'unrecorded'", query)
+                self.assertIn("ELSE 'unrecorded' END", query)
+                self.assertIn("WHEN `valid` IS NULL THEN 'unrecorded'", query)
 
     def test_a_laboratory_group_is_expanded_to_its_copies_and_ranked_by_the_job_rule(self) -> None:
         query = key_facts_query("lab_results")

@@ -44,13 +44,12 @@ class Outcome:
     outcome: str
     branch_hash: str
     keys: dict[str, KeyFacts]
-    flags: dict[str, bool]
     joins: dict[str, JoinFacts]
     snapshots: dict[str, int | None]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: the hash, snapshot IDs, counts of development keys with their dispositions, one flag for the other patients and the
-        checks that ran. Nothing in it names a case, a track, a time or a value."""
+        """What the result line may hold: the hash, snapshot IDs, counts of development keys with their dispositions, the flag of the other patients (a
+        set flag fails the job, so a result always says clean) and the checks that ran. Nothing in it names a case, a track, a time or a value."""
         return {
             "outcome": self.outcome,
             "branch_hash": self.branch_hash,
@@ -60,7 +59,7 @@ class Outcome:
                     "bronze_keys": facts.bronze_keys,
                     "matched_keys": facts.matched,
                     "dispositions": dict(facts.dispositions),
-                    "held_out_clean": not self.flags[name],
+                    "held_out_clean": True,
                 }
                 for name, facts in self.keys.items()
             },
@@ -90,4 +89,4 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         problems.append(BRANCH_MOVED)
     if problems:
         raise ReconcileError(*problems)
-    return Outcome("verified", head, keys, flags, joins, snapshots)
+    return Outcome("verified", head, keys, joins, snapshots)

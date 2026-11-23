@@ -107,6 +107,10 @@ class Keys(unittest.TestCase):
         facts = dataclasses.replace(clean("lab_results"), matched=11)
         self.assertEqual(["lab_results_disposition_total: 1 key"], key_problems("lab_results", facts))
 
+    def test_dispositions_that_add_up_to_more_than_the_matched_keys_are_named_too(self) -> None:
+        facts = dataclasses.replace(clean("lab_results"), matched=9)
+        self.assertEqual(["lab_results_disposition_total: 1 key"], key_problems("lab_results", facts))
+
     def test_a_disposition_outside_the_closed_set_is_named(self) -> None:
         facts = dataclasses.replace(clean("cases"), dispositions={"kept": 9, "dropped": 1})
         self.assertEqual(["cases_disposition_unknown: 1 disposition"], key_problems("cases", facts))

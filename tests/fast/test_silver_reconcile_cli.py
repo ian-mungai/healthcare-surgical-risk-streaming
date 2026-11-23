@@ -113,7 +113,7 @@ class Reads(unittest.TestCase):
                     return False
 
         lake = ReconcileLake(Session(), object(), "branch", "a" * 64)  # type: ignore[arg-type]
-        self.assertEqual({table: None for table in SOURCE_TABLES}, {table: lake.columns(f"lake.{table}") for table in SOURCE_TABLES})
+        lake.source_problems()
         self.assertEqual([f"lake.{table}" for table in SOURCE_TABLES], asked)
         self.assertEqual("a" * 64, lake.at)
 
@@ -126,6 +126,81 @@ class Reads(unittest.TestCase):
 
         lake = ReconcileLake(Session(), object(), "branch", "a" * 64)  # type: ignore[arg-type]
         self.assertEqual([f"source_missing: {len(SOURCE_TABLES)} tables"], lake.source_problems())
+
+
+class Execute(unittest.TestCase):
+    """``execute`` with the Spark session, the Nessie client and the settings replaced by stand-ins that record how they are used."""
+
+    def run_execute(self, outcome: Any) -> tuple[list[tuple[Any, ...]], dict[str, Any] | None, Exception | None]:
+        import spark.jobs.silver_reconcile as job
+
+        calls: list[tuple[Any, ...]] = []
+
+        class Client:
+            def config(self) -> None:
+                calls.append(("config",))
+
+            def reference(self, name: str) -> Any:
+                calls.append(("reference", name))
+                return type("Reference", (), {"hash": "c" * 64})()
+
+        class Session:
+            def stop(self) -> None:
+                calls.append(("stop",))
+
+        def build_session(name: str, ref: str, ref_hash: str | None = None) -> Any:
+            calls.append(("session", name, ref, ref_hash))
+            return Session()
+
+        def run_verify(operations: Any, head: str) -> Any:
+            calls.append(("verify", head))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        settings = type("Settings", (), {"nessie_uri": "u", "nessie_timeout_seconds": 1.0, "deadline_seconds": 5.0})()
+        patches = {
+            "read_settings": lambda: settings,
+            "open_client": lambda uri, timeout: Client(),
+            "start_deadline": lambda seconds, job=None: calls.append(("deadline", seconds, job)),
+            "build_session": build_session,
+            "run_verify": run_verify,
+        }
+        originals = {name: getattr(job, name) for name in patches}
+        for name, value in patches.items():
+            setattr(job, name, value)
+        try:
+            result = job.execute(Namespace(mode="verify", branch="b"))
+            error = None
+        except Exception as caught:
+            result, error = None, caught
+        finally:
+            for name, value in originals.items():
+                setattr(job, name, value)
+        return calls, result, error
+
+    def test_the_session_and_every_read_are_pinned_to_the_hash_that_the_branch_had_at_the_start(self) -> None:
+        outcome = type("Outcome", (), {"facts": lambda self: {"outcome": "verified"}})()
+        calls, result, error = self.run_execute(outcome)
+        self.assertIsNone(error)
+        self.assertEqual(
+            [
+                ("deadline", 5.0, "silver_reconcile"),
+                ("config",),
+                ("reference", "b"),
+                ("session", "silver_reconcile", "b", "c" * 64),
+                ("verify", "c" * 64),
+                ("stop",),
+            ],
+            calls,
+        )
+        self.assertEqual({"mode": "verify", "branch": "b", "job": "silver_reconcile", "outcome": "verified"}, result)
+
+    def test_the_session_is_stopped_when_a_check_fails(self) -> None:
+        calls, result, error = self.run_execute(ReconcileError("cases_key_unaccounted: 1 key"))
+        self.assertIsNone(result)
+        self.assertIsInstance(error, ReconcileError)
+        self.assertEqual(("stop",), calls[-1])
 
 
 class Image(unittest.TestCase):
