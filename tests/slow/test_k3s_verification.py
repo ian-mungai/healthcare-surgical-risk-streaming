@@ -76,6 +76,18 @@ def encryption_verdict(status: str) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
+def rotation_condition() -> Any:
+    """The rotation block's `when` of secrets_encryption.yml, evaluated with Jinja as Ansible does for a given status text."""
+    import jinja2
+
+    tasks = load_yaml((ROLES / "k3s" / "tasks" / "secrets_encryption.yml").read_text())
+    if not isinstance(tasks, list):
+        raise TypeError("the task file must be a list")
+    when = next(task["when"] for task in tasks if str(task.get("name", "")).startswith("Rotate the keys"))
+    expression = jinja2.Environment(autoescape=True).compile_expression(str(when))
+    return lambda status: bool(expression(k3s_secrets_status={"stdout": status}))
+
+
 def configuration() -> dict[str, Any]:
     tasks = load_yaml((ROLES / "k3s" / "tasks" / "main.yml").read_text())
     if not isinstance(tasks, list):
@@ -96,16 +108,35 @@ class SecretsEncryptionTest(unittest.TestCase):
         code, output = encryption_verdict(ENABLED)
         self.assertEqual(0, code, output)
 
-    def test_a_cluster_that_started_with_encryption_on_passes_at_the_start_stage(self) -> None:
-        """The live host's reading (Nov 23 2026): a cluster that started with the flag stays at the start stage with every hash matching."""
+    def test_an_enabled_cluster_still_at_the_start_stage_is_refused_until_its_keys_are_rotated(self) -> None:
+        """The live host's reading (Nov 23 2026). A cluster switched on by a restart with the flag also shows this, with older secrets
+        still stored in plain text; only a key rotation (which re-encrypts every secret) proves them encrypted."""
         code, output = encryption_verdict(STARTED_ENABLED)
-        self.assertEqual(0, code, output)
+        self.assertNotEqual(0, code)
+        self.assertIn(ENCRYPTION_MESSAGE, output)
+
+    def test_the_rotation_runs_at_the_start_stage_whether_encryption_shows_enabled_or_disabled(self) -> None:
+        condition = rotation_condition()
+        for status, expected in (
+            (STARTED_ENABLED, True),
+            ("Encryption Status: Disabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: All hashes match\n", True),
+            (ENABLED, False),
+            ("Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\nServer Encryption Hashes: All hashes match\n", False),
+        ):
+            with self.subTest(status=status.splitlines()[:2]):
+                self.assertIs(expected, condition(status))
 
     def test_every_other_status_is_refused_with_the_same_message(self) -> None:
         cases = {
             "disabled with no file": "Encryption Status: Disabled, no configuration file found\n",
             "disabled at the start stage": "Encryption Status: Disabled\nCurrent Rotation Stage: start\n",
             "enabled while keys rotate": "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\n",
+            "enabled while keys rotate, hashes matching": (
+                "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\nServer Encryption Hashes: All hashes match\n"
+            ),
+            "disabled with a finished stage, hashes matching": (
+                "Encryption Status: Disabled\nCurrent Rotation Stage: reencrypt_finished\nServer Encryption Hashes: All hashes match\n"
+            ),
             "disabled with a finished stage": "Encryption Status: Disabled\nCurrent Rotation Stage: reencrypt_finished\n",
             "enabled at the start stage with hashes that differ": (
                 "Encryption Status: Enabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: hash does not match\n"
