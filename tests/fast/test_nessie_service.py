@@ -41,8 +41,21 @@ class NessieServiceTest(unittest.TestCase):
         service = document["services"]["nessie"]
         self.assertEqual("${SECRETS_DIR:?render the host settings first}/postgres/nessie.password", document["secrets"]["nessie_database_password"]["file"])
         self.assertEqual(["nessie_database_password"], service["secrets"])
-        self.assertIn("/run/secrets/nessie_database_password", " ".join(service["command"]))
+        script = " ".join(service["command"])
+        self.assertIn("/run/secrets/nessie_database_password", script)
         self.assertFalse([key for key in service["environment"] if "PASSWORD" in key])
+        self.assertNotRegex(script, r"\bexport\b", "the start script exports a value, so the password would be in the server's process environment")
+
+    def test_the_password_reaches_quarkus_through_a_properties_file_on_a_memory_file_system_and_not_through_the_environment(self) -> None:
+        service = nessie()["services"]["nessie"]
+        script = " ".join(service["command"])
+        location = service["environment"].get("QUARKUS_CONFIG_LOCATIONS", "")
+        self.assertEqual("file:///run/nessie_config/datasource.properties", location)
+        self.assertEqual(["/run/nessie_config:uid=10000,gid=10001,mode=0700"], service.get("tmpfs"))
+        self.assertIn("umask 077", script)
+        self.assertIn("quarkus.datasource.postgresql.password=%s", script)
+        self.assertIn("> /run/nessie_config/datasource.properties", script)
+        self.assertEqual(1, script.count("datasource.properties"), "the file is written once")
 
     def test_nessie_runs_as_the_numeric_user_of_its_image_and_never_as_root_with_all_capabilities_dropped(self) -> None:
         service = nessie()["services"]["nessie"]

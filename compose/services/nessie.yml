@@ -15,6 +15,9 @@ services:
       NESSIE_VERSION_STORE_PERSIST_JDBC_DATASOURCE: postgresql
       QUARKUS_DATASOURCE_POSTGRESQL_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
       QUARKUS_DATASOURCE_POSTGRESQL_USERNAME: nessie
+      QUARKUS_CONFIG_LOCATIONS: file:///run/nessie_config/datasource.properties
+    tmpfs:
+      - /run/nessie_config:uid=10000,gid=10001,mode=0700
     secrets:
       - nessie_database_password
     command:
@@ -22,9 +25,11 @@ services:
       - -c
       - |
         set -eu
+        umask 077
         password="$$(cat /run/secrets/nessie_database_password)" || { echo "cannot read the database password file" >&2; exit 1; }
         [ -n "$$password" ] || { echo "the database password file is empty" >&2; exit 1; }
-        export QUARKUS_DATASOURCE_POSTGRESQL_PASSWORD="$$password"
+        case "$$password" in *[\\]*) echo "the database password holds a backslash, which a properties file reads as an escape" >&2; exit 1 ;; esac
+        printf 'quarkus.datasource.postgresql.password=%s\n' "$$password" > /run/nessie_config/datasource.properties
         exec /opt/jboss/container/java/run/run-java.sh
     volumes:
       - nessie_data:/deployments/data

@@ -68,12 +68,17 @@ def base64_forms(value: str) -> list[str]:
     return [form for form in dict.fromkeys(found) if form]
 
 
+def lower_escapes(text: str) -> list[str]:
+    """The text with the hexadecimal digits of each percent escape in lower case, which some encoders write."""
+    return [re.sub(r"%[0-9A-F]{2}", lambda found: found[0].lower(), text)]
+
+
 def search_forms(value: str) -> dict[str, list[str]]:
     """Each form that a log or a file may hold for ``value``."""
     forms = {
         "plain": [value],
-        "percent": [quote(value, safe=""), quote(value)],
-        "hex": [value.encode().hex()],
+        "percent": [quote(value, safe=""), quote(value), *lower_escapes(quote(value, safe="")), *lower_escapes(quote(value))],
+        "hex": [value.encode().hex(), value.encode().hex().upper()],
         "base64": base64_forms(value),
     }
     if "/" in value:
@@ -162,6 +167,8 @@ def derived_files(root: Path = ROOT) -> set[str]:
     credentials = roles / "workload_access" / "files" / "workload_credentials.py"
     if "credentials.json" in credentials.read_text():
         files.add("workload_access/credentials.json")
+    if "iam/security-credentials" in credentials.read_text():
+        files.add("instance_metadata/host_role_credentials")
     files |= {f"config/{key}" for key, pattern in OPTIONAL_PATTERNS.items() if pattern.pattern.startswith("(?!tskey)")}
     return files
 
@@ -329,6 +336,15 @@ INPUTS: tuple[SecretInput, ...] = (
         "the credential helper's call of AWS STS with the host role, one file for each workload",
         "each workload's own AWS access, read through the credential process of its AWS configuration",
         "a permitted operation, a refused operation and a renewal for each workload",
+    ),
+    SecretInput(
+        "host_role_credentials",
+        ("instance_metadata/host_role_credentials",),
+        "plain",
+        "host",
+        "the instance metadata service, which gives the host role's temporary credentials to the credential helper only",
+        "the credential helper (workload-credentials.service), which assumes each workload's role with them; the metadata guard refuses every other process",
+        "a container on the host network, a container on the bridge network and an Airbyte pod cannot reach the metadata address",
     ),
     SecretInput(
         "tailscale_client_id",

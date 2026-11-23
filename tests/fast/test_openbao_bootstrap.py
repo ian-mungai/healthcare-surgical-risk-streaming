@@ -230,6 +230,26 @@ class PrepareTest(unittest.TestCase):
             self.assertTrue(self.prepared(Path(scratch), check_only=True))
             self.assertEqual(0o640, stat.S_IMODE(path.stat().st_mode))
 
+    def test_an_admin_file_with_a_trailing_newline_is_refused_by_name_and_left_as_it_was(self) -> None:
+        for ending in ("\n", "\r\n", "\n\n"):
+            with self.subTest(ending=repr(ending)), tempfile.TemporaryDirectory() as scratch:
+                path = Path(scratch) / "secrets" / "openbao" / "bootstrap.secret_id"
+                path.parent.mkdir(parents=True)
+                path.write_text("an-owner-placed-value" + ending)
+                before = path.read_bytes()
+                for check_only in (False, True):
+                    with self.assertRaisesRegex(bootstrap.BootstrapError, "admin secret ID file ends with a line break"):
+                        self.prepared(Path(scratch), check_only=check_only)
+                self.assertEqual(before, path.read_bytes())
+
+    def test_a_made_admin_file_has_no_line_break_so_the_first_start_and_the_login_use_the_same_value(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            self.prepared(Path(scratch))
+            content = (Path(scratch) / "secrets" / "openbao" / "bootstrap.secret_id").read_bytes()
+        self.assertTrue(content)
+        self.assertNotIn(b"\n", content)
+        self.assertNotIn(b"\r", content)
+
     def test_a_missing_unlock_key_file_stops_the_step_before_any_file_is_made(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, self.assertRaisesRegex(bootstrap.BootstrapError, "unlock key file is missing"):
             bootstrap.prepare(Path(scratch) / "secrets", Path(scratch) / "none.env", MY_OWNER, check_only=False)

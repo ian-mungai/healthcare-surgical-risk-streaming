@@ -19,8 +19,11 @@ Failure modes covered here:
 from __future__ import annotations
 
 import base64
+import contextlib
 import grp
+import http.client
 import importlib.util
+import io
 import json
 import os
 import pwd
@@ -33,12 +36,15 @@ import traceback
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 
+from scripts.evidence import export
 from scripts.evidence.manifest import build_manifest
+from scripts.infra.state_bootstrap import RunBinding
 from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
+from scripts.stack.yaml_text import load_yaml
 from tests.fast.secret_inputs import Marker, listed_names, make_marker, scan_text, scan_tree
 from tests.slow.ansible_support import ROLES, SHARED_MODULE_UTILS, environment, shared_module
 
@@ -51,7 +57,7 @@ PYTHON = str(ROOT / ".venv" / "bin" / "python")
 VERIFIER = re.compile(r"CREATE ROLE \"(\w+)\" [A-Z ]+ PASSWORD '(SCRAM-SHA-256\$[^']+)'")
 
 DOCKER_STAND_IN = """#!{python}
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 calls = Path(__file__).resolve().parent.parent / "calls"
 standard_input = sys.stdin.read()
@@ -60,6 +66,11 @@ number = len(list(calls.glob("*.stdin")))
 with open(calls / "calls.jsonl", "a") as handle:
     handle.write(json.dumps({{"argv": sys.argv, "env": dict(os.environ)}}) + "\\n")
 mode = json.loads((calls / "mode.json").read_text())
+for argument in sys.argv:
+    found = re.search(r'PGPASSWORD="\\$\\(cat (\\S+)\\)"', argument)
+    if found:
+        with open(calls / "consumer.jsonl", "a") as handle:
+            handle.write(json.dumps({{"PGPASSWORD": Path(mode["files"][found.group(1)]).read_text().rstrip("\\n")}}) + "\\n")
 if mode.get("fail_on") and mode["fail_on"] in standard_input:
     sys.stderr.write("psql:<stdin>:1: ERROR: could not run the statement\\nLINE 1: " + standard_input + "\\n")
     sys.exit(1)
@@ -108,11 +119,11 @@ class Run:
     def set_mode(self, mode: dict[str, Any]) -> None:
         (self.calls / "mode.json").write_text(json.dumps(mode))
 
-    def place(self, marker: Marker, relative: str) -> Path:
+    def place(self, marker: Marker, relative: str, *, line_break: bool = True) -> Path:
         """Put the marker in its secret file, as the owner's value, before the deploy runs. Only this file may hold it."""
         path = self.secrets / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(marker.value + "\n")
+        path.write_text(marker.value + ("\n" if line_break else ""))
         path.chmod(0o600)
         self.owned.setdefault(marker.label, set()).add(path)
         return path
@@ -133,8 +144,10 @@ class Run:
         path = self.calls / "calls.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def stand_in_input(self, number: int) -> str:
-        return (self.calls / f"{number}.stdin").read_text()
+    def consumer(self) -> list[dict[str, str]]:
+        """What the consumer inside a stand-in received through its intended channel, one record for each call that read a mounted secret."""
+        path = self.calls / "consumer.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def inputs(self) -> list[str]:
         return [path.read_text() for path in sorted(self.calls.glob("*.stdin"), key=lambda item: int(item.stem))]
@@ -146,7 +159,7 @@ class Run:
         for label, text in (("playbook output", output), ("stand-in arguments and environment", calls), *[("text", item) for item in extra_text]):
             found += [f"{label}: {hit.label} ({hit.form})" for hit in scan_text(text, markers)]
         for marker in markers:
-            allowed = self.owned.get(marker.label, set()) | set(self.calls.glob("*.stdin"))
+            allowed = self.owned.get(marker.label, set()) | set(self.calls.glob("*.stdin")) | set(self.calls.glob("consumer.jsonl"))
             found += [f"file {hit.path}: {hit.label} ({hit.form})" for hit in scan_tree(self.work, [marker], allowed)]
         return found
 
@@ -178,11 +191,13 @@ class PostgresSinks(unittest.TestCase):
         self.run_ = Run(Path(self.directory.name))
         self.tools_file, self.services_file = rewritten_lists(self.run_)
         self.tools = listed_names(TOOLS_FILE)
+        self.mode: dict[str, Any] = {}
         self.markers = {name: Marker(f"password of {name}", make_marker("urlsafe").value) for name in ["postgres", *self.tools]}
         for name, marker in self.markers.items():
             self.run_.place(marker, f"postgres/{name}.password")
 
     def tasks(self) -> list[dict[str, Any]]:
+        self.run_.set_mode({"files": {"/run/secrets/postgres_admin_password": str(self.run_.secrets / "postgres" / "postgres.password")}, **self.mode})
         common = {"tools_file": str(self.tools_file), "secrets_directory": str(self.run_.secrets)}
         return [
             {"postgres_accounts": {"step": "passwords", "services_file": str(self.services_file), "root_owner": OWNER, **common}},
@@ -199,6 +214,8 @@ class PostgresSinks(unittest.TestCase):
         self.assertEqual(sorted(self.tools), sorted(verifiers), "control: every tool's account was created")
         for name in self.tools:
             self.assertTrue(accounts.verifier_matches(verifiers[name], self.markers[name].value), f"control: the verifier of {name} belongs to its marker")
+        received = {item["PGPASSWORD"] for item in self.run_.consumer()}
+        self.assertEqual({self.markers["postgres"].value}, received, "control: psql received the owner's admin password through the mounted file")
         self.assertEqual([], self.run_.sinks(list(self.markers.values()), output, extra_text=tuple(sent)))
         for name, marker in self.markers.items():
             path = self.run_.secrets / "postgres" / f"{name}.password"
@@ -206,7 +223,7 @@ class PostgresSinks(unittest.TestCase):
             self.assertEqual(0o400, path.stat().st_mode & 0o777)
 
     def test_a_server_error_that_repeats_the_statement_shows_no_password_and_no_verifier(self) -> None:
-        self.run_.set_mode({"fail_on": "CREATE ROLE"})
+        self.mode = {"fail_on": "CREATE ROLE"}
         result = self.run_.play(self.tasks())
         output = result.stdout + result.stderr
         self.assertNotEqual(0, result.returncode)
@@ -258,7 +275,7 @@ class OpenBaoStandIn:
                 role, secret_id = body.get("role_id"), body.get("secret_id")
                 valid = secret_id == state.admin if role == "bootstrap" else state.issued.get(str(role)) == secret_id
                 if not valid:
-                    return self.reply(400, {"errors": ["invalid role or secret ID"]})
+                    return self.reply(400, {"errors": [f"invalid role or secret ID {secret_id}"]})
                 token = f"token_{len(state.tokens)}"
                 state.tokens[token] = str(role)
                 self.reply(200, {"auth": {"client_token": token}})
@@ -274,6 +291,15 @@ class OpenBaoStandIn:
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def login_over_http(self, role: str, secret_id: str) -> tuple[int, dict[str, Any]]:
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.request("POST", "/v1/auth/approle/login", json.dumps({"role_id": role, "secret_id": secret_id}))
+            response = connection.getresponse()
+            return response.status, json.loads(response.read() or b"{}")
+        finally:
+            connection.close()
 
     @property
     def address(self) -> str:
@@ -332,7 +358,7 @@ class OpenBaoSinks(unittest.TestCase):
         self.unlock.parent.mkdir()
         self.unlock.write_text("OPENBAO_UNLOCK_KEY=" + "0" * 64 + "\n")
         self.admin = Marker("admin secret ID", make_marker("urlsafe").value)
-        self.run_.place(self.admin, "openbao/bootstrap.secret_id")
+        self.run_.place(self.admin, "openbao/bootstrap.secret_id", line_break=False)
         self.passwords = {name: Marker(f"password of {name}", make_marker("urlsafe").value) for name in self.tools}
         for name, marker in self.passwords.items():
             self.run_.place(marker, f"postgres/{name}.password")
@@ -377,16 +403,31 @@ class OpenBaoSinks(unittest.TestCase):
             self.assertEqual(marker.value, self.bao.kv.get(name), f"control: OpenBao holds the owner's password of {name}")
         markers = self.markers()
         self.assertGreaterEqual(len(markers), 1 + 2 * len(self.tools), "control: the issued secret IDs are searched for too")
+        for marker in markers[1 + len(self.tools) :]:
+            role = marker.label.removeprefix("issued secret ID of ").removesuffix(".secret_id")
+            status, _ = self.bao.login_over_http(role, marker.value)
+            self.assertEqual(200, status, f"control: the issued secret ID of {role} logs in against the server that issued it")
+            self.assertEqual(400, self.bao.login_over_http(role, marker.value + "x")[0])
         self.assertEqual([], self.run_.sinks(markers, output))
 
-    def test_a_refused_login_shows_no_secret_id(self) -> None:
-        wrong = Marker("wrong admin secret ID", make_marker("urlsafe").value)
+    def test_a_refused_login_shows_no_secret_id_although_the_server_repeats_it(self) -> None:
         self.bao.admin = "another-value"
         result = self.run_.play(self.tasks())
         output = result.stdout + result.stderr
         self.assertNotEqual(0, result.returncode)
         self.assertIn("login of role bootstrap was refused (HTTP 400)", output, "control: the refusal reached the message")
-        self.assertEqual([], self.run_.sinks([self.admin, wrong], output))
+        refused = [body for method, path, body in self.bao.requests if path == "auth/approle/login"]
+        self.assertEqual(self.admin.value, refused[0]["secret_id"], "control: the server received the secret ID and answered with a text that repeats it")
+        self.assertEqual([], self.run_.sinks([self.admin], output))
+
+    def test_an_admin_secret_id_file_that_ends_with_a_line_break_is_refused_before_any_start(self) -> None:
+        self.run_.place(self.admin, "openbao/bootstrap.secret_id", line_break=True)
+        result = self.run_.play(self.tasks())
+        output = result.stdout + result.stderr
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("admin secret ID file ends with a line break", output, "control: the refusal reached the message")
+        self.assertEqual([], [request for request in self.bao.requests if request[1] != "sys/seal-status"], "no request reached the server")
+        self.assertEqual([], self.run_.sinks([self.admin], output))
 
 
 class AirbyteSinks(unittest.TestCase):
@@ -470,7 +511,7 @@ class FileSinks(unittest.TestCase):
         self.assertEqual(0o400, key_file.stat().st_mode & 0o777)
         self.assertEqual([], self.run_.sinks([marker], output))
 
-    def test_the_grafana_password_the_owner_placed_is_kept_and_never_shown(self) -> None:
+    def test_the_grafana_password_the_owner_placed_is_kept_and_reaches_grafana_through_its_own_file_provider(self) -> None:
         marker = Marker("grafana password", make_marker("urlsafe").value)
         path = self.run_.place(marker, "grafana/admin.password")
         result = self.run_.play([{"secret_file": {"path": str(path), "owner": OWNER}, "no_log": True}])
@@ -478,6 +519,20 @@ class FileSinks(unittest.TestCase):
         self.assertEqual(0, result.returncode, output[-3000:])
         self.assertEqual(marker.value + "\n", path.read_text(), "control: the owner's value was kept")
         self.assertEqual(0o400, path.stat().st_mode & 0o777)
+        provider = re.search(
+            r"^admin_password\s*=\s*\$__file\{([^}]+)\}", (ROOT / "compose" / "monitoring" / "grafana" / "grafana.ini").read_text(), re.MULTILINE
+        )
+        self.assertIsNotNone(provider)
+        provider = cast("re.Match[str]", provider)
+        secret_name = Path(provider[1]).name
+        declared = load_yaml((ROOT / "compose" / "services" / "grafana.yml").read_text())
+        self.assertIsInstance(declared, dict)
+        declared = cast("dict[str, Any]", declared)
+        mounted = re.fullmatch(r"\$\{SECRETS_DIR[^}]*\}/(.+)", str(declared["secrets"][secret_name]["file"]))
+        self.assertIsNotNone(mounted)
+        mounted = cast("re.Match[str]", mounted)
+        received = (self.run_.secrets / mounted[1]).read_text().strip()
+        self.assertEqual(marker.value, received, "control: the file that Grafana's provider reads, by the configuration and the mount, holds the owner's value")
         self.assertEqual([], self.run_.sinks([marker], output))
 
 
@@ -504,25 +559,34 @@ class DiagnosticSinks(unittest.TestCase):
 
 
 class EvidenceSinks(unittest.TestCase):
-    def test_a_value_in_a_plan_in_raw_output_or_in_a_log_does_not_reach_the_export(self) -> None:
+    def test_a_value_in_a_plan_in_raw_output_or_in_a_log_does_not_reach_the_export_made_by_the_real_exporter(self) -> None:
         marker = Marker("secret in the run folder", make_marker("urlsafe").value)
+        run_id = "20260101t0000-abcdef"
         with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
+            root = Path(scratch)
+            folder = root / "runs" / run_id
             for relative in ("raw/terraform.txt", "plans/plan.txt", "plans/plan.json", "logs/deploy.log", "notes.txt"):
                 (folder / relative).parent.mkdir(parents=True, exist_ok=True)
                 (folder / relative).write_text(f"value {marker.value}\n")
             for relative, text in (("inventory.json", "{}"), ("plans/a_binding.json", "{}"), ("acceptance/case.json", '{"passed": true}')):
                 (folder / relative).parent.mkdir(parents=True, exist_ok=True)
                 (folder / relative).write_text(text)
-            manifest = build_manifest(folder, "20260101t0000-abcdef", "c0ffee")
-            archive_path = folder / "evidence.tar.gz"
-            with tarfile.open(archive_path, "w:gz") as archive:
-                for item in manifest["files"]:
-                    archive.add(folder / item["path"], arcname=item["path"])
-            with tarfile.open(archive_path) as archive:
-                members = {name: (archive.extractfile(name) or mock.Mock(read=lambda: b"")).read() for name in archive.getnames()}
+            binding = root / "binding.json"
+            RunBinding(run_id, "c0ffee", "s3", "us-west-2", "example-project", "default", ["a", "b"], "verified").write(binding)
+            with (
+                mock.patch.object(export, "ROOT", root),
+                mock.patch.object(export, "build_manifest", wraps=build_manifest) as built,
+                mock.patch.object(sys, "argv", ["export", "--binding", str(binding)]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                code = export.main()
+            manifest_text = (folder / "export" / "manifest.json").read_text()
+            with tarfile.open(folder / "export" / "evidence.tar.gz") as archive:
+                members = {name: (archive.extractfile(name) or io.BytesIO()).read() for name in archive.getnames()}
+        self.assertEqual(0, code)
+        built.assert_called_once()
         self.assertEqual({"inventory.json", "plans/a_binding.json", "acceptance/case.json"}, set(members), "control: the named evidence is in the archive")
-        self.assertEqual([], scan_text(json.dumps(manifest), [marker]))
+        self.assertEqual([], scan_text(manifest_text, [marker]))
         self.assertEqual([], [name for name, content in members.items() if scan_text(content, [marker])])
 
 

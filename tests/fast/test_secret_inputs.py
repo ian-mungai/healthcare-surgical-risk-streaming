@@ -10,6 +10,7 @@ import base64
 import re
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -48,7 +49,9 @@ class ScannerTest(unittest.TestCase):
         return {
             "plain": f"password={self.marker.value} end",
             "percent": f"password={quote(self.marker.value, safe='')}&x=1",
+            "percent lower": f"password={quote(self.marker.value, safe='').lower()}&x=1",
             "hex": f"digest {raw.hex()} end",
+            "hex upper": f"digest {raw.hex().upper()} end",
             "base64": f"data: {base64.b64encode(raw).decode()}",
             "base64 url": f"data: {base64.urlsafe_b64encode(raw).decode()}",
             "json slash": f'{{"v": "{self.marker.value.replace("/", chr(92) + "/")}"}}',
@@ -120,11 +123,17 @@ class InventoryTest(unittest.TestCase):
                 unclaimed.append(f"{path}: claimed by {claims}, no-secret reason {reason!r}")
         self.assertEqual([], unclaimed)
 
-    def test_every_line_of_the_inventory_claims_at_least_one_file_the_code_names(self) -> None:
+    def test_every_path_of_every_line_of_the_inventory_is_a_file_the_code_names(self) -> None:
         files = derived_files()
-        stale = [entry.name for entry in INPUTS if not any(entry.claims(path) for path in files)]
+        stale = [f"{entry.name}: {path}" for entry in INPUTS for path in sorted(entry.paths()) if path not in files]
         self.assertEqual([], stale)
         self.assertEqual([], [path for path in NOT_SECRET if path not in files])
+
+    def test_a_fictitious_path_added_to_a_valid_line_is_found_by_that_check(self) -> None:
+        files = derived_files()
+        valid = next(entry for entry in INPUTS if entry.name == "grafana_admin_password")
+        widened = replace(valid, patterns=(*valid.patterns, "grafana/not_a_file"))
+        self.assertEqual(["grafana/not_a_file"], sorted(path for path in widened.paths() if path not in files))
 
     def test_each_line_names_its_consumer_its_control_and_where_the_case_runs(self) -> None:
         names = [entry.name for entry in INPUTS]
@@ -150,6 +159,7 @@ class InventoryTest(unittest.TestCase):
             "airbyte_api/aws_secret_access_key",
             "airbyte_api/client_secret",
             "k3s/dagster.token",
+            "instance_metadata/host_role_credentials",
         ):
             with self.subTest(file=expected):
                 self.assertIn(expected, files)
