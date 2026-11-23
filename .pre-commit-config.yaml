@@ -57,7 +57,7 @@ repos:
         always_run: true
       - id: fast-tests
         name: The fast test group passes
-        entry: .venv/bin/python tests/run_quick.py
+        entry: .venv/bin/python -P tests/run_quick.py
         language: system
         pass_filenames: false
         always_run: true

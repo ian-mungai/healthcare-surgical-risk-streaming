@@ -20,7 +20,7 @@ from scripts.stack.yaml_text import load_yaml
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "run_quick.py"
 RUN_SECONDS = 120
-QUICK_COMMAND = ".venv/bin/python tests/run_quick.py"
+QUICK_COMMAND = ".venv/bin/python -P tests/run_quick.py"
 SLOW_MODULE = "import unittest\nVALUE = 1\nclass PlantedSlowTest(unittest.TestCase):\n    def test_x(self):\n        pass\n"
 QUICK_TEST = "import unittest\nclass PlantedQuickTest(unittest.TestCase):\n    def test_q(self):\n{body}"
 
@@ -37,7 +37,8 @@ def planted_tree(top: Path, files: dict[str, str]) -> None:
 
 
 def run_runner(top: Path) -> tuple[int, str]:
-    result = run_command(sys.executable, ["-I", str(top / "tests" / "run_quick.py")], cwd=top, timeout=RUN_SECONDS)
+    # The hook's own form: -P keeps the script's folder off the path, so a file there cannot shadow a standard module.
+    result = run_command(sys.executable, ["-P", str(top / "tests" / "run_quick.py")], cwd=top, timeout=RUN_SECONDS)
     return result.returncode, result.stdout + result.stderr
 
 
@@ -47,7 +48,7 @@ class QuickRunnerTest(unittest.TestCase):
         hooks = [hook for repo in config["repos"] for hook in repo["hooks"]]
         self.assertEqual([hook["entry"] for hook in hooks if hook["id"] == "fast-tests"], [QUICK_COMMAND])
         recipe = (ROOT / "Makefile").read_text().split("\ntest-fast:\n", 1)[1].split("\n\n", 1)[0]
-        self.assertEqual(recipe.strip(), "$(PYTHON) tests/run_quick.py")
+        self.assertEqual(recipe.strip(), "$(PYTHON) -P tests/run_quick.py")
 
     def test_the_slow_group_is_a_package_that_discovery_finds(self) -> None:
         self.assertTrue((ROOT / "tests" / "slow" / "__init__.py").is_file())
@@ -60,6 +61,23 @@ class QuickRunnerTest(unittest.TestCase):
         code, output = run_runner(top)
         self.assertEqual(code, 0, output)
         self.assertIn("Ran 1 test", output)
+
+    def test_a_helper_named_like_a_standard_module_beside_the_runner_does_not_shadow_it(self) -> None:
+        top = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        planted_tree(top, {"tests/fast/test_planted_quick.py": QUICK_TEST.format(body="        pass\n"), "tests/pathlib.py": "raise SystemExit('shadowed')\n"})
+        code, output = run_runner(top)
+        self.assertEqual(code, 0, output)
+        self.assertIn("Ran 1 test", output)
+
+    def test_a_run_that_finds_no_test_fails_as_unittest_does(self) -> None:
+        """unittest exits 5 when it ran no test; a quick group that loads nothing must not pass the hook."""
+        empty_suite = "def load_tests(loader, tests, pattern):\n    import unittest\n    return unittest.TestSuite()\n"
+        for label, files in {"no test file": {}, "a load_tests that returns nothing": {"tests/fast/test_planted_quick.py": empty_suite}}.items():
+            with self.subTest(case=label):
+                top = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                planted_tree(top, files)
+                code, output = run_runner(top)
+                self.assertEqual(code, 5, output)
 
     def test_each_form_of_slow_import_fails_the_quick_run_by_name(self) -> None:
         forms = {

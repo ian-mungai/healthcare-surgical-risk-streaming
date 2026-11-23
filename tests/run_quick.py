@@ -1,7 +1,8 @@
 """Run the quick test group, ``tests/fast``, the way the commit hook and ``make test-fast`` do, and refuse any import of the slow group.
 
-Usage, from the repository root: ``.venv/bin/python tests/run_quick.py``, as a script, so that no package of the project loads before the finder
-is in place. The output is that of ``python -m unittest discover``.
+Usage, from the repository root: ``.venv/bin/python -P tests/run_quick.py``, as a script, so that no package of the project loads before the
+finder is in place; ``-P`` keeps this file's folder off the path, so no file beside it can shadow a standard module.
+The output is that of ``python -m unittest discover``, and a run that finds no test exits 5, as unittest does.
 
 While the quick group loads and runs, a module finder placed first in ``sys.meta_path`` refuses every module named ``tests.slow`` or under it,
 however the import is written. A refused import raises ``ImportError`` (never ``ModuleNotFoundError``, which ``from tests import slow`` would
@@ -52,6 +53,8 @@ def main() -> int:
     loaded = slow_files_loaded()
     for path in loaded:
         sys.stderr.write(f"the quick group loaded {path}; tests under tests/slow run only with make test-slow\n")
+    if result.testsRun == 0 and not result.skipped:
+        return 5  # unittest's own exit code for a run that found no test
     return 0 if result.wasSuccessful() and not loaded else 1
 
 

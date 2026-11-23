@@ -37,7 +37,7 @@ check-ansible:
 	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml connection.yml
 
 test-fast:
-	$(PYTHON) tests/run_quick.py
+	$(PYTHON) -P tests/run_quick.py
 
 test-slow:
 	$(PYTHON) -m unittest discover --start-directory tests/slow --top-level-directory .
