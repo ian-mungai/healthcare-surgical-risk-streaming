@@ -4,3 +4,9 @@ all:
     platform:
       ansible_host: "{{ lookup('ansible.builtin.env', 'PLATFORM_HOST') | default('platform-dev', true) }}"
       ansible_user: ubuntu
+    # Tasks delegated to the controller. An explicit entry keeps the implicit localhost's interpreter and gives it a temporary folder under
+    # .tools, since remote_tmp otherwise defaults to ~/.ansible/tmp, which a machine may not let the owner write. No play targets this host.
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      ansible_remote_tmp: "{{ inventory_dir }}/../.tools/ansible/remote_tmp"
