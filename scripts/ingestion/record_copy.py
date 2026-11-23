@@ -15,8 +15,11 @@ is unique to the run and to the verified content, and the source reads only that
 it before each sync. ``verify_read_keys`` is the check after the last sync: every read key must hold exactly the one version the run wrote, current or not,
 because a version that was current while Airbyte read, or one restored afterwards, leaves an entry (``copy_changed``).
 
-``remove_copies`` deletes, by key and version ID, only the versions that the ledger names. The load step calls it once the run's record is written, so the
-copies are gone after a load, and keeps them when the load fails, for inspection.
+``check_read_keys_owned`` is the first look at the read prefix, before anything is copied or changed: a version that the ledger does not name is refused.
+
+``remove_copies`` deletes, by key and version ID, each version that the ledger names. A version leaves the ledger only after the delete of exactly that
+version succeeded (a version that is already gone is not an error for the store's delete), never because a listing did not show it: a listing can stop early
+or be behind. The load step calls it once the run's record is written, so the copies are gone after a load, and keeps them when the load fails, for inspection.
 """
 
 from __future__ import annotations
@@ -59,8 +62,8 @@ class CopyingStore(ObjectStore, Protocol):
         """Copy exactly ``version`` to ``key``, which gets a new version, and return it. Raise ``CopyError`` unless the store copied that source version."""
         ...
 
-    def delete_version(self, version: ObjectVersion) -> None:
-        """Delete exactly this version or delete marker. A version that is already gone is not an error."""
+    def delete_version(self, key: str, version_id: str) -> None:
+        """Delete exactly this version or delete marker of ``key``. A version that is already gone is not an error. Any other failure raises."""
         ...
 
 
@@ -104,28 +107,38 @@ class S3CopyStore(S3Store):
                 return listed
         raise CopyError("the copy is not in the listing of its key")
 
-    def delete_version(self, version: ObjectVersion) -> None:
+    def delete_version(self, key: str, version_id: str) -> None:
         reply = self.aws.call(
             "s3api",
             "delete-object",
             "--bucket",
             self.bucket,
             "--key",
-            version.key,
+            key,
             "--version-id",
-            version.version_id,
+            version_id,
             missing=NO_SUCH_VERSION,
             timeout=COPY_TIMEOUT_SECONDS,
         )
         if reply is None:
             return
-        if type(reply) is not dict or reply.get("VersionId") != version.version_id:
+        if type(reply) is not dict or reply.get("VersionId") != version_id:
             raise CopyError("the delete call did not name the version that was asked for")
 
 
 def current_object(versions: Sequence[ObjectVersion], key: str) -> ObjectVersion | None:
     found = [version for version in versions if version.key == key and version.is_latest and not version.is_delete_marker]
     return found[0] if found else None
+
+
+def refuse_unrecorded(listed: Sequence[ObjectVersion], ledger: CopyLedger) -> None:
+    if any(version.version_id not in ledger.versions(version.key) for version in listed):
+        raise CopyError("a version in the read prefix of the run is not recorded by this run: it is refused and not deleted")
+
+
+def check_read_keys_owned(store: ObjectStore, run_id: str, ledger: CopyLedger) -> None:
+    """Raise ``CopyError`` when the run's read prefix holds an object version or a delete marker that the ledger does not name. Nothing is deleted."""
+    refuse_unrecorded(store.list_versions(read_prefix(run_id)), ledger)
 
 
 def copy_bound_versions(
@@ -143,8 +156,7 @@ def copy_bound_versions(
     listed = store.list_versions(prefix)
     if {version.key for version in listed} - set(wanted):
         raise CopyError("the read prefix of the run holds an object that is not one of its tables")
-    if any(version.version_id not in ledger.versions(version.key) for version in listed):
-        raise CopyError("a version in the read prefix of the run is not recorded by this run: it is refused and not deleted")
+    refuse_unrecorded(listed, ledger)
     copied: list[Copied] = []
     for key, (table, entry) in wanted.items():
         here = [version for version in listed if version.key == key]
@@ -152,7 +164,7 @@ def copy_bound_versions(
         good = existing if existing is not None and existing.size == entry.size and stream_sha256(store, existing) == entry.sha256 else None
         for version in here:
             if good is None or version.version_id != good.version_id:
-                store.delete_version(version)
+                store.delete_version(version.key, version.version_id)
                 ledger.discard(key, version.version_id)
         if good is None:
             sources = [item for item in store.list_versions(entry.key) if item.key == entry.key and item.version_id == entry.version_id]
@@ -189,17 +201,18 @@ def verify_read_keys(store: ObjectStore, copies: Sequence[Copied]) -> None:
 
 
 def remove_copies(store: CopyingStore, run_id: str, ledger: CopyLedger) -> int:
-    """Delete each version of the run's read keys that the ledger names, by key and version ID, and return how many. Nothing else is deleted."""
+    """Delete each version of the run's read keys that the ledger names, by key and version ID, and return how many deletes succeeded.
+
+    A version is forgotten right after its own delete succeeded, so a stop or a failure leaves every other version owned. A delete that fails raises, and the
+    versions that were not deleted stay in the ledger for the next call. Nothing that the ledger does not name is deleted, and no listing is read.
+    """
     prefix = read_prefix(run_id)
     removed = 0
     for key in sorted(ledger.keys()):
         if not key.startswith(prefix):
             continue
-        for version in store.list_versions(key):
-            if version.key == key and version.version_id in ledger.versions(key):
-                store.delete_version(version)
-                ledger.discard(key, version.version_id)
-                removed += 1
-        for version_id in ledger.versions(key):
+        for version_id in sorted(ledger.versions(key)):
+            store.delete_version(key, version_id)
             ledger.discard(key, version_id)
+            removed += 1
     return removed

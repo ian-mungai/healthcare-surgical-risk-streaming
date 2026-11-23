@@ -9,17 +9,21 @@ The order is the contract, and each step stops the load before the next one star
 3. The same manifest on another run: when any commit on the default branch carries the line ``records-manifest: <SHA-256>`` (the convention below) for this
    manifest, the earlier run's record is returned and nothing is copied, started or branched. A history that is longer than the scan and does not hold the
    line cannot prove that the manifest is new, so the load is refused (``cannot establish absence``).
-4. No job of the three connections may be active. This is checked before any configuration, copy or branch.
-5. The exact-version copy of the two CSV tables (``record_copy``) to ``records_input/<run ID>/<SHA-256>/<table>.csv``. A copy whose hash differs fails here,
-   and a version at a read key that the run's state file does not name is refused and never deleted.
+4. Everything that the run would touch and may not own is found first, before any copy, settings change or sync, and nothing is deleted: a branch of the
+   run's name is refused unless the state file names it and its history holds the hash that it was made at; a version at a read key that the state file does
+   not name is refused; no job of the three connections may be active (the job list must be in the documented shape).
+5. The exact-version copy of the two CSV tables (``record_copy``) to ``records_input/<run ID>/<SHA-256>/<table>.csv``. A copy whose hash differs fails here.
 6. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again.
-7. The load branch ``load_<run ID>`` is created from the head of main and recorded in the state file. A branch of that name that the state file does not record
-   is refused and never deleted; one that it records is the leftover of an unfinished try and is deleted at its current head first. Airbyte is asked which
-   branch its destination writes to, and the load stops unless it is the load branch.
+7. The load branch ``load_<run ID>`` is made at the head of main. A branch that the state file records and that the first look found is the leftover of an
+   unfinished try: it is deleted at exactly the head that was read then (Nessie refuses a branch that moved), and the state entry is cleared. The new pair
+   (name, hash it is made at) is written to the state file before the branch is made, so a stop at any point leaves either nothing to own or a branch that is
+   recorded. Airbyte is asked which branch its destination writes to, and the load stops unless it is the load branch.
 8. Each table is synced in turn: ``clinical_data``, ``lab_data``, then ``track_list``. The copies are confirmed before each sync, so one replaced while an
-   earlier sync read it is found. A sync that succeeds after its deadline is not accepted. A wait that passes its deadline cancels the job and polls, for a
-   bounded time, until it is terminal: a job that is still active then fails the load as ``job_still_active`` with its ID, which the state file records. A sync
-   that ends in any status but success fails the load and the later syncs do not start.
+   earlier sync read it is found. A sync that succeeds after its deadline is not accepted. Each request gets the time that is left of its own budget: the
+   sync's deadline for the reads of the wait, the confirmation's for the cancellation and its reads. A job that passes its deadline, or whose status cannot be
+   read or is outside the statuses of the API, is cancelled and read until it is terminal. A job that is not confirmed terminal inside the confirmation's
+   budget, for any reason (a read that timed out, a cancellation that could not be asked for), fails the load as ``job_still_active`` with its ID, which the
+   state file holds from the start of the job. A sync that ends in any status but success fails the load and the later syncs do not start.
 9. After the last sync every read key must hold exactly the one version that the run wrote, current or not (``copy_changed`` otherwise): the connector reads
    by key, so a version that was current while it read, or one restored afterwards, shows as a second entry. The branch is then left unmerged and nothing is
    recorded as finished.
@@ -44,14 +48,24 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
-from scripts.ingestion.airbyte_api import AirbyteError
+from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, TERMINAL_STATUSES, AirbyteError
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.record_copy import Copied, CopyError, CopyingStore, confirm_copies, copy_bound_versions, remove_copies, verify_read_keys
+from scripts.ingestion.record_copy import (
+    Copied,
+    CopyError,
+    CopyingStore,
+    check_read_keys_owned,
+    confirm_copies,
+    copy_bound_versions,
+    remove_copies,
+    verify_read_keys,
+)
 from scripts.ingestion.record_definitions import (
     DESTINATION,
+    MAIN_BRANCH,
     RECORD_SOURCE_KEYS,
     SOURCE_FILE,
     SOURCE_S3,
@@ -66,8 +80,7 @@ from scripts.ingestion.record_state import RunState
 from scripts.ingestion.store import StoreError
 
 SUCCEEDED = "succeeded"
-ENDED_WITHOUT_SUCCESS = ("failed", "cancelled", "incomplete")
-TERMINAL = (SUCCEEDED, *ENDED_WITHOUT_SUCCESS)
+ENDED_WITHOUT_SUCCESS = tuple(status for status in TERMINAL_STATUSES if status != SUCCEEDED)
 LOAD_RECORD_FORMAT = "load_record_1"
 LOAD_RECORD_FILE = "{run_id}.load_record.json"
 OWN_FIELDS = ("run_id", "manifest_sha256", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
@@ -90,6 +103,14 @@ class JobStillActive(LoadError):
     """A job is still active after its cancellation was asked for, or the cancellation could not be asked for. The message starts with ``job_still_active``."""
 
 
+class BranchExists(LoadError):
+    """The branch could not be made because the name is taken."""
+
+
+class BranchMoved(LoadError):
+    """The branch is no longer at the head that the caller read, so it was not deleted."""
+
+
 class Catalog(Protocol):
     def head(self, branch: str) -> str: ...
 
@@ -100,11 +121,17 @@ class Catalog(Protocol):
 
     def has_branch(self, branch: str) -> bool: ...
 
-    def create_branch(self, branch: str) -> str:
-        """Create the branch at the head of main and return that head."""
+    def descends_from(self, branch: str, ancestor: str) -> bool:
+        """Whether the commit ``ancestor`` is the head of the branch or in its history. Raise ``LoadError`` when that cannot be established."""
         ...
 
-    def delete_branch(self, branch: str, head: str) -> None: ...
+    def create_branch(self, branch: str, at: str) -> str:
+        """Create the branch at exactly the hash ``at`` of main and return that hash. Raise ``BranchExists`` when the name is taken."""
+        ...
+
+    def delete_branch(self, branch: str, head: str) -> None:
+        """Delete the branch when it is still at ``head``. Raise ``BranchMoved`` when it is at another hash. A branch that is gone is not an error."""
+        ...
 
     def snapshot_ids(self, branch: str) -> dict[str, int]:
         """The snapshot of each table of the raw namespace on the branch, by table name."""
@@ -124,13 +151,19 @@ class RecordAirbyte(Protocol):
 
     def destination_branch_now(self) -> str: ...
 
-    def running_jobs(self, connection_id: str) -> list[int]: ...
+    def running_jobs(self, connection_id: str) -> list[int]:
+        """The IDs of the active sync jobs of the connection. Raise ``AirbyteError`` for an answer that is not in the documented shape."""
+        ...
 
     def start_sync(self, connection_id: str) -> int: ...
 
-    def job_status(self, job: int) -> str: ...
+    def job_status(self, job: int, *, timeout: float | None = None) -> str:
+        """The status of the job, one of the statuses of the API, read inside ``timeout`` seconds. Raise ``AirbyteError`` for any other answer or no answer."""
+        ...
 
-    def cancel_job(self, job: int) -> None: ...
+    def cancel_job(self, job: int, *, timeout: float | None = None) -> None:
+        """Ask for the cancellation of the job inside ``timeout`` seconds. Raise ``AirbyteError`` when it cannot be asked for."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,12 +341,18 @@ def confirm_finished(record: LoadResult, reference: ManifestRef, catalog: Catalo
 def wait_for_job(airbyte: RecordAirbyte, job: int, table: str, deadlines: Deadlines, clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
     """Wait for the sync to succeed inside its deadline. Raise ``LoadError`` for any other end.
 
-    A success that is read after the deadline is not accepted. When the deadline passes the job is cancelled and its status is read until it is terminal within
-    ``cancel_confirm_seconds``: ``SyncDeadline`` when it is, ``JobStillActive`` when it is not or when the cancellation cannot be asked for.
+    Each status read is given what is left of the sync's budget. A success that is read after the deadline is not accepted. When the deadline passes, or a
+    status cannot be read, or its text is not one of the statuses of the API, the job is stopped: ``stop_job`` cancels it and reads it until it is terminal.
     """
     deadline = clock() + deadlines.sync_seconds
     while True:
-        status = airbyte.job_status(job)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            stop_job(airbyte, job, table, deadlines, clock, sleep, f"did not end within {deadlines.sync_seconds:g} seconds", late=True)
+        try:
+            status = airbyte.job_status(job, timeout=remaining)
+        except AirbyteError:
+            stop_job(airbyte, job, table, deadlines, clock, sleep, "has a status that could not be read")
         now = clock()
         if status == SUCCEEDED:
             if now > deadline:
@@ -321,29 +360,51 @@ def wait_for_job(airbyte: RecordAirbyte, job: int, table: str, deadlines: Deadli
             return
         if status in ENDED_WITHOUT_SUCCESS:
             raise LoadError(f"the sync of {table} ended with the status {status}")
-        if now >= deadline:
-            cancel_and_confirm(airbyte, job, table, deadlines, clock, sleep)
-        sleep(min(deadlines.poll_seconds, deadline - now))
+        if status not in ACTIVE_STATUSES:
+            stop_job(airbyte, job, table, deadlines, clock, sleep, "has a status outside the statuses of the API")
+        sleep(max(0.0, min(deadlines.poll_seconds, deadline - now)))
 
 
-def cancel_and_confirm(airbyte: RecordAirbyte, job: int, table: str, deadlines: Deadlines, clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
-    """Ask for the cancellation of a late job and wait for it to be terminal. Always raises: ``SyncDeadline`` or ``JobStillActive``."""
+def stop_job(
+    airbyte: RecordAirbyte,
+    job: int,
+    table: str,
+    deadlines: Deadlines,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    because: str,
+    *,
+    late: bool = False,
+) -> NoReturn:
+    """Cancel a job that cannot be waited for and read it until it is terminal. Always raises.
+
+    The whole of the cancellation and its confirmation has one budget, ``cancel_confirm_seconds``, and each request is given what is left of it. A job that
+    is terminal inside the budget raises ``SyncDeadline`` (``late``) or ``LoadError``. A job that is not confirmed terminal inside the budget, whatever the
+    reason (a cancellation that could not be asked for, a read that timed out, a status that is not one of the statuses of the API), raises ``JobStillActive``
+    with the job's ID. The budget is exceeded by at most the overshoot of one exchange, which ``airbyte_api`` states.
+    """
+    ends = clock() + deadlines.cancel_confirm_seconds
+    asked = True
     try:
-        airbyte.cancel_job(job)
+        airbyte.cancel_job(job, timeout=deadlines.cancel_confirm_seconds)
     except AirbyteError:
-        raise JobStillActive(f"job_still_active: the cancellation of job {job} ({table}) could not be asked for: cancel it in Airbyte") from None
-    confirm_until = clock() + deadlines.cancel_confirm_seconds
+        asked = False
     while True:
-        status = airbyte.job_status(job)
-        if status in TERMINAL:
-            ended = "was cancelled" if status == "cancelled" else f"ended as {status} after the cancellation was asked for"
-            raise SyncDeadline(f"the sync of {table} did not end within {deadlines.sync_seconds:g} seconds and {ended}")
-        now = clock()
-        if now >= confirm_until:
-            raise JobStillActive(
-                f"job_still_active: job {job} ({table}) is still {status} {deadlines.cancel_confirm_seconds:g} seconds after its cancellation was asked for"
-            )
-        sleep(min(deadlines.poll_seconds, confirm_until - now))
+        remaining = ends - clock()
+        if remaining <= 0:
+            break
+        try:
+            status = airbyte.job_status(job, timeout=remaining)
+        except AirbyteError:
+            status = ""
+        if status in TERMINAL_STATUSES:
+            ended = "was cancelled" if status == "cancelled" else f"ended as {status}"
+            raise (SyncDeadline if late else LoadError)(f"the sync of {table} {because} and {ended}")
+        sleep(max(0.0, min(deadlines.poll_seconds, ends - clock())))
+    reason = "its cancellation was asked for" if asked else "its cancellation could not be asked for"
+    raise JobStillActive(
+        f"job_still_active: job {job} ({table}) was not confirmed as ended {deadlines.cancel_confirm_seconds:g} seconds after {reason}: cancel it in Airbyte"
+    )
 
 
 def result_tags(result: LoadResult, prefix: str) -> dict[str, str]:
@@ -363,6 +424,45 @@ def remove_all(store: CopyingStore, run_id: str, state: RunState) -> None:
         remove_copies(store, run_id, state)
     except CopyError, StoreError:
         raise LoadError("the load is recorded but its copies in the read prefix could not be removed; call again to remove them") from None
+
+
+def owned_leftover(catalog: Catalog, state: RunState, branch: str) -> str | None:
+    """The head of the leftover branch of an unfinished try that this run owns, or None when there is no branch of the name.
+
+    A branch of the name is owned only when the state file records the name and the branch's history holds the hash that the run made it at. Anything else is
+    refused, and nothing is deleted. The head that is returned is the one that the deletion is sent with.
+    """
+    if not catalog.has_branch(branch):
+        return None
+    if state.branch is None or state.branch[0] != branch:
+        raise LoadError(f"the branch {branch} exists and this host has no record that this run created it: it is refused and not deleted")
+    head = catalog.head(branch)
+    if not catalog.descends_from(branch, state.branch[1]):
+        raise LoadError(f"the branch {branch} is not the branch that this run created: it is refused and not deleted")
+    return head
+
+
+def make_branch(catalog: Catalog, state: RunState, branch: str, leftover: str | None) -> str:
+    """Delete the owned leftover, clear its entry, record the new pair and then make the branch. Return the hash that it was made at.
+
+    The order is the safety: the entry that authorised the deletion is cleared before a new branch can exist, and the new pair is written before the branch
+    is made, so a stop between any two of these steps leaves no branch that the state file does not name, and a retry finds either nothing to own or a branch
+    it can prove it made. A name that is taken when the branch is made is not owned, so its pair is forgotten.
+    """
+    if leftover is not None:
+        catalog.delete_branch(branch, leftover)
+    if state.branch is not None:
+        state.forget_branch()
+    at = catalog.head(MAIN_BRANCH)
+    state.record_branch(branch, at)
+    try:
+        made = catalog.create_branch(branch, at)
+    except BranchExists:
+        state.forget_branch()
+        raise
+    if made != at:
+        raise LoadError(f"the branch {branch} was not made at the hash that was asked for")
+    return made
 
 
 def connectors() -> tuple[str, ...]:
@@ -396,6 +496,8 @@ def load_records(
         if earlier is None:
             raise LoadError("the default branch records this manifest but this host keeps no record of its load")
         return earlier
+    leftover = owned_leftover(catalog, state, branch)
+    check_read_keys_owned(store, run_id, state)
     if any(airbyte.running_jobs(identity) for identity in airbyte.find_connection_ids().values()):
         raise LoadError("a sync of a record connection is already running")
     copies = copy_bound_versions(store, reference, run_id, state, entries)
@@ -407,13 +509,7 @@ def load_records(
         airbyte.ensure_source(table.name, source_configuration(table, run_id, environment, hashes.get(table.name, "")))
         connection_ids[table.name] = airbyte.ensure_connection(table.name, connection_configuration(table))
     confirm_copies(store, run_id, copies)
-    if catalog.has_branch(branch):
-        if state.branch is None or state.branch[0] != branch:
-            raise LoadError(f"the branch {branch} exists and this host has no record that this run created it: it is refused and not deleted")
-        catalog.delete_branch(branch, catalog.head(branch))
-        state.forget_branch()
-    base_hash = catalog.create_branch(branch)
-    state.record_branch(branch, base_hash)
+    base_hash = make_branch(catalog, state, branch, leftover)
     before = catalog.snapshot_ids(branch)
     if airbyte.destination_branch_now() != branch:
         raise LoadError(f"the destination of Airbyte does not write to the branch {branch}")

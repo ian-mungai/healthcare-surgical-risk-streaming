@@ -9,12 +9,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from scripts.ingestion.airbyte_api import AirbyteError
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import Code, Notice
-from scripts.ingestion.record_load import LoadError
+from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError
+from scripts.ingestion.record_state import RunState
 from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE_PREFIX, Landed, list_text_for, selection_for
 from tests.fast.memory_store import MemoryStore
@@ -46,11 +48,13 @@ class CopyingMemoryStore(MemoryStore):
             data = data[:-1] + bytes([data[-1] ^ 1])
         return self.put_object(key, data)
 
-    def delete_version(self, version: ObjectVersion) -> None:
+    def delete_version(self, key: str, version_id: str) -> None:
+        """Delete exactly this version, as the real store does: a version that is not there is not an error, and a failing store raises."""
         if self.fail_deletes:
             raise StoreError(Notice(Code.VERSION_MISSING))
-        self.deletes.append((version.key, version.version_id))
-        self.remove_version(version.key, version.version_id)
+        self.deletes.append((key, version_id))
+        if key in self.history:
+            self.remove_version(key, version_id)
 
 
 @dataclass
@@ -79,10 +83,10 @@ class MemoryLedger:
         self.recorded.get(key, set()).discard(version_id)
 
 
-def landed_records(source: Mapping[str, bytes] = RELEASE_FILES) -> tuple[RecordLanded, ManifestRef]:
-    """Every file of ``source`` landed, one version each, the check passed and the manifest published. The store is a ``CopyingMemoryStore``."""
+def landed_records(source: Mapping[str, bytes] = RELEASE_FILES, store: CopyingMemoryStore | None = None) -> tuple[RecordLanded, ManifestRef]:
+    """Every file of ``source`` landed, one version each, the check passed and the manifest published. The store is a ``CopyingMemoryStore``, or ``store``."""
     list_bytes = list_text_for(source).encode()
-    store = CopyingMemoryStore()
+    store = CopyingMemoryStore() if store is None else store
     landed = RecordLanded(store, selection_for(list(source), list_bytes), list_bytes, {}, {}, {})
     for path, data in source.items():
         landed.land(path, data)
@@ -93,16 +97,57 @@ def source_key(name: str) -> str:
     return SOURCE_PREFIX + name
 
 
-class FakeCatalog:
-    """The catalog calls of the load: the branches with their heads and the snapshot of each table on each branch."""
+class Stopped(RuntimeError):
+    """A stop of the process between two steps of the load, planted by a test."""
+
+
+class Interrupts:
+    """Names of the calls after which, or before which, the process stops: ``stop_after`` raises ``Stopped`` once the call has had its effect."""
 
     def __init__(self) -> None:
+        self.stop_before: set[str] = set()
+        self.stop_after: set[str] = set()
+
+    def before(self, name: str) -> None:
+        if name in self.stop_before:
+            self.stop_before.discard(name)
+            raise Stopped(name)
+
+    def after(self, name: str) -> None:
+        if name in self.stop_after:
+            self.stop_after.discard(name)
+            raise Stopped(name)
+
+
+class FakeCatalog(Interrupts):
+    """The catalog calls of the load: the branches with their chains of commits (oldest first) and the snapshot of each table on each branch.
+
+    ``created_at`` is the hash each branch was made at, which a test compares with what the run's state file said at the time of a deletion: ``violations``
+    lists each deletion of a branch that the state file did not name at that hash.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
         self.calls: list[str] = []
-        self.heads: dict[str, str] = {"main": BASE_HASH}
+        self.chains: dict[str, list[str]] = {"main": [BASE_HASH]}
         self.tables: dict[str, dict[str, int]] = {"main": {}}
         self.counter = 0
         self.recorded: set[str] = set()
         self.cannot_establish_absence = False
+        self.created_at: dict[str, str] = {}
+        self.state_dir: Path | None = None
+        self.violations: list[str] = []
+        self.deleted: list[str] = []
+
+    @property
+    def heads(self) -> _Heads:
+        return _Heads(self)
+
+    def advance_main(self) -> str:
+        """Another commit on main, as a merge of another load makes one."""
+        self.counter += 1
+        self.chains["main"].append(f"{self.counter + 5000:064x}")
+        return self.chains["main"][-1]
 
     def has_recorded_manifest(self, sha256: str) -> bool:
         self.calls.append("has_recorded_manifest")
@@ -114,25 +159,44 @@ class FakeCatalog:
 
     def head(self, branch: str) -> str:
         self.calls.append(f"head {branch}")
-        return self.heads[branch]
+        return self.chains[branch][-1]
 
     def has_branch(self, branch: str) -> bool:
         self.calls.append(f"has_branch {branch}")
-        return branch in self.heads
+        return branch in self.chains
 
-    def create_branch(self, branch: str) -> str:
+    def descends_from(self, branch: str, ancestor: str) -> bool:
+        self.calls.append(f"descends_from {branch}")
+        return ancestor in self.chains[branch]
+
+    def create_branch(self, branch: str, at: str) -> str:
         self.calls.append(f"create_branch {branch}")
-        if branch in self.heads:
-            raise FileExistsError(branch)
-        self.heads[branch] = self.heads["main"]
+        self.before("create_branch")
+        if branch in self.chains:
+            raise BranchExists(branch)
+        self.chains[branch] = self.chains["main"][: self.chains["main"].index(at) + 1]
         self.tables[branch] = dict(self.tables["main"])
-        return self.heads[branch]
+        self.created_at[branch] = at
+        self.after("create_branch")
+        return at
+
+    def make_branch(self, branch: str, *, root: str | None = None) -> None:
+        """A branch that another writer made: from main's head, or, with ``root``, from a history that main does not hold."""
+        self.chains[branch] = [root] if root else list(self.chains["main"])
+        self.tables[branch] = dict(self.tables["main"])
+        self.created_at[branch] = self.chains[branch][-1]
 
     def delete_branch(self, branch: str, head: str) -> None:
         self.calls.append(f"delete_branch {branch}")
-        if self.heads.get(branch) != head:
-            raise FileExistsError(branch)
-        del self.heads[branch], self.tables[branch]
+        self.before("delete_branch")
+        recorded = RunState(self.state_dir, RUN).branch if self.state_dir is not None else None
+        if recorded != (branch, self.created_at.get(branch)):
+            self.violations.append(f"{branch} was deleted while the state file named {recorded} and the branch was made at {self.created_at.get(branch)}")
+        if self.chains[branch][-1] != head:
+            raise BranchMoved(branch)
+        del self.chains[branch], self.tables[branch]
+        self.deleted.append(branch)
+        self.after("delete_branch")
 
     def snapshot_ids(self, branch: str) -> dict[str, int]:
         self.calls.append(f"snapshot_ids {branch}")
@@ -142,23 +206,54 @@ class FakeCatalog:
         """What a sync does to its branch: the table has a new snapshot and the branch a new head."""
         self.counter += 1
         self.tables[branch][f"raw_records.{table}"] = 1000 + self.counter
-        self.heads[branch] = f"{self.counter:064x}"
+        self.chains[branch].append(f"{self.counter:064x}")
+
+
+class _Heads:
+    """The heads of the branches as a mapping, for the tests that read or set one."""
+
+    def __init__(self, catalog: FakeCatalog) -> None:
+        self.catalog = catalog
+
+    def __getitem__(self, branch: str) -> str:
+        return self.catalog.chains[branch][-1]
+
+    def __setitem__(self, branch: str, value: str) -> None:
+        self.catalog.chains[branch].append(value)
+
+    def __delitem__(self, branch: str) -> None:
+        del self.catalog.chains[branch]
+
+    def __contains__(self, branch: object) -> bool:
+        return branch in self.catalog.chains
+
+    def get(self, branch: str) -> str | None:
+        return self.catalog.chains[branch][-1] if branch in self.catalog.chains else None
 
 
 class CommitsTables(Protocol):
     def commit_table(self, branch: str, table: str) -> None: ...
 
 
-class FakeAirbyte:
+class FakeAirbyte(Interrupts):
     """The Airbyte calls of the load. A sync commits its table to the branch that the destination named when the sync started.
 
     ``outcomes`` maps a table to the final status of its job (``succeeded`` by default). ``stuck`` is a job that ends as ``cancelled`` once it is cancelled, and
     ``unkillable`` is a job that acknowledges a cancellation and still reports ``running``. ``polls`` is how many status reads answer ``running`` before the job
-    ends. With a ``clock``, each status read takes ``latency`` seconds of it, so a job can end after its deadline although it is read at once.
+    ends and answer ``polls_as``. With a ``clock``, each status read takes ``latency`` seconds of it, so a job can end after its deadline although it is read
+    at once. ``unreadable`` is how many status reads fail as a call that did not finish, ``unreadable_after_cancel`` the same after a cancellation, and
+    ``status_text`` replaces the answer of every read with that text. ``timeouts`` lists each status read and cancellation with the time that it was given
+    and the clock's time when it was asked.
     """
 
     def __init__(self, catalog: CommitsTables) -> None:
+        super().__init__()
         self.catalog = catalog
+        self.polls_as = "running"
+        self.unreadable = 0
+        self.unreadable_after_cancel = False
+        self.status_text: str | None = None
+        self.timeouts: list[tuple[str, float | None, float]] = []
         self.calls: list[str] = []
         self.destination_branch = ""
         self.read_from: dict[str, str] = {}
@@ -178,6 +273,7 @@ class FakeAirbyte:
         self.clock: Any = None
         self.latency = 0.0
         self.cancel_fails = False
+        self.running_error = False
 
     def find_connection_ids(self) -> dict[str, str]:
         self.calls.append("find_connection_ids")
@@ -207,6 +303,8 @@ class FakeAirbyte:
 
     def running_jobs(self, connection_id: str) -> list[int]:
         self.calls.append(f"running_jobs {connection_id}")
+        if self.running_error:
+            raise AirbyteError("GET jobs gave a job entry that is not an object")
         return list(self.running_for.get(connection_id, self.running))
 
     def start_sync(self, connection_id: str) -> int:
@@ -216,27 +314,35 @@ class FakeAirbyte:
         self.jobs[job] = {"table": table, "branch": self.destination_branch, "polls": 0}
         if table in self.after_start:
             self.after_start[table]()
+        self.after(f"start_sync {table}")
         return job
 
-    def job_status(self, job: int) -> str:
+    def job_status(self, job: int, *, timeout: float | None = None) -> str:
         state = self.jobs[job]
         state["polls"] += 1
         if state["polls"] > 500:
             raise AssertionError("the status of a job was read 500 times: the wait has no deadline")
         outcome = self.outcomes.get(state["table"], "succeeded")
         self.calls.append(f"job_status {state['table']}")
+        self.timeouts.append(("job_status", timeout, self.clock.now if self.clock is not None else 0.0))
         if self.clock is not None:
             self.clock.now += self.latency
+        if self.unreadable > 0 or (self.unreadable_after_cancel and state.get("cancelled")):
+            self.unreadable = max(0, self.unreadable - 1)
+            raise AirbyteError("GET jobs did not finish within its deadline")
+        if self.status_text is not None:
+            return self.status_text
         if outcome == "stuck" and state.get("cancelled"):
             return "cancelled"
         if outcome in ("stuck", "unkillable") or state["polls"] <= self.polls:
-            return "running"
+            return self.polls_as
         if outcome == "succeeded" and self.commits and state["table"] not in self.skip_tables:
             self.catalog.commit_table(state["branch"], state["table"])
         return outcome
 
-    def cancel_job(self, job: int) -> None:
+    def cancel_job(self, job: int, *, timeout: float | None = None) -> None:
         self.calls.append(f"cancel_job {self.jobs[job]['table']}")
+        self.timeouts.append(("cancel_job", timeout, self.clock.now if self.clock is not None else 0.0))
         if self.cancel_fails:
             raise AirbyteError("DELETE jobs could not reach Airbyte")
         self.jobs[job]["cancelled"] = True

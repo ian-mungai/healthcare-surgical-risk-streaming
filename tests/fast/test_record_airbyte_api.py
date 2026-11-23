@@ -10,13 +10,18 @@ secret is sent only in the body of a destination request and never shown in an e
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import socket
+import threading
+import time
 import unittest
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.ingestion import record_definitions as definitions
-from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi, check_api_origin
+from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, JOB_STATUSES, TERMINAL_STATUSES, AirbyteError, HttpAirbyteApi, check_api_origin, main
 from scripts.ingestion.record_definitions import DESTINATION, SOURCE_FILE, SOURCE_S3, TRACK_LIST, Environment
 
 RUN = "run_20261122_ab12cd34"
@@ -29,6 +34,7 @@ PREFIX = "/api/public/v1"
 ORIGIN = "http://10.42.0.1:8001"
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 PLATFORM_FIELD = {"platform_added": "a default"}
+MARKER = "marker_6f1c2e_never_in_a_message"
 
 
 class StandIn:
@@ -48,6 +54,8 @@ class StandIn:
         self.counters: dict[str, int] = {}
         self.workspaces = [{"workspaceId": "workspace1"}]
         self.page_size: int | None = None
+        self.budgets: list[float] = []
+        self.mutations: dict[str, Any] = {}
 
     def ident(self, prefix: str) -> str:
         self.counters[prefix] = self.counters.get(prefix, 0) + 1
@@ -68,11 +76,16 @@ class StandIn:
             raise failure()
         if label == "POST applications/token":
             self.tokens += 1
-            return 200, json.dumps({"access_token": f"token{self.tokens}"}).encode()
+            token = {"access_token": f"token{self.tokens}"}
+            if label in self.mutations:
+                self.mutations[label](token)
+            return 200, json.dumps(token).encode()
         if headers.get("Authorization") != f"Bearer token{self.tokens}" or self.expire_next_token:
             self.expire_next_token = False
             return 401, b'{"message":"expired"}'
         answer = self.route(method, path.strip("/").split("/"), query, body)
+        if label in self.mutations and answer is not None:
+            self.mutations[label](answer)
         return (200, json.dumps(answer).encode()) if answer is not None else (404, b"{}")
 
     def route(self, method: str, parts: list[str], query: dict[str, list[str]], body: dict[str, Any]) -> Any:
@@ -149,7 +162,8 @@ class Api(HttpAirbyteApi):
         super().__init__(ORIGIN, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
         self.stand_in = stand_in
 
-    def send(self, method: str, target: str, payload: bytes | None, headers: dict[str, str]) -> tuple[int, bytes]:
+    def send(self, method: str, target: str, payload: bytes | None, headers: dict[str, str], budget: float) -> tuple[int, bytes]:
+        self.stand_in.budgets.append(budget)
         return self.stand_in.send(method, target, payload, headers)
 
 
@@ -426,6 +440,13 @@ class AddressTest(unittest.TestCase):
         ("port 0", "http://10.42.0.1:0"),
         ("a port over 65535", "http://10.42.0.1:70000"),
         ("a path", "http://10.42.0.1:8001/api"),
+        ("a slash after the port", "http://10.42.0.1:8001/"),
+        ("an empty query", "http://10.42.0.1:8001?"),
+        ("an empty fragment", "http://10.42.0.1:8001#"),
+        ("a line end after the port", "http://10.42.0.1:8001\n"),
+        ("a port with leading zeros", "http://10.42.0.1:08001"),
+        ("a port with a sign", "http://10.42.0.1:+8001"),
+        ("an address in the 172 block outside the private range", "http://172.32.0.1:8001"),
         ("a query", "http://10.42.0.1:8001?a=1"),
         ("a fragment", "http://10.42.0.1:8001#x"),
         ("an IPv6 literal", "http://[fd00::1]:8001"),
@@ -436,7 +457,7 @@ class AddressTest(unittest.TestCase):
         ("a space", "http://10.42.0.1 :8001"),
         ("a decimal address", "http://170524673:8001"),
     )
-    ACCEPTED = ("http://10.42.0.1:8001", "http://172.16.4.1:8001", "http://192.168.1.1:80", "http://169.254.10.2:8001", "http://10.42.0.1:8001/")
+    ACCEPTED = ("http://10.42.0.1:8001", "http://172.16.4.1:8001", "http://192.168.1.1:80", "http://169.254.10.2:8001")
 
     def test_each_address_that_could_send_a_credential_elsewhere_is_refused(self) -> None:
         for name, address in self.REFUSED:
@@ -458,6 +479,316 @@ class AddressTest(unittest.TestCase):
             check_api_origin("http://user:hunter2@8.8.8.8:8001")
         self.assertNotIn("hunter2", str(raised.exception))
         self.assertNotIn("8.8.8.8", str(raised.exception))
+
+
+def first(answer: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = answer["data"][0]
+    return entry
+
+
+def whole_answer(answer: Any) -> dict[str, Any]:
+    whole: dict[str, Any] = answer
+    return whole
+
+
+def in_configuration(answer: Any) -> dict[str, Any]:
+    configuration: dict[str, Any] = answer["data"][0]["configuration"]
+    return configuration
+
+
+def started(api: Api, stand_in: StandIn) -> None:
+    ids = ensure_everything(api)
+    api.start_sync(ids["lab_data"])
+
+
+def read_everything(api: Api) -> None:
+    ensure_everything(api)
+
+
+def read_jobs(api: Api) -> None:
+    api.running_jobs(api.connection_ids.get("lab_data", "connection1"))
+
+
+def read_branch(api: Api) -> None:
+    api.destination_branch_now()
+
+
+def read_status(api: Api) -> None:
+    api.job_status(1)
+
+
+def start_one(api: Api) -> None:
+    api.start_sync("connection1")
+
+
+def nothing(api: Api, stand_in: StandIn) -> None:
+    return None
+
+
+def built(api: Api, stand_in: StandIn) -> None:
+    ensure_everything(api)
+
+
+DEFINITIONS = "workspaces/workspace1/definitions"
+# (name, label of the call, the object of the answer that holds the field, the field, the setup before the call, the call)
+FIELD_CASES = (
+    ("token", "POST applications/token", whole_answer, "access_token", nothing, read_jobs),
+    ("workspace", "GET workspaces", first, "workspaceId", nothing, read_everything),
+    ("source definition id", f"GET {DEFINITIONS}/sources", first, "id", built, read_everything),
+    ("source definition repository", f"GET {DEFINITIONS}/sources", first, "dockerRepository", built, read_everything),
+    ("source definition tag", f"GET {DEFINITIONS}/sources", first, "dockerImageTag", built, read_everything),
+    ("destination definition id", f"GET {DEFINITIONS}/destinations", first, "id", built, read_everything),
+    ("destination definition repository", f"GET {DEFINITIONS}/destinations", first, "dockerRepository", built, read_everything),
+    ("destination definition tag", f"GET {DEFINITIONS}/destinations", first, "dockerImageTag", built, read_everything),
+    ("created source definition", f"POST {DEFINITIONS}/sources", whole_answer, "id", nothing, read_everything),
+    ("created destination definition", f"POST {DEFINITIONS}/destinations", whole_answer, "id", nothing, read_everything),
+    ("source id", "GET sources", first, "sourceId", built, read_everything),
+    ("source definition of a source", "GET sources", first, "definitionId", built, read_everything),
+    ("source configuration", "GET sources", first, "configuration", built, read_everything),
+    ("destination id", "GET destinations", first, "destinationId", built, read_everything),
+    ("destination definition of the destination", "GET destinations", first, "definitionId", built, read_everything),
+    ("destination configuration", "GET destinations", first, "configuration", built, read_everything),
+    ("destination branch", "GET destinations", in_configuration, "main_branch_name", built, read_branch),
+    ("created source", "POST sources", whole_answer, "sourceId", nothing, read_everything),
+    ("created destination", "POST destinations", whole_answer, "destinationId", nothing, read_everything),
+    ("connection id", "GET connections", first, "connectionId", built, read_everything),
+    ("connection source", "GET connections", first, "sourceId", built, read_everything),
+    ("connection destination", "GET connections", first, "destinationId", built, read_everything),
+    ("created connection", "POST connections", whole_answer, "connectionId", nothing, read_everything),
+    ("job id in the list", "GET jobs", first, "jobId", started, read_jobs),
+    ("job status in the list", "GET jobs", first, "status", started, read_jobs),
+    ("job connection in the list", "GET jobs", first, "connectionId", started, read_jobs),
+    ("job type in the list", "GET jobs", first, "jobType", started, read_jobs),
+    ("job id of a started sync", "POST jobs", whole_answer, "jobId", built, start_one),
+    ("job status of a started sync", "POST jobs", whole_answer, "status", built, start_one),
+    ("job id of a read job", "GET jobs/1", whole_answer, "jobId", started, read_status),
+    ("job status of a read job", "GET jobs/1", whole_answer, "status", started, read_status),
+)
+
+
+def run_corrupted(case: tuple[Any, ...], corrupt: Any) -> tuple[Api, StandIn, AirbyteError]:
+    _, label, locate, field, setup, call = case
+    api, stand_in = prepared()
+    setup(api, stand_in)
+    stand_in.log.clear()
+    stand_in.mutations[label] = lambda answer: corrupt(locate(answer), field)
+    try:
+        call(api)
+    except AirbyteError as error:
+        return api, stand_in, error
+    raise AssertionError(f"{case[0]}: the corrupted answer was accepted")
+
+
+class FieldTest(unittest.TestCase):
+    """Every field of every answer that the load reads is checked: a missing or wrong field refuses the call, and no message holds the marker."""
+
+    def test_a_missing_field_and_a_field_of_the_wrong_type_each_refuse_the_call_and_no_message_holds_the_marker(self) -> None:
+        corruptions = {
+            "missing": lambda entry, field: entry.pop(field),
+            "an object": lambda entry, field: entry.__setitem__(field, {MARKER: MARKER}),
+            "a list": lambda entry, field: entry.__setitem__(field, [MARKER]),
+            "a boolean": lambda entry, field: entry.__setitem__(field, True),
+            "a number": lambda entry, field: entry.__setitem__(field, 17),
+            "an empty text": lambda entry, field: entry.__setitem__(field, ""),
+            "null": lambda entry, field: entry.__setitem__(field, None),
+        }
+        for case in FIELD_CASES:
+            for how, corrupt in corruptions.items():
+                if case[3] in ("jobId",) and how == "a number":
+                    continue
+                if case[3] == "configuration" and how == "an object":
+                    continue
+                with self.subTest(f"{case[0]}: {how}"):
+                    _, _, error = run_corrupted(case, corrupt)
+                    self.assertNotIn(MARKER, str(error))
+                    self.assertIn(case[3] if case[3] != "access_token" else "token", str(error))
+
+    def test_a_status_outside_the_closed_set_refuses_the_call_and_the_message_does_not_hold_it(self) -> None:
+        for case in FIELD_CASES:
+            if case[3] != "status":
+                continue
+            with self.subTest(case[0]):
+                _, _, error = run_corrupted(case, lambda entry, field: entry.__setitem__(field, MARKER))
+                self.assertNotIn(MARKER, str(error))
+
+    def test_the_closed_set_is_the_documented_one_and_active_and_terminal_make_it_whole(self) -> None:
+        self.assertEqual({"pending", "queued", "running", "incomplete", "failed", "succeeded", "cancelled"}, set(JOB_STATUSES))
+        self.assertEqual(set(JOB_STATUSES), set(ACTIVE_STATUSES) | set(TERMINAL_STATUSES))
+        self.assertEqual(set(), set(ACTIVE_STATUSES) & set(TERMINAL_STATUSES))
+
+    def test_each_documented_status_is_read_and_only_the_active_ones_count_as_running(self) -> None:
+        for status in JOB_STATUSES:
+            with self.subTest(status):
+                api, stand_in = prepared()
+                ids = ensure_everything(api)
+                job = api.start_sync(ids["lab_data"])
+                stand_in.jobs[job]["status"] = status
+                self.assertEqual(status, api.job_status(job))
+                self.assertEqual([job] if status in ACTIVE_STATUSES else [], api.running_jobs(ids["lab_data"]))
+
+    def test_a_job_entry_that_is_not_an_object_or_of_another_connection_or_type_refuses_the_list(self) -> None:
+        for name, entry in (
+            ("a number", 5),
+            ("a text", MARKER),
+            ("a list", [MARKER]),
+            ("another connection", {"jobId": 9, "connectionId": MARKER, "jobType": "sync", "status": "running"}),
+            ("another type", {"jobId": 9, "connectionId": "connection1", "jobType": "reset", "status": "running"}),
+        ):
+            with self.subTest(name):
+                api, stand_in = prepared()
+                stand_in.mutations["GET jobs"] = lambda answer, entry=entry: answer["data"].append(entry)
+                with self.assertRaises(AirbyteError) as raised:
+                    api.running_jobs("connection1")
+                self.assertNotIn(MARKER, str(raised.exception))
+
+    def test_a_job_that_is_not_the_one_that_was_asked_for_refuses_the_read(self) -> None:
+        api, stand_in = prepared()
+        ids = ensure_everything(api)
+        job = api.start_sync(ids["lab_data"])
+        stand_in.mutations[f"GET jobs/{job}"] = lambda answer: answer.__setitem__("jobId", job + 1)
+        with self.assertRaises(AirbyteError):
+            api.job_status(job)
+
+    def test_a_list_page_with_an_entry_that_is_not_an_object_or_a_next_that_is_not_text_refuses_the_list(self) -> None:
+        for name, corrupt in (
+            ("an entry that is a text", lambda answer: answer["data"].append(MARKER)),
+            ("a next that is a number", lambda answer: answer.__setitem__("next", 7)),
+            ("data that is an object", lambda answer: answer.__setitem__("data", {MARKER: MARKER})),
+            ("data that is missing", lambda answer: answer.pop("data")),
+        ):
+            with self.subTest(name):
+                api, stand_in = prepared()
+                stand_in.mutations["GET workspaces"] = corrupt
+                with self.assertRaises(AirbyteError) as raised:
+                    ensure_everything(api)
+                self.assertNotIn(MARKER, str(raised.exception))
+
+
+class DeadlineTest(unittest.TestCase):
+    """The deadline of an exchange is one elapsed time, whatever the server does, and the call that has no time left makes no request."""
+
+    def test_a_call_with_no_time_left_makes_no_request(self) -> None:
+        api, stand_in = prepared()
+        with self.assertRaises(AirbyteError):
+            api.call("GET", "/jobs/1", timeout=0.0)
+        self.assertEqual([], stand_in.log)
+
+    def test_every_request_of_a_call_is_given_what_is_left_of_the_smaller_of_the_two_limits(self) -> None:
+        api, stand_in = prepared()
+        api.timeout_seconds = 60.0
+        started_at = time.monotonic()
+        api.call("GET", "/workspaces", timeout=5.0)
+        self.assertEqual(2, len(stand_in.budgets))
+        self.assertTrue(all(0 < budget <= 5.0 for budget in stand_in.budgets), stand_in.budgets)
+        self.assertEqual(sorted(stand_in.budgets, reverse=True), stand_in.budgets)
+        self.assertLess(time.monotonic() - started_at, 1.0)
+
+    def test_the_clients_own_limit_bounds_a_call_that_is_given_more_time(self) -> None:
+        api, stand_in = prepared()
+        api.timeout_seconds = 3.0
+        api.call("GET", "/workspaces", timeout=500.0)
+        self.assertTrue(all(0 < budget <= 3.0 for budget in stand_in.budgets), stand_in.budgets)
+
+    def test_an_expired_token_renewal_and_repeat_stay_inside_one_deadline(self) -> None:
+        api, stand_in = prepared()
+        api.call("GET", "/workspaces", timeout=4.0)
+        stand_in.expire_next_token = True
+        stand_in.budgets.clear()
+        api.call("GET", "/workspaces", timeout=4.0)
+        self.assertEqual(3, len(stand_in.budgets))
+        self.assertTrue(all(0 < budget <= 4.0 for budget in stand_in.budgets), stand_in.budgets)
+
+    def serve(self, behaviour: str) -> tuple[int, threading.Thread, threading.Event, socket.socket]:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.2)
+        stop = threading.Event()
+
+        def run() -> None:
+            clients: list[socket.socket] = []
+            try:
+                while not stop.is_set():
+                    try:
+                        client, _ = listener.accept()
+                    except OSError:
+                        continue
+                    clients.append(client)
+                    client.settimeout(0.1)
+                    with contextlib.suppress(OSError):
+                        client.recv(65536)
+                    if behaviour == "silent":
+                        continue
+                    for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n" + b"x" * 1000:
+                        if stop.is_set():
+                            break
+                        with contextlib.suppress(OSError):
+                            client.sendall(bytes([byte]))
+                        time.sleep(0.05)
+            finally:
+                for client in clients:
+                    client.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return listener.getsockname()[1], thread, stop, listener
+
+    def check(self, behaviour: str) -> None:
+        port, thread, stop, listener = self.serve(behaviour)
+        try:
+            api, _ = prepared()
+            api.host, api.port = "127.0.0.1", port
+            started_at = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                HttpAirbyteApi.send(api, "GET", "/api/public/v1/workspaces", None, {}, 0.5)
+            elapsed = time.monotonic() - started_at
+            self.assertLess(elapsed, 1.5, f"the exchange ended after {elapsed:.2f} s")
+            self.assertGreaterEqual(elapsed, 0.4)
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            listener.close()
+            self.assertFalse(thread.is_alive())
+
+    def test_a_server_that_never_answers_ends_the_exchange_at_the_deadline(self) -> None:
+        self.check("silent")
+
+    def test_a_server_that_trickles_one_byte_at_a_time_ends_the_exchange_at_the_deadline(self) -> None:
+        self.check("trickle")
+
+    def test_the_deadline_is_one_error_that_names_the_call_through_the_whole_client(self) -> None:
+        port, thread, stop, listener = self.serve("trickle")
+        try:
+            api = HttpAirbyteApi(ORIGIN, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
+            api.host, api.port = "127.0.0.1", port
+            started_at = time.monotonic()
+            with self.assertRaises(AirbyteError) as raised:
+                api.exchange("POST", "/applications/token", {}, 0.5, authorized=False)
+            self.assertLess(time.monotonic() - started_at, 1.5)
+            self.assertIn("POST applications/token", str(raised.exception))
+            self.assertIn("deadline", str(raised.exception))
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+            listener.close()
+
+
+class CheckCommandTest(unittest.TestCase):
+    def run_main(self, address: str) -> tuple[int, str]:
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            code = main(["check", "--address", address])
+        return code, error.getvalue()
+
+    def test_the_command_accepts_what_the_client_accepts_and_refuses_what_it_refuses_without_naming_the_address(self) -> None:
+        for address in AddressTest.ACCEPTED:
+            with self.subTest(address):
+                self.assertEqual((0, ""), self.run_main(address))
+        for name, address in AddressTest.REFUSED:
+            with self.subTest(name):
+                code, message = self.run_main(address)
+                self.assertEqual(1, code)
+                self.assertNotIn(address or "\0", message)
 
 
 class RedirectTest(unittest.TestCase):

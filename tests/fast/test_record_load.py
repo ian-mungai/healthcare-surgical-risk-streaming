@@ -6,23 +6,26 @@ no record, and a second call of a finished run changes nothing. The stand-ins re
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from orchestration.surgical_risk.run_folder import SECRET_KEY
+from scripts.ingestion.airbyte_api import AirbyteError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.record_copy import CopyChanged, CopyError
 from scripts.ingestion.record_definitions import Environment
 from scripts.ingestion.record_load import (
+    BranchMoved,
     Deadlines,
     JobStillActive,
     LoadError,
@@ -37,7 +40,7 @@ from scripts.ingestion.record_load import (
 )
 from scripts.ingestion.record_state import RunState, StateError
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
-from tests.fast.record_support import BASE_HASH, RELEASE_FILES, RUN, FakeAirbyte, FakeCatalog, FakeClock, landed_records
+from tests.fast.record_support import BASE_HASH, RELEASE_FILES, RUN, FakeAirbyte, FakeCatalog, FakeClock, Stopped, landed_records
 
 ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://nessie.example:19120/api/v2")
 BRANCH = f"load_{RUN}"
@@ -62,6 +65,7 @@ class Setup:
         self.airbyte.clock = self.clock
         self.folder = Path(test.enterContext(tempfile.TemporaryDirectory(prefix="record_load_test_")))
         self.deadlines = Deadlines(sync_seconds=100.0, poll_seconds=10.0)
+        self.catalog.state_dir = self.folder
 
     @property
     def store(self) -> Any:
@@ -155,7 +159,7 @@ class FaultBeforeTheCopyTest(unittest.TestCase):
         with self.assertRaises(CopyError):
             setup.load()
         self.assertEqual(["find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked which connections exist")
-        self.assertEqual(["has_recorded_manifest"], setup.catalog.calls, "the catalog was asked a question and made no branch")
+        self.assertEqual(["has_recorded_manifest", f"has_branch {BRANCH}"], setup.catalog.calls, "the catalog was asked two questions and made no branch")
         self.assertEqual([], setup.records())
 
     def test_a_run_ID_that_is_not_a_plain_name_leaves_everything_untouched(self) -> None:
@@ -593,7 +597,7 @@ def write_earlier(setup: Setup, run: str = "run_earlier", age: float = 0.0) -> L
 
 
 class SameManifestTest(unittest.TestCase):
-    """A load whose manifest the default branch's newest recorded merge already holds returns that earlier run's record and starts nothing."""
+    """A load whose manifest any commit of the default branch's history already records returns the record of the earlier run and starts nothing."""
 
     def earlier(self, setup: Setup, run: str = "run_earlier", age: float = 0.0) -> LoadResult:
         return write_earlier(setup, run, age)
@@ -738,14 +742,15 @@ class RunStateTest(unittest.TestCase):
 
     def test_a_branch_of_the_run_s_name_that_the_state_does_not_record_is_refused_and_never_deleted(self) -> None:
         setup = Setup(self)
-        setup.catalog.create_branch(BRANCH)
+        setup.catalog.make_branch(BRANCH)
         setup.catalog.calls.clear()
         with self.assertRaises(LoadError) as raised:
             setup.load()
         self.assertIn("no record that this run created it", str(raised.exception))
         self.assertNotIn(f"delete_branch {BRANCH}", setup.catalog.calls)
         self.assertIn(BRANCH, setup.catalog.heads)
-        self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith("start_sync")])
+        self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith(("start_sync", "ensure_"))])
+        self.assertEqual([], setup.store.copies, "the refusal came before the first copy")
 
     def test_a_branch_that_the_state_records_is_deleted_at_its_current_head_and_made_again(self) -> None:
         setup = Setup(self)
@@ -846,6 +851,342 @@ class JobWaitTest(unittest.TestCase):
             setup.load()
         self.assertIn("was cancelled", str(raised.exception))
         self.assertNotIsInstance(raised.exception, JobStillActive)
+
+
+@contextlib.contextmanager
+def stopping(owner: Any, name: str, when: str) -> Iterator[None]:
+    """The process stops right before or right after the call of ``owner.name``, which a test plants to interrupt a pair of steps."""
+    original = getattr(owner, name)
+
+    def stop(*arguments: Any, **keywords: Any) -> Any:
+        if when == "before":
+            raise Stopped(name)
+        original(*arguments, **keywords)
+        raise Stopped(name)
+
+    with mock.patch.object(owner, name, stop):
+        yield
+
+
+def failed_first_try(setup: Setup) -> None:
+    setup.airbyte.outcomes["lab_data"] = "failed"
+    with contextlib.suppress(LoadError):
+        setup.load()
+    setup.airbyte.outcomes.clear()
+
+
+class BranchOwnershipTest(unittest.TestCase):
+    """The branch of a run is owned by the pair of its name and the hash that it was made at, which the state file holds before the run uses the branch."""
+
+    def test_a_branch_of_the_name_that_does_not_descend_from_the_recorded_creation_is_refused_and_not_deleted(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        del setup.catalog.heads[BRANCH], setup.catalog.tables[BRANCH]
+        setup.catalog.make_branch(BRANCH, root="e" * 64)
+        with self.assertRaises(LoadError) as raised:
+            setup.load()
+        self.assertIn("not the branch that this run created", str(raised.exception))
+        self.assertEqual([], setup.catalog.deleted)
+        self.assertIn(BRANCH, setup.catalog.heads)
+
+    def test_a_recorded_branch_that_moved_after_the_check_is_refused_by_the_hash_that_the_check_read_and_stays(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        setup.airbyte.on_ensure_connection = lambda table: setup.catalog.chains[BRANCH].append("f" * 64)
+        with self.assertRaises(BranchMoved):
+            setup.load()
+        self.assertEqual([], setup.catalog.deleted)
+        self.assertEqual("f" * 64, setup.catalog.heads[BRANCH])
+
+    def test_the_ownership_of_the_branch_is_checked_before_the_first_copy_and_the_first_settings_change(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        del setup.catalog.heads[BRANCH], setup.catalog.tables[BRANCH]
+        setup.catalog.make_branch(BRANCH, root="e" * 64)
+        copies, calls = len(setup.store.copies), len(setup.airbyte.calls)
+        with self.assertRaises(LoadError):
+            setup.load()
+        self.assertEqual(copies, len(setup.store.copies))
+        self.assertEqual([], [call for call in setup.airbyte.calls[calls:] if call.startswith(("ensure_", "start_sync"))])
+
+    def test_a_branch_made_by_the_run_is_recorded_with_its_creation_hash_before_anything_else_uses_it(self) -> None:
+        setup = Setup(self)
+        setup.catalog.stop_after.add("create_branch")
+        with self.assertRaises(Stopped):
+            setup.load()
+        self.assertEqual((BRANCH, BASE_HASH), RunState(setup.folder, RUN).branch)
+
+    def test_a_recreation_records_the_new_pair_and_the_old_entry_is_gone_before_the_new_branch_exists(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        moved = setup.catalog.advance_main()
+        setup.catalog.stop_before.add("create_branch")
+        with self.assertRaises(Stopped):
+            setup.load()
+        self.assertNotIn(BRANCH, setup.catalog.heads)
+        self.assertEqual((BRANCH, moved), RunState(setup.folder, RUN).branch, "the new pair is recorded before the branch is made")
+
+    def test_a_creation_that_finds_the_name_taken_forgets_the_pair_it_had_just_recorded(self) -> None:
+        setup = Setup(self)
+        original = setup.catalog.create_branch
+
+        def taken(branch: str, at: str) -> str:
+            setup.catalog.make_branch(branch)
+            return original(branch, at)
+
+        with mock.patch.object(setup.catalog, "create_branch", taken), self.assertRaises(LoadError):
+            setup.load()
+        self.assertIsNone(RunState(setup.folder, RUN).branch, "a branch that this run did not make is not owned")
+        self.assertEqual([], setup.catalog.deleted)
+
+    def test_a_deletion_is_always_of_a_branch_that_the_state_file_named_at_the_hash_it_was_made_at(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        setup.catalog.advance_main()
+        setup.load()
+        self.assertEqual([BRANCH], setup.catalog.deleted)
+        self.assertEqual([], setup.catalog.violations)
+
+
+class InterruptionTest(unittest.TestCase):
+    """A stop between two steps of the branch, the state file or the jobs leaves a run that a retry finishes or refuses, and nothing unowned is deleted."""
+
+    STEPS = (
+        ("after the branch delete", lambda setup: setup.catalog.stop_after.add("delete_branch")),
+        ("before the entry is cleared", lambda setup: stopping(RunState, "forget_branch", "before")),
+        ("after the entry is cleared", lambda setup: stopping(RunState, "forget_branch", "after")),
+        ("before the new pair is recorded", lambda setup: stopping(RunState, "record_branch", "before")),
+        ("after the new pair is recorded", lambda setup: stopping(RunState, "record_branch", "after")),
+        ("before the branch is made", lambda setup: setup.catalog.stop_before.add("create_branch")),
+        ("after the branch is made", lambda setup: setup.catalog.stop_after.add("create_branch")),
+    )
+
+    def interrupted(self, setup: Setup, install: Callable[[Setup], Any]) -> None:
+        planted = install(setup)
+        with planted if planted is not None else contextlib.nullcontext(), self.assertRaises(Stopped):
+            setup.load()
+
+    def test_a_retry_after_a_stop_at_any_step_of_the_branch_finishes_the_load_and_deletes_only_what_the_state_file_named(self) -> None:
+        for name, install in self.STEPS:
+            with self.subTest(name):
+                setup = Setup(self)
+                failed_first_try(setup)
+                setup.catalog.advance_main()
+                self.interrupted(setup, install)
+                result = setup.load()
+                self.assertEqual([], setup.catalog.violations)
+                self.assertEqual((BRANCH, result.base_hash), RunState(setup.folder, RUN).branch)
+                self.assertEqual(TABLES, sorted(result.snapshots))
+
+    def test_two_stops_in_a_row_the_second_after_the_branch_is_made_do_not_let_the_third_try_delete_an_unrecorded_branch(self) -> None:
+        for first, second in (("delete_branch", "create_branch"), ("create_branch", "delete_branch")):
+            with self.subTest(f"{first} then {second}"):
+                setup = Setup(self)
+                failed_first_try(setup)
+                setup.catalog.advance_main()
+                setup.catalog.stop_after.add(first)
+                with self.assertRaises(Stopped):
+                    setup.load()
+                setup.catalog.advance_main()
+                setup.catalog.stop_after.add(second)
+                with self.assertRaises(Stopped):
+                    setup.load()
+                result = setup.load()
+                self.assertEqual([], setup.catalog.violations)
+                self.assertEqual(TABLES, sorted(result.snapshots))
+
+    def test_a_stop_between_the_start_of_a_sync_and_its_record_leaves_an_active_job_that_the_retry_refuses_until_it_ends(self) -> None:
+        for name, install in (
+            ("after the start", lambda setup: setup.airbyte.stop_after.add("start_sync clinical_data")),
+            ("before the job is recorded", lambda setup: stopping(RunState, "record_job", "before")),
+        ):
+            with self.subTest(name):
+                setup = Setup(self)
+                self.interrupted(setup, install)
+                setup.airbyte.known = {table: f"connection_{table}" for table in TABLES}
+                setup.airbyte.running = [1]
+                with self.assertRaises(LoadError) as raised:
+                    setup.load()
+                self.assertIn("already running", str(raised.exception))
+                setup.airbyte.running = []
+                self.assertEqual(TABLES, sorted(setup.load().snapshots))
+                self.assertEqual([], setup.catalog.violations)
+
+    def test_a_stop_after_the_last_sync_and_before_the_record_makes_the_retry_load_again_on_a_branch_it_owns(self) -> None:
+        setup = Setup(self)
+        with mock.patch("scripts.ingestion.record_load.write_record", side_effect=Stopped("write_record")), self.assertRaises(Stopped):
+            setup.load()
+        result = setup.load()
+        self.assertEqual([BRANCH], setup.catalog.deleted)
+        self.assertEqual([], setup.catalog.violations)
+        self.assertEqual(TABLES, sorted(result.snapshots))
+
+    def test_a_stop_between_the_record_and_the_removal_of_the_copies_leaves_a_record_and_the_retry_removes_the_copies(self) -> None:
+        setup = Setup(self)
+        with mock.patch("scripts.ingestion.record_load.remove_all", side_effect=Stopped("remove_all")), self.assertRaises(Stopped):
+            setup.load()
+        self.assertEqual(2, len(setup.store.list_versions(PREFIX)))
+        setup.load()
+        self.assertEqual([], setup.store.list_versions(PREFIX))
+
+
+class OwnershipFirstTest(unittest.TestCase):
+    """Whatever the run would touch and does not own is found before anything is copied, configured or synced."""
+
+    def test_an_active_job_that_the_run_did_not_start_stops_the_load_before_any_copy_or_branch(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.known = {table: f"connection_{table}" for table in TABLES}
+        setup.airbyte.running = [7]
+        with self.assertRaises(LoadError):
+            setup.load()
+        self.assertEqual([], setup.store.copies)
+        self.assertEqual([], [call for call in setup.catalog.calls if call.startswith(("create_branch", "delete_branch"))])
+
+    def test_an_active_job_that_the_run_did_start_is_refused_all_the_same(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        setup.airbyte.known = {table: f"connection_{table}" for table in TABLES}
+        setup.airbyte.running = [2]
+        with self.assertRaises(LoadError):
+            setup.load()
+        self.assertEqual([], setup.catalog.deleted)
+
+    def test_a_stranger_version_at_a_read_key_stops_the_load_before_the_branch_is_deleted_or_a_setting_is_changed(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        setup.store.put_object(CLINICAL_KEY, b"stranger")
+        calls = len(setup.airbyte.calls)
+        with self.assertRaises(CopyError):
+            setup.load()
+        self.assertEqual([], setup.catalog.deleted)
+        self.assertEqual([], [call for call in setup.airbyte.calls[calls:] if call.startswith(("ensure_", "start_sync"))])
+
+    def test_the_read_keys_are_checked_before_the_branch_when_both_are_foreign_and_nothing_is_written(self) -> None:
+        setup = Setup(self)
+        setup.store.put_object(CLINICAL_KEY, b"stranger")
+        setup.catalog.make_branch(BRANCH)
+        with self.assertRaises((CopyError, LoadError)):
+            setup.load()
+        self.assertEqual([], setup.store.copies)
+        self.assertEqual([], setup.store.deletes)
+        self.assertEqual([], setup.catalog.deleted)
+
+    def test_a_job_list_that_is_not_in_the_documented_shape_refuses_the_load_before_any_write(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.known = {table: f"connection_{table}" for table in TABLES}
+        setup.airbyte.running_error = True
+        with self.assertRaises(AirbyteError):
+            setup.load()
+        self.assertEqual([], setup.store.copies)
+        self.assertEqual([], [call for call in setup.airbyte.calls if call.startswith(("ensure_", "start_sync"))])
+        self.assertEqual([], [call for call in setup.catalog.calls if call.startswith(("create_branch", "delete_branch"))])
+
+
+class ConfirmationBudgetTest(unittest.TestCase):
+    """The wait for a job and the confirmation of its cancellation give each request the time that is left of their own budget."""
+
+    def deadlines(self, setup: Setup) -> None:
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+
+    def test_every_request_of_the_wait_and_of_the_confirmation_gets_what_is_left_of_its_own_budget(self) -> None:
+        setup = Setup(self)
+        self.deadlines(setup)
+        setup.airbyte.outcomes["lab_data"] = "unkillable"
+        setup.airbyte.latency = 3.0
+        with self.assertRaises(JobStillActive):
+            setup.load()
+        calls = [entry for entry in setup.airbyte.timeouts if entry[0] in ("job_status", "cancel_job")]
+        cancel_at = next(at for name, _, at in calls if name == "cancel_job")
+        for name, timeout, at in calls:
+            self.assertIsNotNone(timeout, name)
+            if at < cancel_at:
+                self.assertLessEqual(at + (timeout or 0), cancel_at + 1e-9, "a read of the wait ends by the sync's deadline")
+            else:
+                self.assertLessEqual(at + (timeout or 0), cancel_at + 30.0 + 1e-9, "a request of the confirmation ends by the confirmation's deadline")
+        self.assertLessEqual(setup.clock.now, cancel_at + 30.0 + 3.0 + 1e-9, "the confirmation overshoots by at most one read")
+
+    def test_a_confirmation_that_cannot_be_read_inside_its_budget_is_job_still_active_with_the_job_recorded(self) -> None:
+        setup = Setup(self)
+        self.deadlines(setup)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        setup.airbyte.unreadable_after_cancel = True
+        with self.assertRaises(JobStillActive) as raised:
+            setup.load()
+        self.assertIn("job_still_active", str(raised.exception))
+        self.assertIn("job 1", str(raised.exception))
+        self.assertEqual(1, RunState(setup.folder, RUN).jobs["clinical_data"])
+        self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
+        self.assertEqual([], setup.records())
+
+    def test_a_status_that_cannot_be_read_in_the_wait_cancels_the_job_and_stops_the_load_without_a_deadline_message(self) -> None:
+        setup = Setup(self)
+        self.deadlines(setup)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        setup.airbyte.unreadable = 1
+        with self.assertRaises(LoadError) as raised:
+            setup.load()
+        self.assertNotIsInstance(raised.exception, (SyncDeadline, JobStillActive))
+        self.assertIn("could not be read", str(raised.exception))
+        self.assertEqual([1], setup.airbyte.cancelled)
+        self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
+
+    def test_a_status_that_can_never_be_read_is_job_still_active(self) -> None:
+        setup = Setup(self)
+        self.deadlines(setup)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        setup.airbyte.unreadable = 10**6
+        with self.assertRaises(JobStillActive) as raised:
+            setup.load()
+        self.assertIn("job 1", str(raised.exception))
+        self.assertLessEqual(setup.clock.now, 30.0 + 10.0 + 1e-9, "the wait for the confirmation is bounded")
+
+    def test_a_cancellation_that_failed_while_the_job_ended_by_itself_is_not_said_to_have_been_asked_for(self) -> None:
+        setup = Setup(self)
+        self.deadlines(setup)
+        setup.airbyte.outcomes["clinical_data"] = "failed"
+        setup.airbyte.polls = 1
+        setup.airbyte.cancel_fails = True
+        with self.assertRaises(LoadError) as raised:
+            setup.load()
+        self.assertIn("failed", str(raised.exception))
+        self.assertEqual([], setup.airbyte.cancelled)
+
+
+class StatusTest(unittest.TestCase):
+    """A status that is not one of the documented ones is never copied into a message and never taken for a job that has ended."""
+
+    MARKER = "marker_status_7e2d1a_never_in_a_message"
+
+    def test_a_status_outside_the_documented_set_is_not_a_success_not_an_end_and_not_shown(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.status_text = self.MARKER
+        with self.assertRaises(JobStillActive) as raised:
+            setup.load()
+        self.assertNotIn(self.MARKER, str(raised.exception))
+        self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
+        self.assertEqual([], setup.records())
+
+    def test_a_job_that_is_pending_or_queued_is_waited_for_like_a_running_one(self) -> None:
+        for status in ("pending", "queued", "running"):
+            with self.subTest(status):
+                setup = Setup(self)
+                setup.airbyte.polls = 3
+                setup.airbyte.polls_as = status
+                self.assertEqual(TABLES, sorted(setup.load().snapshots))
+                self.assertEqual([], setup.airbyte.cancelled)
+
+    def test_the_four_ends_are_each_decided_as_the_documentation_says_and_only_success_goes_on(self) -> None:
+        for status, goes_on in (("succeeded", True), ("failed", False), ("cancelled", False), ("incomplete", False)):
+            with self.subTest(status):
+                setup = Setup(self)
+                setup.airbyte.outcomes["clinical_data"] = status
+                if goes_on:
+                    setup.load()
+                else:
+                    with self.assertRaises(LoadError):
+                        setup.load()
+                    self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
 
 
 class ActiveJobAtStartTest(unittest.TestCase):

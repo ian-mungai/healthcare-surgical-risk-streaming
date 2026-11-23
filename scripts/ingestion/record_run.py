@@ -45,7 +45,6 @@ from scripts.ingestion.record_definitions import DefinitionError, Environment, c
 from scripts.ingestion.record_load import Deadlines, LoadError, LoadResult, load_records
 from scripts.stack.nessie import NessieClient, NessieError
 
-DEFAULT_WAREHOUSE_PATH = "warehouse"
 DEFAULT_PROFILE = "default"
 DEFAULT_RECORD_DIR = "/opt/dagster/runs/record_loads"
 SECRET_FILES = ("AIRBYTE_CLIENT_ID_FILE", "AIRBYTE_CLIENT_SECRET_FILE", "AIRBYTE_AWS_ACCESS_KEY_ID_FILE", "AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE")

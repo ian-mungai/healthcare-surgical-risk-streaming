@@ -15,8 +15,19 @@ from typing import Any
 
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.record_copy import Copied, CopyChanged, CopyError, S3CopyStore, confirm_copies, copy_bound_versions, remove_copies, verify_read_keys
-from scripts.ingestion.store import ObjectVersion
+from scripts.ingestion.notice import Code, Notice
+from scripts.ingestion.record_copy import (
+    Copied,
+    CopyChanged,
+    CopyError,
+    S3CopyStore,
+    check_read_keys_owned,
+    confirm_copies,
+    copy_bound_versions,
+    remove_copies,
+    verify_read_keys,
+)
+from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE_PREFIX, list_text_for, pin_the_synthetic_list, synthetic_pin
 from tests.fast.memory_store import Stored
 from tests.fast.record_support import CLINICAL, LAB, RELEASE_FILES, RUN, CopyingMemoryStore, MemoryLedger, RecordLanded, landed_records, source_key
@@ -339,6 +350,113 @@ class RemoveTest(unittest.TestCase):
             remove_copies(landed.store, "../x", MemoryLedger())
 
 
+class HiddenListingStore(CopyingMemoryStore):
+    """A store whose listing leaves out what it holds, as a page that stopped early or a listing that is behind does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden = False
+
+    def list_versions(self, prefix: str) -> list[ObjectVersion]:
+        return [] if self.hidden else super().list_versions(prefix)
+
+
+class FailingOneStore(CopyingMemoryStore):
+    """A store whose delete of one version fails, as a call that ran out of its time does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refuse: set[str] = set()
+
+    def delete_version(self, key: str, version_id: str) -> None:
+        if version_id in self.refuse:
+            raise StoreError(Notice(Code.VERSION_MISSING))
+        super().delete_version(key, version_id)
+
+
+class ExactDeleteTest(unittest.TestCase):
+    """A version is forgotten only after the delete of exactly that version succeeded. A listing is never the proof that it is gone."""
+
+    def test_a_recorded_version_that_the_listing_does_not_show_is_deleted_by_its_exact_ID_and_then_forgotten(self) -> None:
+        store = HiddenListingStore()
+        _, reference = landed_records(store=store)
+        ledger = MemoryLedger()
+        copied = copy_bound_versions(store, reference, RUN, ledger)
+        recorded = {(item.key, item.version_id) for item in copied}
+        store.hidden = True
+        store.deletes.clear()
+        self.assertEqual(len(recorded), remove_copies(store, RUN, ledger))
+        self.assertEqual(recorded, set(store.deletes), "each recorded version was deleted by its key and version ID though the listing showed nothing")
+        self.assertEqual(set(), set(ledger.keys()))
+        store.hidden = False
+        self.assertEqual([], store.list_versions(PREFIX))
+
+    def test_a_delete_that_fails_keeps_the_version_in_the_ledger_and_the_versions_that_were_deleted_are_forgotten(self) -> None:
+        store = FailingOneStore()
+        _, reference = landed_records(store=store)
+        ledger = MemoryLedger()
+        copied = copy_bound_versions(store, reference, RUN, ledger)
+        failing, other = copied[1], copied[0]
+        store.refuse = {failing.version_id}
+        with self.assertRaises(StoreError):
+            remove_copies(store, RUN, ledger)
+        self.assertEqual(frozenset({failing.version_id}), ledger.versions(failing.key), "the version whose delete failed is still owned")
+        self.assertEqual(frozenset(), ledger.versions(other.key), "the version whose delete succeeded is forgotten")
+        store.refuse = set()
+        self.assertEqual(1, remove_copies(store, RUN, ledger))
+        self.assertEqual(set(), set(ledger.keys()))
+
+    def test_a_version_that_is_already_gone_is_forgotten_because_its_exact_delete_succeeded(self) -> None:
+        landed, reference = landed_records()
+        ledger = MemoryLedger()
+        copied = copy(landed, reference, ledger)
+        landed.store.remove_version(copied[0].key, copied[0].version_id)
+        landed.store.deletes.clear()
+        self.assertEqual(2, remove_copies(landed.store, RUN, ledger))
+        self.assertEqual({(item.key, item.version_id) for item in copied}, set(landed.store.deletes))
+        self.assertEqual(set(), set(ledger.keys()))
+
+    def test_a_recorded_version_that_is_outside_the_read_prefix_is_not_deleted_or_forgotten(self) -> None:
+        landed, _ = landed_records()
+        ledger = MemoryLedger()
+        ledger.add("somewhere/else.csv", "v1")
+        self.assertEqual(0, remove_copies(landed.store, RUN, ledger))
+        self.assertEqual([], landed.store.deletes)
+        self.assertEqual(frozenset({"v1"}), ledger.versions("somewhere/else.csv"))
+
+
+class OwnedReadKeysTest(unittest.TestCase):
+    """Before anything is copied the run finds a version in its read prefix that it did not record, and deletes nothing."""
+
+    def test_control_a_prefix_that_holds_only_recorded_versions_or_nothing_passes(self) -> None:
+        landed, reference = landed_records()
+        ledger = MemoryLedger()
+        check_read_keys_owned(landed.store, RUN, ledger)
+        copy(landed, reference, ledger)
+        check_read_keys_owned(landed.store, RUN, ledger)
+
+    def test_a_version_that_the_ledger_does_not_name_is_refused_with_a_message_that_names_no_key_and_nothing_is_deleted(self) -> None:
+        landed, reference = landed_records()
+        ledger = MemoryLedger()
+        copy(landed, reference, ledger)
+        landed.store.put_object(CLINICAL_KEY, b"stranger")
+        with self.assertRaises(CopyError) as raised:
+            check_read_keys_owned(landed.store, RUN, ledger)
+        self.assertIn("not recorded", str(raised.exception))
+        self.assertNotIn("clinical_data", str(raised.exception))
+        self.assertEqual([], landed.store.deletes)
+
+    def test_an_object_of_another_name_in_the_prefix_and_a_delete_marker_are_refused_too(self) -> None:
+        landed, _ = landed_records()
+        landed.store.put_object(PREFIX + "other.csv", b"x")
+        with self.assertRaises(CopyError):
+            check_read_keys_owned(landed.store, RUN, MemoryLedger())
+        other, _ = landed_records()
+        other.store.put_delete_marker(CLINICAL_KEY)
+        with self.assertRaises(CopyError):
+            check_read_keys_owned(other.store, RUN, MemoryLedger())
+
+
 class FakeAws:
     def __init__(self, replies: list[Any]) -> None:
         self.replies = replies
@@ -395,17 +513,18 @@ class S3CopyTest(unittest.TestCase):
         landed, _ = landed_records()
         version = self.version(landed)
         store, aws = self.store([{"VersionId": version.version_id}])
-        store.delete_version(version)
+        store.delete_version(version.key, version.version_id)
         arguments = aws.calls[0]
         self.assertEqual(("s3api", "delete-object"), arguments[:2])
         self.assertEqual((version.key, version.version_id), (arguments[arguments.index("--key") + 1], arguments[arguments.index("--version-id") + 1]))
         for name, reply in (("other version", {"VersionId": "other"}), ("no version", {}), ("not an object", ["x"])):
             with self.subTest(name), self.assertRaises(CopyError):
-                self.store([reply])[0].delete_version(version)
+                self.store([reply])[0].delete_version(version.key, version.version_id)
 
     def test_a_version_that_is_already_gone_is_not_an_error(self) -> None:
         landed, _ = landed_records()
-        self.store([None])[0].delete_version(self.version(landed))
+        version = self.version(landed)
+        self.store([None])[0].delete_version(version.key, version.version_id)
 
 
 class ReleasePrefixTest(unittest.TestCase):
