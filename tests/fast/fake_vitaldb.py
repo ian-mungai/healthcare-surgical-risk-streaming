@@ -13,6 +13,8 @@ that decide what the decoder sees. Each part names the lines it follows:
 - the skip of a record that does not fit its packet, and the decode of a numeric value with the platform's native format code (line 2159: ``l`` and ``L`` are
   eight bytes on a 64-bit Linux, so a four-byte value fails to unpack, the read stops and ``False`` is returned);
 - the reset command, after which the records of the track named ``EVENT`` that were read before it are gone (lines 2169 to 2173);
+- the end of the recording: it is the latest record time, and a waveform record that was read also extends it to its start plus its samples over the
+  track's rate (lines 2129 to 2130 and 2151 to 2154);
 - the text decode that drops invalid bytes (lines 34 to 44) and the end of a read at an error.
 
 numpy is not in the tools environment, so a waveform record's samples are a small object with the attributes that the decoder reads.
@@ -228,6 +230,8 @@ class FakeVitalFile:
             if len(buf) < pos + nsamp * fmtlen:
                 return True
             trk.recs.append({"dt": dt, "val": FakeSamples(buf[pos : pos + nsamp * fmtlen], fmtcode, fmtlen)})
+            if trk.srate > 0 and dt + nsamp / trk.srate > self.dtend:
+                self.dtend = dt + nsamp / trk.srate
         elif trk.type == 2:
             fmtcode, fmtlen = FMT_TYPE_LEN[trk.fmt]
             if len(buf) < pos + fmtlen:

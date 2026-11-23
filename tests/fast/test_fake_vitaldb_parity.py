@@ -224,6 +224,22 @@ class StandIn(Folder):
         self.assertEqual({"N": [1.0]}, self.records(cases["a packet over one million bytes"]))
         self.assertEqual({"N": [1.0, 2.0]}, self.records(cases["a packet over one million bytes in a packed file"]))
 
+    def test_a_waveform_record_extends_the_end_of_the_recording_by_its_length_over_its_rate(self) -> None:
+        payload = files()["a waveform and a numeric record"]
+        answer = read(FakeVitalFile, self.written("case", payload), None, False)
+        self.assertEqual((START, START + 1.5), (answer["dtstart"], answer["dtend"]))
+
+    def test_a_waveform_track_with_no_rate_or_a_record_that_does_not_fit_does_not_extend_the_end(self) -> None:
+        no_rate = vital(track_packet(1, name="W", kind=1, fmt=6, rate=0.0), waveform_record(1, 6, [1, 2, 3]))
+        answer = read(FakeVitalFile, self.written("norate", no_rate), None, False)
+        self.assertEqual((True, START), (answer["returned"], answer["dtend"]))
+        short = vital(track_packet(1, name="W", kind=1, fmt=6, rate=2.0), record_packet(1, payload=struct.pack("<I", 9) + bytes(4)))
+        self.assertEqual(START, read(FakeVitalFile, self.written("short", short), None, False)["dtend"])
+
+    def test_a_header_only_read_does_not_extend_the_end_by_a_waveform_record(self) -> None:
+        payload = files()["a waveform and a numeric record"]
+        self.assertEqual(START, read(FakeVitalFile, self.written("header", payload), None, True)["dtend"])
+
     def test_a_four_byte_integer_value_ends_the_read_with_false_and_keeps_what_was_read_before_it(self) -> None:
         answer = read(FakeVitalFile, self.written("case", files()["a four-byte integer track after a float track"]), None, False)
         self.assertFalse(answer["returned"])
