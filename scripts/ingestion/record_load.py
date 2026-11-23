@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
 from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, TERMINAL_STATUSES, AirbyteError
-from scripts.ingestion.folder import list_folder
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.record_copy import (
@@ -330,12 +330,12 @@ def write_record(record_dir: Path, result: LoadResult) -> Path:
 def earlier_record(record_dir: Path, sha256: str) -> LoadResult | None:
     """The record of the newest file in ``record_dir`` whose manifest is ``sha256``, or None. A file that is not a record is not one."""
     found: list[tuple[float, str, LoadResult]] = []
-    for path in list_folder(record_dir, "*.json"):
+    for path in list_files(record_dir, "*.json"):
         try:
             record = LoadResult.from_json(path.read_text())
-            modified = path.stat().st_mtime
-        except LoadError, OSError:
+        except LoadError:
             continue
+        modified = path.stat().st_mtime
         if record.manifest_sha256 == sha256:
             found.append((modified, path.name, record))
     return max(found, key=lambda item: item[:2])[2] if found else None

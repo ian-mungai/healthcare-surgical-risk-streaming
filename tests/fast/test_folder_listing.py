@@ -14,7 +14,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts.ingestion.folder import list_folder
+from replay.service.serve import next_request
+from scripts.ingestion.folder import list_files, list_folder
+from scripts.ingestion.record_load import earlier_record
 from scripts.process import run_command
 from scripts.stack.lifecycle import declared_problems
 from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS
@@ -91,6 +93,72 @@ class ListFolderTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             list_folder(self.root, "v????", recursive=True)
 
+    def test_a_folder_behind_an_ancestor_that_cannot_be_searched_is_an_error_in_both_modes(self) -> None:
+        ancestor = self.root / "ancestor"
+        (ancestor / "runs").mkdir(parents=True)
+        ancestor.chmod(0)
+        self.addCleanup(ancestor.chmod, 0o700)
+        if os.access(ancestor, os.X_OK):
+            self.skipTest("this account searches every folder")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
+                list_folder(ancestor / "runs", "*", recursive=recursive)
+
+    def test_a_missing_folder_and_a_missing_ancestor_hold_nothing_in_both_modes(self) -> None:
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive):
+                self.assertEqual([], list_folder(self.root / "absent", recursive=recursive))
+                self.assertEqual([], list_folder(self.root / "absent" / "deeper", recursive=recursive))
+
+    def test_a_link_to_nothing_in_place_of_the_folder_is_an_error_in_both_modes(self) -> None:
+        (self.root / "dangling").symlink_to(self.root / "nowhere")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(OSError):
+                list_folder(self.root / "dangling", recursive=recursive)
+
+    def test_a_listed_file_that_cannot_be_examined_is_an_error_and_is_not_skipped(self) -> None:
+        inbox = self.root / "inbox"
+        inbox.mkdir()
+        (inbox / "request.json").write_text("{}")
+        inbox.chmod(0o400)
+        self.addCleanup(inbox.chmod, 0o700)
+        if os.access(inbox / "request.json", os.R_OK):
+            self.skipTest("this account examines every file")
+        with self.assertRaises(PermissionError):
+            list_files(inbox, "*.json")
+
+    def test_the_inbox_of_the_replay_raises_for_a_request_that_it_cannot_examine(self) -> None:
+        inbox = self.root / "inbox"
+        inbox.mkdir()
+        (inbox / "request.json").write_text("{}")
+        inbox.chmod(0o400)
+        self.addCleanup(inbox.chmod, 0o700)
+        if os.access(inbox / "request.json", os.R_OK):
+            self.skipTest("this account examines every file")
+        with self.assertRaises(PermissionError):
+            next_request(inbox)
+
+    def test_a_record_file_that_cannot_be_read_is_an_error_and_not_a_record_that_is_not_there(self) -> None:
+        record = self.root / "run_one.json"
+        record.write_text("{}")
+        record.chmod(0)
+        self.addCleanup(record.chmod, 0o600)
+        if os.access(record, os.R_OK):
+            self.skipTest("this account reads every file")
+        with self.assertRaises(PermissionError):
+            earlier_record(self.root, "a" * 64)
+
+    def test_only_files_are_listed_as_files(self) -> None:
+        (self.root / "a.json").write_text("{}")
+        (self.root / "b.json").mkdir()
+        (self.root / "c.json").symlink_to(self.root / "a.json")
+        self.assertEqual([self.root / "a.json", self.root / "c.json"], list_files(self.root, "*.json"))
+
+    def test_a_link_to_nothing_among_the_files_is_an_error(self) -> None:
+        (self.root / "x.json").symlink_to(self.root / "nowhere")
+        with self.assertRaises(OSError):
+            list_files(self.root, "*.json")
+
     def test_a_file_in_place_of_the_folder_is_an_error(self) -> None:
         (self.root / "file").touch()
         with self.assertRaises(NotADirectoryError):
@@ -115,6 +183,16 @@ class ScanTests(unittest.TestCase):
             if name in OWN_FILES:
                 continue
             lines = [number for number, line in enumerate((ROOT / name).read_text().splitlines(), 1) if LISTING_CALL.search(line)]
+            if lines:
+                found[name] = lines
+        self.assertEqual({}, found)
+
+    def test_no_module_examines_a_listed_entry_with_a_call_that_says_no_for_an_error(self) -> None:
+        found = {}
+        for name in tracked_sources():
+            if name == "scripts/ingestion/folder.py":
+                continue
+            lines = [number for number, line in enumerate((ROOT / name).read_text().splitlines(), 1) if "list_folder(" in line and ".is_file()" in line]
             if lines:
                 found[name] = lines
         self.assertEqual({}, found)

@@ -15,7 +15,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts.ingestion.folder import list_folder
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.notice import Code, Notice
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
@@ -37,9 +37,9 @@ class FolderStore:
     def entries(self, key: str) -> list[tuple[int, bool, Path]]:
         folder = self.root / key
         found = []
-        for path in list_folder(folder):
+        for path in list_files(folder):
             match = VERSION_FILE.fullmatch(path.name)
-            if match and path.is_file():
+            if match:
                 found.append((int(match.group(1)), match.group(2) is not None, path))
         return sorted(found)
 
@@ -49,12 +49,7 @@ class FolderStore:
 
     def list_versions(self, prefix: str) -> list[ObjectVersion]:
         found: list[ObjectVersion] = []
-        keys = {
-            str(path.parent.relative_to(self.root))
-            for pattern in ("v????", "v????.deleted")
-            for path in list_folder(self.root, pattern, recursive=True)
-            if path.is_file()
-        }
+        keys = {str(path.parent.relative_to(self.root)) for pattern in ("v????", "v????.deleted") for path in list_files(self.root, pattern, recursive=True)}
         for key in sorted(key for key in keys if key.startswith(prefix)):
             entries = self.entries(key)
             found += [self.version_of(key, number, marker, path, latest=index == len(entries) - 1) for index, (number, marker, path) in enumerate(entries)]

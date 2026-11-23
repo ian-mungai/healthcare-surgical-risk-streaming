@@ -50,7 +50,7 @@ from typing import Any, BinaryIO, TextIO
 
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
 from replay.service.state_file import atomic_write
-from scripts.ingestion.folder import list_folder
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.manifest import ManifestError, ManifestRef
 
 BEAT_SECONDS = 5.0
@@ -113,7 +113,7 @@ def healthy(path: Path, now: float, max_age_seconds: float) -> bool:
 
 
 def next_request(inbox: Path) -> Path | None:
-    requests = [path for path in list_folder(inbox, "*.json") if path.is_file()]
+    requests = list_files(inbox, "*.json")
     return requests[0] if requests else None
 
 
