@@ -1,7 +1,7 @@
 """The host figures are parsed from the Linux sources and from Docker's own text, and each reading that cannot be trusted is refused by name.
 
-The fixed sample files in ``tests/fixtures/proc`` are in the form of a Linux host's ``/proc/meminfo``, ``/proc/stat`` and ``/proc/diskstats`` and of Docker's
-formatted output, so the same parsing runs on this computer. Every figure is derived here from the sample files by hand.
+The fixed sample files in ``tests/fixtures/proc`` are in the form of a Linux host's ``/proc/meminfo``, ``/proc/stat`` and ``/proc/diskstats``, so the same
+parsing runs on this computer. The sizes that Docker prints are given as text in the tests. Every figure is derived here from them by hand.
 """
 
 from __future__ import annotations

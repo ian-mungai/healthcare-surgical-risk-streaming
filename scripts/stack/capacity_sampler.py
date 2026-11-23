@@ -93,12 +93,11 @@ class StopFlag:
             signal.signal(number, handler)
         self.previous.clear()
 
-    def sleep(self, seconds: float, *, pause: Callable[[float], None] = time.sleep) -> None:
-        """Wait in short slices and stop waiting when a signal came."""
-        left = seconds
-        while left > 0 and not self.requested:
+    def sleep(self, seconds: float, *, pause: Callable[[float], None] = time.sleep, clock: Clock = time.monotonic) -> None:
+        """Wait in short slices until a monotonic end, and stop waiting when a signal came. A pause that overran is never followed by another."""
+        end = clock() + seconds
+        while not self.requested and (left := end - clock()) > 0:
             pause(min(SLEEP_SLICE_SECONDS, left))
-            left -= SLEEP_SLICE_SECONDS
 
 
 def emit(text: str) -> None:
@@ -166,16 +165,20 @@ def timed(clock: Clock, wall_ns: Callable[[], int], deadline: float, read: Calla
     """One reading with the wall and monotonic times taken immediately before and after it. Its whole body (start, wait, decode, parse) runs inside.
 
     Every exception becomes a ``Failure`` with its cause. A reading whose ``mono_after`` is past ``deadline``, a point fixed before it started, is a
-    ``timeout`` whatever it returned.
+    ``timeout`` whatever it returned and whatever failure it ended with.
     """
     before = (wall_ns(), clock())
+    failure: Exception | None = None
+    body: dict[str, Any] = {}
     try:
         body = read()
-        after = (wall_ns(), clock())
-        if after[1] > deadline:
-            raise Failure("timeout")
     except Exception as error:  # the boundary: no exception ends the loop or drops the line
-        raise Failure(cause_of(error)) from error
+        failure = error
+    after = (wall_ns(), clock())
+    if after[1] > deadline:
+        raise Failure("timeout") from failure
+    if failure is not None:
+        raise Failure(cause_of(failure)) from failure
     return {"wall_ns_before": before[0], "wall_ns_after": after[0], "mono_before": before[1], "mono_after": after[1], **body}
 
 
@@ -310,7 +313,7 @@ def run_sampler(
             began = clock()
             out.write_line(sample_line(seq, began + interval_seconds, sources, runner, program, clock, wall_ns))
             seq += 1
-            flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause)
+            flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause, clock=clock)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})
     except SamplerError as error:
         say_error(str(error))

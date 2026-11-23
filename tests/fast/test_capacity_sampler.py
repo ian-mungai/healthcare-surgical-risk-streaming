@@ -423,6 +423,55 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual("timeout", line["missing"][0]["cause"])
         self.assertNotIn("host", line)
 
+    def test_a_reading_that_fails_after_its_deadline_is_a_timeout_whatever_the_failure_was(self) -> None:
+        failures = {
+            "non-zero status": (CompletedProcess(["docker"], 125, "", "x"), None),
+            "garbled rows": (CompletedProcess(["docker"], 0, "garbled\n", ""), None),
+            "os error": (OSError(errno.EMFILE, "too many open files"), None),
+            "decode error": (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), None),
+        }
+        for label, (outcome, _) in failures.items():
+            with self.subTest(failure=label), tempfile.TemporaryDirectory() as folder:
+                clock = Clock()
+                runner = Runner(clock, cost=1.25, failures={("ps", 1): outcome, ("stats", 1): outcome})
+                line = sample_lines(run_clocked(folder, runner, clock, interval=1.0, max_seconds=1.0))[0]
+                self.assertEqual([{"reading": "containers", "cause": "timeout"}, {"reading": "memory", "cause": "timeout"}], line["missing"])
+
+    def test_a_host_reading_that_fails_after_its_deadline_is_a_timeout_too(self) -> None:
+        clock = Clock()
+
+        def late_and_broken(sources: HostSources) -> HostReading:
+            clock.now += 5.0
+            raise ValueError("x")
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch("scripts.stack.capacity_sampler.read_host", side_effect=late_and_broken):
+            line = sample_lines(run_clocked(folder, Runner(clock), clock, interval=1.0, max_seconds=1.0))[0]
+        self.assertEqual({"reading": "host", "cause": "timeout"}, line["missing"][0])
+
+    def test_a_pause_that_overran_the_end_of_the_run_is_never_followed_by_another_pause(self) -> None:
+        clock, pauses = Clock(), []
+
+        def overrunning(seconds: float) -> None:
+            pauses.append(seconds)
+            clock.now += seconds + 10.0
+
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "s.jsonl"
+            drive(
+                output,
+                interval_seconds=3600.0,
+                max_seconds=1.0,
+                sources=sources(folder),
+                runner=Runner(clock),
+                clock=clock.monotonic,
+                wall_ns=clock.wall_ns,
+                pause=overrunning,
+                say=lambda t: None,
+            )
+            found = lines_of(output)
+        self.assertEqual(1, len(pauses))
+        self.assertEqual({"kind": "end", "reason": "max_seconds", "samples": 1}, found[-1])
+
     def test_a_missing_docker_program_refuses_to_start_before_the_output_file_exists(self) -> None:
         with tempfile.TemporaryDirectory() as folder, mock.patch("scripts.stack.capacity_sampler.shutil.which", return_value=None) as which:
             output = Path(folder) / "s.jsonl"
