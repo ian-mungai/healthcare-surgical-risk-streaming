@@ -133,6 +133,11 @@ class Guard(unittest.TestCase):
             "mount_for(CLINICAL_FILE / 'x', '/c')\n",
             "mount_for(str(TRACK_LIST_FILE), '/c')\n",
             "print(CLINICAL_FILE)\n",
+            "os.lstat(CLINICAL_FILE)\n",
+            "Path(CLINICAL_FILE).resolve(strict=True)\n",
+            "Path(TRACK_LIST_FILE).read_bytes()\n",
+            "open(TRACK_LIST_FILE, 'rb')\n",
+            "hashlib.sha256(CLINICAL_FILE.encode())\n",
         ):
             with self.subTest(planted=planted):
                 self.assertTrue(host_access_problems(GOOD + planted))
