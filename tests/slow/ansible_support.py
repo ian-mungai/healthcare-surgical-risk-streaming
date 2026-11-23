@@ -7,27 +7,18 @@ registered values a real host would give and show the check's verdict, with no h
 from __future__ import annotations
 
 import base64
-import importlib
 import json
 import re
 import tempfile
 from pathlib import Path
-from types import ModuleType
 
 from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT
+from tests.fast.ansible_paths import ROLES as ROLES
+from tests.fast.ansible_paths import SHARED_MODULE_UTILS as SHARED_MODULE_UTILS
+from tests.fast.ansible_paths import shared_module as shared_module
 
 PLAYBOOK_SECONDS = 120
-ROLES = ROOT / "ansible" / "roles"
-SHARED_MODULE_UTILS = ROLES / "secret_files" / "module_utils"
-
-
-def shared_module(name: str) -> ModuleType:
-    """A module of the shared role under ``ansible.module_utils``, found the way a module of a role finds it when Ansible runs it."""
-    package = importlib.import_module("ansible.module_utils")
-    if str(SHARED_MODULE_UTILS) not in package.__path__:
-        package.__path__.append(str(SHARED_MODULE_UTILS))
-    return importlib.import_module(f"ansible.module_utils.{name}")
 
 
 def environment(folder: Path) -> dict[str, str]:

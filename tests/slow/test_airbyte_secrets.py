@@ -21,7 +21,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from tests.fast.ansible_support import ROLES, run_playbook, shared_module
+from tests.slow.ansible_support import ROLES, run_playbook, shared_module
 
 ROLE = ROLES / "airbyte"
 MODULE = ROLE / "library" / "airbyte_secrets.py"

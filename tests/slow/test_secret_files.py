@@ -20,7 +20,7 @@ from unittest import mock
 
 from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.ansible_support import ROLES, load_variable, run_role_tasks, shared_module
+from tests.slow.ansible_support import ROLES, load_variable, run_role_tasks, shared_module
 
 store_module: Any = shared_module("secret_files")
 UID, GID = os.getuid(), os.getgid()

@@ -17,7 +17,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from tests.fast.ansible_support import shared_module
+from tests.fast.ansible_paths import shared_module
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "ansible" / "roles" / "compose_stack" / "library" / "postgres_accounts.py"

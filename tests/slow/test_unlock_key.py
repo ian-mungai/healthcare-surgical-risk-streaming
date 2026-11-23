@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.fast.ansible_support import run_task_files
+from tests.slow.ansible_support import run_task_files
 
 OWNER = pwd.getpwuid(os.getuid()).pw_name
 GROUP = grp.getgrgid(os.getgid()).gr_name

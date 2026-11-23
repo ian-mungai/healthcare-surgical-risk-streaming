@@ -19,7 +19,7 @@ from typing import Any
 
 from scripts.stack.limits import load_limits, render_environment
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.ansible_support import ROLES, run_playbook
+from tests.slow.ansible_support import ROLES, run_playbook
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROLES / "compose_stack"

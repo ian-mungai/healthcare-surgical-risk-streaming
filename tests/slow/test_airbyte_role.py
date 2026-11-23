@@ -19,12 +19,12 @@ from typing import Any
 from scripts.stack.k3s_limits import CHART_WORKLOAD_KEYS
 from scripts.stack.limits import load_limits
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.ansible_support import ROLES, run_playbook
+from tests.fast.ansible_paths import GROUP_VARIABLES, group_variables
 from tests.fast.test_postgres_accounts import TOOLS_FILE, accounts
+from tests.slow.ansible_support import ROLES, run_playbook
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROLES / "airbyte"
-GROUP_VARIABLES = ROOT / "ansible" / "group_vars" / "all.yml"
 OWNER = pwd.getpwuid(os.getuid()).pw_name
 GROUP = grp.getgrgid(os.getgid()).gr_name
 BRIDGE = "10.42.0.1"
@@ -37,10 +37,6 @@ def mapping(document: object) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise TypeError("expected a mapping")
     return document
-
-
-def group_variables() -> dict[str, Any]:
-    return mapping(load_yaml(GROUP_VARIABLES.read_text()))
 
 
 def flatten(tasks: object) -> list[dict[str, Any]]:

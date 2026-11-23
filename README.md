@@ -23,6 +23,7 @@ Run the checks from the repository root.
 ```sh
 make check            # run the manual-stage hooks on every file
 make test-fast        # run the fast tests
+make test-slow        # run the slow tests: Ansible playbook runs and the planted workflow faults (before a push; CI runs them too)
 make test-guards      # commit planted faults in a temporary repository and confirm each guard refuses its own
 make test-deadline    # run a wait that passes its deadline and confirm it fails visibly
 make check-terraform  # check the Terraform code with its plan tests, tflint and Trivy

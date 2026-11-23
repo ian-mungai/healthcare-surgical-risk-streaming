@@ -30,10 +30,11 @@ from scripts.infra.host import HostError, place_project_key
 from scripts.process import CompletedProcess, TimeoutExpired, run_command
 from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.ansible_support import ROLES, SHARED_MODULE_UTILS
-from tests.fast.test_airbyte_role import GROUP as ROLE_GROUP
-from tests.fast.test_airbyte_role import OWNER as ROLE_OWNER
-from tests.fast.test_airbyte_role import group_variables, role_tasks, run_tasks
+from tests.fast.ansible_paths import group_variables
+from tests.slow.ansible_support import ROLES, SHARED_MODULE_UTILS
+from tests.slow.test_airbyte_role import GROUP as ROLE_GROUP
+from tests.slow.test_airbyte_role import OWNER as ROLE_OWNER
+from tests.slow.test_airbyte_role import role_tasks, run_tasks
 
 SCRIPT = ROLES / "airbyte" / "files" / "airbyte_key_install.py"
 OWNER = f"{os.getuid()}:{os.getgid()}"

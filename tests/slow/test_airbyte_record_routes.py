@@ -21,7 +21,7 @@ from typing import Any
 
 from scripts.process import run_command
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.test_airbyte_role import BRIDGE, CHANGED_NONE, ROLE, flatten, run_tasks, values
+from tests.slow.test_airbyte_role import BRIDGE, CHANGED_NONE, ROLE, flatten, run_tasks, values
 
 ROLE_TASKS = ROLE / "tasks"
 CLIENT_ID = "client-id-value-1"
