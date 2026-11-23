@@ -78,6 +78,20 @@ class FakeNessie(NessieClient):
         self.history_reads: list[str] = []
         self.on_history_read: Callable[[], None] | None = None
         self.main_reads = 0
+        self.other: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+
+    def entry_list(self, name: str, hash_value: str) -> list[dict[str, Any]]:
+        """The contents of a commit: the namespace of the tables when it holds any, each table, and every other content that a test put on it."""
+        held = self.tables.get((name, hash_value), {})
+        found: list[dict[str, Any]] = []
+        if held:
+            found.append({"name": {"elements": [rules.NAMESPACE]}, "type": "NAMESPACE", "content": {"type": "NAMESPACE", "elements": [rules.NAMESPACE]}})
+        for table, snapshot in sorted(held.items()):
+            content = {"type": "ICEBERG_TABLE", "snapshotId": snapshot, "metadataLocation": f"s3://warehouse/{table}/{snapshot}.json"}
+            found.append({"name": {"elements": [rules.NAMESPACE, table]}, "type": "ICEBERG_TABLE", "content": content})
+        for key, content in sorted(self.other.get((name, hash_value), {}).items()):
+            found.append({"name": {"elements": key.split(".")}, "type": content["type"], "content": content})
+        return found
 
     def load_branch(self, name: str, snapshots: dict[str, int]) -> str:
         self.heads[name] = fake_hash(name, "load")
@@ -146,6 +160,8 @@ class FakeNessie(NessieClient):
                 "token": str(start + len(entries)),
             }
             return 200, json.dumps(document).encode()
+        if method == "GET" and parts[1] == "entries":
+            return 200, json.dumps({"entries": self.entry_list(name, pinned or self.heads[name]), "hasMore": False}).encode()
         if method == "GET" and parts[1] == "contents":
             table = parts[2].removeprefix(f"{rules.NAMESPACE}.")
             held = self.tables.get((name, pinned or self.heads[name]), {})
@@ -337,6 +353,55 @@ class PassingRunTest(unittest.TestCase):
         self.assertEqual({"iter_version"}, {read.method for read in reads})
         self.assertEqual({case.landed.keys["clinical_data.csv"], case.landed.keys["lab_data.csv"]}, {read.key for read in reads})
         self.assertLessEqual(case.landed.store.largest_block, 8)
+
+
+NAMESPACE_CONTENT = {"type": "NAMESPACE", "elements": ["other_space"]}
+OTHER_TABLE = {"type": "ICEBERG_TABLE", "snapshotId": 9, "metadataLocation": "s3://warehouse/other/9.json"}
+
+
+class OutputBindingTest(unittest.TestCase):
+    """The branch is merged only when everything that it changes against the default branch is the output of this load."""
+
+    def refused(self, case: Case, text: str) -> None:
+        with self.assertRaisesRegex(run.TableChecksError, text):
+            case.go(Runner())
+        self.assertEqual([], case.nessie.merges)
+
+    def test_another_table_on_the_branch_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[(BRANCH, case.branch_hash)] = {"other_space.stray": OTHER_TABLE}
+        self.refused(case, "other_space.stray")
+
+    def test_a_content_that_the_default_branch_holds_and_the_branch_lacks_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {"other_space.kept": OTHER_TABLE}
+        self.refused(case, "other_space.kept")
+
+    def test_an_edit_of_an_existing_namespace_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {"other_space": NAMESPACE_CONTENT}
+        case.nessie.other[(BRANCH, case.branch_hash)] = {"other_space": {**NAMESPACE_CONTENT, "properties": {"owner": "x"}}}
+        self.refused(case, "other_space")
+
+    def test_a_removal_of_an_existing_namespace_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.other[("main", case.nessie.heads["main"])] = {"other_space": NAMESPACE_CONTENT}
+        self.refused(case, "other_space")
+
+    def test_a_table_of_the_load_that_the_default_branch_already_holds_as_it_is_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.tables[("main", case.nessie.heads["main"])] = {"clinical_data": SNAPSHOTS["clinical_data"]}
+        self.refused(case, "clinical_data")
+
+    def test_a_default_branch_that_moved_with_another_change_since_the_branch_was_made_is_not_merged(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("another tool", {"other_table": 5})
+        self.refused(case, "other_table")
+
+    def test_the_namespace_that_the_default_branch_lacks_is_merged_with_the_tables(self) -> None:
+        case = Case(self)
+        self.assertTrue(case.go(Runner()).merged)
+        self.assertEqual([(BRANCH, case.branch_hash, "main")], case.nessie.merges)
 
 
 class MergeRecordTest(unittest.TestCase):

@@ -11,8 +11,10 @@ this order, each step only when the one before it passed:
 4. the Spark job (``spark/jobs/table_checks.py``, started by ``runner``) checks every table and prints its result;
 5. the result is read and held to the plan: the same branch, hash, tables and snapshots, every check's verdict derived from its counts, and an exit code that
    agrees with it;
-6. only when every check passed, and the branch is still at the checked hash, a pending record is written and the branch is merged into the default branch
-   with one request.
+6. only when every check passed, and the branch is still at the checked hash, the contents of the default branch's head and of the branch are compared in
+   full: every key that differs must be one of this load's tables, or a namespace that holds them and the default branch lacks (``output_problem``), so
+   another changed table, or an edited or removed namespace, is never merged along with the load;
+7. then a pending record is written and the branch is merged into the default branch with one request.
 
 The catalog's history is the one source of the merge. The receipt (``table_checks.json``, saved in the run folder against the manifest's reference) takes its
 merge commit and that commit's parent from the commit in the history whose last three lines are this load's, never from what was sent or answered.
@@ -45,7 +47,7 @@ import re
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,7 @@ from scripts.sample.candidates import RELEASE_FILE
 from scripts.stack.groups import Settings, compose_arguments, rendered_environment
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.tags import paged
 from spark import table_checks as rules
 
 LOAD_RECORD_FORMAT = "load_record_1"
@@ -640,6 +643,43 @@ def wait_for_merge(nessie: NessieClient, record: LoadRecord, default: str, timin
         return None
 
 
+def reference_contents(nessie: NessieClient, reference: str) -> dict[str, str]:
+    """Every content of ``reference`` (a name or ``name@hash``) by its dotted key, each as its type and whole content in canonical JSON."""
+    found: dict[str, str] = {}
+    for item in paged(nessie, f"/trees/{quote(reference, safe='@')}/entries", "entries", {"content": "true"}):
+        name = item.get("name")
+        elements = name.get("elements") if isinstance(name, dict) else None
+        kind = item.get("type")
+        if not isinstance(elements, list) or not elements or not all(isinstance(part, str) and part for part in elements) or not isinstance(kind, str):
+            raise TableChecksError("Nessie's answer for the contents is not in the expected form")
+        found[".".join(elements)] = json.dumps({"type": kind, "content": item.get("content")}, sort_keys=True)
+    return found
+
+
+def parent_namespaces(keys: Iterable[str]) -> set[str]:
+    """The dotted names of the namespaces that hold the tables ``keys``: every proper prefix of a table's name."""
+    return {".".join(parts[:length]) for parts in (key.split(".") for key in keys) for length in range(1, len(parts))}
+
+
+def output_problem(base: Mapping[str, str], branch: Mapping[str, str], written: Iterable[str]) -> str | None:
+    """Why the change from the default branch to the load branch is not exactly the output of this load, or ``None``.
+
+    The keys whose content differs, or that only one side holds, must be the tables that the load wrote and the namespaces that hold them and the default
+    branch lacks. An edit or a removal of an existing namespace is a change like any other. A table of the load that the default branch already holds as the
+    branch has it was not written by this load. The rule is the one of ``spark.bronze.publication.output_problem``, over contents given as text.
+    """
+    expected = set(written)
+    changed = {key for key in base.keys() | branch.keys() if base.get(key) != branch.get(key)}
+    created = {key for key in parent_namespaces(expected) if key not in base and key in branch}
+    other = sorted(key for key in changed if key not in expected and key not in created)
+    if other:
+        return f"the load branch changes {', '.join(other[:5])} against the default branch, which this load did not write: nothing was merged"
+    unchanged = sorted(key for key in expected if key not in changed)
+    if unchanged:
+        return f"the table {unchanged[0]} is on the default branch as the load branch holds it, so this load did not write it: nothing was merged"
+    return None
+
+
 def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing, run_id: str) -> MergeCommit:
     """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it. A request is never sent twice.
 
@@ -661,6 +701,13 @@ def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path
     if earlier is not None:
         confirm_main(nessie, record, default, earlier.hash)
         return earlier
+    problem = output_problem(
+        reference_contents(nessie, f"{default}@{head}"),
+        reference_contents(nessie, f"{record.branch}@{record.branch_hash}"),
+        (f"{rules.NAMESPACE}.{table}" for table in record.tables),
+    )
+    if problem is not None:
+        raise TableChecksError(problem)
     message = "\n".join(
         [f"merge {record.branch}: table checks passed", "", branch_line(record.branch), source_line(record.branch_hash), manifest_line(record.manifest.sha256)]
     )
