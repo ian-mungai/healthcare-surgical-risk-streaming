@@ -388,8 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.append(f"{type(error).__name__}: {error}")
         record.expect("run", "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
     finally:
-        remove_fixture(fixture, record)
-        code = record.close(log, blocked=blocked)
+        code = record.close_after(lambda: remove_fixture(fixture, record), log, blocked=blocked)
     return code
 
 

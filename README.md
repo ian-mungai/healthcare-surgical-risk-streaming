@@ -20,7 +20,10 @@ The checks need Python 3.14, Git, GNU Make and curl.
 make setup        # create .venv, install the pinned tools, the commit hooks and the working-tree privacy hook
 make check        # run every hook on every file
 make test-guards  # commit planted faults in a temporary repository and confirm each guard refuses its own
+make test-deadline  # run a wait that passes its deadline and confirm it fails visibly
 ```
+
+Each end-to-end run writes `record.json`, `log.txt` and `retention.json` in a new folder under `runs/`, which Git ignores. Hosted CI keeps the record and retention label of each guard shard and of the deadline case as an artifact for 30 days.
 
 ## Host commands
 

@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 override TERRAFORM := .tools/bin/terraform
 
-.PHONY: setup lock lock-orchestration lock-replay lock-spark check check-terraform check-ansible test-fast test-guards host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
+.PHONY: setup lock lock-orchestration lock-replay lock-spark check check-terraform check-ansible test-fast test-guards test-deadline host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -41,6 +41,9 @@ test-fast:
 
 test-guards:
 	$(PYTHON) -m tests.e2e.commit_guards $(if $(SHARD),--shard $(SHARD))
+
+test-deadline:
+	$(PYTHON) -m tests.e2e.deadline
 
 host-up:
 	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM))
