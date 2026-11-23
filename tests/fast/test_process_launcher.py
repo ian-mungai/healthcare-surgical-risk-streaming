@@ -51,6 +51,8 @@ class LauncherTest(unittest.TestCase):
         # later collection, the warning would land in whichever test runs then and fail one that reads standard error.
         self.addCleanup(self.collect_unreaped)
         self.addCleanup(self.kill_leftovers)
+        # A program that the launcher never reaped warns when it is collected: collect here, not inside a later test's captured error output.
+        self.addCleanup(gc.collect)
 
     def collect_unreaped(self) -> None:
         with warnings.catch_warnings():
