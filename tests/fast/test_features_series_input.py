@@ -165,6 +165,49 @@ class MalformedExactMean(unittest.TestCase):
             build_row(window(huge))
 
 
+class FilteredBeforeConverted(unittest.TestCase):
+    """The window is applied before any reading is converted or checked for its exact mean: a reading that no feature reads, after the cutoff or before the
+    window, changes nothing and aborts nothing, whatever its sample count or its sums are."""
+
+    OUTSIDE = (
+        [CUTOFF_US + SECOND, 60.0, True, 0, 0.0, 0.0],
+        [CUTOFF_US + 2 * SECOND, 60.0, True, None, None, None],
+        [CUTOFF_US + 3 * SECOND, 1.0, True, 4, float("nan"), 0.0],
+        [CUTOFF_US + 4 * SECOND, 1.0, True, -3, 5.0, "x"],
+        [(FIRST - 5) * SECOND, 60.0, True, 0, 0.0, 0.0],
+    )
+
+    @unittest.expectedFailure
+    def test_a_json_reading_outside_the_window_with_a_count_of_zero_or_no_sums_aborts_nothing(self) -> None:
+        entries = series_entries(seconds_of(lambda second: [60.0] * 4))
+        reference = through_the_command_line(entries)
+        for junk in self.OUTSIDE:
+            with self.subTest(junk=junk):
+                self.assertEqual(reference, through_the_command_line([*entries, junk]))
+
+    @unittest.expectedFailure
+    def test_a_reading_outside_the_window_in_a_series_made_by_hand_aborts_nothing_and_changes_nothing(self) -> None:
+        readings = series_readings(seconds_of(lambda second: [60.0] * 4))
+        reference = build_row(window(readings)).values
+        later = Reading(CUTOFF_US + SECOND, 60.0, True)
+        earlier = Reading((FIRST - 5) * SECOND, 60.0, True)
+        self.assertEqual(reference, build_row(window(SeriesReadings([*readings, later, earlier]))).values)
+
+    @unittest.expectedFailure
+    def test_a_reading_inside_the_window_without_its_exact_mean_is_still_refused_by_name(self) -> None:
+        readings = series_readings(seconds_of(lambda second: [60.0] * 4))
+        last = readings[-1]
+        plain = SeriesReadings([*readings[:-1], Reading(last.time_us, 60.0, True)])
+        with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*no exact mean"):
+            build_row(window(plain))
+
+    def test_a_json_reading_inside_the_window_with_a_count_of_zero_is_still_refused_by_name(self) -> None:
+        entries = series_entries(seconds_of(lambda second: [60.0] * 4))
+        entries[-1][3:5] = [0, 0.0]
+        with self.assertRaisesRegex(FeatureInputError, SERIES):
+            build_row(document(entries)["windows"][0])  # type: ignore[index]
+
+
 class ReadingsOutsideTheWindow(unittest.TestCase):
     """A reading after the cutoff is never read: whatever its value is, even a number that no float can hold, it changes no feature and raises nothing."""
 
