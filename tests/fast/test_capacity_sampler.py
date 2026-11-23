@@ -5,6 +5,8 @@ Every case drives the real writer and the real entry point. A reading that fails
 
 from __future__ import annotations
 
+import dataclasses
+import decimal
 import errno
 import io
 import json
@@ -22,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from scripts.process import CompletedProcess, TimeoutExpired
+from scripts.process import CompletedProcess, ProcessGroupSurvived, TimeoutExpired
 from scripts.stack.capacity_sampler import (
     CAUSES,
     MAX_INTERVAL_SECONDS,
@@ -35,8 +37,8 @@ from scripts.stack.capacity_sampler import (
     parser,
     run_sampler,
 )
-from scripts.stack.host_figures import HostSources
-from scripts.stack.limits import load_limits
+from scripts.stack.host_figures import FiguresError, HostReading, HostSources, Memory, read_host
+from scripts.stack.limits import LIMITS_FILE, load_limits
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "proc"
@@ -90,6 +92,12 @@ class Runner:
         return CompletedProcess([program, *args], 0, self.ps if kind == "ps" else self.stats, "")
 
 
+def drive(*arguments: Any, **keywords: Any) -> int:
+    """``run_sampler`` with a docker program named, so that no test depends on the docker program of the computer. The runner is a fake."""
+    keywords.setdefault("docker", "docker")
+    return run_sampler(*arguments, **keywords)
+
+
 def sources(folder: str) -> HostSources:
     return HostSources(FIXTURES / "meminfo_before.txt", FIXTURES / "stat_before.txt", FIXTURES / "diskstats_before.txt", Path(folder), (259, 1))
 
@@ -108,7 +116,7 @@ def sample_run(
     clock = Clock()
     runner = Runner(clock, failures=failures)
     output = Path(folder) / "samples.jsonl"
-    code = run_sampler(
+    code = drive(
         output,
         interval_seconds=interval,
         max_seconds=max_seconds,
@@ -155,7 +163,8 @@ class LineTest(unittest.TestCase):
             header = lines_of(output)[0]
         limits = load_limits()
         self.assertEqual((SCHEMA, 0.25, 1.0), (header["schema"], header["interval_seconds"], header["max_seconds"]))
-        self.assertEqual({"memory", "cpu", "disk", "free_disk"}, set(header["sources"]))
+        self.assertEqual({"memory", "cpu", "disk", "free_disk", "limits"}, set(header["sources"]))
+        self.assertEqual(str(LIMITS_FILE), header["sources"]["limits"])
         self.assertEqual(str(FIXTURES / "meminfo_before.txt"), header["sources"]["memory"])
         self.assertEqual(limits.host_reserve_mib, header["configured"]["host_reserve_mib"])
         self.assertEqual(
@@ -264,7 +273,7 @@ class MissingTest(unittest.TestCase):
         runner = Runner(clock, cost=2.0)
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "s.jsonl"
-            run_sampler(
+            drive(
                 output,
                 interval_seconds=1.0,
                 max_seconds=1.0,
@@ -277,14 +286,14 @@ class MissingTest(unittest.TestCase):
             )
             line = sample_lines(output)[0]
         self.assertEqual({"ps": 1, "stats": 0}, runner.counts)
-        self.assertEqual([{"reading": "memory", "cause": "timeout"}], line["missing"])
+        self.assertEqual([{"reading": "containers", "cause": "timeout"}, {"reading": "memory", "cause": "timeout"}], line["missing"])
         self.assertLessEqual(runner.timeouts[0][1], 1.0)
 
     def test_each_call_gets_what_is_left_of_the_interval(self) -> None:
         clock = Clock()
         runner = Runner(clock, cost=0.4)
         with tempfile.TemporaryDirectory() as folder:
-            run_sampler(
+            drive(
                 Path(folder) / "s.jsonl",
                 interval_seconds=1.0,
                 max_seconds=1.0,
@@ -307,11 +316,209 @@ class MissingTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "s.jsonl"
-            run_sampler(output, interval_seconds=2.0, max_seconds=0.1, sources=sources(folder), runner=slow, say=lambda t: None)
+            drive(output, interval_seconds=2.0, max_seconds=0.1, sources=sources(folder), runner=slow, say=lambda t: None)
             line = sample_lines(output)[0]
         self.assertLess(line["host"]["wall_ns_after"] - line["host"]["wall_ns_before"], 100_000_000)
         self.assertGreaterEqual(line["containers"]["wall_ns_before"], line["host"]["wall_ns_after"])
         self.assertGreaterEqual(line["containers"]["wall_ns_after"] - line["containers"]["wall_ns_before"], 250_000_000)
+
+
+def run_clocked(folder: str, runner: Runner, clock: Clock, *, interval: float = 1.0, max_seconds: float = 1.0, host: HostSources | None = None) -> Path:
+    output = Path(folder) / "s.jsonl"
+    drive(
+        output,
+        interval_seconds=interval,
+        max_seconds=max_seconds,
+        sources=host or sources(folder),
+        runner=runner,
+        clock=clock.monotonic,
+        wall_ns=clock.wall_ns,
+        pause=clock.pause,
+        say=lambda t: None,
+    )
+    return output
+
+
+class BoundaryTest(unittest.TestCase):
+    """Each reading is one function whose whole body runs inside one boundary, so no exception drops the line."""
+
+    def test_every_exception_a_docker_reading_can_raise_is_named_with_its_cause_and_the_other_readings_are_kept(self) -> None:
+        table = {
+            "FileNotFoundError: no docker program": (FileNotFoundError("docker"), "os_error"),
+            "PermissionError: not allowed to run it": (PermissionError(errno.EACCES, "denied"), "os_error"),
+            "OSError EMFILE: no more descriptors": (OSError(errno.EMFILE, "too many open files"), "os_error"),
+            "TimeoutExpired: the call outlived its time": (TimeoutExpired("docker", 1), "timeout"),
+            "ProcessGroupSurvived: a child outlived the call": (ProcessGroupSurvived("left over"), "os_error"),
+            "UnicodeDecodeError: the output is not text": (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "unparsable"),
+            "ValueError: a number is not one": (ValueError("x"), "unparsable"),
+            "decimal.InvalidOperation: a size is not a number": (decimal.InvalidOperation("x"), "unparsable"),
+            "KeyError: an unforeseen type": (KeyError("x"), "unparsable"),
+        }
+        for label, (error, cause) in table.items():
+            for call, reading, other in (("ps", "containers", "memory"), ("stats", "memory", "containers")):
+                with self.subTest(error=label, call=call), tempfile.TemporaryDirectory() as folder:
+                    clock = Clock()
+                    line = sample_lines(run_clocked(folder, Runner(clock, failures={(call, 1): error}), clock))[0]
+                    self.assertEqual([{"reading": reading, "cause": cause}], line["missing"])
+                    self.assertNotIn(reading, line)
+                    self.assertIn(other, line)
+                    self.assertIn("host", line)
+
+    def test_a_stats_row_with_a_size_that_is_not_in_a_known_unit_is_unparsable(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            clock = Clock()
+            line = sample_lines(run_clocked(folder, Runner(clock, stats="p-nessie-1|12parsecs / 1GiB\n"), clock))[0]
+        self.assertEqual([{"reading": "memory", "cause": "unparsable"}], line["missing"])
+
+    def test_every_exception_the_host_reading_can_raise_is_named_with_its_cause_and_the_docker_readings_are_kept(self) -> None:
+        caused = FiguresError("cannot read the host's meminfo")
+        caused.__cause__ = OSError(errno.EIO, "input/output error")
+        table = {
+            "OSError raised directly": (OSError(errno.EIO, "input/output error"), "os_error"),
+            "FiguresError caused by an OSError": (caused, "os_error"),
+            "FiguresError from a line that is not in its form": (FiguresError("no MemTotal line"), "unparsable"),
+            "UnicodeDecodeError: a counter file is not text": (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "unparsable"),
+            "ValueError": (ValueError("x"), "unparsable"),
+            "ArithmeticError": (ArithmeticError("x"), "unparsable"),
+            "KeyError: an unforeseen type": (KeyError("x"), "unparsable"),
+        }
+        for label, (error, cause) in table.items():
+            with self.subTest(error=label), tempfile.TemporaryDirectory() as folder, mock.patch("scripts.stack.capacity_sampler.read_host", side_effect=error):
+                clock = Clock()
+                line = sample_lines(run_clocked(folder, Runner(clock), clock))[0]
+                self.assertEqual([{"reading": "host", "cause": cause}], line["missing"])
+                self.assertNotIn("host", line)
+                self.assertIn("containers", line)
+                self.assertIn("memory", line)
+
+    def test_a_host_counter_file_that_is_not_text_is_unparsable_and_nothing_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            binary = Path(folder) / "meminfo"
+            binary.write_bytes(b"\xff\xfe\x00")
+            odd = HostSources(binary, FIXTURES / "stat_before.txt", FIXTURES / "diskstats_before.txt", Path(folder), (259, 1))
+            clock = Clock()
+            line = sample_lines(run_clocked(folder, Runner(clock), clock, host=odd))[0]
+        self.assertEqual([{"reading": "host", "cause": "unparsable"}], line["missing"])
+        self.assertIn("containers", line)
+
+    def test_a_reading_that_finishes_after_its_deadline_is_a_timeout_whatever_it_returned_and_its_key_is_absent(self) -> None:
+        clock = Clock()
+        runner = Runner(clock, cost=1.25)
+        with tempfile.TemporaryDirectory() as folder:
+            line = sample_lines(run_clocked(folder, runner, clock, interval=1.0, max_seconds=1.0))[0]
+        self.assertEqual([{"reading": "containers", "cause": "timeout"}, {"reading": "memory", "cause": "timeout"}], line["missing"])
+        self.assertNotIn("containers", line)
+        self.assertNotIn("memory", line)
+
+    def test_a_host_reading_that_finishes_after_its_deadline_is_a_timeout_too(self) -> None:
+        clock = Clock()
+
+        def late(sources: HostSources) -> HostReading:
+            clock.now += 5.0
+            return read_host(sources)
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch("scripts.stack.capacity_sampler.read_host", side_effect=late):
+            line = sample_lines(run_clocked(folder, Runner(clock), clock, interval=1.0, max_seconds=1.0))[0]
+        self.assertEqual("host", line["missing"][0]["reading"])
+        self.assertEqual("timeout", line["missing"][0]["cause"])
+        self.assertNotIn("host", line)
+
+    def test_a_missing_docker_program_refuses_to_start_before_the_output_file_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, mock.patch("scripts.stack.capacity_sampler.shutil.which", return_value=None) as which:
+            output = Path(folder) / "s.jsonl"
+            errors = io.StringIO()
+            with mock.patch.object(sys, "stderr", errors):
+                code = run_sampler(output, interval_seconds=0.5, max_seconds=0.5, sources=sources(folder), runner=Runner(), say=lambda t: None)
+            self.assertNotEqual(0, code)
+            self.assertFalse(output.exists())
+            self.assertEqual("capacity sampler: the docker program cannot be found\n", errors.getvalue())
+            which.assert_called_once_with("docker")
+
+    def test_the_program_is_found_once_and_every_call_gets_the_resolved_path(self) -> None:
+        programs: list[str] = []
+        inner = Runner()
+
+        def recording(program: str, args: Sequence[str], *, timeout: float, **rest: object) -> CompletedProcess[str]:
+            programs.append(program)
+            return inner(program, args, timeout=timeout, **rest)
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch("scripts.stack.capacity_sampler.shutil.which", return_value="/opt/bin/docker") as which:
+            clock = Clock()
+            run_sampler(
+                Path(folder) / "s.jsonl",
+                interval_seconds=0.25,
+                max_seconds=1.0,
+                sources=sources(folder),
+                runner=recording,
+                clock=clock.monotonic,
+                wall_ns=clock.wall_ns,
+                pause=clock.pause,
+                say=lambda t: None,
+            )
+        self.assertEqual({"/opt/bin/docker"}, set(programs))
+        self.assertEqual(8, len(programs))
+        which.assert_called_once_with("docker")
+
+    def test_the_wait_between_samples_is_cut_to_the_end_of_the_run(self) -> None:
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as folder:
+            found = lines_of(run_clocked(folder, Runner(clock), clock, interval=3600.0, max_seconds=0.1))
+        self.assertEqual({"kind": "end", "reason": "max_seconds", "samples": 1}, found[-1])
+        self.assertAlmostEqual(0.1, clock.now - 1000.0, delta=0.01)
+
+    def test_a_short_write_is_an_append_failure_with_one_write_call_and_no_second_write(self) -> None:
+        real = os.write
+        calls: list[int] = []
+
+        def short(fd: int, data: bytes) -> int:
+            calls.append(len(data))
+            return real(fd, data[:9]) if len(calls) == 2 else real(fd, data)
+
+        clock, errors = Clock(), io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            mock.patch("scripts.stack.capacity_sampler.os.write", side_effect=short),
+            mock.patch.object(sys, "stderr", errors),
+        ):
+            output = Path(folder) / "s.jsonl"
+            code = drive(
+                output,
+                interval_seconds=0.5,
+                max_seconds=5.0,
+                sources=sources(folder),
+                runner=Runner(clock),
+                clock=clock.monotonic,
+                wall_ns=clock.wall_ns,
+                pause=clock.pause,
+            )
+            written = output.read_text()
+        first, _, rest = written.partition("\n")
+        self.assertNotEqual(0, code)
+        self.assertEqual(2, len(calls), "one call for the header and one for the sample, never a second for the rest")
+        self.assertEqual("header", json.loads(first)["kind"])
+        self.assertEqual(9, len(rest.encode()), "only the nine bytes the call accepted are in the file, and the file has no end line")
+        self.assertEqual("capacity sampler: cannot append to the output file\n", errors.getvalue())
+
+    def test_nothing_is_printed_to_standard_output_and_the_messages_go_to_standard_error(self) -> None:
+        clock, out, err = Clock(), io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            drive(
+                Path(folder) / "s.jsonl",
+                interval_seconds=0.5,
+                max_seconds=0.5,
+                sources=sources(folder),
+                runner=Runner(clock),
+                clock=clock.monotonic,
+                wall_ns=clock.wall_ns,
+                pause=clock.pause,
+            )
+        self.assertEqual("", out.getvalue())
+        self.assertIn("end line written", err.getvalue())
+
+    def test_the_reading_holds_the_counters_only_and_the_memory_figures_are_raw_kib(self) -> None:
+        self.assertEqual({"memory", "cpu", "disk", "free_disk_mib"}, {field.name for field in dataclasses.fields(HostReading)})
+        self.assertEqual({"total_kib", "available_kib", "swap_total_kib", "swap_free_kib"}, {field.name for field in dataclasses.fields(Memory)})
+        self.assertFalse(any(name.endswith("_mib") for name in dir(Memory)))
 
 
 class WriterTest(unittest.TestCase):
@@ -343,7 +550,7 @@ class WriterTest(unittest.TestCase):
             mock.patch("scripts.stack.capacity_sampler.os.fsync", side_effect=tracking_sync),
         ):
             clock = Clock()
-            run_sampler(
+            drive(
                 Path(folder) / "s.jsonl",
                 interval_seconds=0.5,
                 max_seconds=1.0,
@@ -370,10 +577,10 @@ class WriterTest(unittest.TestCase):
             def close(self) -> None:
                 return
 
-        with tempfile.TemporaryDirectory() as folder, mock.patch.object(sys, "stdout", Broken()):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(sys, "stdout", Broken()), mock.patch.object(sys, "stderr", io.StringIO()):
             clock = Clock()
             output = Path(folder) / "s.jsonl"
-            code = run_sampler(
+            code = drive(
                 output,
                 interval_seconds=0.25,
                 max_seconds=0.5,
@@ -396,7 +603,7 @@ class WriterTest(unittest.TestCase):
         ):
             clock = Clock()
             output = Path(folder) / "s.jsonl"
-            code = run_sampler(
+            code = drive(
                 output,
                 interval_seconds=0.25,
                 max_seconds=5.0,
@@ -420,7 +627,7 @@ class WriterTest(unittest.TestCase):
             mock.patch.object(sys, "stderr", io.StringIO()),
         ):
             clock = Clock()
-            code = run_sampler(
+            code = drive(
                 Path(folder) / "s.jsonl",
                 interval_seconds=0.5,
                 max_seconds=0.5,
@@ -445,7 +652,7 @@ class StopTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "s.jsonl"
-            code = run_sampler(
+            code = drive(
                 output,
                 interval_seconds=0.25,
                 max_seconds=60.0,
@@ -520,7 +727,7 @@ class OutputTest(unittest.TestCase):
             target.write_text("someone else\n")
             clock = Clock()
             with mock.patch.object(sys, "stderr", io.StringIO()):
-                code = run_sampler(
+                code = drive(
                     target,
                     interval_seconds=0.5,
                     max_seconds=0.5,
@@ -544,7 +751,8 @@ class OutputTest(unittest.TestCase):
     def test_the_usage_text_says_that_the_status_tells_nothing_about_capacity_and_that_a_file_with_no_end_line_was_cut_off(self) -> None:
         text = " ".join(parser().format_help().split())
         self.assertIn("The exit status says nothing about capacity", text)
-        self.assertIn("A file with no end line was cut off", text)
+        self.assertIn("A file with no end line, or whose last line is incomplete, was cut off", text)
+        self.assertIn("nothing is printed to standard output", text)
 
 
 def shim(folder: Path, *, ps: str = PS_TEXT, stats: str = STATS_TEXT) -> dict[str, str]:
@@ -651,6 +859,37 @@ class EntryPointTest(unittest.TestCase):
             )  # fmt: skip
             found = lines_of(output)
         self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("end", found[-1]["kind"])
+
+
+class ClosedPipeTest(unittest.TestCase):
+    def test_a_standard_output_pipe_whose_reader_has_closed_leaves_status_zero_and_the_end_line(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "samples.jsonl"
+            read_end, write_end = os.pipe()
+            os.close(read_end)
+            command = [
+                sys.executable,
+                "-B",
+                "-m",
+                "scripts.stack.capacity_sampler",
+                "--output",
+                str(output),
+                "--interval-seconds",
+                "0.1",
+                "--max-seconds",
+                "0.5",
+            ]
+            try:
+                process = subprocess.Popen(command, cwd=ROOT, env=shim(Path(folder)), stdout=write_end, stderr=subprocess.PIPE, text=True)  # noqa: S603
+            finally:
+                os.close(write_end)
+            try:
+                _, err = process.communicate(timeout=30)
+            finally:
+                process.kill()
+            found = lines_of(output)
+        self.assertEqual(0, process.returncode, err)
         self.assertEqual("end", found[-1]["kind"])
 
 

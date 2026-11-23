@@ -12,13 +12,11 @@ from __future__ import annotations
 
 import os
 import re
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-KIB_PER_MIB = 1024
 BYTES_PER_MIB = 1024 * 1024
 SECTOR_BYTES = 512
 CPU_FIELDS_NEEDED = 8
@@ -38,22 +36,6 @@ class Memory:
     available_kib: int
     swap_total_kib: int
     swap_free_kib: int
-
-    @property
-    def total_mib(self) -> float:
-        return self.total_kib / KIB_PER_MIB
-
-    @property
-    def available_mib(self) -> float:
-        return self.available_kib / KIB_PER_MIB
-
-    @property
-    def used_mib(self) -> float:
-        return (self.total_kib - self.available_kib) / KIB_PER_MIB
-
-    @property
-    def swap_used_mib(self) -> float:
-        return (self.swap_total_kib - self.swap_free_kib) / KIB_PER_MIB
 
 
 @dataclass(frozen=True)
@@ -87,9 +69,10 @@ def parse_meminfo(text: str) -> Memory:
 
 
 def parse_cpu_times(text: str) -> dict[str, CpuTimes]:
-    """The busy and total time of the ``cpu`` line and of each ``cpuN`` line of a ``/proc/stat`` text, in clock ticks.
+    """The raw counters of the ``cpu`` line and of each ``cpuN`` line of a ``/proc/stat`` text, in clock ticks.
 
-    Idle and waiting for the disk are idle. Guest time is already inside user time, so only the first eight figures count.
+    Only the first eight figures of a line are kept, as read: user, nice, system, idle, iowait, irq, softirq and steal. Guest time is already inside user
+    time. Nothing is added up or derived. A line with fewer than eight whole numbers is refused.
     """
     found: dict[str, CpuTimes] = {}
     for name, rest in CPU_LINE.findall(text):
@@ -152,7 +135,6 @@ class HostSources:
 
 @dataclass(frozen=True)
 class HostReading:
-    at: float
     memory: Memory
     cpu: Mapping[str, CpuTimes]
     disk: DiskCounters
@@ -166,10 +148,10 @@ def read_source(path: Path, label: str) -> str:
         raise FiguresError(f"cannot read the host's {label} from {path}: {error.strerror}") from error
 
 
-def read_host(sources: HostSources, clock: Callable[[], float] = time.monotonic) -> HostReading:
+def read_host(sources: HostSources) -> HostReading:
     """One reading of every host counter."""
     memory = parse_meminfo(read_source(sources.meminfo, "meminfo"))
     cpu = parse_cpu_times(read_source(sources.stat, "stat"))
     major, minor = sources.device if sources.device is not None else device_of(sources.data_path)
     disk = parse_diskstats(read_source(sources.diskstats, "diskstats"), major, minor)
-    return HostReading(clock(), memory, cpu, disk, free_disk_mib(sources.data_path))
+    return HostReading(memory, cpu, disk, free_disk_mib(sources.data_path))

@@ -10,7 +10,15 @@ The file starts with a ``header`` line (the schema, the start time, the interval
 sample line holds the readings of one iteration, each with the wall and monotonic times taken immediately before and after it: ``host`` (the raw
 counters of the Linux host), ``containers`` (the rows of ``docker ps --all`` as read) and ``memory`` (the rows of ``docker stats --no-stream`` as
 read, with their parsed bytes). A reading that fails is named in ``missing`` by a fixed code and a fixed cause and its key is absent from the line.
-``seq`` counts the iterations from 0. Each line is written to the file and synced before the next reading starts.
+``seq`` counts the iterations from 0.
+
+Each reading is one function whose whole body (start, wait, decode, parse) runs inside one boundary, and each has a deadline that is a point fixed before
+it starts (the end of its interval). A reading that ends after its deadline is a ``timeout`` whatever it returned, and its key is absent. The docker
+program is found once at the start: the sampler refuses to start, before it creates the file, if it cannot find it. The wait between samples is never
+longer than the time left in the run. Each line is one ``os.write`` call, synced before the next reading starts. A write that takes fewer bytes than the
+line is an append failure: the sampler stops with a non-zero status and writes nothing more. So a file with no end line, or whose last line is
+incomplete, was cut off. Nothing is printed to standard output, so a standard output that is closed or broken cannot change the exit status. Messages
+go to standard error.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import sys
 import time
@@ -27,7 +36,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from scripts.process import TimeoutExpired, run_command
+from scripts.process import ProcessGroupSurvived, TimeoutExpired, run_command
 from scripts.stack.host_figures import FiguresError, HostSources, parse_size_bytes, read_host
 from scripts.stack.limits import LIMITS_FILE, LimitsError, load_limits
 
@@ -38,9 +47,11 @@ MAX_INTERVAL_SECONDS = 3600.0
 MAX_RUN_SECONDS = 604800.0
 SLEEP_SLICE_SECONDS = 0.25
 MIN_CALL_SECONDS = 0.01
-READINGS = ("host", "containers", "memory")
 CAUSES = ("timeout", "exit_status", "unparsable", "os_error")
-EXIT_NOTE = "The exit status says nothing about capacity: it is 0 when the end line was written. A file with no end line was cut off."
+EXIT_NOTE = (
+    "The exit status says nothing about capacity: it is 0 when the end line was written. "
+    "A file with no end line, or whose last line is incomplete, was cut off. Messages go to standard error and nothing is printed to standard output."
+)
 STATS_ROW = re.compile(r"([^|]+)\|(\S+) / (\S+)")
 Runner = Callable[..., Any]
 Clock = Callable[[], float]
@@ -90,12 +101,11 @@ class StopFlag:
             left -= SLEEP_SLICE_SECONDS
 
 
-def emit(text: str, stream: Any = None) -> None:
-    """Print one line. A standard output that is closed or broken never stops the sampler."""
+def emit(text: str) -> None:
+    """Print one line to standard error. The sampler prints nothing to standard output, and a standard error that is closed or broken never stops it."""
     try:
-        target = stream or sys.stdout
-        target.write(text + "\n")
-        target.flush()
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
     except OSError, ValueError, AttributeError:
         return
 
@@ -109,7 +119,7 @@ def check_output(path: Path) -> None:
 
 
 class Output:
-    """The output file: opened once for append, for its owner only, and every line is written and synced before the call returns."""
+    """The output file: opened once for append, for its owner only. A line is one write, synced before the call returns. A short write is a failure."""
 
     def __init__(self, path: Path) -> None:
         try:
@@ -120,8 +130,8 @@ class Output:
     def write_line(self, line: dict[str, Any]) -> None:
         data = (json.dumps(line, separators=(",", ":"), allow_nan=False) + "\n").encode()
         try:
-            while data:
-                data = data[os.write(self.fd, data) :]
+            if os.write(self.fd, data) != len(data):
+                raise SamplerError("cannot append to the output file")
             os.fsync(self.fd)
         except OSError as error:
             raise SamplerError("cannot append to the output file") from error
@@ -130,24 +140,42 @@ class Output:
         os.close(self.fd)
 
 
-def cause_of(error: BaseException) -> str:
+def cause_of(error: Exception) -> str:
+    """The fixed cause of an exception raised inside a reading.
+
+    ``OSError`` (a missing program, no more descriptors, a counter file that cannot be read, also wrapped in ``FiguresError``) and ``ProcessGroupSurvived``
+    are ``os_error``. ``TimeoutExpired`` is ``timeout``. A line that is not in its form (``FiguresError``), a strict decoding error
+    (``UnicodeDecodeError``) and a number that cannot be parsed (``ValueError``, ``ArithmeticError``) are ``unparsable``. A non-zero status is
+    ``exit_status`` (a ``Failure`` raised by the reading). Any other type is a programming error: it is named ``unparsable`` as well, so that the line is
+    still written for the readings that succeeded and the loop goes on.
+    """
     if isinstance(error, Failure):
         return error.cause
     if isinstance(error, TimeoutExpired):
         return "timeout"
+    if isinstance(error, ProcessGroupSurvived):
+        return "os_error"
     if isinstance(error, FiguresError):
         return "os_error" if isinstance(error.__cause__, OSError) else "unparsable"
-    return "os_error"
+    if isinstance(error, OSError):
+        return "os_error"
+    return "unparsable"
 
 
-def timed(clock: Clock, wall_ns: Callable[[], int], read: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    """The reading with the wall and monotonic times taken immediately before and after it. A failure becomes a ``Failure`` with its cause."""
+def timed(clock: Clock, wall_ns: Callable[[], int], deadline: float, read: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """One reading with the wall and monotonic times taken immediately before and after it. Its whole body (start, wait, decode, parse) runs inside.
+
+    Every exception becomes a ``Failure`` with its cause. A reading whose ``mono_after`` is past ``deadline``, a point fixed before it started, is a
+    ``timeout`` whatever it returned.
+    """
     before = (wall_ns(), clock())
     try:
         body = read()
-    except (Failure, TimeoutExpired, FiguresError, OSError, RuntimeError) as error:
+        after = (wall_ns(), clock())
+        if after[1] > deadline:
+            raise Failure("timeout")
+    except Exception as error:  # the boundary: no exception ends the loop or drops the line
         raise Failure(cause_of(error)) from error
-    after = (wall_ns(), clock())
     return {"wall_ns_before": before[0], "wall_ns_after": after[0], "mono_before": before[1], "mono_after": after[1], **body}
 
 
@@ -162,18 +190,21 @@ def host_body(sources: HostSources) -> dict[str, Any]:
     }
 
 
-def docker_text(runner: Runner, arguments: list[str], timeout: float) -> str:
-    if timeout < MIN_CALL_SECONDS:
+def docker_text(runner: Runner, program: str, arguments: list[str], deadline: float, clock: Clock) -> str:
+    """The standard output of one docker call, decoded strictly by the launcher. The call gets what is left until ``deadline``."""
+    left = deadline - clock()
+    if left < MIN_CALL_SECONDS:
         raise Failure("timeout")
-    result = runner("docker", arguments, timeout=timeout)
+    result = runner(program, arguments, timeout=left)
     if result.returncode != 0:
         raise Failure("exit_status")
     return str(result.stdout)
 
 
-def containers_body(runner: Runner, timeout: float) -> dict[str, Any]:
+def containers_body(runner: Runner, program: str, deadline: float, clock: Clock) -> dict[str, Any]:
     rows = []
-    for line in docker_text(runner, ["ps", "--all", "--format", '{{.Names}}|{{.State}}|{{.Label "com.docker.compose.project"}}'], timeout).splitlines():
+    arguments = ["ps", "--all", "--format", '{{.Names}}|{{.State}}|{{.Label "com.docker.compose.project"}}']
+    for line in docker_text(runner, program, arguments, deadline, clock).splitlines():
         parts = line.split("|")
         if len(parts) != 3 or not parts[0]:
             raise Failure("unparsable")
@@ -181,19 +212,14 @@ def containers_body(runner: Runner, timeout: float) -> dict[str, Any]:
     return {"rows": rows}
 
 
-def memory_body(runner: Runner, timeout: float) -> dict[str, Any]:
+def memory_body(runner: Runner, program: str, deadline: float, clock: Clock) -> dict[str, Any]:
     rows = []
-    for line in docker_text(runner, ["stats", "--no-stream", "--format", "{{.Name}}|{{.MemUsage}}"], timeout).splitlines():
+    for line in docker_text(runner, program, ["stats", "--no-stream", "--format", "{{.Name}}|{{.MemUsage}}"], deadline, clock).splitlines():
         match = STATS_ROW.fullmatch(line.strip())
         if match is None:
             raise Failure("unparsable")
         name, usage, limit = match.groups()
-        try:
-            rows.append(
-                {"name": name, "usage_text": usage, "limit_text": limit, "usage_bytes": parse_size_bytes(usage), "limit_bytes": parse_size_bytes(limit)}
-            )
-        except FiguresError as error:
-            raise Failure("unparsable") from error
+        rows.append({"name": name, "usage_text": usage, "limit_text": limit, "usage_bytes": parse_size_bytes(usage), "limit_bytes": parse_size_bytes(limit)})
     return {"rows": rows}
 
 
@@ -206,7 +232,13 @@ def header_line(interval: float, max_seconds: float, sources: HostSources, limit
         "started_wall_ns": wall_ns(),
         "interval_seconds": interval,
         "max_seconds": max_seconds,
-        "sources": {"memory": str(sources.meminfo), "cpu": str(sources.stat), "disk": str(sources.diskstats), "free_disk": str(sources.data_path)},
+        "sources": {
+            "memory": str(sources.meminfo),
+            "cpu": str(sources.stat),
+            "disk": str(sources.diskstats),
+            "free_disk": str(sources.data_path),
+            "limits": str(limits_path),
+        },
         "configured": {
             "host_reserve_mib": limits.host_reserve_mib,
             "limits": {
@@ -216,22 +248,18 @@ def header_line(interval: float, max_seconds: float, sources: HostSources, limit
     }
 
 
-def sample_line(seq: int, began: float, interval: float, sources: HostSources, runner: Runner, clock: Clock, wall_ns: Callable[[], int]) -> dict[str, Any]:
-    """The line of one iteration. A reading that fails is named in ``missing`` and its key is absent. Each docker call gets what is left of the interval."""
+def sample_line(seq: int, deadline: float, sources: HostSources, runner: Runner, program: str, clock: Clock, wall_ns: Callable[[], int]) -> dict[str, Any]:
+    """The line of one iteration. A reading that fails is named in ``missing`` and its key is absent. All readings share one deadline, fixed first."""
     line: dict[str, Any] = {"kind": "sample", "seq": seq}
     missing: list[dict[str, str]] = []
-
-    def left() -> float:
-        return min(interval, interval - (clock() - began))
-
     readers = (
         ("host", lambda: host_body(sources)),
-        ("containers", lambda: containers_body(runner, left())),
-        ("memory", lambda: memory_body(runner, left())),
+        ("containers", lambda: containers_body(runner, program, deadline, clock)),
+        ("memory", lambda: memory_body(runner, program, deadline, clock)),
     )
     for name, read in readers:
         try:
-            line[name] = timed(clock, wall_ns, read)
+            line[name] = timed(clock, wall_ns, deadline, read)
         except Failure as failure:
             missing.append({"reading": name, "cause": failure.cause})
     line["missing"] = missing
@@ -246,6 +274,7 @@ def run_sampler(
     sources: HostSources = HostSources(),  # noqa: B008
     limits_path: Path = LIMITS_FILE,
     runner: Runner = run_command,
+    docker: str | None = None,
     stop: StopFlag | None = None,
     clock: Clock = time.monotonic,
     wall_ns: Callable[[], int] = time.time_ns,
@@ -254,8 +283,11 @@ def run_sampler(
 ) -> int:
     """Write the header, one line for each iteration and the end line. Return 0 when the end line was written."""
     flag = stop or StopFlag()
+    program = docker or shutil.which("docker")
     try:
         check_output(output)
+        if program is None:
+            raise SamplerError("the docker program cannot be found")
         header = header_line(interval_seconds, max_seconds, sources, limits_path, wall_ns)
         out = Output(output)
     except SamplerError as error:
@@ -276,9 +308,9 @@ def run_sampler(
                 reason = "max_seconds"
                 break
             began = clock()
-            out.write_line(sample_line(seq, began, interval_seconds, sources, runner, clock, wall_ns))
+            out.write_line(sample_line(seq, began + interval_seconds, sources, runner, program, clock, wall_ns))
             seq += 1
-            flag.sleep(max(0.0, interval_seconds - (clock() - began)), pause=pause)
+            flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})
     except SamplerError as error:
         say_error(str(error))
@@ -290,7 +322,7 @@ def run_sampler(
 
 
 def say_error(detail: str) -> None:
-    emit(f"capacity sampler: {detail}", sys.stderr)
+    emit(f"capacity sampler: {detail}")
 
 
 def bounded_seconds(top: float) -> Callable[[str], float]:

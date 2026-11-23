@@ -6,6 +6,7 @@ formatted output, so the same parsing runs on this computer. Every figure is der
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +15,9 @@ from unittest import mock
 
 from scripts.stack.host_figures import (
     FiguresError,
+    HostReading,
     HostSources,
+    Memory,
     device_of,
     free_disk_mib,
     parse_cpu_times,
@@ -27,16 +30,15 @@ from tests.fast.proc_support import FIXTURES, fixture
 
 
 class MemoryTest(unittest.TestCase):
-    def test_the_memory_and_swap_figures_come_from_their_lines_and_the_used_figure_is_the_total_less_the_available(self) -> None:
-        memory = parse_meminfo(fixture("meminfo_after.txt"))
-        self.assertEqual(32768.0, memory.total_mib)
-        self.assertEqual(5120.0, memory.available_mib)
-        self.assertEqual(27648.0, memory.used_mib)
-        self.assertEqual(512.0, memory.swap_used_mib)
+    def test_the_memory_and_swap_figures_are_the_raw_kib_of_their_lines_and_nothing_is_derived(self) -> None:
+        memory = parse_meminfo(fixture("meminfo_before.txt"))
+        self.assertEqual((33554432, 20971520, 2097152, 2097152), (memory.total_kib, memory.available_kib, memory.swap_total_kib, memory.swap_free_kib))
+        self.assertEqual({"total_kib", "available_kib", "swap_total_kib", "swap_free_kib"}, {field.name for field in dataclasses.fields(Memory)})
 
-    def test_a_host_with_no_swap_has_no_swap_in_use(self) -> None:
+    def test_a_host_with_no_swap_has_zero_swap_as_read(self) -> None:
         text = "MemTotal: 1024 kB\nMemAvailable: 512 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n"
-        self.assertEqual(0.0, parse_meminfo(text).swap_used_mib)
+        memory = parse_meminfo(text)
+        self.assertEqual((0, 0), (memory.swap_total_kib, memory.swap_free_kib))
 
     def test_a_missing_line_is_named_and_never_replaced_by_zero(self) -> None:
         for name in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
@@ -135,4 +137,11 @@ class ReadingTest(unittest.TestCase):
                 with self.subTest(field=field):
                     broken = HostSources(**{**good.__dict__, field: Path(folder) / "missing"})
                     with self.assertRaisesRegex(FiguresError, f"cannot read the host's {field}"):
-                        read_host(broken, clock=lambda: 0.0)
+                        read_host(broken)
+
+    def test_a_reading_holds_the_counters_as_read_and_no_time(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            reading = read_host(self.sources(Path(folder), "before"))
+        self.assertEqual({"memory", "cpu", "disk", "free_disk_mib"}, {field.name for field in dataclasses.fields(HostReading)})
+        self.assertEqual(33554432, reading.memory.total_kib)
+        self.assertEqual((2000000 * 512, 1000000 * 512), (reading.disk.read_bytes, reading.disk.written_bytes))

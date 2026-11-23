@@ -1,4 +1,0 @@
-a1b2c3d4e5f6|312.4MiB / 1GiB
-b2c3d4e5f6a1|1.2GiB / 1GiB
-c3d4e5f6a1b2|2.5GiB / 4GiB
-ffffffffffff|900MiB / 2GiB
