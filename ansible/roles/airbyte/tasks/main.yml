@@ -40,3 +40,6 @@
 
 - name: Confirm that Airbyte is ready and answers on the local address
   ansible.builtin.include_tasks: verify.yml
+
+- name: Install the script that places the project profile's access key
+  ansible.builtin.include_tasks: key_script.yml

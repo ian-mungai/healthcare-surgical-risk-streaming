@@ -34,6 +34,7 @@ FIELD_NAMES = frozenset(
         "checksum_list_sha256",
         "citation",
         "credit",
+        "destination_tag",
         "entries",
         "file_count",
         "files",
@@ -66,6 +67,7 @@ FIELD_NAMES = frozenset(
         "source_bucket",
         "source_key",
         "source_prefix",
+        "source_tag",
         "status",
         "tables",
         "track_list",
@@ -133,6 +135,7 @@ class Cause(StrEnum):
     BUCKET_DIFFERS = "bucket_differs"
     VERSION_SUBSTITUTED = "version_substituted"
     SIZE_DIFFERS = "size_differs"
+    LANDED_SHARED = "landed_shared"
 
 
 @unique
@@ -272,6 +275,17 @@ class Code(StrEnum):
     BUILD_NEEDS_OUTPUT = "build needs --output"
     WROTE = "wrote {count} candidates; the checksum list, the clinical table and the track list match their pins"
     CHECKED = "{count} tracked candidates equal the rebuild and match the pinned checksum list (seed {total})"
+    CONNECTION_SELECTION = "the selection names a file that is not a payload of the pinned release; only the two tables and the case files may be copied"
+    LISTED_OUTSIDE = "a listed key is outside the landing prefix, so nothing was read"
+    PAIRING_LANDED_TWICE = "metadata record {position} pairs a landed file that an earlier record pairs with another source"
+    CONNECTION_BUCKET = "the bucket is not a valid bucket name of the project, or it is the publisher's bucket"
+    CONNECTION_REGION = "the region is not an AWS region name"
+    METADATA_LINE = "line {position} of a metadata file is not a record of a file name, a byte count and a file path"
+    NO_METADATA = "the landing prefix holds no metadata file"
+    PAIRINGS_WRITTEN = "wrote {count} pairing records from the metadata of the copy"
+    LIST_FETCHED = "the checksum list was read and matches the pinned size and SHA-256"
+    LIST_PRESENT = "the checksum list is already present and matches the pinned size and SHA-256; nothing was read"
+    CONNECTION_TAG = "the {fields} is not a full version of the form N.N.N"
 
 
 NUMBER_SLOTS = ("position", "index", "count", "total")

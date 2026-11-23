@@ -87,23 +87,41 @@ def make_private_folder(folder: Path) -> None:
         missing.mkdir(mode=0o700)
 
 
-def write_private_file(path: Path, text: str, *, replace: bool, owner: tuple[int, int]) -> None:
-    """Write ``text`` to a new file with mode 0400 from the moment it exists, given to ``owner`` before the text is written.
+def remove_leftovers(path: Path) -> None:
+    """Remove the temporary files that an interrupted write of ``path`` left in its folder. Only names of the form ``.<name>.<8 hex>.new`` of this file go."""
+    pattern = re.compile(rf"\.{re.escape(path.name)}\.[0-9a-f]{{8}}\.new")
+    for item in path.parent.iterdir():
+        if pattern.fullmatch(item.name):
+            item.unlink(missing_ok=True)
 
-    ``replace`` swaps an existing file atomically. A file that cannot be given to its owner is removed again, so no half-made file stays.
+
+def write_private_file(path: Path, text: str, *, replace: bool, owner: tuple[int, int]) -> None:
+    """Write ``text`` to ``path`` through a new temporary file in its folder, so the final file is whole or absent and never empty.
+
+    The temporary file is made with ``O_EXCL`` and mode 0400, given to ``owner`` before the text is written, flushed and synced, and then takes its place:
+    ``replace`` swaps an existing file atomically, and otherwise an existing file stays and ``FileExistsError`` is raised. The leftovers of an interrupted
+    earlier write of this file are removed first. A file that cannot be made for its owner leaves nothing behind.
     """
     make_private_folder(path.parent)
-    target = path.with_name(f".{path.name}.{secrets.token_hex(4)}.new") if replace else path
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
+    remove_leftovers(path)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.new")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, SECRET_FILE_MODE)
     try:
         with os.fdopen(descriptor, "w") as handle:
             os.fchown(handle.fileno(), *owner)
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         if replace:
-            os.replace(target, path)
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+    except FileExistsError:
+        raise
     except OSError as error:
-        target.unlink(missing_ok=True)
         raise SecretFileError(f"the file {path.name} cannot be made for owner {owner[0]}:{owner[1]}: {error.strerror}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def access_differs(path: Path, owner: tuple[int, int]) -> bool:

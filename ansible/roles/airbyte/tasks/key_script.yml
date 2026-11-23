@@ -1,0 +1,54 @@
+# Reads airbyte_bin_directory, airbyte_key_script, airbyte_key_sudoers, airbyte_visudo, airbyte_secrets_directory, airbyte_owner and airbyte_group. The project profile's access key never enters Ansible: the
+# launcher reads it on the owner's computer and pipes it, on standard input of one SSH command, to the script that this step installs. The script and the shared atomic file
+# helper that it imports are placed in a folder only the owner of the files can enter (mode 0700 for the script and the folder, 0600 for the helper), and the secrets folder is
+# made. The script reads the key from standard input, refuses anything else by a fixed code and writes the two root-only files that the connection step reads. Nothing in this
+# step reads or holds the key. The sudoers drop-in beside them turns off sudo's input and output recording for exactly the command line that the launcher runs; it is
+# checked with visudo before it takes its place, so a file that sudo cannot read is never installed. A second run changes nothing.
+- name: Create the folder of the platform's scripts
+  ansible.builtin.file:
+    path: "{{ airbyte_bin_directory }}"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0700"
+
+- name: Create the secrets folder
+  ansible.builtin.file:
+    path: "{{ airbyte_secrets_directory }}"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0700"
+
+- name: Install the helper that writes a secret file whole or not at all
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../secret_files/module_utils/secret_files.py"
+    dest: "{{ airbyte_bin_directory }}/secret_files.py"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0600"
+
+- name: Install the script that places the project profile's access key
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/airbyte_key_install.py"
+    dest: "{{ airbyte_key_script }}"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0700"
+
+- name: Make sure that sudo's folder of drop-in files exists
+  ansible.builtin.file:
+    path: "{{ airbyte_key_sudoers | dirname }}"
+    state: directory
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0750"
+
+- name: Turn off sudo's recording of input and output for the key script's command line
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/airbyte_key_install.sudoers"
+    dest: "{{ airbyte_key_sudoers }}"
+    owner: "{{ airbyte_owner }}"
+    group: "{{ airbyte_group }}"
+    mode: "0440"
+    validate: "{{ airbyte_visudo }} -cf %s"
