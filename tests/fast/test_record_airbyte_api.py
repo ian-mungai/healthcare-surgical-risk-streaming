@@ -57,7 +57,9 @@ class StandIn:
         self.counters: dict[str, int] = {}
         self.workspaces = [{"workspaceId": "workspace1"}]
         self.page_size: int | None = None
-        self.empty_pages = 0
+        self.replies: dict[tuple[str, int], Any] = {}
+        self.endless: set[str] = set()
+        self.requested: list[tuple[str, int, list[str]]] = []
         self.budgets: list[float] = []
         self.mutations: dict[str, Any] = {}
 
@@ -121,13 +123,17 @@ class StandIn:
         key = f"{kind}Id"
         if method == "GET":
             data = [self.shown(kind, value) for value in store.values()]
-            if self.empty_pages > 0:
-                self.empty_pages -= 1
-                return {"data": [], "next": "more"}
+            offset = int(query.get("offset", ["0"])[0])
+            self.requested.append((kind, offset, query.get("workspaceIds", [])))
+            if (kind, offset) in self.replies:
+                reply = self.replies[(kind, offset)]
+                return reply(data) if callable(reply) else reply
+            if kind in self.endless:
+                return {"data": [], "next": self.continuation(kind, offset + 100)}
             if self.page_size is None:
                 return {"data": data}
-            offset = int(query.get("offset", ["0"])[0])
-            return {"data": data[offset : offset + self.page_size], "next": "more" if offset + self.page_size < len(data) else ""}
+            more = offset + self.page_size < len(data)
+            return {"data": data[offset : offset + self.page_size], "next": self.continuation(kind, offset + self.page_size) if more else ""}
         if method == "POST":
             entry = {**body, key: self.ident(kind)}
             entry["configuration"] = {**body["configuration"], **PLATFORM_FIELD}
@@ -135,6 +141,11 @@ class StandIn:
             return entry
         store[rest[0]]["configuration"] = {**body["configuration"], **PLATFORM_FIELD}
         return store[rest[0]]
+
+    @staticmethod
+    def continuation(kind: str, offset: int) -> str:
+        """A ``next`` link as Airbyte's public API gives one: the route of the list, its filters and the offset of the following page."""
+        return f"{ORIGIN}{PREFIX}/{kind}s?workspaceIds=workspace1&limit=100&offset={offset}"
 
     def shown(self, kind: str, entry: dict[str, Any]) -> dict[str, Any]:
         if kind == "source":
@@ -428,22 +439,98 @@ class StartTest(unittest.TestCase):
 
 
 class PagingTest(unittest.TestCase):
-    def test_a_page_with_no_data_and_a_next_is_not_the_end_of_the_list(self) -> None:
+    """A list is followed by the continuation offset of its ``next``, on the route and with the filters that were asked for, and a continuation that does
+    not make progress ends the call at once."""
+
+    def destination_offsets(self, stand_in: StandIn) -> list[int]:
+        return [offset for kind, offset, _ in stand_in.requested if kind == "destination"]
+
+    def test_a_page_with_no_data_and_a_next_that_points_to_offset_100_is_followed_to_that_offset_and_the_object_behind_it_is_found(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
-        stand_in.empty_pages = 3
+        stand_in.replies[("destination", 0)] = {"data": [], "next": StandIn.continuation("destination", 100)}
+        stand_in.replies[("destination", 100)] = lambda data: {"data": data}
+        stand_in.requested.clear()
         stand_in.log.clear()
         ensure_everything(api)
-        self.assertEqual([], writes(stand_in), "the objects behind the empty pages were found, and none was made again")
-        self.assertEqual(4, stand_in.log.count("GET destinations"), "three empty pages and the page with the destination")
+        self.assertEqual([], writes(stand_in), "the destination behind the empty page was found, and none was made again")
+        self.assertEqual([0, 100], self.destination_offsets(stand_in))
 
-    def test_a_list_that_never_stops_saying_next_is_refused_at_the_page_cap(self) -> None:
+    def test_each_request_keeps_the_route_and_the_filters_and_only_the_offset_of_a_next_is_taken(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
-        stand_in.empty_pages = 10**6
+        stand_in.replies[("destination", 0)] = {"data": [], "next": "http://8.8.8.8:80/other/route?workspaceIds=other&limit=1&offset=100"}
+        stand_in.replies[("destination", 100)] = lambda data: {"data": data}
+        stand_in.requested.clear()
+        ensure_everything(api)
+        self.assertEqual(
+            [("destination", 0, ["workspace1"]), ("destination", 100, ["workspace1"])], [item for item in stand_in.requested if item[0] == "destination"]
+        )
+
+    def test_a_next_whose_offset_is_the_one_just_read_ends_the_call_at_the_first_request_and_not_at_the_page_cap(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.replies[("destination", 0)] = {"data": [], "next": StandIn.continuation("destination", 0)}
+        stand_in.requested.clear()
         with self.assertRaises(AirbyteError) as raised:
             ensure_everything(api)
-        self.assertIn("more pages than", str(raised.exception))
+        self.assertIn("not of the documented form", str(raised.exception))
+        self.assertEqual([0], self.destination_offsets(stand_in), "one request, and no request at the same offset again")
+
+    def test_a_next_that_goes_back_after_a_step_forward_is_refused_too(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.replies[("destination", 0)] = {"data": [], "next": StandIn.continuation("destination", 100)}
+        stand_in.replies[("destination", 100)] = {"data": [], "next": StandIn.continuation("destination", 50)}
+        stand_in.requested.clear()
+        with self.assertRaises(AirbyteError):
+            ensure_everything(api)
+        self.assertEqual([0, 100], self.destination_offsets(stand_in))
+
+    def test_a_next_without_one_whole_offset_is_refused_and_no_message_holds_it(self) -> None:
+        for name, following in (
+            ("a text", f"{MARKER}"),
+            ("no offset", f"{ORIGIN}{PREFIX}/destinations?workspaceIds=workspace1&limit=100"),
+            ("a text offset", f"{ORIGIN}{PREFIX}/destinations?offset={MARKER}"),
+            ("a negative offset", f"{ORIGIN}{PREFIX}/destinations?offset=-100"),
+            ("a fraction", f"{ORIGIN}{PREFIX}/destinations?offset=1.5"),
+            ("an exponent", f"{ORIGIN}{PREFIX}/destinations?offset=1e2"),
+            ("a sign", f"{ORIGIN}{PREFIX}/destinations?offset=%2B100"),
+            ("digits of another script", f"{ORIGIN}{PREFIX}/destinations?offset=\u0661\u0660\u0660"),
+            ("two offsets", f"{ORIGIN}{PREFIX}/destinations?offset=100&offset=200"),
+            ("an offset that is too long", f"{ORIGIN}{PREFIX}/destinations?offset=99999999999"),
+            ("an address that cannot be read", "http://[::1"),
+        ):
+            with self.subTest(name):
+                api, stand_in = prepared()
+                ensure_everything(api)
+                stand_in.replies[("destination", 0)] = {"data": [], "next": following}
+                stand_in.requested.clear()
+                with self.assertRaises(AirbyteError) as raised:
+                    ensure_everything(api)
+                self.assertNotIn(MARKER, str(raised.exception))
+                self.assertEqual([0], self.destination_offsets(stand_in))
+
+    def test_a_list_that_goes_forward_for_ever_is_refused_at_the_page_cap(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.endless = {"destination"}
+        stand_in.requested.clear()
+        with mock.patch.object(airbyte_api, "MAX_PAGES", 5), self.assertRaises(AirbyteError) as raised:
+            ensure_everything(api)
+        self.assertIn("more pages than 5", str(raised.exception))
+        self.assertEqual([0, 100, 200, 300, 400], self.destination_offsets(stand_in))
+
+    def test_a_list_in_pages_of_one_is_read_to_its_end_by_the_offsets_that_the_next_links_give(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.page_size = 1
+        stand_in.requested.clear()
+        stand_in.log.clear()
+        ensure_everything(api)
+        self.assertEqual([], writes(stand_in))
+        self.assertEqual([0], self.destination_offsets(stand_in), "one destination is one page")
+        self.assertEqual([0, 1, 2], [offset for kind, offset, _ in stand_in.requested if kind == "source"][:3])
 
 
 class FailureTest(unittest.TestCase):
@@ -850,6 +937,7 @@ class ReplyServer:
     HEADS = {
         "close": b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
         "chunked": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "chunked_extension": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
     }
 
     def __init__(self, kind: str, size: int, gap: float, stall_after: int | None = None) -> None:
@@ -867,6 +955,8 @@ class ReplyServer:
         return int(self.listener.getsockname()[1])
 
     def pieces(self) -> list[bytes]:
+        if self.kind == "chunked_extension":
+            return [b"1;", *([b"e"] * self.size), b"\r\nx\r\n0\r\n\r\n"]
         body = b"x" * self.size
         blocks = [body[start : start + 1 if self.gap else start + 40_000] for start in range(0, self.size, 1 if self.gap else 40_000)]
         if self.kind == "chunked":
@@ -899,7 +989,7 @@ class ReplyServer:
                             time.sleep(self.gap)
                 except OSError:
                     continue
-                if self.kind == "close":
+                if self.kind in ("close", "chunked_extension"):
                     client.close()
         finally:
             for client in clients:
@@ -939,6 +1029,25 @@ class BodyDeadlineTest(unittest.TestCase):
                     server.close()
                 self.assertGreaterEqual(elapsed, self.BUDGET - 0.05)
                 self.assertLess(elapsed, self.BUDGET + self.MARGIN, f"{kind}: the exchange ended after {elapsed:.3f} s")
+
+    def test_a_chunk_extension_that_trickles_under_connection_close_ends_at_the_deadline_although_one_read_is_waiting_for_its_line(self) -> None:
+        server = ReplyServer("chunked_extension", 200, 0.02)
+        try:
+            started_at = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, self.BUDGET)
+            elapsed = time.monotonic() - started_at
+        finally:
+            server.close()
+        self.assertGreaterEqual(elapsed, self.BUDGET - 0.05)
+        self.assertLess(elapsed, self.BUDGET + self.MARGIN, f"the exchange ended after {elapsed:.3f} s")
+
+    def test_control_a_chunked_close_reply_with_a_short_extension_arrives_whole(self) -> None:
+        server = ReplyServer("chunked_extension", 5, 0)
+        try:
+            self.assertEqual((200, b"x"), self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, 5.0))
+        finally:
+            server.close()
 
     def test_a_body_that_stalls_part_way_ends_at_the_deadline_and_not_a_whole_socket_timeout_later_for_each_kind_of_reply(self) -> None:
         for kind in ("close", "length", "chunked"):

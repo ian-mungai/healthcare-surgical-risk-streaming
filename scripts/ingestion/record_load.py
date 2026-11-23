@@ -9,15 +9,16 @@ The order is the contract, and each step stops the load before the next one star
 3. The same manifest on another run: when any commit on the default branch carries the line ``records-manifest: <SHA-256>`` (the convention below) for this
    manifest, the earlier run's record is returned and nothing is copied, started or branched. A history that is longer than the scan and does not hold the
    line cannot prove that the manifest is new, so the load is refused (``cannot establish absence``).
-4. Everything that the run would touch and may not own is found first, before any copy, settings change or sync, and nothing is deleted: a branch of the
-   run's name is refused unless the state file names it and its history holds the hash that it was made at; no job of the three connections may be active (the
-   job list must be in the documented shape). A version at a read key that the state file does not name is refused by the copy's first look, before any copy.
+4. Everything that the run would touch and may not own is found first, before any copy, settings change or sync, and nothing is deleted: a reference of
+   the run's name is refused unless it is a branch (its kind is read, so a tag is refused), the state file names it and its history holds the hash that it
+   was made at; no job of the three connections may be active (the job list must be in the documented shape). A version at a read key that the state file
+   does not name is refused by the copy's first look, before any copy.
 5. The exact-version copy of the two CSV tables (``record_copy``) to ``records_input/<run ID>/<SHA-256>/<table>.csv``. A copy whose hash differs fails here.
 6. The destination, the three sources and the three connections are made to match ``record_definitions`` for this run. The copies are confirmed again.
 7. The load branch ``load_<run ID>`` is made at the head of main. A branch that the state file records and that the first look found is the leftover of an
-   unfinished try: it is deleted at exactly the head that was read then (Nessie refuses a branch that moved), and the state entry is cleared. The new pair
-   (name, hash it is made at) is written to the state file before the branch is made, so a stop at any point leaves either nothing to own or a branch that is
-   recorded. Airbyte is asked which branch its destination writes to, and the load stops unless it is the load branch.
+   unfinished try: it is deleted at exactly the head that was read then (Nessie refuses a branch that moved), and the state entry is cleared. The new record
+   (the name and the hash it is made at; the kind is always a branch) is written to the state file before the branch is made, so a stop at any point leaves
+   either nothing to own or a branch that is recorded. Airbyte is asked which branch its destination writes to, and the load stops unless it is the load branch.
 8. Each table is synced in turn: ``clinical_data``, ``lab_data``, then ``track_list``. The copies are confirmed before each sync, so one replaced while an
    earlier sync read it is found. A sync that succeeds after its deadline is not accepted. Each request gets the time that is left of its own budget: the
    sync's deadline for the reads of the wait, the confirmation's for the cancellation and its reads. A job that passes its deadline, or whose status cannot be

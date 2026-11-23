@@ -3,7 +3,8 @@
 It names each object version the run wrote (read key and version ID), the load branch with the hash it was created from, and each job the run started. It is
 written whole (a temporary file and a rename) right after each creation and before the next step. A creation that a stop left unrecorded is not owned by the run
 on the retry: the retry refuses it and deletes nothing. Deletion uses only this evidence, version ID by version ID and never "every version at a key", and
-deletes the branch only when the file records that this run created it.
+deletes the branch only when the file records that this run created it and the catalog says that the reference of that name is a branch whose history holds
+the recorded hash (the triple of kind, name and creation hash; the file holds the name and the hash).
 
 ``RunState`` is the run's ledger of object versions as ``record_copy`` uses it: ``versions``, ``keys``, ``add`` and ``discard``.
 """

@@ -876,7 +876,8 @@ def failed_first_try(setup: Setup) -> None:
 
 
 class BranchOwnershipTest(unittest.TestCase):
-    """The branch of a run is owned by the pair of its name and the hash that it was made at, which the state file holds before the run uses the branch."""
+    """A branch of a run is owned by the triple of its kind (a branch), its name and the hash that it was made at. The state file holds the name and the hash,
+    written before the run uses the branch, and the catalog says the kind."""
 
     def test_a_branch_of_the_name_that_does_not_descend_from_the_recorded_creation_is_refused_and_not_deleted(self) -> None:
         setup = Setup(self)

@@ -23,12 +23,13 @@ carries the deadline as its socket timeout, which bounds the connect and each wa
 bounds a server that trickles its headers. The body is read in bounded reads (``READ_BYTES``): before each the socket's timeout is set to the time that is
 left, and the clock is read after each, so a body that trickles ends at the deadline whatever its framing, ``Connection: close`` included (``http.client`` sets
 ``connection.sock`` to None as soon as it reads such headers, so the socket is kept from before ``getresponse``, through the public attribute, and no private
-one is used). This is not a second transport: it is the same connection.
+one is used). The watchdog shuts that saved socket too, because a read that waits for a line (a chunk size whose extension trickles in) is ended only by the
+shutdown. This is not a second transport: it is the same connection.
 
 Measured margin, on a local server that sends a body of 200 bytes at one byte every 0.02 s against a 0.5 s budget (five runs for each kind of reply): a
 ``Connection: close`` reply ended at 0.501 to 0.503 s, a ``Content-Length`` reply at 0.501 to 0.503 s and a chunked reply at 0.501 to 0.502 s: 0.003 s over at
-most. A loaded host adds the wake-up delay of one read, and the tests allow 0.25 s. The earlier limit, a ``Connection: close`` reply that was still being
-read after 12 s against a 1.0 s budget, is gone.
+most. A chunked reply with ``Connection: close`` and a trickled chunk extension ended at 0.503 to 0.510 s (five runs). A loaded host adds the wake-up delay of
+one read, and the tests allow 0.25 s. The earlier limit, a ``Connection: close`` reply that was still being read after 12 s against a 1.0 s budget, is gone.
 
 The destination's AWS access key is sent only in the body of a create or update of the destination, and no message holds a request body, a response body or a
 secret.
@@ -51,7 +52,7 @@ import threading
 import time
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from scripts.ingestion import record_definitions as definitions
 from scripts.ingestion.record_definitions import Connector, Table
@@ -72,6 +73,7 @@ TERMINAL_STATUSES = ("incomplete", "failed", "succeeded", "cancelled")
 SYNC = "sync"
 # The addresses that the deploy can write: the bridge address that k3s gives the node is a private address, and the code location reaches it through the host.
 PRIVATE_NETWORKS = tuple(ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
+OFFSET = re.compile(r"[0-9]{1,9}")
 ORIGIN = re.compile(r"http://([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})")
 DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
 DEFINITION_NAMES = {
@@ -136,6 +138,22 @@ def job_entry(entry: object, what: str, connection_id: str | None = None) -> tup
     return job, status
 
 
+def continuation_offset(following: str, offset: int, label: str) -> int:
+    """The offset of the next page, read from the ``next`` link of a page that was read at ``offset``.
+
+    Only the offset is taken from the link: the request keeps its own route and filters, so a link cannot send the credentials or the list anywhere else. The
+    link must carry exactly one ``offset``, of 1 to 9 ASCII digits, that is greater than ``offset``: a link that makes no progress is refused at once, not
+    after the page cap.
+    """
+    try:
+        values = parse_qs(urlsplit(following).query).get("offset", [])
+    except ValueError:
+        values = []
+    if len(values) != 1 or OFFSET.fullmatch(values[0]) is None or int(values[0]) <= offset:
+        raise AirbyteError(f"{label} gave a page that is not of the documented form")
+    return int(values[0])
+
+
 def table_named(name: str) -> Table:
     for table in definitions.TABLES:
         if table.name == name:
@@ -191,10 +209,11 @@ class HttpAirbyteApi:
         started = time.monotonic()
         connection = http.client.HTTPConnection(self.host, self.port, timeout=budget)
         expired = threading.Event()
+        saved: list[socket.socket | None] = [None]
 
         def shut() -> None:
             expired.set()
-            sock = connection.sock
+            sock = saved[0] if saved[0] is not None else connection.sock
             if sock is not None:
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_RDWR)
@@ -205,10 +224,11 @@ class HttpAirbyteApi:
         watchdog.start()
         try:
             connection.request(method, target, body=payload, headers=headers)
-            # A reply that says ``Connection: close`` makes http.client set ``connection.sock`` to None at once, so the socket is kept here for the reads.
-            wire = connection.sock
+            # A reply that says ``Connection: close`` makes http.client set ``connection.sock`` to None at once, so the socket is kept here, for the
+            # reads and for the watchdog: a read that waits for a line (a chunk size with a trickled extension) is ended by the watchdog's shutdown.
+            saved[0] = connection.sock
             response = connection.getresponse()
-            body = self.read_body(response, wire, started + budget)
+            body = self.read_body(response, saved[0], started + budget)
         except OSError, http.client.HTTPException:
             if expired.is_set():
                 raise TimeoutError from None
@@ -301,8 +321,9 @@ class HttpAirbyteApi:
         label = f"GET {path.partition('?')[0].strip('/')}"
         found: list[dict[str, Any]] = []
         separator = "&" if "?" in path else "?"
+        offset = 0
         for _ in range(MAX_PAGES):
-            reply = self.call("GET", f"{path}{separator}limit={PAGE_SIZE}&offset={len(found)}")
+            reply = self.call("GET", f"{path}{separator}limit={PAGE_SIZE}&offset={offset}")
             data = reply.get("data")
             following = reply.get("next")
             if not isinstance(data, list) or any(type(item) is not dict for item in data) or not (following is None or type(following) is str):
@@ -310,6 +331,7 @@ class HttpAirbyteApi:
             found += data
             if not following:
                 return found
+            offset = continuation_offset(following, offset, label)
         raise AirbyteError(f"{label} has more pages than {MAX_PAGES}")
 
     def workspace_id(self) -> str:

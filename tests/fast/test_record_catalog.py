@@ -6,16 +6,19 @@ A stand-in answers the Nessie API version 2 calls that the adapter makes. The ca
 from __future__ import annotations
 
 import json
+import tempfile
 import traceback
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.ingestion import record_catalog
 from scripts.ingestion.record_catalog import CatalogError, NessieCatalog
-from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError, RefState
+from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError, RefState, owned_leftover
+from scripts.ingestion.record_state import RunState
 from scripts.stack.nessie import NessieClient
 
 MAIN = "a" * 64
@@ -36,6 +39,8 @@ class Server:
         self.content_fault: Callable[[dict[str, Any]], None] | None = None
         self.created_hash: str | None = None
         self.kinds: dict[str, str] = {}
+        self.reference_override: dict[str, Any] = {}
+        self.created_reply: Any = None
         self.delete_queries: list[str] = []
         self.fail_body = b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
 
@@ -53,6 +58,8 @@ class Server:
                 return 409, b'{"errorCode":"REFERENCE_ALREADY_EXISTS","message":"x"}'
             self.refs[name] = body["hash"]
             self.contents[name] = dict(self.contents["main"])
+            if self.created_reply is not None:
+                return 200, json.dumps(self.created_reply).encode()
             return 200, json.dumps({"reference": {"type": "BRANCH", "name": name, "hash": self.created_hash or self.refs[name]}}).encode()
         if method == "DELETE":
             name, _, expected = path.removeprefix("/trees/").partition("@")
@@ -105,6 +112,8 @@ class Server:
                 self.content_fault(document)
             return 200, json.dumps(document).encode()
         name = path.removeprefix("/trees/")
+        if name in self.reference_override:
+            return 200, json.dumps(self.reference_override[name]).encode()
         if name not in self.refs:
             return 404, b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
         return 200, json.dumps({"reference": {"type": self.kinds.get(name, "BRANCH"), "name": name, "hash": self.refs[name]}}).encode()
@@ -151,6 +160,61 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(RefState("BRANCH", MAIN), self.catalog.reference("main"))
         self.assertEqual(RefState("TAG", "c" * 64), self.catalog.reference("tag_run1"))
         self.assertIsNone(self.catalog.reference("load_run1"))
+
+    def test_a_reply_that_is_not_the_reference_that_was_asked_for_is_a_catalog_error_for_the_head_and_for_the_reference(self) -> None:
+        good = {"type": "BRANCH", "name": "load_run1", "hash": "3" * 64}
+        replies: dict[str, Any] = {
+            "another name": {"reference": {**good, "name": "load_run2"}},
+            "no name": {"reference": {"type": "BRANCH", "hash": "3" * 64}},
+            "an empty hash": {"reference": {**good, "hash": ""}},
+            "a short hash": {"reference": {**good, "hash": "3" * 63}},
+            "an upper case hash": {"reference": {**good, "hash": "A" * 64}},
+            "a hash that is a number": {"reference": {**good, "hash": 5}},
+            "an unknown kind": {"reference": {**good, "type": "DETACHED"}},
+            "no kind": {"reference": {"name": "load_run1", "hash": "3" * 64}},
+            "no reference": {"other": good},
+            "a reference that is a list": {"reference": [good]},
+            "a list": [good],
+            "a text": "load_run1",
+            "a number": 7,
+            "null": None,
+            "an empty object": {},
+        }
+        for name, reply in replies.items():
+            for operation in ("head", "reference"):
+                with self.subTest(f"{name} {operation}"):
+                    self.server.refs["load_run1"] = "3" * 64
+                    self.server.reference_override["load_run1"] = reply
+                    with self.assertRaises(CatalogError) as raised:
+                        self.catalog.head("load_run1") if operation == "head" else self.catalog.reference("load_run1")
+                    self.assertTrue(str(raised.exception).startswith("catalog_error: "), str(raised.exception))
+                    self.assertNotIsInstance(raised.exception, AttributeError)
+
+    def test_the_head_of_a_branch_is_a_branch_and_a_tag_is_a_catalog_error_but_the_reference_tells_a_tag_from_a_branch(self) -> None:
+        self.server.refs["tag_run1"], self.server.kinds["tag_run1"] = "c" * 64, "TAG"
+        with self.assertRaises(CatalogError):
+            self.catalog.head("tag_run1")
+        self.assertEqual(RefState("TAG", "c" * 64), self.catalog.reference("tag_run1"))
+
+    def test_a_reply_with_an_empty_hash_stops_the_ownership_check_before_any_delete_is_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state = RunState(Path(folder), "run1")
+            state.record_branch("load_run1", "3" * 64)
+            self.server.refs["load_run1"] = "3" * 64
+            self.server.branch_history["load_run1"] = ["3" * 64]
+            self.server.reference_override["load_run1"] = {"reference": {"type": "BRANCH", "name": "load_run1", "hash": ""}}
+            with self.assertRaises(CatalogError):
+                owned_leftover(self.catalog, state, "load_run1")
+        self.assertEqual([], self.server.delete_queries)
+        self.assertEqual([], [call for call in self.server.calls if call.startswith("DELETE")])
+
+    def test_a_reply_that_is_not_an_object_is_a_catalog_error_on_creation_too(self) -> None:
+        replies: list[Any] = [[], "x", 7]
+        for number, reply in enumerate(replies):
+            with self.subTest(repr(reply)):
+                self.server.created_reply = reply
+                with self.assertRaises(CatalogError):
+                    self.catalog.create_branch(f"load_run3_{number}", MAIN)
 
     def test_any_failure_but_a_missing_reference_is_an_error_not_a_no(self) -> None:
         self.server.fail = ("/trees/load_run1", 500)

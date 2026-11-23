@@ -29,6 +29,7 @@ from scripts.ingestion.record_load import BRANCH_KIND, BranchExists, BranchMoved
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError, Reference
 
 NOT_FOUND = 404
+TAG_KIND = "TAG"
 BAD_REQUEST = 400
 HISTORY_PAGE = 100
 HISTORY_LIMIT = 5000
@@ -51,21 +52,33 @@ class NessieCatalog:
     def __init__(self, client: NessieClient) -> None:
         self.client = client
 
-    def head(self, branch: str) -> str:
-        try:
-            return self.client.reference(branch).hash
-        except NessieError:
-            raise catalog_error("head") from None
+    def read_reference(self, name: str, operation: str) -> Reference | None:
+        """The one place a reference answer is read: None when there is no such reference, else the reference, which must be the one that was asked for.
 
-    def reference(self, name: str) -> RefState | None:
-        """The kind and the hash of the reference ``name``, or None when there is none. A tag and a branch of one name are told apart by the kind."""
+        The answer must be a JSON object that names exactly ``name``, with a kind of ``BRANCH`` or ``TAG`` and a hash of 64 lower case hexadecimal digits. Any
+        other answer is ``catalog_error: <operation> failed``, so no copy, settings change, sync or delete follows from it.
+        """
         try:
             found = self.client.reference(name)
         except NessieError as error:
             if error.status == NOT_FOUND:
                 return None
-            raise catalog_error("reference") from None
-        return RefState(found.kind, found.hash)
+            raise catalog_error(operation) from None
+        if found.name != name or found.kind not in (BRANCH_KIND, TAG_KIND) or HASH.fullmatch(found.hash) is None:
+            raise catalog_error(operation)
+        return found
+
+    def head(self, branch: str) -> str:
+        """The hash that the branch points to. A reference that is not there, or is a tag, is ``catalog_error``."""
+        found = self.read_reference(branch, "head")
+        if found is None or found.kind != BRANCH_KIND:
+            raise catalog_error("head")
+        return found.hash
+
+    def reference(self, name: str) -> RefState | None:
+        """The kind and the hash of the reference ``name``, or None when there is none. A tag and a branch of one name are told apart by the kind."""
+        found = self.read_reference(name, "reference")
+        return None if found is None else RefState(found.kind, found.hash)
 
     def create_branch(self, branch: str, at: str) -> str:
         """Create the branch at exactly the hash ``at`` of main and return the hash it was made at.
