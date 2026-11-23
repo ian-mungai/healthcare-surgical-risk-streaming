@@ -19,13 +19,11 @@ from the exact encoded values and not from a rounded start (``spark/bronze/sampl
 from __future__ import annotations
 
 import gc
-from collections.abc import Collection, Iterator
+import importlib
+from collections.abc import Collection, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
-import vitaldb
-
-from replay.service.decode import ANONYMISED_START, samples_of, to_microseconds
 from spark.bronze.plan import GROUPED, track_passes
 from spark.bronze.rows import Lineage, StructureError, numeric_rows, string_rows, track_info, track_row, waveform_rows
 from spark.bronze.structure import (
@@ -39,7 +37,36 @@ from spark.bronze.structure import (
     walk_file,
 )
 
+# The replay's decoder module imports the publisher's library when it is imported, so it is imported by name here, as the library is: the tools environment has
+# neither, and the fast tests put a stand-in for the library in place first. ``ANONYMISED_START``, ``samples_of`` and ``to_microseconds`` are the replay's own.
+decode = importlib.import_module("replay.service.decode")
+ANONYMISED_START: float = decode.ANONYMISED_START
+samples_of: Any = decode.samples_of
+to_microseconds: Any = decode.to_microseconds
 READS = {"header": 0, "load": 0, "walk": 0}
+
+
+class ExactNames:
+    """The tracks that a read asks for, matched by the whole name of each track and by nothing else.
+
+    ``VitalFile.load_vital`` of the installed library (``vitaldb/utils.py`` 1.7.2, lines 2059 to 2066) takes a track when its name is in the requested names
+    and, failing that, when its name ENDS with one of them (line 2065, ``dtname.endswith(sel_dtname)``), or when a requested name is ``<device>/*``. So the
+    name ``HR`` also selects ``D/HR`` and ``E/HR``, and the library would then decode records that this read did not ask for, among them four-byte integers
+    that it cannot unpack. This object answers the membership test of line 2061 and is empty for the loop of line 2064, so only a whole name is taken.
+    It is not empty for the test of line 2059: it holds at least one name.
+    """
+
+    def __init__(self, names: Iterable[str]) -> None:
+        self.names = frozenset(names)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self.names
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
 
 
 def read_counts() -> dict[str, int]:
@@ -53,10 +80,12 @@ def load(path: Path, names: list[str] | None = None, *, header_only: bool = Fals
     ``READS`` counts the reads of this process (the header alone, with records, and the packet walk), so a run can say how often it read its files.
     """
     READS["header" if header_only else "load"] += 1
-    library = vitaldb.VitalFile()
+    if names is not None and not names:
+        raise StructureError("a read with records names at least one track")
+    library = importlib.import_module("vitaldb").VitalFile()
     library.dtstart = 0
     library.dgmt = 0
-    if not library.load_vital(str(path), track_names=names, header_only=header_only):
+    if not library.load_vital(str(path), track_names=None if names is None else ExactNames(names), header_only=header_only):
         raise StructureError("the library could not read the case file to its end")
     return library
 
@@ -126,13 +155,18 @@ def case_problem(path: Path, case_id: int, caseend_us: int, mode: str = GROUPED)
 
 
 def library_group(path: Path, case_id: int, names: list[str]) -> Any:
-    """The library's reading of the tracks ``names`` in one pass, with their records. The other tracks that the library may select are dropped."""
+    """The library's reading of the tracks ``names`` in one pass, with their records. Each name is a track's whole name: device, a slash and the track's own.
+
+    A track that was asked for and is missing, or one that was not asked for and is there, is refused: a read that takes a track that it did not name has
+    decoded records that nothing checked, and the library may not be able to unpack them.
+    """
     library = load(path, names)
     missing = [name for name in names if name not in library.trks]
     if missing:
         raise StructureError(f"case {case_id}: the track {missing[0]} is in the header and not in the pass that reads it")
-    for other in [other for other in library.trks if other not in names]:
-        del library.trks[other]
+    extra = sorted(name for name in library.trks if name not in names)
+    if extra:
+        raise StructureError(f"case {case_id}: the library took the track {extra[0]}, which the pass did not ask for")
     return library
 
 
