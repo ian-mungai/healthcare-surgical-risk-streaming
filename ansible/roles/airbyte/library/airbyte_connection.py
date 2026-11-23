@@ -118,6 +118,10 @@ CONNECTION_FIELDS = ("name", "status", "schedule", "namespaceDefinition", "confi
 Runner = Callable[[list[str]], "tuple[int, str, str]"]
 
 
+# The characters of a bearer token (RFC 6750): anything else could not go in a header, and the header error would carry the token's text.
+TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+
+
 class ApiError(RuntimeError):
     """A call or an object is not usable. The message holds a method, a path, a status or an object's name, and never a token, a secret or a body."""
 
@@ -197,8 +201,13 @@ class HttpApi(Api):
         timer.start()
         late = ApiError(f"{method} {path} did not answer within {allowed:g} seconds")
         try:
-            connection.request(method, f"{self.prefix}{path}", body=data, headers=headers)
+            # The connect is made first so that a request is never sent after the deadline: a connect that ended late, which the timer could not
+            # shut because there was no socket yet, stops here.
+            connection.connect()
             sock = saved[0] = getattr(connection, "sock", None)
+            if expired.is_set() or self.clock() - started > allowed:
+                raise TimeoutError
+            connection.request(method, f"{self.prefix}{path}", body=data, headers=headers)
             if sock is not None:
                 sock.settimeout(max(allowed - (self.clock() - started), 0.001))
             reply = connection.getresponse()
@@ -597,6 +606,8 @@ def access_token(base_url: str, client_id: str, client_secret: str, timeout_seco
     token = reply.get("access_token")
     if not isinstance(token, str) or not token:
         raise ApiError("POST /applications/token answered with no access token")
+    if TOKEN_FORM.fullmatch(token) is None:
+        raise ApiError("POST /applications/token answered with an access token that is not a valid token")
     return token
 
 

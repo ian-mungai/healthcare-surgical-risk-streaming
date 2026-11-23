@@ -1135,6 +1135,44 @@ class SocketDeadlineTest(unittest.TestCase):
         self.assertLess(elapsed, 0.25 + self.MARGIN)
         self.assertIn("did not answer within", message)
 
+    def test_a_token_reply_with_a_character_a_header_cannot_hold_is_a_redacted_refusal(self) -> None:
+        for token in (f"{HIDDEN_THREE}\n", f"{HIDDEN_THREE} x", f"{HIDDEN_THREE}\r\nX: y"):
+            with self.subTest(token=repr(token)):
+                reply = self.answer(json.dumps({"access_token": token}).encode())
+
+                def send(sock: socket.socket, reply: bytes = reply) -> None:
+                    sock.sendall(reply)
+
+                base = self.serve(send)
+                with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+                    MODULE_UNDER_TEST.access_token(base, "id", "secret", 1)
+                self.assertEqual("POST /applications/token answered with an access token that is not a valid token", str(raised.exception))
+                self.assertNotIn(HIDDEN_THREE, str(raised.exception))
+
+    def test_a_connect_that_ends_after_the_deadline_sends_nothing(self) -> None:
+        sent: list[str] = []
+
+        class LateConnection:
+            sock = None
+
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                pass
+
+            def connect(self) -> None:
+                time.sleep(0.4)
+
+            def request(self, method: str, url: str, body: Any = None, headers: Any = None) -> None:
+                sent.append(method)
+
+            def close(self) -> None:
+                pass
+
+        client = MODULE_UNDER_TEST.HttpApi("http://127.0.0.1:8000/api", lambda: "t", timeout_seconds=0.05, connect=LateConnection)
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            client.request("POST", "/sources", {"a": 1})
+        self.assertIn("did not answer within 0.05 seconds", str(raised.exception))
+        self.assertEqual([], sent, "a request is never sent after the deadline")
+
     def test_a_server_that_sends_the_headers_slowly_a_byte_at_a_time_ends_at_the_deadline(self) -> None:
         def trickle(sock: socket.socket) -> None:
             for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}":
@@ -1238,6 +1276,9 @@ class HttpTest(unittest.TestCase):
             self.closed = False
             self.sock = HttpTest.Socket()
             self.sent = 0
+
+        def connect(self) -> None:
+            pass
 
         def request(self, method: str, url: str, body: bytes | None, headers: dict[str, str]) -> None:
             self.log.append((method, url, body, headers))
