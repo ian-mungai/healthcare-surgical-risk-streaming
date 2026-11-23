@@ -72,11 +72,12 @@ PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
 PLANTED_FAILURE = (
     'FAIL: test_planted ({name})\n----------\nTraceback (most recent call last):\n  File "x.py", line 6, in test_planted\nAssertionError: {detail}\n'
 )
-FAST_SUMMARY = "Ran 312 tests in 60.0s\n\nFAILED (failures={count})\n"
+FAST_SUMMARY = "Ran 312 tests in 60.0s\n\nFAILED ({counts})\n"
 
 
-def fast_test_output(*failures: str, count: int = 1) -> str:
-    return HOOK_FAILURE.format(hook="fast-tests", detail="\n".join(failures) + "\n" + FAST_SUMMARY.format(count=count))
+def fast_test_output(*failures: str, count: int = 1, rest: str = "") -> str:
+    summary = FAST_SUMMARY.format(counts=f"failures={count}{rest}")
+    return HOOK_FAILURE.format(hook="fast-tests", detail="\n".join(failures) + "\n" + summary)
 
 
 class FastTestFaultJudgementTest(unittest.TestCase):
@@ -101,6 +102,14 @@ class FastTestFaultJudgementTest(unittest.TestCase):
 
     def test_the_planted_message_from_another_test_is_not_proof(self) -> None:
         self.assertFalse(self.judge(fast_test_output(self.planted(name="tests.fast.test_other.OtherTest.test_other"))))
+
+    def test_skipped_tests_in_the_summary_do_not_hide_the_proof(self) -> None:
+        """The suite has skipped tests, so unittest's summary reads ``FAILED (failures=1, skipped=2)``."""
+        self.assertTrue(self.judge(fast_test_output(self.planted(), rest=", skipped=2")))
+
+    def test_an_error_beside_the_planted_failure_is_not_proof(self) -> None:
+        self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1")))
+        self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1, skipped=2")))
 
     def test_a_second_failure_beside_the_planted_one_is_not_proof(self) -> None:
         other = PLANTED_FAILURE.format(name="tests.fast.test_other.OtherTest.test_other", detail="3 != 4")

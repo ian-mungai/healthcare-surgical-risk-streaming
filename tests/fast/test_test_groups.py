@@ -20,7 +20,7 @@ from scripts.stack.yaml_text import load_yaml
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "run_quick.py"
 RUN_SECONDS = 120
-QUICK_COMMAND = ".venv/bin/python -m tests.run_quick"
+QUICK_COMMAND = ".venv/bin/python tests/run_quick.py"
 SLOW_MODULE = "import unittest\nVALUE = 1\nclass PlantedSlowTest(unittest.TestCase):\n    def test_x(self):\n        pass\n"
 QUICK_TEST = "import unittest\nclass PlantedQuickTest(unittest.TestCase):\n    def test_q(self):\n{body}"
 
@@ -47,7 +47,7 @@ class QuickRunnerTest(unittest.TestCase):
         hooks = [hook for repo in config["repos"] for hook in repo["hooks"]]
         self.assertEqual([hook["entry"] for hook in hooks if hook["id"] == "fast-tests"], [QUICK_COMMAND])
         recipe = (ROOT / "Makefile").read_text().split("\ntest-fast:\n", 1)[1].split("\n\n", 1)[0]
-        self.assertEqual(recipe.strip(), "$(PYTHON) -m tests.run_quick")
+        self.assertEqual(recipe.strip(), "$(PYTHON) tests/run_quick.py")
 
     def test_the_slow_group_is_a_package_that_discovery_finds(self) -> None:
         self.assertTrue((ROOT / "tests" / "slow" / "__init__.py").is_file())
@@ -76,6 +76,15 @@ class QuickRunnerTest(unittest.TestCase):
                 )
             },
             "a file with a byte-order mark": {"tests/fast/test_planted_quick_bom.py": "import tests.slow\n"},
+            "a re-export in the tests package": {"tests/__init__.py": "from tests.slow import test_planted_slow\n"},
+            "discovery of the slow folder by path": {
+                "tests/fast/test_planted_quick.py": (
+                    "import os, unittest\n"
+                    "def load_tests(loader, tests, pattern):\n"
+                    "    tests.addTests(unittest.TestLoader().discover(os.path.join(os.path.dirname(__file__), '..', 'slow')))\n"
+                    "    return tests\n"
+                )
+            },
         }
         for label, files in forms.items():
             with self.subTest(form=label):
@@ -83,4 +92,4 @@ class QuickRunnerTest(unittest.TestCase):
                 planted_tree(top, files)
                 code, output = run_runner(top)
                 self.assertNotEqual(code, 0, f"the {label} import passed: {output}")
-                self.assertIn("the quick group imported tests.slow", output)
+                self.assertRegex(output, r"the quick group (imported tests\.slow|loaded tests/slow/test_planted_slow\.py)")
