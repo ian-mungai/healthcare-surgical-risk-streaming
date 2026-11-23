@@ -1,9 +1,9 @@
 """The settings of the streaming job, from the environment that its Compose service sets.
 
-Every figure that differs between hosts comes from the environment, so the job types no address, path or limit. The late limit and the cutoff
-step are in seconds in the environment and in microseconds in the job. ``STREAM_TEST_EXIT_AFTER_SINK`` is a test input in the way
-``STACK_TEST_AVAILABLE_MIB`` is: it stops the process right after the write of the sink with that number (0 to 3, in the order of
-``spark.streaming.sinks.WRITE_ORDER``) so that a restart test can stop the job after its first sink commit. It is off unless set.
+Every figure that differs between hosts comes from the environment, so the job types no address, path or limit. The late limit and the cutoff step are
+in seconds in the environment and in microseconds in the job. ``STREAM_TEST_EXIT_AFTER_SINK`` is a test input in the way ``STACK_TEST_AVAILABLE_MIB``
+is: a whole number N from 1 that stops the process right after the N-th sink commit of the process (one merge into one lake table), so that a restart
+test can stop the job after its first sink commit. It is off unless set.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from replay.events.formats import FEATURE_READY_TOPIC, INPUT_TOPIC
 from spark.streaming.model import MINUTE, SECOND
 
-SINK_COUNT = 4
 DEFAULT_LATE_LIMIT_SECONDS = 30.0
 DEFAULT_TRIGGER_SECONDS = 2.0
 DEFAULT_MAX_OFFSETS = 50_000
@@ -66,8 +65,8 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
     test_exit: int | None = None
     if env.get("STREAM_TEST_EXIT_AFTER_SINK", ""):
         text = env["STREAM_TEST_EXIT_AFTER_SINK"]
-        if not text.isdigit() or int(text) >= SINK_COUNT:
-            raise StreamSettingsError(f"STREAM_TEST_EXIT_AFTER_SINK must be a whole number from 0 to {SINK_COUNT - 1}")
+        if not text.isdigit() or int(text) < 1:
+            raise StreamSettingsError("STREAM_TEST_EXIT_AFTER_SINK must be a whole number from 1")
         test_exit = int(text)
     return StreamSettings(
         bootstrap=required(env, "KAFKA_BOOTSTRAP"),

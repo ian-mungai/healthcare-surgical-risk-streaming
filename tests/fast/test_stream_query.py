@@ -174,10 +174,11 @@ class TestInput(unittest.TestCase):
             batch_handler(Sinks(), settings)(batch, 1)
         return [call.args[0] for call in leave.call_args_list]
 
-    def test_the_process_stops_after_the_named_sink_and_not_when_the_input_is_off(self) -> None:
+    def test_the_process_stops_after_the_numbered_sink_commit_and_not_when_the_input_is_off(self) -> None:
         self.assertEqual([TEST_EXIT_CODE], self.run_handler(1, [0, 1, 2, 3]))
+        self.assertEqual([TEST_EXIT_CODE], self.run_handler(2, [3, 1]))
         self.assertEqual([], self.run_handler(None, [0, 1, 2, 3]))
-        self.assertEqual([], self.run_handler(3, [0, 1, 2]))
+        self.assertEqual([], self.run_handler(3, [0, 1]))
 
 
 if __name__ == "__main__":

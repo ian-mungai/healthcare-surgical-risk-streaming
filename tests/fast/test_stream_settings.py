@@ -47,14 +47,15 @@ class Settings(unittest.TestCase):
             ("STREAM_MAX_SECONDS", "-5"),
             ("STREAM_TRIGGER_SECONDS", "0"),
             ("STREAM_MAX_OFFSETS_PER_TRIGGER", "0"),
-            ("STREAM_TEST_EXIT_AFTER_SINK", "9"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "0"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "x"),
         ):
             with self.subTest(name=name, value=value), self.assertRaisesRegex(StreamSettingsError, name):
                 from_environment({**BASE, name: value})
 
-    def test_the_test_input_names_one_sink_of_the_four(self) -> None:
-        self.assertEqual(0, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "0"}).test_exit_after_sink)
-        self.assertEqual(3, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "3"}).test_exit_after_sink)
+    def test_the_test_input_counts_sink_commits_from_one(self) -> None:
+        self.assertEqual(1, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "1"}).test_exit_after_sink)
+        self.assertEqual(7, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "7"}).test_exit_after_sink)
 
 
 class ClinicalFile(unittest.TestCase):

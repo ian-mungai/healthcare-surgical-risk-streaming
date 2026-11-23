@@ -28,9 +28,13 @@ SESSION_OPTIONS: Mapping[str, str] = {
 
 
 def batch_handler(sinks: BatchSinks, settings: StreamSettings) -> Callable[[Any, int], None]:
+    commits = 0
+
     def after_merge(index: int) -> None:
-        if settings.test_exit_after_sink == index:
-            os.write(2, f"stream_features: test input: stopping after the write of sink {index}\n".encode())
+        nonlocal commits
+        commits += 1
+        if settings.test_exit_after_sink == commits:
+            os.write(2, f"stream_features: test input: stopping after sink commit {commits}\n".encode())
             os._exit(TEST_EXIT_CODE)
 
     def handle(batch: Any, batch_id: int) -> None:
