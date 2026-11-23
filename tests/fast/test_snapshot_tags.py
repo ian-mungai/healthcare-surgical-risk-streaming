@@ -193,7 +193,7 @@ class ReadTest(unittest.TestCase):
 
 
 class TagRunTest(unittest.TestCase):
-    def test_the_merged_hash_is_tagged_and_each_table_snapshot_is_read_at_the_tag(self) -> None:
+    def test_the_merged_hash_is_tagged_and_each_table_snapshot_is_read_at_the_merged_hash(self) -> None:
         nessie = StandIn()
         result = tags.tag_run(nessie, RUN_ID, HASH_ONE)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
@@ -272,19 +272,20 @@ class TagRunTest(unittest.TestCase):
             tags.tag_run(nessie, RUN_ID, HASH_UNKNOWN)
         self.assertNotIn(f"run-{RUN_ID}", nessie.references)
 
-    def test_a_tag_that_does_not_read_back_at_the_hash_is_an_error(self) -> None:
+    def test_an_answer_to_the_create_call_that_does_not_show_a_tag_at_the_hash_is_an_error_naming_the_tag(self) -> None:
         nessie = StandIn()
         real_send = nessie.send
 
         def lying(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
             status, body = real_send(method, target, payload)
             if method == "POST":
-                nessie.references[f"run-{RUN_ID}"] = ("TAG", HASH_TWO)
+                return status, json.dumps({"reference": {"type": "TAG", "name": f"run-{RUN_ID}", "hash": HASH_TWO}}).encode()
             return status, body
 
         with mock.patch.object(nessie, "send", lying), self.assertRaises(NessieError) as caught:
             tags.tag_run(nessie, RUN_ID, HASH_ONE)
         self.assertIn(HASH_ONE, str(caught.exception))
+        self.assertIn(f"run-{RUN_ID}", str(caught.exception))
 
 
 class TrunkTest(unittest.TestCase):
@@ -671,6 +672,270 @@ class TagLastTest(unittest.TestCase):
         self.assertIn(f"run-{RUN_ID}", err)
         self.assertIn("left in place", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
+
+
+class StageFirstTest(unittest.TestCase):
+    """The record's staging file is made and synced before the tag is created, so the folder's failures come first and only the publish follows it."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.folder = self.root / "run"
+
+    def run_it(self, nessie: StandIn, folder: Path | None = None) -> tuple[int, str, str]:
+        return run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(folder or self.folder)], nessie)
+
+    def test_a_run_folder_that_is_a_dangling_link_exits_1_with_no_tag_made(self) -> None:
+        link = self.root / "link"
+        os.symlink(self.root / "nowhere", link)
+        nessie = StandIn()
+        code, _, err = self.run_it(nessie, link)
+        self.assertEqual(1, code)
+        self.assertIn("no tag was made", err)
+        self.assertEqual([], nessie.writes())
+        self.assertNotIn(f"run-{RUN_ID}", nessie.references)
+
+    def test_a_run_folder_that_is_a_file_or_has_a_file_in_its_path_exits_1_with_no_tag_made(self) -> None:
+        (self.root / "afile").write_text("x")
+        for folder in (self.root / "afile", self.root / "afile" / "deeper"):
+            with self.subTest(folder=folder.name):
+                nessie = StandIn()
+                code, _, err = self.run_it(nessie, folder)
+                self.assertEqual(1, code)
+                self.assertIn("no tag was made", err)
+                self.assertEqual([], nessie.writes())
+
+    def test_a_read_only_run_folder_exits_1_with_no_tag_made(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("a user with every right can write to a read-only folder")
+        self.folder.mkdir()
+        self.folder.chmod(0o500)
+        self.addCleanup(self.folder.chmod, 0o700)
+        nessie = StandIn()
+        code, _, err = self.run_it(nessie)
+        self.assertEqual(1, code)
+        self.assertIn("no tag was made", err)
+        self.assertEqual([], nessie.writes())
+        self.assertNotIn(f"run-{RUN_ID}", nessie.references)
+
+    def test_the_staging_file_exists_when_the_tag_is_created_and_the_tag_is_created_only_after_it(self) -> None:
+        nessie = StandIn()
+        seen: list[list[str]] = []
+        real_send = nessie.send
+
+        def watching(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+            if method == "POST":
+                seen.append(sorted(name for name in os.listdir(self.folder)))
+            return real_send(method, target, payload)
+
+        with mock.patch.object(nessie, "send", watching):
+            self.assertEqual(0, self.run_it(nessie)[0])
+        self.assertEqual(1, len(seen))
+        self.assertEqual(1, len(seen[0]))
+        self.assertTrue(seen[0][0].startswith(".writing_"))
+        self.assertEqual(["data_version.json"], sorted(os.listdir(self.folder)))
+
+    def test_nothing_is_read_from_nessie_after_the_tag_is_created_and_only_the_publish_is_left(self) -> None:
+        nessie = StandIn()
+        at_publish: list[int] = []
+        real_link = os.link
+
+        def watching(source: Any, target: Any) -> None:
+            at_publish.append(len(nessie.calls))
+            real_link(source, target)
+
+        with mock.patch("scripts.stack.tags.os.link", watching):
+            self.assertEqual(0, self.run_it(nessie)[0])
+        create = next(index for index, call in enumerate(nessie.calls) if call[0] == "POST")
+        self.assertEqual(create + 1, len(nessie.calls))
+        self.assertEqual([create + 1], at_publish)
+
+    def test_a_failure_while_the_staging_file_is_written_leaves_no_file_and_no_tag(self) -> None:
+        nessie = StandIn()
+        with mock.patch("scripts.stack.tags.os.fsync", side_effect=OSError("disk error")):
+            code, _, err = self.run_it(nessie)
+        self.assertEqual(1, code)
+        self.assertIn("no tag was made", err)
+        self.assertEqual([], nessie.writes())
+        self.assertEqual([], sorted(os.listdir(self.folder)))
+
+    def test_a_staging_file_is_removed_after_every_failure(self) -> None:
+        refused = StandIn()
+        real_send = refused.send
+
+        def refusing(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+            if method == "POST":
+                return 500, b'{"errorCode": "UNKNOWN", "message": "refused"}'
+            return real_send(method, target, payload)
+
+        with mock.patch.object(refused, "send", refusing):
+            self.assertEqual(1, self.run_it(refused)[0])
+        self.assertEqual([], sorted(os.listdir(self.folder)))
+        with mock.patch("scripts.stack.tags.os.link", side_effect=OSError("disk full")):
+            self.assertEqual(1, self.run_it(StandIn())[0])
+        self.assertEqual([], sorted(os.listdir(self.folder)))
+
+
+class CleanupAfterTagTest(unittest.TestCase):
+    def test_a_staging_file_that_cannot_be_removed_after_the_publish_does_not_fail_a_run_whose_tag_and_record_are_in_place(self) -> None:
+        real_unlink = Path.unlink
+
+        def failing(self: Path, missing_ok: bool = False) -> None:
+            if self.name.startswith(".writing_"):
+                raise PermissionError("cannot remove")
+            real_unlink(self, missing_ok=missing_ok)
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "run"
+            nessie = StandIn()
+            with mock.patch.object(Path, "unlink", failing):
+                code, out, _ = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(folder)], nessie)
+            self.assertEqual(0, code)
+            self.assertIn("tagged", out)
+            self.assertEqual(HASH_ONE, json.loads((folder / "data_version.json").read_text())["hash"])
+
+
+class AfterTagTest(unittest.TestCase):
+    """Any failure after the tag may have been made names the tag and says it is left in place, a deadline included."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.folder = Path(self.directory.name) / "run"
+
+    def run_it(self, nessie: StandIn) -> tuple[int, str, str]:
+        return run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(self.folder)], nessie)
+
+    def test_a_deadline_that_ends_the_publish_names_the_tag_and_says_it_is_left_in_place(self) -> None:
+        nessie = StandIn()
+        with mock.patch("scripts.stack.tags.os.link", side_effect=tags.DeadlineExceeded("the run passed its deadline")):
+            code, _, err = self.run_it(nessie)
+        self.assertEqual(1, code)
+        self.assertIn(f"run-{RUN_ID}", err)
+        self.assertIn("left in place", err)
+        self.assertIn("deadline", err)
+        self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
+
+    def test_a_deadline_during_the_create_call_says_that_the_tag_may_have_been_made_and_is_left_in_place_if_so(self) -> None:
+        nessie = StandIn()
+        real_send = nessie.send
+
+        def late(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+            answer = real_send(method, target, payload)
+            if method == "POST":
+                raise tags.DeadlineExceeded("the run passed its deadline")
+            return answer
+
+        with mock.patch.object(nessie, "send", late):
+            code, _, err = self.run_it(nessie)
+        self.assertEqual(1, code)
+        self.assertIn(f"run-{RUN_ID}", err)
+        self.assertIn("may have been made", err)
+        self.assertIn("left in place", err)
+        self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
+
+    def test_every_kind_of_failure_after_the_create_call_is_named_the_same_way(self) -> None:
+        for error in (OSError("disk full"), tags.TagConflict("a record"), NessieError("a late read"), PermissionError("read-only")):
+            with self.subTest(error=type(error).__name__):
+                nessie = StandIn()
+                folder = Path(self.directory.name) / f"run_{type(error).__name__}"
+                with mock.patch("scripts.stack.tags.os.link", side_effect=error):
+                    code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(folder)], nessie)
+                self.assertEqual(1, code)
+                self.assertIn(f"run-{RUN_ID}", err)
+                self.assertIn("left in place", err)
+
+    def test_a_failure_before_the_create_call_does_not_claim_a_tag(self) -> None:
+        nessie = StandIn()
+        nessie.references[f"run-{RUN_ID}"] = ("TAG", HASH_TWO)
+        code, _, err = self.run_it(nessie)
+        self.assertEqual(1, code)
+        self.assertNotIn("left in place", err)
+        self.assertNotIn("may have been made", err)
+        self.assertNotIn("could not be published", err)
+        self.assertIn("never moves", err)
+
+
+class StrictRecordTest(unittest.TestCase):
+    """Records are compared type for type: a Boolean is never an integer and an integer is never a float, in every field."""
+
+    def test_the_strict_comparison_tells_a_boolean_an_integer_and_a_float_apart_at_any_depth(self) -> None:
+        same = tags.same_record
+        self.assertTrue(same({"a": [1, {"b": None, "c": "x"}]}, {"a": [1, {"b": None, "c": "x"}]}))
+        for left, right in (
+            (True, 1),
+            (1, True),
+            (1, 1.0),
+            (0, False),
+            (0.0, 0),
+            (None, 0),
+            ("1", 1),
+            ([1], [True]),
+            ({"a": 1}, {"a": 1.0}),
+            ({"a": 1}, {"a": 1, "b": 1}),
+            ([1, 2], [2, 1]),
+            ([1], (1,)),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertFalse(same(left, right))
+                self.assertFalse(same(right, left))
+
+    def folder_with(self, directory: str, record: dict[str, Any]) -> Path:
+        folder = Path(directory) / "run"
+        folder.mkdir()
+        (folder / "data_version.json").write_text(json.dumps(record, indent=2) + "\n")
+        return folder
+
+    def nessie_with_snapshot_one(self) -> StandIn:
+        nessie = StandIn()
+        nessie.entries_at[HASH_ONE] = [NAMESPACE_ENTRY, table_entry(["catalog_proof", "numbers"], 1, METADATA)]
+        return nessie
+
+    def good_record(self) -> dict[str, Any]:
+        return tags.version_record(tags.tag_run(self.nessie_with_snapshot_one(), RUN_ID, HASH_ONE))
+
+    def test_a_restored_record_with_a_boolean_or_a_float_for_the_snapshot_id_is_refused_and_no_tag_is_made(self) -> None:
+        for value in (True, 1.0):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                record = self.good_record()
+                record["tables"][0]["snapshot_id"] = value
+                nessie = self.nessie_with_snapshot_one()
+                code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(self.folder_with(directory, record))], nessie)
+                self.assertEqual(1, code)
+                self.assertIn("no tag was made", err)
+                self.assertEqual([], nessie.writes())
+
+    def test_an_equal_record_of_the_same_types_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            nessie = self.nessie_with_snapshot_one()
+            code, out, _ = run_command(
+                ["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(self.folder_with(directory, self.good_record()))], nessie
+            )
+            self.assertEqual(0, code)
+            self.assertIn("tagged", out)
+
+    def test_a_racing_writer_whose_record_is_equal_only_under_loose_comparison_is_refused_at_the_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "run"
+            nessie = self.nessie_with_snapshot_one()
+            record = self.good_record()
+            loose = json.loads(json.dumps(record))
+            loose["tables"][0]["snapshot_id"] = True
+            real_link = os.link
+            raced = {"done": False}
+
+            def racing(source: Any, target: Any) -> None:
+                if not raced["done"]:
+                    raced["done"] = True
+                    folder.mkdir(exist_ok=True)
+                    (folder / "data_version.json").write_text(json.dumps(loose))
+                real_link(source, target)
+
+            with mock.patch("scripts.stack.tags.os.link", racing):
+                code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(folder)], nessie)
+            self.assertEqual(1, code)
+            self.assertIn("left in place", err)
 
 
 class ForgedPages(StandIn):

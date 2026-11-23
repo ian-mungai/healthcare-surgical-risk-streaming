@@ -17,6 +17,7 @@ it is absent. A folder that the run folder writer would name ``*_<run id>`` must
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import json
 import math
@@ -33,7 +34,7 @@ from types import FrameType
 from typing import Any
 from urllib.parse import quote
 
-from scripts.stack.nessie import BODY_LIMIT_BYTES, HASH, NessieClient, NessieConflict, NessieError
+from scripts.stack.nessie import BODY_LIMIT_BYTES, HASH, NessieClient, NessieConflict, NessieError, Reference
 
 RUN_TAG_PREFIX = "run-"
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}")
@@ -227,28 +228,47 @@ def prepare_tag(client: NessieClient, run_id: str, merged_hash: str, trunk: str 
     return TagResult(run_id, name, merged_hash, default, False, table_snapshots(client, f"{default}@{merged_hash}"))
 
 
-def create_tag(client: NessieClient, prepared: TagResult) -> TagResult:
-    """Make the prepared tag, or find it where it must be. A tag of that name at that hash stays, and one at another hash is refused."""
-    name, merged_hash = prepared.tag, prepared.hash
-    created = False
+def check_existing(existing: Reference, prepared: TagResult) -> None:
+    """Refuse a reference of the tag's name that is not a tag at the prepared hash."""
+    if existing.kind != "TAG" or existing.hash != prepared.hash:
+        raise TagConflict(f"{prepared.tag} already exists as a {existing.kind.lower()} at {existing.hash}, not at {prepared.hash}: a run's tag never moves")
+
+
+def find_tag(client: NessieClient, prepared: TagResult) -> Reference | None:
+    """The tag of the prepared name when it exists at the prepared hash, None when there is none, and ``TagConflict`` for anything else of that name."""
     try:
-        existing = client.reference(name)
+        existing = client.reference(prepared.tag)
     except NessieError as error:
         if error.status != 404:
             raise
-        existing = None
-    if existing is None:
-        try:
-            client.create_tag(name, merged_hash, prepared.trunk)
-            created = True
-        except NessieConflict:
-            existing = client.reference(name)
-    if existing is not None and (existing.kind != "TAG" or existing.hash != merged_hash):
-        raise TagConflict(f"{name} already exists as a {existing.kind.lower()} at {existing.hash}, not at {merged_hash}: a run's tag never moves")
-    pinned = client.reference(name)
-    if pinned.kind != "TAG" or pinned.hash != merged_hash:
-        raise NessieError(f"{name} reads back as a {pinned.kind.lower()} at {pinned.hash}, not as a tag at {merged_hash}")
-    return replace(prepared, created=created)
+        return None
+    check_existing(existing, prepared)
+    return existing
+
+
+def post_tag(client: NessieClient, prepared: TagResult) -> bool:
+    """Create the prepared tag. True when this call made it, False when a tag of that name appeared first (a race the caller then judges).
+
+    Nessie's answer to the call is checked and no read follows it: the call is the last operation on Nessie, so the publish of the record is the only step
+    that can still fail after the tag is made.
+    """
+    try:
+        made = client.create_tag(prepared.tag, prepared.hash, prepared.trunk)
+    except NessieConflict:
+        return False
+    if made.kind != "TAG" or made.hash != prepared.hash:
+        raise NessieError(f"{prepared.tag} was made, and Nessie's answer shows a {made.kind.lower()} at {made.hash}, not a tag at {prepared.hash}")
+    return True
+
+
+def create_tag(client: NessieClient, prepared: TagResult) -> TagResult:
+    """Make the prepared tag, or find it where it must be. A tag of that name at that hash stays, and one at another hash is refused."""
+    made = False
+    if find_tag(client, prepared) is None:
+        made = post_tag(client, prepared)
+        if not made:
+            check_existing(client.reference(prepared.tag), prepared)
+    return replace(prepared, created=made)
 
 
 def tag_run(client: NessieClient, run_id: str, merged_hash: str, trunk: str | None = None) -> TagResult:
@@ -270,6 +290,8 @@ def read_record(folder: Path) -> dict[str, Any] | None:
         mode = os.lstat(target).st_mode
     except FileNotFoundError:
         return None
+    except OSError as error:
+        raise TagConflict(f"{target} cannot be examined ({type(error).__name__}): no tag was made") from error
     if not stat.S_ISREG(mode):
         raise TagConflict(f"{target} is not a regular file (it is a link, a folder or another kind of file): no tag was made")
     try:
@@ -281,31 +303,64 @@ def read_record(folder: Path) -> dict[str, Any] | None:
     return held
 
 
+def same_record(left: Any, right: Any) -> bool:
+    """Whether two parsed JSON values are equal type for type: a Boolean is never an integer, an integer is never a float, and a list is never a tuple."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(same_record(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same_record(one, other) for one, other in zip(left, right, strict=True))
+    return bool(left == right)
+
+
 def judge_record(held: dict[str, Any] | None, folder: Path, run_id: str, tag: str, merged_hash: str) -> None:
     """Refuse a record that is not this run's at this hash. This is the cheap check that runs before any call to Nessie."""
-    if held is not None and (held.get("run_id"), held.get("tag"), held.get("hash")) != (run_id, tag, merged_hash):
+    if held is not None and not same_record([held.get("run_id"), held.get("tag"), held.get("hash")], [run_id, tag, merged_hash]):
         raise TagConflict(f"{folder / RECORD_NAME} records {held.get('tag')} at {held.get('hash')}, not {tag} at {merged_hash}: no tag was made")
 
 
 def tag_and_record(client: NessieClient, run_id: str, merged_hash: str, folder: Path, trunk: str | None = None) -> tuple[TagResult, bool]:
-    """Check everything, then tag, then publish the record. Returns the result and whether the record was written now.
+    """Check everything, prepare the record, then tag, then publish. Returns the result and whether the record was written now.
 
     The order: the record's path and its run, tag and hash (no call to Nessie yet); every Nessie read, including the tables at the exact merged hash; the whole
-    record that would be published against an existing one, which must be equal in every field; and only then the tag, as the last step before the record is
-    published. When the publish fails after the tag was made, the error names the tag and says it is left in place.
+    record that would be published against an existing one, which must be equal type for type; the staging file of the record, made and synced in the run
+    folder, so that every failure of the folder comes first; the look for an existing tag; and then the create call, the last operation on Nessie. After it the
+    only step left is the atomic no-replace publish of the prepared file. Any failure from the create call on, a deadline included, names the tag and says
+    that it is left in place (or, when the create call itself did not answer, that it may have been made and is left in place if so). A staging file that is
+    left over is removed.
     """
     held = read_record(folder)
     judge_record(held, folder, run_id, tag_name(run_id), merged_hash)
     prepared = prepare_tag(client, run_id, merged_hash, trunk)
     record = version_record(prepared)
-    if held is not None and held != record:
+    if held is not None and not same_record(held, record):
         raise TagConflict(f"{folder / RECORD_NAME} does not equal the record of {prepared.tag} at {merged_hash} that Nessie's tables give: no tag was made")
-    result = create_tag(client, prepared)
+    staging = stage_record(folder, record)
+    stage, made = "before", False
     try:
-        return result, write_version_record(folder, result)
-    except (TagConflict, OSError) as error:
-        left = f"the tag {result.tag} was made at {merged_hash} and is left in place" if result.created else f"the tag {result.tag} was already in place"
+        if find_tag(client, prepared) is None:
+            stage = "posting"
+            made = post_tag(client, prepared)
+            if not made:
+                stage = "before"
+                check_existing(client.reference(prepared.tag), prepared)
+        stage = "after"
+        result = replace(prepared, created=made)
+        return result, publish_record(staging, folder, record, result.tag, result.hash)
+    except Exception as error:
+        if stage == "before":
+            raise
+        if made:
+            left = f"the tag {prepared.tag} was made at {merged_hash} and is left in place"
+        elif stage == "posting":
+            left = f"the tag {prepared.tag} may have been made at {merged_hash} and is left in place if it was"
+        else:
+            left = f"the tag {prepared.tag} was already in place at {merged_hash}"
         raise RecordNotPublished(f"the record could not be published ({error}); {left}") from error
+    finally:
+        with contextlib.suppress(OSError):
+            Path(staging).unlink(missing_ok=True)
 
 
 def version_record(result: TagResult) -> dict[str, Any]:
@@ -319,35 +374,55 @@ def version_record(result: TagResult) -> dict[str, Any]:
     }
 
 
-def write_version_record(folder: Path, result: TagResult) -> bool:
-    """Write the record into ``folder``. Returns False when the folder already holds this very record, and refuses one that holds another.
+def stage_record(folder: Path, record: dict[str, Any]) -> str:
+    """Write ``record`` whole into a staging file of ``folder``, synced, and return its path. The folder is made when it is absent.
 
-    The record is written whole to a staging file and published with ``os.link``, which fails when the name exists and never replaces a file. A second writer
-    that got past its own checks at the same time meets the first one's record and compares the whole of it: the same record is unchanged, another is refused.
+    Every failure of the folder or of the write is a ``TagConflict`` that says no tag was made, and leaves no staging file.
     """
-    target = folder / RECORD_NAME
-    record = version_record(result)
-    folder.mkdir(parents=True, exist_ok=True)
-    descriptor, staging = tempfile.mkstemp(prefix=".writing_", dir=folder)
+    staging = ""
     try:
+        folder.mkdir(parents=True, exist_ok=True)
+        descriptor, staging = tempfile.mkstemp(prefix=".writing_", dir=folder)
         with os.fdopen(descriptor, "w") as handle:
             handle.write(json.dumps(record, indent=2) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(staging, 0o644)
+    except OSError as error:
+        if staging:
+            Path(staging).unlink(missing_ok=True)
+        raise TagConflict(f"the run folder {folder} cannot be written ({type(error).__name__}: {error}): no tag was made") from error
+    return staging
+
+
+def publish_record(staging: str, folder: Path, record: dict[str, Any], tag: str, merged_hash: str) -> bool:
+    """Publish the staged file as the run's record with ``os.link``, which fails when the name exists and never replaces a file.
+
+    Returns False when the folder already holds this very record, compared type for type, and refuses one that holds another. A second writer that got past its
+    own checks at the same time meets the first one's record and compares the whole of it.
+    """
+    target = folder / RECORD_NAME
+    try:
+        os.link(staging, target)
+    except FileExistsError:
         try:
-            os.link(staging, target)
-        except FileExistsError:
-            try:
-                held = json.loads(target.read_text())
-            except (OSError, ValueError) as error:
-                raise TagConflict(f"{target} exists and cannot be read as JSON ({type(error).__name__}): it is not replaced") from error
-            if held == record:
-                return False
-            raise TagConflict(
-                f"{target} already records {result.tag} at {held.get('hash') if isinstance(held, dict) else None}, not at {result.hash}: it is kept"
-            ) from None
-        return True
+            held = json.loads(target.read_text())
+        except (OSError, ValueError) as error:
+            raise TagConflict(f"{target} exists and cannot be read as JSON ({type(error).__name__}): it is not replaced") from error
+        if same_record(held, record):
+            return False
+        raise TagConflict(
+            f"{target} already records {tag} at {held.get('hash') if isinstance(held, dict) else None}, not at {merged_hash}: it is kept"
+        ) from None
+    return True
+
+
+def write_version_record(folder: Path, result: TagResult) -> bool:
+    """Stage and publish the record of ``result`` in ``folder``. Returns False when the folder already holds this very record."""
+    record = version_record(result)
+    staging = stage_record(folder, record)
+    try:
+        return publish_record(staging, folder, record, result.tag, result.hash)
     finally:
         Path(staging).unlink(missing_ok=True)
 
