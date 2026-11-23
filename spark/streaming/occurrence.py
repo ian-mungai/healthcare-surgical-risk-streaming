@@ -102,15 +102,15 @@ def decide(state: OccurrenceState, event: Event, context: Context, records: list
     watermark = state.high_water_us
     lateness = 0 if watermark is None else max(0, watermark - event.replay_time_us)
     seen = event.suffix in state.recent
+    if lateness > context.policy.late_limit_us:
+        state.count(TOO_LATE)
+        records.append(decision_record(state, event, TOO_LATE, lateness))
+        return
     if state.closed:
         decision = DUPLICATE if seen else AFTER_CASE_END
         state.count(decision)
         records.append(decision_record(state, event, decision, lateness))
         state.recent.setdefault(event.suffix, event.replay_time_us)
-        return
-    if lateness > context.policy.late_limit_us:
-        state.count(TOO_LATE)
-        records.append(decision_record(state, event, TOO_LATE, lateness))
         return
     if seen:
         state.count(DUPLICATE)

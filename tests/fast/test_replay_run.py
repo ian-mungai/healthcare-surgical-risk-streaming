@@ -173,7 +173,7 @@ class Positions(unittest.TestCase):
         replayer.run()
         other = json.loads(saved_state(store).to_json())
         other["event_list"] = "events_0"
-        with self.assertRaisesRegex(ReplayError, "event list"):
+        with self.assertRaisesRegex(ReplayError, "event list.*new run ID"):
             RunState.from_json(json.dumps(other))
 
     def test_the_state_names_the_event_list_it_was_saved_for(self) -> None:

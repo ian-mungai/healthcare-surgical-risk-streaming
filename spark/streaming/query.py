@@ -51,6 +51,17 @@ def wait_for_query(query: Any, deadline: float | None, stop_requested: Callable[
     return None if stop_requested() else QueryEnded("the query ended with no exception and was not stopped")
 
 
+def stop_and_check(query: Any, failure: BaseException | None) -> BaseException | None:
+    """Stop the query, then return the failure that the wait found, or else the exception that Spark stored.
+
+    Spark 4.1.4 stores the failure of a query before it marks the query inactive, so a stop request or a deadline can end the wait while the query
+    still looks active.
+    """
+    query.stop()
+    stored: BaseException | None = query.exception()
+    return failure if failure is not None else stored
+
+
 def batch_handler(sinks: BatchSinks, settings: StreamSettings) -> Callable[[Any, int], None]:
     commits = 0
 

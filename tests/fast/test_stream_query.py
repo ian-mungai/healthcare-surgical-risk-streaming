@@ -21,7 +21,7 @@ from typing import Any
 from unittest import mock
 
 from spark.streaming.model import FeatureRecord
-from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, start_query, wait_for_query
+from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, start_query, stop_and_check, wait_for_query
 from spark.streaming.rows import INPUT_DDL, KEY_COLUMNS, OUTPUT_DDL, event_row, record_from_row
 from spark.streaming.settings import StreamSettings
 from tests.fast.stream_support import events_for, stamp, synthetic_recording
@@ -187,6 +187,35 @@ class Waiting(unittest.TestCase):
     def test_a_query_that_failed_at_the_moment_of_a_stop_request_is_still_a_failure(self) -> None:
         failure = RuntimeError("late failure")
         self.assertIs(failure, wait_for_query(FakeQuery(0, failure), None, lambda: True, 5.0))
+
+
+class StoresBeforeInactive(FakeQuery):
+    """Spark 4.1.4 stores the failure of a query before it marks the query inactive, so a stop or a deadline can come in between."""
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__(10**6, failure)
+
+    def exception(self) -> BaseException | None:
+        return self.failure
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class StopAndCheck(unittest.TestCase):
+    def test_a_failure_stored_while_the_query_still_looked_active_is_found_after_the_stop(self) -> None:
+        failure = RuntimeError("stored first")
+        query = StoresBeforeInactive(failure)
+        self.assertIsNone(wait_for_query(query, 0.0, lambda: False, 5.0))
+        self.assertIs(failure, stop_and_check(query, None))
+        self.assertTrue(query.stopped)
+
+    def test_the_failure_that_the_wait_found_is_kept_and_no_failure_is_none(self) -> None:
+        first, query = RuntimeError("first"), StoresBeforeInactive(RuntimeError("second"))
+        self.assertIs(first, stop_and_check(query, first))
+        quiet = FakeQuery(10**6)
+        quiet.stop = lambda: None  # type: ignore[attr-defined]
+        self.assertIsNone(stop_and_check(quiet, None))
 
 
 class TestInput(unittest.TestCase):

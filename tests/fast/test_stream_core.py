@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -316,13 +317,30 @@ class Duplicates(unittest.TestCase):
             [(record.decision, record.event_id) for record in decisions(records) if record.event_id == pair[1].event_id],
         )
 
-    def test_the_final_score_and_case_end_markers_sent_again_after_the_case_closed_count_as_repeats_not_as_events_after_the_end(self) -> None:
+    def test_a_marker_sent_again_after_the_case_closed_is_too_late_when_old_and_a_repeat_when_within_the_span_never_after_the_end(self) -> None:
         events = events_for(synthetic_recording())
         markers = [event for event in events if event.kind in ("final_score", "case_end")]
         records, _ = run_stream([*events, *markers])
-        self.assertEqual([("duplicate", marker.event_id) for marker in markers], [(record.decision, record.event_id) for record in decisions(records)][-2:])
+        self.assertEqual([("too_late", markers[0].event_id), ("duplicate", markers[1].event_id)], [(r.decision, r.event_id) for r in decisions(records)][-2:])
         self.assertEqual([], decisions(records, "after_case_end"))
         self.assertEqual(1, len([record for record in records if isinstance(record, LedgerRecord)]))
+
+    def test_resends_after_the_case_closed_are_judged_by_lateness_first_whatever_the_batch_split(self) -> None:
+        events = events_for(synthetic_recording())
+        markers = [event for event in events if event.kind in ("final_score", "case_end")]
+        arrival = [*events, *events[:900], *markers]
+        whole, _ = run_stream(arrival)
+        counts = Counter(record.decision for record in decisions(whole))
+        self.assertEqual(0, counts["after_case_end"])
+        old = [event for event in [*events[:900], markers[0]] if event.replay_time_us < events[-1].replay_time_us - LIMIT_US]
+        self.assertEqual(len(old), counts["too_late"])
+        self.assertEqual([("too_late", markers[0].event_id), ("duplicate", markers[1].event_id)], [(r.decision, r.event_id) for r in decisions(whole)][-2:])
+        for size in (1, 7, 64, 500):
+            with self.subTest(size=size):
+                self.assertEqual(
+                    {record.decision_id: record.decision for record in decisions(whole)},
+                    {record.decision_id: record.decision for record in decisions(run_stream(arrival, batch_size=size, restart=True)[0])},
+                )
 
     def test_an_event_sent_again_beyond_the_limit_is_not_applied_either(self) -> None:
         recording = synthetic_recording()

@@ -112,5 +112,5 @@ def source_event_id(run: str, room: int, occurrence_id: str, track: str, case_ti
 
 
 def marker_event_id(run: str, room: int, occurrence_id: str, marker: Marker, case_time_us: int) -> str:
-    """The ID of the generated final-score marker or case-end marker of an occurrence."""
+    """The ID of a generated marker of an occurrence: the start marker, the final-score marker or the case-end marker."""
     return event_id_text(run, room, occurrence_id, MARKER_TRACKS[marker], case_time_us, 0)

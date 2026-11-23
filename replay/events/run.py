@@ -108,7 +108,8 @@ class RunState:
                 raise ReplayError("the saved state is not of this format")
             if document["event_list"] != EVENT_LIST_VERSION:
                 raise ReplayError(
-                    f"the saved state counts the event list {document['event_list']} and this replay sends {EVENT_LIST_VERSION}: it is not resumed"
+                    f"the saved state counts the event list {document['event_list']} and this replay sends {EVENT_LIST_VERSION}: it is not resumed, "
+                    "start the run again under a new run ID"
                 )
             first = document["first_send"]
             return cls(
