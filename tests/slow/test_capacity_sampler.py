@@ -1236,6 +1236,9 @@ class StagingChildTest(unittest.TestCase):
             "unparsable float": self.stand_in(f"print({good.replace('3', '3.5')!r})"),
             "unparsable bool": self.stand_in(f"print({good.replace('2', 'true')!r})"),
             "unparsable negative": self.stand_in(f"print({good.replace('4', '-4')!r})"),
+            "unparsable duplicate first": self.stand_in(f"print({good.replace('{"matches": 1', '{"matches": -1, "matches": 1')!r})"),
+            "unparsable duplicate last": self.stand_in(f"print({good[:-1] + ', "allocated_bytes": 0}'!r})"),
+            "unparsable duplicate same": self.stand_in(f"print({good.replace('"files": 2', '"files": 2, "files": 2')!r})"),
             "os_error no program": ["/nonexistent/program/for/the/test"],
         }
         for name, program in cases.items():

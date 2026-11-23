@@ -270,6 +270,11 @@ class RunWindowTest(unittest.TestCase):
             "2026-13-23T11:00:00Z",
             "2026-11-23T25:00:00Z",
             "2026-11-23T11:00:00+25:00",
+            "2026-11-23T11:00:00+00:99",
+            "2026-11-23T11:00:00+23:60",
+            "2026-11-23T11:00:00-00:60",
+            "2026-11-23T11:00:00+24:00",
+            "2026-11-23T11:00:00-99:00",
             "yesterday",
         )
         for since in bad:
@@ -280,7 +285,14 @@ class RunWindowTest(unittest.TestCase):
                     self.assertEqual([], [word for word in ("2026", "250", "000", "yesterday") if word in err])
 
     def test_a_window_time_in_the_one_exact_form_is_accepted_with_z_or_a_numeric_offset(self) -> None:
-        for since in ("2026-11-23T09:00:00Z", "2026-11-23T11:00:00+02:00", "2026-11-23T04:00:00-05:00"):
+        for since in (
+            "2026-11-23T09:00:00Z",
+            "2026-11-23T11:00:00+02:00",
+            "2026-11-23T04:00:00-05:00",
+            "2026-11-23T09:00:00+00:00",
+            "2026-11-23T09:00:00+23:59",
+            "2026-11-22T10:00:00-23:59",
+        ):
             with self.subTest(since=since):
                 code, record, _ = self.run_with(result_for(), "--since", since)
                 self.assertEqual((0, len(SIZES)), (code, record["copy"]["payload_objects"]))
@@ -292,6 +304,8 @@ class RunWindowTest(unittest.TestCase):
             "2026-11-23 10:00:00+00:00",
             "2026-11-23T10:00:00+0000",
             "2026-13-23T10:00:00+00:00",
+            "2026-11-23T10:00:00+00:99",
+            "2026-11-23T10:00:00-23:60",
         ):
             with self.subTest(odd=odd):
                 code, record, err = self.run_with(result_for(times=(odd,) * len(SIZES)), "--since", "2026-11-23T09:00:00Z")

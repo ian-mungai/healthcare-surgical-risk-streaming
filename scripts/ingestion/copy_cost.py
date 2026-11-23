@@ -86,7 +86,7 @@ def high_requests(size: int) -> int:
     return max(1, math.ceil(size / SMALLEST_PART_BYTES)) + 2
 
 
-INSTANT_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})")
+INSTANT_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])")
 
 
 def parse_instant(text: str) -> datetime:

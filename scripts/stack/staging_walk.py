@@ -5,10 +5,12 @@ and exits 0. The sampler starts it as a child program for each staging source an
 own and no slow folder can hold the sampler's loop.
 
 A segment with no wildcard is joined as written. A segment with a wildcard lists the folder reached so far and keeps the names that match, never a name that
-starts with a dot unless the segment does. A link is never followed: at the last segment it is a match and counts as itself, and at any other wildcard
-position it is skipped. A pattern that ends with a slash matches folders only. Each match is walked without following links and only files are counted. A name
-or folder that is gone is skipped, because a pod removes its volume as it ends. Any other failure, a folder that may not be read among them, ends the walk
-with the exit status ``EXIT_OS_ERROR`` and no output, so an unreadable folder is never an empty one. The walk reads and changes nothing in those folders.
+starts with a dot unless the segment does. A link at a wildcard position is not followed: at the last segment it is a match and counts as itself, and at
+any other wildcard position it is skipped. A link that is a literal part of the pattern, an ancestor of the first wildcard, resolves through its target, as
+the operating system resolves any path. A pattern that ends with a slash matches folders only. Each match is walked without following links, so a link
+inside a match counts as itself, and only files are counted. A name or folder that is gone is skipped, because a pod removes its volume as it ends. Any
+other failure, a folder that may not be read among them, ends the walk with the exit status ``EXIT_OS_ERROR`` and no output, so an unreadable folder is
+never an empty one. The walk reads and changes nothing in those folders.
 """
 
 from __future__ import annotations

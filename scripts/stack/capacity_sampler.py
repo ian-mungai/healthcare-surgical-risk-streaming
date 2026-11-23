@@ -20,6 +20,9 @@ failed child is an ``exit_status`` and an answer that is not four whole numbers 
 The sources of one sample share the one deadline. The sampler reads and changes nothing in those folders. A pattern with no match is a row of zeros: the
 volume does not exist yet. Start the sampler with an interval of at least one second, because each child needs the time of a program start.
 
+Accepted limits (owner, Nov 23 2026): a slow lookup of the child program's executable can start the read-only walk up to a few hundred milliseconds after
+the sample's deadline, and a SIGKILL of the sampler leaves its read-only walk running until it finishes or the launcher's own parent-death notice reaches it.
+
 Each reading is one function whose whole body (start, wait, decode, parse) runs inside one boundary, and each has a deadline that is a point fixed before
 it starts (the end of its interval). A reading that ends after its deadline is a ``timeout`` whatever it returned, and its key is absent. The docker
 program is found once at the start: the sampler refuses to start, before it creates the file, if it cannot find it. The wait between samples is never
@@ -45,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.closed import QuietParser, reject_repeats
 from scripts.process import ProcessGroupSurvived, TimeoutExpired, run_command
 from scripts.stack.host_figures import FiguresError, HostSources, parse_size_bytes, read_host
 from scripts.stack.limits import LIMITS_FILE, LimitsError, load_limits
@@ -269,7 +272,7 @@ def staging_row(source: StagingSource, deadline: float, clock: Clock, runner: Ru
     if result.returncode != 0:
         raise Failure("exit_status")
     try:
-        figures = json.loads(result.stdout)
+        figures = json.loads(result.stdout, object_pairs_hook=reject_repeats)
     except ValueError:
         raise Failure("unparsable") from None
     if type(figures) is not dict or list(figures) != list(STAGING_FIGURES) or any(type(value) is not int or value < 0 for value in figures.values()):
