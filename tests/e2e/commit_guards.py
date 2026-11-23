@@ -41,10 +41,11 @@ CARRIAGE_NOTE = "notes/line\rbreak.txt"
 WORKTREE_GUARD = "working-tree privacy hook"
 PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
 PLANTED_MESSAGE = "planted fast-test fault"
-# unittest's summary for exactly one failure and no error; the suite's skipped tests may follow. A pattern message is matched against the
-# run's last summary line only, so a summary quoted inside a failure message cannot stand for the run.
+# unittest's summary for exactly one failure and no error; the suite's skipped tests may follow. A pattern message is matched only against
+# the status line that directly follows unittest's own "Ran N tests in X s" footer, so a summary quoted in a failure message or printed by a
+# test (pre-commit can emit buffered output after the footer) cannot stand for the run.
 ONE_FAILURE_SUMMARY = re.compile(r"FAILED \(failures=1(, skipped=\d+)?\)")
-SUMMARY_LINE = re.compile(r"^(?:OK|FAILED)\b.*$", re.MULTILINE)
+SUMMARY_LINE = re.compile(r"^Ran \d+ tests? in \d+(?:\.\d+)?s\n\n((?:OK|FAILED)\b.*)$", re.MULTILINE)
 CLEAN_PYTHON = "def double(value: int) -> int:\n    return value * 2\n"
 
 

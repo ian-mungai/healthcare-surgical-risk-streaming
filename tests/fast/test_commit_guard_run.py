@@ -114,6 +114,14 @@ class FastTestFaultJudgementTest(unittest.TestCase):
         )
         self.assertFalse(self.judge(fast_test_output(self.planted(), quoted, count=2, rest=", skipped=2")))
 
+    def test_a_buffered_summary_printed_after_the_real_footer_does_not_stand_for_the_run(self) -> None:
+        """Pre-commit can emit a test's printed text after unittest's footer; only the status paired with the `Ran N tests` line counts."""
+        other = PLANTED_FAILURE.format(name="tests.fast.test_other.OtherTest.test_other", detail="3 != 4")
+        output = fast_test_output(self.planted(), other, count=2, rest=", skipped=2") + "FAILED (failures=1, skipped=2)\n"
+        self.assertFalse(self.judge(output))
+        errored = fast_test_output(self.planted(), rest=", errors=1, skipped=2") + "FAILED (failures=1, skipped=2)\n"
+        self.assertFalse(self.judge(errored))
+
     def test_an_error_beside_the_planted_failure_is_not_proof(self) -> None:
         self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1")))
         self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1, skipped=2")))
