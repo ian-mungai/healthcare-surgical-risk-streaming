@@ -294,9 +294,26 @@ class JobTest(unittest.TestCase):
     def test_a_trace_and_an_error_after_the_capture_prefix_are_error_lines(self) -> None:
         prefix = "[pod/replication-job-7-attempt-0/main] 2026-11-23T17:01:02.123456789Z "
         for line in ("Traceback (most recent call last):", "ERROR could not write", "FATAL out of memory"):
-            for head in (prefix, "[pod/replication-job-7-attempt-0/main] ", "2026-11-23T17:01:02.123456789Z ", ""):
+            for head in (
+                prefix,
+                "[pod/replication-job-7-attempt-0/main] ",
+                "2026-11-23T17:01:02.123456789Z ",
+                "2026-11-23T17:45:27.123456789+00:00 ",
+                "[pod/replication-job-7-attempt-0/main] 2026-11-23T17:45:27.123456789-08:00 ",
+                "",
+            ):
                 with self.subTest(head=head, line=line):
                     self.assertEqual([Code.LOG_ERROR_LINE], codes(job_notices(JOB, LOG + head + line + "\n")))
+
+    def test_a_bracketed_level_is_no_capture_prefix_so_its_error_and_fatal_lines_stay_error_lines(self) -> None:
+        for line in ("[ERROR] uploaded object is incomplete", "[FATAL] could not write the object", "[pod/x/y] [ERROR] uploaded object is incomplete"):
+            with self.subTest(line=line):
+                self.assertEqual([Code.LOG_ERROR_LINE], codes(job_notices(JOB, LOG + line + "\n")))
+
+    def test_a_bracketed_token_that_is_no_capture_prefix_is_not_stripped_from_a_trace(self) -> None:
+        for line in ("[worker] Traceback (most recent call last):", "[pod/only-a-pod] Traceback (most recent call last):"):
+            with self.subTest(line=line):
+                self.assertEqual([], codes(job_notices(JOB, LOG + line + "\n")))
 
     def test_prefixed_lines_that_only_mention_a_trace_are_no_error_lines(self) -> None:
         prefix = "[pod/replication-job-7-attempt-0/main] 2026-11-23T17:01:02.123456789Z "

@@ -54,7 +54,10 @@ SAMPLE_FORMAT = "platform_sample_1"
 SHORT_SLOT = "short_development"
 CASE_KEY = re.compile(r".*/vital_files/[0-9]{4}\.vital")
 ERROR_LINE = re.compile(r"\b(?:ERROR|FATAL)\b|^Traceback \(most recent call last\)")
-CAPTURE_PREFIX = re.compile(r"(?:\[[^\]\s]+\] )?(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?")
+CAPTURE_PREFIX = re.compile(
+    r"(?:\[pod/[A-Za-z0-9.-]+/[A-Za-z0-9._-]+\] )?"
+    r"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}) )?"
+)
 SUCCEEDED = "succeeded"
 
 
@@ -198,8 +201,11 @@ def read_job(text: str) -> JobFacts:
 
 
 def is_error_line(line: str) -> bool:
-    """Whether a log line is an error or a trace, also after the prefix that ``kubectl logs --prefix --timestamps`` puts before it: ``[pod/name/container]``
-    and a timestamp, each optional."""
+    """Whether a log line is an error or a trace, also after the prefix that ``kubectl logs --prefix --timestamps`` puts before it.
+
+    Only that exact form is stripped, in this order: ``[pod/<pod>/<container>]`` and an RFC 3339 timestamp that ends in ``Z`` or a numeric offset, each
+    optional. Any other bracketed token, such as a level in ``[ERROR]``, stays in the line.
+    """
     return ERROR_LINE.search(CAPTURE_PREFIX.sub("", line, count=1)) is not None
 
 
