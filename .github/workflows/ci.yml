@@ -67,7 +67,7 @@ jobs:
       - run: make check-ansible
 
   slow:
-    name: "The slow tests: Ansible roles and planted workflow faults"
+    name: "The slow tests: Ansible roles, local servers and stand-ins, and planted workflow faults"
     runs-on: ubuntu-24.04
     timeout-minutes: 25 # estimate until the first hosted run: make setup about 2 minutes, the slow group about 10.5 minutes locally
     steps:

@@ -170,7 +170,7 @@ PINNED_JOBS: dict[str, dict[str, Any]] = {
         ],
     },
     "slow": {
-        "name": "The slow tests: Ansible roles and planted workflow faults",
+        "name": "The slow tests: Ansible roles, local servers and stand-ins, and planted workflow faults",
         "timeout-minutes": 25,
         "steps": [CHECKOUT_STEP, PYTHON_STEP, {"run": "make setup"}, {"run": "make test-slow"}],
     },
@@ -552,7 +552,7 @@ def aggregate_problems(jobs: dict[str, Any]) -> list[str]:
             problems.append(f"required: its step's {key} is {step.get(key)!r}, not {REQUIRED_STEP[key]!r}")
     environment = step.get("env")
     if not isinstance(environment, dict):
-        problems.append(f"required: its step's env is {environment!r}, not the four results of the needed jobs")
+        problems.append(f"required: its step's env is {environment!r}, not the results of the needed jobs")
         environment = {}
     if set(environment) != set(REQUIRED_ENV_VALUES):
         problems.append(f"required: its env has the keys {sorted(environment)}, not {sorted(REQUIRED_ENV_VALUES)}")

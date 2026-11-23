@@ -1,6 +1,6 @@
 # Every hook is local and pinned: pre-commit, Ruff and MyPy come from requirements.txt in .venv, and gitleaks from scripts/quality/install_tools.py in .tools.
 # Run `make setup` once. The commit stage holds the fast checks. CI runs the manual stage on every file with `make check`.
-# The slow tests (tests/slow: Ansible playbook runs and the planted workflow faults) are not a hook: run `make test-slow` before a push; CI runs them in their own job.
+# The slow tests (tests/slow: Ansible playbook runs, local servers, stand-in programs and the planted workflow faults) are not a hook: run `make test-slow` before a push; CI runs them in their own job.
 # Do not use SKIP= or `git commit --no-verify`.
 default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit, manual]

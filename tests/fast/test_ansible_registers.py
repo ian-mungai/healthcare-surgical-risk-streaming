@@ -8,6 +8,7 @@ encrypted, the skipped re-read inside the enable block replaced the first status
 from __future__ import annotations
 
 import collections
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -35,11 +36,16 @@ def repeated(found: dict[str, list[str]]) -> dict[str, list[str]]:
     return {name: places for name, places in found.items() if len(places) > 1}
 
 
+def task_files(folder: Path) -> list[Path]:
+    """Every YAML file under ``folder``, nested folders included, as ``include_tasks`` can reach any of them."""
+    return sorted(path for path in folder.rglob("*") if path.is_file() and path.suffix in (".yml", ".yaml"))
+
+
 def role_registers(role: Path) -> dict[str, list[str]]:
     found: dict[str, list[str]] = collections.defaultdict(list)
     for folder in ("tasks", "handlers"):
-        for path in sorted((role / folder).glob("*.yml")):
-            registers(load_yaml(path.read_text()), f"{folder}/{path.name}", found)
+        for path in task_files(role / folder):
+            registers(load_yaml(path.read_text()), str(path.relative_to(role)), found)
     return found
 
 
@@ -65,6 +71,16 @@ class RegisterNamesTest(unittest.TestCase):
         for path in sorted(ANSIBLE.glob("*.yml")):
             with self.subTest(playbook=path.name):
                 self.assertEqual(repeated(playbook_registers(path)), {}, "a skipped task would replace the other task's result")
+
+    def test_a_planted_second_register_in_a_yaml_or_nested_task_file_is_found(self) -> None:
+        """The control for the file search: a second register in ``status.yaml`` or in ``nested/status.yml`` of a copied role."""
+        for relative in ("tasks/status.yaml", "tasks/nested/status.yml"):
+            with self.subTest(file=relative):
+                role = Path(self.enterContext(tempfile.TemporaryDirectory())) / "planted"
+                (role / relative).parent.mkdir(parents=True)
+                (role / "tasks" / "main.yml").write_text("- name: read\n  ansible.builtin.command: {cmd: 'true'}\n  register: status\n")
+                (role / relative).write_text("- name: read again\n  ansible.builtin.command: {cmd: 'true'}\n  register: status\n")
+                self.assertEqual(list(repeated(role_registers(role))), ["status"])
 
     def test_a_planted_second_register_inside_a_block_is_found(self) -> None:
         """The control: the shape that failed on the host, a top-level read and a re-read inside a conditional block."""
