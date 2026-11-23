@@ -8,6 +8,9 @@
 - The cleanup failure is not in the record, so a passing record hides it.
 - An interrupt and a cleanup failure together lose the record, or the interrupt.
 - A real interrupt (SIGINT) during the final process listing, or an unexpected error in the cleanup, ends the run with no record.
+- A case's own assertion is weakened (forced to pass, or reading too little of the wait's result), so a wait that misses its deadline, returns a late
+  answer or leaves a process still passes. The tests above replace the cases; ``CaseAssertionTest`` runs the real case code against stand-in results of
+  the wait, with no real waiting.
 """
 
 from __future__ import annotations
@@ -134,6 +137,91 @@ class CleanupFailureTest(unittest.TestCase):
         self.assertEqual("fail", record["outcome"])
         self.assertTrue(str(record["cleanup"]).startswith("cleanup failed: ValueError"), record["cleanup"])
         self.assertEqual(1, len(self.failed_cleanup(record)))
+
+
+MARKER = "3601.000001"
+WHAT = "the planted service to answer"
+DEADLINE_MESSAGE = f"deadline of {deadline.DEADLINE_SECONDS} seconds passed while waiting for {WHAT}"
+CONTROL_CASE = "wait that is ready in time"
+HUNG_CASE = "wait on a program that never answers"
+LATE_CASE = "wait on a program that answers after the deadline"
+# The wait's result as ``timed_wait`` returns it: the value, the error text and the seconds. The right result of each case, and the results that must fail it.
+RIGHT = {
+    CONTROL_CASE: ("ready\n", "", 0.1),
+    HUNG_CASE: (None, DEADLINE_MESSAGE, deadline.DEADLINE_SECONDS + 0.2),
+    LATE_CASE: (None, DEADLINE_MESSAGE, float(deadline.LATE_ANSWER_SECONDS)),
+}
+WRONG: dict[str, dict[str, tuple[str | None, str, float]]] = {
+    CONTROL_CASE: {
+        "no value": (None, "", 0.1),
+        "another value": ("other\n", "", 0.1),
+        "an error beside the value": ("ready\n", DEADLINE_MESSAGE, 0.1),
+        "a value only at the deadline": ("ready\n", "", float(deadline.DEADLINE_SECONDS)),
+    },
+    HUNG_CASE: {
+        "a value": ("ready\n", DEADLINE_MESSAGE, deadline.DEADLINE_SECONDS + 0.2),
+        "no error": (None, "", deadline.DEADLINE_SECONDS + 0.2),
+        "another error": (None, "the host is not ready", deadline.DEADLINE_SECONDS + 0.2),
+        "an error that names no deadline": (None, f"deadline passed while waiting for {WHAT}", deadline.DEADLINE_SECONDS + 0.2),
+        "the error only after the slack": (None, DEADLINE_MESSAGE, float(deadline.DEADLINE_SECONDS + deadline.SLACK_SECONDS)),
+    },
+    LATE_CASE: {
+        "the late value": ("late\n", "", 5.0),
+        "the late value beside the error": ("late\n", DEADLINE_MESSAGE, 5.0),
+        "no error": (None, "", 5.0),
+        "another error": (None, "the host is not ready", 5.0),
+    },
+}
+
+
+class CaseAssertionTest(unittest.TestCase):
+    """The case code of ``deadline.run_cases`` judges the wait's result: each case passes with the right result and fails with every wrong one.
+
+    ``timed_wait`` and the process listing are replaced, so a case runs with no wait and no process, and a case assertion that is forced to pass,
+    or that reads too little of the result, fails here instead of passing every fast test and failing only the real run.
+    """
+
+    def run_cases(self, results: dict[str, tuple[str | None, str, float]], leftovers: list[int] | None = None) -> dict[str, bool]:
+        control = ["-c", "echo ready"]
+        hung = deadline.hung_command(MARKER)
+
+        def timed_wait(what: str, command: list[str], *, attempt_seconds: float | None = None) -> tuple[str | None, str, float]:
+            self.assertEqual(WHAT, what)
+            if command == control:
+                return results[CONTROL_CASE]
+            if command == hung:
+                return results[HUNG_CASE]
+            self.assertIsNotNone(attempt_seconds, "the late case must give its program a timeout beyond the deadline")
+            self.assertEqual(["-c", f"sleep {deadline.LATE_ANSWER_SECONDS}; echo late"], command)
+            return results[LATE_CASE]
+
+        def marked_processes(marker: str) -> list[int]:
+            self.assertEqual(MARKER, marker)
+            return leftovers or []
+
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        with mock.patch.object(deadline, "timed_wait", timed_wait), mock.patch.object(deadline, "marked_processes", marked_processes):
+            deadline.run_cases(record, [], MARKER)
+        judged = {item.case: item.passed for item in record.observations}
+        self.assertEqual([CONTROL_CASE, HUNG_CASE, LATE_CASE], [item.case for item in record.observations], "each case is judged once")
+        return judged
+
+    def test_the_right_results_pass_every_case(self) -> None:
+        self.assertEqual({CONTROL_CASE: True, HUNG_CASE: True, LATE_CASE: True}, self.run_cases(RIGHT))
+
+    def test_each_wrong_result_fails_its_own_case_and_only_that_case(self) -> None:
+        for case, wrong in WRONG.items():
+            for label, result in wrong.items():
+                with self.subTest(case=case, wrong=label):
+                    judged = self.run_cases({**RIGHT, case: result})
+                    self.assertEqual({name: name != case for name in RIGHT}, judged)
+
+    def test_a_process_of_the_hung_program_that_is_left_fails_the_hung_case(self) -> None:
+        self.assertEqual({CONTROL_CASE: True, HUNG_CASE: False, LATE_CASE: True}, self.run_cases(RIGHT, leftovers=[4242]))
+
+    def test_every_case_fails_when_every_result_is_wrong(self) -> None:
+        wrong = {case: next(iter(results.values())) for case, results in WRONG.items()}
+        self.assertEqual({CONTROL_CASE: False, HUNG_CASE: False, LATE_CASE: False}, self.run_cases(wrong, leftovers=[4242]))
 
 
 if __name__ == "__main__":

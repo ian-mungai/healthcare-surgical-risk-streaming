@@ -91,6 +91,25 @@ jobs:
       - name: Show the end of the run's log after a failure
         if: failure()
         run: tail -n 150 runs/*/log.txt
+      - name: Check that the run record and its retention label exist
+        if: ${{ !cancelled() }}
+        run: |
+          shopt -s nullglob
+          folders=(runs/*/)
+          if [ "${#folders[@]}" -eq 0 ]; then
+            echo "No run folder was written under runs/." >&2
+            exit 1
+          fi
+          incomplete=0
+          for folder in "${folders[@]}"; do
+            for file in record.json retention.json; do
+              if [ ! -f "${folder}${file}" ]; then
+                printf 'The run folder %s has no %s.\n' "${folder}" "${file}" >&2
+                incomplete=1
+              fi
+            done
+          done
+          exit "${incomplete}"
       - name: Keep the run record and its retention label
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -117,6 +136,25 @@ jobs:
           cache-dependency-path: requirements.txt
       - run: make setup
       - run: make test-deadline
+      - name: Check that the run record and its retention label exist
+        if: ${{ !cancelled() }}
+        run: |
+          shopt -s nullglob
+          folders=(runs/*/)
+          if [ "${#folders[@]}" -eq 0 ]; then
+            echo "No run folder was written under runs/." >&2
+            exit 1
+          fi
+          incomplete=0
+          for folder in "${folders[@]}"; do
+            for file in record.json retention.json; do
+              if [ ! -f "${folder}${file}" ]; then
+                printf 'The run folder %s has no %s.\n' "${folder}" "${file}" >&2
+                incomplete=1
+              fi
+            done
+          done
+          exit "${incomplete}"
       - name: Keep the run record and its retention label
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
