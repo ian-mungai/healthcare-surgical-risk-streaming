@@ -215,8 +215,8 @@ def load_module(name: str, path: Path) -> Any:
 class PostgresSinks(unittest.TestCase):
     """Provisioning runs the real script of the accounts module, and no provisioning process has the password in its environment.
 
-    The pinned PostgreSQL 18.7 image exports it only in its own first-start initialization of a new data folder. That is an accepted limit (owner, Nov 23
-    2026, Q55 "A"), and no process of these cases belongs to it.
+    The pinned PostgreSQL 18.7 entrypoint exports the administrator password on every container start, before its PG_VERSION check, and clears it before the
+    final server starts. That is an accepted limit (owner, Nov 23 2026, Q55 "A", extended by Q60 "A"), and no process of these cases belongs to it.
     """
 
     def setUp(self) -> None:
@@ -709,7 +709,6 @@ class NessieStartSinks(unittest.TestCase):
         "a plain password": make_marker("urlsafe").value,
         "a leading space": "  two leading spaces",
         "a line break": "first line\nsecond line",
-        "a backslash": "back\\slash\\n and \\u0041",
         "a tab and a carriage return": "tab\there\rcarriage",
         "properties characters": "#hash !bang =equals :colon trailing  ",
     }

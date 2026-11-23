@@ -40,6 +40,8 @@ ADMINISTRATOR_FILE_IN_CONTAINER = "/run/secrets/postgres_admin_password"
 PSQL_SCRIPT = r"""set -eu; umask 077; file=$(mktemp /dev/shm/pgpass.XXXXXX); trap 'rm -f "$file"' EXIT
 { printf '*:*:*:@ACCOUNT@:'; sed -e 's/\\/\\\\/g' -e 's/:/\\:/g' @PASSWORD_FILE@; printf '\n'; } > "$file"
 PGPASSFILE="$file" psql @OPTIONS@"""
+# A tool's reader cannot take every character: SmallRye Config 3.17.2 (Nessie) expands ``${...}`` and drops a backslash before ``$`` after the parse.
+UNREADABLE_CHARACTERS = {"nessie": "$\\"}
 ITERATIONS = 4096
 MAXIMUM_ITERATIONS = 1_000_000
 SALT_BYTES = 16
@@ -223,6 +225,8 @@ def make_password_files(store: PasswordStore, owners: dict[str, tuple[int, int]]
     created: list[str] = []
     protected: list[str] = []
     for account, owner in owners.items():
+        if store.path(account).exists() and any(character in store.read(account) for character in UNREADABLE_CHARACTERS.get(account, "")):
+            raise AccountError(f"the password file of {account} holds a character that its reader treats as an escape ($ or a backslash); replace the password")
         if not store.path(account).exists():
             created.append(account)
             if not check_only:

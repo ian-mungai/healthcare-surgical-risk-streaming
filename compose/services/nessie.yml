@@ -30,7 +30,6 @@ services:
         [ -n "$$password" ] || { echo "the database password file is empty" >&2; exit 1; }
         bs='\'
         value="$$password"
-        value=$${value//"$$bs"/"$$bs$$bs"}
         value=$${value//$$'\n'/"$${bs}n"}
         value=$${value//$$'\r'/"$${bs}r"}
         value=$${value//$$'\t'/"$${bs}t"}
