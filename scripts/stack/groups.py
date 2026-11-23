@@ -299,6 +299,8 @@ def wait_ready(settings: Settings, group: Group, deadline_seconds: float, log: L
         states = read_states(settings)
         waiting = [name for name in group.compose if name not in states or not states[name].ready]
         if not waiting:
+            if time.monotonic() - started >= deadline_seconds:
+                raise GroupError(f"group {group.name}: ready after the deadline of {deadline_seconds:g} seconds")
             return
         stopped = [name for name in waiting if name in states and states[name].state in ("exited", "dead")]
         report = describe_states([states[name] for name in waiting if name in states], [name for name in waiting if name not in states])
