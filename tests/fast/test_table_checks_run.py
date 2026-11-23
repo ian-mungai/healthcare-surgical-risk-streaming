@@ -488,6 +488,23 @@ class OutputBindingTest(unittest.TestCase):
         self.assertEqual([], case.nessie.merges)
         self.assertTrue(self.fresh_load(case).merged)
 
+    def test_a_default_branch_that_moves_after_the_last_check_leaves_no_receipt_and_the_fresh_load_goes_through(self) -> None:
+        case = Case(self)
+        reads: list[int] = []
+
+        def move_at_the_merge() -> None:
+            reads.append(1)
+            if len(reads) == 2:
+                case.nessie.add_main_commit("another tool", {})
+
+        case.nessie.on_branch_read = move_at_the_merge
+        with self.assertRaisesRegex(run.StaleBaseError, "recorded base"):
+            case.go(Runner())
+        case.nessie.on_branch_read = None
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(self.fresh_load(case).merged)
+
     def test_the_namespace_that_the_default_branch_lacks_is_merged_with_the_tables(self) -> None:
         case = Case(self)
         self.assertTrue(case.go(Runner()).merged)

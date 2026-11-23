@@ -734,10 +734,7 @@ def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path
     if earlier is not None:
         confirm_main(nessie, record, default, earlier.hash)
         return earlier
-    if head != record.base_hash:
-        raise TableChecksError(
-            "the default branch is not at the recorded base head that the load branch was made from, so a merge could carry another change: rerun the load"
-        )
+    require_base(head, record)
     problem = output_problem(
         reference_contents(nessie, f"{default}@{head}"),
         reference_contents(nessie, f"{record.branch}@{record.branch_hash}"),
