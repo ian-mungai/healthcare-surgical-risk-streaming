@@ -29,10 +29,11 @@ class LocalTemporaryFolderTest(unittest.TestCase):
     def test_delegated_tasks_run_locally_with_a_temporary_folder_under_the_project_tools(self) -> None:
         host = localhost()
         self.assertEqual("local", host["ansible_connection"])
-        self.assertIn(".tools/ansible/", str(host["ansible_remote_tmp"]))
-        self.assertNotIn("~", str(host["ansible_remote_tmp"]))
+        self.assertEqual("{{ ansible_playbook_python }}", host["ansible_python_interpreter"])
+        self.assertEqual("{{ inventory_dir }}/../.tools/ansible/remote_tmp", host["ansible_remote_tmp"])
 
-    def test_no_play_runs_on_localhost_itself(self) -> None:
+    def test_every_play_targets_the_platform_host_only(self) -> None:
+        """``all``, ``*``, ``ungrouped`` or a list holding them would include localhost now that the inventory names it (review 1, Low)."""
         for path in sorted(ANSIBLE.glob("*.yml")):
             plays = load_yaml(path.read_text())
             if not isinstance(plays, list):
@@ -40,7 +41,7 @@ class LocalTemporaryFolderTest(unittest.TestCase):
             for play in plays:
                 if isinstance(play, dict) and "hosts" in play:
                     with self.subTest(playbook=path.name):
-                        self.assertNotIn(play["hosts"], ("all", "localhost"))
+                        self.assertEqual("platform", play["hosts"])
 
 
 if __name__ == "__main__":
