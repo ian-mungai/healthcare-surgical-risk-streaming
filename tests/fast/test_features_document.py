@@ -83,10 +83,9 @@ class Entry(unittest.TestCase):
         self.root = Path(self.folder.name)
 
     def run_text(self, text: str) -> tuple[int, str, Path]:
-        """Run the entry point on the text of a file, with an earlier result already at the target."""
+        """Run the entry point on the text of a file, to a target that is free."""
         source, target = self.root / "windows.json", self.root / "rows.json"
         source.write_text(text)
-        target.write_text("OLD")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = batch.main([str(source), str(target)])
@@ -97,7 +96,7 @@ class Entry(unittest.TestCase):
         self.assertEqual(2, code, message)
         for pattern in patterns:
             self.assertIn(pattern, message)
-        self.assertEqual("OLD", target.read_text())
+        self.assertFalse(target.exists())
 
 
 class ClosedKeys(Entry):

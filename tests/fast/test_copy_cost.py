@@ -191,7 +191,7 @@ class CommandTest(unittest.TestCase):
             code, _, err = run(*self.arguments(folder))
             self.assertEqual("kept", existing.read_text())
         self.assertEqual(1, code)
-        self.assertIn("exists", err)
+        self.assertIn("already held", err)
 
     def test_a_count_of_extra_objects_that_is_not_a_whole_number_is_a_usage_refusal(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

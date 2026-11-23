@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import os
 import posixpath
 import re
 import sys
@@ -42,7 +41,7 @@ from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX, load_pairing_records, pairings_from_metadata
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
-from scripts.ingestion.output_path import refuse_output_over_input
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.selection import Selection, pinned_release
 from scripts.ingestion.store import S3Store
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
@@ -82,16 +81,9 @@ def read_input_bytes(path: Path, role: Subject) -> bytes:
         raise InputError(Notice(Code.CANNOT_READ, subject=role)) from None
 
 
-def write_private(path: Path, text: str, role: Subject) -> None:
-    """Write a result or reference file for its owner only: it holds the bucket's name and object version IDs."""
-    try:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(text)
-        path.chmod(0o600)
-    except OSError:
-        raise InputError(Notice(Code.CANNOT_WRITE, subject=role)) from None
+def write_private(path: Path, text: str) -> None:
+    """Write a result or reference file for its owner only: it holds the bucket's name and object version IDs. A path that is held, in any form, is refused."""
+    write_new_file(path, text, mode=0o600)
 
 
 def show_progress(done: int, total: int) -> None:
@@ -112,7 +104,7 @@ def command_check(store: S3Store, arguments: argparse.Namespace) -> int:
     selection = Selection.from_json(read_input(arguments.selection, Subject.SELECTION))
     pairings = load_pairing_records(read_input(arguments.pairings, Subject.PAIRINGS))
     result = run_check(store, selection, read_input_bytes(arguments.checksum_list, Subject.CHECKSUM_LIST), pairings, show_progress)
-    write_private(arguments.result, result.to_json(), Subject.RESULT)
+    write_private(arguments.result, result.to_json())
     if not result.passed:
         return refuse(*(finding.notice for finding in result.findings), Notice(Code.CHECK_FAILED, count=len(result.findings), total=result.file_count))
     say(Notice(Code.CHECK_PASSED, count=len(result.files), total=result.file_count, digest=result.result_sha256))
@@ -137,7 +129,7 @@ def command_pairings(store: S3Store, arguments: argparse.Namespace) -> int:
     except UnicodeDecodeError:
         raise InputError(Notice(Code.METADATA_LINE, position=1)) from None
     records = sorted(pairings_from_metadata(texts, pinned_release().source_prefix), key=lambda item: (item.source_key, item.landed_key))
-    write_private(arguments.pairings, json.dumps([dataclasses.asdict(item) for item in records], indent=1) + "\n", Subject.PAIRINGS)
+    write_private(arguments.pairings, json.dumps([dataclasses.asdict(item) for item in records], indent=1) + "\n")
     say(Notice(Code.PAIRINGS_WRITTEN, count=len(records)))
     return 0
 
@@ -145,7 +137,7 @@ def command_pairings(store: S3Store, arguments: argparse.Namespace) -> int:
 def command_publish(store: S3Store, arguments: argparse.Namespace) -> int:
     selection = Selection.from_json(read_input(arguments.selection, Subject.SELECTION))
     reference = publish_manifest(store, selection, CheckResult.from_json(read_input(arguments.result, Subject.RESULT)))
-    write_private(arguments.reference, reference.to_json(), Subject.REFERENCE)
+    write_private(arguments.reference, reference.to_json())
     say(Notice(Code.PUBLISHED, digest=reference.sha256))
     return 0
 
@@ -156,13 +148,15 @@ def command_verify(store: S3Store, arguments: argparse.Namespace) -> int:
     return 0
 
 
-def command_files(arguments: argparse.Namespace) -> tuple[list[Path], list[Path]]:
-    """The output paths and the input paths of the command, which must be different files."""
+def command_outputs(arguments: argparse.Namespace) -> list[Path]:
+    """The output paths of the command, which must be free before anything is read."""
     if arguments.command == "check":
-        return [arguments.result], [arguments.selection, arguments.checksum_list, arguments.pairings]
+        return [arguments.result]
+    if arguments.command == "pairings":
+        return [arguments.pairings]
     if arguments.command == "publish":
-        return [arguments.reference], [arguments.selection, arguments.result]
-    return [], []
+        return [arguments.reference]
+    return []
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -186,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--source-key", action="append", help="a source key the reader needs; repeat for each; every entry when none")
     arguments = parser.parse_args(argv)
     try:
-        refuse_output_over_input(*command_files(arguments))
+        for output in command_outputs(arguments):
+            check_new_output(output)
         configuration = load_configuration()
         store = S3Store(Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"]), bucket_in_use(configuration["S3_BUCKET"], arguments.bucket))
         return {"check": command_check, "pairings": command_pairings, "publish": command_publish, "verify": command_verify}[arguments.command](store, arguments)

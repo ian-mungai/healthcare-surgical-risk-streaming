@@ -376,17 +376,18 @@ class FileHelperTest(unittest.TestCase):
             self.assertEqual("cannot read the selection", str(raised.exception))
             self.assertNotIn(folder, str(raised.exception))
 
-    def test_a_result_or_reference_is_written_for_its_owner_only_and_a_failed_write_names_no_path(self) -> None:
+    def test_a_result_or_reference_is_written_for_its_owner_only_is_never_replaced_and_a_failed_write_names_no_path(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ingestion_inputs_") as folder:
-            target = Path(folder) / "made" / "reference.json"
-            write_private(target, "one\n", Subject.REFERENCE)
-            write_private(target, "two\n", Subject.REFERENCE)
-            self.assertEqual("two\n", target.read_text())
+            target = Path(folder) / "reference.json"
+            write_private(target, "one\n")
             self.assertEqual(0o600, stat.S_IMODE(os.stat(target).st_mode))
+            with self.assertRaises(ClosedInputError):
+                write_private(target, "two\n")
+            self.assertEqual("one\n", target.read_text())
             blocked = target / "inside" / "x.json"
-            with self.assertRaises(InputError) as raised:
-                write_private(blocked, "x", Subject.REFERENCE)
-            self.assertEqual("cannot write the manifest reference", str(raised.exception))
+            with self.assertRaises(ClosedInputError) as raised:
+                write_private(blocked, "x")
+            self.assertNotIn(folder, str(raised.exception))
 
 
 if __name__ == "__main__":

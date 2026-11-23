@@ -31,7 +31,7 @@ from typing import Any
 
 from scripts.ingestion.closed import QuietParser, parse_json
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
-from scripts.ingestion.output_path import refuse_output_over_input
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
     BUCKET,
@@ -401,14 +401,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(render(Notice(Code.BUILD_NEEDS_OUTPUT)))
     try:
         if args.command == "build":
-            refuse_output_over_input([args.output], [args.release])
+            check_new_output(args.output)
         tracked = read_candidates(args.candidates) if args.command == "check" else []
         candidates, sums, sizes = rebuild(args.release)
         if args.command == "build":
-            try:
-                args.output.write_text(format_candidates(candidates))
-            except OSError:
-                raise PublisherError(Notice(Code.CANNOT_WRITE, subject=Subject.CANDIDATE_FILE)) from None
+            write_new_file(args.output, format_candidates(candidates))
             sys.stdout.write(f"{render(Notice(Code.WROTE, count=len(candidates)))}\n")
             return 0
         problems = candidate_problems(tracked) + listing_problems(tracked, sums, sizes) + difference_problems(tracked, candidates)

@@ -48,7 +48,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.ingestion.closed import QuietParser, reject_repeats
+from scripts.ingestion.closed import ClosedInputError, QuietParser, reject_repeats
+from scripts.ingestion.output_file import check_new_output
 from scripts.process import ProcessGroupSurvived, TimeoutExpired, run_command
 from scripts.stack.host_figures import FiguresError, HostSources, parse_size_bytes, read_host
 from scripts.stack.limits import LIMITS_FILE, LimitsError, load_limits
@@ -145,11 +146,11 @@ def emit(text: str) -> None:
 
 
 def check_output(path: Path) -> None:
-    """Refuse an output path that exists or is a link, and a parent that is not a folder (a link that leads nowhere is not one). It creates nothing."""
-    if os.path.lexists(path):
-        raise SamplerError("the output path exists")
-    if not path.parent.is_dir():
-        raise SamplerError("the parent of the output path is not a folder")
+    """Refuse an output path that is held in any form (``check_new_output``) or whose folder does not exist. It creates nothing."""
+    try:
+        check_new_output(path)
+    except ClosedInputError:
+        raise SamplerError("the output path is held or its folder does not exist") from None
 
 
 class Output:

@@ -39,14 +39,14 @@ from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, p
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
 from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
-from replay.service.state_file import ScheduleFile, StateFile, atomic_write
+from replay.service.state_file import ScheduleFile, StateFile
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.closed import ClosedInputError, QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
-from scripts.ingestion.output_path import refuse_output_inside_folders, refuse_output_over_input
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.store import StoreError
 
 READ_DEADLINE_SECONDS = 600.0
@@ -170,7 +170,7 @@ def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
         raise ScheduleError("the run record's plan differs from the frozen schedule on the volume")
     recordings = {case: inputs.decode(times[case]) for case in sorted({item.occurrence.case_id for item in admitted_occurrences(schedule)})}
     manifest = build_manifest(schedule, recordings)
-    atomic_write(Path(arguments.out), manifest.to_json())
+    write_new_file(Path(arguments.out), manifest.to_json(), mode=0o640)
     sys.stdout.write(json.dumps({"events": len(manifest.events), "occurrences": len(manifest.occurrences), "schedule_sha256": manifest.schedule_sha256}) + "\n")
     return 0
 
@@ -178,7 +178,7 @@ def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
 def command_observe(record: RunRecord, arguments: argparse.Namespace) -> int:
     reader = Reader(RegistryClient(record.registry_url))
     received = read_all(record.kafka_bootstrap, reader, [INPUT_TOPIC], READ_DEADLINE_SECONDS)
-    atomic_write(Path(arguments.out), observed_document(received, record.run_id))
+    write_new_file(Path(arguments.out), observed_document(received, record.run_id), mode=0o640)
     sys.stdout.write(json.dumps({"messages_read": len(received)}) + "\n")
     return 0
 
@@ -294,20 +294,12 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--window-only", action="store_true")
     arguments = parser.parse_args(argv)
     service_commands = {"serve": command_serve, "submit": command_submit, "health": command_health}
-    if arguments.command == "submit":
-        try:
-            refuse_output_inside_folders([arguments.manifest_reference], [arguments.inbox])
-        except ClosedError as error:
-            sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
-            return 2
     if arguments.command in service_commands:
         return service_commands[arguments.command](arguments)
     try:
-        output = getattr(arguments, "out", None)
-        refuse_output_over_input([output], [arguments.run_record])
+        if getattr(arguments, "out", None) is not None:
+            check_new_output(arguments.out)
         record = parse_run_record(read_run_record(arguments.run_record))
-        refuse_output_over_input([output], record.input_paths)
-        refuse_output_inside_folders([output], [Path(record.object_store.root) if record.object_store.root else None])
         return COMMANDS[arguments.command](record, arguments)
     except ClosedError as error:
         sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))

@@ -518,7 +518,7 @@ class QuietMessages(unittest.TestCase):
             self.assertIn("cannot read the candidate file", errors.getvalue())
             self.assertNotIn(self.MARKER, errors.getvalue())
 
-    def test_a_build_whose_output_cannot_be_written_is_reported_by_its_role(self) -> None:
+    def test_a_build_whose_output_has_no_folder_is_refused_before_the_release_is_read(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             blocked = Path(folder) / self.MARKER
             blocked.write_text("a file where a folder must be")
@@ -529,7 +529,7 @@ class QuietMessages(unittest.TestCase):
                 contextlib.redirect_stderr(errors),
             ):
                 self.assertEqual(1, candidates.main())
-        self.assertIn("cannot write the candidate file", errors.getvalue())
+        self.assertIn("folder of an output path does not exist", errors.getvalue())
         self.assertNotIn(self.MARKER, errors.getvalue())
 
     def test_a_pin_whose_table_key_is_no_text_is_reported_and_not_raised(self) -> None:
