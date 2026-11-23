@@ -16,6 +16,7 @@ from collections import Counter
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -214,6 +215,78 @@ class MainTest(unittest.TestCase):
             code, out, err, _ = self.run_main(Path(folder), self.passing)
         self.assertEqual(2, code)
         self.assertNotIn(MARKER, out + err)
+
+
+class TrackListDigestTest(unittest.TestCase):
+    """The job's track list path with stand-in frames and a stand-in for ``pyspark``: the digest check holds what the pure comparison gives for the rows
+    that the job streams, so a job that reports ``equal=1`` whatever the rows are fails here."""
+
+    LINES = [f"{number}\tname{number}\tvalue" for number in range(7)]
+
+    class Rows:
+        """The table as the job reads it: a count, a filter that finds no separator and the sorted lines that it streams."""
+
+        def __init__(self, lines: list[str]) -> None:
+            self.lines = lines
+
+        def count(self) -> int:
+            return len(self.lines)
+
+        def filter(self, condition: Any) -> TrackListDigestTest.Rows:
+            return TrackListDigestTest.Rows([])
+
+        def select(self, *columns: Any) -> TrackListDigestTest.Rows:
+            return self
+
+        def orderBy(self, name: str) -> TrackListDigestTest.Rows:  # noqa: N802
+            return self
+
+        def toLocalIterator(self) -> Any:  # noqa: N802
+            return iter(SimpleNamespace(line=line) for line in self.lines)
+
+    def check(self, table_lines: list[str]) -> str:
+        from types import ModuleType
+
+        errors = ModuleType("pyspark.errors")
+        errors.AnalysisException = type("AnalysisException", (Exception,), {})  # type: ignore[attr-defined]
+        sql = ModuleType("pyspark.sql")
+        sql.functions = mock.MagicMock()  # type: ignore[attr-defined]
+        plan = rules.parse_plan(
+            json.dumps(
+                {
+                    "format": rules.PLAN_FORMAT,
+                    "run_id": "a" * 32,
+                    "branch": "load_run_one",
+                    "branch_hash": "b" * 64,
+                    "empty_form": "empty",
+                    "tables": [
+                        {"name": "clinical_data", "snapshot_id": 11, "file": "clinical_data.csv", "file_sha256": "c" * 64, "file_size": 1},
+                        {"name": "lab_data", "snapshot_id": 12, "file": "lab_data.csv", "file_sha256": "d" * 64, "file_size": 1},
+                        {"name": "track_list", "snapshot_id": 13, "rows": 7, "rows_sha256": rules.rows_digest(self.LINES)},
+                    ],
+                }
+            )
+        )
+        columns = [
+            SimpleNamespace(name=name, dataType=SimpleNamespace(simpleString=lambda: "string")) for name in rules.SPEC_BY_NAME["track_list"].pinned_columns
+        ]
+        session = mock.MagicMock()
+        session.table.return_value.schema.fields = columns
+        with (
+            mock.patch.dict("sys.modules", {"pyspark": ModuleType("pyspark"), "pyspark.errors": errors, "pyspark.sql": sql}),
+            mock.patch.object(job, "snapshot_of", return_value=13),
+            mock.patch.object(job, "table_frame", return_value=self.Rows(table_lines)),
+        ):
+            result = job.check_table(session, Path("."), plan, plan.tables[2])
+        self.assertEqual(["snapshot", "columns", "row count", "rows digest"], [check.name for check in result.checks])
+        detail: str = result.checks[-1].detail
+        return detail
+
+    def test_control_the_rows_of_the_pinned_digest_give_equal_1(self) -> None:
+        self.assertEqual("digest_compared;equal=1", self.check(list(self.LINES)))
+
+    def test_rows_that_are_not_the_pinned_rows_give_equal_0_whatever_their_count(self) -> None:
+        self.assertEqual("digest_compared;equal=0", self.check([*self.LINES[:6], "6\tname6\tother"]))
 
 
 if __name__ == "__main__":

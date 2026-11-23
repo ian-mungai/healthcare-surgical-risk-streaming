@@ -166,8 +166,7 @@ def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> Ta
         result.add("rows digest", rules.detail("separator_in_field", rows=ambiguous))
         return result
     lines = table.select(F.concat_ws("\t", *[F.col(f"`{name}`") for name in expected]).alias("line")).orderBy("line")
-    digest = rules.rows_digest(row.line for row in lines.toLocalIterator())
-    result.add("rows digest", rules.detail("digest_compared", equal=int(digest == entry.rows_sha256)))
+    result.add("rows digest", rules.digest_detail((row.line for row in lines.toLocalIterator()), entry.rows_sha256))
     return result
 
 
@@ -190,7 +189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session.stop()
     document = rules.job_document(plan, results)
     sys.stdout.write(RESULT_PREFIX + json.dumps(document, sort_keys=True) + "\n")
-    return 0 if document["passed"] else 1
+    return 0 if rules.job_passed(results) else 1
 
 
 if __name__ == "__main__":

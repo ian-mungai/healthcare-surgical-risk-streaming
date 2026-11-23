@@ -225,7 +225,7 @@ class Runner:
         text = (self.line or result_line)(rules.parse_plan(plan_text))
         code = self.exit_code
         if code is None:
-            code = 0 if text.startswith("RESULT ") and json.loads(text.removeprefix("RESULT "))["passed"] else 1
+            code = 0 if text.startswith("RESULT ") and rules.parse_result(text.removeprefix("RESULT "), rules.parse_plan(plan_text)).passed else 1
         return run.RunnerReply(code, text, self.error_text)
 
 
@@ -607,7 +607,7 @@ class MergeOutcomeTest(unittest.TestCase):
         self.assertFalse(case.pending_path.exists())
 
     def test_the_pending_record_is_written_before_the_request_in_the_fixed_directory_and_not_under_the_results_folder(self) -> None:
-        case = Case(self)
+        case, runner = Case(self), Runner()
         seen: list[dict[str, Any]] = []
         original = case.nessie.send
 
@@ -618,13 +618,14 @@ class MergeOutcomeTest(unittest.TestCase):
             return original(method, target, payload)
 
         with mock.patch.object(case.nessie, "send", look):
-            case.go(Runner())
+            case.go(runner)
         pending, results = seen
         self.assertEqual(case.state / f"{case.reference.sha256}.pending.json", case.pending_path)
         self.assertEqual(
-            (case.reference.sha256, BRANCH, case.branch_hash, case.wall), (pending["manifest"], pending["branch"], pending["source"], pending["started"])
+            (case.reference.sha256, BRANCH, case.branch_hash, case.wall, runner.plan["run_id"]),
+            (pending["manifest"], pending["branch"], pending["source"], pending["started"], pending["run_id"]),
         )
-        self.assertEqual({"format", "manifest", "branch", "source", "started"}, set(pending))
+        self.assertEqual({"format", "manifest", "branch", "source", "started", "run_id"}, set(pending))
         self.assertEqual({"in_results": []}, results)
 
     def test_a_timeout_in_the_run_is_not_sent_again_it_waits_until_one_monotonic_deadline_and_ends_open_with_the_pending_record_kept(self) -> None:
@@ -751,15 +752,43 @@ class MergeOutcomeTest(unittest.TestCase):
         self.assertEqual(1, len(case.nessie.merge_requests))
         self.assertFalse(case.pending_path.exists())
 
-    def test_a_cached_rerun_after_a_successful_merge_removes_a_leftover_pending_record(self) -> None:
+    def test_a_cached_rerun_after_a_successful_merge_removes_a_leftover_pending_record_of_the_same_load(self) -> None:
         case, runner = Case(self), Runner()
         case.go(runner)
-        case.state.mkdir(parents=True, exist_ok=True)
-        case.pending_path.write_text("left over")
+        run.write_pending(case.state, case.record, case.wall, "a" * 32)
         again = case.go(runner)
         self.assertTrue(again.merged)
         self.assertFalse(case.pending_path.exists())
         self.assertEqual((1, 1), (runner.calls, len(case.nessie.merge_requests)))
+
+    def test_a_cached_rerun_never_removes_a_pending_record_that_is_not_shown_to_be_this_loads(self) -> None:
+        case, runner = Case(self), Runner()
+        case.go(runner)
+        case.pending_path.write_text("left over")
+        with self.assertRaises(run.TableChecksError):
+            case.go(runner)
+        self.assertEqual("left over", case.pending_path.read_text())
+
+    def test_a_cached_receipt_of_one_load_never_removes_the_pending_record_of_another_load_and_the_one_request_is_never_resent(self) -> None:
+        case, runner = Case(self), Runner()
+        self.open_outcome(case, runner)
+        before = case.pending_path.read_text()
+        other = run.LoadRecord("load_run_two", case.nessie.load_branch("load_run_two", SNAPSHOTS), case.reference, dict(SNAPSHOTS))
+        cached = run.receipt(other, "empty", None, passed=True)
+        cached.update(merged=True, merged_into="main", main_hash_before="1" * 64, merged_hash="2" * 64)
+        run.write_result(case.root / "other_results", cached)
+        case.run_folder = case.root / "other_results"
+        with self.assertRaisesRegex(run.MergeOutcomeOpen, "another load"):
+            case.go(runner, record=other)
+        self.assertEqual(before, case.pending_path.read_text())
+        case.run_folder = case.root / "run"
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        self.assertEqual(1, len(case.nessie.merge_requests))
+        case.nessie.apply_pending()
+        self.assertTrue(case.go(runner).merged)
+        self.assertEqual((1, 1), (len(case.nessie.merge_requests), len(case.nessie.merges)))
+        self.assertFalse(case.pending_path.exists())
 
     def test_a_success_answer_with_no_commit_in_the_history_is_an_error_and_there_is_no_merged_receipt(self) -> None:
         case = Case(self)
@@ -780,9 +809,28 @@ class MergeOutcomeTest(unittest.TestCase):
             case.go(runner, record=run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS)))
 
     def test_a_pending_record_that_is_not_in_its_form_is_refused(self) -> None:
-        for label in ("empty", "not an object", "not JSON", "another format", "infinite time", "NaN time", "text time", "extra field", "control"):
+        for label in (
+            "empty",
+            "not an object",
+            "not JSON",
+            "another format",
+            "infinite time",
+            "NaN time",
+            "text time",
+            "extra field",
+            "no run id",
+            "bad run id",
+            "control",
+        ):
             case = Case(self)
-            good = {"format": run.PENDING_FORMAT, "manifest": case.reference.sha256, "branch": BRANCH, "source": case.branch_hash, "started": 1.5}
+            good = {
+                "format": run.PENDING_FORMAT,
+                "manifest": case.reference.sha256,
+                "branch": BRANCH,
+                "source": case.branch_hash,
+                "started": 1.5,
+                "run_id": "a" * 32,
+            }
             text = {
                 "empty": "",
                 "not an object": "[]",
@@ -792,6 +840,8 @@ class MergeOutcomeTest(unittest.TestCase):
                 "NaN time": json.dumps({**good, "started": float("nan")}),
                 "text time": json.dumps({**good, "started": "later"}),
                 "extra field": json.dumps({**good, "extra": 1}),
+                "no run id": json.dumps({key: value for key, value in good.items() if key != "run_id"}),
+                "bad run id": json.dumps({**good, "run_id": "not a run id"}),
                 "control": json.dumps(good),
             }[label]
             case.state.mkdir(parents=True)
@@ -823,6 +873,27 @@ class MergeOutcomeTest(unittest.TestCase):
         run.write_result(failed.run_folder, {**run.receipt(case.record, "empty", {"passed": False}, passed=False)})
         again = failed.go(runner)
         self.assertIsNone(again.document["checked"])
+
+    def test_a_receipt_rebuilt_after_the_operator_removed_the_pending_record_cites_no_checks_and_says_so(self) -> None:
+        case, runner = Case(self), Runner()
+        self.open_outcome(case, runner)
+        self.assertTrue(case.saved()["passed"])
+        case.pending_path.unlink()
+        case.nessie.apply_pending()
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertIsNone(outcome.document["checked"])
+        self.assertIn("rebuilt from the log", " ".join(outcome.document["notes"]))
+        self.assertEqual(1, len(case.nessie.merge_requests))
+
+    def test_a_receipt_rebuilt_while_the_pending_record_names_another_attempt_cites_no_checks(self) -> None:
+        case, runner = Case(self), Runner()
+        self.open_outcome(case, runner)
+        case.nessie.apply_pending()
+        case.pending_path.write_text(json.dumps({**case.pending(), "run_id": "0" * 32}))
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertIsNone(outcome.document["checked"])
 
 
 class OtherLoadTest(unittest.TestCase):
@@ -1064,21 +1135,48 @@ class SingleResultTest(unittest.TestCase):
                 self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
                 self.assertTrue(case.main_untouched())
 
-    def test_the_saved_result_holds_the_validated_fields_and_a_verdict_derived_by_the_controller_not_the_jobs_own_flag(self) -> None:
+    def test_the_saved_result_holds_the_validated_fields_and_a_verdict_derived_by_the_controller_from_the_checks(self) -> None:
         case = Case(self)
-
-        def flags_say_failed(plan: rules.Plan) -> str:
-            def change(document: dict[str, Any]) -> None:
-                document["passed"] = False
-                for table in document["tables"]:
-                    table["passed"] = False
-
-            return result_line(plan, change=change)
-
-        outcome = case.go(Runner(flags_say_failed, exit_code=0))
+        outcome = case.go(Runner())
         saved = case.saved()["checked"]
         self.assertEqual({"format", "run_id", "branch", "branch_hash", "empty_form", "passed", "tables"}, set(saved))
         self.assertTrue(saved["passed"] and outcome.merged)
+
+    def test_a_result_with_exit_code_0_and_false_summary_flags_is_refused_and_no_merge_request_is_sent(self) -> None:
+        for label, top, tables in (("the result only", True, False), ("the tables only", False, True), ("both", True, True)):
+
+            def flags(plan: rules.Plan, top: bool = top, tables: bool = tables) -> str:
+                def change(document: dict[str, Any]) -> None:
+                    if top:
+                        document["passed"] = False
+                    for table in document["tables"] if tables else []:
+                        table["passed"] = False
+
+                return result_line(plan, change=change)
+
+            with self.subTest(label):
+                case = Case(self)
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner(flags, exit_code=0))
+                self.assertEqual([], case.nessie.merge_requests)
+                self.assertTrue(case.main_untouched())
+                self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+
+    def test_a_columns_check_with_zero_columns_on_both_sides_is_refused_and_no_merge_request_is_sent(self) -> None:
+        for index in (0, 1):
+
+            def zero(plan: rules.Plan, index: int = index) -> str:
+                def change(document: dict[str, Any]) -> None:
+                    document["tables"][index].update(columns_source=0, columns_table=0)
+
+                return result_line(plan, change=change)
+
+            with self.subTest(table=index):
+                case = Case(self)
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner(zero, exit_code=0))
+                self.assertEqual([], case.nessie.merge_requests)
+                self.assertTrue(case.main_untouched())
 
 
 class RefusalTest(unittest.TestCase):
@@ -1181,15 +1279,12 @@ class FailedCheckTest(unittest.TestCase):
                     case.go(Runner(line, exit_code=0))
                 self.assertTrue(case.main_untouched())
 
-    def test_a_failed_check_with_summary_flags_that_say_passed_is_a_failed_run_and_merges_nothing(self) -> None:
+    def test_a_failed_check_is_a_failed_run_and_merges_nothing(self) -> None:
         def lying(plan: rules.Plan) -> str:
             def flags(document: dict[str, Any]) -> None:
                 document["tables"][1]["checks"][3].update(passed=False, detail="row_count;source=2;table=3")
                 document["tables"][1].update(rows_source=2, rows_table=3)
                 del document["tables"][1]["checks"][4:]
-                document["passed"] = True
-                for table in document["tables"]:
-                    table["passed"] = True
 
             return result_line(plan, change=flags)
 

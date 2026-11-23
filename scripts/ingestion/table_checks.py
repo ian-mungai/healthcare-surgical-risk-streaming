@@ -21,7 +21,13 @@ A merge request is sent at most once for a load, by this step or any later run o
 as an error, but a request that timed out can still be applied later, so the design never relies on that. Before the request a pending record is written in the
 fixed state directory (``STATE_DIRECTORY``, in the volume ``dagster_data``, so it survives a restart). While it exists and the history does not hold the load,
 every run ends as ``merge_outcome_open`` and sends nothing. The operator checks the history of main: if the commit is there, a run writes the receipt; if it
-is not and no request can still be in flight, the operator removes the pending file by hand and the next run sends one new request.
+is not and no request can still be in flight, the operator removes the pending file by hand and the next run sends one new request. A pending record is
+removed only by the load that wrote it (its branch and source hash are the load's own), and a pending record of another load of the same manifest makes
+every run of this load end as ``merge_outcome_open``. The pending record also names the attempt (the run ID of its plan) whose checks justified the request:
+a receipt rebuilt from the history cites the checks of its run folder only if they are that attempt's, and otherwise cites none and says so.
+
+The one request is sent after the search of the history before it ended. If the history pages are slow, it can therefore be sent after the search's budget:
+a reviewer saw 90 seconds against a budget of 70. This is an accepted limit; the request is still one request.
 
 A run in which a check fails merges nothing and leaves the load branch for inspection. A run in which the merge request fails or times out may still have
 merged, and ends as ``merge_outcome_open`` or ``merge_not_found``: the history of main is then the only record of whether it did. A rerun after a merge runs
@@ -74,7 +80,7 @@ STAGING_FILE_MODE = 0o640
 BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 STAGING_DIRECTORY = "/opt/dagster/staging"
 STAGING_VOLUME = "table_check_staging"
-PENDING_FORMAT = "merge_pending_1"
+PENDING_FORMAT = "merge_pending_2"
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGE_LIMIT = 50
 TRACKED_RELEASE_FILE = RELEASE_FILE
@@ -114,6 +120,14 @@ class Timing:
     wall: Callable[[], float] = time.time
     wait_seconds: float = 10.0
     poll_seconds: float = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class Pending:
+    """A pending merge record of this load: when it was written (for the operator to read) and the run ID of the attempt whose checks justified the request."""
+
+    started: float
+    run_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,30 +508,46 @@ def merged_commit(nessie: NessieClient, record: LoadRecord, at: str, until: tupl
     raise TableChecksError("the log of the default branch is too long to search for an earlier merge of this load")
 
 
-def read_pending(state_directory: Path, record: LoadRecord) -> float | None:
-    """The time (for the operator to read) that the pending merge record of this load was written, or None when there is none.
+def read_pending(state_directory: Path, record: LoadRecord) -> Pending | None:
+    """The pending merge record of this load, or None when there is none.
 
-    A record of another load, of another form or with a time that is not a finite number is refused.
+    A record of another form or with a time that is not a finite number is refused. A record of another load (its branch or source hash is not this
+    load's) ends this run as ``merge_outcome_open`` and is never changed by it.
     """
     path = pending_path(record.manifest.sha256, state_directory)
     if not path.is_file():
         return None
     try:
         pending = closed(
-            json.loads(path.read_text()), {"format": str, "manifest": str, "branch": str, "source": str, "started": float}, "the pending merge record"
+            json.loads(path.read_text()),
+            {"format": str, "manifest": str, "branch": str, "source": str, "started": float, "run_id": str},
+            "the pending merge record",
         )
     except ValueError:
         raise TableChecksError("the pending merge record is not JSON") from None
-    if pending["format"] != PENDING_FORMAT or not math.isfinite(pending["started"]):
-        raise TableChecksError("the pending merge record has another format or a time that is not a finite number")
+    if pending["format"] != PENDING_FORMAT or not math.isfinite(pending["started"]) or not rules.RUN_ID.fullmatch(pending["run_id"]):
+        raise TableChecksError("the pending merge record has another format, a time that is not a finite number or a run ID that is not one")
     if (pending["manifest"], pending["branch"], pending["source"]) != (record.manifest.sha256, record.branch, record.branch_hash):
-        raise TableChecksError("the state directory holds a pending merge record of another load")
-    return float(pending["started"])
+        raise MergeOutcomeOpen(f"merge_outcome_open: {path} is the pending merge record of another load of this manifest; this run leaves it as it is")
+    return Pending(float(pending["started"]), pending["run_id"])
 
 
-def write_pending(state_directory: Path, record: LoadRecord, started: float) -> None:
+def clear_pending(state_directory: Path, record: LoadRecord) -> None:
+    """Remove the pending merge record only after it is shown to be this load's. Any other record, or one that cannot be read, stays and ends the run."""
+    if read_pending(state_directory, record) is not None:
+        pending_path(record.manifest.sha256, state_directory).unlink(missing_ok=True)
+
+
+def write_pending(state_directory: Path, record: LoadRecord, started: float, run_id: str) -> None:
     """Write the pending merge record in one step, before the merge request is sent."""
-    document = {"format": PENDING_FORMAT, "manifest": record.manifest.sha256, "branch": record.branch, "source": record.branch_hash, "started": started}
+    document = {
+        "format": PENDING_FORMAT,
+        "manifest": record.manifest.sha256,
+        "branch": record.branch,
+        "source": record.branch_hash,
+        "started": started,
+        "run_id": run_id,
+    }
     fd, partial = tempfile.mkstemp(dir=state_directory, prefix=".pending.")
     try:
         with os.fdopen(fd, "w") as handle:
@@ -609,15 +639,15 @@ def wait_for_merge(nessie: NessieClient, record: LoadRecord, default: str, timin
         return None
 
 
-def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing) -> MergeCommit:
+def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing, run_id: str) -> MergeCommit:
     """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it. A request is never sent twice.
 
     The request carries the recorded hash, the one Spark read, so what is merged is what was checked, and the head of the default branch that the log was
     searched from as its expected target hash. Nessie 0.110.1 can also accept an older expected hash after a compatible commit on the target, so that hash is a
-    guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record is written before the request. The request is sent
-    once: after a failure of it, whatever the failure, the history is searched until one deadline has passed, and a merge not found by then ends as
-    ``merge_outcome_open`` with the pending record kept. After a success answer the merge commit must be in the history (``merge_not_found`` otherwise). The
-    caller builds the receipt from the commit and its parent, never from what was sent or answered.
+    guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record, with the run ID of the checks, is written before
+    the request. The request is sent once: after a failure of it, whatever the failure, the history is searched until one deadline has passed, and a merge
+    not found by then ends as ``merge_outcome_open`` with the pending record kept. After a success answer the merge commit must be in the history
+    (``merge_not_found`` otherwise). The caller builds the receipt from the commit and its parent, never from what was sent or answered.
 
     A second request for the same source is a no-op in Nessie 0.110.1: it answers that nothing was applied, which ``NessieClient.merge`` raises as an error.
     The design does not rely on it, because a request that timed out can still be applied later: only the history says what happened.
@@ -633,7 +663,7 @@ def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path
     message = "\n".join(
         [f"merge {record.branch}: table checks passed", "", branch_line(record.branch), source_line(record.branch_hash), manifest_line(record.manifest.sha256)]
     )
-    write_pending(state_directory, record, timing.wall())
+    write_pending(state_directory, record, timing.wall(), run_id)
     try:
         nessie.merge(record.branch, default, head, message, source_hash=record.branch_hash)
     except NessieError:
@@ -696,11 +726,17 @@ def receipt(record: LoadRecord, empty_form: str, checked: dict[str, Any] | None,
 
 
 def record_merge(run_folder: Path, state_directory: Path, record: LoadRecord, document: dict[str, Any], default: str, commit: MergeCommit) -> Outcome:
-    """Write the receipt of a merge from the commit that the history holds and its parent, then remove the pending record."""
+    """Write the receipt of a merge from the commit that the history holds and its parent, then remove the pending record if it is this load's."""
     document.update(passed=True, merged=True, merged_into=default, main_hash_before=commit.parent, merged_hash=commit.hash)
     write_result(run_folder, document)
-    pending_path(record.manifest.sha256, state_directory).unlink(missing_ok=True)
+    clear_pending(state_directory, record)
     return Outcome(True, True, document)
+
+
+def attempt_evidence(held: dict[str, Any] | None, pending: Pending | None) -> bool:
+    """Whether the saved receipt holds passed checks of the attempt that the pending record names: only then do they stand for the merge that was found."""
+    checked = held.get("checked") if held is not None and held["passed"] is True else None
+    return isinstance(checked, dict) and pending is not None and checked.get("run_id") == pending.run_id
 
 
 def run_locked(
@@ -724,14 +760,14 @@ def run_locked(
     """
     held = saved_result(run_folder, record)
     if held is not None and held["merged"] is True:
-        pending_path(record.manifest.sha256, state_directory).unlink(missing_ok=True)
+        clear_pending(state_directory, record)
         return Outcome(True, True, held)
     default = default_branch(nessie)
     pending = read_pending(state_directory, record)
     found = merged_commit(nessie, record, main_head(nessie, default), deadline_for(nessie, timing))
     if found is not None:
         confirm_main(nessie, record, default, found.hash)
-        evidence = held if held is not None and held["passed"] is True else None
+        evidence = held if attempt_evidence(held, pending) else None
         document = evidence if evidence is not None else receipt(record, empty_form, None, passed=True)
         if evidence is None:
             document["notes"].append("the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch")
@@ -755,4 +791,5 @@ def run_locked(
     write_result(run_folder, document)
     if not result.passed:
         return Outcome(False, False, document)
-    return record_merge(run_folder, state_directory, record, document, default, merge_branch(nessie, record, state_directory, timing))
+    commit = merge_branch(nessie, record, state_directory, timing, result.run_id)
+    return record_merge(run_folder, state_directory, record, document, default, commit)

@@ -31,6 +31,27 @@ class HeaderTest(unittest.TestCase):
             rules.header_columns("")
 
 
+class DigestDetailTest(unittest.TestCase):
+    """The comparison that gives the digest check its detail is one pure function that the job calls."""
+
+    LINES = ["1\ta\tb", "2\tc\td"]
+
+    def test_equal_digests_give_equal_1_and_unequal_digests_give_equal_0(self) -> None:
+        pinned = rules.rows_digest(self.LINES)
+        self.assertEqual("digest_compared;equal=1", rules.digest_detail(iter(self.LINES), pinned))
+        for label, lines in (("a changed row", ["1\ta\tb", "2\tc\tX"]), ("a missing row", self.LINES[:1]), ("an extra row", [*self.LINES, "3\te\tf"])):
+            with self.subTest(label):
+                self.assertEqual("digest_compared;equal=0", rules.digest_detail(iter(lines), pinned))
+
+    def test_the_detail_is_the_one_that_the_digest_rule_reads(self) -> None:
+        pinned = rules.rows_digest(self.LINES)
+        self.assertTrue(rules.detail_holds(rules.digest_detail(iter(self.LINES), pinned)))
+        self.assertFalse(rules.detail_holds(rules.digest_detail(iter(self.LINES[:1]), pinned)))
+
+    def test_the_rows_are_read_once_in_the_order_given(self) -> None:
+        self.assertEqual("digest_compared;equal=0", rules.digest_detail(iter(self.LINES[::-1]), rules.rows_digest(self.LINES)))
+
+
 class ColumnTest(unittest.TestCase):
     def test_control_equal_columns_pass_and_the_connectors_own_columns_are_ignored(self) -> None:
         equal = "columns_differ;missing=0;extra=0;repeated=0;order=0;not_string=0"
@@ -428,16 +449,24 @@ class ResultTest(unittest.TestCase):
         self.assertFalse(rules.JobResult("r", "b", "h", "empty", every[:2]).passed)
         self.assertFalse(rules.JobResult("r", "b", "h", "empty", every[::-1]).passed)
 
-    def test_a_failed_check_fails_the_result_whatever_the_summary_flags_say(self) -> None:
+    def test_the_job_reports_no_summary_flag_and_a_result_that_carries_one_is_refused_whatever_it_says(self) -> None:
+        plan = the_plan()
+        document = self.document(plan, results_for(plan))
+        self.assertNotIn("passed", document)
+        for table in document["tables"]:
+            self.assertNotIn("passed", table)
+        for flag in (True, False):
+            with self.subTest(flag=flag, where="the result"):
+                self.refused(lambda document, flag=flag: document.update(passed=flag))
+            with self.subTest(flag=flag, where="a table"):
+                self.refused(lambda document, flag=flag: document["tables"][0].update(passed=flag))
+
+    def test_a_failed_check_fails_the_result_and_the_verdict_is_derived_from_the_checks_alone(self) -> None:
         plan = the_plan()
         results = results_for(plan, only={"lab_data": 4})
         results[1].rows_source, results[1].rows_table = 2, 3
         results[1].checks[3] = rules.Check("row count", False, rules.detail("row_count", source=2, table=3))
-        document = self.document(plan, results)
-        document["passed"] = True
-        for table in document["tables"]:
-            table["passed"] = True
-        self.assertFalse(self.parse(document, plan).passed)
+        self.assertFalse(self.parse(self.document(plan, results), plan).passed)
 
     def test_a_table_that_stopped_at_its_first_failure_is_a_failed_result_not_a_malformed_one(self) -> None:
         plan = the_plan()
@@ -471,7 +500,6 @@ class ResultTest(unittest.TestCase):
 
     def test_the_shape_of_every_field_is_checked(self) -> None:
         self.refused(lambda document: document.update(extra=1))
-        self.refused(lambda document: document.pop("passed"))
         self.refused(lambda document: document["tables"][0].update(passed="yes"))
         self.refused(lambda document: document["tables"][0].update(rows_table="5"))
         self.refused(lambda document: document["tables"][0].update(columns_source="3"))
@@ -550,11 +578,11 @@ class ResultTest(unittest.TestCase):
                             with self.assertRaises(rules.RulesError):
                                 self.parse(document)
         zeros = rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0)
-        for columns_source in range(1, 5):
-            for columns_table in range(1, 5):
+        for columns_source in range(0, 5):
+            for columns_table in range(0, 5):
                 document = self.with_check(0, clinical.index("columns"), zeros, columns_source=columns_source, columns_table=columns_table)
                 with self.subTest(columns=(columns_source, columns_table)):
-                    if columns_source == columns_table:
+                    if columns_source == columns_table and columns_source >= 1:
                         self.parse(document)
                     else:
                         with self.assertRaises(rules.RulesError):
@@ -691,9 +719,6 @@ class ResultTest(unittest.TestCase):
     def test_the_canonical_document_holds_only_the_validated_fields_and_a_verdict_derived_here(self) -> None:
         plan = the_plan()
         document = self.document(plan, results_for(plan))
-        document["passed"] = False
-        for table in document["tables"]:
-            table["passed"] = False
         result = self.parse(document, plan)
         canonical = result.document()
         self.assertTrue(canonical["passed"])
@@ -701,7 +726,9 @@ class ResultTest(unittest.TestCase):
         self.assertEqual(
             {"table", "snapshot_id", "rows_table", "rows_source", "columns_source", "columns_table", "passed", "checks"}, set(canonical["tables"][0])
         )
-        self.assertEqual(self.document(plan, results_for(plan)), canonical)
+        derived = {key: value for key, value in canonical.items() if key != "passed"}
+        derived["tables"] = [{key: value for key, value in table.items() if key != "passed"} for table in canonical["tables"]]
+        self.assertEqual(self.document(plan, results_for(plan)), derived)
 
     def test_text_that_is_not_json_or_names_a_field_twice_is_refused(self) -> None:
         for text in ("", "[]", "{", '{"format": "table_checks_2", "format": "x"}'):

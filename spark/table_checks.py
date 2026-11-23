@@ -38,7 +38,7 @@ LAB_DATA_NOTE = "lab_data has no unique key (some whole rows repeat), so its key
 HASH = re.compile(r"[0-9a-f]{64}")
 RUN_ID = re.compile(r"[0-9a-f]{32}")
 PLAN_FORMAT = "table_check_plan_2"
-RESULT_FORMAT = "table_checks_3"
+RESULT_FORMAT = "table_checks_4"
 # The details of a check: each is one of these codes with exactly its integer fields, in this order, and one rule that says whether the check passed. The job
 # reports counts only: a check passes if and only if the rule of its code holds for its counts, and a flag that says otherwise refuses the result. A detail is
 # built from this table and parsed back against it, so no text of the data can pass as a detail.
@@ -297,25 +297,28 @@ class TableResult:
             "rows_source": self.rows_source,
             "columns_source": self.columns_source,
             "columns_table": self.columns_table,
-            "passed": self.passed,
             "checks": [{"name": check.name, "passed": check.passed, "detail": check.detail} for check in self.checks],
         }
 
 
+def job_passed(results: Sequence[TableResult]) -> bool:
+    """Whether every table of the job passed: the job's exit code. It is never in the result, which holds the checks only."""
+    return len(results) == len(TABLES) and all(result.passed for result in results)
+
+
 def job_document(plan: Plan, results: Sequence[TableResult]) -> dict[str, Any]:
-    """What the Spark job reports: the plan it ran (run ID, branch, hash, empty form) and one entry for each table. The ``passed`` flags are for a reader."""
+    """What the Spark job reports: the plan it ran (run ID, branch, hash, empty form) and each table. No summary flag: the controller derives the verdict."""
     return {
         "format": RESULT_FORMAT,
         "run_id": plan.run_id,
         "branch": plan.branch,
         "branch_hash": plan.branch_hash,
         "empty_form": plan.empty_form,
-        "passed": len(results) == len(TABLES) and all(result.passed for result in results),
         "tables": [result.document() for result in results],
     }
 
 
-RESULT_FIELDS: Mapping[str, type] = {"format": str, "run_id": str, "branch": str, "branch_hash": str, "empty_form": str, "passed": bool, "tables": list}
+RESULT_FIELDS: Mapping[str, type] = {"format": str, "run_id": str, "branch": str, "branch_hash": str, "empty_form": str, "tables": list}
 TABLE_RESULT_FIELDS: Mapping[str, type] = {
     "table": str,
     "snapshot_id": int,
@@ -323,7 +326,6 @@ TABLE_RESULT_FIELDS: Mapping[str, type] = {
     "rows_source": object,
     "columns_source": object,
     "columns_table": object,
-    "passed": bool,
     "checks": list,
 }
 CHECK_FIELDS: Mapping[str, type] = {"name": str, "passed": bool, "detail": str}
@@ -408,7 +410,7 @@ def bounded(
         return (
             columns_source is not None
             and columns_table is not None
-            and (any(counts.values()) or columns_source == columns_table)
+            and (any(counts.values()) or (columns_source == columns_table and columns_source >= 1))
             and counts["order"] <= 1
             and counts["missing"] <= columns_source
             and all(counts[name] <= columns_table for name in ("extra", "repeated", "not_string"))
@@ -445,6 +447,11 @@ def table_outcome(entry: Any, expected: PlanTable) -> TableOutcome:
     if len(names) < len(required) and checks[-1].passed:
         raise RulesError("a table stopped before its last required check without a failed check")
     return TableOutcome(expected.name, checks, expected.snapshot_id, rows_table, rows_source, columns_source, columns_table)
+
+
+def digest_detail(lines: Iterable[str], expected: str) -> str:
+    """The detail of the digest check: the rows' digest (rows sorted by full text, as ``rows_digest`` says) against the pinned one: ``equal`` is 1 or 0."""
+    return detail("digest_compared", equal=int(rows_digest(lines) == expected))
 
 
 def parse_result(text: str, plan: Plan) -> JobResult:
