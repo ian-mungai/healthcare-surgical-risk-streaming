@@ -16,8 +16,9 @@ from typing import Any
 from scripts.process import run_command
 from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.ansible_support import PLAYBOOK_SECONDS, environment
-from tests.fast.test_airbyte_role import ROLE, flatten, group_variables, role_tasks, run_tasks
+from tests.fast.ansible_paths import group_variables
+from tests.slow.ansible_support import PLAYBOOK_SECONDS, environment
+from tests.slow.test_airbyte_role import ROLE, flatten, role_tasks, run_tasks
 
 BUCKET = "imungai-example-project"
 FULL_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")

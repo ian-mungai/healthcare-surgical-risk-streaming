@@ -41,6 +41,11 @@ CARRIAGE_NOTE = "notes/line\rbreak.txt"
 WORKTREE_GUARD = "working-tree privacy hook"
 PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
 PLANTED_MESSAGE = "planted fast-test fault"
+# unittest's summary for exactly one failure and no error; the suite's skipped tests may follow. A pattern message is matched only against
+# the status line that directly follows unittest's own "Ran N tests in X s" footer, so a summary quoted in a failure message or printed by a
+# test (pre-commit can emit buffered output after the footer) cannot stand for the run.
+ONE_FAILURE_SUMMARY = re.compile(r"FAILED \(failures=1(, skipped=\d+)?\)")
+SUMMARY_LINE = re.compile(r"^Ran \d+ tests? in \d+(?:\.\d+)?s\n\n((?:OK|FAILED)\b.*)$", re.MULTILINE)
 CLEAN_PYTHON = "def double(value: int) -> int:\n    return value * 2\n"
 
 
@@ -60,7 +65,7 @@ class Case:
     name: str
     guard: str
     hooks: tuple[str, ...]
-    messages: tuple[str, ...]
+    messages: tuple[str | re.Pattern[str], ...]
     control: Change
     fault: Change
 
@@ -73,7 +78,7 @@ def planted_account_reference() -> str:
     return "arn:aws:iam::" + "4" * 4 + "7" * 4 + "1" * 4 + ":role/planted"
 
 
-def hook_case(name: str, hook: str, message: str | tuple[str, ...], control: Change, fault: Change) -> Case:
+def hook_case(name: str, hook: str, message: str | tuple[str | re.Pattern[str], ...], control: Change, fault: Change) -> Case:
     return Case(name, hook, (hook,), (message,) if isinstance(message, str) else message, control, fault)
 
 
@@ -190,7 +195,7 @@ def planted_cases() -> list[Case]:
         hook_case(
             "failing fast test",
             "fast-tests",
-            (f"FAIL: test_planted ({PLANTED_TEST})", f"AssertionError: 1 != 2 : {PLANTED_MESSAGE}", "FAILED (failures=1)"),
+            (f"FAIL: test_planted ({PLANTED_TEST})", f"AssertionError: 1 != 2 : {PLANTED_MESSAGE}", ONE_FAILURE_SUMMARY),
             Change({"tests/fast/test_planted.py": failing_test.format(value=1)}, ("tests/fast/test_planted.py",)),
             Change({"tests/fast/test_planted.py": failing_test.format(value=2)}, ("tests/fast/test_planted.py",)),
         ),
@@ -295,7 +300,11 @@ class Fixture:
 def judge_fault(case: Case, code: int, output: str, advanced: bool) -> Observation:
     """Judge a planted-fault commit: refused by the named hooks alone, with the guard's expected message, and HEAD unchanged."""
     failed = sorted(set(FAILED_HOOK.findall(output)))
-    found = all(message in output for message in case.messages)
+    summaries = SUMMARY_LINE.findall(output)
+    found = all(
+        (bool(summaries) and message.fullmatch(summaries[-1].strip()) is not None) if isinstance(message, re.Pattern) else message in output
+        for message in case.messages
+    )
     named = f"only {', '.join(case.hooks)} failed" if case.hooks else "no pre-commit hook failed"
     expected = f"non-zero exit, {named}, every message of {list(case.messages)!r} found and HEAD unchanged"
     observed = f"exit {code}, failed hooks: {failed}, every message found: {found}, HEAD advanced: {advanced}"

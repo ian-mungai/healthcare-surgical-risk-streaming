@@ -11,7 +11,7 @@ import base64
 import json
 import unittest
 
-from tests.fast.ansible_support import run_task_file
+from tests.slow.ansible_support import run_task_file
 
 WRITTEN = 1_000
 GOOD_CONFIGURATION = {"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "5"}}

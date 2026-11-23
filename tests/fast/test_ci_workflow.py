@@ -3,7 +3,8 @@
 """The CI workflow contract: every pull request and every push to main runs every job group, and one job requires them all.
 
 The contract reads the workflow as PyYAML parses it and compares parsed keys and values only, never text, so a spaced key, a quoted key, a
-YAML anchor or a merge key cannot hide a change. Failure modes covered here, each with a planted case and a control:
+YAML anchor or a merge key cannot hide a change. Failure modes covered here, each with a planted case (run by ``tests/slow/test_ci_workflow_plants.py``)
+and a control:
 
 - A group job is skipped: an ``if`` on a job or on one of its steps, or ``continue-on-error`` that lets a failed check pass.
 - A step runs under another shell or folder, so its command can become a no-op (``shell: bash -n {0}``).
@@ -44,7 +45,7 @@ RUNNER = "ubuntu-24.04"
 PYTHON = "3.14.10"
 SHARDS = 8
 REQUIRED_NAME = "Every job of this run passed"
-GROUPS = ("hooks", "infrastructure", "guards", "deadline")
+GROUPS = ("hooks", "infrastructure", "slow", "guards", "deadline")
 EXPRESSION = re.compile(r"\$\{\{ ([^}]+?) \}\}")
 RESULTS = ("success", "failure", "cancelled", "skipped")
 # The command that GitHub runs a `run` script with under the shell `bash`.
@@ -168,6 +169,11 @@ PINNED_JOBS: dict[str, dict[str, Any]] = {
             {"run": "make check-ansible"},
         ],
     },
+    "slow": {
+        "name": "The slow tests: Ansible roles, local servers and stand-ins, and planted workflow faults",
+        "timeout-minutes": 25,
+        "steps": [CHECKOUT_STEP, PYTHON_STEP, {"run": "make setup"}, {"run": "make test-slow"}],
+    },
     "guards": {
         "name": "Planted faults through the real commit path, shard ${{ matrix.shard }} of 8",
         "timeout-minutes": 15,
@@ -192,6 +198,7 @@ REQUIRED_KEYS = {"name", "needs", "if", "runs-on", "timeout-minutes", "steps"}
 REQUIRED_ENV_VALUES = {
     "HOOKS": "${{ needs.hooks.result }}",
     "INFRASTRUCTURE": "${{ needs.infrastructure.result }}",
+    "SLOW": "${{ needs.slow.result }}",
     "GUARDS": "${{ needs.guards.result }}",
     "DEADLINE": "${{ needs.deadline.result }}",
 }
@@ -207,6 +214,7 @@ check() {
 }
 check hooks "${HOOKS}"
 check infrastructure "${INFRASTRUCTURE}"
+check slow "${SLOW}"
 check guards "${GUARDS}"
 check deadline "${DEADLINE}"
 exit "${failed}"
@@ -544,7 +552,7 @@ def aggregate_problems(jobs: dict[str, Any]) -> list[str]:
             problems.append(f"required: its step's {key} is {step.get(key)!r}, not {REQUIRED_STEP[key]!r}")
     environment = step.get("env")
     if not isinstance(environment, dict):
-        problems.append(f"required: its step's env is {environment!r}, not the four results of the needed jobs")
+        problems.append(f"required: its step's env is {environment!r}, not the results of the needed jobs")
         environment = {}
     if set(environment) != set(REQUIRED_ENV_VALUES):
         problems.append(f"required: its env has the keys {sorted(environment)}, not {sorted(REQUIRED_ENV_VALUES)}")
@@ -628,7 +636,7 @@ DEADLINE_UPLOAD = UPLOAD_ACTION + "        with:\n          name: deadline-recor
 REQUIRED_ENV = "        env:\n          HOOKS:"
 GROUP_LINE = "  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.run_id || github.ref }}\n"
 CANCEL_LINE = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n"
-NEEDS_LINE = "needs: [hooks, infrastructure, guards, deadline]"
+NEEDS_LINE = "needs: [hooks, infrastructure, slow, guards, deadline]"
 ACCEPTS = 'if [ "$2" != success ]; then'
 NOT_SUCCESS = "required: its script passes when a needed job did not succeed"
 # Each planted change to the workflow text: (the text to replace, its replacement, the diagnostic that the contract must give).
@@ -759,17 +767,17 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the required job's exit masked by a pipe under bash -e (the reviewer's first plant)": (
         ("        shell: bash\n", '          exit "${failed}"\n'),
         ("", '          ( exit "${failed}" ) | true\n'),
-        ("required: its step's shell is None, not 'bash'", "required: its script differs from the approved one at line 12"),
+        ("required: its step's shell is None, not 'bash'", "required: its script differs from the approved one at line 13"),
     ),
     "the required job's exit masked by a pipe under the approved shell": (
         '          exit "${failed}"\n',
         '          ( exit "${failed}" ) | true\n',
-        "required: its script differs from the approved one at line 12",
+        "required: its script differs from the approved one at line 13",
     ),
     "the required job's script holds a context in a comment (the reviewer's second plant)": (
         '          exit "${failed}"\n',
         '          exit "${failed}" # ${{ github.event_name }}\n',
-        ("required: its script holds an expression", "required: its script differs from the approved one at line 12"),
+        ("required: its script holds an expression", "required: its script differs from the approved one at line 13"),
     ),
     "the required job's script reads a context": (
         'check hooks "${HOOKS}"',
@@ -784,17 +792,18 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the required job's script without its final newline": (
         "        run: |\n          failed=0\n",
         "        run: |-\n          failed=0\n",
-        "required: its script differs from the approved one at line 12",
+        "required: its script differs from the approved one at line 13",
     ),
     "the required job's script with a trailing space": (
         '          exit "${failed}"\n',
         '          exit "${failed}" \n',
-        "required: its script differs from the approved one at line 12",
+        "required: its script differs from the approved one at line 13",
     ),
     "the required job's env given an extra key with no value (the reviewer's low plant)": (
         "          GUARDS: ${{ needs.guards.result }}\n",
         "          GUARDS: ${{ needs.guards.result }}\n          UNUSED:\n",
-        "required: its env has the keys ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'UNUSED'], not ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE']",
+        "required: its env has the keys ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'SLOW', 'UNUSED']"
+        ", not ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'SLOW']",
     ),
     "the required job's env entry reads another job": (
         "INFRASTRUCTURE: ${{ needs.infrastructure.result }}",
@@ -830,7 +839,8 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the required job's step given another variable": (
         "          GUARDS: ${{ needs.guards.result }}\n",
         "          GUARDS: ${{ needs.guards.result }}\n          BASH_ENV: /dev/null\n",
-        "required: its env has the keys ['BASH_ENV', 'DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE'], not ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE']",
+        "required: its env has the keys ['BASH_ENV', 'DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'SLOW']"
+        ", not ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'SLOW']",
     ),
     "the required job given a shell default": (
         REQUIRED_HEAD,
@@ -895,22 +905,42 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         "guards: it has the key 'permissions'",
     ),
     "a plan job added": ("jobs:\n", "jobs:\n  plan:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: make check\n", "the workflow's jobs are"),
-    "the required job without the guards in its needs": (NEEDS_LINE, "needs: [hooks, infrastructure, deadline]", "required: guards is missing from its needs"),
-    "the required job without the hooks in its needs": (NEEDS_LINE, "needs: [infrastructure, guards, deadline]", "required: hooks is missing from its needs"),
+    "the required job without the guards in its needs": (
+        NEEDS_LINE,
+        "needs: [hooks, infrastructure, slow, deadline]",
+        "required: guards is missing from its needs",
+    ),
+    "the required job without the hooks in its needs": (
+        NEEDS_LINE,
+        "needs: [infrastructure, slow, guards, deadline]",
+        "required: hooks is missing from its needs",
+    ),
     "the required job without the infrastructure job in its needs": (
         NEEDS_LINE,
-        "needs: [hooks, guards, deadline]",
+        "needs: [hooks, slow, guards, deadline]",
         "required: infrastructure is missing from its needs",
+    ),
+    "the required job without the slow job in its needs": (
+        NEEDS_LINE,
+        "needs: [hooks, infrastructure, guards, deadline]",
+        "required: slow is missing from its needs",
+    ),
+    "the required job does not check the slow job": (
+        '          check slow "${SLOW}"\n',
+        "",
+        NOT_SUCCESS
+        + ", for 3 of 1024 combinations of results, for example hooks=success, infrastructure=success, slow=failure, guards=success, deadline=success",
     ),
     "the required job without the deadline job in its needs": (
         NEEDS_LINE,
-        "needs: [hooks, infrastructure, guards]",
+        "needs: [hooks, infrastructure, slow, guards]",
         "required: deadline is missing from its needs",
     ),
     "the required job does not check the deadline job": (
         '          check deadline "${DEADLINE}"\n',
         "",
-        NOT_SUCCESS + ", for 3 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=success, deadline=failure",
+        NOT_SUCCESS
+        + ", for 3 of 1024 combinations of results, for example hooks=success, infrastructure=success, slow=success, guards=success, deadline=failure",
     ),
     "the required job reads the wrong result for the deadline job": (
         "DEADLINE: ${{ needs.deadline.result }}",
@@ -1087,26 +1117,29 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         "          failed=1\n          check() {",
         "required: its script fails when every job succeeded",
     ),
-    "the required job passes a failure": ("          failed=1\n", "", NOT_SUCCESS + ", for 255 of 256"),
+    "the required job passes a failure": ("          failed=1\n", "", NOT_SUCCESS + ", for 1023 of 1024"),
     "the required job passes a skipped job": (
         ACCEPTS,
         'if [ "$2" != success ] && [ "$2" != skipped ]; then',
-        NOT_SUCCESS + ", for 15 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=success, deadline=skipped",
+        NOT_SUCCESS
+        + ", for 31 of 1024 combinations of results, for example hooks=success, infrastructure=success, slow=success, guards=success, deadline=skipped",
     ),
     "the required job passes a cancelled job": (
         ACCEPTS,
         'if [ "$2" != success ] && [ "$2" != cancelled ]; then',
-        NOT_SUCCESS + ", for 15 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=success, deadline=cancelled",
+        NOT_SUCCESS
+        + ", for 31 of 1024 combinations of results, for example hooks=success, infrastructure=success, slow=success, guards=success, deadline=cancelled",
     ),
     "the required job does not check the guards": (
         '          check guards "${GUARDS}"\n',
         "",
-        NOT_SUCCESS + ", for 3 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=failure, deadline=success",
+        NOT_SUCCESS
+        + ", for 3 of 1024 combinations of results, for example hooks=success, infrastructure=success, slow=success, guards=failure, deadline=success",
     ),
     "the required job reads the wrong result": (
         "INFRASTRUCTURE: ${{ needs.infrastructure.result }}",
         "INFRASTRUCTURE: ${{ needs.hooks.result }}",
-        "for example hooks=success, infrastructure=failure, guards=success",
+        "for example hooks=success, infrastructure=failure, slow=success, guards=success",
     ),
     "pull requests into main only": ("  pull_request:\n", "  pull_request:\n    branches: [main]\n", "the workflow starts on"),
     "pushes to every branch": ("  push:\n    branches: [main]\n", "  push:\n", "the workflow starts on"),
@@ -1180,28 +1213,6 @@ class WorkflowContractTest(unittest.TestCase):
                 problems = script_problems(script, ())
                 self.assertEqual(len(problems), 1)
                 self.assertIn("fails when every job succeeded", problems[0])
-
-    def assert_plants_are_caught(self, base: str) -> None:
-        for label, (before, after, diagnostics) in PLANTS.items():
-            with self.subTest(label=label):
-                planted = base
-                for old, new in zip(as_tuple(before), as_tuple(after), strict=True):
-                    self.assertIn(old, planted)
-                    if label.startswith("the required job"):
-                        self.assertGreater(planted.index(old), planted.index("\n  required:\n"), "a plant of the required job must change the required job")
-                    planted = planted.replace(old, new, 1)
-                problems = contract_problems(planted)
-                for diagnostic in as_tuple(diagnostics):
-                    self.assertTrue(any(diagnostic in problem for problem in problems), f"no problem names {diagnostic!r}: {problems}")
-
-    def test_a_broken_workflow_fails_the_contract_with_its_own_diagnostic(self) -> None:
-        self.assert_plants_are_caught(WORKFLOW_TEXT)
-
-    def test_every_plant_lands_in_its_own_job_without_the_comments_of_the_workflow(self) -> None:
-        """A plant is located by its job's keys, never by a comment: with any comment after a timeout removed, each plant still changes its own job."""
-        bare = re.sub(r"(timeout-minutes: \d+) #.*", r"\1", WORKFLOW_TEXT)
-        self.assertEqual(contract_problems(bare), [], "the control: the workflow without those comments keeps the contract")
-        self.assert_plants_are_caught(bare)
 
     def test_the_record_check_runs_in_every_run_folder_tree_as_github_runs_it(self) -> None:
         """The control of the record check's plants: the approved script passes with the record and its label and fails in every other tree."""

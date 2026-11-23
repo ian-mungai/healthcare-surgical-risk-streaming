@@ -31,7 +31,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 from scripts.ingestion.connection import desired_state, full_release_selection
-from tests.fast.ansible_support import ROLES, shared_module
+from tests.slow.ansible_support import ROLES, shared_module
 
 MODULE = ROLES / "airbyte" / "library" / "airbyte_connection.py"
 WORKSPACE = "11111111-1111-1111-1111-111111111111"

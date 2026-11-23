@@ -19,7 +19,7 @@ from typing import Any
 from scripts.ingestion import connection
 from scripts.ingestion.connection import ConnectionDefinitionError, desired_state, fixed_sample_selection, full_release_selection
 from scripts.ingestion.selection import Selection
-from tests.fast.test_airbyte_role import group_variables
+from tests.fast.ansible_paths import group_variables
 
 PIN = json.loads(Path("tests/fixtures/vitaldb/release.json").read_text())
 PREFIX = PIN["source"]["release_path"]

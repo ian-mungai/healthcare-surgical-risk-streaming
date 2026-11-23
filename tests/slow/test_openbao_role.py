@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.fast.ansible_support import run_role_tasks
+from tests.slow.ansible_support import run_role_tasks
 
 UID, GID = os.getuid(), os.getgid()
 OTHER_GID = next((group for group in os.getgroups() if group != GID), GID)

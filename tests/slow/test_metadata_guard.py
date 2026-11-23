@@ -14,7 +14,7 @@ from pathlib import Path
 
 from scripts.process import run_command
 from scripts.project_config import ROOT
-from tests.fast.ansible_support import load_list, role_order, run_task_file
+from tests.slow.ansible_support import load_list, role_order, run_task_file
 
 ROLE = ROOT / "ansible" / "roles" / "metadata_guard"
 SCRIPT = ROLE / "files" / "metadata_guard.sh"

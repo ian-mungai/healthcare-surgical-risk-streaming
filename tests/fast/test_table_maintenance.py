@@ -22,7 +22,7 @@ from scripts.stack.tags import TableSnapshot
 from spark.jobs import table_maintenance as job
 from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, table_identifier
 from spark.preconditions import PROPERTY_KEYS, precondition_problems
-from tests.fast.test_snapshot_tags import HASH_SIDE, HASH_TWO, NAMESPACE_ENTRY, StandIn, table_entry
+from tests.fast.nessie_stand_in import HASH_SIDE, HASH_TWO, NAMESPACE_ENTRY, StandIn, table_entry
 
 ROOT = Path(__file__).resolve().parents[2]
 JOB = ROOT / "spark" / "jobs" / "table_maintenance.py"

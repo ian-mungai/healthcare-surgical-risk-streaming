@@ -12,7 +12,7 @@ import unittest
 from typing import Any
 
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.ansible_support import ROLES, run_task_file
+from tests.slow.ansible_support import ROLES, run_task_file
 
 GOOD_ARGUMENTS = ["server", "--disable", "traefik", "--disable", "servicelb", "--write-kubeconfig-mode", "0600"]
 GOOD_OBJECTS = "pod/coredns-1\nservice/kubernetes\nservice/kube-dns\n"
