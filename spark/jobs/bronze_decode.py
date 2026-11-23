@@ -6,7 +6,7 @@
 ``python -m spark.jobs.bronze_decode publish --branch <name> [--base <name>]``
 
 ``write`` (the default) decodes and checks. ``verify`` runs the checks of step 6 on a branch that exists and writes nothing. ``publish`` runs them on the head
-of the branch and merges that head into ``--base`` only when every check passed (step 7); ``write --publish`` does the whole sequence in one job.
+of the branch and publishes that head to ``--base`` only when every check passed (step 7); ``write --publish`` does the whole sequence in one job.
 
 The steps of ``write``, in order:
 
@@ -24,11 +24,13 @@ The steps of ``write``, in order:
 6. The column-level checks run in Great Expectations on the four tables as they are at the head of the branch (``spark/bronze/checks.py`` lists them and
    ``quality.py`` runs them). Guard ``key``: the key columns are never null and the key is unique. Guard ``structure``: every other column is never null, a
    lineage hash has the form of a SHA-256, an occurrence is not negative, a second of a waveform holds a sample and a track's kind and types are ones the file
-   format defines. No check judges a published value: a noisy or out-of-range reading is kept. A failed check ends the job with exit code 1 and nothing merged.
-7. With ``--publish``, or in ``publish``, the head that was checked is merged into the base (``spark/bronze/publication.py``), once, and only when the branch
-   still has that head and the change from the base to it is exactly the four tables that the job wrote (at this run's snapshots, with ``write --publish``):
-   a branch that carries another change, or leaves one of the tables as the base has it, is refused. The result names the merge's hash and the snapshot ID of
-   each table on the base.
+   format defines. No check judges a published value: a noisy or out-of-range reading is kept. A failed check ends the job with exit code 1 and nothing
+   published.
+7. With ``--publish``, or in ``publish``, the base is assigned to the head that was checked (``spark/bronze/publication.py``): Nessie applies it only if the
+   base is still the head that was read, and refuses it otherwise (``base_moved``, base unchanged). The base must be the commit the branch was made on, and
+   the change from it to the branch must be exactly the four tables that the job wrote (at this run's snapshots, with ``write --publish``), with their
+   namespace if it is new: another change, an edit of an existing namespace or a table left as the base has it is refused. The published commit is the
+   checked commit. The result names it and the snapshot ID of each table on the base.
 
 It prints one line that starts with ``RESULT `` and holds the branch, its new hash, for each table its snapshot ID, row count and checksum, the checks with
 their counts, the publication when there is one, and the facts of the run: the memory limit, the peak memory of the container and the peak memory of the largest
@@ -57,7 +59,7 @@ from spark.bronze.commands import branch_report, command_problem, exit_code, fai
 from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
 from spark.bronze.passes import MaxParameter, SumByName, partition_problems, partition_rows
 from spark.bronze.plan import GROUPED, MODES
-from spark.bronze.publication import MergeOutcomeOpen, NessiePublisher, PublicationError
+from spark.bronze.publication import NessiePublisher, PublicationError
 from spark.bronze.quality import QualityError, run_checks
 from spark.bronze.readers import caseend_times, open_store
 from spark.bronze.rows import StructureError
@@ -82,9 +84,9 @@ def parser() -> argparse.ArgumentParser:
     )
     command.add_argument("command", nargs="?", choices=COMMANDS, default="write", help="write (the default), verify the checks of a branch or publish a branch")
     command.add_argument("--branch", required=True, help="the private branch (write: to create from the base and write to)")
-    command.add_argument("--base", default="main", help="write: the branch to create the private branch from. publish: the branch to merge into")
+    command.add_argument("--base", default="main", help="write: the branch to create the private branch from. publish: the branch to assign")
     command.add_argument("--manifest-reference", type=Path, help="write: the file that holds the reference of the passed manifest")
-    command.add_argument("--publish", action="store_true", help="write: merge the branch into the base when every check passed")
+    command.add_argument("--publish", action="store_true", help="write: publish the branch to the base when every check passed")
     command.add_argument("--cases", default="", help="the case numbers to decode, separated by commas; every case file of the manifest when empty")
     command.add_argument(
         "--passes",
@@ -211,7 +213,7 @@ def nessie_client() -> NessieClient:
 
 
 def run_command(arguments: argparse.Namespace) -> dict[str, Any]:
-    """``write``: the decode, then the checks (and the merge with ``--publish``). ``verify`` and ``publish`` work on a branch that exists."""
+    """``write``: the decode, then the checks (and the publication with ``--publish``). ``verify`` and ``publish`` work on a branch that exists."""
     problem = command_problem(
         arguments.command, arguments.manifest_reference is not None, bool(arguments.cases), bool(arguments.landed_folder), arguments.publish
     )
@@ -244,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (InputError, StructureError) as error:
         sys.stderr.write(f"{JOB}: refused: {error}\n")
         return 1
-    except (MergeOutcomeOpen, PublicationError, QualityError) as error:
+    except (PublicationError, QualityError) as error:
         sys.stderr.write(f"{JOB}: {error}\n")
         return 1
     except NessieConflict as error:

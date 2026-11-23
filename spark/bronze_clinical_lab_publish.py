@@ -1,5 +1,5 @@
-"""Publication of the clinical and laboratory Bronze branch: the checks of ``verify`` at the head of the branch, and a merge into Nessie's default branch only
-when every one passed (``spark/bronze/publication.py`` has the sequence and its guards).
+"""Publication of the clinical and laboratory Bronze branch: the checks of ``verify`` at the head of the branch, and its publication to Nessie's default
+branch only when every one passed (``spark/bronze/publication.py`` has the sequence and its guards).
 
 The checks are the job's own (``spark/bronze_clinical_lab_run.py``): the loaded tables did not change since the branch was made, the columns, the key, the row
 count, the value of every row and, for the laboratory table, the occurrence numbers. Each belongs to a guard, so a stop names what failed.
@@ -49,7 +49,7 @@ def verdict_of(document: dict[str, Any]) -> Verdict:
 def publish_job(
     branch: str, source_hash: str, nessie: NessieOps, publisher: PublishOps, open_spark: Callable[[str, str, str, str | None], SparkOps]
 ) -> dict[str, Any]:
-    """Run ``verify`` at the head of ``branch``, every read of the branch at that hash, and merge that head into the default branch when it passed.
+    """Run ``verify`` at the head of ``branch``, every read of the branch at that hash, and publish that head to the default branch when it passed.
 
     The tables of the job are the two Bronze tables, and the change from the default branch to the branch must be exactly those
     (``spark/bronze/publication.py``).
@@ -73,7 +73,7 @@ def publish_job(
             "status": outcome.status,
             "base": outcome.base,
             "base_hash_before": outcome.base_hash_before,
-            "merged_hash": outcome.merged_hash,
+            "published_hash": outcome.published_hash,
             "snapshots": outcome.snapshots,
             "blocked_by": outcome.blocked_by,
         },

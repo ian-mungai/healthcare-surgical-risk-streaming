@@ -12,7 +12,7 @@ from spark.bronze.publication import PublicationError
 from spark.bronze_clinical_lab_publish import publish_job, verdict_of
 from spark.bronze_clinical_lab_run import run_job
 from tests.fast.test_bronze_job_sequence import BRANCH, BRONZE, HASH, SOURCES, TRUNK, Harness
-from tests.fast.test_bronze_publish import BASE_HEAD, HEAD, MERGED, FakeNessie, table
+from tests.fast.test_bronze_publish import BASE_HEAD, HEAD, FakeNessie, table
 
 KEYS = list(BRONZE.values())
 
@@ -29,17 +29,17 @@ def publish_run(harness: Harness, publisher: Publisher) -> dict[str, Any]:
 
 
 class PublishTest(unittest.TestCase):
-    def test_a_branch_that_passes_every_check_is_merged_into_the_default_branch_that_nessie_names(self) -> None:
+    def test_a_branch_that_passes_every_check_is_published_to_the_default_branch_that_nessie_names(self) -> None:
         harness, publisher = Harness(), Publisher()
         result = publish_run(harness, publisher)
         self.assertTrue(result["passed"])
-        self.assertEqual(("merged", TRUNK, MERGED), (result["publication"]["status"], result["publication"]["base"], result["publication"]["merged_hash"]))
-        self.assertEqual([(BRANCH, TRUNK, BASE_HEAD)], [call[:3] for call in publisher.merge_calls])
+        self.assertEqual(("published", TRUNK, HEAD), (result["publication"]["status"], result["publication"]["base"], result["publication"]["published_hash"]))
+        self.assertEqual([(TRUNK, BASE_HEAD, BRANCH, HEAD)], publisher.assign_calls)
         self.assertEqual({KEYS[0]: 10, KEYS[1]: 11}, result["publication"]["snapshots"])
         self.assertIn(f"open:{BRANCH}:{TRUNK}:aaaa:aaaa", harness.calls)
         self.assertEqual(HEAD, harness.spark.pinned)
 
-    def test_a_failed_check_trips_its_guard_and_merges_nothing(self) -> None:
+    def test_a_failed_check_trips_its_guard_and_publishes_nothing(self) -> None:
         for plant, guard in (("null_counts", "key"), ("difference_counts", "equality"), ("duplicates", "key")):
             harness, publisher = Harness(), Publisher()
             if plant == "null_counts":
@@ -51,7 +51,7 @@ class PublishTest(unittest.TestCase):
             result = publish_run(harness, publisher)
             self.assertFalse(result["passed"], plant)
             self.assertEqual(("blocked", [guard]), (result["publication"]["status"], result["publication"]["blocked_by"]), plant)
-            self.assertEqual([], publisher.merge_calls, plant)
+            self.assertEqual([], publisher.assign_calls, plant)
             self.assertEqual(BASE_HEAD, publisher.heads[TRUNK], plant)
 
     def test_a_loaded_table_that_changed_after_the_branch_was_made_trips_the_source_guard(self) -> None:
@@ -59,22 +59,22 @@ class PublishTest(unittest.TestCase):
         harness.nessie.contents[(BRANCH, "raw_records.lab_data")] = type(harness.nessie.contents[(BRANCH, "raw_records.lab_data")])("file:/other", 7)
         result = publish_run(harness, publisher)
         self.assertEqual(["source"], result["publication"]["blocked_by"])
-        self.assertEqual([], publisher.merge_calls)
+        self.assertEqual([], publisher.assign_calls)
 
     def test_a_hash_that_is_not_in_the_history_of_the_default_branch_is_refused_before_any_check_or_merge(self) -> None:
         harness, publisher = Harness(), Publisher()
         with self.assertRaises(NessieError):
             publish_job(BRANCH, "c" * 64, harness.nessie, publisher, harness.open_spark)
-        self.assertEqual([], publisher.merge_calls)
+        self.assertEqual([], publisher.assign_calls)
         self.assertFalse([call for call in harness.calls if call.startswith("open:")])
 
-    def test_a_branch_that_also_carries_an_unchecked_table_is_refused_and_nothing_is_merged(self) -> None:
+    def test_a_branch_that_also_carries_an_unchecked_table_is_refused_and_nothing_is_published(self) -> None:
         harness, publisher = Harness(), Publisher()
         publisher.entries_at[f"{BRANCH}@{HEAD}"]["bronze.waveform_seconds"] = table(77)
         with self.assertRaises(PublicationError) as raised:
             publish_run(harness, publisher)
         self.assertIn("bronze.waveform_seconds", str(raised.exception))
-        self.assertEqual([], publisher.merge_calls)
+        self.assertEqual([], publisher.assign_calls)
         self.assertEqual(BASE_HEAD, publisher.heads[TRUNK])
 
     def test_a_name_that_is_not_a_branch_is_refused(self) -> None:

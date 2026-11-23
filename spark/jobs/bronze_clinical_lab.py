@@ -10,11 +10,11 @@ branch (the name comes from Nessie's configuration, never from an argument), so 
 creates the branch ``--branch`` from that hash on the default branch and refuses a branch that exists. The loaded tables
 ``raw_records.clinical_data`` and ``raw_records.lab_data`` are always read at the pinned reference ``<default branch>@<source hash>``,
 through a second catalog, and never through the run branch. ``write`` replaces the two Bronze tables on the run branch and then runs the
-checks on what it wrote. The key checks (not null, unique) run in Great Expectations, and the equality proofs are plain code. ``write`` never merges. ``verify``
-re-reads a branch and runs the same checks, so any later step can run it again. ``publish`` runs them at the head of the branch, every read of the branch at
-that hash, and merges that head into the default branch only when every one passed and the change from the default branch to it is exactly the two Bronze
-tables (``spark/bronze_clinical_lab_publish.py``). A failed check trips its guard (``key``, ``structure``, ``source`` or ``equality``) and the default branch is
-not changed.
+checks on what it wrote. The key checks (not null, unique) run in Great Expectations, and the equality proofs are plain code. ``write`` never publishes.
+``verify`` re-reads a branch and runs the same checks, so any later step can run it again. ``publish`` runs them at the head of the branch, every read of the
+branch at that hash, and assigns the default branch to that head only when every one passed, the default branch is the commit that the branch was made on and
+the change from it is exactly the two Bronze tables (``spark/bronze_clinical_lab_publish.py``). A failed check trips its guard (``key``, ``structure``,
+``source`` or ``equality``) and the default branch is not changed.
 
 Each Bronze table holds the loaded table's published columns, every one a string, with no value changed (``spark/bronze_clinical_lab.py``
 has the rules). The laboratory table adds the integer column ``source_occurrence``. The checks of one table are, in this order:
@@ -41,7 +41,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
-from spark.bronze.publication import MergeOutcomeOpen, NessiePublisher, PublicationError
+from spark.bronze.publication import NessiePublisher, PublicationError
 from spark.bronze.quality import column_checks
 from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_publish import publish_job
@@ -96,7 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = publish_job(arguments.branch, arguments.source_hash, NessieAdapter(client), NessiePublisher(client), open_spark)
         else:
             result = run_job(arguments.command, arguments.branch, arguments.source_hash, NessieAdapter(client), open_spark)
-    except (MergeOutcomeOpen, PublicationError) as error:
+    except PublicationError as error:
         sys.stderr.write(f"{JOB}: {error}\n")
         return 1
     except NessieConflict as error:

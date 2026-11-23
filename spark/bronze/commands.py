@@ -27,7 +27,7 @@ def command_problem(command: str, has_manifest: bool, has_cases: bool, has_lande
 def branch_report(
     ops: PublishOps, run_checks: Callable[[str], Verdict], branch: str, base: str, expected: Mapping[str, int | None], *, publishing: bool
 ) -> dict[str, Any]:
-    """The checks of the branch at its head and, when ``publishing``, its merge into the base. The document holds names, counts and hashes, never a value.
+    """The checks of the branch at its head and, when ``publishing``, its publication to the base. The document holds names, counts and hashes, never a value.
 
     ``expected`` maps the content key of each table that the job wrote to the snapshot it wrote, or to ``None`` where this run did not write it.
     """
@@ -43,7 +43,7 @@ def branch_report(
             "status": outcome.status,
             "base": outcome.base,
             "base_hash_before": outcome.base_hash_before,
-            "merged_hash": outcome.merged_hash,
+            "published_hash": outcome.published_hash,
             "snapshots": outcome.snapshots,
             "blocked_by": outcome.blocked_by,
         },
