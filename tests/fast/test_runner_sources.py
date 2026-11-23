@@ -27,7 +27,8 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "signal_profile.py"
 SOURCES = ("CLINICAL_FILE", "TRACK_LIST_FILE")
 FILE_WORDS = ("clinical_data.", "trks_plain", "track_list.csv")
-METADATA_CALLS = {"Path", "resolve", "lstat", "S_ISREG", "is_relative_to", "RuntimeError", "str"}
+METADATA_CALLS = {"Path", "resolve", "lstat", "S_ISREG", "inside_repository", "RuntimeError", "str"}
+MOUNT_CALLS = {"resolve_source", "replace"}
 EXEMPT_ASSIGNMENTS = {"STAND_IN"}
 COPY_HELPERS = {"host_copies", "TRACK_LIST_NAME"}
 RAW_READS = {"open", "read_text", "read_bytes", "read"}
@@ -73,24 +74,33 @@ def construction_problems(source: str) -> list[str]:
             for part in ast.walk(node):
                 if isinstance(part, ast.Call):
                     called = part.func.id if isinstance(part.func, ast.Name) else getattr(part.func, "attr", "")
-                    if called != "resolve_source":
+                    if called not in MOUNT_CALLS:
                         problems.append(f"line {part.lineno}: mount_for calls something other than the metadata check")
     return sorted(set(problems), key=lambda item: int(item.split(":")[0].split()[1]))
 
 
-def metadata_problems(source: str) -> list[str]:
-    """``resolve_source`` may only look at metadata: it resolves the path, calls ``os.lstat`` and ``stat.S_ISREG``, tests the repository root and raises."""
-    functions = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef) and node.name == "resolve_source"]
+def called_in(source: str, name: str) -> set[str] | None:
+    functions = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef) and node.name == name]
     if len(functions) != 1:
-        return ["resolve_source is not defined exactly once"]
-    problems = []
-    called = {
+        return None
+    return {
         part.func.id if isinstance(part.func, ast.Name) else getattr(part.func, "attr", "") for part in ast.walk(functions[0]) if isinstance(part, ast.Call)
     }
-    if not {"resolve", "lstat", "S_ISREG", "is_relative_to"} <= called:
+
+
+def metadata_problems(source: str) -> list[str]:
+    """``resolve_source`` and ``inside_repository`` may only look at metadata: the first resolves the path, calls ``os.lstat`` and ``stat.S_ISREG`` and asks the
+    second, which compares each parent with the repository root by file identity (``os.path.samefile``)."""
+    resolver, inside = called_in(source, "resolve_source"), called_in(source, "inside_repository")
+    if resolver is None or inside is None:
+        return ["resolve_source or inside_repository is not defined exactly once"]
+    problems = []
+    if not {"resolve", "lstat", "S_ISREG", "inside_repository"} <= resolver:
         problems.append("resolve_source does not resolve, test for a regular file and test for the repository root")
-    if called - METADATA_CALLS:
+    if resolver - METADATA_CALLS:
         problems.append("resolve_source calls more than the metadata check")
+    if "samefile" not in inside or inside - {"samefile"}:
+        problems.append("inside_repository does not compare by file identity alone")
     return problems
 
 
@@ -152,6 +162,16 @@ def stand_in_order_problems(source: str) -> list[str]:
 
 
 MOUNT_SOURCE = """
+def inside_repository(resolved):
+    for parent in resolved.parents:
+        try:
+            if os.path.samefile(parent, ROOT):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def resolve_source(setting):
     try:
         resolved = Path(setting).resolve(strict=True)
@@ -160,13 +180,13 @@ def resolve_source(setting):
         raise RuntimeError("cannot resolve") from None
     if not stat.S_ISREG(mode):
         raise RuntimeError("not a regular file")
-    if resolved.is_relative_to(ROOT.resolve()):
+    if inside_repository(resolved):
         raise RuntimeError("inside the repository")
     return str(resolved)
 
 
 def mount_for(path, target):
-    return {"type": "bind", "source": resolve_source(path), "target": target, "read_only": True, "bind": {"create_host_path": False}}
+    return {"type": "bind", "source": resolve_source(path).replace("$", "$$"), "target": target, "read_only": True, "bind": {"create_host_path": False}}
 """
 GOOD = (
     "CLINICAL_FILE = os.environ.get('CLINICAL_FILE', str(Path(LANDED_CACHE) / 'clinical_data.csv'))\n"
@@ -175,11 +195,18 @@ GOOD = (
 )
 
 
-def load_mount(source: str, root: Path) -> dict[str, Any]:
-    """Import only ``resolve_source`` and ``mount_for`` from ``source``, as a module of their own, with ``ROOT`` set to ``root``."""
+def load_mount(source: str, root: Path, *, cased: bool = False) -> dict[str, Any]:
+    """Import only the resolver functions and ``mount_for`` from ``source``, as a module of their own, with ``ROOT`` set to ``root``.
+
+    With ``cased`` the root is a ``Path`` whose ``resolve()`` gives the same directory in other letter case, as a case-insensitive file system can.
+    """
     tree = ast.parse(source)
-    wanted: list[ast.stmt] = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"resolve_source", "mount_for"}]
-    head = f"import os\nimport stat\nfrom pathlib import Path\nfrom typing import Any\n\nROOT = Path({str(root)!r})\n\n"
+    wanted: list[ast.stmt] = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"inside_repository", "resolve_source", "mount_for"}
+    ]
+    cased_class = "class CasedRoot(type(Path())):\n    def resolve(self, strict=False):\n        return Path(str(self).swapcase())\n\n\n" if cased else ""
+    root_text = f"CasedRoot({str(root)!r})" if cased else f"Path({str(root)!r})"
+    head = f"import os\nimport stat\nfrom pathlib import Path\nfrom typing import Any\n\n{cased_class}ROOT = {root_text}\n\n"
     text = head + "\n\n".join(ast.unparse(node) for node in wanted) + "\n"
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "mount_under_test.py"
@@ -192,36 +219,51 @@ def load_mount(source: str, root: Path) -> dict[str, Any]:
     return vars(module)
 
 
-def judge(source: str) -> list[str]:
+def judge(source: str, *, cased: bool = False) -> list[str]:
     """Run the mount of ``source`` over the cases and name each one it gets wrong: a source it binds that it must refuse, a refusal that holds a path, or a
-    bind whose source is not the one absolute real path."""
+    bind whose source is not the one absolute real path with every ``$`` doubled (Compose reads a single ``$`` as an interpolation).
+
+    The settings are given through a symlinked folder, so that the raw setting differs from the real path whatever the temporary folder is.
+    """
     wrong: list[str] = []
     with tempfile.TemporaryDirectory() as parent_name:
-        parent = Path(parent_name)
+        parent = Path(parent_name).resolve()
         repo, outside = parent / "repo", parent / "outside"
         (repo / "compose").mkdir(parents=True)
         outside.mkdir()
         (repo / "inside.csv").write_text("x")
+        (repo / "compose" / "deep").mkdir()
+        (repo / "compose" / "deep" / "deeper.csv").write_text("x")
+        (parent / "repo_alias").symlink_to(repo)
         (outside / "file.csv").write_text("x")
+        (outside / "clinical-$RELEASE.csv").write_text("x")
         (outside / "services").mkdir()
         (outside / "folder").mkdir()
+        (parent / "alias").symlink_to(outside)
         (outside / "link_to_folder").symlink_to(outside / "folder")
         (outside / "link_to_file").symlink_to(outside / "file.csv")
         (outside / "link_into_repo").symlink_to(repo / "inside.csv")
-        mount_for = load_mount(source, repo)["mount_for"]
-        for label, candidate in {"file": outside / "file.csv", "link to a file outside": outside / "link_to_file"}.items():
+        mount_for = load_mount(source, parent / "repo_alias", cased=cased)["mount_for"]
+        accepted = {
+            "file": (outside / "file.csv", outside / "file.csv"),
+            "file through an alias folder": (parent / "alias" / "file.csv", outside / "file.csv"),
+            "link to a file outside": (outside / "link_to_file", outside / "file.csv"),
+            "file with a dollar in its name": (outside / "clinical-$RELEASE.csv", outside / "clinical-$RELEASE.csv"),
+        }
+        for label, (candidate, real) in accepted.items():
             try:
                 bound = mount_for(str(candidate), "/t")["source"]
             except RuntimeError, OSError:
                 wrong.append(f"refused {label}")
                 continue
-            if bound != str((outside / "file.csv").resolve()) or not Path(bound).is_absolute():
-                wrong.append(f"{label} is not bound by its one real path")
+            if bound != str(real.resolve()).replace("$", "$$") or not Path(bound).is_absolute():
+                wrong.append(f"{label} is not bound by its one real path with every dollar doubled")
         refused = {
             "directory": outside / "folder",
             "link to a directory": outside / "link_to_folder",
             "file inside the repository": repo / "inside.csv",
             "directory inside the repository": repo / "compose",
+            "file in a subfolder of the repository": repo / "compose" / "deep" / "deeper.csv",
             "link into the repository": outside / "link_into_repo",
             "missing": outside / "none.csv",
         }
@@ -230,7 +272,7 @@ def judge(source: str) -> list[str]:
                 mount_for(str(candidate), "/t")
                 wrong.append(f"bound {label}")
             except (RuntimeError, OSError) as error:
-                if parent_name in str(error) or str(parent.resolve()) in str(error):
+                if parent_name in str(error) or str(parent) in str(error):
                     wrong.append(f"the refusal of {label} names the path")
         with contextlib.chdir(outside):
             try:
@@ -246,6 +288,23 @@ def judge(source: str) -> list[str]:
     return wrong
 
 
+def case_variant_wrong(source: str) -> list[str]:
+    """On a file system that ignores letter case: a file in ``infolder`` is the file in the repository root ``InFolder`` and must be refused."""
+    with tempfile.TemporaryDirectory() as parent_name:
+        parent = Path(parent_name).resolve()
+        (parent / "InFolder").mkdir()
+        (parent / "InFolder" / "clinical.csv").write_text("x")
+        variant = parent / "infolder" / "clinical.csv"
+        if not variant.exists():
+            return ["skip"]
+        mount_for = load_mount(source, parent / "InFolder")["mount_for"]
+        try:
+            mount_for(str(variant), "/t")
+        except RuntimeError, OSError:
+            return []
+        return ["bound a file of the repository through a case variant of its path"]
+
+
 class Behaviour(unittest.TestCase):
     def sources(self) -> list[tuple[str, str]]:
         found = [("template", GOOD)]
@@ -258,18 +317,35 @@ class Behaviour(unittest.TestCase):
             with self.subTest(source=label):
                 self.assertEqual([], judge(source))
 
+    def test_a_root_that_the_text_cannot_match_is_still_matched_by_identity(self) -> None:
+        for label, source in self.sources():
+            with self.subTest(source=label):
+                self.assertEqual([], judge(source, cased=True))
+
+    def test_a_case_variant_of_a_repository_path_is_refused_where_the_file_system_ignores_case(self) -> None:
+        for label, source in self.sources():
+            with self.subTest(source=label):
+                found = case_variant_wrong(source)
+                if found == ["skip"]:
+                    self.skipTest("this file system is case-sensitive; the cased-root case covers the same rule")
+                self.assertEqual([], found)
+
     def test_each_weaker_resolver_gets_a_case_wrong(self) -> None:
         for old, new in (
             ('    if not stat.S_ISREG(mode):\n        raise RuntimeError("not a regular file")\n', ""),
-            ('    if resolved.is_relative_to(ROOT.resolve()):\n        raise RuntimeError("inside the repository")\n', ""),
-            ("resolved.is_relative_to(ROOT.resolve())", "resolved.is_relative_to(ROOT)"),
+            ('    if inside_repository(resolved):\n        raise RuntimeError("inside the repository")\n', ""),
+            ("os.path.samefile(parent, ROOT)", "parent == ROOT"),
+            ("os.path.samefile(parent, ROOT)", "str(parent) == str(ROOT.resolve())"),
+            ("for parent in resolved.parents:", "for parent in [resolved.parent]:"),
             ("Path(setting).resolve(strict=True)", "Path(setting).absolute()"),
             ("    return str(resolved)", "    return setting"),
-            ('"source": resolve_source(path)', '"source": path'),
+            ('"source": resolve_source(path).replace("$", "$$")', '"source": resolve_source(path)'),
+            ('"source": resolve_source(path).replace("$", "$$")', '"source": path'),
             ("mode = os.lstat(resolved).st_mode", "mode = os.lstat(setting).st_mode"),
         ):
             with self.subTest(change=new[:40]):
-                self.assertTrue(judge(GOOD.replace(old, new)), "the weaker resolver got every case right")
+                weaker = GOOD.replace(old, new)
+                self.assertTrue(judge(weaker) or judge(weaker, cased=True), "the weaker resolver got every case right")
 
     def test_the_template_and_the_runner_only_look_at_metadata(self) -> None:
         self.assertEqual([], metadata_problems(GOOD))
