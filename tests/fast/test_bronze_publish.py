@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Callable
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze.checks import GUARD_KEY, GUARD_STRUCTURE, CheckResult, Verdict, plan, verdict
 from spark.bronze.publication import (
+    GUARD_BASE_MOVED,
     GUARD_BRANCH_MOVED,
     Entry,
     MergeOutcomeOpen,
@@ -56,6 +58,9 @@ class FakeNessie:
         self.head_reads = 0
         self.move_after_reads: int | None = None
         self.pending: set[str] = set()
+        self.base_moved = False
+        self.descends_calls: list[tuple[str, str, str]] = []
+        self.after_marker: Callable[[], None] | None = None
         self.pending_events: list[str] = []
 
     def is_branch(self, name: str) -> bool:
@@ -92,12 +97,19 @@ class FakeNessie:
         }
         return MERGED
 
-    def pending_exists(self, name: str) -> bool:
-        return name in self.pending
+    def descends(self, branch: str, branch_hash: str, base_hash: str) -> bool:
+        self.descends_calls.append((branch, branch_hash, base_hash))
+        return not self.base_moved
 
-    def set_pending(self, name: str, branch: str, branch_hash: str) -> None:
+    def set_pending(self, name: str, branch: str, branch_hash: str) -> bool:
+        if name in self.pending:
+            self.pending_events.append(f"lost:{name}")
+            return False
         self.pending_events.append(f"set:{name}")
         self.pending.add(name)
+        if self.after_marker is not None:
+            self.after_marker()
+        return True
 
     def clear_pending(self, name: str) -> None:
         self.pending_events.append(f"clear:{name}")
@@ -281,6 +293,63 @@ class OutputBindingTest(unittest.TestCase):
         self.assertEqual("merged", publish(nessie, Checker(), BRANCH, BASE, EXPECTED).status)
 
 
+class DivergentBaseTest(unittest.TestCase):
+    """The merge brings the branch's own commits, so a base that moved since the branch was made would give a mixed result: nothing is sent."""
+
+    def test_a_base_that_is_not_the_merge_base_of_the_branch_blocks_the_publication_before_the_marker_and_the_merge(self) -> None:
+        nessie = FakeNessie()
+        nessie.base_moved = True
+        result = publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
+        self.assertEqual(("blocked", [GUARD_BASE_MOVED]), (result.status, result.blocked_by))
+        self.assertEqual(([], [], BASE_HEAD), (nessie.merge_calls, nessie.pending_events, nessie.heads[BASE]))
+        self.assertEqual({}, result.snapshots)
+
+    def test_the_branch_is_asked_at_the_checked_hash_whether_it_descends_from_the_base_head_that_was_read(self) -> None:
+        nessie = FakeNessie()
+        publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
+        self.assertEqual([(BRANCH, HEAD, BASE_HEAD)], nessie.descends_calls)
+
+    def test_a_merge_found_in_the_history_is_reported_even_though_the_base_has_moved_since(self) -> None:
+        nessie = FakeNessie()
+        nessie.land(BRANCH, HEAD)
+        nessie.base_moved = True
+        self.assertEqual("unchanged", publish(nessie, Checker(), BRANCH, BASE, EXPECTED).status)
+
+
+class FullContentTest(unittest.TestCase):
+    """Entries are compared by their whole content, so a change that only a property of a namespace or a table shows is a change."""
+
+    def refused(self, nessie: FakeNessie) -> str:
+        with self.assertRaises(PublicationError) as raised:
+            publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
+        self.assertEqual([], nessie.merge_calls)
+        return str(raised.exception)
+
+    def test_a_namespace_that_the_base_has_with_other_properties_is_refused(self) -> None:
+        nessie = FakeNessie()
+        nessie.entries_at[f"{BASE}@{BASE_HEAD}"] = {"other": Entry("NAMESPACE", content='{"properties": {"a": "1"}}')}
+        nessie.entries_at[f"{BRANCH}@{HEAD}"]["other"] = Entry("NAMESPACE", content='{"properties": {"a": "2"}}')
+        self.assertIn("other", self.refused(nessie))
+
+    def test_a_namespace_that_holds_the_tables_may_differ_but_another_with_changed_properties_may_not(self) -> None:
+        nessie = FakeNessie()
+        nessie.entries_at[f"{BASE}@{BASE_HEAD}"] = {"bronze": Entry("NAMESPACE", content='{"properties": {"a": "1"}}')}
+        self.assertEqual("merged", publish(nessie, Checker(), BRANCH, BASE, EXPECTED).status)
+
+    def test_an_entry_of_another_table_that_differs_only_in_its_content_is_refused(self) -> None:
+        nessie = FakeNessie()
+        same = {"bronze.other": Entry("ICEBERG_TABLE", "s3://w/o.json", 3, '{"schemaId": 0}')}
+        nessie.entries_at[f"{BASE}@{BASE_HEAD}"] = same
+        nessie.entries_at[f"{BRANCH}@{HEAD}"]["bronze.other"] = Entry("ICEBERG_TABLE", "s3://w/o.json", 3, '{"schemaId": 1}')
+        self.assertIn("bronze.other", self.refused(nessie))
+
+    def test_a_merged_table_that_differs_from_the_checked_one_only_in_its_content_is_refused(self) -> None:
+        nessie = FakeNessie()
+        nessie.merge_changes_content = True
+        with self.assertRaises(PublicationError):
+            publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
+
+
 class RecoveredMergeTest(unittest.TestCase):
     def test_a_merge_found_in_the_history_from_an_earlier_run_must_hold_the_checked_tables(self) -> None:
         nessie = FakeNessie()
@@ -339,6 +408,28 @@ class PendingMergeTest(unittest.TestCase):
             publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
         self.assertEqual(set(), nessie.pending)
 
+    def test_a_publisher_that_does_not_create_the_marker_sends_zero_merge_requests_and_reports_the_open_outcome(self) -> None:
+        nessie = FakeNessie()
+        nessie.pending.add(pending_name(HEAD))
+        with self.assertRaises(MergeOutcomeOpen) as raised:
+            publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
+        self.assertEqual([], nessie.merge_calls)
+        self.assertEqual({pending_name(HEAD)}, nessie.pending)
+        self.assertEqual([f"lost:{pending_name(HEAD)}"], nessie.pending_events)
+        self.assertIn(pending_name(HEAD), str(raised.exception))
+
+    def test_the_history_is_read_again_after_the_marker_is_made_and_a_merge_found_then_is_not_sent_again(self) -> None:
+        nessie = FakeNessie()
+
+        def land_meanwhile() -> None:
+            nessie.land(BRANCH, HEAD)
+
+        nessie.after_marker = land_meanwhile
+        result = publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
+        self.assertEqual(("unchanged", MERGED), (result.status, result.merged_hash))
+        self.assertEqual([], nessie.merge_calls)
+        self.assertEqual(set(), nessie.pending)
+
     def test_a_marker_does_not_stop_a_branch_that_was_checked_at_another_hash(self) -> None:
         nessie = FakeNessie()
         nessie.pending.add(pending_name(MOVED))
@@ -375,8 +466,24 @@ class EntriesTest(unittest.TestCase):
         return found
 
     def test_a_table_is_its_dotted_name_with_its_metadata_location_and_snapshot_and_a_namespace_is_its_kind_alone(self) -> None:
-        found = self.read([table_item(["bronze", "tracks"]), {"type": "NAMESPACE", "name": {"elements": ["bronze"]}}])
-        self.assertEqual({"bronze.tracks": Entry("ICEBERG_TABLE", "s3://w/m.json", 5), "bronze": Entry("NAMESPACE")}, found)
+        found = self.read(
+            [
+                table_item(["bronze", "tracks"]),
+                {"type": "NAMESPACE", "name": {"elements": ["bronze"]}, "content": {"type": "NAMESPACE", "properties": {"a": "1"}}},
+            ]
+        )
+        self.assertEqual(
+            {
+                "bronze.tracks": Entry("ICEBERG_TABLE", "s3://w/m.json", 5, json.dumps(table_item(["bronze", "tracks"])["content"], sort_keys=True)),
+                "bronze": Entry("NAMESPACE", content=json.dumps({"properties": {"a": "1"}, "type": "NAMESPACE"}, sort_keys=True)),
+            },
+            found,
+        )
+
+    def test_two_namespaces_that_differ_only_in_a_property_are_two_entries(self) -> None:
+        first = self.read([{"type": "NAMESPACE", "name": {"elements": ["a"]}, "content": {"type": "NAMESPACE", "properties": {"k": "1"}}}])
+        second = self.read([{"type": "NAMESPACE", "name": {"elements": ["a"]}, "content": {"type": "NAMESPACE", "properties": {"k": "2"}}}])
+        self.assertNotEqual(first["a"], second["a"])
 
     def test_a_table_with_no_snapshot_is_none_and_not_a_number(self) -> None:
         self.assertEqual(None, self.read([table_item(["bronze", "tracks"], snapshot=-1)])["bronze.tracks"].snapshot_id)
@@ -404,24 +511,24 @@ class MarkerTest(unittest.TestCase):
             }
         )
         publisher = NessiePublisher(client)
-        publisher.set_pending(name, BRANCH, HEAD)
+        self.assertTrue(publisher.set_pending(name, BRANCH, HEAD))
         self.assertEqual({"type": "BRANCH", "name": BRANCH, "hash": HEAD}, client.requests[0][2])
-        self.assertTrue(publisher.pending_exists(name))
         publisher.clear_pending(name)
         self.assertEqual(("DELETE", f"/api/v2/trees/{name}@{HEAD}?type=TAG"), client.requests[-1][:2])
 
-    def test_a_marker_that_is_absent_is_not_pending_and_clearing_it_sends_no_delete(self) -> None:
+    def test_clearing_a_marker_that_is_absent_sends_no_delete(self) -> None:
         name = pending_name(HEAD)
         client = ScriptedClient({f"GET /api/v2/trees/{name}": (404, {"errorCode": "REFERENCE_NOT_FOUND", "message": "x"})})
-        publisher = NessiePublisher(client)
-        self.assertFalse(publisher.pending_exists(name))
-        publisher.clear_pending(name)
-        self.assertEqual(["GET", "GET"], [request[0] for request in client.requests])
+        NessiePublisher(client).clear_pending(name)
+        self.assertEqual(["GET"], [request[0] for request in client.requests])
 
-    def test_a_marker_that_exists_already_is_not_made_again(self) -> None:
+    def test_a_marker_that_another_publisher_holds_is_reported_as_not_made_and_any_other_refusal_is_an_error(self) -> None:
         name = pending_name(HEAD)
-        client = ScriptedClient({f"POST /api/v2/trees?name={name}&type=TAG": (409, {"errorCode": "REFERENCE_ALREADY_EXISTS", "message": "x"})})
-        NessiePublisher(client).set_pending(name, BRANCH, HEAD)
+        held = ScriptedClient({f"POST /api/v2/trees?name={name}&type=TAG": (409, {"errorCode": "REFERENCE_ALREADY_EXISTS", "message": "x"})})
+        self.assertFalse(NessiePublisher(held).set_pending(name, BRANCH, HEAD))
+        refused = ScriptedClient({f"POST /api/v2/trees?name={name}&type=TAG": (400, {"errorCode": "BAD_REQUEST", "message": "x"})})
+        with self.assertRaises(NessieError):
+            NessiePublisher(refused).set_pending(name, BRANCH, HEAD)
 
 
 class LogClient(NessieClient):
@@ -443,6 +550,29 @@ def entry(commit: str, message: str) -> dict[str, Any]:
 
 def page(entries: list[dict[str, Any]], token: str | None = None) -> dict[str, Any]:
     return {"logEntries": entries, "hasMore": token is not None, **({"token": token} if token else {})}
+
+
+class DescendsTest(unittest.TestCase):
+    def ask(self, pages: list[dict[str, Any]]) -> tuple[bool, LogClient]:
+        client = LogClient(pages)
+        return NessiePublisher(client).descends(BRANCH, HEAD, BASE_HEAD), client
+
+    def test_the_branch_descends_from_a_base_head_that_is_a_commit_in_its_log_at_the_checked_hash(self) -> None:
+        found, client = self.ask([page([entry(HEAD, "tip"), entry(BASE_HEAD, "base")])])
+        self.assertTrue(found)
+        self.assertEqual([("GET", f"/api/v2/trees/{BRANCH}@{HEAD}/history?max-records=500")], client.requests)
+
+    def test_a_branch_whose_log_does_not_hold_the_base_head_does_not_descend_from_it(self) -> None:
+        self.assertFalse(self.ask([page([entry(HEAD, "tip"), entry(MOVED, "other")])])[0])
+
+    def test_the_log_is_followed_through_its_pages(self) -> None:
+        found, client = self.ask([page([entry(HEAD, "tip")], "t1"), page([entry(BASE_HEAD, "base")])])
+        self.assertTrue(found)
+        self.assertIn("page-token=t1", client.requests[1][1])
+
+    def test_a_log_that_is_not_in_the_expected_form_is_an_error_and_not_a_branch_that_does_not_descend(self) -> None:
+        with self.assertRaises(NessieError):
+            self.ask([{"logEntries": "x", "hasMore": False}])
 
 
 class HistorySearchTest(unittest.TestCase):

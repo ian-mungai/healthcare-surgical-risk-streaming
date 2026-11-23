@@ -27,6 +27,7 @@ from spark.bronze_clinical_lab_run import RESULT_PREFIX, finish, parser, run_job
 from spark.settings import SettingsError
 
 HASH = "a" * 64
+HEAD_B = "b" * 64
 TRUNK = "trunk"
 BRANCH = "bronze_run"
 STRING = "string"
@@ -70,7 +71,8 @@ class FakeNessie:
 
     def content(self, reference: str, table: str) -> TableContent | None:
         self.calls.append(f"content:{reference.replace(HASH, 'H')}:{table}")
-        return self.contents.get((reference, table))
+        found = self.contents.get((reference, table))
+        return self.contents.get((BRANCH, table)) if found is None and reference == f"{BRANCH}@{HEAD_B}" else found
 
     def create_branch(self, name: str, from_branch: str, source_hash: str) -> None:
         self.calls.append(f"create_branch:{name}:{from_branch}:{source_hash[:4]}")
@@ -82,7 +84,7 @@ class FakeNessie:
 
     def head(self, branch: str) -> str:
         self.calls.append(f"head:{branch}")
-        return "b" * 64
+        return HEAD_B
 
 
 def correct_numbers(rows: Sequence[tuple[str | None, str | None, str | None, str | None]]) -> list[tuple[Any, ...]]:
@@ -204,12 +206,12 @@ class Harness:
         return {check["name"] for table in result["tables"].values() for check in table["checks"] if not check["passed"]}
 
 
-def verify_calls(kind: str) -> list[str]:
+def verify_calls(kind: str, reference: str = BRANCH) -> list[str]:
     source = SOURCES[0] if kind == "clinical" else SOURCES[1]
     calls = [
-        f"content:{BRANCH}:{source}",
+        f"content:{reference}:{source}",
         f"content:{TRUNK}@H:{source}",
-        f"content:{BRANCH}:{BRONZE[kind]}",
+        f"content:{reference}:{BRONZE[kind]}",
         f"bronze_columns:{kind}",
         f"null_keys:{kind}",
         f"source_count:{kind}",
@@ -226,9 +228,9 @@ def start_calls(command: str) -> list[str]:
     calls = ["default_branch", f"history_contains:{TRUNK}:aaaa"]
     if command == "write":
         calls += [f"content:{TRUNK}@H:{SOURCES[0]}", f"content:{TRUNK}@H:{SOURCES[1]}", f"create_branch:{BRANCH}:{TRUNK}:aaaa"]
-    else:
-        calls += [f"is_branch:{BRANCH}"]
-    return [*calls, f"open:{BRANCH}:{TRUNK}:aaaa", "source_columns:clinical", "source_columns:lab"]
+        return [*calls, f"open:{BRANCH}:{TRUNK}:aaaa", "source_columns:clinical", "source_columns:lab"]
+    calls += [f"is_branch:{BRANCH}", f"head:{BRANCH}"]
+    return [*calls, f"open:{BRANCH}:{TRUNK}:aaaa:bbbb", "source_columns:clinical", "source_columns:lab"]
 
 
 class SequenceTest(unittest.TestCase):
@@ -251,7 +253,8 @@ class SequenceTest(unittest.TestCase):
     def test_verify_runs_every_check_and_writes_nothing(self) -> None:
         harness = Harness()
         result = harness.run("verify")
-        expected = [*start_calls("verify"), *verify_calls("clinical"), *verify_calls("lab"), "close", f"head:{BRANCH}"]
+        pinned = f"{BRANCH}@{HEAD_B}"
+        expected = [*start_calls("verify"), *verify_calls("clinical", pinned), *verify_calls("lab", pinned), "close"]
         self.assertEqual(expected, harness.calls)
         self.assertTrue(result["passed"])
         self.assertFalse([call for call in harness.calls if call.startswith(("write", "prepare", "create_branch"))])
@@ -306,9 +309,20 @@ class PinnedBranchTest(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("source_changed", harness.failed(result))
 
-    def test_without_a_hash_the_branch_is_read_by_its_name_as_before(self) -> None:
+    def test_a_verify_with_no_hash_resolves_the_head_once_at_its_start_and_uses_it_for_every_read_and_the_result(self) -> None:
         harness = Harness()
-        harness.run("verify")
+        result = harness.run("verify")
+        self.assertEqual(1, harness.calls.count(f"head:{BRANCH}"))
+        self.assertLess(harness.calls.index(f"head:{BRANCH}"), next(i for i, call in enumerate(harness.calls) if call.startswith("open:")))
+        self.assertEqual(HEAD_B, harness.spark.pinned)
+        self.assertEqual(HEAD_B, result["branch_hash"])
+        reads = [call for call in harness.calls if call.startswith(f"content:{BRANCH}")]
+        self.assertTrue(reads)
+        self.assertTrue(all(call.startswith(f"content:{BRANCH}@{HEAD_B}:") for call in reads), reads)
+
+    def test_a_write_reads_the_head_by_the_branch_name_because_it_writes_there(self) -> None:
+        harness = Harness()
+        harness.run("write")
         self.assertIsNone(harness.spark.pinned)
         self.assertIn(f"content:{BRANCH}:{SOURCES[0]}", harness.calls)
 

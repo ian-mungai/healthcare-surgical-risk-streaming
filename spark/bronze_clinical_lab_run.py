@@ -233,7 +233,8 @@ def run_job(
     created from that hash, the Spark session opens on the run branch and on the pinned reference, the columns are checked, both tables are written
     and then every check runs. ``verify``: the same up to the branch, which must exist, and the same checks without a write.
 
-    With ``branch_hash`` (``verify`` only) every read of the branch is at that hash: Nessie's metadata through ``branch@hash`` and the Spark catalog of the run
+    ``verify`` reads the branch at one hash for everything it does: ``branch_hash``, or the head that it resolves once, after it has found that the branch is
+    a branch, when none is given. With it every read of the branch is at that hash: Nessie's metadata through ``branch@hash`` and the Spark catalog of the run
     branch pinned to it, so the checks judge exactly the commit that a publication will merge, whatever the branch's head is by then.
     """
     if branch_hash is not None and (command != "verify" or not HASH.fullmatch(branch_hash)):
@@ -251,6 +252,8 @@ def run_job(
         nessie.create_branch(branch, default_branch, source_hash)
     elif not nessie.is_branch(branch):
         raise NessieError(f"{branch} is not a branch")
+    if command == "verify" and branch_hash is None:
+        branch_hash = nessie.head(branch)
     reference = branch if branch_hash is None else f"{branch}@{branch_hash}"
     spark = open_spark(branch, default_branch, source_hash, branch_hash)
     try:
