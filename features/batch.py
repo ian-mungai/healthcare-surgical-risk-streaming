@@ -22,6 +22,8 @@ from features import document
 from features.leakage import LeakageError, row_problems
 from features.model import FeatureInputError, FeatureRow, WindowInput
 from features.row import build_row
+from scripts.ingestion.notice import ClosedError, render
+from scripts.ingestion.output_path import refuse_output_over_input
 
 
 def compute_rows(windows: Iterable[WindowInput], include_sensitivity: bool = False) -> list[FeatureRow]:
@@ -72,8 +74,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write("usage: python -m features.batch WINDOWS.json ROWS.json\n")
         return 2
     try:
+        refuse_output_over_input([Path(arguments[1])], [Path(arguments[0])])
         run(Path(arguments[0]), Path(arguments[1]))
-    except (FeatureInputError, LeakageError, OSError, KeyError, TypeError, ValueError) as error:
+    except ClosedError as error:
+        sys.stderr.write("".join(f"features.batch: {render(notice)}\n" for notice in error.notices))
+        return 2
+    except OSError:
+        sys.stderr.write("features.batch: the windows file cannot be read or the rows file cannot be written\n")
+        return 2
+    except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
         sys.stderr.write(f"features.batch: {error}\n")
         return 2
     return 0

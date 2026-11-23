@@ -7,20 +7,23 @@ the same path, a relative and an absolute spelling, a symbolic link and a hard l
 
 from __future__ import annotations
 
-import ast
 import contextlib
+import importlib
 import io
+import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from features import batch as features_batch
 from scripts.ingestion import cli, copy_cost, copy_probe, staging_peak
 from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.notice import Code, Notice, render
 from scripts.ingestion.output_path import refuse_output_over_input, same_file
 from scripts.sample import candidates
-from tests.fast.git_fixture import ROOT
 
 ORIGINAL = "original text\n"
 REFUSAL = render(Notice(Code.OUTPUT_IS_INPUT))
@@ -123,18 +126,83 @@ class CommandTests(Fixture):
         self.assertIn(REFUSAL, err.getvalue())
         self.assertEqual(ORIGINAL, release.read_text())
 
-    def test_the_replay_commands_check_their_output_against_the_run_record(self) -> None:
-        """The replay program imports ``vitaldb``, which only its image holds, so this test reads its source; the image run takes the behavior."""
-        source = (ROOT / "replay" / "service" / "__main__.py").read_text()
-        calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "refuse_output_over_input"]
-        self.assertEqual(1, len(calls))
-        self.assertEqual(
-            ["getattr(arguments, 'out', None)", "arguments.run_record"],
-            [ast.unparse(argument) for argument in (calls[0].args[0].elts if isinstance(calls[0].args[0], ast.List) else [])]
-            + [ast.unparse(argument) for argument in (calls[0].args[1].elts if isinstance(calls[0].args[1], ast.List) else [])],
-        )
-        index = source.index("refuse_output_over_input(")
-        self.assertLess(index, source.index("arguments.run_record.read_text()"))
+    def test_an_output_that_reaches_an_input_through_a_missing_folder_and_a_hard_link_is_refused(self) -> None:
+        samples = self.made("samples.jsonl")
+        os.link(samples, self.root / "alias.jsonl")
+        code, err = self.run_main(staging_peak.main, ["peak", "--samples", str(samples), "--output", str(self.root / "new" / ".." / "alias.jsonl")])
+        self.assertEqual(1, code)
+        self.assertIn(REFUSAL, err)
+        self.assertEqual(ORIGINAL, samples.read_text())
+        self.assertFalse((self.root / "new").exists())
+
+    def test_every_replay_command_refuses_an_output_that_any_input_of_the_run_names(self) -> None:
+        for command in ("manifest", "observe"):
+            for shared in ("run.json", "state/schedule.json", "state/state.json", "reference.json"):
+                with self.subTest(command=command, shared=shared):
+                    record = self.replay_record(command, shared)
+                    code, err = self.run_replay([command, "--run-record", str(self.root / "run.json"), "--out", str(self.root / shared)])
+                    self.assertEqual(2, code)
+                    self.assertIn(REFUSAL, err)
+                    self.assertEqual(record, (self.root / shared).read_text())
+                    self.assertEqual([], sorted(path.name for path in self.root.rglob(".*")))
+
+    def replay_record(self, command: str, shared: str) -> str:
+        """Write a run record, the files that it names and the file ``shared``; return the text of that file."""
+        (self.root / "state").mkdir(exist_ok=True)
+        document = {
+            "run_id": f"r_{command}",
+            "rooms": 1,
+            "speed": 1,
+            "stagger_seconds": 0,
+            "turnover_seconds": 0,
+            "window_seconds": 60,
+            "manifest_reference": str(self.root / "reference.json"),
+            "object_store": {"kind": "folder", "root": str(self.root / "store")},
+            "kafka_bootstrap": "kafka:9092",
+            "registry_url": "http://registry:8081",
+            "state_dir": str(self.root / "state"),
+        }
+        for name in ("run.json", "state/schedule.json", "state/state.json", "reference.json"):
+            (self.root / name).write_text(ORIGINAL)
+        (self.root / "run.json").write_text(json.dumps(document))
+        return (self.root / shared).read_text()
+
+    def run_replay(self, argv: list[str]) -> tuple[int, str]:
+        """Run the replay program with the packages that only its image holds replaced by stand-ins, so its own command line and guard run."""
+        stubs: dict[str, object] = {}
+        while True:
+            with mock.patch.dict(sys.modules, stubs):
+                for name in [name for name in sys.modules if name.startswith("replay.service")]:
+                    del sys.modules[name]
+                try:
+                    program = importlib.import_module("replay.service.__main__")
+                except ModuleNotFoundError as error:
+                    if error.name is None or error.name in stubs:
+                        raise
+                    stubs[error.name] = mock.MagicMock()
+                    continue
+                return self.run_main(program.main, argv)
+
+    def test_a_replay_command_that_cannot_read_its_run_record_names_the_argument_and_not_the_path(self) -> None:
+        missing = self.root / "secret_folder_marker" / "run.json"
+        code, err = self.run_replay(["observe", "--run-record", str(missing), "--out", str(self.root / "out.json")])
+        self.assertNotEqual(0, code)
+        self.assertNotIn("secret_folder_marker", err)
+        self.assertNotIn("run.json", err)
+
+    def test_features_batch_refuses_a_rows_file_that_is_its_windows_file(self) -> None:
+        windows = self.made("windows.json")
+        for target in (windows, self.root / "sub" / ".." / "windows.json"):
+            with self.subTest(target=str(target)):
+                code, err = self.run_main(features_batch.main, [str(windows), str(target)])
+                self.assertEqual(2, code)
+                self.assertIn(REFUSAL, err)
+                self.assertEqual(ORIGINAL, windows.read_text())
+
+    def test_features_batch_names_no_path_when_it_cannot_read_a_file(self) -> None:
+        code, err = self.run_main(features_batch.main, [str(self.root / "secret_name_marker.json"), str(self.root / "rows.json")])
+        self.assertEqual(2, code)
+        self.assertNotIn("secret_name_marker", err)
 
 
 if __name__ == "__main__":

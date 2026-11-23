@@ -123,6 +123,8 @@ class Subject(StrEnum):
     JOB_RECORD = "the job record"
     JOB_LOG = "the job log"
     STAGING_SAMPLES = "the staging samples"
+    RUN_RECORD = "the run record"
+    ROUTES_FILE = "the routes file"
     STAGING_PEAK = "the staging peak record"
     SAMPLE_PIN = "the Platform sample pin"
 

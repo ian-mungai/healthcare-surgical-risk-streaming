@@ -54,6 +54,11 @@ class RunRecord:
     def schedule_path(self) -> Path:
         return Path(self.state_dir) / "schedule.json"
 
+    @property
+    def input_paths(self) -> tuple[Path, ...]:
+        """The files that the record names and a command reads or keeps: the saved state, the frozen schedule and the manifest reference."""
+        return (self.state_path, self.schedule_path, Path(self.manifest_reference))
+
 
 REQUIRED: dict[str, type | tuple[type, ...]] = {
     "run_id": str,

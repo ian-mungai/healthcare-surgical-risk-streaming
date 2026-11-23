@@ -42,11 +42,11 @@ from replay.service.serve import Outcome, healthy, queued_record, serve, submit_
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
-from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.closed import ClosedInputError, QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
-from scripts.ingestion.notice import ClosedError, render
-from scripts.ingestion.output_path import refuse_output_over_input
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.output_path import refuse_output_inside_folders, refuse_output_over_input
 from scripts.ingestion.store import StoreError
 
 READ_DEADLINE_SECONDS = 600.0
@@ -260,6 +260,14 @@ STOPPING_ERRORS = (
 )
 
 
+def read_run_record(path: Path) -> str:
+    """The text of the run record file. A file that cannot be read is named by its role and never by its path."""
+    try:
+        return path.read_text()
+    except OSError, UnicodeDecodeError:
+        raise ClosedInputError(Notice(Code.CANNOT_READ, subject=Subject.RUN_RECORD)) from None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -289,8 +297,11 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command in service_commands:
         return service_commands[arguments.command](arguments)
     try:
-        refuse_output_over_input([getattr(arguments, "out", None)], [arguments.run_record])
-        record = parse_run_record(arguments.run_record.read_text())
+        output = getattr(arguments, "out", None)
+        refuse_output_over_input([output], [arguments.run_record])
+        record = parse_run_record(read_run_record(arguments.run_record))
+        refuse_output_over_input([output], record.input_paths)
+        refuse_output_inside_folders([output], [Path(record.object_store.root) if record.object_store.root else None])
         return COMMANDS[arguments.command](record, arguments)
     except ClosedError as error:
         sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
