@@ -5,10 +5,10 @@
 
 The result is the file ``scripts.ingestion.cli check`` wrote. It must be a passed result that was not edited. The connection is incremental, so a run
 writes only the versions that are new, while the result lists every verified version. The estimate counts the versions whose retrieval time (the time S3
-gives the written version) is at or after ``--since`` and, when ``--until`` is given, before it: the start and the end of this copy, as ISO 8601 times with
-a zone, in whole seconds: S3 records a version's time to the whole second, so a fraction is refused. A run that wrote nothing estimates zero
-payload writes. ``--extra-objects`` is the number of other objects this run landed under the landing
-prefix (the metadata records), which the result does not list; the owner reads it from the bucket's listing. The record holds counts, bytes, prices and
+gives the written version) is at or after ``--since`` and, when ``--until`` is given, before it: the start and the end of this copy, as times in the one
+form ``YYYY-MM-DDTHH:MM:SS`` then ``Z`` or ``+HH:MM`` or ``-HH:MM``. S3 records a version's time to the whole second, so no fraction is accepted and any
+other form is refused. A run that wrote nothing estimates zero payload writes. ``--extra-objects`` is the number of other objects this run landed under the
+landing prefix (the metadata records), which the result does not list; the owner reads it from the bucket's listing. The record holds counts, bytes, prices and
 money, never a key, a bucket, a version or a label of the result. The same result gives the same bytes. The output is a new file for its owner only.
 
 What the estimate says. The destination writes each payload object to the project's bucket in the host's own region, so the project pays only the write
@@ -39,6 +39,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -85,15 +86,17 @@ def high_requests(size: int) -> int:
     return max(1, math.ceil(size / SMALLEST_PART_BYTES)) + 2
 
 
+INSTANT_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})")
+
+
 def parse_instant(text: str) -> datetime:
-    """A time in ISO 8601 form with a zone. Any other text is refused, and the message holds none of it."""
+    """A time in the one form ``YYYY-MM-DDTHH:MM:SS`` then ``Z`` or ``+HH:MM`` or ``-HH:MM``. Any other text is refused, and the message holds none of it."""
+    if INSTANT_FORM.fullmatch(text) is None:
+        raise CostError("a time is not in the form YYYY-MM-DDTHH:MM:SS with Z or an offset")
     try:
-        instant = datetime.fromisoformat(text)
+        return datetime.fromisoformat(text)
     except ValueError:
-        raise CostError("a time is not an ISO 8601 time with a zone") from None
-    if instant.tzinfo is None:
-        raise CostError("a time is not an ISO 8601 time with a zone")
-    return instant
+        raise CostError("a time is not in the form YYYY-MM-DDTHH:MM:SS with Z or an offset") from None
 
 
 def estimate(result: CheckResult, *, region: str, extra_objects: int, since: datetime, until: datetime | None = None) -> dict[str, Any]:
@@ -106,8 +109,6 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int, since: dat
         raise CostError("the code holds no prices for this region")
     if extra_objects < 0:
         raise CostError("the number of extra objects is below zero")
-    if since.microsecond or (until is not None and until.microsecond):
-        raise CostError("a time of the window is not a whole second")
     if until is not None and until <= since:
         raise CostError("the end of the window is not after its start")
     if any(file.size < 0 for file in result.files):
@@ -180,9 +181,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--since",
         type=instant_argument,
         required=True,
-        help="the start of the copy, an ISO 8601 time with a zone, in whole seconds because S3 records a version's time to the whole second",
+        help="the start of the copy as YYYY-MM-DDTHH:MM:SS then Z or +HH:MM or -HH:MM, with no fraction: S3 records a version's time to the second",
     )
-    command.add_argument("--until", type=instant_argument, help="the end of the copy, in whole seconds as for --since; the run's last write when absent")
+    command.add_argument(
+        "--until", type=instant_argument, help="the end of the copy, in the form of --since with no fraction; the run's last write when absent"
+    )
     command.add_argument("--extra-objects", type=whole_number, default=0, help="the other objects the copy landed under the landing prefix")
     command.add_argument("--output", type=Path, required=True, help="a new file for the record")
     arguments = command.parse_args(argv)

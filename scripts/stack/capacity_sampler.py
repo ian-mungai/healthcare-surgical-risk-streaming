@@ -1,9 +1,9 @@
 """The capacity sampler: one JSON line for each iteration, as read, and nothing else.
 
-``.venv/bin/python -m scripts.stack.capacity_sampler --output <new file> --interval-seconds <n> --max-seconds <n>`` starts nothing, launches nothing,
-cleans up nothing and derives nothing. The owner or the lead starts the always-on group and the Spark job with the existing stack commands in one
-terminal and runs the sampler in another, from before the group starts until after the job ends. The sampler never compares a figure with a limit and
-never states a judgment. The owner reads the file.
+``.venv/bin/python -m scripts.stack.capacity_sampler --output <new file> --interval-seconds <n> --max-seconds <n>`` starts no service and no job (the
+only programs it runs are the docker readings and, for a staging source, the read-only walk below), cleans up nothing and derives nothing. The owner or
+the lead starts the always-on group and the Spark job with the existing stack commands in one terminal and runs the sampler in another, from before the
+group starts until after the job ends. The sampler never compares a figure with a limit and never states a judgment. The owner reads the file.
 
 The file starts with a ``header`` line (the schema, the start time, the interval, the files read and the configured limits copied from
 ``compose/limits.yml``) and ends with an ``end`` line (the reason, ``stop_flag`` or ``max_seconds``, and the count of ``sample`` lines written). A
@@ -13,10 +13,12 @@ read, with their parsed bytes) and, when ``--staging NAME=PATTERN`` is given, ``
 bytes of the files under the matches, apparent and allocated, as read). A reading that fails is named in ``missing`` by a fixed code and a fixed cause and
 its key is absent from the line. ``seq`` counts the iterations from 0.
 
-A staging pattern is a shell pattern of absolute paths, for example ``/var/lib/docker/volumes/*staging/_data``. Each match is walked without following
-links, and a link counts as itself. Only files are counted. A file that is gone when the walk reaches it is skipped, because a pod removes its volume as
-it ends; any other failure of the walk, such as a folder the sampler may not read, fails the whole reading and is named, never read as a zero. The
-sampler reads and changes nothing in those folders. A pattern with no match is a row of zeros: the volume does not exist yet.
+A staging pattern is a shell pattern of absolute paths, for example ``/var/lib/docker/volumes/*staging/_data``. Each source is read by a child program,
+``scripts.stack.staging_walk`` (its docstring holds the rules of the walk), that the sampler starts through the project's one launcher and kills at the end
+of the reading's interval, so a slow folder cannot hold the loop. A child that is killed is a ``timeout``, a folder it may not read is an ``os_error``, a
+failed child is an ``exit_status`` and an answer that is not four whole numbers is ``unparsable``; each is named in ``missing`` and is never read as a zero.
+The sources of one sample share the one deadline. The sampler reads and changes nothing in those folders. A pattern with no match is a row of zeros: the
+volume does not exist yet. Start the sampler with an interval of at least one second, because each child needs the time of a program start.
 
 Each reading is one function whose whole body (start, wait, decode, parse) runs inside one boundary, and each has a deadline that is a point fixed before
 it starts (the end of its interval). A reading that ends after its deadline is a ``timeout`` whatever it returned, and its key is absent. The docker
@@ -30,15 +32,12 @@ go to standard error.
 from __future__ import annotations
 
 import argparse
-import fnmatch
-import glob
 import json
 import math
 import os
 import re
 import shutil
 import signal
-import stat
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -50,6 +49,7 @@ from scripts.ingestion.closed import QuietParser
 from scripts.process import ProcessGroupSurvived, TimeoutExpired, run_command
 from scripts.stack.host_figures import FiguresError, HostSources, parse_size_bytes, read_host
 from scripts.stack.limits import LIMITS_FILE, LimitsError, load_limits
+from scripts.stack.staging_walk import EXIT_OS_ERROR
 
 SCHEMA = 6
 DEFAULT_INTERVAL_SECONDS = 5.0
@@ -66,7 +66,9 @@ EXIT_NOTE = (
 STATS_ROW = re.compile(r"([^|]+)\|(\S+) / (\S+)")
 STAGING_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 STAGING_FORM = "a staging source is NAME=PATTERN: a lowercase name of up to 32 characters and an absolute path pattern with no control character"
-BLOCK_BYTES = 512
+ROOT = Path(__file__).resolve().parents[2]
+STAGING_PROGRAM = (sys.executable, "-B", "-m", "scripts.stack.staging_walk")
+STAGING_FIGURES = ("matches", "files", "apparent_bytes", "allocated_bytes")
 Runner = Callable[..., Any]
 Clock = Callable[[], float]
 
@@ -256,84 +258,27 @@ def memory_body(runner: Runner, program: str, deadline: float, clock: Clock) -> 
     return {"rows": rows}
 
 
-def expand_pattern(pattern: str, deadline: float, clock: Clock) -> list[str]:
-    """The paths that an absolute shell pattern names, found by listing folders, under the rules of the walk.
-
-    A segment with no wildcard is joined as written. A segment with a wildcard lists the folder reached so far and keeps the names that match, never a name
-    that starts with a dot unless the segment does. A link at a wildcard position is not followed: it is a match only at the last segment, where it counts as
-    itself. A name or folder that is gone is skipped. Any other failure, a folder that may not be read among them, ends the reading, so an unreadable folder
-    is never an empty one. A pattern that ends with a slash matches folders only. A walk that passes ``deadline`` is a timeout, and no lookup starts after it.
-    """
-    segments = [segment for segment in pattern.split("/") if segment]
-    found: list[str] = []
-    pending: list[tuple[str, int]] = [("/", 0)]
-    while pending:
-        base, index = pending.pop()
-        if index == len(segments):
-            found.append(base)
-            continue
-        segment = segments[index]
-        if not glob.has_magic(segment):
-            pending.append((os.path.join(base, segment), index + 1))
-            continue
-        try:
-            names = os.listdir(base)
-        except FileNotFoundError, NotADirectoryError:
-            continue
-        for name in names:
-            if clock() > deadline:
-                raise Failure("timeout")
-            if (name.startswith(".") and not segment.startswith(".")) or not fnmatch.fnmatchcase(name, segment):
-                continue
-            path = os.path.join(base, name)
-            if index + 1 < len(segments):
-                try:
-                    if not stat.S_ISDIR(os.lstat(path).st_mode):
-                        continue
-                except FileNotFoundError:
-                    continue
-            pending.append((path, index + 1))
-    matched = []
-    for path in found:
-        if clock() > deadline:
-            raise Failure("timeout")
-        if exists(path, folder=pattern.endswith("/")):
-            matched.append(path)
-    return matched
-
-
-def exists(path: str, *, folder: bool = False) -> bool:
-    """Whether a path names something, itself and not what a link leads to; with ``folder``, a folder. Only a name that is not there is False."""
+def staging_row(source: StagingSource, deadline: float, clock: Clock, runner: Runner, program: Sequence[str]) -> dict[str, Any]:
+    """The row of one source, from the child program that reads it. The child gets what is left until ``deadline`` and is killed when that is over."""
+    left = deadline - clock()
+    if left < MIN_CALL_SECONDS:
+        raise Failure("timeout")
+    result = runner(program[0], [*program[1:], source.pattern], cwd=ROOT, timeout=left)
+    if result.returncode == EXIT_OS_ERROR:
+        raise Failure("os_error")
+    if result.returncode != 0:
+        raise Failure("exit_status")
     try:
-        return stat.S_ISDIR(os.lstat(path).st_mode) or not folder
-    except FileNotFoundError, NotADirectoryError:
-        return False
+        figures = json.loads(result.stdout)
+    except ValueError:
+        raise Failure("unparsable") from None
+    if type(figures) is not dict or list(figures) != list(STAGING_FIGURES) or any(type(value) is not int or value < 0 for value in figures.values()):
+        raise Failure("unparsable")
+    return {"name": source.name, **figures}
 
 
-def staging_row(source: StagingSource, deadline: float, clock: Clock) -> dict[str, Any]:
-    """The files under one pattern. A reading that passes ``deadline`` is a timeout. Only a file that is gone is skipped: any other failure ends the reading."""
-    matches = expand_pattern(source.pattern, deadline, clock)
-    pending = list(matches)
-    files = apparent = allocated = 0
-    while pending:
-        if clock() > deadline:
-            raise Failure("timeout")
-        path = pending.pop()
-        try:
-            info = os.lstat(path)
-            if stat.S_ISDIR(info.st_mode):
-                pending.extend(os.path.join(path, name) for name in os.listdir(path))
-                continue
-        except FileNotFoundError:
-            continue
-        files += 1
-        apparent += info.st_size
-        allocated += info.st_blocks * BLOCK_BYTES
-    return {"name": source.name, "matches": len(matches), "files": files, "apparent_bytes": apparent, "allocated_bytes": allocated}
-
-
-def staging_body(sources: Sequence[StagingSource], deadline: float, clock: Clock) -> dict[str, Any]:
-    return {"rows": [staging_row(source, deadline, clock) for source in sources]}
+def staging_body(sources: Sequence[StagingSource], deadline: float, clock: Clock, runner: Runner, program: Sequence[str]) -> dict[str, Any]:
+    return {"rows": [staging_row(source, deadline, clock, runner, program) for source in sources]}
 
 
 def header_line(
@@ -373,6 +318,8 @@ def sample_line(
     clock: Clock,
     wall_ns: Callable[[], int],
     staging: Sequence[StagingSource] = (),
+    staging_runner: Runner = run_command,
+    staging_program: Sequence[str] = STAGING_PROGRAM,
 ) -> dict[str, Any]:
     """The line of one iteration. A reading that fails is named in ``missing`` and its key is absent. All readings share one deadline, fixed first."""
     line: dict[str, Any] = {"kind": "sample", "seq": seq}
@@ -383,7 +330,7 @@ def sample_line(
         ("memory", lambda: memory_body(runner, program, deadline, clock)),
     ]
     if staging:
-        readers.append(("staging", lambda: staging_body(staging, deadline, clock)))
+        readers.append(("staging", lambda: staging_body(staging, deadline, clock, staging_runner, staging_program)))
     for name, read in readers:
         try:
             line[name] = timed(clock, wall_ns, deadline, read)
@@ -408,6 +355,8 @@ def run_sampler(
     pause: Callable[[float], None] = time.sleep,
     say: Callable[[str], None] = emit,
     staging: Sequence[StagingSource] = (),
+    staging_runner: Runner = run_command,
+    staging_program: Sequence[str] = STAGING_PROGRAM,
 ) -> int:
     """Write the header, one line for each iteration and the end line. Return 0 when the end line was written."""
     flag = stop or StopFlag()
@@ -438,7 +387,7 @@ def run_sampler(
                 reason = "max_seconds"
                 break
             began = clock()
-            out.write_line(sample_line(seq, began + interval_seconds, sources, runner, program, clock, wall_ns, staging))
+            out.write_line(sample_line(seq, began + interval_seconds, sources, runner, program, clock, wall_ns, staging, staging_runner, staging_program))
             seq += 1
             flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause, clock=clock)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})

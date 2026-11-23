@@ -250,26 +250,57 @@ class RunWindowTest(unittest.TestCase):
         self.assertEqual({"since": "2026-11-23T11:00:00+00:00", "until": "2026-11-23T13:00:00+00:00", "time_precision_seconds": 1}, record["window"])
         self.assertEqual(str((Decimal(written) / Decimal(GIB) * INTER_REGION_PER_GIB).quantize(SIX_PLACES)), record["transfer_cost_usd"]["if_requester_pays"])
 
-    def test_a_window_time_with_a_fraction_of_a_second_is_refused_with_no_output_and_echoes_nothing(self) -> None:
-        for window in (
-            ("--since", "2026-11-23T11:00:00.250Z"),
-            ("--since", "2026-11-23T11:00:00Z", "--until", "2026-11-23T12:00:00.800+00:00"),
-            ("--since", "2026-11-23T11:00:00.000001+02:00"),
-        ):
-            with self.subTest(window=window):
-                code, record, err = self.run_with(result_for(), *window)
-                self.assertEqual((1, {}), (code, record))
-                self.assertIn("whole second", err)
-                self.assertEqual([], [word for word in ("250", "800", "000001") if word in err])
+    def test_a_window_time_in_any_form_but_the_one_exact_form_is_refused_by_code_and_echoes_nothing(self) -> None:
+        bad = (
+            "2026-11-23T11:00:00.250Z",
+            "2026-11-23T11:00:00.000Z",
+            "2026-11-23T11:00:00.000000001Z",
+            "2026-11-23T11:00:00.000000001+02:00",
+            "2026-11-23 11:00:00Z",
+            "2026-11-23T11:00Z",
+            "20261123T110000Z",
+            "2026-11-23T11:00:00+0200",
+            "2026-11-23T11:00:00+02",
+            "2026-11-23T11:00:00z",
+            "2026-11-23T11:00:00",
+            " 2026-11-23T11:00:00Z",
+            "2026-11-23T11:00:00Z\n",
+            "2026-11-23T11:00:00Z ",
+            "\u0662\u0660\u0662\u0666-11-23T11:00:00Z",
+            "2026-13-23T11:00:00Z",
+            "2026-11-23T25:00:00Z",
+            "2026-11-23T11:00:00+25:00",
+            "yesterday",
+        )
+        for since in bad:
+            for window in (("--since", since), ("--since", "2026-11-23T11:00:00Z", "--until", since)):
+                with self.subTest(window=window):
+                    code, record, err = self.run_with(result_for(), *window)
+                    self.assertEqual((2, {}), (code, record))
+                    self.assertEqual([], [word for word in ("2026", "250", "000", "yesterday") if word in err])
 
-    def test_a_window_time_written_with_a_zero_fraction_is_a_whole_second_and_is_accepted(self) -> None:
-        code, record, _ = self.run_with(result_for(), "--since", "2026-11-23T09:00:00.000Z")
-        self.assertEqual(0, code)
-        self.assertEqual(len(SIZES), record["copy"]["payload_objects"])
+    def test_a_window_time_in_the_one_exact_form_is_accepted_with_z_or_a_numeric_offset(self) -> None:
+        for since in ("2026-11-23T09:00:00Z", "2026-11-23T11:00:00+02:00", "2026-11-23T04:00:00-05:00"):
+            with self.subTest(since=since):
+                code, record, _ = self.run_with(result_for(), "--since", since)
+                self.assertEqual((0, len(SIZES)), (code, record["copy"]["payload_objects"]))
+
+    def test_a_retrieval_time_in_a_result_with_a_fraction_or_another_form_is_refused_with_no_output(self) -> None:
+        for odd in (
+            "2026-11-23T10:00:00.5+00:00",
+            "2026-11-23T10:00:00.000Z",
+            "2026-11-23 10:00:00+00:00",
+            "2026-11-23T10:00:00+0000",
+            "2026-13-23T10:00:00+00:00",
+        ):
+            with self.subTest(odd=odd):
+                code, record, err = self.run_with(result_for(times=(odd,) * len(SIZES)), "--since", "2026-11-23T09:00:00Z")
+                self.assertEqual((1, {}), (code, record))
+                self.assertNotIn("2026", err)
 
     def test_the_precision_of_one_second_is_in_the_help_text_and_in_the_record(self) -> None:
         _, helped, _ = run("--help")
-        self.assertEqual(2, " ".join(helped.split()).count("in whole seconds"), "both options say it")
+        self.assertEqual(2, " ".join(helped.split()).count("no fraction"), "both options say it")
         _, record, _ = self.run_with(result_for(), "--since", "2026-11-23T09:00:00Z")
         self.assertEqual(1, record["window"]["time_precision_seconds"])
 
