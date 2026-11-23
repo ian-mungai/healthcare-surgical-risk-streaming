@@ -10,7 +10,8 @@ content answer of another shape is refused as well. No message holds a value of 
 
 A branch is deleted through the typed form of Nessie's API: ``DELETE /api/v2/trees/{name}@{hash}?type=BRANCH``. The query parameter ``type`` is the
 "optional expected type of the reference being deleted" of ``deleteReferenceV2`` in ``api/model/src/main/java/org/projectnessie/api/v2/http/HttpTreeApi.java``
-of ``projectnessie/nessie`` at the tag ``nessie-0.110.1``, the pinned version. A tag of the name is then not found by the call, and nothing is deleted.
+of ``projectnessie/nessie`` at the tag ``nessie-0.110.1``, the pinned version. A tag of the name is then refused by the call (status 400, measured on
+the pinned server by the acceptance run), and nothing is deleted.
 
 No failure of Nessie reaches a message as Nessie's own text: every call of this adapter that fails becomes ``catalog_error: <operation> failed``, and the
 original exception is not chained (``from None``), because Nessie's answer can hold text that a caller or a proxy put there.
@@ -28,6 +29,7 @@ from scripts.ingestion.record_load import BRANCH_KIND, BranchExists, BranchMoved
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError, Reference
 
 NOT_FOUND = 404
+BAD_REQUEST = 400
 HISTORY_PAGE = 100
 HISTORY_LIMIT = 5000
 HASH = re.compile(r"[0-9a-f]{64}")
@@ -85,14 +87,16 @@ class NessieCatalog:
     def delete_branch(self, branch: str, head: str) -> None:
         """Delete the reference of the name, expected to be a branch, at exactly ``head``, through the typed form of the call.
 
-        ``BranchMoved`` when it is at another hash; a branch that is already gone, or a reference of another kind (which the typed call does not find), is
-        not deleted and is not an error here.
+        ``BranchMoved`` when it is at another hash; a branch that is already gone is not an error. A reference of another kind is refused by Nessie with status
+        400 (``BAD_REQUEST``, "Expected reference type", measured on the pinned server) and nothing is deleted: that is a ``LoadError`` that says so.
         """
         try:
             self.client.delete_reference(branch, head, BRANCH_KIND)
         except NessieConflict:
             raise BranchMoved(f"the branch {branch} is no longer at the head that was read: it is refused and not deleted") from None
         except NessieError as error:
+            if error.status == BAD_REQUEST:
+                raise LoadError(f"the reference {branch} is not a branch: it is refused and not deleted") from None
             if error.status != NOT_FOUND:
                 raise catalog_error("delete_branch") from None
 

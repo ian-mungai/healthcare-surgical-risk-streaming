@@ -58,8 +58,10 @@ class Server:
             name, _, expected = path.removeprefix("/trees/").partition("@")
             self.delete_queries.append(parts.query)
             asked_kind = parse_qs(parts.query).get("type", [None])[0]
-            if name not in self.refs or (asked_kind is not None and self.kinds.get(name, "BRANCH") != asked_kind):
+            if name not in self.refs:
                 return 404, b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
+            if asked_kind is not None and self.kinds.get(name, "BRANCH") != asked_kind:
+                return 400, b'{"errorCode":"BAD_REQUEST","message":"Expected reference type does not match"}'
             if self.refs.get(name) != expected:
                 return 409, b'{"errorCode":"REFERENCE_CONFLICT","message":"x"}'
             del self.refs[name]
@@ -171,7 +173,9 @@ class CatalogTest(unittest.TestCase):
 
     def test_the_delete_names_the_kind_so_a_tag_of_the_name_at_the_same_hash_is_not_deleted(self) -> None:
         self.server.refs["load_run1"], self.server.kinds["load_run1"] = MAIN, "TAG"
-        self.catalog.delete_branch("load_run1", MAIN)
+        with self.assertRaises(LoadError) as raised:
+            self.catalog.delete_branch("load_run1", MAIN)
+        self.assertIn("not a branch", str(raised.exception))
         self.assertIn("load_run1", self.server.refs, "the tag is still there")
         self.assertEqual(["type=BRANCH"], self.server.delete_queries)
 
@@ -432,7 +436,7 @@ class CatalogErrorTest(unittest.TestCase):
             "contents": ("/trees/main/contents/raw_records.clinical_data", lambda: self.catalog.snapshot_ids("main")),
         }
         for name, (path, call) in operations.items():
-            for status in (500, 400, 403):
+            for status in (500, 403) if name == "delete_branch" else (500, 400, 403):
                 with self.subTest(f"{name} {status}"):
                     self.server.fail = (path, status)
                     with self.assertRaises(CatalogError) as raised:
@@ -442,6 +446,14 @@ class CatalogErrorTest(unittest.TestCase):
                     self.assertIsNone(raised.exception.__cause__)
                     self.assertTrue(raised.exception.__suppress_context__)
                     self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
+
+    def test_a_refusal_of_the_typed_delete_as_a_wrong_kind_says_so_in_a_fixed_text_and_holds_no_answer(self) -> None:
+        self.server.fail = (f"/trees/load_run1@{'3' * 64}", 400)
+        with self.assertRaises(LoadError) as raised:
+            self.catalog.delete_branch("load_run1", "3" * 64)
+        self.assertNotIsInstance(raised.exception, CatalogError)
+        self.assertIn("not a branch", str(raised.exception))
+        self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
 
     def test_a_conflict_on_delete_and_on_create_keep_their_own_meaning_and_hold_no_answer_either(self) -> None:
         self.server.fail_body = json.dumps({"errorCode": "REFERENCE_CONFLICT", "message": self.MARKER}).encode()
