@@ -303,9 +303,9 @@ class HttpAirbyteApi:
         """Every object of a list call, page by page, by the client's own offset.
 
         The offset starts at 0 and grows by ``PAGE_SIZE`` after each page, on the same route and with the same filters. The list ends at the first reply
-        that has no ``next``, or an empty one: ``next`` only shows that another page exists, and its text is never read, so a link of any form can send
-        neither the offset nor the request elsewhere. An entry that is not an object, or a ``next`` that is not text, refuses the call, and so do more
-        than ``MAX_PAGES`` pages.
+        whose ``next`` is missing, null or empty: ``next`` only shows that another page exists, and its text is never read, so a link of any form can
+        send neither the offset nor the request elsewhere. An entry that is not an object, or a ``next`` that is neither null nor text, refuses the call,
+        and so do more than ``MAX_PAGES`` pages.
         """
         label = f"GET {path.partition('?')[0].strip('/')}"
         found: list[dict[str, Any]] = []
