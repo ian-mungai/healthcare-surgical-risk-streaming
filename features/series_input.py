@@ -14,8 +14,9 @@ made in one of three ways, all by this module:
   with no exact mean is refused by name when it is valid (its sums are not read when it is not). Nothing is converted to a float here: a reading after the
   cutoff is never read, as for every other track, and the checks of ``features.numeric`` refuse a value that is too large only inside the window.
 
-The constructor of ``SeriesReadings`` refuses a valid reading whose value is a finite number and that has no exact mean, so a series that other code made
-cannot be passed on by accident. ``features.numeric`` refuses, inside the window, a valid reading whose value is not the float of its exact mean.
+``check_window`` (called by ``build_row``) refuses a valid reading inside the window whose value is a number and that has no exact mean, so a series that
+other code made cannot be passed on by accident, and ``features.numeric`` refuses, inside the window, a valid reading whose value is not the float of its exact
+mean. The window is applied first: a reading after the cutoff or before the window is neither converted nor checked, whatever its count or its sums are.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from fractions import Fraction
 
 from features.model import SECOND, FeatureInputError, Reading
 from features.pressure_series import ExactMean, SecondFacts, series_from_seconds
+from features.registry import NUMERIC_WINDOW_SECONDS, complete_seconds
 
 
 def exact_of(value: object) -> Fraction | None:
@@ -39,18 +41,31 @@ def exact_of(value: object) -> Fraction | None:
 
 
 class SeriesReadings(list[Reading]):
-    """The readings of the per-second arterial series, each valid one with the exact value that its float stands for."""
+    """The readings of the per-second arterial series, made by this module. Each valid reading that a feature reads carries the exact value that its float
+    stands for (``check_window``); nothing is converted or checked here, so a reading that no feature reads is never touched."""
 
-    def __init__(self, readings: Iterable[Reading] = ()) -> None:
-        super().__init__(readings)
-        for reading in self:
-            if reading.valid is not True or reading.value is None:
-                continue
-            exact = exact_of(reading.value)
-            if exact is None:
-                continue
-            if reading.exact is None:
-                raise FeatureInputError("Silver/ART_MBP_1S: a valid reading has no exact mean; make the series with features.pressure_series")
+
+def in_window(time_us: object, cutoff_us: int) -> bool:
+    """Whether a reading at ``time_us`` is one that the features read: ``features.numeric.window_readings`` reads the newest complete seconds at the cutoff.
+    A time that is not a whole number of microseconds is left to its checks, which refuse it."""
+    if isinstance(time_us, bool) or not isinstance(time_us, int):
+        return True
+    window = complete_seconds(cutoff_us, NUMERIC_WINDOW_SECONDS)
+    return window[0] * SECOND <= time_us < (window[-1] + 1) * SECOND
+
+
+def is_read(time_us: object, cutoff_us: object) -> bool:
+    """Whether a feature may read a reading at ``time_us``. Without a whole-number cutoff every reading may be, and ``build_row`` refuses the cutoff."""
+    if isinstance(cutoff_us, bool) or not isinstance(cutoff_us, int):
+        return True
+    return in_window(time_us, cutoff_us)
+
+
+def check_window(readings: Iterable[Reading], cutoff_us: object) -> None:
+    """Refuse, by name, a valid reading inside the window whose value is a number and that has no exact mean. A reading outside the window is never read."""
+    for reading in readings:
+        if reading.valid is True and reading.exact is None and exact_of(reading.value) is not None and is_read(reading.time_us, cutoff_us):
+            raise FeatureInputError("Silver/ART_MBP_1S: a valid reading has no exact mean; make the series with features.pressure_series")
 
 
 def series_readings(seconds: Iterable[SecondFacts]) -> SeriesReadings:
@@ -78,7 +93,7 @@ def number_of(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, int | float)
 
 
-def series_readings_from_json(rows: Sequence[object], where: str) -> SeriesReadings:
+def series_readings_from_json(rows: Sequence[object], where: str, cutoff_us: object = None) -> SeriesReadings:
     """The readings of the JSON rows ``[time, value, valid, sample count, sum high, sum low]``. A row of another form is refused by name, a valid row without a
     finite exact mean is refused, and no float is made of a value (so no reading is converted that a feature would not read)."""
     form = f"{where}: a reading is an array of time, value, valid flag, sample count and the high and low parts of the exact sum"
@@ -88,7 +103,7 @@ def series_readings_from_json(rows: Sequence[object], where: str) -> SeriesReadi
             raise FeatureInputError(f"{form} (reading {index})")
         time, value, valid, count, high, low = row
         exact = None
-        if valid is True:
+        if valid is True and is_read(time, cutoff_us):
             if isinstance(count, bool) or not isinstance(count, int) or count <= 0 or not number_of(high) or not number_of(low):
                 raise FeatureInputError(f"{form}, and a valid reading has a sample count above zero and a finite sum (reading {index})")
             exact, part = sum_part(high), sum_part(low)

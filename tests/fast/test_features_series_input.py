@@ -63,10 +63,6 @@ class Binding(unittest.TestCase):
     def test_no_series_at_all_is_not_refused(self) -> None:
         self.assertEqual(0, build_row(window([])).values[PREFIX + "valid_count"])
 
-    def test_a_series_with_a_valid_reading_that_has_no_exact_mean_cannot_be_built(self) -> None:
-        with self.assertRaises(FeatureInputError):
-            SeriesReadings([Reading(SECOND, 60.0, True)])
-
     def test_a_valid_reading_whose_exact_mean_is_not_its_value_is_refused_inside_the_window(self) -> None:
         readings = series_readings(seconds_of(lambda second: [60.0] * 4))
         last = readings[-1]
@@ -177,7 +173,6 @@ class FilteredBeforeConverted(unittest.TestCase):
         [(FIRST - 5) * SECOND, 60.0, True, 0, 0.0, 0.0],
     )
 
-    @unittest.expectedFailure
     def test_a_json_reading_outside_the_window_with_a_count_of_zero_or_no_sums_aborts_nothing(self) -> None:
         entries = series_entries(seconds_of(lambda second: [60.0] * 4))
         reference = through_the_command_line(entries)
@@ -185,7 +180,6 @@ class FilteredBeforeConverted(unittest.TestCase):
             with self.subTest(junk=junk):
                 self.assertEqual(reference, through_the_command_line([*entries, junk]))
 
-    @unittest.expectedFailure
     def test_a_reading_outside_the_window_in_a_series_made_by_hand_aborts_nothing_and_changes_nothing(self) -> None:
         readings = series_readings(seconds_of(lambda second: [60.0] * 4))
         reference = build_row(window(readings)).values
@@ -193,7 +187,6 @@ class FilteredBeforeConverted(unittest.TestCase):
         earlier = Reading((FIRST - 5) * SECOND, 60.0, True)
         self.assertEqual(reference, build_row(window(SeriesReadings([*readings, later, earlier]))).values)
 
-    @unittest.expectedFailure
     def test_a_reading_inside_the_window_without_its_exact_mean_is_still_refused_by_name(self) -> None:
         readings = series_readings(seconds_of(lambda second: [60.0] * 4))
         last = readings[-1]

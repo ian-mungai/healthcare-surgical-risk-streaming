@@ -64,7 +64,7 @@ def parse_window(value: object, path: str = "the window") -> WindowInput:
     for track, readings in as_object(body["numeric"], f"{path}.numeric").items():
         where = f"{path}.numeric[{track}]"
         if track == ARTERIAL_SERIES:
-            numeric[track] = series_readings_from_json(as_array(readings, where), where)
+            numeric[track] = series_readings_from_json(as_array(readings, where), where, body["cutoff_us"])
             continue
         numeric[track] = []
         for index, reading in enumerate(as_array(readings, where)):
