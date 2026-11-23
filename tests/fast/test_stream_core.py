@@ -72,7 +72,7 @@ class OracleParity(unittest.TestCase):
 
     def test_a_long_case_agrees_after_the_buffers_are_pruned(self) -> None:
         recording = synthetic_recording(caseend_s=2_000, opend_s=1_900, rate=4, hr_step_s=10)
-        records, states = run_stream(events_for(recording))
+        records, states = run_stream(events_for(recording), batch_size=50, restart=True)
         found = features_of(records)
         self.assertEqual([60 * SECOND * minute for minute in range(1, 32)] + [1_900 * SECOND], sorted(found))
         for cutoff in (60 * SECOND, 960 * SECOND, 1_200 * SECOND, 1_800 * SECOND, 1_900 * SECOND):
@@ -194,6 +194,14 @@ class Lateness(unittest.TestCase):
         records, states = run_stream([*until, late])
         self.assertEqual(ORIGIN_US + 140 * SECOND, next(iter(states.values())).high_water_us)
         self.assertEqual(1, len(decisions(records, "too_late")))
+
+    def test_a_late_event_does_not_lower_the_watermark_so_a_later_one_is_judged_against_the_highest(self) -> None:
+        until = [event for event in self.arrival if event.replay_time_us <= ORIGIN_US + 120 * SECOND]
+        late = replace(reading_event(HEART_RATE, self.late_time, 111.0), replay_time_us=ORIGIN_US + self.late_time)
+        later = replace(reading_event(HEART_RATE, 85 * SECOND + 500_000, 99.0), replay_time_us=ORIGIN_US + 85 * SECOND + 500_000)
+        records, states = run_stream([*until, late, later])
+        self.assertEqual(["late_accepted", "too_late"], [record.decision for record in decisions(records) if record.decision != "source_duplicate"])
+        self.assertEqual(ORIGIN_US + 120 * SECOND, next(iter(states.values())).high_water_us)
 
     def test_the_decision_names_the_event_the_watermark_and_the_kafka_position(self) -> None:
         arrival = self.inserted_after(ORIGIN_US + 140 * SECOND, ORIGIN_US + self.late_time)
