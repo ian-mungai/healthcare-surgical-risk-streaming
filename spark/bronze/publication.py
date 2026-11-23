@@ -143,7 +143,7 @@ def assigned(ops: PublishOps, base: str, expected_base: str, branch: str, checke
     """Send the assignment once. ``True`` when the base is now the checked commit, ``False`` when the base moved (it keeps the head that it has).
 
     A conflict is a base that is not at the expected hash. A failure with no answer is settled by reading the base head once: the checked hash is a
-    publication, the head that was read means the assignment did not happen, and another head is a base that moved.
+    publication, another head is a base that moved, and the head that was read is an unknown outcome: the request may still be applied after the read.
     """
     try:
         answered = ops.assign(base, expected_base, branch, checked)
@@ -155,7 +155,8 @@ def assigned(ops: PublishOps, base: str, expected_base: str, branch: str, checke
             return True
         if found == expected_base:
             raise PublicationError(
-                f"the assignment of {base} to the checked commit did not finish ({type(error).__name__}) and was not applied: nothing changed"
+                f"the assignment of {base} to the checked commit did not finish ({type(error).__name__}) and its outcome is unknown: "
+                f"read the head of {base} before a rerun"
             ) from None
         return False
     if answered != checked:

@@ -235,12 +235,15 @@ class AssignOutcomeTest(unittest.TestCase):
         self.assertEqual(("published", HEAD), (result.status, result.published_hash))
         self.assertEqual(1, len(nessie.assign_calls))
 
-    def test_a_timeout_after_which_the_base_is_as_it_was_is_an_error_that_changes_nothing_and_a_rerun_may_send_again(self) -> None:
+    def test_a_timeout_after_which_the_base_is_as_it_was_is_an_error_whose_outcome_is_unknown_and_a_rerun_may_send_again(self) -> None:
+        """The request may still be applied after the read (review recheck 4, Low), so the error never says that nothing changed."""
         nessie = FakeNessie()
         nessie.assign_error = NessieError("the assignment did not finish within 30 seconds")
         with self.assertRaises(PublicationError) as raised:
             publish(nessie, Checker(), BRANCH, BASE, EXPECTED)
-        self.assertIn("not applied", str(raised.exception))
+        self.assertIn("outcome is unknown", str(raised.exception))
+        self.assertNotIn("not applied", str(raised.exception))
+        self.assertNotIn("nothing changed", str(raised.exception))
         self.assertEqual((1, BASE_HEAD), (len(nessie.assign_calls), nessie.heads[BASE]))
         nessie.assign_error = None
         self.assertEqual("published", publish(nessie, Checker(), BRANCH, BASE, EXPECTED).status)
