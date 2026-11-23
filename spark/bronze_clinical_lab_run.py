@@ -131,6 +131,7 @@ def parser() -> argparse.ArgumentParser:
     for name, text in (
         ("write", "create the branch from the source hash, write both Bronze tables and verify them"),
         ("verify", "check the Bronze tables of a branch"),
+        ("publish", "check the Bronze tables of a branch and merge it into Nessie's default branch only when every check passed"),
     ):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--branch", required=True, help="the private branch that holds (write: will hold) the Bronze tables")
