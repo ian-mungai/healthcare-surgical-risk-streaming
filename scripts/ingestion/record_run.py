@@ -26,7 +26,6 @@ secret files at ``/run/secrets/airbyte_<name>``. The Airbyte role (``record_clie
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import re
@@ -38,6 +37,7 @@ from urllib.parse import urlsplit
 
 from scripts.aws_cli import Aws
 from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi, check_api_origin
+from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.notice import ClosedError
 from scripts.ingestion.record_catalog import NessieCatalog
@@ -187,7 +187,7 @@ def run_load(settings: RecordSettings, run_id: str, reference: ManifestRef) -> L
 
 
 def main(argv: list[str] | None = None, environment: Mapping[str, str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="scripts.ingestion.record_run", description="Run a record load by hand.")
+    parser = QuietParser(prog="scripts.ingestion.record_run", description="Run a record load by hand.")
     commands = parser.add_subparsers(dest="command", required=True)
     loader = commands.add_parser("load")
     loader.add_argument("--run-id", required=True)

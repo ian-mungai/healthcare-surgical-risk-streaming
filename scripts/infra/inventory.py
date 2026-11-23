@@ -12,7 +12,6 @@ Resources without tags are listed like any other, because the list comes from th
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
@@ -20,6 +19,7 @@ from pathlib import Path
 from scripts.infra.created import DEVICE_FILE, device_entries, run_inventory
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
+from scripts.ingestion.closed import QuietParser
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 
@@ -49,7 +49,7 @@ def write_inventory(binding: Path) -> Path:
 
 def main() -> int:
     """Write the inventory, print its size and return a non-zero code on a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         target = write_inventory(parser.parse_args().binding)

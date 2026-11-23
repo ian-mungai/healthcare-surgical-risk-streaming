@@ -20,6 +20,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.catalog import required_environment
 from spark.session import build_session, start_deadline
@@ -39,7 +40,7 @@ class PlannedFailure(RuntimeError):
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog=f"python -m spark.jobs.{JOB}", description="Write the proof table on a private Nessie branch.")
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Write the proof table on a private Nessie branch.")
     command.add_argument("--branch", required=True, help="the private branch to create from main and write to")
     command.add_argument("--base", default="main", help="the branch to create the private branch from")
     command.add_argument("--rows", type=int, default=DEFAULT_ROWS, help="how many rows to write")

@@ -9,7 +9,6 @@ published checksum file.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import io
 import platform
@@ -19,6 +18,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
 
@@ -174,7 +174,7 @@ def settle_hook(*, check: bool) -> bool:
 
 def main() -> int:
     """Install or check every pinned tool and return 1 when one is missing or differs."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--check", action="store_true", help="verify the installed binaries without downloading or writing")
     check = parser.parse_args().check
     results = [settle(tool, check=check) for tool in TOOL_LIST]

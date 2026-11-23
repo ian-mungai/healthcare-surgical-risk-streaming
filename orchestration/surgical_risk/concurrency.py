@@ -46,7 +46,7 @@ def heavy_memory_mib(environment: Mapping[str, str] = os.environ) -> int:
     if value == "":
         raise ConcurrencyError(f"{HEAVY_MEMORY_ENVIRONMENT} is empty, so the figure above which a job is heavy is unknown")
     if WHOLE_NUMBER.fullmatch(value) is None or int(value) == 0:
-        raise ConcurrencyError(f"{HEAVY_MEMORY_ENVIRONMENT} must be a positive whole number of MiB, not {value!r}")
+        raise ConcurrencyError(f"{HEAVY_MEMORY_ENVIRONMENT} must be a positive whole number of MiB")
     return int(value)
 
 

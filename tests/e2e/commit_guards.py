@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
 from scripts.quality.repo_checks import git, visible_files
@@ -373,7 +374,7 @@ def remove_fixture(fixture: Fixture | None, record: Record) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the planted-fault cases, write the run record and return 0 only when every assertion held."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--shard", type=parse_shard, default=(1, 1), metavar="INDEX/COUNT", help="run one share of the cases")
     index, count = parser.parse_args(argv).shard
     record = Record(feature="commit guards, local commit path", slug="commit_guards", rerun=RERUN, mode="full" if count == 1 else f"shard {index} of {count}")

@@ -10,7 +10,6 @@ header is not a row. A field with a tab or a line break is refused, because the 
 
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import json
@@ -19,6 +18,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.sample.candidates import RELEASE_FILE, release_problems
 from scripts.sample.publisher import TRACK_LIST_COLUMNS
 
@@ -98,7 +98,7 @@ def file_problems(path: Path, pin: PinnedTrackList) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog=PROGRAM, description="Check a track list file against the pinned row count and digest.")
+    parser = QuietParser(prog=PROGRAM, description="Check a track list file against the pinned row count and digest.")
     commands = parser.add_subparsers(dest="command", required=True)
     checker = commands.add_parser("check")
     checker.add_argument("--file", type=Path, required=True)

@@ -412,9 +412,9 @@ def bounded_seconds(top: float) -> Callable[[str], float]:
         try:
             value = float(text)
         except ValueError as error:
-            raise argparse.ArgumentTypeError(f"{text!r} is not a number") from error
+            raise argparse.ArgumentTypeError("the figure must be a number") from error
         if not math.isfinite(value) or not 0 < value <= top:
-            raise argparse.ArgumentTypeError(f"{text!r} must be a finite number above 0 and at most {top:g}")
+            raise argparse.ArgumentTypeError(f"the figure must be a finite number above 0 and at most {top:g}")
         return value
 
     return parse

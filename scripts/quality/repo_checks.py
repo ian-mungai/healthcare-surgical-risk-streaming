@@ -6,7 +6,6 @@ its file and line, the rule and the fix. The privacy scan reports the type of a 
 
 from __future__ import annotations
 
-import argparse
 import fnmatch
 import os
 import re
@@ -15,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 
 GIT_TIMEOUT_SECONDS = 60
@@ -211,7 +211,7 @@ def privacy_scan() -> tuple[list[Finding], list[str]]:
 
 def main() -> int:
     """Run the named check and return 1 when it has findings."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("check", choices=["credential-files", "data-files", "commit-msg", "commit-range", "privacy-scan"])
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--all", action="store_true", help="privacy-scan: every file Git does not ignore, which is the only scope")

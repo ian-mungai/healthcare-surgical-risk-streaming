@@ -17,7 +17,6 @@ object to the bucket.
 
 from __future__ import annotations
 
-import argparse
 import json
 import secrets
 import sys
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.aws_cli import Aws, AwsError
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -235,7 +235,7 @@ def verify(aws: Aws, configuration: dict[str, str], path: Path) -> int:
 
 def main() -> int:
     """Run create or verify and return a non-zero code on a difference or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["create", "verify"])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     parser.add_argument(

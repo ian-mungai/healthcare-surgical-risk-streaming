@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, TextIO
 from urllib.parse import quote
 
+from scripts.ingestion.closed import QuietParser
 from scripts.stack.nessie import NessieClient, NessieError, Reference
 from spark.bronze_clinical_lab import (
     BRONZE_NAMESPACE,
@@ -124,9 +125,7 @@ class TableReport:
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog=f"python -m spark.jobs.{JOB}", description="Copy the loaded clinical and laboratory tables into Bronze on a private branch."
-    )
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Copy the loaded clinical and laboratory tables into Bronze on a private branch.")
     commands = command.add_subparsers(dest="command", required=True)
     for name, text in (
         ("write", "create the branch from the source hash, write both Bronze tables and verify them"),

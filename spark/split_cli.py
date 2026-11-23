@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.stack.nessie import NessieClient, NessieError
 from spark.settings import SettingsError, catalog_options
 from spark.split_table import PatientSplitError
@@ -40,14 +41,6 @@ MAX_NESSIE_TIMEOUT_SECONDS = 600.0
 # Every environment variable that the job reads, here and in spark/session.py. A test holds this list to the source.
 SETTING_NAMES = ("JOB_DEADLINE_SECONDS", "NESSIE_TIMEOUT_SECONDS", "NESSIE_URI", "WAREHOUSE_LOCATION", "AWS_REGION")
 REFERENCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-
-
-class QuietParser(argparse.ArgumentParser):
-    """An argument parser whose only error output is the code ``usage``."""
-
-    def error(self, message: str) -> Any:
-        sys.stderr.write(f"{JOB}: usage\n")
-        raise SystemExit(2)
 
 
 def reference_name(text: str) -> str:

@@ -37,6 +37,7 @@ from typing import Any
 
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
+from scripts.ingestion.closed import QuietParser
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ConfigurationError, load_configuration
 
@@ -365,7 +366,7 @@ def run(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     """Run plan, apply, key or export and return a non-zero code on a refusal, a difference or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["plan", "apply", "key", "export"])
     parser.add_argument("--admin-profile", required=True, help="the owner's administrator AWS profile; never the project profile")
     parser.add_argument("--confirm", default="", help="apply: the confirmation code that plan printed")

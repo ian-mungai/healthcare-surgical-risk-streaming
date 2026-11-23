@@ -42,6 +42,7 @@ from replay.service.serve import Outcome, healthy, queued_record, serve, submit_
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
+from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
 from scripts.ingestion.store import StoreError
@@ -258,7 +259,7 @@ STOPPING_ERRORS = (
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("serve", "submit"):
         command = commands.add_parser(name)

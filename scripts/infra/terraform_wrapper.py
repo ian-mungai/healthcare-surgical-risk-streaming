@@ -19,7 +19,6 @@ A change of a root output counts as a change of the plan. ``plan --destroy`` sav
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -33,6 +32,7 @@ from typing import Any
 
 from scripts.infra.created import created_entries, merge_created
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem
+from scripts.ingestion.closed import QuietParser
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.heavy_inputs import heavy_inputs_text
@@ -407,7 +407,7 @@ def record_created(run: RunBinding, applied_plan: dict[str, Any]) -> None:
 
 def main() -> int:
     """Save a plan or apply the reviewed plan and return a non-zero code on a refusal or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["plan", "apply"])
     parser.add_argument("--destroy", action="store_true", help="plan: save a destroy plan")
     parser.add_argument("--confirm", default="", help="apply: the confirmation code that plan printed")

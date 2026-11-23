@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.ingestion.notice import Code, Notice, render
 from scripts.stack.admission import (
     COMPOSE_PROJECT,
     EXIT_ADMITTED,
@@ -264,8 +265,8 @@ class CommandTest(unittest.TestCase):
             with self.subTest(text=text):
                 code, out, err = run("heavy", "--available-mib", text, "--running", "")
                 self.assertEqual((2, ""), (code, out))
-                self.assertIn("--available-mib", err)
-                self.assertIn("is not a whole number", err)
+                self.assertIn(render(Notice(Code.USAGE)), err)
+                self.assertNotIn(text or "\0", err)
 
 
 if __name__ == "__main__":

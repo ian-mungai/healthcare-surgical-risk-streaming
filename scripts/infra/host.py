@@ -17,7 +17,6 @@ Every wait has a deadline and fails with a message that names what did not happe
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -34,6 +33,7 @@ from scripts.infra import state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
+from scripts.ingestion.closed import QuietParser
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
@@ -547,7 +547,7 @@ def host_check(host_name: str, instance: str) -> int:
 
 def main() -> int:
     """Run one host command and return a non-zero code on a refusal, an expired deadline or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["up", "stop", "start", "check"])
     parser.add_argument("--host-name", default="", help="check: the host's Tailscale name, for example platform-dev")
     parser.add_argument("--instance-id", default="", help="check: the EC2 instance ID that the host must answer with")

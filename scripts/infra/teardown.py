@@ -42,7 +42,6 @@ plan, inventory, approved inventory and receipt it started with.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -72,6 +71,7 @@ from scripts.infra.terraform_wrapper import (
     save_plan,
     terraform,
 )
+from scripts.ingestion.closed import QuietParser
 from scripts.process import TimeoutExpired, run_command
 from scripts.project_config import ENVIRONMENTS, ROOT, ConfigurationError, load_configuration
 
@@ -671,7 +671,7 @@ def destroy(aws: Aws, configuration: dict[str, str], run: RunBinding, confirm: s
 
 def main() -> int:
     """Plan or run the teardown and return a non-zero code on a refusal or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["plan", "destroy"])
     parser.add_argument("--confirm", default="", help="destroy: the confirmation code that plan printed")
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ast
 import os
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -127,13 +126,14 @@ class HeavyFigureTest(unittest.TestCase):
         with self.assertRaisesRegex(ConcurrencyError, f"{HEAVY_MEMORY_ENVIRONMENT} is empty"):
             heavy_memory_mib({HEAVY_MEMORY_ENVIRONMENT: ""})
 
-    def test_a_figure_that_is_not_a_positive_whole_number_is_refused_with_the_value_named(self) -> None:
+    def test_a_figure_that_is_not_a_positive_whole_number_is_refused_without_the_value(self) -> None:
         for value in ("0", "-1", "-11008", "11008.0", "1.5", "abc", "11008m", " 11008", "11008 ", "1_000", "0x2b00", "+5", "١٠٠٠"):
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex(ConcurrencyError, f"{HEAVY_MEMORY_ENVIRONMENT}.*positive whole number.*" + re.escape(repr(value))),
+                self.assertRaisesRegex(ConcurrencyError, f"{HEAVY_MEMORY_ENVIRONMENT}.*positive whole number") as raised,
             ):
                 heavy_memory_mib({HEAVY_MEMORY_ENVIRONMENT: value})
+            self.assertNotIn(value, str(raised.exception))
 
     def test_the_live_environment_is_read_when_none_is_given(self) -> None:
         with mock.patch.dict(os.environ, {HEAVY_MEMORY_ENVIRONMENT: "4321"}):

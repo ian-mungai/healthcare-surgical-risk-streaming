@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from spark import table_checks as rules
 from spark.session import build_session, start_deadline
 from spark.settings import SettingsError
@@ -39,7 +40,7 @@ HASH_BLOCK_BYTES = 1024 * 1024
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog=f"python -m spark.jobs.{JOB}", description="Check each loaded table against its verified source.")
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Check each loaded table against its verified source.")
     command.add_argument("--staging", required=True, help="the folder that holds plan.json and the staged verified files")
     return command
 

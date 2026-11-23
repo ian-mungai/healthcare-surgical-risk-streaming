@@ -8,7 +8,6 @@ manifest's hash. The key's path comes from ``EVIDENCE_VERIFIER_KEY`` in ``.env``
 
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
 import sys
@@ -21,6 +20,7 @@ from scripts.evidence.manifest import archive_problems, manifest_problems, manif
 from scripts.evidence.receipt import NAMESPACE, SIGNATURE_TIMEOUT_SECONDS
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding
 from scripts.infra.terraform_wrapper import WrapperError, load_run
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -86,7 +86,7 @@ def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -
 
 def main() -> int:
     """Check the readback, sign the receipt and return a non-zero code when the readback is incomplete or the signing fails."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         run = load_run(parser.parse_args().binding)

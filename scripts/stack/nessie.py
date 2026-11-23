@@ -17,7 +17,6 @@ hash, and says ``initialised``. It says ``unchanged`` only when the namespace is
 
 from __future__ import annotations
 
-import argparse
 import http.client
 import json
 import os
@@ -27,6 +26,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
+
+from scripts.ingestion.closed import QuietParser
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 NAMESPACE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -247,7 +248,7 @@ class NessieClient:
 
 def main(argv: list[str] | None = None) -> int:
     """Give the default branch the project namespace when its head lacks it. Exit 0 when it holds it, 1 when Nessie fails or refuses, 2 for bad input."""
-    parser = argparse.ArgumentParser(prog="scripts.stack.nessie", description="Give Nessie's default branch its first commit, a namespace, once.")
+    parser = QuietParser(prog="scripts.stack.nessie", description="Give Nessie's default branch its first commit, a namespace, once.")
     commands = parser.add_subparsers(dest="command", required=True)
     initialise = commands.add_parser("initialise")
     initialise.add_argument("--namespace", required=True, help="the namespace of the first commit: lower-case letters, digits and underscores")

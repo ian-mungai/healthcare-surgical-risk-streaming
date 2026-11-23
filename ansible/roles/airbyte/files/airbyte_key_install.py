@@ -31,6 +31,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 
 def load_helper() -> object:
@@ -150,8 +151,16 @@ def place(directory: Path, owner: tuple[int, int], container_owner: tuple[int, i
     return "placed" if changed else "unchanged"
 
 
+class QuietParser(argparse.ArgumentParser):
+    """An argument parser whose only error output is the code ``usage``. It runs alone on the host, so it holds its own copy."""
+
+    def error(self, message: str) -> NoReturn:
+        sys.stderr.write("usage\n")
+        raise SystemExit(3)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Place the project profile's access key from standard input.")
+    parser = QuietParser(description="Place the project profile's access key from standard input.")
     parser.add_argument("--directory", default=DEFAULT_DIRECTORY, help="the secrets folder")
     parser.add_argument("--owner", default=DEFAULT_OWNER, help="the numeric user and group of the root-only files, uid:gid")
     parser.add_argument("--container-owner", default=DEFAULT_CONTAINER_OWNER, help="the numeric user and group of the code location's two copies, uid:gid")

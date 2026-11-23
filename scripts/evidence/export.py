@@ -7,7 +7,6 @@ started on a GitHub runner hands these two files to the owner, who verifies them
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import tarfile
@@ -16,12 +15,13 @@ from pathlib import Path
 from scripts.evidence.manifest import build_manifest, manifest_problems, manifest_sha256
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run
+from scripts.ingestion.closed import QuietParser
 from scripts.project_config import ROOT
 
 
 def main() -> int:
     """Write the manifest and the archive, print their size and return a non-zero code on a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         run = load_run(parser.parse_args().binding)

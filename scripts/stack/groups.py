@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ROOT
 from scripts.stack.admission import EXIT_WAIT, SUPPORTING_GROUP, AdmissionError, Decision, check_group, describe
@@ -194,7 +195,7 @@ def project_name(compose_directory: Path) -> str:
 
 def whole_number(text: str) -> int:
     if not re.fullmatch(r"[0-9]+", text):
-        raise GroupError(f"{text!r} is not a whole number")
+        raise GroupError("a memory figure must be a whole number")
     return int(text)
 
 
@@ -394,7 +395,7 @@ def stop_group(
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog="python -m scripts.stack.groups", description=__doc__.split("\n\n")[0] if __doc__ else None)
+    command = QuietParser(prog="python -m scripts.stack.groups", description=__doc__.split("\n\n")[0] if __doc__ else None)
     command.add_argument("action", choices=("up", "down"))
     command.add_argument("group")
     command.add_argument("--compose-directory", type=Path, help="the compose folder, in place of STACK_COMPOSE_DIRECTORY or the repository's compose folder")

@@ -16,7 +16,6 @@ it is absent. A folder that the run folder writer would name ``*_<run id>`` must
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import http.client
 import json
@@ -34,6 +33,7 @@ from types import FrameType
 from typing import Any
 from urllib.parse import quote
 
+from scripts.ingestion.closed import QuietParser
 from scripts.stack.nessie import BODY_LIMIT_BYTES, HASH, NessieClient, NessieConflict, NessieError, Reference
 
 RUN_TAG_PREFIX = "run-"
@@ -429,9 +429,7 @@ def write_version_record(folder: Path, result: TagResult) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     """Tag a run's merged hash and record it. Exit 0 when the tag and the record are as asked, 1 when Nessie or a record refuses, 2 for bad input."""
-    parser = argparse.ArgumentParser(
-        prog="scripts.stack.tags", description="Tag a run's merged hash and write the tag, hash and snapshot IDs into its run folder."
-    )
+    parser = QuietParser(prog="scripts.stack.tags", description="Tag a run's merged hash and write the tag, hash and snapshot IDs into its run folder.")
     commands = parser.add_subparsers(dest="command", required=True)
     tag = commands.add_parser("tag")
     tag.add_argument("--run-id", required=True)

@@ -24,6 +24,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.stack.limits import LIMITS_FILE, SERVICE_NAME, Limits, LimitsError, load_limits
 
@@ -133,7 +134,7 @@ def check_group(group: str, *, limits_path: Path = LIMITS_FILE, available_mib: i
 
 def whole_number(text: str) -> int:
     if not ASCII_DIGITS.fullmatch(text):
-        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+        raise argparse.ArgumentTypeError("the figure must be a whole number")
     return int(text)
 
 
@@ -142,7 +143,7 @@ def running_names(text: str) -> frozenset[str]:
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog="python -m scripts.stack.admission", description=__doc__.split("\n\n")[0] if __doc__ else None)
+    command = QuietParser(prog="python -m scripts.stack.admission", description=__doc__.split("\n\n")[0] if __doc__ else None)
     command.add_argument("group", help="the service group to start")
     command.add_argument("--limits", type=Path, default=LIMITS_FILE, help="test input: a limits file in place of compose/limits.yml")
     command.add_argument("--available-mib", type=whole_number, help="test input: the host's available memory in MiB, in place of the reading of /proc/meminfo")

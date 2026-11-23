@@ -36,6 +36,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError, ManifestRef
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
@@ -59,9 +60,7 @@ BUCKET_ENVIRONMENT = "BRONZE_LANDED_BUCKET"
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog=f"python -m spark.jobs.{JOB}", description="Decode the verified case files into the Bronze tables on a private Nessie branch."
-    )
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Decode the verified case files into the Bronze tables on a private Nessie branch.")
     command.add_argument("--branch", required=True, help="the private branch to create from the base and write to")
     command.add_argument("--base", default="main", help="the branch to create the private branch from")
     command.add_argument("--manifest-reference", required=True, type=Path, help="the file that holds the reference of the passed manifest")
