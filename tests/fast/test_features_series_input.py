@@ -144,6 +144,27 @@ class JsonParity(unittest.TestCase):
             build_row(document(entries)["windows"][0])  # type: ignore[index]
 
 
+class MalformedExactMean(unittest.TestCase):
+    """Added after the code, by the second self-review: a planted fault in each check below was not caught by another test."""
+
+    def entries(self) -> list[list[object]]:
+        return series_entries(seconds_of(lambda second: [60.0] * 4))
+
+    def test_a_valid_json_reading_with_a_count_of_zero_or_less_or_a_sum_that_is_not_finite_is_refused_by_name(self) -> None:
+        for bad in ([None, 1.0], [0, 60.0], [-4, 60.0], [4, float("nan")], [4, float("inf")], [True, 60.0], [4, "60"]):
+            entries = self.entries()
+            entries[-1][3:5] = bad
+            with self.subTest(bad=bad), self.assertRaisesRegex(FeatureInputError, SERIES):
+                build_row(document(entries)["windows"][0])  # type: ignore[index]
+
+    def test_an_exact_mean_that_no_float_can_hold_is_not_the_value_of_a_reading_inside_the_window(self) -> None:
+        readings = series_readings(seconds_of(lambda second: [60.0] * 4))
+        last = readings[-1]
+        huge = SeriesReadings([*readings[:-1], Reading(last.time_us, last.value, True, Fraction(10**500))])
+        with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*value is not the exact mean"):
+            build_row(window(huge))
+
+
 class ReadingsOutsideTheWindow(unittest.TestCase):
     """A reading after the cutoff is never read: whatever its value is, even a number that no float can hold, it changes no feature and raises nothing."""
 
