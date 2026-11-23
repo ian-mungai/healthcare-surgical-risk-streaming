@@ -6,8 +6,9 @@ written, each table is compared by its fingerprint with the table that the branc
 write is made only while the branch still has the checked hash, each changed table is one commit whose hash comes from the branch's log, and the input and
 both tables are read again at the hash of the last write. The read-back must be the planned tables, with every check passing.
 
-The events are outcomes of the warning, and a held-out patient's outcome is never counted: the result holds the row count and the causes of the series, which
-are inputs, and only a digest of the event table, with no row count and no cause.
+The events are outcomes of the warning, and the test set is sealed: the result holds the row count and the causes of the series, which are inputs, and only a
+digest of the event table (``Digest``, which has no row count), with no count and no cause. The events are made for the development cases only, and the checks
+about them are flags.
 """
 
 from __future__ import annotations
@@ -27,18 +28,26 @@ TABLES = (SERIES, EVENTS)
 
 
 @dataclass(frozen=True, slots=True)
+class Digest:
+    """The sum of a hash of each row of a table, with no row count: equal tables have equal digests, whatever the order of their rows."""
+
+    digest: int
+
+
+@dataclass(frozen=True, slots=True)
 class InputRead:
-    """What a read of the input at one hash gives: the counts of the checks and the snapshot IDs of the two tables it reads."""
+    """What a read of the input at one hash gives: the counts and flags of the checks and the snapshot IDs of the three tables it reads (the waveform
+    seconds, the clinical table and the patient split)."""
 
     facts: InputFacts
-    snapshots: tuple[int | None, int | None]
+    snapshots: tuple[int | None, int | None, int | None]
 
 
 @dataclass(frozen=True, slots=True)
 class TableRead:
     """A table at one hash: its fingerprint, its snapshot ID and, when asked for, the counts of its checks."""
 
-    fingerprint: Fingerprint
+    fingerprint: Fingerprint | Digest
     snapshot_id: int | None
     series: SeriesFacts | None = None
     events: EventFacts | None = None
@@ -50,7 +59,7 @@ class Operations:
 
     head: Callable[[], str]
     read_input: Callable[[str], InputRead]
-    plan: Callable[[str], dict[str, Fingerprint]]
+    plan: Callable[[str], dict[str, Fingerprint | Digest]]
     read_table: Callable[[str, str, bool], TableRead | None]
     write: Callable[[str, bool], None]
     write_hash: Callable[[str, str], str | None]
@@ -66,21 +75,23 @@ class Outcome:
     branch_hash: str
     source: InputRead
     tables: dict[str, TableRead]
-    fingerprints: dict[str, Fingerprint]
+    fingerprints: dict[str, Fingerprint | Digest]
 
     def facts(self) -> dict[str, Any]:
         """What the result line may hold: hashes, snapshot IDs, the series' counts and the checks that ran, and for the events only a digest."""
-        series = self.tables[SERIES].series
+        series, stored, events = self.tables[SERIES].series, self.fingerprints[SERIES], self.fingerprints[EVENTS]
+        if not isinstance(stored, Fingerprint) or not isinstance(events, Digest):
+            raise TypeError("the series has a fingerprint and the events a digest")
         return {
             "outcome": self.outcome,
             "checked_hash": self.checked_hash,
             "write_hash": self.write_hash,
             "branch_hash": self.branch_hash,
-            "source_snapshots": dict(zip(("waveform_seconds", "clinical_cases"), self.source.snapshots, strict=True)),
+            "source_snapshots": dict(zip(("waveform_seconds", "clinical_cases", "patient_split"), self.source.snapshots, strict=True)),
             "snapshots": {table: read.snapshot_id for table, read in self.tables.items()},
-            "rows": {SERIES: self.tables[SERIES].fingerprint.rows},
+            "rows": {SERIES: stored.rows},
             "causes": {SERIES: dict(series.causes) if series else {}},
-            "fingerprints": {SERIES: [self.fingerprints[SERIES].rows, self.fingerprints[SERIES].digest], EVENTS: [self.fingerprints[EVENTS].digest]},
+            "fingerprints": {SERIES: [stored.rows, stored.digest], EVENTS: [events.digest]},
             "checks_run": list(CHECK_NAMES),
         }
 
@@ -100,7 +111,7 @@ def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRe
     return {table: ops.read_table(at, table, with_facts) for table in TABLES}
 
 
-def differs(read: TableRead | None, planned: Fingerprint) -> bool:
+def differs(read: TableRead | None, planned: Fingerprint | Digest) -> bool:
     """Whether the table that a branch holds is not the planned one: it is not there, or its fingerprint is another."""
     return read is None or read.fingerprint != planned
 
@@ -150,11 +161,15 @@ def run_build(ops: Operations, head: str) -> Outcome:
 
 
 def run_verify(ops: Operations, head: str) -> Outcome:
-    """Run every check on the tables that the branch holds at ``head``, and confirm that the branch still has ``head``. Nothing is written."""
+    """Run every check on the tables that the branch holds at ``head``, and confirm that the branch still has ``head``. Nothing is written. The input is
+    checked first, so no table is read with a split that is not trusted."""
     try:
         source = ops.read_input(head)
+        problems = input_problems(source.facts)
+        if problems:
+            raise SilverSignalsError(*problems)
         reads = read_tables(ops, head, True)
-        problems = input_problems(source.facts) + table_problems(source, reads)
+        problems = table_problems(source, reads)
         if problems:
             raise SilverSignalsError(*problems)
         if ops.head() != head:

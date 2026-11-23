@@ -1,7 +1,8 @@
 """The hypotension event rule on the per-second arterial series (``features.pressure_series``): the one definition that Silver and any later path call.
 
 **Rule** (analysis plan, rows 2 and 4, project standard "Analysis decisions and their evidence"). An event is 60 consecutive valid seconds of the series,
-each below 65 mmHg (``EVENT_THRESHOLD_MMHG``; a value of exactly 65 is not low), inside the operation. A second of the series that is invalid, a second the
+each below 65 mmHg (``EVENT_THRESHOLD_MMHG``; a mean of exactly 65 is not low, and a mean below 65 is low even when its float is 65.0, because the
+comparison is made on the exact mean, ``features.pressure_series.exact_below``), inside the operation. A second of the series that is invalid, a second the
 series does not hold and a second at or above 65 each end a run: nothing bridges a gap. The validity of a second is the trailing rule of
 ``features.signal_validity``, and the follow-up seconds that confirm an onset are judged by the same rule as every other second, because they are read from the
 same series.
@@ -25,6 +26,8 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from features.pressure_series import ExactMean
+
 EVENT_SECONDS = 60
 EVENT_THRESHOLD_MMHG = 65.0
 SECOND_US = 1_000_000
@@ -37,10 +40,10 @@ END_REASONS = (END_RECOVERED, END_INVALID, END_MISSING, END_OPERATION)
 
 @dataclass(frozen=True, slots=True)
 class SeriesPoint:
-    """One second of the series: the value (``None`` when invalid) and its validity."""
+    """One second of the series: its exact mean (``None`` when invalid) and its validity."""
 
     second: int
-    value: float | None
+    mean: ExactMean | None
     valid: bool
 
 
@@ -77,9 +80,9 @@ class HypotensionEvent:
 def is_low(point: SeriesPoint) -> bool:
     if not point.valid:
         return False
-    if point.value is None or not math.isfinite(point.value):
-        raise ValueError(f"second {point.second} is valid and has no finite value")
-    return point.value < EVENT_THRESHOLD_MMHG
+    if point.mean is None:
+        raise ValueError(f"second {point.second} is valid and has no mean")
+    return point.mean.below(EVENT_THRESHOLD_MMHG)
 
 
 def inside(second: int, opstart: float, opend: float) -> bool:

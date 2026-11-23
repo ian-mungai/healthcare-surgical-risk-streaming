@@ -11,6 +11,8 @@ Every case here is hand-built and kept apart from published data. Failure modes 
 - The onset or the confirmation time is the wrong end of its second, so a feature at a cutoff could read data after it.
 - Two runs separated by one second at 65 mmHg are joined into one event.
 - The input order or a repeated second changes the answer.
+- A reading is rounded to a float before it is compared with 65: 61 seconds that alternate between 65.0 and 64.99999999999999 mmHg have 60 readings whose exact
+  mean is below 65 and whose float is exactly 65.0, so the event is lost.
 """
 
 from __future__ import annotations
@@ -29,15 +31,15 @@ from features.hypotension import (
     events_of,
     low_runs,
 )
-from features.pressure_series import second_facts, series_from_seconds
+from features.pressure_series import ExactMean, second_facts, series_from_seconds
 from features.registry import LOW_PRESSURE_65
-from features.signal_validity import FLAT_WINDOW_SECONDS, combine_extents, second_extent, waveform_verdict
+from features.signal_validity import FLAT_WINDOW_SECONDS, VALID, combine_extents, second_extent, waveform_verdict
 
 OPSTART, OPEND = 100.0, 10_000.0
 
 
 def low(first: int, count: int, value: float = 60.0) -> list[SeriesPoint]:
-    return [SeriesPoint(second, value, True) for second in range(first, first + count)]
+    return [SeriesPoint(second, ExactMean.of(value), True) for second in range(first, first + count)]
 
 
 def bad(second: int) -> SeriesPoint:
@@ -45,7 +47,7 @@ def bad(second: int) -> SeriesPoint:
 
 
 def high(second: int, value: float = 80.0) -> SeriesPoint:
-    return SeriesPoint(second, value, True)
+    return SeriesPoint(second, ExactMean.of(value), True)
 
 
 def events(points: list[SeriesPoint], opstart: float = OPSTART, opend: float = OPEND) -> list[tuple[int, int, str]]:
@@ -85,6 +87,24 @@ class Boundary(unittest.TestCase):
     def test_a_run_of_60_then_one_second_at_65_then_a_run_of_60_are_two_events(self) -> None:
         points = [*low(200, 60), high(260, 65.0), *low(261, 60), high(321)]
         self.assertEqual([(200, 60, END_RECOVERED), (261, 60, END_RECOVERED)], events(points))
+
+
+class ExactComparison(unittest.TestCase):
+    def alternating(self, count: int) -> list[SeriesPoint]:
+        facts = [second_facts(second, VALID, [65.0] * 4 if second % 2 == 0 else [64.99999999999999] * 4) for second in range(200, 200 + count)]
+        return [SeriesPoint(second, reading.mean, reading.valid) for second, reading in series_from_seconds(facts)]
+
+    def test_readings_whose_exact_mean_is_below_65_and_whose_float_is_65_are_low(self) -> None:
+        points = self.alternating(61)
+        self.assertEqual(65.0, points[1].mean.value if points[1].mean else None)
+        self.assertEqual([(201, 60, END_OPERATION)], events(points, opend=261.0))
+
+    def test_one_reading_fewer_is_still_no_event(self) -> None:
+        self.assertEqual([], events(self.alternating(60), opend=260.0))
+
+    def test_a_valid_point_with_no_mean_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            events_of([SeriesPoint(200, None, True)], OPSTART, OPEND)
 
 
 class InvalidGap(unittest.TestCase):
@@ -154,7 +174,7 @@ class Times(unittest.TestCase):
 
     def test_a_second_given_twice_is_refused(self) -> None:
         with self.assertRaises(ValueError):
-            events_of([*low(200, 3), SeriesPoint(200, 60.0, True)], OPSTART, OPEND)
+            events_of([*low(200, 3), SeriesPoint(200, ExactMean.of(60.0), True)], OPSTART, OPEND)
 
     def test_a_valid_point_without_a_value_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -183,7 +203,7 @@ class TrailingValidityOnFollowUpSeconds(unittest.TestCase):
             prior = combine_extents(second_extent(seconds[s], self.RATE, 0) for s in range(second - FLAT_WINDOW_SECONDS + 1, second) if s in seconds)
             verdict = waveform_verdict("SNUADC/ART", seconds[second], self.RATE, 0, None if before is None else before[-1], prior)
             facts.append(second_facts(second, verdict, seconds[second]))
-        return [SeriesPoint(second, reading.value, reading.valid) for second, reading in series_from_seconds(facts)]
+        return [SeriesPoint(second, reading.mean, reading.valid) for second, reading in series_from_seconds(facts)]
 
     def test_a_low_pressure_waveform_of_60_seconds_is_an_event_from_the_second_after_its_first(self) -> None:
         # The series of the first second needs a second before it, so 61 low seconds give a run of 60 that starts at the second after the first.

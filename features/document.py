@@ -12,7 +12,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from features.model import ClinicalValue, FeatureInputError, Reading, WaveformSecond, WaveformWindow, WindowInput
-from features.registry import INPUT_OBJECTS
+from features.registry import ARTERIAL_SERIES, INPUT_OBJECTS
+from features.series_input import series_readings_from_rows
 
 
 def reject_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -68,6 +69,8 @@ def parse_window(value: object, path: str = "the window") -> WindowInput:
             if len(triple) != 3:
                 raise FeatureInputError(f"{where}[{index}] is not an array of time, value and valid flag")
             numeric[track].append(Reading(triple[0], triple[1], triple[2]))
+        if track == ARTERIAL_SERIES:
+            numeric[track] = series_readings_from_rows([(reading.time_us, reading.value, reading.valid) for reading in numeric[track]])
     waveforms: dict[str, WaveformWindow] = {}
     for track, item in as_object(body["waveforms"], f"{path}.waveforms").items():
         where = f"{path}.waveforms[{track}]"

@@ -14,10 +14,13 @@ waveform sample to its physical value.
 
 The job ``spark/jobs/silver_hypotension.py`` builds two more tables from ``waveform_seconds`` and the clinical table (``HYPOTENSION_TABLES``):
 
-- ``art_mbp_1s``: one row for each second of ``SNUADC/ART``, the trailing 2-second average (``features.pressure_series``). Key: case and second. The reading of
-  second ``s`` is known at the end of ``s``. ``value`` is null when the reading is invalid, and ``invalid_cause`` is the cause then.
+- ``art_mbp_1s``: one row for each second of ``SNUADC/ART``, the trailing 2-second average (``features.pressure_series``). Key: case and second. The
+  reading of second ``s`` is known at the end of ``s``. ``sample_count``, ``sum_high`` and ``sum_low`` are the exact mean (the number of samples of the two
+  seconds and their exact sum as two floats), and ``value`` is that mean rounded once; a limit test uses the exact mean. The three and ``value`` are null
+  when the reading is invalid, and ``invalid_cause`` is the cause then.
 - ``hypotension_events``: one row for each run of at least 60 consecutive valid seconds of the series below 65 mmHg inside the operation
-  (``features.hypotension``). Key: case and onset second. It holds every time the event used: the onset and confirmation times, the end of the run and the
+  (``features.hypotension``), for the cases of the development patients only (the training and validation sets of ``silver.patient_split``, trusted after its
+  rule check). Key: case and onset second. It holds every time the event used: the onset and confirmation times, the end of the run and the
   operation start and end that bounded it, and why the run ended.
 """
 
@@ -81,6 +84,9 @@ ART_MBP_1S = SilverTable(
         ("case_id", "bigint"),
         ("case_second", "bigint"),
         ("value", "double"),
+        ("sample_count", "int"),
+        ("sum_high", "double"),
+        ("sum_low", "double"),
         ("valid", "boolean"),
         ("invalid_cause", "string"),
         *LINEAGE_COLUMNS,

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 
 SECOND = 1_000_000
 MINUTE = 60 * SECOND
@@ -20,11 +21,13 @@ class FeatureInputError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class Reading:
-    """One reading of a numeric track on Silver's one-second grid."""
+    """One reading of a numeric track on Silver's one-second grid. ``exact`` is the exact value of a reading of the per-second arterial series, which every
+    limit test uses instead of ``value`` (``features.series_input``); a source-time reading has none."""
 
     time_us: int
     value: float
     valid: bool
+    exact: Fraction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +71,7 @@ class NumericWindow:
     cutoff_us: int
     times_us: Sequence[int]
     values: Sequence[float]
+    exacts: Sequence[Fraction] | None = None
 
 
 @dataclass(frozen=True, slots=True)

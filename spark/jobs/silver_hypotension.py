@@ -4,14 +4,16 @@
 ``python -m spark.jobs.silver_hypotension verify --branch <name>``
 
 ``build`` creates the branch from ``main`` (or from ``--base``, which must hold ``silver.waveform_seconds``), refuses a branch that exists and takes the base
-hash from the answer that created it. It reads ``silver.waveform_seconds`` and ``bronze.clinical_cases`` at that hash and writes the two tables on the branch
-(the tables are in ``spark/silver/tables.py``, the rules in ``features/pressure_series.py`` and ``features/hypotension.py``). It never writes to the base: the
-merge is the caller's step after its checks. ``verify`` runs the checks on the tables that a branch holds and writes nothing. The order, the freeze of a rerun
-that changes nothing, the writes and the read-back are in ``spark/silver/hypotension_run.py``; the command line, its codes and its exit codes are those of
-``spark/silver/cli.py``. The settings come from the environment, as the Silver signals job's do.
+hash from the answer that created it. It reads ``silver.waveform_seconds``, ``bronze.clinical_cases`` and ``silver.patient_split`` at that hash and writes the
+two tables on the branch (the tables are in ``spark/silver/tables.py``, the rules in ``features/pressure_series.py`` and ``features/hypotension.py``). It never
+writes to the base: the merge is the caller's step after its checks. ``verify`` runs the checks on the tables that a branch holds and writes nothing. The order,
+the freeze of a rerun that changes nothing, the writes and the read-back are in ``spark/silver/hypotension_run.py``; the command line, its codes and its exit
+codes are those of ``spark/silver/cli.py``. The settings come from the environment, as the Silver signals job's do.
 
-No rule is estimated from data, so no patient set is read. The events are outcomes of the warning, so the result holds the series' counts and a digest of the
-event table, and never a count of events, a case, a time or a value.
+The test set is sealed. No rule is estimated from data. The patient split is read after the check of who owns each case and only to find the development cases
+(training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes, so
+the result holds the series' counts and a digest of the event table (no row count), and every check about events is a flag. It never names a count of events, a
+case, a patient, a set, a time or a value.
 """
 
 from __future__ import annotations
@@ -29,16 +31,19 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from spark.silver.frames import fingerprint as fingerprint_of
 from spark.silver.frames import functions
-from spark.silver.hypotension_run import EVENTS, SERIES, InputRead, Operations, TableRead, run_build, run_verify
+from spark.silver.hypotension_checks import InputFacts, split_rule_problems
+from spark.silver.hypotension_run import EVENTS, SERIES, Digest, InputRead, Operations, TableRead, run_build, run_verify
 from spark.silver.run import BRANCH_MOVED, Fingerprint
 from spark.silver.tables import HYPOTENSION_TABLES, NAMESPACE, WAVEFORM
 from spark.split_cli import open_client, read_settings, start_deadline
-from spark.split_table import PatientSplitError, schema_problems, unit
+from spark.split_table import COLUMNS as SPLIT_COLUMNS
+from spark.split_table import PatientSplitError, SplitRow, schema_problems, unit
 
 JOB = "silver_hypotension"
 WAVEFORM_TABLE = f"{NAMESPACE}.{WAVEFORM.name}"
 CLINICAL_TABLE = "bronze.clinical_cases"
-CLINICAL_COLUMNS = (("caseid", "string"), ("opstart", "string"), ("opend", "string"))
+CLINICAL_COLUMNS = (("caseid", "string"), ("subjectid", "string"), ("opstart", "string"), ("opend", "string"))
+SPLIT_TABLE = f"{NAMESPACE}.patient_split"
 
 
 class HypotensionLake(Lake):
@@ -79,22 +84,45 @@ class HypotensionLake(Lake):
             raise SilverSignalsError(*problems)
         return frame, table
 
+    def split(self, at: str) -> tuple[Any, str]:
+        frame, table = self.source_frame(at, SPLIT_TABLE)
+        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS, "split table")
+        if problems:
+            raise SilverSignalsError(*problems)
+        return frame, table
+
+    def split_problems(self, frame: Any) -> list[str]:
+        """The patient split table checked by the split job's own rules: a set is trusted only when this is empty."""
+        rows = [SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in frame.collect()]
+        return split_rule_problems(rows)
+
     def read_input(self, at: str) -> InputRead:
+        """The three inputs at ``at``. The checks of who owns a case and of the split come first, and the facts that join a case to a set are read only when
+        both passed, so no set is used before it is trusted."""
         waveform, waveform_table = self.waveform(at)
         clinical, clinical_table = self.clinical(at)
-        snapshots = (self.snapshot_id(waveform_table), self.snapshot_id(clinical_table))
+        split, split_table = self.split(at)
+        snapshots = (self.snapshot_id(waveform_table), self.snapshot_id(clinical_table), self.snapshot_id(split_table))
         if any(snapshot is None for snapshot in snapshots):
             raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
-        return InputRead(frames.input_facts(waveform, clinical), (snapshots[0], snapshots[1]))
+        held = (snapshots[0], snapshots[1], snapshots[2])
+        if frames.ownership_flag(clinical):
+            return InputRead(InputFacts(0, 0, 0, 1, 0, ()), held)
+        problems = self.split_problems(split)
+        if problems:
+            return InputRead(InputFacts(0, 0, 0, 0, 0, tuple(problems)), held)
+        return InputRead(frames.input_facts(waveform, clinical, split), held)
 
-    def plan(self, at: str) -> dict[str, Fingerprint]:
-        """Build both frames at ``at``, keep them on disk for the write and give their fingerprints. The events are made from the planned series."""
+    def plan(self, at: str) -> dict[str, Fingerprint | Digest]:
+        """Build both frames at ``at``, keep them on disk for the write and give their fingerprints. The events are made from the planned series, for the
+        development cases, and their digest has no row count."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         waveform, _ = self.waveform(at)
         clinical, _ = self.clinical(at)
+        split, _ = self.split(at)
         series = frames.series_frame(waveform).persist(disk)
-        self.planned = {SERIES: series, EVENTS: frames.events_frame(series, clinical).persist(disk)}
-        return {table: fingerprint_of(frame) for table, frame in self.planned.items()}
+        self.planned = {SERIES: series, EVENTS: frames.events_frame(series, clinical, split).persist(disk)}
+        return {SERIES: fingerprint_of(series), EVENTS: frames.digest_of(self.planned[EVENTS])}
 
     def read_signal_table(self, at: str, table: str, with_facts: bool) -> TableRead | None:
         name = f"{self.catalog(at)}.{NAMESPACE}.{table}"
@@ -104,15 +132,17 @@ class HypotensionLake(Lake):
         problems = schema_problems(self.fields_of(frame), HYPOTENSION_TABLES[table].columns, f"{table} table")
         if problems:
             raise SilverSignalsError(*problems)
-        fingerprint, snapshot = fingerprint_of(frame), self.snapshot_id(name)
+        held: Fingerprint | Digest = fingerprint_of(frame) if table == SERIES else frames.digest_of(frame)
+        snapshot = self.snapshot_id(name)
         if not with_facts:
-            return TableRead(fingerprint, snapshot)
+            return TableRead(held, snapshot)
         waveform, _ = self.waveform(at)
         if table == SERIES:
-            return TableRead(fingerprint, snapshot, series=frames.series_facts(frame, waveform))
+            return TableRead(held, snapshot, series=frames.series_facts(frame, waveform))
         series = self.session.table(f"{self.catalog(at)}.{NAMESPACE}.{SERIES}")
         clinical, _ = self.clinical(at)
-        return TableRead(fingerprint, snapshot, events=frames.event_facts(frame, series, clinical))
+        split, _ = self.split(at)
+        return TableRead(held, snapshot, events=frames.event_facts(frame, series, clinical, split))
 
     def write_signal_table(self, table: str, exists: bool) -> None:
         """Write the planned frame as the whole table, as one commit: create it, or overwrite every row of the table that exists, as that job does.

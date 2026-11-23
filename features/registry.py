@@ -38,6 +38,7 @@ from functools import cache
 
 from features import stats
 from features.model import MINUTE, SECOND, NumericWindow, WaveformValid
+from features.pressure_series import exact_below
 
 SOURCE_TIME = "source_time"
 PER_SECOND = "per_second"
@@ -105,14 +106,22 @@ def slug(track: str) -> str:
     return track.lower().replace("/", "_")
 
 
+def below_indexes(window: NumericWindow, limit: float) -> list[int]:
+    """The positions of the valid readings below ``limit``. A reading of the per-second series is compared by its exact mean (``exact_below``), never by its
+    rounded value; any other reading by its value."""
+    if window.exacts is not None:
+        return [index for index, exact in enumerate(window.exacts) if exact_below(exact, limit)]
+    return [index for index, value in enumerate(window.values) if value < limit]
+
+
 def below_minutes(window: NumericWindow, limit: float) -> float:
     """Each valid second of the per-second series stands for one second: the minutes below ``limit`` are the seconds below it over 60."""
-    return sum(1 for value in window.values if value < limit) / 60
+    return len(below_indexes(window, limit)) / 60
 
 
 def seconds_since_below(window: NumericWindow, limit: float) -> float | None:
-    times = [time for time, value in zip(window.times_us, window.values, strict=True) if value < limit]
-    return (window.cutoff_us - times[-1]) / SECOND if times else None
+    positions = below_indexes(window, limit)
+    return (window.cutoff_us - window.times_us[positions[-1]]) / SECOND if positions else None
 
 
 def exact_slope_per_minute(window: NumericWindow) -> Fraction | None:
