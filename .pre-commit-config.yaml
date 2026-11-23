@@ -1,8 +1,16 @@
+# Check-first checks: each check runs at the cheapest layer that can do its job, and hosted CI runs every check in full.
+# 1. Commit hooks, about COMMIT_TIME: the commit and commit-msg stages below (secrets in the staged changes, credential and data files, privacy, Ruff, MyPy,
+#    the quick tests and the commit message). `make check` runs the manual stage on every file; the hosted hooks job runs it.
+# 2. Push gate, about PUSH_TIME, before every push to any branch: the pre-push stage below (scripts/quality/push_gate.py) runs the secret scan (merge diffs
+#    included) and the commit messages of the unpushed commits of HEAD, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the
+#    quick test modules that cover them) and the dependency scan when a lock file changes. A push guard (scripts/quality/push_guard_hook.py, the pre-push.legacy
+#    hook) first refuses a push while tracked files have uncommitted changes, because pre-commit hides unstaged changes from the hooks it runs.
+# 3. Hosted CI (.github/workflows/ci.yml): every check in full on each push of a work branch, each pull request, the squash-merge commit on main, every Monday and on demand.
 # Every hook is local and pinned: pre-commit, Ruff and MyPy come from requirements.txt in .venv, and gitleaks from scripts/quality/install_tools.py in .tools.
-# Run `make setup` once. The commit stage holds the fast checks. CI runs the manual stage on every file with `make check`.
-# The slow tests (tests/slow: Ansible playbook runs, local servers, stand-in programs and the planted workflow faults) are not a hook: run `make test-slow` before a push; CI runs them in their own job.
-# Do not use SKIP= or `git commit --no-verify`.
-default_install_hook_types: [pre-commit, commit-msg]
+# Run `make setup` once: it installs the commit, commit-msg and pre-push hooks and the push guard. The slow tests (tests/slow: Ansible playbook runs, local servers,
+# stand-in programs and the planted workflow faults) are no hook: they run in their own hosted job, and `make test-slow` runs them on demand.
+# Do not use SKIP= or `git commit --no-verify`, or `git push --no-verify`.
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 default_stages: [pre-commit, manual]
 fail_fast: false
 
@@ -66,3 +74,11 @@ repos:
         entry: .venv/bin/python -m scripts.quality.repo_checks commit-msg
         language: system
         stages: [commit-msg]
+      - id: push-gate
+        name: Push gate (secrets and commit messages of the unpushed commits, privacy, the changed files' own checks, the dependency scan)
+        entry: .venv/bin/python -m scripts.quality.push_gate
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true
+        stages: [pre-push]

@@ -1,4 +1,4 @@
-"""Install the pinned command-line tools into ``.tools``: gitleaks, Terraform, tflint, the tflint AWS ruleset and Trivy, and the working-tree privacy hook.
+"""Install the pinned command-line tools into ``.tools``: gitleaks, Terraform, tflint, its AWS ruleset and Trivy, and the privacy and push guard hooks.
 
 Run from the repository root: ``.venv/bin/python -m scripts.quality.install_tools``. ``--check`` verifies each installed
 binary against its pinned archive without downloading or writing anything. Each archive is checked against its pinned
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.process import run_command
-from scripts.quality import worktree_scan_hook
+from scripts.quality import push_guard_hook, worktree_scan_hook
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / ".tools"
@@ -172,6 +172,22 @@ def settle_hook(*, check: bool) -> bool:
     return True
 
 
+def settle_push_guard(*, check: bool) -> bool:
+    if push_guard_hook.installed(ROOT):
+        sys.stdout.write("push guard hook: installed and verified\n")
+        return True
+    if check:
+        sys.stderr.write("push guard hook: missing or changed; run the installer without --check\n")
+        return False
+    try:
+        push_guard_hook.install(ROOT)
+    except worktree_scan_hook.KeptHookError as error:
+        sys.stderr.write(f"push guard hook: {error}\n")
+        return False
+    sys.stdout.write("push guard hook: installed\n")
+    return True
+
+
 def main() -> int:
     """Install or check every pinned tool and return 1 when one is missing or differs."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
@@ -179,6 +195,7 @@ def main() -> int:
     check = parser.parse_args().check
     results = [settle(tool, check=check) for tool in TOOL_LIST]
     results.append(settle_hook(check=check))
+    results.append(settle_push_guard(check=check))
     return 0 if all(results) else 1
 
 

@@ -9,7 +9,7 @@ In development. The first phase builds the host and its lifecycle. It adds the r
 You need macOS on Apple silicon or Linux on x86-64, the two platforms that `scripts/quality/install_tools.py` pins tools for, with Python 3.14, Git, GNU Make and curl. The host commands also need the AWS CLI, OpenSSH and the Tailscale client.
 
 ```sh
-make setup  # create .venv, install the pinned tools (gitleaks, Terraform 1.16.4, tflint, Trivy), the commit and commit message hooks and the working-tree privacy hook
+make setup  # create .venv, install the pinned tools (gitleaks, Terraform 1.16.4, tflint, Trivy), the commit, commit message and push hooks, the working-tree privacy hook and the push guard
 ```
 
 `infra/versions.tf` requires Terraform 1.16.4 or a later 1.16 release, and the hosted CI job installs 1.16.4.
@@ -18,12 +18,19 @@ The host commands read their settings from `.env`. Copy `.env.example` to `.env`
 
 ## Usage
 
+Each check runs at the cheapest layer that can do its job, and hosted CI runs every check in full.
+
+1. **Commit hooks, COMMIT_TIME:** secrets in the staged changes, credential and data files, privacy, Ruff, MyPy, the quick tests (`tests/fast`) and the commit message.
+2. **Push gate, PUSH_TIME, before every push to any branch** (`scripts/quality/push_gate.py`, installed by `make setup`): the secret scan (merge diffs included) and the commit messages of the unpushed commits of HEAD, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the quick test modules that cover the changed files) and the dependency scan when a lock file changes. A push guard first refuses a push while tracked files have uncommitted changes. There is no full local run before a push.
+3. **Hosted CI** (`.github/workflows/ci.yml`): every check in full on each push of a work branch, each pull request, the commit that a squash merge creates on `main`, every Monday and on demand. A separate headroom job, outside the required check, fails any job that used over 80% of its timeout, is missing from the run or has no limit. `main` moves only through a pull request that is up to date with `main` and squash-merged after the required check passes (a recorded exception to the check-first default).
+
 Run the checks from the repository root.
 
 ```sh
 make check            # run the manual-stage hooks on every file
 make test-fast        # run the fast tests
-make test-slow        # run the slow tests: Ansible playbook runs, local servers and stand-ins, and the planted workflow faults (before a push; CI runs them too)
+make test-slow        # run the slow tests: Ansible playbook runs, local servers and stand-ins, and the planted workflow faults (on demand; the hosted run runs them too)
+make headroom         # in a hosted run only: check every job of the run against its timeout (GH_TOKEN, GITHUB_REPOSITORY and GITHUB_RUN_ID are set there)
 make test-guards      # commit planted faults in a temporary repository and confirm each guard refuses its own
 make test-deadline    # run a wait that passes its deadline and confirm it fails visibly
 make check-terraform  # check the Terraform code with its plan tests, tflint and Trivy
