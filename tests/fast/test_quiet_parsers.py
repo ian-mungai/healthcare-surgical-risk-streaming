@@ -7,10 +7,16 @@ scan below fails for any plain parser outside that module. Argument-type errors,
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.process import run_command
+from scripts.stack import caddy
 from tests.fast.git_fixture import TIMEOUT_SECONDS
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +48,48 @@ def value_repeating_messages(source: str, functions: tuple[str, ...]) -> list[in
     return lines
 
 
+PARSED_NAMES = frozenset({"arguments", "args", "parsed", "namespace", "options"})
+FILE_ERRORS = frozenset({"OSError", "IOError", "FileNotFoundError", "PermissionError", "IsADirectoryError", "NotADirectoryError"})
+
+
+def chain_root(node: ast.AST) -> str | None:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def error_sinks(tree: ast.AST) -> list[ast.AST]:
+    """The parts of a module that make an error message: what a ``raise`` builds and what is written to standard error."""
+    found: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            found.append(node.exc)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "write" and ast.unparse(node.func.value) == "sys.stderr":
+            found.append(node)
+    return found
+
+
+def interpolations(sink: ast.AST) -> list[ast.expr]:
+    return [part.value for part in ast.walk(sink) if isinstance(part, ast.FormattedValue)]
+
+
+def argument_values_in_messages(source: str) -> list[int]:
+    """Lines where an error message interpolates an attribute of the parsed command line, or the text of an error about a file, which names its path."""
+    tree = ast.parse(source)
+    lines = []
+    for sink in error_sinks(tree):
+        for value in interpolations(sink):
+            if any(isinstance(part, ast.Attribute) and chain_root(part) in PARSED_NAMES for part in ast.walk(value)):
+                lines.append(value.lineno)
+    for handler in (node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler) and node.name):
+        caught = {ast.unparse(item) for item in (handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type])} if handler.type else set()
+        if caught & FILE_ERRORS:
+            for statement in handler.body:
+                for sink in error_sinks(statement):
+                    lines += [value.lineno for value in interpolations(sink) if isinstance(value, ast.Name) and value.id == handler.name]
+    return sorted(set(lines))
+
+
 class QuietParserTests(unittest.TestCase):
     def test_no_plain_argument_parser_outside_the_quiet_parsers_module(self) -> None:
         found = {name: plain_parser_calls((ROOT / name).read_text()) for name in tracked_python() if name != QUIET_MODULE}
@@ -62,6 +110,31 @@ class QuietParserTests(unittest.TestCase):
                     parser.parse_args(arguments)
             self.assertEqual(2, stop.exception.code)
             self.assertNotIn(MARKER, err.getvalue())
+
+    def test_no_error_message_interpolates_a_command_line_value_or_the_text_of_a_file_error(self) -> None:
+        found = {name: argument_values_in_messages((ROOT / name).read_text()) for name in tracked_python() if not name.startswith(("tests/", "ansible/"))}
+        self.assertEqual({}, {name: lines for name, lines in found.items() if lines})
+
+    def test_the_scan_finds_each_form_that_it_is_written_for(self) -> None:
+        attribute = "def main(arguments):\n    raise Failure(f'bad {arguments.branch}')\n"
+        written = "import sys\n\n\ndef main(args):\n    sys.stderr.write(f'{args.x}')\n"
+        file_error = "def read(path):\n    try:\n        return path.read_text()\n    except OSError as error:\n        raise Failure(f'{error}') from None\n"
+        fixed = "def main(arguments):\n    raise Failure('fixed text')\n"
+        self.assertEqual([2], argument_values_in_messages(attribute))
+        self.assertEqual([5], argument_values_in_messages(written))
+        self.assertEqual([5], argument_values_in_messages(file_error))
+        self.assertEqual([], argument_values_in_messages(fixed))
+
+    def test_caddy_render_names_no_file_when_it_cannot_read_the_routes_file(self) -> None:
+        err = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            mock.patch.object(sys, "argv", ["caddy", "render", str(Path(folder) / "secret_name_marker.txt")]),
+            contextlib.redirect_stderr(err),
+        ):
+            code = caddy.main()
+        self.assertEqual(1, code)
+        self.assertNotIn("secret_name_marker", err.getvalue())
 
     def test_the_named_messages_repeat_no_value(self) -> None:
         for name, functions in (

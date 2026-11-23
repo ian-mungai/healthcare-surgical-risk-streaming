@@ -85,7 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
         result = run_job(arguments.command, arguments.branch, arguments.source_hash, NessieAdapter(client), open_spark)
     except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch {arguments.branch}: {error}\n")
+        sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
         return 1
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")

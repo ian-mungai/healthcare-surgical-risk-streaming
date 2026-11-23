@@ -118,7 +118,7 @@ def maintain(arguments: Any) -> dict[str, Any]:
     client = TagClient(required_environment("NESSIE_URI"), arguments.deadline_seconds)
     trunk = default_branch(client)
     if arguments.trunk is not None and arguments.trunk != trunk:
-        raise RetentionError(f"{arguments.trunk} is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted")
+        raise RetentionError(f"the trunk argument is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted")
     branches = list_references(client, "BRANCH")
     if trunk not in branches:
         raise RetentionError(f"the default branch {trunk} does not exist")

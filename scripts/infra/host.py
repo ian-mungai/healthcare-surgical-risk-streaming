@@ -153,8 +153,8 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
-    except FileNotFoundError as error:
-        raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
+    except FileNotFoundError:
+        raise HostError("the Tailscale client is not installed on this computer") from None
     except TimeoutExpired:
         raise NoPeerError(timeout_text("tailscale status", min(timeout, SSH_ATTEMPT_SECONDS))) from None
     if result.returncode != 0:

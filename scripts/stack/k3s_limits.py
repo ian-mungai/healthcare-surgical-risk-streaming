@@ -256,8 +256,11 @@ def main() -> int:
         else:
             sys.stderr.write("usage: python -m scripts.stack.k3s_limits values | limit-range <namespace> | check-chart\n")
             return 2
-    except (LimitsError, YamlError, OSError) as error:
+    except (LimitsError, YamlError) as error:
         sys.stderr.write(f"k3s limits: {error}\n")
+        return 1
+    except OSError:
+        sys.stderr.write("k3s limits: a file cannot be read\n")
         return 1
     return 0
 

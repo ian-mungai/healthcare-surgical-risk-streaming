@@ -190,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"{JOB}: refused: {error}\n")
         return 1
     except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch {arguments.branch}: {error}\n")
+        sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
         return 1
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")

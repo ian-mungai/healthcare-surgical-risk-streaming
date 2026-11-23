@@ -391,7 +391,7 @@ def stage_record(folder: Path, record: dict[str, Any]) -> str:
     except OSError as error:
         if staging:
             Path(staging).unlink(missing_ok=True)
-        raise TagConflict(f"the run folder {folder} cannot be written ({type(error).__name__}: {error}): no tag was made") from error
+        raise TagConflict(f"the run folder cannot be written ({type(error).__name__}): no tag was made") from error
     return staging
 
 
@@ -453,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     def expire(signal_number: int, frame: FrameType | None) -> None:
-        raise DeadlineExceeded(f"the run passed its deadline of {arguments.deadline_seconds:g} seconds and was stopped")
+        raise DeadlineExceeded("the run passed its deadline and was stopped")
 
     previous = signal.signal(signal.SIGALRM, expire)
     signal.setitimer(signal.ITIMER_REAL, arguments.deadline_seconds)

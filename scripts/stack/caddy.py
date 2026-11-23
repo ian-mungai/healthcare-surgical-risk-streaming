@@ -101,7 +101,7 @@ def load_routes(path: Path = ROUTES_FILE) -> list[Route]:
     try:
         return parse_routes(path.read_text())
     except OSError as error:
-        raise RoutesError(f"cannot read {path.name}: {error.strerror}") from error
+        raise RoutesError(f"cannot read the routes file ({type(error).__name__})") from None
 
 
 def site(address_port: int, body: list[str]) -> str:

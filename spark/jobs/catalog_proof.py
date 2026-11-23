@@ -77,7 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         client.create_branch(arguments.branch, arguments.base)
         written = write_table(arguments.branch, arguments.rows)
         if arguments.fail_after_write:
-            raise PlannedFailure(f"planned failure after the write on branch {arguments.branch}")
+            raise PlannedFailure("planned failure after the write")
         result = {
             "branch": arguments.branch,
             "branch_hash": client.reference(arguments.branch).hash,
@@ -89,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             **written,
         }
     except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch {arguments.branch}: {error}\n")
+        sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
         return 1
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")

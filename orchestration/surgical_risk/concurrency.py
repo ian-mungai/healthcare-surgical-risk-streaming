@@ -55,7 +55,7 @@ def group_memory_mib(group: str, limits_file: Path = LIMITS_FILE) -> int:
     try:
         document = yaml.safe_load(limits_file.read_text())
     except (OSError, yaml.YAMLError) as error:
-        raise ConcurrencyError(f"cannot read the limits file {limits_file.name}: {error}") from error
+        raise ConcurrencyError(f"cannot read the limits file {limits_file.name}: {type(error).__name__}") from error
     services = document.get("services") if isinstance(document, dict) else None
     if not isinstance(services, dict):
         raise ConcurrencyError(f"the limits file {limits_file.name} holds no services mapping")
