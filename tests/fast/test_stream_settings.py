@@ -32,6 +32,10 @@ class Settings(unittest.TestCase):
         self.assertEqual("", settings.clinical_file)
         self.assertIsInstance(settings, StreamSettings)
 
+    def test_the_topics_and_the_branch_can_be_named_for_a_test_and_default_to_the_platforms(self) -> None:
+        settings = from_environment({**BASE, "STREAM_INPUT_TOPIC": "in_x", "STREAM_OUTPUT_TOPIC": "out_x", "STREAM_BRANCH": "b_x"})
+        self.assertEqual(("in_x", "out_x", "b_x"), (settings.input_topic, settings.output_topic, settings.branch))
+
     def test_the_limits_are_read_in_seconds_and_kept_in_microseconds(self) -> None:
         settings = from_environment({**BASE, "STREAM_LATE_LIMIT_SECONDS": "12.5", "STREAM_CUTOFF_STEP_SECONDS": "30"})
         self.assertEqual((12_500_000, 30_000_000), (settings.late_limit_us, settings.cutoff_step_us))

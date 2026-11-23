@@ -72,6 +72,8 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
         bootstrap=required(env, "KAFKA_BOOTSTRAP"),
         registry_url=required(env, "REGISTRY_URL"),
         checkpoint_dir=required(env, "STREAM_CHECKPOINT_DIR"),
+        input_topic=env.get("STREAM_INPUT_TOPIC", "") or INPUT_TOPIC,
+        output_topic=env.get("STREAM_OUTPUT_TOPIC", "") or FEATURE_READY_TOPIC,
         branch=env.get("STREAM_BRANCH", "") or DEFAULT_BRANCH,
         late_limit_us=round(number(env, "STREAM_LATE_LIMIT_SECONDS", DEFAULT_LATE_LIMIT_SECONDS, minimum=0, allow_zero=True) * SECOND),
         cutoff_step_us=round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND),
