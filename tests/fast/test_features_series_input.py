@@ -187,6 +187,21 @@ class FilteredBeforeConverted(unittest.TestCase):
         earlier = Reading((FIRST - 5) * SECOND, 60.0, True)
         self.assertEqual(reference, build_row(window(SeriesReadings([*readings, later, earlier]))).values)
 
+    def test_the_edges_of_the_window_are_the_ones_the_features_read(self) -> None:
+        """A reading at the cutoff (a second not complete) and one a second before the window are not read; the first and last seconds of the window are."""
+        entries = series_entries(seconds_of(lambda second: [60.0] * 4))
+        reference = through_the_command_line(entries)
+        first_in, last_in = CUTOFF_US - 900 * SECOND, CUTOFF_US - SECOND
+        for time, read in ((CUTOFF_US, False), (first_in - SECOND, False), (first_in, True), (last_in, True)):
+            junk = [time, 60.0, True, 0, 0.0, 0.0]
+            kept = [entry for entry in entries if entry[0] != time]
+            with self.subTest(time=time - CUTOFF_US, read=read):
+                if read:
+                    with self.assertRaisesRegex(FeatureInputError, SERIES):
+                        build_row(document([*kept, junk])["windows"][0])  # type: ignore[index]
+                else:
+                    self.assertEqual(reference, through_the_command_line([*kept, junk]))
+
     def test_a_reading_inside_the_window_without_its_exact_mean_is_still_refused_by_name(self) -> None:
         readings = series_readings(seconds_of(lambda second: [60.0] * 4))
         last = readings[-1]
