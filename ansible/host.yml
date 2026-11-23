@@ -20,3 +20,9 @@
     - unlock_key
     - compose_stack
     - airbyte
+
+  post_tasks:
+    - name: Start the orchestration services, which mount files that the Airbyte role made
+      ansible.builtin.include_role:
+        name: compose_stack
+        tasks_from: start_orchestration.yml

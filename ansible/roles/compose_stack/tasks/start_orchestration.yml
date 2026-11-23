@@ -1,0 +1,18 @@
+# Reads compose_stack_orchestration_services, compose_stack_docker, the deadlines and, set by the Airbyte role's record_client_files.yml, airbyte_record_files_changed. The code
+# location and the services that wait for it start only now, after the Airbyte role made the six files that the code location mounts as Compose secrets, so a clean host deploys
+# in one pass. A file that a run replaced is a new file for the host, and a running container keeps the file it was started with, so a changed file recreates the code location.
+# The code location then gives Nessie's main branch its first commit, which it can only do once it runs.
+- name: Start the orchestration services and wait for their health
+  ansible.builtin.include_tasks: start.yml
+  vars:
+    compose_stack_start_services: "{{ compose_stack_orchestration_services }}"
+
+- name: Recreate the code location when a file that it mounts was replaced
+  ansible.builtin.command:
+    argv: "{{ compose_stack_docker + ['up', '--detach', '--wait', '--wait-timeout', compose_stack_health_deadline_seconds | string, '--force-recreate', '--no-deps', 'dagster_code_location'] }}"
+  when: airbyte_record_files_changed | default(false) | bool
+  changed_when: true
+  timeout: "{{ compose_stack_start_deadline_seconds | int }}"
+
+- name: Give Nessie's main branch its first commit
+  ansible.builtin.include_tasks: nessie.yml

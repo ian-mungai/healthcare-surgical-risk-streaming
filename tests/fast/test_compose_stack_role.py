@@ -147,7 +147,7 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_gives_nessie_its_first_commit_and_makes_openbao_match(
+    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_but_the_orchestration_services_and_makes_openbao_match(
         self,
     ) -> None:
         self.assertEqual(
@@ -165,7 +165,6 @@ class StepOrderTest(unittest.TestCase):
                 "provision.yml",
                 "openbao/prepare.yml",
                 "start.yml all",
-                "nessie.yml",
                 "kafka.yml",
                 "registry.yml",
                 "openbao/bootstrap.yml",
@@ -182,6 +181,21 @@ class StepOrderTest(unittest.TestCase):
         document: Any = load_yaml((ROOT / "compose" / "services" / "dagster_code_location.yml").read_text())
         secrets = document["secrets"]
         self.assertEqual({"k3s/dagster.token", "k3s/ca.crt"}, {secrets[name]["file"].split("}/", 1)[1] for name in ("k3s_token", "k3s_ca")})
+
+
+class OrchestrationStartTest(unittest.TestCase):
+    def test_the_orchestration_start_starts_those_services_then_gives_nessie_its_first_commit(self) -> None:
+        tasks: Any = load_yaml((ROLE / "tasks" / "start_orchestration.yml").read_text())
+        files = [task["ansible.builtin.include_tasks"] for task in tasks if "ansible.builtin.include_tasks" in task]
+        self.assertEqual(["start.yml", "nessie.yml"], files)
+        self.assertEqual("{{ compose_stack_orchestration_services }}", tasks[0]["vars"]["compose_stack_start_services"])
+
+    def test_the_playbook_runs_it_after_every_role_as_a_post_task(self) -> None:
+        document: Any = load_yaml((ROOT / "ansible" / "host.yml").read_text())
+        play = document[0]
+        self.assertEqual("airbyte", play["roles"][-1])
+        include = play["post_tasks"][0]["ansible.builtin.include_role"]
+        self.assertEqual(("compose_stack", "start_orchestration.yml"), (include["name"], include["tasks_from"]))
 
 
 class PasswordFilesTest(unittest.TestCase):

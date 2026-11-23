@@ -222,6 +222,13 @@ class ClientFilesTest(unittest.TestCase):
             {"airbyte_bridge_address": "10.42.0.1@8.8.8.8"},
             {"airbyte_bridge_address": "10.42.0.1/x"},
             {"airbyte_bridge_address": ""},
+            {"airbyte_bridge_address": "172.32.0.1"},
+            {"airbyte_bridge_address": "100.64.0.1"},
+            {"airbyte_bridge_address": "10.042.0.1"},
+            {"airbyte_api_route_port": "8001?"},
+            {"airbyte_api_route_port": "8001/"},
+            {"airbyte_api_route_port": "8001#"},
+            {"airbyte_api_route_port": "08001"},
             {"airbyte_api_route_port": 0},
             {"airbyte_api_route_port": 70000},
             {"airbyte_api_route_port": "80/x"},
@@ -415,6 +422,18 @@ class StaticRulesTest(unittest.TestCase):
         self.assertIn("airbyte_record_container_user", copy["owner"])
         self.assertIn("airbyte_record_container_user", copy["group"])
         self.assertEqual("0400", copy["mode"])
+
+    def test_the_deploy_checks_the_api_address_with_the_codes_own_check_and_holds_no_second_list_of_ranges(self) -> None:
+        tasks = self.tasks()["record_client_files.yml"]
+        checks = [task for task in tasks if "ansible.builtin.command" in task and "scripts.ingestion.airbyte_api" in json.dumps(task)]
+        self.assertEqual(1, len(checks))
+        argv = checks[0]["ansible.builtin.command"]["argv"]
+        self.assertEqual(["check", "--address"], argv[3:5])
+        self.assertEqual("http://{{ airbyte_bridge_address }}:{{ airbyte_api_route_port | default(8001) }}", argv[5])
+        self.assertEqual("localhost", checks[0]["delegate_to"])
+        text = (ROLE_TASKS / "record_client_files.yml").read_text()
+        for range_text in ("169", "172\\.", "192\\.168", "match('^(10"):
+            self.assertNotIn(range_text, text, "the allowed ranges are defined once, in scripts/ingestion/airbyte_api.py")
 
 
 if __name__ == "__main__":

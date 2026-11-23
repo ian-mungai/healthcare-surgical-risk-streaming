@@ -89,6 +89,9 @@ compose_stack_built_images:
     dockerfile: replay/Dockerfile
 # The namespace of the first commit that the deploy gives Nessie's main branch.
 compose_stack_nessie_namespace: surgical_risk
+# The services that start last, after the Airbyte role made the files that the code location mounts as Compose secrets (Airbyte writes the instance's client
+# credentials only when it first starts, and its release needs PostgreSQL): the code location and every service that waits for it.
+compose_stack_orchestration_services: [dagster_code_location, dagster_daemon, dagster_webserver]
 # An empty project name keeps the one fixed name in compose.yml.
 compose_stack_project: ""
 # Each deadline is in seconds. The start deadline covers pulling the images and the health deadline each service's health check.
