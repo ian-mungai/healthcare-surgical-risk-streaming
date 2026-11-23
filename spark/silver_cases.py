@@ -310,6 +310,8 @@ def input_problems(
     lab_rows_without_case: int,
     split_problems: Sequence[str],
     sealed_outcome_form_bad: int,
+    sealed_lab_form_bad: int,
+    lab_pinned_mismatch: int,
     development_cases: int | None,
     pinned: bool,
 ) -> list[str]:
@@ -338,12 +340,14 @@ def input_problems(
             problems.append(f"{code}: {columns_text(counted)}")
     if sealed_outcome_form_bad:
         problems.append("sealed_outcome_form: a held-out outcome value is not in its published form")
+    if sealed_lab_form_bad:
+        problems.append("sealed_lab_form: a held-out laboratory value is not in its published form")
     if development_cases == 0:
         problems.append(f"no_development_cases: {unit(0, 'case')}")
-    if pinned and (bronze_case_rows, bronze_lab_rows) != (PINNED_CASES, PINNED_LAB_ROWS):
-        problems.append(
-            f"pinned_counts: {unit(bronze_case_rows, 'case')} and {unit(bronze_lab_rows, 'laboratory row')}, not {PINNED_CASES} and {PINNED_LAB_ROWS}"
-        )
+    if pinned and bronze_case_rows != PINNED_CASES:
+        problems.append(f"pinned_counts: {unit(bronze_case_rows, 'case')}, not {PINNED_CASES}")
+    if pinned and lab_pinned_mismatch:
+        problems.append("pinned_counts: the laboratory row count is not the release's")
     return problems
 
 
@@ -363,6 +367,8 @@ def output_problems(
     case_key_differences: int,
     sealed_outcome_differs: int,
     output_schema_tables_wrong: int,
+    silver_lab_orphans: int,
+    sealed_lab_differs: int,
 ) -> list[str]:
     """What is wrong with the tables that were written, against Bronze: a row count that differs, a changed value, a repeated key or a gap in the occurrence."""
     problems: list[str] = []
@@ -381,9 +387,12 @@ def output_problems(
         ("lab_occurrence_gap", lab_occurrence_gaps, "group"),
         ("never_feature_marking", never_feature_marking_wrong, "table"),
         ("output_schema", output_schema_tables_wrong, "table"),
+        ("lab_case_missing_in_silver", silver_lab_orphans, "row"),
     ):
         if count:
             problems.append(f"{code}: {unit(count, noun)}")
     if sealed_outcome_differs:
         problems.append("sealed_outcome_differs: a held-out outcome value differs from Bronze")
+    if sealed_lab_differs:
+        problems.append("sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key")
     return problems

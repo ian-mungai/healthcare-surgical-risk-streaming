@@ -92,14 +92,17 @@ class Outcome:
     snapshot_ids: dict[str, int | None]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line holds: the outcome, which tables were written, the checks that ran, counts, the snapshot IDs, the measure and the cutoffs."""
+        """What the result line holds: the outcome, which tables were written, the checks that ran, counts, the snapshot IDs, the measure and the cutoffs.
+
+        The laboratory counts are for development patients only.
+        """
         return {
             "outcome": self.outcome,
             "written": self.written,
             "checks_run": CHECKS_BUILD if self.pinned else CHECKS_SAMPLE,
             "cases": self.output["case_rows"],
-            "lab_rows": self.output["lab_rows"],
-            "lab_copies": self.output["lab_copies"],
+            "development_lab_rows": self.output["lab_rows"],
+            "development_lab_copies": self.output["lab_copies"],
             "development_cases": self.cutoffs[0].development_cases,
             "snapshot_ids": self.snapshot_ids,
             "measure": [asdict(row) for row in self.measure],

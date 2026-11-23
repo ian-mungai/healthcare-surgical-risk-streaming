@@ -27,6 +27,7 @@ from spark.silver_cases import (
     NUMBER_PATTERN,
     OCCURRENCE_COLUMN,
     OUTCOME_COLUMNS,
+    PINNED_LAB_ROWS,
     SEX_VALUES,
     STRING,
     TOP_CODED_AGE,
@@ -190,15 +191,63 @@ def sealed_outcome_query(cases: str, split: str) -> str:
     return sql("SELECT CASE WHEN COALESCE(SUM(CASE WHEN", anything, "THEN 1 ELSE 0 END), 0) > 0 THEN 1 ELSE 0 END AS n FROM", joined, "WHERE", held_out)
 
 
-def lab_facts_query(lab: str) -> str:
-    """One row of counts over the Bronze laboratory table: the rows, rows with a null key part and values not in their published form."""
-    caseid, dt = typed_expression("caseid", BIGINT, "l"), typed_expression("dt", BIGINT, "l")
-    name = typed_expression("name", STRING, "l")
-    items = ["COUNT(*) AS row_count", sum_of(f"({caseid}) IS NULL OR ({dt}) IS NULL OR ({name}) IS NULL", "lab_key_null")]
-    for column in ("caseid", "dt", "result"):
+def lab_scope(lab: str, cases: str, split: str, *, development: bool, bronze: bool, strict: bool = False) -> str:
+    """The laboratory rows whose case is a case of a development patient (``development``) or of any other patient, as a subquery. A row with no case is in
+    neither. ``bronze`` is for the Bronze tables, where the case number is a text that is typed first: with the guarded typing of the build, or with the plain
+    ``CAST`` when ``strict`` (the checks of a written table, which run after the input checks found no case number that is not a number)."""
+
+    def number(alias: str) -> str:
+        return f"CAST({reference('caseid', alias)} AS BIGINT)" if strict else typed_expression("caseid", BIGINT, alias)
+
+    lab_case = number("l") if bronze else reference("caseid", "l")
+    case_case = number("c") if bronze else reference("caseid", "c")
+    condition = "s.`set` IN (" + DEVELOPMENT_LIST + ")" if development else "COALESCE(s.`set`, '') NOT IN (" + DEVELOPMENT_LIST + ")"
+    joined = sql(lab, "l JOIN", cases, "c ON", lab_case, "=", case_case, "LEFT JOIN", split, "s ON c.`subjectid` = s.`subjectid`")
+    return sql("( SELECT l.* FROM", joined, "WHERE", condition, ")")
+
+
+def lab_bad_conditions() -> list[str]:
+    """The conditions that make a laboratory row not what the release publishes: a missing time or test name, or a time or result not in its form."""
+    dt, name = typed_expression("dt", BIGINT, "l"), typed_expression("name", STRING, "l")
+    conditions = [f"({dt}) IS NULL", f"({name}) IS NULL"]
+    for column in ("dt", "result"):
+        conditions.append(f"NOT ({missing_text(reference(column, 'l'))}) AND ({typed_expression(column, LAB_TYPES[column], 'l')}) IS NULL")
+    return conditions
+
+
+def lab_facts_query(scope: str) -> str:
+    """One row of counts over the development laboratory rows (``scope`` from ``lab_scope``): the rows, rows with a null key part and values not in their
+    published form."""
+    dt, name = typed_expression("dt", BIGINT, "l"), typed_expression("name", STRING, "l")
+    items = ["COUNT(*) AS row_count", sum_of(f"({dt}) IS NULL OR ({name}) IS NULL", "lab_key_null")]
+    for column in ("dt", "result"):
         unparsed = f"NOT ({missing_text(reference(column, 'l'))}) AND ({typed_expression(column, LAB_TYPES[column], 'l')}) IS NULL"
         items.append(sum_of(unparsed, f"unparsed__{column}"))
-    return sql("SELECT", ", ".join(items), "FROM", lab, "l")
+    return sql("SELECT", ", ".join(items), "FROM", scope, "l")
+
+
+def sealed_lab_form_query(scope: str) -> str:
+    """One flag, 0 or 1, never a count: whether any laboratory value of a patient outside the development sets (``scope`` from ``lab_scope``) is not in its
+    published form."""
+    anything = " OR ".join(f"({condition})" for condition in lab_bad_conditions())
+    return sql("SELECT CASE WHEN COALESCE(SUM(CASE WHEN", anything, "THEN 1 ELSE 0 END), 0) > 0 THEN 1 ELSE 0 END AS n FROM", scope, "l")
+
+
+def lab_pinned_query(lab: str) -> str:
+    """One flag, 0 or 1: whether the table does not hold the release's number of laboratory rows. The total never leaves the query."""
+    return sql("SELECT CASE WHEN COUNT(*) =", str(PINNED_LAB_ROWS), "THEN 0 ELSE 1 END AS n FROM", lab)
+
+
+def silver_lab_orphans_query(lab: str, cases: str) -> str:
+    """The count of written laboratory rows whose case number is in no case row."""
+    return sql("SELECT COUNT(*) AS n FROM", lab, "l LEFT ANTI JOIN", cases, "c ON", reference("caseid", "l"), "=", reference("caseid", "c"))
+
+
+def sealed_lab_output_query(bronze_scope: str, silver_scope: str) -> str:
+    """One flag, 0 or 1, never a count: whether the written laboratory rows of the patients outside the development sets differ from Bronze, repeat a key
+    or leave a gap in the occurrence numbers. The scopes come from ``lab_scope``."""
+    differences, duplicates, gaps, _ = lab_output_queries(bronze_scope, silver_scope)
+    return sql("SELECT CASE WHEN (", differences, ") + (", duplicates, ") + (", gaps, ") > 0 THEN 1 ELSE 0 END AS n")
 
 
 def lab_unmatched_query(lab: str, cases: str) -> str:

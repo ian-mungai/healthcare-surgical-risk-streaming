@@ -60,12 +60,14 @@ def clean_input(**changes: object) -> dict[str, object]:
         "operation_ends_before_it_starts": 0,
         "cases_without_one_split_row": 0,
         "split_patients_without_case": 0,
-        "bronze_lab_rows": 928448,
+        "bronze_lab_rows": 700000,
         "lab_key_null": 0,
         "lab_unparsed": {},
         "lab_rows_without_case": 0,
         "split_problems": [],
         "sealed_outcome_form_bad": 0,
+        "lab_pinned_mismatch": 0,
+        "sealed_lab_form_bad": 0,
         "development_cases": 4900,
     }
     return base | changes
@@ -77,9 +79,9 @@ def clean_output(**changes: object) -> dict[str, object]:
         "bronze_case_rows": 6388,
         "case_value_differences": 0,
         "case_key_duplicates": 0,
-        "lab_rows": 920000,
-        "lab_copies": 928448,
-        "bronze_lab_rows": 928448,
+        "lab_rows": 690000,
+        "lab_copies": 700000,
+        "bronze_lab_rows": 700000,
         "lab_value_differences": 0,
         "lab_key_duplicates": 0,
         "lab_occurrence_gaps": 0,
@@ -87,6 +89,8 @@ def clean_output(**changes: object) -> dict[str, object]:
         "case_key_differences": 0,
         "sealed_outcome_differs": 0,
         "output_schema_tables_wrong": 0,
+        "silver_lab_orphans": 0,
+        "sealed_lab_differs": 0,
     }
     return base | changes
 
@@ -345,10 +349,18 @@ class InputProblemTest(unittest.TestCase):
         self.assertIn("empty_cases: 0 rows", problems)
         self.assertIn("empty_lab: 0 rows", problems)
 
-    def test_the_pinned_release_demands_its_exact_counts_and_a_sample_does_not(self) -> None:
-        problems = input_problems(**clean_input(bronze_case_rows=13, bronze_lab_rows=100), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["pinned_counts: 13 cases and 100 laboratory rows, not 6388 and 928448"], problems)
-        self.assertEqual([], input_problems(**clean_input(bronze_case_rows=13, bronze_lab_rows=100), pinned=False))  # type: ignore[arg-type]
+    def test_the_pinned_release_demands_its_case_count_and_the_laboratory_total_as_a_flag_and_a_sample_does_not(self) -> None:
+        problems = input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1), pinned=True)  # type: ignore[arg-type]
+        self.assertEqual(["pinned_counts: 13 cases, not 6388", "pinned_counts: the laboratory row count is not the release's"], problems)
+        self.assertEqual([], input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1, bronze_lab_rows=100), pinned=False))  # type: ignore[arg-type]
+
+    def test_a_held_out_laboratory_value_not_in_its_published_form_is_a_code_with_no_count_and_no_column(self) -> None:
+        problems = input_problems(**clean_input(sealed_lab_form_bad=1), pinned=True)  # type: ignore[arg-type]
+        self.assertEqual(["sealed_lab_form: a held-out laboratory value is not in its published form"], problems)
+
+    def test_no_laboratory_total_over_all_patients_is_in_any_message(self) -> None:
+        problems = input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1, sealed_lab_form_bad=1), pinned=True)  # type: ignore[arg-type]
+        self.assertNotIn("928448", " ".join(problems))
 
 
 class OutcomeColumnTest(unittest.TestCase):
@@ -407,18 +419,25 @@ class SourceSchemaTest(unittest.TestCase):
 
 class OutputProblemTest(unittest.TestCase):
     def test_more_laboratory_rows_than_copies_is_impossible_and_refused(self) -> None:
-        self.assertEqual(["lab_rows: 928449 rows from 928448 copies"], output_problems(**clean_output(lab_rows=928449)))  # type: ignore[arg-type]
+        self.assertEqual(["lab_rows: 700001 rows from 700000 copies"], output_problems(**clean_output(lab_rows=700001)))  # type: ignore[arg-type]
 
     def test_a_held_out_outcome_value_that_differs_from_bronze_is_a_code_with_no_count(self) -> None:
         problems = output_problems(**clean_output(sealed_outcome_differs=1))  # type: ignore[arg-type]
         self.assertEqual(["sealed_outcome_differs: a held-out outcome value differs from Bronze"], problems)
 
+    def test_a_held_out_laboratory_difference_is_a_code_with_no_count_and_silver_rows_with_no_case_are_counted(self) -> None:
+        self.assertEqual(
+            ["sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key"],
+            output_problems(**clean_output(sealed_lab_differs=1)),  # type: ignore[arg-type]
+        )
+        self.assertEqual(["lab_case_missing_in_silver: 3 rows"], output_problems(**clean_output(silver_lab_orphans=3)))  # type: ignore[arg-type]
+
     def test_a_clean_output_has_no_problem(self) -> None:
         self.assertEqual([], output_problems(**clean_output()))  # type: ignore[arg-type]
 
     def test_a_row_count_that_differs_from_bronze_is_refused_for_both_tables(self) -> None:
-        problems = output_problems(**clean_output(case_rows=6387, lab_copies=928447))  # type: ignore[arg-type]
-        self.assertEqual(["case_rows: silver 6387, bronze 6388", "lab_rows: the copies add up to 928447, bronze 928448"], problems)
+        problems = output_problems(**clean_output(case_rows=6387, lab_copies=699999))  # type: ignore[arg-type]
+        self.assertEqual(["case_rows: silver 6387, bronze 6388", "lab_rows: the copies add up to 699999, bronze 700000"], problems)
 
     def test_a_changed_value_a_repeated_key_and_a_gap_in_the_occurrence_are_each_refused(self) -> None:
         cases = {

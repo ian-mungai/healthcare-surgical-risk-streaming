@@ -15,6 +15,7 @@ from spark.silver_cases import (
     FLAG_COLUMNS,
     LAB_COLUMNS,
     OUTCOME_COLUMNS,
+    PINNED_LAB_ROWS,
     SilverCasesError,
     age_over_89_value,
 )
@@ -35,16 +36,28 @@ from spark.silver_cases_sql import (
     development_lengths_query,
     lab_facts_query,
     lab_output_queries,
+    lab_pinned_query,
     lab_query,
+    lab_scope,
     lab_unmatched_query,
     outcome_facts_query,
     outcome_output_query,
+    sealed_lab_form_query,
+    sealed_lab_output_query,
     sealed_outcome_output_query,
     sealed_outcome_query,
+    silver_lab_orphans_query,
     split_facts_queries,
     typed_expression,
     values_query,
 )
+
+DEV_BRONZE = lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=True, bronze=True)
+DEV_SILVER = lab_scope(LAB_SOURCE, CASES_SOURCE, SPLIT_SOURCE, development=True, bronze=False)
+HELD_BRONZE = lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=False, bronze=True)
+CHECK_DEV_BRONZE = lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=True, bronze=True, strict=True)
+CHECK_HELD_BRONZE = lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=False, bronze=True, strict=True)
+HELD_SILVER = lab_scope(LAB_SOURCE, CASES_SOURCE, SPLIT_SOURCE, development=False, bronze=False)
 
 
 def select_list(query: str) -> list[str]:
@@ -220,12 +233,40 @@ class FactsTest(unittest.TestCase):
             self.assertIn(name, query)
         self.assertNotIn("test", query.replace("TRY_CAST", ""))
 
-    def test_the_laboratory_facts_count_unparsed_numbers_and_null_key_parts(self) -> None:
-        query = lab_facts_query(BRONZE_LAB_SOURCE)
-        for name in ("caseid", "dt", "result"):
+    def test_the_laboratory_facts_count_the_development_rows_only_and_name_no_held_out_set(self) -> None:
+        query = lab_facts_query(DEV_BRONZE)
+        for name in ("dt", "result"):
             self.assertIn(f"AS unparsed__{name}", query)
         self.assertIn("AS lab_key_null", query)
-        self.assertNotIn("JOIN", query)
+        self.assertIn("s.`set` IN ('training', 'validation')", query)
+        self.assertNotIn("NOT IN ('training'", query)
+        self.assertNotIn("test", query.replace("TRY_CAST", ""))
+
+    def test_the_held_out_laboratory_check_is_one_flag_that_is_zero_or_one_and_never_a_count(self) -> None:
+        query = sealed_lab_form_query(HELD_BRONZE)
+        self.assertTrue(query.startswith("SELECT CASE WHEN COALESCE(SUM("))
+        self.assertIn("> 0 THEN 1 ELSE 0 END AS n", query)
+        self.assertIn("COALESCE(s.`set`, '') NOT IN ('training', 'validation')", query)
+        for name in ("dt", "result", "name"):
+            self.assertIn(f"`l`.`{name}`", query)
+        self.assertNotIn("test", query.replace("TRY_CAST", ""))
+
+    def test_the_release_total_of_laboratory_rows_is_a_flag_made_inside_the_query(self) -> None:
+        query = lab_pinned_query(BRONZE_LAB_SOURCE)
+        self.assertEqual("SELECT CASE WHEN COUNT(*) = 928448 THEN 0 ELSE 1 END AS n FROM lake.bronze.lab_results", query)
+        self.assertEqual(928448, PINNED_LAB_ROWS)
+
+    def test_the_scope_of_the_laboratory_rows_joins_the_case_and_the_split_and_keeps_only_the_wanted_side(self) -> None:
+        for scope in (DEV_BRONZE, HELD_BRONZE, DEV_SILVER, HELD_SILVER):
+            self.assertIn("JOIN", scope)
+            self.assertIn("LEFT JOIN", scope)
+            self.assertIn(SPLIT_SOURCE, scope)
+        self.assertIn("WHERE s.`set` IN ('training', 'validation')", DEV_BRONZE)
+        self.assertIn("WHERE COALESCE(s.`set`, '') NOT IN ('training', 'validation')", HELD_BRONZE)
+        self.assertIn("`l`.`caseid` = `c`.`caseid`", DEV_SILVER)
+        self.assertIn("TRY_CAST(`l`.`caseid` AS BIGINT)", DEV_BRONZE)
+        self.assertIn("CAST(`l`.`caseid` AS BIGINT) = CAST(`c`.`caseid` AS BIGINT)", CHECK_DEV_BRONZE)
+        self.assertNotIn("TRY_CAST", CHECK_DEV_BRONZE)
 
     def test_a_laboratory_row_whose_case_has_no_clinical_row_is_found_with_an_anti_join_on_the_typed_case_number(self) -> None:
         query = lab_unmatched_query(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE)
@@ -303,7 +344,7 @@ class OutputQueryTest(unittest.TestCase):
         self.assertIn("`b`.`age` = '>89'", query)
 
     def test_the_laboratory_check_compares_the_groups_of_bronze_with_silver_in_both_directions(self) -> None:
-        differences, duplicates, gaps, copies = lab_output_queries(BRONZE_LAB_SOURCE, LAB_SOURCE)
+        differences, duplicates, gaps, copies = lab_output_queries(CHECK_DEV_BRONZE, DEV_SILVER)
         self.assertEqual(2, differences.count("EXCEPT ALL"))
         self.assertEqual(2, differences.count("( ( SELECT"))
         self.assertEqual(1, differences.count("UNION ALL"))
@@ -314,7 +355,7 @@ class OutputQueryTest(unittest.TestCase):
         self.assertIn("SUM(`source_copies`)", copies)
 
     def test_each_laboratory_row_is_compared_with_its_expected_occurrence_beside_its_result_and_copy_count(self) -> None:
-        differences = lab_output_queries(BRONZE_LAB_SOURCE, LAB_SOURCE)[0]
+        differences = lab_output_queries(CHECK_DEV_BRONZE, DEV_SILVER)[0]
         self.assertEqual(2, differences.count("ROW_NUMBER() OVER (PARTITION BY `caseid`, `dt`, `name` ORDER BY `result` ASC NULLS FIRST)"))
         for side in differences.split(" UNION ALL "):
             self.assertEqual(1, side.count("ROW_NUMBER()"))
@@ -323,13 +364,27 @@ class OutputQueryTest(unittest.TestCase):
 
 class LabCheckQueryTest(unittest.TestCase):
     def test_both_sides_are_grouped_on_all_four_values_and_each_direction_is_bronze_against_silver_then_silver_against_bronze(self) -> None:
-        differences = lab_output_queries(BRONZE_LAB_SOURCE, LAB_SOURCE)[0]
+        differences = lab_output_queries(CHECK_DEV_BRONZE, DEV_SILVER)[0]
         self.assertEqual(2, differences.count("GROUP BY `caseid`, `dt`, `name`, `result`"))
         first, second = differences.split(" UNION ALL ")
         self.assertLess(first.index(BRONZE_LAB_SOURCE), first.index(LAB_SOURCE))
         self.assertLess(second.index(LAB_SOURCE), second.index(BRONZE_LAB_SOURCE))
         self.assertEqual(1, first.count(BRONZE_LAB_SOURCE))
         self.assertEqual(1, second.count(BRONZE_LAB_SOURCE))
+
+    def test_the_held_out_laboratory_comparison_is_one_flag_made_of_the_three_checks_and_never_a_count(self) -> None:
+        query = sealed_lab_output_query(CHECK_HELD_BRONZE, HELD_SILVER)
+        self.assertTrue(query.startswith("SELECT CASE WHEN ("))
+        self.assertTrue(query.endswith("> 0 THEN 1 ELSE 0 END AS n"))
+        differences, duplicates, gaps, _ = lab_output_queries(CHECK_HELD_BRONZE, HELD_SILVER)
+        for part in (differences, duplicates, gaps):
+            self.assertIn(part, query)
+        self.assertEqual(3, query.count("SELECT COUNT(*) AS n FROM"))
+        self.assertNotIn("test", query.replace("TRY_CAST", ""))
+
+    def test_a_silver_laboratory_row_with_no_case_is_counted_with_an_anti_join(self) -> None:
+        query = silver_lab_orphans_query(LAB_SOURCE, CASES_SOURCE)
+        self.assertEqual("SELECT COUNT(*) AS n FROM lake.silver.lab_results l LEFT ANTI JOIN lake.silver.cases c ON `l`.`caseid` = `c`.`caseid`", query)
 
     def test_an_empty_bronze_text_is_missing_in_every_check_of_a_column(self) -> None:
         query = case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE)

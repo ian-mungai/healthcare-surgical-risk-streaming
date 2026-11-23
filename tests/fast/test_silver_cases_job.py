@@ -46,12 +46,14 @@ def clean_input_facts(**changes: object) -> dict[str, object]:
         "operation_ends_before_it_starts": 0,
         "cases_without_one_split_row": 0,
         "split_patients_without_case": 0,
-        "bronze_lab_rows": 928448,
+        "bronze_lab_rows": 700000,
         "lab_key_null": 0,
         "lab_unparsed": {"result": 0},
         "lab_rows_without_case": 0,
         "split_problems": [],
         "sealed_outcome_form_bad": 0,
+        "lab_pinned_mismatch": 0,
+        "sealed_lab_form_bad": 0,
     }
     return base | changes
 
@@ -62,16 +64,18 @@ def clean_output_facts(**changes: object) -> dict[str, object]:
         "bronze_case_rows": 6388,
         "case_value_differences": 0,
         "case_key_duplicates": 0,
-        "lab_copies": 928448,
-        "bronze_lab_rows": 928448,
+        "lab_copies": 700000,
+        "bronze_lab_rows": 700000,
         "lab_value_differences": 0,
         "lab_key_duplicates": 0,
         "lab_occurrence_gaps": 0,
         "never_feature_marking_wrong": 0,
-        "lab_rows": 920000,
+        "lab_rows": 690000,
         "case_key_differences": 0,
         "sealed_outcome_differs": 0,
         "output_schema_tables_wrong": 0,
+        "silver_lab_orphans": 0,
+        "sealed_lab_differs": 0,
     }
     return base | changes
 
@@ -165,7 +169,8 @@ class BuildOrderTest(unittest.TestCase):
         self.assertEqual({"cases": True, "lab": True, "rules": True}, facts["written"])
         self.assertEqual(CHECKS_BUILD, facts["checks_run"])
         self.assertEqual(6388, facts["cases"])
-        self.assertEqual(920000, facts["lab_rows"])
+        self.assertEqual(690000, facts["development_lab_rows"])
+        self.assertEqual(700000, facts["development_lab_copies"])
         self.assertEqual(len(LENGTHS), facts["development_cases"])
         self.assertEqual(
             {"silver.cases": 11, "silver.lab_results": 12, "silver.operation_length_measure": 13, "silver.score_cutoffs": 14}, facts["snapshot_ids"]
@@ -210,6 +215,12 @@ class InputFailureTest(unittest.TestCase):
         self.assertEqual(["sealed_outcome_form: a held-out outcome value is not in its published form"], problems)
         self.assertNotIn("write_cases", ops.calls)
 
+    def test_a_held_out_laboratory_value_not_in_its_published_form_stops_before_any_write_and_names_no_count(self) -> None:
+        ops = FakeOps(input=clean_input_facts(sealed_lab_form_bad=1))
+        problems = refused(lambda: run_build(ops, pinned=True))
+        self.assertEqual(["sealed_lab_form: a held-out laboratory value is not in its published form"], problems)
+        self.assertNotIn("write_cases", ops.calls)
+
     def test_no_development_case_stops_before_any_write(self) -> None:
         ops = FakeOps(lengths=[])
         problems = refused(lambda: run_build(ops, pinned=True))
@@ -223,7 +234,7 @@ class InputFailureTest(unittest.TestCase):
         self.assertNotIn("write_cases", ops.calls)
 
     def test_the_pinned_release_demands_its_counts_before_a_write_and_a_sample_does_not(self) -> None:
-        ops = FakeOps(input=clean_input_facts(bronze_case_rows=13, bronze_lab_rows=100))
+        ops = FakeOps(input=clean_input_facts(bronze_case_rows=13, bronze_lab_rows=100, lab_pinned_mismatch=1))
         self.assertTrue(refused(lambda: run_build(ops, pinned=True))[0].startswith("pinned_counts: "))
         self.assertNotIn("write_cases", ops.calls)
         sample = FakeOps(
@@ -261,6 +272,15 @@ class FreezeTest(unittest.TestCase):
 
 
 class OutputFailureTest(unittest.TestCase):
+    def test_a_held_out_laboratory_difference_ends_the_job_with_one_code_and_no_count(self) -> None:
+        ops = FakeOps(output=clean_output_facts(sealed_lab_differs=1))
+        self.assertEqual(["sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key"], refused(lambda: run_build(ops, pinned=True)))
+
+    def test_the_result_names_development_laboratory_counts_only(self) -> None:
+        facts = build(FakeOps())
+        self.assertNotIn("lab_rows", facts)
+        self.assertNotIn("lab_copies", facts)
+
     def test_a_replaced_case_key_or_a_wrong_stored_schema_or_a_held_out_outcome_difference_ends_the_job(self) -> None:
         ops = FakeOps(output=clean_output_facts(case_key_differences=2, output_schema_tables_wrong=1, sealed_outcome_differs=1))
         self.assertEqual(

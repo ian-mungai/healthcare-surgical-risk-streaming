@@ -216,6 +216,23 @@ class WriteRulesTest(unittest.TestCase):
         self.assertEqual([], log)
 
 
+class LaboratoryScopeTest(unittest.TestCase):
+    def engine(self) -> Lake:
+        return Lake(Session({}, {}, []), None, "b")  # type: ignore[arg-type]
+
+    def test_the_development_scope_keeps_the_development_sets_and_the_held_out_scope_keeps_every_other_row_with_a_case(self) -> None:
+        engine = self.engine()
+        self.assertIn("WHERE s.`set` IN ('training', 'validation')", engine.bronze_lab_scope(development=True))
+        self.assertIn("WHERE COALESCE(s.`set`, '') NOT IN ('training', 'validation')", engine.bronze_lab_scope(development=False))
+        self.assertIn("WHERE s.`set` IN ('training', 'validation')", engine.silver_lab_scope(development=True))
+        self.assertIn("WHERE COALESCE(s.`set`, '') NOT IN ('training', 'validation')", engine.silver_lab_scope(development=False))
+
+    def test_the_checks_of_a_written_table_use_the_plain_cast_and_the_build_side_uses_the_guarded_one(self) -> None:
+        engine = self.engine()
+        self.assertIn("TRY_CAST", engine.bronze_lab_scope(development=True))
+        self.assertNotIn("TRY_CAST", engine.bronze_lab_scope(development=True, strict=True))
+
+
 class SplitRuleTest(unittest.TestCase):
     def test_a_split_made_by_the_rule_passes(self) -> None:
         engine = Lake(Session({"lake.silver.patient_split": split_table(300)}, {}, []), None, "b")  # type: ignore[arg-type]

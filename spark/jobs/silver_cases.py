@@ -68,12 +68,17 @@ from spark.silver_cases_sql import (
     development_lengths_query,
     lab_facts_query,
     lab_output_queries,
+    lab_pinned_query,
     lab_query,
+    lab_scope,
     lab_unmatched_query,
     outcome_facts_query,
     outcome_output_query,
+    sealed_lab_form_query,
+    sealed_lab_output_query,
     sealed_outcome_output_query,
     sealed_outcome_query,
+    silver_lab_orphans_query,
     split_facts_queries,
     values_query,
 )
@@ -121,6 +126,12 @@ class Lake:
         if problems:
             raise SilverCasesError(*problems)
 
+    def bronze_lab_scope(self, *, development: bool, strict: bool = False) -> str:
+        return lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=development, bronze=True, strict=strict)
+
+    def silver_lab_scope(self, *, development: bool) -> str:
+        return lab_scope(LAB_SOURCE, CASES_SOURCE, SPLIT_SOURCE, development=development, bronze=False)
+
     def split_problems(self) -> list[str]:
         """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
         rows = [
@@ -133,11 +144,16 @@ class Lake:
         is not in its published form."""
         case_row = self.session.sql(case_facts_query(BRONZE_CASES_SOURCE)).collect()[0].asDict()
         case_row |= self.session.sql(outcome_facts_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)).collect()[0].asDict()
-        lab_row = self.session.sql(lab_facts_query(BRONZE_LAB_SOURCE)).collect()[0].asDict()
+        lab_row = self.session.sql(lab_facts_query(self.bronze_lab_scope(development=True))).collect()[0].asDict()
         lab_row["lab_rows_without_case"] = self.count(lab_unmatched_query(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE))
         without_one, patients = split_facts_queries(BRONZE_CASES_SOURCE, SPLIT_SOURCE)
         split = {"cases_without_one_split_row": self.count(without_one), "split_patients_without_case": self.count(patients)}
-        sealed = {"split_problems": self.split_problems(), "sealed_outcome_form_bad": self.count(sealed_outcome_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE))}
+        sealed = {
+            "split_problems": self.split_problems(),
+            "sealed_outcome_form_bad": self.count(sealed_outcome_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)),
+            "sealed_lab_form_bad": self.count(sealed_lab_form_query(self.bronze_lab_scope(development=False))),
+            "lab_pinned_mismatch": self.count(lab_pinned_query(BRONZE_LAB_SOURCE)),
+        }
         return {**decode_case_facts(case_row), **decode_lab_facts(lab_row), **split, **sealed}
 
     def development_lengths(self) -> list[int]:
@@ -234,7 +250,9 @@ class Lake:
         return sum(1 for table, fields in wanted.items() if self.columns(table) != fields)
 
     def output_facts(self) -> dict[str, object]:
-        differences, duplicates, gaps, copies = lab_output_queries(BRONZE_LAB_SOURCE, LAB_SOURCE)
+        bronze_lab, silver_lab = self.bronze_lab_scope(development=True, strict=True), self.silver_lab_scope(development=True)
+        differences, duplicates, gaps, copies = lab_output_queries(bronze_lab, silver_lab)
+        held_out = sealed_lab_output_query(self.bronze_lab_scope(development=False, strict=True), self.silver_lab_scope(development=False))
         marked = self.properties(CASES_SOURCE).get(NEVER_FEATURE_PROPERTY) == NEVER_FEATURE_VALUE
         return {
             "case_rows": self.count(count_query(CASES_SOURCE)),
@@ -245,12 +263,14 @@ class Lake:
             "sealed_outcome_differs": self.count(sealed_outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)),
             "output_schema_tables_wrong": self.output_schema_tables_wrong(),
             "case_key_duplicates": self.count(case_duplicates_query(CASES_SOURCE)),
-            "lab_rows": self.count(count_query(LAB_SOURCE)),
+            "lab_rows": self.count(count_query(silver_lab)),
             "lab_copies": self.count(copies),
-            "bronze_lab_rows": self.count(count_query(BRONZE_LAB_SOURCE)),
+            "bronze_lab_rows": self.count(count_query(bronze_lab)),
             "lab_value_differences": self.count(differences),
             "lab_key_duplicates": self.count(duplicates),
             "lab_occurrence_gaps": self.count(gaps),
+            "silver_lab_orphans": self.count(silver_lab_orphans_query(LAB_SOURCE, CASES_SOURCE)),
+            "sealed_lab_differs": self.count(held_out),
             "never_feature_marking_wrong": 0 if marked else 1,
         }
 
