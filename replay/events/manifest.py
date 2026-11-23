@@ -24,7 +24,7 @@ from replay.events.recording import CaseRecording, WaveformTrack
 from replay.events.schedule import FrozenSchedule, ScheduledOccurrence, admitted_occurrences
 from replay.events.waveform import MICROSECONDS, rate_ratio
 
-MANIFEST_FORMAT = "replay_manifest_1"
+MANIFEST_FORMAT = "replay_manifest_2"
 REPORT_LINES_PER_KIND = 20
 
 

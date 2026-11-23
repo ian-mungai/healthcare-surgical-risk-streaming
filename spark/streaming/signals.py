@@ -4,8 +4,10 @@ Analysis plan row 4, "Invalid second", for the arterial pressure waveform: a sec
 when a sample is outside 20 to 200 mmHg, when its range is under 20 mmHg, or when a sample jumps by more than 30 mmHg from the one before it,
 also across the second boundary. The stream applies these rules to each second and builds the series ``Silver/ART_MBP_1S`` as the trailing
 2-second average of the arterial waveform. Every other waveform second is valid when it is a whole block of finite samples. The plan does not say
-how long "the segment that ends at the second under test" is: the second itself is used. Silver, when it is built, must use these functions or
-the same rules, so that batch and stream agree.
+how long "the segment that ends at the second under test" is: the second itself is used here.
+
+TEMPORARY. ``features/signal_validity.py`` is the one definition of signal validity and source deduplication (the owner set the segment to the trailing
+20 seconds), and it replaces this module: the stream calls it when that slice is accepted. Until then these rules must not be taken as Silver's.
 """
 
 from __future__ import annotations

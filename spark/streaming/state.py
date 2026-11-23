@@ -14,7 +14,7 @@ from typing import Any
 
 from spark.streaming.signals import SecondSummary
 
-STATE_FORMAT = "stream_state_1"
+STATE_FORMAT = "stream_state_2"
 
 
 @dataclass(slots=True)

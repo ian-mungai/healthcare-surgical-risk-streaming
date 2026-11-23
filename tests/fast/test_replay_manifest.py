@@ -20,12 +20,13 @@ The numbers of the generated waveform records are timestamps and sample indices 
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
 from array import array
 from collections.abc import Iterable
 from dataclasses import replace
 
-from replay.events.manifest import Manifest, Observed, build_manifest, compare, reference_seconds
+from replay.events.manifest import Manifest, ManifestError, Observed, build_manifest, compare, reference_seconds
 from replay.events.payload import payload_digest
 from replay.events.recording import WaveformRecord, WaveformTrack
 from replay.events.schedule import FrozenSchedule, admitted_occurrences
@@ -191,6 +192,12 @@ class Comparison(unittest.TestCase):
         self.assertEqual(("9002.0",), report.partial_occurrences)
         self.assertEqual((), report.missing_occurrences)
         self.assertIn(marker.event_id, "\n".join(report.failures()))
+
+    def test_a_manifest_file_written_before_the_start_marker_is_refused_and_not_read_as_current(self) -> None:
+        old = json.loads(self.manifest.to_json())
+        old["format"] = "replay_manifest_1"
+        with self.assertRaises(ManifestError):
+            Manifest.from_json(json.dumps(old))
 
     def test_a_planted_missing_op_start_marker_fails_by_its_missing_id(self) -> None:
         marker = next(event for event in self.manifest.events.values() if event.occurrence_id == "9001.0" and event.kind == "op_start")

@@ -1,7 +1,7 @@
 """The Avro formats of the stream: which file holds each schema, which topic carries it and under which subject the registry holds it.
 
 The registry holds the schemas. A message carries the registry's content ID in its first bytes (``replay/events/wire.py``), so one topic carries several
-formats. Every replayed input (numeric readings, waveform seconds, string events and the two markers) goes to one topic, ``replay_events``, with each room
+formats. Every replayed input (numeric readings, waveform seconds, string events and the three markers) goes to one topic, ``replay_events``, with each room
 in the partition of its own number. So the events of one room, markers included, arrive in the order in which they were sent. The feature-ready format has
 its own topic. The subject of a format is its topic and its record name. This table is the one place that names them.
 

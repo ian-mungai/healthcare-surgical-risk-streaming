@@ -179,6 +179,8 @@ class Packages(unittest.TestCase):
     def test_the_replays_packages_are_pinned_where_the_replay_pins_them(self) -> None:
         source, replay = requested(REQUIREMENTS_IN.read_text()), requested(REPLAY_IN.read_text())
         self.assertEqual({*PACKAGES, *STREAM_ONLY_PACKAGES}, set(source))
+        for name in STREAM_ONLY_PACKAGES:
+            self.assertEqual(source[name], locked(LOCK.read_text()).get(name), f"{name} is pinned in the requirements and not at that version in the lock")
         for name in PACKAGES:
             self.assertEqual(replay[name], source[name], name)
             self.assertEqual(replay[name], locked(LOCK.read_text())[name], name)

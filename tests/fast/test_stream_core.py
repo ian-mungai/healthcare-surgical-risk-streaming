@@ -28,6 +28,7 @@ from features.model import ClinicalValue
 from replay.events.identity import marker_event_id
 from spark.streaming.model import Context, DecisionRecord, ErrorRecord, Event, FeatureRecord, LedgerRecord, Policy, Record
 from spark.streaming.occurrence import process
+from spark.streaming.state import OccurrenceState
 from tests.fast.stream_support import (
     CONTEXT,
     HEART_RATE,
@@ -184,6 +185,15 @@ class RiskCutoffs(unittest.TestCase):
         for cutoff in (2_020 * SECOND, 2_040 * SECOND, 2_900 * SECOND):
             with self.subTest(cutoff=cutoff):
                 self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
+
+
+class SavedState(unittest.TestCase):
+    def test_a_state_of_an_earlier_format_is_refused_not_read_with_missing_fields(self) -> None:
+        _, states = run_stream(events_for(synthetic_recording())[:50])
+        saved = json.loads(next(iter(states.values())).to_json())
+        saved["format"] = "stream_state_1"
+        with self.assertRaises(ValueError):
+            OccurrenceState.from_json(json.dumps(saved))
 
 
 class BatchIndependence(unittest.TestCase):
