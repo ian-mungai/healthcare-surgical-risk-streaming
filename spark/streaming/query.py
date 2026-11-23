@@ -20,11 +20,13 @@ from spark.streaming.settings import StreamSettings
 from spark.streaming.sinks import BatchSinks, commit_batch
 
 SHUFFLE_PARTITIONS = "4"
+STOP_TIMEOUT = "30s"
 TEST_EXIT_CODE = 75
 SESSION_OPTIONS: Mapping[str, str] = {
     "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
     "spark.sql.streaming.stateStore.providerClass": STATE_PROVIDER,
     "spark.sql.shuffle.partitions": SHUFFLE_PARTITIONS,
+    "spark.sql.streaming.stopTimeout": STOP_TIMEOUT,
 }
 
 
@@ -57,9 +59,34 @@ def stop_and_check(query: Any, failure: BaseException | None) -> BaseException |
     Spark 4.1.4 stores the failure of a query before it marks the query inactive, so a stop request or a deadline can end the wait while the query
     still looks active.
     """
-    query.stop()
-    stored: BaseException | None = query.exception()
-    return failure if failure is not None else stored
+    stop_error: BaseException | None = None
+    try:
+        query.stop()
+    except BaseException as error:
+        stop_error = error
+    stored: BaseException | None = None
+    try:
+        stored = query.exception()
+    except BaseException as error:
+        stored = stored or error
+    for found in (failure, stored, stop_error):
+        if found is not None:
+            return found
+    return None
+
+
+def shut_down(query: Any, session: Any, failure: BaseException | None) -> BaseException | None:
+    """Stop the query and then the session, each on its own, and return the first failure.
+
+    The stop of the query waits at most ``spark.sql.streaming.stopTimeout`` (Spark's default is to wait without end). A query stop that raises is a failure
+    but never hides an earlier one, and the session is stopped whatever happened to the query.
+    """
+    first = stop_and_check(query, failure)
+    try:
+        session.stop()
+    except BaseException as error:
+        first = first or error
+    return first
 
 
 def batch_handler(sinks: BatchSinks, settings: StreamSettings) -> Callable[[Any, int], None]:

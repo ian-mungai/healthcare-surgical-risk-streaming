@@ -21,7 +21,7 @@ from typing import Any
 from unittest import mock
 
 from spark.streaming.model import FeatureRecord
-from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, start_query, stop_and_check, wait_for_query
+from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, shut_down, start_query, stop_and_check, wait_for_query
 from spark.streaming.rows import INPUT_DDL, KEY_COLUMNS, OUTPUT_DDL, event_row, record_from_row
 from spark.streaming.settings import StreamSettings
 from tests.fast.stream_support import events_for, stamp, synthetic_recording
@@ -216,6 +216,53 @@ class StopAndCheck(unittest.TestCase):
         quiet = FakeQuery(10**6)
         quiet.stop = lambda: None  # type: ignore[attr-defined]
         self.assertIsNone(stop_and_check(quiet, None))
+
+
+class Throwing(FakeQuery):
+    def __init__(self, stop_error: BaseException | None, stored: BaseException | None = None) -> None:
+        super().__init__(10**6, stored)
+        self.stop_error, self.stored = stop_error, stored
+
+    def exception(self) -> BaseException | None:
+        return self.stored
+
+    def stop(self) -> None:
+        if self.stop_error is not None:
+            raise self.stop_error
+
+
+class Session:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error, self.stopped = error, 0
+
+    def stop(self) -> None:
+        self.stopped += 1
+        if self.error is not None:
+            raise self.error
+
+
+class ShutDown(unittest.TestCase):
+    def test_the_stop_timeout_of_the_session_is_finite_and_inside_the_job_deadline(self) -> None:
+        text = SESSION_OPTIONS["spark.sql.streaming.stopTimeout"]
+        self.assertRegex(text, r"^[1-9][0-9]*s$")
+        self.assertLessEqual(int(text.removesuffix("s")), 60)
+
+    def test_a_stop_that_raises_does_not_replace_the_first_failure_and_the_session_is_still_stopped(self) -> None:
+        first, session = RuntimeError("first"), Session()
+        self.assertIs(first, shut_down(Throwing(TimeoutError("stop timed out")), session, first))
+        self.assertEqual(1, session.stopped)
+
+    def test_a_stored_exception_comes_before_a_stop_error_and_a_stop_error_is_a_failure_when_nothing_else_is(self) -> None:
+        stored, stop_error = RuntimeError("stored"), TimeoutError("stop timed out")
+        self.assertIs(stored, shut_down(Throwing(stop_error, stored), Session(), None))
+        self.assertIs(stop_error, shut_down(Throwing(stop_error), Session(), None))
+
+    def test_a_session_that_will_not_stop_is_a_failure_only_when_nothing_failed_before_and_the_query_is_stopped_first(self) -> None:
+        error, query = OSError("session"), Throwing(None)
+        self.assertIs(error, shut_down(query, Session(error), None))
+        first = RuntimeError("first")
+        self.assertIs(first, shut_down(Throwing(None), Session(error), first))
+        self.assertIsNone(shut_down(Throwing(None), Session(), None))
 
 
 class TestInput(unittest.TestCase):
