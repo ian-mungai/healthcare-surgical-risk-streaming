@@ -72,6 +72,7 @@ from scripts.infra.terraform_wrapper import (
     terraform,
 )
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, run_command
 from scripts.project_config import ENVIRONMENTS, ROOT, ConfigurationError, load_configuration
 
@@ -685,7 +686,7 @@ def main() -> int:
             raise TeardownRefused(f"refused before any deletion: {mode_problem}")
         return plan_teardown(aws, configuration, run) if arguments.command == "plan" else destroy(aws, configuration, run, arguments.confirm)
     except (ConfigurationError, WrapperError, TeardownRefused, AwsError, host.HostError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

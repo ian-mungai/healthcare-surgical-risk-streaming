@@ -20,7 +20,7 @@ from features import document
 from features.leakage import LeakageError, row_problems
 from features.model import FeatureInputError, FeatureRow, WindowInput
 from features.row import build_row
-from scripts.ingestion.notice import ClosedError, render
+from scripts.ingestion.notice import ClosedError, describe_error, render
 from scripts.ingestion.output_file import check_new_output, write_new_file
 
 
@@ -75,7 +75,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write("features.batch: the windows file cannot be read or the rows file cannot be written\n")
         return 2
     except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
-        sys.stderr.write(f"features.batch: {error}\n")
+        sys.stderr.write(f"features.batch: {describe_error(error)}\n")
         return 2
     return 0
 

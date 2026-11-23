@@ -55,6 +55,7 @@ from urllib.parse import quote
 
 from scripts.ingestion import record_definitions as definitions
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.ingestion.record_definitions import Connector, Table
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -457,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         check_api_origin(arguments.address)
     except AirbyteError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     return 0
 

@@ -22,7 +22,7 @@ from unittest import mock
 
 from features import batch
 from features.leakage import LeakageError
-from features.model import ClinicalValue, FeatureRow, Reading, WindowInput
+from features.model import ClinicalValue, FeatureInputError, FeatureRow, Reading, WindowInput
 from features.row import build_row
 from tests.fast.features_support import (
     ARTERIAL_MEAN,
@@ -153,7 +153,10 @@ class Entry(unittest.TestCase):
                 with contextlib.redirect_stderr(stderr):
                     code, target = self.run_batch([document])
                 self.assertEqual(2, code)
-                self.assertIn(pattern.strip(), stderr.getvalue())
+                self.assertNotIn(pattern.strip(), stderr.getvalue())
+                with self.assertRaises((FeatureInputError, LeakageError, KeyError, TypeError, ValueError)) as raised:
+                    batch.run(self.root / "windows.json", self.root / "reason_rows.json")
+                self.assertIn(pattern.strip(), str(raised.exception))
                 self.assertFalse(target.exists())
 
     def test_the_rows_keep_the_order_of_the_windows_and_data_after_the_cutoff_changes_nothing(self) -> None:
@@ -190,7 +193,15 @@ class Entry(unittest.TestCase):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = batch.main([str(source), str(target)])
-        return code, stderr.getvalue(), target
+        return code, stderr.getvalue() + self.library_reason(source), target
+
+    def library_reason(self, source: Path) -> str:
+        """The text of the error that the library raises for this file, which the entry point shows by its type only: the rule that names the fault."""
+        try:
+            batch.run(source, self.root / "reason_rows.json")
+        except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
+            return f" | {error}"
+        return ""
 
     def test_a_shape_that_is_not_the_documented_one_is_refused_by_name_and_writes_no_result(self) -> None:
         def edited(change: Callable[[dict[str, Any]], None]) -> str:
@@ -229,6 +240,18 @@ class Entry(unittest.TestCase):
                 self.assertEqual(2, code)
                 self.assertIn(pattern.strip(), message)
                 self.assertFalse(target.exists())
+
+    def test_the_entry_point_shows_the_type_of_the_error_and_no_word_of_its_text(self) -> None:
+        document = window_document("w")
+        document["numeric"][HEART_RATE] = [[CUTOFF_US, 10**400, True]]
+        source, target = self.root / "windows.json", self.root / "rows.json"
+        source.write_text(json.dumps({"windows": [document]}))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = batch.main([str(source), str(target)])
+        self.assertEqual(2, code)
+        self.assertRegex(stderr.getvalue(), r"^features\.batch: (ValueError|FeatureInputError)\n$")
+        self.assertNotIn(HEART_RATE, stderr.getvalue())
 
     def test_a_file_that_is_not_json_is_refused_and_writes_no_result(self) -> None:
         code, message, target = self.run_text("not json")

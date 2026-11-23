@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from spark import table_checks as rules
 from spark.session import build_session, start_deadline
 from spark.settings import SettingsError
@@ -182,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"{JOB}: the plan cannot be read ({type(error).__name__})\n")
         return 2
     except (RulesError, SettingsError) as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     try:
         results = [check_table(session, staging, plan, entry) for entry in plan.tables]

@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any
 
 from features import batch, document
+from features.leakage import LeakageError
 from features.model import FeatureInputError
 from features.registry import INPUT_OBJECTS
 from features.row import build_row
@@ -89,7 +90,15 @@ class Entry(unittest.TestCase):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             code = batch.main([str(source), str(target)])
-        return code, stderr.getvalue(), target
+        return code, stderr.getvalue() + self.library_reason(source), target
+
+    def library_reason(self, source: Path) -> str:
+        """The text of the error that the library raises for this file, which the entry point shows by its type only: the rule that names the fault."""
+        try:
+            batch.run(source, self.root / "reason_rows.json")
+        except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
+            return f" | {error}"
+        return ""
 
     def assert_refused(self, text: str, *patterns: str) -> None:
         code, message, target = self.run_text(text)

@@ -39,6 +39,7 @@ from typing import Any
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError, ManifestRef
+from scripts.ingestion.notice import describe_error
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
 from spark.bronze.passes import MaxParameter, SumByName, partition_problems, partition_rows
@@ -181,22 +182,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
         result = decode(arguments)
     except GateRefused as error:
-        sys.stderr.write(f"{JOB}: the gate refused the inputs before any payload was read: {error}\n")
+        sys.stderr.write(f"{JOB}: the gate refused the inputs before any payload was read: {describe_error(error)}\n")
         return 1
     except ManifestError as error:
-        sys.stderr.write(f"{JOB}: the manifest cannot be trusted: {error}\n")
+        sys.stderr.write(f"{JOB}: the manifest cannot be trusted: {describe_error(error)}\n")
         return 1
     except (InputError, StructureError) as error:
-        sys.stderr.write(f"{JOB}: refused: {error}\n")
+        sys.stderr.write(f"{JOB}: refused: {describe_error(error)}\n")
         return 1
     except NessieConflict as error:
         sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
         return 1
     except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
+        sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")
         return 1
     except SettingsError as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0

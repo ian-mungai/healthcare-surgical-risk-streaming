@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import PATTERNS, ConfigurationError, load_configuration
 
 WAREHOUSE_PREFIX = "warehouse"
@@ -38,7 +39,7 @@ def main() -> int:
     try:
         sys.stdout.write(configured_warehouse_location() + "\n")
     except (ConfigurationError, WarehouseError) as error:
-        sys.stderr.write(f"warehouse: {error}\n")
+        sys.stderr.write(f"warehouse: {describe_error(error)}\n")
         return 1
     return 0
 

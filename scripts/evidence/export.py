@@ -16,6 +16,7 @@ from scripts.evidence.manifest import build_manifest, manifest_problems, manifes
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import ROOT
 
 
@@ -26,7 +27,7 @@ def main() -> int:
     try:
         run = load_run(parser.parse_args().binding)
     except WrapperError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     folder = ROOT / "runs" / run.run_id
     export = folder / "export"

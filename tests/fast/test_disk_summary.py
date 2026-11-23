@@ -344,7 +344,7 @@ class CommandTest(unittest.TestCase):
             code, _, err = run(*self.arguments(folder))
             self.assertEqual("kept", existing.read_text())
         self.assertEqual(1, code)
-        self.assertIn("held", err)
+        self.assertIn("SummaryError", err)
 
     def test_a_refused_file_leaves_no_output(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -353,14 +353,14 @@ class CommandTest(unittest.TestCase):
             code, _, err = run(*arguments)
             self.assertFalse((Path(folder) / "disk.json").exists())
         self.assertEqual(1, code)
-        self.assertIn("retry", err)
+        self.assertIn("SummaryError", err)
 
     def test_the_same_file_for_two_phases_writes_no_record(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             one = write(folder, "one.jsonl", copy_lines())
             code, _, err = run("--phase", f"copy={one}", "--phase", f"retry={one}", "--output", str(Path(folder) / "disk.json"))
             self.assertEqual((1, False), (code, (Path(folder) / "disk.json").exists()))
-        self.assertIn("two phases", err)
+        self.assertIn("SummaryError", err)
 
     def test_an_option_the_command_does_not_know_is_refused_without_repeating_its_value(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

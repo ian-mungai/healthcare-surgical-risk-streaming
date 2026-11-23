@@ -290,7 +290,7 @@ class NoConfigurationTest(unittest.TestCase):
                 code, out, err = run_check(stderr=diagnostic + DENIED_LINE, returncode=255)
                 self.assertEqual(1, code)
                 self.assertNotIn("no lifecycle configuration", out)
-                self.assertIn("not exactly one error line", err)
+                self.assertIn("AwsError", err)
 
     def test_the_real_error_first_and_a_mention_after_it_exits_1_too(self) -> None:
         code, out, _ = run_check(
@@ -400,7 +400,7 @@ class CommandTest(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertNotIn("no lifecycle configuration", out)
                 self.assertNotIn("no rule", out)
-                self.assertIn("lifecycle", err)
+                self.assertIn("ValueError", err)
 
     def test_an_empty_answer_exits_1(self) -> None:
         self.assertEqual(1, run_check(stdout="")[0])
@@ -422,7 +422,7 @@ class CommandTest(unittest.TestCase):
     def test_a_failed_read_exits_1_names_the_code_and_is_never_taken_for_no_rules(self) -> None:
         code, out, err = run_check(stderr=DENIED_LINE, returncode=254)
         self.assertEqual(1, code)
-        self.assertIn("AccessDenied", err)
+        self.assertIn("AwsError", err)
         self.assertNotIn("no rule", out)
 
 

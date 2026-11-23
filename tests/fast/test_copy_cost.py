@@ -337,7 +337,7 @@ class RunWindowTest(unittest.TestCase):
     def test_a_result_whose_retrieval_time_is_not_a_time_is_refused_with_no_output(self) -> None:
         code, record, err = self.run_with(result_for(times=("not a time",) * len(SIZES)), "--since", "2026-11-23T09:00:00Z")
         self.assertEqual((1, {}), (code, record))
-        self.assertIn("time", err)
+        self.assertIn("CostError", err)
         self.assertNotIn("not a time", err)
 
     def test_an_edited_label_of_the_result_is_not_copied_into_the_record(self) -> None:

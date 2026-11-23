@@ -45,7 +45,7 @@ from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.closed import ClosedInputError, QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
-from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, describe_error, render
 from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.store import StoreError
 
@@ -306,10 +306,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except GateRefused as refused:
         problems = [{"position": problem.position, "requested": problem.requested, "cause": problem.cause} for problem in refused.problems]
-        log("gate_refused", reason=str(refused), problems=problems)
+        log("gate_refused", reason=describe_error(refused), problems=problems)
         return 3
     except STOPPING_ERRORS as error:
-        log("stopped", error=type(error).__name__, message=str(error))
+        log("stopped", error=type(error).__name__, message=describe_error(error))
         return 2
 
 

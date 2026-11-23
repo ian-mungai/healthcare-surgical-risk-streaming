@@ -52,6 +52,7 @@ from replay.service.run_record import RunRecord, RunRecordError, parse_run_recor
 from replay.service.state_file import atomic_write
 from scripts.ingestion.folder import list_files
 from scripts.ingestion.manifest import ManifestError, ManifestRef
+from scripts.ingestion.notice import describe_error
 
 BEAT_SECONDS = 5.0
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
@@ -398,6 +399,6 @@ def submit_command(inbox: Path, reference_file: Path, stream: BinaryIO, out: Tex
         record, reference = read_submission(reference_file, stream)
         out.write(submit(inbox, record, reference) + "\n")
     except SubmitError as error:
-        log("submit_refused", message=str(error))
+        log("submit_refused", message=describe_error(error))
         return 2
     return 0

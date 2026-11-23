@@ -31,6 +31,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from scripts.ingestion.notice import describe_error
 from scripts.stack.nessie import NessieError
 from scripts.stack.tags import TableSnapshot, TagClient, default_branch, list_references, list_tags, table_snapshots
 from spark.catalog import add_catalog, required_environment
@@ -166,13 +167,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_deadline(arguments.deadline_seconds, JOB)
         result = maintain(arguments)
     except RetentionError as error:
-        sys.stderr.write(f"{JOB}: refused: {error}\n")
+        sys.stderr.write(f"{JOB}: refused: {describe_error(error)}\n")
         return 1
     except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
+        sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")
         return 1
     except SettingsError as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0

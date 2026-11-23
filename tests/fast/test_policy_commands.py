@@ -327,7 +327,7 @@ class KeyTest(unittest.TestCase):
         (folder / "other_accessKeys.csv").write_text("kept")
         code, output, backup = self.rerun_key(account)
         self.assertEqual(1, code)
-        self.assertIn("LimitExceeded", output)
+        self.assertIn("AwsError", output)
         self.assertFalse(backup.exists())
         self.assertEqual("kept", (folder / "other_accessKeys.csv").read_text())
         account.create_error = None
@@ -350,7 +350,7 @@ class KeyTest(unittest.TestCase):
         with mock.patch.object(aws_cli, "keep_raw_error", side_effect=OSError("disk full")):
             code, output, backup = self.run_key(account)
         self.assertEqual(1, code)
-        self.assertIn("LimitExceeded", output)
+        self.assertIn("AwsError", output)
         self.assertFalse(backup.exists())
         account.create_refusal = None
         code, output, _ = self.rerun_key(account)

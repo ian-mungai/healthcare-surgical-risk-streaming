@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.ingestion.closed import ClosedInputError, QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.ingestion.output_file import write_new_file
 from scripts.stack.capacity_sampler import SCHEMA, SamplerError, parse_staging
 
@@ -219,7 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         document = summarize(dict(arguments.phase), dict(arguments.limit))
         write_record(arguments.output, document)
     except SummaryError as error:
-        sys.stderr.write(f"disk summary: {error}\n")
+        sys.stderr.write(f"disk summary: {describe_error(error)}\n")
         return 1
     for name, summary in document["phases"].items():
         sys.stdout.write("\n".join(describe(name, summary)) + "\n")

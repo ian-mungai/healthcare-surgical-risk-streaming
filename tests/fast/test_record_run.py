@@ -223,13 +223,13 @@ class CommandOutputTest(EnvironmentCase):
             with self.subTest(status):
                 code, output, errors = self.run_command(self.failing("/trees/main/history", status))
                 self.assertEqual(1, code)
-                self.assertIn("catalog_error", errors)
+                self.assertIn("CatalogError", errors)
                 self.assertNotIn(MARKER, errors + output)
 
     def test_a_failing_reference_call_of_the_branch_check_prints_the_fixed_code_and_no_word_of_the_answer(self) -> None:
         code, output, errors = self.run_command(self.failing("/trees/load_run_20261122_ab12cd34"))
         self.assertEqual(1, code)
-        self.assertIn("catalog_error", errors)
+        self.assertIn("CatalogError", errors)
         self.assertNotIn(MARKER, errors + output)
         self.assertNotIn("Traceback", errors)
 

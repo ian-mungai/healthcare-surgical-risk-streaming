@@ -34,6 +34,7 @@ from typing import Any
 from urllib.parse import quote
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.stack.nessie import BODY_LIMIT_BYTES, HASH, NessieClient, NessieConflict, NessieError, Reference
 
 RUN_TAG_PREFIX = "run-"
@@ -449,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(arguments.deadline_seconds) or not 0 < arguments.deadline_seconds <= MAX_DEADLINE_SECONDS:
             raise TagError(f"the deadline must be a finite number of seconds above 0 and at most {MAX_DEADLINE_SECONDS:g}")
     except TagError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 2
 
     def expire(signal_number: int, frame: FrameType | None) -> None:
@@ -460,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result, written = tag_and_record(TagClient(uri, arguments.deadline_seconds), arguments.run_id, arguments.hash, arguments.run_folder, arguments.trunk)
     except NessieError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)

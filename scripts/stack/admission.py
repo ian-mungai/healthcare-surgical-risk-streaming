@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.stack.limits import LIMITS_FILE, SERVICE_NAME, Limits, LimitsError, load_limits
 
@@ -156,7 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         decision = check_group(arguments.group, limits_path=arguments.limits, available_mib=arguments.available_mib, running=arguments.running)
     except (AdmissionError, LimitsError) as error:
-        sys.stderr.write(f"admission: refused: {error}\n")
+        sys.stderr.write(f"admission: refused: {describe_error(error)}\n")
         return EXIT_REFUSED
     sys.stdout.write(f"admission: {describe(decision)}\n")
     return EXIT_ADMITTED if decision.admitted else EXIT_WAIT

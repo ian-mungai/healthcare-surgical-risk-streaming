@@ -48,7 +48,7 @@ from typing import Any
 
 from scripts.ingestion.check import CheckResult
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import ClosedError, Code, Notice, render
+from scripts.ingestion.notice import ClosedError, Code, Notice, describe_error, render
 from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
@@ -196,7 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
         return 1
     except CostError as error:
-        sys.stderr.write(f"copy cost: {error}\n")
+        sys.stderr.write(f"copy cost: {describe_error(error)}\n")
         return 1
     sys.stdout.write(
         f"copy cost: {document['copy']['payload_objects']} payload objects written of {document['copy']['verified_objects']} verified, "

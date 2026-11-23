@@ -398,3 +398,19 @@ class ClosedError(Exception):
 
     def __str__(self) -> str:
         return "; ".join(render(notice) for notice in self.notices)
+
+
+class FixedTextError(Exception):
+    """An exception whose whole text is fixed advice that its raising module builds from constants and the configured project names, never from a value of
+    the command line, a path, an input or a reply. ``describe_error`` shows its text. A class is marked only where the text is operator advice that a command
+    must show (a retry that could create a second access key is one). ``tests/fast/test_error_formatter.py`` lists every marked class, so a new one shows
+    in review."""
+
+
+def describe_error(error: BaseException) -> str:
+    """The one text that a command shows for a caught exception: the fixed notices of a ``ClosedError``, the fixed advice of a ``FixedTextError`` and, for any
+    other exception, the name of its type.
+
+    The text of any other exception can hold a path, a value of an input or a reply of a service, so it is never shown.
+    """
+    return str(error) if isinstance(error, (ClosedError, FixedTextError)) else type(error).__name__

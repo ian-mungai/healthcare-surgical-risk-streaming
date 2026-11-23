@@ -292,6 +292,16 @@ class CommandTests(Fixture):
         self.assertNotIn("secret_folder_marker", err)
         self.assertNotIn("run.json", err)
 
+    def test_the_replay_compare_shows_no_path_when_it_cannot_read_a_file(self) -> None:
+        self.replay_files("compare")
+        missing = self.root / "secret_manifest_marker" / "manifest.json"
+        code, err = self.run_replay(
+            ["compare", "--run-record", str(self.root / "run.json"), "--manifest", str(missing), "--observed", str(self.root / "o.json")]
+        )
+        self.assertNotEqual(0, code)
+        self.assertNotIn("secret_manifest_marker", err)
+        self.assertIn("FileNotFoundError", err)
+
     def test_features_batch_names_no_path_when_it_cannot_read_a_file(self) -> None:
         code, err = self.run_main(features_batch.main, [str(self.root / "secret_name_marker.json"), str(self.root / "rows.json")])
         self.assertEqual(2, code)

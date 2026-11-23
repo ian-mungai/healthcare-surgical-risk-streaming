@@ -39,7 +39,7 @@ from scripts.aws_cli import Aws
 from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi, check_api_origin
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.notice import ClosedError
+from scripts.ingestion.notice import ClosedError, describe_error
 from scripts.ingestion.record_catalog import NessieCatalog
 from scripts.ingestion.record_copy import CopyError, S3CopyStore
 from scripts.ingestion.record_definitions import DefinitionError, Environment, check_environment
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None, environment: Mapping[str, str] | None = 
         reference = ManifestRef.from_json(arguments.reference.read_text())
         result = run_load(settings_from_environment(os.environ if environment is None else environment), arguments.run_id, reference)
     except (SettingsError, LoadError, CopyError, AirbyteError, NessieError, DefinitionError, ClosedError) as error:
-        sys.stderr.write(f"{type(error).__name__}: {error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     except (OSError, ValueError) as error:
         sys.stderr.write(f"{type(error).__name__}\n")

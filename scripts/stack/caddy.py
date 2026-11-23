@@ -16,6 +16,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import ROOT
 
 CADDY_FOLDER = ROOT / "compose" / "caddy"
@@ -177,7 +178,7 @@ def main() -> int:
     try:
         text = render(load_routes(Path(arguments[1]) if len(arguments) == 2 else ROUTES_FILE))
     except (RoutesError, RenderError) as error:
-        sys.stderr.write(f"caddy: {error}\n")
+        sys.stderr.write(f"caddy: {describe_error(error)}\n")
         return 1
     if verb == "render":
         sys.stdout.write(text)

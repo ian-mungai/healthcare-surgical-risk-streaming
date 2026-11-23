@@ -36,6 +36,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from scripts.ingestion.notice import describe_error
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_run import JOB, NessieAdapter, SparkOps, finish, parser, run_job
@@ -88,10 +89,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
         return 1
     except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
+        sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")
         return 1
     except (SettingsError, BronzeRulesError) as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     return finish(result, arguments.branch, sys.stdout, sys.stderr)
 

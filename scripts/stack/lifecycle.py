@@ -33,6 +33,7 @@ from typing import Any
 from scripts.aws_cli import RAW_ERRORS, Aws, AwsError
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.folder import raise_error
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WAREHOUSE_PREFIX
 
@@ -172,7 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         bucket_problems = [] if live is None else expiring_rule_problems(live, PROTECTED_PREFIX)
         found = declared_problems(INFRA_FOLDER) + [f"bucket: {problem}" for problem in bucket_problems]
     except (ConfigurationError, AwsError, ValueError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     if found:
         sys.stderr.write("".join(f"{problem}\n" for problem in found))

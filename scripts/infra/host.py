@@ -34,6 +34,7 @@ from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
@@ -567,7 +568,7 @@ def main() -> int:
             return host_up(aws, configuration, arguments.binding, arguments.confirm)
         return (host_stop if arguments.command == "stop" else host_start)(aws, configuration, arguments.binding)
     except (ConfigurationError, WrapperError, HostError, AwsError, WarehouseError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

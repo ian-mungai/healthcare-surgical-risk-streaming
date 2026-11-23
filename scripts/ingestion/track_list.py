@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.sample.candidates import RELEASE_FILE, release_problems
 from scripts.sample.publisher import TRACK_LIST_COLUMNS
 
@@ -106,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         problems = file_problems(arguments.file, pinned_track_list())
     except TrackListPinError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     for problem in problems:
         sys.stderr.write(f"{problem}\n")

@@ -20,6 +20,7 @@ from scripts.infra.created import DEVICE_FILE, device_entries, run_inventory
 from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 
@@ -54,7 +55,7 @@ def main() -> int:
     try:
         target = write_inventory(parser.parse_args().binding)
     except (ConfigurationError, WrapperError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     inventory = json.loads(target.read_text())
     counts = f"{len(inventory['created'])} created resources and {len(inventory['authorized_retained'])} retained items"

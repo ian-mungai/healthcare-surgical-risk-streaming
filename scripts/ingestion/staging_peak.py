@@ -29,7 +29,7 @@ from typing import Any
 
 from scripts.ingestion.cli import read_input, say, write_private
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, describe_error, render
 from scripts.ingestion.output_file import check_new_output
 from scripts.process import run_command
 from scripts.stack.capacity_sampler import (
@@ -130,7 +130,7 @@ def run_sampler(
         }
         out = Output(output)
     except SamplerError as error:
-        emit(f"staging sampler: {error}")
+        emit(f"staging sampler: {describe_error(error)}")
         return 1
     seq, reason = 0, ""
     try:
@@ -149,7 +149,7 @@ def run_sampler(
             flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause, clock=clock)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})
     except SamplerError as error:
-        emit(f"staging sampler: {error}")
+        emit(f"staging sampler: {describe_error(error)}")
         return 1
     finally:
         out.close()

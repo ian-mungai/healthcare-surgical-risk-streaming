@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
 
@@ -166,7 +167,7 @@ def settle_hook(*, check: bool) -> bool:
     try:
         worktree_scan_hook.install(ROOT)
     except worktree_scan_hook.KeptHookError as error:
-        sys.stderr.write(f"working-tree privacy hook: {error}\n")
+        sys.stderr.write(f"working-tree privacy hook: {describe_error(error)}\n")
         return False
     sys.stdout.write("working-tree privacy hook: installed\n")
     return True

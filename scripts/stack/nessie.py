@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 NAMESPACE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -264,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         done = NessieClient(uri).initialise(arguments.branch, arguments.namespace)
     except NessieError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     if done.committed:
         sys.stdout.write(f"initialised: {done.branch} holds the namespace {arguments.namespace}, committed now\n")

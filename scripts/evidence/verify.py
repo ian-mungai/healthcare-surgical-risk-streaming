@@ -21,6 +21,7 @@ from scripts.evidence.receipt import NAMESPACE, SIGNATURE_TIMEOUT_SECONDS
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding
 from scripts.infra.terraform_wrapper import WrapperError, load_run
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -91,14 +92,14 @@ def main() -> int:
     try:
         run = load_run(parser.parse_args().binding)
     except WrapperError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     folder = ROOT / "runs" / run.run_id
     invalidate_receipt(folder)
     try:
         key = load_configuration().get("EVIDENCE_VERIFIER_KEY", "")
     except ConfigurationError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     missing = export_problem(folder)
     if missing:

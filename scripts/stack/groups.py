@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Protocol
 
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ROOT
 from scripts.stack.admission import EXIT_WAIT, SUPPORTING_GROUP, AdmissionError, Decision, check_group, describe
@@ -423,10 +424,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             stopped = stop_group(settings, arguments.group, log=say)
             say(f"group {arguments.group} is down" + (f": stopped {', '.join(stopped)}" if stopped else ": nothing was running"))
     except GroupWaits as error:
-        sys.stderr.write(f"groups: waits: {error}\n")
+        sys.stderr.write(f"groups: waits: {describe_error(error)}\n")
         return EXIT_WAIT
     except (GroupError, AdmissionError, LimitsError) as error:
-        sys.stderr.write(f"groups: refused: {error}\n")
+        sys.stderr.write(f"groups: refused: {describe_error(error)}\n")
         return 1
     return 0
 

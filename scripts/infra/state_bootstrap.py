@@ -27,6 +27,7 @@ from typing import Any
 
 from scripts.aws_cli import Aws, AwsError
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -251,7 +252,7 @@ def main() -> int:
             return create(aws, configuration, arguments.binding, arguments.backend, not arguments.given_host, arguments.short_lived_bucket)
         return verify(aws, configuration, arguments.binding)
     except (ConfigurationError, AwsError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 
