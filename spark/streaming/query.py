@@ -45,9 +45,12 @@ def wait_for_query(query: Any, deadline: float | None, stop_requested: Callable[
             query.awaitTermination(slice_seconds if deadline is None else min(slice_seconds, max(0.1, deadline - time.monotonic())))
     except BaseException as error:
         return error
-    if query.isActive:
-        return None
-    stored: BaseException | None = query.exception()
+    try:
+        if query.isActive:
+            return None
+        stored: BaseException | None = query.exception()
+    except BaseException as error:
+        return error
     if stored is not None:
         return stored
     return None if stop_requested() else QueryEnded("the query ended with no exception and was not stopped")

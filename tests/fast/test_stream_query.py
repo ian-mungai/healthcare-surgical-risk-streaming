@@ -341,7 +341,6 @@ class FlakyActive(Logged):
 
 
 class AfterTheLoop(unittest.TestCase):
-    @unittest.expectedFailure
     def test_an_is_active_that_raises_after_the_wait_loop_still_stops_the_query_and_the_session_and_is_the_failure(self) -> None:
         log: list[str] = []
         query, session = FlakyActive(log), Logged(log)
@@ -350,7 +349,6 @@ class AfterTheLoop(unittest.TestCase):
         self.assertIsInstance(failure, ConnectionError)
         self.assertEqual(["query stop", "session stop"], [entry for entry in log if entry.endswith("stop")])
 
-    @unittest.expectedFailure
     def test_the_first_error_is_kept_when_the_state_read_and_the_stop_both_fail(self) -> None:
         log: list[str] = []
         query, session = FlakyActive(log), Logged(log)
