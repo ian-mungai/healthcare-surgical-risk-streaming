@@ -56,45 +56,71 @@ SERVICES_FILE = ROOT / "compose" / "openbao_services.txt"
 PYTHON = str(ROOT / ".venv" / "bin" / "python")
 VERIFIER = re.compile(r"CREATE ROLE \"(\w+)\" [A-Z ]+ PASSWORD '(SCRAM-SHA-256\$[^']+)'")
 
-DOCKER_STAND_IN = """#!{python}
-import json, os, re, sys
+DOCKER_STAND_IN = r"""#!__PYTHON__
+import json, os, subprocess, sys
 from pathlib import Path
 calls = Path(__file__).resolve().parent.parent / "calls"
 standard_input = sys.stdin.read()
 number = len(list(calls.glob("*.stdin")))
-(calls / f"{{number}}.stdin").write_text(standard_input)
+(calls / f"{number}.stdin").write_text(standard_input)
 with open(calls / "calls.jsonl", "a") as handle:
-    handle.write(json.dumps({{"argv": sys.argv, "env": dict(os.environ)}}) + "\\n")
+    handle.write(json.dumps({"program": "docker", "argv": sys.argv, "env": dict(os.environ)}) + "\n")
 mode = json.loads((calls / "mode.json").read_text())
-for argument in sys.argv:
-    found = re.search(r'PGPASSWORD="\\$\\(cat (\\S+)\\)"', argument)
-    if found:
-        with open(calls / "consumer.jsonl", "a") as handle:
-            handle.write(json.dumps({{"PGPASSWORD": Path(mode["files"][found.group(1)]).read_text().rstrip("\\n")}}) + "\\n")
+script = sys.argv[sys.argv.index("-c") + 1]
+for container_path, host_path in mode["files"].items():
+    script = script.replace(container_path, host_path)
+script = script.replace("/dev/shm", str(calls.parent / "shm"))
+environment = {"PATH": f"{calls.parent / 'bin' / 'psql_bin'}:/usr/bin:/bin"}
+result = subprocess.run(["/bin/sh", "-c", script], input=standard_input, capture_output=True, text=True, env=environment)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+sys.exit(result.returncode)
+"""
+
+PSQL_STAND_IN = r"""#!__PYTHON__
+import json, os, sys
+from pathlib import Path
+calls = Path(__file__).resolve().parent.parent.parent / "calls"
+standard_input = sys.stdin.read()
+number = len(list(calls.glob("*.stdin")))
+(calls / f"{number}.stdin").write_text(standard_input)
+with open(calls / "calls.jsonl", "a") as handle:
+    handle.write(json.dumps({"program": "psql", "argv": sys.argv, "env": dict(os.environ)}) + "\n")
+password_file = os.environ.get("PGPASSFILE")
+if password_file:
+    status = os.stat(password_file)
+    line = Path(password_file).read_text().splitlines()[0]
+    password = line.split(":", 4)[4].replace("\\:", ":").replace("\\\\", "\\")
+    with open(calls / "consumer.jsonl", "a") as handle:
+        handle.write(json.dumps({"PGPASSFILE_PASSWORD": password, "mode": oct(status.st_mode & 0o777)}) + "\n")
+mode = json.loads((calls / "mode.json").read_text())
+if "PGPASSWORD" in os.environ:
+    with open(calls / "consumer.jsonl", "a") as handle:
+        handle.write(json.dumps({"PGPASSWORD": os.environ["PGPASSWORD"]}) + "\n")
 if mode.get("fail_on") and mode["fail_on"] in standard_input:
-    sys.stderr.write("psql:<stdin>:1: ERROR: could not run the statement\\nLINE 1: " + standard_input + "\\n")
+    sys.stderr.write("psql:<stdin>:1: ERROR: could not run the statement\nLINE 1: " + standard_input + "\n")
     sys.exit(1)
 if "pg_authid" in standard_input:
     sys.stdout.write(mode.get("state", ""))
 sys.exit(0)
 """
 
-KUBECTL_STAND_IN = """#!{python}
+KUBECTL_STAND_IN = r"""#!__PYTHON__
 import json, os, sys
 from pathlib import Path
 calls = Path(__file__).resolve().parent.parent / "calls"
 arguments = sys.argv[1:]
 standard_input = sys.stdin.read() if "-" in arguments else ""
 number = len(list(calls.glob("*.stdin")))
-(calls / f"{{number}}.stdin").write_text(standard_input)
+(calls / f"{number}.stdin").write_text(standard_input)
 with open(calls / "calls.jsonl", "a") as handle:
-    handle.write(json.dumps({{"argv": sys.argv, "env": dict(os.environ)}}) + "\\n")
+    handle.write(json.dumps({"argv": sys.argv, "env": dict(os.environ)}) + "\n")
 mode = json.loads((calls / "mode.json").read_text())
 if arguments[0] == "get":
-    sys.stderr.write('Error from server (NotFound): secrets "x" not found\\n')
+    sys.stderr.write('Error from server (NotFound): secrets "x" not found\n')
     sys.exit(1)
 if mode.get("fail"):
-    sys.stderr.write("error: failed to apply the object: " + standard_input + "\\n")
+    sys.stderr.write("error: failed to apply the object: " + standard_input + "\n")
     sys.exit(1)
 sys.exit(0)
 """
@@ -111,8 +137,10 @@ class Run:
         for folder in (self.secrets, self.calls, self.bin):
             folder.mkdir(mode=0o700)
         self.set_mode({})
-        for name, body in (("docker", DOCKER_STAND_IN), ("kubectl", KUBECTL_STAND_IN)):
-            (self.bin / name).write_text(body.format(python=PYTHON))
+        (self.bin / "psql_bin").mkdir()
+        (self.work / "shm").mkdir(mode=0o700)
+        for name, body in (("docker", DOCKER_STAND_IN), ("kubectl", KUBECTL_STAND_IN), ("psql_bin/psql", PSQL_STAND_IN)):
+            (self.bin / name).write_text(body.replace("__PYTHON__", PYTHON))
             (self.bin / name).chmod(0o755)
         self.owned: dict[str, set[Path]] = {}
 
@@ -214,8 +242,15 @@ class PostgresSinks(unittest.TestCase):
         self.assertEqual(sorted(self.tools), sorted(verifiers), "control: every tool's account was created")
         for name in self.tools:
             self.assertTrue(accounts.verifier_matches(verifiers[name], self.markers[name].value), f"control: the verifier of {name} belongs to its marker")
-        received = {item["PGPASSWORD"] for item in self.run_.consumer()}
-        self.assertEqual({self.markers["postgres"].value}, received, "control: psql received the owner's admin password through the mounted file")
+        records = self.run_.consumer()
+        self.assertEqual(
+            {self.markers["postgres"].value},
+            {item.get("PGPASSFILE_PASSWORD") for item in records},
+            "control: psql read the owner's admin password from its password file",
+        )
+        self.assertEqual({"0o600"}, {item["mode"] for item in records}, "the password file is private")
+        self.assertEqual([], [item for item in records if "PGPASSWORD" in item], "psql's environment holds no password")
+        self.assertEqual([], list((self.run_.work / "shm").iterdir()), "the password file is removed after use")
         self.assertEqual([], self.run_.sinks(list(self.markers.values()), output, extra_text=tuple(sent)))
         for name, marker in self.markers.items():
             path = self.run_.secrets / "postgres" / f"{name}.password"
@@ -519,21 +554,56 @@ class FileSinks(unittest.TestCase):
         self.assertEqual(0, result.returncode, output[-3000:])
         self.assertEqual(marker.value + "\n", path.read_text(), "control: the owner's value was kept")
         self.assertEqual(0o400, path.stat().st_mode & 0o777)
-        provider = re.search(
-            r"^admin_password\s*=\s*\$__file\{([^}]+)\}", (ROOT / "compose" / "monitoring" / "grafana" / "grafana.ini").read_text(), re.MULTILINE
-        )
+        compose = cast("dict[str, Any]", load_yaml((ROOT / "compose" / "services" / "grafana.yml").read_text()))
+        service = compose["services"]["grafana"]
+        mount = next(item for item in service["configs"] if item["target"] == "/etc/grafana/grafana.ini")
+        configuration = (ROOT / "compose" / "services" / compose["configs"][mount["source"]]["file"]).resolve()
+        provider = re.search(r"^admin_password\s*=\s*\$__file\{([^}]+)\}", configuration.read_text(), re.MULTILINE)
         self.assertIsNotNone(provider)
         provider = cast("re.Match[str]", provider)
         secret_name = Path(provider[1]).name
-        declared = load_yaml((ROOT / "compose" / "services" / "grafana.yml").read_text())
-        self.assertIsInstance(declared, dict)
-        declared = cast("dict[str, Any]", declared)
-        mounted = re.fullmatch(r"\$\{SECRETS_DIR[^}]*\}/(.+)", str(declared["secrets"][secret_name]["file"]))
+        self.assertIn(secret_name, service["secrets"], "the service mounts the secret that the provider names")
+        mounted = re.fullmatch(r"\$\{SECRETS_DIR[^}]*\}/(.+)", str(compose["secrets"][secret_name]["file"]))
         self.assertIsNotNone(mounted)
         mounted = cast("re.Match[str]", mounted)
         received = (self.run_.secrets / mounted[1]).read_text().strip()
         self.assertEqual(marker.value, received, "control: the file that Grafana's provider reads, by the configuration and the mount, holds the owner's value")
         self.assertEqual([], self.run_.sinks([marker], output))
+
+    def grafana_play(self, content: str) -> tuple[int, str, Path]:
+        folder = self.run_.secrets
+        path = folder / "grafana" / "admin.password"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.chmod(0o600)
+        path.write_text(content)
+        path.chmod(0o600)
+        variables = {"compose_stack_secrets_directory": str(folder), "grafana_user": OWNER}
+        result = self.run_.play([{"ansible.builtin.include_tasks": str(ROLES / "compose_stack" / "tasks" / "grafana_password.yml")}], variables)
+        return result.returncode, result.stdout + result.stderr, path
+
+    def test_a_grafana_password_with_leading_or_trailing_whitespace_is_refused_by_name_and_never_shown(self) -> None:
+        for label, content in (
+            ("a leading space", " lead-" + "x" * 20),
+            ("a trailing space", "x" * 20 + "-trail "),
+            ("a leading tab", "\t" + "x" * 20),
+            ("a trailing tab", "x" * 20 + "\t\n"),
+        ):
+            with self.subTest(label):
+                marker = Marker("grafana password", content.strip())
+                code, output, path = self.grafana_play(content)
+                self.assertNotEqual(0, code, output[-2000:])
+                self.assertIn("grafana/admin.password", output, "control: the refusal names the file")
+                self.assertIn("whitespace", output)
+                self.assertEqual(content, path.read_text(), "the file is left as it was")
+                self.assertEqual([], scan_text(output, [marker]))
+
+    def test_a_grafana_password_with_no_edge_whitespace_or_with_one_final_line_break_passes(self) -> None:
+        for label, content in (("none", "x" * 24), ("a final line break", "x" * 24 + "\n"), ("inner spaces", "two words " + "x" * 12)):
+            with self.subTest(label):
+                code, output, path = self.grafana_play(content)
+                self.assertEqual(0, code, output[-2000:])
+                self.assertEqual(content, path.read_text(), "control: the value was kept")
 
 
 class DiagnosticSinks(unittest.TestCase):
@@ -588,6 +658,86 @@ class EvidenceSinks(unittest.TestCase):
         self.assertEqual({"inventory.json", "plans/a_binding.json", "acceptance/case.json"}, set(members), "control: the named evidence is in the archive")
         self.assertEqual([], scan_text(manifest_text, [marker]))
         self.assertEqual([], [name for name, content in members.items() if scan_text(content, [marker])])
+
+
+def parse_properties(text: str) -> dict[str, str]:
+    """The entries of a Java properties file as ``java.util.Properties.load`` reads them (SmallRye Config 3.17.2 uses it for properties files)."""
+    entries: dict[str, str] = {}
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "f": "\f"}
+    for line in re.split(r"\r\n|\r|\n", text):
+        stripped = line.lstrip(" \t\f")
+        if not stripped or stripped[0] in "#!":
+            continue
+        key, index = "", 0
+        while index < len(stripped) and stripped[index] not in "=: \t\f":
+            if stripped[index] == "\\":
+                index += 1
+                key += escapes.get(stripped[index], stripped[index])
+            else:
+                key += stripped[index]
+            index += 1
+        rest = stripped[index:].lstrip(" \t\f")
+        if rest[:1] in ("=", ":"):
+            rest = rest[1:].lstrip(" \t\f")
+        value, index = "", 0
+        while index < len(rest):
+            if rest[index] == "\\":
+                index += 1
+                value += escapes.get(rest[index], rest[index])
+            else:
+                value += rest[index]
+            index += 1
+        entries[key] = value
+    return entries
+
+
+class NessieStartSinks(unittest.TestCase):
+    """The real start command of the Nessie service with its two paths moved into a scratch folder and the server replaced by a command that does nothing."""
+
+    SERVICE = ROOT / "compose" / "services" / "nessie.yml"
+    PASSWORDS = {
+        "a plain password": make_marker("urlsafe").value,
+        "a leading space": "  two leading spaces",
+        "a line break": "first line\nsecond line",
+        "a backslash": "back\\slash\\n and \\u0041",
+        "a tab and a carriage return": "tab\there\rcarriage",
+        "properties characters": "#hash !bang =equals :colon trailing  ",
+    }
+
+    def command(self) -> str:
+        document = load_yaml(self.SERVICE.read_text())
+        self.assertIsInstance(document, dict)
+        script = str(cast("dict[str, Any]", document)["services"]["nessie"]["command"][2])
+        return script.replace("$$", "$")
+
+    def started(self, password: str) -> tuple[int, str, str]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "config").mkdir()
+            secret = folder / "password"
+            secret.write_bytes(password.encode())
+            script = self.command().replace("/run/secrets/nessie_database_password", str(secret)).replace("/run/nessie_config", str(folder / "config"))
+            script = script.replace("exec /opt/jboss/container/java/run/run-java.sh", "true")
+            result = run_command("/bin/bash", ["-c", script], env={"PATH": "/usr/bin:/bin"}, timeout=60)
+            written = folder / "config" / "datasource.properties"
+            mode = oct(written.stat().st_mode & 0o777) if written.exists() else "missing"
+            return result.returncode, written.read_bytes().decode() if written.exists() else "", mode + result.stdout + result.stderr
+
+    def test_each_password_is_read_back_exactly_from_the_properties_file(self) -> None:
+        for label, password in self.PASSWORDS.items():
+            with self.subTest(label):
+                code, text, detail = self.started(password)
+                self.assertEqual(0, code, detail)
+                self.assertEqual(
+                    {"quarkus.datasource.postgresql.password": password}, parse_properties(text), f"the parsed value differs from the file's bytes: {text!r}"
+                )
+                self.assertTrue(detail.startswith("0o600"), detail)
+
+    def test_an_empty_password_file_stops_the_start_by_name(self) -> None:
+        code, text, detail = self.started("")
+        self.assertNotEqual(0, code)
+        self.assertEqual("", text)
+        self.assertIn("password file is empty", detail)
 
 
 STANDARD_BAO = """#!/bin/sh

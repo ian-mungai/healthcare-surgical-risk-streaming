@@ -29,7 +29,7 @@ FILE_VARIABLES: dict[tuple[str, str], str] = {
     (
         "apicurio",
         "APICURIO_DATASOURCE_PASSWORD_FILE",
-    ): "holds a path only and the image has no project start script; the acceptance search covers this container on the host",
+    ): "holds a path only; Apicurio 3.3.5's own interceptor reads the mounted password file itself (confirmed in the recheck of the slice)",
     **{
         (
             "dagster_code_location",

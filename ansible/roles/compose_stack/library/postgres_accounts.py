@@ -35,6 +35,11 @@ RESERVED_NAMES = {"postgres", "public", "template0", "template1"}
 ADMINISTRATOR = "postgres"
 SERVICE = "postgres"
 ADMINISTRATOR_FILE_IN_CONTAINER = "/run/secrets/postgres_admin_password"
+# psql reads the administrator's password from a private file on the container's memory file system, which the script removes when psql ends, so the
+# password is in no process environment and no argument.
+PSQL_SCRIPT = r"""set -eu; umask 077; file=$(mktemp /dev/shm/pgpass.XXXXXX); trap 'rm -f "$file"' EXIT
+{ printf '*:*:*:@ACCOUNT@:'; sed -e 's/\\/\\\\/g' -e 's/:/\\:/g' @PASSWORD_FILE@; printf '\n'; } > "$file"
+PGPASSFILE="$file" psql @OPTIONS@"""
 ITERATIONS = 4096
 MAXIMUM_ITERATIONS = 1_000_000
 SALT_BYTES = 16
@@ -194,7 +199,7 @@ class Server:
         options = (
             f'-X -q -A -t -F "|" -v ON_ERROR_STOP=1 -v tools={tool_variable(tools)} -v databases={database_variable(tools)} -U {ADMINISTRATOR} -d postgres'
         )
-        script = f'PGPASSWORD="$(cat {ADMINISTRATOR_FILE_IN_CONTAINER})" exec psql {options}'
+        script = PSQL_SCRIPT.replace("@PASSWORD_FILE@", ADMINISTRATOR_FILE_IN_CONTAINER).replace("@ACCOUNT@", ADMINISTRATOR).replace("@OPTIONS@", options)
         code, output, error = self.run([*self.compose_command, "exec", "-T", SERVICE, "sh", "-c", script], sql)
         if code != 0:
             shown = re.sub(r"SCRAM-SHA-256\$\S+", "<verifier>", error.strip())[:ERROR_CHARACTERS]

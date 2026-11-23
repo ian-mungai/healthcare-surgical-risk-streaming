@@ -28,8 +28,15 @@ services:
         umask 077
         password="$$(cat /run/secrets/nessie_database_password)" || { echo "cannot read the database password file" >&2; exit 1; }
         [ -n "$$password" ] || { echo "the database password file is empty" >&2; exit 1; }
-        case "$$password" in *[\\]*) echo "the database password holds a backslash, which a properties file reads as an escape" >&2; exit 1 ;; esac
-        printf 'quarkus.datasource.postgresql.password=%s\n' "$$password" > /run/nessie_config/datasource.properties
+        bs='\'
+        value="$$password"
+        value=$${value//"$$bs"/"$$bs$$bs"}
+        value=$${value//$$'\n'/"$${bs}n"}
+        value=$${value//$$'\r'/"$${bs}r"}
+        value=$${value//$$'\t'/"$${bs}t"}
+        value=$${value//$$'\f'/"$${bs}f"}
+        case "$$value" in " "*) value="$$bs$$value" ;; esac
+        printf 'quarkus.datasource.postgresql.password=%s\n' "$$value" > /run/nessie_config/datasource.properties
         exec /opt/jboss/container/java/run/run-java.sh
     volumes:
       - nessie_data:/deployments/data

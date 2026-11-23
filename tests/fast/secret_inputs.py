@@ -253,7 +253,7 @@ INPUTS: tuple[SecretInput, ...] = (
         "urlsafe",
         "local",
         "the file under the secrets folder; the secret_file module keeps an existing file",
-        "Grafana's administrator sign-in (GF_SECURITY_ADMIN_PASSWORD__FILE)",
+        "Grafana's administrator sign-in, through the $__file{} provider in its mounted configuration (compose/monitoring/grafana/grafana.ini)",
         "the Grafana API accepts the marker for the administrator and refuses another password",
     ),
     SecretInput(

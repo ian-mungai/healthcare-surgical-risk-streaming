@@ -22,7 +22,6 @@ SERVICES = COMPOSE / "services"
 THIRTY_DAYS = "720h"
 SECRETS_FOLDER = "${SECRETS_DIR"
 DATASOURCE_UIDS = {"prometheus", "loki"}
-GRAFANA_CONFIGURATION = MONITORING / "grafana" / "grafana.ini"
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -78,22 +77,40 @@ def collector_problems(definition: dict[str, Any], declared_secrets: dict[str, A
     return problems
 
 
-GRAFANA_PASSWORD_LINE = re.compile(r"^admin_password\s*=\s*\$__file\{/run/secrets/grafana_admin_password\}\s*$", re.MULTILINE)
+GRAFANA_PASSWORD_LINE = re.compile(r"^admin_password\s*=\s*\$__file\{([^}]+)\}\s*$", re.MULTILINE)
+GRAFANA_SECRET_FILE = re.compile(r"\$\{SECRETS_DIR[^}]*\}/grafana/admin\.password")
 
 
-def grafana_problems(definition: dict[str, Any], configuration: str) -> list[str]:
-    """Grafana's own ``$__file{}`` provider reads the password in the configuration; its entrypoint exports the content of a ``__FILE`` variable."""
+def grafana_problems(document: dict[str, Any], configuration: str | None = None) -> list[str]:
+    """Follow the Grafana service's mounts: its configuration file, then from that file's ``$__file{}`` provider the secret and the file the role keeps.
+
+    ``configuration`` replaces the mounted file's text, for a planted defect. The entrypoint exports a ``__FILE`` variable's content, so none may exist.
+    """
+    definition = document["services"]["grafana"]
     environment = definition.get("environment") or {}
     problems = []
-    if not GRAFANA_PASSWORD_LINE.search(configuration):
-        problems.append("the configuration must read the administrator password with $__file{} from the secrets file")
     if any(key.endswith("__FILE") for key in environment):
         problems.append("no __FILE variable may name the password: Grafana's entrypoint exports its content into the process environment")
     if "GF_SECURITY_ADMIN_PASSWORD" in environment:
         problems.append("the administrator password must not be a value")
     mounted = [item for item in definition.get("configs") or [] if isinstance(item, dict) and item.get("target") == "/etc/grafana/grafana.ini"]
+    declared = (document.get("configs") or {}).get(mounted[0].get("source")) if mounted else None
+    source = SERVICES / str(declared.get("file")) if isinstance(declared, dict) else None
     if not mounted:
         problems.append("the configuration file is not mounted at /etc/grafana/grafana.ini")
+    elif source is None or not source.is_file():
+        problems.append("the mounted configuration names a source file that does not exist")
+    text = configuration if configuration is not None else (source.read_text() if source is not None and source.is_file() else "")
+    provider = GRAFANA_PASSWORD_LINE.search(text)
+    if provider is None:
+        problems.append("the configuration must read the administrator password with $__file{} from the secrets file")
+        return problems
+    secret = Path(provider[1])
+    secret_file = str(((document.get("secrets") or {}).get(secret.name) or {}).get("file", ""))
+    if secret.parent != Path("/run/secrets") or secret.name not in (definition.get("secrets") or []):
+        problems.append("the file named by the provider is not a secret that the service mounts under /run/secrets")
+    elif not GRAFANA_SECRET_FILE.fullmatch(secret_file):
+        problems.append("the mounted secret is not the administrator password file that the deploy keeps (grafana/admin.password)")
     return problems
 
 
@@ -118,7 +135,7 @@ class TrackedFilesTest(unittest.TestCase):
         self.assertEqual([], collector_problems(document["services"]["alloy"], document.get("secrets") or {}))
 
     def test_grafana_takes_its_administrator_password_from_a_file_through_its_own_provider(self) -> None:
-        self.assertEqual([], grafana_problems(service("grafana"), GRAFANA_CONFIGURATION.read_text()))
+        self.assertEqual([], grafana_problems(load(SERVICES / "grafana.yml")))
 
     def test_the_dashboard_names_only_provisioned_data_sources(self) -> None:
         dashboard = json.loads((MONITORING / "grafana" / "dashboards" / "service_memory.json").read_text())
@@ -172,19 +189,34 @@ class PlantedDefectTest(unittest.TestCase):
         other["postgres_alloy_password"]["file"] = "${SECRETS_DIR:?x}/postgres/postgres.password"
         self.assertEqual(1, len(collector_problems(definition, other)))
 
-    def test_a_grafana_password_as_a_value_a_file_variable_or_missing_is_named(self) -> None:
-        definition, configuration = service("grafana"), GRAFANA_CONFIGURATION.read_text()
+    def test_a_grafana_password_as_a_value_a_file_variable_or_a_wrong_mount_is_named(self) -> None:
+        document = load(SERVICES / "grafana.yml")
 
         def check(changed: dict[str, Any]) -> list[str]:
-            return grafana_problems(changed, configuration)
+            return grafana_problems(changed)
 
-        self.assertEqual(1, len(self.planted(definition, lambda d: d["environment"].update({"GF_SECURITY_ADMIN_PASSWORD__FILE": "/run/secrets/x"}), check)))
-        self.assertEqual(1, len(self.planted(definition, lambda d: d["environment"].update({"GF_SECURITY_ADMIN_PASSWORD": "x"}), check)))
-        self.assertEqual(
-            1, len(self.planted(definition, lambda d: d.update(configs=[item for item in d["configs"] if item["target"] != "/etc/grafana/grafana.ini"]), check))
-        )
-        for text in ("", "[security]\nadmin_password = changeme\n", "[security]\nadmin_password = $__env{PASSWORD}\n"):
-            self.assertEqual(1, len(grafana_problems(definition, text)), text)
+        def service_of(changed: dict[str, Any]) -> dict[str, Any]:
+            found: dict[str, Any] = changed["services"]["grafana"]
+            return found
+
+        for mutate in (
+            lambda d: service_of(d)["environment"].update({"GF_SECURITY_ADMIN_PASSWORD__FILE": "/run/secrets/x"}),
+            lambda d: service_of(d)["environment"].update({"GF_SECURITY_ADMIN_PASSWORD": "x"}),
+            lambda d: service_of(d).update(configs=[item for item in service_of(d)["configs"] if item["target"] != "/etc/grafana/grafana.ini"]),
+            lambda d: d["configs"]["grafana_configuration"].update(file="../monitoring/grafana/missing.ini"),
+            lambda d: d["configs"]["grafana_configuration"].update(file="../monitoring/grafana/datasources.yml"),
+            lambda d: d["secrets"]["grafana_admin_password"].update(file="${SECRETS_DIR:?x}/postgres/postgres.password"),
+            lambda d: service_of(d).update(secrets=[]),
+            lambda d: d["secrets"].pop("grafana_admin_password"),
+        ):
+            self.assertGreaterEqual(len(self.planted(document, mutate, check)), 1)
+        for text in (
+            "",
+            "[security]\nadmin_password = changeme\n",
+            "[security]\nadmin_password = $__env{PASSWORD}\n",
+            "[security]\nadmin_password = $__file{/run/secrets/other}\n",
+        ):
+            self.assertGreaterEqual(len(grafana_problems(document, text)), 1, text)
 
     def test_a_panel_on_an_unprovisioned_data_source_is_named(self) -> None:
         dashboard = json.loads((MONITORING / "grafana" / "dashboards" / "service_memory.json").read_text())

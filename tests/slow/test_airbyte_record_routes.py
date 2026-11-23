@@ -262,7 +262,12 @@ class ClientFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             place_aws_files(folder)
-            _, output = self.write(folder)
+            code, output = self.write(folder)
+            held = {name: content.rstrip("\n") for name, (content, _, _) in self.files(folder).items()}
+        self.assertEqual(0, code, output[-2000:])
+        self.assertEqual(
+            (CLIENT_ID, CLIENT_VALUE), (held["client_id"], held["client_secret"]), "control: the files hold the values that the output is searched for"
+        )
         for value in (CLIENT_ID, CLIENT_VALUE):
             for form in (value, base64.b64encode(value.encode()).decode(), base64.b64encode((value + "\n").encode()).decode()):
                 self.assertNotIn(form, output)
