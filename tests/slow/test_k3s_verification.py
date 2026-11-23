@@ -64,6 +64,10 @@ class DisabledComponentsTest(unittest.TestCase):
 
 
 ENABLED = "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_finished\nServer Encryption Hashes: All hashes match\n"
+STARTED_ENABLED = (
+    "Encryption Status: Enabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: All hashes match\n\n"
+    "Active  Key Type  Name\n------  --------  ----\n *      AES-CBC   aescbckey\n"
+)
 ENCRYPTION_MESSAGE = "k3s secret encryption at rest is not on"
 
 
@@ -92,12 +96,21 @@ class SecretsEncryptionTest(unittest.TestCase):
         code, output = encryption_verdict(ENABLED)
         self.assertEqual(0, code, output)
 
+    def test_a_cluster_that_started_with_encryption_on_passes_at_the_start_stage(self) -> None:
+        """The live host's reading (Nov 23 2026): a cluster that started with the flag stays at the start stage with every hash matching."""
+        code, output = encryption_verdict(STARTED_ENABLED)
+        self.assertEqual(0, code, output)
+
     def test_every_other_status_is_refused_with_the_same_message(self) -> None:
         cases = {
             "disabled with no file": "Encryption Status: Disabled, no configuration file found\n",
             "disabled at the start stage": "Encryption Status: Disabled\nCurrent Rotation Stage: start\n",
             "enabled while keys rotate": "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\n",
             "disabled with a finished stage": "Encryption Status: Disabled\nCurrent Rotation Stage: reencrypt_finished\n",
+            "enabled at the start stage with hashes that differ": (
+                "Encryption Status: Enabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: hash does not match\n"
+            ),
+            "enabled and finished with no hash line": "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_finished\n",
             "empty": "",
             "unrelated text": "Enabled\n",
         }
