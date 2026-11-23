@@ -7,10 +7,11 @@ in the fast tests.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TextIO
 from urllib.parse import quote
 
 from scripts.stack.nessie import NessieClient, NessieError, Reference
@@ -29,6 +30,7 @@ from spark.bronze_clinical_lab import (
 from spark.settings import SettingsError
 
 JOB = "bronze_clinical_lab"
+RESULT_PREFIX = "RESULT "
 HASH = re.compile(r"[0-9a-f]{64}")
 HISTORY_PAGE_SIZE = 500
 HISTORY_PAGE_LIMIT = 200
@@ -68,9 +70,13 @@ class SparkOps(Protocol):
 
     def difference(self, kind: str, columns: list[str]) -> tuple[int, int]: ...
 
+    def null_keys(self, kind: str, columns: list[str]) -> tuple[int, int]: ...
+
     def key_statistics(self, kind: str) -> KeyStatistics: ...
 
     def occurrence_gaps(self) -> int: ...
+
+    def repeated_row_count(self) -> int: ...
 
     def repeated_rows(self, limit: int) -> list[Row]: ...
 
@@ -156,6 +162,15 @@ def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, k
     report.add("columns", [name for name, _ in found] == wanted and dict(found) == wanted_types, f"expected {len(wanted)} columns, found {len(found)}")
     if [name for name, _ in found] != wanted:
         return report
+    key = TABLES[kind][2]
+    loaded_nulls, bronze_nulls = spark.null_keys(kind, columns)
+    report.add(
+        "key not null",
+        loaded_nulls == 0 and bronze_nulls == 0,
+        f"{loaded_nulls} null value(s) in the key columns of the loaded table and {bronze_nulls} in bronze (key columns {', '.join(key)})",
+    )
+    if loaded_nulls or bronze_nulls:
+        return report
     report.source_rows, report.rows = spark.source_count(kind, columns), spark.bronze_count(kind)
     report.add("row count", report.rows == report.source_rows, f"loaded {report.source_rows}, bronze {report.rows}")
     missing, extra = spark.difference(kind, columns)
@@ -163,18 +178,21 @@ def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, k
         "no value changed", missing == 0 and extra == 0, f"rows of the loaded table not in bronze {missing}, rows of bronze not in the loaded table {extra}"
     )
     statistics = spark.key_statistics(kind)
-    report.add("key not null", statistics.nulls == 0, f"{statistics.nulls} null value(s) in the key columns {', '.join(key)}")
-    report.add("key unique", statistics.rows == statistics.distinct and statistics.nulls == 0, f"rows {statistics.rows}, distinct keys {statistics.distinct}")
+    report.add("key unique", statistics.rows == statistics.distinct, f"rows {statistics.rows}, distinct keys {statistics.distinct}")
     if kind == "lab":
         gaps = spark.occurrence_gaps()
         report.add("occurrence numbers from 1 without a gap", gaps == 0, f"{gaps} group(s) of case, time and test name with a gap or a start above 1")
+        in_groups = spark.repeated_row_count()
+        if in_groups > REPEATED_ROWS_LIMIT:
+            raise BronzeRulesError(f"the repeated laboratory groups hold {in_groups} rows, more than {REPEATED_ROWS_LIMIT}: the check refuses to collect them")
         repeated = spark.repeated_rows(REPEATED_ROWS_LIMIT)
-        if len(repeated) > REPEATED_ROWS_LIMIT:
-            raise BronzeRulesError(
-                f"the repeated laboratory groups hold more than {REPEATED_ROWS_LIMIT} rows: the independent occurrence check refuses to collect them"
-            )
-        differences = occurrence_differences(repeated)
-        report.add("occurrence rule", differences == 0, f"{len(repeated)} rows of repeated groups, {differences} differ from the Python numbering")
+        differences = occurrence_differences(repeated) if len(repeated) == in_groups else None
+        report.add(
+            "occurrence rule",
+            differences == 0,
+            f"{len(repeated)} rows collected of {in_groups} rows in repeated groups, "
+            f"{'not compared' if differences is None else f'{differences} differ from the Python numbering'}",
+        )
     report.keys_digest, report.rows_digest = spark.digests(kind, columns)
     return report
 
@@ -190,6 +208,21 @@ def result_document(command: str, branch: str, branch_hash: str, default_branch:
         "passed": len(reports) == len(TABLES) and all(report.passed for report in reports),
         "tables": {report.bronze_table: report.document() for report in reports},
     }
+
+
+def finish(result: dict[str, Any], branch: str, stdout: TextIO, stderr: TextIO) -> int:
+    """Print the ``RESULT`` line and return the exit code: 0 when every check passed, else 1 with the failed checks (counts only) on ``stderr``."""
+    stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
+    if result["passed"]:
+        return 0
+    failed = [
+        f"{table['bronze_table']}: {check['name']} ({check['detail']})"
+        for table in result["tables"].values()
+        for check in table["checks"]
+        if not check["passed"]
+    ]
+    stderr.write(f"{JOB}: the table checks failed on branch {branch}: {'; '.join(failed)}\n")
+    return 1
 
 
 def run_job(command: str, branch: str, source_hash: str, nessie: NessieOps, open_spark: Callable[[str, str, str], SparkOps]) -> dict[str, Any]:

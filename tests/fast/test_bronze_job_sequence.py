@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import unittest
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -23,7 +24,7 @@ from spark.bronze_clinical_lab import (
     TableContent,
     assign_occurrences,
 )
-from spark.bronze_clinical_lab_run import parser, run_job
+from spark.bronze_clinical_lab_run import RESULT_PREFIX, finish, parser, run_job
 from spark.settings import SettingsError
 
 HASH = "a" * 64
@@ -114,7 +115,10 @@ class FakeSpark:
         self.opened: tuple[str, str, str] | None = None
         self.numbering: Callable[[Sequence[tuple[str | None, str | None, str | None, str | None]]], list[tuple[Any, ...]]] = correct_numbers
         self.difference_counts = (0, 0)
-        self.statistics = KeyStatistics(6, 6, 0)
+        self.statistics = KeyStatistics(6, 6)
+        self.null_counts = (0, 0)
+        self.collect_nothing = False
+        self.numbering_forbidden = False
         self.gaps = 0
         self.extra_repeated: list[tuple[Any, ...]] = []
         self.bronze_count_value = 6
@@ -146,6 +150,10 @@ class FakeSpark:
         self.calls.append(f"difference:{kind}")
         return self.difference_counts
 
+    def null_keys(self, kind: str, columns: list[str]) -> tuple[int, int]:
+        self.calls.append(f"null_keys:{kind}")
+        return self.null_counts
+
     def key_statistics(self, kind: str) -> KeyStatistics:
         self.calls.append(f"key_statistics:{kind}")
         return self.statistics
@@ -154,11 +162,20 @@ class FakeSpark:
         self.calls.append("occurrence_gaps")
         return self.gaps
 
-    def repeated_rows(self, limit: int) -> list[tuple[Any, ...]]:
-        self.calls.append(f"repeated_rows:{limit}")
+    def collected(self) -> list[tuple[Any, ...]]:
         groups = Counter(row[:3] for row in LAB_ROWS)
         repeated = [row for row in LAB_ROWS if groups[row[:3]] > 1]
         return [*self.numbering(repeated), *self.extra_repeated]
+
+    def repeated_row_count(self) -> int:
+        self.calls.append("repeated_row_count")
+        return len(self.collected())
+
+    def repeated_rows(self, limit: int) -> list[tuple[Any, ...]]:
+        self.calls.append(f"repeated_rows:{limit}")
+        if self.numbering_forbidden:
+            raise AssertionError("no row may be numbered or sorted when a key is null")
+        return [] if self.collect_nothing else self.collected()
 
     def digests(self, kind: str, columns: list[str]) -> tuple[str, str]:
         self.calls.append(f"digests:{kind}")
@@ -193,13 +210,14 @@ def verify_calls(kind: str) -> list[str]:
         f"content:{TRUNK}@H:{source}",
         f"content:{BRANCH}:{BRONZE[kind]}",
         f"bronze_columns:{kind}",
+        f"null_keys:{kind}",
         f"source_count:{kind}",
         f"bronze_count:{kind}",
         f"difference:{kind}",
         f"key_statistics:{kind}",
     ]
     if kind == "lab":
-        calls += ["occurrence_gaps", f"repeated_rows:{REPEATED_ROWS_LIMIT}"]
+        calls += ["occurrence_gaps", "repeated_row_count", f"repeated_rows:{REPEATED_ROWS_LIMIT}"]
     return [*calls, f"digests:{kind}"]
 
 
@@ -335,18 +353,68 @@ class TableCheckTest(unittest.TestCase):
         harness.spark.bronze_count_value = 5
         self.assertIn("row count", harness.failed(harness.run("verify")))
 
-    def test_a_key_that_repeats_or_is_null_fails_the_key_checks(self) -> None:
+    def test_a_key_that_repeats_fails_the_unique_check(self) -> None:
         harness = Harness()
-        harness.spark.statistics = KeyStatistics(6, 5, 0)
-        self.assertIn("key unique", harness.failed(harness.run("verify")))
-        harness = Harness()
-        harness.spark.statistics = KeyStatistics(6, 6, 1)
-        self.assertEqual({"key not null", "key unique"}, harness.failed(harness.run("verify")))
+        harness.spark.statistics = KeyStatistics(6, 5)
+        self.assertEqual({"key unique"}, harness.failed(harness.run("verify")))
 
     def test_a_gap_in_the_occurrence_numbers_fails_the_gap_check(self) -> None:
         harness = Harness()
         harness.spark.gaps = 2
         self.assertEqual({"occurrence numbers from 1 without a gap"}, harness.failed(harness.run("verify")))
+
+
+class NullKeyTest(unittest.TestCase):
+    PLANTED_CASE = "X-PLANTED-CASE"
+
+    def verified(self, harness: Harness) -> tuple[dict[str, Any], int, str, str]:
+        result = harness.run("verify")
+        out, err = io.StringIO(), io.StringIO()
+        return result, finish(result, BRANCH, out, err), out.getvalue(), err.getvalue()
+
+    def test_a_null_key_in_bronze_or_in_the_loaded_table_fails_the_key_check_first_and_nothing_is_numbered_or_sorted(self) -> None:
+        for nulls in ((0, 1), (2, 0), (1, 1)):
+            harness = Harness()
+            harness.spark.null_counts = nulls
+            harness.spark.numbering_forbidden = True
+            with self.subTest(nulls):
+                result, code, out, _ = self.verified(harness)
+                self.assertEqual(1, code)
+                self.assertEqual({"key not null"}, harness.failed(result))
+                self.assertTrue(out.startswith(RESULT_PREFIX))
+                for later in ("occurrence_gaps", "repeated_row_count", "repeated_rows", "source_count", "difference", "digests", "key_statistics"):
+                    self.assertFalse([call for call in harness.calls if call.startswith(later)], later)
+
+    def test_the_key_check_runs_before_every_check_that_reads_the_rows_and_after_the_column_check(self) -> None:
+        harness = Harness()
+        harness.run("verify")
+        first = harness.calls.index("bronze_columns:clinical")
+        self.assertEqual("null_keys:clinical", harness.calls[first + 1])
+
+    def test_a_null_occurrence_in_a_repeated_group_gives_a_result_and_a_failed_exit_not_an_int_of_none(self) -> None:
+        harness = Harness()
+        harness.spark.null_counts = (0, 1)
+        harness.spark.numbering = lambda rows: [(*row[:4], None) for row in rows]
+        harness.spark.numbering_forbidden = True
+        result, code, out, err = self.verified(harness)
+        self.assertEqual((1, False), (code, result["passed"]))
+        self.assertIn("1 in bronze", err)
+        self.assertEqual(1, out.count("\n"))
+
+    def test_a_null_case_and_a_text_case_in_one_group_give_a_result_and_no_row_value_in_any_output(self) -> None:
+        harness = Harness()
+        harness.spark.null_counts = (0, 1)
+        harness.spark.extra_repeated = [(None, "5", "k", "4.0", 1), (self.PLANTED_CASE, "5", "k", "4.1", 2)]
+        harness.spark.numbering_forbidden = True
+        result, code, out, err = self.verified(harness)
+        self.assertEqual(1, code)
+        self.assertFalse(result["passed"])
+        self.assertNotIn(self.PLANTED_CASE, out + err + json.dumps(result))
+
+    def test_a_null_result_is_a_missing_value_and_not_a_null_key(self) -> None:
+        harness = Harness()
+        self.assertTrue(harness.run("verify")["passed"])
+        self.assertIn(None, [row[3] for row in LAB_ROWS])
 
 
 class OccurrenceRuleTest(unittest.TestCase):
@@ -377,6 +445,20 @@ class OccurrenceRuleTest(unittest.TestCase):
         harness.spark.extra_repeated = [("9", "9", "k", "1", 1)] * (REPEATED_ROWS_LIMIT + 1)
         with self.assertRaisesRegex(BronzeRulesError, str(REPEATED_ROWS_LIMIT)):
             harness.run("verify")
+
+    def test_no_row_collected_where_the_counts_say_repeated_groups_exist_fails_the_check(self) -> None:
+        harness = Harness()
+        harness.spark.collect_nothing = True
+        result = harness.run("verify")
+        self.assertEqual({"occurrence rule"}, harness.failed(result))
+        self.assertFalse(result["passed"])
+
+    def test_the_cap_is_applied_on_the_count_before_any_row_is_collected(self) -> None:
+        harness = Harness()
+        harness.spark.extra_repeated = [("9", "9", "k", "1", 1)] * (REPEATED_ROWS_LIMIT + 1)
+        with self.assertRaises(BronzeRulesError):
+            harness.run("verify")
+        self.assertFalse([call for call in harness.calls if call.startswith("repeated_rows")])
 
     def test_the_session_is_closed_also_when_a_step_raises(self) -> None:
         harness = Harness()

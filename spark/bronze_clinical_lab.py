@@ -45,11 +45,10 @@ class TableContent:
 
 @dataclass(frozen=True)
 class KeyStatistics:
-    """The rows of a Bronze table, its distinct keys and the null values in its key columns."""
+    """The rows of a Bronze table and its distinct keys."""
 
     rows: int
     distinct: int
-    nulls: int
 
 
 class BronzeRulesError(ValueError):
