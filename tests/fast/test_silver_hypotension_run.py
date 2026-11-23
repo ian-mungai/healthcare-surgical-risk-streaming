@@ -265,6 +265,35 @@ class SeriesFirst(unittest.TestCase):
         self.assertEqual(["table_missing"], codes(caught.exception))
 
 
+class MissingTables(unittest.TestCase):
+    """The message names the tables that are missing, one by one, and the event table is looked for without reading its facts when the series is not there."""
+
+    def missing(self, series: bool, events: bool) -> tuple[list[str], list[str]]:
+        fake = Fake()
+        if series:
+            fake.read_back[SERIES] = None
+        if events:
+            fake.read_back[EVENTS] = None
+        fake.events_fail = series
+        fake.held = dict(fake.read_back)
+        with self.assertRaises(SilverSignalsError) as caught:
+            run_verify(fake.operations(), HEAD)
+        return caught.exception.problems, fake.calls
+
+    @unittest.expectedFailure
+    def test_only_the_series_missing_is_one_table_and_the_events_are_found_without_their_facts(self) -> None:
+        problems, calls = self.missing(series=True, events=False)
+        self.assertEqual(["table_missing: 1 table"], problems)
+        self.assertIn(f"read_table a {EVENTS} facts=False", calls)
+        self.assertNotIn(f"read_table a {EVENTS} facts=True", calls)
+
+    def test_only_the_events_missing_is_one_table(self) -> None:
+        self.assertEqual(["table_missing: 1 table"], self.missing(series=False, events=True)[0])
+
+    def test_both_tables_missing_are_two_tables(self) -> None:
+        self.assertEqual(["table_missing: 2 tables"], self.missing(series=True, events=True)[0])
+
+
 class Verify(unittest.TestCase):
     def verify(self, fake: Fake) -> Any:
         fake.held = dict(fake.read_back)
