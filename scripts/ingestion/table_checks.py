@@ -698,6 +698,18 @@ def output_problem(base: Mapping[Key, str], branch: Mapping[Key, str], written: 
     return None
 
 
+class StaleBaseError(TableChecksError):
+    """The default branch is not at the head that the load branch was made from. Nothing is saved for the load, so a fresh load can use the folder."""
+
+
+def require_base(head: str, record: LoadRecord) -> None:
+    """Raise ``StaleBaseError`` unless ``head``, the default branch's head, is the recorded base head of the load."""
+    if head != record.base_hash:
+        raise StaleBaseError(
+            "the default branch is not at the recorded base head that the load branch was made from, so a merge could carry another change: rerun the load"
+        )
+
+
 def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing, run_id: str) -> MergeCommit:
     """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it. A request is never sent twice.
 
@@ -845,6 +857,7 @@ def run_locked(
     if pending is not None:
         raise MergeOutcomeOpen(open_message(record, state_directory))
     confirm_load(nessie, record)
+    require_base(main_head(nessie, default), record)
     try:
         staged = stage_verified_files(store, record.manifest, staging, staging_gid)
         plan_document = build_plan(record, staged, track_pin, empty_form, uuid.uuid4().hex)
@@ -858,8 +871,14 @@ def run_locked(
         remove_staged(staging)
     result, checked = read_result(reply, plan, run_folder)
     document = receipt(record, empty_form, checked, passed=result.passed)
+    if result.passed:
+        require_base(main_head(nessie, default), record)
     write_result(run_folder, document)
     if not result.passed:
         return Outcome(False, False, document)
-    commit = merge_branch(nessie, record, state_directory, timing, result.run_id)
+    try:
+        commit = merge_branch(nessie, record, state_directory, timing, result.run_id)
+    except StaleBaseError:
+        (run_folder / RESULT_FILE).unlink(missing_ok=True)
+        raise
     return record_merge(run_folder, state_directory, record, document, default, commit)

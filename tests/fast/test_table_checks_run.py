@@ -239,9 +239,12 @@ class Runner:
         self.calls = 0
         self.seen_files: dict[str, str] = {}
         self.plan: dict[str, Any] = {}
+        self.during: Callable[[], None] | None = None
 
     def __call__(self, staging: Path) -> run.RunnerReply:
         self.calls += 1
+        if self.during is not None:
+            self.during()
         plan_text = (staging / "plan.json").read_text()
         self.plan = json.loads(plan_text)
         self.seen_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in staging.iterdir() if path.name != "plan.json"}
@@ -455,6 +458,36 @@ class OutputBindingTest(unittest.TestCase):
         with self.assertRaises(run.TableChecksError):
             run.parse_load_record(json.dumps(record))
 
+    def fresh_load(self, case: Case) -> run.Outcome:
+        """The advised retry: a new load branch, made from the default branch as it is now, checked and merged in the same results folder."""
+        branch_hash = case.nessie.load_branch("load_run_two", SNAPSHOTS)
+        record = run.LoadRecord("load_run_two", branch_hash, case.reference, dict(SNAPSHOTS), case.nessie.heads["main"])
+        return case.go(Runner(), record=record)
+
+    def test_a_stale_base_is_refused_before_the_checks_run_and_before_any_result_is_saved(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.add_main_commit("another tool", {})
+        with self.assertRaisesRegex(run.TableChecksError, "recorded base"):
+            case.go(runner)
+        self.assertEqual(0, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(self.fresh_load(case).merged)
+
+    def test_a_default_branch_that_moves_while_the_checks_run_saves_no_result_and_the_fresh_load_goes_through(self) -> None:
+        case, runner = Case(self), Runner()
+
+        def move() -> None:
+            case.nessie.add_main_commit("another tool", {})
+
+        runner.during = move
+        with self.assertRaisesRegex(run.TableChecksError, "recorded base"):
+            case.go(runner)
+        self.assertEqual(1, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+        self.assertTrue(self.fresh_load(case).merged)
+
     def test_the_namespace_that_the_default_branch_lacks_is_merged_with_the_tables(self) -> None:
         case = Case(self)
         self.assertTrue(case.go(Runner()).merged)
@@ -650,7 +683,9 @@ class OneTargetHashTest(unittest.TestCase):
         merged = case.nessie.heads["main"]
         self.assertEqual([head, head, merged], case.nessie.history_reads)
         self.assertEqual([head], [request["expected"] for request in case.nessie.merge_requests])
-        self.assertEqual(3, case.nessie.main_reads)
+        self.assertEqual(
+            5, case.nessie.main_reads, "the base is read before the checks, before the result is saved and at the merge, besides the two reads of the history"
+        )
 
     def test_a_merge_refused_because_main_moved_is_an_open_outcome_that_is_not_sent_again(self) -> None:
         case = Case(self)
