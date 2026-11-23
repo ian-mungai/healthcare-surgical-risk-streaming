@@ -89,6 +89,20 @@ def shut_down(query: Any, session: Any, failure: BaseException | None) -> BaseEx
     return first
 
 
+def run_query(query: Any, session: Any, deadline: float | None, stop_requested: Callable[[], bool], slice_seconds: float) -> tuple[Any, BaseException | None]:
+    """Wait for the query, read its last progress, stop the query and then the session. Returns the progress and the first failure, in that order of time.
+
+    The error of the wait comes first. A progress lookup that raises is a failure only when nothing failed before, and the stops run whatever happened.
+    """
+    failure = wait_for_query(query, deadline, stop_requested, slice_seconds)
+    progress: Any = None
+    try:
+        progress = query.lastProgress
+    except BaseException as error:
+        failure = failure or error
+    return progress, shut_down(query, session, failure)
+
+
 def batch_handler(sinks: BatchSinks, settings: StreamSettings) -> Callable[[Any, int], None]:
     commits = 0
 

@@ -22,7 +22,7 @@ from spark.session import build_session
 from spark.settings import SettingsError
 from spark.streaming.clinical import ClinicalFileError, load_clinical
 from spark.streaming.lake_sinks import LakeSinks
-from spark.streaming.query import SESSION_OPTIONS, shut_down, start_query, wait_for_query
+from spark.streaming.query import SESSION_OPTIONS, run_query, start_query
 from spark.streaming.settings import StreamSettingsError, from_environment
 
 JOB = "stream_features"
@@ -69,13 +69,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     deadline = time.monotonic() + settings.max_seconds if settings.max_seconds else None
-    failure: BaseException | None = None
-    progress: Any = None
-    try:
-        failure = wait_for_query(query, deadline, lambda: stopped["signal"], WAIT_SLICE_SECONDS)
-        progress = query.lastProgress
-    finally:
-        failure = shut_down(query, session, failure)
+    progress, failure = run_query(query, session, deadline, lambda: stopped["signal"], WAIT_SLICE_SECONDS)
     if failure is not None:
         sys.stderr.write(f"{JOB}: the query failed: {type(failure).__name__}: {str(failure)[:500]}\n")
         return 1

@@ -21,7 +21,7 @@ from typing import Any
 from unittest import mock
 
 from spark.streaming.model import FeatureRecord
-from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, shut_down, start_query, stop_and_check, wait_for_query
+from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, run_query, shut_down, start_query, stop_and_check, wait_for_query
 from spark.streaming.rows import INPUT_DDL, KEY_COLUMNS, OUTPUT_DDL, event_row, record_from_row
 from spark.streaming.settings import StreamSettings
 from tests.fast.stream_support import events_for, stamp, synthetic_recording
@@ -263,6 +263,66 @@ class ShutDown(unittest.TestCase):
         first = RuntimeError("first")
         self.assertIs(first, shut_down(Throwing(None), Session(error), first))
         self.assertIsNone(shut_down(Throwing(None), Session(), None))
+
+
+class Logged:
+    """A query and a session that write what is called on them to one log, in the order of the calls."""
+
+    def __init__(self, log: list[str], errors: dict[str, BaseException] | None = None) -> None:
+        self.log, self.errors = log, errors or {}
+        self.waits = 0
+
+    def step(self, name: str) -> None:
+        self.log.append(name)
+        if name in self.errors:
+            raise self.errors[name]
+
+    @property
+    def isActive(self) -> bool:  # noqa: N802
+        return True
+
+    @property
+    def lastProgress(self) -> dict[str, int]:  # noqa: N802
+        self.step("progress")
+        return {"batchId": 3}
+
+    def awaitTermination(self, timeout: float) -> bool:  # noqa: N802
+        self.step("wait")
+        return False
+
+    def exception(self) -> BaseException | None:
+        self.step("exception")
+        return None
+
+    def stop(self) -> None:
+        self.step("stop")
+
+
+class RunQuery(unittest.TestCase):
+    def test_the_query_is_stopped_before_the_session_and_both_are_always_stopped(self) -> None:
+        log: list[str] = []
+        query, session = Logged(log), Logged(log)
+        query.stop, session.stop = lambda: log.append("query stop"), lambda: log.append("session stop")  # type: ignore[method-assign]
+        progress, failure = run_query(query, session, 0.0, lambda: False, 5.0)
+        self.assertIsNone(failure)
+        self.assertEqual({"batchId": 3}, progress)
+        self.assertEqual(["query stop", "session stop"], [entry for entry in log if entry.endswith("stop")])
+
+    def test_the_wait_error_stays_first_when_the_progress_lookup_the_stop_and_the_session_all_fail_too(self) -> None:
+        log: list[str] = []
+        wait_error = RuntimeError("the wait failed")
+        query = Logged(log, {"wait": wait_error, "progress": OSError("progress"), "stop": TimeoutError("stop")})
+        session = Logged(log, {"stop": ValueError("session")})
+        session.stop = lambda: (_ for _ in ()).throw(ValueError("session"))  # type: ignore[method-assign]
+        progress, failure = run_query(query, session, None, lambda: False, 5.0)
+        self.assertIs(wait_error, failure)
+        self.assertIsNone(progress)
+
+    def test_a_progress_lookup_that_fails_is_a_failure_when_nothing_failed_before(self) -> None:
+        log: list[str] = []
+        error = OSError("progress")
+        _, failure = run_query(Logged(log, {"progress": error}), Logged(log), 0.0, lambda: False, 5.0)
+        self.assertIs(error, failure)
 
 
 class TestInput(unittest.TestCase):
