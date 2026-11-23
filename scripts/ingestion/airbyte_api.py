@@ -52,7 +52,7 @@ import threading
 import time
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import quote
 
 from scripts.ingestion import record_definitions as definitions
 from scripts.ingestion.record_definitions import Connector, Table
@@ -73,7 +73,6 @@ TERMINAL_STATUSES = ("incomplete", "failed", "succeeded", "cancelled")
 SYNC = "sync"
 # The addresses that the deploy can write: the bridge address that k3s gives the node is a private address, and the code location reaches it through the host.
 PRIVATE_NETWORKS = tuple(ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
-OFFSET = re.compile(r"[0-9]{1,9}")
 ORIGIN = re.compile(r"http://([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})")
 DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
 DEFINITION_NAMES = {
@@ -136,22 +135,6 @@ def job_entry(entry: object, what: str, connection_id: str | None = None) -> tup
     if connection_id is not None and (text(entry, "connectionId", what) != connection_id or text(entry, "jobType", what) != SYNC):
         raise AirbyteError(f"{what} gave a job that is not a sync of the connection that was asked for")
     return job, status
-
-
-def continuation_offset(following: str, offset: int, label: str) -> int:
-    """The offset of the next page, read from the ``next`` link of a page that was read at ``offset``.
-
-    Only the offset is taken from the link: the request keeps its own route and filters, so a link cannot send the credentials or the list anywhere else. The
-    link must carry exactly one ``offset``, of 1 to 9 ASCII digits, that is greater than ``offset``: a link that makes no progress is refused at once, not
-    after the page cap.
-    """
-    try:
-        values = parse_qs(urlsplit(following).query).get("offset", [])
-    except ValueError:
-        values = []
-    if len(values) != 1 or OFFSET.fullmatch(values[0]) is None or int(values[0]) <= offset:
-        raise AirbyteError(f"{label} gave a page that is not of the documented form")
-    return int(values[0])
 
 
 def table_named(name: str) -> Table:
@@ -317,7 +300,13 @@ class HttpAirbyteApi:
         return document
 
     def listing(self, path: str) -> list[dict[str, Any]]:
-        """Every object of a list call, page by page. An entry that is not an object, or a ``next`` that is not text, refuses the call."""
+        """Every object of a list call, page by page, by the client's own offset.
+
+        The offset starts at 0 and grows by ``PAGE_SIZE`` after each page, on the same route and with the same filters. The list ends at the first reply
+        that has no ``next``, or an empty one: ``next`` only shows that another page exists, and its text is never read, so a link of any form can send
+        neither the offset nor the request elsewhere. An entry that is not an object, or a ``next`` that is not text, refuses the call, and so do more
+        than ``MAX_PAGES`` pages.
+        """
         label = f"GET {path.partition('?')[0].strip('/')}"
         found: list[dict[str, Any]] = []
         separator = "&" if "?" in path else "?"
@@ -331,7 +320,7 @@ class HttpAirbyteApi:
             found += data
             if not following:
                 return found
-            offset = continuation_offset(following, offset, label)
+            offset += PAGE_SIZE
         raise AirbyteError(f"{label} has more pages than {MAX_PAGES}")
 
     def workspace_id(self) -> str:

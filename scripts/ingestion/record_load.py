@@ -467,7 +467,9 @@ def make_branch(catalog: Catalog, state: RunState, branch: str, leftover: str | 
 
     The order is the safety: the entry that authorised the deletion is cleared before a new branch can exist, and the new pair is written before the branch
     is made, so a stop between any two of these steps leaves no branch that the state file does not name, and a retry finds either nothing to own or a branch
-    it can prove it made. A name that is taken when the branch is made is not owned, so its pair is forgotten.
+    it can prove it made. A name that is taken when the branch is made is not owned, so its pair is forgotten. The ownership check refuses before any write, but
+    the read of ``main`` comes after the deletion: a ``main`` hash that is refused there leaves the leftover deleted and its entry cleared, and a retry owns
+    nothing and makes the branch again.
     """
     if leftover is not None:
         catalog.delete_branch(branch, leftover)

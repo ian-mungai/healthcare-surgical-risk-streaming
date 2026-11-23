@@ -56,7 +56,9 @@ class NessieCatalog:
         """The one place a reference answer is read: None when there is no such reference, else the reference, which must be the one that was asked for.
 
         The answer must be a JSON object that names exactly ``name``, with a kind of ``BRANCH`` or ``TAG`` and a hash of 64 lower case hexadecimal digits. Any
-        other answer is ``catalog_error: <operation> failed``, so no copy, settings change, sync or delete follows from it.
+        other answer is ``catalog_error: <operation> failed``. For the ownership check (``reference``) that is before any write: no copy, settings change,
+        sync or delete follows from it. It is not so for the read of ``main`` (``head``) that makes a new branch: the load makes it after it has deleted an
+        owned leftover and cleared its entry, so an answer for ``main`` that is refused there leaves that deletion done.
         """
         try:
             found = self.client.reference(name)

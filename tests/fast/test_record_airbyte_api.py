@@ -38,6 +38,7 @@ ORIGIN = "http://10.42.0.1:8001"
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 PLATFORM_FIELD = {"platform_added": "a default"}
 MARKER = "marker_6f1c2e_never_in_a_message"
+ENDLESS_LIMIT = 5000
 
 
 class StandIn:
@@ -56,9 +57,9 @@ class StandIn:
         self.failures: dict[str, tuple[int, bytes] | type[Exception]] = {}
         self.counters: dict[str, int] = {}
         self.workspaces = [{"workspaceId": "workspace1"}]
-        self.page_size: int | None = None
         self.replies: dict[tuple[str, int], Any] = {}
         self.endless: set[str] = set()
+        self.link = f"{ORIGIN}{PREFIX}/more"
         self.requested: list[tuple[str, int, list[str]]] = []
         self.budgets: list[float] = []
         self.mutations: dict[str, Any] = {}
@@ -128,12 +129,11 @@ class StandIn:
             if (kind, offset) in self.replies:
                 reply = self.replies[(kind, offset)]
                 return reply(data) if callable(reply) else reply
+            limit = int(query.get("limit", ["100"])[0])
             if kind in self.endless:
-                return {"data": [], "next": self.continuation(kind, offset + 100)}
-            if self.page_size is None:
-                return {"data": data}
-            more = offset + self.page_size < len(data)
-            return {"data": data[offset : offset + self.page_size], "next": self.continuation(kind, offset + self.page_size) if more else ""}
+                return {"data": [], "next": self.link} if offset < ENDLESS_LIMIT else {"data": []}
+            more = offset + limit < len(data)
+            return {"data": data[offset : offset + limit], **({"next": self.link} if more else {})}
         if method == "POST":
             entry = {**body, key: self.ident(kind)}
             entry["configuration"] = {**body["configuration"], **PLATFORM_FIELD}
@@ -141,11 +141,6 @@ class StandIn:
             return entry
         store[rest[0]]["configuration"] = {**body["configuration"], **PLATFORM_FIELD}
         return store[rest[0]]
-
-    @staticmethod
-    def continuation(kind: str, offset: int) -> str:
-        """A ``next`` link as Airbyte's public API gives one: the route of the list, its filters and the offset of the following page."""
-        return f"{ORIGIN}{PREFIX}/{kind}s?workspaceIds=workspace1&limit=100&offset={offset}"
 
     def shown(self, kind: str, entry: dict[str, Any]) -> dict[str, Any]:
         if kind == "source":
@@ -439,79 +434,57 @@ class StartTest(unittest.TestCase):
 
 
 class PagingTest(unittest.TestCase):
-    """A list is followed by the continuation offset of its ``next``, on the route and with the filters that were asked for, and a continuation that does
-    not make progress ends the call at once."""
+    """A list is paged by the client's own offset: it starts at 0, adds the page size after each page, keeps its route and filters and ends when a reply has
+    no ``next``. No ``next`` link is parsed: only whether there is one matters."""
 
     def destination_offsets(self, stand_in: StandIn) -> list[int]:
         return [offset for kind, offset, _ in stand_in.requested if kind == "destination"]
 
-    def test_a_page_with_no_data_and_a_next_that_points_to_offset_100_is_followed_to_that_offset_and_the_object_behind_it_is_found(self) -> None:
+    def behind_an_empty_first_page(self, following: Any) -> tuple[Api, StandIn]:
+        """Everything is ensured, then the first destination page is empty and says ``following``; the destination is on the page at offset 100."""
         api, stand_in = prepared()
         ensure_everything(api)
-        stand_in.replies[("destination", 0)] = {"data": [], "next": StandIn.continuation("destination", 100)}
+        stand_in.replies[("destination", 0)] = {"data": [], "next": following}
         stand_in.replies[("destination", 100)] = lambda data: {"data": data}
         stand_in.requested.clear()
         stand_in.log.clear()
+        return api, stand_in
+
+    def test_an_empty_page_with_a_next_moves_to_the_next_page_and_the_object_behind_it_is_found(self) -> None:
+        api, stand_in = self.behind_an_empty_first_page(f"{ORIGIN}{PREFIX}/destinations?workspaceIds=workspace1&limit=100&offset=100")
         ensure_everything(api)
         self.assertEqual([], writes(stand_in), "the destination behind the empty page was found, and none was made again")
         self.assertEqual([0, 100], self.destination_offsets(stand_in))
 
-    def test_each_request_keeps_the_route_and_the_filters_and_only_the_offset_of_a_next_is_taken(self) -> None:
-        api, stand_in = prepared()
-        ensure_everything(api)
-        stand_in.replies[("destination", 0)] = {"data": [], "next": "http://8.8.8.8:80/other/route?workspaceIds=other&limit=1&offset=100"}
-        stand_in.replies[("destination", 100)] = lambda data: {"data": data}
-        stand_in.requested.clear()
+    def test_each_request_keeps_the_route_and_the_filters_whatever_the_next_says(self) -> None:
+        api, stand_in = self.behind_an_empty_first_page("http://8.8.8.8:80/other/route?workspaceIds=other&limit=1&offset=100")
         ensure_everything(api)
         self.assertEqual(
             [("destination", 0, ["workspace1"]), ("destination", 100, ["workspace1"])], [item for item in stand_in.requested if item[0] == "destination"]
         )
 
-    def test_a_next_whose_offset_is_the_one_just_read_ends_the_call_at_the_first_request_and_not_at_the_page_cap(self) -> None:
-        api, stand_in = prepared()
-        ensure_everything(api)
-        stand_in.replies[("destination", 0)] = {"data": [], "next": StandIn.continuation("destination", 0)}
-        stand_in.requested.clear()
-        with self.assertRaises(AirbyteError) as raised:
-            ensure_everything(api)
-        self.assertIn("not of the documented form", str(raised.exception))
-        self.assertEqual([0], self.destination_offsets(stand_in), "one request, and no request at the same offset again")
-
-    def test_a_next_that_goes_back_after_a_step_forward_is_refused_too(self) -> None:
-        api, stand_in = prepared()
-        ensure_everything(api)
-        stand_in.replies[("destination", 0)] = {"data": [], "next": StandIn.continuation("destination", 100)}
-        stand_in.replies[("destination", 100)] = {"data": [], "next": StandIn.continuation("destination", 50)}
-        stand_in.requested.clear()
-        with self.assertRaises(AirbyteError):
-            ensure_everything(api)
-        self.assertEqual([0, 100], self.destination_offsets(stand_in))
-
-    def test_a_next_without_one_whole_offset_is_refused_and_no_message_holds_it(self) -> None:
+    def test_a_next_of_any_form_is_never_parsed_the_next_page_is_the_one_after_the_page_size(self) -> None:
         for name, following in (
-            ("a text", f"{MARKER}"),
+            ("a text", MARKER),
             ("no offset", f"{ORIGIN}{PREFIX}/destinations?workspaceIds=workspace1&limit=100"),
             ("a text offset", f"{ORIGIN}{PREFIX}/destinations?offset={MARKER}"),
-            ("a negative offset", f"{ORIGIN}{PREFIX}/destinations?offset=-100"),
-            ("a fraction", f"{ORIGIN}{PREFIX}/destinations?offset=1.5"),
-            ("an exponent", f"{ORIGIN}{PREFIX}/destinations?offset=1e2"),
-            ("a sign", f"{ORIGIN}{PREFIX}/destinations?offset=%2B100"),
-            ("digits of another script", f"{ORIGIN}{PREFIX}/destinations?offset=\u0661\u0660\u0660"),
+            ("a blank second offset", f"{ORIGIN}{PREFIX}/destinations?offset=100&offset="),
+            ("an offset split by a line break", f"{ORIGIN}{PREFIX}/destinations?offset=1\n00"),
+            ("an offset split by an encoded line break", f"{ORIGIN}{PREFIX}/destinations?offset=1%0A00"),
             ("two offsets", f"{ORIGIN}{PREFIX}/destinations?offset=100&offset=200"),
+            ("an offset that is the one just read", f"{ORIGIN}{PREFIX}/destinations?offset=0"),
+            ("an offset that goes back", f"{ORIGIN}{PREFIX}/destinations?offset=-100"),
+            ("an offset far ahead", f"{ORIGIN}{PREFIX}/destinations?offset=900"),
             ("an offset that is too long", f"{ORIGIN}{PREFIX}/destinations?offset=99999999999"),
             ("an address that cannot be read", "http://[::1"),
         ):
             with self.subTest(name):
-                api, stand_in = prepared()
+                api, stand_in = self.behind_an_empty_first_page(following)
                 ensure_everything(api)
-                stand_in.replies[("destination", 0)] = {"data": [], "next": following}
-                stand_in.requested.clear()
-                with self.assertRaises(AirbyteError) as raised:
-                    ensure_everything(api)
-                self.assertNotIn(MARKER, str(raised.exception))
-                self.assertEqual([0], self.destination_offsets(stand_in))
+                self.assertEqual([], writes(stand_in))
+                self.assertEqual([0, 100], self.destination_offsets(stand_in))
 
-    def test_a_list_that_goes_forward_for_ever_is_refused_at_the_page_cap(self) -> None:
+    def test_a_list_that_has_a_next_for_ever_is_refused_at_the_page_cap_and_each_offset_is_one_page_size_further(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
         stand_in.endless = {"destination"}
@@ -521,16 +494,27 @@ class PagingTest(unittest.TestCase):
         self.assertIn("more pages than 5", str(raised.exception))
         self.assertEqual([0, 100, 200, 300, 400], self.destination_offsets(stand_in))
 
-    def test_a_list_in_pages_of_one_is_read_to_its_end_by_the_offsets_that_the_next_links_give(self) -> None:
+    def test_a_list_in_pages_of_one_is_read_to_its_end_by_the_clients_own_offsets_and_stops_at_the_reply_with_no_next(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
-        stand_in.page_size = 1
         stand_in.requested.clear()
         stand_in.log.clear()
-        ensure_everything(api)
+        with mock.patch.object(airbyte_api, "PAGE_SIZE", 1):
+            ensure_everything(api)
         self.assertEqual([], writes(stand_in))
         self.assertEqual([0], self.destination_offsets(stand_in), "one destination is one page")
         self.assertEqual([0, 1, 2], [offset for kind, offset, _ in stand_in.requested if kind == "source"][:3])
+
+    def test_a_reply_with_no_next_or_an_empty_next_ends_the_list_at_its_first_page(self) -> None:
+        for name, extra in (("no next", {}), ("an empty next", {"next": ""}), ("a null next", {"next": None})):
+            with self.subTest(name):
+                api, stand_in = prepared()
+                ensure_everything(api)
+                stand_in.replies[("destination", 0)] = lambda data, extra=extra: {"data": data, **extra}
+                stand_in.requested.clear()
+                stand_in.log.clear()
+                ensure_everything(api)
+                self.assertEqual([0], self.destination_offsets(stand_in))
 
 
 class FailureTest(unittest.TestCase):
@@ -567,9 +551,9 @@ class FailureTest(unittest.TestCase):
     def test_a_list_with_more_pages_is_read_to_its_end(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
-        stand_in.page_size = 1
         stand_in.log.clear()
-        ensure_everything(api)
+        with mock.patch.object(airbyte_api, "PAGE_SIZE", 1):
+            ensure_everything(api)
         self.assertEqual([], writes(stand_in))
         self.assertIn("GET sources", stand_in.log)
         self.assertGreater(stand_in.log.count("GET sources"), 3, "each list was read in pages")
