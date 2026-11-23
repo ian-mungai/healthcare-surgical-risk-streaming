@@ -17,8 +17,6 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
-from features.series_input import series_readings_from_rows
-
 from features.leakage import FORBIDDEN_FIELDS, row_problems
 from features.model import ClinicalValue, FeatureInputError, FeatureRow, Reading, WaveformSecond, WaveformWindow, WindowInput
 from features.registry import NUMERIC_TRACKS, WAVEFORM_STATUS, WAVEFORM_TRACKS, feature_specs, is_registered
@@ -31,6 +29,7 @@ from tests.fast.features_support import (
     SERIES,
     alternating,
     arithmetic,
+    exact_series,
     numeric_window,
     series_window,
     waveform_window,
@@ -246,7 +245,7 @@ class Row(unittest.TestCase):
             seconds = tuple(WaveformSecond(s.second, s.samples if s.valid else (junk,) * len(s.samples), s.valid) for s in wave.seconds)
             return WindowInput(
                 CUTOFF_US,
-                {ARTERIAL_MEAN: readings(numeric_window), SERIES: series_readings_from_rows([(r.time_us, r.value, r.valid) for r in readings(series_window)])},
+                {ARTERIAL_MEAN: readings(numeric_window), SERIES: exact_series([(r.time_us, r.value, r.valid) for r in readings(series_window)])},
                 {"SNUADC/ART": WaveformWindow(wave.sample_rate, seconds)},
                 {},
             )

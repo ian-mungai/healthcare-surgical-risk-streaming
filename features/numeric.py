@@ -42,8 +42,20 @@ def window_readings(track: str, readings: Sequence[Reading], cutoff_us: int, per
     if not all(math.isfinite(value) for value in values):
         raise FeatureInputError(f"{track}: a valid reading is not a finite number")
     known = SECOND if per_second else 0
+    if per_second:
+        for reading, value in zip(valid, values, strict=True):
+            if reading.exact is not None and not same_float(reading.exact, value):
+                raise FeatureInputError(f"{track}: a valid reading's value is not the exact mean it carries")
     exacts = [reading.exact if reading.exact is not None else Fraction(value) for reading, value in zip(valid, values, strict=True)] if per_second else None
     return NumericWindow(cutoff_us, [reading.time_us + known for reading in valid], values, exacts)
+
+
+def same_float(exact: Fraction, value: float) -> bool:
+    """Whether ``value`` is the float of ``exact``. An exact value that no float can hold is not."""
+    try:
+        return float(exact) == value
+    except OverflowError:
+        return False
 
 
 def numeric_group(track: str, readings: Sequence[Reading], cutoff_us: int) -> GroupResult:

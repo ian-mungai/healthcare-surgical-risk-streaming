@@ -38,12 +38,19 @@ from tests.fast.features_support import (
 )
 
 
+def series_row(reading: Reading) -> list[Any]:
+    """The JSON reading of the series: its value, its flag and its exact mean as a count and the two parts of the sum."""
+    if reading.valid:
+        return [reading.time_us, reading.value, True, 1, reading.value, 0.0]
+    return [reading.time_us, reading.value, False, None, None, None]
+
+
 def window_document(window_id: str, future: bool = False) -> dict[str, Any]:
     readings = [[reading.time_us, reading.value, reading.valid] for reading in numeric_window(arithmetic(100.0, -0.05), valid=lambda index: index != 10)]
-    series = [[reading.time_us, reading.value, reading.valid] for reading in series_window(arithmetic(100.0, -0.05), valid=lambda index: index != 10)]
+    series = [series_row(reading) for reading in series_window(arithmetic(100.0, -0.05), valid=lambda index: index != 10)]
     if future:
         readings += [[CUTOFF_US + SECOND, 0.0, True]]
-        series += [[CUTOFF_US, 0.0, True], [CUTOFF_US + SECOND, 0.0, True]]
+        series += [[CUTOFF_US, 0.0, True, 1, 0.0, 0.0], [CUTOFF_US + SECOND, 0.0, True, 1, 0.0, 0.0]]
     wave = waveform_window(alternating)
     seconds = [{"second": second.second, "samples": list(second.samples), "valid": second.valid, "start_offset_us": 0} for second in wave.seconds]
     clinical: dict[str, Any] = {

@@ -28,7 +28,7 @@ from features.model import FeatureInputError, Reading, WindowInput
 from features.pressure_series import ExactMean, SecondFacts, second_facts, series_from_seconds
 from features.registry import LOW_PRESSURE_65
 from features.row import build_row
-from features.series_input import SeriesReadings, exact_of, series_readings, series_readings_from_rows
+from features.series_input import SeriesReadings, exact_of, series_readings, series_readings_from_json
 from features.signal_validity import VALID, Verdict
 from tests.fast.features_support import CUTOFF_US, SECOND, SERIES
 
@@ -63,11 +63,16 @@ class Binding(unittest.TestCase):
     def test_no_series_at_all_is_not_refused(self) -> None:
         self.assertEqual(0, build_row(window([])).values[PREFIX + "valid_count"])
 
-    def test_a_series_with_a_valid_reading_that_has_no_exact_mean_or_the_wrong_one_cannot_be_built(self) -> None:
+    def test_a_series_with_a_valid_reading_that_has_no_exact_mean_cannot_be_built(self) -> None:
         with self.assertRaises(FeatureInputError):
             SeriesReadings([Reading(SECOND, 60.0, True)])
-        with self.assertRaises(FeatureInputError):
-            SeriesReadings([Reading(SECOND, 60.0, True, Fraction(61))])
+
+    def test_a_valid_reading_whose_exact_mean_is_not_its_value_is_refused_inside_the_window(self) -> None:
+        readings = series_readings(seconds_of(lambda second: [60.0] * 4))
+        last = readings[-1]
+        wrong = SeriesReadings([*readings[:-1], Reading(last.time_us, last.value, True, Fraction(61))])
+        with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*value is not the exact mean"):
+            build_row(window(wrong))
 
     def test_the_readings_have_the_time_of_their_second_the_value_of_their_mean_and_no_value_when_invalid(self) -> None:
         seconds = [second_facts(10, VALID, [60.0] * 4), second_facts(11, VALID, [70.0] * 4), second_facts(12, Verdict(False, "jump"), ())]
@@ -76,10 +81,11 @@ class Binding(unittest.TestCase):
         self.assertEqual((65.0, Fraction(65)), (got[1].value, got[1].exact))
         self.assertTrue(all(r.exact is None for r in got if not r.valid))
 
-    def test_the_json_triples_of_a_series_are_bound_with_the_exact_value_of_their_float(self) -> None:
-        got = series_readings_from_rows([(SECOND, 64.99999999999999, True), (2 * SECOND, 0.0, False)])
+    def test_the_json_rows_of_a_series_are_bound_with_the_exact_mean_that_they_carry(self) -> None:
+        tie = [SECOND, 65.0, True, 8, 520.0, -(2.0**-47)]
+        got = series_readings_from_json([tie, [2 * SECOND, 0.0, False, None, None, None]], "x")
         self.assertIsInstance(got, SeriesReadings)
-        self.assertEqual(Fraction(64.99999999999999), got[0].exact)
+        self.assertEqual((Fraction(520) - Fraction(1, 2**47)) / 8, got[0].exact)
         self.assertIsNone(got[1].exact)
 
 
@@ -108,7 +114,6 @@ def through_the_command_line(entries: Sequence[Sequence[object]]) -> dict[str, o
 
 
 class JsonParity(unittest.TestCase):
-    @unittest.expectedFailure
     def test_the_same_readings_give_the_same_minutes_below_65_through_the_window_input_and_the_batch_command_line(self) -> None:
         facts = seconds_of(alternating)
         direct = build_row(window(series_readings(facts))).values
@@ -123,18 +128,15 @@ class JsonParity(unittest.TestCase):
         ):
             self.assertEqual(direct[key], batch_values[key], key)
 
-    @unittest.expectedFailure
     def test_a_mapping_window_gives_the_same_row_as_the_window_input(self) -> None:
         facts = seconds_of(alternating)
         mapped = build_row(document(series_entries(facts))["windows"][0])  # type: ignore[index]
         self.assertEqual(build_row(window(series_readings(facts))).values, mapped.values)
 
-    @unittest.expectedFailure
     def test_a_json_reading_of_the_series_without_its_exact_mean_is_refused_by_name(self) -> None:
         with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*sample count"):
             build_row(document([[CUTOFF_US - SECOND, 60.0, True]])["windows"][0])  # type: ignore[index]
 
-    @unittest.expectedFailure
     def test_a_json_reading_whose_value_is_not_its_exact_mean_is_refused_when_it_is_inside_the_window(self) -> None:
         entries = series_entries(seconds_of(lambda second: [60.0] * 4))
         entries[-1][1] = 61.0
@@ -145,13 +147,11 @@ class JsonParity(unittest.TestCase):
 class ReadingsOutsideTheWindow(unittest.TestCase):
     """A reading after the cutoff is never read: whatever its value is, even a number that no float can hold, it changes no feature and raises nothing."""
 
-    @unittest.expectedFailure
     def test_a_number_that_no_float_can_hold_has_no_exact_value_and_raises_nothing(self) -> None:
         for value in (10**500, -(10**500), float("inf"), float("nan"), True, "60"):
             with self.subTest(value=value):
                 self.assertIsNone(exact_of(value))
 
-    @unittest.expectedFailure
     def test_a_reading_after_the_cutoff_with_an_enormous_value_changes_nothing(self) -> None:
         facts = seconds_of(lambda second: [60.0] * 4)
         entries = series_entries(facts)
@@ -163,7 +163,6 @@ class ReadingsOutsideTheWindow(unittest.TestCase):
             with self.subTest(junk=junk):
                 self.assertEqual(reference, through_the_command_line([*entries, junk]))
 
-    @unittest.expectedFailure
     def test_an_enormous_value_inside_the_window_is_refused_by_name_and_not_with_a_traceback(self) -> None:
         entries = series_entries(seconds_of(lambda second: [60.0] * 4))
         entries[-1] = [entries[-1][0], 10**500, True, 4, 10**500, 0]
