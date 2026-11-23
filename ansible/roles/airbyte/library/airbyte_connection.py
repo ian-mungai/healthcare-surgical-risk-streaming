@@ -118,7 +118,8 @@ CONNECTION_FIELDS = ("name", "status", "schedule", "namespaceDefinition", "confi
 Runner = Callable[[list[str]], "tuple[int, str, str]"]
 
 
-# The characters of a bearer token (RFC 6750): anything else could not go in a header, and the header error would carry the token's text.
+# The form of a bearer token (RFC 6750, b64token). A header could hold some other text, a space for one, but no Airbyte token has it, and a control
+# character such as a line break makes the HTTP library's header error carry the token's text.
 TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
@@ -187,7 +188,7 @@ class HttpApi(Api):
         started = self.clock()
         expired = threading.Event()
         connection = self.connect(self.host, self.port, timeout=allowed)
-        # The socket is saved once the request is sent: under Connection: close the HTTP library drops its own reference before the body is read, and the
+        # The socket is saved once the connect is made: under Connection: close the HTTP library drops its own reference before the body is read, and the
         # timer must still be able to shut the socket that a pending read waits on.
         saved: list[Any] = [None]
 

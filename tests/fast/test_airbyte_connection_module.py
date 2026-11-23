@@ -1164,6 +1164,10 @@ class SocketDeadlineTest(unittest.TestCase):
             def request(self, method: str, url: str, body: Any = None, headers: Any = None) -> None:
                 sent.append(method)
 
+            def getresponse(self) -> Any:
+                # A quick, good answer, so that without the check before sending the test fails on the request it records, not on a missing method.
+                return type("Reply", (), {"status": 200, "read": lambda self, amount=None: b"{}"})()
+
             def close(self) -> None:
                 pass
 
