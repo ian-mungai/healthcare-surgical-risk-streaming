@@ -73,6 +73,12 @@ class TrackedPinsTest(unittest.TestCase):
         self.assertNotIn(565, PROBE_CASES)
         self.assertEqual(len(PROBE_CASES), len(set(PROBE_CASES)))
 
+    def test_the_probe_cases_meet_the_rules_of_the_platform_sample(self) -> None:
+        pins = tracked_pins()
+        by_case = {item.case: item for item in pins.candidates}
+        entries = [landed_entry(by_case[case]) for case in PROBE_CASES]
+        self.assertEqual([], sample_problems(entries, pins))
+
     def test_the_tracked_pins_hold_both_tables_of_the_release(self) -> None:
         with tracked_pin():
             pins = tracked_pins()

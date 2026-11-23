@@ -48,7 +48,7 @@ from scripts.sample.split import is_development
 
 PROGRAM = "scripts.ingestion.copy_probe"
 PROBE_NAME = "copy_probe"
-PROBE_CASES = (908, 1147, 5754)
+PROBE_CASES = (908, 1147, 2466, 5145, 5754)
 SAMPLE_FILE = FIXTURES / "platform_sample.json"
 SAMPLE_FORMAT = "platform_sample_1"
 SHORT_SLOT = "short_development"
