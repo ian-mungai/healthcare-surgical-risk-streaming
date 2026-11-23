@@ -1,9 +1,9 @@
 """The project profile's access key never enters Ansible: the launcher reads it on the owner's computer and pipes it to one script on the host.
 
 The launcher exports the key with the AWS command line, checks it in memory and sends it to the host on standard input of one SSH command, which runs a fixed
-root-owned script. The script checks the document again and writes the two root-only files. These cases use synthetic marker values and search every argument
-list, every environment, every output, every exception text and every file of the run for them: a value is found only on the standard input of the SSH
-command and in the two files made for it.
+root-owned script. The script checks the document again and writes the two root-only files and the code location's two copies. These cases use synthetic marker
+values and search every argument list, every environment, every output, every exception text and every file of the run for them: a value is found only on the
+standard input of the SSH command and in the four files made for it.
 """
 
 from __future__ import annotations
@@ -360,7 +360,21 @@ class ScriptTest(unittest.TestCase):
 
     def test_an_owner_that_is_malformed_or_out_of_range_is_refused_by_the_code_bad_owner_before_any_file_is_written(self) -> None:
         for option in ("--container-owner", "--owner"):
-            for owner in ("abc", "1", "1:", ":1", "-1:5", "5:-1", "4294967295:5", "5:4294967295", "99999999999999999999:1", "1:99999999999999999999", "01:5"):
+            for owner in (
+                "abc",
+                "1",
+                "1:",
+                ":1",
+                "-1:5",
+                "5:-1",
+                "4294967295:5",
+                "5:4294967295",
+                "99999999999999999999:1",
+                "1:99999999999999999999",
+                "01:5",
+                "9" * 4301 + ":1",
+                "1:" + "9" * 4301,
+            ):
                 with self.subTest(option=option, owner=owner):
                     code, output, given = self.run_given([option, owner])
                     self.assertEqual((3, "bad_owner\n", []), (code, output, given))

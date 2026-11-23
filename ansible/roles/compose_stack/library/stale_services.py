@@ -75,17 +75,19 @@ def stale_services(files: dict[str, list[Path]], started: dict[str, float], modi
     """The services, in list order, that have a container and a file modified after that container started.
 
     With ``targets`` only those services are looked at, and no file of another service is read, so a file that another service mounts and that is not there yet
-    cannot stop a start that does not name it. A service of the list that has a container and mounts a file that is not there is a ``StaleError``.
+    cannot stop a start that does not name it. A service of the list that has a container and mounts a file that is not there is a ``StaleError``, whatever
+    its other files are: every file is looked at before the service is judged.
     """
     found: list[str] = []
     for name, paths in files.items():
         if name not in started or (targets and name not in targets):
             continue
         try:
-            if any(modified(path) > started[name] for path in paths):
-                found.append(name)
+            times = [modified(path) for path in paths]
         except FileNotFoundError as error:
             raise StaleError(f"service {name} mounts a file that is not there: {error.filename}") from None
+        if any(moment > started[name] for moment in times):
+            found.append(name)
     return found
 
 

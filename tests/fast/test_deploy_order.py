@@ -4,9 +4,10 @@ The order is read from the real playbooks, not described: the roles and post tas
 role's dependencies first, each task file with the files it includes right after it; then the launcher's one step that places the project profile's key (it
 runs between the two playbooks in ``host_up``, which ``test_host_commands`` holds); then the tasks of ``ansible/connection.yml``. A service starts at the first
 ``start.yml`` that names it, or that names none and so starts every service that is not left out (``compose_stack_start_except``). A secret file is made by the
-task file that the tables below name for it or for its folder. A redeploy finds every file there already, so it needs no order; a replaced file is the
-one case that needs the service to start again, which ``stale_services`` holds for configs and for file secrets, and ``test_compose_stack_start`` holds as
-the Compose command.
+task file that the tables below name for it or for its folder. On a redeploy a file can be new (a host deployed before the file existed) or replaced:
+the stale check reads only the files of the services that a start names, so a file made later in the order cannot stop an earlier start; a named service
+whose file is missing is refused by name; a replaced file starts the service again, which ``stale_services`` holds for configs and for file secrets and
+``test_compose_stack_start`` holds as the Compose command.
 """
 
 from __future__ import annotations

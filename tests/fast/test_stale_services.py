@@ -161,6 +161,18 @@ class TargetsTest(unittest.TestCase):
         self.assertEqual([], stale.stale_services(self.FILES, {"postgres": 100.0}, self.modified(looked), ["dagster_code_location", "postgres"]))
         self.assertEqual([Path("/s/postgres/password")], looked)
 
+    def test_a_missing_file_later_in_the_list_is_a_refusal_even_when_an_earlier_file_is_newer_than_the_container(self) -> None:
+        files = {"dagster_code_location": [Path("/s/configs/dagster_limits"), Path("/s/airbyte_api/aws_secret_access_key")]}
+
+        def modified(path: Path) -> float:
+            if path.parts[2] == "airbyte_api":
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return 200.0
+
+        with self.assertRaises(stale.StaleError) as raised:
+            stale.stale_services(files, {"dagster_code_location": 100.0}, modified, ["dagster_code_location"])
+        self.assertEqual("service dagster_code_location mounts a file that is not there: /s/airbyte_api/aws_secret_access_key", str(raised.exception))
+
 
 class StartTimeTest(unittest.TestCase):
     def test_a_start_time_with_nanoseconds_and_a_zone_is_read_to_the_second_fraction_that_python_keeps(self) -> None:

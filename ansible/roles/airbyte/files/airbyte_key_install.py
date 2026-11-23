@@ -106,7 +106,7 @@ def check_owner(text: str, *, allow_root: bool) -> tuple[int, int]:
     """
     try:
         owner = parse_owner(text, allow_root=allow_root)
-    except SecretFileError:
+    except (SecretFileError, ValueError):
         raise Refusal("bad_owner") from None
     if max(owner) > HIGHEST_ID:
         raise Refusal("bad_owner")

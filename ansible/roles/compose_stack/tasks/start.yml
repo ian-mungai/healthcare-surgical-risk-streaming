@@ -70,10 +70,8 @@
   ansible.builtin.command:
     argv: >-
       {{ compose_stack_docker + ['up', '--detach', '--wait', '--wait-timeout', compose_stack_health_deadline_seconds | string, '--force-recreate', '--no-deps']
-      + compose_stack_recreated }}
-  vars:
-    compose_stack_recreated: "{{ compose_stack_stale.stale if not compose_stack_to_start else compose_stack_stale.stale | select('in', compose_stack_to_start) | list }}"
-  when: compose_stack_recreated | length > 0
+      + compose_stack_stale.stale }}
+  when: compose_stack_stale.stale | length > 0
   changed_when: false
   timeout: "{{ compose_stack_start_deadline_seconds | int }}"
 
