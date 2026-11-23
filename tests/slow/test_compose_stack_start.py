@@ -696,7 +696,7 @@ class BuiltImagesTest(unittest.TestCase):
         images: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
         sources = {image["name"]: image["sources"] for image in images}
         self.assertEqual(["tests/fixtures/vitaldb"], [source for source in sources["spark"] if source.split("/")[0] == "tests"])
-        self.assertEqual(["spark", "scripts", "replay"], [source for source in sources["spark"] if source.split("/")[0] != "tests"])
+        self.assertEqual(["spark", "scripts", "replay", "features"], [source for source in sources["spark"] if source.split("/")[0] != "tests"])
         self.assertEqual(["orchestration", "scripts", "compose", "spark", "tests/fixtures/vitaldb"], sources["dagster"])
         self.assertEqual(["replay", "scripts", "tests"], sources["replay"])
         self.assertTrue((ROOT / "tests" / "fixtures" / "vitaldb" / "release.json").is_file())

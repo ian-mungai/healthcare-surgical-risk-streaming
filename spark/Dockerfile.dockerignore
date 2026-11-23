@@ -5,6 +5,8 @@
 !scripts/stack/__init__.py
 !scripts/stack/nessie.py
 !scripts/stack/tags.py
+!features/__init__.py
+!features/signal_validity.py
 !spark/requirements.txt
 !replay/__init__.py
 !replay/events/__init__.py
