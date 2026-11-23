@@ -7,11 +7,14 @@ YAML anchor or a merge key cannot hide a change. Failure modes covered here, eac
 
 - A group job is skipped: an ``if`` on a job or on one of its steps, or ``continue-on-error`` that lets a failed check pass.
 - A step runs under another shell or folder, so its command can become a no-op (``shell: bash -n {0}``).
+- A job group has no unconditional step list: a step behind a condition other than the guards' log tail, the two record checks and the two record
+  uploads (each check fails unless every run folder holds the record and its retention label as regular files, and each upload keeps them unless the
+  run is cancelled), a dropped, added, moved or changed step.
 - A guard shard is missing, runs twice, runs another shard's cases or is excluded through ``matrix.exclude``.
 - A check command changes in the workflow: a dry-run flag, a dropped or reordered command, another Python or tool version.
 - The required job leaves a group out of ``needs``, does not always run, has its step disabled or under another shell, or its script differs
   from the approved one by a character, holds an expression, or passes when a needed job failed, was cancelled or was skipped. The step sets
-  ``shell: bash``, so GitHub runs it with ``-eo pipefail``; its script runs here the same way, exactly as parsed, for all 64 combinations of the
+  ``shell: bash``, so GitHub runs it with ``-eo pipefail``; its script runs here the same way, exactly as parsed, for all 256 combinations of the
   needed jobs' results.
 - A pending run on main is cancelled before its groups start, or a pull request run is never superseded.
 """
@@ -41,12 +44,13 @@ RUNNER = "ubuntu-24.04"
 PYTHON = "3.14.10"
 SHARDS = 8
 REQUIRED_NAME = "Every job of this run passed"
-GROUPS = ("hooks", "infrastructure", "guards")
+GROUPS = ("hooks", "infrastructure", "guards", "deadline")
 EXPRESSION = re.compile(r"\$\{\{ ([^}]+?) \}\}")
 RESULTS = ("success", "failure", "cancelled", "skipped")
 # The command that GitHub runs a `run` script with under the shell `bash`.
 GITHUB_BASH = ("--noprofile", "--norc", "-eo", "pipefail")
 SHARD_COMMAND = f'make test-guards SHARD="${{SHARD}}/{SHARDS}"'
+DEADLINE_COMMAND = "make test-deadline"
 COMMIT_RANGE_SCRIPT = "\n".join(
     [
         'if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then',
@@ -59,10 +63,73 @@ COMMIT_RANGE_SCRIPT = "\n".join(
 )
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_PYTHON = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+UPLOAD_ARTIFACT = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 SETUP_TERRAFORM = "hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e"
 PYTHON_STEP = {"uses": SETUP_PYTHON, "with": {"python-version": PYTHON, "cache": "pip", "cache-dependency-path": "requirements.txt"}}
 CHECKOUT_STEP = {"uses": CHECKOUT, "with": {"persist-credentials": False}}
 TAIL_STEP = {"name": "Show the end of the run's log after a failure", "if": "failure()", "run": "tail -n 150 runs/*/log.txt"}
+
+
+def record_step(artifact: str) -> dict[str, Any]:
+    """The step that keeps a run's record and retention label as a hosted artifact, also after a failure; no file is an error."""
+    return {
+        "name": "Keep the run record and its retention label",
+        "if": "${{ !cancelled() }}",
+        "uses": UPLOAD_ARTIFACT,
+        "with": {"name": artifact, "path": "runs/*/record.json\nruns/*/retention.json\n", "if-no-files-found": "error", "retention-days": 30},
+    }
+
+
+# The script of the step before each upload. The upload matches runs/*/record.json and runs/*/retention.json as separate patterns, so it succeeds with
+# one of them alone: this step fails unless every run folder holds both files as regular files that are not links, and at least one run folder exists.
+# GitHub runs it with `bash -e {0}`.
+RECORD_CHECK_NAME = "Check that the run record and its retention label exist"
+RECORD_CHECK_SCRIPT = r"""shopt -s nullglob
+folders=(runs/*/)
+if [ "${#folders[@]}" -eq 0 ]; then
+  echo "No run folder was written under runs/." >&2
+  exit 1
+fi
+incomplete=0
+for folder in "${folders[@]}"; do
+  for file in record.json retention.json; do
+    if [ ! -f "${folder}${file}" ] || [ -L "${folder}${file}" ]; then
+      printf 'The run folder %s has no %s.\n' "${folder}" "${file}" >&2
+      incomplete=1
+    fi
+  done
+done
+exit "${incomplete}"
+"""
+RECORD_CHECK_STEP = {"name": RECORD_CHECK_NAME, "if": "${{ !cancelled() }}", "run": RECORD_CHECK_SCRIPT}
+# What the check does in a run folder tree: the files that exist (a trailing slash makes a directory, "name -> target" a link) and whether the step must pass.
+RECORD_CHECK_CASES: dict[str, tuple[tuple[str, ...], bool]] = {
+    "the record and its label in one run folder": (("runs/a/record.json", "runs/a/retention.json"), True),
+    "the record alone": (("runs/a/record.json",), False),
+    "the label alone": (("runs/a/retention.json",), False),
+    "no run folder": ((), False),
+    "an empty runs folder": (("runs/",), False),
+    "the record and the label in two run folders": (("runs/a/record.json", "runs/b/retention.json"), False),
+    "a second run folder without a label": (("runs/a/record.json", "runs/a/retention.json", "runs/b/record.json"), False),
+    "a directory where the label belongs": (("runs/a/record.json", "runs/a/retention.json/"), False),
+    "the label a link to the label of another run": (
+        ("runs/a/record.json", "runs/a/retention.json -> runs/b/retention.json", "runs/b/record.json", "runs/b/retention.json"),
+        False,
+    ),
+    "the record a link to the record of another run": (
+        ("runs/a/record.json -> runs/b/record.json", "runs/a/retention.json", "runs/b/record.json", "runs/b/retention.json"),
+        False,
+    ),
+    "two complete run folders": (("runs/a/record.json", "runs/a/retention.json", "runs/b/record.json", "runs/b/retention.json"), True),
+}
+GUARD_RECORD_STEP = record_step("guard-record-shard-${{ matrix.shard }}")
+DEADLINE_RECORD_STEP = record_step("deadline-record")
+# The only conditions that a step may have, by job: the log tail after a failure, and the record check and the record upload unless the run is cancelled.
+# A step with one of them must still equal its pinned step, which the comparison with PINNED_JOBS checks.
+STEP_CONDITIONS = {
+    "guards": {TAIL_STEP["if"], RECORD_CHECK_STEP["if"], GUARD_RECORD_STEP["if"]},
+    "deadline": {RECORD_CHECK_STEP["if"], DEADLINE_RECORD_STEP["if"]},
+}
 # A pull request run is superseded by a newer commit of the same pull request. A push to main has a group of its own (its run, so even the same
 # commit pushed again does not replace a pending run), so no push cancels or replaces another run.
 CONCURRENCY = {
@@ -104,12 +171,30 @@ PINNED_JOBS: dict[str, dict[str, Any]] = {
     "guards": {
         "name": "Planted faults through the real commit path, shard ${{ matrix.shard }} of 8",
         "timeout-minutes": 15,
-        "steps": [CHECKOUT_STEP, PYTHON_STEP, {"run": "make setup"}, {"run": SHARD_COMMAND, "env": {"SHARD": "${{ matrix.shard }}"}}, TAIL_STEP],
+        "steps": [
+            CHECKOUT_STEP,
+            PYTHON_STEP,
+            {"run": "make setup"},
+            {"run": SHARD_COMMAND, "env": {"SHARD": "${{ matrix.shard }}"}},
+            TAIL_STEP,
+            RECORD_CHECK_STEP,
+            GUARD_RECORD_STEP,
+        ],
+    },
+    "deadline": {
+        "name": "A project wait passes its deadline and fails visibly",
+        "timeout-minutes": 5,
+        "steps": [CHECKOUT_STEP, PYTHON_STEP, {"run": "make setup"}, {"run": DEADLINE_COMMAND}, RECORD_CHECK_STEP, DEADLINE_RECORD_STEP],
     },
 }
 JOB_KEYS = {"name", "runs-on", "timeout-minutes", "steps"}
 REQUIRED_KEYS = {"name", "needs", "if", "runs-on", "timeout-minutes", "steps"}
-REQUIRED_ENV_VALUES = {"HOOKS": "${{ needs.hooks.result }}", "INFRASTRUCTURE": "${{ needs.infrastructure.result }}", "GUARDS": "${{ needs.guards.result }}"}
+REQUIRED_ENV_VALUES = {
+    "HOOKS": "${{ needs.hooks.result }}",
+    "INFRASTRUCTURE": "${{ needs.infrastructure.result }}",
+    "GUARDS": "${{ needs.guards.result }}",
+    "DEADLINE": "${{ needs.deadline.result }}",
+}
 # With `shell: bash` GitHub runs the script as `bash --noprofile --norc -eo pipefail {0}`; without a shell it runs `bash -e {0}`, without pipefail.
 REQUIRED_STEP = {"name": "Check that every needed job succeeded", "shell": "bash", "env": REQUIRED_ENV_VALUES}
 # The approved script of the required job's step, character for character. No `${{` expression: the jobs' results reach it through its env.
@@ -123,6 +208,7 @@ check() {
 check hooks "${HOOKS}"
 check infrastructure "${INFRASTRUCTURE}"
 check guards "${GUARDS}"
+check deadline "${DEADLINE}"
 exit "${failed}"
 """
 
@@ -242,7 +328,7 @@ def substituted(text: str, values: dict[str, str]) -> str:
 
 
 def step_problems(name: str, steps: list[Any], *, shell_pinned: bool = False) -> list[str]:
-    """A step that skips, lets a failure pass or runs under another shell or folder. Only the guards' log tail may have a condition: exactly ``failure()``.
+    """A step that skips, lets a failure pass or runs under another shell or folder. Only the guards' log tail and the record checks and uploads may have one.
 
     The aggregate's step is the one that sets a shell (``shell_pinned``): its value is compared with the approved one on its own.
     """
@@ -253,7 +339,7 @@ def step_problems(name: str, steps: list[Any], *, shell_pinned: bool = False) ->
             continue
         if "continue-on-error" in step:
             problems.append(f"{name}: continue-on-error is set on step {position}, so a failed check can pass")
-        if "if" in step and not (name == "guards" and step == TAIL_STEP):
+        if "if" in step and step["if"] not in STEP_CONDITIONS.get(name, set()):
             problems.append(f"{name}: step {position} runs behind the condition {step['if']!r}")
         if "shell" in step and not shell_pinned:
             problems.append(f"{name}: step {position} sets the shell {step['shell']!r}, which can turn its command into a no-op")
@@ -263,7 +349,50 @@ def step_problems(name: str, steps: list[Any], *, shell_pinned: bool = False) ->
 
 
 def runs_of(steps: list[Any]) -> list[str]:
-    return [str(step["run"]) for step in steps if isinstance(step, dict) and "run" in step]
+    """The commands of the steps, without the record check, whose script the probe in ``record_check_problems`` runs."""
+    return [str(step["run"]) for step in steps if isinstance(step, dict) and "run" in step and step.get("name") != RECORD_CHECK_NAME]
+
+
+@functools.cache
+def record_check_script_problems(script: str) -> tuple[str, ...]:
+    """What is wrong with the record check's ``script``: it must pass in a run folder tree that holds the record and its label, and fail in every other.
+
+    The script runs with the options that GitHub gives a ``run`` step without a ``shell`` (``bash -e {0}``), in a folder with the files of each case.
+    """
+    problems = []
+    for label, (paths, passes) in RECORD_CHECK_CASES.items():
+        with tempfile.TemporaryDirectory(prefix="ci_record_check_") as folder:
+            for path in paths:
+                path, _, link_target = path.partition(" -> ")
+                target = Path(folder) / path
+                if link_target:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(Path(folder) / link_target)
+                elif path.endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("{}\n")
+            (Path(folder) / "step.sh").write_text(script)
+            run = run_command("bash", ["--noprofile", "--norc", "-e", "step.sh"], env={"PATH": os.environ["PATH"]}, cwd=Path(folder), timeout=TIMEOUT_SECONDS)
+        if (run.returncode == 0) != passes:
+            problems.append(f"its record check {'fails' if passes else 'passes'} with {label}")
+    return tuple(problems)
+
+
+def record_check_problems(name: str, job: dict[str, Any]) -> list[str]:
+    """The record check is the one step named so, directly before the upload step, and its script does its work."""
+    steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
+    checks = [position for position, step in enumerate(steps) if step.get("name") == RECORD_CHECK_NAME]
+    uploads = [position for position, step in enumerate(steps) if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+    if len(checks) != 1:
+        return [f"{name}: it has {len(checks)} steps named {RECORD_CHECK_NAME!r}, not one"]
+    problems = []
+    if len(uploads) != 1 or uploads[0] != checks[0] + 1:
+        problems.append(f"{name}: the record check is not directly before the one upload step")
+    if "run" not in steps[checks[0]]:
+        return [*problems, f"{name}: the record check runs no script"]
+    return [*problems, *(f"{name}: {problem}" for problem in record_check_script_problems(str(steps[checks[0]]["run"])))]
 
 
 def job_problems(name: str, job: dict[str, Any]) -> list[str]:
@@ -289,6 +418,8 @@ def job_problems(name: str, job: dict[str, Any]) -> list[str]:
     problems += step_found
     if runs_of(steps) != runs_of(pinned["steps"]):
         problems.append(f"{name}: it runs {runs_of(steps)}, not {runs_of(pinned['steps'])}")
+    elif not step_found and len(steps) != len(pinned["steps"]):
+        problems.append(f"{name}: it has {len(steps)} steps, not {len(pinned['steps'])}")
     elif not step_found and steps != pinned["steps"]:
         differing = [position for position, (step, wanted) in enumerate(zip(steps, pinned["steps"], strict=False), 1) if step != wanted]
         problems.append(f"{name}: step {', '.join(map(str, differing))} differs from the pinned one (its action, version or inputs)")
@@ -413,7 +544,7 @@ def aggregate_problems(jobs: dict[str, Any]) -> list[str]:
             problems.append(f"required: its step's {key} is {step.get(key)!r}, not {REQUIRED_STEP[key]!r}")
     environment = step.get("env")
     if not isinstance(environment, dict):
-        problems.append(f"required: its step's env is {environment!r}, not the three results of the needed jobs")
+        problems.append(f"required: its step's env is {environment!r}, not the four results of the needed jobs")
         environment = {}
     if set(environment) != set(REQUIRED_ENV_VALUES):
         problems.append(f"required: its env has the keys {sorted(environment)}, not {sorted(REQUIRED_ENV_VALUES)}")
@@ -456,6 +587,8 @@ def contract_problems(text: str) -> list[str]:
         for name in GROUPS:
             problems += job_problems(name, workflow["jobs"][name])
         problems += matrix_problems(workflow["jobs"]["guards"])
+        for name in ("guards", "deadline"):
+            problems += record_check_problems(name, workflow["jobs"][name])
         problems += aggregate_problems(workflow["jobs"])
     except (AssertionError, KeyError, StopIteration, ValueError, TypeError, AttributeError, yaml.YAMLError) as error:
         problems.append(f"the workflow cannot be read as the contract expects: {type(error).__name__}: {error}")
@@ -470,10 +603,32 @@ def as_tuple(value: str | tuple[str, ...]) -> tuple[str, ...]:
 TERRAFORM = "      - run: make check-terraform\n"
 ANSIBLE = "      - run: make check-ansible\n"
 GUARDS = '      - run: make test-guards SHARD="${SHARD}/8"\n'
+DEADLINE_RUN = "      - run: make test-deadline\n"
+UPLOAD_ACTION = f"      - name: Keep the run record and its retention label\n        if: ${{{{ !cancelled() }}}}\n        uses: {UPLOAD_ARTIFACT} # v7.0.2\n"
+UPLOAD_FILES = (
+    "          path: |\n            runs/*/record.json\n            runs/*/retention.json\n          if-no-files-found: error\n          retention-days: 30\n"
+)
+TAIL_YAML = "      - name: Show the end of the run's log after a failure\n        if: failure()\n        run: tail -n 150 runs/*/log.txt\n"
+CHECK_YAML = f"      - name: {RECORD_CHECK_NAME}\n        if: ${{{{ !cancelled() }}}}\n        run: |\n" + "".join(
+    f"          {line}\n" for line in RECORD_CHECK_SCRIPT.splitlines()
+)
+# The check that the upload's own patterns would give: one file of each name anywhere under runs/, not both in each run folder.
+LOOSE_CHECK_SCRIPT = (
+    'shopt -s nullglob\nrecords=(runs/*/record.json)\nlabels=(runs/*/retention.json)\n[ "${#records[@]}" -gt 0 ] && [ "${#labels[@]}" -gt 0 ]\n'
+)
+LOOSE_CHECK_YAML = f"      - name: {RECORD_CHECK_NAME}\n        if: ${{{{ !cancelled() }}}}\n        run: |\n" + "".join(
+    f"          {line}\n" for line in LOOSE_CHECK_SCRIPT.splitlines()
+)
+# The check and the upload of one job, anchored to the job by the step before them.
+GUARD_CHECK = TAIL_YAML + CHECK_YAML
+DEADLINE_CHECK = DEADLINE_RUN + CHECK_YAML
+REQUIRED_HEAD = "    if: always()\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n"
+GUARD_UPLOAD = UPLOAD_ACTION + "        with:\n          name: guard-record-shard-${{ matrix.shard }}\n" + UPLOAD_FILES
+DEADLINE_UPLOAD = UPLOAD_ACTION + "        with:\n          name: deadline-record\n" + UPLOAD_FILES
 REQUIRED_ENV = "        env:\n          HOOKS:"
 GROUP_LINE = "  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.run_id || github.ref }}\n"
 CANCEL_LINE = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n"
-NEEDS_LINE = "needs: [hooks, infrastructure, guards]"
+NEEDS_LINE = "needs: [hooks, infrastructure, guards, deadline]"
 ACCEPTS = 'if [ "$2" != success ]; then'
 NOT_SUCCESS = "required: its script passes when a needed job did not succeed"
 # Each planted change to the workflow text: (the text to replace, its replacement, the diagnostic that the contract must give).
@@ -604,17 +759,17 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the required job's exit masked by a pipe under bash -e (the reviewer's first plant)": (
         ("        shell: bash\n", '          exit "${failed}"\n'),
         ("", '          ( exit "${failed}" ) | true\n'),
-        ("required: its step's shell is None, not 'bash'", "required: its script differs from the approved one at line 11"),
+        ("required: its step's shell is None, not 'bash'", "required: its script differs from the approved one at line 12"),
     ),
     "the required job's exit masked by a pipe under the approved shell": (
         '          exit "${failed}"\n',
         '          ( exit "${failed}" ) | true\n',
-        "required: its script differs from the approved one at line 11",
+        "required: its script differs from the approved one at line 12",
     ),
     "the required job's script holds a context in a comment (the reviewer's second plant)": (
         '          exit "${failed}"\n',
         '          exit "${failed}" # ${{ github.event_name }}\n',
-        ("required: its script holds an expression", "required: its script differs from the approved one at line 11"),
+        ("required: its script holds an expression", "required: its script differs from the approved one at line 12"),
     ),
     "the required job's script reads a context": (
         'check hooks "${HOOKS}"',
@@ -629,17 +784,17 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the required job's script without its final newline": (
         "        run: |\n          failed=0\n",
         "        run: |-\n          failed=0\n",
-        "required: its script differs from the approved one at line 11",
+        "required: its script differs from the approved one at line 12",
     ),
     "the required job's script with a trailing space": (
         '          exit "${failed}"\n',
         '          exit "${failed}" \n',
-        "required: its script differs from the approved one at line 11",
+        "required: its script differs from the approved one at line 12",
     ),
     "the required job's env given an extra key with no value (the reviewer's low plant)": (
         "          GUARDS: ${{ needs.guards.result }}\n",
         "          GUARDS: ${{ needs.guards.result }}\n          UNUSED:\n",
-        "required: its env has the keys ['GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'UNUSED'], not ['GUARDS', 'HOOKS', 'INFRASTRUCTURE']",
+        "required: its env has the keys ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE', 'UNUSED'], not ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE']",
     ),
     "the required job's env entry reads another job": (
         "INFRASTRUCTURE: ${{ needs.infrastructure.result }}",
@@ -675,14 +830,14 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
     "the required job's step given another variable": (
         "          GUARDS: ${{ needs.guards.result }}\n",
         "          GUARDS: ${{ needs.guards.result }}\n          BASH_ENV: /dev/null\n",
-        "required: its env has the keys ['BASH_ENV', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE'], not ['GUARDS', 'HOOKS', 'INFRASTRUCTURE']",
+        "required: its env has the keys ['BASH_ENV', 'DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE'], not ['DEADLINE', 'GUARDS', 'HOOKS', 'INFRASTRUCTURE']",
     ),
     "the required job given a shell default": (
-        "    timeout-minutes: 5\n",
-        "    timeout-minutes: 5\n    defaults:\n      run:\n        shell: bash -n {0}\n",
+        REQUIRED_HEAD,
+        REQUIRED_HEAD + "    defaults:\n      run:\n        shell: bash -n {0}\n",
         "required: it has the key 'defaults'",
     ),
-    "the required job's timeout changed": ("    timeout-minutes: 5\n", "    timeout-minutes: 6\n", "required: its timeout is 6 minutes, not 5"),
+    "the required job's timeout changed": (REQUIRED_HEAD, REQUIRED_HEAD.replace("minutes: 5", "minutes: 6"), "required: its timeout is 6 minutes, not 5"),
     "a shard dropped": ("shard: [1, 2, 3, 4, 5, 6, 7, 8]", "shard: [1, 2, 3, 4, 5, 6, 7]", "guards: the shards ['8/8'] never run"),
     "one shard twice": ("shard: [1, 2, 3", "shard: [1, 1, 3", "guards: the shards ['1/8'] run more than once"),
     "a shard that does not exist": ("shard: [1, 2, 3, 4, 5, 6, 7, 8]", "shard: [1, 2, 3, 4, 5, 6, 7, 9]", "guards: the matrix runs shards ['9/8']"),
@@ -740,12 +895,184 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         "guards: it has the key 'permissions'",
     ),
     "a plan job added": ("jobs:\n", "jobs:\n  plan:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: make check\n", "the workflow's jobs are"),
-    "the required job without the guards in its needs": (NEEDS_LINE, "needs: [hooks, infrastructure]", "required: guards is missing from its needs"),
-    "the required job without the hooks in its needs": (NEEDS_LINE, "needs: [infrastructure, guards]", "required: hooks is missing from its needs"),
+    "the required job without the guards in its needs": (NEEDS_LINE, "needs: [hooks, infrastructure, deadline]", "required: guards is missing from its needs"),
+    "the required job without the hooks in its needs": (NEEDS_LINE, "needs: [infrastructure, guards, deadline]", "required: hooks is missing from its needs"),
     "the required job without the infrastructure job in its needs": (
         NEEDS_LINE,
-        "needs: [hooks, guards]",
+        "needs: [hooks, guards, deadline]",
         "required: infrastructure is missing from its needs",
+    ),
+    "the required job without the deadline job in its needs": (
+        NEEDS_LINE,
+        "needs: [hooks, infrastructure, guards]",
+        "required: deadline is missing from its needs",
+    ),
+    "the required job does not check the deadline job": (
+        '          check deadline "${DEADLINE}"\n',
+        "",
+        NOT_SUCCESS + ", for 3 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=success, deadline=failure",
+    ),
+    "the required job reads the wrong result for the deadline job": (
+        "DEADLINE: ${{ needs.deadline.result }}",
+        "DEADLINE: ${{ needs.hooks.result }}",
+        "required: its env entry DEADLINE is '${{ needs.hooks.result }}', not '${{ needs.deadline.result }}'",
+    ),
+    "the deadline job never run": (
+        "    name: A project wait passes its deadline and fails visibly\n",
+        "    name: A project wait passes its deadline and fails visibly\n    if: false\n",
+        "deadline: it runs behind the condition False",
+    ),
+    "the deadline job run only on push": (
+        "    name: A project wait passes its deadline and fails visibly\n",
+        "    name: A project wait passes its deadline and fails visibly\n    if: github.event_name == 'push'\n",
+        "deadline: it runs behind the condition \"github.event_name == 'push'\"",
+    ),
+    "the deadline job waits for the hooks": (
+        "    name: A project wait passes its deadline and fails visibly\n",
+        "    name: A project wait passes its deadline and fails visibly\n    needs: hooks\n",
+        "deadline: it waits for hooks",
+    ),
+    "the deadline case never run": (DEADLINE_RUN, "", "deadline: it runs ['make setup']"),
+    "the deadline case run as a dry run": (DEADLINE_RUN, "      - run: make test-deadline -n\n", "deadline: it runs ['make setup', 'make test-deadline -n']"),
+    "the deadline case's failure tolerated": (DEADLINE_RUN, DEADLINE_RUN + "        continue-on-error: true\n", "deadline: continue-on-error is set on step 4"),
+    "the deadline job's timeout changed": (
+        "    name: A project wait passes its deadline and fails visibly\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5",
+        "    name: A project wait passes its deadline and fails visibly\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30",
+        "deadline: its timeout is 30 minutes, not 5",
+    ),
+    "the deadline record not kept": (DEADLINE_UPLOAD, "", "deadline: it has 5 steps, not 6"),
+    "the deadline record check removed": (DEADLINE_CHECK, DEADLINE_RUN, ("deadline: it has 5 steps, not 6", "deadline: it has 0 steps named")),
+    "the guard record check removed": (GUARD_CHECK, TAIL_YAML, ("guards: it has 6 steps, not 7", "guards: it has 0 steps named")),
+    "the deadline record check after the upload": (
+        DEADLINE_CHECK + DEADLINE_UPLOAD,
+        DEADLINE_RUN + DEADLINE_UPLOAD + CHECK_YAML,
+        ("deadline: the record check is not directly before the one upload step", "deadline: step 5, 6 differs from the pinned one"),
+    ),
+    "the guard record check before the log tail": (
+        GUARD_CHECK,
+        CHECK_YAML + TAIL_YAML,
+        ("guards: step 5, 6 differs from the pinned one",),
+    ),
+    "the deadline record check only after a success": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace("${{ !cancelled() }}", "success()"),
+        "deadline: step 5 runs behind the condition 'success()'",
+    ),
+    "the deadline record check without a condition": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace("        if: ${{ !cancelled() }}\n", ""),
+        "deadline: step 5 differs from the pinned one",
+    ),
+    "the guard record check only after a failure": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace("${{ !cancelled() }}", "failure()"),
+        "guards: step 6 differs from the pinned one",
+    ),
+    "the guard record check's failure tolerated": (
+        GUARD_CHECK,
+        GUARD_CHECK.replace("        run: |\n", "        continue-on-error: true\n        run: |\n", 1),
+        "guards: continue-on-error is set on step 6",
+    ),
+    "the deadline record check in another folder": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace("        run: |\n", "        working-directory: docs\n        run: |\n", 1),
+        "deadline: step 5 sets the working directory 'docs'",
+    ),
+    "the deadline record check only looks for the record": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace("for file in record.json retention.json; do", "for file in record.json; do"),
+        "deadline: its record check passes with the record alone",
+    ),
+    "the deadline record check only looks for the label": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace("for file in record.json retention.json; do", "for file in retention.json; do"),
+        "deadline: its record check passes with the label alone",
+    ),
+    "the guard record check lets a missing file pass": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace("      incomplete=1\n", "      incomplete=0\n"),
+        "guards: its record check passes with the record alone",
+    ),
+    "the guard record check passes with no run folder": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace('"${#folders[@]}" -eq 0', '"${#folders[@]}" -eq 99'),
+        "guards: its record check passes with no run folder",
+    ),
+    "the guard record check ends with a success": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace('exit "${incomplete}"', "exit 0"),
+        "guards: its record check passes with the record alone",
+    ),
+    "the guard record check gives one folder a free pass": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace('for folder in "${folders[@]}"; do', 'for folder in "${folders[0]}"; do'),
+        "guards: its record check passes with a second run folder without a label",
+    ),
+    "the deadline record check matches the two files as the upload does, each in any folder": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + LOOSE_CHECK_YAML,
+        ("deadline: its record check passes with the record and the label in two run folders", "deadline: step 5 differs from the pinned one"),
+    ),
+    "the guard record check accepts a link as the file": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace(' || [ -L "${folder}${file}" ]', ""),
+        ("guards: its record check passes with the label a link to the label of another run", "guards: its record check passes with the record a link"),
+    ),
+    "the guard record check refuses a link only as the label": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace('[ -L "${folder}${file}" ]', '[ -L "${folder}retention.json" ]'),
+        "guards: its record check passes with the record a link to the record of another run",
+    ),
+    "the deadline record check refuses a link only as the record": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace('[ -L "${folder}${file}" ]', '[ -L "${folder}record.json" ]'),
+        "deadline: its record check passes with the label a link to the label of another run",
+    ),
+    "the guard record check accepts a directory as the label": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace('[ ! -f "${folder}${file}" ]', '[ ! -e "${folder}${file}" ]'),
+        "guards: its record check passes with a directory where the label belongs",
+    ),
+    "the guard record check looks in the runs folder itself": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace("folders=(runs/*/)", "folders=(runs/)"),
+        "guards: its record check fails with the record and its label in one run folder",
+    ),
+    "the deadline record kept only after a success": (
+        DEADLINE_UPLOAD,
+        DEADLINE_UPLOAD.replace("${{ !cancelled() }}", "success()"),
+        "deadline: step 6 runs behind the condition 'success()'",
+    ),
+    "the deadline record upload without a file is no error": (
+        DEADLINE_UPLOAD,
+        DEADLINE_UPLOAD.replace("if-no-files-found: error", "if-no-files-found: warn"),
+        "deadline: step 6 differs from the pinned one",
+    ),
+    "the deadline record kept without its retention label": (
+        DEADLINE_UPLOAD,
+        DEADLINE_UPLOAD.replace("            runs/*/retention.json\n", ""),
+        "deadline: step 6 differs from the pinned one",
+    ),
+    "the deadline record kept by another version of the upload action": (
+        DEADLINE_UPLOAD,
+        DEADLINE_UPLOAD.replace("cf430e030ddbb5b0abf93d22962f4752f3646cd9", "0000000000000000000000000000000000000000"),
+        "deadline: step 6 differs from the pinned one",
+    ),
+    "the guard record not kept": (GUARD_UPLOAD, "", "guards: it has 6 steps, not 7"),
+    "the guard record kept only after a success": (
+        GUARD_UPLOAD,
+        GUARD_UPLOAD.replace("${{ !cancelled() }}", "success()"),
+        "guards: step 7 runs behind the condition 'success()'",
+    ),
+    "the guard record upload without a file is no error": (
+        GUARD_UPLOAD,
+        GUARD_UPLOAD.replace("if-no-files-found: error", "if-no-files-found: ignore"),
+        "guards: step 7 differs from the pinned one",
+    ),
+    "the guard record of every shard kept under one name": (
+        "name: guard-record-shard-${{ matrix.shard }}",
+        "name: guard-record",
+        "guards: step 7 differs from the pinned one",
     ),
     "the required job skipped after a failure": ("    if: always()\n", "", "required: its condition is None, not always()"),
     "the required job run only after success": ("    if: always()\n", "    if: success()\n", "required: its condition is 'success()', not always()"),
@@ -760,21 +1087,21 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         "          failed=1\n          check() {",
         "required: its script fails when every job succeeded",
     ),
-    "the required job passes a failure": ("          failed=1\n", "", NOT_SUCCESS + ", for 63 of 64"),
+    "the required job passes a failure": ("          failed=1\n", "", NOT_SUCCESS + ", for 255 of 256"),
     "the required job passes a skipped job": (
         ACCEPTS,
         'if [ "$2" != success ] && [ "$2" != skipped ]; then',
-        NOT_SUCCESS + ", for 7 of 64 combinations of results, for example hooks=success, infrastructure=success, guards=skipped",
+        NOT_SUCCESS + ", for 15 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=success, deadline=skipped",
     ),
     "the required job passes a cancelled job": (
         ACCEPTS,
         'if [ "$2" != success ] && [ "$2" != cancelled ]; then',
-        NOT_SUCCESS + ", for 7 of 64 combinations of results, for example hooks=success, infrastructure=success, guards=cancelled",
+        NOT_SUCCESS + ", for 15 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=success, deadline=cancelled",
     ),
     "the required job does not check the guards": (
         '          check guards "${GUARDS}"\n',
         "",
-        NOT_SUCCESS + ", for 3 of 64 combinations of results, for example hooks=success, infrastructure=success, guards=failure",
+        NOT_SUCCESS + ", for 3 of 256 combinations of results, for example hooks=success, infrastructure=success, guards=failure, deadline=success",
     ),
     "the required job reads the wrong result": (
         "INFRASTRUCTURE: ${{ needs.infrastructure.result }}",
@@ -854,16 +1181,31 @@ class WorkflowContractTest(unittest.TestCase):
                 self.assertEqual(len(problems), 1)
                 self.assertIn("fails when every job succeeded", problems[0])
 
-    def test_a_broken_workflow_fails_the_contract_with_its_own_diagnostic(self) -> None:
+    def assert_plants_are_caught(self, base: str) -> None:
         for label, (before, after, diagnostics) in PLANTS.items():
             with self.subTest(label=label):
-                planted = WORKFLOW_TEXT
+                planted = base
                 for old, new in zip(as_tuple(before), as_tuple(after), strict=True):
                     self.assertIn(old, planted)
+                    if label.startswith("the required job"):
+                        self.assertGreater(planted.index(old), planted.index("\n  required:\n"), "a plant of the required job must change the required job")
                     planted = planted.replace(old, new, 1)
                 problems = contract_problems(planted)
                 for diagnostic in as_tuple(diagnostics):
                     self.assertTrue(any(diagnostic in problem for problem in problems), f"no problem names {diagnostic!r}: {problems}")
+
+    def test_a_broken_workflow_fails_the_contract_with_its_own_diagnostic(self) -> None:
+        self.assert_plants_are_caught(WORKFLOW_TEXT)
+
+    def test_every_plant_lands_in_its_own_job_without_the_comments_of_the_workflow(self) -> None:
+        """A plant is located by its job's keys, never by a comment: with any comment after a timeout removed, each plant still changes its own job."""
+        bare = re.sub(r"(timeout-minutes: \d+) #.*", r"\1", WORKFLOW_TEXT)
+        self.assertEqual(contract_problems(bare), [], "the control: the workflow without those comments keeps the contract")
+        self.assert_plants_are_caught(bare)
+
+    def test_the_record_check_runs_in_every_run_folder_tree_as_github_runs_it(self) -> None:
+        """The control of the record check's plants: the approved script passes with the record and its label and fails in every other tree."""
+        self.assertEqual(record_check_script_problems(RECORD_CHECK_SCRIPT), ())
 
 
 class RulesetRequiredFieldsTest(unittest.TestCase):

@@ -4,6 +4,7 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` makes the real commits. 
 
 - A planted fault passes because its hook crashed with another message, since only the hook id and the exit code were read.
 - A timeout, an OS error or an interrupt before or inside the protected run leaves no record, or leaves the scratch folder.
+- A real interrupt (SIGINT) or an unexpected error while the temporary repository is removed leaves no record.
 - Two runs or two shards that start in the same second write into one record folder.
 - The source list reads a path that Git quotes, or one that holds a carriage return, as a missing file and drops it from the copy.
 """
@@ -15,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -158,6 +160,35 @@ class ProtectedRunTest(unittest.TestCase):
         self.assertEqual("blocked: interrupted", record["outcome"])
         self.assertEqual("temporary repository removed", record["cleanup"])
         self.assertEqual([], list(self.temp.iterdir()))
+
+    def interrupt(self) -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+
+    def test_a_real_interrupt_while_the_temporary_repository_is_removed_writes_a_blocked_record_and_propagates(self) -> None:
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+        with (
+            mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
+            mock.patch.object(commit_guards, "run_cases"),
+            mock.patch.object(commit_guards.Fixture, "remove", side_effect=self.interrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            commit_guards.main()
+        record = self.record()
+        self.assertEqual("blocked: interrupted", record["outcome"])
+        self.assertEqual("cleanup interrupted", record["cleanup"])
+        self.assertIn("cleanup", [item["case"] for item in record["observations"] if not item["passed"]])  # type: ignore[attr-defined]
+
+    def test_an_unexpected_error_while_the_temporary_repository_is_removed_writes_a_failed_record(self) -> None:
+        with (
+            mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
+            mock.patch.object(commit_guards, "run_cases"),
+            mock.patch.object(commit_guards.Fixture, "remove", side_effect=ValueError("planted")),
+        ):
+            self.assertEqual(1, commit_guards.main())
+        record = self.record()
+        self.assertEqual("fail", record["outcome"])
+        self.assertTrue(str(record["cleanup"]).startswith("cleanup failed: ValueError"), record["cleanup"])
 
     def run_without_cases(self, listed: list[list[str]]) -> int:
         with (
