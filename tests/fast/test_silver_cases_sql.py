@@ -429,6 +429,11 @@ class OwnershipTest(unittest.TestCase):
         self.assertNotIn("`set`", query)
         self.assertIn(f"FROM {BRONZE_CASES_SOURCE}", query)
 
+    def test_case_numbers_that_cannot_be_typed_are_left_out_so_two_of_them_do_not_make_one_ambiguous_owner(self) -> None:
+        query = ownership_query(BRONZE_CASES_SOURCE)
+        guarded = "CASE WHEN `caseid` RLIKE '^-?[0-9]+\\\\z' THEN TRY_CAST(`caseid` AS BIGINT) END"
+        self.assertIn(f"WHERE ({guarded}) IS NOT NULL GROUP BY {guarded}", query)
+
 
 class ValuesTest(unittest.TestCase):
     def test_a_row_is_a_literal_in_the_column_order_and_a_missing_value_is_null(self) -> None:

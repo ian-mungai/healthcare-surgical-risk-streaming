@@ -193,12 +193,14 @@ def sealed_outcome_query(cases: str, split: str) -> str:
 
 def ownership_query(cases: str) -> str:
     """One flag, 0 or 1: whether any Bronze case number is in more than one row. A case under two patients is in two rows, so this covers both. The flag is
-    made from the case number alone, before any aggregate that joins a case to its patient."""
+    made from the case number alone, before any aggregate that joins a case to its patient. A case number that cannot be typed is left out: it is refused
+    later, as a key that is not a number, and two of them are not one case."""
+    typed = typed_expression("caseid", BIGINT)
     return sql(
         "SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS n FROM ( SELECT 1 FROM",
         cases,
-        "GROUP BY",
-        typed_expression("caseid", BIGINT),
+        "WHERE (" + typed + ") IS NOT NULL GROUP BY",
+        typed,
         "HAVING COUNT(*) > 1 )",
     )
 

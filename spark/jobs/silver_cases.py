@@ -298,8 +298,12 @@ class Lake:
 
 
 def execute(arguments: argparse.Namespace) -> dict[str, Any]:
-    """Run one call. Every local step comes first: the settings, the Nessie client, the deadline and the Spark session. Then the first call to Nessie, which
-    creates the branch (build) or finds it (verify), and the job on that branch."""
+    """Run one call: the settings, the Nessie client and the deadline come first.
+
+    A verify resolves the branch hash, opens its Spark session pinned to it, reads and looks up snapshots at that hash only, carries the hash in its result
+    and fails with ``branch_moved`` when the branch head is another one at the end. A build creates the branch from the base and writes on it, so it is not
+    pinned: only this job moves a branch that it just made.
+    """
     session = None
     try:
         settings = read_settings()
