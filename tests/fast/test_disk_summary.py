@@ -223,6 +223,55 @@ class RefusalTest(unittest.TestCase):
                     summarize(phases, {})
                 self.assertIn("copy and retry", str(caught.exception))
 
+    def test_one_file_named_for_two_phases_is_refused_whatever_its_path(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            one = write(folder, "one.jsonl", copy_lines())
+            (Path(folder) / "alias.jsonl").symlink_to(one)
+            (Path(folder) / "twin.jsonl").hardlink_to(one)
+            for second in (one, Path(folder) / "alias.jsonl", Path(folder) / "twin.jsonl"):
+                with self.subTest(second=second.name), self.assertRaises(SummaryError) as caught:
+                    summarize({"copy": one, "retry": second}, {})
+                self.assertIn("two phases", str(caught.exception))
+            with self.assertRaises(SummaryError) as third:
+                summarize({"copy": one, "retry": write(folder, "r.jsonl", retry_lines()), "limit": one}, {})
+        self.assertIn("two phases", str(third.exception))
+
+    def test_a_header_whose_staging_name_or_pattern_is_not_in_the_sampler_s_form_is_refused(self) -> None:
+        bad = {"Upper": "/a/*", "ok_name": "relative/path", "bad name": "/a", "ok": "/a\n"}
+        for name, pattern in bad.items():
+            with self.subTest(name=name):
+                lines = [header(staging={name: pattern}), sample(0, 150000.0, rows(**{name: 1}))]
+                self.assertIn("staging", self.refused(copy=lines))
+
+    def test_a_header_whose_free_disk_source_or_interval_is_not_a_plain_value_is_refused(self) -> None:
+        for change in (
+            {"interval_seconds": "five"},
+            {"interval_seconds": True},
+            {"sources": {"free_disk": 7, "staging": PATTERNS}},
+            {"sources": {"free_disk": "/a\nb", "staging": PATTERNS}},
+        ):
+            with self.subTest(change=change):
+                first = {**header(staging=PATTERNS), **change}
+                self.assertIn("header", self.refused(copy=[first, *copy_lines()[1:]]))
+
+    def test_a_missing_reading_with_a_name_the_sampler_does_not_write_is_refused_without_repeating_it(self) -> None:
+        lines = copy_lines()
+        lines[1] = sample(0, 150000.0, rows(**{STAGE: 0, CHECKS: 0}), missing=[{"reading": "secret-looking", "cause": "os_error"}])
+        message = self.refused(copy=lines)
+        self.assertIn("missing", message)
+        self.assertNotIn("secret-looking", message)
+
+    def test_an_end_line_with_a_reason_the_sampler_does_not_write_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = write(folder, "copy.jsonl", copy_lines())
+            lines = path.read_text().splitlines()
+            lines[-1] = json.dumps({"kind": "end", "reason": "secret-looking reason", "samples": 5})
+            path.write_text("\n".join(lines) + "\n")
+            with self.assertRaises(SummaryError) as caught:
+                summarize({"copy": path, "retry": write(folder, "r.jsonl", retry_lines())}, {})
+        self.assertIn("reason", str(caught.exception))
+        self.assertNotIn("secret-looking", str(caught.exception))
+
     def test_a_limit_for_a_name_no_file_holds_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             phases = {"copy": write(folder, "c.jsonl", copy_lines()), "retry": write(folder, "r.jsonl", retry_lines())}
@@ -273,6 +322,19 @@ class CommandTest(unittest.TestCase):
             self.assertFalse((Path(folder) / "disk.json").exists())
         self.assertEqual(1, code)
         self.assertIn("retry", err)
+
+    def test_the_same_file_for_two_phases_writes_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            one = write(folder, "one.jsonl", copy_lines())
+            code, _, err = run("--phase", f"copy={one}", "--phase", f"retry={one}", "--output", str(Path(folder) / "disk.json"))
+            self.assertEqual((1, False), (code, (Path(folder) / "disk.json").exists()))
+        self.assertIn("two phases", err)
+
+    def test_an_option_the_command_does_not_know_is_refused_without_repeating_its_value(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            code, out, err = run(*self.arguments(folder), "--bogus", "private-value", "--phasee=private-too")
+            self.assertEqual((2, False), (code, (Path(folder) / "disk.json").exists()))
+        self.assertEqual([], [word for word in ("private-value", "private-too", "--bogus") if word in out + err])
 
     def test_a_phase_named_twice_is_a_usage_refusal(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

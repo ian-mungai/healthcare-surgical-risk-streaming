@@ -30,6 +30,7 @@ go to standard error.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import json
 import math
@@ -45,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import ProcessGroupSurvived, TimeoutExpired, run_command
 from scripts.stack.host_figures import FiguresError, HostSources, parse_size_bytes, read_host
 from scripts.stack.limits import LIMITS_FILE, LimitsError, load_limits
@@ -254,9 +256,58 @@ def memory_body(runner: Runner, program: str, deadline: float, clock: Clock) -> 
     return {"rows": rows}
 
 
+def expand_pattern(pattern: str, deadline: float, clock: Clock) -> list[str]:
+    """The paths that an absolute shell pattern names, found by listing folders, under the rules of the walk.
+
+    A segment with no wildcard is joined as written. A segment with a wildcard lists the folder reached so far and keeps the names that match, never a name
+    that starts with a dot unless the segment does. A link at a wildcard position is not followed: it is a match only at the last segment, where it counts as
+    itself. A name or folder that is gone is skipped. Any other failure, a folder that may not be read among them, ends the reading, so an unreadable folder
+    is never an empty one. A reading that passes ``deadline`` is a timeout.
+    """
+    segments = [segment for segment in pattern.split("/") if segment]
+    found: list[str] = []
+    pending: list[tuple[str, int]] = [("/", 0)]
+    while pending:
+        base, index = pending.pop()
+        if index == len(segments):
+            found.append(base)
+            continue
+        segment = segments[index]
+        if not glob.has_magic(segment):
+            pending.append((os.path.join(base, segment), index + 1))
+            continue
+        try:
+            names = os.listdir(base)
+        except FileNotFoundError, NotADirectoryError:
+            continue
+        for name in names:
+            if clock() > deadline:
+                raise Failure("timeout")
+            if (name.startswith(".") and not segment.startswith(".")) or not fnmatch.fnmatchcase(name, segment):
+                continue
+            path = os.path.join(base, name)
+            if index + 1 < len(segments):
+                try:
+                    if not stat.S_ISDIR(os.lstat(path).st_mode):
+                        continue
+                except FileNotFoundError:
+                    continue
+            pending.append((path, index + 1))
+    return [path for path in found if exists(path)]
+
+
+def exists(path: str) -> bool:
+    """Whether a path names something, itself and not what a link leads to. Only a name that is not there is False: a folder that may not be read raises."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError, NotADirectoryError:
+        return False
+    return True
+
+
 def staging_row(source: StagingSource, deadline: float, clock: Clock) -> dict[str, Any]:
-    """The files under one pattern. A walk that passes ``deadline`` is a timeout. Only a file that is gone is skipped: any other failure ends the reading."""
-    matches = glob.glob(source.pattern)
+    """The files under one pattern. A reading that passes ``deadline`` is a timeout. Only a file that is gone is skipped: any other failure ends the reading."""
+    matches = expand_pattern(source.pattern, deadline, clock)
     pending = list(matches)
     files = apparent = allocated = 0
     while pending:
@@ -420,9 +471,7 @@ def staging_argument(text: str) -> StagingSource:
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog="python -m scripts.stack.capacity_sampler", description=__doc__.split("\n\n")[0] if __doc__ else None, epilog=EXIT_NOTE
-    )
+    command = QuietParser(prog="python -m scripts.stack.capacity_sampler", description=__doc__.split("\n\n")[0] if __doc__ else None, epilog=EXIT_NOTE)
     command.add_argument("--output", type=Path, required=True, help="a new file for the lines; an existing path, a link or a dangling link above it is refused")
     command.add_argument(
         "--interval-seconds", type=bounded_seconds(MAX_INTERVAL_SECONDS), default=DEFAULT_INTERVAL_SECONDS, help="seconds between two iterations"

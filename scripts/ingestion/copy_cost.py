@@ -1,11 +1,14 @@
 """The copy cost record: the request and transfer cost of the copy into the project's bucket, estimated from the passed check result.
 
-``.venv/bin/python -m scripts.ingestion.copy_cost --result result.json --region <the bucket's region> --extra-objects <n> --output copy_cost.json``
+``.venv/bin/python -m scripts.ingestion.copy_cost --result result.json --region <the bucket's region> --since <time> [--until <time>]
+--extra-objects <n> --output copy_cost.json``
 
-The result is the file ``scripts.ingestion.cli check`` wrote. It must be a passed result that was not edited, because the estimate takes its object count
-and bytes as the copy's. ``--extra-objects`` is the number of other objects the copy landed under the landing prefix (the metadata records), which the
-result does not list; the owner reads it from the bucket's listing. The record holds counts, bytes, prices and money, never a key, a bucket or a version.
-The same result gives the same bytes. The output is a new file for its owner only.
+The result is the file ``scripts.ingestion.cli check`` wrote. It must be a passed result that was not edited. The connection is incremental, so a run
+writes only the versions that are new, while the result lists every verified version. The estimate counts the versions whose retrieval time (the time S3
+gives the written version) is at or after ``--since`` and, when ``--until`` is given, before it: the start and the end of this copy, as ISO 8601 times with
+a zone. A run that wrote nothing estimates zero payload writes. ``--extra-objects`` is the number of other objects this run landed under the landing
+prefix (the metadata records), which the result does not list; the owner reads it from the bucket's listing. The record holds counts, bytes, prices and
+money, never a key, a bucket, a version or a label of the result. The same result gives the same bytes. The output is a new file for its owner only.
 
 What the estimate says. The destination writes each payload object to the project's bucket in the host's own region, so the project pays only the write
 requests (PUT, COPY, POST and LIST requests share one price). The count depends on the part size of the destination's multipart upload, which the
@@ -37,11 +40,13 @@ import math
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from scripts.ingestion.check import CheckResult
+from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import ClosedError, Code, Notice, render
 from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
@@ -79,8 +84,19 @@ def high_requests(size: int) -> int:
     return max(1, math.ceil(size / SMALLEST_PART_BYTES)) + 2
 
 
-def estimate(result: CheckResult, *, region: str, extra_objects: int) -> dict[str, Any]:
-    """The record for a passed, unedited check result and the other objects the copy landed. A result that did not pass or was edited is refused."""
+def parse_instant(text: str) -> datetime:
+    """A time in ISO 8601 form with a zone. Any other text is refused, and the message holds none of it."""
+    try:
+        instant = datetime.fromisoformat(text)
+    except ValueError:
+        raise CostError("a time is not an ISO 8601 time with a zone") from None
+    if instant.tzinfo is None:
+        raise CostError("a time is not an ISO 8601 time with a zone")
+    return instant
+
+
+def estimate(result: CheckResult, *, region: str, extra_objects: int, since: datetime, until: datetime | None = None) -> dict[str, Any]:
+    """The record for a passed, unedited check result, the versions written from ``since`` (and before ``until``) and the other objects this run landed."""
     if not result.passed:
         raise ClosedError(Notice(Code.NOT_PASSED))
     if result.claimed_sha256 != result.result_sha256:
@@ -89,9 +105,11 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int) -> dict[st
         raise CostError("the code holds no prices for this region")
     if extra_objects < 0:
         raise CostError("the number of extra objects is below zero")
-    sizes = [file.size for file in result.files]
-    if any(size < 0 for size in sizes):
+    if until is not None and until <= since:
+        raise CostError("the end of the window is not after its start")
+    if any(file.size < 0 for file in result.files):
         raise CostError("a size in the result is below zero")
+    sizes = [file.size for file in result.files if since <= parse_instant(file.retrieved_utc) and (until is None or parse_instant(file.retrieved_utc) < until)]
     price = PUT_TIER_USD_PER_REQUEST[region]
     low = len(sizes) + extra_objects
     high = sum(high_requests(size) for size in sizes) + 3 * extra_objects
@@ -101,7 +119,6 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int) -> dict[st
         "format": COST_FORMAT,
         "kind": "estimate",
         "check_result_sha256": result.result_sha256,
-        "selection_name": result.selection_name,
         "region": region,
         "source_region": PUBLISHER_REGION,
         "prices": {
@@ -110,7 +127,8 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int) -> dict[st
             "put_tier_usd_per_request": str(price.normalize()),
             "inter_region_out_usd_per_gib": str(INTER_REGION_OUT_USD_PER_GIB[PUBLISHER_REGION].normalize()),
         },
-        "copy": {"payload_objects": len(sizes), "payload_bytes": sum(sizes), "extra_objects": extra_objects},
+        "window": {"since": since.isoformat(), "until": until.isoformat() if until else None},
+        "copy": {"verified_objects": len(result.files), "payload_objects": len(sizes), "payload_bytes": sum(sizes), "extra_objects": extra_objects},
         "write_requests": {"low": low, "high": high},
         "request_cost_usd": request_cost,
         "transfer_cost_usd": {
@@ -144,10 +162,19 @@ def whole_number(text: str) -> int:
     return int(text)
 
 
+def instant_argument(text: str) -> datetime:
+    try:
+        return parse_instant(text)
+    except CostError:
+        raise argparse.ArgumentTypeError("a time is an ISO 8601 time with a zone") from None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    command = argparse.ArgumentParser(prog="python -m scripts.ingestion.copy_cost", description=(__doc__ or "").split("\n\n")[0])
+    command = QuietParser(prog="python -m scripts.ingestion.copy_cost", description=(__doc__ or "").split("\n\n")[0])
     command.add_argument("--result", type=Path, required=True, help="the passed check result of the copy")
     command.add_argument("--region", required=True, help="the region of the project's bucket and of the host")
+    command.add_argument("--since", type=instant_argument, required=True, help="the start of the copy, an ISO 8601 time with a zone")
+    command.add_argument("--until", type=instant_argument, help="the end of the copy, an ISO 8601 time with a zone; the run's last write when absent")
     command.add_argument("--extra-objects", type=whole_number, default=0, help="the other objects the copy landed under the landing prefix")
     command.add_argument("--output", type=Path, required=True, help="a new file for the record")
     arguments = command.parse_args(argv)
@@ -156,7 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             text = arguments.result.read_text()
         except OSError, UnicodeDecodeError:
             raise CostError("the check result cannot be read") from None
-        document = estimate(CheckResult.from_json(text), region=arguments.region, extra_objects=arguments.extra_objects)
+        document = estimate(
+            CheckResult.from_json(text), region=arguments.region, extra_objects=arguments.extra_objects, since=arguments.since, until=arguments.until
+        )
         write_record(arguments.output, document)
     except ClosedError as error:
         sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
@@ -165,7 +194,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"copy cost: {error}\n")
         return 1
     sys.stdout.write(
-        f"copy cost: {document['copy']['payload_objects']} payload objects, {document['copy']['payload_bytes']} bytes; "
+        f"copy cost: {document['copy']['payload_objects']} payload objects written of {document['copy']['verified_objects']} verified, "
+        f"{document['copy']['payload_bytes']} bytes; "
         f"write requests {document['write_requests']['low']} to {document['write_requests']['high']}; "
         f"request cost {document['request_cost_usd']['low']} to {document['request_cost_usd']['high']} USD; "
         f"transfer billed to the project {document['transfer_cost_usd']['billed_to_project']} USD\n"

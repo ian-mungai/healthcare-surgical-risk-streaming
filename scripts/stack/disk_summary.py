@@ -25,10 +25,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from scripts.stack.capacity_sampler import SCHEMA
+from scripts.ingestion.closed import QuietParser
+from scripts.stack.capacity_sampler import SCHEMA, SamplerError, parse_staging
 
 SUMMARY_FORMAT = "disk_measurements_1"
 REQUIRED_PHASES = ("copy", "retry")
+END_REASONS = ("stop_flag", "max_seconds")
+READINGS = ("host", "containers", "memory", "staging")
 NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 
 
@@ -62,17 +65,41 @@ def sampler_lines(phase: str, path: Path) -> tuple[dict[str, Any], list[dict[str
     return found[0], samples, found[-1]
 
 
+def plain_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def check_header(phase: str, header: Mapping[str, Any]) -> None:
+    """Refuse a header whose values the record would copy and that are not in the form the sampler writes them."""
+    sources = header["sources"]
+    free_source = sources["free_disk"]
+    patterns = sources.get("staging", {})
+    plain = isinstance(free_source, str) and not any(ord(character) < 32 for character in free_source)
+    if not plain or not plain_number(header["interval_seconds"]) or not isinstance(patterns, dict):
+        raise SummaryError(f"the {phase} file's header holds a value that is not in the sampler's form")
+    try:
+        for name, pattern in patterns.items():
+            parse_staging(f"{name}={pattern}")
+    except SamplerError:
+        raise SummaryError(f"the {phase} file's header has a staging source that is not in the sampler's form") from None
+
+
 def phase_summary(phase: str, path: Path, limits: Mapping[str, int]) -> dict[str, Any]:
     header, samples, end = sampler_lines(phase, path)
     if header.get("schema") != SCHEMA:
         raise SummaryError(f"the {phase} file is of another schema than {SCHEMA}")
+    check_header(phase, header)
     patterns = header["sources"].get("staging")
     if not patterns:
         raise SummaryError(f"the {phase} run had no staging source: start the sampler with --staging")
+    if end["reason"] not in END_REASONS:
+        raise SummaryError(f"the {phase} file's end line has a reason that the sampler does not write")
     free: list[tuple[float, int]] = []
     peaks: dict[str, dict[str, int]] = {name: {"readings": 0, "allocated": -1, "apparent": -1, "at_seq": -1} for name in patterns}
     missing: Counter[str] = Counter()
     for line in samples:
+        if any(item["reading"] not in READINGS for item in line["missing"]):
+            raise SummaryError(f"the {phase} file names a missing reading that the sampler does not write")
         missing.update(item["reading"] for item in line["missing"])
         if "host" in line:
             free.append((line["host"]["free_disk_mib"], line["seq"]))
@@ -119,6 +146,15 @@ def summarize(phases: Mapping[str, Path], limits: Mapping[str, int]) -> dict[str
     if not set(REQUIRED_PHASES) <= set(phases):
         raise SummaryError("the copy and retry phases are both required")
     ordered = [*REQUIRED_PHASES, *(name for name in phases if name not in REQUIRED_PHASES)]
+    seen: set[tuple[int, int]] = set()
+    for name in ordered:
+        try:
+            info = phases[name].stat()
+        except OSError:
+            raise SummaryError(f"the {name} file cannot be read") from None
+        if (info.st_dev, info.st_ino) in seen:
+            raise SummaryError("one sampler file is named for two phases")
+        seen.add((info.st_dev, info.st_ino))
     summaries: dict[str, Any] = {}
     for name in ordered:
         try:
@@ -167,7 +203,7 @@ def describe(name: str, summary: Mapping[str, Any]) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    command = argparse.ArgumentParser(prog="python -m scripts.stack.disk_summary", description=(__doc__ or "").split("\n\n")[0])
+    command = QuietParser(prog="python -m scripts.stack.disk_summary", description=(__doc__ or "").split("\n\n")[0])
     command.add_argument(
         "--phase", type=phase_argument, action="append", required=True, metavar="NAME=FILE", help="a sampler file; copy and retry are required"
     )
