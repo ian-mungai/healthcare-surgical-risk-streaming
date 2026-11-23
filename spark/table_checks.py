@@ -17,7 +17,7 @@ import hashlib
 import io
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,25 +33,37 @@ NOT_THE_EMPTY_VALUE = "\x01not the published empty value\x01"
 COUNT = re.compile(r"0|[1-9][0-9]{0,14}")
 MAX_ROWS = 10**12
 MAX_COLUMN_COUNT = 4096
-# The details of a check: each is one of these codes with exactly its integer fields, in this order. A detail is built from this table and parsed back against
-# it, so no text of the data can pass as a detail.
-DETAIL_CODES: Mapping[str, tuple[str, ...]] = {
-    "ok": (),
-    "bytes_differ": (),
-    "table_missing": (),
-    "snapshot_differs": (),
-    "columns_differ": ("missing", "extra", "repeated", "order", "not_string"),
-    "row_count": ("source", "table"),
-    "rows_differ": ("only_file", "only_table"),
-    "separator_in_field": ("rows",),
-    "digest_differs": (),
-}
-RUN_ID = re.compile(r"[0-9a-f]{32}")
 SEPARATOR_PATTERN = "[\\t\\n\\r]"
 LAB_DATA_NOTE = "lab_data has no unique key (some whole rows repeat), so its key is the whole row: its key check and its payload check are the same comparison"
 HASH = re.compile(r"[0-9a-f]{64}")
+RUN_ID = re.compile(r"[0-9a-f]{32}")
 PLAN_FORMAT = "table_check_plan_2"
-RESULT_FORMAT = "table_checks_2"
+RESULT_FORMAT = "table_checks_3"
+# The details of a check: each is one of these codes with exactly its integer fields, in this order, and one rule that says whether the check passed. The job
+# reports counts only: a check passes if and only if the rule of its code holds for its counts, and a flag that says otherwise refuses the result. A detail is
+# built from this table and parsed back against it, so no text of the data can pass as a detail.
+DETAIL_RULES: Mapping[str, tuple[tuple[str, ...], Callable[[Mapping[str, int]], bool]]] = {
+    "ok": ((), lambda counts: True),
+    "bytes_differ": ((), lambda counts: False),
+    "table_missing": ((), lambda counts: False),
+    "snapshot_differs": ((), lambda counts: False),
+    "digest_differs": ((), lambda counts: False),
+    "columns_differ": (("missing", "extra", "repeated", "order", "not_string"), lambda counts: not any(counts.values())),
+    "row_count": (("source", "table"), lambda counts: counts["source"] == counts["table"]),
+    "rows_differ": (("only_file", "only_table"), lambda counts: not any(counts.values())),
+    "separator_in_field": (("rows",), lambda counts: counts["rows"] == 0),
+}
+DETAIL_CODES: Mapping[str, tuple[str, ...]] = {code: fields for code, (fields, _) in DETAIL_RULES.items()}
+# The codes that each check may hold.
+CHECK_CODES: Mapping[str, tuple[str, ...]] = {
+    "staged file": ("ok", "bytes_differ"),
+    "snapshot": ("ok", "table_missing", "snapshot_differs"),
+    "columns": ("columns_differ",),
+    "row count": ("row_count",),
+    "key multiset": ("rows_differ",),
+    "row payload": ("rows_differ",),
+    "rows digest": ("ok", "digest_differs", "separator_in_field"),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,10 +122,16 @@ def parse_detail(text: str) -> tuple[str, dict[str, int]]:
     return code, {name: int(value) for name, value in pairs}
 
 
-def column_detail(expected: Sequence[str], found: Sequence[tuple[str, str]]) -> str | None:
-    """What differs between the file's column list and the table's ``(name, type)`` list, as a code and counts, or None when they are equal.
+def detail_holds(text: str) -> bool:
+    """Whether the check that holds this detail passed: the rule of its code applied to its counts."""
+    code, counts = parse_detail(text)
+    return DETAIL_RULES[code][1](counts)
 
-    Only the names in ``CONNECTOR_COLUMNS`` are set aside: any other column of the table is a column of the table that the file does not have.
+
+def column_detail(expected: Sequence[str], found: Sequence[tuple[str, str]]) -> str:
+    """The detail of the column check: what differs between the file's columns and the table's ``(name, type)`` columns, as counts, all zero when equal.
+
+    Only the names in ``CONNECTOR_COLUMNS`` are set aside: any other column of the table is one that the file does not have.
     """
     own = [(name, kind) for name, kind in found if name not in CONNECTOR_COLUMNS]
     names = [name for name, _ in own]
@@ -122,8 +140,6 @@ def column_detail(expected: Sequence[str], found: Sequence[tuple[str, str]]) -> 
     repeated = len(names) - len(set(names))
     order = int(not missing and not extra and not repeated and names != list(expected))
     not_string = sum(kind != STRING_TYPE for _, kind in own)
-    if not (missing or extra or repeated or order or not_string):
-        return None
     return detail("columns_differ", missing=missing, extra=extra, repeated=repeated, order=order, not_string=not_string)
 
 
@@ -256,14 +272,20 @@ class TableResult:
     snapshot_id: int
     rows_table: int | None = None
     rows_source: int | None = None
+    columns_source: int | None = None
+    columns_table: int | None = None
     checks: list[Check] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
         return bool(self.checks) and all(check.passed for check in self.checks)
 
-    def add(self, name: str, passed: bool, text: str) -> bool:
-        parse_detail(text)
+    def add(self, name: str, text: str) -> bool:
+        """Record a check by its detail. It passed if the rule of the detail's code holds. A code that the check may not hold is refused."""
+        code, _ = parse_detail(text)
+        if code not in CHECK_CODES.get(name, ()):
+            raise RulesError("a check may hold only the codes allowed for its name")
+        passed = detail_holds(text)
         self.checks.append(Check(name, passed, text))
         return passed
 
@@ -273,6 +295,8 @@ class TableResult:
             "snapshot_id": self.snapshot_id,
             "rows_table": self.rows_table,
             "rows_source": self.rows_source,
+            "columns_source": self.columns_source,
+            "columns_table": self.columns_table,
             "passed": self.passed,
             "checks": [{"name": check.name, "passed": check.passed, "detail": check.detail} for check in self.checks],
         }
@@ -292,7 +316,16 @@ def job_document(plan: Plan, results: Sequence[TableResult]) -> dict[str, Any]:
 
 
 RESULT_FIELDS: Mapping[str, type] = {"format": str, "run_id": str, "branch": str, "branch_hash": str, "empty_form": str, "passed": bool, "tables": list}
-TABLE_RESULT_FIELDS: Mapping[str, type] = {"table": str, "snapshot_id": int, "rows_table": object, "rows_source": object, "passed": bool, "checks": list}
+TABLE_RESULT_FIELDS: Mapping[str, type] = {
+    "table": str,
+    "snapshot_id": int,
+    "rows_table": object,
+    "rows_source": object,
+    "columns_source": object,
+    "columns_table": object,
+    "passed": bool,
+    "checks": list,
+}
 CHECK_FIELDS: Mapping[str, type] = {"name": str, "passed": bool, "detail": str}
 
 
@@ -303,10 +336,12 @@ class TableOutcome:
     snapshot_id: int = 0
     rows_table: int | None = None
     rows_source: int | None = None
+    columns_source: int | None = None
+    columns_table: int | None = None
 
     @property
     def passed(self) -> bool:
-        """Derived here and nowhere else: every required check is there, in order, and passed."""
+        """Every required check is there, in order, and passed. A check's flag was held to the rule of its code when the result was read."""
         return tuple(check.name for check in self.checks) == REQUIRED_CHECKS[self.table] and all(check.passed for check in self.checks)
 
     def document(self) -> dict[str, Any]:
@@ -315,6 +350,8 @@ class TableOutcome:
             "snapshot_id": self.snapshot_id,
             "rows_table": self.rows_table,
             "rows_source": self.rows_source,
+            "columns_source": self.columns_source,
+            "columns_table": self.columns_table,
             "passed": self.passed,
             "checks": [{"name": check.name, "passed": check.passed, "detail": check.detail} for check in self.checks],
         }
@@ -345,43 +382,60 @@ class JobResult:
         }
 
 
-def counts_agree(table: str, checks: Sequence[Check], rows_source: int | None, rows_table: int | None) -> bool:
-    """Whether every count of a detail is a count the table's own row counts allow, so a number of the data cannot pass as a count."""
-    for check in checks:
-        code, counts = parse_detail(check.detail)
-        if code == "row_count" and (rows_source is None or rows_table is None or (counts["source"], counts["table"]) != (rows_source, rows_table)):
-            return False
-        if code == "rows_differ" and (rows_source is None or rows_table is None or counts["only_file"] > rows_source or counts["only_table"] > rows_table):
-            return False
-        if code == "separator_in_field" and (rows_table is None or counts["rows"] > rows_table):
-            return False
-        if code == "columns_differ" and (counts["order"] > 1 or max(counts.values()) > MAX_COLUMN_COUNT):
-            return False
+def whole(value: Any, bound: int) -> bool:
+    return type(value) is int and 0 <= value <= bound
+
+
+def bounded(
+    code: str, counts: Mapping[str, int], rows_source: int | None, rows_table: int | None, columns_source: int | None, columns_table: int | None
+) -> bool:
+    """Whether every count of a detail is within the bound that the other values of the same table give it. A bound that is not reported refuses."""
+    if code == "row_count":
+        return rows_source is not None and rows_table is not None and (counts["source"], counts["table"]) == (rows_source, rows_table)
+    if code == "rows_differ":
+        return rows_source is not None and rows_table is not None and counts["only_file"] <= rows_source and counts["only_table"] <= rows_table
+    if code == "separator_in_field":
+        return rows_table is not None and counts["rows"] <= rows_table
+    if code == "columns_differ":
+        return (
+            columns_source is not None
+            and columns_table is not None
+            and counts["order"] <= 1
+            and counts["missing"] <= columns_source
+            and all(counts[name] <= columns_table for name in ("extra", "repeated", "not_string"))
+        )
     return True
 
 
 def table_outcome(entry: Any, expected: PlanTable) -> TableOutcome:
-    """One table of a result, held to its shape and to the plan. The job's own summary flag must be a boolean and is not used."""
+    """One table of a result, held to its shape and to the plan. Every check's flag must be the one that the rule of its code gives for its counts."""
     table = closed(entry, TABLE_RESULT_FIELDS, "a table of the result")
     if table["table"] != expected.name or table["snapshot_id"] != expected.snapshot_id or type(table["snapshot_id"]) is bool:
         raise RulesError("a table of the result is not the planned table at the planned snapshot")
-    rows_table, rows_source = table["rows_table"], table["rows_source"]
-    if any(count is not None and (type(count) is not int or not 0 <= count <= MAX_ROWS) for count in (rows_table, rows_source)):
+    rows_table, rows_source, columns_source, columns_table = (table[name] for name in ("rows_table", "rows_source", "columns_source", "columns_table"))
+    if any(count is not None and not whole(count, MAX_ROWS) for count in (rows_table, rows_source)):
         raise RulesError("a row count of the result is not a whole number or null")
-    if SPEC_BY_NAME[expected.name].source == "pin" and rows_source is not None and rows_source != expected.rows:
+    if any(count is not None and not whole(count, MAX_COLUMN_COUNT) for count in (columns_source, columns_table)):
+        raise RulesError("a column count of the result is not a whole number within its bound or null")
+    spec = SPEC_BY_NAME[expected.name]
+    if spec.source == "pin" and rows_source is not None and rows_source != expected.rows:
         raise RulesError("the pinned row count of the result is not the planned one")
+    if spec.source == "pin" and columns_source is not None and columns_source != len(spec.pinned_columns):
+        raise RulesError("the column count of the track list in the result is not the pinned one")
     checks = tuple(Check(**closed(check, CHECK_FIELDS, "a check of the result")) for check in table["checks"])
-    for check in checks:
-        parse_detail(check.detail)
     names = tuple(check.name for check in checks)
     required = REQUIRED_CHECKS[expected.name]
     if not names or names != required[: len(names)]:
         raise RulesError("the checks of a table are not the required checks in order")
+    for check in checks:
+        code, counts = parse_detail(check.detail)
+        if code not in CHECK_CODES[check.name] or check.passed != DETAIL_RULES[code][1](counts):
+            raise RulesError("a check holds a code that its name may not hold, or a flag that the rule of its code does not give")
+        if not bounded(code, counts, rows_source, rows_table, columns_source, columns_table):
+            raise RulesError("a count of a check is outside the bound that the other values of its table give it")
     if len(names) < len(required) and checks[-1].passed:
         raise RulesError("a table stopped before its last required check without a failed check")
-    if not counts_agree(expected.name, checks, rows_source, rows_table):
-        raise RulesError("a count of a check does not agree with the row counts of its table")
-    return TableOutcome(expected.name, checks, expected.snapshot_id, rows_table, rows_source)
+    return TableOutcome(expected.name, checks, expected.snapshot_id, rows_table, rows_source, columns_source, columns_table)
 
 
 def parse_result(text: str, plan: Plan) -> JobResult:

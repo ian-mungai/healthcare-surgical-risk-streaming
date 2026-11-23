@@ -60,7 +60,12 @@ class FakeNessie(NessieClient):
         self.calls: list[tuple[str, str]] = []
         self.merges: list[tuple[str, str, str]] = []
         self.merge_messages: list[str] = []
-        self.commits: list[tuple[str, str]] = []
+        self.commits: list[tuple[str, str, str]] = []
+        self.accept_stale_expected = False
+        self.noop_when_merged = False
+        self.reply_without_commit = False
+        self.crash_before_merge = False
+        self.reply_hash = ""
         self.lose_next_merge_reply = False
         self.on_branch_read: Callable[[], None] | None = None
         self.history_page_size = 100
@@ -80,18 +85,26 @@ class FakeNessie(NessieClient):
 
     def add_main_commit(self, message: str, tables: dict[str, int] | None = None) -> str:
         """A commit on main that is not a merge of this step, as another tool would write it."""
+        parent = self.heads["main"]
         self.heads["main"] = fake_hash("main", "other", message, str(len(self.commits)))
         self.tables[("main", self.heads["main"])] = dict(tables or {})
-        self.commits.append((self.heads["main"], message))
+        self.commits.append((self.heads["main"], message, parent))
         return self.heads["main"]
+
+    def apply_pending(self) -> None:
+        """The first request, which the client gave up on, reaches Nessie now."""
+        if self.pending_merge is not None:
+            late, self.pending_merge = self.pending_merge, None
+            self.apply_merge(late["target"], late["body"])
 
     def apply_merge(self, name: str, body: dict[str, Any]) -> None:
         self.merges.append((body["fromRefName"], body["fromHash"], name))
         self.merge_messages.append(body["message"])
         merged = {**self.tables[(name, self.heads[name])], **self.tables[(body["fromRefName"], body["fromHash"])]}
+        parent = self.heads[name]
         self.heads[name] = fake_hash(name, "merged", body["fromHash"], str(len(self.commits)))
         self.tables[(name, self.heads[name])] = merged
-        self.commits.append((self.heads[name], body["message"]))
+        self.commits.append((self.heads[name], body["message"], parent))
 
     def move_branch(self, name: str) -> str:
         self.heads[name] = fake_hash(name, "moved", self.heads[name])
@@ -120,14 +133,14 @@ class FakeNessie(NessieClient):
             if self.history_answer is not None:
                 return self.history_answer
             start = int(parse_qs(urlsplit(target).query).get("page-token", ["0"])[0])
-            known = [hash_value for hash_value, _ in self.commits]
+            known = [commit[0] for commit in self.commits]
             upto = self.commits[: known.index(pinned) + 1] if pinned in known else ([] if pinned in ("", fake_hash("main", "0")) else None)
             if upto is None:
                 return 404, json.dumps({"errorCode": "REFERENCE_NOT_FOUND", "message": "no such commit"}).encode()
             entries = list(reversed(upto))[start : start + self.history_page_size]
             more = start + self.history_page_size < len(upto)
             document = {
-                "logEntries": [{"commitMeta": {"hash": hash_value, "message": message}} for hash_value, message in entries],
+                "logEntries": [{"commitMeta": {"hash": hash_value, "message": message}, "parentCommitHash": parent} for hash_value, message, parent in entries],
                 "hasMore": more,
                 "token": str(start + len(entries)),
             }
@@ -140,15 +153,20 @@ class FakeNessie(NessieClient):
             return 200, json.dumps({"content": {"type": "ICEBERG_TABLE", "snapshotId": held[table]}}).encode()
         if method == "POST" and parts[1:] == ["history", "merge"]:
             body = json.loads(payload or b"{}")
-            if self.pending_merge is not None:
-                late, self.pending_merge = self.pending_merge, None
-                self.apply_merge(late["target"], late["body"])
+            if self.crash_before_merge:
+                self.crash_before_merge = False
+                raise RuntimeError("the process stopped before the request was sent")
+            self.apply_pending()
             if self.defer_main_commit:
                 text, self.defer_main_commit = self.defer_main_commit, ""
                 self.add_main_commit(text)
             self.merge_requests.append({"expected": pinned, **body})
-            if pinned != self.heads[name]:
+            if pinned != self.heads[name] and not self.accept_stale_expected:
                 return 409, json.dumps({"errorCode": "REFERENCE_CONFLICT", "message": "the target moved"}).encode()
+            if self.noop_when_merged and any(message == body["message"] for _, message, _ in self.commits):
+                return 200, json.dumps({"wasApplied": True, "wasSuccessful": True, "resultantTargetHash": self.heads[name]}).encode()
+            if self.reply_without_commit:
+                return 200, json.dumps({"wasApplied": True, "wasSuccessful": True, "resultantTargetHash": self.heads[name]}).encode()
             if self.defer_next_merge:
                 self.defer_next_merge = False
                 self.pending_merge = {"target": name, "body": body}
@@ -157,21 +175,28 @@ class FakeNessie(NessieClient):
             if self.lose_next_merge_reply:
                 self.lose_next_merge_reply = False
                 raise TimeoutError
-            return 200, json.dumps({"wasApplied": True, "wasSuccessful": True, "resultantTargetHash": self.heads[name]}).encode()
+            return 200, json.dumps({"wasApplied": True, "wasSuccessful": True, "resultantTargetHash": self.reply_hash or self.heads[name]}).encode()
         raise AssertionError(f"the stand-in has no answer for {method} {path}")
+
+
+PASSING_DETAILS = {
+    "columns": rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0),
+    "key multiset": rules.detail("rows_differ", only_file=0, only_table=0),
+    "row payload": rules.detail("rows_differ", only_file=0, only_table=0),
+}
 
 
 def result_line(plan: rules.Plan, *, passed: bool = True, change: Callable[[dict[str, Any]], None] | None = None) -> str:
     """The result line of a job that ran ``plan``: every required check passed, or ``lab_data`` stopped at a failed row count. ``change`` then edits it."""
     results = []
     for entry in plan.tables:
-        table = rules.TableResult(entry.name, entry.snapshot_id)
-        stop = 4 if not passed and entry.name == "lab_data" else 99
-        for name in rules.REQUIRED_CHECKS[entry.name][:stop]:
-            failing = not passed and entry.name == "lab_data" and name == "row count"
-            table.add(name, not failing, rules.detail("row_count", source=2, table=3) if failing else "ok")
-        if not passed and entry.name == "lab_data":
-            table.rows_source, table.rows_table = 2, 3
+        failing_table = not passed and entry.name == "lab_data"
+        rows = entry.rows if entry.rows else 5
+        table = rules.TableResult(entry.name, entry.snapshot_id, columns_source=3, columns_table=3)
+        table.rows_source, table.rows_table = (2, 3) if failing_table else (rows, rows)
+        for name in rules.REQUIRED_CHECKS[entry.name][: 4 if failing_table else 99]:
+            counts = rules.detail("row_count", source=table.rows_source, table=table.rows_table)
+            table.add(name, counts if name == "row count" else PASSING_DETAILS.get(name, "ok"))
         results.append(table)
     document = json.loads(json.dumps(rules.job_document(plan, results)))
     if change is not None:
@@ -213,11 +238,22 @@ class Case:
         self.run_folder = self.root / "run"
         self.run_folder.mkdir()
         self.locks = self.root / "locks"
+        self.now = 1_000_000.0
+        self.slept: list[float] = []
+        self.timing = run.Timing(clock=lambda: self.now, sleep=self.sleep)
         self.landed: Landed = landed_set(SOURCE)
         self.reference: ManifestRef = publish_manifest(self.landed.store, self.landed.selection, self.landed.check())
         self.nessie = FakeNessie()
         self.branch_hash = self.nessie.load_branch(BRANCH, SNAPSHOTS)
         self.record = run.LoadRecord(BRANCH, self.branch_hash, self.reference, dict(SNAPSHOTS))
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def pending(self) -> dict[str, Any]:
+        pending: dict[str, Any] = json.loads((self.run_folder / run.PENDING_FILE).read_text())
+        return pending
 
     def go(self, runner: Runner, *, record: run.LoadRecord | None = None, empty_form: str | None = None) -> run.Outcome:
         options = {} if empty_form is None else {"empty_form": empty_form}
@@ -231,6 +267,7 @@ class Case:
             runner=runner,
             staging_gid=os.getgid(),
             lock_directory=self.locks,
+            timing=self.timing,
             **options,
         )
 
@@ -376,19 +413,18 @@ class MergeOnceTest(unittest.TestCase):
         self.assertTrue(outcome.merged)
         self.assertEqual(added[0], case.saved()["merged_hash"])
 
-    def test_a_lost_reply_is_found_in_the_log_of_main_so_the_retry_sends_no_second_merge(self) -> None:
+    def test_a_lost_reply_is_found_in_the_log_of_main_in_the_same_run_and_a_rerun_sends_nothing(self) -> None:
         case, runner = Case(self), Runner()
         case.nessie.lose_next_merge_reply = True
-        with self.assertRaises(NessieError):
-            case.go(runner)
-        self.assertEqual(1, len(case.nessie.merges))
-        self.assertEqual((True, False), (case.saved()["passed"], case.saved()["merged"]))
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertEqual((1, 1), (len(case.nessie.merges), len(case.nessie.merge_requests)))
         again = case.go(runner)
-        self.assertEqual((1, 1), (runner.calls, len(case.nessie.merges)))
+        self.assertEqual((1, 1), (runner.calls, len(case.nessie.merge_requests)))
         self.assertTrue(again.passed and again.merged)
         saved = case.saved()
         self.assertEqual((True, True, self.merge_commit(case)), (saved["passed"], saved["merged"], saved["merged_hash"]))
-        self.assertEqual(1, len([message for message in case.nessie.merge_messages if run.manifest_line(case.reference.sha256) in message]))
+        self.assertFalse((case.run_folder / run.PENDING_FILE).exists())
 
     def test_a_receipt_that_was_lost_is_rebuilt_from_the_log_and_nothing_is_run_or_merged(self) -> None:
         case, runner = Case(self), Runner()
@@ -415,7 +451,8 @@ class MergeOnceTest(unittest.TestCase):
         found = case.nessie.add_main_commit(self.message(case))
         for number in range(3):
             case.nessie.add_main_commit(f"later commit {number}")
-        self.assertEqual(found, run.merged_commit(case.nessie, case.record, case.nessie.heads["main"]))
+        merged = run.merged_commit(case.nessie, case.record, case.nessie.heads["main"])
+        self.assertEqual(found, merged.hash if merged else None)
 
     def test_a_log_too_long_to_search_is_refused_not_taken_for_unmerged(self) -> None:
         case = Case(self)
@@ -477,23 +514,12 @@ class OneTargetHashTest(unittest.TestCase):
         case.nessie.add_main_commit("an unrelated commit")
         head = case.nessie.heads["main"]
         case.go(Runner())
-        self.assertEqual({head}, set(case.nessie.history_reads))
+        merged = case.nessie.heads["main"]
+        self.assertEqual([head, head, merged], case.nessie.history_reads)
         self.assertEqual([head], [request["expected"] for request in case.nessie.merge_requests])
-        self.assertEqual(2, case.nessie.main_reads)
+        self.assertEqual(3, case.nessie.main_reads)
 
-    def test_a_first_request_that_lands_after_the_retry_reads_the_log_gives_one_merge_and_no_second_one(self) -> None:
-        case, runner = Case(self), Runner()
-        case.nessie.defer_next_merge = True
-        with self.assertRaises(NessieError):
-            case.go(runner)
-        self.assertEqual(([], 1), (case.nessie.merges, len(case.nessie.merge_requests)))
-        outcome = case.go(runner)
-        self.assertEqual(1, len(case.nessie.merges))
-        self.assertEqual(2, len(case.nessie.merge_requests))
-        self.assertTrue(outcome.merged)
-        self.assertEqual(case.nessie.heads["main"], case.saved()["merged_hash"])
-
-    def test_a_merge_refused_because_main_moved_and_still_without_the_load_fails_once_and_sends_nothing_more(self) -> None:
+    def test_a_merge_refused_because_main_moved_is_an_open_outcome_that_is_not_sent_again(self) -> None:
         case = Case(self)
         reads: list[int] = []
 
@@ -503,7 +529,7 @@ class OneTargetHashTest(unittest.TestCase):
                 case.nessie.defer_main_commit = "another tool writes to main"
 
         case.nessie.on_history_read = main_moves_after_the_search
-        with self.assertRaisesRegex(run.TableChecksError, "main moved"):
+        with self.assertRaisesRegex(run.MergeOutcomeOpen, "merge_outcome_open"):
             case.go(Runner())
         self.assertEqual(([], 1), (case.nessie.merges, len(case.nessie.merge_requests)))
         self.assertEqual((True, False), (case.saved()["passed"], case.saved()["merged"]))
@@ -550,6 +576,170 @@ class OneTargetHashTest(unittest.TestCase):
         self.assertIsNone(run.table_snapshot(case.nessie, BRANCH, case.branch_hash, "no_such_table"))
 
 
+class MergeOutcomeTest(unittest.TestCase):
+    """The catalog's history is the one source of the merge: a pending record is written before the request, a retry never sends while the outcome can be open,
+    and the receipt always comes from the commit found in the history, with its true parent."""
+
+    def test_the_receipt_is_built_from_the_commit_in_the_history_and_its_parent_and_not_from_what_was_sent_or_answered(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("an unrelated commit")
+        case.nessie.reply_hash = "f" * 64
+        case.go(Runner())
+        commit, _, parent = case.nessie.commits[-1]
+        saved = case.saved()
+        self.assertEqual((commit, parent), (saved["merged_hash"], saved["main_hash_before"]))
+        self.assertNotEqual("f" * 64, saved["merged_hash"])
+        self.assertFalse((case.run_folder / run.PENDING_FILE).exists())
+
+    def test_the_pending_record_is_written_before_the_request_with_the_load_and_the_time(self) -> None:
+        case = Case(self)
+        seen: list[dict[str, Any]] = []
+        original = case.nessie.send
+
+        def look(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+            if method == "POST":
+                seen.append(case.pending())
+            return original(method, target, payload)
+
+        with mock.patch.object(case.nessie, "send", look):
+            case.go(Runner())
+        (pending,) = seen
+        self.assertEqual(
+            (case.reference.sha256, BRANCH, case.branch_hash, case.now), (pending["manifest"], pending["branch"], pending["source"], pending["started"])
+        )
+        self.assertEqual({"format", "manifest", "branch", "source", "started"}, set(pending))
+
+    def test_a_timeout_in_the_run_is_not_sent_again_it_waits_for_the_history_and_ends_open_with_the_pending_record_kept(self) -> None:
+        case = Case(self)
+        case.nessie.defer_next_merge = True
+        with self.assertRaisesRegex(run.MergeOutcomeOpen, "merge_outcome_open"):
+            case.go(Runner())
+        self.assertEqual(1, len(case.nessie.merge_requests))
+        self.assertTrue((case.run_folder / run.PENDING_FILE).exists())
+        self.assertTrue(case.slept)
+        self.assertLessEqual(sum(case.slept), case.nessie.timeout_seconds + run.Timing().wait_seconds + run.Timing().poll_seconds)
+
+    def test_the_reviewers_sequence_exactly_one_request_across_both_runs_when_the_first_lands_after_the_retry_read_the_log(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.defer_next_merge = True
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        # The first request reaches Nessie just after the retry's log read: the retry finds nothing and must not send.
+        case.nessie.on_history_read = case.nessie.apply_pending
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        case.nessie.on_history_read = None
+        outcome = case.go(runner)
+        self.assertEqual((1, 1), (len(case.nessie.merges), len(case.nessie.merge_requests)))
+        self.assertTrue(outcome.merged)
+        commit, _, parent = case.nessie.commits[-1]
+        self.assertEqual((commit, parent), (case.saved()["merged_hash"], case.saved()["main_hash_before"]))
+        self.assertFalse((case.run_folder / run.PENDING_FILE).exists())
+
+    def test_a_success_answer_that_was_a_no_op_gives_a_receipt_from_the_history_with_the_true_parent(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.defer_next_merge = True
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        old_head = case.nessie.heads["main"]
+        case.now = case.pending()["started"] + run.MERGE_SETTLE_SECONDS + 1
+        case.nessie.accept_stale_expected = True
+        case.nessie.noop_when_merged = True
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertEqual(1, len(case.nessie.merges))
+        saved = case.saved()
+        self.assertEqual((case.nessie.heads["main"], old_head), (saved["merged_hash"], saved["main_hash_before"]))
+        self.assertNotEqual(saved["merged_hash"], saved["main_hash_before"])
+
+    def test_a_success_answer_with_no_commit_in_the_history_is_an_error_and_there_is_no_merged_receipt(self) -> None:
+        case = Case(self)
+        case.nessie.reply_without_commit = True
+        with self.assertRaisesRegex(run.MergeNotFound, "merge_not_found"):
+            case.go(Runner())
+        self.assertEqual((True, False), (case.saved()["passed"], case.saved()["merged"]))
+        self.assertTrue((case.run_folder / run.PENDING_FILE).exists())
+
+    def test_a_pending_record_younger_than_the_settle_time_ends_open_and_sends_nothing(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.defer_next_merge = True
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        runner.calls = 0
+        case.now = case.pending()["started"] + run.MERGE_SETTLE_SECONDS - 1
+        with self.assertRaisesRegex(run.MergeOutcomeOpen, "merge_outcome_open"):
+            case.go(runner)
+        self.assertEqual((0, 1), (runner.calls, len(case.nessie.merge_requests)))
+
+    def test_a_pending_record_older_than_the_settle_time_allows_one_new_request_with_a_new_pending_time(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.defer_next_merge = True
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        case.nessie.pending_merge = None
+        case.now = case.pending()["started"] + run.MERGE_SETTLE_SECONDS + 1
+        before = case.now
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertEqual(2, len(case.nessie.merge_requests))
+        self.assertEqual(1, len(case.nessie.merges))
+        self.assertFalse((case.run_folder / run.PENDING_FILE).exists())
+        self.assertGreaterEqual(case.now, before)
+
+    def test_a_crash_between_the_pending_write_and_the_request_sends_one_request_after_the_settle_time(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.crash_before_merge = True
+        with self.assertRaises(RuntimeError):
+            case.go(runner)
+        self.assertEqual(0, len(case.nessie.merge_requests))
+        self.assertTrue((case.run_folder / run.PENDING_FILE).exists())
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        self.assertEqual(0, len(case.nessie.merge_requests))
+        case.now = case.pending()["started"] + run.MERGE_SETTLE_SECONDS + 1
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertEqual((1, 1), (len(case.nessie.merge_requests), len(case.nessie.merges)))
+
+    def test_a_found_merge_removes_the_pending_record_and_sends_nothing(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.defer_next_merge = True
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(runner)
+        case.nessie.apply_pending()
+        outcome = case.go(runner)
+        self.assertTrue(outcome.merged)
+        self.assertEqual(1, len(case.nessie.merge_requests))
+        self.assertFalse((case.run_folder / run.PENDING_FILE).exists())
+
+    def test_a_pending_record_of_another_load_is_refused(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.crash_before_merge = True
+        with self.assertRaises(RuntimeError):
+            case.go(runner)
+        (case.run_folder / run.RESULT_FILE).unlink()
+        other_hash = case.nessie.load_branch("load_run_two", SNAPSHOTS)
+        with self.assertRaisesRegex(run.TableChecksError, "pending merge record of another load"):
+            case.go(runner, record=run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS)))
+
+    def test_a_pending_record_that_is_not_in_its_form_is_refused(self) -> None:
+        for text in ("", "[]", "{", '{"format": "x"}'):
+            case = Case(self)
+            (case.run_folder / run.PENDING_FILE).write_text(text)
+            with self.subTest(text), self.assertRaises(run.TableChecksError):
+                case.go(Runner())
+
+    def test_the_settle_time_is_at_least_twice_the_request_deadline_of_the_client_and_a_client_with_a_longer_deadline_is_refused(self) -> None:
+        self.assertGreaterEqual(run.MERGE_SETTLE_SECONDS, 2 * 60)
+        case = Case(self)
+        slow = FakeNessie()
+        slow.timeout_seconds = run.MERGE_SETTLE_SECONDS
+        slow.heads, slow.tables = case.nessie.heads, case.nessie.tables
+        case.nessie = slow
+        with self.assertRaisesRegex(run.TableChecksError, "settle"):
+            case.go(Runner())
+
+
 class OtherLoadTest(unittest.TestCase):
     """A receipt is rebuilt from the log only when the merge commit names this run's checked branch and source hash."""
 
@@ -592,6 +782,36 @@ class OtherLoadTest(unittest.TestCase):
             case.go(runner)
         self.assertEqual(0, runner.calls)
         self.assertEqual([], case.nessie.merge_requests)
+
+    def test_the_requested_lines_in_the_body_and_another_load_in_the_final_three_lines_refuses_recovery(self) -> None:
+        case = Case(self)
+        message = "\n".join(
+            [
+                run.branch_line(BRANCH),
+                run.source_line(case.branch_hash),
+                "",
+                "merge",
+                run.branch_line("load_other"),
+                run.source_line("c" * 64),
+                run.manifest_line(case.reference.sha256),
+            ]
+        )
+        case.nessie.add_main_commit(message, SNAPSHOTS)
+        with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
+            case.go(Runner())
+
+    def test_the_final_three_lines_are_one_ordered_unit_so_another_order_a_gap_or_a_line_between_refuses_recovery(self) -> None:
+        for label in ("order swapped", "a blank line between", "another line between"):
+            case = Case(self)
+            branch, source, manifest = run.branch_line(BRANCH), run.source_line(case.branch_hash), run.manifest_line(case.reference.sha256)
+            lines = {
+                "order swapped": ["merge", "", source, branch, manifest],
+                "a blank line between": ["merge", branch, "", source, manifest],
+                "another line between": ["merge", branch, source, "another line", manifest],
+            }[label]
+            case.nessie.add_main_commit("\n".join(lines), SNAPSHOTS)
+            with self.subTest(label), self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
+                case.go(Runner())
 
     def test_a_commit_with_only_one_of_the_two_lines_refuses_recovery(self) -> None:
         for lines in ([run.branch_line(BRANCH)], ["records-source: " + "b" * 64]):

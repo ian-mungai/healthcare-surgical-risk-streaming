@@ -64,6 +64,18 @@ def outcome(result: rules.TableResult) -> dict[str, bool]:
 
 
 class CompareRowsTest(unittest.TestCase):
+    def test_every_comparison_reports_its_counts_whether_it_passed_or_not(self) -> None:
+        result = compare("clinical_data")
+        self.assertEqual(
+            ["row_count;source=4;table=4", "rows_differ;only_file=0;only_table=0", "rows_differ;only_file=0;only_table=0"],
+            [check.detail for check in result.checks],
+        )
+        failed = compare("clinical_data", ROWS[:3])
+        self.assertEqual(
+            ["row_count;source=4;table=3", "rows_differ;only_file=1;only_table=0", "rows_differ;only_file=1;only_table=0"],
+            [check.detail for check in failed.checks],
+        )
+
     def test_control_equal_rows_pass_every_comparison_in_the_required_order(self) -> None:
         result = compare("clinical_data")
         self.assertEqual({"row count": True, "key multiset": True, "row payload": True}, outcome(result))
@@ -154,9 +166,16 @@ class MainTest(unittest.TestCase):
 
     @staticmethod
     def passing(session: Any, staging: Path, plan: rules.Plan, entry: rules.PlanTable) -> rules.TableResult:
-        result = rules.TableResult(entry.name, entry.snapshot_id)
+        rows = entry.rows if entry.rows else 5
+        result = rules.TableResult(entry.name, entry.snapshot_id, rows_table=rows, rows_source=rows, columns_source=3, columns_table=3)
+        details = {
+            "columns": rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0),
+            "row count": rules.detail("row_count", source=rows, table=rows),
+            "key multiset": rules.detail("rows_differ", only_file=0, only_table=0),
+            "row payload": rules.detail("rows_differ", only_file=0, only_table=0),
+        }
         for name in rules.REQUIRED_CHECKS[entry.name]:
-            result.add(name, True, "ok")
+            result.add(name, details.get(name, "ok"))
         return result
 
     def test_the_catalog_is_opened_on_the_branch_as_of_the_recorded_hash(self) -> None:
@@ -174,7 +193,7 @@ class MainTest(unittest.TestCase):
     def test_a_failed_check_ends_with_exit_code_1_and_a_result_that_names_the_check(self) -> None:
         def failing(session: Any, staging: Path, plan: rules.Plan, entry: rules.PlanTable) -> rules.TableResult:
             result = rules.TableResult(entry.name, entry.snapshot_id)
-            result.add(rules.REQUIRED_CHECKS[entry.name][0], entry.name != "lab_data", "ok" if entry.name != "lab_data" else "bytes_differ")
+            result.add(rules.REQUIRED_CHECKS[entry.name][0], "bytes_differ" if entry.name == "lab_data" else "ok")
             return result
 
         code, out, _, _ = self.run_main(self.staging(), failing)

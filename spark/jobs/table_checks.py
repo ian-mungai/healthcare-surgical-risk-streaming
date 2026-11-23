@@ -105,10 +105,8 @@ def ticked(names: Sequence[str]) -> list[str]:
 
 
 def multiset_check(result: TableResult, name: str, source: Any, table: Any) -> None:
-    """Pass when the rows of the two frames are the same multiset. A failure counts the rows each side alone holds and shows no row."""
-    missing, extra = source.exceptAll(table).count(), table.exceptAll(source).count()
-    same = missing == 0 and extra == 0
-    result.add(name, same, "ok" if same else rules.detail("rows_differ", only_file=missing, only_table=extra))
+    """Count the rows that each frame alone holds, as multisets. The check passes if both counts are zero (the rule of its code). No row is shown."""
+    result.add(name, rules.detail("rows_differ", only_file=source.exceptAll(table).count(), only_table=table.exceptAll(source).count()))
 
 
 def compare_rows(result: TableResult, spec: TableSpec, columns: Sequence[str], source: Any, table: Any) -> None:
@@ -117,8 +115,7 @@ def compare_rows(result: TableResult, spec: TableSpec, columns: Sequence[str], s
     The frames need ``select``, ``exceptAll`` and ``count`` only. The key is the spec's key columns, or the whole row when the table has none.
     """
     result.rows_source, result.rows_table = source.count(), table.count()
-    same = result.rows_source == result.rows_table
-    result.add("row count", same, "ok" if same else rules.detail("row_count", source=result.rows_source, table=result.rows_table))
+    result.add("row count", rules.detail("row_count", source=result.rows_source, table=result.rows_table))
     keys = ticked(spec.key if spec.key else columns)
     multiset_check(result, "key multiset", source.select(*keys), table.select(*keys))
     multiset_check(result, "row payload", source, table)
@@ -142,34 +139,35 @@ def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> Ta
     if path is not None:
         found, size = file_digest(path) if path.is_file() else ("", -1)
         same = found == entry.file_sha256 and size == entry.file_size
-        if not result.add("staged file", same, "ok" if same else rules.detail("bytes_differ")):
+        if not result.add("staged file", rules.detail("ok" if same else "bytes_differ")):
             return result
     try:
         current = snapshot_of(session, entry.name)
         frame = session.table(f"lake.{rules.NAMESPACE}.{entry.name}")
     except AnalysisException:
-        result.add("snapshot", False, rules.detail("table_missing"))
+        result.add("snapshot", rules.detail("table_missing"))
         return result
-    if not result.add("snapshot", current == entry.snapshot_id, "ok" if current == entry.snapshot_id else rules.detail("snapshot_differs")):
+    if not result.add("snapshot", rules.detail("ok" if current == entry.snapshot_id else "snapshot_differs")):
         return result
     expected = read_header(path) if path is not None else list(spec.pinned_columns)
-    problem = rules.column_detail(expected, [(field.name, field.dataType.simpleString()) for field in frame.schema.fields])
-    if not result.add("columns", problem is None, problem or "ok"):
+    found = [(field.name, field.dataType.simpleString()) for field in frame.schema.fields]
+    result.columns_source = len(expected)
+    result.columns_table = sum(name not in rules.CONNECTOR_COLUMNS for name, _ in found)
+    if not result.add("columns", rules.column_detail(expected, found)):
         return result
     table = table_frame(frame, expected, plan.empty_form)
     if path is not None:
         compare_rows(result, spec, expected, source_frame(session, path, expected), table)
         return result
     result.rows_source, result.rows_table = entry.rows, table.count()
-    same = result.rows_table == entry.rows
-    result.add("row count", same, "ok" if same else rules.detail("row_count", source=entry.rows, table=result.rows_table))
+    result.add("row count", rules.detail("row_count", source=entry.rows, table=result.rows_table))
     ambiguous = table.filter(functools.reduce(operator.or_, [F.col(f"`{name}`").rlike(rules.SEPARATOR_PATTERN) for name in expected])).count()
     if ambiguous:
-        result.add("rows digest", False, rules.detail("separator_in_field", rows=ambiguous))
+        result.add("rows digest", rules.detail("separator_in_field", rows=ambiguous))
         return result
     lines = table.select(F.concat_ws("\t", *[F.col(f"`{name}`") for name in expected]).alias("line")).orderBy("line")
     digest = rules.rows_digest(row.line for row in lines.toLocalIterator())
-    result.add("rows digest", digest == entry.rows_sha256, "ok" if digest == entry.rows_sha256 else rules.detail("digest_differs"))
+    result.add("rows digest", rules.detail("ok" if digest == entry.rows_sha256 else "digest_differs"))
     return result
 
 
