@@ -107,6 +107,13 @@ class FastTestFaultJudgementTest(unittest.TestCase):
         """The suite has skipped tests, so unittest's summary reads ``FAILED (failures=1, skipped=2)``."""
         self.assertTrue(self.judge(fast_test_output(self.planted(), rest=", skipped=2")))
 
+    def test_a_summary_quoted_inside_a_failure_message_does_not_stand_for_the_run(self) -> None:
+        """Only the run's last summary line counts: a one-failure summary quoted in a message must not hide a second failure."""
+        quoted = PLANTED_FAILURE.format(
+            name="tests.fast.test_other.OtherTest.test_other", detail="'FAILED (failures=1, skipped=2)'\nFAILED (failures=1, skipped=2)"
+        )
+        self.assertFalse(self.judge(fast_test_output(self.planted(), quoted, count=2, rest=", skipped=2")))
+
     def test_an_error_beside_the_planted_failure_is_not_proof(self) -> None:
         self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1")))
         self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1, skipped=2")))

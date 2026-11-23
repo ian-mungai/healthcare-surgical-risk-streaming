@@ -41,8 +41,10 @@ CARRIAGE_NOTE = "notes/line\rbreak.txt"
 WORKTREE_GUARD = "working-tree privacy hook"
 PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
 PLANTED_MESSAGE = "planted fast-test fault"
-# unittest's summary for exactly one failure and no error; the suite's skipped tests may follow.
-ONE_FAILURE_SUMMARY = re.compile(r"^FAILED \(failures=1(, skipped=\d+)?\)$", re.MULTILINE)
+# unittest's summary for exactly one failure and no error; the suite's skipped tests may follow. A pattern message is matched against the
+# run's last summary line only, so a summary quoted inside a failure message cannot stand for the run.
+ONE_FAILURE_SUMMARY = re.compile(r"FAILED \(failures=1(, skipped=\d+)?\)")
+SUMMARY_LINE = re.compile(r"^(?:OK|FAILED)\b.*$", re.MULTILINE)
 CLEAN_PYTHON = "def double(value: int) -> int:\n    return value * 2\n"
 
 
@@ -297,7 +299,11 @@ class Fixture:
 def judge_fault(case: Case, code: int, output: str, advanced: bool) -> Observation:
     """Judge a planted-fault commit: refused by the named hooks alone, with the guard's expected message, and HEAD unchanged."""
     failed = sorted(set(FAILED_HOOK.findall(output)))
-    found = all(message.search(output) if isinstance(message, re.Pattern) else message in output for message in case.messages)
+    summaries = SUMMARY_LINE.findall(output)
+    found = all(
+        (bool(summaries) and message.fullmatch(summaries[-1].strip()) is not None) if isinstance(message, re.Pattern) else message in output
+        for message in case.messages
+    )
     named = f"only {', '.join(case.hooks)} failed" if case.hooks else "no pre-commit hook failed"
     expected = f"non-zero exit, {named}, every message of {list(case.messages)!r} found and HEAD unchanged"
     observed = f"exit {code}, failed hooks: {failed}, every message found: {found}, HEAD advanced: {advanced}"

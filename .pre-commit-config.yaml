@@ -57,7 +57,7 @@ repos:
         always_run: true
       - id: fast-tests
         name: The fast test group passes
-        entry: .venv/bin/python -P tests/run_quick.py
+        entry: .venv/bin/python -m unittest discover --start-directory tests/fast --top-level-directory .
         language: system
         pass_filenames: false
         always_run: true
