@@ -111,6 +111,18 @@ def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRe
     return {table: ops.read_table(at, table, with_facts) for table in TABLES}
 
 
+def read_checked(ops: Operations, at: str, source: InputRead) -> dict[str, TableRead | None]:
+    """Both tables with the counts of their checks. The events are recomputed from the stored series, so the series is read and checked first: a series that
+    fails its checks is reported with its own codes and the event table is not read, and a series that is not there is named by ``table_problems``."""
+    series = ops.read_table(at, SERIES, True)
+    if series is None or series.series is None:
+        return {SERIES: series, EVENTS: None}
+    problems = series_problems(series.series, source.facts.art_seconds)
+    if problems:
+        raise SilverSignalsError(*problems)
+    return {SERIES: series, EVENTS: ops.read_table(at, EVENTS, True)}
+
+
 def differs(read: TableRead | None, planned: Fingerprint | Digest) -> bool:
     """Whether the table that a branch holds is not the planned one: it is not there, or its fingerprint is another."""
     return read is None or read.fingerprint != planned
@@ -138,7 +150,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
         at = on
     if ops.read_input(at) != source:
         raise SilverSignalsError(f"source_changed: {unit(1, 'read')} of the input differs")
-    reads = read_tables(ops, at, True)
+    reads = read_checked(ops, at, source)
     problems = table_problems(source, reads)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
@@ -168,7 +180,7 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         problems = input_problems(source.facts)
         if problems:
             raise SilverSignalsError(*problems)
-        reads = read_tables(ops, head, True)
+        reads = read_checked(ops, head, source)
         problems = table_problems(source, reads)
         if problems:
             raise SilverSignalsError(*problems)

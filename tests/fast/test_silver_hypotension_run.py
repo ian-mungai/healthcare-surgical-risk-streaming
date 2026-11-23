@@ -189,13 +189,20 @@ class Build(unittest.TestCase):
             run_build(fake.operations(), HEAD)
         self.assertEqual(["table_missing"], codes(caught.exception))
 
-    def test_the_checks_of_both_tables_run_on_the_read_back(self) -> None:
+    def test_the_checks_of_the_series_run_on_the_read_back_and_come_first(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = TableRead(FINGERPRINTS[SERIES], 101, series=dataclasses.replace(SERIES_FACTS, differs=3))
         fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102, events=dataclasses.replace(EVENT_FACTS, short=1))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["series_differs", "event_short"], codes(caught.exception))
+        self.assertEqual(["series_differs"], codes(caught.exception))
+
+    def test_the_checks_of_the_events_run_on_the_read_back_when_the_series_passes(self) -> None:
+        fake = Fake()
+        fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102, events=dataclasses.replace(EVENT_FACTS, short=1))
+        with self.assertRaises(SilverSignalsError) as caught:
+            run_build(fake.operations(), HEAD)
+        self.assertEqual(["event_short"], codes(caught.exception))
 
     def test_an_input_that_changed_between_the_reads_is_named(self) -> None:
         for later in (InputRead(INPUT.facts, (21, 22, 24)), InputRead(dataclasses.replace(INPUT.facts, art_seconds=5001), (21, 22, 23))):
@@ -234,7 +241,6 @@ class SeriesFirst(unittest.TestCase):
         fake.events_fail = True
         return fake
 
-    @unittest.expectedFailure
     def test_a_verify_reports_a_damaged_series_with_its_codes_and_never_reads_the_event_facts(self) -> None:
         fake = self.damaged()
         fake.held = dict(fake.read_back)
@@ -243,7 +249,6 @@ class SeriesFirst(unittest.TestCase):
         self.assertEqual(["series_value", "series_differs"], codes(caught.exception))
         self.assertNotIn(f"read_table a {EVENTS} facts=True", fake.calls)
 
-    @unittest.expectedFailure
     def test_a_build_reports_a_damaged_series_at_the_read_back_with_its_codes_and_never_reads_the_event_facts(self) -> None:
         fake = self.damaged()
         with self.assertRaises(SilverSignalsError) as caught:
@@ -251,7 +256,6 @@ class SeriesFirst(unittest.TestCase):
         self.assertEqual(["series_value", "series_differs"], codes(caught.exception))
         self.assertNotIn(f"read_table d {EVENTS} facts=True", fake.calls)
 
-    @unittest.expectedFailure
     def test_a_missing_series_table_is_named_without_reading_the_events(self) -> None:
         fake = self.damaged()
         fake.read_back[SERIES] = None
