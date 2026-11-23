@@ -144,7 +144,7 @@ class BucketScopeTest(unittest.TestCase):
     def test_no_other_statement_of_the_boundary_reaches_records_input(self) -> None:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
         reaching = [statement["Sid"] for statement in document["Statement"] if "records_input" in json.dumps(statement)]
-        self.assertEqual(["ProjectBucketListing", "ProjectRecordCopyObjects"], sorted(reaching))
+        self.assertEqual(["ProjectRecordCopyListing", "ProjectRecordCopyObjects"], sorted(reaching))
 
     def test_no_statement_of_the_boundary_names_the_airbyte_prefix(self) -> None:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
@@ -171,7 +171,8 @@ class BucketScopeTest(unittest.TestCase):
 class RoleListingTest(unittest.TestCase):
     BUCKETS = ["arn:aws:s3:::example-project", "arn:aws:s3:::example-project-test-*"]
     LISTING = ["s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:ListBucketVersions"]
-    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*", "manifests/*", "records_input/*"]}}
+    PREFIXES = {"StringLike": {"s3:prefix": ["landing/*", "warehouse/*", "manifests/*"]}}
+    RECORD_PREFIXES = {"StringLike": {"s3:prefix": ["records_input/*"]}}
 
     def boundary(self) -> dict[str, dict[str, Any]]:
         document = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")["role"]
@@ -197,9 +198,25 @@ class RoleListingTest(unittest.TestCase):
             and set(as_list(statement["Action"])) & set(self.LISTING)
             and set(as_list(statement["Resource"])) & set(self.BUCKETS)
         ]
-        self.assertEqual(["ProjectBucketListing"], [statement["Sid"] for statement in listing])
+        self.assertEqual(["ProjectBucketListing", "ProjectRecordCopyListing"], sorted(statement["Sid"] for statement in listing))
         for statement in listing:
-            self.assertEqual(self.PREFIXES, statement.get("Condition"))
+            self.assertEqual(self.PREFIXES if statement["Sid"] == "ProjectBucketListing" else self.RECORD_PREFIXES, statement.get("Condition"))
+
+    def test_the_read_copies_prefix_has_its_own_listing_statement_with_only_the_two_actions_the_load_calls(self) -> None:
+        statement = self.boundary()["ProjectRecordCopyListing"]
+        self.assertEqual("Allow", statement["Effect"])
+        self.assertEqual(["s3:ListBucket", "s3:ListBucketVersions"], sorted(as_list(statement["Action"])))
+        self.assertEqual(self.BUCKETS, sorted(as_list(statement["Resource"])))
+        self.assertEqual(self.RECORD_PREFIXES, statement["Condition"])
+        self.assertNotIn("records_input", json.dumps(self.boundary()["ProjectBucketListing"]))
+
+    def test_the_multipart_listing_is_not_allowed_on_the_read_copies_prefix(self) -> None:
+        for sid, statement in self.boundary().items():
+            if statement["Effect"] == "Allow" and "s3:ListBucketMultipartUploads" in as_list(statement["Action"]):
+                with self.subTest(sid):
+                    patterns = as_list(statement.get("Condition", {}).get("StringLike", {}).get("s3:prefix", []))
+                    self.assertTrue(patterns, "a multipart listing without a prefix condition would reach every prefix")
+                    self.assertFalse(any(fnmatchcase("records_input/run/", pattern) for pattern in patterns))
 
 
 def arn(name: str) -> str:

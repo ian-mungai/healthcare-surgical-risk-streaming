@@ -6,6 +6,7 @@ A stand-in answers the Nessie API version 2 calls that the adapter makes. The ca
 from __future__ import annotations
 
 import json
+import traceback
 import unittest
 from collections.abc import Callable
 from typing import Any
@@ -13,9 +14,9 @@ from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.ingestion import record_catalog
-from scripts.ingestion.record_catalog import NessieCatalog
-from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError
-from scripts.stack.nessie import NessieClient, NessieError
+from scripts.ingestion.record_catalog import CatalogError, NessieCatalog
+from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError, RefState
+from scripts.stack.nessie import NessieClient
 
 MAIN = "a" * 64
 
@@ -34,13 +35,16 @@ class Server:
         self.entry_fault: Callable[[dict[str, Any]], None] | None = None
         self.content_fault: Callable[[dict[str, Any]], None] | None = None
         self.created_hash: str | None = None
+        self.kinds: dict[str, str] = {}
+        self.delete_queries: list[str] = []
+        self.fail_body = b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
 
     def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
         parts = urlsplit(target)
         path = unquote(parts.path).removeprefix("/api/v2")
         self.calls.append(f"{method} {path}")
         if self.fail and self.fail[0] == path:
-            return self.fail[1], b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
+            return self.fail[1], self.fail_body
         if method == "POST" and path == "/trees":
             name = parse_qs(parts.query)["name"][0]
             body = json.loads(payload or b"{}")
@@ -52,7 +56,9 @@ class Server:
             return 200, json.dumps({"reference": {"type": "BRANCH", "name": name, "hash": self.created_hash or self.refs[name]}}).encode()
         if method == "DELETE":
             name, _, expected = path.removeprefix("/trees/").partition("@")
-            if name not in self.refs:
+            self.delete_queries.append(parts.query)
+            asked_kind = parse_qs(parts.query).get("type", [None])[0]
+            if name not in self.refs or (asked_kind is not None and self.kinds.get(name, "BRANCH") != asked_kind):
                 return 404, b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
             if self.refs.get(name) != expected:
                 return 409, b'{"errorCode":"REFERENCE_CONFLICT","message":"x"}'
@@ -99,7 +105,7 @@ class Server:
         name = path.removeprefix("/trees/")
         if name not in self.refs:
             return 404, b'{"errorCode":"REFERENCE_NOT_FOUND","message":"x"}'
-        return 200, json.dumps({"reference": {"type": "BRANCH", "name": name, "hash": self.refs[name]}}).encode()
+        return 200, json.dumps({"reference": {"type": self.kinds.get(name, "BRANCH"), "name": name, "hash": self.refs[name]}}).encode()
 
 
 class Client(NessieClient):
@@ -138,14 +144,16 @@ class CatalogTest(unittest.TestCase):
             self.catalog.create_branch("load_run1", MAIN)
         self.assertIn("load_run1", self.server.refs)
 
-    def test_a_branch_that_exists_is_found_and_one_that_does_not_is_not(self) -> None:
-        self.assertTrue(self.catalog.has_branch("main"))
-        self.assertFalse(self.catalog.has_branch("load_run1"))
+    def test_a_reference_is_found_with_its_kind_and_hash_and_one_that_does_not_exist_is_none(self) -> None:
+        self.server.refs["tag_run1"], self.server.kinds["tag_run1"] = "c" * 64, "TAG"
+        self.assertEqual(RefState("BRANCH", MAIN), self.catalog.reference("main"))
+        self.assertEqual(RefState("TAG", "c" * 64), self.catalog.reference("tag_run1"))
+        self.assertIsNone(self.catalog.reference("load_run1"))
 
-    def test_any_failure_but_a_missing_branch_is_an_error_not_a_no(self) -> None:
+    def test_any_failure_but_a_missing_reference_is_an_error_not_a_no(self) -> None:
         self.server.fail = ("/trees/load_run1", 500)
-        with self.assertRaises(NessieError):
-            self.catalog.has_branch("load_run1")
+        with self.assertRaises(CatalogError):
+            self.catalog.reference("load_run1")
 
     def test_a_branch_is_deleted_only_at_the_head_that_was_read_and_another_head_is_a_branch_moved_error(self) -> None:
         self.catalog.create_branch("load_run1", MAIN)
@@ -158,8 +166,25 @@ class CatalogTest(unittest.TestCase):
     def test_a_branch_that_is_already_gone_is_not_an_error_to_delete_and_any_other_refusal_is(self) -> None:
         self.catalog.delete_branch("load_run1", MAIN)
         self.server.fail = ("/trees/load_run1@" + MAIN, 500)
-        with self.assertRaises(NessieError):
+        with self.assertRaises(CatalogError):
             self.catalog.delete_branch("load_run1", MAIN)
+
+    def test_the_delete_names_the_kind_so_a_tag_of_the_name_at_the_same_hash_is_not_deleted(self) -> None:
+        self.server.refs["load_run1"], self.server.kinds["load_run1"] = MAIN, "TAG"
+        self.catalog.delete_branch("load_run1", MAIN)
+        self.assertIn("load_run1", self.server.refs, "the tag is still there")
+        self.assertEqual(["type=BRANCH"], self.server.delete_queries)
+
+    def test_the_delete_of_a_branch_carries_the_type_parameter_of_the_typed_call(self) -> None:
+        self.catalog.create_branch("load_run1", MAIN)
+        self.catalog.delete_branch("load_run1", MAIN)
+        self.assertEqual(["type=BRANCH"], self.server.delete_queries)
+        self.assertNotIn("load_run1", self.server.refs)
+
+    def test_the_client_sends_no_type_when_it_is_not_asked_to(self) -> None:
+        self.catalog.create_branch("load_run1", MAIN)
+        self.catalog.client.delete_reference("load_run1", MAIN)
+        self.assertEqual([""], self.server.delete_queries)
 
     def test_the_snapshot_of_each_raw_table_is_read_and_other_entries_are_ignored(self) -> None:
         self.server.contents["main"] = {
@@ -382,6 +407,54 @@ class AnswerShapeTest(unittest.TestCase):
         self.assertEqual({"clinical_data": 11, "lab_data": 22}, self.catalog.snapshot_ids("main"))
 
 
+class CatalogErrorTest(unittest.TestCase):
+    """A failure of Nessie reaches the caller as a fixed code and the name of the operation, and never as a word of what Nessie answered."""
+
+    MARKER = "marker_catalog_5d90b1_never_in_an_output"
+
+    def setUp(self) -> None:
+        self.server = Server()
+        self.server.refs["load_run1"] = "3" * 64
+        self.server.branch_history["load_run1"] = ["3" * 64, "2" * 64, "1" * 64]
+        self.server.contents["main"] = {"raw_records.clinical_data": table(11)}
+        self.server.fail_body = json.dumps({"errorCode": "SOMETHING", "message": self.MARKER}).encode()
+        self.catalog = NessieCatalog(Client(self.server))
+
+    def test_each_failing_call_of_the_load_s_path_is_a_catalog_error_with_the_chain_suppressed_and_no_word_of_the_answer(self) -> None:
+        operations: dict[str, tuple[str, Callable[[], object]]] = {
+            "head": ("/trees/load_run1", lambda: self.catalog.head("load_run1")),
+            "reference": ("/trees/load_run1", lambda: self.catalog.reference("load_run1")),
+            "create_branch": ("/trees", lambda: self.catalog.create_branch("load_run2", MAIN)),
+            "delete_branch": (f"/trees/load_run1@{'3' * 64}", lambda: self.catalog.delete_branch("load_run1", "3" * 64)),
+            "history": ("/trees/main/history", lambda: self.catalog.has_recorded_manifest("a" * 64)),
+            "history of a branch": ("/trees/load_run1/history", lambda: self.catalog.descends_from("load_run1", "9" * 64)),
+            "entries": ("/trees/main/entries", lambda: self.catalog.snapshot_ids("main")),
+            "contents": ("/trees/main/contents/raw_records.clinical_data", lambda: self.catalog.snapshot_ids("main")),
+        }
+        for name, (path, call) in operations.items():
+            for status in (500, 400, 403):
+                with self.subTest(f"{name} {status}"):
+                    self.server.fail = (path, status)
+                    with self.assertRaises(CatalogError) as raised:
+                        call()
+                    self.assertTrue(str(raised.exception).startswith("catalog_error: "), str(raised.exception))
+                    self.assertNotIn(self.MARKER, str(raised.exception))
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertTrue(raised.exception.__suppress_context__)
+                    self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
+
+    def test_a_conflict_on_delete_and_on_create_keep_their_own_meaning_and_hold_no_answer_either(self) -> None:
+        self.server.fail_body = json.dumps({"errorCode": "REFERENCE_CONFLICT", "message": self.MARKER}).encode()
+        self.server.fail = (f"/trees/load_run1@{'3' * 64}", 409)
+        with self.assertRaises(BranchMoved) as raised:
+            self.catalog.delete_branch("load_run1", "3" * 64)
+        self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
+        self.server.fail = ("/trees", 409)
+        with self.assertRaises(BranchExists) as exists:
+            self.catalog.create_branch("load_run2", MAIN)
+        self.assertNotIn(self.MARKER, "".join(traceback.format_exception(exists.exception)))
+
+
 class RecordedManifestTest(unittest.TestCase):
     def setUp(self) -> None:
         self.server = Server()
@@ -427,7 +500,7 @@ class RecordedManifestTest(unittest.TestCase):
 
     def test_a_failing_history_call_is_an_error_not_an_absence(self) -> None:
         self.server.fail = ("/trees/main/history", 500)
-        with self.assertRaises(NessieError):
+        with self.assertRaises(CatalogError):
             self.catalog.has_recorded_manifest("a" * 64)
 
     def test_a_digest_that_is_not_64_lower_case_hex_digits_is_refused_before_any_call(self) -> None:

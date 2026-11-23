@@ -15,7 +15,7 @@ from typing import Any, Protocol
 from scripts.ingestion.airbyte_api import AirbyteError
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.ingestion.notice import Code, Notice
-from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError
+from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError, RefState
 from scripts.ingestion.record_state import RunState
 from scripts.ingestion.store import ObjectVersion, StoreError
 from tests.fast.ingestion_support import SOURCE_PREFIX, Landed, list_text_for, selection_for
@@ -138,6 +138,8 @@ class FakeCatalog(Interrupts):
         self.state_dir: Path | None = None
         self.violations: list[str] = []
         self.deleted: list[str] = []
+        self.kinds: dict[str, str] = {}
+        self.typed_misses: list[str] = []
 
     @property
     def heads(self) -> _Heads:
@@ -161,9 +163,9 @@ class FakeCatalog(Interrupts):
         self.calls.append(f"head {branch}")
         return self.chains[branch][-1]
 
-    def has_branch(self, branch: str) -> bool:
-        self.calls.append(f"has_branch {branch}")
-        return branch in self.chains
+    def reference(self, name: str) -> RefState | None:
+        self.calls.append(f"reference {name}")
+        return RefState(self.kinds.get(name, "BRANCH"), self.chains[name][-1]) if name in self.chains else None
 
     def descends_from(self, branch: str, ancestor: str) -> bool:
         self.calls.append(f"descends_from {branch}")
@@ -186,8 +188,18 @@ class FakeCatalog(Interrupts):
         self.tables[branch] = dict(self.tables["main"])
         self.created_at[branch] = self.chains[branch][-1]
 
+    def make_tag(self, name: str, *, at: str) -> None:
+        """A tag of another writer, at the hash ``at`` of main: a reference that is not a branch, whatever its name."""
+        self.chains[name] = self.chains["main"][: self.chains["main"].index(at) + 1]
+        self.tables[name] = dict(self.tables["main"])
+        self.created_at[name] = at
+        self.kinds[name] = "TAG"
+
     def delete_branch(self, branch: str, head: str) -> None:
         self.calls.append(f"delete_branch {branch}")
+        if self.kinds.get(branch, "BRANCH") != "BRANCH":
+            self.typed_misses.append(branch)
+            return
         self.before("delete_branch")
         recorded = RunState(self.state_dir, RUN).branch if self.state_dir is not None else None
         if recorded != (branch, self.created_at.get(branch)):
@@ -274,6 +286,8 @@ class FakeAirbyte(Interrupts):
         self.latency = 0.0
         self.cancel_fails = False
         self.running_error = False
+        self.start_error = False
+        self.on_status: Callable[[], None] | None = None
 
     def find_connection_ids(self) -> dict[str, str]:
         self.calls.append("find_connection_ids")
@@ -310,6 +324,8 @@ class FakeAirbyte(Interrupts):
     def start_sync(self, connection_id: str) -> int:
         table = connection_id.removeprefix("connection_")
         self.calls.append(f"start_sync {table}")
+        if self.start_error:
+            raise AirbyteError("POST jobs has no whole number field jobId: a job may have started that cannot be named")
         job = len(self.jobs) + 1
         self.jobs[job] = {"table": table, "branch": self.destination_branch, "polls": 0}
         if table in self.after_start:
@@ -319,6 +335,8 @@ class FakeAirbyte(Interrupts):
 
     def job_status(self, job: int, *, timeout: float | None = None) -> str:
         state = self.jobs[job]
+        if self.on_status is not None:
+            self.on_status()
         state["polls"] += 1
         if state["polls"] > 500:
             raise AssertionError("the status of a job was read 500 times: the wait has no deadline")

@@ -6,16 +6,29 @@ holds a secret value or a path.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from scripts.ingestion.record_run import SECRET_FILES, SettingsError, settings_from_environment
+from scripts.ingestion import record_run
+from scripts.ingestion.record_run import SECRET_FILES, SettingsError, main, settings_from_environment
+from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
+from tests.fast.record_support import RELEASE_FILES, FakeAirbyte, FakeCatalog, landed_records
+from tests.fast.test_record_catalog import Client, Server
 
 CLIENT_ID = "client-id-value-1"
 CLIENT_VALUE = "client-value-2"
 KEY_ID = "AKIAEXAMPLEEXAMPLE0"
 KEY_VALUE = "access-value-3"
+MARKER = "marker_command_8c3e71_never_in_an_output"
+
+
+def setUpModule() -> None:
+    pin_the_synthetic_list(list_text_for(RELEASE_FILES).encode())
 
 
 class EnvironmentCase(unittest.TestCase):
@@ -175,6 +188,50 @@ class ApiAddressTest(EnvironmentCase):
             with self.subTest(value), self.assertRaises(SettingsError) as raised:
                 settings_from_environment({**self.environment, "RECORD_CANCEL_CONFIRM_SECONDS": value})
             self.assertIn("RECORD_CANCEL_CONFIRM_SECONDS", str(raised.exception))
+
+
+class CommandOutputTest(EnvironmentCase):
+    """What the command prints when Nessie fails: a fixed code and an exit status, and no word of what Nessie, a proxy or a caller put in its answer."""
+
+    def run_command(self, server: Server) -> tuple[int, str, str]:
+        landed, reference = landed_records()
+        (self.folder / "reference.json").write_text(reference.to_json())
+        errors, output = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(record_run, "S3CopyStore", lambda *arguments: landed.store),
+            mock.patch.object(record_run, "Aws", lambda *arguments: None),
+            mock.patch.object(record_run, "HttpAirbyteApi", lambda *arguments: FakeAirbyte(FakeCatalog())),
+            mock.patch.object(record_run, "NessieClient", lambda uri: Client(server)),
+            mock.patch.dict("os.environ", {"RECORD_LOAD_DIR": str(self.folder / "loads")}),
+            contextlib.redirect_stderr(errors),
+            contextlib.redirect_stdout(output),
+        ):
+            code = main(
+                ["load", "--run-id", "run_20261122_ab12cd34", "--reference", str(self.folder / "reference.json")],
+                {**self.environment, "RECORD_LOAD_DIR": str(self.folder / "loads")},
+            )
+        return code, output.getvalue(), errors.getvalue()
+
+    def failing(self, path: str, status: int = 500) -> Server:
+        server = Server()
+        server.fail = (path, status)
+        server.fail_body = json.dumps({"errorCode": "X", "message": MARKER}).encode()
+        return server
+
+    def test_a_failing_history_call_prints_the_fixed_code_and_no_word_of_the_answer(self) -> None:
+        for status in (500, 400, 403):
+            with self.subTest(status):
+                code, output, errors = self.run_command(self.failing("/trees/main/history", status))
+                self.assertEqual(1, code)
+                self.assertIn("catalog_error", errors)
+                self.assertNotIn(MARKER, errors + output)
+
+    def test_a_failing_reference_call_of_the_branch_check_prints_the_fixed_code_and_no_word_of_the_answer(self) -> None:
+        code, output, errors = self.run_command(self.failing("/trees/load_run_20261122_ab12cd34"))
+        self.assertEqual(1, code)
+        self.assertIn("catalog_error", errors)
+        self.assertNotIn(MARKER, errors + output)
+        self.assertNotIn("Traceback", errors)
 
 
 if __name__ == "__main__":

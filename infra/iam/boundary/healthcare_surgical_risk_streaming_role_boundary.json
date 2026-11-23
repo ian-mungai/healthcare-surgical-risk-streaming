@@ -27,7 +27,25 @@
           "s3:prefix": [
             "landing/*",
             "warehouse/*",
-            "manifests/*",
+            "manifests/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ProjectRecordCopyListing",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${S3_BUCKET}",
+        "arn:aws:s3:::${S3_BUCKET}-test-*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
             "records_input/*"
           ]
         }

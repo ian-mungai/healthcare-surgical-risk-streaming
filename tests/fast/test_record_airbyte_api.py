@@ -54,6 +54,7 @@ class StandIn:
         self.counters: dict[str, int] = {}
         self.workspaces = [{"workspaceId": "workspace1"}]
         self.page_size: int | None = None
+        self.empty_pages = 0
         self.budgets: list[float] = []
         self.mutations: dict[str, Any] = {}
 
@@ -117,6 +118,9 @@ class StandIn:
         key = f"{kind}Id"
         if method == "GET":
             data = [self.shown(kind, value) for value in store.values()]
+            if self.empty_pages > 0:
+                self.empty_pages -= 1
+                return {"data": [], "next": "more"}
             if self.page_size is None:
                 return {"data": data}
             offset = int(query.get("offset", ["0"])[0])
@@ -148,7 +152,7 @@ class StandIn:
         if method == "POST":
             number = len(self.jobs) + 1
             self.jobs[number] = {"jobId": number, "connectionId": body["connectionId"], "jobType": body["jobType"], "status": "running"}
-            return self.jobs[number]
+            return dict(self.jobs[number])
         if method == "GET" and not rest:
             return {"data": [job for job in self.jobs.values() if job["connectionId"] == query["connectionId"][0]]}
         if method == "GET":
@@ -381,6 +385,64 @@ class SyncTest(unittest.TestCase):
         self.assertEqual([], api.running_jobs(ids["clinical_data"]))
 
 
+class StartTest(unittest.TestCase):
+    """The job ID is all that the start of a sync needs from its answer, because the ID is what lets the caller record the job and cancel it."""
+
+    def test_a_started_job_whose_answer_has_no_readable_status_is_still_returned_by_its_ID_and_its_status_is_read_later(self) -> None:
+        for name, status in (("null", None), ("missing", ...), ("an object", {MARKER: MARKER}), ("a text outside the set", MARKER)):
+            with self.subTest(name):
+                api, stand_in = prepared()
+                ids = ensure_everything(api)
+
+                def corrupt(answer: dict[str, Any], status: Any = status) -> None:
+                    if status is ...:
+                        answer.pop("status")
+                    else:
+                        answer["status"] = status
+
+                stand_in.mutations["POST jobs"] = corrupt
+                job = api.start_sync(ids["lab_data"])
+                self.assertEqual(1, job)
+                stand_in.mutations.clear()
+                self.assertEqual("running", api.job_status(job))
+
+    def test_a_reply_with_no_job_ID_is_refused_with_a_message_that_says_nothing_can_be_cancelled_and_holds_no_answer(self) -> None:
+        for name, corrupt in (
+            ("missing", lambda answer: answer.pop("jobId")),
+            ("null", lambda answer: answer.__setitem__("jobId", None)),
+            ("a text", lambda answer: answer.__setitem__("jobId", MARKER)),
+            ("a boolean", lambda answer: answer.__setitem__("jobId", True)),
+        ):
+            with self.subTest(name):
+                api, stand_in = prepared()
+                ids = ensure_everything(api)
+                stand_in.mutations["POST jobs"] = corrupt
+                with self.assertRaises(AirbyteError) as raised:
+                    api.start_sync(ids["lab_data"])
+                self.assertIn("cannot cancel", str(raised.exception))
+                self.assertIn("jobId", str(raised.exception))
+                self.assertNotIn(MARKER, str(raised.exception))
+
+
+class PagingTest(unittest.TestCase):
+    def test_a_page_with_no_data_and_a_next_is_not_the_end_of_the_list(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.empty_pages = 3
+        stand_in.log.clear()
+        ensure_everything(api)
+        self.assertEqual([], writes(stand_in), "the objects behind the empty pages were found, and none was made again")
+        self.assertEqual(4, stand_in.log.count("GET destinations"), "three empty pages and the page with the destination")
+
+    def test_a_list_that_never_stops_saying_next_is_refused_at_the_page_cap(self) -> None:
+        api, stand_in = prepared()
+        ensure_everything(api)
+        stand_in.empty_pages = 10**6
+        with self.assertRaises(AirbyteError) as raised:
+            ensure_everything(api)
+        self.assertIn("more pages than", str(raised.exception))
+
+
 class FailureTest(unittest.TestCase):
     def test_a_refused_call_a_dropped_connection_and_a_deadline_are_each_one_error_that_names_the_call(self) -> None:
         for name, failure in (("refused", (500, b"{}")), ("dropped", ConnectionResetError), ("late", TimeoutError)):
@@ -560,7 +622,6 @@ FIELD_CASES = (
     ("job connection in the list", "GET jobs", first, "connectionId", started, read_jobs),
     ("job type in the list", "GET jobs", first, "jobType", started, read_jobs),
     ("job id of a started sync", "POST jobs", whole_answer, "jobId", built, start_one),
-    ("job status of a started sync", "POST jobs", whole_answer, "status", built, start_one),
     ("job id of a read job", "GET jobs/1", whole_answer, "jobId", started, read_status),
     ("job status of a read job", "GET jobs/1", whole_answer, "status", started, read_status),
 )

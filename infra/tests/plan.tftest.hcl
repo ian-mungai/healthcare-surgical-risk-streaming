@@ -855,8 +855,8 @@ run "orchestrator_workload_lists_reads_copies_and_deletes_only_what_the_record_l
   }
 
   assert {
-    condition     = !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "\"*\"") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "s3:*") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "s3:DeleteObject\"") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "AbortMultipartUpload")
-    error_message = "The orchestrator's policy holds no wildcard action or resource, no delete of a whole object and no multipart action."
+    condition     = !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "\"*\"") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "s3:*") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "s3:DeleteObject\"") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "AbortMultipartUpload") && !strcontains(aws_iam_role_policy.workload["orchestrator"].policy, "ListBucketMultipartUploads")
+    error_message = "The orchestrator's policy holds no wildcard action or resource, no delete of a whole object and no multipart action, listing included."
   }
 }
 

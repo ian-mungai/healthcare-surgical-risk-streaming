@@ -183,9 +183,9 @@ class NessieClient:
         document = self.request("POST", "/trees", {"type": source.kind, "name": source.name, "hash": source.hash}, {"name": name, "type": kind})
         return reference_from((document or {}).get("reference", document))
 
-    def delete_reference(self, name: str, hash_value: str) -> None:
-        """Delete the branch or tag ``name`` when it is still at ``hash_value``."""
-        self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}")
+    def delete_reference(self, name: str, hash_value: str, kind: str | None = None) -> None:
+        """Delete the branch or tag ``name`` when it is still at ``hash_value``. With ``kind`` (``BRANCH`` or ``TAG``), the other kind is not found."""
+        self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}", None, None if kind is None else {"type": kind})
 
     def merge(self, source: str, target: str, expected_target_hash: str, message: str) -> str:
         """Merge the branch ``source`` as it is now into ``target``, which must still be at ``expected_target_hash``. Returns the new hash of ``target``."""

@@ -159,7 +159,7 @@ class FaultBeforeTheCopyTest(unittest.TestCase):
         with self.assertRaises(CopyError):
             setup.load()
         self.assertEqual(["find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked which connections exist")
-        self.assertEqual(["has_recorded_manifest", f"has_branch {BRANCH}"], setup.catalog.calls, "the catalog was asked two questions and made no branch")
+        self.assertEqual(["has_recorded_manifest", f"reference {BRANCH}"], setup.catalog.calls, "the catalog was asked two questions and made no branch")
         self.assertEqual([], setup.records())
 
     def test_a_run_ID_that_is_not_a_plain_name_leaves_everything_untouched(self) -> None:
@@ -1190,6 +1190,116 @@ class StatusTest(unittest.TestCase):
                     with self.assertRaises(LoadError):
                         setup.load()
                     self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
+
+
+class TagOfTheNameTest(unittest.TestCase):
+    """Ownership is the triple of kind, name and creation hash: a tag of the run's branch name is never a leftover branch, whatever hash it is at."""
+
+    def retry_over_a_tag(self, setup: Setup, *, recorded: bool = True) -> LoadError:
+        failed_first_try(setup)
+        creation = RunState(setup.folder, RUN).branch
+        self.assertIsNotNone(creation)
+        del setup.catalog.heads[BRANCH], setup.catalog.tables[BRANCH]
+        setup.catalog.make_tag(BRANCH, at=creation[1] if creation else BASE_HASH)
+        if not recorded:
+            (setup.folder / f"{RUN}.state.json").unlink()
+        copies, calls = len(setup.store.copies), len(setup.airbyte.calls)
+        with self.assertRaises(LoadError) as raised:
+            setup.load()
+        self.assertEqual(copies, len(setup.store.copies), "the refusal came before any copy")
+        self.assertEqual([], [call for call in setup.airbyte.calls[calls:] if call.startswith(("ensure_", "start_sync"))])
+        return raised.exception
+
+    def test_a_tag_of_the_name_at_the_recorded_creation_hash_is_refused_and_no_delete_is_sent(self) -> None:
+        setup = Setup(self)
+        error = self.retry_over_a_tag(setup)
+        self.assertIn("not a branch", str(error))
+        self.assertEqual([], setup.catalog.deleted)
+        self.assertEqual([], setup.catalog.typed_misses, "not even a delete that the typed call would have missed was sent")
+        self.assertNotIn(f"delete_branch {BRANCH}", setup.catalog.calls)
+        self.assertEqual("TAG", setup.catalog.kinds[BRANCH])
+        self.assertIn(BRANCH, setup.catalog.heads)
+
+    def test_a_tag_of_the_name_with_no_state_record_is_refused_too(self) -> None:
+        setup = Setup(self)
+        self.retry_over_a_tag(setup, recorded=False)
+        self.assertEqual([], setup.catalog.deleted)
+        self.assertNotIn(f"delete_branch {BRANCH}", setup.catalog.calls)
+
+    def test_a_finished_run_whose_branch_name_is_now_a_tag_at_the_recorded_head_is_refused(self) -> None:
+        setup = Setup(self)
+        setup.load()
+        setup.catalog.kinds[BRANCH] = "TAG"
+        with self.assertRaises(LoadError):
+            setup.load()
+
+    def test_control_a_branch_of_the_name_at_the_recorded_creation_is_still_the_run_s_leftover(self) -> None:
+        setup = Setup(self)
+        failed_first_try(setup)
+        self.assertEqual(TABLES, sorted(setup.load().snapshots))
+        self.assertEqual([BRANCH], setup.catalog.deleted)
+
+
+class LateConfirmationTest(unittest.TestCase):
+    """An answer that comes back after the confirmation's budget is not a confirmation, whatever it says."""
+
+    def setup_with(self, confirm: float, latency: float) -> Setup:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=confirm)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        setup.airbyte.latency = latency
+        return setup
+
+    def test_a_status_that_says_cancelled_but_arrives_after_the_budget_is_job_still_active_with_the_job_recorded(self) -> None:
+        setup = self.setup_with(1.0, 1.15)
+        with self.assertRaises(JobStillActive) as raised:
+            setup.load()
+        self.assertNotIsInstance(raised.exception, SyncDeadline)
+        self.assertIn("job 1", str(raised.exception))
+        self.assertEqual(1, RunState(setup.folder, RUN).jobs["clinical_data"])
+        self.assertNotIn("start_sync lab_data", setup.airbyte.calls)
+
+    def test_control_the_same_answer_inside_the_budget_confirms_the_cancellation(self) -> None:
+        setup = self.setup_with(1.0, 0.5)
+        with self.assertRaises(SyncDeadline) as raised:
+            setup.load()
+        self.assertIn("was cancelled", str(raised.exception))
+
+    def test_an_answer_that_ends_exactly_at_the_budget_is_inside_it(self) -> None:
+        setup = self.setup_with(1.0, 1.0)
+        with self.assertRaises(SyncDeadline):
+            setup.load()
+
+
+class StartedJobTest(unittest.TestCase):
+    """The job ID is recorded before anything else is read about the job, and a start that gives no ID names what cannot be done."""
+
+    def test_the_job_is_in_the_state_file_when_its_first_status_is_read(self) -> None:
+        setup = Setup(self)
+        seen: list[dict[str, int]] = []
+        setup.airbyte.on_status = lambda: seen.append(dict(RunState(setup.folder, RUN).jobs))
+        setup.load()
+        self.assertEqual({"clinical_data": 1}, seen[0])
+
+    def test_a_job_whose_status_cannot_be_read_is_recorded_and_goes_through_the_bounded_cancellation(self) -> None:
+        setup = Setup(self)
+        setup.deadlines = Deadlines(sync_seconds=20.0, poll_seconds=10.0, cancel_confirm_seconds=30.0)
+        setup.airbyte.outcomes["clinical_data"] = "stuck"
+        setup.airbyte.unreadable = 1
+        with self.assertRaises(LoadError):
+            setup.load()
+        self.assertEqual({"clinical_data": 1}, RunState(setup.folder, RUN).jobs)
+        self.assertEqual([1], setup.airbyte.cancelled)
+
+    def test_a_start_with_no_job_ID_stops_the_load_with_nothing_recorded_and_nothing_to_cancel(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.start_error = True
+        with self.assertRaises(AirbyteError) as raised:
+            setup.load()
+        self.assertIn("cannot be named", str(raised.exception))
+        self.assertEqual({}, RunState(setup.folder, RUN).jobs)
+        self.assertEqual([], setup.airbyte.cancelled)
+        self.assertEqual([], setup.records())
 
 
 class ActiveJobAtStartTest(unittest.TestCase):

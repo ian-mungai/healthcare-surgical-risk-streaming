@@ -110,15 +110,28 @@ class BranchMoved(LoadError):
     """The branch is no longer at the head that the caller read, so it was not deleted."""
 
 
+BRANCH_KIND = "BRANCH"
+
+
+@dataclass(frozen=True, slots=True)
+class RefState:
+    """What the catalog says a reference is: its kind (``BRANCH``, ``TAG``) and the hash it points to."""
+
+    kind: str
+    hash: str
+
+
 class Catalog(Protocol):
     def head(self, branch: str) -> str: ...
+
+    def reference(self, name: str) -> RefState | None:
+        """The kind and hash of the reference of this name, or None when there is none."""
+        ...
 
     def has_recorded_manifest(self, sha256: str) -> bool:
         """Whether any commit of the default branch's history carries the ``records-manifest`` line for this manifest. Raise ``LoadError`` when the history is
         longer than the scan and the line was not found: absence cannot then be established."""
         ...
-
-    def has_branch(self, branch: str) -> bool: ...
 
     def descends_from(self, branch: str, ancestor: str) -> bool:
         """Whether the commit ``ancestor`` is the head of the branch or in its history. Raise ``LoadError`` when that cannot be established."""
@@ -329,7 +342,8 @@ def confirm_finished(record: LoadResult, reference: ManifestRef, catalog: Catalo
     """The record of a finished run, once its manifest, its branch head and its snapshots are as they were recorded."""
     if record.manifest_sha256 != reference.sha256:
         raise LoadError("this run ID was loaded from another manifest")
-    if not catalog.has_branch(record.branch) or catalog.head(record.branch) != record.head_hash:
+    found = catalog.reference(record.branch)
+    if found is None or found.kind != BRANCH_KIND or found.hash != record.head_hash:
         raise LoadError(f"the branch {record.branch} is not at the head that the load recorded")
     now = catalog.snapshot_ids(record.branch)
     if {table: now.get(table) for table in record.snapshots} != record.snapshots:
@@ -380,7 +394,8 @@ def stop_job(
     The whole of the cancellation and its confirmation has one budget, ``cancel_confirm_seconds``, and each request is given what is left of it. A job that
     is terminal inside the budget raises ``SyncDeadline`` (``late``) or ``LoadError``. A job that is not confirmed terminal inside the budget, whatever the
     reason (a cancellation that could not be asked for, a read that timed out, a status that is not one of the statuses of the API), raises ``JobStillActive``
-    with the job's ID. The budget is exceeded by at most the overshoot of one exchange, which ``airbyte_api`` states.
+    with the job's ID. An answer that comes back after the budget has passed is not a confirmation, whatever it says: the clock is read after each read. The
+    budget is exceeded by at most the overshoot of one exchange, which ``airbyte_api`` states.
     """
     ends = clock() + deadlines.cancel_confirm_seconds
     asked = True
@@ -396,6 +411,8 @@ def stop_job(
             status = airbyte.job_status(job, timeout=remaining)
         except AirbyteError:
             status = ""
+        if clock() > ends:
+            break
         if status in TERMINAL_STATUSES:
             ended = "was cancelled" if status == "cancelled" else f"ended as {status}"
             raise (SyncDeadline if late else LoadError)(f"the sync of {table} {because} and {ended}")
@@ -428,17 +445,20 @@ def remove_all(store: CopyingStore, run_id: str, state: RunState) -> None:
 def owned_leftover(catalog: Catalog, state: RunState, branch: str) -> str | None:
     """The head of the leftover branch of an unfinished try that this run owns, or None when there is no branch of the name.
 
-    A branch of the name is owned only when the state file records the name and the branch's history holds the hash that the run made it at. Anything else is
-    refused, and nothing is deleted. The head that is returned is the one that the deletion is sent with.
+    A reference of the name is owned only when it is a branch (the kind is read, so a tag of the name is refused), the state file records the name, and the
+    branch's history holds the hash that the run made it at: the triple of kind, name and creation hash. Anything else is refused, and nothing is deleted.
+    The hash that is returned is the one that the deletion is sent with, and the deletion names the kind as well.
     """
-    if not catalog.has_branch(branch):
+    found = catalog.reference(branch)
+    if found is None:
         return None
+    if found.kind != BRANCH_KIND:
+        raise LoadError(f"the reference {branch} exists and is not a branch: it is refused and not deleted")
     if state.branch is None or state.branch[0] != branch:
         raise LoadError(f"the branch {branch} exists and this host has no record that this run created it: it is refused and not deleted")
-    head = catalog.head(branch)
     if not catalog.descends_from(branch, state.branch[1]):
         raise LoadError(f"the branch {branch} is not the branch that this run created: it is refused and not deleted")
-    return head
+    return found.hash
 
 
 def make_branch(catalog: Catalog, state: RunState, branch: str, leftover: str | None) -> str:

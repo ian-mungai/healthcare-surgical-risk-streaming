@@ -21,8 +21,15 @@ while it is pending, queued or running.
 Every exchange has one elapsed deadline: the smaller of the client's own limit and the time that the caller's operation has left (``timeout``). The connection
 carries the deadline as its socket timeout, which bounds the connect and each wait for a byte, and a watchdog timer shuts the socket at the deadline, which
 bounds a server that trickles its headers or its body. The standard library offers no other bound on a whole exchange without socket machinery of its own, and
-this is not a second transport: it is the same connection. Remaining overshoot: an exchange ends within about one second after its deadline (the watchdog's
-wake-up and the unwinding of a blocked read), and the test holds it under 1.5 seconds.
+this is not a second transport: it is the same connection. Remaining overshoot, measured on a local server that sends one byte every 0.02 s under a 1.0 s
+budget: a reply with a ``Content-Length`` or a chunked body ends at 1.01 s (about 0.01 s over; a loaded host adds the watchdog's wake-up delay), and the
+test holds it under 1.5 s.
+
+Accepted limit (the lead's decision, by the owner's decision on the same limit in phase 4 slice 1): a reply that says ``Connection: close`` makes
+``http.client`` hand the socket to the response and set ``connection.sock`` to None as soon as the headers are read, so the watchdog has no socket to shut,
+and the body is bounded only by each read's own timeout (a byte must arrive inside the budget) and by the cap of ``BODY_LIMIT_BYTES``. The same server and
+budget, with ``Connection: close`` and no length, was still being read after 12 s (the test stopped it): the overshoot is not bounded by the deadline, only by
+the end of the body or the cap. No transport code is changed for it.
 
 The destination's AWS access key is sent only in the body of a create or update of the destination, and no message holds a request body, a response body or a
 secret.
@@ -274,7 +281,7 @@ class HttpAirbyteApi:
             if not isinstance(data, list) or any(type(item) is not dict for item in data) or not (following is None or type(following) is str):
                 raise AirbyteError(f"{label} gave a page that is not of the documented form")
             found += data
-            if not following or not data:
+            if not following:
                 return found
         raise AirbyteError(f"{label} has more pages than {MAX_PAGES}")
 
@@ -377,9 +384,19 @@ class HttpAirbyteApi:
         return [job for job, status in read if status in ACTIVE_STATUSES]
 
     def start_sync(self, connection_id: str) -> int:
+        """Start a sync and return the ID of the job. Only the ID is read from the answer, so that the caller can record the job, and cancel it, whatever else
+        the answer holds: its status is read later, by ``job_status``, which refuses a status that is not one of ``JOB_STATUSES``.
+
+        An answer with no job ID is refused. A job may then have started that this tool cannot name, so it cannot cancel it: the message says so, and the
+        next load refuses to start while a job of the three connections is active.
+        """
         answer = self.call("POST", "/jobs", {"connectionId": connection_id, "jobType": SYNC})
-        job, _ = job_entry(answer, "POST jobs")
-        return job
+        value = answer.get("jobId")
+        if type(value) is not int:
+            raise AirbyteError(
+                "POST jobs has no whole number field jobId: a job may have started that cannot be named, so this tool cannot cancel it: look for it in Airbyte"
+            )
+        return value
 
     def job_status(self, job: int, *, timeout: float | None = None) -> str:
         """The status of the job, one of ``JOB_STATUSES``, read inside ``timeout`` seconds when it is given."""
