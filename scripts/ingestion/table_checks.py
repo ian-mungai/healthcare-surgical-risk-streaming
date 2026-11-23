@@ -69,6 +69,7 @@ from scripts.stack.tags import paged
 from spark import table_checks as rules
 
 LOAD_RECORD_FORMAT = "load_record_2"
+LEGACY_LOAD_RECORD_FORMAT = "load_record_1"
 RUN_FORMAT = "table_checks_run_1"
 RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
@@ -228,6 +229,8 @@ def parse_load_record(text: str) -> LoadRecord:
         raise TableChecksError(str(error)) from None
     except ValueError:
         raise TableChecksError("the load record is not JSON") from None
+    if isinstance(document, dict) and document.get("format") == LEGACY_LOAD_RECORD_FORMAT:
+        raise TableChecksError("the load record is of version 1 and names no base head: the load step makes it again from its run record")
     fields = closed(document, LOAD_RECORD_FIELDS, "the load record")
     manifest = closed(fields["manifest"], MANIFEST_FIELDS, "the load record's manifest")
     tables = fields["tables"]

@@ -30,6 +30,7 @@ from scripts.ingestion.record_load import (
     LoadError,
     LoadResult,
     SyncDeadline,
+    current_load_record_text,
     earlier_record,
     load_records,
     manifest_line,
@@ -267,6 +268,57 @@ class FaultInTheLoadTest(unittest.TestCase):
             setup.load()
         self.assertIn("track_list", str(raised.exception))
         self.assertEqual([], setup.records())
+
+
+def make_legacy(setup: Setup) -> LoadResult:
+    """Rewrite the two files of a finished load as version 1 left them: the full record and the five-field file, both in the format ``load_record_1``."""
+    result = setup.load()
+    full = json.loads((setup.folder / f"{RUN}.json").read_text())
+    full["format"] = "load_record_1"
+    (setup.folder / f"{RUN}.json").write_text(json.dumps(full))
+    five = {name: full[name] for name in ("format", "branch", "branch_hash", "manifest", "tables")}
+    (setup.folder / f"{RUN}.load_record.json").write_text(json.dumps(five))
+    return result
+
+
+class LegacyRecordTest(unittest.TestCase):
+    """A record that version 1 wrote is read as it is, and the file for the table checks is made again from its saved base head."""
+
+    def test_the_full_record_of_version_1_is_read(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        self.assertEqual(result, LoadResult.from_json((setup.folder / f"{RUN}.json").read_text()))
+
+    def test_a_second_call_of_a_run_that_version_1_finished_loads_nothing_and_makes_the_table_checks_file_again(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        airbyte_calls = list(setup.airbyte.calls)
+        self.assertEqual(result, setup.load())
+        self.assertEqual(airbyte_calls, setup.airbyte.calls)
+        text = (setup.folder / f"{RUN}.load_record.json").read_text()
+        self.assertEqual(LOAD_RECORD_FIELDS, set(json.loads(text)))
+        self.assertEqual(BASE_HASH, parse_load_record(text).base_hash)
+
+    def test_the_manifest_lookup_finds_a_record_that_version_1_wrote(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256))
+
+    def test_the_table_checks_file_of_version_1_is_made_again_from_the_full_record_when_the_job_reads_it(self) -> None:
+        setup = Setup(self)
+        make_legacy(setup)
+        path = setup.folder / f"{RUN}.load_record.json"
+        text = current_load_record_text(path)
+        self.assertEqual(BASE_HASH, parse_load_record(text).base_hash)
+        self.assertEqual(text, path.read_text())
+        self.assertEqual(text, current_load_record_text(path))
+
+    def test_a_file_of_version_1_with_no_full_record_beside_it_is_refused(self) -> None:
+        setup = Setup(self)
+        make_legacy(setup)
+        (setup.folder / f"{RUN}.json").unlink()
+        with self.assertRaises(LoadError):
+            current_load_record_text(setup.folder / f"{RUN}.load_record.json")
 
 
 class SecondCallTest(unittest.TestCase):

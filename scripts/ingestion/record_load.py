@@ -83,6 +83,7 @@ from scripts.ingestion.store import StoreError
 SUCCEEDED = "succeeded"
 ENDED_WITHOUT_SUCCESS = tuple(status for status in TERMINAL_STATUSES if status != SUCCEEDED)
 LOAD_RECORD_FORMAT = "load_record_2"
+LEGACY_LOAD_RECORD_FORMAT = "load_record_1"
 LOAD_RECORD_FILE = "{run_id}.load_record.json"
 OWN_FIELDS = ("run_id", "manifest_sha256", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
 LOAD_RECORD_FIELDS = ("format", "branch", "branch_hash", "base_hash", "manifest", "tables")
@@ -239,6 +240,8 @@ class LoadResult:
     def from_json(cls, text: str) -> LoadResult:
         try:
             document = json.loads(text)
+            if isinstance(document, dict) and document.get("format") == LEGACY_LOAD_RECORD_FORMAT:
+                document = {**document, "format": LOAD_RECORD_FORMAT}
             if not isinstance(document, dict) or set(document) != set(RECORD_FIELDS):
                 raise ValueError
             copies = tuple(Copied(**entry) for entry in document["copies"] if set(entry) == set(COPY_FIELDS))
@@ -304,6 +307,29 @@ def write_load_record(record_dir: Path, result: LoadResult) -> Path:
         Path(temporary).unlink(missing_ok=True)
         raise
     return final
+
+
+def current_load_record_text(path: Path) -> str:
+    """The text of the file for the table checks at ``path``, made again from the full run record beside it when version 1 wrote it.
+
+    Version 1 wrote five fields and no base head. Its full run record saved the base head, so the file is regenerated from that record in the current
+    format. A file of the current format is returned as it is, and the table checks' parser judges it.
+    """
+    text = path.read_text()
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(document, dict) or document.get("format") != LEGACY_LOAD_RECORD_FORMAT:
+        return text
+    run_id = path.name.removesuffix(LOAD_RECORD_FILE.format(run_id=""))
+    if not run_id or path.name != LOAD_RECORD_FILE.format(run_id=run_id):
+        raise LoadError("the load record is of version 1 and its name does not give a run ID")
+    full = read_record(path.parent, run_id)
+    if full is None:
+        raise LoadError("the load record is of version 1 and the full record that it is made again from is missing")
+    write_load_record(path.parent, full)
+    return full.load_record_json()
 
 
 def write_record(record_dir: Path, result: LoadResult) -> Path:
@@ -513,6 +539,7 @@ def load_records(
     finished = read_record(record_dir, run_id)
     if finished is not None:
         result = confirm_finished(finished, reference, catalog)
+        write_load_record(record_dir, result)
         remove_all(store, run_id, state)
         return result
     if catalog.has_recorded_manifest(reference.sha256):

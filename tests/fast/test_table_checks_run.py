@@ -1596,6 +1596,13 @@ class LoadRecordTest(unittest.TestCase):
             "tables": dict(SNAPSHOTS),
         }
 
+    def test_a_load_record_of_version_1_is_refused_by_name_and_not_as_an_unknown_field(self) -> None:
+        document = self.document()
+        del document["base_hash"]
+        document["format"] = "load_record_1"
+        with self.assertRaisesRegex(run.TableChecksError, "version 1"):
+            run.parse_load_record(json.dumps(document))
+
     def test_control_a_record_with_a_branch_a_hash_a_manifest_and_a_snapshot_for_each_table_is_read(self) -> None:
         record = run.parse_load_record(json.dumps(self.document()))
         self.assertEqual((BRANCH, "a" * 64, SNAPSHOTS), (record.branch, record.branch_hash, record.tables))
