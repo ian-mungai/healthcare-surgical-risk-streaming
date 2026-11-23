@@ -77,7 +77,7 @@ class Derivation(unittest.TestCase):
         self.assertEqual(admitted, {event.occurrence_id for event in self.manifest.events.values()})
         self.assertEqual(admitted, set(self.manifest.occurrences))
         self.assertEqual(
-            18 * len([item for item in admitted if item.startswith("9001")]) + 8 * len([item for item in admitted if item.startswith("9002")]),
+            19 * len([item for item in admitted if item.startswith("9001")]) + 9 * len([item for item in admitted if item.startswith("9002")]),
             len(self.manifest.events),
         )
 
@@ -85,16 +85,16 @@ class Derivation(unittest.TestCase):
         started = next(event for event in self.manifest.events.values() if event.kind == "string" and event.event_id.endswith("|Test/EVENT|0|0"))
         self.assertEqual("Case started", (started.payload or {}).get("text"))
         for event in self.manifest.events.values():
-            if event.kind in ("string", "final_score", "case_end"):
+            if event.kind in ("string", "op_start", "final_score", "case_end"):
                 self.assertIsNotNone(event.payload, event.event_id)
             else:
                 self.assertIsNone(event.payload, event.event_id)
 
     def test_the_markers_and_the_string_events_are_distinct_kinds_with_distinct_ids(self) -> None:
         kinds = {event.kind for event in self.manifest.events.values()}
-        self.assertEqual({"numeric", "waveform", "string", "final_score", "case_end"}, kinds)
-        marker_ids = {event.event_id for event in self.manifest.events.values() if event.kind in ("final_score", "case_end")}
-        source_ids = {event.event_id for event in self.manifest.events.values() if event.kind not in ("final_score", "case_end")}
+        self.assertEqual({"numeric", "waveform", "string", "op_start", "final_score", "case_end"}, kinds)
+        marker_ids = {event.event_id for event in self.manifest.events.values() if event.kind in ("op_start", "final_score", "case_end")}
+        source_ids = {event.event_id for event in self.manifest.events.values() if event.kind not in ("op_start", "final_score", "case_end")}
         self.assertFalse(marker_ids & source_ids)
 
     def test_each_event_is_flagged_by_whether_it_is_due_inside_the_half_open_window(self) -> None:
@@ -113,7 +113,7 @@ class Derivation(unittest.TestCase):
         observed = replayed(frozen)
         self.assertEqual(set(manifest.events), set(observed.events))
         self.assertEqual({key: event.payload_sha256 for key, event in manifest.events.items()}, {key: value[0] for key, value in observed.events.items()})
-        self.assertEqual(7 * 3, len(manifest.events))
+        self.assertEqual(8 * 3, len(manifest.events))
         outside = next(event for event in manifest.events.values() if event.event_id.endswith("|Test/HR|10400000|0") and event.occurrence_id == "9003.0")
         self.assertEqual(10 * SECOND, outside.due_us)
 
@@ -191,6 +191,11 @@ class Comparison(unittest.TestCase):
         self.assertEqual(("9002.0",), report.partial_occurrences)
         self.assertEqual((), report.missing_occurrences)
         self.assertIn(marker.event_id, "\n".join(report.failures()))
+
+    def test_a_planted_missing_op_start_marker_fails_by_its_missing_id(self) -> None:
+        marker = next(event for event in self.manifest.events.values() if event.occurrence_id == "9001.0" and event.kind == "op_start")
+        report = compare(self.manifest, without(self.observed, [marker.event_id]))
+        self.assertEqual((marker.event_id,), report.missing_ids)
 
     def test_a_planted_missing_final_score_marker_fails_by_its_missing_id(self) -> None:
         marker = next(event for event in self.manifest.events.values() if event.occurrence_id == "9001.0" and event.kind == "final_score")

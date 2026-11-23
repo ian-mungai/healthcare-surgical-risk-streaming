@@ -47,6 +47,7 @@ KIND_FORMAT: dict[str, str] = {
     "numeric": "numeric",
     "waveform": "waveform",
     "string": "string_event",
+    "op_start": "case_lifecycle",
     "final_score": "case_lifecycle",
     "case_end": "case_lifecycle",
 }

@@ -32,7 +32,9 @@ class OccurrenceState:
     case_id: int
     start_us: int | None = None
     high_water_us: int | None = None
+    opstart_us: int | None = None
     opend_us: int | None = None
+    risk_pending: list[int] = field(default_factory=list)
     next_index: int = 1
     final_emitted: bool = False
     closed: bool = False
@@ -54,7 +56,9 @@ class OccurrenceState:
             "case_id": self.case_id,
             "start_us": self.start_us,
             "high_water_us": self.high_water_us,
+            "opstart_us": self.opstart_us,
             "opend_us": self.opend_us,
+            "risk_pending": self.risk_pending,
             "next_index": self.next_index,
             "final_emitted": self.final_emitted,
             "closed": self.closed,
@@ -81,7 +85,9 @@ class OccurrenceState:
             document["case_id"],
             document["start_us"],
             document["high_water_us"],
+            document["opstart_us"],
             document["opend_us"],
+            list(document["risk_pending"]),
             document["next_index"],
             document["final_emitted"],
             document["closed"],

@@ -72,11 +72,11 @@ class Events(unittest.TestCase):
                     (payload["sample_rate"], payload["gain"], payload["offset"], payload["start_offset_us"]),
                     (event.sample_rate, event.gain, event.physical_offset, event.start_offset_us),
                 )
-        self.assertEqual({"numeric", "waveform", "string", "final_score", "case_end"}, kinds)
+        self.assertEqual({"numeric", "waveform", "string", "op_start", "final_score", "case_end"}, kinds)
 
     def test_a_marker_is_a_marker_and_its_id_is_not_a_source_id(self) -> None:
-        markers = [event_from_record(name, payload, 0, 0) for kind, name, payload in sent_payloads() if kind in ("final_score", "case_end")]
-        self.assertEqual(["final_score", "case_end"], [event.kind for event in markers])
+        markers = [event_from_record(name, payload, 0, 0) for kind, name, payload in sent_payloads() if kind in ("op_start", "final_score", "case_end")]
+        self.assertEqual(["op_start", "final_score", "case_end"], [event.kind for event in markers])
         self.assertTrue(all("|!" in event.event_id for event in markers))
 
     def test_an_unknown_record_or_marker_is_refused(self) -> None:

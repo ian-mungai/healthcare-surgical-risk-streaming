@@ -48,6 +48,7 @@ from tests.fast.stream_support import (
 
 LIMIT_US = Policy().late_limit_us
 MINUTES = [60 * SECOND * minute for minute in range(1, 6)]
+START = 30 * SECOND
 
 
 def decisions(records: Sequence[Record], kind: str | None = None) -> list[DecisionRecord]:
@@ -63,7 +64,7 @@ class OracleParity(unittest.TestCase):
         recording = synthetic_recording()
         records, _ = run_stream(events_for(recording))
         found = features_of(records)
-        self.assertEqual(MINUTES, sorted(found))
+        self.assertEqual([START, *MINUTES], sorted(found))
         for cutoff, record in found.items():
             with self.subTest(cutoff=cutoff):
                 self.assertEqual(oracle_values(recording, cutoff), values_of(record))
@@ -74,7 +75,7 @@ class OracleParity(unittest.TestCase):
         recording = synthetic_recording(caseend_s=2_000, opend_s=1_900, rate=4, hr_step_s=10)
         records, states = run_stream(events_for(recording), batch_size=50, restart=True)
         found = features_of(records)
-        self.assertEqual([60 * SECOND * minute for minute in range(1, 32)] + [1_900 * SECOND], sorted(found))
+        self.assertEqual(sorted([START, 1_650 * SECOND, 1_900 * SECOND, *(60 * SECOND * minute for minute in range(1, 32))]), sorted(found))
         for cutoff in (60 * SECOND, 960 * SECOND, 1_200 * SECOND, 1_800 * SECOND, 1_900 * SECOND):
             with self.subTest(cutoff=cutoff):
                 self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
@@ -88,7 +89,7 @@ class OracleParity(unittest.TestCase):
         _, states = run_stream([event for event in events if event.replay_time_us <= ORIGIN_US + 1_500 * SECOND])
         state = next(iter(states.values()))
         oldest = min(time for readings in state.numeric.values() for time in readings)
-        self.assertGreater(oldest, 600 * SECOND)
+        self.assertGreater(oldest, 510 * SECOND)
         self.assertLess(len(state.art_summary), 1_000)
         self.assertGreater(len(state.numeric), 0)
 
@@ -109,7 +110,7 @@ class Cutoffs(unittest.TestCase):
         recording = synthetic_recording(opend_s=290)
         records, _ = run_stream(events_for(recording))
         found = features_of(records)
-        self.assertEqual([60 * SECOND * minute for minute in range(1, 5)] + [290 * SECOND], sorted(found))
+        self.assertEqual([START] + [60 * SECOND * minute for minute in range(1, 5)] + [290 * SECOND], sorted(found))
         self.assertEqual([290 * SECOND], [cutoff for cutoff, record in found.items() if record.is_final])
         self.assertEqual(oracle_values(recording, 290 * SECOND), values_of(found[290 * SECOND]))
 
@@ -142,6 +143,41 @@ class Cutoffs(unittest.TestCase):
         record = features_of(records)[60 * SECOND]
         self.assertEqual(f"{RUN}|3|101.0|{60 * SECOND}|features_test", record.feature_id)
         self.assertEqual(("features_test", 3, "101.0", 101), (record.feature_version, record.room, record.occurrence_id, record.case_id))
+
+
+class RiskCutoffs(unittest.TestCase):
+    def test_the_op_start_marker_gives_the_starting_row_and_the_frozen_offsets_give_the_later_risk_rows(self) -> None:
+        self.assertEqual((1_620 * SECOND, 3_300 * SECOND, 4_920 * SECOND), Policy().risk_offsets_us)
+        recording = synthetic_recording(caseend_s=2_000, opend_s=1_900, rate=4, hr_step_s=10)
+        found = features_of(run_stream(events_for(recording))[0])
+        for cutoff in (START, 1_650 * SECOND):
+            with self.subTest(cutoff=cutoff):
+                self.assertIn(cutoff, found)
+                self.assertFalse(found[cutoff].is_final)
+                self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
+
+    def test_a_risk_cutoff_after_opend_is_never_built_and_one_on_a_minute_is_one_row(self) -> None:
+        short = features_of(run_stream(events_for(synthetic_recording(opend_s=300)))[0])
+        self.assertEqual([START, *MINUTES], sorted(short))
+        on_minute = features_of(run_stream(events_for(synthetic_recording(opstart_s=60)))[0])
+        self.assertEqual(MINUTES, sorted(on_minute))
+
+    def test_a_start_that_equals_opend_is_the_final_row_only(self) -> None:
+        found = features_of(run_stream(events_for(synthetic_recording(opstart_s=300, opend_s=300)))[0])
+        self.assertEqual(MINUTES, sorted(found))
+        self.assertTrue(found[300 * SECOND].is_final)
+
+    def test_without_the_op_start_marker_there_is_no_starting_row(self) -> None:
+        events = [event for event in events_for(synthetic_recording()) if event.kind != "op_start"]
+        self.assertEqual(MINUTES, sorted(features_of(run_stream(events)[0])))
+
+    def test_a_start_cutoff_late_in_a_long_case_still_has_its_whole_window_after_the_buffers_were_pruned(self) -> None:
+        recording = synthetic_recording(caseend_s=3_000, opstart_s=2_020, opend_s=2_900, rate=4, hr_step_s=10)
+        found = features_of(run_stream(events_for(recording), batch_size=40, restart=True)[0])
+        self.assertIn(2_020 * SECOND, found)
+        for cutoff in (2_020 * SECOND, 2_040 * SECOND, 2_900 * SECOND):
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
 
 
 class Lateness(unittest.TestCase):
@@ -298,7 +334,7 @@ class RoomTransition(unittest.TestCase):
         self.assertEqual(["late_accepted"], [record.decision for record in decisions(records) if record.decision != "source_duplicate"])
         for occurrence, recording in (("101.0", room0_first), ("102.0", room1_with), ("103.1", room0_next)):
             mine = features_of([record for record in records if getattr(record, "occurrence_id", "") == occurrence])
-            self.assertEqual(7, len(mine))
+            self.assertEqual(8, len(mine))
             for cutoff, record in mine.items():
                 with self.subTest(occurrence=occurrence, cutoff=cutoff):
                     self.assertEqual(oracle_values(recording, cutoff), values_of(record))
@@ -357,7 +393,7 @@ class CaseEnd(unittest.TestCase):
         recording = synthetic_recording()
         events = [event for event in events_for(recording) if event.kind != "final_score"]
         found = features_of(run_stream(events)[0])
-        self.assertEqual([60 * SECOND * minute for minute in range(1, 7)], sorted(found))
+        self.assertEqual([START] + [60 * SECOND * minute for minute in range(1, 7)], sorted(found))
 
     def test_a_marker_event_id_is_the_replays_and_not_a_source_id(self) -> None:
         events = events_for(synthetic_recording())
@@ -370,7 +406,7 @@ class BadInput(unittest.TestCase):
         recording = synthetic_recording(arterial_rate=62.5)
         records, _ = run_stream(events_for(recording))
         errors = [record for record in records if isinstance(record, ErrorRecord)]
-        self.assertEqual(MINUTES, sorted(record.cutoff_case_time_us for record in errors))
+        self.assertEqual([START, *MINUTES], sorted(record.cutoff_case_time_us for record in errors))
         self.assertIn("sample rate", errors[0].message)
         self.assertEqual({}, features_of(records))
         self.assertEqual(1, len([record for record in records if isinstance(record, LedgerRecord)]))

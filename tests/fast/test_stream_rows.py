@@ -40,7 +40,7 @@ RECORDS: list[Record] = [
 class Events(unittest.TestCase):
     def test_every_event_of_a_case_survives_a_spark_row(self) -> None:
         events = events_for(synthetic_recording(caseend_s=60, opend_s=50))
-        self.assertEqual({"numeric", "waveform", "string", "final_score", "case_end"}, {event.kind for event in events})
+        self.assertEqual({"numeric", "waveform", "string", "op_start", "final_score", "case_end"}, {event.kind for event in events})
         for event in events:
             self.assertEqual(repr(event), repr(event_from_row(event_row(event))))
 

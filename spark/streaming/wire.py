@@ -20,7 +20,7 @@ RECORD_KINDS: dict[str, Kind] = {
     FORMATS["waveform"].record_name: "waveform",
     FORMATS["string_event"].record_name: "string",
 }
-MARKER_KINDS: dict[str, Kind] = {"FINAL_SCORE": "final_score", "CASE_END": "case_end"}
+MARKER_KINDS: dict[str, Kind] = {"OP_START": "op_start", "FINAL_SCORE": "final_score", "CASE_END": "case_end"}
 
 
 class StreamEventError(EventModelError):

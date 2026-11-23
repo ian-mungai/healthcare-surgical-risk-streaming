@@ -55,16 +55,20 @@ class Schemas(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
 
     def test_every_replayed_input_goes_to_one_topic_so_that_a_rooms_events_stay_in_order_and_feature_ready_has_its_own(self) -> None:
-        for kind in ("numeric", "waveform", "string", "final_score", "case_end"):
+        for kind in ("numeric", "waveform", "string", "op_start", "final_score", "case_end"):
             self.assertEqual(INPUT_TOPIC, FORMATS[KIND_FORMAT[kind]].topic, kind)
         self.assertEqual(FEATURE_READY_TOPIC, FORMATS["feature_ready"].topic)
         self.assertNotEqual(INPUT_TOPIC, FEATURE_READY_TOPIC)
         self.assertEqual("replay_events", INPUT_TOPIC)
 
     def test_every_kind_the_replay_sends_has_a_format_and_the_five_formats_are_the_five_the_slice_names(self) -> None:
-        self.assertEqual({"numeric", "waveform", "string", "final_score", "case_end"}, set(KIND_FORMAT))
+        self.assertEqual({"numeric", "waveform", "string", "op_start", "final_score", "case_end"}, set(KIND_FORMAT))
         self.assertEqual({"numeric", "waveform", "string_event", "case_lifecycle", "feature_ready"}, set(FORMATS))
-        self.assertEqual(KIND_FORMAT["final_score"], KIND_FORMAT["case_end"])
+        self.assertEqual({KIND_FORMAT["op_start"]}, {KIND_FORMAT["final_score"], KIND_FORMAT["case_end"]})
+
+    def test_the_marker_enum_ends_with_the_symbol_added_later_so_the_registry_accepts_the_new_version(self) -> None:
+        marker = next(field["type"] for field in schema_of("case_lifecycle")["fields"] if field["name"] == "marker")
+        self.assertEqual(["FINAL_SCORE", "CASE_END", "OP_START"], marker["symbols"])
 
     def test_the_payload_of_each_kind_has_exactly_the_fields_and_the_types_of_its_schema(self) -> None:
         recordings = boundary_recordings()

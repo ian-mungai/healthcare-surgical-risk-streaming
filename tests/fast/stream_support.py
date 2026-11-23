@@ -54,6 +54,7 @@ def synthetic_recording(
     case_id: int = 101,
     *,
     caseend_s: int = 400,
+    opstart_s: int = 30,
     opend_s: int = 300,
     rate: int = 10,
     hr_base: float = 60.0,
@@ -73,7 +74,7 @@ def synthetic_recording(
     arterial_samples = [value for second in range(caseend_s) for value in second_wave(second, rate, second == 150)]
     pleth_samples = [float((second * rate + position) % 50) for second in range(caseend_s) for position in range(rate)]
     return CaseRecording(
-        CaseTimes(case_id, 30 * SECOND, opend_s * SECOND, caseend_s * SECOND),
+        CaseTimes(case_id, opstart_s * SECOND, opend_s * SECOND, caseend_s * SECOND),
         numeric=(
             NumericTrack(HEART_RATE, "bpm", tuple(heart)),
             NumericTrack(ARTERIAL_MEAN, "mmHg", tuple(mean_pressure)),

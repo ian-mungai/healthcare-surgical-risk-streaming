@@ -15,7 +15,7 @@ from features.model import ClinicalValue
 SECOND = 1_000_000
 MINUTE = 60 * SECOND
 
-Kind = Literal["numeric", "waveform", "string", "final_score", "case_end"]
+Kind = Literal["numeric", "waveform", "string", "op_start", "final_score", "case_end"]
 
 ON_TIME = "on_time"
 LATE_ACCEPTED = "late_accepted"
@@ -36,10 +36,11 @@ class Policy:
 
     late_limit_us: int = 30 * SECOND
     cutoff_step_us: int = MINUTE
+    risk_offsets_us: tuple[int, ...] = (1_620 * SECOND, 3_300 * SECOND, 4_920 * SECOND)
 
     def __post_init__(self) -> None:
-        if self.late_limit_us < 0 or self.cutoff_step_us <= 0:
-            raise ValueError("the late limit is zero or more and the cutoff step is longer than zero")
+        if self.late_limit_us < 0 or self.cutoff_step_us <= 0 or any(offset <= 0 for offset in self.risk_offsets_us):
+            raise ValueError("the late limit is zero or more, and the cutoff step and each risk offset are longer than zero")
 
 
 ClinicalLookup = Callable[[int], Mapping[str, ClinicalValue]]

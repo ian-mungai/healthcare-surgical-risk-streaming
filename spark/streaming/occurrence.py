@@ -113,7 +113,7 @@ def decide(state: OccurrenceState, event: Event, context: Context, records: list
         state.count(DUPLICATE)
         records.append(decision_record(state, event, DUPLICATE, lateness))
         return
-    if not apply(state, event, lateness, records):
+    if not apply(state, event, lateness, context, records):
         return
     state.recent[event.suffix] = event.replay_time_us
     if watermark is None or event.replay_time_us > watermark:
@@ -127,11 +127,17 @@ def decide(state: OccurrenceState, event: Event, context: Context, records: list
         finish(state, event, context, records)
 
 
-def apply(state: OccurrenceState, event: Event, lateness_us: int, records: list[Record]) -> bool:
+def apply(state: OccurrenceState, event: Event, lateness_us: int, context: Context, records: list[Record]) -> bool:
     """Put the event into the buffers. Returns False for an event that is dropped as a source duplicate (and recorded as one)."""
     if state.start_us is None and event.case_time_us >= 0:
         state.start_us = event.replay_time_us - event.due_offset_us
-    if event.kind == "final_score":
+    if event.kind == "op_start":
+        state.opstart_us = event.case_time_us
+        emitted = (state.next_index - 1) * context.policy.cutoff_step_us
+        state.risk_pending = sorted(
+            {cutoff for cutoff in (event.case_time_us, *(event.case_time_us + offset for offset in context.policy.risk_offsets_us)) if cutoff > emitted}
+        )
+    elif event.kind == "final_score":
         state.opend_us = event.case_time_us
     elif event.kind == "string":
         state.count("string_events")
@@ -159,15 +165,28 @@ def apply(state: OccurrenceState, event: Event, lateness_us: int, records: list[
 
 
 def next_cutoff(state: OccurrenceState, context: Context, bound_us: int | None) -> tuple[int, bool] | None:
-    """The next cutoff to emit and whether it is the final one, or None. ``bound_us`` limits the minute cutoffs when ``opend`` is not known."""
+    """The next cutoff to emit and whether it is the final one, or None.
+
+    The cutoffs are the minute grid, the risk cutoffs that the start marker gave (``opstart`` and the frozen offsets after it) and ``opend``, the smallest
+    first. A grid or risk cutoff at ``opend`` or after it is not built apart: ``opend`` is the final row. ``bound_us`` limits the cutoffs when ``opend``
+    is not known.
+    """
     grid = state.next_index * context.policy.cutoff_step_us
-    if state.opend_us is not None:
-        if grid < state.opend_us:
-            return grid, False
-        return None if state.final_emitted else (state.opend_us, True)
-    if bound_us is not None and grid > bound_us:
+    opend = state.opend_us
+    candidates = []
+    if opend is None or grid < opend:
+        candidates.append(grid)
+    risk = [cutoff for cutoff in state.risk_pending if opend is None or cutoff < opend]
+    if risk:
+        candidates.append(min(risk))
+    if opend is not None and not state.final_emitted:
+        candidates.append(opend)
+    if opend is None and bound_us is not None:
+        candidates = [cutoff for cutoff in candidates if cutoff <= bound_us]
+    if not candidates:
         return None
-    return grid, False
+    cutoff = min(candidates)
+    return cutoff, opend is not None and cutoff == opend and not state.final_emitted
 
 
 def is_closed(state: OccurrenceState, context: Context, cutoff_us: int) -> bool:
@@ -186,8 +205,9 @@ def emit_due(state: OccurrenceState, context: Context, records: list[Record], fo
         records.append(row_record(state, context, cutoff, final))
         if final:
             state.final_emitted = True
-        else:
+        while state.next_index * context.policy.cutoff_step_us <= cutoff:
             state.next_index += 1
+        state.risk_pending = [pending for pending in state.risk_pending if pending > cutoff]
     prune(state, context)
 
 
@@ -269,7 +289,8 @@ def prune(state: OccurrenceState, context: Context) -> None:
         state.wave_samples.clear()
         state.art_summary.clear()
         return
-    cutoff = following[0]
+    margin_us = context.policy.cutoff_step_us + context.policy.late_limit_us
+    cutoff = following[0] - margin_us
     lower_us = cutoff - NUMERIC_WINDOW_SECONDS * SECOND
     for readings in state.numeric.values():
         for time in [time for time in readings if time <= lower_us]:

@@ -169,7 +169,11 @@ def expected_events(frozen: FrozenSchedule, scheduled: ScheduledOccurrence, reco
                 "samples": samples,
             }
             add("waveform", identity, (second + 1) * MICROSECONDS, base() | fields, keep=False)
-    markers: tuple[tuple[Marker, int], ...] = (("final_score", recording.times.opend_us), ("case_end", recording.times.caseend_us))
+    markers: tuple[tuple[Marker, int], ...] = (
+        ("op_start", recording.times.opstart_us),
+        ("final_score", recording.times.opend_us),
+        ("case_end", recording.times.caseend_us),
+    )
     for marker, time in markers:
         identity = marker_event_id(run, occurrence.room, occurrence.id, marker, time)
         add(marker, identity, time, base() | {"marker": marker.upper(), "case_time_us": time}, keep=True)

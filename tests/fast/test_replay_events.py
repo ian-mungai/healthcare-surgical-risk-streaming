@@ -90,6 +90,7 @@ class EventOrder(unittest.TestCase):
                 ("numeric", "Test/NIBP", 2 * SECOND, 2 * SECOND, 0),
                 ("waveform", wave, 1 * SECOND, 2 * SECOND, 0),
                 ("waveform", wave, 3 * SECOND, 4 * SECOND, 0),
+                ("op_start", "!op_start", 4 * SECOND, 4 * SECOND, 0),
                 ("waveform", wave, 4 * SECOND, 5 * SECOND, 0),
                 ("waveform", wave, 6 * SECOND, 7 * SECOND, 0),
                 ("numeric", "Test/HR", 7_250_000, 7_250_000, 0),
@@ -112,24 +113,33 @@ class EventOrder(unittest.TestCase):
         )
         self.assertEqual(keys_of(recording), keys_of(shuffled))
 
-    def test_every_reading_is_one_event_and_each_case_has_one_final_score_marker_and_one_case_end_marker(self) -> None:
+    def test_every_reading_is_one_event_and_each_case_has_one_op_start_one_final_score_and_one_case_end_marker(self) -> None:
         kinds = [key[0] for key in keys_of(boundary_recordings()[9001])]
-        self.assertEqual({"numeric": 6, "string": 4, "waveform": 6, "final_score": 1, "case_end": 1}, {kind: kinds.count(kind) for kind in set(kinds)})
+        self.assertEqual(
+            {"numeric": 6, "string": 4, "waveform": 6, "op_start": 1, "final_score": 1, "case_end": 1}, {kind: kinds.count(kind) for kind in set(kinds)}
+        )
 
     def test_a_case_with_no_waveform_has_no_waveform_event(self) -> None:
         self.assertNotIn("waveform", {key[0] for key in keys_of(boundary_recordings()[9002])})
 
-    def test_the_final_score_marker_is_due_at_the_opend_and_the_case_end_marker_at_the_caseend(self) -> None:
+    def test_the_op_start_marker_is_due_at_the_opstart_the_final_score_marker_at_the_opend_and_the_case_end_marker_at_the_caseend(self) -> None:
         for case_id, recording in boundary_recordings().items():
             with self.subTest(case=case_id):
-                marks = {event.kind: event.due_offset_us for event in occurrence_events(recording) if event.kind in ("final_score", "case_end")}
-                self.assertEqual({"final_score": recording.times.opend_us, "case_end": recording.times.caseend_us}, marks)
+                marks = {event.kind: event.due_offset_us for event in occurrence_events(recording) if event.kind in ("op_start", "final_score", "case_end")}
+                times = recording.times
+                self.assertEqual({"op_start": times.opstart_us, "final_score": times.opend_us, "case_end": times.caseend_us}, marks)
+
+    def test_markers_that_are_due_together_come_in_the_order_start_final_end(self) -> None:
+        times = CaseTimes(9100, 5 * SECOND, 5 * SECOND, 5 * SECOND)
+        recording = CaseRecording(times, numeric=(NumericTrack("Test/HR", "", ((5 * SECOND, 1.0),)),))
+        self.assertEqual(["numeric", "op_start", "final_score", "case_end"], [event.kind for event in occurrence_events(recording)])
 
     def test_a_reading_or_a_waveform_second_outside_the_case_is_due_inside_it_and_keeps_its_case_time(self) -> None:
         self.assertEqual(
             [
                 ("numeric", "Test/HR", -500_000, 0, 0),
                 ("numeric", "Test/HR", 0, 0, 0),
+                ("op_start", "!op_start", 2 * SECOND, 2 * SECOND, 0),
                 ("final_score", "!final_score", 6 * SECOND, 6 * SECOND, 0),
                 ("numeric", "Test/HR", 10_400_000, 10 * SECOND, 0),
                 ("waveform", "Test/WAVE", 9 * SECOND, 10 * SECOND, 0),
@@ -241,6 +251,13 @@ class OutgoingEvents(unittest.TestCase):
         again = self.events("9001.1")[("string", "Test/EVENT", 13 * SECOND, 0)]
         self.assertEqual(first["source_id"], again["source_id"])
         self.assertNotEqual(first["event_id"], again["event_id"])
+
+    def test_the_op_start_marker_names_its_kind_and_its_instant_and_has_the_reserved_track(self) -> None:
+        marker = self.events("9002.0")[("op_start", "!op_start", 6 * SECOND, 0)]
+        self.assertEqual(
+            (f"{RUN_ID}|1|9002.0|!op_start|6000000|0", "OP_START", 6 * SECOND, 6 * SECOND),
+            (marker["event_id"], marker["marker"], marker["case_time_us"], marker["replay_time_us"]),
+        )
 
     def test_the_two_markers_name_their_kind_and_their_instants_and_have_no_track(self) -> None:
         events = self.events("9002.0")

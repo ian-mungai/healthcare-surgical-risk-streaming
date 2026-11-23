@@ -92,9 +92,9 @@ class Processor(unittest.TestCase):
         self.assertEqual([], empty)
         records = [record_from_row(row) for row in first + second]
         features = [record for record in records if isinstance(record, FeatureRecord)]
-        self.assertEqual([60_000_000 * minute for minute in range(1, 6)], sorted(record.cutoff_case_time_us for record in features))
+        self.assertEqual([30_000_000, *(60_000_000 * minute for minute in range(1, 6))], sorted(record.cutoff_case_time_us for record in features))
         self.assertTrue(any(isinstance(record, FeatureRecord) and record.is_final for record in records))
-        self.assertEqual(0, len([record for record in records if isinstance(record, FeatureRecord) and record.cutoff_case_time_us < 60_000_000]))
+        self.assertEqual(0, len([record for record in records if isinstance(record, FeatureRecord) and record.cutoff_case_time_us < 30_000_000]))
 
 
 class Recorder:
