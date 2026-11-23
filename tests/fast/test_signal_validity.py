@@ -4,7 +4,9 @@ Failure modes covered here:
 
 - A boundary moves: exactly 20 or 200 mmHg, exactly a range of 20 mmHg and exactly a jump of 30 mmHg are valid, and the next value past each is
   invalid with its own cause.
-- A difference that a float rounds onto its limit is decided by the exact values of the floats, so a second whose range is a hair under 20 mmHg is flat.
+- A difference that a float rounds onto its limit is decided by the exact values of the floats, so a segment whose range is a hair under 20 mmHg is flat.
+- The flat rule looks at the second alone, or at fewer than the 20 seconds that end with it, or counts a sample that is missing or outside 20 to 200 mmHg, or a
+  sample that has left the window, or moves the first second at which a segment is long enough.
 - A rule leaks to a track that has no sourced rule: ECG and pleth seconds, or a numeric track other than the arterial mean, are judged by a pressure limit.
 - A second that is missing, short, late or on a rate that is not a whole number is called valid, or gets another cause than the one that comes first.
 - A jump over the boundary between two seconds is not seen, or is seen against a sample that is itself missing.
@@ -18,20 +20,25 @@ import math
 import unittest
 
 from features.signal_validity import (
+    EMPTY_EXTENT,
     FIRST_OCCURRENCE,
     FLAT,
+    FLAT_WINDOW_SECONDS,
     INCOMPLETE,
     INVALID_CAUSES,
     JUMP,
     MISSING,
     OUT_OF_RANGE,
     VALID,
+    Extent,
     Verdict,
+    combine_extents,
     difference_above,
     difference_below,
     is_duplicate,
     numeric_verdict,
     physical_samples,
+    valid_extent,
     waveform_verdict,
 )
 
@@ -44,8 +51,15 @@ def second(*samples: float) -> tuple[float, ...]:
     return tuple(samples)
 
 
-def arterial(samples: tuple[float | None, ...], previous_last: float | None = None, offset_us: int = 0, rate: float = RATE) -> Verdict:
-    return waveform_verdict(ART, samples, rate, offset_us, previous_last)
+def arterial(
+    samples: tuple[float | None, ...], previous_last: float | None = None, offset_us: int = 0, rate: float = RATE, prior: Extent = EMPTY_EXTENT
+) -> Verdict:
+    return waveform_verdict(ART, samples, rate, offset_us, previous_last, prior)
+
+
+def full_prior(low: float, high: float, missing: int = 0) -> Extent:
+    """The valid samples of the 19 seconds before a second of ``RATE`` samples, less ``missing`` of them."""
+    return Extent((FLAT_WINDOW_SECONDS - 1) * RATE - missing, low, high)
 
 
 class Numeric(unittest.TestCase):
@@ -83,9 +97,28 @@ class Boundaries(unittest.TestCase):
         self.assertEqual(Verdict(False, OUT_OF_RANGE), arterial(second(120.0, 140.0, 160.0, 200.00000000000003)))
 
     def test_a_range_just_under_the_minimum_is_flat_and_the_minimum_itself_is_not(self) -> None:
-        self.assertEqual(VALID, arterial(second(80.0, 90.0, 100.0, 85.0)))
-        self.assertEqual(Verdict(False, FLAT), arterial(second(80.0, 90.0, 99.99999999999999, 85.0)))
-        self.assertEqual(Verdict(False, FLAT), arterial(second(100.0, 100.0, 100.0, 100.0)))
+        self.assertEqual(VALID, arterial(second(100.0, 100.0, 100.0, 100.0), prior=full_prior(100.0, 120.0)))
+        self.assertEqual(VALID, arterial(second(80.0, 100.0, 80.0, 100.0), prior=full_prior(100.0, 100.0)))
+        self.assertEqual(Verdict(False, FLAT), arterial(second(100.0, 100.0, 100.0, 100.0), prior=full_prior(100.0, 119.99999999999999)))
+        self.assertEqual(Verdict(False, FLAT), arterial(second(81.0, 100.0, 81.0, 100.0), prior=full_prior(100.0, 100.0)))
+        self.assertEqual(Verdict(False, FLAT), arterial(second(100.0, 100.0, 100.0, 100.0), prior=full_prior(100.0, 100.0)))
+
+    def test_the_segment_is_the_20_seconds_that_end_with_the_second_and_not_the_second_alone(self) -> None:
+        self.assertEqual(20, FLAT_WINDOW_SECONDS)
+        self.assertEqual(VALID, arterial(second(100.0, 100.0, 100.0, 100.0), prior=full_prior(80.0, 100.0)))
+        self.assertEqual(Verdict(False, FLAT), arterial(second(100.0, 100.0, 100.0, 100.0), prior=full_prior(90.0, 100.0)))
+
+    def test_a_segment_shorter_than_20_seconds_of_samples_is_never_flat(self) -> None:
+        constant = second(100.0, 100.0, 100.0, 100.0)
+        self.assertEqual(VALID, arterial(constant))
+        self.assertEqual(VALID, arterial(constant, prior=full_prior(100.0, 100.0, missing=1)))
+        self.assertEqual(Verdict(False, FLAT), arterial(constant, prior=full_prior(100.0, 100.0)))
+        self.assertEqual(VALID, arterial(constant, prior=Extent(0, None, None)))
+
+    def test_the_length_of_a_segment_is_20_seconds_of_the_rate(self) -> None:
+        constant = second(100.0, 100.0)
+        self.assertEqual(VALID, arterial(constant, rate=2, prior=Extent(37, 100.0, 100.0)))
+        self.assertEqual(Verdict(False, FLAT), arterial(constant, rate=2, prior=Extent(38, 100.0, 100.0)))
 
     def test_a_jump_of_exactly_the_limit_is_valid_and_any_more_is_a_jump(self) -> None:
         self.assertEqual(VALID, arterial(second(80.0, 110.0, 90.0, 120.0)))
@@ -160,8 +193,21 @@ class Causes(unittest.TestCase):
 
     def test_out_of_range_comes_before_flat_and_flat_before_jump(self) -> None:
         self.assertEqual(Verdict(False, OUT_OF_RANGE), arterial(second(0.0, 0.0, 0.0, 0.0), previous_last=100.0))
-        self.assertEqual(Verdict(False, FLAT), arterial(second(100.0, 100.0, 100.0, 100.0), previous_last=50.0))
+        self.assertEqual(Verdict(False, FLAT), arterial(second(100.0, 100.0, 100.0, 100.0), previous_last=50.0, prior=full_prior(100.0, 100.0)))
         self.assertEqual(Verdict(False, JUMP), arterial(second(100.0, 150.0, 100.0, 150.0)))
+
+
+class Extents(unittest.TestCase):
+    def test_the_extent_of_a_second_counts_the_samples_that_are_present_and_inside_the_pressure_limits(self) -> None:
+        self.assertEqual(Extent(4, 20.0, 200.0), valid_extent((20.0, 200.0, 100.0, 150.0)))
+        self.assertEqual(Extent(2, 50.0, 60.0), valid_extent((50.0, None, 60.0, math.nan, math.inf, 19.999999999999996, 200.00000000000003, 4.5e9)))
+        self.assertEqual(EMPTY_EXTENT, valid_extent(()))
+        self.assertEqual(EMPTY_EXTENT, valid_extent((None, math.nan, 0.0)))
+
+    def test_extents_combine_by_adding_counts_and_taking_the_least_and_the_most(self) -> None:
+        self.assertEqual(Extent(7, 30.0, 90.0), combine_extents([Extent(4, 30.0, 80.0), EMPTY_EXTENT, Extent(3, 40.0, 90.0)]))
+        self.assertEqual(EMPTY_EXTENT, combine_extents([]))
+        self.assertEqual(EMPTY_EXTENT, combine_extents([EMPTY_EXTENT, EMPTY_EXTENT]))
 
 
 class OtherWaveforms(unittest.TestCase):

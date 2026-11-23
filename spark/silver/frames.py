@@ -14,7 +14,16 @@ from functools import reduce
 from operator import or_
 from typing import Any
 
-from features.signal_validity import FIRST_OCCURRENCE, INVALID_CAUSES, numeric_verdict, physical_samples, waveform_verdict
+from features.signal_validity import (
+    FIRST_OCCURRENCE,
+    FLAT_WINDOW_SECONDS,
+    INVALID_CAUSES,
+    Extent,
+    numeric_verdict,
+    physical_samples,
+    valid_extent,
+    waveform_verdict,
+)
 from spark.silver.checks import VALID_LABEL, BronzeFacts, NumericFacts, WaveformFacts
 from spark.silver.run import Fingerprint
 from spark.silver.tables import NUMERIC, WAVEFORM
@@ -49,10 +58,26 @@ def physical_row(raw: list[float | None] | None, sample_format: int | None, gain
     return physical_samples(raw, int(sample_format), gain, offset)
 
 
+def extent_row(samples: list[float | None] | None) -> tuple[int, float | None, float | None]:
+    """The count, least and most of the valid samples of one second (``valid_extent``)."""
+    extent = valid_extent(samples or [])
+    return extent.count, extent.low, extent.high
+
+
 def second_row(
-    track: str | None, samples: list[float | None] | None, rate: float | None, offset_us: int | None, previous_last: float | None
+    track: str | None,
+    samples: list[float | None] | None,
+    rate: float | None,
+    offset_us: int | None,
+    previous_last: float | None,
+    prior_count: int | None,
+    prior_low: float | None,
+    prior_high: float | None,
 ) -> tuple[bool, str | None]:
-    verdict = waveform_verdict(track or "", samples or [], math.nan if rate is None else rate, -1 if offset_us is None else offset_us, previous_last)
+    """The verdict of one second. The prior columns are the extent of the valid samples of the 19 seconds before it: nothing when there are none."""
+    prior = Extent(int(prior_count or 0), prior_low, prior_high)
+    rate = math.nan if rate is None else rate
+    verdict = waveform_verdict(track or "", samples or [], rate, -1 if offset_us is None else offset_us, previous_last, prior)
     return verdict.valid, verdict.cause
 
 
@@ -67,6 +92,12 @@ def numeric_udf() -> Any:
 
 def physical_udf() -> Any:
     return functions().udf(physical_row, types().ArrayType(types().DoubleType())).asNondeterministic()
+
+
+def extent_udf() -> Any:
+    t = types()
+    fields = [t.StructField("count", t.LongType()), t.StructField("low", t.DoubleType()), t.StructField("high", t.DoubleType())]
+    return functions().udf(extent_row, t.StructType(fields)).asNondeterministic()
 
 
 def second_udf() -> Any:
@@ -93,21 +124,32 @@ def numeric_frame(bronze: Any) -> Any:
 def judged(frame: Any) -> Any:
     """The frame with a ``_verdict`` of each second.
 
-    The sample before a second's first is the last sample of the second before it, when that is the second ``s - 1``.
-
-    The last samples are taken on a narrow frame, so the sort that the window needs never holds a second's samples.
+    The sample before a second's first is the last sample of the second before it, when that is the second ``s - 1``. The segment of the flat rule is the
+    20 seconds that end with the second, so the extent of the valid samples of the seconds ``s - 19`` to ``s - 1`` is taken over a window of second numbers
+    (a second that is absent adds nothing) and the second's own extent is joined to it by ``waveform_verdict``. The last samples and the extents are taken on a
+    narrow frame, so the sort that the windows need never holds a second's samples.
     """
     f = functions()
     ordered = window().partitionBy(*TRACK_KEY).orderBy("case_second")
+    trailing = ordered.rangeBetween(-(FLAT_WINDOW_SECONDS - 1), -1)
     last = f.try_element_at(f.col("samples"), f.lit(-1))
-    narrow = frame.select(*WAVEFORM_KEY, last.alias("_last")).withColumns(
-        {"_before_second": f.lag("case_second").over(ordered), "_before_last": f.lag("_last").over(ordered)}
+    staged = frame.select(*WAVEFORM_KEY, last.alias("_last"), extent_udf()(f.col("samples")).alias("_own"))
+    narrow = staged.select(
+        *WAVEFORM_KEY, "_last", f.col("_own.count").alias("_count"), f.col("_own.low").alias("_low"), f.col("_own.high").alias("_high")
+    ).withColumns(
+        {
+            "_before_second": f.lag("case_second").over(ordered),
+            "_before_last": f.lag("_last").over(ordered),
+            "_prior_count": f.coalesce(f.sum("_count").over(trailing), f.lit(0)),
+            "_prior_low": f.min("_low").over(trailing),
+            "_prior_high": f.max("_high").over(trailing),
+        }
     )
     previous = f.when(f.col("_before_second") == f.col("case_second") - f.lit(1), f.col("_before_last")).alias("_previous_last")
-    before = narrow.select(*WAVEFORM_KEY, previous)
+    before = narrow.select(*WAVEFORM_KEY, previous, "_prior_count", "_prior_low", "_prior_high")
     joined = frame.join(before, list(WAVEFORM_KEY), "left")
-    verdict = second_udf()(f.col("track"), f.col("samples"), f.col("sample_rate"), f.col("start_offset_us"), f.col("_previous_last"))
-    return joined.withColumn("_verdict", verdict)
+    arguments = ["track", "samples", "sample_rate", "start_offset_us", "_previous_last", "_prior_count", "_prior_low", "_prior_high"]
+    return joined.withColumn("_verdict", second_udf()(*[f.col(name) for name in arguments]))
 
 
 def waveform_frame(bronze: Any, tracks: Any) -> Any:
