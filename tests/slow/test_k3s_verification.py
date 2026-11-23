@@ -76,6 +76,31 @@ def encryption_verdict(status: str) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
+def command_words() -> list[list[str]]:
+    """The words of every command or shell task in the k3s role, whether written as ``cmd``, ``argv`` or free-form, blocks included."""
+    found: list[list[str]] = []
+
+    def walk(tasks: object) -> None:
+        if not isinstance(tasks, list):
+            return
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            for key in ("block", "rescue", "always"):
+                walk(task.get(key))
+            for module in ("ansible.builtin.command", "ansible.builtin.shell", "command", "shell"):
+                if module in task:
+                    value = task[module]
+                    if isinstance(value, str):
+                        found.append(value.split())
+                    elif isinstance(value, dict):
+                        found.append([str(word) for word in value.get("argv", [])] + str(value.get("cmd", "")).split())
+
+    for path in sorted((ROLES / "k3s" / "tasks").glob("*.yml")):
+        walk(load_yaml(path.read_text()))
+    return found
+
+
 def configuration() -> dict[str, Any]:
     tasks = load_yaml((ROLES / "k3s" / "tasks" / "main.yml").read_text())
     if not isinstance(tasks, list):
@@ -102,11 +127,25 @@ class SecretsEncryptionTest(unittest.TestCase):
         code, output = encryption_verdict(STARTED_ENABLED)
         self.assertEqual(0, code, output)
 
-    def test_no_task_rotates_the_keys(self) -> None:
-        """The pinned rotate-keys can drop a key in use at the start stage, so no task of the role runs it."""
-        for path in sorted((ROLES / "k3s").rglob("*.yml")):
-            with self.subTest(path=path.name):
-                self.assertNotRegex(path.read_text(), r"(?m)^\s*(cmd:|ansible.builtin.(command|shell):).*rotate")
+    def test_no_task_rotates_the_keys_or_calls_enable_in_any_command_form(self) -> None:
+        """The pinned rotate-keys can drop a key in use (owner Q64). enable writes an identity-only configuration that the pinned k3s keeps on a
+        restart, so a run stopped before its restart could leave the cluster at Disabled/start (recheck 3); a restart with the flag makes the file."""
+        for words in command_words():
+            with self.subTest(words=words):
+                self.assertNotIn("rotate-keys", words)
+                self.assertFalse("secrets-encrypt" in words and "enable" in words, words)
+
+    def test_a_cluster_with_no_encryption_configuration_is_restarted_with_the_flag_and_read_again(self) -> None:
+        tasks = load_yaml((ROLES / "k3s" / "tasks" / "secrets_encryption.yml").read_text())
+        if not isinstance(tasks, list):
+            raise TypeError("the task file must be a list")
+        branch = next(task for task in tasks if "no configuration file found" in str(task.get("when", "")))
+        steps = [next(key for key in step if key.startswith("ansible.builtin.")) for step in branch["block"]]
+        self.assertEqual("ansible.builtin.systemd_service", steps[0])
+        self.assertEqual("restarted", branch["block"][0]["ansible.builtin.systemd_service"]["state"])
+        self.assertIn("ansible.builtin.include_tasks", steps)
+        self.assertEqual(["ansible.builtin.command"], [step for step in steps if step == "ansible.builtin.command"])
+        self.assertEqual("k3s secrets-encrypt status", branch["block"][steps.index("ansible.builtin.command")]["ansible.builtin.command"]["cmd"])
 
     def test_every_other_status_is_refused_with_the_same_message(self) -> None:
         cases = {
@@ -124,6 +163,12 @@ class SecretsEncryptionTest(unittest.TestCase):
                 "Encryption Status: Enabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: hash does not match\n"
             ),
             "enabled and finished with no hash line": "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_finished\n",
+            "enabled at a stage whose name only starts like start": (
+                "Encryption Status: Enabled\nCurrent Rotation Stage: started\nServer Encryption Hashes: All hashes match\n"
+            ),
+            "enabled at a stage whose name only starts like reencrypt_finished": (
+                "Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_finished_x\nServer Encryption Hashes: All hashes match\n"
+            ),
             "empty": "",
             "unrelated text": "Enabled\n",
         }
