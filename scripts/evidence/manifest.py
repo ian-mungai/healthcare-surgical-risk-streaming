@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.folder import list_folder
+
 EVIDENCE_PATTERNS = (
     "inventory.json",
     "created.json",
@@ -25,7 +27,7 @@ def evidence_files(folder: Path) -> list[str]:
 
     Raw plans and tool output hold private infrastructure values and are never evidence: the plan bindings carry their hashes.
     """
-    paths = [path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file() and not path.is_symlink()]
+    paths = [path.relative_to(folder).as_posix() for path in list_folder(folder, "*", recursive=True) if path.is_file() and not path.is_symlink()]
     return sorted(path for path in paths if any(fnmatch.fnmatchcase(path, pattern) for pattern in EVIDENCE_PATTERNS))
 
 

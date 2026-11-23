@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.folder import list_folder
+
 REDACTED = "[redacted]"
 LEFT_RUNNING_TAG = "surgical_risk/left_running"
 NO_SERVICE_LEFT = "-"
@@ -234,7 +236,7 @@ def folder_name(record: Mapping[str, Any]) -> str:
 def write_record(runs: Path, record: Mapping[str, Any]) -> Path:
     """Write the record into its folder under ``runs`` and return the folder. A run that has a folder keeps it unchanged."""
     runs.mkdir(parents=True, exist_ok=True)
-    existing = sorted(runs.glob(f"*_{record['run_id']}"))
+    existing = list_folder(runs, f"*_{record['run_id']}")
     if existing:
         return existing[0]
     text = json.dumps(record, indent=2) + "\n"

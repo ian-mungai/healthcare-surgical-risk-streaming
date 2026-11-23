@@ -35,7 +35,7 @@ COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py s
 # The table checks and the record load: the ingestion package (gate, manifest, table checks, copy, Airbyte client, catalog and load),
 # the pinned publisher files they read, the rules of the Spark job that the controller also holds the result to, and the tracked release pin that the manifest
 # reader and the track list's pin open.
-COPY --from=stack_scripts ingestion/__init__.py ingestion/airbyte_api.py ingestion/check.py ingestion/closed.py ingestion/gate.py ingestion/landing.py \
+COPY --from=stack_scripts ingestion/__init__.py ingestion/airbyte_api.py ingestion/check.py ingestion/closed.py ingestion/folder.py ingestion/gate.py ingestion/landing.py \
     ingestion/manifest.py ingestion/notice.py ingestion/record_catalog.py ingestion/record_copy.py ingestion/record_definitions.py ingestion/record_load.py \
     ingestion/record_run.py ingestion/record_state.py ingestion/selection.py ingestion/store.py ingestion/table_checks.py ingestion/track_list.py \
     /opt/dagster/app/scripts/ingestion/

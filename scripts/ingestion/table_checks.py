@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from scripts.ingestion.folder import list_folder
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.selection import pinned_release
@@ -362,7 +363,7 @@ def remove_staged(staging: Path) -> None:
         return
     for name in (*(f"{table}.csv" for table in FILE_TABLES), PLAN_FILE):
         (staging / name).unlink(missing_ok=True)
-    for partial in staging.glob(".*"):
+    for partial in list_folder(staging, ".*"):
         if partial.is_file():
             partial.unlink()
     with contextlib.suppress(OSError):

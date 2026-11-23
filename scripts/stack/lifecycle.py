@@ -32,6 +32,7 @@ from typing import Any
 
 from scripts.aws_cli import RAW_ERRORS, Aws, AwsError
 from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.folder import raise_error
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WAREHOUSE_PREFIX
 
@@ -87,7 +88,7 @@ def declared_problems(infra: str | Path) -> list[str]:
     """
     root = Path(infra)
     found = []
-    for directory, names, files in os.walk(root, followlinks=False):
+    for directory, names, files in os.walk(root, followlinks=False, onerror=raise_error):
         names.sort()
         for file_name in sorted(files):
             if not file_name.endswith(DECLARATION_ENDINGS):
