@@ -9,8 +9,10 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -82,6 +84,29 @@ class ClosedOutputTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("fail", written["outcome"])
         self.assertEqual(FAILED, json.loads((folder / "retention.json").read_text())["end_condition"])
+        self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+
+class BrokenPipeTest(unittest.TestCase):
+    """A write to a pipe whose reader is gone only fails when the buffer is flushed, so the record must flush before it says pass."""
+
+    def test_a_pipe_with_no_reader_gives_a_record_that_says_fail_and_exit_status_1(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        stream = os.fdopen(write_end, "w", buffering=8192)
+        with mock.patch.object(run_record, "ROOT", root), mock.patch.object(sys, "stdout", stream):
+            record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+            record.expect("case", "step", "expected", "observed", True)
+            code = record.close([])
+        with contextlib.suppress(OSError):
+            stream.close()
+        (folder,) = (root / "runs").iterdir()
+        written = json.loads((folder / "record.json").read_text())
+        self.assertEqual(1, code)
+        self.assertEqual("fail", written["outcome"])
         self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
 
 
