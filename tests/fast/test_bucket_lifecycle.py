@@ -344,6 +344,39 @@ class NoConfigurationTest(unittest.TestCase):
                 self.assertNotIn("no lifecycle configuration", out)
         self.assertEqual(1, run_check(timeout=True)[0])
 
+    def test_a_vertical_tab_before_the_error_text_makes_it_a_mention_in_a_line_and_exits_1(self) -> None:
+        line = "An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifecycleConfiguration operation: x\n"
+        for lead in ("warning:\v", "warning:\x0b ", "\v"):
+            with self.subTest(lead=lead):
+                code, out, _ = run_check(stderr=lead + line, returncode=255)
+                self.assertEqual(1, code)
+                self.assertNotIn("no lifecycle configuration", out)
+
+    def test_a_form_feed_or_a_lone_carriage_return_before_the_error_text_exits_1(self) -> None:
+        line = "An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifecycleConfiguration operation: x\n"
+        for lead in ("warning:\f", "warning:\r", "\f", "\r", "\x1c", "\x85", "warning: \x00"):
+            with self.subTest(lead=lead):
+                code, out, _ = run_check(stderr=lead + line, returncode=255)
+                self.assertEqual(1, code)
+                self.assertNotIn("no lifecycle configuration", out)
+
+    def test_a_control_character_inside_the_accepted_line_exits_1(self) -> None:
+        for inside in ("\v", "\f", "\r", "\x00", "\x1b", "\x7f", "\x85", "\t"):
+            with self.subTest(inside=repr(inside)):
+                text = f"An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifecycleConfiguration operation: x{inside}y\n"
+                code, out, _ = run_check(stderr=text, returncode=254)
+                self.assertEqual(1, code)
+                self.assertNotIn("no lifecycle configuration", out)
+
+    def test_two_error_lines_split_by_a_vertical_tab_are_one_line_with_a_control_character_and_exit_1(self) -> None:
+        line = "An error occurred (NoSuchLifecycleConfiguration) when calling the GetBucketLifecycleConfiguration operation: x"
+        self.assertEqual(1, run_check(stderr=line + "\v" + line + "\n", returncode=254)[0])
+
+    def test_a_control_character_in_another_line_does_not_stop_the_exact_form(self) -> None:
+        code, out, _ = run_check(stderr="note\x0b of the CLI\n" + NO_CONFIGURATION_LINE, returncode=254)
+        self.assertEqual(0, code)
+        self.assertIn("no lifecycle configuration", out)
+
     def test_crlf_line_ends_do_not_change_the_reading(self) -> None:
         self.assertEqual(0, run_check(stderr=NO_CONFIGURATION_LINE.replace("\n", "\r\n"), returncode=254)[0])
         self.assertEqual(1, run_check(stderr=(NO_CONFIGURATION_LINE + DENIED_LINE).replace("\n", "\r\n"), returncode=254)[0])

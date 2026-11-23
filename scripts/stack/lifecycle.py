@@ -11,8 +11,9 @@ The live check reads the bucket's configuration in the form that S3 returns it. 
 ``Disabled``, or when it is on, it expires current objects (``Expiration`` with days or a date) and its scope can reach the warehouse prefix. A scope
 that cannot be shown to stay clear is a problem too: a rule with no filter, and a filter of tags or a size only. A rule that only aborts incomplete
 uploads, expires old versions or delete markers, or moves objects between storage classes expires no live object, so it passes. "No configuration" is
-accepted only when the AWS error code is exactly ``NoSuchLifecycleConfiguration``; every other error, and every successful answer that is not a JSON
-object with a list of rules, is a failure.
+accepted only when the CLI's error output holds exactly one line of the CLI's error form, for the code ``NoSuchLifecycleConfiguration`` and the operation
+that was asked for, with no control character in it; every other error, and every successful answer that is not a JSON object with a list of rules, is a
+failure.
 
 ``.venv/bin/python -m scripts.stack.lifecycle check`` runs both under the project profile in ``.env``.
 It exits 0 when no rule reaches the warehouse, and 1 naming each problem, or when the bucket cannot be read.
@@ -25,6 +26,7 @@ import argparse
 import os
 import re
 import sys
+import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -117,11 +119,12 @@ def live_rules(document: Any) -> dict[str, Any]:
 def no_configuration(stderr: str) -> bool:
     """Whether the CLI's error output is exactly one error line, in the CLI's form, for the code ``NoSuchLifecycleConfiguration`` and the operation asked for.
 
-    A line counts as an error line when it begins with ``An error occurred (``. Zero such lines, more than one, another code, another operation and a mention of
-    the code anywhere else in the text are not "no configuration": each is a failed read.
+    Lines are split on line feeds only, and one carriage return at the end of a line is removed, so CRLF output reads as it was written. A line counts as an
+    error line when it begins with ``An error occurred (``, and the accepted line holds no control character. Zero such lines, more than one, another code,
+    another operation and a mention of the code anywhere else in the text are not "no configuration": each is a failed read.
     """
-    lines = [line for line in stderr.splitlines() if line.startswith(ERROR_LINE_START)]
-    if len(lines) != 1:
+    lines = [line.removesuffix("\r") for line in stderr.split("\n") if line.startswith(ERROR_LINE_START)]
+    if len(lines) != 1 or any(unicodedata.category(character) == "Cc" for character in lines[0]):
         return False
     found = ERROR_LINE.match(lines[0])
     return found is not None and found.groups() == (NO_CONFIGURATION_CODE, READ_OPERATION)
