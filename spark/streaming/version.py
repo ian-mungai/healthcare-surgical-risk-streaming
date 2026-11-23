@@ -1,8 +1,7 @@
 """The version of the feature code and the stable IDs of the job's records.
 
-The version is the SHA-256 of the sources of the feature package, so a change to any feature, rule or limit gives a new version and new feature IDs,
-and a rebuild
-from one commit gives the same version. The batch path takes its version from this function too.
+The version is the SHA-256 of the sources of the feature package, so a change to any feature, rule or limit gives a new version and new feature
+IDs, and a rebuild from one commit gives the same version. The batch path takes its version from this function too.
 """
 
 from __future__ import annotations

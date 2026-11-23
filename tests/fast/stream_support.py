@@ -68,7 +68,8 @@ def synthetic_recording(
     heart.extend((time, value) for time, value in extra_hr)
     heart.sort(key=lambda reading: reading[0])
     mean_pressure = [(second * SECOND, 70.0 + (second % 5) * 2.0) for second in range(1, caseend_s, 2)]
-    mean_pressure[49] = (mean_pressure[49][0], float("nan"))
+    middle = min(49, len(mean_pressure) - 1)
+    mean_pressure[middle] = (mean_pressure[middle][0], float("nan"))
     arterial_samples = [value for second in range(caseend_s) for value in second_wave(second, rate, second == 150)]
     pleth_samples = [float((second * rate + position) % 50) for second in range(caseend_s) for position in range(rate)]
     return CaseRecording(

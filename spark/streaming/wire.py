@@ -1,7 +1,9 @@
-"""The edge between the wire and the core: a decoded message becomes an ``Event``, and a feature record becomes the payload of a feature-ready message.
+"""The edge between the wire and the core: a decoded message becomes an ``Event``, and a feature record becomes the payload of a feature-ready
+message.
 
-The bytes are framed by ``replay.events.wire`` and coded by the replay's ``Reader`` and ``Writer`` (``replay/service/wire_codec.py``), so the replay and the
-streaming job use one definition of the wire bytes and of the registry format ID. Nothing here imports Avro or Kafka: a reader is anything with ``decode``.
+The bytes are framed by ``replay.events.wire`` and coded by the replay's ``Reader`` and ``Writer`` (``replay/service/wire_codec.py``), so the
+replay and the streaming job use one definition of the wire bytes and of the registry format ID. Nothing here imports Avro or Kafka: a reader is
+anything with ``decode``.
 """
 
 from __future__ import annotations

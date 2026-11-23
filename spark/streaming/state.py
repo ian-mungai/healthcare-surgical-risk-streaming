@@ -1,10 +1,9 @@
 """The state of one case occurrence, kept by Spark under the key run, room and case occurrence, as one JSON text.
 
-A new occurrence has a new key and so an empty state: a rolling feature of it never holds a value of the case before it in the room.
-The buffers hold only what a
-later cutoff can still read: the readings of the last 15 minutes before the next cutoff, the last 20 seconds of each waveform and the summary of each arterial
-second of the series window. The recent event suffixes are the events of the last late-limit span, which a re-sent event is checked against. The state is
-plain data, so a restart that reads it back from JSON gives the same rows.
+A new occurrence has a new key and so an empty state: a rolling feature of it never holds a value of the case before it in the room. The buffers
+hold only what a later cutoff can still read: the readings of the last 15 minutes before the next cutoff, the last 20 seconds of each waveform
+and the summary of each arterial second of the series window. The recent event suffixes are the events of the last late-limit span, which a
+re-sent event is checked against. The state is plain data, so a restart that reads it back from JSON gives the same rows.
 """
 
 from __future__ import annotations

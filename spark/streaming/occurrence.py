@@ -1,19 +1,19 @@
 """One case occurrence: the late-event decision of each event, the buffers, the cutoffs and the feature rows.
 
-**Lateness is on the replay time.** The watermark of an occurrence is the highest replay time among the events it has applied. An event whose replay
-time is at most ``late_limit_us`` behind it is applied, and recorded as late when it is behind at all. An event further behind is recorded with its
-decision and counted and is never applied. The watermark belongs to the occurrence: another room, or the next case of the same room, has its own, so a
-room that starts its next case or is read ahead of another room discards no in-policy event of another occurrence. An event whose ID the occurrence
-applied a moment ago is a duplicate: a replay that stopped after Kafka's acknowledgment and before its position write sends the same IDs again, and
-they have no second effect.
+**Lateness is on the replay time.** The watermark of an occurrence is the highest replay time among the events it has applied. An event whose
+replay time is at most ``late_limit_us`` behind it is applied, and recorded as late when it is behind at all. An event further behind is recorded
+with its decision and counted and is never applied. The watermark belongs to the occurrence: another room, or the next case of the same room, has
+its own, so a room that starts its next case or is read ahead of another room discards no in-policy event of another occurrence. An event whose
+ID the occurrence applied a moment ago is a duplicate: a replay that stopped after Kafka's acknowledgment and before its position write sends the
+same IDs again, and they have no second effect.
 
-**Features are on the case time.** A row is built at every ``cutoff_step_us`` of case time and at ``opend``, the case time of the final-score marker.
-A cutoff is emitted once no in-policy event can still arrive for it: when the watermark is further than the limit past the cutoff, or at the case-end
-marker. So a row does not depend on how the events were cut into batches. The values are ``features.row.build_row`` of the window of the cutoff, and a
-window that the feature code refuses leaves an error record and does not stop the job.
+**Features are on the case time.** A row is built at every ``cutoff_step_us`` of case time and at ``opend``, the case time of the final-score
+marker. A cutoff is emitted once no in-policy event can still arrive for it: when the watermark is further than the limit past the cutoff, or at
+the case-end marker. So a row does not depend on how the events were cut into batches. The values are ``features.row.build_row`` of the window of
+the cutoff, and a window that the feature code refuses leaves an error record and does not stop the job.
 
-**Source duplicates.** Two readings of one track and one case time keep the one first in the file, the lowest discriminator, whatever their arrival
-order.
+**Source duplicates.** Two readings of one track and one case time keep the one first in the file, the lowest discriminator, whatever their
+arrival order.
 """
 
 from __future__ import annotations

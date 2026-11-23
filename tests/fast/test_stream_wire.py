@@ -19,7 +19,9 @@ from replay.events.identity import Occurrence
 from replay.events.schedule import ScheduledOccurrence
 from replay.events.stream import occurrence_events, outgoing
 from replay.events.wire import WireError, frame
+from spark.streaming.decode import decode_row
 from spark.streaming.model import FeatureRecord
+from spark.streaming.rows import INPUT_COLUMNS, event_row
 from spark.streaming.wire import StreamEventError, decode_message, event_from_record, feature_ready_payload
 from tests.fast.stream_support import ORIGIN_US, RUN, synthetic_recording
 
@@ -102,6 +104,19 @@ class Messages(unittest.TestCase):
         for bad in (b"", b"{}", b"\x01\x00\x00\x00\x09body"):
             with self.subTest(bad=bad), self.assertRaises(WireError):
                 decode_message(reader, bad, 0, 0)
+
+
+class DecodeStep(unittest.TestCase):
+    def test_a_message_becomes_one_row_in_the_input_column_order_and_a_bad_message_raises(self) -> None:
+        kind, name, payload = next(item for item in sent_payloads() if item[0] == "waveform")
+        row = decode_row(Reader(name, payload), frame(9, b"body"), 4, 11)
+        event = event_from_record(name, payload, 4, 11)
+        self.assertEqual(tuple(event_row(event)[column] for column, _ in INPUT_COLUMNS), row)
+        self.assertEqual(len(INPUT_COLUMNS), len(row))
+        with self.assertRaises(WireError):
+            decode_row(Reader(name, payload), b"not framed", 0, 0)
+        with self.assertRaises(StreamEventError):
+            decode_row(Reader("FeatureReady", payload), frame(9, b"body"), 0, 0)
 
 
 class FeatureReady(unittest.TestCase):

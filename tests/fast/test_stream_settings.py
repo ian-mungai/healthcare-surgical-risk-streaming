@@ -1,0 +1,99 @@
+"""The settings of the streaming job and the file of clinical facts.
+
+Failure modes covered here:
+
+- A setting is missing, empty or not a number and the job starts anyway, or a limit is zero or negative.
+- A late limit or a step is read in the wrong unit.
+- The test input that stops the job after a sink commit is on without being asked for.
+- A clinical file with an unknown key, a repeated field or a value of the wrong type is read, or a case that is not in the file gets the facts of another case.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+from features.model import ClinicalValue
+from spark.streaming.clinical import ClinicalFileError, load_clinical
+from spark.streaming.settings import StreamSettings, StreamSettingsError, from_environment
+
+BASE = {"KAFKA_BOOTSTRAP": "kafka:9092", "REGISTRY_URL": "http://apicurio:8080/apis/registry/v3", "STREAM_CHECKPOINT_DIR": "/checkpoints/stream"}
+
+
+class Settings(unittest.TestCase):
+    def test_the_defaults_are_the_policy_of_the_job_and_nothing_is_on_that_was_not_asked_for(self) -> None:
+        settings = from_environment(BASE)
+        self.assertEqual(("replay_events", "feature_ready", "stream"), (settings.input_topic, settings.output_topic, settings.branch))
+        self.assertEqual((30_000_000, 60_000_000), (settings.late_limit_us, settings.cutoff_step_us))
+        self.assertIsNone(settings.test_exit_after_sink)
+        self.assertEqual("", settings.clinical_file)
+        self.assertIsInstance(settings, StreamSettings)
+
+    def test_the_limits_are_read_in_seconds_and_kept_in_microseconds(self) -> None:
+        settings = from_environment({**BASE, "STREAM_LATE_LIMIT_SECONDS": "12.5", "STREAM_CUTOFF_STEP_SECONDS": "30"})
+        self.assertEqual((12_500_000, 30_000_000), (settings.late_limit_us, settings.cutoff_step_us))
+
+    def test_a_missing_or_bad_setting_is_refused_and_named(self) -> None:
+        for name in BASE:
+            with self.subTest(missing=name), self.assertRaisesRegex(StreamSettingsError, name):
+                from_environment({key: value for key, value in BASE.items() if key != name})
+        for name, value in (
+            ("STREAM_LATE_LIMIT_SECONDS", "-1"),
+            ("STREAM_LATE_LIMIT_SECONDS", "x"),
+            ("STREAM_CUTOFF_STEP_SECONDS", "0"),
+            ("STREAM_MAX_SECONDS", "-5"),
+            ("STREAM_TRIGGER_SECONDS", "0"),
+            ("STREAM_MAX_OFFSETS_PER_TRIGGER", "0"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "9"),
+        ):
+            with self.subTest(name=name, value=value), self.assertRaisesRegex(StreamSettingsError, name):
+                from_environment({**BASE, name: value})
+
+    def test_the_test_input_names_one_sink_of_the_four(self) -> None:
+        self.assertEqual(0, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "0"}).test_exit_after_sink)
+        self.assertEqual(3, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "3"}).test_exit_after_sink)
+
+
+class ClinicalFile(unittest.TestCase):
+    def write(self, text: str) -> str:
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        path = Path(folder) / "clinical.json"
+        path.write_text(text)
+        return str(path)
+
+    def test_a_case_gets_its_own_facts_and_an_unknown_case_gets_none(self) -> None:
+        lookup = load_clinical(
+            self.write(json.dumps({"cases": {"908": {"age": {"value": 61.0, "available_us": 0}, "sex": {"value": "F", "available_us": None}}}}))
+        )
+        self.assertEqual({"age": ClinicalValue(61.0, 0), "sex": ClinicalValue("F", None)}, dict(lookup(908)))
+        self.assertEqual({}, dict(lookup(1147)))
+
+    def test_no_file_means_no_clinical_facts(self) -> None:
+        self.assertEqual({}, dict(load_clinical("")(908)))
+
+    def test_a_file_that_does_not_follow_the_form_is_refused(self) -> None:
+        bad = [
+            "{}",
+            '{"cases": []}',
+            '{"cases": {"x": {}}}',
+            '{"cases": {"1": {"age": {"value": 1}}}}',
+            '{"cases": {"1": {"age": {"value": 1, "available_us": 0, "extra": 1}}}}',
+            '{"cases": {"1": {"age": {"value": 1, "available_us": 0.5}}}}',
+            '{"cases": {"1": {"age": {"value": 1, "available_us": 0}, "age": {"value": 2, "available_us": 0}}}}',
+            "not json",
+        ]
+        for text in bad:
+            with self.subTest(text=text), self.assertRaises(ClinicalFileError):
+                load_clinical(self.write(text))
+
+    def test_a_file_that_is_not_there_is_refused(self) -> None:
+        with self.assertRaises(ClinicalFileError):
+            load_clinical("/nonexistent/clinical.json")
+
+
+if __name__ == "__main__":
+    unittest.main()

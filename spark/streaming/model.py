@@ -1,6 +1,7 @@
 """The plain data of the streaming job: a decoded input event, the policy, and the four kinds of record the core produces.
 
-A time is a whole number of microseconds. A replay time is since the one origin that every room shares. A case time is since the start of the case.
+A time is a whole number of microseconds. A replay time is since the one origin that every room shares. A case time is since the start of the
+case.
 """
 
 from __future__ import annotations
