@@ -101,8 +101,10 @@ class ImageTest(unittest.TestCase):
         self.assertTrue(needed)
         for path, importers in sorted(needed.items()):
             with self.subTest(path=path):
-                self.assertIn(path, copies, f"{sorted(importers)} import it and the image does not copy it")
-                self.assertEqual(f"{root}/{path}", copies[path], f"{sorted(importers)} import it from {root} and the image copies it elsewhere")
+                # A module is copied either by its own line or by the line that copies a folder holding it.
+                source = next((name for name in (path, *(str(parent) for parent in Path(path).parents if str(parent) != ".")) if name in copies), None)
+                self.assertIsNotNone(source, f"{sorted(importers)} import it and the image does not copy it")
+                self.assertEqual(f"{root}/{source}", copies[str(source)], f"{sorted(importers)} import it from {root} and the image copies it elsewhere")
 
 
 if __name__ == "__main__":

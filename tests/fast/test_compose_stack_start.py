@@ -11,11 +11,13 @@ import json
 import os
 import pwd
 import re
+import shutil
 import signal
 import stat
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ ROLE = ROLES / "compose_stack"
 CHANGED_NONE = re.compile(r"changed=0\s")
 LABEL = re.compile(r"surgical-risk\.context=([0-9a-f]{64})")
 TAG = "surgical-risk-sample:1.0.0"
+SOURCE_PATH = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 
 STAND_IN = r"""#!/bin/sh
 here="$(dirname "$0")"
@@ -94,7 +97,8 @@ def variables(folder: Path, stand_in: Path, context: Path, **more: object) -> di
         "compose_stack_owner": pwd.getpwuid(os.getuid()).pw_name,
         "compose_stack_group": grp.getgrgid(os.getgid()).gr_name,
         "compose_stack_docker": [str(stand_in), "compose", "--project-name", "sample"],
-        "compose_stack_built_images": [{"tag": TAG, "name": "sample", "sources": [str(context)]}],
+        "compose_stack_source_root": str(context.parent),
+        "compose_stack_built_images": [{"tag": TAG, "name": "sample", "sources": [context.name]}],
         "compose_stack_build_deadline_seconds": 60,
         "compose_stack_start_deadline_seconds": 60,
         "compose_stack_health_deadline_seconds": 30,
@@ -327,7 +331,7 @@ class ExtraContextBuildTest(unittest.TestCase):
         extra = folder / "source" / "extra"
         extra.mkdir()
         (extra / "module.py").write_text("VALUE = 1\n")
-        image = {"tag": TAG, "name": "sample", "sources": [str(context), str(extra)], "context": ".", "dockerfile": "sample/Dockerfile"}
+        image = {"tag": TAG, "name": "sample", "sources": [context.name, extra.name], "context": ".", "dockerfile": "sample/Dockerfile"}
         return stand_in, context, extra, image | {"build_contexts": {"more": "extra"}}
 
     def build(self, folder: Path, stand_in: Path, context: Path, image: dict[str, object]) -> tuple[int, str]:
@@ -365,6 +369,182 @@ class ExtraContextBuildTest(unittest.TestCase):
         self.assertEqual((1, 2), (unchanged, changed))
 
 
+class NestedSourcesTest(unittest.TestCase):
+    """A source keeps its path relative to the repository: a top-level folder lands as it always did and a nested folder lands under its full path.
+
+    The Spark image needs one fixture folder from ``tests/``, and the image's fingerprint must change with that folder and with no other file under
+    ``tests/``. The sources are checked before anything is staged: a path that is absolute, holds ``..`` or is not a plain relative path is refused, and so is
+    a source that is a symbolic link or holds one, because the copy would follow it out of the repository.
+    """
+
+    def prepare(self, folder: Path) -> tuple[Path, Path, dict[str, object]]:
+        stand_in, context = prepare(folder)
+        root = context.parent
+        (root / "tests" / "fixtures" / "vitaldb").mkdir(parents=True)
+        (root / "tests" / "fixtures" / "vitaldb" / "release.json").write_text("{}\n")
+        (root / "tests" / "fixtures" / "other.txt").write_text("not staged\n")
+        (root / "tests" / "unrelated.py").write_text("VALUE = 1\n")
+        image: dict[str, object] = {
+            "tag": TAG,
+            "name": "sample",
+            "sources": [context.name, "tests/fixtures/vitaldb"],
+            "context": ".",
+            "dockerfile": "sample/Dockerfile",
+        }
+        return stand_in, root, image
+
+    def build(self, folder: Path, stand_in: Path, root: Path, image: dict[str, object]) -> tuple[int, str]:
+        return run_tasks("build_images.yml", variables(folder, stand_in, root / "sample", compose_stack_built_images=[image]))
+
+    def staged(self, folder: Path) -> list[str]:
+        placed = folder / "platform" / "images" / "sample"
+        return sorted(str(path.relative_to(placed)) for path in placed.rglob("*") if path.is_file()) if placed.exists() else []
+
+    def test_a_nested_source_lands_under_its_full_relative_path_and_a_top_level_one_as_before(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, root, image = self.prepare(folder)
+            code, output = self.build(folder, stand_in, root, image)
+            files = self.staged(folder)
+        self.assertEqual(0, code, output)
+        self.assertEqual(["sample/Dockerfile", "sample/run.sh", "tests/fixtures/vitaldb/release.json"], files)
+
+    def test_the_build_context_of_an_image_without_one_is_its_first_source_by_its_full_path(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, root, image = self.prepare(folder)
+            plain: dict[str, object] = {"tag": TAG, "name": "sample", "sources": ["tests/fixtures/vitaldb"]}
+            code, output = self.build(folder, stand_in, root, plain)
+            logged = [line for line in calls(stand_in) if line.startswith("build ")]
+        self.assertEqual(0, code, output)
+        self.assertTrue(logged[0].endswith("/platform/images/sample/tests/fixtures/vitaldb"), logged)
+
+    def test_the_fingerprint_changes_with_a_file_of_the_nested_source_and_with_no_other_file_under_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, root, image = self.prepare(folder)
+            self.build(folder, stand_in, root, image)
+            (root / "tests" / "unrelated.py").write_text("VALUE = 2\n")
+            (root / "tests" / "fixtures" / "other.txt").write_text("changed\n")
+            code, output = self.build(folder, stand_in, root, image)
+            unchanged = len([line for line in calls(stand_in) if line.startswith("build ")])
+            (root / "tests" / "fixtures" / "vitaldb" / "release.json").write_text('{"changed": true}\n')
+            changed_code, changed_output = self.build(folder, stand_in, root, image)
+            changed = len([line for line in calls(stand_in) if line.startswith("build ")])
+        self.assertEqual((0, 0), (code, changed_code), output + changed_output)
+        self.assertRegex(output, CHANGED_NONE)
+        self.assertEqual((1, 2), (unchanged, changed))
+
+    def test_a_source_that_is_not_a_plain_relative_path_is_refused_before_anything_is_staged(self) -> None:
+        for source in (
+            "/etc",
+            "/",
+            "../elsewhere",
+            "tests/../../elsewhere",
+            "tests/../sample",
+            ".",
+            "",
+            "tests//fixtures",
+            "./sample",
+            "sample/",
+            "~/sample",
+            "tests/fixtures/..",
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, root, image = self.prepare(folder)
+                code, output = self.build(folder, stand_in, root, {**image, "sources": ["sample", source]})
+                staged = self.staged(folder)
+                builds = [line for line in calls(stand_in) if line.startswith("build ")]
+            self.assertNotEqual(0, code, output)
+            self.assertIn("is not a plain relative path inside the repository", output)
+            self.assertEqual(([], []), (staged, builds))
+
+    def test_a_source_that_does_not_exist_is_refused_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, root, image = self.prepare(folder)
+            code, output = self.build(folder, stand_in, root, {**image, "sources": ["sample", "tests/fixtures/missing"]})
+            staged = self.staged(folder)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("the source tests/fixtures/missing is missing, is a symbolic link or holds a symbolic link", output)
+        self.assertEqual([], staged)
+
+    def test_a_source_that_is_a_symbolic_link_or_holds_one_is_refused_and_nothing_is_staged(self) -> None:
+        fixtures = Path("tests") / "fixtures" / "vitaldb"
+        cases: list[tuple[str, Callable[[Path, Path], None]]] = [
+            ("a link to a file outside the repository inside a source", lambda root, outside: (root / fixtures / "leak").symlink_to(outside / "secret.txt")),
+            ("a link to a folder outside the repository inside a source", lambda root, outside: (root / fixtures / "leak").symlink_to(outside)),
+            (
+                "a link to a file inside the repository inside a source",
+                lambda root, outside: (root / fixtures / "inside").symlink_to(root / "tests" / "unrelated.py"),
+            ),
+            ("a source that is a link to a folder outside the repository", lambda root, outside: (root / "linked").symlink_to(outside)),
+        ]
+        for label, make in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, root, image = self.prepare(folder)
+                outside = folder / "outside"
+                outside.mkdir()
+                (outside / "secret.txt").write_text("secret\n")
+                make(root, outside)
+                sources = ["sample", "linked" if label.startswith("a source") else "tests/fixtures/vitaldb"]
+                code, output = self.build(folder, stand_in, root, {**image, "sources": sources})
+                staged = self.staged(folder)
+                builds = [line for line in calls(stand_in) if line.startswith("build ")]
+            self.assertNotEqual(0, code, output)
+            self.assertIn("is missing, is a symbolic link or holds a symbolic link", output)
+            self.assertEqual(([], []), (staged, builds))
+
+    def test_a_link_at_any_depth_of_a_nested_sources_path_is_refused_and_nothing_is_staged(self) -> None:
+        def relink(root: Path, outside: Path, depth: int) -> None:
+            """Move a folder of the source's path to ``outside`` and link it back: ``depth`` 1 is ``tests``, 2 is ``tests/fixtures`` and 3 is the source."""
+            moved = [root / "tests", root / "tests" / "fixtures", root / "tests" / "fixtures" / "vitaldb"][depth - 1]
+            target = outside / "moved"
+            shutil.copytree(moved, target)
+            shutil.rmtree(moved)
+            moved.symlink_to(target)
+
+        for depth in (1, 2, 3):
+            with self.subTest(depth=depth), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, root, image = self.prepare(folder)
+                outside = folder / "outside"
+                outside.mkdir()
+                relink(root, outside, depth)
+                code, output = self.build(folder, stand_in, root, image)
+                staged = self.staged(folder)
+                builds = [line for line in calls(stand_in) if line.startswith("build ")]
+            self.assertNotEqual(0, code, output)
+            self.assertIn("is missing, is a symbolic link or holds a symbolic link", output)
+            self.assertEqual(([], []), (staged, builds))
+
+    def test_a_staged_folder_without_links_passes_the_same_check(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, root, image = self.prepare(folder)
+            code, output = self.build(folder, stand_in, root, image)
+        self.assertEqual(0, code, output)
+
+
+class SourceCoverageTest(unittest.TestCase):
+    def test_a_path_is_held_by_a_source_that_is_it_or_a_folder_above_it_and_not_by_a_sibling_with_the_same_prefix(self) -> None:
+        sources = ["spark", "tests/fixtures/vitaldb"]
+        self.assertEqual(set(), uncovered({"spark", "spark/Dockerfile", "tests/fixtures/vitaldb/release.json", "tests/fixtures/vitaldb"}, sources))
+        self.assertEqual(
+            {"tests", "tests/fixtures", "tests/fixtures/vitaldb2/release.json", "tests/other.json", "sparkle/x"},
+            uncovered({"tests", "tests/fixtures", "tests/fixtures/vitaldb2/release.json", "tests/other.json", "sparkle/x"}, sources),
+        )
+
+    def test_the_paths_that_a_dockerfile_copies_are_found_with_their_full_path(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            dockerfile = Path(scratch) / "Dockerfile"
+            dockerfile.write_text("FROM scratch\nCOPY a/b.txt /x/\nCOPY --from=other c /y\nCOPY scripts/ingestion \\\n  /z\n")
+            found = copied_paths(dockerfile)
+        self.assertEqual({"a/b.txt", "scripts/ingestion"}, found)
+
+
 def from_contexts(dockerfile: Path) -> set[str]:
     """The named build contexts that a Dockerfile copies from: every ``COPY --from=<name>`` whose name is neither an image nor a stage of the file."""
     text = dockerfile.read_text()
@@ -372,11 +552,16 @@ def from_contexts(dockerfile: Path) -> set[str]:
     return {name for name in re.findall(r"--from=(\S+)", text) if ":" not in name and "@" not in name and name not in stages}
 
 
-def context_sources(dockerfile: Path) -> set[str]:
-    """The first folder of each path that a Dockerfile copies from its build context: each must be a source of the image on the host."""
+def copied_paths(dockerfile: Path) -> set[str]:
+    """Each path that a Dockerfile copies from its build context, without a trailing slash."""
     lines = dockerfile.read_text().replace("\\\n", " ").splitlines()
     copied = [line.split()[1:-1] for line in lines if line.startswith("COPY ") and "--from=" not in line]
-    return {source.split("/")[0] for sources in copied for source in sources}
+    return {source.rstrip("/") for sources in copied for source in sources}
+
+
+def uncovered(paths: set[str], sources: list[str]) -> set[str]:
+    """The paths that no source of the image holds: a source holds itself and every path below it, and a sibling that only shares its prefix is not held."""
+    return {path for path in paths if not any(path == source or path.startswith(source + "/") for source in sources)}
 
 
 class BuiltImagesTest(unittest.TestCase):
@@ -394,13 +579,23 @@ class BuiltImagesTest(unittest.TestCase):
             context = image.get("context", image["sources"][0])
             dockerfile = image.get("dockerfile", f"{context}/Dockerfile")
             with self.subTest(image=image["tag"]):
-                self.assertIn(dockerfile.split("/")[0], image["sources"])
+                self.assertEqual(set(), uncovered({dockerfile}, image["sources"]))
                 self.assertTrue((ROOT / dockerfile).is_file())
                 self.assertTrue(context == "." or context in image["sources"])
+                self.assertTrue(all(re.fullmatch(SOURCE_PATH, source) for source in image["sources"]), image["sources"])
                 self.assertEqual(from_contexts(ROOT / dockerfile), set(image.get("build_contexts", {})))
                 if context == ".":
-                    self.assertEqual(set(), context_sources(ROOT / dockerfile) - set(image["sources"]))
+                    self.assertEqual(set(), uncovered(copied_paths(ROOT / dockerfile), image["sources"]))
                 self.assertTrue(set(image.get("build_contexts", {}).values()) <= set(image["sources"]))
+
+    def test_the_spark_image_stages_the_release_pin_folder_of_tests_and_no_other_file_of_tests(self) -> None:
+        images: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
+        sources = {image["name"]: image["sources"] for image in images}
+        self.assertEqual(["tests/fixtures/vitaldb"], [source for source in sources["spark"] if source.split("/")[0] == "tests"])
+        self.assertEqual(["spark", "scripts", "replay"], [source for source in sources["spark"] if source.split("/")[0] != "tests"])
+        self.assertEqual(["orchestration", "scripts", "compose"], sources["dagster"])
+        self.assertEqual(["replay", "scripts", "tests"], sources["replay"])
+        self.assertTrue((ROOT / "tests" / "fixtures" / "vitaldb" / "release.json").is_file())
 
     def test_the_dagster_image_gets_the_scripts_and_compose_folders_and_the_spark_image_is_built_from_the_folder_above_its_dockerfile(self) -> None:
         images: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")

@@ -1,8 +1,77 @@
 # Reads compose_stack_directory, compose_stack_built_images, compose_stack_docker (its first word is the docker command), compose_stack_build_deadline_seconds,
-# compose_stack_owner and compose_stack_group. Until the project pushes its images to a registry, the host builds them. Each image has its own folder under
-# images/ on the host, which holds a copy of each of its source folders. The build context is that folder or one source in it, the Dockerfile and the named
-# build contexts are sources in it too, and an image is built only when the folder differs from the one the image was built from: the image carries the hash
-# of the whole folder as a label, so a change in a named context builds the image again.
+# compose_stack_owner and compose_stack_group, and compose_stack_source_root (default: the repository's root). Until the project pushes its images to a registry,
+# the host builds them. Each image has its own folder under images/ on the host, which holds a copy of each of its sources. A source is a path relative to the
+# repository's root and keeps that path in the image's folder: a top-level folder lands at images/<name>/<folder>, and tests/fixtures/vitaldb lands at
+# images/<name>/tests/fixtures/vitaldb, so a Dockerfile copies it from the path that the repository has. The build context is that folder or one source in it, the
+# Dockerfile and the named build contexts are sources in it too, and an image is built only when the folder differs from the one the image was built from: the
+# image carries the hash of the whole folder as a label, so a change in a named context builds the image again.
+# Every source is checked before anything is staged: it must be a plain relative path (no leading slash, no "..", no empty or "." part), it must exist, and
+# no folder on the way to it from the repository's root, nor it, nor anything in it may be a symbolic link, because the copy would follow the link out of it.
+- name: Refuse a source that is not a plain relative path
+  ansible.builtin.assert:
+    that: item.1 is regex('^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$') and '..' not in item.1.split('/')
+    quiet: true
+    fail_msg: "{{ item.0.tag }}: the source {{ item.1 | to_json }} is not a plain relative path inside the repository"
+  loop: "{{ compose_stack_built_images | subelements('sources') }}"
+  loop_control:
+    label: "{{ item.0.tag }}: {{ item.1 }}"
+
+- name: List every folder on the way to each source, from the repository's root down
+  ansible.builtin.set_fact:
+    compose_stack_source_steps: >-
+      {%- set ns = namespace(steps=[]) -%}
+      {%- for image in compose_stack_built_images -%}
+      {%- for source in image.sources -%}
+      {%- set parts = source.split('/') -%}
+      {%- for depth in range(1, parts | length + 1) -%}
+      {%- set _ = ns.steps.append({'tag': image.tag, 'source': source, 'path': parts[:depth] | join('/'), 'last': depth == parts | length}) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.steps | to_json }}
+
+- name: Look at each of them without following a link
+  ansible.builtin.stat:
+    path: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.path] | path_join }}"
+    follow: false
+  register: compose_stack_source_stats
+  delegate_to: localhost
+  become: false
+  loop: "{{ compose_stack_source_steps | from_json }}"
+  loop_control:
+    label: "{{ item.tag }}: {{ item.path }}"
+
+- name: List the symbolic links inside each source
+  ansible.builtin.find:
+    paths: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.path] | path_join }}"
+    file_type: link
+    recurse: true
+    hidden: true
+    follow: false
+  register: compose_stack_source_links
+  delegate_to: localhost
+  become: false
+  when: item.last and (compose_stack_source_stats.results[ansible_loop.index0].stat.isdir | default(false))
+  loop: "{{ compose_stack_source_steps | from_json }}"
+  loop_control:
+    label: "{{ item.tag }}: {{ item.path }}"
+    extended: true
+
+- name: Refuse a source that is missing, is a link, passes through a link or holds one
+  ansible.builtin.assert:
+    that:
+      - compose_stack_source_stats.results[ansible_loop.index0].stat.exists
+      - not (compose_stack_source_stats.results[ansible_loop.index0].stat.islnk | default(false))
+      - (compose_stack_source_links.results[ansible_loop.index0].files | default([])) | length == 0
+    quiet: true
+    fail_msg: >-
+      {{ item.tag }}: the source {{ item.source }} is missing, is a symbolic link or holds a symbolic link
+      (found at {{ item.path }}; the copy would follow it out of the repository)
+  loop: "{{ compose_stack_source_steps | from_json }}"
+  loop_control:
+    label: "{{ item.tag }}: {{ item.path }}"
+    extended: true
+
 - name: Create the folder of each image the project makes itself
   ansible.builtin.file:
     path: "{{ compose_stack_directory }}/images/{{ item.name }}"
@@ -14,14 +83,26 @@
   loop_control:
     label: "{{ item.tag }}"
 
-- name: Place each source folder of each image
+- name: Create the folder that each source goes into
+  ansible.builtin.file:
+    path: "{{ [compose_stack_directory, 'images', item.0.name, item.1 | dirname] | path_join }}"
+    state: directory
+    owner: "{{ compose_stack_owner }}"
+    group: "{{ compose_stack_group }}"
+    mode: "0755"
+  loop: "{{ compose_stack_built_images | subelements('sources') }}"
+  loop_control:
+    label: "{{ item.0.tag }}: {{ item.1 }}"
+
+- name: Place each source of each image at its path relative to the repository
   ansible.builtin.copy:
-    src: "{{ [role_path ~ '/../../..', item.1] | path_join }}"
-    dest: "{{ compose_stack_directory }}/images/{{ item.0.name }}/"
+    src: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.1] | path_join }}"
+    dest: "{{ [compose_stack_directory, 'images', item.0.name, item.1 | dirname] | path_join }}/"
     owner: "{{ compose_stack_owner }}"
     group: "{{ compose_stack_group }}"
     mode: preserve
     directory_mode: "0755"
+    local_follow: false
   loop: "{{ compose_stack_built_images | subelements('sources') }}"
   loop_control:
     label: "{{ item.0.tag }}: {{ item.1 | basename }}"
@@ -56,7 +137,7 @@
   vars:
     image: "{{ item.item }}"
     image_folder: "{{ compose_stack_directory }}/images/{{ image.name }}"
-    context: "{{ image.context | default(image.sources[0] | basename) }}"
+    context: "{{ image.context | default(image.sources[0]) }}"
     contexts: "{{ image.build_contexts | default({}) | dict2items }}"
     context_files: "{{ item.files | sort(attribute='path') }}"
     context_hash: "{{ (context_files | map(attribute='path') | zip(context_files | map(attribute='checksum'), context_files | map(attribute='mode')) | list | to_json) | hash('sha256') }}"
