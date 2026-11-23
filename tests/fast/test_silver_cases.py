@@ -60,11 +60,10 @@ def clean_input(**changes: object) -> dict[str, object]:
         "operation_ends_before_it_starts": 0,
         "cases_without_one_split_row": 0,
         "split_patients_without_case": 0,
-        "bronze_lab_rows": 700000,
+        "lab_source_empty": 0,
         "lab_key_null": 0,
         "lab_unparsed": {},
         "lab_rows_without_case": 0,
-        "split_problems": [],
         "sealed_outcome_form_bad": 0,
         "lab_pinned_mismatch": 0,
         "sealed_lab_form_bad": 0,
@@ -88,7 +87,6 @@ def clean_output(**changes: object) -> dict[str, object]:
         "never_feature_marking_wrong": 0,
         "case_key_differences": 0,
         "sealed_outcome_differs": 0,
-        "output_schema_tables_wrong": 0,
         "silver_lab_orphans": 0,
         "sealed_lab_differs": 0,
     }
@@ -315,7 +313,6 @@ class InputProblemTest(unittest.TestCase):
             "cases_without_one_split_row": ("split_join", "5 cases"),
             "split_patients_without_case": ("split_patient_without_case", "2 patients"),
             "lab_key_null": ("lab_key_null", "7 rows"),
-            "lab_rows_without_case": ("lab_case_missing", "9 rows"),
         }
         for field, (code, count) in cases.items():
             number = int(count.split()[0])
@@ -332,9 +329,9 @@ class InputProblemTest(unittest.TestCase):
         problems = input_problems(**clean_input(domain={"emop": 1, "sex": 2}), pinned=True)  # type: ignore[arg-type]
         self.assertEqual(["domain: 3 values in 2 columns (emop, sex)"], problems)
 
-    def test_a_split_that_breaks_the_rule_stops_the_job_with_the_split_checks_own_codes(self) -> None:
-        problems = input_problems(**clean_input(split_problems=["rule_mismatch: 1 patient", "unknown_set: 2 rows"]), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["rule_mismatch: 1 patient", "unknown_set: 2 rows"], problems)
+    def test_a_laboratory_row_with_no_case_is_one_flag_with_no_count_because_its_owner_cannot_be_classified(self) -> None:
+        problems = input_problems(**clean_input(lab_rows_without_case=1), pinned=True)  # type: ignore[arg-type]
+        self.assertEqual(["lab_case_missing: a laboratory row has no case"], problems)
 
     def test_a_held_out_outcome_value_not_in_its_published_form_is_a_code_with_no_count_and_no_column(self) -> None:
         problems = input_problems(**clean_input(sealed_outcome_form_bad=1), pinned=True)  # type: ignore[arg-type]
@@ -345,14 +342,17 @@ class InputProblemTest(unittest.TestCase):
 
     def test_no_development_case_and_empty_tables_are_refused(self) -> None:
         self.assertEqual(["no_development_cases: 0 cases"], input_problems(**clean_input(development_cases=0), pinned=True))  # type: ignore[arg-type]
-        problems = input_problems(**clean_input(bronze_case_rows=0, bronze_lab_rows=0), pinned=False)  # type: ignore[arg-type]
+        problems = input_problems(**clean_input(bronze_case_rows=0, lab_source_empty=1), pinned=False)  # type: ignore[arg-type]
         self.assertIn("empty_cases: 0 rows", problems)
-        self.assertIn("empty_lab: 0 rows", problems)
+        self.assertIn("empty_lab: the laboratory table has no row", problems)
+
+    def test_a_laboratory_table_that_has_rows_only_for_held_out_patients_is_not_empty(self) -> None:
+        self.assertEqual([], input_problems(**clean_input(lab_source_empty=0), pinned=True))  # type: ignore[arg-type]
 
     def test_the_pinned_release_demands_its_case_count_and_the_laboratory_total_as_a_flag_and_a_sample_does_not(self) -> None:
         problems = input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1), pinned=True)  # type: ignore[arg-type]
         self.assertEqual(["pinned_counts: 13 cases, not 6388", "pinned_counts: the laboratory row count is not the release's"], problems)
-        self.assertEqual([], input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1, bronze_lab_rows=100), pinned=False))  # type: ignore[arg-type]
+        self.assertEqual([], input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1), pinned=False))  # type: ignore[arg-type]
 
     def test_a_held_out_laboratory_value_not_in_its_published_form_is_a_code_with_no_count_and_no_column(self) -> None:
         problems = input_problems(**clean_input(sealed_lab_form_bad=1), pinned=True)  # type: ignore[arg-type]
@@ -430,7 +430,7 @@ class OutputProblemTest(unittest.TestCase):
             ["sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key"],
             output_problems(**clean_output(sealed_lab_differs=1)),  # type: ignore[arg-type]
         )
-        self.assertEqual(["lab_case_missing_in_silver: 3 rows"], output_problems(**clean_output(silver_lab_orphans=3)))  # type: ignore[arg-type]
+        self.assertEqual(["lab_case_missing_in_silver: a written laboratory row has no case"], output_problems(**clean_output(silver_lab_orphans=1)))  # type: ignore[arg-type]
 
     def test_a_clean_output_has_no_problem(self) -> None:
         self.assertEqual([], output_problems(**clean_output()))  # type: ignore[arg-type]
@@ -448,7 +448,6 @@ class OutputProblemTest(unittest.TestCase):
             "lab_occurrence_gaps": "lab_occurrence_gap: 4 groups",
             "never_feature_marking_wrong": "never_feature_marking: 4 tables",
             "case_key_differences": "case_key_differences: 4 keys",
-            "output_schema_tables_wrong": "output_schema: 4 tables",
         }
         for field, text in cases.items():
             self.assertEqual([text], output_problems(**clean_output(**{field: 4})), field)  # type: ignore[arg-type]

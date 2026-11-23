@@ -46,11 +46,10 @@ def clean_input_facts(**changes: object) -> dict[str, object]:
         "operation_ends_before_it_starts": 0,
         "cases_without_one_split_row": 0,
         "split_patients_without_case": 0,
-        "bronze_lab_rows": 700000,
+        "lab_source_empty": 0,
         "lab_key_null": 0,
         "lab_unparsed": {"result": 0},
         "lab_rows_without_case": 0,
-        "split_problems": [],
         "sealed_outcome_form_bad": 0,
         "lab_pinned_mismatch": 0,
         "sealed_lab_form_bad": 0,
@@ -73,7 +72,6 @@ def clean_output_facts(**changes: object) -> dict[str, object]:
         "lab_rows": 690000,
         "case_key_differences": 0,
         "sealed_outcome_differs": 0,
-        "output_schema_tables_wrong": 0,
         "silver_lab_orphans": 0,
         "sealed_lab_differs": 0,
     }
@@ -91,8 +89,18 @@ class FakeOps:
         self.held: tuple[list[MeasureRow] | None, list[CutoffRow] | None] = (None, None)
         self.writes = {"cases": True, "lab": True, "rules": True}
         self.after_write_rules: tuple[list[MeasureRow] | None, list[CutoffRow] | None] | None = None
+        self.split: list[str] = []
+        self.schema_wrong = 0
         for name, value in changes.items():
             setattr(self, name, value)
+
+    def split_problems(self) -> list[str]:
+        self.calls.append("split_problems")
+        return self.split
+
+    def output_schema_tables_wrong(self) -> int:
+        self.calls.append("output_schema")
+        return self.schema_wrong
 
     def input_facts(self) -> dict[str, object]:
         self.calls.append("input_facts")
@@ -150,12 +158,14 @@ class BuildOrderTest(unittest.TestCase):
         build(ops)
         self.assertEqual(
             [
+                "split_problems",
                 "input_facts",
                 "development_lengths",
                 "existing_rules",
                 "write_cases",
                 "write_lab",
                 "write_rules",
+                "output_schema",
                 "existing_rules",
                 "output_facts",
                 "snapshot_ids",
@@ -198,16 +208,20 @@ class BuildOrderTest(unittest.TestCase):
 
 class InputFailureTest(unittest.TestCase):
     def test_a_failed_input_check_stops_before_any_write_and_names_every_cause_once(self) -> None:
-        ops = FakeOps(input=clean_input_facts(case_key_duplicates=2, lab_rows_without_case=5, unparsed={"height": 1}))
+        ops = FakeOps(input=clean_input_facts(case_key_duplicates=2, lab_rows_without_case=1, unparsed={"height": 1}))
         problems = refused(lambda: run_build(ops, pinned=True))
-        self.assertEqual(["key_duplicate: 2 keys", "lab_case_missing: 5 rows", "unparsed: 1 value in 1 column (height)"], problems)
+        self.assertEqual(["key_duplicate: 2 keys", "lab_case_missing: a laboratory row has no case", "unparsed: 1 value in 1 column (height)"], problems)
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
 
-    def test_a_split_that_breaks_the_rule_stops_before_the_lengths_are_read_and_before_any_write(self) -> None:
-        ops = FakeOps(input=clean_input_facts(split_problems=["rule_mismatch: 1 patient"]))
+    def test_a_split_that_breaks_the_rule_stops_before_any_fact_that_depends_on_it_and_reports_only_the_split_codes(self) -> None:
+        ops = FakeOps(split=["rule_mismatch: 1 patient"], input=clean_input_facts(case_key_duplicates=2, sealed_outcome_form_bad=1, sealed_lab_form_bad=1))
         self.assertEqual(["rule_mismatch: 1 patient"], refused(lambda: run_build(ops, pinned=True)))
-        self.assertNotIn("development_lengths", ops.calls)
-        self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
+        self.assertEqual(["split_problems"], ops.calls)
+
+    def test_verify_checks_the_split_first_too(self) -> None:
+        ops = FakeOps(split=["rule_mismatch: 1 patient"])
+        self.assertEqual(["rule_mismatch: 1 patient"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertEqual(["split_problems"], ops.calls)
 
     def test_a_held_out_outcome_value_not_in_its_published_form_stops_before_any_write_and_names_no_count(self) -> None:
         ops = FakeOps(input=clean_input_facts(sealed_outcome_form_bad=1))
@@ -234,11 +248,11 @@ class InputFailureTest(unittest.TestCase):
         self.assertNotIn("write_cases", ops.calls)
 
     def test_the_pinned_release_demands_its_counts_before_a_write_and_a_sample_does_not(self) -> None:
-        ops = FakeOps(input=clean_input_facts(bronze_case_rows=13, bronze_lab_rows=100, lab_pinned_mismatch=1))
+        ops = FakeOps(input=clean_input_facts(bronze_case_rows=13, lab_pinned_mismatch=1))
         self.assertTrue(refused(lambda: run_build(ops, pinned=True))[0].startswith("pinned_counts: "))
         self.assertNotIn("write_cases", ops.calls)
         sample = FakeOps(
-            input=clean_input_facts(bronze_case_rows=13, bronze_lab_rows=100),
+            input=clean_input_facts(bronze_case_rows=13),
             output=clean_output_facts(case_rows=13, bronze_case_rows=13, lab_rows=90, lab_copies=100, bronze_lab_rows=100),
         )
         self.assertEqual("written", build(sample, pinned=False)["outcome"])
@@ -281,12 +295,23 @@ class OutputFailureTest(unittest.TestCase):
         self.assertNotIn("lab_rows", facts)
         self.assertNotIn("lab_copies", facts)
 
-    def test_a_replaced_case_key_or_a_wrong_stored_schema_or_a_held_out_outcome_difference_ends_the_job(self) -> None:
-        ops = FakeOps(output=clean_output_facts(case_key_differences=2, output_schema_tables_wrong=1, sealed_outcome_differs=1))
+    def test_a_replaced_case_key_or_a_held_out_outcome_difference_ends_the_job(self) -> None:
+        ops = FakeOps(output=clean_output_facts(case_key_differences=2, sealed_outcome_differs=1))
         self.assertEqual(
-            ["case_key_differences: 2 keys", "output_schema: 1 table", "sealed_outcome_differs: a held-out outcome value differs from Bronze"],
+            ["case_key_differences: 2 keys", "sealed_outcome_differs: a held-out outcome value differs from Bronze"],
             refused(lambda: run_build(ops, pinned=True)),
         )
+
+    def test_a_dropped_or_retyped_column_stops_the_job_before_any_value_query_and_reports_only_the_schema(self) -> None:
+        ops = FakeOps(schema_wrong=2, output=clean_output_facts(case_key_differences=2, sealed_outcome_differs=1))
+        self.assertEqual(["output_schema: 2 tables"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertNotIn("output_facts", ops.calls)
+        self.assertNotIn("existing_rules", ops.calls[ops.calls.index("write_rules") :])
+
+    def test_verify_checks_the_stored_schema_before_any_value_query(self) -> None:
+        ops = FakeOps(schema_wrong=1, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
+        self.assertEqual(["output_schema: 1 table"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertNotIn("output_facts", ops.calls)
 
     def test_a_check_of_a_written_table_that_fails_ends_the_job_with_its_code(self) -> None:
         ops = FakeOps(output=clean_output_facts(lab_value_differences=3, case_key_duplicates=1))
@@ -322,7 +347,7 @@ class VerifyTest(unittest.TestCase):
         facts = run_verify(ops, pinned=True).facts()
         self.assertEqual("verified", facts["outcome"])
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
-        self.assertEqual(["input_facts", "development_lengths", "existing_rules", "output_facts", "snapshot_ids"], ops.calls)
+        self.assertEqual(["split_problems", "input_facts", "development_lengths", "existing_rules", "output_schema", "output_facts", "snapshot_ids"], ops.calls)
 
     def test_verify_fails_when_the_cutoffs_were_never_saved(self) -> None:
         ops = FakeOps(held=(None, None))

@@ -64,6 +64,8 @@ class SilverOps(Protocol):
     ``development_lengths`` the operation lengths of the development patients only. A write gives ``True`` when it changed the table and ``False`` when the
     table already held the rows."""
 
+    def split_problems(self) -> list[str]: ...
+
     def input_facts(self) -> dict[str, object]: ...
 
     def development_lengths(self) -> list[int]: ...
@@ -75,6 +77,8 @@ class SilverOps(Protocol):
     def write_lab(self) -> bool: ...
 
     def write_rules(self, measure: list[MeasureRow], cutoffs: list[CutoffRow]) -> bool: ...
+
+    def output_schema_tables_wrong(self) -> int: ...
 
     def output_facts(self) -> dict[str, object]: ...
 
@@ -112,6 +116,9 @@ class Outcome:
 
 def checked_inputs(ops: SilverOps, *, pinned: bool) -> tuple[list[MeasureRow], list[CutoffRow]]:
     """Run every input check, then measure the development operation lengths and set the cutoffs, or raise every cause."""
+    problems = ops.split_problems()
+    if problems:
+        raise SilverCasesError(*problems)
     facts = ops.input_facts()
     problems = input_problems(**facts, development_cases=None, pinned=pinned)  # type: ignore[arg-type]
     if problems:
@@ -123,6 +130,13 @@ def checked_inputs(ops: SilverOps, *, pinned: bool) -> tuple[list[MeasureRow], l
     return measure_rows(lengths), cutoff_rows(lengths)
 
 
+def check_stored_schema(ops: SilverOps) -> None:
+    """Refuse a written table with a dropped, extra or retyped column before any query reads a value of it."""
+    wrong = ops.output_schema_tables_wrong()
+    if wrong:
+        raise SilverCasesError(f"output_schema: {unit(wrong, 'table')}")
+
+
 def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
     """Check the inputs and the freeze, write the tables that change, then check what was written and read the cutoffs back."""
     measure, cutoffs = checked_inputs(ops, pinned=pinned)
@@ -131,6 +145,7 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
     if problems:
         raise SilverCasesError(*problems)
     written = {"cases": ops.write_cases(), "lab": ops.write_lab(), "rules": ops.write_rules(measure, cutoffs)}
+    check_stored_schema(ops)
     saved = ops.existing_rules()
     output = ops.output_facts()
     problems = output_problems(**output)  # type: ignore[arg-type]
@@ -147,6 +162,7 @@ def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
     held_measure, held_cutoffs = ops.existing_rules()
     missing = (held_measure is None) + (held_cutoffs is None)
     problems = [f"table_missing: {unit(missing, 'table')}"] if missing else frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
+    check_stored_schema(ops)
     output = ops.output_facts()
     problems += output_problems(**output)  # type: ignore[arg-type]
     if problems:

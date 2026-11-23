@@ -24,12 +24,26 @@ from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, CutoffRow, SilverCases
 from spark.split_table import RULE_VERSION, SET_NAMES
 
 
-class Count:
+class Rows:
     def __init__(self, value: int) -> None:
         self.value = value
 
     def count(self) -> int:
         return self.value
+
+
+class Difference:
+    """The rows of one side that the other side lacks. A count of all of them must never be taken, because they may include held-out rows: only the first
+    row may be asked for."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def count(self) -> int:
+        raise AssertionError("a count of differing rows must not be taken")
+
+    def limit(self, rows: int) -> Rows:
+        return Rows(min(self.value, rows))
 
 
 class Writer:
@@ -61,8 +75,8 @@ class Frame:
             type("Field", (), {"name": name, "dataType": type("Type", (), {"simpleString": lambda self, kind=kind: kind})()})() for name, kind in self.dtypes
         ]
 
-    def exceptAll(self, other: Frame) -> Count:
-        return Count(sum((Counter(self.rows) - Counter(other.rows)).values()))
+    def exceptAll(self, other: Frame) -> Difference:
+        return Difference(sum((Counter(self.rows) - Counter(other.rows)).values()))
 
     def coalesce(self, _count: int) -> Frame:
         return self
@@ -226,6 +240,13 @@ class LaboratoryScopeTest(unittest.TestCase):
         self.assertIn("WHERE COALESCE(s.`set`, '') NOT IN ('training', 'validation')", engine.bronze_lab_scope(development=False))
         self.assertIn("WHERE s.`set` IN ('training', 'validation')", engine.silver_lab_scope(development=True))
         self.assertIn("WHERE COALESCE(s.`set`, '') NOT IN ('training', 'validation')", engine.silver_lab_scope(development=False))
+
+    def test_both_tables_are_scoped_by_the_bronze_case_owner_and_never_by_the_silver_case_row(self) -> None:
+        engine = self.engine()
+        for development in (True, False):
+            for scope in (engine.bronze_lab_scope(development=development), engine.silver_lab_scope(development=development)):
+                self.assertIn("lake.bronze.clinical_cases", scope)
+                self.assertNotIn("lake.silver.cases", scope)
 
     def test_the_checks_of_a_written_table_use_the_plain_cast_and_the_build_side_uses_the_guarded_one(self) -> None:
         engine = self.engine()

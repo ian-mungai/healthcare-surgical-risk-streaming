@@ -43,7 +43,7 @@ DOUBLE = "double"
 STRING = "string"
 PERCENTILES = (5, 10, 25, 50, 75, 90, 95)
 CUTOFF_FRACTIONS = (25, 50, 75)
-CUTOFF_RULE_VERSION = f"operation_cutoffs:fractions_of_median={','.join(str(percent) for percent in CUTOFF_FRACTIONS)}:whole_minutes:nearest_rank"
+CUTOFF_RULE_VERSION = f"operation_cutoffs:fractions_of_median={','.join(str(percent) for percent in CUTOFF_FRACTIONS)}:whole_minutes:exact_median"
 FLAG_COLUMNS = ("emop", "preop_htn", "preop_dm", "death_inhosp")
 # The outcome columns: the stay in intensive care and the death. Their values are checked and counted for development patients only; for the held-out
 # patients the job checks their form inside the job and reports one flag, never a count.
@@ -304,11 +304,10 @@ def input_problems(
     operation_ends_before_it_starts: int,
     cases_without_one_split_row: int,
     split_patients_without_case: int,
-    bronze_lab_rows: int,
+    lab_source_empty: int,
     lab_key_null: int,
     lab_unparsed: Mapping[str, int],
     lab_rows_without_case: int,
-    split_problems: Sequence[str],
     sealed_outcome_form_bad: int,
     sealed_lab_form_bad: int,
     lab_pinned_mismatch: int,
@@ -319,8 +318,8 @@ def input_problems(
     problems: list[str] = []
     if bronze_case_rows == 0:
         problems.append(f"empty_cases: {unit(0, 'row')}")
-    if bronze_lab_rows == 0:
-        problems.append(f"empty_lab: {unit(0, 'row')}")
+    if lab_source_empty:
+        problems.append("empty_lab: the laboratory table has no row")
     for code, count, noun in (
         ("key_null", case_key_null, "row"),
         ("key_duplicate", case_key_duplicates, "key"),
@@ -329,11 +328,11 @@ def input_problems(
         ("split_join", cases_without_one_split_row, "case"),
         ("split_patient_without_case", split_patients_without_case, "patient"),
         ("lab_key_null", lab_key_null, "row"),
-        ("lab_case_missing", lab_rows_without_case, "row"),
     ):
         if count:
             problems.append(f"{code}: {unit(count, noun)}")
-    problems += split_problems
+    if lab_rows_without_case:
+        problems.append("lab_case_missing: a laboratory row has no case")
     for code, counts in (("unparsed", unparsed), ("domain", domain), ("lab_unparsed", lab_unparsed)):
         counted = {name: count for name, count in counts.items() if count}
         if counted:
@@ -366,7 +365,6 @@ def output_problems(
     never_feature_marking_wrong: int,
     case_key_differences: int,
     sealed_outcome_differs: int,
-    output_schema_tables_wrong: int,
     silver_lab_orphans: int,
     sealed_lab_differs: int,
 ) -> list[str]:
@@ -386,13 +384,13 @@ def output_problems(
         ("lab_key_duplicate", lab_key_duplicates, "key"),
         ("lab_occurrence_gap", lab_occurrence_gaps, "group"),
         ("never_feature_marking", never_feature_marking_wrong, "table"),
-        ("output_schema", output_schema_tables_wrong, "table"),
-        ("lab_case_missing_in_silver", silver_lab_orphans, "row"),
     ):
         if count:
             problems.append(f"{code}: {unit(count, noun)}")
     if sealed_outcome_differs:
         problems.append("sealed_outcome_differs: a held-out outcome value differs from Bronze")
+    if silver_lab_orphans:
+        problems.append("lab_case_missing_in_silver: a written laboratory row has no case")
     if sealed_lab_differs:
         problems.append("sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key")
     return problems

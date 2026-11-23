@@ -71,6 +71,7 @@ from spark.silver_cases_sql import (
     lab_pinned_query,
     lab_query,
     lab_scope,
+    lab_source_empty_query,
     lab_unmatched_query,
     outcome_facts_query,
     outcome_output_query,
@@ -127,10 +128,10 @@ class Lake:
             raise SilverCasesError(*problems)
 
     def bronze_lab_scope(self, *, development: bool, strict: bool = False) -> str:
-        return lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=development, bronze=True, strict=strict)
+        return lab_scope(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=development, lab_text=True, strict=strict)
 
     def silver_lab_scope(self, *, development: bool) -> str:
-        return lab_scope(LAB_SOURCE, CASES_SOURCE, SPLIT_SOURCE, development=development, bronze=False)
+        return lab_scope(LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=development, lab_text=False, strict=True)
 
     def split_problems(self) -> list[str]:
         """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
@@ -146,10 +147,10 @@ class Lake:
         case_row |= self.session.sql(outcome_facts_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)).collect()[0].asDict()
         lab_row = self.session.sql(lab_facts_query(self.bronze_lab_scope(development=True))).collect()[0].asDict()
         lab_row["lab_rows_without_case"] = self.count(lab_unmatched_query(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE))
+        lab_row["lab_source_empty"] = self.count(lab_source_empty_query(BRONZE_LAB_SOURCE))
         without_one, patients = split_facts_queries(BRONZE_CASES_SOURCE, SPLIT_SOURCE)
         split = {"cases_without_one_split_row": self.count(without_one), "split_patients_without_case": self.count(patients)}
         sealed = {
-            "split_problems": self.split_problems(),
             "sealed_outcome_form_bad": self.count(sealed_outcome_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)),
             "sealed_lab_form_bad": self.count(sealed_lab_form_query(self.bronze_lab_scope(development=False))),
             "lab_pinned_mismatch": self.count(lab_pinned_query(BRONZE_LAB_SOURCE)),
@@ -172,7 +173,7 @@ class Lake:
         held = self.session.table(source) if self.exists(source) else None
         same_columns = held is not None and held.dtypes == frame.dtypes
         if held is not None and same_columns:
-            if held.exceptAll(frame).count() == 0 and frame.exceptAll(held).count() == 0:
+            if held.exceptAll(frame).limit(1).count() == 0 and frame.exceptAll(held).limit(1).count() == 0:
                 return self.set_properties(source, properties)
             frame.coalesce(1).writeTo(source).overwritePartitions()
             self.set_properties(source, properties)
@@ -261,7 +262,6 @@ class Lake:
             + self.count(outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)),
             "case_key_differences": self.count(case_key_query(BRONZE_CASES_SOURCE, CASES_SOURCE)),
             "sealed_outcome_differs": self.count(sealed_outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)),
-            "output_schema_tables_wrong": self.output_schema_tables_wrong(),
             "case_key_duplicates": self.count(case_duplicates_query(CASES_SOURCE)),
             "lab_rows": self.count(count_query(silver_lab)),
             "lab_copies": self.count(copies),
@@ -269,7 +269,7 @@ class Lake:
             "lab_value_differences": self.count(differences),
             "lab_key_duplicates": self.count(duplicates),
             "lab_occurrence_gaps": self.count(gaps),
-            "silver_lab_orphans": self.count(silver_lab_orphans_query(LAB_SOURCE, CASES_SOURCE)),
+            "silver_lab_orphans": self.count(silver_lab_orphans_query(LAB_SOURCE, BRONZE_CASES_SOURCE)),
             "sealed_lab_differs": self.count(held_out),
             "never_feature_marking_wrong": 0 if marked else 1,
         }
