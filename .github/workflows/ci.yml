@@ -103,7 +103,7 @@ jobs:
           incomplete=0
           for folder in "${folders[@]}"; do
             for file in record.json retention.json; do
-              if [ ! -f "${folder}${file}" ]; then
+              if [ ! -f "${folder}${file}" ] || [ -L "${folder}${file}" ]; then
                 printf 'The run folder %s has no %s.\n' "${folder}" "${file}" >&2
                 incomplete=1
               fi
@@ -148,7 +148,7 @@ jobs:
           incomplete=0
           for folder in "${folders[@]}"; do
             for file in record.json retention.json; do
-              if [ ! -f "${folder}${file}" ]; then
+              if [ ! -f "${folder}${file}" ] || [ -L "${folder}${file}" ]; then
                 printf 'The run folder %s has no %s.\n' "${folder}" "${file}" >&2
                 incomplete=1
               fi

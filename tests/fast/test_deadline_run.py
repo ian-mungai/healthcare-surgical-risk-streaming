@@ -182,6 +182,7 @@ class CaseAssertionTest(unittest.TestCase):
     """
 
     def run_cases(self, results: dict[str, tuple[str | None, str, float]], leftovers: list[int] | None = None) -> dict[str, bool]:
+        self.late_attempt_seconds: float | None = None
         control = ["-c", "echo ready"]
         hung = deadline.hung_command(MARKER)
 
@@ -192,6 +193,7 @@ class CaseAssertionTest(unittest.TestCase):
             if command == hung:
                 return results[HUNG_CASE]
             self.assertIsNotNone(attempt_seconds, "the late case must give its program a timeout beyond the deadline")
+            self.late_attempt_seconds = attempt_seconds
             self.assertEqual(["-c", f"sleep {deadline.LATE_ANSWER_SECONDS}; echo late"], command)
             return results[LATE_CASE]
 
@@ -215,6 +217,12 @@ class CaseAssertionTest(unittest.TestCase):
                 with self.subTest(case=case, wrong=label):
                     judged = self.run_cases({**RIGHT, case: result})
                     self.assertEqual({name: name != case for name in RIGHT}, judged)
+
+    def test_the_late_program_may_run_longer_than_its_answer_delay(self) -> None:
+        """A timeout that ends before the program answers stops it first, so the late case would pass without proving that a late answer is refused."""
+        self.run_cases(RIGHT)
+        self.assertIsNotNone(self.late_attempt_seconds)
+        self.assertGreater(self.late_attempt_seconds or 0.0, deadline.LATE_ANSWER_SECONDS)
 
     def test_a_process_of_the_hung_program_that_is_left_fails_the_hung_case(self) -> None:
         self.assertEqual({CONTROL_CASE: True, HUNG_CASE: False, LATE_CASE: True}, self.run_cases(RIGHT, leftovers=[4242]))

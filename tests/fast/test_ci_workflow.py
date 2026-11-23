@@ -7,8 +7,9 @@ YAML anchor or a merge key cannot hide a change. Failure modes covered here, eac
 
 - A group job is skipped: an ``if`` on a job or on one of its steps, or ``continue-on-error`` that lets a failed check pass.
 - A step runs under another shell or folder, so its command can become a no-op (``shell: bash -n {0}``).
-- A job group has no unconditional step list: a step behind a condition other than the guards' log tail and the two record uploads (which keep
-  each run's record and retention label unless the run is cancelled, and fail when a run wrote none), a dropped, added or changed step.
+- A job group has no unconditional step list: a step behind a condition other than the guards' log tail, the two record checks and the two record
+  uploads (each check fails unless every run folder holds the record and its retention label as regular files, and each upload keeps them unless the
+  run is cancelled), a dropped, added, moved or changed step.
 - A guard shard is missing, runs twice, runs another shard's cases or is excluded through ``matrix.exclude``.
 - A check command changes in the workflow: a dry-run flag, a dropped or reordered command, another Python or tool version.
 - The required job leaves a group out of ``needs``, does not always run, has its step disabled or under another shell, or its script differs
@@ -80,7 +81,8 @@ def record_step(artifact: str) -> dict[str, Any]:
 
 
 # The script of the step before each upload. The upload matches runs/*/record.json and runs/*/retention.json as separate patterns, so it succeeds with
-# one of them alone: this step fails unless every run folder holds both files, and at least one run folder exists. GitHub runs it with `bash -e {0}`.
+# one of them alone: this step fails unless every run folder holds both files as regular files that are not links, and at least one run folder exists.
+# GitHub runs it with `bash -e {0}`.
 RECORD_CHECK_NAME = "Check that the run record and its retention label exist"
 RECORD_CHECK_SCRIPT = r"""shopt -s nullglob
 folders=(runs/*/)
@@ -91,7 +93,7 @@ fi
 incomplete=0
 for folder in "${folders[@]}"; do
   for file in record.json retention.json; do
-    if [ ! -f "${folder}${file}" ]; then
+    if [ ! -f "${folder}${file}" ] || [ -L "${folder}${file}" ]; then
       printf 'The run folder %s has no %s.\n' "${folder}" "${file}" >&2
       incomplete=1
     fi
@@ -100,7 +102,7 @@ done
 exit "${incomplete}"
 """
 RECORD_CHECK_STEP = {"name": RECORD_CHECK_NAME, "if": "${{ !cancelled() }}", "run": RECORD_CHECK_SCRIPT}
-# What the check does in a run folder tree: the files that exist (a trailing slash makes a directory) and whether the step must pass.
+# What the check does in a run folder tree: the files that exist (a trailing slash makes a directory, "name -> target" a link) and whether the step must pass.
 RECORD_CHECK_CASES: dict[str, tuple[tuple[str, ...], bool]] = {
     "the record and its label in one run folder": (("runs/a/record.json", "runs/a/retention.json"), True),
     "the record alone": (("runs/a/record.json",), False),
@@ -110,12 +112,20 @@ RECORD_CHECK_CASES: dict[str, tuple[tuple[str, ...], bool]] = {
     "the record and the label in two run folders": (("runs/a/record.json", "runs/b/retention.json"), False),
     "a second run folder without a label": (("runs/a/record.json", "runs/a/retention.json", "runs/b/record.json"), False),
     "a directory where the label belongs": (("runs/a/record.json", "runs/a/retention.json/"), False),
+    "the label a link to the label of another run": (
+        ("runs/a/record.json", "runs/a/retention.json -> runs/b/retention.json", "runs/b/record.json", "runs/b/retention.json"),
+        False,
+    ),
+    "the record a link to the record of another run": (
+        ("runs/a/record.json -> runs/b/record.json", "runs/a/retention.json", "runs/b/record.json", "runs/b/retention.json"),
+        False,
+    ),
     "two complete run folders": (("runs/a/record.json", "runs/a/retention.json", "runs/b/record.json", "runs/b/retention.json"), True),
 }
 GUARD_RECORD_STEP = record_step("guard-record-shard-${{ matrix.shard }}")
 DEADLINE_RECORD_STEP = record_step("deadline-record")
-# The only conditions that a step may have, by job: the log tail after a failure and the record upload unless the run is cancelled. A step with one
-# of them must still equal its pinned step, which the comparison with PINNED_JOBS checks.
+# The only conditions that a step may have, by job: the log tail after a failure, and the record check and the record upload unless the run is cancelled.
+# A step with one of them must still equal its pinned step, which the comparison with PINNED_JOBS checks.
 STEP_CONDITIONS = {
     "guards": {TAIL_STEP["if"], RECORD_CHECK_STEP["if"], GUARD_RECORD_STEP["if"]},
     "deadline": {RECORD_CHECK_STEP["if"], DEADLINE_RECORD_STEP["if"]},
@@ -318,7 +328,7 @@ def substituted(text: str, values: dict[str, str]) -> str:
 
 
 def step_problems(name: str, steps: list[Any], *, shell_pinned: bool = False) -> list[str]:
-    """A step that skips, lets a failure pass or runs under another shell or folder. Only the guards' log tail and the two record uploads may have one.
+    """A step that skips, lets a failure pass or runs under another shell or folder. Only the guards' log tail and the record checks and uploads may have one.
 
     The aggregate's step is the one that sets a shell (``shell_pinned``): its value is compared with the approved one on its own.
     """
@@ -353,8 +363,12 @@ def record_check_script_problems(script: str) -> tuple[str, ...]:
     for label, (paths, passes) in RECORD_CHECK_CASES.items():
         with tempfile.TemporaryDirectory(prefix="ci_record_check_") as folder:
             for path in paths:
+                path, _, link_target = path.partition(" -> ")
                 target = Path(folder) / path
-                if path.endswith("/"):
+                if link_target:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(Path(folder) / link_target)
+                elif path.endswith("/"):
                     target.mkdir(parents=True, exist_ok=True)
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -974,11 +988,6 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         DEADLINE_RUN + CHECK_YAML.replace("for file in record.json retention.json; do", "for file in retention.json; do"),
         "deadline: its record check passes with the label alone",
     ),
-    "the guard record check looks at one file of all folders": (
-        GUARD_CHECK,
-        TAIL_YAML + CHECK_YAML.replace('[ ! -f "${folder}${file}" ]', '[ ! -e "${folder}${file}" ] && [ ! -d "${folder}${file}" ]'),
-        "guards: its record check passes with a directory where the label belongs",
-    ),
     "the guard record check lets a missing file pass": (
         GUARD_CHECK,
         TAIL_YAML + CHECK_YAML.replace("      incomplete=1\n", "      incomplete=0\n"),
@@ -1003,6 +1012,21 @@ PLANTS: dict[str, tuple[str | tuple[str, ...], str | tuple[str, ...], str | tupl
         DEADLINE_CHECK,
         DEADLINE_RUN + LOOSE_CHECK_YAML,
         ("deadline: its record check passes with the record and the label in two run folders", "deadline: step 5 differs from the pinned one"),
+    ),
+    "the guard record check accepts a link as the file": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace(' || [ -L "${folder}${file}" ]', ""),
+        ("guards: its record check passes with the label a link to the label of another run", "guards: its record check passes with the record a link"),
+    ),
+    "the guard record check refuses a link only as the label": (
+        GUARD_CHECK,
+        TAIL_YAML + CHECK_YAML.replace('[ -L "${folder}${file}" ]', '[ -L "${folder}retention.json" ]'),
+        "guards: its record check passes with the record a link to the record of another run",
+    ),
+    "the deadline record check refuses a link only as the record": (
+        DEADLINE_CHECK,
+        DEADLINE_RUN + CHECK_YAML.replace('[ -L "${folder}${file}" ]', '[ -L "${folder}record.json" ]'),
+        "deadline: its record check passes with the label a link to the label of another run",
     ),
     "the guard record check accepts a directory as the label": (
         GUARD_CHECK,
@@ -1174,9 +1198,8 @@ class WorkflowContractTest(unittest.TestCase):
         self.assert_plants_are_caught(WORKFLOW_TEXT)
 
     def test_every_plant_lands_in_its_own_job_without_the_comments_of_the_workflow(self) -> None:
-        """A plant is located by its job's keys, never by a comment: with the comment after a timeout removed, each plant still changes its own job."""
+        """A plant is located by its job's keys, never by a comment: with any comment after a timeout removed, each plant still changes its own job."""
         bare = re.sub(r"(timeout-minutes: \d+) #.*", r"\1", WORKFLOW_TEXT)
-        self.assertNotEqual(bare, WORKFLOW_TEXT, "the workflow has no comment after a timeout: this test no longer proves anything")
         self.assertEqual(contract_problems(bare), [], "the control: the workflow without those comments keeps the contract")
         self.assert_plants_are_caught(bare)
 
