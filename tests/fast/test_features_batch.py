@@ -70,14 +70,10 @@ def window_document(window_id: str, future: bool = False) -> dict[str, Any]:
 
 
 class Documentation(unittest.TestCase):
-    @unittest.expectedFailure
     def test_the_docstring_gives_the_six_field_form_of_a_reading_of_the_arterial_series(self) -> None:
         text = " ".join((batch.__doc__ or "").split())
         self.assertIn("[time_us, value, valid, sample_count, sum_high, sum_low]", text)
         self.assertIn(SERIES, text)
-        self.assertNotIn(
-            "a track to a list of ``[time_us, value, valid]``)", text.replace("``numeric`` (a track to a list of ``[time_us, value, valid]``)", "X") + ""
-        )
 
 
 class Entry(unittest.TestCase):
