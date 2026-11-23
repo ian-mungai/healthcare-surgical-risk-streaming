@@ -51,8 +51,8 @@ def read_memory_limit_mib(path: Path | None = None) -> int:
     raise SettingsError(f"cannot read the container's memory limit from {paths[0].name}: the job refuses to run without one")
 
 
-def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str) -> dict[str, str]:
-    """The Spark options that open the catalog ``lake`` on the Nessie reference ``ref``, or ``SettingsError`` naming the setting that is wrong."""
+def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str, catalog: str = CATALOG) -> dict[str, str]:
+    """The Spark options that open the catalog ``catalog`` (``lake`` unless named) on the Nessie reference ``ref``, or ``SettingsError`` naming one."""
     parts = urlsplit(nessie_uri)
     if parts.scheme != "http" or not parts.hostname or parts.path != "/api/v2" or parts.query or parts.fragment:
         raise SettingsError("the Nessie address must be a plain http URL ending in /api/v2, such as http://nessie:19120/api/v2")
@@ -63,7 +63,7 @@ def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str) -
         raise SettingsError("the Nessie reference is empty: a job names the branch it writes to")
     if scheme == "s3" and not region:
         raise SettingsError("the AWS region is empty: an s3 warehouse needs it")
-    prefix = f"spark.sql.catalog.{CATALOG}"
+    prefix = f"spark.sql.catalog.{catalog}"
     options = {
         prefix: "org.apache.iceberg.spark.SparkCatalog",
         f"{prefix}.catalog-impl": "org.apache.iceberg.nessie.NessieCatalog",

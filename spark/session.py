@@ -6,22 +6,17 @@ for an s3 warehouse, ``AWS_REGION``. A job never types an address, a bucket or a
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import threading
 from typing import Any
 
-from spark.settings import SettingsError, catalog_options, driver_memory_mib, read_memory_limit_mib
+from spark.catalog import environment_catalog_options
+from spark.settings import driver_memory_mib, read_memory_limit_mib
 
 SCRATCH_FOLDER = "/scratch"
 DEADLINE_EXIT_CODE = 124
-
-
-def required_environment(name: str) -> str:
-    value = os.environ.get(name, "")
-    if not value:
-        raise SettingsError(f"the environment variable {name} is not set")
-    return value
 
 
 def start_deadline(seconds: float, job: str) -> threading.Timer:
@@ -39,16 +34,14 @@ def start_deadline(seconds: float, job: str) -> threading.Timer:
 
 
 def build_session(name: str, ref: str) -> Any:
-    """A local Spark session on the Nessie reference ``ref`` with the memory that the container's limit allows."""
-    from pyspark.sql import SparkSession
+    """A local Spark session on the Nessie reference ``ref`` with the memory that the container's limit allows.
+
+    PySpark is installed in the job image only, so it is imported by name here and the rest of the sources are checked without it.
+    """
+    SparkSession = importlib.import_module("pyspark.sql").SparkSession
 
     heap = f"{driver_memory_mib(read_memory_limit_mib())}m"
-    options = catalog_options(
-        nessie_uri=required_environment("NESSIE_URI"),
-        warehouse=required_environment("WAREHOUSE_LOCATION"),
-        ref=ref,
-        region=os.environ.get("AWS_REGION", ""),
-    )
+    options = environment_catalog_options(ref)
     builder = SparkSession.builder.appName(name).master("local[*]")
     for key, value in {
         **options,

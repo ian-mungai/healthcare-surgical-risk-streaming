@@ -39,6 +39,7 @@ COPY spark /opt/jobs/spark
 COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
+COPY scripts/stack/tags.py /opt/jobs/scripts/stack/tags.py
 COPY scripts/sample/__init__.py /opt/jobs/scripts/sample/__init__.py
 COPY scripts/sample/split.py /opt/jobs/scripts/sample/split.py
 WORKDIR /opt/jobs
