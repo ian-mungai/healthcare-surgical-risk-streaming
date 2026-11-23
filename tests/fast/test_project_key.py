@@ -318,7 +318,11 @@ class ScriptTest(unittest.TestCase):
         self.assertEqual(0o700, stat.S_IMODE(self.copy("aws_access_key_id").parent.stat().st_mode))
         self.assertEqual({"aws_access_key_id", "aws_secret_access_key"}, {item.name for item in self.copy("x").parent.iterdir()}, "no file but the two copies")
 
-    def test_the_root_files_are_given_to_the_owner_and_the_copies_to_the_container_owner(self) -> None:
+    def run_given(self, arguments: list[str], data: str | None = None) -> tuple[int, str, list[tuple[int, int]]]:
+        """Run the script's ``main`` with these arguments, as ``--directory`` is always the folder of the test, and return what it gave to which owner.
+
+        The real ``fchown`` is replaced by one that records the owner it was asked for and gives the file to the user of the test, which may not be root.
+        """
         given: list[tuple[int, int]] = []
         real = os.fchown
 
@@ -326,16 +330,67 @@ class ScriptTest(unittest.TestCase):
             given.append((user, group))
             real(descriptor, self.owner[0], self.owner[1])
 
-        output, errors = io.StringIO(), io.StringIO()
+        output = io.StringIO()
         with (
-            mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload().encode()))),
+            mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO((payload() if data is None else data).encode()))),
             mock.patch("secret_files.os.fchown", side_effect=record),
             contextlib.redirect_stdout(output),
-            contextlib.redirect_stderr(errors),
+            contextlib.redirect_stderr(io.StringIO()),
         ):
-            code = INSTALL.main(["--directory", str(self.folder), "--owner", "0:0", "--container-owner", "10001:10001"])
-        self.assertEqual((0, "placed\n"), (code, output.getvalue()))
+            code = INSTALL.main(["--directory", str(self.folder), *arguments])
+        return code, output.getvalue(), given
+
+    def test_the_root_files_are_given_to_the_owner_and_the_copies_to_the_container_owner(self) -> None:
+        code, output, given = self.run_given(["--owner", "0:0", "--container-owner", "10001:10001"])
+        self.assertEqual((0, "placed\n"), (code, output))
         self.assertEqual([(0, 0), (0, 0), (10001, 10001), (10001, 10001)], given)
+
+    def test_with_the_option_left_out_the_copies_are_given_to_10001_and_10001_whatever_the_owner_of_the_root_files_is(self) -> None:
+        for owner in ("0:0", "5:6"):
+            with self.subTest(owner=owner):
+                code, output, given = self.run_given(["--owner", owner])
+                self.assertEqual((0, "placed\n"), (code, output))
+                root = tuple(int(part) for part in owner.split(":"))
+                self.assertEqual([root, root, (10001, 10001), (10001, 10001)], given)
+                for name in ("airbyte", "airbyte_api"):
+                    for item in (self.folder / name).iterdir():
+                        item.chmod(0o600)
+                        item.unlink()
+                    (self.folder / name).rmdir()
+
+    def test_an_owner_that_is_malformed_or_out_of_range_is_refused_by_the_code_bad_owner_before_any_file_is_written(self) -> None:
+        for option in ("--container-owner", "--owner"):
+            for owner in ("abc", "1", "1:", ":1", "-1:5", "5:-1", "4294967295:5", "5:4294967295", "99999999999999999999:1", "1:99999999999999999999", "01:5"):
+                with self.subTest(option=option, owner=owner):
+                    code, output, given = self.run_given([option, owner])
+                    self.assertEqual((3, "bad_owner\n", []), (code, output, given))
+                    self.assertFalse((self.folder / "airbyte").exists() or (self.folder / "airbyte_api").exists(), "no file and no folder is made")
+
+    def test_a_container_owner_that_is_root_is_refused_and_the_highest_valid_id_is_accepted(self) -> None:
+        self.assertEqual((3, "bad_owner\n", []), self.run_given(["--container-owner", "0:0"]))
+        code, output, given = self.run_given(["--container-owner", "4294967294:4294967294"])
+        self.assertEqual((0, "placed\n"), (code, output))
+        self.assertEqual((4294967294, 4294967294), given[-1])
+
+    def test_every_refusal_code_of_the_script_has_a_message_in_the_launcher(self) -> None:
+        refusals = set(INSTALL.CODES) - {"placed", "unchanged"}
+        self.assertEqual(refusals, set(host.SCRIPT_REFUSALS))
+        for code in refusals:
+            self.assertIn(f"script_{code}", host.KEY_MESSAGES)
+
+    def test_a_file_that_holds_bytes_that_are_not_text_is_a_content_that_differs_and_is_repaired_not_a_failure(self) -> None:
+        self.run_main(payload())
+        for path in (self.copy("aws_access_key_id"), self.path("aws_secret_access_key"), self.copy("aws_secret_access_key")):
+            with self.subTest(path=str(path.relative_to(self.folder))):
+                path.chmod(0o600)
+                path.write_bytes(b"\xff\xfe\x80")
+                path.chmod(0o400)
+                self.assertEqual((0, "placed\n", ""), self.run_main(payload()))
+                self.assertEqual(
+                    {KEY_ID, KEY_VALUE},
+                    {item.read_text() for item in (*self.folder.joinpath("airbyte").iterdir(), *self.folder.joinpath("airbyte_api").iterdir())},
+                )
+                self.assertEqual((0, "unchanged\n"), self.run_main(payload())[:2])
 
     def test_without_the_option_the_copies_belong_to_the_code_locations_user_and_group_the_compose_service_runs_as(self) -> None:
         self.assertEqual("10001:10001", INSTALL.DEFAULT_CONTAINER_OWNER)

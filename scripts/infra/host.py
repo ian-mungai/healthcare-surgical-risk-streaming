@@ -61,7 +61,7 @@ KEY_EXPORT_SECONDS = 60
 KEY_SEND_SECONDS = 60
 KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
 KEY_VALUE_FORM = re.compile(r"[A-Za-z0-9/+=]{20,128}")
-SCRIPT_REFUSALS = ("oversized", "not_json", "bad_keys", "session_token", "empty", "bad_form", "cannot_write")
+SCRIPT_REFUSALS = ("oversized", "not_json", "bad_keys", "session_token", "empty", "bad_form", "bad_owner", "cannot_write")
 KEY_MESSAGES = {
     "export_failed": "the AWS command line could not export the credentials of the project profile (exit status {status}); run it by hand to see why",
     "export_timeout": "the AWS command line did not finish within {seconds} seconds",
@@ -79,6 +79,7 @@ KEY_MESSAGES = {
     "script_session_token": "the key script on the host refused the document: it holds a session token",
     "script_empty": "the key script on the host refused the document: a value is empty",
     "script_bad_form": "the key script on the host refused the document: a value is not in the form of an AWS access key",
+    "script_bad_owner": "the key script on the host refused its owner options: an owner is not a numeric uid:gid that the system takes",
     "script_cannot_write": "the key script on the host could not write the key files under the secrets folder; check the folder's owner and free space",
     "script_unknown": "the key script on the host answered with something that this program does not know",
 }

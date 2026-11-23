@@ -1,7 +1,8 @@
 # Reads airbyte_bin_directory, airbyte_key_script, airbyte_key_sudoers, airbyte_visudo, airbyte_secrets_directory, airbyte_owner and airbyte_group. The project profile's access key never enters Ansible: the
 # launcher reads it on the owner's computer and pipes it, on standard input of one SSH command, to the script that this step installs. The script and the shared atomic file
 # helper that it imports are placed in a folder only the owner of the files can enter (mode 0700 for the script and the folder, 0600 for the helper), and the secrets folder is
-# made. The script reads the key from standard input, refuses anything else by a fixed code and writes the two root-only files that the connection step reads. Nothing in this
+# made. The script reads the key from standard input, refuses anything else by a fixed code and writes four files: the two root-only files that the connection step reads
+# and the two copies, for the code location container's user, in the folder of the record load's files (airbyte_api, which the record role makes). Nothing in this
 # step reads or holds the key. The sudoers drop-in beside them turns off sudo's input and output recording for exactly the command line that the launcher runs; it is
 # checked with visudo before it takes its place, so a file that sudo cannot read is never installed. A second run changes nothing.
 - name: Create the folder of the platform's scripts

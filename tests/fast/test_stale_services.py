@@ -124,6 +124,44 @@ class SecretsOfServicesTest(unittest.TestCase):
         self.assertEqual(["dagster_code_location"], names)
 
 
+class TargetsTest(unittest.TestCase):
+    """Only the files of the services that a start names are looked at, so a file of another service that is not there yet cannot stop the start."""
+
+    FILES = {"postgres": [Path("/s/postgres/password")], "dagster_code_location": [Path("/s/airbyte_api/client_id")], "alloy": []}
+    STARTED = {"postgres": 100.0, "dagster_code_location": 100.0}
+
+    def modified(self, looked: list[Path]) -> Any:
+        def read(path: Path) -> float:
+            looked.append(path)
+            if path.parts[2] == "airbyte_api":
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return 50.0
+
+        return read
+
+    def test_the_files_of_a_service_that_the_start_does_not_name_are_never_looked_at(self) -> None:
+        looked: list[Path] = []
+        names = stale.stale_services(self.FILES, self.STARTED, self.modified(looked), ["postgres"])
+        self.assertEqual([], names)
+        self.assertEqual([Path("/s/postgres/password")], looked)
+
+    def test_a_start_that_names_no_service_looks_at_every_service_that_has_a_container(self) -> None:
+        looked: list[Path] = []
+        with self.assertRaises(stale.StaleError):
+            stale.stale_services(self.FILES, self.STARTED, self.modified(looked), [])
+        self.assertIn(Path("/s/airbyte_api/client_id"), looked)
+
+    def test_a_named_service_with_a_container_whose_file_is_not_there_is_a_refusal_that_names_the_service_and_the_file(self) -> None:
+        with self.assertRaises(stale.StaleError) as raised:
+            stale.stale_services(self.FILES, self.STARTED, self.modified([]), ["dagster_code_location"])
+        self.assertEqual("service dagster_code_location mounts a file that is not there: /s/airbyte_api/client_id", str(raised.exception))
+
+    def test_a_named_service_with_no_container_is_not_looked_at_because_its_first_start_reads_the_file(self) -> None:
+        looked: list[Path] = []
+        self.assertEqual([], stale.stale_services(self.FILES, {"postgres": 100.0}, self.modified(looked), ["dagster_code_location", "postgres"]))
+        self.assertEqual([Path("/s/postgres/password")], looked)
+
+
 class StartTimeTest(unittest.TestCase):
     def test_a_start_time_with_nanoseconds_and_a_zone_is_read_to_the_second_fraction_that_python_keeps(self) -> None:
         self.assertEqual(1767225600.123456, stale.parse_started("2026-01-01T00:00:00.123456789Z"))

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -71,9 +71,22 @@ def parse_containers(text: str) -> dict[str, str]:
     return containers
 
 
-def stale_services(files: dict[str, list[Path]], started: dict[str, float], modified: Callable[[Path], float]) -> list[str]:
-    """The services, in list order, that have a container and a file modified after that container started."""
-    return [name for name, paths in files.items() if name in started and any(modified(path) > started[name] for path in paths)]
+def stale_services(files: dict[str, list[Path]], started: dict[str, float], modified: Callable[[Path], float], targets: Sequence[str] = ()) -> list[str]:
+    """The services, in list order, that have a container and a file modified after that container started.
+
+    With ``targets`` only those services are looked at, and no file of another service is read, so a file that another service mounts and that is not there yet
+    cannot stop a start that does not name it. A service of the list that has a container and mounts a file that is not there is a ``StaleError``.
+    """
+    found: list[str] = []
+    for name, paths in files.items():
+        if name not in started or (targets and name not in targets):
+            continue
+        try:
+            if any(modified(path) > started[name] for path in paths):
+                found.append(name)
+        except FileNotFoundError as error:
+            raise StaleError(f"service {name} mounts a file that is not there: {error.filename}") from None
+    return found
 
 
 def run(module: AnsibleModule, arguments: list[str]) -> str:
@@ -85,8 +98,15 @@ def run(module: AnsibleModule, arguments: list[str]) -> str:
 
 
 def main() -> None:
-    module = AnsibleModule(argument_spec={"compose_command": {"type": "list", "elements": "str", "required": True}}, supports_check_mode=True)
+    module = AnsibleModule(
+        argument_spec={
+            "compose_command": {"type": "list", "elements": "str", "required": True},
+            "services": {"type": "list", "elements": "str", "default": []},
+        },
+        supports_check_mode=True,
+    )
     command: list[str] = module.params["compose_command"]
+    targets: list[str] = module.params["services"]
     try:
         files = service_files(json.loads(run(module, [*command, "config", "--format", "json"])))
         containers = parse_containers(run(module, [*command, "ps", "--all", "--format", "json"]))
@@ -98,7 +118,7 @@ def main() -> None:
                 moment = next((text for full, text in by_id.items() if full.startswith(identifier) or identifier.startswith(full)), None)
                 if moment is not None:
                     started[service] = parse_started(moment)
-        names = stale_services(files, started, lambda path: os.stat(path).st_mtime)
+        names = stale_services(files, started, lambda path: os.stat(path).st_mtime, targets)
     except (StaleError, ValueError, OSError) as error:
         module.fail_json(msg=str(error))
     module.exit_json(changed=False, stale=names)

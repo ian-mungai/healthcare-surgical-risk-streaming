@@ -1,6 +1,7 @@
 # Reads compose_stack_docker, compose_stack_start_services (the services to start; none named starts every service), compose_stack_start_except (services that an
 # empty start leaves out) and the deadlines. A service whose
-# placed configuration file is newer than its container is recreated alone, because Compose compares no file content. Every wait ends at
+# placed configuration or secret file is newer than its container is recreated alone, because Compose compares no file content. The services to start are
+# worked out first, and only their files are read, so a file that another service mounts and that is not placed yet cannot stop the start. Every wait ends at
 # its deadline and a failure names the service and holds no secret. The containers are read through the first word of compose_stack_docker, the docker command.
 - name: Read the stack's containers before the start
   ansible.builtin.command:
@@ -19,13 +20,6 @@
   when: compose_stack_before.stdout_lines | length > 0
   timeout: 60
 
-- name: Read which services run with an older copy of a placed configuration file
-  stale_services:
-    compose_command: "{{ compose_stack_docker }}"
-  register: compose_stack_stale
-  check_mode: false
-  timeout: 60
-
 - name: Read the names of every service when some are left out of an empty start
   ansible.builtin.command:
     argv: "{{ compose_stack_docker + ['config', '--services'] }}"
@@ -40,6 +34,14 @@
     compose_stack_to_start: >-
       {{ compose_stack_start_services | default([]) if (compose_stack_start_services | default([])) | length > 0
       else (compose_stack_service_names.stdout_lines | difference(compose_stack_start_except) | sort if (compose_stack_start_except | default([])) | length > 0 else []) }}
+
+- name: Read which of the services to start run with an older copy of a placed configuration or secret file
+  stale_services:
+    compose_command: "{{ compose_stack_docker }}"
+    services: "{{ compose_stack_to_start }}"
+  register: compose_stack_stale
+  check_mode: false
+  timeout: 60
 
 - name: Start the services and wait for every health check
   block:

@@ -2,10 +2,11 @@
 
 The order is read from the real playbooks, not described: the roles and post tasks of ``ansible/host.yml`` are expanded in the order Ansible runs them, each
 role's dependencies first, each task file with the files it includes right after it; then the launcher's one step that places the project profile's key (it
-runs between the two playbooks in ``host_up``, which a test reads); then the tasks of ``ansible/connection.yml``. A service starts at the first ``start.yml``
-that names it, or that names none and so starts every service that is not left out (``compose_stack_start_except``). A secret file is made by the task file
-that the tables below name for it or for its folder. A redeploy finds every file there already, so it needs no order of its own; a replaced file is the one
-case that needs the service to start again, which ``stale_services`` holds for configs and for file secrets.
+runs between the two playbooks in ``host_up``, which ``test_host_commands`` holds); then the tasks of ``ansible/connection.yml``. A service starts at the first
+``start.yml`` that names it, or that names none and so starts every service that is not left out (``compose_stack_start_except``). A secret file is made by the
+task file that the tables below name for it or for its folder. A redeploy finds every file there already, so it needs no order; a replaced file is the
+one case that needs the service to start again, which ``stale_services`` holds for configs and for file secrets, and ``test_compose_stack_start`` holds as
+the Compose command.
 """
 
 from __future__ import annotations
@@ -33,7 +34,6 @@ PRODUCERS = {
 KEY_STEP = ("launcher", "place_project_key")
 FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP}
 CONNECTION = ROOT / "ansible" / "connection.yml"
-HOST_COMMANDS = ROOT / "scripts" / "infra" / "host.py"
 
 
 @dataclass
@@ -187,14 +187,6 @@ class DeployOrderTest(unittest.TestCase):
         connection_files = {(event.role, event.file) for event in play_events(CONNECTION)}
         self.assertIn(("compose_stack", "start_orchestration.yml"), connection_files)
         self.assertNotIn(("compose_stack", "start_orchestration.yml"), host_files)
-
-    def test_the_launcher_runs_the_host_playbook_then_places_the_key_then_runs_the_connection_playbook(self) -> None:
-        body = HOST_COMMANDS.read_text().split("def host_up(", 1)[1].split("\ndef ", 1)[0]
-        order = [
-            body.index(call)
-            for call in ("run_ansible(run.run_id, address, variables)", "place_project_key(", 'run_ansible(run.run_id, address, variables, "connection.yml")')
-        ]
-        self.assertEqual(sorted(order), order)
 
     def test_the_orchestration_services_are_the_code_location_and_every_service_that_waits_for_it(self) -> None:
         services = mapping(load_yaml((COMPOSE / "services" / "dagster_code_location.yml").read_text()))

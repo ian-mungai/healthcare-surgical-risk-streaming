@@ -5,16 +5,17 @@ the container's user. Run as root on the host by the launcher.
 The launcher reads the key on the owner's computer and sends one JSON document on standard input: ``{"aws_access_key_id": ...,
 "aws_secret_access_key": ...}``. The script takes no secret in an argument or the environment, and no Ansible task or module ever holds the key. It
 refuses anything else by a fixed code: input over 4 KiB (``oversized``), text that is not a JSON object (``not_json``), a key whose name holds "token"
-(``session_token``), another set of keys than the two (``bad_keys``), values that are not text or not in the form of an AWS access key (``bad_form``)
-and empty values (``empty``). It writes ``airbyte/aws_access_key_id`` and ``airbyte/aws_secret_access_key`` under the secrets folder with the shared
+(``session_token``), another set of keys than the two (``bad_keys``), values that are not text or not in the form of an AWS access key (``bad_form``),
+empty values (``empty``), and an owner that is not a numeric ``uid:gid`` of ids up to 4294967294 or a container owner that is root (``bad_owner``, checked
+first, before anything is written). It writes ``airbyte/aws_access_key_id`` and ``airbyte/aws_secret_access_key`` under the secrets folder with the shared
 atomic helper: each file is written through a fresh temporary file that is flushed and synced before it takes its place, mode 0400, so a file is whole
 or absent and never empty. It writes the same two files again as ``airbyte_api/aws_access_key_id`` and ``airbyte_api/aws_secret_access_key``, owned by the
 code location container's user and group (``--container-owner``, by default 10001:10001, the user that ``compose/services/dagster_code_location.yml`` runs
 as), in the folder that the Airbyte role makes for the other four files of that container. The script is the only writer of the key, so no Ansible task,
 variable or result holds it. A folder that is missing is made for root with mode 0700, as the role makes it. The leftovers of an interrupted write are removed
-at the start, an empty or short file is replaced like a changed one (a rotated key), a file with another mode or owner is given the right ones, and a second
-run changes nothing. A file that cannot be written is ``cannot_write``. The script prints one code (``placed``, ``unchanged`` or a refusal) and nothing
-else, and exits 0 for the first two and 3 otherwise.
+at the start, an empty or short file is replaced like a changed one (a rotated key; so is a file whose bytes are not text), a file with another mode or
+owner is given the right ones, and a second run changes nothing. A file that cannot be written is ``cannot_write``. The script prints one code (``placed``,
+``unchanged`` or a refusal) and nothing else, and exits 0 for the first two and 3 otherwise.
 It uses only the standard library and the helper that the role installs beside it, and runs on the host's Python.
 
 The launcher starts it as ``sudo /usr/bin/python3 -I <this file>``: the host's interpreter in isolated mode (no environment variable, no user site
@@ -62,7 +63,8 @@ ID_FILE = "aws_access_key_id"
 VALUE_FILE = "aws_secret_access_key"
 KEY_ID_FORM = re.compile(r"[A-Z0-9]{16,128}")
 KEY_VALUE_FORM = re.compile(r"[A-Za-z0-9/+=]{20,128}")
-CODES = ("placed", "unchanged", "oversized", "not_json", "bad_keys", "session_token", "empty", "bad_form", "cannot_write")
+HIGHEST_ID = 4294967294
+CODES = ("placed", "unchanged", "oversized", "not_json", "bad_keys", "session_token", "empty", "bad_form", "bad_owner", "cannot_write")
 
 
 class Refusal(RuntimeError):
@@ -97,13 +99,29 @@ def parse_document(data: bytes) -> tuple[str, str]:
     return key_id, value
 
 
+def check_owner(text: str, *, allow_root: bool) -> tuple[int, int]:
+    """The numeric user and group of ``uid:gid``, each no higher than ``HIGHEST_ID`` (the system call takes no more), or ``Refusal`` with ``bad_owner``.
+
+    It is called for both owners before the first file is written, so a bad owner leaves no file and no folder.
+    """
+    try:
+        owner = parse_owner(text, allow_root=allow_root)
+    except SecretFileError:
+        raise Refusal("bad_owner") from None
+    if max(owner) > HIGHEST_ID:
+        raise Refusal("bad_owner")
+    return owner
+
+
 def current_value(path: Path) -> str | None:
-    """What the file holds, or ``None`` when it is absent. An empty file holds the empty text, which no key equals."""
+    """What the file holds, or ``None`` when it is absent. The empty text, which no key equals, stands for an empty file and for bytes that are not text."""
     try:
         return path.read_text().rstrip("\n")
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeDecodeError):
+    except UnicodeDecodeError:
+        return ""
+    except OSError:
         raise Refusal("cannot_write") from None
 
 
@@ -139,8 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--container-owner", default=DEFAULT_CONTAINER_OWNER, help="the numeric user and group of the code location's two copies, uid:gid")
     arguments = parser.parse_args(argv)
     try:
+        owner, container_owner = check_owner(arguments.owner, allow_root=True), check_owner(arguments.container_owner, allow_root=False)
         key_id, value = parse_document(sys.stdin.buffer.read(MAX_INPUT_BYTES + 1))
-        code = place(Path(arguments.directory), parse_owner(arguments.owner, allow_root=True), parse_owner(arguments.container_owner), key_id, value)
+        code = place(Path(arguments.directory), owner, container_owner, key_id, value)
     except Refusal as error:
         code = error.code
     except SecretFileError:

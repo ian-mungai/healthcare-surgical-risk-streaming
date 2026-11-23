@@ -257,6 +257,72 @@ class RecreateTest(unittest.TestCase):
         self.assertEqual(["compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps grafana"], forced)
 
 
+class SecretRecreateTest(unittest.TestCase):
+    """A service whose secret file was replaced after its container started is recreated alone by the Compose command; only a named service is read."""
+
+    RECREATE = "compose --project-name sample up --detach --wait --wait-timeout 30 --force-recreate --no-deps dagster_code_location"
+
+    def setup(self, folder: Path, *, secret_age: int | None) -> tuple[Path, Path]:
+        """The stand-in with two containers that started in 2025, and a secret file of the code location that is as old as ``secret_age`` or absent."""
+        stand_in, _ = prepare(folder)
+        secret = folder / "client_id"
+        if secret_age is not None:
+            secret.write_text("x")
+            os.utime(secret, (secret_age, secret_age))
+        config = {
+            "services": {"postgres": {}, "dagster_code_location": {"secrets": [{"source": "airbyte_client_id"}]}},
+            "secrets": {"airbyte_client_id": {"file": str(secret)}},
+        }
+        started = {"postgres": "2025-01-01T00:00:00Z", "dagster_code_location": "2025-01-01T00:00:00Z"}
+        (stand_in.parent / "config.json").write_text(json.dumps(config))
+        (stand_in.parent / "ps.json").write_text("".join(json.dumps({"Service": name, "ID": f"id_{name}"}) + "\n" for name in started))
+        (stand_in.parent / "inspect.txt").write_text("".join(f"id_{name} {moment}\n" for name, moment in started.items()))
+        (stand_in.parent / "started").write_text("")
+        return stand_in, secret
+
+    def start(self, folder: Path, stand_in: Path, services: list[str]) -> tuple[int, str]:
+        return run_tasks("start.yml", variables(folder, stand_in, folder, compose_stack_start_services=services))
+
+    def recreations(self, stand_in: Path) -> list[str]:
+        return [line for line in calls(stand_in) if "--force-recreate" in line]
+
+    def test_a_secret_file_that_was_replaced_after_the_start_is_recreated_by_the_compose_command_and_a_second_run_recreates_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, _ = self.setup(folder, secret_age=1_800_000_000)
+            code, output = self.start(folder, stand_in, ["dagster_code_location"])
+            self.assertEqual(0, code, output)
+            self.assertEqual([self.RECREATE], self.recreations(stand_in))
+            code, output = self.start(folder, stand_in, ["dagster_code_location"])
+            self.assertEqual((0, 1), (code, len(self.recreations(stand_in))), output)
+            self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_secret_file_older_than_its_container_recreates_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, _ = self.setup(folder, secret_age=1_700_000_000)
+            code, output = self.start(folder, stand_in, ["dagster_code_location"])
+        self.assertEqual(0, code, output)
+        self.assertEqual([], self.recreations(stand_in))
+
+    def test_a_start_that_does_not_name_the_service_does_not_look_for_its_secret_file_that_is_not_there_yet(self) -> None:
+        """The in-place redeploy: the PostgreSQL start comes before the step that writes a copy that is missing, and it must reach that step."""
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, _ = self.setup(folder, secret_age=None)
+            code, output = self.start(folder, stand_in, ["postgres"])
+        self.assertEqual(0, code, output)
+        self.assertEqual([], self.recreations(stand_in))
+
+    def test_a_start_that_names_the_service_refuses_its_missing_secret_file_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, secret = self.setup(folder, secret_age=None)
+            code, output = self.start(folder, stand_in, ["dagster_code_location"])
+        self.assertNotEqual(0, code)
+        self.assertIn(f"service dagster_code_location mounts a file that is not there: {secret}", output)
+
+
 class BuildTest(unittest.TestCase):
     def build(self, values_from: tuple[Path, Path, Path], **more: object) -> tuple[int, str]:
         folder, stand_in, context = values_from
