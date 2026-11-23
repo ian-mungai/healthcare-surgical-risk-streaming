@@ -441,6 +441,12 @@ class OutputBindingTest(unittest.TestCase):
         case.nessie.other[(BRANCH, case.branch_hash)] = {("other_space", "stray"): OTHER_TABLE}
         self.refused(case, "other_space")
 
+    def test_a_base_hash_that_is_not_a_hash_is_refused(self) -> None:
+        document = json.loads(Case(self).reference.to_json())
+        record = {"format": run.LOAD_RECORD_FORMAT, "branch": BRANCH, "branch_hash": "a" * 64, "base_hash": "main", "manifest": document, "tables": SNAPSHOTS}
+        with self.assertRaises(run.TableChecksError):
+            run.parse_load_record(json.dumps(record))
+
     def test_the_load_record_names_the_base_hash_and_refuses_a_record_without_it(self) -> None:
         document = json.loads(Case(self).reference.to_json())
         record = {"format": run.LOAD_RECORD_FORMAT, "branch": BRANCH, "branch_hash": "a" * 64, "base_hash": "b" * 64, "manifest": document, "tables": SNAPSHOTS}

@@ -294,6 +294,12 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--window-only", action="store_true")
     arguments = parser.parse_args(argv)
     service_commands = {"serve": command_serve, "submit": command_submit, "health": command_health}
+    if arguments.command == "submit":
+        try:
+            refuse_output_inside_folders([arguments.manifest_reference], [arguments.inbox])
+        except ClosedError as error:
+            sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
+            return 2
     if arguments.command in service_commands:
         return service_commands[arguments.command](arguments)
     try:

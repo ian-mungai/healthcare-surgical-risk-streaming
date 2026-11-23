@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,6 +58,12 @@ class SameFileTests(Fixture):
         for other in (target, self.root / "." / "target", link, hard, self.root / "sub" / ".." / "target"):
             with self.subTest(other=other.name):
                 self.assertTrue(same_file(target, other))
+
+    def test_a_path_through_a_link_and_a_dot_dot_is_compared_in_its_written_form_too(self) -> None:
+        target = self.made("target")
+        (self.root / "elsewhere" / "deep").mkdir(parents=True)
+        (self.root / "lnk").symlink_to(self.root / "elsewhere" / "deep")
+        self.assertTrue(same_file(self.root / "lnk" / ".." / "target", target))
 
     def test_two_files_and_a_missing_output_are_not_the_same(self) -> None:
         self.assertFalse(same_file(self.made("one"), self.made("two")))
@@ -181,7 +188,21 @@ class CommandTests(Fixture):
                         raise
                     stubs[error.name] = mock.MagicMock()
                     continue
-                return self.run_main(program.main, argv)
+                with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(b""))):
+                    return self.run_main(program.main, argv)
+
+    def test_the_replay_submit_refuses_a_manifest_reference_that_lies_in_the_inbox_it_writes(self) -> None:
+        inbox = self.root / "inbox"
+        (inbox / "sub").mkdir(parents=True)
+        for name in ("reference.json", "r_one.json", "sub/../r_one.reference.json"):
+            with self.subTest(name=name):
+                reference = inbox / name
+                reference.parent.mkdir(exist_ok=True)
+                reference.write_text(ORIGINAL)
+                code, err = self.run_replay(["submit", "--inbox", str(inbox), "--manifest-reference", str(reference)])
+                self.assertEqual(2, code)
+                self.assertIn(REFUSAL, err)
+                self.assertEqual(ORIGINAL, reference.read_text())
 
     def test_a_replay_command_that_cannot_read_its_run_record_names_the_argument_and_not_the_path(self) -> None:
         missing = self.root / "secret_folder_marker" / "run.json"

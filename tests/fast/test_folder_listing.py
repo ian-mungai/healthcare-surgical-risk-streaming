@@ -154,6 +154,19 @@ class ListFolderTests(unittest.TestCase):
         (self.root / "c.json").symlink_to(self.root / "a.json")
         self.assertEqual([self.root / "a.json", self.root / "c.json"], list_files(self.root, "*.json"))
 
+    def test_a_file_that_vanishes_between_the_listing_and_the_examination_is_not_listed(self) -> None:
+        (self.root / "a.json").write_text("{}")
+        (self.root / "b.json").write_text("{}")
+        real = os.lstat
+
+        def vanishing(path: str | Path) -> os.stat_result:
+            if Path(path).name == "a.json":
+                raise FileNotFoundError(path)
+            return real(path)
+
+        with mock.patch("scripts.ingestion.folder.os.lstat", vanishing):
+            self.assertEqual([self.root / "b.json"], list_files(self.root, "*.json"))
+
     def test_a_link_to_nothing_among_the_files_is_an_error(self) -> None:
         (self.root / "x.json").symlink_to(self.root / "nowhere")
         with self.assertRaises(OSError):
