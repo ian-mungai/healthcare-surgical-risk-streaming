@@ -23,6 +23,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -37,8 +38,9 @@ from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
 from scripts.sample.candidates import RELEASE_FILE
-from scripts.stack.groups import Settings, compose_arguments
-from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.groups import Settings, compose_arguments, rendered_environment
+from scripts.stack.limits import load_limits
+from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark import table_checks as rules
 
 LOAD_RECORD_FORMAT = "load_record_1"
@@ -47,13 +49,23 @@ RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
 JOB_OUTPUT_FILE = "job_output.txt"
-LOCK_FILE = ".table_checks.lock"
+# One fixed place for the locks of every load, on the tmpfs the code location already has. A lock ends with its process, so a crash leaves none.
+LOCK_DIRECTORY = Path("/run/dagster/table_check_locks")
+# The job runs as the Spark user of the Spark image, with the launcher's own group as its primary group. The staged folder is 0750 and each staged file 0640
+# in that group, set by the launcher, so the job reads them and no other user does.
+SPARK_UID = 10100
+STAGING_GID = 10001
+STAGING_FOLDER_MODE = 0o750
+STAGING_FILE_MODE = 0o640
+BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 STAGING_DIRECTORY = "/opt/dagster/staging"
 STAGING_VOLUME = "table_check_staging"
 HISTORY_PAGE_SIZE = 100
 HISTORY_PAGE_LIMIT = 50
 TRACKED_RELEASE_FILE = RELEASE_FILE
 MANIFEST_LINE_PREFIX = "records-manifest: "
+SOURCE_LINE_PREFIX = "records-source: "
+BRANCH_LINE_PREFIX = "records-branch: "
 MANIFEST_FIELDS: Mapping[str, type] = {"bucket": str, "key": str, "version_id": str, "sha256": str}
 LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "manifest": dict, "tables": dict}
 FILE_TABLES = tuple(spec.name for spec in rules.TABLES if spec.source == "file")
@@ -101,8 +113,10 @@ Runner = Callable[[Path], RunnerReply]
 def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_seconds: float) -> Runner:
     """A runner that starts the job as a one-off of the stack's ``spark`` service, in the ``batch`` profile and with no service it depends on started.
 
-    The staging folders are subfolders of ``directory``, which this process sees and which is the Docker volume ``volume``; the job sees that volume, read-only,
-    at ``/staging``. A job that passes its deadline is stopped by the launcher and its reply carries the exit code 124.
+    The staging folders are subfolders of ``directory``, which this process sees and which is the Docker volume ``volume``; the job sees that volume,
+    read-only, at ``/staging``. The job runs as ``SPARK_UID`` with ``STAGING_GID`` as its group, the group of the staged files. The environment of the command
+    is the one the group commands use: the memory limits that ``scripts.stack.limits`` renders from the limits file, then the process's own variables. A job
+    that passes its deadline is stopped by the launcher and its reply carries the exit code 124.
     """
     root = Path(directory)
 
@@ -112,11 +126,12 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
         arguments = compose_arguments(
             settings,
             "batch",
-            *["run", "--rm", "--no-TTY", "--no-deps", "--volume", f"{volume}:/staging:ro", "--entrypoint", "python", "spark"],
-            *["-m", "spark.jobs.table_checks", "--staging", f"/staging/{staging.name}"],
+            *["run", "--rm", "--no-TTY", "--no-deps", "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
+            *["--entrypoint", "python", "spark", "-m", "spark.jobs.table_checks", "--staging", f"/staging/{staging.name}"],
         )
+        environment = rendered_environment(load_limits(settings.limits_file))
         try:
-            result = run_command("docker", arguments, timeout=deadline_seconds)
+            result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
         except TimeoutExpired:
             return RunnerReply(124, "", f"the table checks job did not finish within {deadline_seconds:g} seconds and was stopped")
         return RunnerReply(result.returncode, result.stdout, result.stderr)
@@ -146,7 +161,7 @@ def parse_load_record(text: str) -> LoadRecord:
     manifest = closed(fields["manifest"], MANIFEST_FIELDS, "the load record's manifest")
     tables = fields["tables"]
     names = [spec.name for spec in rules.TABLES]
-    if fields["format"] != LOAD_RECORD_FORMAT or not fields["branch"] or fields["branch"] == "main":
+    if fields["format"] != LOAD_RECORD_FORMAT or not BRANCH_NAME.fullmatch(fields["branch"]) or fields["branch"] == "main":
         raise TableChecksError("the load record has another format or names no load branch")
     if not rules.HASH.fullmatch(fields["branch_hash"]) or not rules.HASH.fullmatch(manifest["sha256"]):
         raise TableChecksError("the load record holds a hash that is not 64 lower-case hex digits")
@@ -156,10 +171,24 @@ def parse_load_record(text: str) -> LoadRecord:
 
 
 def manifest_line(sha256: str) -> str:
-    """The line of a merge commit's message that names the manifest the merged load read. The load step reads it to skip a manifest main holds."""
+    """The last line of a merge commit's message: it names the manifest the merged load read. The load step reads it to skip a manifest main holds."""
     if rules.HASH.fullmatch(sha256) is None:
         raise TableChecksError("a manifest SHA-256 is 64 lower-case hex digits")
     return f"{MANIFEST_LINE_PREFIX}{sha256}"
+
+
+def source_line(sha256: str) -> str:
+    """The line of a merge commit's message that names the hash of the load branch that was checked and merged."""
+    if rules.HASH.fullmatch(sha256) is None:
+        raise TableChecksError("a source hash is 64 lower-case hex digits")
+    return f"{SOURCE_LINE_PREFIX}{sha256}"
+
+
+def branch_line(branch: str) -> str:
+    """The line of a merge commit's message that names the load branch that was checked and merged."""
+    if BRANCH_NAME.fullmatch(branch) is None:
+        raise TableChecksError("a load branch name is letters, digits, dots, underscores, dashes and slashes")
+    return f"{BRANCH_LINE_PREFIX}{branch}"
 
 
 def read_track_pin(path: Path = TRACKED_RELEASE_FILE) -> rules.TrackPin:
@@ -171,15 +200,21 @@ def read_track_pin(path: Path = TRACKED_RELEASE_FILE) -> rules.TrackPin:
 
 
 def table_snapshot(nessie: NessieClient, branch: str, branch_hash: str, table: str) -> int | None:
-    """The snapshot ID that Nessie holds for the table on the branch at exactly that hash, or None when the table is not there."""
+    """The snapshot ID that Nessie holds for the table on the branch at exactly that hash, or None when Nessie says the table is not there (404).
+
+    Any other answer must hold ``content.snapshotId`` as a whole number: an answer of another form is an error and never a missing table.
+    """
     try:
-        document = nessie.request("GET", f"/trees/{quote(f'{branch}@{branch_hash}', safe='@')}/contents/{rules.NAMESPACE}.{table}") or {}
+        document = nessie.request("GET", f"/trees/{quote(f'{branch}@{branch_hash}', safe='@')}/contents/{rules.NAMESPACE}.{table}")
     except NessieError as error:
         if error.status == 404:
             return None
         raise
-    snapshot = (document.get("content") or {}).get("snapshotId")
-    return snapshot if type(snapshot) is int else None
+    content = document.get("content") if isinstance(document, dict) else None
+    snapshot = content.get("snapshotId") if isinstance(content, dict) else None
+    if type(snapshot) is not int:
+        raise TableChecksError("Nessie's answer for a table is not in the expected form")
+    return snapshot
 
 
 def confirm_load(nessie: NessieClient, record: LoadRecord) -> None:
@@ -203,8 +238,21 @@ class Staged:
     size: int
 
 
-def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Path) -> list[Staged]:
-    """Stream the manifest's version of each file table into ``staging`` and prove its bytes. If one differs, raise and leave no staged file."""
+def secure(path: Path, mode: int, gid: int) -> None:
+    """Give a staged file or folder exactly ``mode`` and the group ``gid``, whatever the umask. A group the launcher cannot set stops the run."""
+    os.chmod(path, mode)
+    if path.stat().st_gid != gid:
+        try:
+            os.chown(path, -1, gid)
+        except OSError:
+            raise TableChecksError("the staged files could not be given the group that the job reads them through") from None
+
+
+def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Path, gid: int = STAGING_GID) -> list[Staged]:
+    """Stream the manifest's version of each file table into ``staging`` and prove its bytes. If anything fails, raise and leave no staged file.
+
+    The folder is ``STAGING_FOLDER_MODE`` and each file ``STAGING_FILE_MODE`` in the group ``gid``, set here and not by the umask.
+    """
     import hashlib
 
     source_prefix = pinned_release().source_prefix
@@ -214,6 +262,7 @@ def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Pa
     staging.mkdir(parents=True, exist_ok=True)
     staged: list[Staged] = []
     try:
+        secure(staging, STAGING_FOLDER_MODE, gid)
         for name, entry in zip(FILE_TABLES, entries, strict=True):
             version = versions.get((entry.key, entry.version_id))
             if version is None:
@@ -228,13 +277,20 @@ def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Pa
             if digest.hexdigest() != entry.sha256 or size != entry.size:
                 Path(partial).unlink()
                 raise TableChecksError(f"the bytes read for {name} are not the verified file of the manifest")
-            os.chmod(partial, 0o644)
+            secure(Path(partial), STAGING_FILE_MODE, gid)
             os.replace(partial, staging / f"{name}.csv")
             staged.append(Staged(name, f"{name}.csv", entry.sha256, size))
     except BaseException:
         remove_staged(staging)
         raise
     return staged
+
+
+def write_plan(staging: Path, document: Mapping[str, Any], gid: int) -> None:
+    """Write the plan into the staging folder with the same mode and group as the staged files."""
+    path = staging / PLAN_FILE
+    path.write_text(json.dumps(document, indent=1) + "\n")
+    secure(path, STAGING_FILE_MODE, gid)
 
 
 def remove_staged(staging: Path) -> None:
@@ -246,6 +302,8 @@ def remove_staged(staging: Path) -> None:
     for partial in staging.glob(".*"):
         if partial.is_file():
             partial.unlink()
+    with contextlib.suppress(OSError):
+        staging.rmdir()
 
 
 def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, empty_form: str, run_id: str) -> dict[str, Any]:
@@ -276,19 +334,18 @@ def keep_output(run_folder: Path, reply: RunnerReply) -> None:
 
 
 def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple[rules.JobResult, dict[str, Any]]:
-    """The job's result held to the plan it was run for, with pass or fail derived from its checks, and an exit code that agrees with it.
+    """The job's one result held to the plan it was run for, with pass or fail derived from its checks, and an exit code that agrees with it.
 
-    Every message here is fixed text and numbers. The raw output of the job goes to ``JOB_OUTPUT_FILE`` of the run folder, also when the result is refused.
+    The output must hold exactly one ``RESULT`` line. The document kept is the validated one (``JobResult.document``), never the job's own text. Every message
+    here is fixed text and numbers; the raw output of the job goes to ``JOB_OUTPUT_FILE`` of the run folder, also when the result is refused.
     """
     lines = [line for line in reply.stdout.splitlines() if line.startswith(RESULT_PREFIX)]
-    if not lines:
+    if len(lines) != 1:
         keep_output(run_folder, reply)
-        raise TableChecksError(
-            f"the table checks job ended with exit code {reply.exit_code} and printed no result; its output is in {JOB_OUTPUT_FILE} of the run folder"
-        )
-    text = lines[-1].removeprefix(RESULT_PREFIX)
+        what = "printed no result" if not lines else "printed more than one result"
+        raise TableChecksError(f"the table checks job ended with exit code {reply.exit_code} and {what}; its output is in {JOB_OUTPUT_FILE} of the run folder")
     try:
-        result = rules.parse_result(text, plan)
+        result = rules.parse_result(lines[0].removeprefix(RESULT_PREFIX), plan)
     except rules.RulesError:
         keep_output(run_folder, reply)
         raise TableChecksError(
@@ -301,15 +358,19 @@ def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple
         )
     if not result.passed:
         keep_output(run_folder, reply)
-    checked: dict[str, Any] = json.loads(text)
-    return result, checked
+    return result, result.document()
+
+
+def lock_path(manifest_sha256: str, directory: Path = LOCK_DIRECTORY) -> Path:
+    """The lock file of a load: in ``directory``, named by the manifest's SHA-256 only, so it does not depend on where the results are kept."""
+    return directory / f"{manifest_sha256}.lock"
 
 
 @contextlib.contextmanager
-def load_lock(run_folder: Path) -> Iterator[None]:
+def load_lock(manifest_sha256: str, directory: Path = LOCK_DIRECTORY) -> Iterator[None]:
     """Hold the one lock of a load: a second run of the same load fails at once with a clear message. The lock ends with the process, so a crash leaves none."""
-    run_folder.mkdir(parents=True, exist_ok=True)
-    handle = (run_folder / LOCK_FILE).open("w")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = lock_path(manifest_sha256, directory).open("w")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -322,34 +383,60 @@ def load_lock(run_folder: Path) -> Iterator[None]:
 
 
 def default_branch(nessie: NessieClient) -> str:
-    name = str(nessie.config().get("defaultBranch") or "")
-    if not name:
+    name = nessie.config().get("defaultBranch")
+    if type(name) is not str or not name:
         raise TableChecksError("Nessie names no default branch to merge into")
     return name
 
 
-def merged_commit(nessie: NessieClient, record: LoadRecord) -> str | None:
-    """The hash of the commit on the default branch whose message ends with this load's ``records-manifest`` line, or None.
+def history_page(document: Any) -> tuple[list[tuple[str, str]], str]:
+    """The ``(hash, message)`` entries of a log page, newest first, and the token of the next page or "" for the last.
 
-    The log is read newest first, page by page. A log too long to read within ``HISTORY_PAGE_LIMIT`` pages is refused, never taken for a log with no merge.
+    The page must hold ``logEntries`` (a list of entries with ``commitMeta`` holding a commit hash and a message) and a boolean ``hasMore``; a page with
+    more pages must name a token. Fields that Nessie adds beyond these are not read. Any other form is an error, never an empty log.
     """
-    line = manifest_line(record.manifest.sha256)
+    if not isinstance(document, dict) or not isinstance(document.get("logEntries"), list) or type(document.get("hasMore")) is not bool:
+        raise TableChecksError("Nessie's answer for the log is not in the expected form")
+    entries: list[tuple[str, str]] = []
+    for entry in document["logEntries"]:
+        meta = entry.get("commitMeta") if isinstance(entry, dict) else None
+        commit, message = (meta.get("hash"), meta.get("message")) if isinstance(meta, dict) else (None, None)
+        if not isinstance(commit, str) or rules.HASH.fullmatch(commit) is None or not isinstance(message, str):
+            raise TableChecksError("Nessie's answer for the log is not in the expected form")
+        entries.append((commit, message))
+    token = document.get("token")
+    if document["hasMore"] and (not isinstance(token, str) or not token):
+        raise TableChecksError("Nessie's answer for the log has more pages but names no token for the next")
+    return entries, token if document["hasMore"] and isinstance(token, str) else ""
+
+
+def merged_commit(nessie: NessieClient, record: LoadRecord, at: str) -> str | None:
+    """The hash of the commit in the log of the default branch, read from exactly the commit ``at``, that merged this load, or None when none did.
+
+    A commit merged this manifest when its message ends with this load's ``records-manifest`` line (compared exactly, as the whole last line). It merged this
+    load when its message also holds the lines naming this run's branch and checked source hash. A commit for this manifest that does not is the merge of
+    another
+    load, or one written before those lines: it is refused. The log is read newest first, page by page, and a log too long to read within ``HISTORY_PAGE_LIMIT``
+    pages is refused, never taken for a log with no merge.
+    """
+    last = manifest_line(record.manifest.sha256)
+    wanted = {branch_line(record.branch), source_line(record.branch_hash)}
     default = quote(default_branch(nessie), safe="")
     token = ""
     for _ in range(HISTORY_PAGE_LIMIT):
         query = {"max-records": str(HISTORY_PAGE_SIZE), **({"page-token": token} if token else {})}
-        document = nessie.request("GET", f"/trees/{default}/history", query=query) or {}
-        for entry in document.get("logEntries", []):
-            meta = entry.get("commitMeta") or {}
-            message, commit = meta.get("message"), meta.get("hash")
-            if isinstance(message, str) and isinstance(commit, str) and message.rstrip().splitlines()[-1:] == [line]:
-                return commit
-        if not document.get("hasMore"):
+        entries, token = history_page(nessie.request("GET", f"/trees/{default}@{at}/history", query=query))
+        for commit, message in entries:
+            lines = message.split("\n")
+            if lines[-1] != last:
+                continue
+            if not wanted <= set(lines):
+                raise TableChecksError(
+                    "main already holds a merge of another load of this manifest: another branch or source hash, or an older form of the merge message"
+                )
+            return commit
+        if not token:
             return None
-        following = document.get("token")
-        if not isinstance(following, str) or not following:
-            raise TableChecksError("the log of the default branch has more pages but names no token for the next")
-        token = following
     raise TableChecksError("the log of the default branch is too long to search for an earlier merge of this load")
 
 
@@ -398,24 +485,52 @@ def confirm_main(nessie: NessieClient, record: LoadRecord, default: str, merged:
             raise TableChecksError(f"the default branch at the merge commit does not hold {table} at the recorded snapshot")
 
 
+def main_head(nessie: NessieClient, default: str) -> str:
+    """The hash of the default branch now, as a commit hash."""
+    head = nessie.reference(default)
+    if rules.HASH.fullmatch(head.hash) is None:
+        raise TableChecksError("Nessie's hash for the default branch is not a commit hash")
+    return head.hash
+
+
 def merge_branch(nessie: NessieClient, record: LoadRecord) -> tuple[str, str]:
     """Merge the branch at the checked hash into the default branch and return the default branch's hash before and after the merge.
 
     The request carries the recorded hash, the one Spark read, so what is merged is what was checked. A branch that has moved since is refused here (Nessie
-    would merge it at that hash only). When the log of the default branch already holds a merge of this load, nothing is sent and that commit is returned.
+    would merge it at that hash only). The head of the default branch is read once: the log is searched from exactly that hash and the merge names it as its
+    expected target hash, so the catalog refuses the merge if main moved after the search. After that refusal the log is searched once more from the new head: a
+    merge of this load found there is recorded and nothing more is sent; otherwise the step fails with a clear message and sends nothing, to be rerun.
     """
     if nessie.reference(record.branch).hash != record.branch_hash:
         raise TableChecksError("the load branch moved after the checks, so what was checked is not what would be merged")
     default = default_branch(nessie)
-    earlier = merged_commit(nessie, record)
+    head = main_head(nessie, default)
+    earlier = merged_commit(nessie, record, head)
     if earlier is not None:
         confirm_main(nessie, record, default, earlier)
         return "", earlier
-    before = nessie.reference(default).hash
-    message = f"merge {record.branch}: table checks passed\n\n{manifest_line(record.manifest.sha256)}"
-    after = nessie.merge(record.branch, default, before, message, source_hash=record.branch_hash)
+    message = "\n".join(
+        [f"merge {record.branch}: table checks passed", "", branch_line(record.branch), source_line(record.branch_hash), manifest_line(record.manifest.sha256)]
+    )
+    try:
+        after = nessie.merge(record.branch, default, head, message, source_hash=record.branch_hash)
+    except NessieConflict:
+        earlier = merged_commit(nessie, record, main_head(nessie, default))
+        if earlier is None:
+            raise TableChecksError(
+                "Nessie refused the merge, because main moved or its content conflicts with this load, and the load is still not in the log of main: "
+                "nothing more was sent; run the step again"
+            ) from None
+        confirm_main(nessie, record, default, earlier)
+        return "", earlier
     confirm_main(nessie, record, default, after)
-    return before, after
+    return head, after
+
+
+def check_pin(pin: rules.TrackPin) -> None:
+    """The pin is a positive row count and a SHA-256, checked before anything is staged."""
+    if type(pin.rows) is not int or pin.rows <= 0 or type(pin.sha256) is not str or rules.HASH.fullmatch(pin.sha256) is None:
+        raise TableChecksError("the track list's pin is not a positive row count and a SHA-256")
 
 
 def run_table_checks(
@@ -428,12 +543,15 @@ def run_table_checks(
     run_folder: Path,
     runner: Runner,
     empty_form: str = rules.EMPTY_FORM,
+    staging_gid: int = STAGING_GID,
+    lock_directory: Path = LOCK_DIRECTORY,
 ) -> Outcome:
     """Run the table checks for one load in the order of the module's description. Raise ``TableChecksError`` for a step that cannot go on."""
     if empty_form not in rules.EMPTY_FORMS:
         raise TableChecksError(f"the empty form must be one of {', '.join(rules.EMPTY_FORMS)}")
-    with load_lock(run_folder):
-        return run_locked(store, nessie, record, track_pin, staging, run_folder, runner, empty_form)
+    check_pin(track_pin)
+    with load_lock(record.manifest.sha256, lock_directory):
+        return run_locked(store, nessie, record, track_pin, staging, run_folder, runner, empty_form, staging_gid)
 
 
 def receipt(record: LoadRecord, empty_form: str, checked: dict[str, Any] | None, *, passed: bool) -> dict[str, Any]:
@@ -461,13 +579,14 @@ def run_locked(
     run_folder: Path,
     runner: Runner,
     empty_form: str,
+    staging_gid: int,
 ) -> Outcome:
     held = saved_result(run_folder, record)
     if held is not None and held["merged"] is True:
         return Outcome(True, True, held)
-    earlier = merged_commit(nessie, record)
+    default = default_branch(nessie)
+    earlier = merged_commit(nessie, record, main_head(nessie, default))
     if earlier is not None:
-        default = default_branch(nessie)
         confirm_main(nessie, record, default, earlier)
         document = held if held is not None else receipt(record, empty_form, None, passed=True)
         if held is None:
@@ -476,11 +595,14 @@ def run_locked(
         write_result(run_folder, document)
         return Outcome(True, True, document)
     confirm_load(nessie, record)
-    staged = stage_verified_files(store, record.manifest, staging)
-    plan_document = build_plan(record, staged, track_pin, empty_form, uuid.uuid4().hex)
-    plan = rules.parse_plan(json.dumps(plan_document))
     try:
-        (staging / PLAN_FILE).write_text(json.dumps(plan_document, indent=1) + "\n")
+        staged = stage_verified_files(store, record.manifest, staging, staging_gid)
+        plan_document = build_plan(record, staged, track_pin, empty_form, uuid.uuid4().hex)
+        try:
+            plan = rules.parse_plan(json.dumps(plan_document))
+        except rules.RulesError:
+            raise TableChecksError("the plan cannot be built from the inputs of this run") from None
+        write_plan(staging, plan_document, staging_gid)
         reply = runner(staging)
     finally:
         remove_staged(staging)
@@ -489,6 +611,6 @@ def run_locked(
     write_result(run_folder, document)
     if result.passed:
         before, after = merge_branch(nessie, record)
-        document.update(merged=True, merged_into=default_branch(nessie), main_hash_before=before, merged_hash=after)
+        document.update(merged=True, merged_into=default, main_hash_before=before, merged_hash=after)
         write_result(run_folder, document)
     return Outcome(result.passed, document["merged"], document)

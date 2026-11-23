@@ -116,7 +116,7 @@ class CompareRowsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertNotIn(MARKER, json.dumps(result.document()))
         for check in result.checks:
-            self.assertRegex(check.detail, rules.DETAIL)
+            rules.parse_detail(check.detail)
 
 
 class MainTest(unittest.TestCase):

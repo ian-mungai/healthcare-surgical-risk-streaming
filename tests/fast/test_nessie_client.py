@@ -176,5 +176,56 @@ class MergeRequestTest(unittest.TestCase):
                 NessieClient("http://127.0.0.1:1/api/v2").merge("feature", "main", "b" * 64, "m", source_hash=value)
 
 
+def raw_handler(status: int, body: bytes) -> Any:
+    """A handler that answers every call with these exact bytes, which need not be JSON."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def respond(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = do_DELETE = respond
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    return Handler
+
+
+class AnswerFormTest(unittest.TestCase):
+    """A success answer is JSON or empty. A truncated or plain-text success answer is an error and never an empty document."""
+
+    def call(self, status: int, body: bytes) -> Any:
+        server = HTTPServer(("127.0.0.1", 0), raw_handler(status, body))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            return NessieClient(f"http://127.0.0.1:{server.server_address[1]}/api/v2", timeout_seconds=5).request("GET", "/trees/main/history")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=10)
+
+    def test_control_a_json_answer_and_an_empty_answer_are_returned_as_they_are(self) -> None:
+        self.assertEqual({"logEntries": []}, self.call(200, b'{"logEntries": []}'))
+        self.assertIsNone(self.call(200, b""))
+        self.assertEqual({"message": "a json document with a message field"}, self.call(200, b'{"message": "a json document with a message field"}'))
+
+    def test_a_truncated_or_plain_text_success_answer_is_an_error(self) -> None:
+        for body in (b'{"logEntries": [{"commitMeta": {"message": "a', b"not json at all", b"<html>gateway</html>", b"[1, 2"):
+            with self.subTest(body=body), self.assertRaisesRegex(NessieError, "not JSON"):
+                self.call(200, body)
+
+    def test_a_refusal_with_a_plain_text_body_still_names_its_status_and_the_start_of_the_text(self) -> None:
+        with self.assertRaises(NessieError) as caught:
+            self.call(502, b"bad gateway")
+        self.assertEqual(502, caught.exception.status)
+        self.assertIn("bad gateway", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

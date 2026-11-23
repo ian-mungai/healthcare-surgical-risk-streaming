@@ -74,7 +74,7 @@ class ColumnTest(unittest.TestCase):
     def test_no_detail_holds_a_column_name(self) -> None:
         detail = rules.column_detail(["secret_marker_a", "b"], [("other_marker_b", "string")])
         self.assertNotIn("marker", detail or "")
-        self.assertRegex(detail or "", rules.DETAIL)
+        rules.parse_detail(detail or "")
 
 
 class EmptyValueTest(unittest.TestCase):
@@ -250,16 +250,72 @@ class RequiredChecksTest(unittest.TestCase):
 
 
 class DetailTest(unittest.TestCase):
-    def test_a_detail_is_a_code_and_counts_and_nothing_else(self) -> None:
-        for good in ("ok", "rows_differ;only_file=1;only_table=0", "row_count;file=6388;table=6388"):
-            self.assertRegex(good, rules.DETAIL)
-        for bad in ("", "OK", "caseid 5 differs", "ok;caseid=x", "rows_differ;only_file=-1", "ok\n", "ok;a=1;", "ok; a=1"):
-            self.assertNotRegex(bad, rules.DETAIL)
+    """A detail is one code of a closed table with exactly that code's integer fields. It is built and parsed from the same table: there is no free pattern."""
 
-    def test_a_check_refuses_a_detail_that_is_not_in_that_form(self) -> None:
+    def test_the_table_lists_every_code_with_its_named_integer_fields(self) -> None:
+        self.assertEqual(
+            {
+                "ok": (),
+                "bytes_differ": (),
+                "table_missing": (),
+                "snapshot_differs": (),
+                "columns_differ": ("missing", "extra", "repeated", "order", "not_string"),
+                "row_count": ("source", "table"),
+                "rows_differ": ("only_file", "only_table"),
+                "separator_in_field": ("rows",),
+                "digest_differs": (),
+            },
+            dict(rules.DETAIL_CODES),
+        )
+
+    def test_a_detail_is_built_from_a_code_and_its_counts_and_parsed_back(self) -> None:
+        self.assertEqual("ok", rules.detail("ok"))
+        self.assertEqual("row_count;source=6388;table=6387", rules.detail("row_count", source=6388, table=6387))
+        self.assertEqual(("rows_differ", {"only_file": 1, "only_table": 0}), rules.parse_detail("rows_differ;only_file=1;only_table=0"))
+        for code, fields in rules.DETAIL_CODES.items():
+            built = rules.detail(code, **dict.fromkeys(fields, 3))
+            self.assertEqual((code, dict.fromkeys(fields, 3)), rules.parse_detail(built))
+
+    def test_a_detail_that_is_not_in_the_table_is_refused_whatever_words_or_digits_it_holds(self) -> None:
+        for bad in (
+            "",
+            "OK",
+            "ok;a=1",
+            "caseid 5 differs",
+            "marker_9d2",
+            "rows_differ_marker_9d2;only_file=1;only_table=0",
+            "rows_differ;only_file=1",
+            "rows_differ;only_table=0;only_file=1",
+            "rows_differ;only_file=1;only_table=0;extra=1",
+            "rows_differ;only_file=x;only_table=0",
+            "rows_differ;only_file=-1;only_table=0",
+            "rows_differ;only_file=01;only_table=0",
+            "rows_differ;only_file=1;only_table=0\n",
+            "rows_differ; only_file=1;only_table=0",
+            "row_count;source=1;table=2;",
+            "ok;",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(rules.RulesError):
+                rules.parse_detail(bad)
+
+    def test_building_a_detail_refuses_an_unknown_code_the_wrong_fields_and_a_value_that_is_not_a_whole_number(self) -> None:
+        for code, counts in (
+            ("nope", {}),
+            ("ok", {"extra": 1}),
+            ("row_count", {"source": 1}),
+            ("row_count", {"source": 1, "table": -1}),
+            ("row_count", {"source": True, "table": 1}),
+            ("row_count", {"source": "1", "table": 1}),
+        ):
+            with self.subTest(code=code, counts=counts), self.assertRaises(rules.RulesError):
+                rules.detail(code, **counts)
+
+    def test_a_check_refuses_a_detail_that_is_not_in_the_table(self) -> None:
         result = rules.TableResult("t", 1)
-        with self.assertRaises(rules.RulesError):
-            result.add("columns", False, "the value MARKER_17 differs")
+        for bad in ("the value MARKER_17 differs", "marker_17", "rows_differ_marker;only_file=1;only_table=0"):
+            with self.subTest(bad=bad), self.assertRaises(rules.RulesError):
+                result.add("columns", False, bad)
+        self.assertTrue(result.add("columns", True, "ok"))
 
 
 class ResultTest(unittest.TestCase):
@@ -299,14 +355,15 @@ class ResultTest(unittest.TestCase):
         self.assertFalse(rules.TableOutcome("lab_data", (*passed[:-1], rules.Check(required[-1], False, "rows_differ;only_file=1;only_table=0"))).passed)
         self.assertFalse(rules.TableOutcome("lab_data", ()).passed)
         every = tuple(rules.TableOutcome(name, tuple(rules.Check(check, True, "ok") for check in names)) for name, names in rules.REQUIRED_CHECKS.items())
-        self.assertTrue(rules.JobResult(every).passed)
-        self.assertFalse(rules.JobResult(every[:2]).passed)
-        self.assertFalse(rules.JobResult(every[::-1]).passed)
+        self.assertTrue(rules.JobResult("r", "b", "h", "empty", every).passed)
+        self.assertFalse(rules.JobResult("r", "b", "h", "empty", every[:2]).passed)
+        self.assertFalse(rules.JobResult("r", "b", "h", "empty", every[::-1]).passed)
 
     def test_a_failed_check_fails_the_result_whatever_the_summary_flags_say(self) -> None:
         plan = the_plan()
         results = results_for(plan)
-        results[1].checks[3] = rules.Check("row count", False, "row_count;file=2;table=3")
+        results[1].checks[3] = rules.Check("row count", False, "row_count;source=2;table=3")
+        results[1].rows_source, results[1].rows_table = 2, 3
         document = self.document(plan, results)
         document["passed"] = True
         for table in document["tables"]:
@@ -357,6 +414,54 @@ class ResultTest(unittest.TestCase):
         self.refused(lambda document: document["tables"][0]["checks"][0].pop("detail"))
         self.refused(lambda document: document["tables"][0]["checks"][0].update(detail="MARKER_17 differs"))
         self.refused(lambda document: document["tables"][0].update(snapshot_id=True))
+
+    def with_rows(self, rows_source: int | None, rows_table: int | None, check: int, detail: str, passed: bool = False) -> dict[str, Any]:
+        plan = the_plan()
+        results = results_for(plan)
+        results[0].rows_source, results[0].rows_table = rows_source, rows_table
+        results[0].checks[check] = rules.Check(rules.REQUIRED_CHECKS["clinical_data"][check], passed, detail)
+        return self.document(plan, results)
+
+    def test_the_counts_of_a_detail_agree_with_the_row_counts_of_the_table(self) -> None:
+        self.assertFalse(self.parse(self.with_rows(5, 6, 3, "row_count;source=5;table=6")).passed)
+        for document in (
+            self.with_rows(5, 6, 3, "row_count;source=5;table=7"),
+            self.with_rows(5, 6, 3, "row_count;source=4719238;table=6"),
+            self.with_rows(None, None, 3, "row_count;source=5;table=6"),
+            self.with_rows(5, 6, 5, "rows_differ;only_file=4719238;only_table=0"),
+            self.with_rows(5, 6, 4, "rows_differ;only_file=0;only_table=7"),
+            self.with_rows(None, None, 5, "rows_differ;only_file=1;only_table=0"),
+            self.with_rows(5, 6, 2, "columns_differ;missing=4719238;extra=0;repeated=0;order=0;not_string=0"),
+            self.with_rows(5, 6, 2, "columns_differ;missing=0;extra=0;repeated=0;order=2;not_string=0"),
+        ):
+            with self.subTest(document["tables"][0]["checks"]), self.assertRaises(rules.RulesError):
+                self.parse(document)
+
+    def test_a_count_within_the_row_counts_is_accepted(self) -> None:
+        self.assertFalse(self.parse(self.with_rows(5, 6, 5, "rows_differ;only_file=5;only_table=6")).passed)
+        self.assertFalse(self.parse(self.with_rows(5, 6, 2, "columns_differ;missing=1;extra=0;repeated=0;order=0;not_string=0")).passed)
+
+    def test_the_pinned_row_count_of_the_track_list_is_the_one_the_result_names(self) -> None:
+        plan = the_plan()
+        results = results_for(plan)
+        results[2].rows_source, results[2].rows_table = 8, 8
+        with self.assertRaises(rules.RulesError):
+            self.parse(self.document(plan, results), plan)
+        results[2].rows_source, results[2].rows_table = 7, 8
+        self.assertTrue(self.parse(self.document(plan, results), plan).passed)
+
+    def test_the_canonical_document_holds_only_the_validated_fields_and_a_verdict_derived_here(self) -> None:
+        plan = the_plan()
+        document = self.document(plan, results_for(plan))
+        document["passed"] = False
+        for table in document["tables"]:
+            table["passed"] = False
+        result = self.parse(document, plan)
+        canonical = result.document()
+        self.assertTrue(canonical["passed"])
+        self.assertEqual({"format", "run_id", "branch", "branch_hash", "empty_form", "passed", "tables"}, set(canonical))
+        self.assertEqual({"table", "snapshot_id", "rows_table", "rows_source", "passed", "checks"}, set(canonical["tables"][0]))
+        self.assertEqual(self.document(plan, results_for(plan)), canonical)
 
     def test_text_that_is_not_json_or_names_a_field_twice_is_refused(self) -> None:
         for text in ("", "[]", "{", '{"format": "table_checks_2", "format": "x"}'):

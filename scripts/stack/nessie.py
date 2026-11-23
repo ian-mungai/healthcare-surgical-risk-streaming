@@ -34,6 +34,10 @@ CONFLICT_STATUS = 409
 BODY_LIMIT_BYTES = 1_000_000
 
 
+class PlainText(str):
+    """The start of an answer body that is not JSON."""
+
+
 class NessieError(RuntimeError):
     """A call did not complete or Nessie refused it. The message names the call and never holds a request body."""
 
@@ -99,21 +103,28 @@ class NessieClient:
         except (OSError, http.client.HTTPException) as error:
             raise NessieError(f"{label} failed: {type(error).__name__}") from error
         document = self.decode(raw)
+        if status < 400 and isinstance(document, PlainText):
+            raise NessieError(f"{label} answered with status {status} and a body that is not JSON")
         if status >= 400:
             code = document.get("errorCode") if isinstance(document, dict) else None
-            reason = document.get("message") if isinstance(document, dict) else None
+            reason = document.get("message") if isinstance(document, dict) else (str(document) if isinstance(document, PlainText) else None)
             kind = NessieConflict if status == CONFLICT_STATUS else NessieError
             raise kind(f"{label} was refused with status {status}, error code {code}: {reason}", status=status, error_code=code)
         return document
 
     @staticmethod
     def decode(raw: bytes) -> Any:
+        """The JSON of an answer, None for an empty one, or ``PlainText`` with the start of a body that is not JSON.
+
+        Only a refusal may carry ``PlainText``: ``request`` raises for a success answer that does, so a truncated or plain-text success answer is never read
+        as an empty document.
+        """
         if not raw.strip():
             return None
         try:
             return json.loads(raw)
         except ValueError:
-            return {"message": raw[:200].decode(errors="replace")}
+            return PlainText(raw[:200].decode(errors="replace"))
 
     def reference(self, name: str) -> Reference:
         """The branch or tag ``name`` with the hash it points to now."""

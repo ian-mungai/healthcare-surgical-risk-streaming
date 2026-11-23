@@ -30,7 +30,22 @@ EMPTY_FORM = "empty"
 EMPTY_FORMS = ("null", "empty")
 BYTE_ORDER_MARK = "﻿"
 NOT_THE_EMPTY_VALUE = "\x01not the published empty value\x01"
-DETAIL = re.compile(r"\A[a-z_]+(;[a-z_]+=[0-9]+)*\Z")
+COUNT = re.compile(r"0|[1-9][0-9]{0,14}")
+MAX_ROWS = 10**12
+MAX_COLUMN_COUNT = 4096
+# The details of a check: each is one of these codes with exactly its integer fields, in this order. A detail is built from this table and parsed back against
+# it, so no text of the data can pass as a detail.
+DETAIL_CODES: Mapping[str, tuple[str, ...]] = {
+    "ok": (),
+    "bytes_differ": (),
+    "table_missing": (),
+    "snapshot_differs": (),
+    "columns_differ": ("missing", "extra", "repeated", "order", "not_string"),
+    "row_count": ("source", "table"),
+    "rows_differ": ("only_file", "only_table"),
+    "separator_in_field": ("rows",),
+    "digest_differs": (),
+}
 RUN_ID = re.compile(r"[0-9a-f]{32}")
 SEPARATOR_PATTERN = "[\\t\\n\\r]"
 LAB_DATA_NOTE = "lab_data has no unique key (some whole rows repeat), so its key is the whole row: its key check and its payload check are the same comparison"
@@ -77,6 +92,24 @@ def header_columns(header_line: str) -> list[str]:
     return rows[0]
 
 
+def detail(code: str, **counts: int) -> str:
+    """A detail from a code of ``DETAIL_CODES`` and exactly its fields, each a whole number of at least 0."""
+    fields = DETAIL_CODES.get(code)
+    if fields is None or set(counts) != set(fields) or any(type(counts[name]) is not int or counts[name] < 0 for name in fields):
+        raise RulesError("a detail is a code of the table with exactly its fields, each a whole number")
+    return ";".join([code, *(f"{name}={counts[name]}" for name in fields)])
+
+
+def parse_detail(text: str) -> tuple[str, dict[str, int]]:
+    """The code and counts of a detail, or ``RulesError`` for any text that is not exactly a code of ``DETAIL_CODES`` with its fields in order."""
+    code, *items = text.split(";")
+    fields = DETAIL_CODES.get(code)
+    pairs = [item.split("=", 1) for item in items]
+    if fields is None or [pair[0] for pair in pairs] != list(fields) or any(len(pair) != 2 or not COUNT.fullmatch(pair[1]) for pair in pairs):
+        raise RulesError("a detail is a code of the table with exactly its fields, each a whole number")
+    return code, {name: int(value) for name, value in pairs}
+
+
 def column_detail(expected: Sequence[str], found: Sequence[tuple[str, str]]) -> str | None:
     """What differs between the file's column list and the table's ``(name, type)`` list, as a code and counts, or None when they are equal.
 
@@ -91,7 +124,7 @@ def column_detail(expected: Sequence[str], found: Sequence[tuple[str, str]]) -> 
     not_string = sum(kind != STRING_TYPE for _, kind in own)
     if not (missing or extra or repeated or order or not_string):
         return None
-    return f"columns_differ;missing={missing};extra={extra};repeated={repeated};order={order};not_string={not_string}"
+    return detail("columns_differ", missing=missing, extra=extra, repeated=repeated, order=order, not_string=not_string)
 
 
 def row_line(values: Iterable[str]) -> str:
@@ -229,10 +262,9 @@ class TableResult:
     def passed(self) -> bool:
         return bool(self.checks) and all(check.passed for check in self.checks)
 
-    def add(self, name: str, passed: bool, detail: str) -> bool:
-        if not DETAIL.fullmatch(detail):
-            raise RulesError("a check's detail is a code and counts: lower-case words and whole numbers, nothing else")
-        self.checks.append(Check(name, passed, detail))
+    def add(self, name: str, passed: bool, text: str) -> bool:
+        parse_detail(text)
+        self.checks.append(Check(name, passed, text))
         return passed
 
     def document(self) -> dict[str, Any]:
@@ -268,20 +300,64 @@ CHECK_FIELDS: Mapping[str, type] = {"name": str, "passed": bool, "detail": str}
 class TableOutcome:
     table: str
     checks: tuple[Check, ...]
+    snapshot_id: int = 0
+    rows_table: int | None = None
+    rows_source: int | None = None
 
     @property
     def passed(self) -> bool:
         """Derived here and nowhere else: every required check is there, in order, and passed."""
         return tuple(check.name for check in self.checks) == REQUIRED_CHECKS[self.table] and all(check.passed for check in self.checks)
 
+    def document(self) -> dict[str, Any]:
+        return {
+            "table": self.table,
+            "snapshot_id": self.snapshot_id,
+            "rows_table": self.rows_table,
+            "rows_source": self.rows_source,
+            "passed": self.passed,
+            "checks": [{"name": check.name, "passed": check.passed, "detail": check.detail} for check in self.checks],
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class JobResult:
+    run_id: str
+    branch: str
+    branch_hash: str
+    empty_form: str
     tables: tuple[TableOutcome, ...]
 
     @property
     def passed(self) -> bool:
         return tuple(table.table for table in self.tables) == tuple(REQUIRED_CHECKS) and all(table.passed for table in self.tables)
+
+    def document(self) -> dict[str, Any]:
+        """The result as the controller keeps it: only the validated fields, with the verdict derived here and not the job's own."""
+        return {
+            "format": RESULT_FORMAT,
+            "run_id": self.run_id,
+            "branch": self.branch,
+            "branch_hash": self.branch_hash,
+            "empty_form": self.empty_form,
+            "passed": self.passed,
+            "tables": [table.document() for table in self.tables],
+        }
+
+
+def counts_agree(table: str, checks: Sequence[Check], rows_source: int | None, rows_table: int | None) -> bool:
+    """Whether every count of a detail is a count the table's own row counts allow, so a number of the data cannot pass as a count."""
+    for check in checks:
+        code, counts = parse_detail(check.detail)
+        if code == "row_count" and (rows_source is None or rows_table is None or (counts["source"], counts["table"]) != (rows_source, rows_table)):
+            return False
+        if code == "rows_differ" and (rows_source is None or rows_table is None or counts["only_file"] > rows_source or counts["only_table"] > rows_table):
+            return False
+        if code == "separator_in_field" and (rows_table is None or counts["rows"] > rows_table):
+            return False
+        if code == "columns_differ" and (counts["order"] > 1 or max(counts.values()) > MAX_COLUMN_COUNT):
+            return False
+    return True
 
 
 def table_outcome(entry: Any, expected: PlanTable) -> TableOutcome:
@@ -289,18 +365,23 @@ def table_outcome(entry: Any, expected: PlanTable) -> TableOutcome:
     table = closed(entry, TABLE_RESULT_FIELDS, "a table of the result")
     if table["table"] != expected.name or table["snapshot_id"] != expected.snapshot_id or type(table["snapshot_id"]) is bool:
         raise RulesError("a table of the result is not the planned table at the planned snapshot")
-    if any(table[name] is not None and (type(table[name]) is not int or table[name] < 0) for name in ("rows_table", "rows_source")):
+    rows_table, rows_source = table["rows_table"], table["rows_source"]
+    if any(count is not None and (type(count) is not int or not 0 <= count <= MAX_ROWS) for count in (rows_table, rows_source)):
         raise RulesError("a row count of the result is not a whole number or null")
+    if SPEC_BY_NAME[expected.name].source == "pin" and rows_source is not None and rows_source != expected.rows:
+        raise RulesError("the pinned row count of the result is not the planned one")
     checks = tuple(Check(**closed(check, CHECK_FIELDS, "a check of the result")) for check in table["checks"])
-    if any(not DETAIL.fullmatch(check.detail) for check in checks):
-        raise RulesError("a check of the result has a detail that is not a code and counts")
+    for check in checks:
+        parse_detail(check.detail)
     names = tuple(check.name for check in checks)
     required = REQUIRED_CHECKS[expected.name]
     if not names or names != required[: len(names)]:
         raise RulesError("the checks of a table are not the required checks in order")
     if len(names) < len(required) and checks[-1].passed:
         raise RulesError("a table stopped before its last required check without a failed check")
-    return TableOutcome(expected.name, checks)
+    if not counts_agree(expected.name, checks, rows_source, rows_table):
+        raise RulesError("a count of a check does not agree with the row counts of its table")
+    return TableOutcome(expected.name, checks, expected.snapshot_id, rows_table, rows_source)
 
 
 def parse_result(text: str, plan: Plan) -> JobResult:
@@ -320,4 +401,5 @@ def parse_result(text: str, plan: Plan) -> JobResult:
         raise RulesError("the result is not for the plan it was run for: another format, run, branch, hash or empty form")
     if len(fields["tables"]) != len(plan.tables):
         raise RulesError("the result names another number of tables than the plan")
-    return JobResult(tuple(table_outcome(entry, expected) for entry, expected in zip(fields["tables"], plan.tables, strict=True)))
+    tables = tuple(table_outcome(entry, expected) for entry, expected in zip(fields["tables"], plan.tables, strict=True))
+    return JobResult(plan.run_id, plan.branch, plan.branch_hash, plan.empty_form, tables)

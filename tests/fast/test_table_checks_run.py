@@ -8,10 +8,13 @@ job did not run and that nothing was merged.
 from __future__ import annotations
 
 import ast
+import contextlib
 import fcntl
 import hashlib
 import inspect
 import json
+import os
+import stat
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -35,6 +38,7 @@ SOURCE = {"vital_files/0001.vital": b"a recording", "clinical_data.csv": CLINICA
 SNAPSHOTS = {"clinical_data": 111, "lab_data": 222, "track_list": 333}
 PIN = rules.TrackPin(7, "a" * 64)
 BRANCH = "load_run_one"
+ROOT = Path(__file__).resolve().parents[2]
 MARKER = "MARKER_9d2"
 
 
@@ -60,6 +64,13 @@ class FakeNessie(NessieClient):
         self.lose_next_merge_reply = False
         self.on_branch_read: Callable[[], None] | None = None
         self.history_page_size = 100
+        self.merge_requests: list[dict[str, Any]] = []
+        self.pending_merge: dict[str, Any] | None = None
+        self.defer_next_merge = False
+        self.defer_main_commit = ""
+        self.history_answer: tuple[int, bytes] | None = None
+        self.history_reads: list[str] = []
+        self.on_history_read: Callable[[], None] | None = None
 
     def load_branch(self, name: str, snapshots: dict[str, int]) -> str:
         self.heads[name] = fake_hash(name, "load")
@@ -72,6 +83,14 @@ class FakeNessie(NessieClient):
         self.tables[("main", self.heads["main"])] = dict(tables or {})
         self.commits.append((self.heads["main"], message))
         return self.heads["main"]
+
+    def apply_merge(self, name: str, body: dict[str, Any]) -> None:
+        self.merges.append((body["fromRefName"], body["fromHash"], name))
+        self.merge_messages.append(body["message"])
+        merged = {**self.tables[(name, self.heads[name])], **self.tables[(body["fromRefName"], body["fromHash"])]}
+        self.heads[name] = fake_hash(name, "merged", body["fromHash"], str(len(self.commits)))
+        self.tables[(name, self.heads[name])] = merged
+        self.commits.append((self.heads[name], body["message"]))
 
     def move_branch(self, name: str) -> str:
         self.heads[name] = fake_hash(name, "moved", self.heads[name])
@@ -92,9 +111,18 @@ class FakeNessie(NessieClient):
                 self.on_branch_read()
             return 200, json.dumps({"reference": {"type": "BRANCH", "name": name, "hash": self.heads[name]}}).encode()
         if method == "GET" and parts[1] == "history":
+            self.history_reads.append(pinned)
+            if self.on_history_read is not None:
+                self.on_history_read()
+            if self.history_answer is not None:
+                return self.history_answer
             start = int(parse_qs(urlsplit(target).query).get("page-token", ["0"])[0])
-            entries = list(reversed(self.commits))[start : start + self.history_page_size]
-            more = start + self.history_page_size < len(self.commits)
+            known = [hash_value for hash_value, _ in self.commits]
+            upto = self.commits[: known.index(pinned) + 1] if pinned in known else ([] if pinned in ("", fake_hash("main", "0")) else None)
+            if upto is None:
+                return 404, json.dumps({"errorCode": "REFERENCE_NOT_FOUND", "message": "no such commit"}).encode()
+            entries = list(reversed(upto))[start : start + self.history_page_size]
+            more = start + self.history_page_size < len(upto)
             document = {
                 "logEntries": [{"commitMeta": {"hash": hash_value, "message": message}} for hash_value, message in entries],
                 "hasMore": more,
@@ -109,14 +137,20 @@ class FakeNessie(NessieClient):
             return 200, json.dumps({"content": {"type": "ICEBERG_TABLE", "snapshotId": held[table]}}).encode()
         if method == "POST" and parts[1:] == ["history", "merge"]:
             body = json.loads(payload or b"{}")
+            if self.pending_merge is not None:
+                late, self.pending_merge = self.pending_merge, None
+                self.apply_merge(late["target"], late["body"])
+            if self.defer_main_commit:
+                text, self.defer_main_commit = self.defer_main_commit, ""
+                self.add_main_commit(text)
+            self.merge_requests.append({"expected": pinned, **body})
             if pinned != self.heads[name]:
                 return 409, json.dumps({"errorCode": "REFERENCE_CONFLICT", "message": "the target moved"}).encode()
-            self.merges.append((body["fromRefName"], body["fromHash"], name))
-            self.merge_messages.append(body["message"])
-            merged = {**self.tables[(name, self.heads[name])], **self.tables[(body["fromRefName"], body["fromHash"])]}
-            self.heads[name] = fake_hash(name, "merged", body["fromHash"])
-            self.tables[(name, self.heads[name])] = merged
-            self.commits.append((self.heads[name], body["message"]))
+            if self.defer_next_merge:
+                self.defer_next_merge = False
+                self.pending_merge = {"target": name, "body": body}
+                raise TimeoutError
+            self.apply_merge(name, body)
             if self.lose_next_merge_reply:
                 self.lose_next_merge_reply = False
                 raise TimeoutError
@@ -131,7 +165,10 @@ def result_line(plan: rules.Plan, *, passed: bool = True, change: Callable[[dict
         table = rules.TableResult(entry.name, entry.snapshot_id)
         stop = 4 if not passed and entry.name == "lab_data" else 99
         for name in rules.REQUIRED_CHECKS[entry.name][:stop]:
-            table.add(name, passed or entry.name != "lab_data" or name != "row count", "ok" if name != "row count" or passed else "row_count;source=2;table=3")
+            failing = not passed and entry.name == "lab_data" and name == "row count"
+            table.add(name, not failing, rules.detail("row_count", source=2, table=3) if failing else "ok")
+        if not passed and entry.name == "lab_data":
+            table.rows_source, table.rows_table = 2, 3
         results.append(table)
     document = json.loads(json.dumps(rules.job_document(plan, results)))
     if change is not None:
@@ -172,6 +209,7 @@ class Case:
         self.staging = self.root / "staging"
         self.run_folder = self.root / "run"
         self.run_folder.mkdir()
+        self.locks = self.root / "locks"
         self.landed: Landed = landed_set(SOURCE)
         self.reference: ManifestRef = publish_manifest(self.landed.store, self.landed.selection, self.landed.check())
         self.nessie = FakeNessie()
@@ -188,6 +226,8 @@ class Case:
             staging=self.staging,
             run_folder=self.run_folder,
             runner=runner,
+            staging_gid=os.getgid(),
+            lock_directory=self.locks,
             **options,
         )
 
@@ -250,18 +290,27 @@ class PassingRunTest(unittest.TestCase):
 
 
 class MergeRecordTest(unittest.TestCase):
-    def test_the_merge_message_holds_the_manifest_line_on_a_line_of_its_own(self) -> None:
+    def test_the_merge_message_ends_with_the_manifest_line_and_names_the_checked_branch_and_source_hash_on_lines_of_their_own(self) -> None:
         case = Case(self)
         case.go(Runner())
         (message,) = case.nessie.merge_messages
-        self.assertIn(f"records-manifest: {case.reference.sha256}", message.splitlines())
-        self.assertEqual(1, sum(line.startswith("records-manifest:") for line in message.splitlines()))
+        lines = message.split("\n")
+        self.assertEqual(run.manifest_line(case.reference.sha256), lines[-1])
+        self.assertIn(f"records-branch: {BRANCH}", lines)
+        self.assertIn(f"records-source: {case.branch_hash}", lines)
+        self.assertEqual(1, sum(line.startswith("records-manifest:") for line in lines))
 
-    def test_the_line_has_exactly_the_form_the_load_step_reads(self) -> None:
+    def test_the_lines_have_exactly_the_forms_the_recovery_reads(self) -> None:
         self.assertEqual("records-manifest: " + "ab" * 32, run.manifest_line("ab" * 32))
+        self.assertEqual("records-source: " + "ab" * 32, run.source_line("ab" * 32))
+        self.assertEqual("records-branch: load_run_one", run.branch_line("load_run_one"))
         for value in ("", "ab" * 31, "AB" * 32, "ab" * 33, "gg" * 32, "ab" * 32 + "\n"):
-            with self.subTest(value=value), self.assertRaises(run.TableChecksError):
-                run.manifest_line(value)
+            for make in (run.manifest_line, run.source_line):
+                with self.subTest(value=value, make=make.__name__), self.assertRaises(run.TableChecksError):
+                    make(value)
+        for branch in ("", "a b", "a\nb", "load_x\nrecords-manifest: " + "a" * 64):
+            with self.subTest(branch=branch), self.assertRaises(run.TableChecksError):
+                run.branch_line(branch)
 
     def test_a_failed_run_writes_no_commit_and_so_no_line(self) -> None:
         case = Case(self)
@@ -289,6 +338,10 @@ class MergeOnceTest(unittest.TestCase):
     def merge_commit(self, case: Case) -> str:
         return case.nessie.heads["main"]
 
+    @staticmethod
+    def message(case: Case, *, branch: str = BRANCH, source: str | None = None, title: str = "merge of this load") -> str:
+        return "\n".join([title, "", run.branch_line(branch), run.source_line(source or case.branch_hash), run.manifest_line(case.reference.sha256)])
+
     def test_a_branch_that_moves_while_the_merge_is_sent_is_merged_at_the_checked_hash_only(self) -> None:
         case = Case(self)
         reads: list[int] = []
@@ -312,7 +365,7 @@ class MergeOnceTest(unittest.TestCase):
         def another_tool_merges_it() -> None:
             reads.append(1)
             if len(reads) == 2:
-                added.append(case.nessie.add_main_commit(f"merged elsewhere\n\n{run.manifest_line(case.reference.sha256)}", SNAPSHOTS))
+                added.append(case.nessie.add_main_commit(self.message(case, title="merged elsewhere"), SNAPSHOTS))
 
         case.nessie.on_branch_read = another_tool_merges_it
         outcome = case.go(runner)
@@ -343,19 +396,23 @@ class MergeOnceTest(unittest.TestCase):
         self.assertTrue(again.merged)
         self.assertEqual(self.merge_commit(case), case.saved()["merged_hash"])
 
-    def test_the_log_is_searched_page_by_page_and_only_a_last_line_that_is_the_manifest_line_counts(self) -> None:
+    def test_the_log_is_searched_page_by_page_and_only_a_last_line_that_is_exactly_the_manifest_line_counts(self) -> None:
         case = Case(self)
         line = run.manifest_line(case.reference.sha256)
         case.nessie.history_page_size = 1
-        self.assertIsNone(run.merged_commit(case.nessie, case.record))
+        head = case.nessie.heads["main"]
+        self.assertIsNone(run.merged_commit(case.nessie, case.record, head))
         case.nessie.add_main_commit(f"note: {line} is mentioned\n\nin the middle")
         case.nessie.add_main_commit(f"{line}\n\nand then more text")
         case.nessie.add_main_commit(f"merge of another load\n\n{run.manifest_line('b' * 64)}")
-        self.assertIsNone(run.merged_commit(case.nessie, case.record))
-        found = case.nessie.add_main_commit(f"merge of this load\n\n{line}\n")
+        case.nessie.add_main_commit(f"{self.message(case)} ")
+        case.nessie.add_main_commit(f"{self.message(case)}\n")
+        case.nessie.add_main_commit(f"{self.message(case)}\n\n")
+        self.assertIsNone(run.merged_commit(case.nessie, case.record, case.nessie.heads["main"]))
+        found = case.nessie.add_main_commit(self.message(case))
         for number in range(3):
             case.nessie.add_main_commit(f"later commit {number}")
-        self.assertEqual(found, run.merged_commit(case.nessie, case.record))
+        self.assertEqual(found, run.merged_commit(case.nessie, case.record, case.nessie.heads["main"]))
 
     def test_a_log_too_long_to_search_is_refused_not_taken_for_unmerged(self) -> None:
         case = Case(self)
@@ -363,17 +420,33 @@ class MergeOnceTest(unittest.TestCase):
         for number in range(run.HISTORY_PAGE_LIMIT + 1):
             case.nessie.add_main_commit(f"commit {number}")
         with self.assertRaisesRegex(run.TableChecksError, "log"):
-            run.merged_commit(case.nessie, case.record)
+            run.merged_commit(case.nessie, case.record, case.nessie.heads["main"])
 
     def test_a_second_run_of_one_load_while_the_first_holds_the_lock_fails_with_a_clear_message_and_does_nothing(self) -> None:
         case, runner = Case(self), Runner()
-        case.run_folder.mkdir(exist_ok=True)
-        with (case.run_folder / run.LOCK_FILE).open("w") as held:
+        case.locks.mkdir(parents=True)
+        with (case.locks / f"{case.reference.sha256}.lock").open("w") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(run.TableChecksError, "another run of this load"):
                 case.go(runner)
         self.assertEqual(0, runner.calls)
         self.assertTrue(case.main_untouched())
+
+    def test_the_lock_of_a_load_is_in_one_fixed_place_that_does_not_depend_on_the_results_folder(self) -> None:
+        case, runner = Case(self), Runner()
+        case.locks.mkdir(parents=True)
+        with (case.locks / f"{case.reference.sha256}.lock").open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            other = Case(self)
+            other.locks = case.locks
+            other.landed, other.reference = case.landed, case.reference
+            other.record = case.record
+            other.nessie = case.nessie
+            with self.assertRaisesRegex(run.TableChecksError, "another run of this load"):
+                other.go(runner)
+        self.assertEqual([], [path.name for path in case.run_folder.iterdir()])
+        self.assertTrue(run.LOCK_DIRECTORY.is_absolute())
+        self.assertEqual(run.LOCK_DIRECTORY / f"{'a' * 64}.lock", run.lock_path("a" * 64, run.LOCK_DIRECTORY))
 
     def test_the_lock_is_released_after_a_run_and_after_a_failed_run(self) -> None:
         case = Case(self)
@@ -391,6 +464,312 @@ class MergeOnceTest(unittest.TestCase):
         self.assertTrue(case.saved()["merged"])
         run.write_result(case.run_folder, {**outcome.document, "notes": ["still merged"]})
         self.assertEqual(["still merged"], case.saved()["notes"])
+
+
+class OneTargetHashTest(unittest.TestCase):
+    """The search of the log and the merge are bound to one hash of main: the catalog refuses a merge when main moved after the search."""
+
+    def test_the_log_is_searched_from_the_hash_of_main_that_the_merge_names_as_its_expected_hash(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("an unrelated commit")
+        head = case.nessie.heads["main"]
+        case.go(Runner())
+        self.assertEqual({head}, set(case.nessie.history_reads))
+        self.assertEqual([head], [request["expected"] for request in case.nessie.merge_requests])
+
+    def test_a_first_request_that_lands_after_the_retry_reads_the_log_gives_one_merge_and_no_second_one(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.defer_next_merge = True
+        with self.assertRaises(NessieError):
+            case.go(runner)
+        self.assertEqual(([], 1), (case.nessie.merges, len(case.nessie.merge_requests)))
+        outcome = case.go(runner)
+        self.assertEqual(1, len(case.nessie.merges))
+        self.assertEqual(2, len(case.nessie.merge_requests))
+        self.assertTrue(outcome.merged)
+        self.assertEqual(case.nessie.heads["main"], case.saved()["merged_hash"])
+
+    def test_a_merge_refused_because_main_moved_and_still_without_the_load_fails_once_and_sends_nothing_more(self) -> None:
+        case = Case(self)
+        reads: list[int] = []
+
+        def main_moves_after_the_search() -> None:
+            reads.append(1)
+            if len(reads) == 2:
+                case.nessie.defer_main_commit = "another tool writes to main"
+
+        case.nessie.on_history_read = main_moves_after_the_search
+        with self.assertRaisesRegex(run.TableChecksError, "main moved"):
+            case.go(Runner())
+        self.assertEqual(([], 1), (case.nessie.merges, len(case.nessie.merge_requests)))
+        self.assertEqual((True, False), (case.saved()["passed"], case.saved()["merged"]))
+
+    def test_a_truncated_success_answer_of_the_log_is_an_error_and_no_merge_is_sent(self) -> None:
+        case = Case(self)
+        case.nessie.history_answer = (200, b'{"logEntries": [{"commitMeta": {"hash": "a')
+        with self.assertRaises(NessieError):
+            case.go(Runner())
+        self.assertEqual([], case.nessie.merge_requests)
+
+    def test_an_answer_of_the_log_that_is_not_in_the_expected_form_is_an_error_and_no_merge_is_sent(self) -> None:
+        good = {"commitMeta": {"hash": "a" * 64, "message": "m"}}
+        for label, document in (
+            ("not an object", []),
+            ("no entries", {"hasMore": False}),
+            ("entries not a list", {"logEntries": "x", "hasMore": False}),
+            ("no hasMore", {"logEntries": []}),
+            ("hasMore not a boolean", {"logEntries": [], "hasMore": "no"}),
+            ("an entry that is not an object", {"logEntries": ["x"], "hasMore": False}),
+            ("an entry without commitMeta", {"logEntries": [{}], "hasMore": False}),
+            ("a message that is not text", {"logEntries": [{"commitMeta": {"hash": "a" * 64, "message": 5}}], "hasMore": False}),
+            ("a hash that is not a hash", {"logEntries": [{"commitMeta": {"hash": "zz", "message": "m"}}], "hasMore": False}),
+            ("more pages and no token", {"logEntries": [good], "hasMore": True}),
+        ):
+            with self.subTest(label):
+                case = Case(self)
+                case.nessie.history_answer = (200, json.dumps(document).encode())
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner())
+                self.assertEqual([], case.nessie.merge_requests)
+
+    def test_an_answer_for_a_table_that_is_not_in_the_expected_form_is_an_error_and_not_a_missing_table(self) -> None:
+        case = Case(self)
+        original = case.nessie.send
+
+        def odd(method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+            if "/contents/" in target:
+                return 200, json.dumps({"content": {"type": "ICEBERG_TABLE", "snapshotId": "11"}}).encode()
+            return original(method, target, payload)
+
+        with mock.patch.object(case.nessie, "send", odd), self.assertRaises(run.TableChecksError):
+            run.table_snapshot(case.nessie, BRANCH, case.branch_hash, "clinical_data")
+        self.assertIsNone(run.table_snapshot(case.nessie, BRANCH, case.branch_hash, "no_such_table"))
+
+
+class OtherLoadTest(unittest.TestCase):
+    """A receipt is rebuilt from the log only when the merge commit names this run's checked branch and source hash."""
+
+    def lost_receipt(self, case: Case) -> None:
+        case.go(Runner())
+        (case.run_folder / run.RESULT_FILE).unlink()
+
+    def test_a_retry_with_the_same_manifest_and_snapshots_but_another_branch_and_hash_is_not_given_the_receipt(self) -> None:
+        case = Case(self)
+        self.lost_receipt(case)
+        other_hash = case.nessie.load_branch("load_run_two", SNAPSHOTS)
+        retry = run.LoadRecord("load_run_two", other_hash, case.reference, dict(SNAPSHOTS))
+        runner = Runner()
+        with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
+            case.go(runner, record=retry)
+        self.assertEqual(0, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+
+    def test_the_same_branch_with_another_source_hash_is_not_given_the_receipt_either(self) -> None:
+        case = Case(self)
+        self.lost_receipt(case)
+        moved = fake_hash("elsewhere")
+        case.nessie.heads[BRANCH] = moved
+        case.nessie.tables[(BRANCH, moved)] = dict(SNAPSHOTS)
+        with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
+            case.go(Runner(), record=run.LoadRecord(BRANCH, moved, case.reference, dict(SNAPSHOTS)))
+
+    def test_a_matching_recovery_rebuilds_the_receipt_and_runs_and_sends_nothing(self) -> None:
+        case, runner = Case(self), Runner()
+        self.lost_receipt(case)
+        runner.calls = 0
+        again = case.go(runner)
+        self.assertEqual((0, 1), (runner.calls, len(case.nessie.merges)))
+        self.assertTrue(again.merged and case.saved()["merged"])
+
+    def test_a_merge_commit_in_the_older_form_without_the_new_lines_refuses_recovery(self) -> None:
+        case, runner = Case(self), Runner()
+        case.nessie.add_main_commit(f"merge {BRANCH}: table checks passed\n\n{run.manifest_line(case.reference.sha256)}", SNAPSHOTS)
+        with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
+            case.go(runner)
+        self.assertEqual(0, runner.calls)
+        self.assertEqual([], case.nessie.merge_requests)
+
+    def test_a_commit_with_only_one_of_the_two_lines_refuses_recovery(self) -> None:
+        for lines in ([run.branch_line(BRANCH)], ["records-source: " + "b" * 64]):
+            case = Case(self)
+            case.nessie.add_main_commit("\n".join(["merge", "", *lines, run.manifest_line(case.reference.sha256)]), SNAPSHOTS)
+            with self.assertRaisesRegex(run.TableChecksError, "another load of this manifest"):
+                case.go(Runner())
+
+
+class StagedModesTest(unittest.TestCase):
+    """The staged inputs are readable by the Spark user through the shared group and by nobody else: the folder 0750, every file 0640, set by the launcher."""
+
+    def seen_during_run(self, case: Case, umask: int) -> dict[str, tuple[int, int]]:
+        seen: dict[str, tuple[int, int]] = {}
+
+        def look(plan: rules.Plan) -> str:
+            folder = case.staging
+            seen["."] = (stat.S_IMODE(folder.stat().st_mode), folder.stat().st_gid)
+            for path in folder.iterdir():
+                seen[path.name] = (stat.S_IMODE(path.stat().st_mode), path.stat().st_gid)
+            return result_line(plan)
+
+        previous = os.umask(umask)
+        try:
+            case.go(Runner(look))
+        finally:
+            os.umask(previous)
+        return seen
+
+    def test_the_folder_and_every_file_have_exactly_the_stated_modes_and_group_whatever_the_umask(self) -> None:
+        for umask in (0o077, 0o022, 0o000):
+            with self.subTest(umask=oct(umask)):
+                case = Case(self)
+                seen = self.seen_during_run(case, umask)
+                self.assertEqual({".", "plan.json", "clinical_data.csv", "lab_data.csv"}, set(seen))
+                self.assertEqual({"."}, {name for name, (mode, _) in seen.items() if mode == 0o750})
+                self.assertEqual({"plan.json", "clinical_data.csv", "lab_data.csv"}, {name for name, (mode, _) in seen.items() if mode == 0o640})
+                self.assertEqual({os.getgid()}, {group for _, group in seen.values()})
+
+    def test_the_constants_name_the_user_the_job_runs_as_and_the_group_it_shares_with_the_launcher(self) -> None:
+        self.assertEqual((10100, 10001), (run.SPARK_UID, run.STAGING_GID))
+        self.assertEqual(0o750, run.STAGING_FOLDER_MODE)
+        self.assertEqual(0o640, run.STAGING_FILE_MODE)
+
+    def test_a_group_the_launcher_cannot_set_stops_the_run_before_the_job_and_leaves_nothing_staged(self) -> None:
+        case, runner = Case(self), Runner()
+        with (
+            mock.patch.object(os, "chown", side_effect=PermissionError),
+            self.assertRaisesRegex(run.TableChecksError, "group"),
+        ):
+            run.run_table_checks(
+                store=case.landed.store,
+                nessie=case.nessie,
+                record=case.record,
+                track_pin=PIN,
+                staging=case.staging,
+                run_folder=case.run_folder,
+                runner=runner,
+                staging_gid=99998,
+                lock_directory=case.locks,
+            )
+        self.assertEqual(0, runner.calls)
+        self.assertEqual([], list(case.staging.iterdir()) if case.staging.exists() else [])
+
+
+class StagingCleanupTest(unittest.TestCase):
+    """Nothing stays in the staging folder when the step ends, whichever step ends it."""
+
+    def nothing_staged(self, case: Case) -> None:
+        self.assertEqual([], list(case.staging.iterdir()) if case.staging.exists() else [])
+
+    def test_an_invalid_pin_is_refused_before_anything_is_staged(self) -> None:
+        for pin in (rules.TrackPin(0, "a" * 64), rules.TrackPin(-1, "a" * 64), rules.TrackPin(7, "A" * 64), rules.TrackPin(7, "a" * 63)):
+            with self.subTest(pin=pin):
+                case = Case(self)
+                case.landed.store.reads.clear()
+                with self.assertRaises(run.TableChecksError):
+                    run.run_table_checks(
+                        store=case.landed.store,
+                        nessie=case.nessie,
+                        record=case.record,
+                        track_pin=pin,
+                        staging=case.staging,
+                        run_folder=case.run_folder,
+                        runner=Runner(),
+                        staging_gid=os.getgid(),
+                        lock_directory=case.locks,
+                    )
+                self.nothing_staged(case)
+                self.assertEqual([], case.landed.store.payload_reads("landing/"))
+
+    def test_a_runner_that_raises_a_result_that_is_refused_and_a_job_that_fails_leave_nothing_staged(self) -> None:
+        def raising(staging: Path) -> run.RunnerReply:
+            raise RuntimeError("the runner broke")
+
+        for label, runner in (
+            ("raises", raising),
+            ("no result", Runner(lambda plan: "nothing\n", exit_code=1)),
+            ("failed check", Runner(lambda plan: result_line(plan, passed=False))),
+            ("refused result", Runner(lambda plan: "RESULT {}\n", exit_code=0)),
+        ):
+            with self.subTest(label):
+                case = Case(self)
+                with contextlib.suppress(run.TableChecksError, RuntimeError):
+                    case.go(runner)  # type: ignore[arg-type]
+                self.nothing_staged(case)
+
+    def test_a_bytes_mismatch_a_gate_refusal_and_a_moved_branch_leave_nothing_staged(self) -> None:
+        case = Case(self)
+        case.landed.store.history[case.landed.versions["lab_data.csv"].key][-1].data = LAB.replace(b"2.9", b"2.8")
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner())
+        self.nothing_staged(case)
+        case = Case(self)
+        case.landed.land("clinical_data.csv", b"caseid,age\r\n9,99\r\n")
+        with self.assertRaises(GateRefused):
+            case.go(Runner())
+        self.nothing_staged(case)
+        case = Case(self)
+        case.nessie.move_branch(BRANCH)
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner())
+        self.nothing_staged(case)
+
+
+class SingleResultTest(unittest.TestCase):
+    """Exactly one result line, from the closed table of details, and only validated fields are kept."""
+
+    def test_two_result_lines_one_failed_and_one_passed_authorise_nothing(self) -> None:
+        for order in ((False, True), (True, False), (True, True)):
+            with self.subTest(order=order):
+                case = Case(self)
+
+                def two(plan: rules.Plan, order: tuple[bool, ...] = order) -> str:
+                    return "".join(result_line(plan, passed=passed) for passed in order)
+
+                with self.assertRaisesRegex(run.TableChecksError, "more than one"):
+                    case.go(Runner(two, exit_code=0))
+                self.assertTrue(case.main_untouched())
+                self.assertIn("RESULT", (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    @staticmethod
+    def with_detail(detail: str) -> Callable[[rules.Plan], str]:
+        def change(document: dict[str, Any]) -> None:
+            document["tables"][0]["checks"][4]["detail"] = detail
+
+        return lambda plan: result_line(plan, change=change)
+
+    def test_a_marker_in_a_detail_as_a_word_as_digits_and_as_a_code_like_token_reaches_no_file_and_no_message(self) -> None:
+        variants = {
+            "a lower-case word": "marker_9d2",
+            "a code-like token": "rows_differ_marker_9d2;only_file=1;only_table=0",
+            "digits in a count": "row_count;source=4719238;table=4719238",
+            "a word where a count goes": "rows_differ;only_file=marker;only_table=0",
+            "a known code with an extra field": "ok;marker=9",
+        }
+        for label, detail in variants.items():
+            with self.subTest(label):
+                case = Case(self)
+                line = Runner(self.with_detail(detail), exit_code=0)
+                with self.assertRaises(run.TableChecksError) as raised:
+                    case.go(line)
+                self.assertNotIn("marker", str(raised.exception))
+                self.assertNotIn("4719238", str(raised.exception))
+                self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+                self.assertTrue(case.main_untouched())
+
+    def test_the_saved_result_holds_the_validated_fields_and_a_verdict_derived_by_the_controller_not_the_jobs_own_flag(self) -> None:
+        case = Case(self)
+
+        def flags_say_failed(plan: rules.Plan) -> str:
+            def change(document: dict[str, Any]) -> None:
+                document["passed"] = False
+                for table in document["tables"]:
+                    table["passed"] = False
+
+            return result_line(plan, change=change)
+
+        outcome = case.go(Runner(flags_say_failed, exit_code=0))
+        saved = case.saved()["checked"]
+        self.assertEqual({"format", "run_id", "branch", "branch_hash", "empty_form", "passed", "tables"}, set(saved))
+        self.assertTrue(saved["passed"] and outcome.merged)
 
 
 class RefusalTest(unittest.TestCase):
@@ -497,6 +876,7 @@ class FailedCheckTest(unittest.TestCase):
         def lying(plan: rules.Plan) -> str:
             def flags(document: dict[str, Any]) -> None:
                 document["tables"][1]["checks"][3].update(passed=False, detail="row_count;source=2;table=3")
+                document["tables"][1].update(rows_source=2, rows_table=3)
                 document["passed"] = True
                 for table in document["tables"]:
                     table["passed"] = True
@@ -589,7 +969,7 @@ class ComposeRunnerTest(unittest.TestCase):
     """The command that starts the job through the stack's Compose files: the batch profile, no dependency started, the staging volume read-only."""
 
     def settings(self) -> Settings:
-        return Settings(compose_directory=Path("/opt/stack/compose"), project="stack_example", host_env=Path("/opt/stack/compose/host.env"))
+        return Settings(compose_directory=ROOT / "compose", project="stack_example", host_env=Path("/opt/stack/compose/host.env"))
 
     def runner(self) -> run.Runner:
         return run.compose_runner(self.settings(), volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77)
@@ -601,12 +981,32 @@ class ComposeRunnerTest(unittest.TestCase):
         self.assertEqual("docker", program)
         self.assertEqual(77, started.call_args.kwargs["timeout"])
         text = " ".join(arguments)
-        self.assertIn("compose --project-directory /opt/stack/compose", text)
+        self.assertIn(f"compose --project-directory {ROOT / 'compose'}", text)
         self.assertIn("--project-name stack_example", text)
         self.assertIn("--profile batch run --rm --no-TTY --no-deps", text)
         self.assertIn("--volume stack_example_table_check_staging:/staging:ro", text)
         self.assertTrue(text.endswith("--entrypoint python spark -m spark.jobs.table_checks --staging /staging/run_one"), text)
         self.assertEqual((0, "RESULT {}\n"), (reply.exit_code, reply.stdout))
+
+    def test_the_command_runs_the_job_as_the_spark_user_with_the_launchers_group_and_the_environment_carries_the_memory_limit(self) -> None:
+        from scripts.stack.groups import rendered_environment
+        from scripts.stack.limits import load_limits
+
+        with mock.patch.object(run, "run_command", return_value=CompletedProcess([], 0, "", "")) as started:
+            self.runner()(Path("/opt/dagster/staging/run_one"))
+        arguments = started.call_args.args[1]
+        self.assertEqual(f"{run.SPARK_UID}:{run.STAGING_GID}", arguments[arguments.index("--user") + 1])
+        environment = started.call_args.kwargs["env"]
+        expected = rendered_environment(load_limits(ROOT / "compose" / "limits.yml"))["MEM_LIMIT_SPARK"]
+        self.assertRegex(expected, r"^[0-9]+m$")
+        self.assertEqual(expected, environment["MEM_LIMIT_SPARK"])
+        every = {name for name in rendered_environment(load_limits(ROOT / "compose" / "limits.yml")) if name.startswith("MEM_LIMIT_")}
+        self.assertTrue(every <= set(environment))
+
+    def test_the_figure_has_one_source_the_limits_file_that_the_group_commands_read(self) -> None:
+        source = (ROOT / "scripts" / "ingestion" / "table_checks.py").read_text()
+        self.assertIn("rendered_environment(load_limits(settings.limits_file))", source)
+        self.assertNotIn("MEM_LIMIT", source)
 
     def test_a_job_that_passes_its_deadline_is_a_reply_with_the_timeout_code_and_no_output_of_the_command(self) -> None:
         with mock.patch.object(run, "run_command", side_effect=TimeoutExpired("docker", 77)):
@@ -659,6 +1059,9 @@ class LoadRecordTest(unittest.TestCase):
             lambda document: document.update(branch_hash="A" * 64),
             lambda document: document.update(branch="main"),
             lambda document: document.update(branch=""),
+            lambda document: document.update(branch="load_x\nrecords-manifest: " + "a" * 64),
+            lambda document: document.update(branch="load x"),
+            lambda document: document.update(branch="-load"),
             lambda document: document["tables"].pop("lab_data"),
             lambda document: document["tables"].update(other=5),
             lambda document: document["tables"].update(lab_data="222"),
