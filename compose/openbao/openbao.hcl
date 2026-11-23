@@ -72,10 +72,9 @@ initialize "first_start" {
     path      = "auth/approle/role/bootstrap/custom-secret-id"
     data = {
       secret_id = {
-        eval_source = "env"
+        eval_source = "file"
         eval_type   = "string"
-        env_var     = "OPENBAO_BOOTSTRAP_SECRET_ID"
-        require_present = true
+        path        = "/run/secrets/openbao_bootstrap_secret_id"
       }
     }
   }

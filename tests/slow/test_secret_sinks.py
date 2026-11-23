@@ -526,5 +526,61 @@ class EvidenceSinks(unittest.TestCase):
         self.assertEqual([], [name for name, content in members.items() if scan_text(content, [marker])])
 
 
+STANDARD_BAO = """#!/bin/sh
+env > "$SINK_OUT/environment"
+printf '%s\\n' "$@" > "$SINK_OUT/arguments"
+"""
+
+
+class OpenBaoStartSinks(unittest.TestCase):
+    """The real start script of the OpenBao container, run with a stand-in server program: what the server process receives."""
+
+    START = ROOT / "compose" / "openbao" / "start.sh"
+    CONFIG = ROOT / "compose" / "openbao" / "openbao.hcl"
+
+    def run_start(self, scratch: Path, unlock: Marker, admin: Marker) -> tuple[int, str, str, str]:
+        secrets_folder = scratch / "run_secrets"
+        secrets_folder.mkdir()
+        (secrets_folder / "openbao_unlock_key_file").write_text(f"OPENBAO_UNLOCK_KEY={unlock.value}\n")
+        (secrets_folder / "openbao_bootstrap_secret_id").write_text(admin.value)
+        script = scratch / "start.sh"
+        script.write_text(self.START.read_text().replace("/run/secrets/", f"{secrets_folder}/"))
+        bin_folder = scratch / "bin"
+        bin_folder.mkdir()
+        (bin_folder / "bao").write_text(STANDARD_BAO)
+        (bin_folder / "bao").chmod(0o755)
+        out = scratch / "out"
+        out.mkdir()
+        result = run_command("/bin/sh", [str(script)], env={"PATH": f"{bin_folder}:/usr/bin:/bin", "SINK_OUT": str(out)}, timeout=60)
+        environment = (out / "environment").read_text() if (out / "environment").exists() else ""
+        arguments = (out / "arguments").read_text() if (out / "arguments").exists() else ""
+        return result.returncode, environment, arguments, result.stdout + result.stderr
+
+    def test_the_server_process_gets_the_unlock_key_and_no_bootstrap_secret_id(self) -> None:
+        unlock, admin = Marker("unlock key", make_marker("hex64").value), Marker("admin secret ID", make_marker("urlsafe").value)
+        with tempfile.TemporaryDirectory() as scratch:
+            code, environment, arguments, output = self.run_start(Path(scratch), unlock, admin)
+        self.assertEqual(0, code, output)
+        self.assertIn(
+            f"OPENBAO_UNLOCK_KEY={unlock.value}", environment, "control: the unlock key reaches the server's environment, as the owner's exception allows"
+        )
+        self.assertIn("server", arguments, "control: the stand-in was started as the server")
+        self.assertEqual([], scan_text(environment, [admin]), "the bootstrap secret ID is in the server's environment")
+        self.assertEqual([], scan_text(arguments + output, [admin, unlock]))
+
+    def test_the_first_start_reads_the_bootstrap_secret_id_from_its_own_file_and_not_from_the_environment(self) -> None:
+        config = self.CONFIG.read_text()
+        self.assertRegex(config, r'eval_source\s*=\s*"file"[^}]*path\s*=\s*"/run/secrets/openbao_bootstrap_secret_id"')
+        self.assertNotIn("OPENBAO_BOOTSTRAP_SECRET_ID", config + self.START.read_text())
+
+    def test_a_missing_or_empty_secret_id_file_stops_the_start_by_name(self) -> None:
+        unlock = Marker("unlock key", make_marker("hex64").value)
+        with tempfile.TemporaryDirectory() as scratch:
+            code, environment, _, output = self.run_start(Path(scratch), unlock, Marker("empty", ""))
+        self.assertNotEqual(0, code)
+        self.assertEqual("", environment, "the server was not started")
+        self.assertIn("bootstrap secret ID", output)
+
+
 if __name__ == "__main__":
     unittest.main()
