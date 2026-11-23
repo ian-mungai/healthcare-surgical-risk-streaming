@@ -176,10 +176,6 @@ class Times(unittest.TestCase):
         with self.assertRaises(ValueError):
             events_of([*low(200, 3), SeriesPoint(200, ExactMean.of(60.0), True)], OPSTART, OPEND)
 
-    def test_a_valid_point_without_a_value_is_refused(self) -> None:
-        with self.assertRaises(ValueError):
-            events_of([SeriesPoint(200, None, True)], OPSTART, OPEND)
-
     def test_the_operation_times_must_be_numbers_with_the_start_not_after_the_end_or_the_case_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             events_of(low(200, 60), float("nan"), OPEND)

@@ -84,15 +84,13 @@ class SeriesFacts:
 class EventFacts:
     """What a read of the event table shows, as flags (0 or 1, or any positive number that is only tested for being positive): ``duplicate_keys``, ``short`` (an
     event of fewer than 60 seconds), ``times_differ`` (times that are not those of the onset and duration), ``differs`` (not the recomputed events, in both
-    directions) and ``held_out_events`` (an event of a case outside the development sets). ``cases_without_operation`` is a fact of the development cases and
-    is not a defect; the result does not name it."""
+    directions) and ``held_out_events`` (an event of a case outside the development sets)."""
 
     duplicate_keys: int
     short: int
     times_differ: int
     differs: int
     held_out_events: int
-    cases_without_operation: int = 0
 
 
 def split_rule_problems(rows: Sequence[SplitRow]) -> list[str]:

@@ -48,7 +48,7 @@ SERIES = SeriesFacts(
     differs=0,
     causes={MISSING: 3, FLAT: 7, "valid": 4990},
 )
-EVENTS = EventFacts(duplicate_keys=0, short=0, times_differ=0, differs=0, held_out_events=0, cases_without_operation=2)
+EVENTS = EventFacts(duplicate_keys=0, short=0, times_differ=0, differs=0, held_out_events=0)
 MESSAGE = re.compile(r"[a-z_]+: (\d+ [a-z]+s?|failed)")
 
 
@@ -129,7 +129,7 @@ class Series(unittest.TestCase):
 
 
 class Events(unittest.TestCase):
-    def test_a_good_table_has_no_problem_and_a_case_without_an_operation_is_not_one(self) -> None:
+    def test_a_good_table_has_no_problem(self) -> None:
         self.assertEqual([], event_problems(EVENTS))
 
     def test_each_defect_is_one_flag_by_its_own_code_whatever_the_count_is(self) -> None:
@@ -145,7 +145,7 @@ class Events(unittest.TestCase):
                     self.assertEqual([f"{code}: failed"], event_problems(dataclasses.replace(EVENTS, **{field: count})))
 
     def test_no_message_about_events_holds_a_digit(self) -> None:
-        problems = event_problems(EventFacts(55, 66, 77, 88, 99, 111))
+        problems = event_problems(EventFacts(55, 66, 77, 88, 99))
         self.assertEqual(5, len(problems))
         self.assertFalse([problem for problem in problems if any(char.isdigit() for char in problem)])
 

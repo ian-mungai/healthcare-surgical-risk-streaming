@@ -279,17 +279,10 @@ def event_facts(stored: Any, series: Any, clinical: Any, split: Any) -> EventFac
     columns = tuple((name, kind) for name, kind in HYPOTENSION_EVENTS.columns)
     left, right = typed(stored, columns), typed(events_frame(series, clinical, split), columns)
     development = development_cases(clinical, split).select("case_id")
-    ops = usable(development_cases(clinical, split))
     return EventFacts(
         exists(twice),
         exists(stored.filter(duration < EVENT_SECONDS)),
         exists(stored.filter(times)),
         exists(left.exceptAll(right)) or exists(right.exceptAll(left)),
         exists(stored.join(development, "case_id", "left_anti")),
-        count_distinct_cases(per_case(series).join(ops, "case_id", "left_anti")),
     )
-
-
-def count_distinct_cases(frame: Any) -> int:
-    """The development cases with arterial seconds and no usable operation times. A fact that the result does not name."""
-    return int(frame.count())
