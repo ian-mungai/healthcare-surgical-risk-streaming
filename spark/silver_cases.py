@@ -48,6 +48,7 @@ FLAG_COLUMNS = ("emop", "preop_htn", "preop_dm", "death_inhosp")
 # The outcome columns: the stay in intensive care and the death. Their values are checked and counted for development patients only; for the held-out
 # patients the job checks their form inside the job and reports one flag, never a count.
 OUTCOME_COLUMNS = ("icu_days", "death_inhosp")
+OWNERSHIP_PROBLEM = "ambiguous_case_owner: a Bronze case has more than one row or more than one patient"
 SEX_VALUES = ("F", "M")
 ASA_VALUES = (1, 2, 3, 4, 5, 6)
 

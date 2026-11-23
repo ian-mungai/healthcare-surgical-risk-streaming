@@ -66,6 +66,8 @@ class SilverOps(Protocol):
 
     def split_problems(self) -> list[str]: ...
 
+    def ownership_problems(self) -> list[str]: ...
+
     def input_facts(self) -> dict[str, object]: ...
 
     def development_lengths(self) -> list[int]: ...
@@ -116,9 +118,10 @@ class Outcome:
 
 def checked_inputs(ops: SilverOps, *, pinned: bool) -> tuple[list[MeasureRow], list[CutoffRow]]:
     """Run every input check, then measure the development operation lengths and set the cutoffs, or raise every cause."""
-    problems = ops.split_problems()
-    if problems:
-        raise SilverCasesError(*problems)
+    for step in (ops.split_problems, ops.ownership_problems):
+        problems = step()
+        if problems:
+            raise SilverCasesError(*problems)
     facts = ops.input_facts()
     problems = input_problems(**facts, development_cases=None, pinned=pinned)  # type: ignore[arg-type]
     if problems:
@@ -159,10 +162,10 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
 def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
     """Run the input checks and the output checks on what the branch holds, and compare the saved cutoffs with the ones the development data gives."""
     measure, cutoffs = checked_inputs(ops, pinned=pinned)
+    check_stored_schema(ops)
     held_measure, held_cutoffs = ops.existing_rules()
     missing = (held_measure is None) + (held_cutoffs is None)
     problems = [f"table_missing: {unit(missing, 'table')}"] if missing else frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
-    check_stored_schema(ops)
     output = ops.output_facts()
     problems += output_problems(**output)  # type: ignore[arg-type]
     if problems:

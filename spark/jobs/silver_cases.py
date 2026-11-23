@@ -39,6 +39,7 @@ from spark.silver_cases import (
     MEASURE_TABLE,
     NEVER_FEATURE_COLUMNS,
     NEVER_FEATURE_PROPERTY,
+    OWNERSHIP_PROBLEM,
     SOURCE_SCHEMAS,
     CutoffRow,
     MeasureRow,
@@ -75,6 +76,7 @@ from spark.silver_cases_sql import (
     lab_unmatched_query,
     outcome_facts_query,
     outcome_output_query,
+    ownership_query,
     sealed_lab_form_query,
     sealed_lab_output_query,
     sealed_outcome_output_query,
@@ -84,7 +86,7 @@ from spark.silver_cases_sql import (
     values_query,
 )
 from spark.split_cli import open_client, read_settings
-from spark.split_table import SplitRow
+from spark.split_table import BRANCH_MOVED, SplitRow
 
 MEASURE_COLUMNS = (("statistic", "string"), ("unit", "string"), ("value", "bigint"))
 CUTOFF_COLUMNS = (
@@ -104,10 +106,11 @@ NOT_FOUND = 404
 class Lake:
     """The Spark steps of a build or a verify, on one branch, through the catalog of the branch (``lake``)."""
 
-    def __init__(self, session: Any, client: NessieClient, branch: str) -> None:
+    def __init__(self, session: Any, client: NessieClient, branch: str, at: str | None = None) -> None:
         self.session = session
         self.client = client
         self.branch = branch
+        self.at = at
 
     def count(self, query: str) -> int:
         return int(self.session.sql(query).collect()[0]["n"])
@@ -132,6 +135,10 @@ class Lake:
 
     def silver_lab_scope(self, *, development: bool) -> str:
         return lab_scope(LAB_SOURCE, BRONZE_CASES_SOURCE, SPLIT_SOURCE, development=development, lab_text=False, strict=True)
+
+    def ownership_problems(self) -> list[str]:
+        """The one code of an ambiguous Bronze owner, or none. It runs before any aggregate that joins a case to its patient."""
+        return [OWNERSHIP_PROBLEM] if self.count(ownership_query(BRONZE_CASES_SOURCE)) else []
 
     def split_problems(self) -> list[str]:
         """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
@@ -275,9 +282,10 @@ class Lake:
         }
 
     def snapshot_id(self, table: str) -> int | None:
-        """The snapshot that Nessie holds for ``table`` on the branch, or ``None`` when the branch has no such table."""
+        """The snapshot that Nessie holds for ``table`` on the branch (at the hash it was pinned to, if any), or ``None`` when it has no such table."""
+        reference = quote(self.branch if self.at is None else f"{self.branch}@{self.at}", safe="@")
         try:
-            document = self.client.request("GET", f"/trees/{quote(self.branch, safe='')}/contents/{table}") or {}
+            document = self.client.request("GET", f"/trees/{reference}/contents/{table}") or {}
         except NessieError as error:
             if error.status == NOT_FOUND:
                 return None
@@ -297,22 +305,22 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         settings = read_settings()
         client = open_client(settings.nessie_uri, settings.nessie_timeout_seconds)
         start_deadline(settings.deadline_seconds)
-        session = build_session(JOB, arguments.branch)
-        lake = Lake(session, client, arguments.branch)
-        client.config()
         building = arguments.mode == "build"
-        if building:
-            base = client.create_branch(arguments.branch, arguments.base).hash
-        else:
-            base = None
-            client.reference(arguments.branch)
+        client.config()
+        pinned = None if building else client.reference(arguments.branch).hash
+        session = build_session(JOB, arguments.branch, pinned)
+        lake = Lake(session, client, arguments.branch, pinned)
+        base = client.create_branch(arguments.branch, arguments.base).hash if building else None
         lake.check_sources()
         outcome = (run_build if building else run_verify)(lake, pinned=arguments.pinned_release)
+        head = client.reference(arguments.branch).hash
+        if pinned is not None and head != pinned:
+            raise SilverCasesError(BRANCH_MOVED)
         return {
             "mode": arguments.mode,
             "branch": arguments.branch,
             "base_hash": base,
-            "branch_hash": client.reference(arguments.branch).hash,
+            "branch_hash": head,
             "pinned_release": arguments.pinned_release,
             **outcome.facts(),
         }

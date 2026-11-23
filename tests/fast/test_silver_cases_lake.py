@@ -89,10 +89,10 @@ class Frame:
 
 
 class Result:
-    def __init__(self, rows: list[dict[str, str]]) -> None:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
 
-    def collect(self) -> list[dict[str, str]]:
+    def collect(self) -> list[dict[str, Any]]:
         return self.rows
 
 
@@ -110,11 +110,14 @@ class Session:
         self.catalog = Catalog(tables)
         self.held_properties = properties
         self.log = log
+        self.flag = 0
 
     def table(self, name: str) -> Frame:
         return self.tables[name]
 
     def sql(self, text: str) -> Result:
+        if text.startswith("SELECT CASE WHEN COUNT(*) > 0"):
+            return Result([{"n": self.flag}])
         if text.startswith("SHOW TBLPROPERTIES"):
             return Result([{"key": key, "value": value} for key, value in self.held_properties.items()])
         self.log.append(text)
@@ -252,6 +255,41 @@ class LaboratoryScopeTest(unittest.TestCase):
         engine = self.engine()
         self.assertIn("TRY_CAST", engine.bronze_lab_scope(development=True))
         self.assertNotIn("TRY_CAST", engine.bronze_lab_scope(development=True, strict=True))
+
+
+class OwnershipTest(unittest.TestCase):
+    def test_a_bronze_case_with_more_than_one_row_is_one_code_and_a_clean_table_is_none(self) -> None:
+        session = Session({}, {}, [])
+        engine = Lake(session, None, "b")  # type: ignore[arg-type]
+        self.assertEqual([], engine.ownership_problems())
+        session.flag = 1
+        self.assertEqual(["ambiguous_case_owner: a Bronze case has more than one row or more than one patient"], engine.ownership_problems())
+
+
+class PinnedReadTest(unittest.TestCase):
+    def test_the_snapshot_lookup_of_a_pinned_branch_names_the_branch_at_its_hash(self) -> None:
+        seen: list[str] = []
+
+        class Client:
+            def request(self, method: str, path: str) -> dict[str, Any]:
+                seen.append(path)
+                return {"content": {"snapshotId": 5}}
+
+        engine = Lake(Session({}, {}, []), Client(), "run_b", at="a" * 64)  # type: ignore[arg-type]
+        self.assertEqual(5, engine.snapshot_id("silver.cases"))
+        self.assertEqual([f"/trees/run_b@{'a' * 64}/contents/silver.cases"], seen)
+
+    def test_a_branch_that_is_not_pinned_is_looked_up_by_name(self) -> None:
+        seen: list[str] = []
+
+        class Client:
+            def request(self, method: str, path: str) -> dict[str, Any]:
+                seen.append(path)
+                return {}
+
+        engine = Lake(Session({}, {}, []), Client(), "run_b")  # type: ignore[arg-type]
+        self.assertIsNone(engine.snapshot_id("silver.cases"))
+        self.assertEqual(["/trees/run_b/contents/silver.cases"], seen)
 
 
 class SplitRuleTest(unittest.TestCase):

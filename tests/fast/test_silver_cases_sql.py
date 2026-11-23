@@ -43,6 +43,7 @@ from spark.silver_cases_sql import (
     lab_unmatched_query,
     outcome_facts_query,
     outcome_output_query,
+    ownership_query,
     sealed_lab_form_query,
     sealed_lab_output_query,
     sealed_outcome_output_query,
@@ -416,6 +417,17 @@ class CountQueryTest(unittest.TestCase):
     def test_a_row_count_and_a_repeated_case_number_are_counted_on_the_table_that_is_named(self) -> None:
         self.assertEqual("SELECT COUNT(*) AS n FROM lake.silver.cases", count_query(CASES_SOURCE))
         self.assertEqual("SELECT COUNT(*) - COUNT(DISTINCT `caseid`) AS n FROM lake.silver.cases", case_duplicates_query(CASES_SOURCE))
+
+
+class OwnershipTest(unittest.TestCase):
+    def test_a_case_that_is_there_twice_or_under_two_patients_is_one_flag_from_the_case_number_alone(self) -> None:
+        query = ownership_query(BRONZE_CASES_SOURCE)
+        self.assertTrue(query.startswith("SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS n FROM ( SELECT"))
+        self.assertIn("GROUP BY CASE WHEN `caseid` RLIKE", query)
+        self.assertIn("HAVING COUNT(*) > 1", query)
+        self.assertNotIn("subjectid", query)
+        self.assertNotIn("`set`", query)
+        self.assertIn(f"FROM {BRONZE_CASES_SOURCE}", query)
 
 
 class ValuesTest(unittest.TestCase):

@@ -90,6 +90,7 @@ class FakeOps:
         self.writes = {"cases": True, "lab": True, "rules": True}
         self.after_write_rules: tuple[list[MeasureRow] | None, list[CutoffRow] | None] | None = None
         self.split: list[str] = []
+        self.owner: list[str] = []
         self.schema_wrong = 0
         for name, value in changes.items():
             setattr(self, name, value)
@@ -97,6 +98,10 @@ class FakeOps:
     def split_problems(self) -> list[str]:
         self.calls.append("split_problems")
         return self.split
+
+    def ownership_problems(self) -> list[str]:
+        self.calls.append("ownership_problems")
+        return self.owner
 
     def output_schema_tables_wrong(self) -> int:
         self.calls.append("output_schema")
@@ -159,6 +164,7 @@ class BuildOrderTest(unittest.TestCase):
         self.assertEqual(
             [
                 "split_problems",
+                "ownership_problems",
                 "input_facts",
                 "development_lengths",
                 "existing_rules",
@@ -217,6 +223,18 @@ class InputFailureTest(unittest.TestCase):
         ops = FakeOps(split=["rule_mismatch: 1 patient"], input=clean_input_facts(case_key_duplicates=2, sealed_outcome_form_bad=1, sealed_lab_form_bad=1))
         self.assertEqual(["rule_mismatch: 1 patient"], refused(lambda: run_build(ops, pinned=True)))
         self.assertEqual(["split_problems"], ops.calls)
+
+    def test_an_ambiguous_bronze_owner_stops_before_any_aggregate_and_reports_only_its_code(self) -> None:
+        ops = FakeOps(
+            owner=["ambiguous_case_owner: a Bronze case has more than one row or more than one patient"], input=clean_input_facts(case_key_duplicates=2)
+        )
+        self.assertEqual(["ambiguous_case_owner: a Bronze case has more than one row or more than one patient"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["split_problems", "ownership_problems"], ops.calls)
+
+    def test_verify_checks_the_owner_too_before_any_aggregate(self) -> None:
+        ops = FakeOps(owner=["ambiguous_case_owner: a Bronze case has more than one row or more than one patient"])
+        refused(lambda: run_verify(ops, pinned=True))
+        self.assertEqual(["split_problems", "ownership_problems"], ops.calls)
 
     def test_verify_checks_the_split_first_too(self) -> None:
         ops = FakeOps(split=["rule_mismatch: 1 patient"])
@@ -308,10 +326,11 @@ class OutputFailureTest(unittest.TestCase):
         self.assertNotIn("output_facts", ops.calls)
         self.assertNotIn("existing_rules", ops.calls[ops.calls.index("write_rules") :])
 
-    def test_verify_checks_the_stored_schema_before_any_value_query(self) -> None:
+    def test_verify_checks_the_stored_schema_before_it_reads_the_saved_rules_or_any_value(self) -> None:
         ops = FakeOps(schema_wrong=1, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
         self.assertEqual(["output_schema: 1 table"], refused(lambda: run_verify(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
+        self.assertNotIn("existing_rules", ops.calls)
 
     def test_a_check_of_a_written_table_that_fails_ends_the_job_with_its_code(self) -> None:
         ops = FakeOps(output=clean_output_facts(lab_value_differences=3, case_key_duplicates=1))
@@ -347,7 +366,10 @@ class VerifyTest(unittest.TestCase):
         facts = run_verify(ops, pinned=True).facts()
         self.assertEqual("verified", facts["outcome"])
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
-        self.assertEqual(["split_problems", "input_facts", "development_lengths", "existing_rules", "output_schema", "output_facts", "snapshot_ids"], ops.calls)
+        self.assertEqual(
+            ["split_problems", "ownership_problems", "input_facts", "development_lengths", "output_schema", "existing_rules", "output_facts", "snapshot_ids"],
+            ops.calls,
+        )
 
     def test_verify_fails_when_the_cutoffs_were_never_saved(self) -> None:
         ops = FakeOps(held=(None, None))

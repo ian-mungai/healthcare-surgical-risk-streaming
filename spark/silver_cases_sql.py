@@ -191,6 +191,18 @@ def sealed_outcome_query(cases: str, split: str) -> str:
     return sql("SELECT CASE WHEN COALESCE(SUM(CASE WHEN", anything, "THEN 1 ELSE 0 END), 0) > 0 THEN 1 ELSE 0 END AS n FROM", joined, "WHERE", held_out)
 
 
+def ownership_query(cases: str) -> str:
+    """One flag, 0 or 1: whether any Bronze case number is in more than one row. A case under two patients is in two rows, so this covers both. The flag is
+    made from the case number alone, before any aggregate that joins a case to its patient."""
+    return sql(
+        "SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS n FROM ( SELECT 1 FROM",
+        cases,
+        "GROUP BY",
+        typed_expression("caseid", BIGINT),
+        "HAVING COUNT(*) > 1 )",
+    )
+
+
 def lab_scope(lab: str, cases: str, split: str, *, development: bool, lab_text: bool, strict: bool = False) -> str:
     """The laboratory rows whose case is a case of a development patient (``development``) or of any other patient, as a subquery. ``cases`` is always the
     Bronze case table: the owner of a row is Bronze case, then patient, then set, whichever laboratory table the row is in. A row with no case is in neither.
