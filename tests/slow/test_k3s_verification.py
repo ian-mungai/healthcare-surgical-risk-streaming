@@ -76,18 +76,6 @@ def encryption_verdict(status: str) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
-def rotation_condition() -> Any:
-    """The rotation block's `when` of secrets_encryption.yml, evaluated with Jinja as Ansible does for a given status text."""
-    import jinja2
-
-    tasks = load_yaml((ROLES / "k3s" / "tasks" / "secrets_encryption.yml").read_text())
-    if not isinstance(tasks, list):
-        raise TypeError("the task file must be a list")
-    when = next(task["when"] for task in tasks if str(task.get("name", "")).startswith("Rotate the keys"))
-    expression = jinja2.Environment(autoescape=True).compile_expression(str(when))
-    return lambda status: bool(expression(k3s_secrets_status={"stdout": status}))
-
-
 def configuration() -> dict[str, Any]:
     tasks = load_yaml((ROLES / "k3s" / "tasks" / "main.yml").read_text())
     if not isinstance(tasks, list):
@@ -108,23 +96,17 @@ class SecretsEncryptionTest(unittest.TestCase):
         code, output = encryption_verdict(ENABLED)
         self.assertEqual(0, code, output)
 
-    def test_an_enabled_cluster_still_at_the_start_stage_is_refused_until_its_keys_are_rotated(self) -> None:
-        """The live host's reading (Nov 23 2026). A cluster switched on by a restart with the flag also shows this, with older secrets
-        still stored in plain text; only a key rotation (which re-encrypts every secret) proves them encrypted."""
+    def test_an_enabled_cluster_at_the_start_stage_with_matching_hashes_passes(self) -> None:
+        """The live host's reading (Nov 23 2026). Owner Q64 "A": the role runs no key rotation, so Enabled at the start stage with every
+        hash matching is accepted; secrets written before the flag may keep plain-text copies in Kine rows, a recorded limit."""
         code, output = encryption_verdict(STARTED_ENABLED)
-        self.assertNotEqual(0, code)
-        self.assertIn(ENCRYPTION_MESSAGE, output)
+        self.assertEqual(0, code, output)
 
-    def test_the_rotation_runs_at_the_start_stage_whether_encryption_shows_enabled_or_disabled(self) -> None:
-        condition = rotation_condition()
-        for status, expected in (
-            (STARTED_ENABLED, True),
-            ("Encryption Status: Disabled\nCurrent Rotation Stage: start\nServer Encryption Hashes: All hashes match\n", True),
-            (ENABLED, False),
-            ("Encryption Status: Enabled\nCurrent Rotation Stage: reencrypt_active\nServer Encryption Hashes: All hashes match\n", False),
-        ):
-            with self.subTest(status=status.splitlines()[:2]):
-                self.assertIs(expected, condition(status))
+    def test_no_task_rotates_the_keys(self) -> None:
+        """The pinned rotate-keys can drop a key in use at the start stage, so no task of the role runs it."""
+        for path in sorted((ROLES / "k3s").rglob("*.yml")):
+            with self.subTest(path=path.name):
+                self.assertNotRegex(path.read_text(), r"(?m)^\s*(cmd:|ansible.builtin.(command|shell):).*rotate")
 
     def test_every_other_status_is_refused_with_the_same_message(self) -> None:
         cases = {
