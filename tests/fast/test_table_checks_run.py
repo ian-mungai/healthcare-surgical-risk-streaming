@@ -71,6 +71,7 @@ class FakeNessie(NessieClient):
         self.history_answer: tuple[int, bytes] | None = None
         self.history_reads: list[str] = []
         self.on_history_read: Callable[[], None] | None = None
+        self.main_reads = 0
 
     def load_branch(self, name: str, snapshots: dict[str, int]) -> str:
         self.heads[name] = fake_hash(name, "load")
@@ -109,6 +110,8 @@ class FakeNessie(NessieClient):
         if method == "GET" and len(parts) == 1:
             if name == BRANCH and self.on_branch_read is not None:
                 self.on_branch_read()
+            if name == "main":
+                self.main_reads += 1
             return 200, json.dumps({"reference": {"type": "BRANCH", "name": name, "hash": self.heads[name]}}).encode()
         if method == "GET" and parts[1] == "history":
             self.history_reads.append(pinned)
@@ -476,6 +479,7 @@ class OneTargetHashTest(unittest.TestCase):
         case.go(Runner())
         self.assertEqual({head}, set(case.nessie.history_reads))
         self.assertEqual([head], [request["expected"] for request in case.nessie.merge_requests])
+        self.assertEqual(2, case.nessie.main_reads)
 
     def test_a_first_request_that_lands_after_the_retry_reads_the_log_gives_one_merge_and_no_second_one(self) -> None:
         case, runner = Case(self), Runner()
