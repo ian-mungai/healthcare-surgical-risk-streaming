@@ -213,6 +213,12 @@ def load_module(name: str, path: Path) -> Any:
 
 
 class PostgresSinks(unittest.TestCase):
+    """Provisioning runs the real script of the accounts module, and no provisioning process has the password in its environment.
+
+    The pinned PostgreSQL 18.7 image exports it only in its own first-start initialization of a new data folder. That is an accepted limit (owner, Nov 23
+    2026, Q55 "A"), and no process of these cases belongs to it.
+    """
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -242,6 +248,10 @@ class PostgresSinks(unittest.TestCase):
         self.assertEqual(sorted(self.tools), sorted(verifiers), "control: every tool's account was created")
         for name in self.tools:
             self.assertTrue(accounts.verifier_matches(verifiers[name], self.markers[name].value), f"control: the verifier of {name} belongs to its marker")
+        programs = {call.get("program") for call in self.run_.stand_in_calls()}
+        self.assertEqual(
+            {"docker", "psql"}, programs, "control: the environment of the exec and of psql, the provisioning processes, were recorded and are searched"
+        )
         records = self.run_.consumer()
         self.assertEqual(
             {self.markers["postgres"].value},
