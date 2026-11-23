@@ -27,7 +27,7 @@ from spark.streaming.settings import StreamSettingsError, from_environment
 
 JOB = "stream_features"
 RESULT_PREFIX = "RESULT "
-WAIT_SLICE_SECONDS = 30.0
+WAIT_SLICE_SECONDS = 5.0
 NESSIE_TIMEOUT_SECONDS = 30.0
 
 

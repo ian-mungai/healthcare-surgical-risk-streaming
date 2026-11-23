@@ -80,7 +80,7 @@ compose_stack_built_images:
       stack_fixtures: tests/fixtures/vitaldb
   - tag: surgical-risk-spark:4.1.4
     name: spark
-    sources: [spark, scripts, replay, tests/fixtures/vitaldb]
+    sources: [spark, scripts, replay, features, tests/fixtures/vitaldb]
     context: "."
     dockerfile: spark/Dockerfile
   - tag: surgical-risk-replay:1.7.2
