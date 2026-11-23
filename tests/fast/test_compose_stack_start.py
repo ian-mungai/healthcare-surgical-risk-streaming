@@ -11,6 +11,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import signal
 import stat
 import tempfile
@@ -490,6 +491,29 @@ class NestedSourcesTest(unittest.TestCase):
                 make(root, outside)
                 sources = ["sample", "linked" if label.startswith("a source") else "tests/fixtures/vitaldb"]
                 code, output = self.build(folder, stand_in, root, {**image, "sources": sources})
+                staged = self.staged(folder)
+                builds = [line for line in calls(stand_in) if line.startswith("build ")]
+            self.assertNotEqual(0, code, output)
+            self.assertIn("is missing, is a symbolic link or holds a symbolic link", output)
+            self.assertEqual(([], []), (staged, builds))
+
+    def test_a_link_at_any_depth_of_a_nested_sources_path_is_refused_and_nothing_is_staged(self) -> None:
+        def relink(root: Path, outside: Path, depth: int) -> None:
+            """Move a folder of the source's path to ``outside`` and link it back: ``depth`` 1 is ``tests``, 2 is ``tests/fixtures`` and 3 is the source."""
+            moved = [root / "tests", root / "tests" / "fixtures", root / "tests" / "fixtures" / "vitaldb"][depth - 1]
+            target = outside / "moved"
+            shutil.copytree(moved, target)
+            shutil.rmtree(moved)
+            moved.symlink_to(target)
+
+        for depth in (1, 2, 3):
+            with self.subTest(depth=depth), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, root, image = self.prepare(folder)
+                outside = folder / "outside"
+                outside.mkdir()
+                relink(root, outside, depth)
+                code, output = self.build(folder, stand_in, root, image)
                 staged = self.staged(folder)
                 builds = [line for line in calls(stand_in) if line.startswith("build ")]
             self.assertNotEqual(0, code, output)

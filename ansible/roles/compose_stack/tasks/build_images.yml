@@ -5,8 +5,8 @@
 # images/<name>/tests/fixtures/vitaldb, so a Dockerfile copies it from the path that the repository has. The build context is that folder or one source in it, the
 # Dockerfile and the named build contexts are sources in it too, and an image is built only when the folder differs from the one the image was built from: the
 # image carries the hash of the whole folder as a label, so a change in a named context builds the image again.
-# Every source is checked before anything is staged: it must be a plain relative path (no leading slash, no "..", no empty or "." part), it must exist, and neither
-# it nor anything in it may be a symbolic link, because the copy would follow the link out of the repository.
+# Every source is checked before anything is staged: it must be a plain relative path (no leading slash, no "..", no empty or "." part), it must exist, and
+# no folder on the way to it from the repository's root, nor it, nor anything in it may be a symbolic link, because the copy would follow the link out of it.
 - name: Refuse a source that is not a plain relative path
   ansible.builtin.assert:
     that: item.1 is regex('^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$') and '..' not in item.1.split('/')
@@ -16,20 +16,34 @@
   loop_control:
     label: "{{ item.0.tag }}: {{ item.1 }}"
 
-- name: Look at each source in the repository
+- name: List every folder on the way to each source, from the repository's root down
+  ansible.builtin.set_fact:
+    compose_stack_source_steps: >-
+      {%- set ns = namespace(steps=[]) -%}
+      {%- for image in compose_stack_built_images -%}
+      {%- for source in image.sources -%}
+      {%- set parts = source.split('/') -%}
+      {%- for depth in range(1, parts | length + 1) -%}
+      {%- set _ = ns.steps.append({'tag': image.tag, 'source': source, 'path': parts[:depth] | join('/'), 'last': depth == parts | length}) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ ns.steps | to_json }}
+
+- name: Look at each of them without following a link
   ansible.builtin.stat:
-    path: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.1] | path_join }}"
+    path: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.path] | path_join }}"
     follow: false
   register: compose_stack_source_stats
   delegate_to: localhost
   become: false
-  loop: "{{ compose_stack_built_images | subelements('sources') }}"
+  loop: "{{ compose_stack_source_steps | from_json }}"
   loop_control:
-    label: "{{ item.0.tag }}: {{ item.1 }}"
+    label: "{{ item.tag }}: {{ item.path }}"
 
 - name: List the symbolic links inside each source
   ansible.builtin.find:
-    paths: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.1] | path_join }}"
+    paths: "{{ [compose_stack_source_root | default(role_path ~ '/../../..'), item.path] | path_join }}"
     file_type: link
     recurse: true
     hidden: true
@@ -37,13 +51,13 @@
   register: compose_stack_source_links
   delegate_to: localhost
   become: false
-  when: compose_stack_source_stats.results[ansible_loop.index0].stat.isdir | default(false)
-  loop: "{{ compose_stack_built_images | subelements('sources') }}"
+  when: item.last and (compose_stack_source_stats.results[ansible_loop.index0].stat.isdir | default(false))
+  loop: "{{ compose_stack_source_steps | from_json }}"
   loop_control:
-    label: "{{ item.0.tag }}: {{ item.1 }}"
+    label: "{{ item.tag }}: {{ item.path }}"
     extended: true
 
-- name: Refuse a source that is missing, is a symbolic link or holds one
+- name: Refuse a source that is missing, is a link, passes through a link or holds one
   ansible.builtin.assert:
     that:
       - compose_stack_source_stats.results[ansible_loop.index0].stat.exists
@@ -51,11 +65,11 @@
       - (compose_stack_source_links.results[ansible_loop.index0].files | default([])) | length == 0
     quiet: true
     fail_msg: >-
-      {{ item.0.tag }}: the source {{ item.1 }} is missing, is a symbolic link or holds a symbolic link
-      (the copy would follow it out of the repository)
-  loop: "{{ compose_stack_built_images | subelements('sources') }}"
+      {{ item.tag }}: the source {{ item.source }} is missing, is a symbolic link or holds a symbolic link
+      (found at {{ item.path }}; the copy would follow it out of the repository)
+  loop: "{{ compose_stack_source_steps | from_json }}"
   loop_control:
-    label: "{{ item.0.tag }}: {{ item.1 }}"
+    label: "{{ item.tag }}: {{ item.path }}"
     extended: true
 
 - name: Create the folder of each image the project makes itself
