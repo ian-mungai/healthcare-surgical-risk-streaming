@@ -68,8 +68,8 @@ class Record:
     def close(self, log: list[str], *, blocked: str = "") -> int:
         """Print each assertion, set the outcome, write the record, its log and its retention label in a new folder and return the exit code.
 
-        The result is printed and flushed before the files are written. A print or flush that fails (a closed or broken stdout) is itself a failed assertion, so the record
-        never says pass for a run whose result could not be printed.
+        The result is printed and flushed before the files are written. A print or flush that fails (a closed or broken stdout) is itself a failed
+        assertion, so the record never says pass for a run whose result could not be printed.
         """
         stamp = self.started_utc.replace(":", "").replace("-", "")
         runs = ROOT / "runs"
