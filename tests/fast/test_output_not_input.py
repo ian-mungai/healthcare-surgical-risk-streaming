@@ -153,6 +153,18 @@ class CommandTests(Fixture):
                     self.assertEqual(record, (self.root / shared).read_text())
                     self.assertEqual([], sorted(path.name for path in self.root.rglob(".*")))
 
+    def test_a_replay_command_refuses_an_output_below_the_object_store_it_reads_case_files_from(self) -> None:
+        for command in ("manifest", "observe"):
+            with self.subTest(command=command):
+                self.replay_record(command, "run.json")
+                (self.root / "store" / "cases").mkdir(parents=True, exist_ok=True)
+                inside = self.root / "store" / "cases" / "v0001"
+                inside.write_text(ORIGINAL)
+                code, err = self.run_replay([command, "--run-record", str(self.root / "run.json"), "--out", str(inside)])
+                self.assertEqual(2, code)
+                self.assertIn(REFUSAL, err)
+                self.assertEqual(ORIGINAL, inside.read_text())
+
     def replay_record(self, command: str, shared: str) -> str:
         """Write a run record, the files that it names and the file ``shared``; return the text of that file."""
         (self.root / "state").mkdir(exist_ok=True)
