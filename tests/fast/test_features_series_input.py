@@ -7,16 +7,22 @@ Failure modes covered here:
 - A feature compares the rounded value of a reading with 65 or 60: a reading whose exact mean is below 65 and whose float is 65.0 is not counted
   below, while the
   event rule (which compares the exact mean) calls the same second low. The two disagree at one cutoff.
-- The JSON entry point reads the series as plain readings and so skips the binding, or its readings are not given the exact value of their float.
+- The JSON entry point rebuilds the exact mean of a reading from its rounded float, so the same readings give 1.0 minute below 65 through ``WindowInput``
+  and 0.0 through the batch command line. A JSON reading of the series carries its exact mean (the sample count and the two floats of the exact sum), and
+  a reading that does not is refused by name.
 - A reading of the series is given a time from the wrong end of its second, or a second that is invalid is given a value.
 """
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from collections.abc import Callable
 from fractions import Fraction
+from pathlib import Path
 
+from features import batch
 from features.hypotension import SeriesPoint, is_low
 from features.model import FeatureInputError, Reading, WindowInput
 from features.pressure_series import ExactMean, SecondFacts, second_facts, series_from_seconds
@@ -75,6 +81,65 @@ class Binding(unittest.TestCase):
         self.assertIsInstance(got, SeriesReadings)
         self.assertEqual(Fraction(64.99999999999999), got[0].exact)
         self.assertIsNone(got[1].exact)
+
+
+def series_entries(facts: list[SecondFacts]) -> list[list[object]]:
+    """The JSON readings of the series: time, value, valid flag and the exact mean (sample count, high and low parts of the sum), as the definition gives."""
+    entries: list[list[object]] = []
+    for second, reading in series_from_seconds(facts):
+        mean = reading.mean
+        if mean is None:
+            entries.append([second * SECOND, 0.0, False, None, None, None])
+        else:
+            entries.append([second * SECOND, mean.value, True, mean.count, mean.total_high, mean.total_low])
+    return entries
+
+
+def document(entries: list[list[object]]) -> dict[str, object]:
+    return {"windows": [{"window_id": "w", "cutoff_us": CUTOFF_US, "numeric": {SERIES: entries}, "waveforms": {}, "clinical": {}}]}
+
+
+def through_the_command_line(entries: list[list[object]]) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as folder:
+        source, target = Path(folder) / "windows.json", Path(folder) / "rows.json"
+        source.write_text(json.dumps(document(entries)))
+        batch.run(source, target)
+        return json.loads(target.read_text())["rows"][0]["features"]  # type: ignore[no-any-return]
+
+
+class JsonParity(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_the_same_readings_give_the_same_minutes_below_65_through_the_window_input_and_the_batch_command_line(self) -> None:
+        facts = seconds_of(alternating)
+        direct = build_row(window(series_readings(facts))).values
+        batch_values = through_the_command_line(series_entries(facts))
+        self.assertEqual(15.0, direct[PREFIX + "minutes_below_65"])
+        for key in (
+            PREFIX + "minutes_below_65",
+            PREFIX + "minutes_below_60",
+            PREFIX + "seconds_since_below_65",
+            PREFIX + "valid_count",
+            PREFIX + "projection_5min",
+        ):
+            self.assertEqual(direct[key], batch_values[key], key)
+
+    @unittest.expectedFailure
+    def test_a_mapping_window_gives_the_same_row_as_the_window_input(self) -> None:
+        facts = seconds_of(alternating)
+        mapped = build_row(document(series_entries(facts))["windows"][0])  # type: ignore[index]
+        self.assertEqual(build_row(window(series_readings(facts))).values, mapped.values)
+
+    @unittest.expectedFailure
+    def test_a_json_reading_of_the_series_without_its_exact_mean_is_refused_by_name(self) -> None:
+        with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*sample count"):
+            build_row(document([[CUTOFF_US - SECOND, 60.0, True]])["windows"][0])  # type: ignore[index]
+
+    @unittest.expectedFailure
+    def test_a_json_reading_whose_value_is_not_its_exact_mean_is_refused_when_it_is_inside_the_window(self) -> None:
+        entries = series_entries(seconds_of(lambda second: [60.0] * 4))
+        entries[-1][1] = 61.0
+        with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*value is not the exact mean"):
+            build_row(document(entries)["windows"][0])  # type: ignore[index]
 
 
 class ParityAtOneCutoff(unittest.TestCase):
