@@ -32,8 +32,10 @@ from scripts.stack.capacity_sampler import (
     SCHEMA,
     Output,
     SamplerError,
+    StagingSource,
     StopFlag,
     check_output,
+    parse_staging,
     parser,
     run_sampler,
 )
@@ -220,6 +222,7 @@ class LineTest(unittest.TestCase):
         for line in found:
             if line["kind"] == "sample":
                 self.assertLessEqual(set(line), {"kind", "seq", "host", "containers", "memory", "missing"})
+                self.assertNotIn("staging", line, "a run with no staging source reads none")
 
 
 class MissingTest(unittest.TestCase):
@@ -940,6 +943,209 @@ class ClosedPipeTest(unittest.TestCase):
             found = lines_of(output)
         self.assertEqual(0, process.returncode, err)
         self.assertEqual("end", found[-1]["kind"])
+
+
+def staging_run(
+    folder: str, sources_: Sequence[StagingSource], *, between: Any = None, interval: float = 0.25, max_seconds: float = 1.0, clock: Clock | None = None
+) -> tuple[int, Path]:
+    """One run with staging sources. ``between(n)`` runs after each wait, so a test can grow or shrink the staging folder between two samples."""
+    clock = clock or Clock()
+    waits = [0]
+
+    def pause(seconds: float) -> None:
+        clock.pause(seconds)
+        waits[0] += 1
+        if between is not None:
+            between(waits[0])
+
+    output = Path(folder) / "samples.jsonl"
+    code = drive(
+        output,
+        interval_seconds=interval,
+        max_seconds=max_seconds,
+        sources=sources(folder),
+        runner=Runner(clock),
+        clock=clock.monotonic,
+        wall_ns=clock.wall_ns,
+        pause=pause,
+        say=lambda text: None,
+        staging=sources_,
+    )
+    return code, output
+
+
+def staging_rows(output: Path) -> list[dict[str, Any]]:
+    return [row for line in sample_lines(output) for row in line["staging"]["rows"]]
+
+
+class StagingTest(unittest.TestCase):
+    """The staging reading: the bytes of the files under each named pattern, as read, for each sample."""
+
+    def make_pods(self, folder: str) -> Path:
+        pods = Path(folder) / "pods"
+        for pod, size in (("a", 1000), ("b", 4000)):
+            (pods / pod / "stage" / "deep").mkdir(parents=True)
+            (pods / pod / "stage" / "deep" / "file.bin").write_bytes(b"x" * size)
+            (pods / pod / "stage" / "empty.bin").write_bytes(b"")
+        (pods / "a" / "other").mkdir()
+        (pods / "a" / "other" / "not_staged.bin").write_bytes(b"y" * 777)
+        return pods
+
+    def test_the_rows_count_every_file_under_every_match_and_nothing_outside_the_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            pods = self.make_pods(folder)
+            _, output = staging_run(folder, [StagingSource("copy_stage", str(pods / "*" / "stage"))], max_seconds=0.25)
+            row = staging_rows(output)[0]
+        self.assertEqual({"name": "copy_stage", "matches": 2, "files": 4}, {key: row[key] for key in ("name", "matches", "files")})
+        self.assertEqual(5000, row["apparent_bytes"])
+        self.assertGreaterEqual(row["allocated_bytes"], 5000)
+        self.assertEqual(0, row["allocated_bytes"] % 512)
+
+    def test_two_sources_are_two_rows_in_the_order_given_and_a_pattern_with_no_match_is_a_row_of_zeros_and_not_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            pods = self.make_pods(folder)
+            given = [StagingSource("none_yet", str(pods / "*" / "absent")), StagingSource("copy_stage", str(pods / "a" / "stage"))]
+            _, output = staging_run(folder, given, max_seconds=0.25)
+            line = sample_lines(output)[0]
+        self.assertEqual(["none_yet", "copy_stage"], [row["name"] for row in line["staging"]["rows"]])
+        self.assertEqual(
+            {"matches": 0, "files": 0, "apparent_bytes": 0, "allocated_bytes": 0}, {k: v for k, v in line["staging"]["rows"][0].items() if k != "name"}
+        )
+        self.assertEqual([], line["missing"])
+
+    def test_growth_and_removal_between_two_samples_are_seen_in_the_samples_that_follow(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / "stage"
+            stage.mkdir()
+            (stage / "first.bin").write_bytes(b"x" * 1000)
+
+            def between(wait: int) -> None:
+                if wait == 1:
+                    (stage / "second.bin").write_bytes(b"x" * 5000)
+                if wait == 2:
+                    (stage / "second.bin").unlink()
+
+            _, output = staging_run(folder, [StagingSource("copy_stage", str(stage))], between=between)
+            sizes = [row["apparent_bytes"] for row in staging_rows(output)]
+        self.assertEqual([1000, 6000, 1000, 1000], sizes)
+
+    def test_a_link_is_counted_as_the_link_and_the_file_it_leads_to_is_not_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            stage, outside = Path(folder) / "stage", Path(folder) / "outside.bin"
+            stage.mkdir()
+            outside.write_bytes(b"z" * 90000)
+            (stage / "link").symlink_to(outside)
+            (stage / "folder_link").symlink_to(Path(folder))
+            _, output = staging_run(folder, [StagingSource("copy_stage", str(stage))], max_seconds=0.25)
+            row = staging_rows(output)[0]
+        self.assertEqual(2, row["files"])
+        self.assertLess(row["apparent_bytes"], 90000)
+
+    def test_a_file_that_vanishes_during_the_walk_is_not_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / "stage"
+            stage.mkdir()
+            (stage / "stays.bin").write_bytes(b"x" * 2000)
+            (stage / "goes.bin").write_bytes(b"x" * 3000)
+            real = os.lstat
+
+            def vanishing(path: Any, *args: Any, **keywords: Any) -> os.stat_result:
+                if str(path).endswith("goes.bin"):
+                    raise FileNotFoundError(errno.ENOENT, "gone")
+                return real(path, *args, **keywords)
+
+            with mock.patch("scripts.stack.capacity_sampler.os.lstat", vanishing):
+                _, output = staging_run(folder, [StagingSource("copy_stage", str(stage))], max_seconds=0.25)
+            line = sample_lines(output)[0]
+        self.assertEqual((1, 2000, []), (line["staging"]["rows"][0]["files"], line["staging"]["rows"][0]["apparent_bytes"], line["missing"]))
+
+    @unittest.skipIf(os.geteuid() == 0, "a file system permission does not stop the owner of the system")
+    def test_a_folder_that_cannot_be_read_names_the_reading_missing_and_is_never_a_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / "stage"
+            (stage / "locked").mkdir(parents=True)
+            (stage / "locked" / "file.bin").write_bytes(b"x" * 100)
+            (stage / "locked").chmod(0)
+            try:
+                _, output = staging_run(folder, [StagingSource("copy_stage", str(stage))], max_seconds=0.25)
+            finally:
+                (stage / "locked").chmod(0o700)
+            line = sample_lines(output)[0]
+        self.assertEqual([{"reading": "staging", "cause": "os_error"}], line["missing"])
+        self.assertNotIn("staging", line)
+        self.assertIn("host", line)
+
+    def test_a_walk_that_runs_past_the_end_of_its_interval_is_a_timeout_and_its_key_is_absent(self) -> None:
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / "stage"
+            stage.mkdir()
+            for number in range(5):
+                (stage / f"{number}.bin").write_bytes(b"x")
+            real = os.lstat
+
+            calls: list[str] = []
+
+            def slow(path: Any, *args: Any, **keywords: Any) -> os.stat_result:
+                if str(path).startswith(str(stage)):
+                    calls.append(str(path))
+                    clock.now += 2.0
+                return real(path, *args, **keywords)
+
+            with mock.patch("scripts.stack.capacity_sampler.os.lstat", slow):
+                _, output = staging_run(folder, [StagingSource("copy_stage", str(stage))], max_seconds=1.0, interval=1.0, clock=clock)
+            line = sample_lines(output)[0]
+        self.assertEqual([{"reading": "staging", "cause": "timeout"}], line["missing"])
+        self.assertNotIn("staging", line)
+        self.assertLessEqual(len(calls), 3, "the walk stops when its deadline has passed and does not go on through the folder")
+
+    def test_the_header_names_each_pattern_under_the_staging_source(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            _, output = staging_run(folder, [StagingSource("copy_stage", "/a/*/b")], max_seconds=0.25)
+            header = lines_of(output)[0]
+        self.assertEqual({"copy_stage": "/a/*/b"}, header["sources"]["staging"])
+
+    def test_the_form_of_a_staging_argument_is_a_lowercase_name_an_equals_sign_and_an_absolute_pattern(self) -> None:
+        self.assertEqual(StagingSource("copy_stage", "/var/x/*/y"), parse_staging("copy_stage=/var/x/*/y"))
+        for bad in ("", "noequals", "=/x", "Upper=/x", "a b=/x", "name=relative/path", "name=", "9name=/x", "a" * 40 + "=/x", "name=/x\n"):
+            with self.subTest(bad=bad), self.assertRaises(SamplerError) as caught:
+                parse_staging(bad)
+            if len(bad) > 3:
+                self.assertNotIn(bad, str(caught.exception), "the message repeats no word of the argument")
+
+    def test_two_sources_with_one_name_are_refused_before_the_file_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            clock = Clock()
+            output = Path(folder) / "samples.jsonl"
+            code = drive(
+                output,
+                interval_seconds=0.25,
+                max_seconds=0.25,
+                sources=sources(folder),
+                runner=Runner(clock),
+                clock=clock.monotonic,
+                wall_ns=clock.wall_ns,
+                pause=clock.pause,
+                say=lambda text: None,
+                staging=[StagingSource("same", "/a"), StagingSource("same", "/b")],
+            )
+            self.assertEqual((1, False), (code, output.exists()))
+
+    def test_the_command_takes_each_staging_source_and_writes_its_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / "stage"
+            stage.mkdir()
+            (stage / "file.bin").write_bytes(b"x" * 4096)
+            process, output = start(Path(folder), shim(Path(folder)), "--interval-seconds", "0.1", "--max-seconds", "0.5", "--staging", f"copy_stage={stage}")
+            _, err = process.communicate(timeout=30)
+            found = sample_lines(output)
+        self.assertEqual(0, process.returncode, err)
+        self.assertEqual([4096] * len(found), [line["staging"]["rows"][0]["apparent_bytes"] for line in found])
+
+    def test_the_sampler_never_removes_or_changes_a_file(self) -> None:
+        source = (ROOT / "scripts" / "stack" / "capacity_sampler.py").read_text()
+        for name in ("unlink", "rmtree", "os.remove", "os.rmdir", "os.rename", "os.replace", "os.chmod", "os.truncate", "shutil.move"):
+            self.assertNotIn(name, source)
 
 
 class SourceTest(unittest.TestCase):

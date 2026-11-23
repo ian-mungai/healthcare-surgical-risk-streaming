@@ -8,9 +8,15 @@ never states a judgment. The owner reads the file.
 The file starts with a ``header`` line (the schema, the start time, the interval, the files read and the configured limits copied from
 ``compose/limits.yml``) and ends with an ``end`` line (the reason, ``stop_flag`` or ``max_seconds``, and the count of ``sample`` lines written). A
 sample line holds the readings of one iteration, each with the wall and monotonic times taken immediately before and after it: ``host`` (the raw
-counters of the Linux host), ``containers`` (the rows of ``docker ps --all`` as read) and ``memory`` (the rows of ``docker stats --no-stream`` as
-read, with their parsed bytes). A reading that fails is named in ``missing`` by a fixed code and a fixed cause and its key is absent from the line.
-``seq`` counts the iterations from 0.
+counters of the Linux host), ``containers`` (the rows of ``docker ps --all`` as read), ``memory`` (the rows of ``docker stats --no-stream`` as
+read, with their parsed bytes) and, when ``--staging NAME=PATTERN`` is given, ``staging`` (for each named pattern the number of matches and files and the
+bytes of the files under the matches, apparent and allocated, as read). A reading that fails is named in ``missing`` by a fixed code and a fixed cause and
+its key is absent from the line. ``seq`` counts the iterations from 0.
+
+A staging pattern is a shell pattern of absolute paths, for example ``/var/lib/docker/volumes/*staging/_data``. Each match is walked without following
+links, and a link counts as itself. Only files are counted. A file that is gone when the walk reaches it is skipped, because a pod removes its volume as
+it ends; any other failure of the walk, such as a folder the sampler may not read, fails the whole reading and is named, never read as a zero. The
+sampler reads and changes nothing in those folders. A pattern with no match is a row of zeros: the volume does not exist yet.
 
 Each reading is one function whose whole body (start, wait, decode, parse) runs inside one boundary, and each has a deadline that is a point fixed before
 it starts (the end of its interval). A reading that ends after its deadline is a ``timeout`` whatever it returned, and its key is absent. The docker
@@ -24,15 +30,18 @@ go to standard error.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
 import re
 import shutil
 import signal
+import stat
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +49,7 @@ from scripts.process import ProcessGroupSurvived, TimeoutExpired, run_command
 from scripts.stack.host_figures import FiguresError, HostSources, parse_size_bytes, read_host
 from scripts.stack.limits import LIMITS_FILE, LimitsError, load_limits
 
-SCHEMA = 5
+SCHEMA = 6
 DEFAULT_INTERVAL_SECONDS = 5.0
 DEFAULT_RUN_SECONDS = 3600.0
 MAX_INTERVAL_SECONDS = 3600.0
@@ -53,12 +62,31 @@ EXIT_NOTE = (
     "A file with no end line, or whose last line is incomplete, was cut off. Messages go to standard error and nothing is printed to standard output."
 )
 STATS_ROW = re.compile(r"([^|]+)\|(\S+) / (\S+)")
+STAGING_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+STAGING_FORM = "a staging source is NAME=PATTERN: a lowercase name of up to 32 characters and an absolute path pattern with no control character"
+BLOCK_BYTES = 512
 Runner = Callable[..., Any]
 Clock = Callable[[], float]
 
 
 class SamplerError(RuntimeError):
     """The output cannot be used or written. The message is fixed and holds no text from a command."""
+
+
+@dataclass(frozen=True)
+class StagingSource:
+    """A named place that holds staged files: a shell pattern of absolute paths."""
+
+    name: str
+    pattern: str
+
+
+def parse_staging(text: str) -> StagingSource:
+    """The source of one ``NAME=PATTERN`` argument. The message of a refusal holds no word of the argument."""
+    name, separator, pattern = text.partition("=")
+    if not separator or STAGING_NAME.fullmatch(name) is None or not pattern.startswith("/") or any(ord(character) < 32 for character in pattern):
+        raise SamplerError(STAGING_FORM)
+    return StagingSource(name, pattern)
 
 
 class Failure(Exception):
@@ -226,7 +254,35 @@ def memory_body(runner: Runner, program: str, deadline: float, clock: Clock) -> 
     return {"rows": rows}
 
 
-def header_line(interval: float, max_seconds: float, sources: HostSources, limits_path: Path, wall_ns: Callable[[], int]) -> dict[str, Any]:
+def staging_row(source: StagingSource, deadline: float, clock: Clock) -> dict[str, Any]:
+    """The files under one pattern. A walk that passes ``deadline`` is a timeout. Only a file that is gone is skipped: any other failure ends the reading."""
+    matches = glob.glob(source.pattern)
+    pending = list(matches)
+    files = apparent = allocated = 0
+    while pending:
+        if clock() > deadline:
+            raise Failure("timeout")
+        path = pending.pop()
+        try:
+            info = os.lstat(path)
+            if stat.S_ISDIR(info.st_mode):
+                pending.extend(os.path.join(path, name) for name in os.listdir(path))
+                continue
+        except FileNotFoundError:
+            continue
+        files += 1
+        apparent += info.st_size
+        allocated += info.st_blocks * BLOCK_BYTES
+    return {"name": source.name, "matches": len(matches), "files": files, "apparent_bytes": apparent, "allocated_bytes": allocated}
+
+
+def staging_body(sources: Sequence[StagingSource], deadline: float, clock: Clock) -> dict[str, Any]:
+    return {"rows": [staging_row(source, deadline, clock) for source in sources]}
+
+
+def header_line(
+    interval: float, max_seconds: float, sources: HostSources, limits_path: Path, wall_ns: Callable[[], int], staging: Sequence[StagingSource] = ()
+) -> dict[str, Any]:
     limits = load_limits(limits_path)
     return {
         "kind": "header",
@@ -241,6 +297,7 @@ def header_line(interval: float, max_seconds: float, sources: HostSources, limit
             "disk": str(sources.diskstats),
             "free_disk": str(sources.data_path),
             "limits": str(limits_path),
+            **({"staging": {source.name: source.pattern for source in staging}} if staging else {}),
         },
         "configured": {
             "host_reserve_mib": limits.host_reserve_mib,
@@ -251,15 +308,26 @@ def header_line(interval: float, max_seconds: float, sources: HostSources, limit
     }
 
 
-def sample_line(seq: int, deadline: float, sources: HostSources, runner: Runner, program: str, clock: Clock, wall_ns: Callable[[], int]) -> dict[str, Any]:
+def sample_line(
+    seq: int,
+    deadline: float,
+    sources: HostSources,
+    runner: Runner,
+    program: str,
+    clock: Clock,
+    wall_ns: Callable[[], int],
+    staging: Sequence[StagingSource] = (),
+) -> dict[str, Any]:
     """The line of one iteration. A reading that fails is named in ``missing`` and its key is absent. All readings share one deadline, fixed first."""
     line: dict[str, Any] = {"kind": "sample", "seq": seq}
     missing: list[dict[str, str]] = []
-    readers = (
+    readers: list[tuple[str, Callable[[], dict[str, Any]]]] = [
         ("host", lambda: host_body(sources)),
         ("containers", lambda: containers_body(runner, program, deadline, clock)),
         ("memory", lambda: memory_body(runner, program, deadline, clock)),
-    )
+    ]
+    if staging:
+        readers.append(("staging", lambda: staging_body(staging, deadline, clock)))
     for name, read in readers:
         try:
             line[name] = timed(clock, wall_ns, deadline, read)
@@ -283,6 +351,7 @@ def run_sampler(
     wall_ns: Callable[[], int] = time.time_ns,
     pause: Callable[[float], None] = time.sleep,
     say: Callable[[str], None] = emit,
+    staging: Sequence[StagingSource] = (),
 ) -> int:
     """Write the header, one line for each iteration and the end line. Return 0 when the end line was written."""
     flag = stop or StopFlag()
@@ -291,7 +360,9 @@ def run_sampler(
         check_output(output)
         if program is None:
             raise SamplerError("the docker program cannot be found")
-        header = header_line(interval_seconds, max_seconds, sources, limits_path, wall_ns)
+        if len({source.name for source in staging}) != len(staging):
+            raise SamplerError("two staging sources have one name")
+        header = header_line(interval_seconds, max_seconds, sources, limits_path, wall_ns, staging)
         out = Output(output)
     except SamplerError as error:
         say_error(str(error))
@@ -311,7 +382,7 @@ def run_sampler(
                 reason = "max_seconds"
                 break
             began = clock()
-            out.write_line(sample_line(seq, began + interval_seconds, sources, runner, program, clock, wall_ns))
+            out.write_line(sample_line(seq, began + interval_seconds, sources, runner, program, clock, wall_ns, staging))
             seq += 1
             flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause, clock=clock)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})
@@ -341,6 +412,13 @@ def bounded_seconds(top: float) -> Callable[[str], float]:
     return parse
 
 
+def staging_argument(text: str) -> StagingSource:
+    try:
+        return parse_staging(text)
+    except SamplerError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(
         prog="python -m scripts.stack.capacity_sampler", description=__doc__.split("\n\n")[0] if __doc__ else None, epilog=EXIT_NOTE
@@ -350,6 +428,14 @@ def parser() -> argparse.ArgumentParser:
         "--interval-seconds", type=bounded_seconds(MAX_INTERVAL_SECONDS), default=DEFAULT_INTERVAL_SECONDS, help="seconds between two iterations"
     )
     command.add_argument("--max-seconds", type=bounded_seconds(MAX_RUN_SECONDS), default=DEFAULT_RUN_SECONDS, help="how long to sample at the most")
+    command.add_argument(
+        "--staging",
+        type=staging_argument,
+        action="append",
+        default=[],
+        metavar="NAME=PATTERN",
+        help="a place that holds staged files, read in each sample; repeat for each place",
+    )
     command.add_argument("--data-path", type=Path, default=Path("/var/lib/docker"), help="a folder on the data disk, for its free space and its disk counters")
     return command
 
@@ -365,6 +451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_seconds=arguments.max_seconds,
             sources=HostSources(data_path=arguments.data_path),
             stop=stop,
+            staging=arguments.staging,
         )
     finally:
         stop.restore()
