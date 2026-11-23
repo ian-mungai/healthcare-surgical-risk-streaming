@@ -7,6 +7,7 @@ the import is written (absolute, relative, a package attribute, inside a method 
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -36,9 +37,10 @@ def planted_tree(top: Path, files: dict[str, str]) -> None:
         (top / relative).write_bytes(text.encode("utf-8-sig") if relative.endswith("_bom.py") else text.encode())
 
 
-def run_runner(top: Path) -> tuple[int, str]:
+def run_runner(top: Path, python_path: str | None = None) -> tuple[int, str]:
     # The hook's own form: -P keeps the script's folder off the path, so a file there cannot shadow a standard module.
-    result = run_command(sys.executable, ["-P", str(top / "tests" / "run_quick.py")], cwd=top, timeout=RUN_SECONDS)
+    env = {"PATH": os.environ["PATH"], **({"PYTHONPATH": python_path} if python_path is not None else {})}
+    result = run_command(sys.executable, ["-P", str(top / "tests" / "run_quick.py")], cwd=top, env=env, timeout=RUN_SECONDS)
     return result.returncode, result.stdout + result.stderr
 
 
@@ -68,6 +70,27 @@ class QuickRunnerTest(unittest.TestCase):
         code, output = run_runner(top)
         self.assertEqual(code, 0, output)
         self.assertIn("Ran 1 test", output)
+
+    def test_the_checkout_of_the_runner_comes_first_on_the_path(self) -> None:
+        """Another checkout named first in PYTHONPATH must not supply the quick group: this checkout's failing test still fails the run."""
+        # Resolved paths, as the runner resolves its own: an unresolved alias of the same folder would hide the case.
+        top = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        other = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        planted_tree(top, {"tests/fast/test_planted_quick.py": QUICK_TEST.format(body="        self.fail('this checkout')\n")})
+        planted_tree(other, {"tests/fast/test_planted_quick.py": QUICK_TEST.format(body="        pass\n")})
+        code, output = run_runner(top, python_path=f"{other}{os.pathsep}{top}")
+        self.assertEqual(code, 1, output)
+        self.assertIn("this checkout", output)
+
+    def test_a_setup_error_with_no_test_run_is_a_failure_not_an_empty_run(self) -> None:
+        setup_error = (
+            "import unittest\nclass Q(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        raise RuntimeError('setup')\n"
+            "    def test_q(self):\n        pass\n"
+        )
+        top = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        planted_tree(top, {"tests/fast/test_planted_quick.py": setup_error})
+        code, output = run_runner(top)
+        self.assertEqual(code, 1, output)
 
     def test_a_run_that_finds_no_test_fails_as_unittest_does(self) -> None:
         """unittest exits 5 when it ran no test; a quick group that loads nothing must not pass the hook."""

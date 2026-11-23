@@ -42,20 +42,21 @@ def slow_files_loaded() -> list[str]:
 
 
 def main() -> int:
-    # Run as a script, Python puts this file's folder first on the path; the project root takes its place.
-    if sys.path and Path(sys.path[0]).resolve() == Path(__file__).resolve().parent:
-        sys.path[0] = str(TOP)
-    elif str(TOP) not in sys.path:
-        sys.path.insert(0, str(TOP))
+    # This checkout's root comes first, whatever PYTHONPATH names: another checkout's tests package must never stand in for this one's.
+    # The script's own folder (on the path when run without -P) is dropped.
+    here = Path(__file__).resolve().parent
+    sys.path[:] = [str(TOP), *(entry for entry in sys.path if not entry or Path(entry).resolve() not in (TOP, here))]
     sys.meta_path.insert(0, RefuseSlowGroup())
     argv = ["python -m unittest", "discover", "--start-directory", str(TOP / "tests" / "fast"), "--top-level-directory", str(TOP)]
     result = unittest.main(module=None, argv=argv, exit=False).result
     loaded = slow_files_loaded()
     for path in loaded:
         sys.stderr.write(f"the quick group loaded {path}; tests under tests/slow run only with make test-slow\n")
+    if not result.wasSuccessful() or loaded:
+        return 1
     if result.testsRun == 0 and not result.skipped:
         return 5  # unittest's own exit code for a run that found no test
-    return 0 if result.wasSuccessful() and not loaded else 1
+    return 0
 
 
 if __name__ == "__main__":
