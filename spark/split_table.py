@@ -36,7 +36,8 @@ PATIENT_NUMBER = re.compile(r"[1-9][0-9]*")
 CASE_NUMBER = re.compile(r"[0-9]+")
 SAFE_VERSION = re.compile(r"[A-Za-z0-9_:=<>.-]+")
 CANDIDATE_HEADER = ("case", "patient", "key", "size_bytes", "sha256", "arterial_waveform", "slot")
-# The complete tracked fixed sample (tests/fixtures/vitaldb/candidates.tsv): a fast test holds both values to the tracked file.
+# The assignment roster: the 13 case-to-patient assignments of tests/fixtures/vitaldb/candidates.tsv (the 9 development candidates of the fixed sample
+# and the 4 test-patient refusal cases). A fast test holds both values to the tracked file.
 FIXED_SAMPLE_ROWS = 13
 FIXED_SAMPLE_SHA256 = "2e512b4530fe1ca8a0bfc6a3fde62eb5c102e7ea9d4b182ed1197ca6f0b4212e"
 SLOT_KINDS = {"development": ("training", "validation"), "test": ("test",)}

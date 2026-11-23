@@ -116,6 +116,16 @@ class CaseFacts:
     arterial_waveform: bool
 
 
+def is_development_candidate(item: Candidate) -> bool:
+    """True for a candidate of a development patient. Every selection of the fixed sample's cases uses this one definition."""
+    return is_development(item.patient)
+
+
+def development_candidates(items: Sequence[Candidate]) -> list[Candidate]:
+    """The candidates of development patients, in the order given."""
+    return [item for item in items if is_development_candidate(item)]
+
+
 def case_key(case: int) -> str:
     return f"{CASE_PREFIX}{case:04d}.vital"
 
