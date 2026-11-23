@@ -2,13 +2,15 @@
 
 Failure modes covered here:
 
-- A Bronze input that cannot be cleaned (a key missing, a second twice, a reading whose position skips one, a signal without its track) reaches the write.
+- A Bronze input that cannot be cleaned (a key missing, a second twice, a reading whose positions are not 0 to n - 1 once each, a signal without its
+  track) reaches the write.
 - A reading is lost or counted twice: the Silver rows and the ledger of dropped duplicates do not add up to the Bronze rows.
 - A key is twice in a Silver table, a kept reading is not the first of its time, or a second is lost.
+- A kept reading, a ledger or a stored second is not the Bronze row (and the physical samples) that it came from, and the table still passes because
+  only its own aggregates were checked.
 - A verdict is not what the one validity definition gives for the stored samples, has no cause when invalid, has a cause when valid or names a cause
   that is not one.
-- A check that has no fault in the data reports one.
-"""
+- A check that has no fault in the data reports one."""
 
 from __future__ import annotations
 
@@ -93,8 +95,8 @@ class Controls(unittest.TestCase):
     def test_every_message_is_a_known_code_and_a_count(self) -> None:
         planted = [
             *bronze_problems(BronzeFacts(1, 1, 1, 1, 1, 1, 1, 1, 1)),
-            *numeric_problems(NumericFacts(1, 1, 1, 1, 1, 1, 1, 1, 1, {"x": 1}), 5),
-            *waveform_problems(WaveformFacts(1, 1, 1, 1, 1, 1, 1, 1, {"x": 1}), 5),
+            *numeric_problems(NumericFacts(1, 1, 1, 1, 1, 1, 1, 1, 1, {"x": 1}, source_differs=1), 5),
+            *waveform_problems(WaveformFacts(1, 1, 1, 1, 1, 1, 1, 1, {"x": 1}, source_differs=1), 5),
         ]
         self.assertGreaterEqual(len(planted), 15)
         for problem in planted:
@@ -142,6 +144,7 @@ class Numeric(unittest.TestCase):
             ("invalid_without_cause", "numeric_invalid_without_cause"),
             ("unknown_cause", "numeric_unknown_cause"),
             ("verdict_differs", "numeric_verdict_differs"),
+            ("source_differs", "numeric_source_differs"),
         ):
             with self.subTest(field=field):
                 self.assertEqual(code, one(numeric_problems(with_count(NUMERIC, field), BRONZE.numeric_rows)))
@@ -162,6 +165,7 @@ class Waveform(unittest.TestCase):
             ("invalid_without_cause", "waveform_invalid_without_cause"),
             ("unknown_cause", "waveform_unknown_cause"),
             ("verdict_differs", "waveform_verdict_differs"),
+            ("source_differs", "waveform_source_differs"),
         ):
             with self.subTest(field=field):
                 self.assertEqual(code, one(waveform_problems(with_count(WAVEFORM, field), BRONZE.waveform_rows)))

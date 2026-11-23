@@ -24,6 +24,7 @@ from features.signal_validity import (
     FIRST_OCCURRENCE,
     FLAT,
     FLAT_WINDOW_SECONDS,
+    GAP_MARKERS,
     INCOMPLETE,
     INVALID_CAUSES,
     JUMP,
@@ -238,6 +239,29 @@ class Physical(unittest.TestCase):
         self.assertEqual(12.0, result[0])
         self.assertIsNone(result[1])
         self.assertTrue(isinstance(result[2], float) and math.isnan(result[2]))
+
+    def test_the_gap_marker_of_each_integer_format_is_a_missing_sample_before_calibration(self) -> None:
+        markers = {3: -128.0, 4: 255.0, 5: -32768.0, 6: 65535.0, 7: -2147483648.0, 8: 4294967295.0}
+        for fmt, marker in markers.items():
+            with self.subTest(fmt=fmt):
+                self.assertEqual(markers, GAP_MARKERS)
+                self.assertEqual([None, 0.0001 * 100.0 + 80.0, None], physical_samples([marker, 100.0, marker], fmt, 0.0001, 80.0))
+
+    def test_the_uint16_marker_does_not_become_a_calibrated_pressure(self) -> None:
+        samples = physical_samples([65535.0, 65535.0, 65535.0, 65535.0], 6, 0.0001, 80.0)
+        self.assertEqual([None] * 4, samples)
+        self.assertEqual(Verdict(False, MISSING), arterial(tuple(samples)))
+
+    def test_a_value_next_to_a_marker_and_a_marker_of_another_format_are_samples(self) -> None:
+        self.assertEqual([65534.0 * 0.5, 65536.0 * 0.5], physical_samples([65534.0, 65536.0], 6, 0.5, 0.0))
+        self.assertEqual([-32767.0 * 0.5, 32767.0 * 0.5], physical_samples([-32767.0, 32767.0], 5, 0.5, 0.0))
+        self.assertEqual([65535.0 * 0.5], physical_samples([65535.0], 5, 0.5, 0.0))
+        self.assertEqual([-32768.0 * 0.5], physical_samples([-32768.0], 6, 0.5, 0.0))
+
+    def test_a_float_format_keeps_every_value_that_an_integer_marker_would_be(self) -> None:
+        for fmt in (1, 2):
+            with self.subTest(fmt=fmt):
+                self.assertEqual([65535.0, 255.0, -32768.0], physical_samples([65535.0, 255.0, -32768.0], fmt, 0.5, 10.0))
 
     def test_the_result_is_a_new_list_of_floats(self) -> None:
         raw = [1.0, 2.0]

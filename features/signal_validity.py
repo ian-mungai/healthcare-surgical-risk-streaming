@@ -28,8 +28,9 @@ is judged on its structure only. No rule here is estimated from data.
 A limit is part of the valid range. A comparison with a limit uses the exact values of the floats: a difference that a float rounds onto its limit is decided
 by the exact difference.
 
-**Samples.** A waveform sample of an integer format is a raw count, and its physical value is ``raw * gain + offset``. A sample of a float format is already
-physical (``vitaldb`` 1.7.2, ``VitalFile.to_numpy``). Bronze holds the raw samples and the track's gain, offset and format code.
+**Samples.** A waveform sample of an integer format is a raw count, and its physical value is ``raw * gain + offset``, except the format's gap marker, which
+is a missing sample and is recognised on the raw value, before the calibration (``GAP_MARKERS``). A sample of a float format is already physical (``vitaldb``
+1.7.2, ``VitalFile.to_numpy``). Bronze holds the raw samples and the track's gain, offset and format code.
 
 **Duplicates.** A second reading of one track at one case time is a duplicate. The first reading in the file's order is the reading, because a feature at a
 cutoff must not change when a later duplicate arrives. The position of a reading among those of its track and time is Bronze's ``source_occurrence`` (the
@@ -60,6 +61,9 @@ NUMERIC_LIMITS_MMHG: dict[str, tuple[float, float]] = {"Solar8000/ART_MBP": (PRE
 MISSING_SENTINEL = 4e9
 FLOAT_FORMATS = (1, 2)
 FLAT_WINDOW_SECONDS = 20
+# The raw sample that the publisher's library writes into a gap of each integer format (``vitaldb`` 1.7.2 ``FMT_NAN``, used by
+# ``_pack_wav_recs``). A float format uses NaN.
+GAP_MARKERS: dict[int, float] = {3: -128.0, 4: 255.0, 5: -32768.0, 6: 65535.0, 7: -2147483648.0, 8: 4294967295.0}
 FIRST_OCCURRENCE = 0
 
 
@@ -111,10 +115,14 @@ def present(sample: float | None) -> bool:
 
 
 def physical_samples(raw: Sequence[float | None], sample_format: int, gain: float, offset: float) -> list[float | None]:
-    """The physical samples of a waveform second from its raw samples. A missing sample stays missing and is never filled."""
+    """The physical samples of a waveform second from its raw samples. A missing sample stays missing and is never filled.
+
+    The gap marker of an integer format is a missing sample and is recognised on the raw value, before the calibration turns it into a plausible pressure.
+    """
     if sample_format in FLOAT_FORMATS:
         return [None if sample is None else float(sample) for sample in raw]
-    return [None if sample is None else float(sample) * gain + offset for sample in raw]
+    marker = GAP_MARKERS.get(sample_format)
+    return [None if sample is None or sample == marker else float(sample) * gain + offset for sample in raw]
 
 
 def valid_extent(samples: Sequence[float | None]) -> Extent:

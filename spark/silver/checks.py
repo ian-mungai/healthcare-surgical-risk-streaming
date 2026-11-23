@@ -1,11 +1,12 @@
 """The checks of the Silver signal tables, on counts that the Spark job reads from the tables. No Spark runs here.
 
-``bronze_problems`` judges the input before anything is written: a key that is missing, a waveform second twice, a reading whose position among those at its
-time skips one (the position is Bronze's ``source_occurrence``, and the first is ``FIRST_OCCURRENCE``) and a signal whose track Bronze does not hold. The other
-two judge a Silver table that was written (or that a branch holds): the rows and the ledger add up to Bronze, each key is once, the kept reading is the first
-of its time, and each verdict is complete and is the one that the single definition in ``features.signal_validity`` gives for the stored samples. A check
-returns its problems and never raises, so that one run names every cause. A problem is a code and a count, and holds no case, track, time or value.
-"""
+``bronze_problems`` judges the input before anything is written: a key that is missing, a waveform second twice, a reading whose positions among those
+at its time are not 0 to n - 1 once each (the position is Bronze's ``source_occurrence``, and the first is ``FIRST_OCCURRENCE``) and a signal whose
+track Bronze does not hold. The other two judge a Silver table that was written (or that a branch holds): the rows and the ledger add up to Bronze,
+each key is once, the kept reading is the first of its time, each kept reading, ledger and stored second is the Bronze row that it came from
+(``source_differs``, found by key against Bronze at the same hash, with the physical samples made again from the raw ones), and each verdict is
+complete and is the one that the single definition in ``features.signal_validity`` gives for the stored samples. A check returns its problems and
+never raises, so that one run names every cause. A problem is a code and a count, and holds no case, track, time or value."""
 
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ CHECK_NAMES = (
     "numeric_invalid_without_cause",
     "numeric_unknown_cause",
     "numeric_verdict_differs",
+    "numeric_source_differs",
     "waveform_not_every_second",
     "waveform_duplicate_key",
     "waveform_shape",
@@ -39,6 +41,7 @@ CHECK_NAMES = (
     "waveform_invalid_without_cause",
     "waveform_unknown_cause",
     "waveform_verdict_differs",
+    "waveform_source_differs",
 )
 JOB_CODES = frozenset(
     {
@@ -49,8 +52,6 @@ JOB_CODES = frozenset(
         "catalog_hash",
         "source_table",
         "source_no_snapshot",
-        "unwritable_table",
-        "bronze_schema",
         "source_changed",
     }
 )
@@ -98,6 +99,7 @@ class NumericFacts:
     unknown_cause: int
     verdict_differs: int
     causes: dict[str, int] = field(default_factory=dict)
+    source_differs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +115,7 @@ class WaveformFacts:
     shape_differs: int
     verdict_differs: int
     causes: dict[str, int] = field(default_factory=dict)
+    source_differs: int = 0
 
 
 def counted(pairs: list[tuple[str, int, str]]) -> list[str]:
@@ -146,6 +149,7 @@ def numeric_problems(facts: NumericFacts, bronze_rows: int) -> list[str]:
             ("numeric_invalid_without_cause", facts.invalid_without_cause, "row"),
             ("numeric_unknown_cause", facts.unknown_cause, "row"),
             ("numeric_verdict_differs", facts.verdict_differs, "row"),
+            ("numeric_source_differs", facts.source_differs, "row"),
         ]
     )
 
@@ -161,5 +165,6 @@ def waveform_problems(facts: WaveformFacts, bronze_rows: int) -> list[str]:
             ("waveform_invalid_without_cause", facts.invalid_without_cause, "row"),
             ("waveform_unknown_cause", facts.unknown_cause, "row"),
             ("waveform_verdict_differs", facts.verdict_differs, "row"),
+            ("waveform_source_differs", facts.source_differs, "row"),
         ]
     )

@@ -4,6 +4,7 @@ Failure modes covered here:
 
 - An extra or a malformed argument, or a branch name that Nessie would refuse, is echoed by the argument parser.
 - A failed check, a missing branch, a settings error or any other error carries text of its own into the output.
+- The watchdog that stops a job that runs too long names another job, or holds a duration.
 - A failed check prints no line, or prints a line that is not a code and a count, or the exit code does not tell a failed check from a bad call.
 """
 
@@ -19,7 +20,8 @@ from typing import Any
 from scripts.stack.nessie import NessieError
 from spark.settings import SettingsError
 from spark.silver.checks import SilverSignalsError
-from spark.silver.cli import run
+from spark.silver.cli import JOB, run
+from spark.split_cli import start_deadline
 
 MARKER = "MARKER_8731"
 
@@ -82,6 +84,22 @@ class CommandLine(unittest.TestCase):
         self.assertEqual((2, "", "silver_signals: settings\n"), (code, out, err))
         code, out, err = invoke(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
         self.assertEqual((70, "", "silver_signals: internal_error\n"), (code, out, err))
+
+
+class Watchdog(unittest.TestCase):
+    def test_the_watchdog_names_this_job_and_holds_no_duration(self) -> None:
+        err, stops = io.StringIO(), list[int]()
+        with contextlib.redirect_stderr(err):
+            timer = start_deadline(0.0517, exit_with=stops.append, job=JOB)
+            timer.join(5)
+        self.assertEqual(([124], "silver_signals: timeout\n"), (stops, err.getvalue()))
+
+    def test_the_patient_split_watchdog_keeps_its_own_name(self) -> None:
+        err, stops = io.StringIO(), list[int]()
+        with contextlib.redirect_stderr(err):
+            timer = start_deadline(0.0517, exit_with=stops.append)
+            timer.join(5)
+        self.assertEqual(([124], "patient_split: timeout\n"), (stops, err.getvalue()))
 
 
 if __name__ == "__main__":

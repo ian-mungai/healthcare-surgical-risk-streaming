@@ -110,14 +110,20 @@ def typed(frame: Any, columns: tuple[tuple[str, str], ...]) -> Any:
     return frame.select(*[f.col(name).cast(kind).alias(name) for name, kind in columns])
 
 
-def numeric_frame(bronze: Any) -> Any:
-    """``silver.numeric_observations`` from ``bronze.numeric_observations``: the first reading of each time, its dropped duplicates, its verdict."""
+def numeric_kept(bronze: Any) -> Any:
+    """The first reading of each time from ``bronze.numeric_observations``, with the positions of its dropped duplicates (the ledger) and no verdict."""
     f = functions()
     first = f.col("source_occurrence") == f.lit(FIRST_OCCURRENCE)
     dropped = bronze.filter(~first).groupBy(*NUMERIC_KEY).agg(f.sort_array(f.collect_list("source_occurrence")).alias("duplicate_source_occurrences"))
     kept = bronze.filter(first).join(dropped, list(NUMERIC_KEY), "left")
     ledger = f.coalesce(f.col("duplicate_source_occurrences"), f.array().cast("array<int>"))
-    judged = kept.withColumn("duplicate_source_occurrences", ledger).withColumn("_verdict", numeric_udf()(f.col("track"), f.col("value")))
+    return kept.withColumn("duplicate_source_occurrences", ledger)
+
+
+def numeric_frame(bronze: Any) -> Any:
+    """``silver.numeric_observations`` from ``bronze.numeric_observations``: the first reading of each time, its dropped duplicates, its verdict."""
+    f = functions()
+    judged = numeric_kept(bronze).withColumn("_verdict", numeric_udf()(f.col("track"), f.col("value")))
     return typed(judged.withColumn("valid", f.col("_verdict.valid")).withColumn("invalid_cause", f.col("_verdict.cause")), NUMERIC.columns)
 
 
@@ -152,21 +158,31 @@ def judged(frame: Any) -> Any:
     return joined.withColumn("_verdict", second_udf()(*[f.col(name) for name in arguments]))
 
 
-def waveform_frame(bronze: Any, tracks: Any) -> Any:
-    """``silver.waveform_seconds`` from ``bronze.waveform_seconds`` and the rate, format, gain and offset of each track."""
+def waveform_physical(bronze: Any, tracks: Any) -> Any:
+    """The seconds of ``bronze.waveform_seconds`` with the rate of each track and the physical samples made from the raw ones, and no verdict."""
     f = functions()
     wanted = tracks.select(*TRACK_KEY, "sample_rate", "sample_format", "gain", "value_offset")
     raw = bronze.join(wanted, list(TRACK_KEY), "left")
     physical = raw.withColumn("samples", physical_udf()(f.col("samples"), f.col("sample_format"), f.col("gain"), f.col("value_offset")))
-    count = f.coalesce(f.size("samples"), f.lit(0))
-    decided = judged(physical.withColumn("sample_count", count))
+    return physical.withColumn("sample_count", f.coalesce(f.size("samples"), f.lit(0)))
+
+
+def waveform_frame(bronze: Any, tracks: Any) -> Any:
+    """``silver.waveform_seconds`` from ``bronze.waveform_seconds`` and the rate, format, gain and offset of each track."""
+    f = functions()
+    decided = judged(waveform_physical(bronze, tracks))
     return typed(decided.withColumn("valid", f.col("_verdict.valid")).withColumn("invalid_cause", f.col("_verdict.cause")), WAVEFORM.columns)
 
 
 def fingerprint(frame: Any) -> Fingerprint:
-    """The number of rows and the sum of the 64-bit hash of each row, as a decimal so that the sum cannot pass a long."""
+    """The number of rows and the sum of the 64-bit hash of each row, as a decimal so that the sum cannot pass a long.
+
+    A row is hashed as its JSON text, which keeps the place of every null in an array: Spark's own hash of an array skips its nulls, so ``[null, 80]`` and
+    ``[80, null]`` would hash alike. Fields that are null are written, so that a null and an absent field differ too.
+    """
     f = functions()
-    digest = f.xxhash64(*[f.col(name) for name in frame.columns]).cast(DIGEST_TYPE)
+    text = f.to_json(f.struct(*[f.col(name) for name in frame.columns]), {"ignoreNullFields": "false"})
+    digest = f.xxhash64(text).cast(DIGEST_TYPE)
     row = frame.agg(f.count(f.lit(1)).alias("rows"), f.sum(digest).alias("digest")).first()
     return Fingerprint(int(row["rows"]), int(row["digest"] or 0))
 
@@ -200,7 +216,15 @@ def verdict_columns(frame: Any) -> tuple[Any, Any, Any, Any, Any]:
     )
 
 
-def numeric_facts(frame: Any) -> NumericFacts:
+def source_differences(stored: Any, expected: Any, columns: tuple[tuple[str, str], ...]) -> int:
+    """The rows of the Bronze-made ``expected`` frame that no stored row equals, and the stored rows that no expected row equals, over the columns that do not
+    hold a verdict. A row is equal when each of its columns is, an array element by element with its nulls in place and NaN equal to NaN."""
+    names = [name for name, _ in columns if name not in ("valid", "invalid_cause")]
+    left, right = typed(stored, tuple((n, k) for n, k in columns if n in names)), typed(expected, tuple((n, k) for n, k in columns if n in names))
+    return int(left.exceptAll(right).count()) + int(right.exceptAll(left).count())
+
+
+def numeric_facts(frame: Any, bronze: Any) -> NumericFacts:
     f = functions()
     again = frame.withColumn("_verdict", numeric_udf()(f.col("track"), f.col("value")))
     key = f.struct(*[f.col(name) for name in NUMERIC_KEY])
@@ -226,10 +250,11 @@ def numeric_facts(frame: Any) -> NumericFacts:
         int(row["unknown"] or 0),
         int(row["differs"] or 0),
         causes_of(frame),
+        source_differences(frame, numeric_kept(bronze), NUMERIC.columns),
     )
 
 
-def waveform_facts(frame: Any) -> WaveformFacts:
+def waveform_facts(frame: Any, bronze: Any, tracks: Any) -> WaveformFacts:
     f = functions()
     again = judged(frame)
     key = f.struct(*[f.col(name) for name in WAVEFORM_KEY])
@@ -253,6 +278,7 @@ def waveform_facts(frame: Any) -> WaveformFacts:
         int(row["shape"] or 0),
         int(row["differs"] or 0),
         causes_of(frame),
+        source_differences(frame, waveform_physical(bronze, tracks), WAVEFORM.columns),
     )
 
 
@@ -269,10 +295,15 @@ def bronze_facts(numeric: Any, waveform: Any, tracks: Any) -> BronzeFacts:
     def present(kind: str) -> Any:
         return tracks.filter(f.col("kind") == f.lit(kind)).select(*TRACK_KEY)
 
+    # The positions at one time are exactly 0 to n - 1 once each: n rows, n distinct positions, the least 0 and the most n - 1.
     per_time = numeric.groupBy(*NUMERIC_KEY).agg(
-        f.count(f.lit(1)).alias("n"), f.min("source_occurrence").alias("low"), f.max("source_occurrence").alias("high")
+        f.count(f.lit(1)).alias("n"),
+        f.countDistinct("source_occurrence").alias("distinct"),
+        f.min("source_occurrence").alias("low"),
+        f.max("source_occurrence").alias("high"),
     )
-    gaps = per_time.filter((f.col("low") != f.lit(FIRST_OCCURRENCE)) | (f.col("high") != f.col("n") - f.lit(1))).count()
+    skewed = (f.col("distinct") != f.col("n")) | (f.col("low") != f.lit(FIRST_OCCURRENCE)) | (f.col("high") != f.col("n") - f.lit(1))
+    gaps = per_time.filter(skewed).count()
     twice = waveform.groupBy(*WAVEFORM_KEY).agg(f.count(f.lit(1)).alias("n")).agg(f.sum(f.col("n") - f.lit(1)).alias("extra")).first()["extra"]
     doubled = tracks.groupBy(*TRACK_KEY).agg(f.count(f.lit(1)).alias("n")).filter(f.col("n") > 1).count()
     return BronzeFacts(

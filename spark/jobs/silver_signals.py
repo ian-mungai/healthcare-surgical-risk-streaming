@@ -79,7 +79,7 @@ class SignalsLake(Lake):
         }
         return {table: frames.fingerprint(frame) for table, frame in self.planned.items()}
 
-    def read_table(self, at: str, table: str, with_facts: bool) -> TableRead | None:
+    def read_signal_table(self, at: str, table: str, with_facts: bool) -> TableRead | None:
         name = f"{self.catalog(at)}.{NAMESPACE}.{table}"
         if not self.session.catalog.tableExists(name):
             return None
@@ -90,20 +90,22 @@ class SignalsLake(Lake):
         fingerprint, snapshot = frames.fingerprint(frame), self.snapshot_id(name)
         if not with_facts:
             return TableRead(fingerprint, snapshot)
+        held = self.sources(at)
         if table == NUMERIC:
-            return TableRead(fingerprint, snapshot, numeric=frames.numeric_facts(frame))
-        return TableRead(fingerprint, snapshot, waveform=frames.waveform_facts(frame))
+            return TableRead(fingerprint, snapshot, numeric=frames.numeric_facts(frame, held[bronze.NUMERIC.name][0]))
+        return TableRead(fingerprint, snapshot, waveform=frames.waveform_facts(frame, held[bronze.WAVEFORM.name][0], held[bronze.TRACKS.name][0]))
 
-    def write(self, table: str, exists: bool) -> None:
+    def write_signal_table(self, table: str, exists: bool) -> None:
         """Write the planned frame as the whole table, as one commit: create it, or overwrite every row of the table that exists.
 
-        A replace of a table that exists stalls in Spark with the Nessie catalog, so an existing table is overwritten in place. The table is not partitioned, so
-        the overwrite replaces every row, and the read-back of the build proves it.
+        A replace of a table that exists stalls in Spark with the Nessie catalog, so an existing table is overwritten in place, by the condition that holds for
+        every row. That overwrite clears the table when the planned frame is empty too: a dynamic overwrite of partitions does nothing for an empty input
+        (Iceberg 1.12.0), so a table that must become empty would keep its rows. The read-back of the build proves the result.
         """
         target = f"{WRITE_CATALOG}.{NAMESPACE}.{table}"
         writer = self.planned[table].writeTo(target)
         if exists:
-            writer.overwritePartitions()
+            writer.overwrite(frames.functions().lit(True))
             return
         writer.tableProperty("format-version", "2").create()
 
@@ -116,7 +118,9 @@ class SignalsLake(Lake):
         self.planned = {}
 
     def operations(self) -> Operations:
-        return Operations(self.head, self.read_input, self.plan, self.read_table, self.write, self.write_hash_of, self.prepare, self.release)
+        return Operations(
+            self.head, self.read_input, self.plan, self.read_signal_table, self.write_signal_table, self.write_hash_of, self.prepare, self.release
+        )
 
 
 def execute(arguments: Any) -> dict[str, Any]:
@@ -126,7 +130,7 @@ def execute(arguments: Any) -> dict[str, Any]:
     try:
         settings = read_settings()
         client = open_client(settings.nessie_uri, settings.nessie_timeout_seconds)
-        start_deadline(settings.deadline_seconds)
+        start_deadline(settings.deadline_seconds, job=JOB)
         session = build_session(JOB, arguments.branch)
         lake = SignalsLake(session, client, arguments.branch, {"nessie_uri": settings.nessie_uri, "warehouse": settings.warehouse, "region": settings.region})
         client.config()
