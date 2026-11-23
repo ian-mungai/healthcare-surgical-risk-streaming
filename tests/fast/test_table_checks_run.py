@@ -383,6 +383,12 @@ class OutputBindingTest(unittest.TestCase):
         case.nessie.other[(BRANCH, case.branch_hash)] = {"other_space": {**NAMESPACE_CONTENT, "properties": {"owner": "x"}}}
         self.refused(case, "other_space")
 
+    def test_an_edit_of_the_namespace_that_holds_the_tables_of_the_load_is_not_merged(self) -> None:
+        case = Case(self)
+        held = {"type": "NAMESPACE", "elements": [rules.NAMESPACE], "properties": {"owner": "x"}}
+        case.nessie.other[("main", case.nessie.heads["main"])] = {rules.NAMESPACE: held}
+        self.refused(case, rules.NAMESPACE)
+
     def test_a_removal_of_an_existing_namespace_is_not_merged(self) -> None:
         case = Case(self)
         case.nessie.other[("main", case.nessie.heads["main"])] = {"other_space": NAMESPACE_CONTENT}

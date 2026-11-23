@@ -6,11 +6,13 @@ run ID was chosen twice. ``list_folder`` raises instead, and the scan below hold
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.ingestion.folder import list_folder
 from scripts.process import run_command
@@ -44,6 +46,20 @@ class ListFolderTests(unittest.TestCase):
         for name in ("b_run", "a_run", "other.txt"):
             (self.root / name).touch()
         self.assertEqual([self.root / "a_run", self.root / "b_run"], list_folder(self.root, "*_run"))
+
+    def test_the_listing_is_sorted_whatever_order_the_folder_gives(self) -> None:
+        for name in ("b_run", "a_run", "c_run"):
+            (self.root / name).touch()
+        real = os.scandir
+
+        def reversed_scan(folder: Path) -> contextlib.AbstractContextManager[list[os.DirEntry[str]]]:
+            with real(folder) as entries:
+                return contextlib.nullcontext(sorted(entries, key=lambda entry: entry.name, reverse=True))
+
+        with mock.patch("scripts.ingestion.folder.os.scandir", reversed_scan):
+            wanted = [self.root / "a_run", self.root / "b_run", self.root / "c_run"]
+            self.assertEqual(wanted, list_folder(self.root, "*_run"))
+            self.assertEqual(wanted, list_folder(self.root, "*_run", recursive=True))
 
     def test_a_folder_that_does_not_exist_holds_nothing(self) -> None:
         self.assertEqual([], list_folder(self.root / "absent"))
