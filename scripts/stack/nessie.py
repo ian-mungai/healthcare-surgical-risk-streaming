@@ -35,6 +35,10 @@ CONFLICT_STATUS = 409
 BODY_LIMIT_BYTES = 1_000_000
 
 
+class PlainText(str):
+    """The start of an answer body that is not JSON."""
+
+
 class NessieError(RuntimeError):
     """A call did not complete or Nessie refused it. The message names the call and never holds a request body."""
 
@@ -108,21 +112,28 @@ class NessieClient:
         except (OSError, http.client.HTTPException) as error:
             raise NessieError(f"{label} failed: {type(error).__name__}") from error
         document = self.decode(raw)
+        if status < 400 and isinstance(document, PlainText):
+            raise NessieError(f"{label} answered with status {status} and a body that is not JSON")
         if status >= 400:
             code = document.get("errorCode") if isinstance(document, dict) else None
-            reason = document.get("message") if isinstance(document, dict) else None
+            reason = document.get("message") if isinstance(document, dict) else (str(document) if isinstance(document, PlainText) else None)
             kind = NessieConflict if status == CONFLICT_STATUS else NessieError
             raise kind(f"{label} was refused with status {status}, error code {code}: {reason}", status=status, error_code=code)
         return document
 
     @staticmethod
     def decode(raw: bytes) -> Any:
+        """The JSON of an answer, None for an empty one, or ``PlainText`` with the start of a body that is not JSON.
+
+        Only a refusal may carry ``PlainText``: ``request`` raises for a success answer that does, so a truncated or plain-text success answer is never read
+        as an empty document.
+        """
         if not raw.strip():
             return None
         try:
             return json.loads(raw)
         except ValueError:
-            return {"message": raw[:200].decode(errors="replace")}
+            return PlainText(raw[:200].decode(errors="replace"))
 
     def reference(self, name: str) -> Reference:
         """The branch or tag ``name`` with the hash it points to now."""
@@ -203,9 +214,16 @@ class NessieClient:
         """Delete the branch or tag ``name`` when it is still at ``hash_value``."""
         self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}")
 
-    def merge(self, source: str, target: str, expected_target_hash: str, message: str) -> str:
-        """Merge the branch ``source`` as it is now into ``target``, which must still be at ``expected_target_hash``. Returns the new hash of ``target``."""
-        source_hash = self.reference(source).hash
+    def merge(self, source: str, target: str, expected_target_hash: str, message: str, *, source_hash: str) -> str:
+        """Merge ``source`` as it was at ``source_hash`` into ``target``, which the caller expects at ``expected_target_hash``. Returns ``target``'s new hash.
+
+        The caller names the source hash, usually the one it checked, and the client never looks the head of ``source`` up. Nessie merges the commits of
+        ``source`` up to ``source_hash`` and no later one, so a branch that has moved since is merged at the named hash only. The expected target hash is a
+        guard and not a guarantee: Nessie 0.110.1 can accept an older expected hash after a compatible commit on ``target``, so a caller that must know what
+        happened reads the history of ``target``.
+        """
+        if not HASH.fullmatch(source_hash):
+            raise ValueError("the source hash must be 64 lower-case hex digits")
         document = self.request(
             "POST",
             f"/trees/{quote(f'{target}@{expected_target_hash}', safe='@')}/history/merge",

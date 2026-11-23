@@ -91,7 +91,7 @@ class ClientTest(unittest.TestCase):
     def test_a_refusal_for_a_stale_hash_is_a_conflict_that_carries_nessies_error_code(self) -> None:
         refusal = {"status": 409, "reason": "Conflict", "message": "Expected hash does not match", "errorCode": "REFERENCE_CONFLICT"}
         with serving(409, refusal, methods=("POST",)) as (url, _handler), self.assertRaises(NessieConflict) as caught:
-            NessieClient(url, timeout_seconds=5).merge("feature", "main", "b" * 64, "merge")
+            NessieClient(url, timeout_seconds=5).merge("feature", "main", "b" * 64, "merge", source_hash="a" * 64)
         self.assertEqual("REFERENCE_CONFLICT", caught.exception.error_code)
 
     def test_any_other_refusal_is_an_error_that_is_not_a_conflict(self) -> None:
@@ -115,6 +115,116 @@ class WarehouseTest(unittest.TestCase):
         for bucket in ("", "Upper", "a", "has space", "has/slash", "s3://bucket", "-leading", "trailing-"):
             with self.subTest(bucket=bucket), self.assertRaises(WarehouseError):
                 warehouse_location(bucket)
+
+
+def recording_handler(answers: list[tuple[str, str, dict[str, Any] | None]]) -> Any:
+    """A handler that records each request's method, path and decoded body, and answers a merge as Nessie does."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def respond(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length)) if length else None
+            answers.append((self.command, self.path, body))
+            reply = {"wasApplied": True, "wasSuccessful": True, "resultantTargetHash": "c" * 64} if self.command == "POST" else {"reference": BRANCH}
+            payload = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_POST = respond
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    return Handler
+
+
+class MergeRequestTest(unittest.TestCase):
+    """The merge request names the source hash the caller gives and the client never reads the source's head: a moved branch is merged at that hash only."""
+
+    def merge(self, **extra: str) -> list[tuple[str, str, dict[str, Any] | None]]:
+        seen: list[tuple[str, str, dict[str, Any] | None]] = []
+        server = HTTPServer(("127.0.0.1", 0), recording_handler(seen))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/api/v2"
+            hash_after = NessieClient(url, timeout_seconds=5).merge("feature", "main", "b" * 64, "the message", source_hash="a" * 64)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=10)
+        self.assertEqual("c" * 64, hash_after)
+        return seen
+
+    def test_the_request_carries_the_given_source_hash_the_expected_target_hash_and_the_message(self) -> None:
+        (method, path, body) = self.merge()[-1]
+        self.assertEqual("POST", method)
+        self.assertEqual("/api/v2/trees/main@" + "b" * 64 + "/history/merge", path)
+        self.assertEqual({"fromRefName": "feature", "fromHash": "a" * 64, "message": "the message"}, body)
+
+    def test_the_client_makes_one_call_and_never_looks_up_the_head_of_the_source(self) -> None:
+        self.assertEqual([("POST", "/api/v2/trees/main@" + "b" * 64 + "/history/merge")], [(method, path) for method, path, _ in self.merge()])
+
+    def test_the_source_hash_is_required_and_must_be_a_commit_hash(self) -> None:
+        with self.assertRaises(TypeError):
+            NessieClient("http://127.0.0.1:1/api/v2").merge("feature", "main", "b" * 64, "m")  # type: ignore[call-arg]
+        for value in ("", "main", "a" * 63, "A" * 64):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                NessieClient("http://127.0.0.1:1/api/v2").merge("feature", "main", "b" * 64, "m", source_hash=value)
+
+
+def raw_handler(status: int, body: bytes) -> Any:
+    """A handler that answers every call with these exact bytes, which need not be JSON."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def respond(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = do_DELETE = respond
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    return Handler
+
+
+class AnswerFormTest(unittest.TestCase):
+    """A success answer is JSON or empty. A truncated or plain-text success answer is an error and never an empty document."""
+
+    def call(self, status: int, body: bytes) -> Any:
+        server = HTTPServer(("127.0.0.1", 0), raw_handler(status, body))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            return NessieClient(f"http://127.0.0.1:{server.server_address[1]}/api/v2", timeout_seconds=5).request("GET", "/trees/main/history")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=10)
+
+    def test_control_a_json_answer_and_an_empty_answer_are_returned_as_they_are(self) -> None:
+        self.assertEqual({"logEntries": []}, self.call(200, b'{"logEntries": []}'))
+        self.assertIsNone(self.call(200, b""))
+        self.assertEqual({"message": "a json document with a message field"}, self.call(200, b'{"message": "a json document with a message field"}'))
+
+    def test_a_truncated_or_plain_text_success_answer_is_an_error(self) -> None:
+        for body in (b'{"logEntries": [{"commitMeta": {"message": "a', b"not json at all", b"<html>gateway</html>", b"[1, 2"):
+            with self.subTest(body=body), self.assertRaisesRegex(NessieError, "not JSON"):
+                self.call(200, body)
+
+    def test_a_refusal_with_a_plain_text_body_still_names_its_status_and_the_start_of_the_text(self) -> None:
+        with self.assertRaises(NessieError) as caught:
+            self.call(502, b"bad gateway")
+        self.assertEqual(502, caught.exception.status)
+        self.assertIn("bad gateway", str(caught.exception))
 
 
 if __name__ == "__main__":

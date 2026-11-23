@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 DOCKERFILE = Path(__file__).resolve().parents[2] / "orchestration" / "Dockerfile"
-NAMED_CONTEXTS = {"stack_scripts", "stack_compose"}
+NAMED_CONTEXTS = {"stack_scripts", "stack_compose", "stack_spark", "stack_fixtures"}
 PINNED = re.compile(r"^[a-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 
 

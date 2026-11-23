@@ -7,6 +7,7 @@ the file system: ``s3://`` opens Iceberg's S3 file system and ``file:`` its Hado
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -17,6 +18,7 @@ BYTES_PER_MIB = 1024 * 1024
 UNLIMITED_BYTES = 2**62
 OVERHEAD_FLOOR_MIB = 384
 MINIMUM_HEAP_MIB = 512
+COMMIT_HASH = re.compile(r"[0-9a-f]{64}")
 FILE_IO = {"s3": "org.apache.iceberg.aws.s3.S3FileIO", "file": "org.apache.iceberg.hadoop.HadoopFileIO"}
 
 
@@ -51,8 +53,11 @@ def read_memory_limit_mib(path: Path | None = None) -> int:
     raise SettingsError(f"cannot read the container's memory limit from {paths[0].name}: the job refuses to run without one")
 
 
-def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str, catalog: str = CATALOG) -> dict[str, str]:
-    """The Spark options that open the catalog ``catalog`` (``lake`` unless named) on the Nessie reference ``ref``, or ``SettingsError`` naming one."""
+def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str, catalog: str = CATALOG, ref_hash: str | None = None) -> dict[str, str]:
+    """The Spark options that open the catalog ``catalog`` (``lake`` unless named) on the Nessie reference ``ref``, or ``SettingsError`` naming one.
+
+    With ``ref_hash`` the catalog reads ``ref`` as it was at that commit, whatever its head is now.
+    """
     parts = urlsplit(nessie_uri)
     if parts.scheme != "http" or not parts.hostname or parts.path != "/api/v2" or parts.query or parts.fragment:
         raise SettingsError("the Nessie address must be a plain http URL ending in /api/v2, such as http://nessie:19120/api/v2")
@@ -63,6 +68,8 @@ def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str, c
         raise SettingsError("the Nessie reference is empty: a job names the branch it writes to")
     if scheme == "s3" and not region:
         raise SettingsError("the AWS region is empty: an s3 warehouse needs it")
+    if ref_hash is not None and not COMMIT_HASH.fullmatch(ref_hash):
+        raise SettingsError("the Nessie reference hash must be 64 lower-case hex digits")
     prefix = f"spark.sql.catalog.{catalog}"
     options = {
         prefix: "org.apache.iceberg.spark.SparkCatalog",
@@ -75,4 +82,6 @@ def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str, c
     }
     if scheme == "s3":
         options[f"{prefix}.client.region"] = region
+    if ref_hash is not None:
+        options[f"{prefix}.ref.hash"] = ref_hash
     return options

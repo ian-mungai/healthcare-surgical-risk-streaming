@@ -128,6 +128,17 @@ class CatalogTest(unittest.TestCase):
         self.assertIn("region", refused(region=""))
         self.assertNotIn("spark.sql.catalog.lake.client.region", catalog_options(**{**GOOD, "warehouse": "file:///warehouse/", "region": ""}))
 
+    def test_a_reference_hash_pins_the_catalog_to_that_commit_and_nothing_else_changes(self) -> None:
+        plain = catalog_options(**GOOD)
+        pinned = catalog_options(**GOOD, ref_hash="ab" * 32)
+        self.assertEqual({"spark.sql.catalog.lake.ref.hash": "ab" * 32}, {key: value for key, value in pinned.items() if plain.get(key) != value})
+        self.assertNotIn("spark.sql.catalog.lake.ref.hash", plain)
+
+    def test_a_reference_hash_that_is_not_64_lower_case_hex_digits_is_refused(self) -> None:
+        for value in ("abc", "AB" * 32, "ab" * 33, "gg" * 32, " "):
+            with self.subTest(value=value), self.assertRaisesRegex(SettingsError, "hash"):
+                catalog_options(**GOOD, ref_hash=value)
+
 
 if __name__ == "__main__":
     unittest.main()

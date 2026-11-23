@@ -19,14 +19,15 @@ def required_environment(name: str) -> str:
     return value
 
 
-def environment_catalog_options(ref: str, catalog: str = CATALOG) -> dict[str, str]:
-    """The options of the catalog ``catalog`` on the Nessie reference ``ref``, from the environment of the job."""
+def environment_catalog_options(ref: str, catalog: str = CATALOG, ref_hash: str | None = None) -> dict[str, str]:
+    """The options of the catalog ``catalog`` on the Nessie reference ``ref`` (as of ``ref_hash`` when given), from the environment of the job."""
     return catalog_options(
         nessie_uri=required_environment("NESSIE_URI"),
         warehouse=required_environment("WAREHOUSE_LOCATION"),
         ref=ref,
         region=os.environ.get("AWS_REGION", ""),
         catalog=catalog,
+        ref_hash=ref_hash,
     )
 
 

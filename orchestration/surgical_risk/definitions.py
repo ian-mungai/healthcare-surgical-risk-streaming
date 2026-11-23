@@ -17,7 +17,7 @@ from dagster import (
     sensor,
 )
 
-from . import housekeeping, lineage_sample
+from . import housekeeping, lineage_sample, table_checks
 from .concurrency import HEAVY_TAG_KEY, HEAVY_TAG_VALUE, heavy_memory_mib
 from .groups import GroupResource
 from .run_records import run_folder_sensors
@@ -80,5 +80,6 @@ defs = Definitions.merge(
     Definitions(jobs=[ping_job, group_probe_job], schedules=[ping_every_minute], sensors=[marker_file_sensor]),
     lineage_sample.defs,
     housekeeping.defs,
+    table_checks.defs,
     Definitions(sensors=run_folder_sensors),
 )

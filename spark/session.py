@@ -33,15 +33,15 @@ def start_deadline(seconds: float, job: str) -> threading.Timer:
     return timer
 
 
-def build_session(name: str, ref: str) -> Any:
-    """A local Spark session on the Nessie reference ``ref`` with the memory that the container's limit allows.
+def build_session(name: str, ref: str, ref_hash: str | None = None) -> Any:
+    """A local Spark session on the Nessie reference ``ref`` (as of ``ref_hash`` when given) with the memory that the container's limit allows.
 
     PySpark is installed in the job image only, so it is imported by name here and the rest of the sources are checked without it.
     """
     SparkSession = importlib.import_module("pyspark.sql").SparkSession
 
     heap = f"{driver_memory_mib(read_memory_limit_mib())}m"
-    options = environment_catalog_options(ref)
+    options = environment_catalog_options(ref, ref_hash=ref_hash)
     builder = SparkSession.builder.appName(name).master("local[*]")
     for key, value in {
         **options,
