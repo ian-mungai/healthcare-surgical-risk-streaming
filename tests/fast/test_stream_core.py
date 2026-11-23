@@ -162,6 +162,12 @@ class RiskCutoffs(unittest.TestCase):
         on_minute = features_of(run_stream(events_for(synthetic_recording(opstart_s=60)))[0])
         self.assertEqual(MINUTES, sorted(on_minute))
 
+    def test_an_op_start_at_zero_gives_its_starting_row(self) -> None:
+        recording = synthetic_recording(opstart_s=0)
+        found = features_of(run_stream(events_for(recording))[0])
+        self.assertEqual([0, *MINUTES], sorted(found))
+        self.assertEqual(oracle_values(recording, 0), values_of(found[0]))
+
     def test_a_start_that_equals_opend_is_the_final_row_only(self) -> None:
         found = features_of(run_stream(events_for(synthetic_recording(opstart_s=300, opend_s=300)))[0])
         self.assertEqual(MINUTES, sorted(found))
@@ -178,6 +184,32 @@ class RiskCutoffs(unittest.TestCase):
         for cutoff in (2_020 * SECOND, 2_040 * SECOND, 2_900 * SECOND):
             with self.subTest(cutoff=cutoff):
                 self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
+
+
+class BatchIndependence(unittest.TestCase):
+    def test_a_track_with_no_second_in_the_window_is_left_out_so_no_batch_split_changes_a_row(self) -> None:
+        recording = synthetic_recording(arterial_rate=10.5, arterial_start_s=95, caseend_s=300, opend_s=250)
+        events = events_for(recording)
+        whole, _ = run_stream(events)
+        errors = {record.cutoff_case_time_us for record in whole if isinstance(record, ErrorRecord)}
+        rows_ok = set(features_of(whole))
+        self.assertIn(60 * SECOND, rows_ok)
+        self.assertIn(120 * SECOND, errors)
+        for size in (1, 5, 40, 333):
+            with self.subTest(size=size):
+                cut, _ = run_stream(events, batch_size=size, restart=True)
+                self.assertEqual(whole, cut)
+
+    def test_the_same_events_in_every_batch_split_give_the_same_records_for_a_late_first_arterial_second(self) -> None:
+        recording = synthetic_recording(arterial_start_s=95, caseend_s=300, opend_s=250)
+        events = events_for(recording)
+        whole, _ = run_stream(events)
+        self.assertEqual([START, *MINUTES[:4], 250 * SECOND], sorted(features_of(whole)))
+        for size in (1, 3, 17, 100):
+            with self.subTest(size=size):
+                self.assertEqual(whole, run_stream(events, batch_size=size, restart=True)[0])
+        for cutoff, record in features_of(whole).items():
+            self.assertEqual(oracle_values(recording, cutoff), values_of(record))
 
 
 class Lateness(unittest.TestCase):
@@ -406,9 +438,9 @@ class BadInput(unittest.TestCase):
         recording = synthetic_recording(arterial_rate=62.5)
         records, _ = run_stream(events_for(recording))
         errors = [record for record in records if isinstance(record, ErrorRecord)]
-        self.assertEqual([START, *MINUTES], sorted(record.cutoff_case_time_us for record in errors))
+        self.assertEqual([START, 60 * SECOND], sorted(record.cutoff_case_time_us for record in errors))
         self.assertIn("sample rate", errors[0].message)
-        self.assertEqual({}, features_of(records))
+        self.assertEqual(MINUTES[1:], sorted(features_of(records)))
         self.assertEqual(1, len([record for record in records if isinstance(record, LedgerRecord)]))
 
     def test_an_unregistered_track_and_a_string_event_are_counted_and_never_reach_the_features(self) -> None:

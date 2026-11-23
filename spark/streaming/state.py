@@ -35,6 +35,7 @@ class OccurrenceState:
     opstart_us: int | None = None
     opend_us: int | None = None
     risk_pending: list[int] = field(default_factory=list)
+    last_cutoff_us: int | None = None
     next_index: int = 1
     final_emitted: bool = False
     closed: bool = False
@@ -59,6 +60,7 @@ class OccurrenceState:
             "opstart_us": self.opstart_us,
             "opend_us": self.opend_us,
             "risk_pending": self.risk_pending,
+            "last_cutoff_us": self.last_cutoff_us,
             "next_index": self.next_index,
             "final_emitted": self.final_emitted,
             "closed": self.closed,
@@ -88,6 +90,7 @@ class OccurrenceState:
             document["opstart_us"],
             document["opend_us"],
             list(document["risk_pending"]),
+            document["last_cutoff_us"],
             document["next_index"],
             document["final_emitted"],
             document["closed"],

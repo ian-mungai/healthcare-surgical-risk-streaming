@@ -60,6 +60,7 @@ def synthetic_recording(
     hr_base: float = 60.0,
     hr_step_s: int = 2,
     arterial_rate: float | None = None,
+    arterial_start_s: int = 0,
     extra_hr: Sequence[tuple[int, float]] = (),
 ) -> CaseRecording:
     """A case with registry tracks: two numeric tracks (one with a duplicate reading and one with a not-a-number reading), an unregistered numeric track, a
@@ -71,7 +72,7 @@ def synthetic_recording(
     mean_pressure = [(second * SECOND, 70.0 + (second % 5) * 2.0) for second in range(1, caseend_s, 2)]
     middle = min(49, len(mean_pressure) - 1)
     mean_pressure[middle] = (mean_pressure[middle][0], float("nan"))
-    arterial_samples = [value for second in range(caseend_s) for value in second_wave(second, rate, second == 150)]
+    arterial_samples = [value for second in range(arterial_start_s, caseend_s) for value in second_wave(second, rate, second == 150)]
     pleth_samples = [float((second * rate + position) % 50) for second in range(caseend_s) for position in range(rate)]
     return CaseRecording(
         CaseTimes(case_id, opstart_s * SECOND, opend_s * SECOND, caseend_s * SECOND),
@@ -82,7 +83,9 @@ def synthetic_recording(
         ),
         strings=(StringTrack("Test/EVENT", ((50 * SECOND, "note"),)),),
         waveforms=(
-            WaveformTrack(ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), 1.0, 0.0, (WaveformRecord(0, array("d", arterial_samples)),)),
+            WaveformTrack(
+                ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), 1.0, 0.0, (WaveformRecord(arterial_start_s * SECOND, array("d", arterial_samples)),)
+            ),
             WaveformTrack("SNUADC/PLETH", "%", float(rate), 0.5, 1.0, (WaveformRecord(0, array("d", pleth_samples)),)),
         ),
     )

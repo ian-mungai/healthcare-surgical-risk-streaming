@@ -133,10 +133,8 @@ def apply(state: OccurrenceState, event: Event, lateness_us: int, context: Conte
         state.start_us = event.replay_time_us - event.due_offset_us
     if event.kind == "op_start":
         state.opstart_us = event.case_time_us
-        emitted = (state.next_index - 1) * context.policy.cutoff_step_us
-        state.risk_pending = sorted(
-            {cutoff for cutoff in (event.case_time_us, *(event.case_time_us + offset for offset in context.policy.risk_offsets_us)) if cutoff > emitted}
-        )
+        wanted = (event.case_time_us, *(event.case_time_us + offset for offset in context.policy.risk_offsets_us))
+        state.risk_pending = sorted({cutoff for cutoff in wanted if state.last_cutoff_us is None or cutoff > state.last_cutoff_us})
     elif event.kind == "final_score":
         state.opend_us = event.case_time_us
     elif event.kind == "string":
@@ -208,6 +206,7 @@ def emit_due(state: OccurrenceState, context: Context, records: list[Record], fo
         while state.next_index * context.policy.cutoff_step_us <= cutoff:
             state.next_index += 1
         state.risk_pending = [pending for pending in state.risk_pending if pending > cutoff]
+        state.last_cutoff_us = cutoff
     prune(state, context)
 
 
@@ -273,10 +272,9 @@ def window_at(state: OccurrenceState, cutoff_us: int, context: Context) -> Windo
             else:
                 valid = summarise_second(item.samples, whole_rate(item.sample_rate), item.start_offset_us, arterial=False).valid
             seconds.append(WaveformSecond(second, item.samples, valid, item.start_offset_us))
-        if not held:
+        if not seconds:
             continue
-        rate = next(iter(held.values())).sample_rate
-        waveforms[track] = WaveformWindow(rate, tuple(seconds))
+        waveforms[track] = WaveformWindow(held[seconds[0].second].sample_rate, tuple(seconds))
     clinical: Mapping[str, ClinicalValue] = context.clinical(state.case_id)
     return WindowInput(cutoff_us, numeric, waveforms, dict(clinical))
 
