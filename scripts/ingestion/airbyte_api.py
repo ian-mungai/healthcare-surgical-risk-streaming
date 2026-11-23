@@ -20,16 +20,15 @@ while it is pending, queued or running.
 
 Every exchange has one elapsed deadline: the smaller of the client's own limit and the time that the caller's operation has left (``timeout``). The connection
 carries the deadline as its socket timeout, which bounds the connect and each wait for a byte, and a watchdog timer shuts the socket at the deadline, which
-bounds a server that trickles its headers or its body. The standard library offers no other bound on a whole exchange without socket machinery of its own, and
-this is not a second transport: it is the same connection. Remaining overshoot, measured on a local server that sends one byte every 0.02 s under a 1.0 s
-budget: a reply with a ``Content-Length`` or a chunked body ends at 1.01 s (about 0.01 s over; a loaded host adds the watchdog's wake-up delay), and the
-test holds it under 1.5 s.
+bounds a server that trickles its headers. The body is read in bounded reads (``READ_BYTES``): before each the socket's timeout is set to the time that is
+left, and the clock is read after each, so a body that trickles ends at the deadline whatever its framing, ``Connection: close`` included (``http.client`` sets
+``connection.sock`` to None as soon as it reads such headers, so the socket is kept from before ``getresponse``, through the public attribute, and no private
+one is used). This is not a second transport: it is the same connection.
 
-Accepted limit (the lead's decision, by the owner's decision on the same limit in phase 4 slice 1): a reply that says ``Connection: close`` makes
-``http.client`` hand the socket to the response and set ``connection.sock`` to None as soon as the headers are read, so the watchdog has no socket to shut,
-and the body is bounded only by each read's own timeout (a byte must arrive inside the budget) and by the cap of ``BODY_LIMIT_BYTES``. The same server and
-budget, with ``Connection: close`` and no length, was still being read after 12 s (the test stopped it): the overshoot is not bounded by the deadline, only by
-the end of the body or the cap. No transport code is changed for it.
+Measured margin, on a local server that sends a body of 200 bytes at one byte every 0.02 s against a 0.5 s budget (five runs for each kind of reply): a
+``Connection: close`` reply ended at 0.501 to 0.503 s, a ``Content-Length`` reply at 0.501 to 0.503 s and a chunked reply at 0.501 to 0.502 s: 0.003 s over at
+most. A loaded host adds the wake-up delay of one read, and the tests allow 0.25 s. The earlier limit, a ``Connection: close`` reply that was still being
+read after 12 s against a 1.0 s budget, is gone.
 
 The destination's AWS access key is sent only in the body of a create or update of the destination, and no message holds a request body, a response body or a
 secret.
@@ -59,6 +58,7 @@ from scripts.ingestion.record_definitions import Connector, Table
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 BODY_LIMIT_BYTES = 8_000_000
+READ_BYTES = 65_536
 API_PREFIX = "/api/public/v1"
 UNAUTHORIZED = 401
 REDIRECT_FIRST = 300
@@ -184,8 +184,11 @@ class HttpAirbyteApi:
     def send(self, method: str, target: str, payload: bytes | None, headers: dict[str, str], budget: float) -> tuple[int, bytes]:
         """One HTTP exchange on the wire that ends within ``budget`` seconds: the status and the body. A caller with no direct route overrides this one method.
 
-        The budget is the socket's timeout, and a watchdog shuts the socket when it passes, so a trickled header or body cannot hold the exchange.
+        The budget is the socket's timeout, and a watchdog shuts the socket when it passes, so a trickled header cannot hold the exchange. The body is read in
+        bounded reads of ``READ_BYTES``: before each read the socket's timeout is set to the time that is left, and the clock is read after it, so a body that
+        trickles, whatever its framing (``Content-Length``, chunked or ``Connection: close``), ends at the deadline with a ``TimeoutError``.
         """
+        started = time.monotonic()
         connection = http.client.HTTPConnection(self.host, self.port, timeout=budget)
         expired = threading.Event()
 
@@ -202,8 +205,10 @@ class HttpAirbyteApi:
         watchdog.start()
         try:
             connection.request(method, target, body=payload, headers=headers)
+            # A reply that says ``Connection: close`` makes http.client set ``connection.sock`` to None at once, so the socket is kept here for the reads.
+            wire = connection.sock
             response = connection.getresponse()
-            body = response.read(BODY_LIMIT_BYTES)
+            body = self.read_body(response, wire, started + budget)
         except OSError, http.client.HTTPException:
             if expired.is_set():
                 raise TimeoutError from None
@@ -214,6 +219,28 @@ class HttpAirbyteApi:
         if expired.is_set():
             raise TimeoutError
         return response.status, body
+
+    @staticmethod
+    def read_body(response: http.client.HTTPResponse, wire: socket.socket | None, deadline: float) -> bytes:
+        """The body of the reply, at most ``BODY_LIMIT_BYTES`` of it, read until ``deadline`` (a ``time.monotonic`` value). Past it: ``TimeoutError``."""
+        blocks: list[bytes] = []
+        total = 0
+        while total < BODY_LIMIT_BYTES:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                response.close()
+                raise TimeoutError
+            if wire is not None:
+                wire.settimeout(left)
+            block = response.read1(min(READ_BYTES, BODY_LIMIT_BYTES - total))
+            if time.monotonic() > deadline:
+                response.close()
+                raise TimeoutError
+            if not block:
+                break
+            blocks.append(block)
+            total += len(block)
+        return b"".join(blocks)
 
     def exchange(self, method: str, path: str, body: Mapping[str, Any] | None, budget: float, *, authorized: bool = True) -> tuple[int, Any]:
         headers = {"Accept": "application/json"}

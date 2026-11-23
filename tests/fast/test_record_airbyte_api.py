@@ -11,6 +11,7 @@ secret is sent only in the body of a destination request and never shown in an e
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
 import socket
@@ -18,8 +19,10 @@ import threading
 import time
 import unittest
 from typing import Any
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.ingestion import airbyte_api
 from scripts.ingestion import record_definitions as definitions
 from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, JOB_STATUSES, TERMINAL_STATUSES, AirbyteError, HttpAirbyteApi, check_api_origin, main
 from scripts.ingestion.record_definitions import DESTINATION, SOURCE_FILE, SOURCE_S3, TRACK_LIST, Environment
@@ -836,6 +839,212 @@ class DeadlineTest(unittest.TestCase):
             stop.set()
             thread.join(timeout=5)
             listener.close()
+
+
+class ReplyServer:
+    """A local server that sends one reply of a kind: ``close`` (``Connection: close``, no length), ``length`` (``Content-Length``) or ``chunked``.
+
+    ``gap`` is the seconds between two bytes of the body: 0 sends the body at once, in blocks, and any other value trickles it one byte at a time.
+    """
+
+    HEADS = {
+        "close": b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+        "chunked": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+    }
+
+    def __init__(self, kind: str, size: int, gap: float, stall_after: int | None = None) -> None:
+        self.kind, self.size, self.gap, self.stall_after = kind, size, gap, stall_after
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.listener.settimeout(0.2)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    @property
+    def port(self) -> int:
+        return int(self.listener.getsockname()[1])
+
+    def pieces(self) -> list[bytes]:
+        body = b"x" * self.size
+        blocks = [body[start : start + 1 if self.gap else start + 40_000] for start in range(0, self.size, 1 if self.gap else 40_000)]
+        if self.kind == "chunked":
+            return [f"{len(block):x}\r\n".encode() + block + b"\r\n" for block in blocks] + [b"0\r\n\r\n"]
+        return blocks
+
+    def run(self) -> None:
+        clients: list[socket.socket] = []
+        head = self.HEADS.get(self.kind, f"HTTP/1.1 200 OK\r\nContent-Length: {self.size}\r\n\r\n".encode())
+        try:
+            while not self.stop.is_set():
+                try:
+                    client, _ = self.listener.accept()
+                except OSError:
+                    continue
+                clients.append(client)
+                client.settimeout(0.5)
+                with contextlib.suppress(OSError):
+                    client.recv(65536)
+                try:
+                    client.sendall(head)
+                    for number, piece in enumerate(self.pieces()):
+                        if self.stop.is_set():
+                            break
+                        if self.stall_after is not None and number >= self.stall_after:
+                            self.stop.wait(30)
+                            break
+                        client.sendall(piece)
+                        if self.gap:
+                            time.sleep(self.gap)
+                except OSError:
+                    continue
+                if self.kind == "close":
+                    client.close()
+        finally:
+            for client in clients:
+                client.close()
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(timeout=5)
+        self.listener.close()
+
+
+class BodyDeadlineTest(unittest.TestCase):
+    """A body is read in bounded reads and the clock is read after each, so the exchange ends at its deadline whatever the reply's framing says.
+
+    Measured on this machine against a 0.5 s budget with a body of 200 bytes at one byte every 0.02 s, five runs for each kind: ``Connection: close`` ended at
+    0.501 to 0.503 s, ``Content-Length`` at 0.501 to 0.503 s and chunked at 0.501 to 0.502 s. The margin that the tests allow is 0.25 s.
+    """
+
+    BUDGET = 0.5
+    MARGIN = 0.25
+
+    def api(self, server: ReplyServer) -> HttpAirbyteApi:
+        api = HttpAirbyteApi(ORIGIN, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
+        api.host, api.port = "127.0.0.1", server.port
+        return api
+
+    def test_a_body_that_trickles_ends_within_the_budget_and_a_small_margin_for_each_kind_of_reply(self) -> None:
+        for kind in ("close", "length", "chunked"):
+            with self.subTest(kind):
+                server = ReplyServer(kind, 200, 0.02)
+                try:
+                    started_at = time.monotonic()
+                    with self.assertRaises(TimeoutError):
+                        self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, self.BUDGET)
+                    elapsed = time.monotonic() - started_at
+                finally:
+                    server.close()
+                self.assertGreaterEqual(elapsed, self.BUDGET - 0.05)
+                self.assertLess(elapsed, self.BUDGET + self.MARGIN, f"{kind}: the exchange ended after {elapsed:.3f} s")
+
+    def test_a_body_that_stalls_part_way_ends_at_the_deadline_and_not_a_whole_socket_timeout_later_for_each_kind_of_reply(self) -> None:
+        for kind in ("close", "length", "chunked"):
+            with self.subTest(kind):
+                server = ReplyServer(kind, 200, 0.02, stall_after=20)
+                try:
+                    started_at = time.monotonic()
+                    with self.assertRaises(TimeoutError):
+                        self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, self.BUDGET)
+                    elapsed = time.monotonic() - started_at
+                finally:
+                    server.close()
+                self.assertGreaterEqual(elapsed, self.BUDGET - 0.05)
+                self.assertLess(elapsed, self.BUDGET + self.MARGIN, f"{kind}: the exchange ended after {elapsed:.3f} s")
+
+    def test_a_body_that_is_larger_than_one_read_arrives_whole_for_each_kind_of_reply(self) -> None:
+        for kind in ("close", "length", "chunked"):
+            for size in (0, 5, 65_536, 300_000):
+                with self.subTest(f"{kind} {size}"):
+                    server = ReplyServer(kind, size, 0)
+                    try:
+                        status, body = self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, 5.0)
+                    finally:
+                        server.close()
+                    self.assertEqual((200, b"x" * size), (status, body))
+
+    def test_the_whole_client_names_the_call_and_the_deadline_when_a_close_reply_trickles(self) -> None:
+        server = ReplyServer("close", 200, 0.02)
+        try:
+            started_at = time.monotonic()
+            with self.assertRaises(AirbyteError) as raised:
+                self.api(server).exchange("POST", "/applications/token", {}, self.BUDGET, authorized=False)
+            elapsed = time.monotonic() - started_at
+        finally:
+            server.close()
+        self.assertLess(elapsed, self.BUDGET + self.MARGIN)
+        self.assertIn("POST applications/token", str(raised.exception))
+        self.assertIn("deadline", str(raised.exception))
+
+    def late_clock(self, trigger: str) -> tuple[Any, Any]:
+        """A clock that jumps 10 s ahead once ``trigger`` has happened: ``headers`` (``getresponse`` returned) or ``end`` (the read that found the end of the
+        body returned). Each of the two clock checks of the body loop is then the only thing that can end the exchange."""
+        real = time.monotonic
+        late = [False]
+        original_read1, original_get = http.client.HTTPResponse.read1, http.client.HTTPConnection.getresponse
+
+        def read1(response: http.client.HTTPResponse, *arguments: Any) -> bytes:
+            block = original_read1(response, *arguments)
+            if trigger == "end" and not block:
+                late[0] = True
+            return block
+
+        def getresponse(connection: http.client.HTTPConnection) -> http.client.HTTPResponse:
+            reply = original_get(connection)
+            if trigger == "headers":
+                late[0] = True
+            return reply
+
+        def clock() -> float:
+            return real() + (10.0 if late[0] else 0.0)
+
+        return clock, (read1, getresponse)
+
+    def test_a_reply_whose_headers_took_all_the_time_is_a_timeout_before_the_first_read_of_its_body(self) -> None:
+        clock, (read1, getresponse) = self.late_clock("headers")
+        server = ReplyServer("length", 100, 0)
+        try:
+            with (
+                mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock),
+                mock.patch.object(http.client.HTTPConnection, "getresponse", getresponse),
+                self.assertRaises(TimeoutError),
+            ):
+                self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, 5.0)
+        finally:
+            server.close()
+
+    def test_a_body_whose_last_read_came_back_after_the_deadline_is_a_timeout_although_the_whole_body_arrived(self) -> None:
+        clock, (read1, getresponse) = self.late_clock("end")
+        server = ReplyServer("length", 100, 0)
+        try:
+            with (
+                mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock),
+                mock.patch.object(http.client.HTTPResponse, "read1", read1),
+                self.assertRaises(TimeoutError),
+            ):
+                self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, 5.0)
+        finally:
+            server.close()
+
+    def test_control_the_same_reply_with_a_clock_that_never_jumps_is_returned(self) -> None:
+        clock, (read1, getresponse) = self.late_clock("never")
+        server = ReplyServer("length", 100, 0)
+        try:
+            with mock.patch("scripts.ingestion.airbyte_api.time.monotonic", clock), mock.patch.object(http.client.HTTPResponse, "read1", read1):
+                self.assertEqual((200, b"x" * 100), self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, 5.0))
+        finally:
+            server.close()
+
+    def test_a_body_that_is_cut_off_at_the_cap_is_returned_at_the_cap(self) -> None:
+        server = ReplyServer("length", 300_000, 0)
+        try:
+            with mock.patch.object(airbyte_api, "BODY_LIMIT_BYTES", 100_000):
+                status, body = self.api(server).send("GET", "/api/public/v1/workspaces", None, {}, 5.0)
+        finally:
+            server.close()
+        self.assertEqual((200, 100_000), (status, len(body)))
 
 
 class CheckCommandTest(unittest.TestCase):
