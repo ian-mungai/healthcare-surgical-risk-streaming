@@ -1,108 +1,86 @@
-"""The commit hook runs the quick group under ``tests/fast``; the slow group under ``tests/slow`` runs with ``make test-slow`` and its own CI job.
+"""The commit hook runs the quick group under ``tests/fast`` through ``tests/run_quick.py``, which refuses any import of the slow group.
 
-A quick test that imports the slow group in any form would bring its playbook runs, local servers or planted loops back into every commit. Two
-checks: every import statement in every quick file, inside functions and methods included, with relative and package forms resolved; and the
-quick group loaded the way ``unittest discover`` does, in a fresh interpreter, for imports made while loading. Limit: a name built at run time
-inside a test (``importlib.import_module`` with a computed string) is seen by neither.
+A quick test that reaches ``tests/slow`` in any form would bring its playbook runs, local servers or planted loops back into every commit. The
+runner uses Python's own import machinery: while the quick group loads and runs, a module finder refuses every ``tests.slow`` name, however
+the import is written (absolute, relative, a package attribute, inside a method or built at run time).
 """
 
 from __future__ import annotations
 
-import ast
-import json
+import shutil
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
+from typing import Any
 
 from scripts.process import run_command
+from scripts.stack.yaml_text import load_yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-LOAD_SECONDS = 120
-# Loads tests/fast from the given top-level folder and prints the slow-group modules it imported and the modules its tests come from.
-PROBE = textwrap.dedent(
-    """
-    import json, sys, unittest
-    top = sys.argv[1]
-    sys.path.insert(0, top)
-    suite = unittest.TestLoader().discover(top + "/tests/fast", top_level_dir=top)
-    def cases(item):
-        for child in item:
-            yield from cases(child) if isinstance(child, unittest.TestSuite) else [child]
-    slow = lambda name: name == "tests.slow" or name.startswith("tests.slow.")
-    imported = sorted(name for name in sys.modules if slow(name))
-    collected = sorted({type(case).__module__ for case in cases(suite) if slow(type(case).__module__)})
-    print(json.dumps({"imported": imported, "collected": collected}))
-    """
-)
+RUNNER = ROOT / "tests" / "run_quick.py"
+RUN_SECONDS = 120
+QUICK_COMMAND = ".venv/bin/python -m tests.run_quick"
+SLOW_MODULE = "import unittest\nVALUE = 1\nclass PlantedSlowTest(unittest.TestCase):\n    def test_x(self):\n        pass\n"
+QUICK_TEST = "import unittest\nclass PlantedQuickTest(unittest.TestCase):\n    def test_q(self):\n{body}"
 
 
-def slow_reach(top: Path) -> dict[str, list[str]]:
-    """The slow-group modules that loading the quick group under ``top`` imports, and the slow-group modules its collected tests come from."""
-    result = run_command(sys.executable, ["-I", "-c", PROBE, str(top)], cwd=top, timeout=LOAD_SECONDS)
-    if result.returncode != 0:
-        raise AssertionError(f"loading the quick group failed: {result.stderr[-2000:]}")
-    reach = json.loads(result.stdout.strip().splitlines()[-1])
-    return {"imported": [str(name) for name in reach["imported"]], "collected": [str(name) for name in reach["collected"]]}
+def planted_tree(top: Path, files: dict[str, str]) -> None:
+    """A copy of the runner in a tree of empty packages, with a slow module and the given quick files."""
+    for package in ("tests", "tests/fast", "tests/fast/nested", "tests/slow"):
+        (top / package).mkdir(parents=True, exist_ok=True)
+        (top / package / "__init__.py").write_text("")
+    shutil.copy(RUNNER, top / "tests" / "run_quick.py")
+    (top / "tests/slow/test_planted_slow.py").write_text(SLOW_MODULE)
+    for relative, text in files.items():
+        (top / relative).write_bytes(text.encode("utf-8-sig") if relative.endswith("_bom.py") else text.encode())
 
 
-def imported_names(path: Path, package: str) -> list[str]:
-    """Every module name that an import statement anywhere in the file names, inside functions included, with relative imports resolved
-    against ``package`` and ``from X import Y`` also read as ``X.Y``, since ``Y`` may be a module."""
-    names: list[str] = []
-    for node in ast.walk(ast.parse(path.read_text(), str(path))):
-        if isinstance(node, ast.Import):
-            names += [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            parts = package.split(".")
-            base = ".".join(parts[: len(parts) - node.level + 1]) if node.level else ""
-            module = ".".join(part for part in (base, node.module or "") if part)
-            names += [module, *(f"{module}.{alias.name}" for alias in node.names)]
-    return names
+def run_runner(top: Path) -> tuple[int, str]:
+    result = run_command(sys.executable, ["-I", str(top / "tests" / "run_quick.py")], cwd=top, timeout=RUN_SECONDS)
+    return result.returncode, result.stdout + result.stderr
 
 
-def slow_imports(path: Path, package: str) -> list[str]:
-    return sorted({name for name in imported_names(path, package) if name == "tests.slow" or name.startswith("tests.slow.")})
-
-
-class TestGroupsTest(unittest.TestCase):
-    def test_the_quick_group_loads_nothing_of_the_slow_group(self) -> None:
-        self.assertEqual(slow_reach(ROOT), {"imported": [], "collected": []}, "a quick test reaches the slow group, so the commit hook would run its work")
-
-    def test_no_quick_module_names_the_slow_group_in_any_import(self) -> None:
-        for path in sorted((ROOT / "tests" / "fast").rglob("*.py")):
-            with self.subTest(path=path.name):
-                self.assertEqual(slow_imports(path, "tests.fast"), [], f"{path.name} imports the slow group")
+class QuickRunnerTest(unittest.TestCase):
+    def test_the_commit_hook_and_make_run_the_quick_group_through_the_runner(self) -> None:
+        config: Any = load_yaml((ROOT / ".pre-commit-config.yaml").read_text())
+        hooks = [hook for repo in config["repos"] for hook in repo["hooks"]]
+        self.assertEqual([hook["entry"] for hook in hooks if hook["id"] == "fast-tests"], [QUICK_COMMAND])
+        recipe = (ROOT / "Makefile").read_text().split("\ntest-fast:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(recipe.strip(), "$(PYTHON) -m tests.run_quick")
 
     def test_the_slow_group_is_a_package_that_discovery_finds(self) -> None:
         self.assertTrue((ROOT / "tests" / "slow" / "__init__.py").is_file())
         self.assertTrue(any((ROOT / "tests" / "slow").glob("test_*.py")))
 
-    def test_each_planted_form_of_import_is_found(self) -> None:
-        """The control: in a copy with a slow module, each import form in a quick module is seen as an import, and a planted class as collected."""
+    def test_a_quick_group_that_imports_nothing_slow_passes(self) -> None:
+        """The control: the same tree with a quick test that imports nothing of the slow group passes and runs its test."""
+        top = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        planted_tree(top, {"tests/fast/test_planted_quick.py": QUICK_TEST.format(body="        pass\n")})
+        code, output = run_runner(top)
+        self.assertEqual(code, 0, output)
+        self.assertIn("Ran 1 test", output)
+
+    def test_each_form_of_slow_import_fails_the_quick_run_by_name(self) -> None:
         forms = {
-            "absolute": "import tests.slow.test_planted_slow\n",
-            "from absolute": "from tests.slow.test_planted_slow import VALUE\n",
-            "from package": "from tests import slow\n",
-            "relative": "from ..slow.test_planted_slow import PlantedSlowTest\n",
-            "run time": "import importlib\nimportlib.import_module('tests.slow.test_planted_slow')\n",
-            "inside a method": "import unittest\nclass Q(unittest.TestCase):\n    def test_q(self):\n        from tests.slow.test_planted_slow import VALUE\n",
+            "absolute at load": {"tests/fast/test_planted_quick.py": "import tests.slow.test_planted_slow\n"},
+            "package attribute": {"tests/fast/test_planted_quick.py": "from tests import slow\n"},
+            "relative at load": {"tests/fast/test_planted_quick.py": "from ..slow.test_planted_slow import PlantedSlowTest\n"},
+            "inside a method": {"tests/fast/test_planted_quick.py": QUICK_TEST.format(body="        from tests.slow.test_planted_slow import VALUE\n")},
+            "nested relative inside a method": {
+                "tests/fast/nested/test_planted_quick.py": QUICK_TEST.format(body="        from ...slow.test_planted_slow import VALUE\n")
+            },
+            "built at run time": {
+                "tests/fast/test_planted_quick.py": QUICK_TEST.format(
+                    body="        import importlib\n        importlib.import_module('.'.join(['tests', 'slow']))\n"
+                )
+            },
+            "a file with a byte-order mark": {"tests/fast/test_planted_quick_bom.py": "import tests.slow\n"},
         }
-        for label, source in forms.items():
+        for label, files in forms.items():
             with self.subTest(form=label):
                 top = Path(self.enterContext(tempfile.TemporaryDirectory()))
-                for package in ("tests", "tests/fast", "tests/slow"):
-                    (top / package).mkdir(parents=True, exist_ok=True)
-                    (top / package / "__init__.py").write_text("")
-                (top / "tests/slow/test_planted_slow.py").write_text(
-                    "import unittest\nVALUE = 1\nclass PlantedSlowTest(unittest.TestCase):\n    def test_x(self):\n        pass\n"
-                )
-                (top / "tests/fast/test_planted_quick.py").write_text(source)
-                seen_in_source = slow_imports(top / "tests/fast/test_planted_quick.py", "tests.fast") != []
-                reach = slow_reach(top)
-                self.assertTrue(seen_in_source or reach["imported"], f"the {label} import was not seen")
-                if label != "run time":
-                    self.assertTrue(seen_in_source, f"the source check missed the {label} import")
-                if label == "relative":
-                    self.assertEqual(reach["collected"], ["tests.slow.test_planted_slow"])
+                planted_tree(top, files)
+                code, output = run_runner(top)
+                self.assertNotEqual(code, 0, f"the {label} import passed: {output}")
+                self.assertIn("the quick group imported tests.slow", output)
