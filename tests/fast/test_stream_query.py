@@ -325,6 +325,40 @@ class RunQuery(unittest.TestCase):
         self.assertIs(error, failure)
 
 
+class FlakyActive(Logged):
+    """A query whose ``isActive`` answers once and then raises, as a lost connection to the JVM does after the wait loop."""
+
+    def __init__(self, log: list[str]) -> None:
+        super().__init__(log)
+        self.asked = 0
+
+    @property
+    def isActive(self) -> bool:  # noqa: N802
+        self.asked += 1
+        if self.asked > 1:
+            raise ConnectionError("the query's state cannot be read")
+        return False
+
+
+class AfterTheLoop(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_an_is_active_that_raises_after_the_wait_loop_still_stops_the_query_and_the_session_and_is_the_failure(self) -> None:
+        log: list[str] = []
+        query, session = FlakyActive(log), Logged(log)
+        query.stop, session.stop = lambda: log.append("query stop"), lambda: log.append("session stop")  # type: ignore[method-assign]
+        progress, failure = run_query(query, session, None, lambda: False, 5.0)
+        self.assertIsInstance(failure, ConnectionError)
+        self.assertEqual(["query stop", "session stop"], [entry for entry in log if entry.endswith("stop")])
+
+    @unittest.expectedFailure
+    def test_the_first_error_is_kept_when_the_state_read_and_the_stop_both_fail(self) -> None:
+        log: list[str] = []
+        query, session = FlakyActive(log), Logged(log)
+        query.stop = lambda: (_ for _ in ()).throw(TimeoutError("stop"))  # type: ignore[method-assign]
+        _, failure = run_query(query, session, None, lambda: False, 5.0)
+        self.assertIsInstance(failure, ConnectionError)
+
+
 class TestInput(unittest.TestCase):
     def run_handler(self, stop_after: int | None, indexes: list[int]) -> list[int]:
         settings = StreamSettings("k", "r", "c", test_exit_after_sink=stop_after)
