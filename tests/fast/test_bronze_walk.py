@@ -18,6 +18,7 @@ The library's own reading is proved against the published recordings by the acce
 from __future__ import annotations
 
 import gzip
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,7 @@ from tests.fast.vital_support import (
     numeric_record,
     packet,
     record_packet,
+    text,
     text_record,
     track_packet,
     vital,
@@ -165,16 +167,85 @@ class Counts(Files):
     def test_two_tracks_with_one_name_and_another_type_are_refused(self) -> None:
         self.assertIn("one name", self.problem(track_packet(1, name="HR"), track_packet(2, name="HR", kind=5, fmt=0)))
 
-    def test_a_declared_length_adds_up_over_the_tracks_that_share_a_name(self) -> None:
+    def test_each_track_id_is_judged_by_its_own_declaration_even_when_two_share_a_name(self) -> None:
         one = len(record_packet(1))
-        walked = self.walk(
+        whole = self.walk(
             track_packet(1, reclen=2 * one, name="HR"),
             track_packet(2, reclen=one, name="HR"),
             record_packet(1),
             record_packet(2),
             record_packet(1),
         )
+        self.assertIsNone(whole.problem)
+        self.assertEqual({"HR": 3}, {name: track.count for name, track in whole.tracks.items()})
+
+    def test_declarations_that_only_add_up_across_two_tracks_of_one_name_are_refused(self) -> None:
+        one = len(record_packet(1))
+        for first, second in ((one + 1, one - 1), (one - 1, one + 1), (2 * one, 0 + one + 0)):
+            found = self.problem(track_packet(1, reclen=first, name="HR"), track_packet(2, reclen=second, name="HR"), record_packet(1), record_packet(2))
+            self.assertIn("declares", found, (first, second))
+
+    def test_records_moved_from_one_track_id_to_the_other_keep_the_sum_and_are_refused(self) -> None:
+        one = len(record_packet(1))
+        found = self.problem(
+            track_packet(1, reclen=2 * one, name="HR"), track_packet(2, reclen=one, name="HR"), record_packet(1), record_packet(2), record_packet(2)
+        )
+        self.assertIn("declares", found)
+
+    def test_a_track_id_that_declares_a_length_is_checked_and_another_of_the_same_name_that_declares_none_is_not(self) -> None:
+        one = len(record_packet(1))
+        walked = self.walk(track_packet(1, reclen=one, name="HR"), track_packet(2, name="HR"), record_packet(1), record_packet(2), record_packet(2))
         self.assertIsNone(walked.problem)
+        refused = self.problem(track_packet(1, reclen=2 * one, name="HR"), track_packet(2, name="HR"), record_packet(1), record_packet(2), record_packet(2))
+        self.assertIn("declares", refused)
+
+    def test_a_track_whose_records_are_not_as_long_as_it_declares_is_refused_and_the_baseline_passes(self) -> None:
+        one = len(record_packet(1))
+        self.assertIsNone(self.walk(track_packet(1, reclen=3 * one), *(record_packet(1) for _ in range(3))).problem)
+        self.assertIn("declares", self.problem(track_packet(1, reclen=3 * one), *(record_packet(1) for _ in range(2))))
+        self.assertIn("declares", self.problem(track_packet(1, reclen=3 * one), *(record_packet(1) for _ in range(4))))
+
+
+class Limits(Files):
+    def test_a_packet_over_the_librarys_limit_is_refused_wherever_it_is(self) -> None:
+        big = packet(77, bytes(1_000_001))
+        for label, packets in (
+            ("last", (track_packet(1), record_packet(1), big)),
+            ("first", (big, track_packet(1), record_packet(1))),
+            ("middle", (track_packet(1), record_packet(1), big, record_packet(1))),
+        ):
+            self.assertIn("limit", self.problem(*packets), label)
+
+    def test_a_packet_of_exactly_the_limit_passes_and_so_does_one_over_it_in_a_packed_file(self) -> None:
+        self.assertIsNone(self.walk(track_packet(1), record_packet(1), packet(77, bytes(1_000_000))).problem)
+        packed = bytes(26) + b"\x01"
+        count = self.count + 1
+        path = self.root / f"packed{count}.vital"
+        path.write_bytes(gzip.compress(vital(track_packet(1), record_packet(1), packet(77, bytes(1_000_001)), header=packed)))
+        self.assertIsNone(walk_file(path).problem)
+
+    def test_a_record_packet_over_the_limit_is_refused_by_the_limit_before_its_own_lengths(self) -> None:
+        samples = bytes(1_000_000)
+        found = self.problem(track_packet(1, kind=1, fmt=6, rate=2.0), record_packet(1, payload=b"\x40\x42\x0f\x00" + samples))
+        self.assertIn("limit", found)
+
+
+class Text(Files):
+    def test_a_text_record_that_is_not_valid_utf8_is_refused_naming_the_case_part_and_no_bytes(self) -> None:
+        for content in (b"ab\xffcd", b"\xc3", b"\xed\xa0\x80"):
+            found = self.problem(track_packet(1, kind=5, fmt=0), record_packet(1, payload=struct.pack("<I", 0) + struct.pack("<I", len(content)) + content))
+            self.assertIn("UTF-8", found, content)
+            for byte in (b"\xff", b"\xc3", b"\xed"):
+                self.assertNotIn(byte.decode("latin-1"), found)
+
+    def test_valid_utf8_text_including_multibyte_text_is_kept(self) -> None:
+        self.assertIsNone(self.walk(track_packet(1, kind=5, fmt=0), text_record(1, "caf\u00e9 \u00b5g/kg \u6e29\u5ea6"), text_record(1, "")).problem)
+
+    def test_a_track_or_device_name_that_is_not_valid_utf8_is_refused(self) -> None:
+        bad_track = packet(0, struct.pack("<HBB", 1, 2, 1) + struct.pack("<I", 3) + b"H\xffR" + text("unit"))
+        self.assertIn("UTF-8", self.problem(bad_track))
+        bad_device = packet(9, struct.pack("<I", 1) + text("type") + struct.pack("<I", 2) + b"D\xff")
+        self.assertIn("UTF-8", self.problem(bad_device))
 
 
 class Values(Files):

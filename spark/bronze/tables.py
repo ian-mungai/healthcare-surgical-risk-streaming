@@ -7,7 +7,7 @@ Bronze holds what the case files publish and changes no value. The namespace ``b
 - ``waveform_seconds``: one row per case, track and second, holding that second's samples in the order of the file. Key: case, track and second. The samples
   are doubles whatever the track's own sample type is (the types of the format are all held exactly by a double), and the track's type is in ``tracks``.
 - ``tracks``: one row per track of each case with its device, name, unit and the publisher's track metadata: the sample format code of the file as published
-  and its type name (``uint16`` for a 16-bit unsigned sample, ``text`` for a text track whatever its code, empty when the file format names none), the sample
+  and its type name (``uint16`` for a 16-bit unsigned sample, ``text`` for a text track whatever its code), the sample
   rate, the gain and the offset. Key: case and track.
 - ``string_events``: one row per published string event, with its original time, text and stable source ID. Key as for numeric readings.
 

@@ -4,11 +4,12 @@ Bronze keeps every published value, so it refuses a file only when the file is n
 first error and still returns what it had read, and it skips a record that it cannot place without a word, so a cut file looks like a short recording and a
 damaged record is a reading that is not there. Three checks stand in front of the decoder, and the job runs all of them for every case before the branch exists:
 
-1. ``walk_file`` reads the whole gzip stream of the file once, packet by packet, with its own reading of the packets' framing. A stream that ends early, a
-   checksum that does not match, a file that is not gzip, a stream that does not start with the mark ``VITA``, a packet that is cut short and a track whose
-   records are not as long as it declares are refused. So is a record whose declared lengths do not fit its packet, a record of a track that the file does not
-   declare, a track of a type that Bronze does not carry and a sample format that the file format does not define. The walk counts the records of each
-   track by its name, keeps the time of each numeric and text record, and reads the values of the tracks that it is asked to read itself.
+1. ``walk_file`` reads the whole gzip stream of the file once, packet by packet, with its own reading of the packets' framing. A stream that ends
+   early, a checksum that does not match, a file that is not gzip, a stream that does not start with the mark ``VITA``, a packet that is cut short, a
+   packet over the library's limit of one million bytes and a track ID whose records are not as long as it declares are refused. So is a name or a
+   text that is not valid UTF-8. So is a record whose declared lengths do not fit its packet, a record of a track that the file does not declare, a
+   track of a type that Bronze does not carry and a sample format that the file format does not define. The walk counts the records of each track by
+   its name, keeps the time of each numeric and text record, and reads the values of the tracks that it is asked to read itself.
 2. ``recording_problem`` judges what the library read from the header of the file: it must have read the file, the file must hold a track, every track must
    be of a type that Bronze carries, the recording must start at the anonymised start and must end within a couple of seconds of the clinical end of the case.
    The published recordings end within a second of the whole-second clinical end, which is why the tolerance is not zero.
@@ -38,6 +39,8 @@ PACKET_HEAD_BYTES = 5
 DEVICE_PACKET, TRACK_PACKET, RECORD_PACKET = 9, 0, 1
 RECORD_TIME_START, RECORD_TRACK_START, RECORD_FIXED_BYTES = 2, 10, 12
 INFO_FIXED_BYTES = 10
+MAX_PACKET_BYTES = 1_000_000
+PACKED_FLAG_AT = 26
 SAMPLE_BYTES = {1: 4, 2: 8, 3: 1, 4: 1, 5: 2, 6: 2, 7: 4, 8: 4}
 OWN_FORMATS = {7: "<i", 8: "<I"}
 
@@ -79,11 +82,14 @@ def read_exactly(stream: gzip.GzipFile, size: int) -> bytes | None:
 
 
 def text_at(body: bytes, position: int) -> tuple[str, int]:
-    """The text of the file format (four bytes of length, then the bytes) at ``position`` and the position after it. A text past the packet is refused."""
+    """The text of the file format (four bytes of length, then the bytes) at ``position`` and the position after it.
+
+    A text past the packet is refused, and so is one that is not valid UTF-8: the library decodes with ``errors="ignore"`` and would drop the bytes.
+    """
     (size,) = struct.unpack_from("<I", body, position)
     if position + 4 + size > len(body):
         raise struct.error("a text runs past its packet")
-    return body[position + 4 : position + 4 + size].decode("utf-8", "replace"), position + 4 + size
+    return body[position + 4 : position + 4 + size].decode("utf-8"), position + 4 + size
 
 
 def parse_track(body: bytes) -> TrackHead:
@@ -126,8 +132,13 @@ def record_problem(track: WalkedTrack, body: bytes) -> str | None:
     payload = body[2 + infolen :]
     if track.track_type == NUMERIC and size != SAMPLE_BYTES[track.fmt]:
         return "a numeric record's value is not as long as its track's format"
-    if track.track_type == TEXT and (size < 8 or 8 + struct.unpack_from("<I", payload, 4)[0] > size):
-        return "a text record's text is not inside its packet"
+    if track.track_type == TEXT:
+        if size < 8 or 8 + struct.unpack_from("<I", payload, 4)[0] > size:
+            return "a text record's text is not inside its packet"
+        try:
+            payload[8 : 8 + struct.unpack_from("<I", payload, 4)[0]].decode("utf-8")
+        except UnicodeDecodeError:
+            return "a text record's text is not valid UTF-8, and the library would drop the bytes that are not"
     if track.track_type == WAVEFORM and (size < 4 or 4 + struct.unpack_from("<I", payload)[0] * SAMPLE_BYTES[track.fmt] > size):
         return "a waveform record's samples are not inside its packet"
     return None
@@ -136,16 +147,18 @@ def record_problem(track: WalkedTrack, body: bytes) -> str | None:
 def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
     """The walk of the file at ``path``: why it is not a complete case file (``problem``) and what it holds (``tracks``).
 
-    The stream must be whole, start with the mark ``VITA``, have its header and end on the end of a packet. A track that declares the length of its records
-    must have exactly that many bytes of record packets, summed over the tracks that share its name. A track that declares none is not checked. A file that
+    The stream must be whole, start with the mark ``VITA``, have its header and end on the end of a packet, and no packet may be over the library's limit
+    (a non-packed file). A track ID that declares the length of its records must have exactly that many bytes of record packets, each ID by its own declaration
+    even when two share a name. A track that declares none is not checked. A file that
     is cut at the end of a packet and declares no lengths cannot be told from a shorter recording by this check: the publisher's checksum is what stops it.
     The tracks in ``values_for`` have the value of each record read here, which only the numeric formats that the library cannot read allow.
     """
     walk = Walk()
     devices: dict[int, str] = {}
     by_tid: dict[int, str] = {}
-    declared: defaultdict[str, int] = defaultdict(int)
-    held: defaultdict[str, int] = defaultdict(int)
+    declared: dict[int, int] = {}
+    held: defaultdict[int, int] = defaultdict(int)
+    packed = False
     try:
         with gzip.open(path, "rb") as stream:
             if stream.read(len(MARK)) != MARK:
@@ -156,11 +169,15 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
             if header is None:
                 walk.problem = CUT_SHORT
                 return walk
+            packed = len(header) > PACKED_FLAG_AT and header[PACKED_FLAG_AT] == 1
             while head := stream.read(PACKET_HEAD_BYTES):
                 if len(head) < PACKET_HEAD_BYTES:
                     walk.problem = CUT_SHORT
                     return walk
                 kind, length = struct.unpack("<BI", head)
+                if length > MAX_PACKET_BYTES and not packed:
+                    walk.problem = "a packet is over the library's limit of one million bytes, so the library stops reading there and drops what follows"
+                    return walk
                 body = read_exactly(stream, length)
                 if body is None:
                     walk.problem = CUT_SHORT
@@ -182,12 +199,13 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
                         name, WalkedTrack(track.track_type, track.fmt, values=[] if name in values_for and track.fmt in OWN_FORMATS else None)
                     )
                     by_tid[track.tid] = name
-                    declared[name] += track.declared
+                    declared[track.tid] = track.declared
                 elif kind == RECORD_PACKET:
                     if len(body) < RECORD_FIXED_BYTES:
                         walk.problem = "a record packet is too short to name its track"
                         return walk
-                    name = by_tid.get(struct.unpack_from("<H", body, RECORD_TRACK_START)[0], "")
+                    (tid,) = struct.unpack_from("<H", body, RECORD_TRACK_START)
+                    name = by_tid.get(tid, "")
                     if not name:
                         walk.problem = "a record names a track that the file does not declare before it"
                         return walk
@@ -195,7 +213,7 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
                     walk.problem = record_problem(track_walked, body)
                     if walk.problem:
                         return walk
-                    held[name] += PACKET_HEAD_BYTES + length
+                    held[tid] += PACKET_HEAD_BYTES + length
                     track_walked.count += 1
                     (time,) = struct.unpack_from("<d", body, RECORD_TIME_START)
                     if track_walked.track_type != WAVEFORM:
@@ -209,14 +227,12 @@ def walk_file(path: Path, values_for: Collection[str] = ()) -> Walk:
     except struct.error:
         walk.problem = "a packet is too short for the fields that its type holds"
         return walk
-    if any(size and held[name] != size for name, size in declared.items()):
+    except UnicodeDecodeError:
+        walk.problem = "a device or track name is not valid UTF-8, and the library would drop the bytes that are not"
+        return walk
+    if any(size and held[tid] != size for tid, size in declared.items()):
         walk.problem = "a track has records of another length than it declares"
     return walk
-
-
-def file_problem(path: Path) -> str | None:
-    """Why the file at ``path`` is not a complete case file, or ``None``: the problem of its walk."""
-    return walk_file(path).problem
 
 
 def tracks_problem(case_id: int, walked: Iterable[str], read: Iterable[str]) -> str | None:

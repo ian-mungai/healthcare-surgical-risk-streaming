@@ -20,8 +20,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from spark.bronze.structure import END_TOLERANCE_SECONDS, file_problem, recording_problem
+from spark.bronze.structure import END_TOLERANCE_SECONDS, recording_problem, walk_file
 from tests.fast.vital_support import START, packet, record_packet, track_packet, vital
+
+
+def file_problem(path: Path) -> str | None:
+    return walk_file(path).problem
 
 
 def written(folder: Path, name: str, data: bytes) -> Path:

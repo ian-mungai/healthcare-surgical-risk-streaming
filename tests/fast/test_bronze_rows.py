@@ -259,11 +259,12 @@ class TrackRows(unittest.TestCase):
             info = track_info("X", fake_track(fmt=fmt), None)
             self.assertEqual((fmt, name), (info.sample_format, info.sample_type))
 
-    def test_a_format_with_no_sample_type_keeps_its_code_and_has_no_name(self) -> None:
-        for fmt in (0, 9, 255):
-            info = track_info("N", fake_track(type=2, fmt=fmt), None)
-            self.assertEqual((fmt, ""), (info.sample_format, info.sample_type))
-            self.assertTrue(conforms(TRACKS, track_row(1, info, LINEAGE)))
+    def test_a_numeric_or_waveform_format_that_the_file_format_does_not_define_is_refused_by_track(self) -> None:
+        for kind in (1, 2):
+            for fmt in (0, 9, 255):
+                with self.assertRaises(StructureError) as caught:
+                    track_info("D/HR", fake_track(type=kind, fmt=fmt), None)
+                self.assertIn("D/HR", str(caught.exception))
 
     def test_a_text_track_is_text_whatever_its_format_code_is(self) -> None:
         for fmt in (0, 1, 6, 9):

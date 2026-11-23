@@ -60,6 +60,15 @@ class TrackInfo:
     monitor_type: int
 
 
+def sample_type(dtname: str, kind: str, fmt: int) -> str:
+    """The type name of a track's samples: ``text`` for a text track whatever its code, otherwise the file format's name for it. Another code is refused."""
+    if kind == "string":
+        return "text"
+    if fmt not in SAMPLE_TYPES:
+        raise StructureError(f"the track {dtname} has a sample format that the file format does not define")
+    return SAMPLE_TYPES[fmt]
+
+
 def track_info(dtname: str, track: Any, device: Any | None) -> TrackInfo:
     """The metadata of a library track and of its device (``None`` when it has none). A track type that the design does not carry is refused."""
     kind = KIND_OF_TYPE.get(track.type)
@@ -74,7 +83,7 @@ def track_info(dtname: str, track: Any, device: Any | None) -> TrackInfo:
         kind,
         int(track.type),
         int(track.fmt),
-        "text" if kind == "string" else SAMPLE_TYPES.get(int(track.fmt), ""),
+        sample_type(dtname, kind, int(track.fmt)),
         str(track.unit),
         float(track.srate),
         float(track.gain),
