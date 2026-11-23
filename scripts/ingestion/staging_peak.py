@@ -78,7 +78,7 @@ def summary_body(runner: Runner, kubectl: Sequence[str], node: str, namespace: s
         reference = row["podRef"]
         if reference["namespace"] != namespace:
             continue
-        used = row.get("ephemeral-storage", {}).get("usedBytes", 0)
+        used = row.get("ephemeral-storage", {}).get("usedBytes")
         if type(reference["name"]) is not str or not whole(used):
             raise Failure("unparsable")
         pods[reference["name"]] = used
@@ -143,7 +143,7 @@ def run_sampler(
                 reason = "max_seconds"
                 break
             began = clock()
-            out.write_line(sample_line(seq, began + interval_seconds, kubectl, node, namespace, runner, clock, wall_ns))
+            out.write_line(sample_line(seq, min(began + interval_seconds, started + max_seconds), kubectl, node, namespace, runner, clock, wall_ns))
             seq += 1
             flag.sleep(max(0.0, min(interval_seconds - (clock() - began), max_seconds - (clock() - started))), pause=pause, clock=clock)
         out.write_line({"kind": "end", "reason": reason, "samples": seq})
@@ -197,7 +197,8 @@ def peak_record(text: str) -> dict[str, Any]:
     if not rows or rows[0]["kind"] != "header" or rows[0].get("schema") != SCHEMA:
         raise StagingRefused(Notice(Code.STAGING_FORM, position=1))
     samples = rows[1:-1]
-    if rows[-1].get("samples") != len(samples):
+    last = rows[-1]
+    if last["kind"] != "end" or type(last.get("samples")) is not int or last["samples"] != len(samples):
         raise StagingRefused(Notice(Code.STAGING_CUT_OFF))
     readings = []
     for position, row in enumerate(samples, 2):

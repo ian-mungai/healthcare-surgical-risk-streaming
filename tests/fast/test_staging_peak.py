@@ -52,9 +52,11 @@ class FakeKubectl:
     def __init__(self, answers: Sequence[tuple[int, str]]) -> None:
         self.answers = list(answers)
         self.calls: list[tuple[str, list[str]]] = []
+        self.timeouts: list[float] = []
 
     def __call__(self, program: str, arguments: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         self.calls.append((program, list(arguments)))
+        self.timeouts.append(timeout)
         code, text = self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
         return subprocess.CompletedProcess([program, *arguments], code, text, "")
 
@@ -115,6 +117,26 @@ class SamplerTest(unittest.TestCase):
         self.assertEqual([{"reading": "summary", "cause": "exit_status"}], lines[1]["missing"])
         self.assertNotIn("summary", lines[1])
         self.assertEqual([], lines[2]["missing"])
+
+    def test_a_pod_with_no_storage_statistics_names_the_reading_failed_and_is_not_counted_as_zero(self) -> None:
+        bare = json.loads(summary({"job": 5_000}))
+        bare["pods"].append({"podRef": {"name": "starting", "namespace": NAMESPACE, "uid": "s"}})
+        empty = json.loads(summary({"job": 5_000}))
+        empty["pods"].append({"podRef": {"name": "starting", "namespace": NAMESPACE, "uid": "s"}, "ephemeral-storage": {"time": "now"}})
+        for answer in (bare, empty):
+            _, lines, _, _ = sample_file([(0, json.dumps(answer))], max_seconds=5.0)
+            self.assertEqual([{"reading": "summary", "cause": "unparsable"}], lines[1]["missing"])
+            self.assertNotIn("summary", lines[1])
+
+    def test_a_pod_of_another_namespace_with_no_statistics_is_not_a_failed_reading(self) -> None:
+        answer = json.loads(summary({"job": 5_000}))
+        answer["pods"].append({"podRef": {"name": "elsewhere", "namespace": "kube-system", "uid": "e"}})
+        _, lines, _, _ = sample_file([(0, json.dumps(answer))], max_seconds=5.0)
+        self.assertEqual([], lines[1]["missing"])
+
+    def test_no_reading_is_given_more_time_than_the_run_has_left(self) -> None:
+        _, _, kubectl, _ = sample_file([(0, summary({"p": 1}))], max_seconds=7.0, interval=5.0)
+        self.assertEqual([5.0, 2.0], kubectl.timeouts)
 
     def test_an_answer_that_is_not_the_summary_form_is_named_unparsable(self) -> None:
         for text in (
@@ -201,6 +223,22 @@ class PeakTest(unittest.TestCase):
         with self.assertRaises(StagingRefused) as refused:
             peak_record(rows)
         self.assertEqual([Code.STAGING_CUT_OFF], codes(refused.exception.notices))
+
+    def test_an_end_record_must_be_an_end_with_a_whole_number_that_equals_the_samples_read(self) -> None:
+        base = lines_for([{"a": 1}, {"a": 2}]).splitlines()
+        counted_sample = json.dumps(json.loads(base[2]) | {"samples": 1})
+        one = lines_for([{"a": 1}]).splitlines()
+        cases = (
+            ("a boolean", [*one[:-1], json.dumps({"kind": "end", "reason": "stop_flag", "samples": True})]),
+            ("a float", [*one[:-1], json.dumps({"kind": "end", "reason": "stop_flag", "samples": 1.0})]),
+            ("a string", [*one[:-1], json.dumps({"kind": "end", "reason": "stop_flag", "samples": "1"})]),
+            ("no count", [*one[:-1], json.dumps({"kind": "end", "reason": "stop_flag"})]),
+            ("a last sample line that holds the count of the one before", [*base[:2], counted_sample]),
+        )
+        for label, lines in cases:
+            with self.subTest(label), self.assertRaises(StagingRefused) as refused:
+                peak_record("\n".join(lines) + "\n")
+            self.assertEqual([Code.STAGING_CUT_OFF], codes(refused.exception.notices))
 
     def test_a_file_with_no_sample_is_refused_for_that_cause(self) -> None:
         with self.assertRaises(StagingRefused) as refused:

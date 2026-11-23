@@ -300,6 +300,8 @@ class Code(StrEnum):
     PROBE_NOT_THIS = "the manifest is not the passed manifest of the copy probe's selection"
     PROBE_NULL_VERSION = "landed payload {position} has no object version ID, or a null one"
     PROBE_PIN_DIFFERS = "landed payload {position} differs from the tracked pin in its size or its SHA-256, or no tracked pin names it"
+    PROBE_LANDING_EXTRA = "the landing prefix holds {count} current payloads that the manifest does not bind"
+    PROBE_LANDING_MISSING = "{count} payloads that the manifest binds are not current objects of the landing prefix"
     PROBE_REFUSED = "the landed payloads of the copy probe are refused; no payload was read"
     PROBE_PASSED = "the {total} landed payloads of the copy probe are the selected keys, each at its pinned size and SHA-256 with a version ID that is not null"
     JOB_NOT_RECORD = "{subject} is not a job in the documented form: a text status, a whole number rowsSynced and a whole number bytesSynced"

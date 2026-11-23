@@ -186,6 +186,40 @@ class VerifyLandedTest(unittest.TestCase):
         self.assertTrue(all(entry.version_id not in ("", "null") for entry in entries))
         self.assertEqual([], landed.store.payload_reads(LANDING_PREFIX))
 
+    def test_an_extra_current_payload_in_the_landing_prefix_is_refused_for_that_cause(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        landed.store.put_object(f"{LANDING_PREFIX}sync_99/{SOURCE_PREFIX}vital_files/0099.vital", b"a payload that no check covered")
+        landed.store.reads.clear()
+        with self.assertRaises(ProbeRefused) as refused:
+            verify_landed(landed.store, reference, landed.selection, synthetic_pins(landed))
+        self.assertEqual([Code.PROBE_REFUSED, Code.PROBE_LANDING_EXTRA], codes(refused.exception.notices))
+        self.assertEqual(1, refused.exception.notices[1].count)
+        self.assertEqual([], landed.store.payload_reads(LANDING_PREFIX))
+
+    def test_a_metadata_file_in_the_landing_prefix_is_no_payload(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        landed.store.put_object(f"{LANDING_PREFIX}sync_00/{SOURCE_PREFIX}vital_files/0001.vital.jsonl", b"{}")
+        self.assertEqual(len(SOURCE), len(verify_landed(landed.store, reference, landed.selection, synthetic_pins(landed))))
+
+    def test_an_extra_payload_that_was_replaced_by_a_delete_marker_is_no_current_object(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        extra = f"{LANDING_PREFIX}sync_99/{SOURCE_PREFIX}vital_files/0099.vital"
+        landed.store.put_object(extra, b"x")
+        landed.store.put_delete_marker(extra)
+        self.assertEqual(len(SOURCE), len(verify_landed(landed.store, reference, landed.selection, synthetic_pins(landed))))
+
+    def test_a_manifest_payload_that_is_no_current_object_is_refused_for_that_cause(self) -> None:
+        landed = landed_set()
+        reference = published(landed)
+        landed.store.put_delete_marker(landed.key_for(SOURCE_PREFIX + "vital_files/0001.vital"))
+        with self.assertRaises(ProbeRefused) as refused:
+            verify_landed(landed.store, reference, landed.selection, synthetic_pins(landed))
+        self.assertEqual([Code.PROBE_REFUSED, Code.PROBE_LANDING_MISSING], codes(refused.exception.notices))
+        self.assertEqual(1, refused.exception.notices[1].count)
+
     def test_a_missing_manifest_is_refused_before_anything_is_derived(self) -> None:
         landed = landed_set()
         reference = published(landed)
@@ -256,6 +290,17 @@ class JobTest(unittest.TestCase):
 
     def test_a_trace_in_the_log_is_an_error_line_too(self) -> None:
         self.assertEqual([Code.LOG_ERROR_LINE], codes(job_notices(JOB, LOG + "Traceback (most recent call last):\n")))
+
+    def test_a_trace_and_an_error_after_the_capture_prefix_are_error_lines(self) -> None:
+        prefix = "[pod/replication-job-7-attempt-0/main] 2026-11-23T17:01:02.123456789Z "
+        for line in ("Traceback (most recent call last):", "ERROR could not write", "FATAL out of memory"):
+            for head in (prefix, "[pod/replication-job-7-attempt-0/main] ", "2026-11-23T17:01:02.123456789Z ", ""):
+                with self.subTest(head=head, line=line):
+                    self.assertEqual([Code.LOG_ERROR_LINE], codes(job_notices(JOB, LOG + head + line + "\n")))
+
+    def test_prefixed_lines_that_only_mention_a_trace_are_no_error_lines(self) -> None:
+        prefix = "[pod/replication-job-7-attempt-0/main] 2026-11-23T17:01:02.123456789Z "
+        self.assertEqual([], job_notices(JOB, LOG + prefix + "INFO copied 5 files\n" + prefix + "INFO the word Traceback is in a file name\n"))
 
     def test_a_word_that_only_contains_error_is_no_error_line(self) -> None:
         self.assertEqual([], job_notices(JOB, LOG + "INFO file errors_report.csv copied\n"))

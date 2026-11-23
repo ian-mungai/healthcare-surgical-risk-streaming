@@ -134,9 +134,9 @@ class DocumentTest(unittest.TestCase):
         self.assertEqual("1.9.11", document["destination"]["definition"]["dockerImageTag"])
         self.assertEqual(6390, len(document["source"]["configuration"]["streams"][0]["globs"]))
 
-    def test_the_scope_full_release_selects_the_pins_6390_files_and_fixed_sample_the_15_of_the_sample(self) -> None:
+    def test_the_scope_full_release_selects_the_pins_6390_files_and_fixed_sample_the_11_of_the_sample(self) -> None:
         self.assertEqual(6390, len(self.document(VARIABLES | {"airbyte_connection_scope": "full_release"})["source"]["configuration"]["streams"][0]["globs"]))
-        self.assertEqual(15, len(self.document(VARIABLES | {"airbyte_connection_scope": "fixed_sample"})["source"]["configuration"]["streams"][0]["globs"]))
+        self.assertEqual(11, len(self.document(VARIABLES | {"airbyte_connection_scope": "fixed_sample"})["source"]["configuration"]["streams"][0]["globs"]))
 
     def test_another_scope_is_refused_and_the_scope_defaults_to_the_full_release(self) -> None:
         code, output = render(VARIABLES | {"airbyte_connection_scope": "everything"})

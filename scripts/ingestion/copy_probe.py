@@ -38,13 +38,13 @@ from scripts.ingestion.cli import KEPT_ERROR_TEXT, bucket_in_use, read_input, re
 from scripts.ingestion.closed import ClosedInputError, QuietParser, parse_json
 from scripts.ingestion.connection import MEASUREMENT_PERIOD, selection_document
 from scripts.ingestion.gate import verify_before_read
+from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX
 from scripts.ingestion.manifest import ManifestRef, read_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
 from scripts.ingestion.selection import FULL_RELEASE_TABLES, Selection, SelectionError, pinned_release
-from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, S3Store
+from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, S3Store
 from scripts.project_config import ConfigurationError, load_configuration
-from scripts.sample.candidates import FIXTURES, RELEASE_FILE, Candidate, read_candidates, release_problems
-from scripts.sample.split import is_development
+from scripts.sample.candidates import FIXTURES, RELEASE_FILE, Candidate, is_development_candidate, read_candidates, release_problems
 
 PROGRAM = "scripts.ingestion.copy_probe"
 PROBE_NAME = "copy_probe"
@@ -54,6 +54,7 @@ SAMPLE_FORMAT = "platform_sample_1"
 SHORT_SLOT = "short_development"
 CASE_KEY = re.compile(r".*/vital_files/[0-9]{4}\.vital")
 ERROR_LINE = re.compile(r"\b(?:ERROR|FATAL)\b|^Traceback \(most recent call last\)")
+CAPTURE_PREFIX = re.compile(r"(?:\[[^\]\s]+\] )?(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z )?")
 SUCCEEDED = "succeeded"
 
 
@@ -101,7 +102,7 @@ def probe_selection(cases: Sequence[int] = PROBE_CASES, pins: Pins | None = None
     for position, case in enumerate(cases, 1):
         if case not in by_case:
             problems.append(Notice(Code.PROBE_CASE_NOT_CANDIDATE, position=position))
-        elif not is_development(by_case[case].patient):
+        elif not is_development_candidate(by_case[case]):
             problems.append(Notice(Code.PROBE_CASE_NOT_DEVELOPMENT, position=position))
     if problems:
         raise SelectionError(*problems)
@@ -138,6 +139,22 @@ def landed_problems(entries: Sequence[CheckedFile], selection: Selection, pins: 
     return problems
 
 
+def landing_problems(listing: Sequence[ObjectVersion], entries: Sequence[CheckedFile]) -> list[Notice]:
+    """Why the current payloads of the landing prefix are not the manifest's: an extra current payload, or a bound key that is no current object.
+
+    The listing is the full listing of the landing prefix. A key counts when its current version is not a delete marker. The metadata files that the copy
+    writes beside the payloads are no payloads.
+    """
+    current = {item.key for item in listing if item.is_latest and not item.is_delete_marker and not item.key.endswith(METADATA_SUFFIX)}
+    bound = {entry.key for entry in entries}
+    problems = []
+    if current - bound:
+        problems.append(Notice(Code.PROBE_LANDING_EXTRA, count=len(current - bound)))
+    if bound - current:
+        problems.append(Notice(Code.PROBE_LANDING_MISSING, count=len(bound - current)))
+    return problems
+
+
 def verify_landed(store: ObjectStore, reference: ManifestRef, selection: Selection, pins: Pins) -> tuple[CheckedFile, ...]:
     """The manifest entries of the probe once the passed manifest is confirmed and its payloads are the probe's. Raise before any payload is read.
 
@@ -147,6 +164,9 @@ def verify_landed(store: ObjectStore, reference: ManifestRef, selection: Selecti
     manifest = read_manifest(store, reference)
     if manifest.selection["selection_sha256"] != selection.selection_sha256:
         raise ProbeRefused(Notice(Code.PROBE_NOT_THIS))
+    problems = landing_problems(store.list_versions(LANDING_PREFIX), manifest.entries)
+    if problems:
+        raise ProbeRefused(Notice(Code.PROBE_REFUSED), *problems)
     entries = verify_before_read(store, reference)
     problems = landed_problems(entries, selection, pins)
     if problems:
@@ -177,6 +197,12 @@ def read_job(text: str) -> JobFacts:
     return JobFacts(record["status"], record["rowsSynced"], record["bytesSynced"])
 
 
+def is_error_line(line: str) -> bool:
+    """Whether a log line is an error or a trace, also after the prefix that ``kubectl logs --prefix --timestamps`` puts before it: ``[pod/name/container]``
+    and a timestamp, each optional."""
+    return ERROR_LINE.search(CAPTURE_PREFIX.sub("", line, count=1)) is not None
+
+
 def job_problems(job: JobFacts, log: str, file_count: int) -> list[Notice]:
     """Each way that Airbyte's record of the sync and its log do not show a clean copy of ``file_count`` files, in one pass."""
     problems = []
@@ -188,7 +214,7 @@ def job_problems(job: JobFacts, log: str, file_count: int) -> list[Notice]:
         problems.append(Notice(Code.JOB_BYTES))
     if not log.strip():
         problems.append(Notice(Code.LOG_EMPTY))
-    problems += [Notice(Code.LOG_ERROR_LINE, position=number) for number, line in enumerate(log.splitlines(), 1) if ERROR_LINE.search(line)]
+    problems += [Notice(Code.LOG_ERROR_LINE, position=number) for number, line in enumerate(log.splitlines(), 1) if is_error_line(line)]
     return problems
 
 
@@ -208,7 +234,7 @@ def sample_problems(entries: Sequence[CheckedFile], pins: Pins) -> list[Notice]:
             problems.append(Notice(Code.SAMPLE_NOT_CANDIDATE, position=position))
         elif (item.size_bytes, item.sha256) != (entry.size, entry.sha256):
             problems.append(Notice(Code.PROBE_PIN_DIFFERS, position=position))
-        elif not is_development(item.patient):
+        elif not is_development_candidate(item):
             problems.append(Notice(Code.SAMPLE_NOT_DEVELOPMENT, position=position))
         else:
             found.append(item)

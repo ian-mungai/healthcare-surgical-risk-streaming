@@ -19,6 +19,7 @@ from typing import Any
 from scripts.ingestion import connection
 from scripts.ingestion.connection import ConnectionDefinitionError, desired_state, fixed_sample_selection, full_release_selection
 from scripts.ingestion.selection import Selection
+from scripts.sample.split import is_development
 from tests.fast.ansible_paths import group_variables
 
 PIN = json.loads(Path("tests/fixtures/vitaldb/release.json").read_text())
@@ -83,12 +84,17 @@ class SelectionTest(unittest.TestCase):
 class FixedSampleTest(unittest.TestCase):
     def candidates(self) -> list[str]:
         lines = Path("tests/fixtures/vitaldb/candidates.tsv").read_text().splitlines()[1:]
-        return [line.split("\t")[2] for line in lines]
+        return [line.split("\t")[2] for line in lines if is_development(int(line.split("\t")[1]))]
 
-    def test_the_fixed_sample_is_the_tracked_candidates_and_the_two_tables(self) -> None:
+    def test_the_fixed_sample_is_the_development_candidates_and_the_two_tables(self) -> None:
         keys = set(fixed_sample_selection().source_keys)
         self.assertEqual({table["key"] for table in PIN["tables"]} | set(self.candidates()), keys)
-        self.assertEqual(15, len(keys))
+        self.assertEqual(11, len(keys))
+
+    def test_the_fixed_sample_selects_no_case_of_a_test_patient(self) -> None:
+        keys = set(fixed_sample_selection().source_keys)
+        for case in (565, 2367, 2535, 5105):
+            self.assertNotIn(f"{PREFIX}vital_files/{case:04d}.vital", keys)
 
     def test_the_sample_is_a_part_of_the_full_release_so_a_later_full_copy_adds_only_the_rest(self) -> None:
         self.assertLess(set(fixed_sample_selection().source_keys), set(full_release_selection().source_keys))
