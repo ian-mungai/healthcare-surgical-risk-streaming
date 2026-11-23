@@ -15,6 +15,7 @@ import io
 import json
 import math
 import os
+import threading
 import unittest
 from argparse import Namespace
 from typing import Any
@@ -22,7 +23,7 @@ from unittest import mock
 
 from scripts.stack.nessie import NessieConflict, NessieError
 from spark.settings import SettingsError
-from spark.split_cli import number_setting, open_client, run
+from spark.split_cli import number_setting, open_client, run, start_deadline
 from spark.split_table import PatientSplitError
 
 MARKER = "MARKER_8731"
@@ -109,27 +110,70 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual((1, "", "patient_split: two_sets: 1 patient\npatient_split: rule_mismatch: 1 patient\n"), (code, out, err))
 
 
+class DeadlineTest(unittest.TestCase):
+    """A deadline stops the process with a fixed code and never prints how long it was."""
+
+    def test_the_timer_prints_a_fixed_code_and_exits_124_without_the_duration(self) -> None:
+        exited = threading.Event()
+        codes: list[int] = []
+
+        def stop(code: int) -> None:
+            codes.append(code)
+            exited.set()
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            start_deadline(0.0517, exit_with=stop)
+            self.assertTrue(exited.wait(5), "the deadline did not fire within 5 seconds")
+        self.assertEqual(([124], "patient_split: timeout\n"), (codes, err.getvalue()))
+        self.assertNotIn("0.05", err.getvalue())
+
+
+class ReferenceNameTest(unittest.TestCase):
+    """A branch or base name that Nessie would refuse is a usage error before anything is called."""
+
+    def test_a_name_that_is_not_plain_is_a_usage_error_and_a_plain_name_is_not(self) -> None:
+        for argv in (
+            ["build", "--branch", ""],
+            ["build", "--branch", "a b"],
+            ["build", "--branch", "b", "--base", "x;y"],
+            ["verify", "--branch", "-x"],
+            ["build", "--branch", "b" * 200],
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = invoke(argv)
+                self.assertEqual((2, "", "patient_split: usage\n"), (code, out, err))
+        for name in ("main", "split_52c8bf", "p6_trunk_ab12.x-y", "a" * 128):
+            with self.subTest(name=name):
+                self.assertEqual(0, invoke(["build", "--branch", name, "--base", name])[0])
+
+
 class SettingsTest(unittest.TestCase):
     """A setting that cannot be parsed ends as ``settings`` and never shows its value."""
 
     def test_a_number_setting_is_read_or_defaulted(self) -> None:
         with mock.patch.dict(os.environ, {"X_SECONDS": "2.5"}):
-            self.assertEqual(2.5, number_setting("X_SECONDS", 9.0))
+            self.assertEqual(2.5, number_setting("X_SECONDS", 9.0, 100.0))
         with mock.patch.dict(os.environ):
             os.environ.pop("X_SECONDS", None)
-            self.assertEqual(9.0, number_setting("X_SECONDS", 9.0))
+            self.assertEqual(9.0, number_setting("X_SECONDS", 9.0, 100.0))
 
     def test_a_number_setting_that_is_not_a_positive_number_is_refused_without_its_value(self) -> None:
-        for value in (MARKER, "", "0", "-1", "nan", "inf", f"1{MARKER}"):
+        for value in (MARKER, "", "0", "-1", "nan", "inf", f"1{MARKER}", "1e100", "100.5"):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"X_SECONDS": value}), self.assertRaises(SettingsError) as caught:
-                number_setting("X_SECONDS", 9.0)
+                number_setting("X_SECONDS", 9.0, 100.0)
             self.assertNotIn(MARKER, str(caught.exception))
-        self.assertTrue(math.isfinite(number_setting("X_SECONDS", 9.0)))
+        self.assertTrue(math.isfinite(number_setting("X_SECONDS", 9.0, 100.0)))
 
     def test_a_nessie_address_with_a_bad_port_is_a_settings_error_without_its_text(self) -> None:
         with self.assertRaises(SettingsError) as caught:
             open_client(f"http://nessie:{MARKER}/api/v2", 1.0)
         self.assertNotIn(MARKER, str(caught.exception))
+
+    def test_a_nessie_address_that_is_not_plain_http_is_a_settings_error(self) -> None:
+        for uri in ("https://nessie:19120/api/v2", "ftp://nessie/api/v2", "nessie:19120", "http://", ""):
+            with self.subTest(uri=uri), self.assertRaises(SettingsError):
+                open_client(uri, 1.0)
 
     def test_a_marker_in_each_setting_of_the_job_reaches_no_output(self) -> None:
         job = importlib.import_module("spark.jobs.patient_split")

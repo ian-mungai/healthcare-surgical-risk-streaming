@@ -25,7 +25,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib
+import io
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -35,11 +37,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, get_args
+from unittest import mock
 
 from scripts.sample.candidates import CANDIDATES_FILE, SLOTS, read_candidates
 from scripts.sample.split import Part, patient_part
 from scripts.stack.nessie import NessieClient
-from spark import split_table
+from spark import split_cli, split_table
 from spark.split_table import (
     COLUMNS,
     PINNED_COUNTS,
@@ -900,6 +903,9 @@ class FakeSession:
         self.reads.append(("snapshot", name))
         return SimpleNamespace(currentSnapshot=lambda: SimpleNamespace(snapshotId=lambda: 5))
 
+    def stop(self) -> None:
+        return None
+
     def sql(self, text: str) -> Chain:
         self.sql_calls.append(text)
         return Chain(self)
@@ -1008,6 +1014,140 @@ class LakeAdapterTest(unittest.TestCase):
             self.build(session, AnsweringNessie(BASE))
         self.assertEqual(["inherited_empty: 0 rows"], caught.exception.problems)
         self.assertEqual(([], []), (session.sql_calls, session.writes))
+
+
+GOOD_SETTINGS = {
+    "NESSIE_URI": "http://nessie:19120/api/v2",
+    "WAREHOUSE_LOCATION": "file:///warehouse/",
+    "JOB_DEADLINE_SECONDS": "100",
+    "NESSIE_TIMEOUT_SECONDS": "5",
+}
+NOT_A_NUMBER = ["MARKER_8731", "0", "-1", "nan", "inf", "1e100", "", "1e9999"]
+S3 = "s3://bucket/prefix/"
+# One list of invalid inputs for each setting that the job reads: a value that is missing, empty, malformed or out of range.
+INVALID_SETTINGS: dict[str, list[dict[str, str | None]]] = {
+    "NESSIE_URI": [
+        {"NESSIE_URI": value}
+        for value in (None, "", "https://nessie:19120/api/v2", "http://nessie:MARKER_8731/api/v2", "http://nessie:19120/api/v1", "ftp://nessie/api/v2")
+    ],
+    "WAREHOUSE_LOCATION": [{"WAREHOUSE_LOCATION": value} for value in (None, "", "relative/path", "s3://", "http://bucket/prefix/")],
+    "AWS_REGION": [{"WAREHOUSE_LOCATION": S3, "AWS_REGION": ""}, {"WAREHOUSE_LOCATION": S3, "AWS_REGION": None}],
+    "JOB_DEADLINE_SECONDS": [{"JOB_DEADLINE_SECONDS": value} for value in NOT_A_NUMBER],
+    "NESSIE_TIMEOUT_SECONDS": [{"NESSIE_TIMEOUT_SECONDS": value} for value in NOT_A_NUMBER],
+}
+
+
+class Wire:
+    """The Nessie wire of the entry point: every request is recorded and the few that a build makes are answered."""
+
+    def __init__(self, events: list[Any], heads: Sequence[str] = (BASE,)) -> None:
+        self.events = events
+        self.heads = list(heads)
+        self.requests: list[tuple[str, str]] = []
+
+    def send(self, _client: Any, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
+        path = target.split("?")[0]
+        self.requests.append((method, path))
+        self.events.append(("wire", method, path))
+        if path.endswith("/config"):
+            return 200, b"{}"
+        if path.endswith("/entries"):
+            return 200, json.dumps({"entries": []}).encode()
+        if path.endswith("/history"):
+            return 200, json.dumps({"logEntries": []}).encode()
+        if method == "POST":
+            return 200, json.dumps({"reference": {"type": "BRANCH", "name": "b", "hash": BASE}}).encode()
+        head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
+        return 200, json.dumps({"reference": {"type": "BRANCH", "name": "b", "hash": head}}).encode()
+
+
+class EntryPointTest(unittest.TestCase):
+    """``main`` against a stand-in wire and a stand-in session: the order of its steps, what it does with a bad setting and what it writes when it must not."""
+
+    def drive(self, session: FakeSession, wire: Wire, argv: list[str], env: dict[str, str | None] | None = None) -> tuple[int, str, str, Any, Any]:
+        job = importlib.import_module("spark.jobs.patient_split")
+        settings = {**GOOD_SETTINGS, **(env or {})}
+        merged = {name: value for name, value in settings.items() if value is not None}
+        events = wire.events
+        original = job.read_fixed_sample
+
+        def sampled(path: Any) -> Any:
+            events.append(("sample",))
+            return original(path)
+
+        def build(*_arguments: Any) -> FakeSession:
+            events.append(("session",))
+            return session
+
+        with (
+            mock.patch.dict(os.environ, merged, clear=False),
+            mock.patch.object(NessieClient, "send", autospec=True, side_effect=wire.send),
+            mock.patch.object(job, "build_session", side_effect=build) as session_built,
+            mock.patch.object(job, "start_deadline", side_effect=lambda *_a, **_k: events.append(("deadline",))) as timer,
+            mock.patch.object(job, "read_fixed_sample", side_effect=sampled),
+        ):
+            for name, value in settings.items():
+                if value is None:
+                    os.environ.pop(name, None)
+            code, out, err = call_main(job.main, argv)
+        return code, out, err, session_built, timer
+
+    def test_every_setting_the_job_reads_is_listed_and_each_has_invalid_cases(self) -> None:
+        root = Path(split_table.__file__).parent
+        found: set[str] = set()
+        for path in (root / "jobs" / "patient_split.py", root / "split_cli.py", root / "session.py"):
+            found |= set(re.findall(r'(?:environ\.get|required_environment|required_setting|number_setting)\(\s*"([A-Z_]+)"', path.read_text()))
+        self.assertEqual(set(split_cli.SETTING_NAMES), found)
+        self.assertEqual(set(split_cli.SETTING_NAMES), set(INVALID_SETTINGS))
+        self.assertTrue(all(INVALID_SETTINGS.values()))
+
+    def test_each_invalid_setting_ends_as_settings_with_no_remote_call_no_session_and_no_timer(self) -> None:
+        for name, cases in INVALID_SETTINGS.items():
+            for case in cases:
+                for mode in (["build", "--branch", "b"], ["verify", "--branch", "b"]):
+                    events: list[Any] = []
+                    wire = Wire(events)
+                    session = FakeSession()
+                    with self.subTest(setting=name, case=case, mode=mode[0]):
+                        code, out, err, built, timer = self.drive(session, wire, mode, case)
+                        self.assertEqual((2, "", "patient_split: settings\n"), (code, out, err))
+                        self.assertEqual(([], [], False, False), (wire.requests, events, built.called, timer.called))
+
+    def test_every_local_step_is_done_before_the_first_remote_call(self) -> None:
+        events: list[Any] = []
+        wire = Wire(events)
+        session = FakeSession(missing=("clinical_cases",))
+        sample = str(CANDIDATES_FILE)
+        self.drive(session, wire, ["build", "--branch", "b", "--fixed-sample", sample], None)
+        first = next(index for index, event in enumerate(events) if event[0] == "wire")
+        self.assertEqual({("sample",), ("deadline",), ("session",)}, {event for event in events[:first] if event[0] != "wire"})
+        self.assertEqual([], [event for event in events[first:] if event[0] in ("sample", "deadline", "session")])
+
+    def test_a_source_table_that_is_missing_commits_no_namespace_and_writes_nothing(self) -> None:
+        wire = Wire([])
+        session = FakeSession(missing=("clinical_cases",))
+        code, out, err, _, _ = self.drive(session, wire, ["build", "--branch", "b"])
+        self.assertEqual((1, "", "patient_split: source_table: 0 tables\n"), (code, out, err))
+        self.assertEqual(([], []), (session.sql_calls, session.writes))
+        self.assertEqual(["POST"], [method for method, _ in wire.requests if method != "GET"])
+
+    def test_a_branch_that_moved_commits_no_namespace_and_writes_nothing(self) -> None:
+        wire = Wire([], heads=(BASE, "12" * 32))
+        session = FakeSession(missing=("patient_split",))
+        code, out, err, _, _ = self.drive(session, wire, ["build", "--branch", "b"])
+        self.assertEqual((1, "", "patient_split: branch_moved: the branch head is not the one that was checked\n"), (code, out, err))
+        self.assertEqual(([], []), (session.sql_calls, session.writes))
+
+
+def call_main(main: Callable[[list[str]], int], argv: list[str]) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = main(argv)
+        except SystemExit as stop:
+            code = int(stop.code or 0)
+    return code, out.getvalue(), err.getvalue()
 
 
 def all_messages() -> list[str]:

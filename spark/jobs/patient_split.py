@@ -14,6 +14,7 @@ still has it. The hash of the write is taken from the branch's log: the head, on
 table's namespace is a commit of its own, made only after every check passed and the head was confirmed, so a failed check or a moved branch writes
 nothing. The table is read again at that hash, and the job ends with ``branch_moved`` when the branch no longer has the hash that it checked.
 The result names that hash, the hash of the write and nothing derived from the rows.
+Every local input is validated before the first call to Nessie, so a bad input never leaves a branch that blocks the retry.
 
 The table is frozen. When the branch already holds the table (merged earlier), that table must be valid by itself (rows, no patient twice, one rule
 version) and a rebuild that would change a set, drop a patient or use another rule version fails before it writes. A rebuild that changes nothing writes
@@ -30,16 +31,15 @@ Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AW
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from collections.abc import Sequence
 from typing import Any
 from urllib.parse import quote
 
 from scripts.stack.nessie import NessieClient
-from spark.session import build_session, required_environment, start_deadline
+from spark.session import build_session
 from spark.settings import CATALOG
-from spark.split_cli import number_setting, open_client, run
+from spark.split_cli import open_client, read_settings, run, start_deadline
 from spark.split_table import (
     BRANCH_MOVED,
     COLUMNS,
@@ -66,8 +66,6 @@ TARGET_NAMESPACE = "silver"
 TARGET_NAME = f"{TARGET_NAMESPACE}.patient_split"
 TABLE_KEY = (TARGET_NAMESPACE, "patient_split")
 WRITE_CATALOG = CATALOG
-DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
-DEFAULT_JOB_DEADLINE_SECONDS = 900.0
 
 
 class Lake:
@@ -159,23 +157,19 @@ class Lake:
 
 
 def execute(arguments: argparse.Namespace) -> dict[str, Any]:
-    """Run one call: create the branch (build) or find it (verify), resolve its hash once and check or build the table at that hash."""
+    """Run one call. Every local step comes first: the settings, the Nessie client, the candidate file, the deadline and the Spark session. Then the first call
+    to Nessie, which creates the branch (build) or finds it (verify), resolves its hash once and checks or builds the table at that hash."""
     session = None
     try:
-        deadline = number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)
-        client = open_client(required_environment("NESSIE_URI"), number_setting("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS))
-        start_deadline(deadline, JOB)
+        settings = read_settings()
+        client = open_client(settings.nessie_uri, settings.nessie_timeout_seconds)
         sample = None if arguments.fixed_sample is None else read_fixed_sample(arguments.fixed_sample)
+        start_deadline(settings.deadline_seconds)
+        session = build_session(JOB, arguments.branch)
+        lake = Lake(session, client, arguments.branch, {"nessie_uri": settings.nessie_uri, "warehouse": settings.warehouse, "region": settings.region})
         client.config()
         building = arguments.mode == "build"
         base = client.create_branch(arguments.branch, arguments.base).hash if building else client.reference(arguments.branch).hash
-        session = build_session(JOB, arguments.branch)
-        settings = {
-            "nessie_uri": required_environment("NESSIE_URI"),
-            "warehouse": required_environment("WAREHOUSE_LOCATION"),
-            "region": os.environ.get("AWS_REGION", ""),
-        }
-        lake = Lake(session, client, arguments.branch, settings)
         operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash, lake.prepare)
         outcome = (run_build if building else run_verify)(operations, base, pinned=arguments.pinned_release, sample=sample)
         return {
