@@ -146,6 +146,11 @@ class Causes(unittest.TestCase):
             with self.subTest(rate=rate):
                 self.assertEqual(Verdict(False, INCOMPLETE), arterial(second(100.0, 120.0, 100.0, 120.0), rate=rate))
 
+    def test_a_rate_with_a_fraction_is_not_cut_to_a_whole_rate(self) -> None:
+        for rate in (4.5, 4.000001, 3.999999):
+            with self.subTest(rate=rate):
+                self.assertEqual(Verdict(False, INCOMPLETE), arterial(second(100.0, 120.0, 100.0, 120.0), rate=rate))
+
     def test_a_whole_rate_given_as_a_float_is_a_whole_rate(self) -> None:
         self.assertEqual(VALID, arterial(second(100.0, 120.0, 100.0, 120.0), rate=4.0))
 
