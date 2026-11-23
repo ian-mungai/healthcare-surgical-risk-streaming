@@ -1189,6 +1189,48 @@ class StagingTest(unittest.TestCase):
         self.assertEqual([{"reading": "staging", "cause": "timeout"}], line["missing"])
         self.assertLessEqual(len(calls), 3, "the expansion stops when the deadline has passed")
 
+    def test_the_final_lookups_of_the_matches_stop_at_the_deadline_and_none_starts_after_it(self) -> None:
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "stage"
+            root.mkdir()
+            for number in range(9):
+                (root / f"part_{number}.bin").write_bytes(b"x")
+            real = os.lstat
+            started: list[float] = []
+
+            def slow(path: Any, *args: Any, **keywords: Any) -> os.stat_result:
+                if str(path).startswith(str(root)):
+                    started.append(clock.now)
+                    clock.now += 0.065
+                return real(path, *args, **keywords)
+
+            with mock.patch("scripts.stack.capacity_sampler.os.lstat", slow):
+                _, output = staging_run(folder, [StagingSource("copy_stage", str(root / "*"))], max_seconds=0.15, interval=0.15, clock=clock)
+            line = sample_lines(output)[0]
+        deadline = 1000.0 + 0.15
+        self.assertEqual([{"reading": "staging", "cause": "timeout"}], line["missing"])
+        self.assertEqual([], [moment for moment in started if moment > deadline], "no lookup starts after the deadline")
+
+    def test_a_pattern_that_ends_with_a_slash_matches_folders_only_and_not_a_file_or_a_link(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / "stage"
+            (stage / "dir_a").mkdir(parents=True)
+            (stage / "dir_a" / "part.bin").write_bytes(b"x" * 100)
+            (stage / "file.bin").write_bytes(b"x" * 1000)
+            (stage / "link").symlink_to(stage / "dir_a")
+            _, wildcard = staging_run(folder, [StagingSource("copy_stage", str(stage) + "/*/")], max_seconds=0.25)
+            second = Path(folder) / "second"
+            second.mkdir()
+            _, literal = staging_run(str(second), [StagingSource("copy_stage", str(stage / "file.bin") + "/")], max_seconds=0.25)
+            third = Path(folder) / "third"
+            third.mkdir()
+            _, plain = staging_run(str(third), [StagingSource("copy_stage", str(stage / "*"))], max_seconds=0.25)
+            wildcard_row, literal_row, plain_row = staging_rows(wildcard)[0], staging_rows(literal)[0], staging_rows(plain)[0]
+        self.assertEqual((1, 100), (wildcard_row["matches"], wildcard_row["apparent_bytes"]))
+        self.assertEqual(0, literal_row["matches"])
+        self.assertEqual(3, plain_row["matches"], "the same pattern with no slash matches the file and the link as well")
+
     def test_the_header_names_each_pattern_under_the_staging_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             _, output = staging_run(folder, [StagingSource("copy_stage", "/a/*/b")], max_seconds=0.25)

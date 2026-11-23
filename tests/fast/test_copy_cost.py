@@ -247,8 +247,31 @@ class RunWindowTest(unittest.TestCase):
         old, new = "2026-11-23T08:00:00+00:00", "2026-11-23T12:00:00+00:00"
         _, record, _ = self.run_with(result_for(times=(old, new, old, new)), "--since", "2026-11-23T11:00:00Z", "--until", "2026-11-23T13:00:00Z")
         written = SIZES[1] + SIZES[3]
-        self.assertEqual({"since": "2026-11-23T11:00:00+00:00", "until": "2026-11-23T13:00:00+00:00"}, record["window"])
+        self.assertEqual({"since": "2026-11-23T11:00:00+00:00", "until": "2026-11-23T13:00:00+00:00", "time_precision_seconds": 1}, record["window"])
         self.assertEqual(str((Decimal(written) / Decimal(GIB) * INTER_REGION_PER_GIB).quantize(SIX_PLACES)), record["transfer_cost_usd"]["if_requester_pays"])
+
+    def test_a_window_time_with_a_fraction_of_a_second_is_refused_with_no_output_and_echoes_nothing(self) -> None:
+        for window in (
+            ("--since", "2026-11-23T11:00:00.250Z"),
+            ("--since", "2026-11-23T11:00:00Z", "--until", "2026-11-23T12:00:00.800+00:00"),
+            ("--since", "2026-11-23T11:00:00.000001+02:00"),
+        ):
+            with self.subTest(window=window):
+                code, record, err = self.run_with(result_for(), *window)
+                self.assertEqual((1, {}), (code, record))
+                self.assertIn("whole second", err)
+                self.assertEqual([], [word for word in ("250", "800", "000001") if word in err])
+
+    def test_a_window_time_written_with_a_zero_fraction_is_a_whole_second_and_is_accepted(self) -> None:
+        code, record, _ = self.run_with(result_for(), "--since", "2026-11-23T09:00:00.000Z")
+        self.assertEqual(0, code)
+        self.assertEqual(len(SIZES), record["copy"]["payload_objects"])
+
+    def test_the_precision_of_one_second_is_in_the_help_text_and_in_the_record(self) -> None:
+        _, helped, _ = run("--help")
+        self.assertEqual(2, " ".join(helped.split()).count("in whole seconds"), "both options say it")
+        _, record, _ = self.run_with(result_for(), "--since", "2026-11-23T09:00:00Z")
+        self.assertEqual(1, record["window"]["time_precision_seconds"])
 
     def test_the_extra_objects_of_a_run_that_wrote_no_payload_are_still_counted(self) -> None:
         _, record, _ = self.run_with(result_for(), "--since", "2026-11-23T11:00:00Z", extra="2")

@@ -189,8 +189,8 @@ class RefusalTest(unittest.TestCase):
             odd = [copy_lines()[0], {"kind": "mystery"}]
             self.assertTrue(self.refused(copy=odd))
 
-    def test_a_reading_that_is_not_a_number_is_refused_as_a_file_not_in_the_sampler_s_form(self) -> None:
-        lines = [copy_lines()[0], sample(0, 150000.0, rows(**{STAGE: 1, CHECKS: 1})), sample(1, "lots", rows(**{STAGE: 2, CHECKS: 2}))]  # type: ignore[arg-type]
+    def test_a_sample_line_that_lacks_a_field_is_refused_as_a_file_not_in_the_sampler_s_form(self) -> None:
+        lines = [copy_lines()[0], sample(0, 150000.0, rows(**{STAGE: 1, CHECKS: 1})), {"kind": "sample", "seq": 1}]
         self.assertIn("not in the form", self.refused(copy=lines))
 
     def test_the_header_must_come_first_and_the_end_line_last_and_each_once(self) -> None:
@@ -242,6 +242,38 @@ class RefusalTest(unittest.TestCase):
             with self.subTest(name=name):
                 lines = [header(staging={name: pattern}), sample(0, 150000.0, rows(**{name: 1}))]
                 self.assertIn("staging", self.refused(copy=lines))
+
+    def test_a_free_disk_reading_that_is_not_a_finite_number_is_refused_whatever_its_form(self) -> None:
+        for bad in (float("nan"), float("inf"), -float("inf"), True, "5", [1]):
+            with self.subTest(bad=repr(bad)):
+                lines = [copy_lines()[0], sample(0, 150000.0, rows(**{STAGE: 1, CHECKS: 1})), sample(1, bad, rows(**{STAGE: 2, CHECKS: 2}))]  # type: ignore[arg-type]
+                self.assertIn("figure", self.refused(copy=lines))
+
+    def test_a_sample_number_that_is_not_a_whole_number_is_refused_whatever_its_form(self) -> None:
+        for bad in ("1", 1.5, True, None, float("nan"), -1):
+            with self.subTest(bad=repr(bad)):
+                lines = copy_lines()
+                lines[2] = {**lines[2], "seq": bad}
+                self.assertIn("figure", self.refused(copy=lines))
+
+    def test_an_interval_that_is_not_a_finite_number_above_zero_is_refused(self) -> None:
+        for bad in (float("nan"), float("inf"), 0, -5.0, "5", True):
+            with self.subTest(bad=repr(bad)):
+                lines = copy_lines()
+                lines[0] = {**lines[0], "interval_seconds": bad}
+                self.assertIn("header", self.refused(copy=lines))
+
+    def test_the_apparent_peak_has_its_own_sample_number_where_it_came_first(self) -> None:
+        def line(seq: int, apparent: int, allocated: int) -> dict[str, Any]:
+            row = {"name": STAGE, "matches": 1, "files": 1, "apparent_bytes": apparent, "allocated_bytes": allocated}
+            return {"kind": "sample", "seq": seq, "missing": [], "host": {"free_disk_mib": 8.0}, "staging": {"rows": [row]}}
+
+        lines = [header(staging={STAGE: PATTERNS[STAGE]}), line(0, 10, 4096), line(1, 900, 8192), line(2, 950, 8192), line(3, 950, 4096)]
+        with tempfile.TemporaryDirectory() as folder:
+            figures = summarize({"copy": write(folder, "copy.jsonl", lines), "retry": write(folder, "retry.jsonl", retry_lines())}, {})["phases"]["copy"][
+                "staging"
+            ][0]
+        self.assertEqual((8192, 1, 950, 2), (figures["peak_allocated_bytes"], figures["at_seq"], figures["peak_apparent_bytes"], figures["apparent_at_seq"]))
 
     def test_a_header_whose_free_disk_source_or_interval_is_not_a_plain_value_is_refused(self) -> None:
         for change in (

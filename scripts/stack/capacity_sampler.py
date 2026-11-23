@@ -262,7 +262,7 @@ def expand_pattern(pattern: str, deadline: float, clock: Clock) -> list[str]:
     A segment with no wildcard is joined as written. A segment with a wildcard lists the folder reached so far and keeps the names that match, never a name
     that starts with a dot unless the segment does. A link at a wildcard position is not followed: it is a match only at the last segment, where it counts as
     itself. A name or folder that is gone is skipped. Any other failure, a folder that may not be read among them, ends the reading, so an unreadable folder
-    is never an empty one. A reading that passes ``deadline`` is a timeout.
+    is never an empty one. A pattern that ends with a slash matches folders only. A walk that passes ``deadline`` is a timeout, and no lookup starts after it.
     """
     segments = [segment for segment in pattern.split("/") if segment]
     found: list[str] = []
@@ -293,16 +293,21 @@ def expand_pattern(pattern: str, deadline: float, clock: Clock) -> list[str]:
                 except FileNotFoundError:
                     continue
             pending.append((path, index + 1))
-    return [path for path in found if exists(path)]
+    matched = []
+    for path in found:
+        if clock() > deadline:
+            raise Failure("timeout")
+        if exists(path, folder=pattern.endswith("/")):
+            matched.append(path)
+    return matched
 
 
-def exists(path: str) -> bool:
-    """Whether a path names something, itself and not what a link leads to. Only a name that is not there is False: a folder that may not be read raises."""
+def exists(path: str, *, folder: bool = False) -> bool:
+    """Whether a path names something, itself and not what a link leads to; with ``folder``, a folder. Only a name that is not there is False."""
     try:
-        os.lstat(path)
+        return stat.S_ISDIR(os.lstat(path).st_mode) or not folder
     except FileNotFoundError, NotADirectoryError:
         return False
-    return True
 
 
 def staging_row(source: StagingSource, deadline: float, clock: Clock) -> dict[str, Any]:

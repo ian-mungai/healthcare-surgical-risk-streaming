@@ -102,7 +102,7 @@ class CostReadTest(unittest.TestCase):
 
     AWS's service authorization reference for AWS Cost Explorer lists ``ce:GetCostAndUsage`` at the Read access level, with the optional resource type
     ``billingview`` and no required one, so a call that names no billing view is allowed only on ``*``
-    (https://docs.aws.amazon.com/service-authorization/latest/reference/list_awscostexplorerservice.html, read Nov 23 2026).
+    (https://docs.aws.amazon.com/service-authorization/latest/reference/list_ce.html, read Nov 23 2026).
     """
 
     def statements(self) -> list[dict[str, Any]]:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -65,8 +66,8 @@ def sampler_lines(phase: str, path: Path) -> tuple[dict[str, Any], list[dict[str
     return found[0], samples, found[-1]
 
 
-def plain_number(value: object) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool)
+def finite_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def check_header(phase: str, header: Mapping[str, Any]) -> None:
@@ -75,7 +76,7 @@ def check_header(phase: str, header: Mapping[str, Any]) -> None:
     free_source = sources["free_disk"]
     patterns = sources.get("staging", {})
     plain = isinstance(free_source, str) and not any(ord(character) < 32 for character in free_source)
-    if not plain or not plain_number(header["interval_seconds"]) or not isinstance(patterns, dict):
+    if not plain or not (finite_number(header["interval_seconds"]) and header["interval_seconds"] > 0) or not isinstance(patterns, dict):
         raise SummaryError(f"the {phase} file's header holds a value that is not in the sampler's form")
     try:
         for name, pattern in patterns.items():
@@ -95,12 +96,14 @@ def phase_summary(phase: str, path: Path, limits: Mapping[str, int]) -> dict[str
     if end["reason"] not in END_REASONS:
         raise SummaryError(f"the {phase} file's end line has a reason that the sampler does not write")
     free: list[tuple[float, int]] = []
-    peaks: dict[str, dict[str, int]] = {name: {"readings": 0, "allocated": -1, "apparent": -1, "at_seq": -1} for name in patterns}
+    peaks: dict[str, dict[str, int]] = {name: {"readings": 0, "allocated": -1, "apparent": -1, "at_seq": -1, "apparent_at_seq": -1} for name in patterns}
     missing: Counter[str] = Counter()
     for line in samples:
         if any(item["reading"] not in READINGS for item in line["missing"]):
             raise SummaryError(f"the {phase} file names a missing reading that the sampler does not write")
         missing.update(item["reading"] for item in line["missing"])
+        if type(line["seq"]) is not int or line["seq"] < 0 or ("host" in line and not finite_number(line["host"]["free_disk_mib"])):
+            raise SummaryError(f"the {phase} file holds a figure that is not a finite number or a whole sample number")
         if "host" in line:
             free.append((line["host"]["free_disk_mib"], line["seq"]))
         for row in line["staging"]["rows"] if "staging" in line else ():
@@ -108,7 +111,8 @@ def phase_summary(phase: str, path: Path, limits: Mapping[str, int]) -> dict[str
                 raise SummaryError(f"the {phase} file has a staging name that is not in the header")
             peak = peaks[row["name"]]
             peak["readings"] += 1
-            peak["apparent"] = max(peak["apparent"], row["apparent_bytes"])
+            if row["apparent_bytes"] > peak["apparent"]:
+                peak["apparent"], peak["apparent_at_seq"] = row["apparent_bytes"], line["seq"]
             if row["allocated_bytes"] > peak["allocated"]:
                 peak["allocated"], peak["at_seq"] = row["allocated_bytes"], line["seq"]
     if not free:
@@ -125,6 +129,7 @@ def phase_summary(phase: str, path: Path, limits: Mapping[str, int]) -> dict[str
             "peak_allocated_bytes": peak["allocated"],
             "peak_apparent_bytes": peak["apparent"],
             "at_seq": peak["at_seq"],
+            "apparent_at_seq": peak["apparent_at_seq"],
             "readings": peak["readings"],
         }
         if name in limits:

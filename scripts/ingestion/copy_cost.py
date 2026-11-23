@@ -6,7 +6,8 @@
 The result is the file ``scripts.ingestion.cli check`` wrote. It must be a passed result that was not edited. The connection is incremental, so a run
 writes only the versions that are new, while the result lists every verified version. The estimate counts the versions whose retrieval time (the time S3
 gives the written version) is at or after ``--since`` and, when ``--until`` is given, before it: the start and the end of this copy, as ISO 8601 times with
-a zone. A run that wrote nothing estimates zero payload writes. ``--extra-objects`` is the number of other objects this run landed under the landing
+a zone, in whole seconds: S3 records a version's time to the whole second, so a fraction is refused. A run that wrote nothing estimates zero
+payload writes. ``--extra-objects`` is the number of other objects this run landed under the landing
 prefix (the metadata records), which the result does not list; the owner reads it from the bucket's listing. The record holds counts, bytes, prices and
 money, never a key, a bucket, a version or a label of the result. The same result gives the same bytes. The output is a new file for its owner only.
 
@@ -105,6 +106,8 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int, since: dat
         raise CostError("the code holds no prices for this region")
     if extra_objects < 0:
         raise CostError("the number of extra objects is below zero")
+    if since.microsecond or (until is not None and until.microsecond):
+        raise CostError("a time of the window is not a whole second")
     if until is not None and until <= since:
         raise CostError("the end of the window is not after its start")
     if any(file.size < 0 for file in result.files):
@@ -127,7 +130,7 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int, since: dat
             "put_tier_usd_per_request": str(price.normalize()),
             "inter_region_out_usd_per_gib": str(INTER_REGION_OUT_USD_PER_GIB[PUBLISHER_REGION].normalize()),
         },
-        "window": {"since": since.isoformat(), "until": until.isoformat() if until else None},
+        "window": {"since": since.isoformat(), "until": until.isoformat() if until else None, "time_precision_seconds": 1},
         "copy": {"verified_objects": len(result.files), "payload_objects": len(sizes), "payload_bytes": sum(sizes), "extra_objects": extra_objects},
         "write_requests": {"low": low, "high": high},
         "request_cost_usd": request_cost,
@@ -173,8 +176,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = QuietParser(prog="python -m scripts.ingestion.copy_cost", description=(__doc__ or "").split("\n\n")[0])
     command.add_argument("--result", type=Path, required=True, help="the passed check result of the copy")
     command.add_argument("--region", required=True, help="the region of the project's bucket and of the host")
-    command.add_argument("--since", type=instant_argument, required=True, help="the start of the copy, an ISO 8601 time with a zone")
-    command.add_argument("--until", type=instant_argument, help="the end of the copy, an ISO 8601 time with a zone; the run's last write when absent")
+    command.add_argument(
+        "--since",
+        type=instant_argument,
+        required=True,
+        help="the start of the copy, an ISO 8601 time with a zone, in whole seconds because S3 records a version's time to the whole second",
+    )
+    command.add_argument("--until", type=instant_argument, help="the end of the copy, in whole seconds as for --since; the run's last write when absent")
     command.add_argument("--extra-objects", type=whole_number, default=0, help="the other objects the copy landed under the landing prefix")
     command.add_argument("--output", type=Path, required=True, help="a new file for the record")
     arguments = command.parse_args(argv)
