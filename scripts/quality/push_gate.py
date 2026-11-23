@@ -37,7 +37,7 @@ from scripts.quality import repo_checks
 
 ROOT = Path(__file__).resolve().parents[2]
 # The version of this gate. ``make setup`` installs the shared pre-push hook for it, and the hook refuses a worktree whose gate is older or missing.
-GATE_VERSION = 3
+GATE_VERSION = 4
 TRACKED = "tracked changes"
 SECRETS = "secret scan"
 MESSAGES = "commit messages"
@@ -343,7 +343,9 @@ def commit_message_problems(commits: list[str]) -> str | None:
 
 
 def privacy_problems() -> str | None:
-    findings, unreviewed = repo_checks.privacy_scan()
+    """The privacy scan of the tracked blobs of HEAD, which the head check has bound to the pushed commit. The working tree does not count: a sparse checkout
+    leaves tracked files out of it."""
+    findings, unreviewed = repo_checks.privacy_scan(commit=git("rev-parse", "HEAD").strip())
     lines = [*unreviewed, *(f"{repo_checks.on_one_line(finding.location)}: {finding.problem}\n  fix: {finding.fix}" for finding in findings)]
     return "\n".join(lines) or None
 

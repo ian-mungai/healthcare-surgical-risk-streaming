@@ -11,7 +11,7 @@ import fnmatch
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,13 +159,18 @@ def commit_range(revisions: str) -> list[Finding]:
     return [*findings, *message_secret_findings("\n\n".join(messages))] if messages else findings
 
 
-def read_allowlist() -> tuple[list[tuple[str, str]], list[Finding]]:
+def read_allowlist(commit: str | None = None) -> tuple[list[tuple[str, str]], list[Finding]]:
+    """The reasoned allowlist of the working tree, or of ``commit`` when one is given."""
     entries: list[tuple[str, str]] = []
     findings: list[Finding] = []
     kinds = [*PRIVACY_PATTERNS, "env-value"]
-    if not Path(ALLOWLIST).exists():
+    if commit is None:
+        source = Path(ALLOWLIST).read_text() if Path(ALLOWLIST).exists() else None
+    else:
+        source = next((data.decode("utf-8", "replace") for path, data in committed_files(commit, [ALLOWLIST])), None)
+    if source is None:
         return entries, findings
-    for number, line in enumerate(Path(ALLOWLIST).read_text().splitlines(), 1):
+    for number, line in enumerate(source.splitlines(), 1):
         text = "" if line.lstrip().startswith("#") else line.strip()
         if not text:
             continue
@@ -205,15 +210,47 @@ def line_privacy(line: str, values: list[str]) -> list[str]:
     return kinds
 
 
-def privacy_scan() -> tuple[list[Finding], list[str]]:
-    allowed, findings = read_allowlist()
+def committed_files(commit: str, only: list[str] | None = None) -> list[tuple[str, bytes]]:
+    """The tracked blobs of ``commit`` with their contents, read from Git's objects: a symbolic link, a submodule and a file that a sparse checkout left out
+    of the working tree are all judged by what the commit holds. ``only`` names the paths to read."""
+    listed = git("ls-tree", "-r", "-z", "--full-tree", commit, keep_newlines=True)
+    wanted: list[tuple[str, str]] = []
+    for entry in filter(None, listed.split("\0")):
+        meta, _, path = entry.partition("\t")
+        mode, kind, sha = meta.split()
+        if kind == "blob" and mode != "120000" and (only is None or path in only):
+            wanted.append((path, sha))
+    if not wanted:
+        return []
+    answer = run_command(
+        "git", ["cat-file", "--batch"], input_text="".join(f"{sha}\n" for _, sha in wanted), timeout=GIT_TIMEOUT_SECONDS, check=True, keep_newlines=True
+    ).stdout
+    raw = os.fsencode(answer)
+    files: list[tuple[str, bytes]] = []
+    position = 0
+    for path, sha in wanted:
+        end = raw.index(b"\n", position)
+        header = raw[position:end].split()
+        if len(header) != 3 or header[0].decode() != sha or header[1] != b"blob":
+            raise SystemExit(f"cannot read the blob {sha} of {path!r} in {commit}")
+        size = int(header[2])
+        files.append((path, raw[end + 1 : end + 1 + size]))
+        position = end + 1 + size + 1
+    return files
+
+
+def privacy_scan(commit: str | None = None) -> tuple[list[Finding], list[str]]:
+    """Scan every file that Git does not ignore, or, with ``commit``, every tracked blob of that commit and its own allowlist: what a push publishes."""
+    allowed, findings = read_allowlist(commit)
     values = env_values()
     unreviewed = []
     descriptions = {kind: description for kind, (description, _) in PRIVACY_PATTERNS.items()} | {"env-value": "value declared in .env"}
-    for path in visible_files():
-        if os.path.islink(path) or not os.path.isfile(path):
-            continue
-        data = Path(path).read_bytes()
+    sources: Iterable[tuple[str, bytes]]
+    if commit is None:
+        sources = [(path, Path(path).read_bytes()) for path in visible_files() if not os.path.islink(path) and os.path.isfile(path)]
+    else:
+        sources = committed_files(commit)
+    for path, data in sources:
         if b"\0" in data[:8192]:
             unreviewed.append(f"{on_one_line(path)}: unreviewed: cannot be read as text; inspect it before publishing")
             continue
@@ -234,10 +271,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("check", choices=["credential-files", "data-files", "commit-msg", "commit-range", "privacy-scan"])
     parser.add_argument("paths", nargs="*")
-    parser.add_argument("--all", action="store_true", help="privacy-scan: every file Git does not ignore, which is the only scope")
+    parser.add_argument("--all", action="store_true", help="privacy-scan: every file Git does not ignore")
+    parser.add_argument("--commit", help="privacy-scan: the tracked blobs of this commit instead of the working tree (what a push publishes)")
     args = parser.parse_args()
     if args.check == "privacy-scan":
-        findings, unreviewed = privacy_scan()
+        findings, unreviewed = privacy_scan(args.commit)
         for line in unreviewed:
             sys.stderr.write(f"{line}\n")
         return report(findings)

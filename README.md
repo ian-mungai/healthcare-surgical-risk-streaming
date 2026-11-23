@@ -24,6 +24,13 @@ Each check runs at the cheapest layer that can do its job, and hosted CI runs ev
 2. **Push gate, about 40 seconds for one commit (2 minutes at most), before every push to any branch** (a plain Git `pre-push` hook that `make setup` installs, `scripts/quality/push_gate.py`): it reads what Git sends and checks every commit that the remote ref in Git's input does not hold, and the whole history for a new ref, because the receiver's history is not known. It refuses a push while tracked files have uncommitted changes, then runs the secret scan of the diffs (merge diffs included) and of whole commit messages, the commit messages, the privacy scan, the changed files' own checks (Ruff, MyPy, Terraform's formatter and the quick test modules that cover the changed files; a rename or delete of a Python file runs the whole quick group) and the dependency scan when a lock file changes. One hook is shared by every worktree and refuses a push from a worktree whose gate is missing or older than the version that `make setup` installed it for (run `make setup` or rebase). A push that sends nothing, or only deletes, runs nothing. There is no full local run before a push.
 3. **Hosted CI** (`.github/workflows/ci.yml`): every check in full on each push of a work branch, each pull request, the commit that a squash merge creates on `main`, every Monday and on demand. The manual-stage hooks also scan every lock file (Trivy) and every commit message of the history for secrets. A separate headroom job, outside the required check, waits for the required job and fails any job that used over 80% of its timeout, is missing from the run or has no limit. `main` moves only through a pull request that is up to date with `main` and squash-merged after the required check passes (a recorded exception to the check-first default).
 
+Recorded limits of the push gate (owner, Nov 23 2026, "A"; neither skips a check that publishes data):
+
+- With `diff.renames=false` in a Git configuration, Git reports a rename as a delete and an add, so the changed-file checks select fewer quick test modules. The hosted run still runs every test.
+- A `make setup` run from a worktree that holds an older gate can leave a pre-push hook that calls itself. It blocks the push and never skips a check.
+
+The privacy scan in the gate reads the tracked blobs of the pushed commit, not the working tree, so a sparse checkout cannot hide a file from it.
+
 Terraform providers are pinned by hash in `infra/.terraform.lock.hcl` and are not vulnerability-scanned: Trivy 0.76.2 detects no package in a Terraform lock file.
 
 Run the checks from the repository root.

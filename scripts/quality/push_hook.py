@@ -13,6 +13,8 @@ push that sent only deletes) and the ``pre-push`` script that ``pre-commit insta
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 from scripts.quality import push_gate, worktree_scan_hook
@@ -44,9 +46,16 @@ _VERSION_CHECK = (
 )
 
 
+# An input that cannot be read is a failed push, not an empty one: the status of ``cat`` decides.
+_READ_INPUT = (
+    'refs="$(cat)" || {\n  echo "push gate stopped by input: the list of refs that Git sends could not be read, so what is sent is unknown" >&2\n  exit 1\n}\n'
+)
+
+
 def hook_text(version: int) -> str:
     """The shared hook for gate ``version``: it refuses a worktree whose gate is missing, has no version constant or is older, and otherwise runs the gate."""
-    return ROUND_TWO_TEXT.replace("#!/bin/sh\n", "#!/bin/sh\n" + _VERSION_CHECK.replace("@VERSION@", str(version)), 1)
+    checked = ROUND_TWO_TEXT.replace("#!/bin/sh\n", "#!/bin/sh\n" + _VERSION_CHECK.replace("@VERSION@", str(version)), 1)
+    return checked.replace('refs="$(cat)"\n', _READ_INPUT, 1)
 
 
 HOOK_TEXT = hook_text(REQUIRED_GATE_VERSION)
@@ -93,23 +102,44 @@ def installed(root: Path) -> bool:
     return worktree_scan_hook.installed(root, PUSH_HOOK) and not predecessors(root) and not (hooks / ORPHAN_NAME).exists()
 
 
-def install(root: Path) -> bool:
-    """Remove what earlier versions left, write the hook and return True, or False when nothing changed.
+def write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to a new temporary file beside ``path``, make it executable and rename it over ``path``: the old file stays until the new one is whole."""
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.")
+    os.close(descriptor)
+    pending = Path(name)
+    try:
+        pending.write_text(text)
+        pending.chmod(worktree_scan_hook.HOOK_MODE)
+        os.replace(pending, path)
+    finally:
+        pending.unlink(missing_ok=True)
 
-    The owner's hook that a shipped guard kept as ``pre-push.legacy.previous`` is moved to ``pre-push.previous``, so that it keeps running. An older hook that
-    cannot be kept raises ``KeptHookError`` before anything is removed.
+
+def install(root: Path) -> bool:
+    """Write the hook, remove what earlier versions left and return True, or False when nothing changed.
+
+    The hook of an earlier version, or a script that pre-commit wrote, is replaced in place and atomically, so the old hook stays active until the new one is
+    whole. The owner's hook that a shipped guard kept as ``pre-push.legacy.previous`` is moved to ``pre-push.previous``, so that it keeps running. An older hook
+    that cannot be kept raises ``KeptHookError`` before anything is changed.
     """
     hooks = hooks_folder(root)
     stale = predecessors(root)
+    own = hooks / HOOK_NAME
+    guards = [path for path in stale if path != own]
     orphan = hooks / ORPHAN_NAME
-    migrate = orphan.exists() and not (hooks / PREDECESSOR_NAME).exists() or any(path.name == PREDECESSOR_NAME for path in stale) and orphan.exists()
+    migrate = orphan.exists() and (bool(guards) or not (hooks / PREDECESSOR_NAME).exists())
     kept = hooks / KEPT_NAME
     if migrate and kept.exists():
         raise worktree_scan_hook.KeptHookError(
             f"{orphan.name} holds the owner's hook and {kept.name} already holds another: compare the two files, move one away, then run setup again"
         )
-    for path in stale:
+    if own in stale:
+        write_atomic(own, HOOK_TEXT)
+        written = True
+    else:
+        written = worktree_scan_hook.install(root, PUSH_HOOK)
+    for path in guards:
         path.unlink()
     if migrate:
         orphan.rename(kept)
-    return worktree_scan_hook.install(root, PUSH_HOOK) or bool(stale) or migrate
+    return written or bool(guards) or migrate

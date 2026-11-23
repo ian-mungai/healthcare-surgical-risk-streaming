@@ -331,6 +331,29 @@ class PushGateTest(TemporaryRepository):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertNotIn("push gate stopped", run.stdout + run.stderr)
 
+    def test_a_tracked_file_that_a_sparse_checkout_leaves_out_of_the_working_tree_is_still_scanned(self) -> None:
+        """Round 4, finding 2: the privacy scan reads the tracked blobs of the pushed commit, not the working tree."""
+        self.write("hidden/contact.txt", f"contact {planted_address()}\n")
+        self.commit("chore: add a contact")
+        self.git("sparse-checkout", "set", "--no-cone", "/*", "!/hidden/")
+        self.assertFalse((self.repo / "hidden" / "contact.txt").exists(), "the sparse checkout left the file out")
+        self.assertEqual(self.git("status", "--porcelain", "--untracked-files=no").stdout, "", "the tree counts as clean")
+        self.assert_refused_by(push_gate.PRIVACY)
+
+    def test_the_privacy_scan_of_a_commit_reads_its_blobs_and_the_allowlist_of_that_commit(self) -> None:
+        self.write("notes.txt", f"contact {planted_address()}\n")
+        self.commit("chore: add a contact")
+        scan = [sys.executable, "-m", "scripts.quality.repo_checks", "privacy-scan", "--commit", "HEAD"]
+        run = run_command(scan[0], scan[1:], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("notes.txt:1", run.stderr)
+        self.write(".privacy_allowlist", "email notes.txt -- a public address of the test\n")
+        self.commit("chore: allow the address")
+        self.assertEqual(run_command(scan[0], scan[1:], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS).returncode, 0)
+        (self.repo / "notes.txt").write_text("changed in the tree only\n")
+        (self.repo / ".privacy_allowlist").write_text("")
+        self.assertEqual(run_command(scan[0], scan[1:], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS).returncode, 0, "the working tree does not count")
+
     def test_a_message_that_is_not_a_conventional_commit_stops_the_push(self) -> None:
         self.write("notes.txt", "second\n")
         self.commit("added a note")
