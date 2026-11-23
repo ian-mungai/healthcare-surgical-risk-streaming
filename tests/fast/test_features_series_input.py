@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from fractions import Fraction
 from pathlib import Path
 
@@ -28,7 +28,7 @@ from features.model import FeatureInputError, Reading, WindowInput
 from features.pressure_series import ExactMean, SecondFacts, second_facts, series_from_seconds
 from features.registry import LOW_PRESSURE_65
 from features.row import build_row
-from features.series_input import SeriesReadings, series_readings, series_readings_from_rows
+from features.series_input import SeriesReadings, exact_of, series_readings, series_readings_from_rows
 from features.signal_validity import VALID, Verdict
 from tests.fast.features_support import CUTOFF_US, SECOND, SERIES
 
@@ -95,11 +95,11 @@ def series_entries(facts: list[SecondFacts]) -> list[list[object]]:
     return entries
 
 
-def document(entries: list[list[object]]) -> dict[str, object]:
+def document(entries: Sequence[Sequence[object]]) -> dict[str, object]:
     return {"windows": [{"window_id": "w", "cutoff_us": CUTOFF_US, "numeric": {SERIES: entries}, "waveforms": {}, "clinical": {}}]}
 
 
-def through_the_command_line(entries: list[list[object]]) -> dict[str, object]:
+def through_the_command_line(entries: Sequence[Sequence[object]]) -> dict[str, object]:
     with tempfile.TemporaryDirectory() as folder:
         source, target = Path(folder) / "windows.json", Path(folder) / "rows.json"
         source.write_text(json.dumps(document(entries)))
@@ -139,6 +139,35 @@ class JsonParity(unittest.TestCase):
         entries = series_entries(seconds_of(lambda second: [60.0] * 4))
         entries[-1][1] = 61.0
         with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*value is not the exact mean"):
+            build_row(document(entries)["windows"][0])  # type: ignore[index]
+
+
+class ReadingsOutsideTheWindow(unittest.TestCase):
+    """A reading after the cutoff is never read: whatever its value is, even a number that no float can hold, it changes no feature and raises nothing."""
+
+    @unittest.expectedFailure
+    def test_a_number_that_no_float_can_hold_has_no_exact_value_and_raises_nothing(self) -> None:
+        for value in (10**500, -(10**500), float("inf"), float("nan"), True, "60"):
+            with self.subTest(value=value):
+                self.assertIsNone(exact_of(value))
+
+    @unittest.expectedFailure
+    def test_a_reading_after_the_cutoff_with_an_enormous_value_changes_nothing(self) -> None:
+        facts = seconds_of(lambda second: [60.0] * 4)
+        entries = series_entries(facts)
+        reference = through_the_command_line(entries)
+        for junk in (
+            [CUTOFF_US + SECOND, 10**500, True, 4, 10**500, 0],
+            [CUTOFF_US + 2 * SECOND, 10**500, False, None, None, None],
+        ):
+            with self.subTest(junk=junk):
+                self.assertEqual(reference, through_the_command_line([*entries, junk]))
+
+    @unittest.expectedFailure
+    def test_an_enormous_value_inside_the_window_is_refused_by_name_and_not_with_a_traceback(self) -> None:
+        entries = series_entries(seconds_of(lambda second: [60.0] * 4))
+        entries[-1] = [entries[-1][0], 10**500, True, 4, 10**500, 0]
+        with self.assertRaisesRegex(FeatureInputError, rf"{SERIES}.*too large for a float"):
             build_row(document(entries)["windows"][0])  # type: ignore[index]
 
 
