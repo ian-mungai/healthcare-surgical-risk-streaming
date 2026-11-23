@@ -26,6 +26,7 @@ from spark.silver_cases import (
     LAB_PUBLISHED_COLUMNS,
     NUMBER_PATTERN,
     OCCURRENCE_COLUMN,
+    OUTCOME_COLUMNS,
     SEX_VALUES,
     STRING,
     TOP_CODED_AGE,
@@ -47,7 +48,7 @@ WHOLE_PATTERN = f"^{INT_PATTERN}\\\\z"
 DECIMAL_PATTERN = f"^{NUMBER_PATTERN.replace('\\.', '[.]')}\\\\z"
 PATIENT_PATTERN = "^[1-9][0-9]*\\\\z"
 PATTERNS = {BIGINT: WHOLE_PATTERN, DOUBLE: DECIMAL_PATTERN}
-DOMAIN_COLUMNS = (*FLAG_COLUMNS, "sex", "asa")
+DOMAIN_COLUMNS = (*(name for name in FLAG_COLUMNS if name not in OUTCOME_COLUMNS), "sex", "asa")
 LAB_TYPES = {"caseid": BIGINT, "dt": BIGINT, "name": STRING, "result": DOUBLE}
 DEVELOPMENT_LIST = ", ".join(f"'{name}'" for name in DEVELOPMENT_SETS)
 
@@ -132,7 +133,7 @@ def case_facts_query(source: str) -> str:
         sum_of(f"({start}) IS NULL OR ({end}) IS NULL OR ({end}) < ({start})", "operation_order"),
     ]
     for column in CASE_COLUMNS:
-        if column.type not in SPARK_TYPES:
+        if column.type not in SPARK_TYPES or column.name in OUTCOME_COLUMNS:
             continue
         top = f" AND {reference(column.name)} <> '{TOP_CODED_AGE}'" if column.name == AGE_COLUMN else ""
         unparsed = f"NOT ({missing_text(reference(column.name))}) AND ({typed_expression(column.name, column.type)}) IS NULL{top}"
@@ -157,6 +158,36 @@ def split_facts_queries(cases: str, split: str) -> tuple[str, str]:
     )
     patients = sql("SELECT COUNT(*) AS n FROM", split, "s LEFT ANTI JOIN", cases, "b ON s.`subjectid` = b.`subjectid`")
     return sql("SELECT COUNT(*) AS n FROM (", joined, ")"), patients
+
+
+def outcome_unparsed(name: str, kinds: dict[str, str]) -> str:
+    return f"NOT ({missing_text(reference(name, 'b'))}) AND ({typed_expression(name, kinds[name], 'b')}) IS NULL"
+
+
+def outcome_bad(kinds: dict[str, str]) -> list[str]:
+    """The conditions that make an outcome value not what the release publishes: a value that is not in its form, or a death flag outside 0 and 1."""
+    conditions = [outcome_unparsed(name, kinds) for name in OUTCOME_COLUMNS]
+    typed = f"({typed_expression('death_inhosp', kinds['death_inhosp'], 'b')})"
+    return [*conditions, f"{typed} IS NOT NULL AND {typed} NOT IN (0, 1)"]
+
+
+def outcome_facts_query(cases: str, split: str) -> str:
+    """One row of counts of the outcome columns over the development patients only: the values not in their form and the death flags outside 0 and 1."""
+    kinds = {column.name: column.type for column in CASE_COLUMNS}
+    items = [sum_of(outcome_unparsed(name, kinds), f"unparsed__{name}") for name in OUTCOME_COLUMNS]
+    typed = f"({typed_expression('death_inhosp', kinds['death_inhosp'], 'b')})"
+    items.append(sum_of(f"{typed} IS NOT NULL AND {typed} NOT IN (0, 1)", "domain__death_inhosp"))
+    joined = sql(cases, "b JOIN", split, "s ON b.`subjectid` = s.`subjectid`")
+    return sql("SELECT", ", ".join(items), "FROM", joined, "WHERE s.`set` IN (" + DEVELOPMENT_LIST + ")")
+
+
+def sealed_outcome_query(cases: str, split: str) -> str:
+    """One flag, 0 or 1, never a count: whether any outcome value of a patient outside the development sets is not in its published form."""
+    kinds = {column.name: column.type for column in CASE_COLUMNS}
+    anything = " OR ".join(f"({condition})" for condition in outcome_bad(kinds))
+    joined = sql(cases, "b LEFT JOIN", split, "s ON b.`subjectid` = s.`subjectid`")
+    held_out = "COALESCE(s.`set`, '') NOT IN (" + DEVELOPMENT_LIST + ")"
+    return sql("SELECT CASE WHEN COALESCE(SUM(CASE WHEN", anything, "THEN 1 ELSE 0 END), 0) > 0 THEN 1 ELSE 0 END AS n FROM", joined, "WHERE", held_out)
 
 
 def lab_facts_query(lab: str) -> str:
@@ -229,9 +260,35 @@ def case_difference(name: str, kind: str) -> str:
 
 
 def case_output_query(bronze: str, silver: str) -> str:
-    """The count of Silver case rows whose value in any column differs from its Bronze row, joined on the case number."""
-    conditions = " OR ".join(case_difference(column.name, column.type) for column in CASE_COLUMNS)
+    """The count of Silver case rows whose value in any column but the outcome columns differs from its Bronze row, joined on the case number."""
+    conditions = " OR ".join(case_difference(column.name, column.type) for column in CASE_COLUMNS if column.name not in OUTCOME_COLUMNS)
     return sql("SELECT COUNT(*) AS n FROM", bronze, "b JOIN", silver, "s ON CAST(b.`caseid` AS BIGINT) = s.`caseid` WHERE", conditions)
+
+
+def outcome_differences() -> str:
+    kinds = {column.name: column.type for column in CASE_COLUMNS}
+    return " OR ".join(case_difference(name, kinds[name]) for name in OUTCOME_COLUMNS)
+
+
+def outcome_output_query(bronze: str, silver: str, split: str) -> str:
+    """The count of development case rows whose outcome value in Silver differs from Bronze."""
+    joined = sql(bronze, "b JOIN", silver, "s ON CAST(b.`caseid` AS BIGINT) = s.`caseid` JOIN", split, "p ON b.`subjectid` = p.`subjectid`")
+    return sql("SELECT COUNT(*) AS n FROM", joined, "WHERE p.`set` IN (" + DEVELOPMENT_LIST + ") AND (" + outcome_differences() + ")")
+
+
+def sealed_outcome_output_query(bronze: str, silver: str, split: str) -> str:
+    """One flag, 0 or 1, never a count: whether any outcome value of a patient outside the development sets differs between Silver and Bronze."""
+    joined = sql(bronze, "b JOIN", silver, "s ON CAST(b.`caseid` AS BIGINT) = s.`caseid` LEFT JOIN", split, "p ON b.`subjectid` = p.`subjectid`")
+    held_out = "COALESCE(p.`set`, '') NOT IN (" + DEVELOPMENT_LIST + ")"
+    return sql("SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS n FROM", joined, "WHERE", held_out, "AND (" + outcome_differences() + ")")
+
+
+def case_key_query(bronze: str, silver: str) -> str:
+    """The count of case numbers that one table has and the other has not: Bronze against Silver and Silver against Bronze, by anti-joins."""
+    typed = "CAST(b.`caseid` AS BIGINT)"
+    missing_in_silver = sql("SELECT", typed, "AS caseid FROM", bronze, "b LEFT ANTI JOIN", silver, "s ON", typed, "= s.`caseid`")
+    missing_in_bronze = sql("SELECT s.`caseid` AS caseid FROM", silver, "s LEFT ANTI JOIN", bronze, "b ON", typed, "= s.`caseid`")
+    return sql("SELECT COUNT(*) AS n FROM (", missing_in_silver, "UNION ALL", missing_in_bronze, ")")
 
 
 def lab_output_queries(bronze: str, silver: str) -> tuple[str, str, str, str]:
@@ -240,8 +297,10 @@ def lab_output_queries(bronze: str, silver: str) -> tuple[str, str, str, str]:
     typed = "CAST(`caseid` AS BIGINT) AS `caseid`, CAST(`dt` AS BIGINT) AS `dt`, NULLIF(`name`, '') AS `name`, CAST(NULLIF(`result`, '') AS DOUBLE) AS `result`"
     counted = f"CAST(COUNT(*) AS INT) AS `{COPIES_COLUMN}`"
     inner = sql("SELECT", typed, "FROM", bronze)
-    grouped = sql("SELECT `caseid`, `dt`, `name`, `result`,", counted, "FROM (", inner, ") GROUP BY `caseid`, `dt`, `name`, `result`")
-    held = sql("SELECT `caseid`, `dt`, `name`, `result`,", f"`{COPIES_COLUMN}` FROM", silver)
+    counts = sql("SELECT `caseid`, `dt`, `name`, `result`,", counted, "FROM (", inner, ") GROUP BY `caseid`, `dt`, `name`, `result`")
+    ranked = f"CAST(ROW_NUMBER() OVER (PARTITION BY `caseid`, `dt`, `name` ORDER BY `result` ASC NULLS FIRST) AS INT) AS `{OCCURRENCE_COLUMN}`"
+    grouped = sql("SELECT `caseid`, `dt`, `name`, `result`,", f"`{COPIES_COLUMN}`,", ranked, "FROM (", counts, ")")
+    held = sql("SELECT `caseid`, `dt`, `name`, `result`,", f"`{COPIES_COLUMN}`, `{OCCURRENCE_COLUMN}` FROM", silver)
     missing_in_silver = sql("( (", grouped, ") EXCEPT ALL (", held, ") )")
     missing_in_bronze = sql("( (", held, ") EXCEPT ALL (", grouped, ") )")
     differences = sql("SELECT COUNT(*) AS n FROM (", missing_in_silver, "UNION ALL", missing_in_bronze, ")")

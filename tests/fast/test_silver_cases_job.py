@@ -50,6 +50,8 @@ def clean_input_facts(**changes: object) -> dict[str, object]:
         "lab_key_null": 0,
         "lab_unparsed": {"result": 0},
         "lab_rows_without_case": 0,
+        "split_problems": [],
+        "sealed_outcome_form_bad": 0,
     }
     return base | changes
 
@@ -67,6 +69,9 @@ def clean_output_facts(**changes: object) -> dict[str, object]:
         "lab_occurrence_gaps": 0,
         "never_feature_marking_wrong": 0,
         "lab_rows": 920000,
+        "case_key_differences": 0,
+        "sealed_outcome_differs": 0,
+        "output_schema_tables_wrong": 0,
     }
     return base | changes
 
@@ -193,6 +198,18 @@ class InputFailureTest(unittest.TestCase):
         self.assertEqual(["key_duplicate: 2 keys", "lab_case_missing: 5 rows", "unparsed: 1 value in 1 column (height)"], problems)
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
 
+    def test_a_split_that_breaks_the_rule_stops_before_the_lengths_are_read_and_before_any_write(self) -> None:
+        ops = FakeOps(input=clean_input_facts(split_problems=["rule_mismatch: 1 patient"]))
+        self.assertEqual(["rule_mismatch: 1 patient"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertNotIn("development_lengths", ops.calls)
+        self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
+
+    def test_a_held_out_outcome_value_not_in_its_published_form_stops_before_any_write_and_names_no_count(self) -> None:
+        ops = FakeOps(input=clean_input_facts(sealed_outcome_form_bad=1))
+        problems = refused(lambda: run_build(ops, pinned=True))
+        self.assertEqual(["sealed_outcome_form: a held-out outcome value is not in its published form"], problems)
+        self.assertNotIn("write_cases", ops.calls)
+
     def test_no_development_case_stops_before_any_write(self) -> None:
         ops = FakeOps(lengths=[])
         problems = refused(lambda: run_build(ops, pinned=True))
@@ -226,6 +243,16 @@ class FreezeTest(unittest.TestCase):
         self.assertNotIn("write_cases", ops.calls)
         self.assertNotIn("write_rules", ops.calls)
 
+    def test_a_held_cutoff_table_with_a_repeated_key_stops_before_any_write(self) -> None:
+        rows = cutoff_rows(LENGTHS)
+        ops = FakeOps(held=(measure_rows(LENGTHS), [*rows, rows[1]]))
+        self.assertEqual(["inherited_duplicates: 1 key"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertNotIn("write_cases", ops.calls)
+
+    def test_held_rows_in_another_order_are_the_same_rows_and_the_rebuild_goes_on(self) -> None:
+        ops = FakeOps(writes={"cases": False, "lab": False, "rules": False}, held=(measure_rows(LENGTHS)[::-1], cutoff_rows(LENGTHS)[::-1]))
+        self.assertEqual("unchanged", build(ops)["outcome"])
+
     def test_a_held_table_that_is_empty_or_half_there_stops_before_any_write(self) -> None:
         for held, code in (((measure_rows(LENGTHS), None), "inherited_incomplete"), (([], []), "inherited_empty")):
             ops = FakeOps(held=held)
@@ -234,6 +261,13 @@ class FreezeTest(unittest.TestCase):
 
 
 class OutputFailureTest(unittest.TestCase):
+    def test_a_replaced_case_key_or_a_wrong_stored_schema_or_a_held_out_outcome_difference_ends_the_job(self) -> None:
+        ops = FakeOps(output=clean_output_facts(case_key_differences=2, output_schema_tables_wrong=1, sealed_outcome_differs=1))
+        self.assertEqual(
+            ["case_key_differences: 2 keys", "output_schema: 1 table", "sealed_outcome_differs: a held-out outcome value differs from Bronze"],
+            refused(lambda: run_build(ops, pinned=True)),
+        )
+
     def test_a_check_of_a_written_table_that_fails_ends_the_job_with_its_code(self) -> None:
         ops = FakeOps(output=clean_output_facts(lab_value_differences=3, case_key_duplicates=1))
         self.assertEqual(["case_key_duplicate: 1 key", "lab_value_differences: 3 rows"], refused(lambda: run_build(ops, pinned=True)))
@@ -246,6 +280,15 @@ class OutputFailureTest(unittest.TestCase):
     def test_cutoffs_read_back_that_differ_from_the_ones_written_fail(self) -> None:
         other = (measure_rows([100, 200, 300]), cutoff_rows([6000, 6000, 6000]))
         ops = FakeOps(after_write_rules=other)
+        self.assertTrue(any(problem.startswith("readback_differs") for problem in refused(lambda: run_build(ops, pinned=True))))
+
+    def test_cutoffs_read_back_in_another_order_are_the_same_cutoffs(self) -> None:
+        reordered = (measure_rows(LENGTHS)[::-1], cutoff_rows(LENGTHS)[::-1])
+        self.assertEqual("written", build(FakeOps(after_write_rules=reordered))["outcome"])
+
+    def test_cutoffs_read_back_with_a_repeated_row_fail_even_when_every_row_is_one_that_was_written(self) -> None:
+        rows = cutoff_rows(LENGTHS)
+        ops = FakeOps(after_write_rules=(measure_rows(LENGTHS), [*rows, rows[0]]))
         self.assertTrue(any(problem.startswith("readback_differs") for problem in refused(lambda: run_build(ops, pinned=True))))
 
     def test_cutoffs_missing_after_the_write_fail(self) -> None:

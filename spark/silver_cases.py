@@ -11,13 +11,16 @@ from development patients only.
 
 from __future__ import annotations
 
+import math
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
+from spark.split_table import SplitRow, table_problems
 
-NAMESPACE = "silver"
 BRONZE_CASES = "bronze.clinical_cases"
 BRONZE_LAB = "bronze.lab_results"
 SPLIT_TABLE = "silver.patient_split"
@@ -42,6 +45,9 @@ PERCENTILES = (5, 10, 25, 50, 75, 90, 95)
 CUTOFF_FRACTIONS = (25, 50, 75)
 CUTOFF_RULE_VERSION = f"operation_cutoffs:fractions_of_median={','.join(str(percent) for percent in CUTOFF_FRACTIONS)}:whole_minutes:nearest_rank"
 FLAG_COLUMNS = ("emop", "preop_htn", "preop_dm", "death_inhosp")
+# The outcome columns: the stay in intensive care and the death. Their values are checked and counted for development patients only; for the held-out
+# patients the job checks their form inside the job and reports one flag, never a count.
+OUTCOME_COLUMNS = ("icu_days", "death_inhosp")
 SEX_VALUES = ("F", "M")
 ASA_VALUES = (1, 2, 3, 4, 5, 6)
 
@@ -139,14 +145,15 @@ def typed_value(kind: str, raw: str | None) -> int | float | str | None:
     """The typed value of a published text, by the one rule that the Spark expressions of ``silver_cases_sql.py`` follow.
 
     A missing value (no value, or an empty text) stays missing; any other text is a value, a blank one included, and is never trimmed. A whole number is
-    an optional minus and ASCII digits within 64 bits. A decimal number is an optional minus, digits, and digits after a point. Nothing else is a number
-    (no plus, no exponent, no space, no ``NaN``), and such a value is a ``SilverCasesError`` here and a counted failure in the job. A text is returned as it is.
+    an optional minus and ASCII digits within the signed 64 bits. A decimal number is an optional minus, digits, and digits after a point. Nothing else is
+    a number (no plus, no exponent, no space, no ``NaN``), and such a value is a ``SilverCasesError`` here and a counted failure in the job. A text is
+    returned as it is.
     """
     if raw is None or raw == "":
         return None
     if kind == STRING:
         return raw
-    if kind == BIGINT and INT_FORMAT.fullmatch(raw) and abs(int(raw)) < BIGINT_LIMIT:
+    if kind == BIGINT and INT_FORMAT.fullmatch(raw) and -BIGINT_LIMIT <= int(raw) < BIGINT_LIMIT:
         return int(raw)
     if kind == DOUBLE and NUMBER_FORMAT.fullmatch(raw):
         return float(raw)
@@ -201,15 +208,23 @@ def measure_rows(lengths: Sequence[int]) -> list[MeasureRow]:
     return [*rows, MeasureRow("max", "seconds", ordered[-1])]
 
 
+def median_of(lengths: Sequence[int]) -> Fraction:
+    """The median: the middle length of an odd number of lengths, the mean of the two middle lengths of an even number. Exact, never rounded."""
+    ordered = sorted(lengths)
+    middle = len(ordered) // 2
+    return Fraction(ordered[middle]) if len(ordered) % 2 else Fraction(ordered[middle - 1] + ordered[middle], 2)
+
+
 def cutoff_rows(lengths: Sequence[int]) -> list[CutoffRow]:
     """The score cutoffs: the start (``opstart``), a quarter, a half and three quarters of the median development operation length after the start, each
-    rounded down to a whole minute, and the final (``opend``). The times must be strictly increasing, or the median is too short to set them."""
+    rounded down to a whole minute after the exact fraction of the exact median, and the final (``opend``). ``median_length_seconds`` is the median rounded
+    down to a second. The times must be strictly increasing, or the median is too short to set them."""
     check_lengths(lengths)
-    median = nearest_rank(lengths, 50)
-    elapsed = [median * percent // 100 // SECONDS_PER_MINUTE * SECONDS_PER_MINUTE for percent in CUTOFF_FRACTIONS]
+    median = median_of(lengths)
+    elapsed = [math.floor(median * percent / (100 * SECONDS_PER_MINUTE)) * SECONDS_PER_MINUTE for percent in CUTOFF_FRACTIONS]
     if [0, *elapsed] != sorted({0, *elapsed}):
         raise SilverCasesError(f"cutoffs_not_increasing: {unit(len(CUTOFF_FRACTIONS), 'cutoff')} that are not after one another")
-    common = (CUTOFF_RULE_VERSION, len(lengths), median)
+    common = (CUTOFF_RULE_VERSION, len(lengths), math.floor(median))
     rows = [CutoffRow("start", "opstart", 0, "fixed", *common)]
     rows += [
         CutoffRow(f"p{percent}_of_median", "opstart", seconds, f"{percent} percent of the median", *common)
@@ -218,32 +233,51 @@ def cutoff_rows(lengths: Sequence[int]) -> list[CutoffRow]:
     return [*rows, CutoffRow("final", "opend", None, "fixed", *common)]
 
 
-def cutoff_identity(row: CutoffRow) -> tuple[str, str, int | None, str, str]:
-    return (row.cutoff, row.anchor, row.elapsed_seconds, row.basis, row.rule_version)
+def same_rows(first: Sequence[object], second: Sequence[object]) -> bool:
+    """Whether two lists hold the same rows, each as many times, whatever their order."""
+    return sorted(first, key=repr) == sorted(second, key=repr)
+
+
+def repeated_keys(keys: Sequence[str]) -> int:
+    """How many keys are there more than once."""
+    return sum(1 for count in Counter(keys).values() if count > 1)
+
+
+def changed_count(held: Mapping[str, object], wanted: Mapping[str, object]) -> int:
+    return sum(1 for name in held.keys() | wanted.keys() if held.get(name) != wanted.get(name))
 
 
 def frozen_problems(
     existing_measure: Sequence[MeasureRow] | None, existing_cutoffs: Sequence[CutoffRow] | None, measure: Sequence[MeasureRow], cutoffs: Sequence[CutoffRow]
 ) -> list[str]:
-    """How a rebuild would change the measure and the cutoffs that the branch already holds. ``None`` for both is a first build and has nothing to freeze."""
+    """How a rebuild would change the measure and the cutoffs that the branch already holds. ``None`` for both is a first build and has nothing to freeze.
+
+    A held table with no row, with a key twice (an equal copy included) or without its partner is refused first. Then every cutoff row is compared in full
+    (time, basis, rule, development count and median) and every measure row in full, in any order.
+    """
     if existing_measure is None and existing_cutoffs is None:
         return []
     if existing_measure is None or existing_cutoffs is None:
         return ["inherited_incomplete: the measure and the cutoffs are not both there"]
     if not existing_measure or not existing_cutoffs:
         return [f"inherited_empty: {unit(0, 'row')}"]
-    held = {row.cutoff: cutoff_identity(row) for row in existing_cutoffs}
-    wanted = {row.cutoff: cutoff_identity(row) for row in cutoffs}
-    changed_cutoffs = sum(1 for name in held.keys() | wanted.keys() if held.get(name) != wanted.get(name))
-    held_measure = {row.statistic: row for row in existing_measure}
-    wanted_measure = {row.statistic: row for row in measure}
-    changed_measure = sum(1 for name in held_measure.keys() | wanted_measure.keys() if held_measure.get(name) != wanted_measure.get(name))
+    repeated = repeated_keys([row.statistic for row in existing_measure]) + repeated_keys([row.cutoff for row in existing_cutoffs])
+    if repeated:
+        return [f"inherited_duplicates: {unit(repeated, 'key')}"]
+    changed_cutoffs = changed_count({row.cutoff: row for row in existing_cutoffs}, {row.cutoff: row for row in cutoffs})
+    changed_measure = changed_count({row.statistic: row for row in existing_measure}, {row.statistic: row for row in measure})
     problems = []
     if changed_cutoffs:
         problems.append(f"changed_cutoff: {unit(changed_cutoffs, 'cutoff')}")
     if changed_measure:
         problems.append(f"changed_measure: {unit(changed_measure, 'statistic')}")
     return problems
+
+
+def split_rule_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
+    """What is wrong with the patient split table by itself, by the split job's own checks: a patient twice, a set that the one rule of
+    ``scripts/sample/split.py`` does not give, another rule version, mixed source snapshots. The set of a development patient is only trusted after this."""
+    return table_problems(rows, pinned=pinned)
 
 
 def source_schema_problems(found: Mapping[str, Sequence[tuple[str, str]] | None]) -> list[str]:
@@ -274,7 +308,9 @@ def input_problems(
     lab_key_null: int,
     lab_unparsed: Mapping[str, int],
     lab_rows_without_case: int,
-    development_cases: int,
+    split_problems: Sequence[str],
+    sealed_outcome_form_bad: int,
+    development_cases: int | None,
     pinned: bool,
 ) -> list[str]:
     """What is wrong with the inputs, found before anything is written. Each cause is one code and a count, and no value or identifier is named."""
@@ -295,10 +331,13 @@ def input_problems(
     ):
         if count:
             problems.append(f"{code}: {unit(count, noun)}")
+    problems += split_problems
     for code, counts in (("unparsed", unparsed), ("domain", domain), ("lab_unparsed", lab_unparsed)):
         counted = {name: count for name, count in counts.items() if count}
         if counted:
             problems.append(f"{code}: {columns_text(counted)}")
+    if sealed_outcome_form_bad:
+        problems.append("sealed_outcome_form: a held-out outcome value is not in its published form")
     if development_cases == 0:
         problems.append(f"no_development_cases: {unit(0, 'case')}")
     if pinned and (bronze_case_rows, bronze_lab_rows) != (PINNED_CASES, PINNED_LAB_ROWS):
@@ -321,6 +360,9 @@ def output_problems(
     lab_key_duplicates: int,
     lab_occurrence_gaps: int,
     never_feature_marking_wrong: int,
+    case_key_differences: int,
+    sealed_outcome_differs: int,
+    output_schema_tables_wrong: int,
 ) -> list[str]:
     """What is wrong with the tables that were written, against Bronze: a row count that differs, a changed value, a repeated key or a gap in the occurrence."""
     problems: list[str] = []
@@ -333,11 +375,15 @@ def output_problems(
     for code, count, noun in (
         ("case_value_differences", case_value_differences, "row"),
         ("case_key_duplicate", case_key_duplicates, "key"),
+        ("case_key_differences", case_key_differences, "key"),
         ("lab_value_differences", lab_value_differences, "row"),
         ("lab_key_duplicate", lab_key_duplicates, "key"),
         ("lab_occurrence_gap", lab_occurrence_gaps, "group"),
         ("never_feature_marking", never_feature_marking_wrong, "table"),
+        ("output_schema", output_schema_tables_wrong, "table"),
     ):
         if count:
             problems.append(f"{code}: {unit(count, noun)}")
+    if sealed_outcome_differs:
+        problems.append("sealed_outcome_differs: a held-out outcome value differs from Bronze")
     return problems

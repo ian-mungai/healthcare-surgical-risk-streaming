@@ -32,6 +32,7 @@ from spark.silver_cases import (
     input_problems,
     measure_rows,
     output_problems,
+    same_rows,
     unit,
 )
 from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, reference_name
@@ -109,6 +110,9 @@ class Outcome:
 def checked_inputs(ops: SilverOps, *, pinned: bool) -> tuple[list[MeasureRow], list[CutoffRow]]:
     """Run every input check, then measure the development operation lengths and set the cutoffs, or raise every cause."""
     facts = ops.input_facts()
+    problems = input_problems(**facts, development_cases=None, pinned=pinned)  # type: ignore[arg-type]
+    if problems:
+        raise SilverCasesError(*problems)
     lengths = ops.development_lengths()
     problems = input_problems(**facts, development_cases=len(lengths), pinned=pinned)  # type: ignore[arg-type]
     if problems:
@@ -127,7 +131,7 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
     saved = ops.existing_rules()
     output = ops.output_facts()
     problems = output_problems(**output)  # type: ignore[arg-type]
-    if saved != (measure, cutoffs):
+    if saved[0] is None or saved[1] is None or not same_rows(saved[0], measure) or not same_rows(saved[1], cutoffs):
         problems.append(RULES_READ_BACK)
     if problems:
         raise SilverCasesError(*problems)

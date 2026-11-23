@@ -18,8 +18,10 @@ import unittest
 from collections import Counter
 from typing import Any
 
-from spark.jobs.silver_cases import CUTOFF_COLUMNS, Lake
-from spark.silver_cases import CutoffRow, SilverCasesError
+from scripts.sample.split import patient_part
+from spark.jobs.silver_cases import CUTOFF_COLUMNS, MEASURE_COLUMNS, Lake
+from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, CutoffRow, SilverCasesError, cutoff_rows, measure_rows
+from spark.split_table import RULE_VERSION, SET_NAMES
 
 
 class Count:
@@ -116,7 +118,7 @@ def lake(held: Frame | None, properties: dict[str, str] | None = None) -> tuple[
     return Lake(Session(tables, properties or {}, log), None, "b"), log  # type: ignore[arg-type]
 
 
-def frame(rows: list[tuple[Any, ...]], log: list[str], dtypes: list[tuple[str, str]] | None = None) -> Frame:
+def frame(rows: list[Any], log: list[str], dtypes: list[tuple[str, str]] | None = None) -> Frame:
     return Frame(dtypes or TYPES, rows, log)
 
 
@@ -175,6 +177,72 @@ class ExistingRulesTest(unittest.TestCase):
         rows = [dict(zip((name for name, _ in CUTOFF_COLUMNS), row, strict=True))]
         engine = Lake(Session({"lake.silver.score_cutoffs": frame(rows, log, list(CUTOFF_COLUMNS))}, {}, log), None, "b")  # type: ignore[arg-type]
         self.assertEqual((None, [CutoffRow("start", "opstart", 0, "fixed", "v", 3, 5400)]), engine.existing_rules())
+
+
+def split_table(count: int, relabel: int | None = None) -> Frame:
+    rows = [
+        {"subjectid": str(patient), "set": SET_NAMES[patient_part(patient)], "rule_version": RULE_VERSION, "source_snapshot_id": 7}
+        for patient in range(1, count + 1)
+    ]
+    if relabel is not None:
+        rows[relabel]["set"] = "training"
+    return Frame([("subjectid", "string")], rows, [])  # type: ignore[arg-type]
+
+
+class WriteRulesTest(unittest.TestCase):
+    def test_held_rows_in_another_order_are_the_same_rows_and_nothing_is_written(self) -> None:
+        log: list[str] = []
+        lengths = [3600, 7200, 5400, 4800]
+        measure, cutoffs = measure_rows(lengths), cutoff_rows(lengths)
+        measure_rows_held = [{"statistic": r.statistic, "unit": r.unit, "value": r.value} for r in measure[::-1]]
+        cutoff_rows_held = [
+            {
+                "cutoff": r.cutoff,
+                "anchor": r.anchor,
+                "elapsed_seconds": r.elapsed_seconds,
+                "basis": r.basis,
+                "rule_version": r.rule_version,
+                "development_cases": r.development_cases,
+                "median_length_seconds": r.median_length_seconds,
+            }
+            for r in cutoffs[::-1]
+        ]
+        tables = {
+            "lake.silver.operation_length_measure": frame(measure_rows_held, log, list(MEASURE_COLUMNS)),
+            "lake.silver.score_cutoffs": frame(cutoff_rows_held, log, list(CUTOFF_COLUMNS)),
+        }
+        engine = Lake(Session(tables, {}, log), None, "b")  # type: ignore[arg-type]
+        self.assertFalse(engine.write_rules(measure, cutoffs))
+        self.assertEqual([], log)
+
+
+class SplitRuleTest(unittest.TestCase):
+    def test_a_split_made_by_the_rule_passes(self) -> None:
+        engine = Lake(Session({"lake.silver.patient_split": split_table(300)}, {}, []), None, "b")  # type: ignore[arg-type]
+        self.assertEqual([], engine.split_problems())
+
+    def test_a_held_out_patient_relabelled_training_is_refused_before_any_length_is_measured(self) -> None:
+        held_out = next(patient for patient in range(1, 300) if patient_part(patient) == "test")
+        engine = Lake(Session({"lake.silver.patient_split": split_table(300, held_out - 1)}, {}, []), None, "b")  # type: ignore[arg-type]
+        self.assertEqual(["rule_mismatch: 1 patient"], engine.split_problems())
+
+
+class OutputSchemaTest(unittest.TestCase):
+    def tables(self, cases: list[tuple[str, str]], lab: list[tuple[str, str]]) -> Lake:
+        log: list[str] = []
+        held = {"lake.silver.cases": frame([], log, cases), "lake.silver.lab_results": frame([], log, lab)}
+        return Lake(Session(held, {}, log), None, "b")  # type: ignore[arg-type]
+
+    def test_tables_with_the_columns_and_types_of_the_rules_are_not_counted(self) -> None:
+        engine = self.tables([(c.name, c.type) for c in CASE_COLUMNS], [(c.name, c.type) for c in LAB_COLUMNS])
+        self.assertEqual(0, engine.output_schema_tables_wrong())
+
+    def test_a_changed_type_an_extra_column_or_a_missing_table_is_counted_once_for_each_table(self) -> None:
+        cases = [(c.name, "string" if c.name == "height" else c.type) for c in CASE_COLUMNS]
+        lab = [*((c.name, c.type) for c in LAB_COLUMNS), ("extra", "string")]
+        self.assertEqual(2, self.tables(cases, lab).output_schema_tables_wrong())
+        engine = Lake(Session({}, {}, []), None, "b")  # type: ignore[arg-type]
+        self.assertEqual(2, engine.output_schema_tables_wrong())
 
 
 if __name__ == "__main__":

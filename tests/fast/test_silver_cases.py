@@ -7,13 +7,16 @@ The Spark job applies these rules. A wrong rule changes a value in Silver withou
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from features.leakage import is_forbidden
+from scripts.sample.split import patient_part
 from spark.silver_cases import (
     CASE_COLUMNS,
     CUTOFF_FRACTIONS,
     LAB_COLUMNS,
     NEVER_FEATURE_COLUMNS,
+    OUTCOME_COLUMNS,
     PUBLISHED_CLINICAL_COLUMNS,
     SOURCE_SCHEMAS,
     SilverCasesError,
@@ -24,8 +27,10 @@ from spark.silver_cases import (
     nearest_rank,
     output_problems,
     source_schema_problems,
+    split_rule_problems,
     typed_value,
 )
+from spark.split_table import RULE_VERSION, SET_NAMES, SplitRow
 
 CLINICAL_HEADER = (
     "caseid,subjectid,casestart,caseend,anestart,aneend,opstart,opend,adm,dis,icu_days,death_inhosp,age,sex,height,weight,bmi,asa,emop,department,optype,dx,"
@@ -59,6 +64,8 @@ def clean_input(**changes: object) -> dict[str, object]:
         "lab_key_null": 0,
         "lab_unparsed": {},
         "lab_rows_without_case": 0,
+        "split_problems": [],
+        "sealed_outcome_form_bad": 0,
         "development_cases": 4900,
     }
     return base | changes
@@ -77,6 +84,9 @@ def clean_output(**changes: object) -> dict[str, object]:
         "lab_key_duplicates": 0,
         "lab_occurrence_gaps": 0,
         "never_feature_marking_wrong": 0,
+        "case_key_differences": 0,
+        "sealed_outcome_differs": 0,
+        "output_schema_tables_wrong": 0,
     }
     return base | changes
 
@@ -154,6 +164,10 @@ class TypedValueTest(unittest.TestCase):
         self.assertEqual(2**63 - 1, typed_value("bigint", str(2**63 - 1)))
         self.assertEqual("refused", refusal_or_value("bigint", str(2**63)))
 
+    def test_the_signed_64_bit_minimum_is_accepted_as_spark_accepts_it_and_one_below_is_refused(self) -> None:
+        self.assertEqual(-(2**63), typed_value("bigint", str(-(2**63))))
+        self.assertEqual("refused", refusal_or_value("bigint", str(-(2**63) - 1)))
+
 
 def refusal_or_value(kind: str, raw: str) -> object:
     try:
@@ -203,6 +217,21 @@ class CutoffTest(unittest.TestCase):
         rows = cutoff_rows([6099] * 3)
         self.assertEqual([0, 1500, 3000, 4560, None], [row.elapsed_seconds for row in rows])
 
+    def test_the_median_of_an_even_number_of_cases_is_the_mean_of_the_two_middle_lengths_and_the_minute_rounding_comes_after_it(self) -> None:
+        rows = cutoff_rows([4799, 4800])
+        self.assertEqual([0, 1140, 2340, 3540, None], [row.elapsed_seconds for row in rows])
+        self.assertEqual({4799}, {row.median_length_seconds for row in rows})
+        self.assertEqual([0, 1080, 2220, 3360, None], [row.elapsed_seconds for row in cutoff_rows([3000, 6000])])
+
+    def test_an_odd_number_of_cases_gives_the_same_cutoffs_as_the_nearest_rank_median_did(self) -> None:
+        for size in (3, 5, 101, 5125):
+            lengths = [85 + (index * 7919 + size * 104729) % 57215 for index in range(size)]
+            median = nearest_rank(lengths, 50)
+            old = [median * percent // 100 // 60 * 60 for percent in CUTOFF_FRACTIONS]
+            rows = cutoff_rows(lengths)
+            self.assertEqual([0, *old, None], [row.elapsed_seconds for row in rows], size)
+            self.assertEqual({median}, {row.median_length_seconds for row in rows}, size)
+
     def test_every_row_names_the_development_case_count_the_median_and_one_rule_version(self) -> None:
         rows = cutoff_rows([3600, 7200, 5400])
         self.assertEqual({3}, {row.development_cases for row in rows})
@@ -220,31 +249,53 @@ class CutoffTest(unittest.TestCase):
 class FreezeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.lengths = [3600, 7200, 5400, 4800]
+        self.measure = measure_rows(self.lengths)
+        self.cutoffs = cutoff_rows(self.lengths)
 
     def test_a_first_build_has_nothing_to_freeze(self) -> None:
-        self.assertEqual([], frozen_problems(None, None, measure_rows(self.lengths), cutoff_rows(self.lengths)))
+        self.assertEqual([], frozen_problems(None, None, self.measure, self.cutoffs))
 
-    def test_the_same_measure_and_cutoffs_pass(self) -> None:
-        self.assertEqual([], frozen_problems(measure_rows(self.lengths), cutoff_rows(self.lengths), measure_rows(self.lengths), cutoff_rows(self.lengths)))
+    def test_the_same_measure_and_cutoffs_pass_in_any_order(self) -> None:
+        self.assertEqual([], frozen_problems(self.measure, self.cutoffs, self.measure, self.cutoffs))
+        self.assertEqual([], frozen_problems(self.measure[::-1], self.cutoffs[::-1], self.measure, self.cutoffs))
 
-    def test_a_changed_cutoff_is_refused_with_its_count(self) -> None:
+    def test_a_changed_cutoff_is_refused_with_its_count_and_every_row_carries_the_development_count_and_the_median(self) -> None:
         other = [*self.lengths, 20000, 20000, 20000]
-        problems = frozen_problems(measure_rows(self.lengths), cutoff_rows(self.lengths), measure_rows(other), cutoff_rows(other))
-        self.assertIn("changed_cutoff: 3 cutoffs", problems)
+        problems = frozen_problems(self.measure, self.cutoffs, measure_rows(other), cutoff_rows(other))
+        self.assertIn("changed_cutoff: 5 cutoffs", problems)
         self.assertTrue(any(problem.startswith("changed_measure: ") for problem in problems))
+
+    def test_a_wrong_development_count_or_median_with_the_same_times_is_refused(self) -> None:
+        held = [replace(row, development_cases=row.development_cases + 1) if row.cutoff == "p50_of_median" else row for row in self.cutoffs]
+        self.assertEqual(["changed_cutoff: 1 cutoff"], frozen_problems(self.measure, held, self.measure, self.cutoffs))
+        held = [replace(row, median_length_seconds=row.median_length_seconds + 1) if row.cutoff == "final" else row for row in self.cutoffs]
+        self.assertEqual(["changed_cutoff: 1 cutoff"], frozen_problems(self.measure, held, self.measure, self.cutoffs))
 
     def test_a_measure_that_changed_with_the_same_cutoffs_is_still_refused(self) -> None:
         other = [3600, 7200, 5400, 4800, 7300]
-        problems = frozen_problems(measure_rows(self.lengths), cutoff_rows(self.lengths), measure_rows(other), cutoff_rows(self.lengths))
+        problems = frozen_problems(self.measure, self.cutoffs, measure_rows(other), self.cutoffs)
         self.assertEqual(1, len(problems))
         self.assertTrue(problems[0].startswith("changed_measure: "))
 
+    def test_a_held_cutoff_that_is_there_twice_with_another_time_is_refused_as_a_repeated_key(self) -> None:
+        twice = [*self.cutoffs, replace(self.cutoffs[2], elapsed_seconds=999)]
+        self.assertEqual(["inherited_duplicates: 1 key"], frozen_problems(self.measure, twice, self.measure, self.cutoffs))
+
+    def test_a_held_measure_row_that_is_there_twice_is_refused_as_a_repeated_key_even_when_the_copy_is_equal(self) -> None:
+        twice = [*self.measure, self.measure[3]]
+        self.assertEqual(["inherited_duplicates: 1 key"], frozen_problems(twice, self.cutoffs, self.measure, self.cutoffs))
+        self.assertEqual(["inherited_duplicates: 1 key"], frozen_problems(self.measure, [*self.cutoffs, self.cutoffs[0]], self.measure, self.cutoffs))
+
+    def test_a_repeated_key_in_both_tables_counts_each_key_once_per_table(self) -> None:
+        problems = frozen_problems([*self.measure, self.measure[0]], [*self.cutoffs, self.cutoffs[0]], self.measure, self.cutoffs)
+        self.assertEqual(["inherited_duplicates: 2 keys"], problems)
+
     def test_an_existing_table_with_no_row_is_refused(self) -> None:
-        problems = frozen_problems([], cutoff_rows(self.lengths), measure_rows(self.lengths), cutoff_rows(self.lengths))
+        problems = frozen_problems([], self.cutoffs, self.measure, self.cutoffs)
         self.assertEqual(["inherited_empty: 0 rows"], problems)
 
     def test_an_existing_measure_with_no_cutoffs_or_the_reverse_is_refused(self) -> None:
-        self.assertEqual(["inherited_incomplete: the measure and the cutoffs are not both there"], frozen_problems(measure_rows(self.lengths), None, [], []))
+        self.assertEqual(["inherited_incomplete: the measure and the cutoffs are not both there"], frozen_problems(self.measure, None, [], []))
 
 
 class InputProblemTest(unittest.TestCase):
@@ -277,6 +328,17 @@ class InputProblemTest(unittest.TestCase):
         problems = input_problems(**clean_input(domain={"emop": 1, "sex": 2}), pinned=True)  # type: ignore[arg-type]
         self.assertEqual(["domain: 3 values in 2 columns (emop, sex)"], problems)
 
+    def test_a_split_that_breaks_the_rule_stops_the_job_with_the_split_checks_own_codes(self) -> None:
+        problems = input_problems(**clean_input(split_problems=["rule_mismatch: 1 patient", "unknown_set: 2 rows"]), pinned=True)  # type: ignore[arg-type]
+        self.assertEqual(["rule_mismatch: 1 patient", "unknown_set: 2 rows"], problems)
+
+    def test_a_held_out_outcome_value_not_in_its_published_form_is_a_code_with_no_count_and_no_column(self) -> None:
+        problems = input_problems(**clean_input(sealed_outcome_form_bad=1), pinned=True)  # type: ignore[arg-type]
+        self.assertEqual(["sealed_outcome_form: a held-out outcome value is not in its published form"], problems)
+
+    def test_no_measurement_yet_skips_the_development_count_check(self) -> None:
+        self.assertEqual([], input_problems(**clean_input(development_cases=None), pinned=True))  # type: ignore[arg-type]
+
     def test_no_development_case_and_empty_tables_are_refused(self) -> None:
         self.assertEqual(["no_development_cases: 0 cases"], input_problems(**clean_input(development_cases=0), pinned=True))  # type: ignore[arg-type]
         problems = input_problems(**clean_input(bronze_case_rows=0, bronze_lab_rows=0), pinned=False)  # type: ignore[arg-type]
@@ -287,6 +349,34 @@ class InputProblemTest(unittest.TestCase):
         problems = input_problems(**clean_input(bronze_case_rows=13, bronze_lab_rows=100), pinned=True)  # type: ignore[arg-type]
         self.assertEqual(["pinned_counts: 13 cases and 100 laboratory rows, not 6388 and 928448"], problems)
         self.assertEqual([], input_problems(**clean_input(bronze_case_rows=13, bronze_lab_rows=100), pinned=False))  # type: ignore[arg-type]
+
+
+class OutcomeColumnTest(unittest.TestCase):
+    def test_the_outcome_columns_are_the_stay_and_the_death_and_are_columns_of_the_table(self) -> None:
+        self.assertEqual(("icu_days", "death_inhosp"), OUTCOME_COLUMNS)
+        self.assertTrue(set(OUTCOME_COLUMNS) <= {column.name for column in CASE_COLUMNS})
+
+
+def split_rows(count: int) -> list[SplitRow]:
+    return [SplitRow(str(patient), SET_NAMES[patient_part(patient)], RULE_VERSION, 7) for patient in range(1, count + 1)]
+
+
+class SplitRuleTest(unittest.TestCase):
+    def test_a_split_made_by_the_rule_has_no_problem(self) -> None:
+        self.assertEqual([], split_rule_problems(split_rows(300), pinned=False))
+
+    def test_a_held_out_patient_relabelled_training_is_a_rule_mismatch_and_counted_once(self) -> None:
+        rows = split_rows(300)
+        held_out = next(index for index, row in enumerate(rows) if row.set == "test")
+        rows[held_out] = replace(rows[held_out], set="training")
+        self.assertEqual(["rule_mismatch: 1 patient"], split_rule_problems(rows, pinned=False))
+
+    def test_a_patient_in_two_sets_an_unknown_set_and_another_rule_version_are_each_refused(self) -> None:
+        rows = split_rows(300)
+        problems = split_rule_problems([*rows, replace(rows[0], set="validation")], pinned=False)
+        self.assertTrue(any(problem.startswith("two_sets: ") for problem in problems))
+        self.assertIn("unknown_set: 1 row", split_rule_problems([*rows[1:], replace(rows[0], set="holdout")], pinned=False))
+        self.assertIn("rule_version: 1 row", split_rule_problems([*rows[1:], replace(rows[0], rule_version="other")], pinned=False))
 
 
 class SourceSchemaTest(unittest.TestCase):
@@ -319,6 +409,10 @@ class OutputProblemTest(unittest.TestCase):
     def test_more_laboratory_rows_than_copies_is_impossible_and_refused(self) -> None:
         self.assertEqual(["lab_rows: 928449 rows from 928448 copies"], output_problems(**clean_output(lab_rows=928449)))  # type: ignore[arg-type]
 
+    def test_a_held_out_outcome_value_that_differs_from_bronze_is_a_code_with_no_count(self) -> None:
+        problems = output_problems(**clean_output(sealed_outcome_differs=1))  # type: ignore[arg-type]
+        self.assertEqual(["sealed_outcome_differs: a held-out outcome value differs from Bronze"], problems)
+
     def test_a_clean_output_has_no_problem(self) -> None:
         self.assertEqual([], output_problems(**clean_output()))  # type: ignore[arg-type]
 
@@ -334,6 +428,8 @@ class OutputProblemTest(unittest.TestCase):
             "lab_key_duplicates": "lab_key_duplicate: 4 keys",
             "lab_occurrence_gaps": "lab_occurrence_gap: 4 groups",
             "never_feature_marking_wrong": "never_feature_marking: 4 tables",
+            "case_key_differences": "case_key_differences: 4 keys",
+            "output_schema_tables_wrong": "output_schema: 4 tables",
         }
         for field, text in cases.items():
             self.assertEqual([text], output_problems(**clean_output(**{field: 4})), field)  # type: ignore[arg-type]

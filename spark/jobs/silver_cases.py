@@ -31,8 +31,10 @@ from scripts.stack.nessie import NessieClient, NessieError
 from spark.session import build_session
 from spark.settings import CATALOG
 from spark.silver_cases import (
+    CASE_COLUMNS,
     CASES_TABLE,
     CUTOFFS_TABLE,
+    LAB_COLUMNS,
     LAB_TABLE,
     MEASURE_TABLE,
     NEVER_FEATURE_COLUMNS,
@@ -41,7 +43,9 @@ from spark.silver_cases import (
     CutoffRow,
     MeasureRow,
     SilverCasesError,
+    same_rows,
     source_schema_problems,
+    split_rule_problems,
     unit,
 )
 from spark.silver_cases_run import JOB, run, run_build, run_verify, start_deadline
@@ -55,6 +59,7 @@ from spark.silver_cases_sql import (
     SPLIT_SOURCE,
     case_duplicates_query,
     case_facts_query,
+    case_key_query,
     case_output_query,
     cases_query,
     count_query,
@@ -65,10 +70,15 @@ from spark.silver_cases_sql import (
     lab_output_queries,
     lab_query,
     lab_unmatched_query,
+    outcome_facts_query,
+    outcome_output_query,
+    sealed_outcome_output_query,
+    sealed_outcome_query,
     split_facts_queries,
     values_query,
 )
 from spark.split_cli import open_client, read_settings
+from spark.split_table import SplitRow
 
 MEASURE_COLUMNS = (("statistic", "string"), ("unit", "string"), ("value", "bigint"))
 CUTOFF_COLUMNS = (
@@ -111,13 +121,24 @@ class Lake:
         if problems:
             raise SilverCasesError(*problems)
 
+    def split_problems(self) -> list[str]:
+        """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
+        rows = [
+            SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in self.session.table(SPLIT_SOURCE).collect()
+        ]
+        return split_rule_problems(rows, pinned=False)
+
     def input_facts(self) -> dict[str, object]:
+        """The counts over the inputs. The outcome columns are counted for development patients only; for the others one flag (0 or 1) says whether any value
+        is not in its published form."""
         case_row = self.session.sql(case_facts_query(BRONZE_CASES_SOURCE)).collect()[0].asDict()
+        case_row |= self.session.sql(outcome_facts_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)).collect()[0].asDict()
         lab_row = self.session.sql(lab_facts_query(BRONZE_LAB_SOURCE)).collect()[0].asDict()
         lab_row["lab_rows_without_case"] = self.count(lab_unmatched_query(BRONZE_LAB_SOURCE, BRONZE_CASES_SOURCE))
         without_one, patients = split_facts_queries(BRONZE_CASES_SOURCE, SPLIT_SOURCE)
         split = {"cases_without_one_split_row": self.count(without_one), "split_patients_without_case": self.count(patients)}
-        return {**decode_case_facts(case_row), **decode_lab_facts(lab_row), **split}
+        sealed = {"split_problems": self.split_problems(), "sealed_outcome_form_bad": self.count(sealed_outcome_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE))}
+        return {**decode_case_facts(case_row), **decode_lab_facts(lab_row), **split, **sealed}
 
     def development_lengths(self) -> list[int]:
         rows = self.session.sql(development_lengths_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)).collect()
@@ -198,14 +219,19 @@ class Lake:
     def write_rules(self, measure: list[MeasureRow], cutoffs: list[CutoffRow]) -> bool:
         held_measure, held_cutoffs = self.existing_rules()
         changed = False
-        if held_measure != measure:
+        if held_measure is None or not same_rows(held_measure, measure):
             changed |= self.write_values(MEASURE_SOURCE, MEASURE_COLUMNS, [(row.statistic, row.unit, row.value) for row in measure])
-        if held_cutoffs != cutoffs:
+        if held_cutoffs is None or not same_rows(held_cutoffs, cutoffs):
             rows = [
                 (row.cutoff, row.anchor, row.elapsed_seconds, row.basis, row.rule_version, row.development_cases, row.median_length_seconds) for row in cutoffs
             ]
             changed |= self.write_values(CUTOFFS_SOURCE, CUTOFF_COLUMNS, rows)
         return changed
+
+    def output_schema_tables_wrong(self) -> int:
+        """How many of the two written tables have other columns or types than the rules give, or are not there."""
+        wanted = {CASES_SOURCE: [(column.name, column.type) for column in CASE_COLUMNS], LAB_SOURCE: [(column.name, column.type) for column in LAB_COLUMNS]}
+        return sum(1 for table, fields in wanted.items() if self.columns(table) != fields)
 
     def output_facts(self) -> dict[str, object]:
         differences, duplicates, gaps, copies = lab_output_queries(BRONZE_LAB_SOURCE, LAB_SOURCE)
@@ -213,7 +239,11 @@ class Lake:
         return {
             "case_rows": self.count(count_query(CASES_SOURCE)),
             "bronze_case_rows": self.count(count_query(BRONZE_CASES_SOURCE)),
-            "case_value_differences": self.count(case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE)),
+            "case_value_differences": self.count(case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE))
+            + self.count(outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)),
+            "case_key_differences": self.count(case_key_query(BRONZE_CASES_SOURCE, CASES_SOURCE)),
+            "sealed_outcome_differs": self.count(sealed_outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)),
+            "output_schema_tables_wrong": self.output_schema_tables_wrong(),
             "case_key_duplicates": self.count(case_duplicates_query(CASES_SOURCE)),
             "lab_rows": self.count(count_query(LAB_SOURCE)),
             "lab_copies": self.count(copies),

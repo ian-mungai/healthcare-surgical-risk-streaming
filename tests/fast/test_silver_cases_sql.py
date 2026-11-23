@@ -14,7 +14,7 @@ from spark.silver_cases import (
     DEVELOPMENT_SETS,
     FLAG_COLUMNS,
     LAB_COLUMNS,
-    PUBLISHED_CLINICAL_COLUMNS,
+    OUTCOME_COLUMNS,
     SilverCasesError,
     age_over_89_value,
 )
@@ -26,6 +26,7 @@ from spark.silver_cases_sql import (
     SPLIT_SOURCE,
     case_duplicates_query,
     case_facts_query,
+    case_key_query,
     case_output_query,
     cases_query,
     count_query,
@@ -36,6 +37,10 @@ from spark.silver_cases_sql import (
     lab_output_queries,
     lab_query,
     lab_unmatched_query,
+    outcome_facts_query,
+    outcome_output_query,
+    sealed_outcome_output_query,
+    sealed_outcome_query,
     split_facts_queries,
     typed_expression,
     values_query,
@@ -163,8 +168,13 @@ class FactsTest(unittest.TestCase):
     def test_the_case_facts_name_one_unparsed_count_for_each_published_column_except_the_text_ones(self) -> None:
         query = case_facts_query(BRONZE_CASES_SOURCE)
         aliases = re.findall(r" AS (unparsed__\w+)", query)
-        typed = [column.name for column in CASE_COLUMNS if column.type in {"bigint", "double"}]
+        typed = [column.name for column in CASE_COLUMNS if column.type in {"bigint", "double"} and column.name not in OUTCOME_COLUMNS]
         self.assertEqual([f"unparsed__{name}" for name in typed], aliases)
+
+    def test_no_outcome_column_is_read_in_the_full_cohort_facts(self) -> None:
+        query = case_facts_query(BRONZE_CASES_SOURCE)
+        for name in OUTCOME_COLUMNS:
+            self.assertNotIn(name, query)
 
     def test_the_age_count_does_not_count_the_top_coded_value_as_unparsed(self) -> None:
         items = {item.rsplit(" AS ", 1)[1]: item for item in select_list(case_facts_query(BRONZE_CASES_SOURCE))}
@@ -174,7 +184,8 @@ class FactsTest(unittest.TestCase):
     def test_the_flags_the_sex_and_the_asa_class_are_held_to_their_published_values(self) -> None:
         query = case_facts_query(BRONZE_CASES_SOURCE)
         for name in FLAG_COLUMNS:
-            self.assertRegex(query, rf"NOT IN \(0, 1\) THEN 1 ELSE 0 END\), 0\) AS domain__{name}\b")
+            if name not in OUTCOME_COLUMNS:
+                self.assertRegex(query, rf"NOT IN \(0, 1\) THEN 1 ELSE 0 END\), 0\) AS domain__{name}\b")
         self.assertIn("NOT IN ('F', 'M')", query)
         self.assertIn("NOT IN (1, 2, 3, 4, 5, 6)", query)
 
@@ -191,6 +202,23 @@ class FactsTest(unittest.TestCase):
         self.assertIn("HAVING COUNT(s.`subjectid`) <> 1", cases)
         self.assertIn("LEFT JOIN", cases)
         self.assertIn("LEFT ANTI JOIN", patients)
+
+    def test_the_outcome_columns_are_counted_for_development_patients_only_and_never_name_the_held_out_set(self) -> None:
+        query = outcome_facts_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)
+        self.assertIn("WHERE s.`set` IN ('training', 'validation')", query)
+        for alias in ("unparsed__icu_days", "unparsed__death_inhosp", "domain__death_inhosp"):
+            self.assertIn(f" AS {alias}", query)
+        self.assertNotIn("test", query.replace("TRY_CAST", ""))
+
+    def test_the_held_out_outcome_check_is_one_flag_that_is_zero_or_one_and_never_a_count(self) -> None:
+        query = sealed_outcome_query(BRONZE_CASES_SOURCE, SPLIT_SOURCE)
+        self.assertTrue(query.startswith("SELECT CASE WHEN COALESCE(SUM("))
+        self.assertIn("> 0 THEN 1 ELSE 0 END AS n", query)
+        self.assertIn("COALESCE(s.`set`, '') NOT IN ('training', 'validation')", query)
+        self.assertIn("LEFT JOIN", query)
+        for name in OUTCOME_COLUMNS:
+            self.assertIn(name, query)
+        self.assertNotIn("test", query.replace("TRY_CAST", ""))
 
     def test_the_laboratory_facts_count_unparsed_numbers_and_null_key_parts(self) -> None:
         query = lab_facts_query(BRONZE_LAB_SOURCE)
@@ -241,9 +269,31 @@ class FactsTest(unittest.TestCase):
 class OutputQueryTest(unittest.TestCase):
     def test_every_silver_column_is_compared_with_its_bronze_value_through_a_null_safe_equality(self) -> None:
         query = case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE)
-        self.assertEqual(len(CASE_COLUMNS), query.count("<=>"))
-        for name in PUBLISHED_CLINICAL_COLUMNS:
-            self.assertIn(f"`s`.`{name}`", query)
+        outside = [column for column in CASE_COLUMNS if column.name not in OUTCOME_COLUMNS]
+        self.assertEqual(len(outside), query.count("<=>"))
+        for column in outside:
+            if column.name != "age_over_89":
+                self.assertIn(f"`s`.`{column.name}`", query)
+
+    def test_the_outcome_columns_are_compared_for_development_patients_only_and_the_held_out_ones_as_one_flag(self) -> None:
+        full = case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE)
+        for name in OUTCOME_COLUMNS:
+            self.assertNotIn(name, full)
+        development = outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)
+        self.assertEqual(len(OUTCOME_COLUMNS), development.count("<=>"))
+        self.assertIn("p.`set` IN ('training', 'validation')", development)
+        flag = sealed_outcome_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE, SPLIT_SOURCE)
+        self.assertTrue(flag.startswith("SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS n"))
+        self.assertIn("COALESCE(p.`set`, '') NOT IN ('training', 'validation')", flag)
+        self.assertEqual(len(OUTCOME_COLUMNS), flag.count("<=>"))
+
+    def test_the_case_keys_are_compared_both_ways_with_anti_joins_so_a_replaced_key_fails(self) -> None:
+        query = case_key_query(BRONZE_CASES_SOURCE, CASES_SOURCE)
+        self.assertEqual(2, query.count("LEFT ANTI JOIN"))
+        self.assertEqual(1, query.count("UNION ALL"))
+        left, right = query.split("UNION ALL")
+        self.assertLess(left.index(BRONZE_CASES_SOURCE), left.index(CASES_SOURCE))
+        self.assertLess(right.index(CASES_SOURCE), right.index(BRONZE_CASES_SOURCE))
 
     def test_a_missing_bronze_value_is_compared_as_missing(self) -> None:
         self.assertIn("NULLIF(`b`.`height`, '')", case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE))
@@ -263,6 +313,13 @@ class OutputQueryTest(unittest.TestCase):
         self.assertIn("HAVING MIN(`source_occurrence`) <> 1 OR MAX(`source_occurrence`) <> COUNT(*)", gaps)
         self.assertIn("SUM(`source_copies`)", copies)
 
+    def test_each_laboratory_row_is_compared_with_its_expected_occurrence_beside_its_result_and_copy_count(self) -> None:
+        differences = lab_output_queries(BRONZE_LAB_SOURCE, LAB_SOURCE)[0]
+        self.assertEqual(2, differences.count("ROW_NUMBER() OVER (PARTITION BY `caseid`, `dt`, `name` ORDER BY `result` ASC NULLS FIRST)"))
+        for side in differences.split(" UNION ALL "):
+            self.assertEqual(1, side.count("ROW_NUMBER()"))
+            self.assertEqual(1, side.count("`source_copies`, `source_occurrence` FROM"))
+
 
 class LabCheckQueryTest(unittest.TestCase):
     def test_both_sides_are_grouped_on_all_four_values_and_each_direction_is_bronze_against_silver_then_silver_against_bronze(self) -> None:
@@ -276,10 +333,11 @@ class LabCheckQueryTest(unittest.TestCase):
 
     def test_an_empty_bronze_text_is_missing_in_every_check_of_a_column(self) -> None:
         query = case_output_query(BRONZE_CASES_SOURCE, CASES_SOURCE)
-        for column in CASE_COLUMNS:
+        outside = [column for column in CASE_COLUMNS if column.name not in OUTCOME_COLUMNS]
+        for column in outside:
             if column.name != "age_over_89":
                 self.assertIn(f"NULLIF(`b`.`{column.name}`, '')" if column.name != "age" else "NULLIF(`b`.`age`, '')", query, column.name)
-        self.assertEqual(len(CASE_COLUMNS), query.count("NULLIF("))
+        self.assertEqual(len(outside), query.count("NULLIF("))
 
 
 class CountQueryTest(unittest.TestCase):
