@@ -11,23 +11,21 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from replay.events.identity import partition_of
 from spark.streaming.model import FeatureRecord, Record
 from spark.streaming.rows import TABLES, TableSpec, ddl, table_values
 from spark.streaming.sinks import SOURCE_VIEW, create_sql, merge_sql
 from spark.streaming.wire import feature_ready_payload
 
 NAMESPACES = ("lake.feature", "lake.stream")
-KAFKA_FRAME_DDL = "key binary, value binary, partition int"
+KAFKA_FRAME_DDL = "key binary, value binary"
 
 
 class LakeSinks:
-    def __init__(self, session: Any, writer: Any, bootstrap: str, topic: str, partitions: int) -> None:
+    def __init__(self, session: Any, writer: Any, bootstrap: str, topic: str) -> None:
         self.session = session
         self.writer = writer
         self.bootstrap = bootstrap
         self.topic = topic
-        self.partitions = partitions
 
     def create_tables(self) -> None:
         for namespace in NAMESPACES:
@@ -41,10 +39,7 @@ class LakeSinks:
         self.session.sql(merge_sql(spec))
 
     def publish_ready(self, records: Sequence[FeatureRecord]) -> None:
-        rows = [
-            (str(record.room).encode(), self.writer.message("feature_ready", feature_ready_payload(record)), partition_of(record.room, self.partitions))
-            for record in records
-        ]
+        rows = [(str(record.room).encode(), self.writer.message("feature_ready", feature_ready_payload(record))) for record in records]
         frame = self.session.createDataFrame(rows, schema=KAFKA_FRAME_DDL)
         (
             frame.write.format("kafka")

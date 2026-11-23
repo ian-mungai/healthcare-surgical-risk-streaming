@@ -16,8 +16,6 @@ import sys
 import time
 from typing import Any
 
-from replay.events.formats import FORMATS
-from replay.events.identity import partition_of
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.catalog import required_environment
 from spark.session import build_session
@@ -42,13 +40,6 @@ def ensure_branch(client: NessieClient, branch: str) -> None:
             raise NessieError(f"{branch} exists and is not a branch") from None
 
 
-def topic_partitions(bootstrap: str, topic: str) -> int:
-    """The partition count of the output topic, from Kafka's own metadata. The replay does the same, with the same client."""
-    from replay.service.kafka_io import partition_count
-
-    return partition_count(bootstrap, topic)
-
-
 def main() -> int:
     try:
         settings = from_environment(os.environ)
@@ -60,8 +51,6 @@ def main() -> int:
         from replay.service.wire_codec import Writer
 
         writer = Writer(RegistryClient(settings.registry_url))
-        partitions = topic_partitions(settings.bootstrap, FORMATS["feature_ready"].topic)
-        partition_of(0, partitions)
     except (StreamSettingsError, SettingsError, ClinicalFileError) as error:
         sys.stderr.write(f"{JOB}: {error}\n")
         return 2
@@ -69,7 +58,7 @@ def main() -> int:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
         return 1
     session = build_session(JOB, settings.branch, extra=SESSION_OPTIONS)
-    sinks = LakeSinks(session, writer, settings.bootstrap, settings.output_topic, partitions)
+    sinks = LakeSinks(session, writer, settings.bootstrap, settings.output_topic)
     sinks.create_tables()
     query = start_query(session, sinks, settings)
     stopped = {"signal": False}

@@ -1,4 +1,9 @@
-# The packages of the Spark image that the Bronze decoder needs, in spark/Dockerfile. `make lock-spark` writes requirements.txt with hashes.
+# The packages of the Spark image that the Bronze decoder and the streaming job need, in spark/Dockerfile. `make lock-spark` writes requirements.txt with hashes.
 # vitaldb decodes the publisher's case files. boto3 reads the landed object versions from S3 on the host. Both are the replay's pins.
 vitaldb==1.7.2
 boto3==1.43.126
+# The streaming job: fastavro reads and writes the Avro wire bytes (the replay's pin). pyarrow and protobuf are what Spark 4.1.4's Python transformWithState
+# needs, and protobuf is Spark's own pin (dev/requirements.txt of the 4.1.4 tag, the version of its generated code). Each was released at least two weeks before.
+fastavro==1.13.1
+pyarrow==26.0.1
+protobuf==6.33.0
