@@ -8,6 +8,7 @@ services:
     user: "10001:10001"
     group_add:
       - ${DOCKER_SOCKET_GID:?write the host settings first}
+      - "20105"
     env_file:
       - path: ../host.env
         required: false
@@ -24,9 +25,13 @@ services:
       AIRBYTE_CLIENT_SECRET_FILE: /run/secrets/airbyte_client_secret
       AIRBYTE_AWS_ACCESS_KEY_ID_FILE: /run/secrets/airbyte_aws_access_key_id
       AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/airbyte_aws_secret_access_key
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
     configs:
       - source: dagster_limits
         target: /opt/dagster/limits.yml
+      - source: dagster_aws_client_config
+        target: /etc/workload_access/client_config
     extra_hosts:
       - k3s_api:host-gateway
     secrets:
@@ -45,6 +50,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - dagster_data:/opt/dagster/data
       - dagster_runs:/opt/dagster/runs
+      - workload_access_orchestrator:/run/workload_access:ro
       - dagster_storage:/opt/dagster/instance/storage
     healthcheck:
       test: [CMD, dagster, api, grpc-health-check, --port, "4266"]
@@ -56,6 +62,8 @@ services:
 configs:
   dagster_limits:
     file: ../limits.yml
+  dagster_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
 
 secrets:
   dagster_postgres_password:
@@ -81,3 +89,9 @@ volumes:
   dagster_data:
   dagster_runs:
   dagster_storage:
+  workload_access_orchestrator:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${ORCHESTRATOR_ACCESS_DIR:-/run/workload_access/orchestrator}

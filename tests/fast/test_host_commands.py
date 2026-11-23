@@ -696,14 +696,15 @@ class WorkloadVariablesTest(unittest.TestCase):
         self.assertEqual({"workload_access_region": "us-west-2", "workload_access_workloads": expected}, workload_variables(state, "us-west-2"))
 
     def test_project_workloads_keep_their_own_group_ids_whatever_other_workloads_exist(self) -> None:
-        names = ("airbyte", "ingestion_check", "spark", "trino", "replay")
+        names = ("airbyte", "ingestion_check", "spark", "trino", "replay", "orchestrator")
         for others in ((), ("reader", "writer"), ("aaa_first", "dagster", "zzz_last")):
             with self.subTest(others=others):
                 roles = {name: f"arn:{name}" for name in (*names, *others)}
                 workloads = workload_variables({"values": {"outputs": {"workload_role_arns": {"value": roles}}}}, "us-west-2")["workload_access_workloads"]
                 by_name = {workload["name"]: workload["gid"] for workload in workloads}
                 self.assertEqual(
-                    {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103, "replay": 20104}, {name: by_name[name] for name in names}
+                    {"airbyte": 20100, "ingestion_check": 20101, "spark": 20102, "trino": 20103, "replay": 20104, "orchestrator": 20105},
+                    {name: by_name[name] for name in names},
                 )
                 self.assertEqual(len(by_name), len(set(by_name.values())))
                 self.assertEqual(sorted(others), [name for name, _ in sorted(by_name.items(), key=lambda item: item[1]) if name in others])
