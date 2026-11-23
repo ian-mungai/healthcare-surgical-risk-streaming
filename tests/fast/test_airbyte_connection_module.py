@@ -1102,6 +1102,39 @@ class SocketDeadlineTest(unittest.TestCase):
         self.assertLess(elapsed, 0.25 + self.MARGIN)
         self.assertIn("did not answer within", message)
 
+    def test_a_trickled_body_under_connection_close_ends_at_the_deadline(self) -> None:
+        def trickle(sock: socket.socket) -> None:
+            sock.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 100000\r\n\r\n")
+            for _ in range(200):
+                sock.sendall(b"x")
+                time.sleep(0.02)
+
+        elapsed, message = self.timed(self.serve(trickle), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+        self.assertIn("did not answer within", message)
+
+    def test_a_trickled_body_under_connection_close_without_a_length_ends_at_the_deadline(self) -> None:
+        def trickle(sock: socket.socket) -> None:
+            sock.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+            for _ in range(200):
+                sock.sendall(b"x")
+                time.sleep(0.02)
+
+        elapsed, message = self.timed(self.serve(trickle), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+        self.assertIn("did not answer within", message)
+
+    def test_a_chunk_extension_that_trickles_under_connection_close_ends_at_the_deadline(self) -> None:
+        def trickle(sock: socket.socket) -> None:
+            sock.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2;")
+            for _ in range(200):
+                sock.sendall(b"a")
+                time.sleep(0.02)
+
+        elapsed, message = self.timed(self.serve(trickle), 0.25)
+        self.assertLess(elapsed, 0.25 + self.MARGIN)
+        self.assertIn("did not answer within", message)
+
     def test_a_server_that_sends_the_headers_slowly_a_byte_at_a_time_ends_at_the_deadline(self) -> None:
         def trickle(sock: socket.socket) -> None:
             for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}":

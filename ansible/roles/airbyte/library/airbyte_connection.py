@@ -26,8 +26,7 @@ Every exchange with Airbyte has one elapsed deadline, enforced by a timer that s
 (``Budget``), so no exchange and no kubectl call runs past it. The token, the client credentials, the key and every body of a call stay out of every
 message: a failed call names its method, its path and its status.
 
-Accepted limit (owner decision, Nov 22 2026): for an answer that carries ``Connection: close`` the body read can outlast the exchange deadline, and
-the kill grace of the ``timeout`` program around kubectl is outside the run budget.
+Accepted limit (owner decision, Nov 22 2026): the kill grace of the ``timeout`` program around kubectl is outside the run budget.
 
 The module uses only the standard library and runs on the host's Python.
 """
@@ -145,8 +144,8 @@ class HttpApi(Api):
     """Calls over plain HTTP to Airbyte's local address only, so the bearer token never leaves the host.
 
     One exchange (connect, send, read the whole answer) has one deadline: the smaller of ``timeout_seconds`` and the time left in the run's budget. A
-    timer shuts the socket down when it expires, so any read that is pending fails at once, however slowly the server sends its headers or its body,
-    and an exchange that ended after the deadline is a timeout too."""
+    timer shuts the socket down when it expires, so any read that is pending fails at once, however slowly the server sends its headers or its body
+    (under ``Connection: close`` too, and in a chunk size line), and an exchange that ended after the deadline is a timeout too."""
 
     def __init__(
         self,
@@ -184,11 +183,14 @@ class HttpApi(Api):
         started = self.clock()
         expired = threading.Event()
         connection = self.connect(self.host, self.port, timeout=allowed)
+        # The socket is saved once the request is sent: under Connection: close the HTTP library drops its own reference before the body is read, and the
+        # timer must still be able to shut the socket that a pending read waits on.
+        saved: list[Any] = [None]
 
         def stop() -> None:
             expired.set()
             with contextlib.suppress(OSError, AttributeError):
-                connection.sock.shutdown(socket.SHUT_RDWR)
+                (saved[0] if saved[0] is not None else connection.sock).shutdown(socket.SHUT_RDWR)
 
         timer = threading.Timer(allowed, stop)
         timer.daemon = True
@@ -196,7 +198,7 @@ class HttpApi(Api):
         late = ApiError(f"{method} {path} did not answer within {allowed:g} seconds")
         try:
             connection.request(method, f"{self.prefix}{path}", body=data, headers=headers)
-            sock = getattr(connection, "sock", None)
+            sock = saved[0] = getattr(connection, "sock", None)
             if sock is not None:
                 sock.settimeout(max(allowed - (self.clock() - started), 0.001))
             reply = connection.getresponse()
