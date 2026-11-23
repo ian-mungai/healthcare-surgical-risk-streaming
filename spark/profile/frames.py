@@ -1,0 +1,201 @@
+"""The Spark frames of the signal profile tables, from the Silver signal tables, the patient split and Bronze, and the counts that the checks read.
+
+PySpark is installed in the job image only, so it is imported by name inside the functions and the rest of the sources are checked without it. Spark runs Python
+only to call the one count of the unscored cutoffs (``spark.profile.unscored``), once for each case. Everything else is Spark SQL. Spark 4 runs with ANSI mode
+on, so a division that could have a zero divisor is ``try_divide`` and a text that may not be a number is read with ``try_cast``.
+
+The development cases are the cases of the patients in the training and validation sets, by a join of ``bronze.clinical_cases`` and ``silver.patient_split``
+(``development_cases``). The checks count the development rows by another route: the list of the development case numbers that the job made in Python.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from functools import reduce
+from operator import add
+from typing import Any
+
+from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
+from features.signal_validity import ARTERIAL_WAVEFORM, INVALID_CAUSES
+from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, UnscoredFacts
+from spark.profile.counts import ARTERIAL_TRACK, BY_NAME, FULL_COHORT, NONINVASIVE_TRACK, PRESPECIFIED, SECONDS_PER_HOUR
+from spark.profile.tables import CAUSE_COLUMNS, COUNTS, DEVELOPMENT_SCOPE, KINDS, NUMERIC_KIND, PROFILE, UNSCORED, WAVEFORM_KIND
+from spark.profile.unscored import CUTOFF_STEP_SECONDS, count_unscored
+from spark.silver.frames import count_where, functions, typed, types
+
+DEVELOPMENT_SETS = ("training", "validation")
+TRACK_KEY = ("kind", "track")
+
+
+def unscored_row(valid_seconds: list[int] | None, first: int | None, last: int | None) -> tuple[int, int, int, int]:
+    """The cutoffs, the cutoffs that fail the waveform limit, the numeric limit and either, for one case (``count_unscored``)."""
+    if first is None or last is None:
+        return (0, 0, 0, 0)
+    counted = count_unscored(valid_seconds or [], int(first), int(last))
+    return (counted.cutoffs, counted.waveform, counted.numeric, counted.either)
+
+
+def unscored_udf() -> Any:
+    t = types()
+    fields = [t.StructField(name, t.LongType()) for name in ("cutoffs", "waveform", "numeric", "either")]
+    return functions().udf(unscored_row, t.StructType(fields)).asNondeterministic()
+
+
+def development_cases(clinical: Any, split: Any) -> Any:
+    """One row, ``case_id``, for each case of a patient in the training or validation set."""
+    f = functions()
+    patients = split.filter(f.col("set").isin(*DEVELOPMENT_SETS)).select("subjectid")
+    return clinical.join(f.broadcast(patients), "subjectid").select(f.col("caseid").cast("bigint").alias("case_id")).distinct()
+
+
+def kind_profile(frame: Any, kind: str, development: Any) -> Any:
+    """The profile rows of one kind of signal: for each track, the development cases that hold it, its rows, its valid rows and each cause."""
+    f = functions()
+    held = frame.join(f.broadcast(development), "case_id")
+    causes = [count_where(f.col("invalid_cause") == f.lit(cause)).alias(name) for cause, name in zip(INVALID_CAUSES, CAUSE_COLUMNS, strict=True)]
+    grouped = held.groupBy("track").agg(
+        f.countDistinct("case_id").alias("cases"), f.count(f.lit(1)).alias("rows"), count_where(f.col("valid")).alias("valid_rows"), *causes
+    )
+    return grouped.withColumn("kind", f.lit(kind))
+
+
+def profile_frame(numeric: Any, waveform: Any, development: Any) -> Any:
+    """``silver.signal_profile``: the numeric and the waveform tracks of the development cases."""
+    f = functions()
+    both = kind_profile(numeric, NUMERIC_KIND, development).unionByName(kind_profile(waveform, WAVEFORM_KIND, development))
+    return typed(both.withColumn("valid_share", f.try_divide(f.col("valid_rows").cast("double"), f.col("rows").cast("double"))), PROFILE.columns)
+
+
+def unscored_frame(waveform: Any, development: Any) -> Any:
+    """``silver.unscored_share``: one row, from the arterial waveform seconds of the development cases, counted once for each case."""
+    f = functions()
+    held = waveform.filter(f.col("track") == f.lit(ARTERIAL_WAVEFORM)).join(f.broadcast(development), "case_id")
+    per_case = held.groupBy("case_id").agg(
+        f.min("case_second").alias("first"),
+        f.max("case_second").alias("last"),
+        f.collect_list(f.when(f.col("valid"), f.col("case_second"))).alias("valid_seconds"),
+    )
+    counted = per_case.withColumn("_u", unscored_udf()(f.col("valid_seconds"), f.col("first"), f.col("last")))
+    total = counted.agg(
+        f.count(f.lit(1)).alias("cases"),
+        *[f.coalesce(f.sum(f.col(f"_u.{name}")), f.lit(0)).alias(name) for name in ("cutoffs", "waveform", "numeric", "either")],
+    )
+    rule = {
+        "scope": f.lit(DEVELOPMENT_SCOPE),
+        "unscored_share": f.try_divide(f.col("either").cast("double"), f.col("cutoffs").cast("double")),
+        "cutoff_step": f.lit(CUTOFF_STEP_SECONDS),
+        "waveform_window": f.lit(WAVEFORM_WINDOW_SECONDS),
+        "waveform_limit": f.lit(MAX_INVALID_WAVEFORM_SECONDS),
+        "numeric_window": f.lit(NUMERIC_WINDOW_SECONDS),
+        "numeric_limit": f.lit(MAX_INVALID_NUMERIC_PERCENT),
+    }
+    return typed(total.withColumns(rule), UNSCORED.columns)
+
+
+def counts_frame(session: Any, rows: Sequence[Mapping[str, Any]]) -> Any:
+    """``silver.source_counts`` from the rows of ``spark.profile.counts.count_rows``."""
+    names = [name for name, _ in COUNTS.columns]
+    ddl = ", ".join(f"{name} {kind}" for name, kind in COUNTS.columns)
+    return session.createDataFrame([tuple(row[name] for name in names) for row in rows], ddl)
+
+
+def fixed_counts(clinical: Any, tracks: Any) -> dict[str, float | None]:
+    """The reproduced counts of the full cohort, from Bronze. Each is a number and is never printed: the job judges it and keeps the flag."""
+    f = functions()
+    hours = clinical.select((f.col("caseend").try_cast("double") / f.lit(SECONDS_PER_HOUR)).alias("hours")).filter(f.col("hours").isNotNull())
+    spread = hours.agg(f.sum("hours").alias("total"), f.avg("hours").alias("mean"), f.expr("percentile(hours, 0.5)").alias("median")).first()
+    held = tracks.select("case_id", "track")
+
+    def cases_with(track: str) -> float:
+        return float(held.filter(f.col("track") == f.lit(track)).select("case_id").distinct().count())
+
+    return {
+        "cases": float(clinical.count()),
+        "patients": float(clinical.select("subjectid").distinct().count()),
+        "tracks": float(tracks.count()),
+        "cases_with_arterial_waveform": cases_with(ARTERIAL_TRACK),
+        "cases_with_noninvasive_pressure": cases_with(NONINVASIVE_TRACK),
+        "recorded_hours": None if spread["total"] is None else float(spread["total"]),
+        "mean_case_hours": None if spread["mean"] is None else float(spread["mean"]),
+        "median_case_hours": None if spread["median"] is None else float(spread["median"]),
+    }
+
+
+def input_facts(numeric: Any, waveform: Any, case_ids: list[int]) -> InputFacts:
+    """The development rows of the Silver signal tables, counted with the list of development case numbers instead of the plan's join."""
+    f = functions()
+    kept_numeric = numeric.filter(f.col("case_id").isin(case_ids))
+    kept_waveform = waveform.filter(f.col("case_id").isin(case_ids))
+    tracks = kept_numeric.select("track").distinct().count() + kept_waveform.select("track").distinct().count()
+    arterial = kept_waveform.filter(f.col("track") == f.lit(ARTERIAL_WAVEFORM)).select("case_id").distinct().count()
+    return InputFacts(kept_numeric.count(), kept_waveform.count(), tracks, arterial)
+
+
+def profile_facts(frame: Any) -> ProfileFacts:
+    f = functions()
+    key = f.struct(*[f.col(name) for name in TRACK_KEY])
+    added = reduce(add, [f.col("valid_rows"), *[f.col(name) for name in CAUSE_COLUMNS]])
+    exact = f.try_divide(f.col("valid_rows").cast("double"), f.col("rows").cast("double"))
+    share_ok = f.coalesce(f.abs(f.col("valid_share") - exact) <= f.lit(FLOAT_TOLERANCE), f.lit(False))
+    row = frame.agg(
+        f.count(f.lit(1)).alias("rows"),
+        (f.count(f.lit(1)) - f.countDistinct(key)).alias("duplicate_keys"),
+        count_where(added != f.col("rows")).alias("partition"),
+        count_where(~share_ok).alias("share"),
+        count_where(~f.col("kind").isin(*KINDS)).alias("kind"),
+        f.sum(f.when(f.col("kind") == f.lit(NUMERIC_KIND), f.col("rows"))).alias("numeric_rows"),
+        f.sum(f.when(f.col("kind") == f.lit(WAVEFORM_KIND), f.col("rows"))).alias("waveform_rows"),
+        f.countDistinct(key).alias("tracks"),
+    ).first()
+    return ProfileFacts(
+        int(row["rows"]),
+        int(row["duplicate_keys"]),
+        int(row["partition"] or 0),
+        int(row["share"] or 0),
+        int(row["kind"] or 0),
+        int(row["numeric_rows"] or 0),
+        int(row["waveform_rows"] or 0),
+        int(row["tracks"]),
+    )
+
+
+def unscored_facts(frame: Any) -> UnscoredFacts:
+    rows = frame.collect()
+    if not rows:
+        return UnscoredFacts(0, 0, 0, 0, 0, None, 0, 0, 0, 0, 0, 0)
+    one = rows[0]
+    share = one["unscored_share"]
+    return UnscoredFacts(
+        len(rows),
+        int(one["cutoffs"]),
+        int(one["waveform"]),
+        int(one["numeric"]),
+        int(one["either"]),
+        None if share is None else float(share),
+        int(one["cases"]),
+        int(one["cutoff_step"]),
+        int(one["waveform_window"]),
+        int(one["waveform_limit"]),
+        int(one["numeric_window"]),
+        int(one["numeric_limit"]),
+    )
+
+
+def counts_facts(frame: Any) -> tuple[CountsFacts, tuple[str, ...]]:
+    """The facts of ``source_counts`` and the names of the counts whose flag is false. The table is a dozen rows, so it is read whole."""
+    held = [row.asDict() for row in frame.collect()]
+    names = [row["name"] for row in held]
+    expected = {count.name for count in PRESPECIFIED}
+    sealed = {count.name for count in PRESPECIFIED if count.scope == FULL_COHORT}
+    sealed_with_value = sum(1 for row in held if row["name"] in sealed and row["value"] is not None)
+    expected_differs = sum(1 for row in held if row["name"] in BY_NAME and row["expected"] != float(BY_NAME[row["name"]].expected))
+    flags = [row["matches"] for row in held]
+    facts = CountsFacts(
+        len(held),
+        len(set(names) ^ expected),
+        sealed_with_value,
+        expected_differs,
+        sum(1 for flag in flags if flag is None),
+        sum(1 for flag in flags if flag is not None),
+    )
+    return facts, tuple(sorted(row["name"] for row in held if row["matches"] is False))
