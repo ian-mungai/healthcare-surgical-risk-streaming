@@ -11,12 +11,13 @@ import unittest
 
 from spark.bronze.checks import CheckResult, plan, verdict
 from spark.bronze.commands import branch_report, command_problem, exit_code, failed_text
-from tests.fast.test_bronze_publish import BASE, BASE_HEAD, BRANCH, HEAD, KEYS, MERGED, Checker, FakeNessie, failing
+from spark.bronze.publication import PublicationError
+from tests.fast.test_bronze_publish import BASE, BASE_HEAD, BRANCH, EXPECTED, HEAD, KEYS, MERGED, Checker, FakeNessie, failing
 
 
 class ReportTest(unittest.TestCase):
     def test_a_verify_report_holds_the_checked_hash_and_the_checks_and_no_publication(self) -> None:
-        document = branch_report(FakeNessie(), Checker(), BRANCH, BASE, KEYS, publishing=False)
+        document = branch_report(FakeNessie(), Checker(), BRANCH, BASE, EXPECTED, publishing=False)
         self.assertEqual((HEAD, True), (document["checked_hash"], document["passed"]))
         self.assertNotIn("publication", document)
         self.assertEqual(len(plan()), len(document["checks"]["checks"]))
@@ -24,7 +25,7 @@ class ReportTest(unittest.TestCase):
 
     def test_a_publish_report_names_the_merge_and_the_snapshot_of_each_table_on_the_base(self) -> None:
         nessie = FakeNessie()
-        document = branch_report(nessie, Checker(), BRANCH, BASE, KEYS, publishing=True)
+        document = branch_report(nessie, Checker(), BRANCH, BASE, EXPECTED, publishing=True)
         self.assertEqual(
             {"status": "merged", "base": BASE, "base_hash_before": BASE_HEAD, "merged_hash": MERGED, "snapshots": {KEYS[0]: 10, KEYS[1]: 11}, "blocked_by": []},
             document["publication"],
@@ -34,7 +35,7 @@ class ReportTest(unittest.TestCase):
 
     def test_a_failed_check_is_a_report_that_stops_the_job_and_names_the_check_and_its_guard(self) -> None:
         nessie = FakeNessie()
-        document = branch_report(nessie, Checker(failing("numeric_observations", "case_id not null")), BRANCH, BASE, KEYS, publishing=True)
+        document = branch_report(nessie, Checker(failing("numeric_observations", "case_id not null")), BRANCH, BASE, EXPECTED, publishing=True)
         self.assertEqual(
             ("blocked", None, ["key"]), (document["publication"]["status"], document["publication"]["merged_hash"], document["publication"]["blocked_by"])
         )
@@ -43,16 +44,31 @@ class ReportTest(unittest.TestCase):
         self.assertEqual([], nessie.merge_calls)
 
     def test_a_failed_verify_exits_with_one_and_publishes_nothing(self) -> None:
-        document = branch_report(FakeNessie(), Checker(failing("tracks", "kind in set")), BRANCH, BASE, KEYS, publishing=False)
+        document = branch_report(FakeNessie(), Checker(failing("tracks", "kind in set")), BRANCH, BASE, EXPECTED, publishing=False)
         self.assertEqual((False, 1), (document["passed"], exit_code(document)))
         self.assertIn("tracks: kind in set (structure guard", failed_text(document))
 
     def test_a_missing_check_result_is_reported_as_unexpected_minus_one(self) -> None:
         results = [CheckResult(check, True, 0) for check in plan() if check.name != "key unique"]
-        document = branch_report(FakeNessie(), Checker(results), BRANCH, BASE, KEYS, publishing=False)
+        document = branch_report(FakeNessie(), Checker(results), BRANCH, BASE, EXPECTED, publishing=False)
         self.assertEqual(1, exit_code(document))
         self.assertEqual(-1, document["checks"]["failed"][0]["unexpected"])
         self.assertTrue(verdict(plan(), results).failed)
+
+
+class BoundOutputTest(unittest.TestCase):
+    def test_a_branch_with_one_new_table_and_one_inherited_table_is_refused_and_the_base_is_unchanged(self) -> None:
+        nessie = FakeNessie()
+        nessie.entries_at[f"{BASE}@{BASE_HEAD}"] = {KEYS[1]: nessie.entries_at[f"{BRANCH}@{HEAD}"][KEYS[1]]}
+        with self.assertRaises(PublicationError):
+            branch_report(nessie, Checker(), BRANCH, BASE, EXPECTED, publishing=True)
+        self.assertEqual(([], BASE_HEAD), (nessie.merge_calls, nessie.heads[BASE]))
+
+    def test_the_snapshots_the_job_wrote_are_bound_into_the_merge(self) -> None:
+        nessie = FakeNessie()
+        with self.assertRaises(PublicationError):
+            branch_report(nessie, Checker(), BRANCH, BASE, {KEYS[0]: 99, KEYS[1]: 11}, publishing=True)
+        self.assertEqual([], nessie.merge_calls)
 
 
 class ArgumentTest(unittest.TestCase):

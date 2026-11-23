@@ -26,7 +26,9 @@ The steps of ``write``, in order:
    lineage hash has the form of a SHA-256, an occurrence is not negative, a second of a waveform holds a sample and a track's kind and types are ones the file
    format defines. No check judges a published value: a noisy or out-of-range reading is kept. A failed check ends the job with exit code 1 and nothing merged.
 7. With ``--publish``, or in ``publish``, the head that was checked is merged into the base (``spark/bronze/publication.py``), once, and only when the branch
-   still has that head. The result names the merge's hash and the snapshot ID of each table on the base.
+   still has that head and the change from the base to it is exactly the four tables that the job wrote (at this run's snapshots, with ``write --publish``):
+   a branch that carries another change, or leaves one of the tables as the base has it, is refused. The result names the merge's hash and the snapshot ID of
+   each table on the base.
 
 It prints one line that starts with ``RESULT `` and holds the branch, its new hash, for each table its snapshot ID, row count and checksum, the checks with
 their counts, the publication when there is one, and the facts of the run: the memory limit, the peak memory of the container and the peak memory of the largest
@@ -217,8 +219,11 @@ def run_command(arguments: argparse.Namespace) -> dict[str, Any]:
         raise SettingsError(problem)
     result = decode(arguments) if arguments.command == "write" else {"branch": arguments.branch}
     publishing = arguments.command == "publish" or arguments.publish
-    keys = [f"{NAMESPACE}.{table.name}" for table in TABLES]
-    report = branch_report(NessiePublisher(nessie_client()), branch_checker(arguments.branch), arguments.branch, arguments.base, keys, publishing=publishing)
+    written = {table.name: result.get("tables", {}).get(table.name, {}).get("snapshot_id") for table in TABLES}
+    expected = {f"{NAMESPACE}.{name}": snapshot for name, snapshot in written.items()}
+    report = branch_report(
+        NessiePublisher(nessie_client()), branch_checker(arguments.branch), arguments.branch, arguments.base, expected, publishing=publishing
+    )
     return {**result, **report}
 
 

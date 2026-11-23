@@ -11,8 +11,8 @@ from scripts.stack.nessie import NessieError
 from spark.bronze.publication import PublicationError
 from spark.bronze_clinical_lab_publish import publish_job, verdict_of
 from spark.bronze_clinical_lab_run import run_job
-from tests.fast.test_bronze_job_sequence import BRANCH, BRONZE, HASH, TRUNK, Harness
-from tests.fast.test_bronze_publish import BASE_HEAD, MERGED, FakeNessie
+from tests.fast.test_bronze_job_sequence import BRANCH, BRONZE, HASH, SOURCES, TRUNK, Harness
+from tests.fast.test_bronze_publish import BASE_HEAD, HEAD, MERGED, FakeNessie, table
 
 KEYS = list(BRONZE.values())
 
@@ -23,6 +23,8 @@ class Publisher(FakeNessie):
 
 
 def publish_run(harness: Harness, publisher: Publisher) -> dict[str, Any]:
+    for name in (*SOURCES, *BRONZE.values()):
+        harness.nessie.contents[(f"{BRANCH}@{HEAD}", name)] = harness.nessie.contents[(BRANCH, name)]
     return publish_job(BRANCH, HASH, harness.nessie, publisher, harness.open_spark)
 
 
@@ -34,17 +36,18 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(("merged", TRUNK, MERGED), (result["publication"]["status"], result["publication"]["base"], result["publication"]["merged_hash"]))
         self.assertEqual([(BRANCH, TRUNK, BASE_HEAD)], [call[:3] for call in publisher.merge_calls])
         self.assertEqual({KEYS[0]: 10, KEYS[1]: 11}, result["publication"]["snapshots"])
-        self.assertIn(f"open:{BRANCH}:{TRUNK}:aaaa", harness.calls)
+        self.assertIn(f"open:{BRANCH}:{TRUNK}:aaaa:aaaa", harness.calls)
+        self.assertEqual(HEAD, harness.spark.pinned)
 
     def test_a_failed_check_trips_its_guard_and_merges_nothing(self) -> None:
-        for plant, guard in (("null_counts", "key"), ("difference_counts", "equality"), ("statistics", "key")):
+        for plant, guard in (("null_counts", "key"), ("difference_counts", "equality"), ("duplicates", "key")):
             harness, publisher = Harness(), Publisher()
             if plant == "null_counts":
                 harness.spark.null_counts = (1, 0)
             elif plant == "difference_counts":
                 harness.spark.difference_counts = (1, 0)
             else:
-                harness.spark.statistics = type(harness.spark.statistics)(6, 5)
+                harness.spark.duplicates = 2
             result = publish_run(harness, publisher)
             self.assertFalse(result["passed"], plant)
             self.assertEqual(("blocked", [guard]), (result["publication"]["status"], result["publication"]["blocked_by"]), plant)
@@ -64,6 +67,15 @@ class PublishTest(unittest.TestCase):
             publish_job(BRANCH, "c" * 64, harness.nessie, publisher, harness.open_spark)
         self.assertEqual([], publisher.merge_calls)
         self.assertFalse([call for call in harness.calls if call.startswith("open:")])
+
+    def test_a_branch_that_also_carries_an_unchecked_table_is_refused_and_nothing_is_merged(self) -> None:
+        harness, publisher = Harness(), Publisher()
+        publisher.entries_at[f"{BRANCH}@{HEAD}"]["bronze.waveform_seconds"] = table(77)
+        with self.assertRaises(PublicationError) as raised:
+            publish_run(harness, publisher)
+        self.assertIn("bronze.waveform_seconds", str(raised.exception))
+        self.assertEqual([], publisher.merge_calls)
+        self.assertEqual(BASE_HEAD, publisher.heads[TRUNK])
 
     def test_a_name_that_is_not_a_branch_is_refused(self) -> None:
         harness, publisher = Harness(), Publisher()

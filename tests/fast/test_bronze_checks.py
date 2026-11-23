@@ -17,6 +17,7 @@ from spark.bronze.checks import (
     CheckError,
     CheckResult,
     checks_for,
+    key_checks,
     plan,
     result_document,
     verdict,
@@ -90,11 +91,26 @@ class PlanTest(unittest.TestCase):
             self.assertEqual([], [check for check in checks_for(table) if check.expectation == "ExpectColumnValuesToBeBetween"])
 
     def test_a_second_of_a_waveform_holds_at_least_one_sample(self) -> None:
-        found = [check for check in checks_for(WAVEFORM) if check.expectation == "UnexpectedRowsExpectation"]
+        found = [check for check in checks_for(WAVEFORM) if check.name == "samples hold a sample"]
         self.assertEqual(1, len(found))
+        self.assertEqual("UnexpectedRowsExpectation", found[0].expectation)
         self.assertIn("{batch}", found[0].kwargs["unexpected_rows_query"])
         self.assertIn("size(samples) < 1", found[0].kwargs["unexpected_rows_query"])
         self.assertEqual(GUARD_STRUCTURE, found[0].guard)
+
+    def test_no_sample_of_a_waveform_second_is_null_but_a_nan_is_a_published_value(self) -> None:
+        found = [check for check in checks_for(WAVEFORM) if check.name == "samples have no null element"]
+        self.assertEqual(1, len(found))
+        self.assertEqual("UnexpectedRowsExpectation", found[0].expectation)
+        self.assertEqual(GUARD_STRUCTURE, found[0].guard)
+        query = found[0].kwargs["unexpected_rows_query"]
+        self.assertEqual("SELECT * FROM {batch} WHERE exists(samples, sample -> sample IS NULL)", query)
+        self.assertNotIn("isnan", query)
+
+    def test_only_the_waveform_table_has_a_query_check(self) -> None:
+        for table in TABLES:
+            found = [check for check in checks_for(table) if check.expectation == "UnexpectedRowsExpectation"]
+            self.assertEqual(2 if table is WAVEFORM else 0, len(found), table.name)
 
     def test_the_kind_the_types_and_the_sample_type_of_a_track_are_ones_the_file_format_defines(self) -> None:
         sets = {check.kwargs["column"]: set(check.kwargs["value_set"]) for check in checks_for(TRACKS) if check.expectation == "ExpectColumnValuesToBeInSet"}
@@ -121,6 +137,27 @@ class PlanTest(unittest.TestCase):
 
     def test_the_plan_is_the_checks_of_the_four_tables_in_order(self) -> None:
         self.assertEqual([check for table in TABLES for check in checks_for(table)], plan())
+
+
+class KeyChecksTest(unittest.TestCase):
+    def test_the_key_checks_of_a_table_are_a_not_null_check_for_each_key_column_and_one_unique_check_over_the_key(self) -> None:
+        found = key_checks("lab_results", ("caseid", "dt", "name", "source_occurrence"))
+        self.assertEqual(
+            [
+                ("caseid not null", "ExpectColumnValuesToNotBeNull", {"column": "caseid"}),
+                ("dt not null", "ExpectColumnValuesToNotBeNull", {"column": "dt"}),
+                ("name not null", "ExpectColumnValuesToNotBeNull", {"column": "name"}),
+                ("source_occurrence not null", "ExpectColumnValuesToNotBeNull", {"column": "source_occurrence"}),
+                ("key unique", "ExpectCompoundColumnsToBeUnique", {"column_list": ["caseid", "dt", "name", "source_occurrence"]}),
+            ],
+            [(check.name, check.expectation, check.kwargs) for check in found],
+        )
+        self.assertEqual({GUARD_KEY}, {check.guard for check in found})
+        self.assertEqual({"lab_results"}, {check.table for check in found})
+
+    def test_the_plan_holds_exactly_the_key_checks_of_each_table(self) -> None:
+        for table in TABLES:
+            self.assertEqual(key_checks(table.name, table.key), [check for check in checks_for(table) if check.guard == GUARD_KEY])
 
 
 class VerdictTest(unittest.TestCase):

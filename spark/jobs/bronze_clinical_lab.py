@@ -10,9 +10,11 @@ branch (the name comes from Nessie's configuration, never from an argument), so 
 creates the branch ``--branch`` from that hash on the default branch and refuses a branch that exists. The loaded tables
 ``raw_records.clinical_data`` and ``raw_records.lab_data`` are always read at the pinned reference ``<default branch>@<source hash>``,
 through a second catalog, and never through the run branch. ``write`` replaces the two Bronze tables on the run branch and then runs the
-checks on what it wrote. ``write`` never merges. ``verify`` re-reads a branch and runs the same checks, so any later step can run it again. ``publish``
-runs them at the head of the branch and merges that head into the default branch only when every one passed (``spark/bronze_clinical_lab_publish.py``): a
-failed check trips its guard (``key``, ``structure``, ``source`` or ``equality``) and the default branch is not changed.
+checks on what it wrote. The key checks (not null, unique) run in Great Expectations, and the equality proofs are plain code. ``write`` never merges. ``verify``
+re-reads a branch and runs the same checks, so any later step can run it again. ``publish`` runs them at the head of the branch, every read of the branch at
+that hash, and merges that head into the default branch only when every one passed and the change from the default branch to it is exactly the two Bronze
+tables (``spark/bronze_clinical_lab_publish.py``). A failed check trips its guard (``key``, ``structure``, ``source`` or ``equality``) and the default branch is
+not changed.
 
 Each Bronze table holds the loaded table's published columns, every one a string, with no value changed (``spark/bronze_clinical_lab.py``
 has the rules). The laboratory table adds the integer column ``source_occurrence``. The checks of one table are, in this order:
@@ -40,6 +42,7 @@ from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze.publication import MergeOutcomeOpen, NessiePublisher, PublicationError
+from spark.bronze.quality import column_checks
 from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_publish import publish_job
 from spark.bronze_clinical_lab_run import JOB, NessieAdapter, SparkOps, finish, parser, run_job
@@ -52,8 +55,8 @@ DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
 DEFAULT_JOB_DEADLINE_SECONDS = 1800.0
 
 
-def build_job_session(branch: str, default_branch: str, source_hash: str) -> Any:
-    """A local Spark session with the settings that ``job_session_settings`` gives."""
+def build_job_session(branch: str, default_branch: str, source_hash: str, branch_hash: str | None = None) -> Any:
+    """A local Spark session with the settings that ``job_session_settings`` gives, the run branch pinned to ``branch_hash`` when it is given."""
     spark_session = importlib.import_module("pyspark.sql").SparkSession
     settings = job_session_settings(
         nessie_uri=required_environment("NESSIE_URI"),
@@ -62,6 +65,7 @@ def build_job_session(branch: str, default_branch: str, source_hash: str) -> Any
         branch=branch,
         default_branch=default_branch,
         source_hash=source_hash,
+        branch_hash=branch_hash,
         heap=f"{driver_memory_mib(read_memory_limit_mib())}m",
         scratch=SCRATCH_FOLDER,
     )
@@ -73,12 +77,13 @@ def build_job_session(branch: str, default_branch: str, source_hash: str) -> Any
     return session
 
 
-def open_spark(branch: str, default_branch: str, source_hash: str) -> SparkOps:
+def open_spark(branch: str, default_branch: str, source_hash: str, branch_hash: str | None = None) -> SparkOps:
     return SparkAdapter(
-        build_job_session(branch, default_branch, source_hash),
+        build_job_session(branch, default_branch, source_hash, branch_hash),
         importlib.import_module("pyspark.sql.functions"),
         importlib.import_module("pyspark.sql").Window,
         importlib.import_module("pyspark.errors").AnalysisException,
+        column_checks,
     )
 
 

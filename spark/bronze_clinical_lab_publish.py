@@ -46,16 +46,23 @@ def verdict_of(document: dict[str, Any]) -> Verdict:
     return Verdict(tuple(results), tuple(failed), guards)
 
 
-def publish_job(branch: str, source_hash: str, nessie: NessieOps, publisher: PublishOps, open_spark: Callable[[str, str, str], SparkOps]) -> dict[str, Any]:
-    """Run ``verify`` at the head of ``branch`` and merge that head into the default branch when it passed. The document names counts and hashes only."""
+def publish_job(
+    branch: str, source_hash: str, nessie: NessieOps, publisher: PublishOps, open_spark: Callable[[str, str, str, str | None], SparkOps]
+) -> dict[str, Any]:
+    """Run ``verify`` at the head of ``branch``, every read of the branch at that hash, and merge that head into the default branch when it passed.
+
+    The tables of the job are the two Bronze tables, and the change from the default branch to the branch must be exactly those
+    (``spark/bronze/publication.py``).
+    A publication is a job of its own, so it does not know the snapshots that the write made. The document names counts and hashes only.
+    """
     default = nessie.default_branch()
     documents: list[dict[str, Any]] = []
 
-    def run_checks(_branch_hash: str) -> Verdict:
-        documents.append(run_job("verify", branch, source_hash, nessie, open_spark))
+    def run_checks(branch_hash: str) -> Verdict:
+        documents.append(run_job("verify", branch, source_hash, nessie, open_spark, branch_hash))
         return verdict_of(documents[-1])
 
-    outcome: Publication = publish(publisher, run_checks, branch, default, [f"{BRONZE_NAMESPACE}.{bronze}" for _, bronze, _ in TABLES.values()])
+    outcome: Publication = publish(publisher, run_checks, branch, default, {f"{BRONZE_NAMESPACE}.{bronze}": None for _, bronze, _ in TABLES.values()})
     document = documents[-1] if documents else {"tables": {}}
     return {
         **{key: value for key, value in document.items() if key in ("job", "branch", "default_branch", "source_hash", "tables")},

@@ -11,7 +11,9 @@ format asks for no unexpected values, so a result holds counts only). The tables
 from __future__ import annotations
 
 import importlib
+import itertools
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from spark.bronze.checks import Check, CheckResult, Verdict, plan, verdict
@@ -20,6 +22,7 @@ from spark.bronze.tables import TABLES
 ANALYTICS_VARIABLE = "GX_ANALYTICS_ENABLED"
 RESULT_FORMAT = {"result_format": "BASIC", "partial_unexpected_count": 0}
 QUERY_RESULT_KEY = "observed_value"
+SOURCE_NUMBERS = itertools.count()
 
 
 class QualityError(RuntimeError):
@@ -48,25 +51,34 @@ def unexpected_count(result: Any, check: Check) -> int:
     raise QualityError(f"the check {check.name} of {check.table} failed and its result holds no count")
 
 
+def column_checks(frame: Any, checks: Sequence[Check], context: Any | None = None) -> list[CheckResult]:
+    """Run ``checks`` in Great Expectations on one Spark table ``frame`` and return a result for each, in order.
+
+    A check that the library cannot judge is an error and never a pass (``unexpected_count``).
+    """
+    gx = importlib.import_module("great_expectations")
+    context = context if context is not None else open_context()
+    source = context.data_sources.add_spark(name=f"bronze_{next(SOURCE_NUMBERS)}", persist=False)
+    asset = source.add_dataframe_asset(name="table")
+    batch = asset.add_batch_definition_whole_dataframe("whole").get_batch(batch_parameters={"dataframe": frame})
+    results: list[CheckResult] = []
+    for check in checks:
+        expectation = getattr(gx.expectations, check.expectation)(**check.kwargs)
+        outcome = batch.validate(expectation, result_format=RESULT_FORMAT)
+        results.append(CheckResult(check, bool(outcome.success), unexpected_count(outcome, check)))
+    return results
+
+
 def run_checks(session: Any, checks: list[Check] | None = None) -> Verdict:
     """Run ``checks`` (the whole plan when none are given) on the Bronze tables that the session's catalog reads, and return their verdict.
 
     A table that the catalog does not hold fails all of its checks (their count is ``-1`` and they have no result), so it is a failed verdict and not an error.
     """
-    gx = importlib.import_module("great_expectations")
     wanted = plan() if checks is None else checks
     context = open_context()
-    source = context.data_sources.add_spark(name="bronze", persist=False)
     results: list[CheckResult] = []
     for table in TABLES:
         mine = [check for check in wanted if check.table == table.name]
-        if not mine or not session.catalog.tableExists(table.full_name):
-            continue
-        asset = source.add_dataframe_asset(name=table.name)
-        definition = asset.add_batch_definition_whole_dataframe(table.name)
-        batch = definition.get_batch(batch_parameters={"dataframe": session.table(table.full_name)})
-        for check in mine:
-            expectation = getattr(gx.expectations, check.expectation)(**check.kwargs)
-            outcome = batch.validate(expectation, result_format=RESULT_FORMAT)
-            results.append(CheckResult(check, bool(outcome.success), unexpected_count(outcome, check)))
+        if mine and session.catalog.tableExists(table.full_name):
+            results += column_checks(session.table(table.full_name), mine, context)
     return verdict(wanted, results)

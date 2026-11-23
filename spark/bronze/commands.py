@@ -5,13 +5,11 @@ The job (``spark/jobs/bronze_decode.py``) passes the Nessie operations and the c
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from spark.bronze.checks import Verdict, result_document
 from spark.bronze.publication import PublishOps, publish, verify
-
-PUBLISHING = "publish"
 
 
 def command_problem(command: str, has_manifest: bool, has_cases: bool, has_landed_folder: bool, publish_flag: bool) -> str | None:
@@ -26,12 +24,17 @@ def command_problem(command: str, has_manifest: bool, has_cases: bool, has_lande
     return None
 
 
-def branch_report(ops: PublishOps, run_checks: Callable[[str], Verdict], branch: str, base: str, keys: Sequence[str], *, publishing: bool) -> dict[str, Any]:
-    """The checks of the branch at its head and, when ``publishing``, its merge into the base. The document holds names, counts and hashes, never a value."""
+def branch_report(
+    ops: PublishOps, run_checks: Callable[[str], Verdict], branch: str, base: str, expected: Mapping[str, int | None], *, publishing: bool
+) -> dict[str, Any]:
+    """The checks of the branch at its head and, when ``publishing``, its merge into the base. The document holds names, counts and hashes, never a value.
+
+    ``expected`` maps the content key of each table that the job wrote to the snapshot it wrote, or to ``None`` where this run did not write it.
+    """
     if not publishing:
         branch_hash, result = verify(ops, run_checks, branch)
         return {"checked_hash": branch_hash, "passed": result.passed, "checks": result_document(result)}
-    outcome = publish(ops, run_checks, branch, base, keys)
+    outcome = publish(ops, run_checks, branch, base, expected)
     return {
         "checked_hash": outcome.branch_hash,
         "passed": outcome.status != "blocked",

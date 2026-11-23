@@ -86,22 +86,34 @@ class Verdict:
         return not self.failed
 
 
+def key_checks(table: str, key: Sequence[str]) -> list[Check]:
+    """The key checks of a table named ``table``: a not-null check for each key column and one unique check over the whole key."""
+    found = [Check(table, GUARD_KEY, f"{column} not null", "ExpectColumnValuesToNotBeNull", {"column": column}) for column in key]
+    found.append(Check(table, GUARD_KEY, "key unique", "ExpectCompoundColumnsToBeUnique", {"column_list": list(key)}))
+    return found
+
+
 def checks_for(table: TableSpec) -> list[Check]:
     """The checks of one table, in a fixed order."""
     name = table.name
-    found: list[Check] = []
-    for column, _ in table.columns:
-        guard = GUARD_KEY if column in table.key else GUARD_STRUCTURE
-        found.append(Check(name, guard, f"{column} not null", "ExpectColumnValuesToNotBeNull", {"column": column}))
-    found.append(Check(name, GUARD_KEY, "key unique", "ExpectCompoundColumnsToBeUnique", {"column_list": list(table.key)}))
+    key = key_checks(name, table.key)
+    others = [
+        Check(name, GUARD_STRUCTURE, f"{column} not null", "ExpectColumnValuesToNotBeNull", {"column": column})
+        for column, _ in table.columns
+        if column not in table.key
+    ]
+    found = [*key[:-1], *others, key[-1]]
     found.append(Check(name, GUARD_STRUCTURE, "source_sha256 form", "ExpectColumnValuesToMatchRegex", {"column": "source_sha256", "regex": SHA256_FORM}))
     if table in (NUMERIC, STRINGS):
         found.append(
             Check(name, GUARD_STRUCTURE, "source_occurrence at least 0", "ExpectColumnValuesToBeBetween", {"column": "source_occurrence", "min_value": 0})
         )
     if table is WAVEFORM:
-        query = "SELECT * FROM {batch} WHERE size(samples) < 1"
-        found.append(Check(name, GUARD_STRUCTURE, "samples hold a sample", "UnexpectedRowsExpectation", {"unexpected_rows_query": query}))
+        for check_name, query in (
+            ("samples hold a sample", "SELECT * FROM {batch} WHERE size(samples) < 1"),
+            ("samples have no null element", "SELECT * FROM {batch} WHERE exists(samples, sample -> sample IS NULL)"),
+        ):
+            found.append(Check(name, GUARD_STRUCTURE, check_name, "UnexpectedRowsExpectation", {"unexpected_rows_query": query}))
     if table is TRACKS:
         for column, values in (("kind", KINDS), ("track_type", TRACK_TYPES), ("sample_type", SAMPLE_TYPES)):
             found.append(Check(name, GUARD_STRUCTURE, f"{column} in set", "ExpectColumnValuesToBeInSet", {"column": column, "value_set": list(values)}))
