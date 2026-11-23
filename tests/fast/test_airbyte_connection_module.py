@@ -82,6 +82,8 @@ class FakeAirbyte:
         self.counter = 0
         self.fail_on: str | None = None
         self.damage: tuple[str, str | None, str, Any] | None = None
+        self.write_damage: tuple[str, str, str, str] | None = None
+        self.write_log: list[tuple[str, str]] = []
         self.bodies: list[tuple[str, str, dict[str, Any]]] = []
         self.keys: dict[str, str] = dict(KEYS)
         self.recorded: dict[str, str] = {}
@@ -147,6 +149,19 @@ class FakeAirbyte:
         return self.listing(parts[0], offset)
 
     def write(self, method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
+        """Store the write and answer it. A test can plant a fault in the answer of one call: the object is stored, the answer is faulty."""
+        kind = f"{parts[3][:-1]}_definition" if parts[0] == "workspaces" else self.KIND_NAMES[parts[0]]
+        self.write_log.append((method, kind))
+        answer = copy.deepcopy(self.store(method, parts, body))
+        if self.write_damage is not None and self.write_damage[:2] == (method, kind):
+            _, _, key, how = self.write_damage
+            if how == "missing":
+                answer.pop(key, None)
+            else:
+                answer[key] = "" if how == "empty" else "an-id-that-is-text-but-not-a-uuid"
+        return answer
+
+    def store(self, method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
         if parts[0] == "workspaces":
             kind, identifier = f"{parts[3][:-1]}_definitions", parts[4] if len(parts) > 4 else None
             record = self.objects[kind].get(identifier or "", {}) | body | {"id": identifier or self.new_id(), "documentationUrl": "https://example.invalid"}
@@ -877,11 +892,6 @@ class AnswerShapeTest(unittest.TestCase):
         for text in ("", " ", "x", "0b0d1d3a4d9b4a5e8b0c1f2e3d4c5b6a", "0b0d1d3a-4d9b-4a5e-8b0c-1f2e3d4c5b6", "0b0d1d3a-4d9b-4a5e-8b0c-1f2e3d4c5b6a\n", "../a"):
             self.assertFalse(MODULE_UNDER_TEST.is_id(text), repr(text))
 
-    def test_the_id_in_the_answer_of_a_create_is_held_to_the_same_form(self) -> None:
-        for answer in ({"sourceId": ""}, {"sourceId": "not-a-uuid"}, {"sourceId": 5}, {}):
-            with self.subTest(answer=answer), self.assertRaises(MODULE_UNDER_TEST.ApiError):
-                MODULE_UNDER_TEST.created_id(answer, "sourceId")
-
     def test_an_item_that_is_not_an_object_is_refused_and_nothing_is_written(self) -> None:
         api = self.drifted()
         api.damage = ("connection", None, "not an object", None)
@@ -908,6 +918,85 @@ class AnswerShapeTest(unittest.TestCase):
         with mock.patch.object(api, "write", without_id), self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
             apply(api)
         self.assertIn("answer", str(raised.exception))
+
+
+class WriteAnswerTest(unittest.TestCase):
+    """The answer of every write is checked with the same closed table as a read, and a faulty answer stops the run at that call."""
+
+    def creating(self) -> FakeAirbyte:
+        return FakeAirbyte()
+
+    def updating(self) -> FakeAirbyte:
+        api = FakeAirbyte()
+        apply(api)
+        api.only("source_definitions")["dockerImageTag"] = "latest"
+        api.only("destination_definitions")["dockerImageTag"] = "latest"
+        api.only("sources")["configuration"]["streams"][0]["globs"].pop()
+        api.only("destinations")["configuration"]["s3_bucket_path"] = "warehouse"
+        api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
+        api.writes.clear()
+        api.write_log.clear()
+        return api
+
+    def sequence(self, scenario: Callable[[], FakeAirbyte]) -> list[tuple[str, str]]:
+        api = scenario()
+        apply(api)
+        return list(api.write_log)
+
+    def test_the_list_of_write_calls_is_the_set_the_module_makes_and_each_has_an_id_key(self) -> None:
+        made = {call for scenario in (self.creating, self.updating) for call in self.sequence(scenario)}
+        self.assertEqual(made, set(MODULE_UNDER_TEST.WRITE_CALLS))
+        self.assertEqual(10, len(MODULE_UNDER_TEST.WRITE_CALLS))
+        for _, kind in MODULE_UNDER_TEST.WRITE_CALLS:
+            self.assertIn(MODULE_UNDER_TEST.ID_OF[kind], MODULE_UNDER_TEST.ID_KEYS[kind])
+
+    def test_a_faulty_answer_of_each_write_call_is_an_error_that_names_the_call_and_no_dependent_write_follows(self) -> None:
+        for scenario in (self.creating, self.updating):
+            clean = self.sequence(scenario)
+            for index, (method, kind) in enumerate(clean):
+                key = MODULE_UNDER_TEST.ID_OF[kind]
+                for how in ("missing", "empty", "not a uuid"):
+                    with self.subTest(scenario=scenario.__name__, call=f"{method} {kind}", how=how):
+                        api = scenario()
+                        api.write_damage = (method, kind, key, how)
+                        before = dict(api.recorded)
+                        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+                            apply(api)
+                        self.assertEqual(clean[: index + 1], api.write_log, "the run stops at the faulty answer: no dependent write is sent after it")
+                        self.assertIn(f"{method} /", str(raised.exception))
+                        self.assertIn(key, str(raised.exception))
+                        for value in (KEY_ID, KEY_VALUE, OTHER_KEY_ID, OTHER_KEY_VALUE):
+                            self.assertNotIn(value, str(raised.exception))
+                        if method != "POST" and kind in ("source", "destination"):
+                            self.assertEqual(before, api.recorded, "a key whose update was not answered properly is not recorded as applied")
+
+    def test_an_answer_for_another_object_than_the_one_updated_is_an_error(self) -> None:
+        api = self.updating()
+        real = api.write
+
+        def other(method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
+            answer = real(method, parts, body)
+            if method == "PATCH" and parts[0] == "connections":
+                answer["connectionId"] = "33333333-3333-3333-3333-333333333333"
+            return answer
+
+        with mock.patch.object(api, "write", other), self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            apply(api)
+        self.assertIn("PATCH /connections/", str(raised.exception))
+
+    def test_an_answer_that_lacks_any_other_required_key_is_an_error_too(self) -> None:
+        for method, kind in MODULE_UNDER_TEST.WRITE_CALLS:
+            scenario = self.creating if method == "POST" else self.updating
+            for key in MODULE_UNDER_TEST.ANSWER_SHAPES[kind]:
+                with self.subTest(call=f"{method} {kind}", key=key):
+                    api = scenario()
+                    api.write_damage = (method, kind, key, "missing")
+                    with self.assertRaises(MODULE_UNDER_TEST.ApiError):
+                        apply(api)
+
+    def test_a_clean_run_of_each_scenario_is_unchanged_by_the_check(self) -> None:
+        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], apply(self.creating()))
+        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], apply(self.updating()))
 
 
 class RecordPermissionTest(unittest.TestCase):

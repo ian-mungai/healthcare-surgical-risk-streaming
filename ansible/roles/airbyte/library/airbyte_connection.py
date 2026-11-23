@@ -90,6 +90,25 @@ ID_KEYS: dict[str, tuple[str, ...]] = {
     "destination": ("destinationId", "definitionId"),
     "connection": ("connectionId", "sourceId", "destinationId"),
 }
+ID_OF: dict[str, str] = {
+    "source_definition": "id",
+    "destination_definition": "id",
+    "source": "sourceId",
+    "destination": "destinationId",
+    "connection": "connectionId",
+}
+WRITE_CALLS: tuple[tuple[str, str], ...] = (
+    ("POST", "source_definition"),
+    ("PUT", "source_definition"),
+    ("POST", "destination_definition"),
+    ("PUT", "destination_definition"),
+    ("POST", "source"),
+    ("PATCH", "source"),
+    ("POST", "destination"),
+    ("PATCH", "destination"),
+    ("POST", "connection"),
+    ("PATCH", "connection"),
+)
 KUBECTL_SECONDS = 60
 KUBECTL_KILL_SECONDS = 5
 TIMED_OUT = (124, 137)
@@ -249,12 +268,19 @@ def listing(api: Api, path: str, kind: str) -> list[dict[str, Any]]:
     raise ApiError(f"GET {path} has more pages than {MAX_PAGES}")
 
 
-def created_id(answer: dict[str, Any], field: str) -> str:
-    """The ID in the answer of a create. The write is made, so a missing ID is a named error and not a plan."""
-    value = answer.get(field)
-    if not isinstance(value, str) or not is_id(value):
-        raise ApiError(f"the answer of a create holds no {field} in the form of an ID")
-    return value
+def written(api: Api, method: str, path: str, body: dict[str, Any], kind: str, expected_id: str | None = None) -> dict[str, Any]:
+    """Make one write and return its answer, checked with the same closed table as a read: each required key of the kind, its type, each ID a UUID.
+
+    An answer that fails is an error that names the call, and the step that made it reports no change. An update must answer for the object that it updated.
+    Every write of the module goes through this function (``WRITE_CALLS``).
+    """
+    try:
+        item = checked(api.request(method, path, body), kind)
+    except ApiError as error:
+        raise ApiError(f"{method} {path} answered, and {error}") from None
+    if expected_id is not None and item[ID_OF[kind]] != expected_id:
+        raise ApiError(f"{method} {path} answered for another {kind} than the one it updated")
+    return item
 
 
 def named(objects: list[dict[str, Any]], name: str, what: str) -> dict[str, Any] | None:
@@ -430,7 +456,8 @@ def plan_definition(workspace: str, kind: str, wanted: dict[str, Any], current: 
     if current is None:
 
         def create(api: Api) -> None:
-            ids[f"{kind}_definition"] = created_id(api.request("POST", path, {field: wanted[field] for field in DEFINITION_FIELDS}), "id")
+            answer = written(api, "POST", path, {field: wanted[field] for field in DEFINITION_FIELDS}, f"{kind}_definition")
+            ids[f"{kind}_definition"] = answer["id"]
 
         return [Step(f"{kind} definition", create)]
     if current["dockerRepository"] != wanted["dockerRepository"]:
@@ -439,7 +466,12 @@ def plan_definition(workspace: str, kind: str, wanted: dict[str, Any], current: 
     if current["dockerImageTag"] == wanted["dockerImageTag"]:
         return []
     body = {"name": wanted["name"], "dockerImageTag": wanted["dockerImageTag"]}
-    return [Step(f"{kind} definition", lambda api: api.request("PUT", f"{path}/{current['id']}", body))]
+    definition_id = current["id"]
+
+    def update_definition(api: Api) -> None:
+        written(api, "PUT", f"{path}/{definition_id}", body, f"{kind}_definition", definition_id)
+
+    return [Step(f"{kind} definition", update_definition)]
 
 
 def plan_actor(
@@ -459,7 +491,7 @@ def plan_actor(
 
         def create(api: Api) -> None:
             body = {"name": wanted["name"], "workspaceId": workspace, "definitionId": ids[f"{kind}_definition"], "configuration": sent}
-            ids[kind] = created_id(api.request("POST", path, body), id_field)
+            ids[kind] = written(api, "POST", path, body, kind)[id_field]
             recorded[kind] = fingerprint(ids[kind], secrets)
 
         return [Step(kind, create)]
@@ -472,7 +504,7 @@ def plan_actor(
         return []
 
     def update(api: Api) -> None:
-        api.request("PATCH", f"{path}/{actor_id}", {"configuration": sent})
+        written(api, "PATCH", f"{path}/{actor_id}", {"configuration": sent}, kind, actor_id)
         recorded[kind] = applied
 
     return [Step(kind, update)]
@@ -483,7 +515,7 @@ def plan_connection(wanted: dict[str, Any], current: dict[str, Any] | None, ids:
     if current is None:
 
         def create(api: Api) -> None:
-            api.request("POST", "/connections", {**fields, "sourceId": ids["source"], "destinationId": ids["destination"]})
+            written(api, "POST", "/connections", {**fields, "sourceId": ids["source"], "destinationId": ids["destination"]}, "connection")
 
         return [Step("connection", create)]
     known = ("source" in ids and "destination" in ids) and (current["sourceId"], current["destinationId"]) == (ids["source"], ids["destination"])
@@ -494,7 +526,11 @@ def plan_connection(wanted: dict[str, Any], current: dict[str, Any] | None, ids:
     if covers(current, fields):
         return []
     connection_id = current["connectionId"]
-    return [Step("connection", lambda api: api.request("PATCH", f"/connections/{connection_id}", fields))]
+
+    def update(api: Api) -> None:
+        written(api, "PATCH", f"/connections/{connection_id}", fields, "connection", connection_id)
+
+    return [Step("connection", update)]
 
 
 def execute(api: Api, steps: list[Step]) -> list[str]:
