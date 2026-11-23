@@ -43,6 +43,9 @@ COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
 COPY scripts/stack/tags.py /opt/jobs/scripts/stack/tags.py
+# The Silver signal job calls the one definition of validity that the feature code shares (standard library only).
+COPY features/__init__.py /opt/jobs/features/__init__.py
+COPY features/signal_validity.py /opt/jobs/features/signal_validity.py
 # The Bronze decoder imports the replay's decoder and stores and the ingestion gate, and the gate reads the tracked release pin through ROOT.
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py
