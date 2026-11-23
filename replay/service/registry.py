@@ -93,11 +93,15 @@ class RegistryClient:
         return Registered(group, artifact_id, str(version["version"]), version["contentId"], version["globalId"])
 
     def register(self, group: str, artifact_id: str, schema_text: str) -> Registered:
-        """Create the artifact with this schema as its first version, or find the version that holds exactly these bytes."""
+        """Create the artifact with this schema, or find the version that holds exactly these bytes, or add the schema as the next version.
+
+        The request names no version: the registry gives the first one the name 1 and each later one the next name. A name in the request would be refused
+        for a changed format, because the registry creates the new version under that name (Apicurio Registry 3.3.5, ``GroupsResourceImpl``).
+        """
         body = {
             "artifactId": artifact_id,
             "artifactType": "AVRO",
-            "firstVersion": {"version": "1", "content": {"content": schema_text, "contentType": "application/json"}},
+            "firstVersion": {"content": {"content": schema_text, "contentType": "application/json"}},
         }
         _, document = self.request("POST", f"/groups/{quote(group, safe='')}/artifacts?ifExists=FIND_OR_CREATE_VERSION", body)
         return self.registered(group, artifact_id, (document or {}).get("version"))

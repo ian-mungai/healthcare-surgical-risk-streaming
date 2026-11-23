@@ -21,7 +21,7 @@ from typing import Any
 from unittest import mock
 
 from spark.streaming.model import FeatureRecord
-from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, batch_handler, start_query
+from spark.streaming.query import SESSION_OPTIONS, TEST_EXIT_CODE, QueryEnded, batch_handler, start_query, wait_for_query
 from spark.streaming.rows import INPUT_DDL, KEY_COLUMNS, OUTPUT_DDL, event_row, record_from_row
 from spark.streaming.settings import StreamSettings
 from tests.fast.stream_support import events_for, stamp, synthetic_recording
@@ -153,6 +153,40 @@ class Query(unittest.TestCase):
     def test_the_session_has_the_iceberg_extensions_and_the_rocksdb_state_store(self) -> None:
         self.assertEqual("org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions", SESSION_OPTIONS["spark.sql.extensions"])
         self.assertTrue(SESSION_OPTIONS["spark.sql.streaming.stateStore.providerClass"].endswith("RocksDBStateStoreProvider"))
+
+
+class FakeQuery:
+    def __init__(self, active_for: int, failure: BaseException | None = None) -> None:
+        self.waits, self.active_for, self.failure, self.stopped = 0, active_for, failure, False
+
+    @property
+    def isActive(self) -> bool:  # noqa: N802
+        return self.waits < self.active_for
+
+    def awaitTermination(self, timeout: float) -> bool:  # noqa: N802
+        self.waits += 1
+        return not self.isActive
+
+    def exception(self) -> BaseException | None:
+        return None if self.isActive else self.failure
+
+
+class Waiting(unittest.TestCase):
+    def test_a_query_that_ended_with_a_stored_exception_is_a_failure_not_a_success(self) -> None:
+        failure = RuntimeError("the batch failed")
+        self.assertIs(failure, wait_for_query(FakeQuery(2, failure), None, lambda: False, 5.0))
+
+    def test_a_query_that_ended_by_itself_with_no_exception_is_a_failure_too(self) -> None:
+        self.assertIsInstance(wait_for_query(FakeQuery(1), None, lambda: False, 5.0), QueryEnded)
+
+    def test_a_query_that_runs_to_its_deadline_or_is_asked_to_stop_is_no_failure(self) -> None:
+        self.assertIsNone(wait_for_query(FakeQuery(10**6), 0.0, lambda: False, 5.0))
+        stops = iter([False, False, True])
+        self.assertIsNone(wait_for_query(FakeQuery(10**6), None, lambda: next(stops), 5.0))
+
+    def test_a_query_that_failed_at_the_moment_of_a_stop_request_is_still_a_failure(self) -> None:
+        failure = RuntimeError("late failure")
+        self.assertIs(failure, wait_for_query(FakeQuery(0, failure), None, lambda: True, 5.0))
 
 
 class TestInput(unittest.TestCase):

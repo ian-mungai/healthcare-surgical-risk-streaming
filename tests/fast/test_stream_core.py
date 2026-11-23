@@ -296,6 +296,24 @@ class Duplicates(unittest.TestCase):
         ledger = next(record for record in records if isinstance(record, LedgerRecord))
         self.assertEqual(40, json.loads(ledger.counts_json)["duplicate"])
 
+    def test_a_source_duplicate_that_is_sent_again_counts_as_a_repeat_of_its_message(self) -> None:
+        events = events_for(synthetic_recording())
+        pair = [event for event in events if event.track == HEART_RATE and event.case_time_us == 41 * SECOND]
+        position = events.index(pair[1])
+        records, _ = run_stream([*events[: position + 1], pair[1], *events[position + 1 :]])
+        self.assertEqual(
+            [("source_duplicate", pair[1].event_id), ("duplicate", pair[1].event_id)],
+            [(record.decision, record.event_id) for record in decisions(records) if record.event_id == pair[1].event_id],
+        )
+
+    def test_the_final_score_and_case_end_markers_sent_again_after_the_case_closed_count_as_repeats_not_as_events_after_the_end(self) -> None:
+        events = events_for(synthetic_recording())
+        markers = [event for event in events if event.kind in ("final_score", "case_end")]
+        records, _ = run_stream([*events, *markers])
+        self.assertEqual([("duplicate", marker.event_id) for marker in markers], [(record.decision, record.event_id) for record in decisions(records)][-2:])
+        self.assertEqual([], decisions(records, "after_case_end"))
+        self.assertEqual(1, len([record for record in records if isinstance(record, LedgerRecord)]))
+
     def test_an_event_sent_again_beyond_the_limit_is_not_applied_either(self) -> None:
         recording = synthetic_recording()
         events = events_for(recording)

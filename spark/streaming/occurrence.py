@@ -75,7 +75,7 @@ def process(state: OccurrenceState | None, events: Sequence[Event], context: Con
         decide(state, event, context, records)
     if not state.closed:
         emit_due(state, context, records, force_to=None)
-        prune_recent(state, context)
+    prune_recent(state, context)
     return state, records
 
 
@@ -101,21 +101,24 @@ def decision_record(state: OccurrenceState, event: Event, decision: str, latenes
 def decide(state: OccurrenceState, event: Event, context: Context, records: list[Record]) -> None:
     watermark = state.high_water_us
     lateness = 0 if watermark is None else max(0, watermark - event.replay_time_us)
+    seen = event.suffix in state.recent
     if state.closed:
-        state.count(AFTER_CASE_END)
-        records.append(decision_record(state, event, AFTER_CASE_END, lateness))
+        decision = DUPLICATE if seen else AFTER_CASE_END
+        state.count(decision)
+        records.append(decision_record(state, event, decision, lateness))
+        state.recent.setdefault(event.suffix, event.replay_time_us)
         return
     if lateness > context.policy.late_limit_us:
         state.count(TOO_LATE)
         records.append(decision_record(state, event, TOO_LATE, lateness))
         return
-    if event.suffix in state.recent:
+    if seen:
         state.count(DUPLICATE)
         records.append(decision_record(state, event, DUPLICATE, lateness))
         return
+    state.recent[event.suffix] = event.replay_time_us
     if not apply(state, event, lateness, context, records):
         return
-    state.recent[event.suffix] = event.replay_time_us
     if watermark is None or event.replay_time_us > watermark:
         state.high_water_us = event.replay_time_us
     if lateness > 0:
@@ -328,4 +331,3 @@ def finish(state: OccurrenceState, event: Event, context: Context, records: list
     state.numeric.clear()
     state.wave_samples.clear()
     state.art_summary.clear()
-    state.recent.clear()

@@ -32,7 +32,9 @@ from replay.events.recording import CaseRecording
 from replay.events.schedule import FrozenSchedule, ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import CaseEvent, OutgoingEvent, occurrence_events, outgoing
 
-STATE_FORMAT = "replay_state_1"
+STATE_FORMAT = "replay_state_2"
+OLD_STATE_FORMATS = ("replay_state_1",)
+EVENT_LIST_VERSION = "events_2"
 DEFAULT_CHECKPOINT_EVENTS = 100
 DEFAULT_IDLE_CHECKPOINT_US = 5_000_000
 MIN_SPEED = 0.01
@@ -78,6 +80,7 @@ class RunState:
     first_send: FirstSend | None = None
     admissions: dict[str, int] = field(default_factory=dict)
     finished: bool = False
+    event_list: str = EVENT_LIST_VERSION
 
     def to_json(self) -> str:
         document = {
@@ -88,6 +91,7 @@ class RunState:
             "first_send": None if self.first_send is None else [self.first_send.event_id, self.first_send.wall_us],
             "admissions": dict(sorted(self.admissions.items())),
             "finished": self.finished,
+            "event_list": self.event_list,
         }
         return json.dumps(document, indent=1, sort_keys=True) + "\n"
 
@@ -95,8 +99,17 @@ class RunState:
     def from_json(cls, text: str) -> RunState:
         try:
             document = json.loads(text)
+            if document["format"] in OLD_STATE_FORMATS:
+                raise ReplayError(
+                    "the saved state was written before the start marker joined the events of a case, so its position counts another list "
+                    "of events and is not resumed: start the run again under a new run ID"
+                )
             if document["format"] != STATE_FORMAT:
                 raise ReplayError("the saved state is not of this format")
+            if document["event_list"] != EVENT_LIST_VERSION:
+                raise ReplayError(
+                    f"the saved state counts the event list {document['event_list']} and this replay sends {EVENT_LIST_VERSION}: it is not resumed"
+                )
             first = document["first_send"]
             return cls(
                 document["schedule_sha256"],
@@ -105,6 +118,7 @@ class RunState:
                 None if first is None else FirstSend(*first),
                 {key: int(value) for key, value in document["admissions"].items()},
                 bool(document["finished"]),
+                document["event_list"],
             )
         except (ValueError, KeyError, TypeError) as error:
             if isinstance(error, ReplayError):
@@ -205,7 +219,7 @@ class Replayer:
         def checkpoint(*, finished: bool) -> None:
             nonlocal unsaved
             self.sink.flush()
-            self.store.save(RunState(self.frozen.sha256, dict(positions), anchor, first_send, dict(admissions), finished))
+            self.store.save(RunState(self.frozen.sha256, dict(positions), anchor, first_send, dict(admissions), finished, EVENT_LIST_VERSION))
             unsaved = 0
 
         while True:

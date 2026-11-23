@@ -20,13 +20,14 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import json
 import unittest
 from collections import Counter
 from typing import Any
 
 from replay.events.manifest import Observed, build_manifest, compare
 from replay.events.payload import payload_digest
-from replay.events.run import Replayer, ReplayError, RunSettings, RunState
+from replay.events.run import EVENT_LIST_VERSION, Replayer, ReplayError, RunSettings, RunState
 from replay.events.schedule import admitted_occurrences
 from tests.fast.replay_support import FakeClock, MemorySink, MemoryStore, RecordingSource, StopHere, boundary_recordings, boundary_schedule, saved_state
 
@@ -157,6 +158,28 @@ class Positions(unittest.TestCase):
         replayer.run()
         state = saved_state(store)
         self.assertEqual(state, RunState.from_json(state.to_json()))
+
+    def test_a_state_saved_before_the_start_marker_is_refused_with_its_reason_and_never_resumed(self) -> None:
+        _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
+        replayer.run()
+        old = json.loads(saved_state(store).to_json())
+        old["format"] = "replay_state_1"
+        del old["event_list"]
+        with self.assertRaisesRegex(ReplayError, "before the start marker"):
+            RunState.from_json(json.dumps(old))
+
+    def test_a_state_of_another_event_list_is_refused(self) -> None:
+        _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
+        replayer.run()
+        other = json.loads(saved_state(store).to_json())
+        other["event_list"] = "events_0"
+        with self.assertRaisesRegex(ReplayError, "event list"):
+            RunState.from_json(json.dumps(other))
+
+    def test_the_state_names_the_event_list_it_was_saved_for(self) -> None:
+        _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
+        replayer.run()
+        self.assertEqual(EVENT_LIST_VERSION, json.loads(saved_state(store).to_json())["event_list"])
 
 
 class Restart(unittest.TestCase):

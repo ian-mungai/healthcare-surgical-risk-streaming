@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -25,6 +26,29 @@ SESSION_OPTIONS: Mapping[str, str] = {
     "spark.sql.streaming.stateStore.providerClass": STATE_PROVIDER,
     "spark.sql.shuffle.partitions": SHUFFLE_PARTITIONS,
 }
+
+
+class QueryEnded(RuntimeError):
+    """The query is no longer active, nobody stopped it and Spark kept no exception."""
+
+
+def wait_for_query(query: Any, deadline: float | None, stop_requested: Callable[[], bool], slice_seconds: float) -> BaseException | None:
+    """Wait in short slices until the deadline passes, a stop is requested or the query ends. Returns the failure of a query that ended, or None.
+
+    A query that is no longer active has failed whenever Spark stored an exception for it, also when a stop request or the deadline came at the same moment.
+    A query that ended with no exception and no stop is a failure as well.
+    """
+    try:
+        while query.isActive and not stop_requested() and (deadline is None or time.monotonic() < deadline):
+            query.awaitTermination(slice_seconds if deadline is None else min(slice_seconds, max(0.1, deadline - time.monotonic())))
+    except BaseException as error:
+        return error
+    if query.isActive:
+        return None
+    stored: BaseException | None = query.exception()
+    if stored is not None:
+        return stored
+    return None if stop_requested() else QueryEnded("the query ended with no exception and was not stopped")
 
 
 def batch_handler(sinks: BatchSinks, settings: StreamSettings) -> Callable[[Any, int], None]:
