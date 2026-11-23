@@ -10,7 +10,8 @@ writes only while the branch still has the checked hash, creates the namespace a
 commit and reads the inputs and the three tables at the hash of the last write. The read-back must be the planned tables, with every check passing. The job
 ends only when the branch still has that hash.
 
-A prespecified count that the reproduced count does not equal is a finding, not a failure: its name is in the result (``source_counts.mismatched``).
+A verify builds the same plan and requires the stored tables to be equal to it. A prespecified count that the reproduced count does not equal is a
+finding, not a failure: its name is in the result (``source_counts.mismatched``).
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ PROFILE = PROFILE_TABLE.name
 UNSCORED = UNSCORED_TABLE.name
 COUNTS = COUNTS_TABLE.name
 TABLES = (PROFILE, UNSCORED, COUNTS)
-SOURCE_NAMES = ("numeric_observations", "waveform_seconds", "patient_split", "clinical_cases", "tracks")
+SOURCE_NAMES = ("numeric_observations", "waveform_seconds", "patient_split", "clinical_cases", "track_list")
 BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
 
 
@@ -203,11 +204,21 @@ def run_build(ops: Operations, head: str, *, pinned: bool) -> Outcome:
 
 
 def run_verify(ops: Operations, head: str, *, pinned: bool) -> Outcome:
-    """Run every check on the tables that the branch holds at ``head``, and confirm that the branch still has ``head``. Nothing is written."""
+    """Run every check on the tables that the branch holds at ``head``, and confirm that the branch still has ``head``. Nothing is written.
+
+    The tables that the branch holds must be the plan at ``head`` in full: a new Silver snapshot can change a verdict and keep every row and track count, so
+    the counts alone cannot tell a stale profile. The plan is built from the inputs at ``head`` and compared by fingerprint, as a rebuild compares it.
+    """
     try:
         source = ops.read_input(head)
+        problems = input_problems(source)
+        planned = ops.plan(head) if not problems else {}
         reads = read_tables(ops, head, True)
-        problems = input_problems(source) + table_problems(source, reads, pinned=pinned)
+        problems += table_problems(source, reads, pinned=pinned)
+        if planned and not problems:
+            stale = len([table for table in TABLES if differs(reads[table], planned[table])])
+            if stale:
+                problems.append(f"plan_differs: {unit(stale, 'table')}")
         if problems:
             raise SignalProfileError(*problems)
         if ops.head() != head:

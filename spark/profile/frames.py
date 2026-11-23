@@ -99,20 +99,21 @@ def counts_frame(session: Any, rows: Sequence[Mapping[str, Any]]) -> Any:
     return session.createDataFrame([tuple(row[name] for name in names) for row in rows], ddl)
 
 
-def fixed_counts(clinical: Any, tracks: Any) -> dict[str, float | None]:
-    """The reproduced counts of the full cohort, from Bronze. Each is a number and is never printed: the job judges it and keeps the flag."""
+def fixed_counts(clinical: Any, track_list: Any) -> dict[str, float | None]:
+    """The reproduced counts of the full cohort: the case counts from ``bronze.clinical_cases`` and the track counts from ``raw_records.track_list``, the
+    input that the guide's count is of. Each is a number and is never printed: the job judges it and keeps the flag."""
     f = functions()
     hours = clinical.select((f.col("caseend").try_cast("double") / f.lit(SECONDS_PER_HOUR)).alias("hours")).filter(f.col("hours").isNotNull())
     spread = hours.agg(f.sum("hours").alias("total"), f.avg("hours").alias("mean"), f.expr("percentile(hours, 0.5)").alias("median")).first()
-    held = tracks.select("case_id", "track")
+    held = track_list.select("caseid", "tname")
 
     def cases_with(track: str) -> float:
-        return float(held.filter(f.col("track") == f.lit(track)).select("case_id").distinct().count())
+        return float(held.filter(f.col("tname") == f.lit(track)).select("caseid").distinct().count())
 
     return {
         "cases": float(clinical.count()),
         "patients": float(clinical.select("subjectid").distinct().count()),
-        "tracks": float(tracks.count()),
+        "tracks": float(track_list.count()),
         "cases_with_arterial_waveform": cases_with(ARTERIAL_TRACK),
         "cases_with_noninvasive_pressure": cases_with(NONINVASIVE_TRACK),
         "recorded_hours": None if spread["total"] is None else float(spread["total"]),

@@ -13,11 +13,9 @@ from dataclasses import dataclass
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from spark.profile.counts import PRESPECIFIED
-from spark.profile.tables import PROFILE_TABLES
 from spark.profile.unscored import CUTOFF_STEP_SECONDS
 from spark.silver.checks import counted
 
-TABLE_NAMES = tuple(PROFILE_TABLES)
 CHECK_NAMES = (
     "input_empty",
     "profile_empty",
@@ -44,6 +42,7 @@ JOB_CODES = frozenset(
         "schema",
         "table_missing",
         "readback_differs",
+        "plan_differs",
         "branch_moved",
         "catalog_hash",
         "source_table",

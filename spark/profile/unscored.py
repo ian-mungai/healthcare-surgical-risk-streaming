@@ -66,8 +66,3 @@ def count_unscored(valid_seconds: Iterable[int], first: int, last: int) -> Unsco
         numeric += over
         either += short_waveform or over
     return Unscored(cutoffs, waveform, numeric, either)
-
-
-def share_of(counts: Unscored) -> float | None:
-    """The unscored share of the cutoffs, or ``None`` when there is no cutoff."""
-    return counts.either / counts.cutoffs if counts.cutoffs else None

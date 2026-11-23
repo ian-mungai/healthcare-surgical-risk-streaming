@@ -8,7 +8,7 @@ Failure modes covered here:
   accepted.
 - The cutoff grid moves: a cutoff before 15 minutes of recording, after the last recorded second or off the whole minute is counted.
 - A second that is absent counts as valid, or the reading of a second whose predecessor is invalid counts as valid.
-- A case with too little recording gives a cutoff, or a share of 0 where it has no cutoff at all.
+- A case with too little recording gives a cutoff.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import unittest
 from features.eligibility import warning_eligibility
 from features.model import Reading, WaveformSecond, WaveformWindow
 from features.registry import NUMERIC_OVER_10_PERCENT_INVALID, NUMERIC_WINDOW_SECONDS, WAVEFORM_INVALID_SECOND, WAVEFORM_WINDOW_SECONDS
-from spark.profile.unscored import CUTOFF_STEP_SECONDS, Unscored, count_unscored, cutoffs_of, share_of
+from spark.profile.unscored import CUTOFF_STEP_SECONDS, Unscored, count_unscored, cutoffs_of
 
 SECOND = 1_000_000
 
@@ -133,16 +133,6 @@ class Grid(unittest.TestCase):
     def test_the_second_after_the_last_recorded_second_is_not_a_cutoff(self) -> None:
         self.assertEqual([900], list(cutoffs_of(0, 958)))
         self.assertEqual([900, 960], list(cutoffs_of(0, 959)))
-
-
-class Share(unittest.TestCase):
-    def test_the_share_is_the_unscored_cutoffs_over_all_cutoffs(self) -> None:
-        self.assertEqual(0.25, share_of(Unscored(8, 2, 1, 2)))
-        self.assertEqual(0.0, share_of(Unscored(5, 0, 0, 0)))
-        self.assertEqual(1.0, share_of(Unscored(3, 3, 0, 3)))
-
-    def test_no_cutoff_has_no_share(self) -> None:
-        self.assertIsNone(share_of(Unscored(0, 0, 0, 0)))
 
 
 if __name__ == "__main__":

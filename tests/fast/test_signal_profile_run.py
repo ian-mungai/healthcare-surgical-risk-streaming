@@ -22,7 +22,7 @@ from typing import Any
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from spark.profile.checks import CountsFacts, InputFacts, ProfileFacts, SignalProfileError, UnscoredFacts
 from spark.profile.counts import PRESPECIFIED
-from spark.profile.run import COUNTS, PROFILE, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
+from spark.profile.run import COUNTS, PROFILE, TABLES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
 from spark.profile.unscored import CUTOFF_STEP_SECONDS
 from spark.silver.run import Fingerprint
 
@@ -69,6 +69,7 @@ class Fake:
             COUNTS: TableRead(FINGERPRINTS[COUNTS], 103, counts=COUNTS_FACTS),
         }
         self.hashes: dict[str, str | None] = dict(HASHES)
+        self.planned = dict(FINGERPRINTS)
         self.moved_after: int | None = None
 
     def head(self) -> str:
@@ -83,7 +84,7 @@ class Fake:
 
     def plan(self, at: str) -> dict[str, Fingerprint]:
         self.calls.append(f"plan {at[:1]}")
-        return dict(FINGERPRINTS)
+        return dict(self.planned)
 
     def read_table(self, at: str, table: str, with_facts: bool) -> TableRead | None:
         self.calls.append(f"read_table {at[:1]} {table} facts={with_facts}")
@@ -148,7 +149,7 @@ class Build(unittest.TestCase):
                 "checked_hash": HEAD,
                 "write_hash": HASHES[COUNTS],
                 "branch_hash": HASHES[COUNTS],
-                "source_snapshots": {"numeric_observations": 11, "waveform_seconds": 12, "patient_split": 13, "clinical_cases": 14, "tracks": 15},
+                "source_snapshots": {"numeric_observations": 11, "waveform_seconds": 12, "patient_split": 13, "clinical_cases": 14, "track_list": 15},
                 "snapshots": {PROFILE: 101, UNSCORED: 102, COUNTS: 103},
                 "rows": {PROFILE: 12, UNSCORED: 1, COUNTS: len(PRESPECIFIED)},
                 "development": {"numeric_rows": 500, "waveform_rows": 300, "tracks": 12, "arterial_cases": 3},
@@ -290,6 +291,7 @@ class Verify(unittest.TestCase):
         self.assertEqual(
             [
                 "read_input a",
+                "plan a",
                 "read_table a signal_profile facts=True",
                 "read_table a unscored_share facts=True",
                 "read_table a source_counts facts=True",
@@ -298,6 +300,32 @@ class Verify(unittest.TestCase):
             ],
             fake.calls,
         )
+
+    def test_a_stored_table_that_is_not_the_plan_at_the_checked_hash_is_named(self) -> None:
+        for pinned in (False, True):
+            for table in TABLES:
+                with self.subTest(table=table, pinned=pinned):
+                    fake = Fake()
+                    fake.planned[table] = Fingerprint(FINGERPRINTS[table].rows, FINGERPRINTS[table].digest + 1)
+                    with self.assertRaises(SignalProfileError) as caught:
+                        self.verify(fake, pinned)
+                    self.assertEqual(["plan_differs"], codes(caught.exception))
+                    self.assertEqual("1 table", caught.exception.problems[0].split(": ")[1])
+                    self.assertEqual("release", fake.calls[-1])
+
+    def test_a_stale_profile_with_the_same_counts_is_not_verified(self) -> None:
+        for pinned in (False, True):
+            with self.subTest(pinned=pinned):
+                fake = Fake()
+                fake.planned[PROFILE] = Fingerprint(FINGERPRINTS[PROFILE].rows, 999)
+                fake.read_back[PROFILE] = TableRead(FINGERPRINTS[PROFILE], 101, profile=PROFILE_FACTS)
+                with self.assertRaises(SignalProfileError):
+                    self.verify(fake, pinned)
+
+    def test_a_good_branch_is_verified_in_either_mode(self) -> None:
+        for pinned in (False, True):
+            with self.subTest(pinned=pinned):
+                self.assertEqual({"pinned": pinned, "mismatched": []}, self.verify(Fake(), pinned).facts()["source_counts"])
 
     def test_a_branch_without_a_table_is_named(self) -> None:
         fake = Fake()

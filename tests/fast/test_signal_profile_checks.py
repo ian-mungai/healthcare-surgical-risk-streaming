@@ -173,6 +173,12 @@ class SourceCounts(unittest.TestCase):
         self.assertIn(ARTERIAL_TRACK, BY_NAME["cases_with_arterial_waveform"].method)
         self.assertIn(NONINVASIVE_TRACK, BY_NAME["cases_with_noninvasive_pressure"].method)
 
+    def test_the_track_counts_come_from_the_publishers_track_list_that_the_guide_names(self) -> None:
+        for name in ("tracks", "cases_with_arterial_waveform", "cases_with_noninvasive_pressure"):
+            with self.subTest(count=name):
+                self.assertEqual("raw_records.track_list", BY_NAME[name].input)
+                self.assertIn("track list", BY_NAME[name].method)
+
     def test_every_count_names_its_input_method_and_denominator(self) -> None:
         for count in PRESPECIFIED:
             with self.subTest(count=count.name):
@@ -234,6 +240,11 @@ class CountsChecks(unittest.TestCase):
         self.assertEqual([], counts_problems(counts(), pinned=True))
         self.assertEqual([], counts_problems(counts(), pinned=False))
 
+    def test_a_table_with_a_row_too_many_or_too_few_is_named(self) -> None:
+        for rows in (len(PRESPECIFIED) + 1, len(PRESPECIFIED) - 1, 0):
+            with self.subTest(rows=rows):
+                self.assertEqual(["counts_rows"], names(counts_problems(counts(rows=rows), pinned=True)))
+
     def test_each_defect_is_named(self) -> None:
         cases = {
             "counts_names": counts(names_differ=1),
@@ -252,6 +263,20 @@ class CountsChecks(unittest.TestCase):
 
 
 class Codes(unittest.TestCase):
+    def test_every_code_that_the_build_and_the_verify_raise_is_in_the_code_list(self) -> None:
+        for code in (
+            "plan_differs",
+            "readback_differs",
+            "table_missing",
+            "branch_moved",
+            "source_changed",
+            "input_empty",
+            "source_table",
+            "source_no_snapshot",
+        ):
+            with self.subTest(code=code):
+                self.assertIn(code, CODES)
+
     def test_every_problem_code_is_in_the_code_list(self) -> None:
         produced = set()
         produced |= set(names(profile_problems(ProfileFacts(0, 1, 1, 1, 1, 9, 9, 9), InputFacts(1, 1, 1, 1))))

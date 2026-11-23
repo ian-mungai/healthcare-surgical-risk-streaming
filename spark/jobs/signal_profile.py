@@ -4,9 +4,9 @@
 ``python -m spark.jobs.signal_profile verify --branch <name> [--pinned-release]``
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it.
-It reads ``silver.numeric_observations``, ``silver.waveform_seconds``, ``silver.patient_split``, ``bronze.clinical_cases`` and ``bronze.tracks`` at that hash
-and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). It never writes to the base: the merge is the caller's step after
-its checks.
+It reads ``silver.numeric_observations``, ``silver.waveform_seconds``, ``silver.patient_split``, ``bronze.clinical_cases`` and
+``raw_records.track_list`` at that hash and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). It never writes to
+the base: the merge is the caller's step after its checks.
 ``verify`` runs the checks on the tables that a branch holds and writes nothing. The order, the freeze of a rerun that changes nothing, the writes and the
 read-back are in ``spark/profile/run.py``. The command line, its codes and its exit codes are in ``spark/profile/cli.py``. The settings come from the
 environment, as the Silver signals job's do.
@@ -27,7 +27,6 @@ from collections.abc import Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieClient
-from spark.bronze import tables as bronze
 from spark.jobs.patient_split import SOURCE_NAME, TARGET_NAME, WRITE_CATALOG, Lake
 from spark.profile import frames
 from spark.profile.checks import InputFacts, SignalProfileError
@@ -52,6 +51,7 @@ from spark.split_table import (
 )
 
 CLINICAL_COLUMNS = (*SOURCE_COLUMNS, ("caseend", "string"))
+TRACK_LIST_COLUMNS = (("caseid", "string"), ("tname", "string"), ("tid", "string"))
 EMPTY_FACTS = InputFacts(0, 0, 0, 0)
 NO_INPUT_FACTS = "development_empty: 0 cases"
 INPUTS = {
@@ -59,7 +59,7 @@ INPUTS = {
     "waveform_seconds": (f"{NAMESPACE}.{WAVEFORM.name}", WAVEFORM.columns, False),
     "patient_split": (TARGET_NAME, COLUMNS, False),
     "clinical_cases": (SOURCE_NAME, CLINICAL_COLUMNS, True),
-    "tracks": (f"{bronze.NAMESPACE}.{bronze.TRACKS.name}", bronze.TRACKS.columns, False),
+    "track_list": ("raw_records.track_list", TRACK_LIST_COLUMNS, True),
 }
 
 
@@ -135,7 +135,7 @@ class ProfileLake(Lake):
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         held = self.inputs(at)
         numeric, waveform = held["numeric_observations"][0], held["waveform_seconds"][0]
-        clinical, split, tracks = held["clinical_cases"][0], held["patient_split"][0], held["tracks"][0]
+        clinical, split, track_list = held["clinical_cases"][0], held["patient_split"][0], held["track_list"][0]
         development = frames.development_cases(clinical, split)
         differing = abs(int(development.count()) - len(self.development_ids))
         if differing:
@@ -146,7 +146,7 @@ class ProfileLake(Lake):
             "development_patients_validation": float(self.patients["validation"]),
         }
         if self.pinned_release:
-            values |= frames.fixed_counts(clinical, tracks)
+            values |= frames.fixed_counts(clinical, track_list)
         self.planned = {
             PROFILE: frames.profile_frame(numeric, waveform, development).persist(disk),
             UNSCORED: frames.unscored_frame(waveform, development).persist(disk),

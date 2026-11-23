@@ -21,6 +21,7 @@ FULL_COHORT = "full cohort"
 ARTERIAL_TRACK = "SNUADC/ART"
 NONINVASIVE_TRACK = "Solar8000/NIBP_MBP"
 SECONDS_PER_HOUR = 3600
+TRACK_LIST = "raw_records.track_list"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,17 +70,17 @@ PRESPECIFIED = (
         FULL_COHORT,
         486449,
         None,
-        "bronze.tracks",
-        "the rows, one for each case and track",
-        "the tracks of the cases of the release (the lead's count of the publisher's track list; the publisher reports 486,451)",
+        TRACK_LIST,
+        "the rows of the publisher's track list, one for each case and track",
+        "the rows of the pinned track list (the lead's count of it, project guide section 8 item 2; the publisher reports 486,451)",
     ),
     SourceCount(
         "cases_with_arterial_waveform",
         FULL_COHORT,
         3645,
         None,
-        "bronze.tracks",
-        f"the distinct cases that hold the waveform track {ARTERIAL_TRACK}",
+        TRACK_LIST,
+        f"the distinct cases in the track list with the track name {ARTERIAL_TRACK}",
         "the cases of the release",
     ),
     SourceCount(
@@ -87,8 +88,8 @@ PRESPECIFIED = (
         FULL_COHORT,
         5763,
         None,
-        "bronze.tracks",
-        f"the distinct cases that hold the numeric track {NONINVASIVE_TRACK} (every other non-invasive pressure track is in the same cases)",
+        TRACK_LIST,
+        f"the distinct cases in the track list with the track name {NONINVASIVE_TRACK} (every other non-invasive pressure track is in the same cases)",
         "the cases of the release",
     ),
     SourceCount(
