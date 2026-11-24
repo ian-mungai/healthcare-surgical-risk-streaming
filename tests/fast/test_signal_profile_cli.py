@@ -20,9 +20,10 @@ from argparse import Namespace
 from typing import Any
 
 from scripts.stack.nessie import NessieError
-from spark.jobs.signal_profile import ProfileLake
+from spark.jobs.signal_profile import CLINICAL_COLUMNS, INPUTS, ProfileLake
 from spark.profile.checks import SignalProfileError
 from spark.profile.cli import JOB, run
+from spark.profile.grid_rule import GRID_ORIGIN, RULE_END
 from spark.settings import SettingsError
 from spark.split_cli import start_deadline
 
@@ -121,6 +122,16 @@ class Watchdog(unittest.TestCase):
             timer = start_deadline(0.0517, exit_with=stops.append)
             timer.join(5)
         self.assertEqual(([124], "patient_split: timeout\n"), (stops, err.getvalue()))
+
+
+class TheClinicalInput(unittest.TestCase):
+    def test_the_profile_reads_the_operation_start_and_end_of_the_clinical_cases(self) -> None:
+        names = [name for name, _ in CLINICAL_COLUMNS]
+        self.assertIn(GRID_ORIGIN, names)
+        self.assertIn(RULE_END, names)
+        self.assertEqual({"caseid", "subjectid", "caseend", GRID_ORIGIN, RULE_END}, set(names))
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(INPUTS["clinical_cases"][2])
 
 
 class NamespaceCommit(unittest.TestCase):

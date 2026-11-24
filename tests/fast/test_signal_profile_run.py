@@ -25,9 +25,8 @@ from typing import Any
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from spark.profile.checks import CountsFacts, InputFacts, ProfileFacts, SignalProfileError, UnscoredFacts
 from spark.profile.counts import PRESPECIFIED
-from spark.profile.grid_rule import GridRule, RuleRead, planned_rule
+from spark.profile.grid_rule import FIRST_CUTOFF_OFFSET_SECONDS, GRID_STEP_SECONDS, LAST_CUTOFF_MARGIN_SECONDS, GridRule, RuleRead, planned_rule
 from spark.profile.run import COUNTS, PROFILE, RULE, TABLES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
-from spark.profile.unscored import CUTOFF_STEP_SECONDS
 from spark.silver.run import Fingerprint
 
 HEAD = "a" * 64
@@ -40,18 +39,21 @@ RULE_ROW = planned_rule(SPLIT_SNAPSHOT)
 FINGERPRINTS = {PROFILE: Fingerprint(12, 5), UNSCORED: Fingerprint(1, 6), COUNTS: Fingerprint(len(PRESPECIFIED), 7)}
 PROFILE_FACTS = ProfileFacts(12, 0, 0, 0, 0, 500, 300, 12)
 UNSCORED_FACTS = UnscoredFacts(
-    1,
-    100,
-    10,
-    5,
-    12,
-    0.12,
-    3,
-    CUTOFF_STEP_SECONDS,
-    WAVEFORM_WINDOW_SECONDS,
-    MAX_INVALID_WAVEFORM_SECONDS,
-    NUMERIC_WINDOW_SECONDS,
-    MAX_INVALID_NUMERIC_PERCENT,
+    rows=1,
+    cutoffs=100,
+    waveform=10,
+    numeric=5,
+    either=12,
+    share=0.12,
+    cases=3,
+    no_grid=1,
+    cutoff_step=GRID_STEP_SECONDS,
+    cutoff_offset=FIRST_CUTOFF_OFFSET_SECONDS,
+    last_margin=LAST_CUTOFF_MARGIN_SECONDS,
+    waveform_window=WAVEFORM_WINDOW_SECONDS,
+    waveform_limit=MAX_INVALID_WAVEFORM_SECONDS,
+    numeric_window=NUMERIC_WINDOW_SECONDS,
+    numeric_limit=MAX_INVALID_NUMERIC_PERCENT,
 )
 COUNTS_FACTS = CountsFacts(len(PRESPECIFIED), 0, 0, 0, 0, 0)
 
@@ -184,7 +186,7 @@ class Build(unittest.TestCase):
                 "snapshots": {PROFILE: 101, UNSCORED: 102, COUNTS: 103},
                 "rows": {PROFILE: 12, UNSCORED: 1, COUNTS: len(PRESPECIFIED)},
                 "development": {"numeric_rows": 500, "waveform_rows": 300, "tracks": 12, "arterial_cases": 3},
-                "unscored": {"cutoffs": 100, "waveform": 10, "numeric": 5, "either": 12},
+                "unscored": {"cutoffs": 100, "waveform": 10, "numeric": 5, "either": 12, "no_grid": 1},
                 "source_counts": {"pinned": False, "mismatched": []},
                 "fingerprints": {PROFILE: [12, 5], UNSCORED: [1, 6], COUNTS: [len(PRESPECIFIED), 7]},
                 "checks_run": facts["checks_run"],

@@ -2,8 +2,10 @@
 
 Failure modes covered here:
 
-- A value of the rule is written in two places (the saved row and the grid of the unscored share), so a change of one leaves the other: the step of the
-  unscored cutoffs comes from the same constant as the saved row.
+- A value of the rule is written in two places (the saved row and the grid of the unscored share), so a change of one leaves the other: the step, the first
+  cutoff and the last cutoff margin of the unscored cutoffs come from the same constants as the saved row, and the columns that the measure reads are the
+  rule's origin and end.
+- A status comment still says that the owner has not decided the values.
 - The rule text says something other than the constants (a constant that changes does not change the text, or the text holds a value that no constant holds).
 - The row holds a case, a patient or a count, or lacks a constant, or holds another split snapshot than the one that was read.
 - A stored row that differs from the planned row in any column is accepted, or the refusal holds a value, or a table with no row or two rows is accepted.
@@ -11,10 +13,13 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib.util
 import sys
 import unittest
+from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 from spark.profile import grid_rule, unscored
@@ -30,7 +35,7 @@ from spark.profile.grid_rule import (
     rule_problems,
     rule_text,
 )
-from spark.profile.tables import GRID_RULE
+from spark.profile.tables import GRID_RULE, UNSCORED
 
 SPLIT_SNAPSHOT = 7_412_000_000_000_000_001
 BASE = planned_rule(SPLIT_SNAPSHOT)
@@ -41,21 +46,48 @@ def stored(rule: GridRule, *, rows: int = 1, dated: bool = True) -> RuleRead:
 
 
 class TheConstants(unittest.TestCase):
-    def test_the_values_are_the_pending_ones_of_the_analysis_plan(self) -> None:
+    def test_the_values_are_the_ones_the_owner_decided(self) -> None:
         self.assertEqual(("opstart", 60, 0, 300), (GRID_ORIGIN, GRID_STEP_SECONDS, FIRST_CUTOFF_OFFSET_SECONDS, LAST_CUTOFF_MARGIN_SECONDS))
+        self.assertEqual("opend", grid_rule.RULE_END)
         self.assertTrue(GRID_RULE_VERSION)
 
-    def test_the_cutoff_step_of_the_unscored_share_is_the_step_of_the_rule(self) -> None:
-        self.assertEqual(GRID_STEP_SECONDS, unscored.CUTOFF_STEP_SECONDS)
-        spec = importlib.util.spec_from_file_location("unscored_with_another_step", unscored.__file__)
+    def test_the_status_comment_says_decided_and_not_pending(self) -> None:
+        text = Path(grid_rule.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("PENDING", text)
+        self.assertNotIn("pending", text)
+        self.assertIn("Status: decided", text)
+        self.assertIn("Nov 23 2026", text)
+
+    def load_with(self, **changes: int) -> ModuleType:
+        """A copy of the unscored module that is loaded while the grid rule's constants have other values."""
+        spec = importlib.util.spec_from_file_location("unscored_with_other_constants", unscored.__file__)
         if spec is None or spec.loader is None:
             self.fail("the unscored module has no file to load")
         copy = importlib.util.module_from_spec(spec)
-        with mock.patch.object(grid_rule, "GRID_STEP_SECONDS", 120), mock.patch.dict(sys.modules, {spec.name: copy}):
+        with contextlib.ExitStack() as patches:
+            for name, value in changes.items():
+                patches.enter_context(mock.patch.object(grid_rule, name, value))
+            patches.enter_context(mock.patch.dict(sys.modules, {spec.name: copy}))
             spec.loader.exec_module(copy)
-        self.assertEqual(120, copy.CUTOFF_STEP_SECONDS)
-        self.assertEqual([960, 1080], list(copy.cutoffs_of(0, 2399))[:2])
-        self.assertEqual(GRID_STEP_SECONDS, unscored.CUTOFF_STEP_SECONDS)
+        return copy
+
+    def test_the_grid_of_the_unscored_share_reads_the_constants_of_the_saved_row(self) -> None:
+        self.assertEqual([0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720], list(unscored.grid_cutoffs(0, 1020)))
+        copy = self.load_with(GRID_STEP_SECONDS=120, FIRST_CUTOFF_OFFSET_SECONDS=30, LAST_CUTOFF_MARGIN_SECONDS=600)
+        self.assertEqual([30, 150, 270, 390], list(copy.grid_cutoffs(0, 1000)))
+        self.assertEqual([0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720], list(unscored.grid_cutoffs(0, 1020)))
+
+    def test_the_stored_unscored_row_is_held_to_the_same_constants(self) -> None:
+        columns = {name for name, _ in UNSCORED.columns}
+        self.assertLessEqual({"cutoff_step", "cutoff_offset", "last_margin", "no_grid"}, columns)
+
+    def test_the_measure_reads_the_origin_and_the_end_by_the_rule_and_holds_no_copy_of_their_names(self) -> None:
+        for module in ("frames", "unscored"):
+            text = (Path(grid_rule.__file__).parent / f"{module}.py").read_text(encoding="utf-8")
+            code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(("#", '"""')))
+            with self.subTest(module=module):
+                self.assertNotIn('"opstart"', code)
+                self.assertNotIn('"opend"', code)
 
 
 class TheText(unittest.TestCase):

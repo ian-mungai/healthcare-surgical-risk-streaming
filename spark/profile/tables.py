@@ -11,9 +11,12 @@ patient, with the one exception that the sealed source counts say. The fourth, `
 - ``signal_profile``: one row for each track of the development cases, by kind (``numeric`` or ``waveform``). ``rows`` are the readings or the seconds
   that Silver holds for the track, ``valid_rows`` those marked valid and each ``cause_*`` column those marked invalid with that cause, so that the valid
   rows and the cause columns add up to the rows. ``valid_share`` is ``valid_rows / rows``. ``cases`` is the number of development cases that hold the track.
-- ``unscored_share``: one row, ``scope = development``. The cutoffs are the whole minutes of the arterial waveform's recorded span with a full 15-minute
-  history (``spark.profile.unscored``). ``waveform`` and ``numeric`` count the cutoffs that break the limit of analysis decision 5 for that window, ``either``
-  those that break one, and ``unscored_share`` is ``either / cutoffs``. The rule columns hold the limits that the count used.
+- ``unscored_share``: one row, ``scope = development``, of the development cases that hold the arterial waveform. The cutoffs are those of the saved warning
+  grid of each case (``warning_grid_rule``: from ``opstart`` in 60-second steps through the latest at or before ``opend`` minus 300 seconds), and a cutoff
+  whose history is not recorded is unscored (``spark.profile.unscored``). ``waveform`` and ``numeric`` count the cutoffs that break the limit of analysis
+  decision 5 for that window, ``either`` those that break one, and ``unscored_share`` is ``either / cutoffs``. ``no_grid`` counts the cases (of ``cases``) with
+  no ``opstart``, no ``opend`` or an ``opend`` that is not after ``opstart``: they hold no cutoff. The rule columns hold the grid's step, first cutoff
+  offset and last cutoff margin and the limits that the count used.
 - ``source_counts``: one row for each prespecified source count (``spark.profile.counts``): the value that the guide or the standard names, whether the
   reproduced count equals it, and its input, method and denominator. A count of the full cohort is sealed: it is saved as a flag only and its ``value`` is null.
 """
@@ -47,12 +50,15 @@ UNSCORED = SilverTable(
     (
         ("scope", "string"),
         ("cases", "bigint"),
+        ("no_grid", "bigint"),
         ("cutoffs", "bigint"),
         ("waveform", "bigint"),
         ("numeric", "bigint"),
         ("either", "bigint"),
         ("unscored_share", "double"),
         ("cutoff_step", "int"),
+        ("cutoff_offset", "int"),
+        ("last_margin", "int"),
         ("waveform_window", "int"),
         ("waveform_limit", "int"),
         ("numeric_window", "int"),

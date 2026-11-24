@@ -6,10 +6,10 @@ snapshot ID of the frozen patient split that it read, before it measures the uns
 split changes nothing; a rerun whose rule or split differs from the stored row refuses with ``grid_rule_changed`` and writes nothing (owner, Nov 23 2026
 PST: "B").
 
-**Status: the values below are PENDING the owner.** They come from the approved analysis plan ("Sample grid": one sample at each fixed 1-minute elapsed
-time; "Eligible monitored time": between ``opstart`` and ``opend``; the primary label window is 5 minutes). The owner's answer changes these constants and
-the version only. ``GRID_STEP_SECONDS`` is also the step of the cutoffs of the unscored share (``spark.profile.unscored``), so there is one value and not
-two.
+**Status: decided.** The owner decided the values below on Nov 23 2026 PST ("A"; project standard, Data, "Warning grid rule"). They come from the approved
+analysis plan ("Sample grid": one sample at each fixed 1-minute elapsed time; "Eligible monitored time": between ``opstart`` and ``opend``; the primary label
+window is 5 minutes). The unscored share is measured on this grid and reads these constants and no copy of them: the cutoffs, the step, the first cutoff, the
+last cutoff margin and the names of the origin and end columns (``spark.profile.unscored``, ``spark.profile.frames``).
 """
 
 from __future__ import annotations

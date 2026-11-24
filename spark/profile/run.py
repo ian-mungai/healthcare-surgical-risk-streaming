@@ -139,7 +139,13 @@ class Outcome:
                 "tracks": facts.tracks,
                 "arterial_cases": facts.arterial_cases,
             },
-            "unscored": {"cutoffs": unscored.cutoffs, "waveform": unscored.waveform, "numeric": unscored.numeric, "either": unscored.either}
+            "unscored": {
+                "cutoffs": unscored.cutoffs,
+                "waveform": unscored.waveform,
+                "numeric": unscored.numeric,
+                "either": unscored.either,
+                "no_grid": unscored.no_grid,
+            }
             if unscored
             else {},
             "source_counts": {"pinned": self.pinned, "mismatched": list(self.tables[COUNTS].mismatched)},
