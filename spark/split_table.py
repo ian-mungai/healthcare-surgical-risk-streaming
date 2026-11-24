@@ -88,7 +88,8 @@ CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_tabl
 
 
 class PatientSplitError(ValueError):
-    """The split cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
+    """The split cannot be built or a check failed. ``problems`` holds one message for each cause: a code and a count (``two_sets: 1 patient``), a code and
+    a flag (``schema: failed``) or a code and a fixed sentence that names no size (``sample_file: a line is not a candidate line``)."""
 
     def __init__(self, *problems: str) -> None:
         super().__init__("; ".join(problems))
