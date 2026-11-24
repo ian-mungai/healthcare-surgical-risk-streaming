@@ -256,30 +256,5 @@ class ClusterStepTest(unittest.TestCase):
         self.assertIn("refused", str(caught.exception))
 
 
-class ChartKeysTest(unittest.TestCase):
-    """Chart 2.5.0 reads the database user and password, and the replica's user and password, from the secret that ``global.database.secretName`` names. A
-    replica key that ``values.yaml`` leaves unset defaults to ``CONFIG_DATABASE_REPLICA_USER`` or ``CONFIG_DATABASE_REPLICA_PASSWORD``, which the role does
-    not write, so the bootloader stops with CreateContainerConfigError (host session 8, Nov 24 2026). Each key the values name must be one the role writes."""
-
-    def test_every_database_key_that_the_values_name_is_a_key_the_role_writes(self) -> None:
-        import yaml
-
-        database = yaml.safe_load((ROLE / "files" / "values.yaml").read_text())["global"]["database"]
-        files = type("Files", (), {"read": lambda self, name: "value"})()
-        written = secrets.wanted_secrets(files, "user")[database["secretName"]]
-        replica = database.get("replica") or {}
-        named = {
-            "user": database.get("userSecretKey"),
-            "password": database.get("passwordSecretKey"),
-            "replica user": replica.get("userSecretKey"),
-            "replica password": replica.get("passwordSecretKey"),
-        }
-        for role, key in named.items():
-            with self.subTest(role):
-                self.assertIn(key, written, f"the {role} key {key!r} is not written to {database['secretName']}")
-        self.assertEqual(named["user"], named["replica user"], "the replica is the same database, read with the same account")
-        self.assertEqual(named["password"], named["replica password"])
-
-
 if __name__ == "__main__":
     unittest.main()

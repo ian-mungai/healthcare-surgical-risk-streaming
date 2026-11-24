@@ -620,6 +620,14 @@ class ReleaseRecoveryStructureTest(unittest.TestCase):
         self.assertIn("airbyte_release_recovery", str(self.tasks()[self.index("Forget the recorded inputs before the recovery")]["when"]))
 
 
+def merge_values(base: dict[str, Any], later: dict[str, Any]) -> dict[str, Any]:
+    """Helm's merge of values files: a later file's mapping merges into the earlier one key by key, and any other value replaces it."""
+    merged = dict(base)
+    for key, value in later.items():
+        merged[key] = merge_values(merged[key], value) if isinstance(value, dict) and isinstance(merged.get(key), dict) else value
+    return merged
+
+
 class PlacementTest(unittest.TestCase):
     def test_the_values_are_placed_with_the_limits_and_the_host_settings_and_a_second_run_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -638,6 +646,39 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual(8001, host["server"]["service"]["port"])
         self.assertEqual(0, again_code, again)
         self.assertRegex(again, CHANGED_NONE)
+
+    def test_every_database_key_the_chart_reads_with_the_placed_values_is_a_key_the_role_writes(self) -> None:
+        """Chart 2.5.0 reads the database account from the secret that ``global.database.secretName`` names, under keys that each values file may set: the
+        primary (default ``DATABASE_USER`` and ``DATABASE_PASSWORD``), the replica (default ``CONFIG_DATABASE_REPLICA_USER`` and
+        ``CONFIG_DATABASE_REPLICA_PASSWORD``) and Temporal (default: the primary's keys). A key that the role does not write stops the pod that reads it with
+        CreateContainerConfigError. The three placed files are merged in Helm's order, later files winning, before the chart's rules are applied."""
+        from tests.slow.test_airbyte_secrets import secrets
+
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = run_tasks(["place_files.yml"], values(folder))
+            self.assertEqual(0, code, output)
+            merged: dict[str, Any] = {}
+            for name in ("values.yaml", "limits.values.yaml", "host.values.yaml"):
+                merged = merge_values(merged, mapping(load_yaml((folder / "airbyte" / name).read_text())))
+        database = merged["global"]["database"]
+        replica = database.get("replica") or {}
+        temporal = (merged.get("temporal") or {}).get("database") or {}
+        user = database.get("userSecretKey") or "DATABASE_USER"
+        password = database.get("passwordSecretKey") or "DATABASE_PASSWORD"
+        read = {
+            "user": user,
+            "password": password,
+            "replica user": replica.get("userSecretKey") or "CONFIG_DATABASE_REPLICA_USER",
+            "replica password": replica.get("passwordSecretKey") or "CONFIG_DATABASE_REPLICA_PASSWORD",
+            "Temporal user": temporal.get("userSecretKey") or user,
+            "Temporal password": temporal.get("passwordSecretKey") or password,
+        }
+        files = type("Files", (), {"read": lambda self, name: "value"})()
+        written = secrets.wanted_secrets(files, "user")[database["secretName"]]
+        for role, key in read.items():
+            with self.subTest(role):
+                self.assertIn(key, written, f"the {role} key {key!r} is not written to {database['secretName']}")
 
     def test_temporal_keeps_its_two_databases_apart_and_creates_none(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
