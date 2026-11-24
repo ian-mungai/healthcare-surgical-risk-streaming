@@ -30,6 +30,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from scripts.process import run_command
 from tests.fast.label_accept import accepted, empty_exit_ok, refusal_ok
 from tests.fast.test_outcome_acceptance import split_run
 from tests.fast.test_silver_acceptance import written
@@ -232,11 +233,18 @@ class SealedList(unittest.TestCase):
                 self.assertTrue(all("--result <path>" in line for line in lines), lines)
 
 
+def git_tracked(folder: Path) -> list[str]:
+    """The names of the files Git tracks directly in ``folder``."""
+    listed = run_command("git", ["ls-files", "--", "."], cwd=folder, timeout=60)
+    return [name for name in listed.stdout.splitlines() if "/" not in name]
+
+
 class EveryRunner(unittest.TestCase):
     def test_no_runner_on_this_machine_calls_a_sealed_job_without_the_result_option(self) -> None:
+        tracked = set(git_tracked(E2E))
         paths = sorted(path for path in E2E.glob("*.py") if path.name != "__init__.py")
-        if not paths:
-            self.skipTest("the untracked runners are not on this machine")
+        if not [path for path in paths if path.name not in tracked]:
+            self.skipTest("the untracked runners are not on this machine (a clean checkout holds only the tracked ones)")
         found = {path.name: sealed_calls_without_result(path.read_text()) for path in paths}
         self.assertEqual({}, {name: problems for name, problems in found.items() if problems})
         self.assertTrue(any(sealed_job_calls(path.read_text()) for path in paths))
