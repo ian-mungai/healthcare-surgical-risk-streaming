@@ -14,6 +14,16 @@ Failure modes covered here (fix round 4, owner decision D):
   return flags that Spark makes, and a held-out laboratory change leaves the flags identical.
 - The profile dump holds a total that a held-out row changes. A test runs the dump on stand-in tables where only held-out rows change and requires an
   identical dump (the earlier guard read the syntax of the dump and missed a count through a variable and a filter on a non-null case).
+
+Failure modes covered here (fix round 5, owner decision D):
+
+- The Gold adapter dropped the real command line's ``source_missing`` and ``source_schema`` refusals and kept a count after an unknown dimension or after a
+  code with no dimension. It now keeps exactly the lines that the producer can print (each code with its detail), tested with the lines of the real producer.
+- A result of the pre-seal shape was rejected, but its lab count reached the record, and a lab reply with a member count was accepted by the independent read.
+  The result and each reply are checked for their exact keys and Boolean and whole-number types before anything of them is formatted, and an invalid one is
+  recorded as a fixed error.
+- The Gold and Silver cases setups merged the stand-in Bronze tables (and the Silver cases runner the split and the sample-sized tables) before they checked
+  the flags of the answer.
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.process import TimeoutExpired
+from spark.settings import SettingsError
 from tests.e2e.run_record import Record
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
@@ -48,6 +59,16 @@ def runner(name: str) -> ModuleType:
 
 def texts(record: Record) -> str:
     return json.dumps([item.observed for item in record.observations], sort_keys=True, default=str)
+
+
+def recorder(calls: list[tuple[Any, ...]]) -> Any:
+    """A stand-in for ``Run.merge`` that records the arguments of each call and answers that the merge was made."""
+
+    def merge(*arguments: Any, **_: Any) -> str:
+        calls.append(arguments)
+        return "merged"
+
+    return merge
 
 
 def namespace(source: str, **given: Any) -> dict[str, Any]:
@@ -73,6 +94,7 @@ class SetupLoad(unittest.TestCase):
             for case in (*cases, *cases[:2], "424242"):
                 writer.writerow([case, "1", "x", "2"])
         self.lab_rows = len(cases) + 2
+        self.merges: list[tuple[Any, ...]] = []
 
     def setup_of(self, answer: dict[str, Any], code: int = 0) -> tuple[Record, list[dict[str, Any]]]:
         record = Record(feature="test", slug="test", rerun="none")
@@ -83,7 +105,7 @@ class SetupLoad(unittest.TestCase):
         run.stack = SimpleNamespace(write_spec=specs.append, stand_in=lambda *_, **__: (code, answer, "", 0.1), split=lambda *_, **__: (1, {}, "", 0.0))
         run.staged = contextlib.nullcontext
         run.name = lambda base: base
-        run.merge = lambda *_, **__: "merged"
+        run.merge = recorder(self.merges)
         run.recreate = lambda *_: None
         run.setup()
         return record, specs
@@ -124,6 +146,28 @@ class SetupLoad(unittest.TestCase):
             with self.subTest(name=name, value="missing"):
                 record, _ = self.setup_of({key: True for key in self.FLAGS if key != name})
                 self.assertFalse(record.observations[0].passed)
+
+    def test_the_loader_tables_are_merged_only_after_the_four_flags_are_true(self) -> None:
+        for name in self.FLAGS:
+            for value in (False, None, 1, "True", [True]):
+                with self.subTest(name=name, value=value):
+                    self.merges.clear()
+                    self.setup_of(self.answer(**{name: value}))
+                    self.assertEqual([], self.merges)
+            with self.subTest(name=name, value="missing"):
+                self.merges.clear()
+                self.setup_of({key: True for key in self.FLAGS if key != name})
+                self.assertEqual([], self.merges)
+        self.merges.clear()
+        self.setup_of({"cases": len(self.module.CASES), "types": ["string"]})
+        self.assertEqual([], self.merges)
+        self.setup_of({**self.answer(), "rows": 4417})
+        self.assertEqual([], self.merges)
+        self.setup_of(self.answer(), code=1)
+        self.assertEqual([], self.merges)
+        self.setup_of(self.answer())
+        self.assertEqual(1, len(self.merges))
+        self.assertEqual("stand-in bronze tables", self.merges[0][2])
 
     def test_the_old_answer_and_a_failed_exit_fail(self) -> None:
         record, _ = self.setup_of({"cases": len(self.module.CASES), "types": ["string"]})
@@ -255,6 +299,670 @@ class Refusals(unittest.TestCase):
         with mock.patch.object(self.module.base.Stack, "job", sealed_job):
             self.assertEqual("", stack.job(["-m", "x"], sealed=("cases", "build", "b"))[2])
             self.assertEqual("gold_dimensions: key_null: dim_case, 1 row\n", stack.job(["-m", "x"])[2])
+
+
+class SilverLoaderFlags(unittest.TestCase):
+    """The Silver cases runner merges the stand-in Bronze tables only after the loader's four flags are true (fix round 5)."""
+
+    FLAGS = ("cases_as_expected", "columns_as_expected", "every_column_a_string", "lab_total_ok")
+
+    def setUp(self) -> None:
+        self.module = runner("silver_cases")
+
+    def setup_of(self, answer: dict[str, Any], code: int = 0) -> tuple[Record, list[tuple[Any, ...]]]:
+        record = Record(feature="test", slug="test", rerun="none")
+        merges: list[tuple[Any, ...]] = []
+        run = self.module.Run.__new__(self.module.Run)
+        run.record, run.made, run.trunk, run.facts = record, [], "trunk", {}
+        run.nessie = SimpleNamespace(create_branch=lambda *_: None, entries=lambda *_: {})
+        run.stack = SimpleNamespace(write_spec=lambda *_: None, stand_in=lambda *_, **__: (code, answer, "", 0.1))
+        run.staged = contextlib.nullcontext
+        run.name = lambda base: base
+        run.recreate = lambda *_: None
+        run.merge = recorder(merges)
+        run.known = None
+        with mock.patch.object(self.module.Expected, "from_container", side_effect=RuntimeError("not reached")), contextlib.suppress(RuntimeError):
+            run.setup()
+        return record, merges
+
+    def answer(self, **flags: Any) -> dict[str, Any]:
+        return {name: flags.get(name, True) for name in self.FLAGS}
+
+    def test_a_false_missing_or_extra_flag_is_never_merged(self) -> None:
+        for name in self.FLAGS:
+            for value in (False, None, 1, "True"):
+                with self.subTest(name=name, value=value):
+                    record, merges = self.setup_of(self.answer(**{name: value}))
+                    self.assertEqual([], merges)
+                    self.assertFalse(record.observations[0].passed)
+            with self.subTest(name=name, value="missing"):
+                self.assertEqual([], self.setup_of({key: True for key in self.FLAGS if key != name})[1])
+        with self.subTest("extra key"):
+            self.assertEqual([], self.setup_of({**self.answer(), "rows": 4417})[1])
+        with self.subTest("failed exit"):
+            self.assertEqual([], self.setup_of(self.answer(), code=1)[1])
+
+    def test_four_true_flags_are_merged_once(self) -> None:
+        record, merges = self.setup_of(self.answer())
+        self.assertEqual(1, len(merges))
+        self.assertEqual("stand-in bronze tables", merges[0][2])
+        self.assertTrue(record.observations[0].passed)
+
+
+class SilverMergeOrder(unittest.TestCase):
+    """The Silver cases runner merges a sealed job's branch only after every flag of the job's answer is true: the patient split and the sample-sized loader
+    (fix round 5, the same order as the loader of the setup)."""
+
+    GOOD_SPLIT = {"base_hash": "a" * 64, "branch_hash": "b" * 64, "passed": {"patient_split": True}}
+
+    def setUp(self) -> None:
+        self.module = runner("silver_cases")
+
+    def run_of(self) -> tuple[Any, list[tuple[Any, ...]]]:
+        merges: list[tuple[Any, ...]] = []
+        run = self.module.Run.__new__(self.module.Run)
+        run.record, run.made, run.trunk, run.facts, run.labels = Record(feature="test", slug="test", rerun="none"), [], "trunk", {}, {}
+        run.nessie = SimpleNamespace(create_branch=lambda *_: None, entries=lambda *_: {"bronze.clinical_cases": 1, "bronze.lab_results": 1})
+        run.staged = contextlib.nullcontext
+        run.name = lambda base: base
+        run.recreate = lambda *_: None
+        run.fork = lambda base, label: label
+        run.merge = recorder(merges)
+        run.candidates = []
+        run.known = SimpleNamespace(cases_as_expected=True, patients_as_expected=True, counts_as_frozen=True, lab_total_is_published=True)
+        return run, merges
+
+    def patient_split(self, split: dict[str, Any], code: int = 0) -> list[str]:
+        run, merges = self.run_of()
+        loader = {name: True for name in ("cases_as_expected", "columns_as_expected", "every_column_a_string", "lab_total_ok")}
+        run.stack = SimpleNamespace(
+            write_spec=lambda *_: None,
+            stand_in=lambda *_, **__: (0, loader, "", 0.1),
+            split=lambda *_, **__: (code, split, "", 0.1),
+            spark_containers=lambda: [],
+        )
+        with mock.patch.object(self.module.Expected, "from_container", return_value=run.known), contextlib.suppress(Exception):
+            run.setup()
+        return [arguments[2] for arguments in merges]
+
+    def test_a_patient_split_with_a_false_flag_or_a_removed_field_is_never_merged(self) -> None:
+        bad: dict[str, dict[str, Any]] = {
+            "a false pass flag": {**self.GOOD_SPLIT, "passed": {"patient_split": False}},
+            "a pass flag that is 1": {**self.GOOD_SPLIT, "passed": {"patient_split": 1}},
+            "no pass flag": {**self.GOOD_SPLIT, "passed": {}},
+            "no write": {**self.GOOD_SPLIT, "branch_hash": "a" * 64},
+            "a removed field": {**self.GOOD_SPLIT, "patients": 4417},
+        }
+        for label, answer in bad.items():
+            with self.subTest(label):
+                self.assertEqual(["stand-in bronze tables"], self.patient_split(answer))
+        with self.subTest("a failed exit"):
+            self.assertEqual(["stand-in bronze tables"], self.patient_split(self.GOOD_SPLIT, code=1))
+
+    def test_a_patient_split_with_every_flag_true_is_merged(self) -> None:
+        self.assertEqual(["stand-in bronze tables", "patient split"], self.patient_split(self.GOOD_SPLIT))
+
+    def sample_sized(self, loader: dict[str, Any], split: dict[str, Any], split_code: int = 0) -> list[str]:
+        run, merges = self.run_of()
+        run.candidates = [SimpleNamespace(case=1, slot="a_development")]
+        calls = {"split": 0}
+
+        def stand_split(*_: Any, **__: Any) -> tuple[int, dict[str, Any], str, float]:
+            calls["split"] += 1
+            return split_code, split, "", 0.1
+
+        run.stack = SimpleNamespace(
+            write_spec=lambda *_: None, stand_in=lambda *_, **__: (0, loader, "", 0.1), split=stand_split, silver=lambda *_, **__: (1, {}, "", 0.1)
+        )
+        run.head = lambda branch: "h"
+        run.table_snapshot = lambda *_: 1
+        with contextlib.suppress(Exception):
+            run.sample_sized()
+        return [arguments[2] for arguments in merges]
+
+    def test_the_sample_sized_loader_is_merged_only_when_its_flag_is_true(self) -> None:
+        for flag in (False, None, 1, "True"):
+            with self.subTest(flag=flag):
+                self.assertEqual([], self.sample_sized({"cases_as_expected": flag}, self.GOOD_SPLIT))
+        self.assertEqual(["sample-sized bronze", "sample-sized split"], self.sample_sized({"cases_as_expected": True}, self.GOOD_SPLIT))
+
+    def test_the_sample_sized_split_is_merged_only_when_its_pass_flag_is_true(self) -> None:
+        loader = {"cases_as_expected": True}
+        self.assertEqual(["sample-sized bronze"], self.sample_sized(loader, {**self.GOOD_SPLIT, "passed": {"patient_split": False}}))
+        self.assertEqual(["sample-sized bronze"], self.sample_sized(loader, self.GOOD_SPLIT, split_code=1))
+
+
+def healthy_result(module: ModuleType) -> dict[str, Any]:
+    """The result of a Gold build as the sealed job prints it: no member count and no write indicator for the lab dimension."""
+    open_names = [item.name for item in module.DIMENSIONS if not item.sealed]
+    return {
+        "mode": "build",
+        "branch": "branch",
+        "base_hash": "a" * 64,
+        "branch_hash": "b" * 64,
+        "outcome": "written",
+        "written": {name: True for name in open_names},
+        "checks_run": list(module.CHECKS),
+        "members": {name: 4 for name in open_names},
+        "passed": {item.name: True for item in module.DIMENSIONS},
+        "snapshot_ids": {item.table: 7 for item in module.DIMENSIONS},
+    }
+
+
+LAB_COUNT = 31337
+
+
+def pre_seal_result(module: ModuleType) -> dict[str, Any]:
+    """The shape before the seal: the lab dimension has a member count and a write indicator."""
+    found = healthy_result(module)
+    lab = next(item.name for item in module.DIMENSIONS if item.sealed)
+    found["members"][lab] = LAB_COUNT
+    found["written"][lab] = True
+    return found
+
+
+class SealedResult(unittest.TestCase):
+    """The Gold result is checked for its exact keys and Boolean types before anything of it is formatted, and an invalid one is recorded as a fixed error."""
+
+    def setUp(self) -> None:
+        self.module = runner("gold_dimensions")
+        self.lab = next(item.name for item in self.module.DIMENSIONS if item.sealed)
+
+    def test_the_result_of_the_sealed_job_has_no_problem(self) -> None:
+        self.assertEqual([], self.module.sealed_result_problems(healthy_result(self.module)))
+
+    def test_each_wrong_shape_is_a_problem(self) -> None:
+        healthy = healthy_result(self.module)
+        case = next(item.name for item in self.module.DIMENSIONS if item.name == "dim_case")
+
+        def changed(**edits: Any) -> dict[str, Any]:
+            return {**copy.deepcopy(healthy), **edits}
+
+        def without(name: str) -> dict[str, Any]:
+            return {key: value for key, value in copy.deepcopy(healthy).items() if key != name}
+
+        wrong: dict[str, dict[str, Any]] = {
+            "an extra count": changed(lab_members=LAB_COUNT),
+            "a result with no members": without("members"),
+            "a result with no written": without("written"),
+            "a result with no passed": without("passed"),
+            "a result with no outcome": without("outcome"),
+            "a result with no snapshot IDs": without("snapshot_ids"),
+            "a lab member count": changed(members={**healthy["members"], self.lab: LAB_COUNT}),
+            "a lab write indicator": changed(written={**healthy["written"], self.lab: True}),
+            "a written flag that is 1": changed(written={**healthy["written"], case: 1}),
+            "a written flag that is a text": changed(written={**healthy["written"], case: "True"}),
+            "a member count that is a Boolean": changed(members={**healthy["members"], case: True}),
+            "a member count that is a text": changed(members={**healthy["members"], case: "4"}),
+            "a member count below zero": changed(members={**healthy["members"], case: -1}),
+            "a missing member count": changed(members={key: value for key, value in healthy["members"].items() if key != case}),
+            "a passed flag that is false": changed(passed={**healthy["passed"], self.lab: False}),
+            "a passed flag that is 1": changed(passed={**healthy["passed"], case: 1}),
+            "a missing passed flag": changed(passed={key: value for key, value in healthy["passed"].items() if key != self.lab}),
+            "an extra passed flag": changed(passed={**healthy["passed"], "dim_extra": True}),
+            "an outcome that is not one of the three": changed(outcome="maybe"),
+            "an outcome that is a number": changed(outcome=1),
+            "other checks": changed(checks_run=["input_sources"]),
+            "a snapshot ID that is a text": changed(snapshot_ids={**healthy["snapshot_ids"], f"gold.{self.lab}": "7"}),
+            "a missing snapshot ID": changed(snapshot_ids={key: value for key, value in healthy["snapshot_ids"].items() if key != f"gold.{self.lab}"}),
+            "an extra snapshot ID": changed(snapshot_ids={**healthy["snapshot_ids"], "gold.dim_extra": 1}),
+            "a result that is not a mapping": {},
+        }
+        for label, document in wrong.items():
+            with self.subTest(label):
+                self.assertTrue(self.module.sealed_result_problems(document), label)
+        for label, answer in (("none", None), ("a list", []), ("a text", "written")):
+            with self.subTest(label):
+                self.assertTrue(self.module.sealed_result_problems(answer))
+
+    def test_a_verify_result_with_the_verified_outcome_has_no_problem(self) -> None:
+        found = {**healthy_result(self.module), "mode": "verify", "outcome": "verified", "base_hash": None, "written": {}}
+        found["written"] = {item.name: False for item in self.module.DIMENSIONS if not item.sealed}
+        self.assertEqual([], self.module.sealed_result_problems(found))
+
+    def run_of(self, answer: dict[str, Any], code: int = 0) -> tuple[Any, Record]:
+        record = Record(feature="test", slug="test", rerun="none")
+        run = self.module.GoldRun.__new__(self.module.GoldRun)
+        run.record, run.trunk, run.facts = record, "trunk", {}
+        run.gold = SimpleNamespace(gold=lambda *_, **__: (code, answer, "", 0.1))
+        run.stack = SimpleNamespace(spark_containers=lambda: [])
+        run.nessie = SimpleNamespace(entries=lambda branch: {item.table: 1 for item in self.module.DIMENSIONS})
+        run.head = lambda branch: "b" * 64 if branch != "trunk" else "a" * 64
+        run.table_snapshot = lambda branch, table: 7
+        run.name = lambda base: base
+        run.merge = lambda *_, **__: "merged"
+        return run, record
+
+    def assert_sealed(self, record: Record, out: str) -> None:
+        for text in (texts(record), out, json.dumps([item.__dict__ for item in record.observations], default=str)):
+            self.assertNotIn(str(LAB_COUNT), text)
+            self.assertNotIn(self.lab, text)
+
+    def test_the_control_records_the_healthy_result_and_passes(self) -> None:
+        run, record = self.run_of(healthy_result(self.module))
+        with contextlib.redirect_stdout(io.StringIO()):
+            built = run.control()
+        self.assertTrue(built)
+        self.assertTrue(all(item.passed for item in record.observations), texts(record))
+
+    def test_the_control_records_a_pre_seal_result_as_a_fixed_error_and_never_its_lab_count(self) -> None:
+        run, record = self.run_of(pre_seal_result(self.module))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            built = run.control()
+        self.assertFalse(built)
+        self.assertFalse(record.observations[0].passed)
+        self.assert_sealed(record, out.getvalue())
+        self.assertEqual(1, len(record.observations))
+
+    def test_the_control_never_formats_an_extra_key_a_wrong_type_or_a_text_of_a_pre_seal_result(self) -> None:
+        changes: dict[str, dict[str, Any]] = {
+            "an extra key": {"lab_members": LAB_COUNT},
+            "a wrong type": {"members": {"dim_case": True}},
+            "a lab key in written": {"written": {self.lab: True}},
+        }
+        for label, change in changes.items():
+            with self.subTest(label):
+                run, record = self.run_of({**healthy_result(self.module), **change})
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    run.control()
+                self.assertFalse(record.observations[0].passed)
+                self.assert_sealed(record, out.getvalue())
+                self.assertIn("the result is not the sealed shape", record.observations[0].observed)
+                self.assertNotIn("written", record.observations[0].observed)
+
+    def test_the_verify_the_rebuild_and_the_nights_record_a_pre_seal_result_as_a_fixed_error(self) -> None:
+        pre = pre_seal_result(self.module)
+        run, record = self.run_of({**pre, "mode": "verify", "outcome": "verified", "branch_hash": "b" * 64})
+        self.assertIsNone(run.verify_and_merge("branch", "message"))
+        self.assertFalse(record.observations[0].passed)
+        self.assert_sealed(record, "")
+        run, record = self.run_of({**pre, "outcome": "unchanged"})
+        run.rebuild()
+        self.assertFalse(record.observations[0].passed)
+        self.assert_sealed(record, "")
+
+    def test_a_night_records_a_pre_seal_build_result_as_a_fixed_error(self) -> None:
+        run, record = self.run_of(pre_seal_result(self.module))
+        names = [item.name for item in self.module.DIMENSIONS]
+        night = self.module.NIGHTS[0]
+        healthy = {item.name: {"controls": {name: True for name in self.module.HISTORY_CONTROLS}} for item in self.module.DIMENSIONS if item.sealed}
+        quiet = {
+            "columns_equal": True,
+            "prior_rows": 3,
+            "closed_prior": 0,
+            "after_rows": 3,
+            "newly_closed": 0,
+            "opened": 0,
+            "opened_ok": 0,
+            "opened_corrected": 0,
+            "prior_changed": 0,
+            "closed_changed": 0,
+            "other_state_change": 0,
+        }
+        dump = {
+            item.name: {"flags": {name: True for name in self.module.DUMP_FLAGS}, "columns": [], "types": [], "versions": 3, "members": 3}
+            for item in self.module.DIMENSIONS
+        }
+        run.fork = lambda base, label: f"{label}_branch"
+        run.edit = lambda *_, **__: 0
+        run.digest = lambda branch: {"x": 1}
+        run.dump = lambda branch: dump
+        run.history = lambda *_: {name: healthy.get(name) or quiet for name in names}
+        run.verify_and_merge = lambda *_, **__: None
+        run.gold = SimpleNamespace(gold=lambda *_, **__: (0, pre_seal_result(self.module), "", 0.1))
+        run.nights()
+        self.assertEqual(night.title, record.observations[0].case)
+        self.assertFalse(record.observations[0].passed)
+        self.assert_sealed(record, "")
+
+
+class DumpShape(unittest.TestCase):
+    """The independent read is checked for its exact keys and types before it is formatted."""
+
+    def setUp(self) -> None:
+        self.module = runner("gold_dimensions")
+        self.helpers = namespace(self.module.GOLD_HELPERS)
+        self.lab = next(item for item in self.module.DIMENSIONS if item.sealed)
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "rows": 4,
+            "members": 3,
+            "expected_members": 3,
+            "extra_members": 0,
+            "missing_members": 0,
+            "versions": 3,
+            "wrong_keys": 0,
+            "distinct_keys": 4,
+            "unknown_rows": 1,
+            "unknown_holding_a_value": 0,
+        }
+
+    def good(self, item: Any) -> dict[str, Any]:
+        found: dict[str, Any] = self.helpers["facts_for"](item.name, self.counts(), [c.name for c in item.columns], [c.type for c in item.columns])
+        return found
+
+    def test_a_reply_of_the_exact_shape_has_no_problem(self) -> None:
+        for item in self.module.DIMENSIONS:
+            with self.subTest(item=item.name):
+                self.assertEqual([], self.module.dump_problems(item, self.good(item)))
+
+    def test_a_lab_reply_with_a_member_count_or_any_extra_key_is_a_problem(self) -> None:
+        for extra in ({"members": LAB_COUNT}, {"rows": LAB_COUNT}, {"versions": 3}, {"anything": True}):
+            with self.subTest(extra=extra):
+                self.assertTrue(self.module.dump_problems(self.lab, {**self.good(self.lab), **extra}))
+
+    def test_a_reply_with_a_missing_key_or_a_wrong_type_is_a_problem(self) -> None:
+        case = next(item for item in self.module.DIMENSIONS if item.name == "dim_case")
+        for item in (case, self.lab):
+            good = self.good(item)
+            variants: dict[str, dict[str, Any]] = {
+                "an extra flag": {**good, "flags": {**good["flags"], "extra": True}},
+                "a missing flag": {**good, "flags": {key: value for key, value in good["flags"].items() if key != "keys_ok"}},
+                "a flag that is 1": {**good, "flags": {**good["flags"], "keys_ok": 1}},
+                "flags that are a list": {**good, "flags": [True] * 7},
+                "columns that are a text": {**good, "columns": "x"},
+                "columns that hold a number": {**good, "columns": [*good["columns"][:-1], 4]},
+                "types that are a tuple": {**good, "types": tuple(good["types"])},
+                "no types": {key: value for key, value in good.items() if key != "types"},
+            }
+            for label, facts in variants.items():
+                with self.subTest(item=item.name, label=label):
+                    self.assertTrue(self.module.dump_problems(item, facts))
+        open_good = self.good(case)
+        for name in self.counts():
+            with self.subTest(count=name):
+                self.assertTrue(self.module.dump_problems(case, {**open_good, name: True}))
+                self.assertTrue(self.module.dump_problems(case, {key: value for key, value in open_good.items() if key != name}))
+                self.assertTrue(self.module.dump_problems(case, {**open_good, name: "3"}))
+
+    def run_of(self, replies: dict[str, Any]) -> tuple[Record, str]:
+        record = Record(feature="test", slug="test", rerun="none")
+        run = self.module.GoldRun.__new__(self.module.GoldRun)
+        run.record = record
+        run.dump = lambda branch: replies
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run.independent_read({"branch": "built"})
+        return record, out.getvalue()
+
+    def test_the_independent_read_records_a_fixed_error_for_columns_and_types_of_the_wrong_shape(self) -> None:
+        for name, wrong in (("columns", [LAB_COUNT]), ("types", str(LAB_COUNT)), ("columns", {"x": LAB_COUNT}), ("types", [[LAB_COUNT]])):
+            with self.subTest(name=name, wrong=wrong):
+                replies = {item.name: self.good(item) for item in self.module.DIMENSIONS}
+                replies[self.lab.name] = {**replies[self.lab.name], name: wrong}
+                self.assertTrue(self.module.dump_shape_problems(self.lab, replies[self.lab.name]))
+                record, out = self.run_of(replies)
+                self.assertFalse(all(item.passed for item in record.observations))
+                for text in (texts(record), out):
+                    self.assertNotIn(str(LAB_COUNT), text)
+
+    def test_the_dump_keeps_only_the_replies_of_the_exact_shape(self) -> None:
+        replies = {item.name: self.good(item) for item in self.module.DIMENSIONS}
+        replies[self.lab.name] = {**replies[self.lab.name], "members": LAB_COUNT}
+        run = self.module.GoldRun.__new__(self.module.GoldRun)
+        run.stack = SimpleNamespace(write_spec=lambda *_: None, stand_in=lambda *_: (0, replies, "", 0.1))
+        kept = run.dump("branch")
+        self.assertEqual({item.name for item in self.module.DIMENSIONS} - {self.lab.name}, set(kept))
+        self.assertNotIn(str(LAB_COUNT), json.dumps(kept))
+        self.assertEqual(
+            {}, run.dump.__func__(SimpleNamespace(stack=SimpleNamespace(write_spec=lambda *_: None, stand_in=lambda *_: (1, replies, "", 0.1))), "b")
+        )
+        self.assertEqual(
+            {}, run.dump.__func__(SimpleNamespace(stack=SimpleNamespace(write_spec=lambda *_: None, stand_in=lambda *_: (0, ["x"], "", 0.1))), "b")
+        )
+
+    def test_the_independent_read_passes_the_replies_of_the_exact_shape(self) -> None:
+        record, _ = self.run_of({item.name: self.good(item) for item in self.module.DIMENSIONS})
+        self.assertTrue(all(item.passed for item in record.observations), texts(record))
+
+    def test_the_independent_read_fails_a_lab_reply_with_a_member_count_and_never_records_it(self) -> None:
+        replies = {item.name: self.good(item) for item in self.module.DIMENSIONS}
+        replies[self.lab.name] = {**replies[self.lab.name], "members": LAB_COUNT, "rows": LAB_COUNT + 1}
+        record, out = self.run_of(replies)
+        failed = [item for item in record.observations if not item.passed]
+        self.assertEqual([self.lab.name], [item.case.removeprefix("an independent read of ") for item in failed])
+        for text in (texts(record), out):
+            self.assertNotIn(str(LAB_COUNT), text)
+            self.assertNotIn(str(LAB_COUNT + 1), text)
+
+    def test_the_independent_read_records_a_fixed_error_for_each_reply_of_the_wrong_shape(self) -> None:
+        wrong_replies: list[Any] = [{"members": LAB_COUNT}, {"flags": {"keys_ok": LAB_COUNT}, "columns": [], "types": []}, "text 31337", [LAB_COUNT]]
+        for reply in wrong_replies:
+            with self.subTest(reply=reply):
+                replies = {item.name: self.good(item) for item in self.module.DIMENSIONS}
+                replies[self.lab.name] = reply
+                record, out = self.run_of(replies)
+                self.assertFalse(all(item.passed for item in record.observations))
+                for text in (texts(record), out):
+                    self.assertNotIn(str(LAB_COUNT), text)
+
+
+class ProducerLines(unittest.TestCase):
+    """Every line that the real Gold command line can print goes through the adapter, and nothing else does (fix round 5).
+
+    The lines come from the producer itself: ``spark/gold_dimensions.py`` (the checks), ``spark/gold_dimensions_run.py`` (the command line and the schema
+    checks) and ``spark/jobs/gold_dimensions.py`` (the source and inherited schema checks). The adapter keeps the code and the detail that the producer
+    can print for it and drops every other combination: an unknown dimension, a count after a code that takes no dimension, a code with a dimension that has
+    no such count, a count of the lab dimension (its failures print as ``<code>: failed``) and a noun or a number that the producer never writes.
+    """
+
+    COUNTS = (1, 2, 7)
+
+    def setUp(self) -> None:
+        self.module = runner("gold_dimensions")
+        self.run_module = importlib.import_module("spark.gold_dimensions_run")
+        self.producer = importlib.import_module("spark.gold_dimensions")
+        self.job = importlib.import_module("spark.jobs.gold_dimensions")
+
+    def printed(self, error: BaseException | None = None, argv: list[str] | None = None) -> list[str]:
+        """The lines that the real command line writes to standard error when ``execute`` raises ``error`` (or when ``argv`` is a bad call)."""
+        err = io.StringIO()
+
+        def execute(arguments: Any) -> dict[str, Any]:
+            if error is not None:
+                raise error
+            return {}
+
+        with contextlib.redirect_stderr(err), contextlib.suppress(SystemExit):
+            self.run_module.run(argv or ["verify", "--branch", "b"], execute)
+        return err.getvalue().splitlines()
+
+    def facts(self, **values: int) -> dict[str, int]:
+        names = (*self.producer.INPUT_FACTS, *self.producer.OUTPUT_FACTS)
+        return {name: values.get(name, 0) for name in names}
+
+    def check_lines(self, count: int) -> list[str]:
+        """The lines of the input, output and frozen checks for every dimension, with ``count`` as each count."""
+        names = [item.name for item in self.producer.DIMENSIONS]
+        inputs = {name: self.facts(source_members=0, ambiguous_members=count, key_null_rows=count) for name in names}
+        output_facts = {name: count for name in (*self.producer.OUTPUT_FACTS,)}
+        outputs = {name: self.facts(**{**output_facts, "members": 0, "unknown_rows": count + 1}) for name in names}
+        empty = {name: self.facts(**{**output_facts, "members": 1, "unknown_rows": 0}) for name in names}
+        held = {name: (count, count) for name in names}
+        lines: list[str] = []
+        for problems in (
+            self.producer.input_problems(inputs),
+            self.producer.output_problems(outputs),
+            self.producer.output_problems(empty),
+            self.producer.frozen_problems(held),
+        ):
+            lines += self.printed(self.producer.GoldDimensionsError(*problems))
+        return lines
+
+    def table_lines(self) -> list[str]:
+        lines: list[str] = []
+        schemas = self.producer.SOURCE_SCHEMAS
+        for missing in range(len(schemas) + 1):
+            for wrong in range(len(schemas) - missing + 1):
+                found: dict[str, Any] = {}
+                for index, (table, fields) in enumerate(schemas.items()):
+                    found[table] = None if index < missing else ([("x", "string")] if index < missing + wrong else list(fields))
+                lines += self.printed(self.producer.GoldDimensionsError(*self.producer.source_schema_problems(found)))
+        names = [item.name for item in self.producer.DIMENSIONS]
+        for tables in range(1, len(names) + 1):
+            ops = SimpleNamespace(
+                source_facts=lambda: {name: self.facts(source_members=1) for name in names},
+                tables_missing=lambda tables=tables: tables,
+                output_schema_tables_wrong=lambda tables=tables: tables,
+            )
+            for call in (self.run_module.run_verify, self.run_module.check_stored_schema):
+                try:
+                    call(ops)
+                except self.producer.GoldDimensionsError as error:
+                    lines += self.printed(error)
+        lake = object.__new__(self.job.GoldLake)
+        lake.columns = lambda name: [("x", "string")]
+        with self.assertRaises(self.producer.GoldDimensionsError) as caught:
+            lake.held_changes()
+        return lines + self.printed(caught.exception)
+
+    def fixed_lines(self) -> list[str]:
+        """The lines of the fixed messages that hold no code count: a bad name, type, date, key or fact, and a moved branch."""
+        raisers = [
+            lambda: self.producer.dimension("dim_nothing"),
+            lambda: self.producer.version_date("not a date"),
+            lambda: self.producer.surrogate_key("dim_case", "", "2026-01-01"),
+            lambda: self.producer.count_of({}, "members"),
+            lambda: self.producer.facts_of({}, self.producer.DIMENSIONS[0]),
+            lambda: self.producer.frozen_problems({}),
+            lambda: importlib.import_module("spark.gold_dimensions_sql").plain("bad name"),
+            lambda: importlib.import_module("spark.gold_dimensions_sql").spark_type("nothing"),
+            self.build_without_a_date,
+        ]
+        lines = [line for raiser in raisers for line in self.raised(raiser)]
+        return lines + self.printed(self.producer.GoldDimensionsError(self.job.BRANCH_MOVED))
+
+    def build_without_a_date(self) -> None:
+        lake = object.__new__(self.job.GoldLake)
+        lake.valid_from = None
+        lake.version_start()
+
+    def raised(self, raiser: Any) -> list[str]:
+        try:
+            raiser()
+        except self.producer.GoldDimensionsError as error:
+            return self.printed(error)
+        self.fail("the producer raised nothing")
+        return []
+
+    def generic_lines(self) -> list[str]:
+        lines = self.printed(argv=["nothing"]) + self.printed(SettingsError("x")) + self.printed(RuntimeError("x"))
+        lines += self.printed(self.run_module.NessieError("x", status=404, error_code=self.run_module.REFERENCE_NOT_FOUND))
+        lines += self.printed(self.run_module.NessieError("x", status=500))
+        start = importlib.import_module("spark.split_cli")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            start.start_deadline(0.0, exit_with=lambda code: None, job="gold_dimensions").join()
+        return lines + err.getvalue().splitlines()
+
+    def every_line(self) -> list[str]:
+        lines = [line for count in self.COUNTS for line in self.check_lines(count)]
+        return [*lines, *self.table_lines(), *self.fixed_lines(), *self.generic_lines()]
+
+    def test_the_producer_prints_every_form_that_the_adapter_must_keep(self) -> None:
+        lines = self.every_line()
+        stripped = {line.removeprefix(self.module.JOB_PREFIX) for line in lines}
+        for wanted in (
+            "usage",
+            "settings",
+            "branch_missing",
+            "catalog_error",
+            "internal_error",
+            "timeout",
+            "empty_source: failed",
+            "empty_source: dim_case, 0 members",
+            "key_null: dim_patient, 7 rows",
+            "unknown_member: dim_track, 0 rows",
+            "unknown_member: dim_track, 8 rows",
+            "member_removed: dim_department, 1 member",
+            "version_date_not_after: dim_surgery_type, 2 members",
+            "version_chain: dim_case, 1 version",
+            "key_duplicate: dim_track, 2 keys",
+            "source_missing: 1 table",
+            "source_missing: 3 tables",
+            "source_schema: 2 tables",
+            "output_schema: 6 tables",
+            "table_missing: 1 table",
+            "inherited_schema: 1 table",
+            "branch_moved: failed",
+        ):
+            self.assertIn(wanted, stripped)
+
+    def test_every_line_that_the_producer_prints_goes_through_the_adapter_unchanged(self) -> None:
+        lines = self.every_line()
+        self.assertGreater(len(lines), 100)
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertTrue(line.startswith(self.module.JOB_PREFIX), line)
+                self.assertEqual([line.removeprefix(self.module.JOB_PREFIX)], self.module.codes(line + "\n"))
+
+    def test_the_source_refusals_of_the_real_command_line_are_kept(self) -> None:
+        stream = "gold_dimensions: source_missing: 1 table\ngold_dimensions: source_schema: 2 tables\n"
+        self.assertEqual(["source_missing: 1 table", "source_schema: 2 tables"], self.module.codes(stream))
+
+    def test_a_count_after_an_unknown_dimension_or_after_a_code_without_a_dimension_is_dropped(self) -> None:
+        dropped = [
+            "key_rule: dim_nothing, 1 member",
+            "key_rule: dim_, 1 member",
+            "key_rule: 1 member",
+            "key_rule: dim_case 1 member",
+            "empty_source: 1 member",
+            "version_chain: 3 versions",
+            "source_missing: dim_case, 1 table",
+            "source_schema: dim_lab_test, 1 table",
+            "output_schema: dim_case, 1 table",
+            "inherited_schema: dim_case, 1 table",
+            "table_missing: 1 member",
+        ]
+        for line in dropped:
+            with self.subTest(line=line):
+                self.assertEqual([], self.module.codes(f"gold_dimensions: {line}\n"))
+
+    def test_a_count_of_the_lab_dimension_is_dropped_whatever_the_code(self) -> None:
+        for code in self.module.DIMENSION_NOUNS:
+            for detail in ("0 members", "1 member", "2 rows", "1 key", "3 versions"):
+                with self.subTest(code=code, detail=detail):
+                    self.assertEqual([], self.module.codes(f"gold_dimensions: {code}: dim_lab_test, {detail}\n"))
+
+    def test_a_form_that_the_producer_never_writes_is_dropped(self) -> None:
+        dropped = [
+            "key_rule: dim_case, 1 members",
+            "key_rule: dim_case, 2 member",
+            "key_rule: dim_case, 1 row",
+            "key_rule: dim_case, 1 key",
+            "key_rule: dim_case, 0 members",
+            "key_rule: dim_case, 01 member",
+            "key_rule: dim_case, -1 member",
+            "empty_source: dim_case, 3 members",
+            "no_members: dim_track, 1 member",
+            "key_null: dim_track, 1 row",
+            "key_null: dim_department, 1 row",
+            "key_null: failed",
+            "output_schema: failed",
+            "source_missing: failed",
+            "table_missing: 0 tables",
+            "source_missing: 4 tables",
+            "source_schema: 1 tables",
+            "output_schema: 7 tables",
+            "inherited_schema: 2 tables",
+            "inherited_schema: 1 tables",
+            "branch_moved: dim_case, 1 row",
+            "branch_moved",
+            "bad_fact: a count",
+            "bad_date: a date",
+            "usage: dim_case, 1 row",
+        ]
+        for line in dropped:
+            with self.subTest(line=line):
+                self.assertEqual([], self.module.codes(f"gold_dimensions: {line}\n"))
+
+    def test_the_known_codes_are_the_codes_that_the_producer_can_print(self) -> None:
+        printed = {line.removeprefix(self.module.JOB_PREFIX).split(":")[0] for line in self.every_line()}
+        known = {*self.module.GENERIC_CODES, *self.module.DIMENSION_NOUNS, *self.module.TABLE_CODES, *self.module.FIXED_LINES_CODES}
+        self.assertEqual(printed, known)
 
 
 class HistoryFlags(unittest.TestCase):
@@ -459,7 +1167,9 @@ class DumpFlags(unittest.TestCase):
         run.dump = dump
         run.table_snapshot = lambda branch, table: 1
         run.name = lambda base: base
-        run.gold = SimpleNamespace(gold=lambda *_, **__: (0, {"written": {n: n in night.written for n in names if n != "dim_lab_test"}}, "", 0.1))
+        built = healthy_result(self.module)
+        built["written"] = {n: n in night.written for n in names if n != "dim_lab_test"}
+        run.gold = SimpleNamespace(gold=lambda *_, **__: (0, built, "", 0.1))
         open_facts = {
             "columns_equal": True,
             "prior_rows": 3,

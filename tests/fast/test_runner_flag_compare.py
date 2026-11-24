@@ -20,25 +20,36 @@ Failure modes covered here (fix round 3, owner decision D):
 - The profile dump prints and logs the row totals of the numeric and waveform tables, which a held-out change moves. ``tests/fast/test_runner_gold_sealed.py``
   runs the dump on stand-in tables where only held-out rows change and requires an identical dump (fix round 4: the syntax guard that stood here missed a count
   through a variable and a filter on a non-null case).
+
+Failure modes covered here (fix round 5, owner decision D):
+
+- The syntax guard of the load steps missed a total that a local variable carries to the print (and let the names ``snapshot``, ``lab_case``,
+  ``held_out_exists`` and ``STEPS`` through). Each runner's load steps now run on stand-in files and tables where only the held-out rows change, and the printed
+  load output must stay identical. The planted copies of the stand-ins show that the check sees a total through a variable, through arithmetic, through a list
+  of rows, under an allowed name and in a laboratory case that is chosen among the held-out cases too.
 """
 
 from __future__ import annotations
 
 import ast
+import contextlib
+import dataclasses
 import importlib
+import io
 import json
+import sys
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+from spark.split_table import COLUMNS, RULE_VERSION, SplitRow, build_assignments
 from tests.e2e.run_record import Record
+from tests.fast.fake_spark import Functions, Session
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 NAMES = ("cases_with_arterial_waveform", "tracks")
 TOTAL = 987654
-LOAD_FUNCTIONS = ("load_signals", "load_clinical", "load_lab", "write_split")
-PROFILE_LOADS = ("load_clinical", "load_track_list", "write_split")
 FLAG_NODES = (ast.Compare, ast.BoolOp, ast.Constant)
 
 
@@ -49,7 +60,7 @@ def flag_shaped(node: ast.expr) -> bool:
     return isinstance(node, FLAG_NODES) or (isinstance(node, ast.Name) and node.id in ALLOWED_NAMES)
 
 
-ALLOWED_NAMES = {"STEPS", "lab_case", "held_out_exists", "pin_checked", "snapshot"}
+ALLOWED_NAMES = {"STEPS"}
 
 
 def runner(name: str) -> ModuleType:
@@ -256,8 +267,232 @@ class ProfileLoads(unittest.TestCase):
         record = self.run_setup([(0, {"rows": TOTAL, "pin_checked": True}, "", 0.0)] * 3)
         self.assertFalse(record.observations[2].passed, texts(record))
 
-    def test_the_load_steps_of_the_stand_in_print_flags_and_no_total(self) -> None:
-        self.assertEqual([], total_values(runner("signal_profile").STAND_IN, PROFILE_LOADS))
+
+CLINICAL_COLUMNS = ["caseid", "subjectid", "caseend", "opstart", "opend", "death_inhosp"]
+DEVELOPMENT = [908, 1147]
+HELD_BASE = 7000
+
+
+def held_cases(held: int) -> list[int]:
+    return [HELD_BASE + index for index in range(held)]
+
+
+def subject_of(case: int) -> str:
+    """A patient number in the published form."""
+    return str(case * 10 + 1)
+
+
+def test_set_patient() -> str:
+    """A patient number in the published form that the split rule puts in the test set."""
+    return next(str(number) for number in range(1, 1000) if build_assignments([str(number)])[str(number)] == "test")
+
+
+def stand_in_namespace(source: str, functions: tuple[str, ...], **given: Any) -> dict[str, Any]:
+    """The names that the load steps of a stand-in program define, with Spark, the files and the project's row builders stood in. The program's own ``step``,
+    ``first_read`` and ``frame`` and the named load functions run as they are written."""
+    wanted = {"step", "first_read", "frame", *functions}
+    tree = ast.parse(source)
+    keep: list[ast.stmt] = [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in wanted) or isinstance(node, ast.Assign)]
+    table_spec = SimpleNamespace(ddl="stand-in")
+    names: dict[str, Any] = {
+        "json": json,
+        "sys": sys,
+        "Path": Path,
+        "F": Functions,
+        "B": SimpleNamespace(NUMERIC=table_spec, WAVEFORM=table_spec, TRACKS=table_spec),
+        "COLUMNS": COLUMNS,
+        "RULE_VERSION": RULE_VERSION,
+        "SplitRow": SplitRow,
+        "build_assignments": build_assignments,
+        "values_query": lambda rows: ("values", [dataclasses.asdict(row) for row in rows]),
+        "snapshot_of": lambda session, table: 5,
+        "pin_check": lambda name, path, pin: (names["step"]("pin_check"), names["step"]("pin_ok")),
+        **given,
+    }
+    exec(compile(ast.Module(body=keep, type_ignores=[]), "<stand-in>", "exec"), names)  # noqa: S102
+    return names
+
+
+def printed_result(call: Any, *arguments: Any) -> dict[str, Any]:
+    """Run a load step and return the one ``RESULT`` line that it printed."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        call(*arguments)
+    lines = [line for line in out.getvalue().splitlines() if line.startswith("RESULT ")]
+    if len(lines) != 1:
+        raise AssertionError(out.getvalue())
+    document: dict[str, Any] = json.loads(lines[0][len("RESULT ") :])
+    return document
+
+
+class LoadStepCase(unittest.TestCase):
+    """The base of the two load-step tests: a stand-in program, a planted copy of it and the output of its load steps for a number of held-out cases."""
+
+    runner_name = ""
+    source = ""
+
+    def setUp(self) -> None:
+        self.source = runner(self.runner_name).STAND_IN
+
+    def outputs(self, held: int, source: str | None = None) -> dict[str, dict[str, Any]]:
+        raise NotImplementedError
+
+    def plant(self, line: str, replacement: str) -> str:
+        """The program with ``line`` (which must be there) replaced."""
+        self.assertIn(line, self.source)
+        return self.source.replace(line, replacement)
+
+    def assert_total_is_seen(self, function: str, planted: str) -> None:
+        """A stand-in with a total in its output gives another output for a different number of held-out cases."""
+        self.assertNotEqual(self.outputs(1, planted)[function], self.outputs(4, planted)[function])
+
+
+class ProfileLoadSteps(LoadStepCase):
+    """The load steps of the profile runner's stand-in, run on files and tables where only the held-out rows change: the printed load output stays identical
+    (fix round 5: the syntax guard that stood here missed a total that a local variable carries to the print)."""
+
+    runner_name = "signal_profile"
+    FUNCTIONS = ("load_clinical", "load_track_list", "write_split")
+    CLINICAL = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(CLIN).count() == spec["expected"]["cases"], '
+    TRACKS = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(TLIST).count() == spec["expected"]["tracks"], '
+    SPLIT = 'print("RESULT " + json.dumps({"patients_as_pinned": len(rows) == spec["expected"]["patients"], '
+
+    def inputs(self, held: int) -> tuple[Session, dict[str, Any]]:
+        cases = [*DEVELOPMENT, *held_cases(held), 424242]
+        clinical = [
+            {"caseid": str(case), "subjectid": subject_of(case), "caseend": "9", "opstart": "1", "opend": "8", "death_inhosp": str(case % 2 + held)}
+            for case in cases
+        ]
+        tracks = [{"caseid": str(case), "tname": f"T{index}", "tid": f"{case:04d}{index}"} for case in cases for index in range(1 + (case >= HELD_BASE) * held)]
+        spec = {"pins": {"clinical": {}, "track_list": {}}, "expected": {"cases": len(clinical), "tracks": len(tracks), "patients": len(clinical)}}
+        files = {"/pinned/clinical_data.csv": (clinical, CLINICAL_COLUMNS), "/pinned/trks_plain.csv": (tracks, ["caseid", "tname", "tid"])}
+        return Session(files=files), spec
+
+    def outputs(self, held: int, source: str | None = None) -> dict[str, dict[str, Any]]:
+        names = stand_in_namespace(source or self.source, self.FUNCTIONS)
+        session, spec = self.inputs(held)
+        found = {name: printed_result(names[name], session, spec) for name in ("load_clinical", "load_track_list")}
+        found["write_split"] = printed_result(names["write_split"], session, spec, False)
+        again = printed_result(names["write_split"], session, spec, True)
+        self.assertEqual(found["write_split"], again)
+        return found
+
+    def test_every_load_step_prints_flags_that_are_true_on_the_stand_in_tables(self) -> None:
+        for step, result in self.outputs(1).items():
+            with self.subTest(step=step):
+                flags = {key: value for key, value in result.items() if key not in ("steps", "clinical_snapshot")}
+                self.assertTrue(flags)
+                self.assertTrue(all(value is True for value in flags.values()), result)
+
+    def test_a_change_of_held_out_rows_alone_leaves_the_load_output_identical(self) -> None:
+        self.assertEqual(self.outputs(1), self.outputs(4))
+
+    def test_the_check_sees_a_total_that_a_local_variable_carries_to_the_print(self) -> None:
+        plants = {
+            "load_clinical": self.plant(
+                self.CLINICAL, 'total = session.table(CLIN).count(); print("RESULT " + json.dumps({"rows_as_pinned": True, "rows": total, '
+            ),
+            "load_track_list": self.plant(
+                self.TRACKS, 'total = session.table(TLIST).count(); print("RESULT " + json.dumps({"rows_as_pinned": True, "rows": total, '
+            ),
+            "write_split": self.plant(self.SPLIT, 'total = len(rows); print("RESULT " + json.dumps({"patients_as_pinned": True, "patients": total, '),
+        }
+        for function, planted in plants.items():
+            with self.subTest(function=function):
+                self.assert_total_is_seen(function, planted)
+
+    def test_the_check_sees_a_total_that_a_name_of_the_old_guard_carries(self) -> None:
+        """The syntax guard let the names ``snapshot`` and ``STEPS`` through, so a total held in one of them was never seen."""
+        planted = self.plant("snapshot = snapshot_of(session, CLIN)", "snapshot = session.table(CLIN).count()")
+        self.assert_total_is_seen("write_split", planted)
+
+    def test_the_check_sees_a_total_through_arithmetic_and_a_list_of_rows(self) -> None:
+        for label, extra in (("arithmetic", "len(rows) + 0"), ("a list", "[row.subjectid for row in rows]")):
+            with self.subTest(label):
+                self.assert_total_is_seen("write_split", self.plant(self.SPLIT, self.SPLIT + f'"extra": {extra}, '))
+
+
+class ReconcileLoadSteps(LoadStepCase):
+    """The load steps of the reconcile runner's stand-in, run on files where only the held-out rows change: the printed load output stays identical."""
+
+    runner_name = "silver_reconcile"
+    FUNCTIONS = ("load_signals", "load_clinical", "load_lab", "write_split")
+    SIGNALS = 'print("RESULT " + json.dumps({"loaded": '
+    LAB = '{"has_rows": session.table(LAB).count() > 0, "lab_case": lab_case, '
+    DEVELOPMENT_ONLY = 'development = {case: n for case, n in per_case.items() if case != spec["held_case"]}'
+
+    def inputs(self, held: int) -> tuple[Session, dict[str, Any]]:
+        """The sample is the development cases and the one held-out case. ``held`` is how many laboratory rows the held-out case has (ten times it) and how
+        many rows the case outside the sample has."""
+        cases = [*DEVELOPMENT, HELD_BASE]
+        clinical = [
+            {"caseid": str(case), "subjectid": subject_of(case), "caseend": "9", "opstart": "1", "opend": "8", "death_inhosp": str(held)}
+            for case in (*cases, *([424242] * held))
+        ]
+        lab = [
+            {"caseid": str(case), "dt": str(index), "name": f"n{index}", "result": str(held)}
+            for case in (*cases, 424242)
+            for index in range(10 * held if case >= HELD_BASE else 2 + DEVELOPMENT.index(case))
+        ]
+        spec = {
+            "cases": cases,
+            "files": {str(case): {"sha256": "x", "path": "p"} for case in cases},
+            "numeric_case": DEVELOPMENT[0],
+            "held_case": HELD_BASE,
+            "held_patient": test_set_patient(),
+            "pins": {"clinical": {}, "lab": {}},
+        }
+        files = {"/pinned/clinical_data.csv": (clinical, CLINICAL_COLUMNS), "/pinned/lab_data.csv": (lab, ["caseid", "dt", "name", "result"])}
+        return Session(files=files), spec
+
+    def outputs(self, held: int, source: str | None = None) -> dict[str, dict[str, Any]]:
+        def case_rows(path: Path, case: int, kind: str, lineage: Any) -> list[dict[str, Any]]:
+            many = 5 * held if case >= HELD_BASE else 2
+            return [{"case_id": case, "track": "T", "case_time_us": index, "source_occurrence": 0, "value": 1.0} for index in range(many)]
+
+        names = stand_in_namespace(
+            source or self.source,
+            self.FUNCTIONS,
+            case_rows=case_rows,
+            Lineage=lambda *_: None,
+            Window=None,
+            occurrences=lambda frame, F, Window: frame,
+        )
+        session, spec = self.inputs(held)
+        return {name: printed_result(names[name], session, spec) for name in self.FUNCTIONS}
+
+    def test_every_load_step_prints_flags_and_one_development_case_that_are_right_on_the_stand_in_tables(self) -> None:
+        found = self.outputs(1)
+        for step, result in found.items():
+            with self.subTest(step=step):
+                flags = {key: value for key, value in result.items() if key not in ("steps", "lab_case")}
+                self.assertTrue(flags)
+                self.assertTrue(all(value is True or isinstance(value, dict) for value in flags.values()), result)
+        self.assertEqual(DEVELOPMENT[1], found["load_lab"]["lab_case"])
+
+    def test_a_change_of_held_out_rows_alone_leaves_the_load_output_identical(self) -> None:
+        self.assertEqual(self.outputs(1), self.outputs(4))
+
+    def test_the_check_sees_a_total_that_a_local_variable_carries_to_the_print(self) -> None:
+        plants = {
+            "load_signals": self.plant(self.SIGNALS, 'total = counts; print("RESULT " + json.dumps({"rows": total, "loaded": '),
+            "load_lab": self.plant(self.LAB, '{"has_rows": session.table(LAB).count() > 0, "lab_case": lab_case, "per_case": per_case, '),
+        }
+        for function, planted in plants.items():
+            with self.subTest(function=function):
+                self.assert_total_is_seen(function, planted)
+
+    def test_the_check_sees_a_total_that_a_name_of_the_old_guard_carries(self) -> None:
+        """The syntax guard let the names ``held_out_exists`` and ``lab_case`` through, so a total held in one of them was never seen."""
+        planted = self.plant(
+            'held_out_exists = kept.filter(F.col("caseid").cast("bigint") == spec["held_case"]).limit(1).count() > 0',
+            "held_out_exists = session.table(LAB).count()",
+        )
+        self.assert_total_is_seen("load_lab", planted)
+
+    def test_the_check_sees_a_laboratory_case_that_is_chosen_among_the_held_out_cases_too(self) -> None:
+        planted = self.plant(self.DEVELOPMENT_ONLY, "development = per_case")
+        self.assertNotEqual(self.outputs(1, planted)["load_lab"], self.outputs(1)["load_lab"])
 
 
 class ReconcileLoads(unittest.TestCase):
@@ -312,10 +547,6 @@ class ReconcileLoads(unittest.TestCase):
                 run.name = lambda base: base
                 run.setup()
                 self.assertFalse(all(item.passed for item in record.observations))
-
-    def test_the_load_steps_of_the_stand_in_print_flags_and_no_total(self) -> None:
-        source = runner("silver_reconcile").STAND_IN
-        self.assertEqual([], total_values(source, LOAD_FUNCTIONS))
 
 
 if __name__ == "__main__":
