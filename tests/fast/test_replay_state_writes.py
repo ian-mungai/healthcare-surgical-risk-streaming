@@ -429,6 +429,98 @@ class QueuedStateFolderTests(ReplayHarness):
         self.assertIn(CANNOT_WRITE + "\n", error)
         self.assertEqual("kept\n", log.read_text())
 
+    def standalone(self, command: str, read_log: Path, created: list[Path] | None = None) -> tuple[int, str, list[str]]:
+        """Run the real standalone ``freeze``, ``run`` or ``manifest`` command for a record that names ``read_log``. Only what lies beyond the opening of the
+        folder store is replaced: the Kafka lookup of ``run``, the frozen schedule that ``manifest`` needs, and the manifest read, which records that it was
+        reached and stops the command. Return the exit code, the error text and the commands' marks of having read the manifest."""
+        self.replay_files(command)
+        document = json.loads((self.root / "run.json").read_text())
+        document["object_store"]["read_log"] = str(read_log)
+        (self.root / "run.json").write_text(json.dumps(document))
+        (self.root / "reference.json").write_text(REFERENCE)
+        reached: list[str] = []
+
+        def patched(program: Any) -> Any:
+            inputs_module = sys.modules[program.verify_inputs.__module__]
+
+            def read_manifest(store: object, reference: object) -> None:
+                reached.append(command)
+                raise inputs_module.InputError("the manifest read was reached")
+
+            stack = contextlib.ExitStack()
+            stack.enter_context(mock.patch.object(inputs_module, "read_manifest", read_manifest))
+            stack.enter_context(mock.patch.object(program, "partition_count", lambda bootstrap, topic: 1))
+            if created is not None:
+                original = inputs_module.ReadLog.create
+
+                def create(path: Path) -> Any:
+                    created.append(path)
+                    return original(path)
+
+                stack.enter_context(mock.patch.object(inputs_module.ReadLog, "create", staticmethod(create)))
+            stack.enter_context(mock.patch.object(program, "ScheduleFile", lambda path: types.SimpleNamespace(load=lambda: object())))
+            return stack
+
+        argv = [command, "--run-record", str(self.root / "run.json")] + (["--out", str(self.root / "manifest.json")] if command == "manifest" else [])
+        code, error = super().run_replay(argv, patched)
+        return code, error, reached
+
+    def test_a_standalone_command_refuses_a_name_the_replay_writes_in_its_state_folder_as_the_read_log_before_anything_is_made(self) -> None:
+        names = ("state.json", "schedule.json", "health.json", "STATE.JSON", "Schedule.Json", "HEALTH.json")
+        for command in ("freeze", "run", "manifest"):
+            for name in names:
+                for folder_label in ("the state folder", "a folder directly inside it"):
+                    with self.subTest(command=command, read_log=name, folder=folder_label):
+                        self.setUp()
+                        named = self.root / "state" if folder_label == "the state folder" else self.root / "state" / "replay_0a1b2c3d"
+                        named.mkdir(parents=True, exist_ok=True)
+                        before = sorted(path.relative_to(self.root) for path in self.root.rglob("*"))
+                        code, error, reached = self.standalone(command, named / name)
+                        self.assertEqual(2, code)
+                        self.assertIn(CANNOT_WRITE + "\n", error)
+                        self.assertEqual([], reached, "the refusal comes before the first read")
+                        after = sorted(path.relative_to(self.root) for path in self.root.rglob("*"))
+                        self.assertEqual(sorted({*before, Path("run.json"), Path("reference.json")}), after, "nothing is created")
+                        self.assertFalse((named / name).exists())
+
+    def test_a_standalone_command_creates_a_read_log_with_any_other_name_and_reaches_the_manifest(self) -> None:
+        for command in ("freeze", "run", "manifest"):
+            with self.subTest(command=command):
+                self.setUp()
+                log = self.root / "state" / "reads.log"
+                (self.root / "state").mkdir(exist_ok=True)
+                code, _, reached = self.standalone(command, log)
+                self.assertEqual(2, code)
+                self.assertEqual([command], reached)
+                self.assertEqual(b"", log.read_bytes())
+
+    def test_a_standalone_command_whose_read_log_is_a_link_to_a_vacant_reserved_name_is_refused_and_the_name_stays_vacant(self) -> None:
+        for command in ("freeze", "run", "manifest"):
+            for target in ("state.json", "schedule.json", "reads_target.log"):
+                with self.subTest(command=command, target=target):
+                    self.setUp()
+                    (self.root / "state").mkdir(exist_ok=True)
+                    log = self.root / "state" / "reads.log"
+                    log.symlink_to(self.root / "state" / target)
+                    code, error, reached = self.standalone(command, log)
+                    self.assertEqual((2, []), (code, reached))
+                    self.assertIn(CANNOT_WRITE + "\n", error)
+                    self.assertTrue(log.is_symlink())
+                    self.assertFalse((self.root / "state" / target).exists())
+
+    def test_the_read_log_is_created_in_its_resolved_folder_under_its_own_last_name(self) -> None:
+        (self.root / "state" / "sub").mkdir(parents=True)
+        (self.root / "link").symlink_to(self.root / "state")
+        for text, expected in (
+            (self.root / "state" / "sub" / ".." / "reads.log", (self.root / "state").resolve() / "reads.log"),
+            (self.root / "link" / "reads.log", (self.root / "state").resolve() / "reads.log"),
+        ):
+            with self.subTest(read_log=str(text)):
+                created: list[Path] = []
+                code, _, reached = self.standalone("freeze", text, created)
+                self.assertEqual((2, ["freeze"], [expected]), (code, reached, created))
+                expected.unlink()
+
     def test_an_empty_read_log_means_no_log_and_a_queued_run_with_it_is_not_refused(self) -> None:
         for label in ("a per-run folder", "the state folder itself"):
             with self.subTest(named=label):

@@ -55,6 +55,14 @@ SCHEDULE_NAME = "schedule.json"
 STATE_NAME = "state.json"
 HEALTH_NAME = "health.json"
 STATE_FOLDER_NAMES = frozenset(name.casefold() for name in (SCHEDULE_NAME, STATE_NAME, HEALTH_NAME))
+
+
+def is_state_folder_name(name: str) -> bool:
+    """Whether ``name`` cannot be a read log's last part: it is empty, it is ``..`` or it is a file that the replay writes in its state folder, compared
+    without letter case."""
+    return name in {"", ".."} or name.casefold() in STATE_FOLDER_NAMES
+
+
 REQUIRED: dict[str, type | tuple[type, ...]] = {
     "run_id": str,
     "rooms": int,
