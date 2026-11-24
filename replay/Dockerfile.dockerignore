@@ -1,4 +1,6 @@
 *
+!features/__init__.py
+!features/sampling.py
 !replay
 !scripts/__init__.py
 !scripts/process.py

@@ -65,6 +65,17 @@ class ImageTest(unittest.TestCase):
         runtime = f"iceberg-spark-runtime-{spark_minor}_{values['SCALA_VERSION']}-{values['ICEBERG_VERSION']}.jar"
         self.assertTrue(any(runtime in expanded(line) for line in lines() if line.startswith("ADD ")), runtime)
 
+    def test_the_kafka_connector_matches_the_spark_and_scala_versions_and_brings_the_client_and_its_dependencies(self) -> None:
+        values = arguments()
+        downloads = [expanded(line) for line in lines() if line.startswith("ADD ")]
+        suffix = f"_{values['SCALA_VERSION']}-{values['SPARK_VERSION']}.jar"
+        for artifact in ("spark-sql-kafka-0-10", "spark-token-provider-kafka-0-10"):
+            self.assertTrue(any(f"/{artifact}_{values['SCALA_VERSION']}/{values['SPARK_VERSION']}/{artifact}{suffix}" in line for line in downloads), artifact)
+        for artifact, version in (("kafka-clients", values["KAFKA_CLIENTS_VERSION"]), ("commons-pool2", values["COMMONS_POOL_VERSION"])):
+            self.assertTrue(any(f"/{artifact}/{version}/{artifact}-{version}.jar" in line for line in downloads), artifact)
+        held = "the Spark 4.1.4 distribution already holds scala-parallel-collections 1.2.0"
+        self.assertFalse([line for line in downloads if "scala-parallel-collections" in line], held)
+
     def test_nothing_is_fetched_when_a_job_starts(self) -> None:
         for line in lines():
             if line.startswith(("ENTRYPOINT", "CMD")):

@@ -1,4 +1,4 @@
-"""The Spark image holds the Python packages and the project modules that the Bronze decoder imports, and installs the packages only from a locked list.
+"""The Spark image holds the packages and the project modules that the Bronze decoder and the streaming job import, and installs the packages only from a lock.
 
 Failure modes covered here:
 
@@ -7,7 +7,8 @@ Failure modes covered here:
 - The image installs a package from an unpinned name, without the hash of each file, from a source file that needs a build step or with the dependencies chosen
   at build time, so the platform changes with the day of the build.
 - The Spark image's lock holds another version of a package than the replay's lock, so the decoder reads a file with a library that the replay did not run on.
-- The decoder's two packages are pinned at another version than the replay's, which are the versions that its acceptance run proved.
+- A package that the replay also pins (the decoder's two and the Avro reader) is pinned at another version than the replay's, which its acceptance run proved.
+- The streaming job's two Spark packages (pyarrow and protobuf) are left out of the lock or not pinned.
 
 The wheels for Python 3.14 on linux/amd64 and the hashes are proved by the build of the image in ``tests/e2e/bronze_decode.py``.
 """
@@ -28,8 +29,10 @@ LOCK = ROOT / "spark" / "requirements.txt"
 REPLAY_IN = ROOT / "replay" / "requirements.in"
 REPLAY_LOCK = ROOT / "replay" / "requirements.txt"
 JOBS = "/opt/jobs"
-READ_FILES = ("tests/fixtures/vitaldb/release.json",)
-PACKAGES = ("vitaldb", "boto3")
+SCHEMAS = ("numeric", "waveform", "string_event", "case_lifecycle", "feature_ready")
+READ_FILES = ("tests/fixtures/vitaldb/release.json", *(f"replay/events/schemas/{name}.avsc" for name in SCHEMAS))
+PACKAGES = ("vitaldb", "boto3", "fastavro")
+STREAM_ONLY_PACKAGES = ("pyarrow", "protobuf")
 CHECK_PACKAGES = {"great-expectations": "1.24.1", "marshmallow": "4.3.1", "narwhals": "2.28.0", "pydantic": "2.14.3", "pydantic-core": "2.50.4"}
 INSTALL_FLAGS = ("--require-hashes", "--only-binary :all:", "--no-deps")
 LOCK_ENTRY = re.compile(r"^([A-Za-z0-9_.-]+)==(\S+) \\$", re.MULTILINE)
@@ -37,6 +40,10 @@ LOCK_ENTRY = re.compile(r"^([A-Za-z0-9_.-]+)==(\S+) \\$", re.MULTILINE)
 
 def bronze_sources() -> list[str]:
     return sorted(str(path.relative_to(ROOT)) for path in (ROOT / "spark" / "bronze").glob("*.py")) + ["spark/jobs/bronze_decode.py"]
+
+
+def stream_sources() -> list[str]:
+    return sorted(str(path.relative_to(ROOT)) for path in (ROOT / "spark" / "streaming").glob("*.py")) + ["spark/jobs/stream_features.py"]
 
 
 def copied_pairs(dockerfile: str) -> list[tuple[str, str]]:
@@ -107,19 +114,24 @@ def requested(text: str) -> dict[str, str]:
 
 class Image(unittest.TestCase):
     def test_every_module_that_the_decoder_imports_and_the_pin_are_in_the_image(self) -> None:
-        needed = imported_files(bronze_sources()) | set(READ_FILES)
+        needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         for path in (
             "replay/service/decode.py",
             "replay/events/waveform.py",
             "scripts/ingestion/gate.py",
             "scripts/sample/candidates.py",
             "scripts/stack/nessie.py",
+            "replay/service/wire_codec.py",
+            "replay/service/registry.py",
+            "replay/events/formats.py",
+            "replay/events/wire.py",
+            "features/row.py",
         ):
             self.assertIn(path, needed)
         self.assertEqual([], image_problems(DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text()), needed))
 
     def test_a_module_or_the_pin_left_out_is_named(self) -> None:
-        needed = imported_files(bronze_sources()) | set(READ_FILES)
+        needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         text, rules = DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text())
         for path in ("replay/service/decode.py", "replay/events/stream.py", "scripts/process.py", "tests/fixtures/vitaldb/release.json"):
             with self.subTest(ignored=path):
@@ -128,11 +140,22 @@ class Image(unittest.TestCase):
                 without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
                 self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, rules, needed))
 
-    def test_the_image_copies_no_replay_module_that_the_decoder_does_not_import(self) -> None:
-        needed = imported_files(bronze_sources()) | set(READ_FILES)
+    def test_the_image_holds_every_file_of_the_feature_package_so_its_version_is_the_hosts(self) -> None:
+        """``spark.streaming.version.feature_version`` is the digest of every ``features/*.py`` file, and the batch path and the acceptance run compute it on
+        the host: an image with fewer files gives the job another version and other feature IDs."""
+        every = {str(path.relative_to(ROOT)) for path in (ROOT / "features").glob("*.py")}
+        self.assertEqual([], image_problems(DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text()), every))
+        text = DOCKERFILE.read_text()
+        for path in sorted(every):
+            with self.subTest(left_out=path):
+                without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
+                self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, ignore_rules(IGNORE_FILE.read_text()), every))
+
+    def test_the_image_copies_no_replay_module_that_no_job_imports(self) -> None:
+        needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         for source, _ in copied_pairs(DOCKERFILE.read_text()):
             if source.startswith("replay/"):
-                self.assertIn(source, needed, source)
+                self.assertTrue(any(path == source or path.startswith(source + "/") for path in needed), source)
 
 
 class Packages(unittest.TestCase):
@@ -165,9 +188,11 @@ class Packages(unittest.TestCase):
         self.assertEqual(["numpy: not pinned to one version"], lock_problems(good.replace("numpy==2.5.5", "numpy>=2")))
         self.assertEqual(["vitaldb: not pinned to one version"], lock_problems(good.replace("vitaldb==1.7.2", "vitaldb")))
 
-    def test_the_two_packages_are_pinned_where_the_replay_pins_them(self) -> None:
+    def test_the_replays_packages_are_pinned_where_the_replay_pins_them(self) -> None:
         source, replay = requested(REQUIREMENTS_IN.read_text()), requested(REPLAY_IN.read_text())
-        self.assertEqual(set(PACKAGES) | set(CHECK_PACKAGES), set(source))
+        self.assertEqual({*PACKAGES, *STREAM_ONLY_PACKAGES, *CHECK_PACKAGES}, set(source))
+        for name in STREAM_ONLY_PACKAGES:
+            self.assertEqual(source[name], locked(LOCK.read_text()).get(name), f"{name} is pinned in the requirements and not at that version in the lock")
         for name in PACKAGES:
             self.assertEqual(replay[name], source[name], name)
             self.assertEqual(replay[name], locked(LOCK.read_text())[name], name)
@@ -189,7 +214,7 @@ class Packages(unittest.TestCase):
     def test_a_package_that_both_locks_hold_has_one_version(self) -> None:
         ours, replay = locked(LOCK.read_text()), locked(REPLAY_LOCK.read_text())
         shared = ours.keys() & replay.keys()
-        self.assertTrue({"vitaldb", "boto3", "numpy"} <= shared)
+        self.assertTrue({"vitaldb", "boto3", "numpy", "fastavro"} <= shared)
         self.assertEqual({}, {name: (ours[name], replay[name]) for name in shared if ours[name] != replay[name]})
 
 

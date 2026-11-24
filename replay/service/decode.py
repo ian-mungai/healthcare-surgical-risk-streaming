@@ -5,7 +5,9 @@ recording's clock starts at the publisher's anonymised start (2100-01-01 00:00:0
 ends within a couple of seconds of the clinical ``caseend``. A file that fails either check, or that the library stopped reading half way, is refused by name.
 
 The library keeps a numeric reading as a float or an integer, a waveform record as an array of raw samples and a string event as a text, each with the record's
-time as seconds since the epoch. The decoder keeps the order of the records, which the discriminators depend on.
+time as seconds since the epoch. The decoder keeps the order of the records, which the discriminators depend on. A numeric reading or a string event has its
+time rounded to whole microseconds from the case start, as Bronze rounds it. A waveform packet keeps its start as the file holds it, with no rounding, because
+the second of each sample depends on the exact value (``features/sampling.py``).
 """
 
 from __future__ import annotations
@@ -19,9 +21,9 @@ from typing import Any
 
 import vitaldb
 
+from features.sampling import ANONYMISED_START
 from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
 
-ANONYMISED_START = 4102444800.0
 END_TOLERANCE_SECONDS = 2.0
 WAVEFORM, NUMERIC, STRING = 1, 2, 5
 TYPECODES = {"B": "B", "b": "b", "H": "H", "h": "h", "I": "I", "i": "i", "f": "f", "d": "d"}
@@ -94,8 +96,8 @@ def decode_case(path: Path, times: CaseTimes) -> CaseRecording:
         elif track.type == STRING:
             strings.append(StringTrack(name, tuple((to_microseconds(record["dt"]), str(record["val"])) for record in track.recs)))
         elif track.type == WAVEFORM:
-            records = tuple(WaveformRecord(to_microseconds(record["dt"]), samples_of(record["val"])) for record in track.recs)
-            waveforms.append(WaveformTrack(name, track.unit, float(track.srate), float(track.gain), float(track.offset), records))
+            records = tuple(WaveformRecord(float(record["dt"]), samples_of(record["val"])) for record in track.recs)
+            waveforms.append(WaveformTrack(name, track.unit, float(track.srate), float(track.gain), float(track.offset), int(track.fmt), records))
         else:
             raise DecodeError(f"case {case}: the track {name} has a type that the replay does not carry")
     try:

@@ -20,18 +20,20 @@ The numbers of the generated waveform records are timestamps and sample indices 
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
 from array import array
 from collections.abc import Iterable
 from dataclasses import replace
 
-from replay.events.manifest import Manifest, Observed, build_manifest, compare, reference_seconds
+from features.sampling import ANONYMISED_START
+from replay.events.manifest import Manifest, ManifestError, Observed, build_manifest, compare, reference_seconds
 from replay.events.payload import payload_digest
 from replay.events.recording import WaveformRecord, WaveformTrack
 from replay.events.schedule import FrozenSchedule, admitted_occurrences
 from replay.events.stream import occurrence_events, outgoing
 from replay.events.waveform import second_samples, second_spans
-from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule
+from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule, encoded
 
 
 def replayed(frozen: FrozenSchedule) -> Observed:
@@ -77,7 +79,7 @@ class Derivation(unittest.TestCase):
         self.assertEqual(admitted, {event.occurrence_id for event in self.manifest.events.values()})
         self.assertEqual(admitted, set(self.manifest.occurrences))
         self.assertEqual(
-            18 * len([item for item in admitted if item.startswith("9001")]) + 8 * len([item for item in admitted if item.startswith("9002")]),
+            19 * len([item for item in admitted if item.startswith("9001")]) + 9 * len([item for item in admitted if item.startswith("9002")]),
             len(self.manifest.events),
         )
 
@@ -85,16 +87,16 @@ class Derivation(unittest.TestCase):
         started = next(event for event in self.manifest.events.values() if event.kind == "string" and event.event_id.endswith("|Test/EVENT|0|0"))
         self.assertEqual("Case started", (started.payload or {}).get("text"))
         for event in self.manifest.events.values():
-            if event.kind in ("string", "final_score", "case_end"):
+            if event.kind in ("string", "op_start", "final_score", "case_end"):
                 self.assertIsNotNone(event.payload, event.event_id)
             else:
                 self.assertIsNone(event.payload, event.event_id)
 
     def test_the_markers_and_the_string_events_are_distinct_kinds_with_distinct_ids(self) -> None:
         kinds = {event.kind for event in self.manifest.events.values()}
-        self.assertEqual({"numeric", "waveform", "string", "final_score", "case_end"}, kinds)
-        marker_ids = {event.event_id for event in self.manifest.events.values() if event.kind in ("final_score", "case_end")}
-        source_ids = {event.event_id for event in self.manifest.events.values() if event.kind not in ("final_score", "case_end")}
+        self.assertEqual({"numeric", "waveform", "string", "op_start", "final_score", "case_end"}, kinds)
+        marker_ids = {event.event_id for event in self.manifest.events.values() if event.kind in ("op_start", "final_score", "case_end")}
+        source_ids = {event.event_id for event in self.manifest.events.values() if event.kind not in ("op_start", "final_score", "case_end")}
         self.assertFalse(marker_ids & source_ids)
 
     def test_each_event_is_flagged_by_whether_it_is_due_inside_the_half_open_window(self) -> None:
@@ -113,7 +115,7 @@ class Derivation(unittest.TestCase):
         observed = replayed(frozen)
         self.assertEqual(set(manifest.events), set(observed.events))
         self.assertEqual({key: event.payload_sha256 for key, event in manifest.events.items()}, {key: value[0] for key, value in observed.events.items()})
-        self.assertEqual(7 * 3, len(manifest.events))
+        self.assertEqual(8 * 3, len(manifest.events))
         outside = next(event for event in manifest.events.values() if event.event_id.endswith("|Test/HR|10400000|0") and event.occurrence_id == "9003.0")
         self.assertEqual(10 * SECOND, outside.due_us)
 
@@ -144,11 +146,34 @@ class WaveformCrossCheck(unittest.TestCase):
             start = draw(f"{rate}:start", -5_000_000, 5_000_000)
             for number in range(12):
                 count = draw(f"{rate}:{number}:count", 1, 900)
-                records.append(WaveformRecord(start, array("d", (float(index) for index in range(count)))))
+                records.append(WaveformRecord(encoded(start), array("d", (float(index) for index in range(count)))))
                 start += draw(f"{rate}:{number}:step", -300_000, 1_800_000)
-            track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, tuple(records))
+            track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, 2, tuple(records))
             replay_side = {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)}
             self.assertEqual(reference_seconds(track), replay_side, f"rate {rate}")
+
+
+class BoundaryPackets(unittest.TestCase):
+    """The manifest's derivation reads the exact packet start, as the replay's second function does, so a packet half a microsecond before a
+    boundary has its first sample in the second before it in both."""
+
+    def test_the_manifest_and_the_replay_place_a_packet_half_a_microsecond_before_940_seconds_in_the_second_before_it(self) -> None:
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (WaveformRecord(ANONYMISED_START + 940.0 - 2.0**-21, array("d", [1.0, 2.0, 3.0, 4.0])),))
+        expected = {939: (999_999, [1.0]), 940: (249_999, [2.0, 3.0, 4.0])}
+        self.assertEqual(expected, reference_seconds(track))
+        self.assertEqual(expected, {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)})
+
+    def test_control_a_packet_on_the_boundary_is_one_whole_second_in_both(self) -> None:
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (WaveformRecord(ANONYMISED_START + 940.0, array("d", [1.0, 2.0, 3.0, 4.0])),))
+        self.assertEqual({940: (0, [1.0, 2.0, 3.0, 4.0])}, reference_seconds(track))
+
+    def test_the_two_derivations_agree_on_packets_at_the_floats_around_a_boundary(self) -> None:
+        for rate in (4.0, 62.5, 500.0, 0.3):
+            for step in (-3, -2, -1, 0, 1, 2):
+                start = ANONYMISED_START + 940.0 + step * 2.0**-21
+                track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, 2, (WaveformRecord(start, array("d", (float(index) for index in range(70)))),))
+                replay_side = {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)}
+                self.assertEqual(reference_seconds(track), replay_side, (rate, step))
 
 
 class Comparison(unittest.TestCase):
@@ -191,6 +216,17 @@ class Comparison(unittest.TestCase):
         self.assertEqual(("9002.0",), report.partial_occurrences)
         self.assertEqual((), report.missing_occurrences)
         self.assertIn(marker.event_id, "\n".join(report.failures()))
+
+    def test_a_manifest_file_written_before_the_start_marker_is_refused_and_not_read_as_current(self) -> None:
+        old = json.loads(self.manifest.to_json())
+        old["format"] = "replay_manifest_1"
+        with self.assertRaises(ManifestError):
+            Manifest.from_json(json.dumps(old))
+
+    def test_a_planted_missing_op_start_marker_fails_by_its_missing_id(self) -> None:
+        marker = next(event for event in self.manifest.events.values() if event.occurrence_id == "9001.0" and event.kind == "op_start")
+        report = compare(self.manifest, without(self.observed, [marker.event_id]))
+        self.assertEqual((marker.event_id,), report.missing_ids)
 
     def test_a_planted_missing_final_score_marker_fails_by_its_missing_id(self) -> None:
         marker = next(event for event in self.manifest.events.values() if event.occurrence_id == "9001.0" and event.kind == "final_score")

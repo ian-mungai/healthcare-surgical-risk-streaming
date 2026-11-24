@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from features.sampling import ANONYMISED_START
 from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, StringTrack, WaveformRecord, WaveformTrack
 from replay.events.run import RunState
 from replay.events.schedule import FrozenSchedule, Plan, first_due_instant, freeze
@@ -21,6 +22,11 @@ from replay.events.stream import OutgoingEvent, earliest_due_offset_us
 BOUNDARY_FILE = Path(__file__).resolve().parents[1] / "fixtures" / "boundary" / "replay_cases.json"
 RUN_ID = "replay_0a1b2c3d"
 SECOND = 1_000_000
+
+
+def encoded(case_time_us: int) -> float:
+    """The packet start that a file would hold for a case time: the float of seconds since the epoch. Exact for a multiple of 15 625 microseconds."""
+    return ANONYMISED_START + case_time_us / SECOND
 
 
 def boundary_recordings() -> dict[int, CaseRecording]:
@@ -41,7 +47,8 @@ def boundary_recordings() -> dict[int, CaseRecording]:
                     body["sample_rate"],
                     body["gain"],
                     body["offset"],
-                    tuple(WaveformRecord(start, array("d", samples)) for start, samples in body["records"]),
+                    body["sample_format"],
+                    tuple(WaveformRecord(encoded(start), array("d", samples)) for start, samples in body["records"]),
                 )
                 for track, body in sorted(case["waveform"].items())
             ),

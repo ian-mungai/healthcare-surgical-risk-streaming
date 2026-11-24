@@ -13,7 +13,7 @@ why ``case_problem`` judges a file before any row is made (``spark/bronze/struct
 
 A numeric or text reading's case time is the record time minus the anonymised start, in whole microseconds, as the replay's decoder
 (``replay/service/decode.py``) makes it, so a row and the replay's event for the same reading have the same key. A waveform sample's second is placed
-from the exact encoded values and not from a rounded start (``spark/bronze/sampling.py``). The numeric tracks of the four-byte integer formats (codes
+from the exact encoded values and not from a rounded start (``features/sampling.py``). The numeric tracks of the four-byte integer formats (codes
 7 and 8) are read by the packet walk with fixed-width little-endian formats, because the library unpacks eight bytes from each four-byte value.
 """
 

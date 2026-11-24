@@ -1,10 +1,14 @@
-"""The second of each waveform sample, from the encoded values with no rounding on the way. Pure code: no library, no file.
+"""The one definition of the second of each waveform sample, from the encoded values with no rounding on the way. Pure code: no library, no file.
+
+Bronze (``spark/bronze/rows.py``) and the replay's event model (``replay/events/waveform.py``, so the stream) call ``packet_pieces`` and nothing else to cut a
+packet into seconds, so the same packet gives the same seconds, the same offsets and the same samples on both paths. The replay's manifest derives the seconds
+again sample by sample with code that shares no step with this module (``replay/events/manifest.py``).
 
 A packet's start time is the file's own float of seconds since the epoch and a track's rate is the file's own float. Each is taken at its exact value, as a
 ``Fraction``. The time of sample ``i`` is the start, minus the anonymised start, plus ``i`` over the rate. Its second is the floor of that time. The offset of
 the first sample of a piece in its second is the exact time within the second, floored once to whole microseconds, so it is always below one second.
-Nothing is rounded before that, which is what separates this module from the replay's decoder: that decoder rounds a packet's start to whole microseconds
-first, which moves a sample that lies less than half a microsecond before a boundary into the next second.
+Nothing is rounded before that: rounding a packet's start to whole microseconds first would move a sample that lies less than half a microsecond before
+a boundary into the next second.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 
 MICROSECONDS = 1_000_000
+ANONYMISED_START = 4102444800.0
 
 
 class SamplingError(ValueError):

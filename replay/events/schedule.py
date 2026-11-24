@@ -5,7 +5,8 @@ replay speed, which only paces the wall clock. The plan names the cases in play 
 turnover between two cases of a room and the length of the window. Room ``r`` starts at ``r`` times the stagger and plays its occurrences back to back, each
 ``caseend`` long, with the turnover between them.
 
-The schedule is frozen before any admission: the plan and the first due instant, with a digest. The first due instant is the earliest instant at which any
+The schedule is frozen before any admission: the plan, the first due instant and the version of the event list that gave it, with a digest. A saved schedule
+whose version is missing or another one is refused when it is read, before anything is sent. The first due instant is the earliest instant at which any
 event of the first occurrence of any room is due. The window is ``[first due, first due + window length)``. An occurrence is admitted when its mapped
 ``opstart``, which is its start plus the case's ``opstart``, falls inside the window. An admitted occurrence plays in full, also past the end of the window.
 """
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from replay.events.errors import EventModelError
+from replay.events.event_list import EVENT_LIST_REFUSAL_CODE, EVENT_LIST_VERSION
 from replay.events.identity import Occurrence, check_run_id, occurrence_for
 from replay.events.recording import CaseTimes
 
@@ -95,6 +97,7 @@ class FrozenSchedule:
                 {"case_id": case.case_id, "opstart_us": case.opstart_us, "opend_us": case.opend_us, "caseend_us": case.caseend_us} for case in plan.cases
             ],
             "first_due_us": self.first_due_us,
+            "event_list": EVENT_LIST_VERSION,
         }
 
     @property
@@ -110,6 +113,13 @@ class FrozenSchedule:
             document = json.loads(text)
             if document.pop("format") != SCHEDULE_FORMAT:
                 raise ScheduleError("the saved schedule is not of this format")
+            saved_list = document.pop("event_list", None)
+            if saved_list != EVENT_LIST_VERSION:
+                raise ScheduleError(
+                    f"{EVENT_LIST_REFUSAL_CODE}: the saved schedule was frozen for "
+                    f"{'no event list' if saved_list is None else f'the event list {saved_list}'} and this replay sends {EVENT_LIST_VERSION}: its first due "
+                    "instant is not used, start the run again under a new run ID"
+                )
             claimed = document.pop("sha256")
             plan = Plan(
                 document["run_id"],

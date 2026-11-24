@@ -24,6 +24,8 @@ from collections import Counter
 from types import SimpleNamespace
 
 from replay.events.manifest import reference_seconds
+from replay.events.recording import WaveformRecord, WaveformTrack
+from replay.events.waveform import second_samples, second_spans
 from spark.bronze.rows import (
     Lineage,
     StructureError,
@@ -194,21 +196,30 @@ class WaveformRows(unittest.TestCase):
         self.assertEqual(0.1, rows[1][4][0])
         self.assertTrue(math.isnan(rows[1][4][1]))
 
-    def test_the_boundary_cases_equal_the_manifest_derivation_in_seconds_and_samples_and_within_a_microsecond_in_offsets(self) -> None:
+    def test_the_boundary_cases_equal_the_manifest_derivation_in_seconds_samples_and_offsets(self) -> None:
         checked = 0
         for case, recording in boundary_recordings().items():
             for track in recording.waveforms:
                 reference = reference_seconds(track)
-                records = [(ORIGIN + record.start_us / 1_000_000, record.samples) for record in track.records]
+                records = [(record.start_s, record.samples) for record in track.records]
                 rows = list(waveform_rows(case, track.name, track.sample_rate, records, ORIGIN, LINEAGE))
                 self.assertEqual(sorted(reference), [row[2] for row in rows])
                 for row in rows:
                     offset, samples = reference[row[2]]
                     self.assertEqual(samples, row[4])
-                    self.assertLessEqual(abs(offset - row[3]), 1)
+                    self.assertEqual(offset, row[3])
                 self.assertEqual(len(rows), len(set(keys_of(WAVEFORM, rows))))
                 checked += 1
         self.assertGreaterEqual(checked, 2)
+
+    def test_the_reviewers_packet_half_a_microsecond_before_940_seconds_is_cut_alike_by_bronze_and_by_the_replays_events(self) -> None:
+        for shift, expected in ((-(2.0**-21), [(939, 999_999, [1.0]), (940, 249_999, [2.0, 3.0, 4.0])]), (0.0, [(940, 0, [1.0, 2.0, 3.0, 4.0])])):
+            with self.subTest(shift=shift):
+                packet = WaveformRecord(ORIGIN + 940.0 + shift, array("d", [1.0, 2.0, 3.0, 4.0]))
+                track = WaveformTrack("Test/WAVE", "mV", 4.0, 1.0, 0.0, 2, (packet,))
+                rows = list(waveform_rows(1, track.name, track.sample_rate, [(packet.start_s, packet.samples)], ORIGIN, LINEAGE))
+                self.assertEqual(expected, [(row[2], row[3], row[4]) for row in rows])
+                self.assertEqual(expected, [(span.second, span.start_offset_us, second_samples(track, span)) for span in second_spans(track)])
 
     def test_a_rate_that_is_not_a_positive_number_is_refused_by_case_and_track(self) -> None:
         for rate in RATE_ERRORS:

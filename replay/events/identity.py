@@ -23,13 +23,14 @@ from typing import Literal
 
 from replay.events.errors import EventModelError
 
-Marker = Literal["final_score", "case_end"]
+Marker = Literal["op_start", "final_score", "case_end"]
 
 DELIMITER = "|"
 RESERVED_PREFIX = "!"
+OP_START_TRACK = "!op_start"
 FINAL_SCORE_TRACK = "!final_score"
 CASE_END_TRACK = "!case_end"
-MARKER_TRACKS: dict[Marker, str] = {"final_score": FINAL_SCORE_TRACK, "case_end": CASE_END_TRACK}
+MARKER_TRACKS: dict[Marker, str] = {"op_start": OP_START_TRACK, "final_score": FINAL_SCORE_TRACK, "case_end": CASE_END_TRACK}
 
 RUN_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 RUN_ID = re.compile(r"[a-z][a-z0-9_]*_[0-9a-f]{8}(?:_[2-9]|_[1-9][0-9]+)?")
@@ -111,5 +112,5 @@ def source_event_id(run: str, room: int, occurrence_id: str, track: str, case_ti
 
 
 def marker_event_id(run: str, room: int, occurrence_id: str, marker: Marker, case_time_us: int) -> str:
-    """The ID of the generated final-score marker or case-end marker of an occurrence."""
+    """The ID of a generated marker of an occurrence: the start marker, the final-score marker or the case-end marker."""
     return event_id_text(run, room, occurrence_id, MARKER_TRACKS[marker], case_time_us, 0)

@@ -8,17 +8,25 @@ Failure modes covered here:
 - The first due instant is taken from the plan and not from the first reading of the cases, so the first send is checked against the wrong instant.
 - The frozen schedule changes after a restart, or a changed plan is accepted against a saved schedule, so the expected window moves.
 - The speed enters the schedule, so the same run at another speed has other IDs or another window.
+- A schedule frozen by an older event list, with no saved position, is accepted: its first due instant belongs to another list, so the first event is sent at
+  the wrong instant and an occurrence is admitted that the current list would not admit.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import tempfile
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 
 from replay.events.errors import EventModelError
+from replay.events.event_list import EVENT_LIST_VERSION
 from replay.events.recording import CaseTimes
 from replay.events.schedule import FrozenSchedule, Plan, ScheduleError, admitted_occurrences, ensure_same_schedule, first_due_instant, freeze
 from replay.events.stream import earliest_due_offset_us
+from replay.service.state_file import ScheduleFile
 from tests.fast.replay_support import RUN_ID, SECOND, boundary_plan, boundary_recordings, boundary_schedule
 
 A = CaseTimes(9001, 4 * SECOND, 10 * SECOND, 14 * SECOND)
@@ -149,6 +157,46 @@ class Freezing(unittest.TestCase):
         text = freeze(plan(), 0).to_json().replace('"rooms": 2', '"rooms": 3')
         with self.assertRaisesRegex(ScheduleError, "digest"):
             FrozenSchedule.from_json(text)
+
+    def test_a_frozen_schedule_names_the_event_list_it_was_frozen_for_and_the_digest_covers_it(self) -> None:
+        frozen = freeze(plan(), 0)
+        document = json.loads(frozen.to_json())
+        self.assertEqual(EVENT_LIST_VERSION, document["event_list"])
+        self.assertEqual(frozen.sha256, document["sha256"])
+        without = {key: value for key, value in document.items() if key not in ("event_list", "sha256")}
+        self.assertNotEqual(frozen.sha256, hashlib.sha256(json.dumps(without, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+
+    def test_a_schedule_of_the_old_format_without_an_event_list_is_refused_with_the_code_not_as_edited(self) -> None:
+        """The old sampler froze a first due time of 2 s that this list sends at 1 s: with no saved position nothing else would have caught it."""
+        old = json.loads(freeze(plan(), 2 * SECOND).to_json())
+        del old["event_list"]
+        document = {key: value for key, value in old.items() if key != "sha256"}
+        old["sha256"] = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        with self.assertRaisesRegex(ScheduleError, "replay_event_list_refused.*no event list.*new run ID"):
+            FrozenSchedule.from_json(json.dumps(old))
+
+    def test_a_schedule_of_another_event_list_is_refused_with_the_code_and_both_lists_named(self) -> None:
+        other = json.loads(freeze(plan(), 0).to_json())
+        other["event_list"] = "events_2"
+        with self.assertRaisesRegex(ScheduleError, f"replay_event_list_refused.*events_2.*{EVENT_LIST_VERSION}.*new run ID"):
+            FrozenSchedule.from_json(json.dumps(other))
+        self.assertNotEqual("events_2", EVENT_LIST_VERSION)
+
+    def test_a_saved_old_format_schedule_with_no_saved_position_is_refused_when_the_file_is_loaded_and_left_as_it_was(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schedule.json"
+            old = json.loads(freeze(plan(), 2 * SECOND).to_json())
+            del old["event_list"], old["sha256"]
+            old["sha256"] = hashlib.sha256(json.dumps(old, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            text = json.dumps(old, indent=1, sort_keys=True) + "\n"
+            path.write_text(text)
+            self.assertFalse((Path(directory) / "state.json").exists())
+            with self.assertRaisesRegex(ScheduleError, "replay_event_list_refused"):
+                ScheduleFile(path).load()
+            self.assertEqual(text, path.read_text())
+            current = Path(directory) / "current.json"
+            current.write_text(freeze(plan(), 2 * SECOND).to_json())
+            self.assertEqual(freeze(plan(), 2 * SECOND), ScheduleFile(current).load())
 
     def test_a_plan_that_differs_from_the_saved_schedule_is_refused_with_the_part_that_differs(self) -> None:
         saved = freeze(plan(), 0)

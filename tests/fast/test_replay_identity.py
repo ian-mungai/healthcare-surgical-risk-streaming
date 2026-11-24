@@ -18,6 +18,7 @@ from collections.abc import Callable
 from replay.events.identity import (
     CASE_END_TRACK,
     FINAL_SCORE_TRACK,
+    OP_START_TRACK,
     IdentityError,
     Occurrence,
     check_run_id,
@@ -140,8 +141,10 @@ class EventIdentity(unittest.TestCase):
         ended = marker_event_id(RUN, 3, "908.1", "case_end", 4_207_000_000)
         self.assertEqual(f"{RUN}|3|908.1|{FINAL_SCORE_TRACK}|2965000000|0", final)
         self.assertEqual(f"{RUN}|3|908.1|{CASE_END_TRACK}|4207000000|0", ended)
-        self.assertNotEqual(final, ended)
-        for track in (FINAL_SCORE_TRACK, CASE_END_TRACK, "!anything"):
+        started = marker_event_id(RUN, 3, "908.1", "op_start", 1_000_000_000)
+        self.assertEqual(f"{RUN}|3|908.1|{OP_START_TRACK}|1000000000|0", started)
+        self.assertEqual(3, len({final, ended, started}))
+        for track in (FINAL_SCORE_TRACK, CASE_END_TRACK, OP_START_TRACK, "!anything"):
             with self.subTest(track=track), self.assertRaises(IdentityError):
                 source_event_id(RUN, 3, "908.1", track, 2_965_000_000, 0)
 
