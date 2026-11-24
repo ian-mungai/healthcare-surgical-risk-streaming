@@ -5,7 +5,8 @@ and the order of a build run in the fast tests on plain rows and stand-in steps.
 calls it and keeps no copy.
 
 The test set is sealed until the choice record is frozen, so nothing here may name which set a patient or a case is in. Every failure is a code and a count
-(``two_sets: 1 patient``), never an identifier. A check returns its problems and never raises for a failed check, so that one run names every cause.
+(``two_sets: 1 patient``), never an identifier, except a table whose columns are not those of its card, which is ``schema: failed``. A check returns its
+problems and never raises for a failed check, so that one run names every cause.
 
 A build resolves the branch to one hash and reads only at that hash. It writes only while the branch still has that hash, reads the written table at the
 hash of the write and checks it, and ends only when the branch still has that hash.
@@ -309,10 +310,11 @@ def source_problems(rows: Sequence[SplitRow], source_subjects: set[str], source_
     return problems
 
 
-def schema_problems(fields: Sequence[tuple[str, str]], expected: Sequence[tuple[str, str]], label: str) -> list[str]:
+def schema_problems(fields: Sequence[tuple[str, str]], expected: Sequence[tuple[str, str]]) -> list[str]:
+    """The refusal of a table whose columns are not those of its card: the code and a flag, with no table and no count of columns."""
     if list(fields) == list(expected):
         return []
-    return [f"schema: the {label} has {unit(len(fields), 'column')} that differ from the {len(expected)} of the card"]
+    return ["schema: failed"]
 
 
 def fixed_sample_problems(assignments: Mapping[str, str], cases: Mapping[int, str], sample: Sequence[SampleCase]) -> list[str]:

@@ -60,7 +60,7 @@ class SignalsLake(Lake):
         if not self.session.catalog.tableExists(table):
             raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
         frame = self.session.table(table)
-        problems = schema_problems(self.fields_of(frame), spec.columns, f"bronze {spec.name} table")
+        problems = schema_problems(self.fields_of(frame), spec.columns)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
@@ -92,7 +92,7 @@ class SignalsLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), SILVER_TABLES[table].columns, f"{table} table")
+        problems = schema_problems(self.fields_of(frame), SILVER_TABLES[table].columns)
         if problems:
             raise SilverSignalsError(*problems)
         fingerprint, snapshot = frames.fingerprint(frame), self.snapshot_id(name)

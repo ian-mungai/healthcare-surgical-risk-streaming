@@ -292,10 +292,10 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(["source_extra: 1 patient"], source_problems(rows_of(FULL), set(short), SNAPSHOT))
 
     def test_the_columns_are_the_four_of_the_card_in_order(self) -> None:
-        self.assertEqual([], schema_problems(list(COLUMNS), COLUMNS, "table"))
+        self.assertEqual([], schema_problems(list(COLUMNS), COLUMNS))
         self.assertEqual((("subjectid", "string"), ("set", "string"), ("rule_version", "string"), ("source_snapshot_id", "bigint")), COLUMNS)
-        self.assertTrue(schema_problems([("subjectid", "bigint"), *COLUMNS[1:]], COLUMNS, "table"))
-        self.assertTrue(schema_problems(list(COLUMNS[:3]), COLUMNS, "table"))
+        self.assertEqual(["schema: failed"], schema_problems([("subjectid", "bigint"), *COLUMNS[1:]], COLUMNS))
+        self.assertEqual(["schema: failed"], schema_problems(list(COLUMNS[:3]), COLUMNS))
 
     def test_source_rows_give_the_patient_of_each_case_and_refuse_bad_rows_with_counts_only(self) -> None:
         cases, patients = source_cases([("1", "10"), ("2", "10"), ("3", "11")])
@@ -1182,7 +1182,7 @@ def all_messages() -> list[str]:
     messages += frozen_problems(rows_of(base, version="v9"), base, pinned=True)
     messages += source_problems(rows, set(base) - {patient}, SNAPSHOT + 1)
     messages += source_problems(rows, set(base) | {"9" + patient}, SNAPSHOT)
-    messages += schema_problems([(patient, "string")], COLUMNS, "table")
+    messages += schema_problems([(patient, "string")], COLUMNS)
     sample = [
         SampleCase(int(case), int(patient), "repeat_test"),
         SampleCase(int(case) + 1, int(patient) + 1, "odd"),

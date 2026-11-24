@@ -8,6 +8,8 @@ Failure modes covered here:
 - A result holds a number that is not a snapshot ID (or the development events digest of the hypotension job), so a held-out row could change it.
 - Changing one held-out row (its counts, its fingerprint) changes the result in more than the snapshot IDs, the hashes and the pass flags.
 - A refusal or a problem message carries a count of rows, cases, seconds, readings, keys or patients, or the size of a defect changes its text.
+- A result holds the field ``outcome``, which says whether a table was written, so it changes when only a held-out row changes.
+- A refusal of a table's columns carries a count of columns.
 - A split-rule problem (``two_sets: 1 patient``) reaches a caller with its count.
 """
 
@@ -16,20 +18,26 @@ from __future__ import annotations
 import dataclasses
 import re
 import unittest
+from types import SimpleNamespace
 from typing import Any
 
+from spark.jobs.patient_split import Lake
+from spark.jobs.silver_hypotension import HypotensionLake
+from spark.jobs.silver_signals import SOURCES, SignalsLake
 from spark.silver import hypotension_run as hypo_run
 from spark.silver import run as signals_run
 from spark.silver.checks import BronzeFacts, NumericFacts, SilverSignalsError, WaveformFacts
 from spark.silver.hypotension_checks import EventFacts, InputFacts, SeriesFacts
 from spark.silver.run import BRANCH_MOVED, Fingerprint
+from spark.silver.tables import ART_MBP_1S, SILVER_TABLES
+from spark.split_table import COLUMNS, PatientSplitError, schema_problems
 from tests.fast import test_silver_hypotension_run as hypo
 from tests.fast import test_silver_signals_run as signals
 
 TABLE_COUNT_CODES = ("table_missing", "readback_differs", "source_no_snapshot", "source_table")
 MESSAGE = re.compile(r"^[a-z_]+: failed$|^(" + "|".join(TABLE_COUNT_CODES) + r"): [0-9]+ tables?$|^" + re.escape(BRANCH_MOVED) + "$")
 VOLATILE = ("snapshots", "source_snapshots", "checked_hash", "write_hash", "branch_hash")
-BANNED_KEYS = ("rows", "bronze_rows", "duplicates_dropped", "causes", "fingerprints", "fingerprint", "digest", "count", "counts")
+BANNED_KEYS = ("outcome", "rows", "bronze_rows", "duplicates_dropped", "causes", "fingerprints", "fingerprint", "digest", "count", "counts")
 SNAPSHOT_KEYS = ("snapshots", "source_snapshots")
 
 
@@ -326,6 +334,60 @@ class HypotensionMessages(unittest.TestCase):
         fake = hypo.Fake()
         fake.input = hypo_run.InputRead(InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient", "unknown_set: 2 rows")), (21, 22, 23))
         self.assertEqual(["two_sets: failed", "unknown_set: failed"], self.build(fake))
+
+
+class WrongColumnsSession:
+    """A session whose every table exists and holds one column that no table of the project has: any schema check of a job must refuse it."""
+
+    def __init__(self) -> None:
+        field = SimpleNamespace(name="stray", dataType=SimpleNamespace(simpleString=lambda: "string"))
+        self.conf = SimpleNamespace(set=lambda key, value: None)
+        self.catalog = SimpleNamespace(tableExists=lambda name: True)
+        self.table = lambda name: SimpleNamespace(schema=SimpleNamespace(fields=[field]))
+
+
+SETTINGS = {"nessie_uri": "http://nessie:19120/api/v2", "warehouse": "file:///w/", "region": ""}
+AT = "a" * 64
+
+
+class SchemaRefusals(unittest.TestCase):
+    """A table whose columns are not those of its card is refused as ``schema: failed`` and never with a count of columns."""
+
+    def refused(self, call: Any, error: type[Exception]) -> list[str]:
+        try:
+            call()
+        except error as caught:
+            return list(caught.problems)  # type: ignore[attr-defined]
+        raise AssertionError("the call did not refuse")
+
+    def test_the_check_names_no_count_and_no_table(self) -> None:
+        self.assertEqual([], schema_problems(list(COLUMNS), COLUMNS))
+        for fields in ([], list(COLUMNS[:3]), [("subjectid", "bigint"), *COLUMNS[1:]], [*COLUMNS, ("extra", "string")]):
+            with self.subTest(columns=len(fields)):
+                self.assertEqual(["schema: failed"], schema_problems(fields, COLUMNS))
+
+    def test_the_silver_signals_job_refuses_each_bronze_input_and_each_table_it_reads(self) -> None:
+        lake = SignalsLake(WrongColumnsSession(), None, "b", SETTINGS)  # type: ignore[arg-type]
+        for spec in SOURCES:
+            with self.subTest(table=spec.name):
+                self.assertEqual(["schema: failed"], self.refused(lambda spec=spec: lake.source(AT, spec), SilverSignalsError))
+        for table in SILVER_TABLES:
+            with self.subTest(table=table):
+                self.assertEqual(["schema: failed"], self.refused(lambda table=table: lake.read_signal_table(AT, table, False), SilverSignalsError))
+
+    def test_the_hypotension_job_refuses_each_input_and_each_table_it_reads(self) -> None:
+        lake = HypotensionLake(WrongColumnsSession(), None, "b", SETTINGS)  # type: ignore[arg-type]
+        for name, call in (("waveform", lake.waveform), ("clinical", lake.clinical), ("split", lake.split)):
+            with self.subTest(table=name):
+                self.assertEqual(["schema: failed"], self.refused(lambda call=call: call(AT), SilverSignalsError))
+        for table in (ART_MBP_1S.name, "hypotension_events"):
+            with self.subTest(table=table):
+                self.assertEqual(["schema: failed"], self.refused(lambda table=table: lake.read_signal_table(AT, table, False), SilverSignalsError))
+
+    def test_the_patient_split_job_refuses_its_source_and_its_table(self) -> None:
+        lake = Lake(WrongColumnsSession(), None, "b", SETTINGS)  # type: ignore[arg-type]
+        self.assertEqual(["schema: failed"], self.refused(lambda: lake.read_source(AT), PatientSplitError))
+        self.assertEqual(["schema: failed"], self.refused(lambda: lake.read_table(AT), PatientSplitError))
 
 
 if __name__ == "__main__":

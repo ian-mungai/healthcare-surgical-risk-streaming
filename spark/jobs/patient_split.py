@@ -119,7 +119,7 @@ class Lake:
             raise PatientSplitError(f"source_table: {unit(0, 'table')}")
         frame = self.session.table(table)
         fields = [(field.name, field.dataType.simpleString()) for field in frame.schema.fields if field.name in dict(SOURCE_COLUMNS)]
-        problems = schema_problems(sorted(fields), sorted(SOURCE_COLUMNS), "source table")
+        problems = schema_problems(sorted(fields), sorted(SOURCE_COLUMNS))
         if problems:
             raise PatientSplitError(*problems)
         snapshot = self.snapshot_id(table)
@@ -135,7 +135,7 @@ class Lake:
         if not self.session.catalog.tableExists(table):
             return None
         frame = self.session.table(table)
-        problems = schema_problems([(field.name, field.dataType.simpleString()) for field in frame.schema.fields], COLUMNS, "split table")
+        problems = schema_problems([(field.name, field.dataType.simpleString()) for field in frame.schema.fields], COLUMNS)
         if problems:
             raise PatientSplitError(*problems)
         rows = [SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in frame.collect()]

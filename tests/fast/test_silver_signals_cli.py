@@ -7,7 +7,9 @@ Failure modes covered here:
 - The namespace commit of a branch that moved ends the job with the exception of the patient split, which the command line maps to an internal error
   and not to the refusal ``branch_moved``.
 - The watchdog that stops a job that runs too long names another job, or holds a duration.
-- A failed check prints no line, or prints a line that is not a code and a count, or the exit code does not tell a failed check from a bad call.
+- A failed check prints no line, or prints a line that is not a code and a flag (or, for a count of tables, a code and that count), or the exit code does not
+  tell a failed check from a bad call.
+- A table whose columns are not those of its card prints a count of columns, or the name of a table, and not the code and flag ``schema: failed``.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from spark.settings import SettingsError
 from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
 from spark.split_cli import start_deadline
+from spark.split_table import schema_problems
 
 MARKER = "MARKER_8731"
 
@@ -73,6 +76,12 @@ class CommandLine(unittest.TestCase):
         code, out, err = invoke(["build", "--branch", "b"], raising(SilverSignalsError("numeric_verdict_differs: failed", "waveform_shape: failed")))
         self.assertEqual((1, ""), (code, out))
         self.assertEqual("silver_signals: numeric_verdict_differs: failed\nsilver_signals: waveform_shape: failed\n", err)
+
+    def test_a_table_with_the_wrong_columns_prints_the_code_schema_and_a_flag(self) -> None:
+        code, out, err = invoke(
+            ["verify", "--branch", "b"], raising(SilverSignalsError(*schema_problems([("stray", "string")], [("a", "string"), ("b", "int")])))
+        )
+        self.assertEqual((1, "", "silver_signals: schema: failed\n"), (code, out, err))
 
     def test_an_error_of_nessie_is_a_code_and_never_its_text(self) -> None:
         missing = NessieError(f"{MARKER} not found", status=404, error_code="REFERENCE_NOT_FOUND")

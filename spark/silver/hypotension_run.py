@@ -71,7 +71,6 @@ class Operations:
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    outcome: str
     checked_hash: str
     write_hash: str | None
     branch_hash: str
@@ -82,9 +81,9 @@ class Outcome:
 
     def facts(self) -> dict[str, Any]:
         """What the result line may hold: hashes, snapshot IDs, one pass flag for each table, the checks that ran and the digest of the development events.
-        It holds no count, no digest of the series and no cause."""
+        It holds no count, no digest of the series and no cause, and no field that says whether a table was written: a held-out row alone changes that, and the
+        write hash and the snapshot IDs show it."""
         return {
-            "outcome": self.outcome,
             "checked_hash": self.checked_hash,
             "write_hash": self.write_hash,
             "branch_hash": self.branch_hash,
@@ -178,7 +177,6 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     if ops.head() != at:
         raise SilverSignalsError(BRANCH_MOVED)
     return Outcome(
-        "written" if changed else "unchanged",
         head,
         written,
         at,
@@ -212,6 +210,6 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome("verified", head, None, head, source, tables, events_digest(reads[EVENTS]), passed_flags(source, reads, None))
+        return Outcome(head, None, head, source, tables, events_digest(reads[EVENTS]), passed_flags(source, reads, None))
     finally:
         ops.release()

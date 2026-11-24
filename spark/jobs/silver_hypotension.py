@@ -71,7 +71,7 @@ class HypotensionLake(Lake):
 
     def waveform(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, WAVEFORM_TABLE)
-        problems = schema_problems(self.fields_of(frame), WAVEFORM.columns, f"{WAVEFORM.name} table")
+        problems = schema_problems(self.fields_of(frame), WAVEFORM.columns)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
@@ -79,14 +79,14 @@ class HypotensionLake(Lake):
     def clinical(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, CLINICAL_TABLE)
         held = dict(self.fields_of(frame))
-        problems = schema_problems([(name, held.get(name, "")) for name, _ in CLINICAL_COLUMNS], CLINICAL_COLUMNS, "clinical table")
+        problems = schema_problems([(name, held.get(name, "")) for name, _ in CLINICAL_COLUMNS], CLINICAL_COLUMNS)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
 
     def split(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, SPLIT_TABLE)
-        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS, "split table")
+        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
@@ -129,7 +129,7 @@ class HypotensionLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), HYPOTENSION_TABLES[table].columns, f"{table} table")
+        problems = schema_problems(self.fields_of(frame), HYPOTENSION_TABLES[table].columns)
         if problems:
             raise SilverSignalsError(*problems)
         held: Fingerprint | Digest = fingerprint_of(frame) if table == SERIES else frames.digest_of(frame)
