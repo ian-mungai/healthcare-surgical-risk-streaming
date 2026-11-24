@@ -49,6 +49,7 @@ from tests.fast.silver_accept import (
     HYPOTENSION_JOB,
     NOT_CLOSED,
     NOT_EMPTY,
+    NOT_PASSED,
     REASONS,
     REFUSAL_REASONS,
     SIGNALS_JOB,
@@ -58,6 +59,7 @@ from tests.fast.silver_accept import (
     Catalog,
     accept_keep,
     accept_refusal,
+    accept_setup,
     accept_usage,
     accept_write,
     catalog_matches,
@@ -309,6 +311,52 @@ class Writes(unittest.TestCase):
         self.assertTrue(wrote(hypotension(), HYPOTENSION_JOB, HYPO_WROTE))
         self.assertTrue(kept(hypotension(write_hash=None, branch_hash=HEAD), HYPOTENSION_JOB, HYPO_KEPT))
         self.assertFalse(wrote(hypotension(), SIGNALS_JOB, HYPO_WROTE))
+
+
+class SetupCalls(unittest.TestCase):
+    """A runner that builds Silver tables as a setup step reads the job's result file through ``accept_setup``: exit 0, the closed schema, a build that wrote
+    and every pass flag true. The old setup read ``outcome == "written"``, a field that the sealed jobs do not write, and called the job without ``--result``,
+    which now exits 2.
+
+    Failure modes covered here:
+
+    - A setup that passes on a result with a false pass flag, a missing flag, a call that wrote nothing, a verify or a refusal document.
+    - A setup that reads ``outcome`` and so rejects every valid result, or passes on a document that only says ``outcome: written``.
+    """
+
+    def test_a_build_that_exited_0_wrote_and_passed_every_check_is_accepted(self) -> None:
+        accepted = accept_setup(0, written(), SIGNALS_JOB)
+        self.assertTrue(accepted.ok)
+        self.assertEqual(written(), dict(accepted.result))
+        self.assertTrue(accept_setup(0, hypotension(), HYPOTENSION_JOB).ok)
+
+    def test_each_failed_rule_gives_its_own_fixed_phrase_and_no_document(self) -> None:
+        for name, code, document, reason in (
+            ("a failed exit", 1, written(), WRONG_EXIT),
+            ("a usage exit", 2, written(), WRONG_EXIT),
+            ("no file", 0, None, "no result file"),
+            ("a refusal document", 0, refusal(), NOT_CLOSED),
+            ("an outcome only", 0, {"outcome": "written"}, NOT_CLOSED),
+            ("an extra key", 0, written(outcome="written"), NOT_CLOSED),
+            ("a false flag", 0, written(passed={"numeric_observations": True, "waveform_seconds": False}), NOT_PASSED),
+            ("another job's document", 0, hypotension(), NOT_CLOSED),
+            ("a call that wrote nothing", 0, unwritten(), "the result is not a write"),
+            ("a verify", 0, verified(), "the result is not a write"),
+        ):
+            with self.subTest(name):
+                accepted = accept_setup(code, document, SIGNALS_JOB)
+                self.assertEqual(reason, accepted.reason)
+                self.assertEqual({}, dict(accepted.result))
+                self.assertIn(accepted.reason, REASONS)
+
+    def test_a_flag_that_is_not_a_boolean_is_not_a_pass(self) -> None:
+        for value in (1, "true", None):
+            with self.subTest(value=value):
+                self.assertFalse(accept_setup(0, written(passed={"numeric_observations": value, "waveform_seconds": True}), SIGNALS_JOB).ok)
+
+    def test_a_write_hash_that_is_the_checked_hash_is_no_setup_write(self) -> None:
+        self.assertFalse(accept_setup(0, written(write_hash=HEAD, branch_hash=HEAD), SIGNALS_JOB).ok)
+        self.assertFalse(accept_setup(0, written(branch_hash=HEAD), SIGNALS_JOB).ok)
 
 
 class MovedNull(unittest.TestCase):
