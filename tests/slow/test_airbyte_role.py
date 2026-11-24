@@ -344,6 +344,25 @@ class GroupAccessAloneTest(unittest.TestCase):
         self.assertLess(folder, template)
 
 
+class GroupAccessCheckTest(unittest.TestCase):
+    """`kubectl auth can-i VERB kind/sub` reads `sub` as a resource name, so a subresource check must pass `--subresource` (host run, Nov 23 2026)."""
+
+    def check(self) -> dict[str, Any]:
+        document: Any = load_yaml((ROLE / "tasks" / "group_access.yml").read_text())
+        return next(task for task in document[0]["block"] if task.get("name") == "Check what the account may do and may not do")
+
+    def test_no_check_names_a_subresource_inside_the_resource(self) -> None:
+        for item in self.check()["loop"]:
+            with self.subTest(item=item):
+                self.assertNotIn("/", item["resource"])
+
+    def test_the_scale_and_exec_checks_name_their_subresource_and_the_command_passes_it(self) -> None:
+        task = self.check()
+        subresources = {(item["verb"], item["resource"], item.get("subresource")) for item in task["loop"]}
+        self.assertTrue({("patch", "deployments", "scale"), ("patch", "statefulsets", "scale"), ("create", "pods", "exec")} <= subresources)
+        self.assertIn("--subresource={{ item.subresource | default('') }}", task["ansible.builtin.command"]["argv"])
+
+
 def policies(text: str) -> list[dict[str, Any]]:
     return [mapping(load_yaml(part)) for part in text.split("\n---\n") if part.strip()]
 

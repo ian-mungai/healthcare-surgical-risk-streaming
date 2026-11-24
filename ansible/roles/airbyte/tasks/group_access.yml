@@ -103,6 +103,7 @@
           - can-i
           - "{{ item.verb }}"
           - "{{ item.resource }}"
+          - "--subresource={{ item.subresource | default('') }}"
           - --namespace
           - "{{ item.namespace | default(airbyte_namespace) }}"
           - --as
@@ -112,15 +113,15 @@
       failed_when: airbyte_group_access_checks.stdout | trim != item.answer
       check_mode: false
       loop:
-        - {verb: patch, resource: deployments/scale, answer: "yes"}
-        - {verb: patch, resource: statefulsets/scale, answer: "yes"}
+        - {verb: patch, resource: deployments, subresource: scale, answer: "yes"}
+        - {verb: patch, resource: statefulsets, subresource: scale, answer: "yes"}
         - {verb: list, resource: pods, answer: "yes"}
         - {verb: get, resource: deployments, answer: "yes"}
         - {verb: patch, resource: deployments, answer: "no"}
         - {verb: delete, resource: pods, answer: "no"}
-        - {verb: create, resource: pods/exec, answer: "no"}
+        - {verb: create, resource: pods, subresource: exec, answer: "no"}
         - {verb: get, resource: secrets, answer: "no"}
         - {verb: list, resource: pods, namespace: kube-system, answer: "no"}
       loop_control:
-        label: "{{ item.verb }} {{ item.resource }} {{ item.namespace | default(airbyte_namespace) }}"
+        label: "{{ item.verb }} {{ item.resource }} {{ item.subresource | default('') }} {{ item.namespace | default(airbyte_namespace) }}"
       timeout: 30
