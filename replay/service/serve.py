@@ -15,11 +15,14 @@ are still in the inbox.
 
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
-reference fails at once with its reason. A request that already has a finished or failed result is only moved: it is never run again and its result is never
-written again. A result file that is not a valid terminal result (larger than 64 KiB, not a file that can be read, not UTF-8 or JSON, too deeply nested, not an
-object, no ``finished`` or ``failed`` outcome) is logged, kept beside its place as ``<name>.json.invalid`` for inspection and treated as no result; judging it
-can never raise. A run that a stop signal ends stays in the inbox, so the restarted service runs it
-again and the replay resumes from its saved position.
+reference fails at once with its reason, and so does one whose ``state_dir`` is the inbox, inside it or a folder that holds it (the fixed code
+``state_dir_overlaps_inbox``): the replay's checkpoint would sit among the requests and be archived as a failed one. ``submit`` refuses such a record with
+the same code, and ``serve`` returns 2 at start, before it writes anything, when its health file is inside the inbox (``health_file_in_inbox``).
+
+A request that already has a finished or failed result is only moved: it is never run again and its result is never written again. A result file that is not a
+valid terminal result (larger than 64 KiB, not a file that can be read, not UTF-8 or JSON, too deeply nested, not an object, no ``finished`` or ``failed``
+outcome) is logged, kept beside its place as ``<name>.json.invalid`` for inspection and treated as no result; judging it can never raise. A run that a stop
+signal ends stays in the inbox, so the restarted service runs it again and the replay resumes from its saved position.
 
 Before it starts a request, ``serve`` adds one to the count in ``<run ID>.attempts`` beside it. A request that is found with the count at 3 has stopped the
 service three times, whatever the error was, so it fails with that reason and is archived without a replay and the next request runs. A planned stop ends
@@ -68,6 +71,12 @@ MAX_ATTEMPTS = 3
 LOCK_SECONDS = 30.0
 LOCK_POLL_SECONDS = 0.01
 FILE_MODE = 0o640
+STATE_DIR_CODE = "state_dir_overlaps_inbox"
+HEALTH_FILE_CODE = "health_file_in_inbox"
+HEALTH_FILE_MESSAGE = f"{HEALTH_FILE_CODE}: the health file must be outside the inbox, where the loop would take it for a request"
+STATE_DIR_MESSAGE = (
+    f"{STATE_DIR_CODE}: the run record's state_dir must share no place with the inbox: it is not the inbox, not inside it and not a folder that holds it"
+)
 
 
 class SubmitError(ValueError):
@@ -235,12 +244,26 @@ def queued_record(request: Path) -> RunRecord:
     return replace(record, manifest_reference=str(reference))
 
 
+def inside(path: str | Path, folder: Path) -> bool:
+    """Whether ``path`` is ``folder`` or inside it, once links and ``..`` are resolved. Nothing is created or read."""
+    return Path(os.path.realpath(path)).is_relative_to(os.path.realpath(folder))
+
+
+def state_dir_overlaps(state_dir: str, inbox: Path) -> bool:
+    """Whether the state folder is the inbox, inside it or a folder that holds it. Such a run would write its checkpoint among the requests, where the loop
+    would take it for a request and archive it as a failed one."""
+    return inside(state_dir, inbox) or inside(inbox, Path(state_dir))
+
+
 def unusable(request: Path) -> Outcome | None:
-    """A failed outcome with its reason when the request cannot be read or is not a valid run record with its reference, else None."""
+    """A failed outcome with its reason when the request cannot be read, is not a valid run record with its reference or names a state folder that shares
+    a place with the inbox (the folder of the request), else None. Nothing is written before this answer."""
     try:
-        queued_record(request)
+        record = queued_record(request)
     except (OSError, ValueError) as error:
         return Outcome("failed", 2, f"{type(error).__name__}: {error}")
+    if state_dir_overlaps(record.state_dir, request.parent):
+        return Outcome("failed", 2, STATE_DIR_MESSAGE)
     return None
 
 
@@ -255,7 +278,11 @@ def serve(
     log: Callable[..., None] = lambda event, **fields: None,
 ) -> int:
     """Serve the inbox until ``stopped`` says so. ``run_request`` runs one record and calls the beat it is given as the run makes progress. A record that is
-    not a valid run record never reaches it."""
+    not a valid run record never reaches it. A health file inside the inbox stops the start with 2 before anything is written: it is a ``.json`` file, so the
+    loop would take it for a request."""
+    if inside(health_path, inbox):
+        log("serve_refused", message=HEALTH_FILE_MESSAGE)
+        return 2
     inbox.mkdir(parents=True, exist_ok=True)
     health = Health(health_path, clock)
     health.beat("waiting", force=True)
@@ -378,6 +405,8 @@ def submit(inbox: Path, record_data: bytes | str, reference_data: bytes | str) -
         raise SubmitError(str(error)) from None
     if not RUN_ID.fullmatch(record.run_id):
         raise SubmitError("the run ID must be lower-case letters, digits and underscores, at most 64")
+    if state_dir_overlaps(record.state_dir, inbox):
+        raise SubmitError(STATE_DIR_MESSAGE)
     name = f"{record.run_id}.json"
     with held(inbox, record.run_id):
         if conflicts_with_held(inbox, name, record_bytes, reference_bytes):
