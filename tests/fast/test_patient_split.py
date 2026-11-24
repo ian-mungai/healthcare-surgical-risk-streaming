@@ -704,7 +704,7 @@ class VerifySequenceTest(unittest.TestCase):
     def test_a_branch_with_no_table_is_refused(self) -> None:
         with self.assertRaises(PatientSplitError) as caught:
             self.verify_with(Lake(FULL))
-        self.assertEqual(["table_missing: 0 tables"], caught.exception.problems)
+        self.assertEqual(["table_missing: failed"], caught.exception.problems)
 
     def test_a_branch_that_moved_during_the_check_is_refused(self) -> None:
         lake = Lake(FULL, existing=rows_of(FULL, snapshot=11), script=["h4"])
@@ -997,7 +997,7 @@ class LakeAdapterTest(unittest.TestCase):
         session = FakeSession(missing=("clinical_cases",))
         with self.assertRaises(PatientSplitError) as caught:
             self.build(session, AnsweringNessie(BASE))
-        self.assertEqual(["source_table: 0 tables"], caught.exception.problems)
+        self.assertEqual(["source_table: failed"], caught.exception.problems)
         self.assertEqual(([], []), (session.sql_calls, session.writes))
 
     def test_a_branch_that_moved_before_the_write_is_refused_before_any_statement_or_write(self) -> None:
@@ -1113,7 +1113,7 @@ class EntryPointTest(unittest.TestCase):
                     session = FakeSession()
                     with self.subTest(setting=name, case=case, mode=mode[0]):
                         code, out, err, built, timer = self.drive(session, wire, mode, case)
-                        self.assertEqual((2, "", "patient_split: settings\n"), (code, out, err))
+                        self.assertEqual((2, "", "patient_split: settings: failed\n"), (code, out, err))
                         self.assertEqual(([], [], False, False), (wire.requests, events, built.called, timer.called))
 
     def test_every_local_step_is_done_before_the_first_remote_call(self) -> None:
@@ -1130,7 +1130,7 @@ class EntryPointTest(unittest.TestCase):
         wire = Wire([])
         session = FakeSession(missing=("clinical_cases",))
         code, out, err, _, _ = self.drive(session, wire, ["build", "--branch", "b"])
-        self.assertEqual((1, "", "patient_split: source_table: 0 tables\n"), (code, out, err))
+        self.assertEqual((1, "", "patient_split: source_table: failed\n"), (code, out, err))
         self.assertEqual(([], []), (session.sql_calls, session.writes))
         self.assertEqual(["POST"], [method for method, _ in wire.requests if method != "GET"])
 

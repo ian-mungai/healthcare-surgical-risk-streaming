@@ -60,7 +60,6 @@ from spark.split_table import (
     run_verify,
     schema_problems,
     source_cases,
-    unit,
     values_query,
 )
 from spark.split_table import write_commit as write_commit_of
@@ -121,7 +120,7 @@ class Lake:
     def read_source(self, at: str) -> Source:
         table = f"{self.catalog(at)}.{SOURCE_NAME}"
         if not self.session.catalog.tableExists(table):
-            raise PatientSplitError(f"source_table: {unit(0, 'table')}")
+            raise PatientSplitError(flag("source_table"))
         frame = self.session.table(table)
         fields = [(field.name, field.dataType.simpleString()) for field in frame.schema.fields if field.name in dict(SOURCE_COLUMNS)]
         problems = schema_problems(sorted(fields), sorted(SOURCE_COLUMNS))

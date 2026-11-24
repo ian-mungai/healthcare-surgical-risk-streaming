@@ -2,8 +2,8 @@
 
 The rules are those of the patient split job (``spark/split_cli.py``, whose settings, deadline and Nessie client this job also uses): the parser prints
 ``usage`` for any bad call, a setting that cannot be used is ``settings``, an error from Nessie or from anything else that is not mapped is one of
-``branch_missing``, ``catalog_error`` and ``internal_error``, and a failed check prints one line for each problem, each a code and a flag (``code: failed``),
-except a count of tables.
+``branch_missing``, ``catalog_error`` and ``internal_error``, and every refusal, a failed check included, prints one line for each code, each the code
+and a flag (``code: failed``), never a count.
 Exit 0 on success, 1 on a failed check or a failed upstream, 2 on a bad call or setting, 70 on anything else.
 """
 
@@ -57,13 +57,14 @@ def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict
             sys.stderr.write(f"{job}: {problem}\n")
         return 1
     except NessieError as error:
-        sys.stderr.write(f"{job}: {'branch_missing' if error.status == NOT_FOUND and error.error_code == REFERENCE_NOT_FOUND else 'catalog_error'}\n")
+        code = "branch_missing" if error.status == NOT_FOUND and error.error_code == REFERENCE_NOT_FOUND else "catalog_error"
+        sys.stderr.write(f"{job}: {code}: failed\n")
         return 1
     except SettingsError:
-        sys.stderr.write(f"{job}: settings\n")
+        sys.stderr.write(f"{job}: settings: failed\n")
         return 2
     except Exception:
-        sys.stderr.write(f"{job}: internal_error\n")
+        sys.stderr.write(f"{job}: internal_error: failed\n")
         return INTERNAL_EXIT_CODE
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0

@@ -18,14 +18,16 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from spark.bronze_clinical_lab_cli import CHECKS_FAILED, EXIT_CODES
 from spark.bronze_clinical_lab_run import CHECK_NAMES, CHECKS_PASSED
+from spark.jobs.silver_cases import READ_TABLES
 
 RESULT_NAME = "result.json"
+PART_NAME = f"{RESULT_NAME}.part"
 RESULT_LIMIT_BYTES = 1_000_000
 BRONZE_JOB = "bronze_clinical_lab"
 BRONZE_COMMANDS = ("write", "verify")
@@ -90,10 +92,11 @@ def read_result_file(folder: Path) -> tuple[dict[str, Any] | None, str | None]:
     """The one result file that a job left in its fresh result folder, and why it is refused as a fixed text that holds nothing of it, or ``None``.
 
     A folder with no file is no result and no problem (a bad call and a job that the watchdog stopped write none); the caller decides whether one was due. A
+    folder that holds only the part file is the same: a job that was killed after it reserved its result and before it renamed it. A
     folder that holds anything else than ``result.json`` is refused, as is a file that is not a plain file of at most ``RESULT_LIMIT_BYTES``, is not text, is
     not one JSON document with no key written twice, or is not an object."""
     names = sorted(os.listdir(folder))
-    if not names:
+    if not names or names == [PART_NAME]:
         return None, None
     if names != [RESULT_NAME]:
         return None, "the result folder holds a file other than the result"
@@ -246,8 +249,21 @@ def moved(before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
 # --- Patient split and Silver cases
 
 
+CASES_SNAPSHOT_TABLES = tuple(READ_TABLES)
+
+
 def snapshot_map(value: Any) -> bool:
-    return isinstance(value, dict) and all(isinstance(key, str) and fits(item, (int, None)) for key, item in value.items())
+    """Whether a map of snapshot IDs holds exactly the seven tables that the Silver cases job reads, each a whole number (never ``None`` or a Boolean)."""
+    return isinstance(value, dict) and set(value) == set(CASES_SNAPSHOT_TABLES) and all(snapshot(item) for item in value.values())
+
+
+def snapshot_ids_are(held: Any, lookup: Callable[[str], int | None]) -> bool:
+    """Whether the snapshot IDs of a result are the ones that Nessie holds. The comparison is driven by the seven expected tables, never by the keys of the
+    result: ``lookup`` is asked for each of them, in order, and a result with a key too many, a key too few or an ID that is not a whole number is not equal."""
+    if not isinstance(held, dict):
+        return False
+    expected = {table: lookup(table) for table in CASES_SNAPSHOT_TABLES}
+    return set(held) == set(expected) and all(snapshot(expected[table]) and snapshot(held[table]) and held[table] == expected[table] for table in expected)
 
 
 SPLIT_JOB, CASES_JOB = "patient_split", "silver_cases"
@@ -255,15 +271,15 @@ MODES = frozenset({"build", "verify"})
 SPLIT_SPEC: Spec = {
     "mode": MODES,
     "branch": str,
-    "base_hash": (named, None),
+    "base_hash": (is_hash, None),
     "pinned_release": bool,
     "table": "silver.patient_split",
     "source_table": "bronze.clinical_cases",
-    "checked_hash": named,
-    "write_hash": (named, None),
-    "branch_hash": named,
-    "snapshot_id": (int, None),
-    "source_snapshot_id": (int, None),
+    "checked_hash": is_hash,
+    "write_hash": (is_hash, None),
+    "branch_hash": is_hash,
+    "snapshot_id": snapshot,
+    "source_snapshot_id": snapshot,
     "rule_version": named,
     "passed": {"patient_split": bool},
     "checks_run": [str],
@@ -274,8 +290,8 @@ CASES_TABLES = ("cases", "lab", "operation_length_measure", "score_cutoffs")
 CASES_SPEC: Spec = {
     "mode": MODES,
     "branch": str,
-    "base_hash": (named, None),
-    "branch_hash": named,
+    "base_hash": (is_hash, None),
+    "branch_hash": is_hash,
     "pinned_release": bool,
     "checks_run": [str],
     "passed": dict.fromkeys(CASES_TABLES, bool),
@@ -334,13 +350,13 @@ def cases_problem(document: Any, mode: str, branch: str, exit_code: int) -> str 
 def wrote(result: Mapping[str, Any]) -> bool:
     """Whether a build moved its branch off the base: it names both hashes and they differ."""
     base, branch = result.get("base_hash"), result.get("branch_hash")
-    return named(base) and named(branch) and base != branch
+    return is_hash(base) and is_hash(branch) and base != branch
 
 
 def kept_at_base(result: Mapping[str, Any]) -> bool:
     """Whether a build wrote nothing: the branch is at the base hash."""
     base, branch = result.get("base_hash"), result.get("branch_hash")
-    return named(base) and named(branch) and base == branch
+    return is_hash(base) and is_hash(branch) and base == branch
 
 
 def all_passed(result: Mapping[str, Any], tables: Sequence[str]) -> bool:

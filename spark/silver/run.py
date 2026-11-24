@@ -32,12 +32,11 @@ from spark.silver.checks import (
     numeric_problems,
     waveform_problems,
 )
-from spark.split_table import unit
 
 NUMERIC = "numeric_observations"
 WAVEFORM = "waveform_seconds"
 TABLES = (NUMERIC, WAVEFORM)
-BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
+BRANCH_MOVED = f"branch_moved: {FLAG}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,9 +127,9 @@ def table_problems(reads: dict[str, TableRead | None]) -> list[str]:
     """The tables that are not there, or else the problems of both tables against the counts of the Bronze input."""
     missing = sum(1 for read in reads.values() if read is None)
     if missing:
-        return [f"table_missing: {unit(missing, 'table')}"]
+        return [f"table_missing: {FLAG}"]
     if not all(checked(table, reads[table]) for table in TABLES):
-        return [f"table_missing: {unit(1, 'table')}"]
+        return [f"table_missing: {FLAG}"]
     problems: list[str] = []
     for table in TABLES:
         read = reads[table]
@@ -184,7 +183,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     problems = table_problems(reads)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
-        problems.append(f"readback_differs: {unit(differing, 'table')}")
+        problems.append(f"readback_differs: {FLAG}")
     if problems:
         raise SilverSignalsError(*problems)
     if ops.head() != at:

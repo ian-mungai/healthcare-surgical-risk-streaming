@@ -39,8 +39,7 @@ from tests.fast import test_silver_hypotension_run as hypo
 from tests.fast import test_silver_signals_run as signals
 from tests.fast.silver_accept import HYPOTENSION_JOB, RESULT_KEYS, SIGNALS_JOB, TABLE_KEYS
 
-TABLE_COUNT_CODES = ("table_missing", "readback_differs", "source_no_snapshot", "source_table")
-MESSAGE = re.compile(r"^[a-z_]+: failed$|^(" + "|".join(TABLE_COUNT_CODES) + r"): [0-9]+ tables?$|^" + re.escape(BRANCH_MOVED) + "$")
+MESSAGE = re.compile(r"^[a-z_]+: failed$|^" + re.escape(BRANCH_MOVED) + "$")
 VOLATILE = ("snapshots", "source_snapshots", "checked_hash", "write_hash", "branch_hash")
 BANNED_KEYS = ("outcome", "rows", "bronze_rows", "duplicates_dropped", "causes", "fingerprints", "fingerprint", "digest", "count", "counts")
 SNAPSHOT_KEYS = ("snapshots", "source_snapshots")
@@ -192,7 +191,7 @@ class SignalsMessages(unittest.TestCase):
         fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, input_empty=1), (11, 12, 13))
         return fake
 
-    def test_every_message_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
+    def test_every_message_is_a_code_and_a_flag(self) -> None:
         found = self.messages(1)
         self.assertGreaterEqual(len(found), 25)
         for message in found:
@@ -202,13 +201,11 @@ class SignalsMessages(unittest.TestCase):
     def test_the_size_of_a_defect_never_changes_a_message(self) -> None:
         self.assertEqual(self.messages(1), self.messages(40))
 
-    def test_no_digit_follows_a_code_unless_it_counts_tables(self) -> None:
+    def test_no_digit_follows_a_code(self) -> None:
         for message in self.messages(7):
-            code, _, rest = message.partition(": ")
+            _, _, rest = message.partition(": ")
             with self.subTest(message=message):
-                if re.search(r"[0-9]", rest):
-                    self.assertIn(code, TABLE_COUNT_CODES)
-                    self.assertRegex(rest, r"^[0-9]+ tables?$")
+                self.assertEqual(("failed", None), (rest, re.search(r"[0-9]", rest)))
 
     def test_a_verify_refuses_in_the_same_form(self) -> None:
         fake = signals.Fake()
@@ -318,7 +315,7 @@ class HypotensionMessages(unittest.TestCase):
         found += self.build(fake)
         return found
 
-    def test_every_message_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
+    def test_every_message_is_a_code_and_a_flag(self) -> None:
         found = self.messages(1)
         self.assertGreaterEqual(len(found), 22)
         for message in found:
@@ -328,12 +325,11 @@ class HypotensionMessages(unittest.TestCase):
     def test_the_size_of_a_defect_never_changes_a_message(self) -> None:
         self.assertEqual(self.messages(1), self.messages(40))
 
-    def test_no_digit_follows_a_code_unless_it_counts_tables(self) -> None:
+    def test_no_digit_follows_a_code(self) -> None:
         for message in self.messages(7):
-            code, _, rest = message.partition(": ")
+            _, _, rest = message.partition(": ")
             with self.subTest(message=message):
-                if re.search(r"[0-9]", rest):
-                    self.assertIn(code, TABLE_COUNT_CODES)
+                self.assertEqual(("failed", None), (rest, re.search(r"[0-9]", rest)))
 
     def test_a_split_problem_reaches_the_caller_as_its_code_only(self) -> None:
         fake = hypo.Fake()

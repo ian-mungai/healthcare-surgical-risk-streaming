@@ -13,6 +13,7 @@ import threading
 from typing import Any
 
 from spark.catalog import environment_catalog_options
+from spark.result_file import release_reserved
 from spark.settings import driver_memory_mib, read_memory_limit_mib
 
 SCRATCH_FOLDER = "/scratch"
@@ -21,11 +22,12 @@ DEADLINE_EXIT_CODE = 124
 
 def start_deadline(seconds: float, job: str) -> threading.Timer:
     """Kill the whole process when the job runs past ``seconds``. The JVM child ends with it, and so does the container. The message is the fixed code
-    ``timeout`` and holds no duration."""
+    ``timeout`` and holds no duration. A part file that the job reserved for its result (``spark/result_file.py``) is removed first."""
 
     def expire() -> None:
         sys.stderr.write(f"{job}: timeout\n")
         sys.stderr.flush()
+        release_reserved()
         os._exit(DEADLINE_EXIT_CODE)
 
     timer = threading.Timer(seconds, expire)

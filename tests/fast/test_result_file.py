@@ -7,6 +7,9 @@ Failure modes covered here:
 - A path that is not absolute, a path with a NUL, a folder that is missing, a file or a part file that exists, or a second ``--result`` is taken, so that a
   file is replaced or a caller reads another one.
 - A reader sees half a file: the document is written whole to ``<path>.part`` and renamed into place, and a failure leaves no part file.
+- A path that passes the preflight but cannot hold its part file (a name of 255 bytes: ``<name>.part`` is too long) fails only after the job ran. The part
+  file is reserved (created exclusively) before any work, and a reservation that fails is a bad call: ``usage``, exit 2, and nothing runs.
+- A job that the watchdog stops leaves its reserved part file for a reader to take for a result.
 - The file is not readable by the caller or is executable.
 - An ending that the job maps to a code writes no file, or a failure writes the text of its error, a count or an argument into the file or a stream.
 """
@@ -23,11 +26,12 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 
 from scripts.stack.nessie import NessieError
-from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, result_path, run_sealed, usable, write_result
+from spark import result_file
+from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, release_reserved, reserve, result_path, run_sealed, write_reserved
 from spark.settings import SettingsError
 
 DOCUMENT = {"job": "j", "passed": True, "diagnostics": []}
@@ -66,23 +70,45 @@ class Writing(unittest.TestCase):
         self.folder = self.enterContext(tempfile.TemporaryDirectory(prefix="result_file_"))
         self.path = f"{self.folder}/result.json"
 
-    def test_a_path_is_usable_only_when_its_folder_is_there_and_neither_it_nor_its_part_file_is(self) -> None:
-        self.assertTrue(usable(self.path))
-        self.assertFalse(usable(f"{self.folder}/missing/result.json"))
-        Path(f"{self.path}.part").write_text("x")
-        self.assertFalse(usable(self.path))
-        os.remove(f"{self.path}.part")
-        Path(self.path).write_text("x")
-        self.assertFalse(usable(self.path))
+    def tearDown(self) -> None:
+        release_reserved()
 
-    def test_a_dangling_link_and_a_folder_are_not_usable(self) -> None:
+    def written(self, document: dict[str, Any] = DOCUMENT) -> None:
+        descriptor = reserve(self.path)
+        self.assertIsNotNone(descriptor)
+        write_reserved(cast("int", descriptor), self.path, document)
+
+    def test_a_path_is_reserved_only_when_its_folder_is_there_and_neither_it_nor_its_part_file_is(self) -> None:
+        descriptor = reserve(self.path)
+        self.assertIsNotNone(descriptor)
+        self.assertEqual(["result.json.part"], os.listdir(self.folder))
+        self.assertIsNone(reserve(self.path))
+        release_reserved()
+        self.assertEqual([], os.listdir(self.folder))
+        self.assertIsNone(reserve(f"{self.folder}/missing/result.json"))
+        Path(self.path).write_text("x")
+        self.assertIsNone(reserve(self.path))
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+
+    def test_a_dangling_link_a_folder_and_a_part_file_that_exists_are_not_reserved(self) -> None:
         os.symlink(f"{self.folder}/nowhere", f"{self.folder}/link")
         os.mkdir(f"{self.folder}/dir")
-        self.assertFalse(usable(f"{self.folder}/link"))
-        self.assertFalse(usable(f"{self.folder}/dir"))
+        Path(f"{self.folder}/old.json.part").write_text("old")
+        for name in ("link", "dir", "old.json"):
+            with self.subTest(name=name):
+                self.assertIsNone(reserve(f"{self.folder}/{name}"))
+        self.assertEqual("old", Path(f"{self.folder}/old.json.part").read_text())
+
+    def test_a_name_of_255_bytes_cannot_be_reserved_and_one_of_250_can(self) -> None:
+        self.assertIsNone(reserve(f"{self.folder}/{'r' * 255}"))
+        self.assertEqual([], os.listdir(self.folder))
+        long_path = f"{self.folder}/{'r' * 250}"
+        self.assertIsNotNone(reserve(long_path))
+        release_reserved()
+        self.assertEqual([], os.listdir(self.folder))
 
     def test_the_document_is_written_whole_with_sorted_keys_and_the_file_is_not_executable(self) -> None:
-        write_result(self.path, DOCUMENT)
+        self.written()
         self.assertEqual(DOCUMENT, json.loads(Path(self.path).read_text()))
         self.assertEqual(0o644, os.stat(self.path).st_mode & 0o777)
         self.assertEqual(0o644, FILE_MODE)
@@ -99,7 +125,7 @@ class Writing(unittest.TestCase):
             real(source, target)
 
         with mock.patch("os.rename", rename):
-            write_result(self.path, DOCUMENT)
+            self.written()
         self.assertEqual((False, DOCUMENT, ("result.json.part", "result.json")), (seen["target_before"], seen["whole"], seen["names"]))
 
     def test_the_document_is_flushed_to_disk_before_the_rename(self) -> None:
@@ -118,7 +144,7 @@ class Writing(unittest.TestCase):
             mock.patch("os.fsync", fsync),
             mock.patch("os.rename", rename),
         ):
-            write_result(self.path, DOCUMENT)
+            self.written()
         self.assertEqual(["fsync", "rename"], order)
 
     def test_a_failed_write_leaves_neither_a_file_nor_a_part_file(self) -> None:
@@ -126,18 +152,19 @@ class Writing(unittest.TestCase):
             raise OSError("disk full")
 
         with mock.patch("os.rename", refuse), self.assertRaises(OSError):
-            write_result(self.path, DOCUMENT)
+            self.written()
         self.assertEqual([], os.listdir(self.folder))
 
-    def test_a_part_file_that_exists_is_never_opened(self) -> None:
-        Path(f"{self.path}.part").write_text("old")
-        with self.assertRaises(FileExistsError):
-            write_result(self.path, DOCUMENT)
-        self.assertEqual("old", Path(f"{self.path}.part").read_text())
+    def test_the_watchdog_release_removes_the_reserved_part_file_and_nothing_else(self) -> None:
+        Path(f"{self.folder}/other.part").write_text("x")
+        self.assertIsNotNone(reserve(self.path))
+        release_reserved()
+        release_reserved()
+        self.assertEqual(["other.part"], os.listdir(self.folder))
 
     def test_a_document_that_is_not_json_leaves_no_part_file(self) -> None:
         with self.assertRaises(TypeError):
-            write_result(self.path, {"x": object()})
+            self.written({"x": object()})
         self.assertEqual([], os.listdir(self.folder))
 
 
@@ -189,21 +216,29 @@ class Sealed(unittest.TestCase):
         document: dict[str, Any] = json.loads(Path(self.path).read_text())
         return document
 
-    def test_a_clean_run_writes_its_facts_and_an_empty_list_of_diagnostics_and_prints_one_result_line(self) -> None:
+    def tearDown(self) -> None:
+        release_reserved()
+
+    def test_a_clean_run_writes_its_facts_and_an_empty_list_of_diagnostics_and_prints_nothing(self) -> None:
         code, out, err = sealed(self.argv, lambda arguments: {"mode": arguments.mode, "branch": arguments.branch, "passed": {"t": True}})
-        self.assertEqual((0, ""), (code, err))
+        self.assertEqual((0, "", ""), (code, out, err))
         self.assertEqual({"mode": "verify", "branch": "b", "passed": {"t": True}, "diagnostics": []}, self.written())
-        self.assertEqual(self.written(), json.loads(out.removeprefix("RESULT ")))
+        self.assertEqual(["result.json"], os.listdir(self.folder))
 
     def test_a_failed_check_writes_each_cause_as_a_code_and_no_count_and_prints_the_lines(self) -> None:
-        error = SealedError("two_sets: failed", "source_table: 2 tables", "pinned_counts: failed")
+        error = SealedError("two_sets: failed", "source_table: failed", "pinned_counts: failed")
         code, out, err = sealed(self.argv, raising(error))
         self.assertEqual((1, ""), (code, out))
         self.assertEqual(
             {"mode": "verify", "branch": "b", "job": JOB, "diagnostics": [{"code": "two_sets"}, {"code": "source_table"}, {"code": "pinned_counts"}]},
             self.written(),
         )
-        self.assertEqual(f"{JOB}: two_sets: failed\n{JOB}: source_table: 2 tables\n{JOB}: pinned_counts: failed\n", err)
+        self.assertEqual(f"{JOB}: two_sets: failed\n{JOB}: source_table: failed\n{JOB}: pinned_counts: failed\n", err)
+
+    def test_a_problem_that_holds_more_than_its_code_is_printed_as_its_code_and_a_flag(self) -> None:
+        code, out, err = sealed(self.argv, raising(SealedError("source_table: 2 tables", "bare_code", "x: 7 rows")))
+        self.assertEqual((1, ""), (code, out))
+        self.assertEqual(f"{JOB}: source_table: failed\n{JOB}: bare_code: failed\n{JOB}: x: failed\n", err)
 
     def test_every_other_ending_is_one_code_in_the_file_and_the_text_of_the_error_is_in_no_output(self) -> None:
         missing = NessieError(f"{MARKER} not found", status=404, error_code="REFERENCE_NOT_FOUND")
@@ -218,7 +253,7 @@ class Sealed(unittest.TestCase):
         for error, status, expected in endings:
             with self.subTest(expected=expected):
                 code, out, err = sealed(self.argv, raising(error))
-                self.assertEqual((status, "", f"{JOB}: {expected}\n"), (code, out, err))
+                self.assertEqual((status, "", f"{JOB}: {expected}: failed\n"), (code, out, err))
                 self.assertEqual({"mode": "verify", "branch": "b", "job": JOB, "diagnostics": [{"code": expected}]}, self.written())
                 self.assertNotIn(MARKER, Path(self.path).read_text())
                 os.remove(self.path)
@@ -240,13 +275,50 @@ class Sealed(unittest.TestCase):
                 self.assertEqual((2, "", f"{JOB}: usage\n"), sealed(argv, execute))
         self.assertEqual(([], ["old.json"]), (ran, os.listdir(self.folder)))
 
+    def test_a_path_that_cannot_hold_its_part_file_is_a_bad_call_before_any_work(self) -> None:
+        ran: list[str] = []
+
+        def execute(arguments: argparse.Namespace) -> dict[str, Any]:
+            ran.append("run")
+            return {"mode": "verify", "branch": "b"}
+
+        argv = ["verify", "--branch", "b", "--result", f"{self.folder}/{'r' * 255}"]
+        self.assertEqual((2, "", f"{JOB}: usage\n"), sealed(argv, execute))
+        self.assertEqual(([], []), (ran, os.listdir(self.folder)))
+
+    def test_a_path_whose_part_file_fits_runs_and_leaves_only_the_result(self) -> None:
+        name = "r" * 250
+        argv = ["verify", "--branch", "b", "--result", f"{self.folder}/{name}"]
+        self.assertEqual((0, "", ""), sealed(argv, lambda arguments: {"mode": "verify", "branch": "b"}))
+        self.assertEqual([name], os.listdir(self.folder))
+
+    def test_the_part_file_is_reserved_before_the_job_runs_and_gone_after_it(self) -> None:
+        seen: list[list[str]] = []
+
+        def execute(arguments: argparse.Namespace) -> dict[str, Any]:
+            seen.append(os.listdir(self.folder))
+            return {"mode": "verify", "branch": "b"}
+
+        self.assertEqual(0, sealed(self.argv, execute)[0])
+        self.assertEqual([["result.json.part"]], seen)
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+
+    def test_a_job_that_raises_past_the_mapping_leaves_no_part_file(self) -> None:
+        def execute(arguments: argparse.Namespace) -> dict[str, Any]:
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_sealed(toy_parser(), self.argv, execute, JOB)
+        self.assertEqual([], os.listdir(self.folder))
+
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_result_line(self) -> None:
         def refuse(source: str, target: str) -> None:
             raise OSError(f"{MARKER} disk full")
 
         with mock.patch("os.rename", refuse):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error\n"), (code, out, err))
+        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertIs(result_file.INTERNAL_EXIT_CODE, 70)
         self.assertEqual([], os.listdir(self.folder))
 
     def test_a_sealed_error_keeps_its_problems_in_order(self) -> None:

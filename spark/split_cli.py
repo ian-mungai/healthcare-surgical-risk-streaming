@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieError
-from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, add_result_option, run_sealed
+from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, add_result_option, release_reserved, run_sealed
 from spark.settings import SettingsError, catalog_options
 
 JOB = "patient_split"
@@ -115,6 +115,7 @@ def start_deadline(seconds: float, exit_with: Callable[[int], object] = os._exit
     def expire() -> None:
         sys.stderr.write(f"{job}: timeout\n")
         sys.stderr.flush()
+        release_reserved()
         exit_with(DEADLINE_EXIT_CODE)
 
     timer = threading.Timer(seconds, expire)

@@ -48,10 +48,10 @@ from spark.silver_cases import (
     CutoffRow,
     MeasureRow,
     SilverCasesError,
+    flag,
     same_rows,
     source_schema_problems,
     split_rule_problems,
-    unit,
 )
 from spark.silver_cases_run import JOB, result_document, run, run_build, run_verify, start_deadline
 from spark.silver_cases_sql import (
@@ -216,7 +216,7 @@ class Lake:
         if fields is None:
             return None
         if fields != list(expected):
-            raise SilverCasesError(f"inherited_schema: {unit(1, 'table')}")
+            raise SilverCasesError(flag("inherited_schema"))
         return list(self.session.table(source).collect())
 
     def existing_rules(self) -> tuple[list[MeasureRow] | None, list[CutoffRow] | None]:

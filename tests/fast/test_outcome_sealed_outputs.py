@@ -3,7 +3,7 @@
 The clinical table holds the outcome columns (``icu_days`` and ``death_inhosp``), and every table built from it (the cases, the patient split) is a table
 whose rows can follow an outcome. A result or a refusal that holds a count, a digest or a changed-or-unchanged field over such a table changes when only a
 held-out patient's outcome changes. The results hold hashes, snapshot IDs, the checks that ran, one pass flag for each table and measures of the development
-patients. A refusal is ``code: failed``, and a count of tables is the only count left. Bronze signal tables keep their row counts: they hold no outcome.
+patients. A refusal is ``code: failed``, with no count of anything. Bronze signal tables keep their row counts: they hold no outcome.
 
 Failure modes covered here:
 
@@ -32,6 +32,7 @@ from unittest import mock
 from scripts.stack.tags import TableSnapshot
 from spark import maintenance, silver_cases, split_table
 from spark.bronze_clinical_lab_cli import ending
+from spark.bronze_clinical_lab_run import TableReport
 from spark.jobs import table_maintenance as maintenance_job
 from spark.jobs.patient_split import Lake as SplitLake
 from spark.silver_cases import OWNERSHIP_PROBLEM, SilverCasesError, check_lengths, cutoff_rows, frozen_problems, input_problems, measure_rows, output_problems
@@ -45,7 +46,7 @@ from tests.fast.test_silver_sealed_outputs import keys_of, numbers
 
 ROOT = Path(__file__).resolve().parents[2]
 BRANCH_MOVED_TEXT = re.escape(split_table.BRANCH_MOVED)
-SEALED = re.compile(rf"^[a-z_]+: failed$|^[a-z_]+: [0-9]+ tables?$|^{BRANCH_MOVED_TEXT}$")
+SEALED = re.compile(rf"^[a-z_]+: failed$|^{BRANCH_MOVED_TEXT}$")
 BANNED_KEYS = {"outcome", "written", "rows", "source_rows", "keys_digest", "rows_digest", "patients", "counts", "checksum", "digest", "count"}
 
 
@@ -80,7 +81,7 @@ class CasesResult(unittest.TestCase):
     def test_a_changed_held_out_row_changes_only_the_snapshot_ids(self) -> None:
         class Other(cases.FakeOps):
             def snapshot_ids(self) -> dict[str, int | None]:
-                return {"silver.cases": 21, "silver.lab_results": 22, "silver.operation_length_measure": 23, "silver.score_cutoffs": 24}
+                return {table: 21 + index for index, table in enumerate(cases.SNAPSHOTS)}
 
         other = Other(
             output=cases.clean_output_facts(case_rows=7000, bronze_case_rows=7000),
@@ -142,7 +143,7 @@ def cases_messages() -> list[str]:
 
 
 class CasesRefusals(unittest.TestCase):
-    def test_every_refusal_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
+    def test_every_refusal_is_a_code_and_a_flag(self) -> None:
         messages = cases_messages()
         self.assertGreater(len(messages), 40)
         self.assertEqual([], unsealed(messages))
@@ -183,7 +184,7 @@ class SplitResult(unittest.TestCase):
 
 
 class SplitRefusals(unittest.TestCase):
-    def test_every_refusal_of_the_split_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
+    def test_every_refusal_of_the_split_is_a_code_and_a_flag(self) -> None:
         messages = split.all_messages()
         self.assertGreater(len(messages), 30)
         self.assertEqual([], unsealed(messages))
@@ -204,6 +205,11 @@ class BronzeResult(unittest.TestCase):
 
     TABLES = ("clinical_cases", "lab_results")
     FIELDS = {"source_table", "bronze_table", "source_snapshot_id", "bronze_snapshot_id", "passed", "checks"}
+
+    def test_a_table_report_holds_only_what_the_result_writes(self) -> None:
+        self.assertEqual(
+            {"source_table", "bronze_table", "source_snapshot_id", "bronze_snapshot_id", "checks"}, {item.name for item in dataclasses.fields(TableReport)}
+        )
 
     def result(self, harness: bronze.Harness | None = None, command: str = "write") -> dict[str, Any]:
         return (harness or bronze.Harness()).run(command)
@@ -393,15 +399,15 @@ class SplitJobRefusals(unittest.TestCase):
         session._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable = session.load
         self.assertEqual(["source_no_snapshot: failed"], self.refusal(session))
 
-    def test_a_source_with_other_columns_is_the_schema_flag_and_a_missing_source_is_a_count_of_tables(self) -> None:
+    def test_a_source_with_other_columns_is_the_schema_flag_and_a_missing_source_is_a_flag(self) -> None:
         session = split.FakeSession()
         session.table = lambda name: split.FakeFrame([("caseid", "string"), ("subjectid", "bigint")], [])  # type: ignore[method-assign]
         self.assertEqual(["schema: failed"], self.refusal(session))
-        self.assertEqual(["source_table: 0 tables"], self.refusal(split.FakeSession(missing=("clinical_cases",))))
+        self.assertEqual(["source_table: failed"], self.refusal(split.FakeSession(missing=("clinical_cases",))))
 
 
 class ClassScan(unittest.TestCase):
-    """The sources of the sealed jobs hold no message that puts a count after a code, except a count of tables."""
+    """The sources of the sealed jobs hold no message that puts a count after a code, and no function that formats one."""
 
     FILES = (
         "spark/silver_cases.py",
@@ -418,13 +424,13 @@ class ClassScan(unittest.TestCase):
         "spark/silver/cli.py",
     )
 
-    def test_no_message_formats_a_count_with_a_noun_other_than_table(self) -> None:
-        pattern = re.compile(r"unit\([^)]*,\s*'(?!table)[a-z ]+'\)")
+    def test_no_source_formats_a_count_with_a_noun(self) -> None:
+        pattern = re.compile(r"\bunit\(|def unit\b|import[^\n]*\bunit\b")
         for path in self.FILES:
             self.assertEqual([], pattern.findall((ROOT / path).read_text()), path)
 
     def test_no_message_holds_a_code_and_a_written_count(self) -> None:
-        pattern = re.compile(r"""["'f][a-z_]+: (\{[^}]+\}|[0-9]+) (?!tables?\b)[a-z]+""")
+        pattern = re.compile(r"""["'f][a-z_]+: (\{[^}]+\}|[0-9]+) [a-z]+""")
         for path in self.FILES:
             self.assertEqual([], pattern.findall((ROOT / path).read_text()), path)
 

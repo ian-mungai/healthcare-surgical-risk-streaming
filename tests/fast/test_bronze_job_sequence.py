@@ -463,7 +463,7 @@ class NullKeyTest(unittest.TestCase):
         harness.spark.numbering_forbidden = True
         result, code, err = self.verified(harness)
         self.assertEqual((1, False), (code, result["passed"]))
-        self.assertEqual(f"{JOB}: checks_failed\n{JOB}: clinical_cases: key not null: failed\n{JOB}: lab_results: key not null: failed\n", err)
+        self.assertEqual(f"{JOB}: checks_failed: failed\n{JOB}: clinical_cases: key not null: failed\n{JOB}: lab_results: key not null: failed\n", err)
 
     def test_a_null_case_and_a_text_case_in_one_group_give_a_result_and_no_row_value_in_any_output(self) -> None:
         harness = Harness()

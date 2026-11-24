@@ -188,28 +188,28 @@ class Build(unittest.TestCase):
         fake.read_back[EVENTS] = TableRead(Digest(10), 102, events=EVENT_FACTS)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["readback_differs: 1 table"], messages(caught.exception))
+        self.assertEqual(["readback_differs: failed"], messages(caught.exception))
 
     def test_a_table_that_is_not_there_at_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_a_series_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = TableRead(FINGERPRINTS[SERIES], 101)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_an_event_table_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
         fake = Fake()
         fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_the_checks_of_the_series_run_on_the_read_back_and_come_first(self) -> None:
         fake = Fake()
@@ -284,7 +284,7 @@ class SeriesFirst(unittest.TestCase):
         fake.held = dict(fake.read_back)
         with self.assertRaises(SilverSignalsError) as caught:
             run_verify(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
 
 class MissingTables(unittest.TestCase):
@@ -304,15 +304,15 @@ class MissingTables(unittest.TestCase):
 
     def test_only_the_series_missing_is_one_table_and_the_events_are_found_without_their_facts(self) -> None:
         problems, calls = self.missing(series=True, events=False)
-        self.assertEqual(["table_missing: 1 table"], problems)
+        self.assertEqual(["table_missing: failed"], problems)
         self.assertIn(f"read_table a {EVENTS} facts=False", calls)
         self.assertNotIn(f"read_table a {EVENTS} facts=True", calls)
 
     def test_only_the_events_missing_is_one_table(self) -> None:
-        self.assertEqual(["table_missing: 1 table"], self.missing(series=False, events=True)[0])
+        self.assertEqual(["table_missing: failed"], self.missing(series=False, events=True)[0])
 
     def test_both_tables_missing_are_two_tables(self) -> None:
-        self.assertEqual(["table_missing: 2 tables"], self.missing(series=True, events=True)[0])
+        self.assertEqual(["table_missing: failed"], self.missing(series=True, events=True)[0])
 
 
 class Verify(unittest.TestCase):
@@ -345,7 +345,7 @@ class Verify(unittest.TestCase):
         fake.read_back[EVENTS] = None
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_a_defect_in_a_table_is_named(self) -> None:
         fake = Fake()

@@ -37,7 +37,7 @@ from spark.silver.run import BRANCH_MOVED, Fingerprint
 from spark.silver.tables import HYPOTENSION_TABLES, NAMESPACE, WAVEFORM
 from spark.split_cli import open_client, read_settings, start_deadline
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
-from spark.split_table import PatientSplitError, SplitRow, schema_problems, unit
+from spark.split_table import PatientSplitError, SplitRow, flag, schema_problems
 
 JOB = "silver_hypotension"
 WAVEFORM_TABLE = f"{NAMESPACE}.{WAVEFORM.name}"
@@ -66,7 +66,7 @@ class HypotensionLake(Lake):
     def source_frame(self, at: str, name: str) -> tuple[Any, str]:
         table = f"{self.catalog(at)}.{name}"
         if not self.session.catalog.tableExists(table):
-            raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
+            raise SilverSignalsError(flag("source_table"))
         return self.session.table(table), table
 
     def waveform(self, at: str) -> tuple[Any, str]:
@@ -104,7 +104,7 @@ class HypotensionLake(Lake):
         split, split_table = self.split(at)
         snapshots = (self.snapshot_id(waveform_table), self.snapshot_id(clinical_table), self.snapshot_id(split_table))
         if any(snapshot is None for snapshot in snapshots):
-            raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
+            raise SilverSignalsError(flag("source_no_snapshot"))
         held = (snapshots[0], snapshots[1], snapshots[2])
         if frames.ownership_flag(clinical):
             return InputRead(InputFacts(0, 0, 0, 1, 0, ()), held)

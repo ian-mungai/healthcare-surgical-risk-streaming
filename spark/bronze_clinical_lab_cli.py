@@ -15,8 +15,6 @@ Exit 0 when every check passed, 1 when one failed or Nessie or the publication r
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -24,11 +22,9 @@ from scripts.stack.nessie import NessieConflict, NessieError
 from spark.bronze.publication import PublicationError
 from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_run import JOB, NotABranch, SourceNotInHistory, parser
-from spark.result_file import usable, write_result
+from spark.result_file import INTERNAL_EXIT_CODE, line_of, run_sealed
 from spark.settings import SettingsError
 
-RESULT_PREFIX = "RESULT "
-INTERNAL_EXIT_CODE = 70
 CHECKS_FAILED = "checks_failed"
 # Every code that a refusal can give, with its exit status. The runner of the job reads its result file against this list.
 EXIT_CODES = {
@@ -73,37 +69,23 @@ def check_lines(result: dict[str, Any]) -> list[str]:
         for check in table["checks"]
         if not check["passed"]
     ]
-    return [CHECKS_FAILED, *[f"{name}: failed" for name in failed]]
+    return [line_of(CHECKS_FAILED), *[line_of(name) for name in failed]]
 
 
-def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace], dict[str, Any]]) -> tuple[int, dict[str, Any], list[str]]:
-    """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error."""
+def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace], dict[str, Any]], job: str = JOB) -> tuple[int, dict[str, Any], list[str]]:
+    """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error, each a fixed code and the flag."""
     try:
         result = execute(arguments)
     except Exception as error:
         status, code = code_of(error)
         document = {"job": JOB, "command": arguments.command, "branch": arguments.branch, "passed": False, "diagnostics": [{"code": code}]}
-        return status, document, [code]
+        return status, document, [line_of(code)]
     if result["passed"]:
         return 0, {**result, "diagnostics": []}, []
     return 1, {**result, "diagnostics": [{"code": CHECKS_FAILED}]}, check_lines(result)
 
 
 def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict[str, Any]]) -> int:
-    """Parse the call, run ``execute``, write the result file and then print the operator lines. A path that cannot hold a result is a bad call and nothing
-    runs. A result that cannot be written is ``internal_error``."""
-    arguments = parser().parse_args(argv)
-    if not usable(arguments.result):
-        sys.stderr.write(f"{JOB}: usage\n")
-        return 2
-    status, document, lines = ending(arguments, execute)
-    try:
-        write_result(arguments.result, document)
-    except Exception:
-        sys.stderr.write(f"{JOB}: internal_error\n")
-        return INTERNAL_EXIT_CODE
-    for line in lines:
-        sys.stderr.write(f"{JOB}: {line}\n")
-    if status == 0:
-        sys.stdout.write(RESULT_PREFIX + json.dumps(document, sort_keys=True) + "\n")
-    return status
+    """Parse the call, reserve the result file, run ``execute``, write the result file and then print the operator lines (``run_sealed``). A path that cannot
+    hold a result, its part file included, is a bad call and nothing runs. A result that cannot be written is ``internal_error``. No result line is printed."""
+    return run_sealed(parser(), argv, execute, JOB, ending)

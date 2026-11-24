@@ -392,17 +392,17 @@ class SourceSchemaTest(unittest.TestCase):
     def test_a_missing_table_a_changed_type_an_extra_column_and_a_missing_column_are_each_counted(self) -> None:
         found = self.found()
         found["bronze.lab_results"] = None
-        self.assertEqual(["source_missing: 1 table"], source_schema_problems(found))
+        self.assertEqual(["source_missing: failed"], source_schema_problems(found))
         found = self.found()
         found["bronze.clinical_cases"] = [(name, "bigint" if name == "caseid" else kind) for name, kind in SOURCE_SCHEMAS["bronze.clinical_cases"]]
         found["silver.patient_split"] = [*SOURCE_SCHEMAS["silver.patient_split"], ("extra", "string")]
-        self.assertEqual(["source_schema: 2 tables"], source_schema_problems(found))
+        self.assertEqual(["source_schema: failed"], source_schema_problems(found))
         found = self.found()
         found["bronze.lab_results"] = SOURCE_SCHEMAS["bronze.lab_results"][:-1]
-        self.assertEqual(["source_schema: 1 table"], source_schema_problems(found))
+        self.assertEqual(["source_schema: failed"], source_schema_problems(found))
 
     def test_a_table_that_is_not_asked_about_counts_as_missing(self) -> None:
-        self.assertEqual(["source_missing: 3 tables"], source_schema_problems({}))
+        self.assertEqual(["source_missing: failed"], source_schema_problems({}))
 
 
 class OutputProblemTest(unittest.TestCase):

@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from scripts.stack.nessie import NessieError
+from spark.jobs.silver_cases import READ_TABLES
+from spark.result_file import release_reserved, reserve
 from spark.settings import SettingsError
 from spark.silver_cases import CutoffRow, MeasureRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.silver_cases_run import (
@@ -36,6 +38,8 @@ from spark.silver_cases_run import (
 )
 
 LENGTHS = [3600, 7200, 5400, 4800, 9000, 1800]
+# The job reads three Bronze and Silver inputs and writes four tables, and names the snapshot of each of the seven.
+SNAPSHOTS = {table: 11 + index for index, table in enumerate(READ_TABLES)}
 MARKER = "MARKER_4417"
 
 
@@ -146,7 +150,7 @@ class FakeOps:
 
     def snapshot_ids(self) -> dict[str, int | None]:
         self.calls.append("snapshot_ids")
-        return {"silver.cases": 11, "silver.lab_results": 12, "silver.operation_length_measure": 13, "silver.score_cutoffs": 14}
+        return dict(SNAPSHOTS)
 
 
 def build(ops: FakeOps, *, pinned: bool = True) -> dict[str, Any]:
@@ -190,9 +194,7 @@ class BuildOrderTest(unittest.TestCase):
         self.assertEqual(690000, facts["development_lab_rows"])
         self.assertEqual(700000, facts["development_lab_copies"])
         self.assertEqual(len(LENGTHS), facts["development_cases"])
-        self.assertEqual(
-            {"silver.cases": 11, "silver.lab_results": 12, "silver.operation_length_measure": 13, "silver.score_cutoffs": 14}, facts["snapshot_ids"]
-        )
+        self.assertEqual(SNAPSHOTS, facts["snapshot_ids"])
         self.assertEqual(
             [(row.cutoff, row.elapsed_seconds) for row in cutoff_rows(LENGTHS)], [(item["cutoff"], item["elapsed_seconds"]) for item in facts["cutoffs"]]
         )
@@ -327,13 +329,13 @@ class OutputFailureTest(unittest.TestCase):
 
     def test_a_dropped_or_retyped_column_stops_the_job_before_any_value_query_and_reports_only_the_schema(self) -> None:
         ops = FakeOps(schema_wrong=2, output=clean_output_facts(case_key_differences=2, sealed_outcome_differs=1))
-        self.assertEqual(["output_schema: 2 tables"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_build(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
         self.assertNotIn("existing_rules", ops.calls[ops.calls.index("write_rules") :])
 
     def test_verify_checks_the_stored_schema_before_it_reads_the_saved_rules_or_any_value(self) -> None:
         ops = FakeOps(schema_wrong=1, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
-        self.assertEqual(["output_schema: 1 table"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
         self.assertNotIn("existing_rules", ops.calls)
 
@@ -380,7 +382,7 @@ class VerifyTest(unittest.TestCase):
 
     def test_verify_fails_when_the_cutoffs_were_never_saved(self) -> None:
         ops = FakeOps(held=(None, None))
-        self.assertEqual(["table_missing: 2 tables"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertEqual(["table_missing: failed"], refused(lambda: run_verify(ops, pinned=True)))
 
     def test_verify_fails_when_the_saved_cutoffs_are_not_the_ones_the_development_data_gives(self) -> None:
         ops = FakeOps(held=(measure_rows([9000, 9000]), cutoff_rows([9000, 9000])))
@@ -420,10 +422,31 @@ def raising(error: Exception) -> Any:
 
 
 class CommandLineTest(unittest.TestCase):
-    def test_a_good_call_prints_one_result_line_and_exits_0(self) -> None:
-        code, out, err = invoke(["build", "--branch", "b", "--pinned-release"])
-        self.assertEqual((0, ""), (code, err))
-        self.assertEqual({"mode": "build", "diagnostics": []}, json.loads(out.removeprefix("RESULT ")))
+    def test_a_good_call_writes_its_file_prints_nothing_and_exits_0(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="cases_good_"))
+        code, out, err = invoke(["build", "--branch", "b", "--pinned-release", "--result", f"{folder}/result.json"])
+        self.assertEqual((0, "", ""), (code, out, err))
+        self.assertEqual({"mode": "build", "diagnostics": []}, json.loads(Path(f"{folder}/result.json").read_text()))
+
+    def test_a_path_that_cannot_hold_its_part_file_is_usage_and_the_job_does_not_run(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="cases_long_"))
+        seen: list[Namespace] = []
+        self.assertEqual((2, "", "silver_cases: usage\n"), invoke(["build", "--branch", "b", "--result", f"{folder}/{'r' * 255}"], recording(seen)))
+        self.assertEqual(([], []), (seen, os.listdir(folder)))
+
+    def test_every_refusal_is_a_fixed_code_and_the_flag_through_the_command_line(self) -> None:
+        refusals = (
+            (SilverCasesError("output_schema: failed"), 1, "output_schema"),
+            (SilverCasesError("table_missing: failed"), 1, "table_missing"),
+            (SilverCasesError("source_table: failed"), 1, "source_table"),
+            (SettingsError(MARKER), 2, "settings"),
+            (NessieError(MARKER, status=404, error_code="REFERENCE_NOT_FOUND"), 1, "branch_missing"),
+            (NessieError(MARKER, status=500), 1, "catalog_error"),
+            (RuntimeError(MARKER), 70, "internal_error"),
+        )
+        for error, status, code in refusals:
+            with self.subTest(code=code):
+                self.assertEqual((status, "", f"silver_cases: {code}: failed\n"), invoke(["build", "--branch", "b"], raising(error)))
 
     def test_the_arguments_are_a_mode_a_branch_a_base_for_build_and_the_pinned_flag(self) -> None:
         seen: list[Namespace] = []
@@ -438,17 +461,17 @@ class CommandLineTest(unittest.TestCase):
             code, out, err = invoke(argv)
             self.assertEqual((2, "", "silver_cases: usage\n"), (code, out, err), argv)
 
-    def test_a_failed_check_prints_each_code_and_a_count_and_exits_1(self) -> None:
+    def test_a_failed_check_prints_each_code_and_the_flag_and_no_count_and_exits_1(self) -> None:
         code, out, err = invoke(["build", "--branch", "b"], raising(SilverCasesError("key_duplicate: 2 keys", "unparsed: 1 value in 1 column (height)")))
         self.assertEqual((1, ""), (code, out))
-        self.assertEqual("silver_cases: key_duplicate: 2 keys\nsilver_cases: unparsed: 1 value in 1 column (height)\n", err)
+        self.assertEqual("silver_cases: key_duplicate: failed\nsilver_cases: unparsed: failed\n", err)
 
     def test_the_result_is_one_file_and_a_failed_check_writes_its_codes_and_no_count(self) -> None:
         with tempfile.TemporaryDirectory(prefix="cases_file_") as folder:
             path = f"{folder}/result.json"
             argv = ["build", "--branch", "b", "--result", path]
             with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(1, run(argv, raising(SilverCasesError("key_duplicate: failed", "source_table: 2 tables"))))
+                self.assertEqual(1, run(argv, raising(SilverCasesError("key_duplicate: failed", "source_table: failed"))))
             self.assertEqual(
                 {"mode": "build", "branch": "b", "job": "silver_cases", "diagnostics": [{"code": "key_duplicate"}, {"code": "source_table"}]},
                 json.loads(Path(path).read_text()),
@@ -480,15 +503,15 @@ class CommandLineTest(unittest.TestCase):
 
     def test_nessie_is_a_fixed_code_whatever_its_message_holds(self) -> None:
         code, _, err = invoke(["build", "--branch", "b"], raising(NessieError(f"cannot work with {MARKER}", status=409)))
-        self.assertEqual((1, "silver_cases: catalog_error\n"), (code, err))
+        self.assertEqual((1, "silver_cases: catalog_error: failed\n"), (code, err))
         code, _, err = invoke(["verify", "--branch", "b"], raising(NessieError(f"missing {MARKER}", status=404, error_code="REFERENCE_NOT_FOUND")))
-        self.assertEqual((1, "silver_cases: branch_missing\n"), (code, err))
+        self.assertEqual((1, "silver_cases: branch_missing: failed\n"), (code, err))
 
     def test_a_setting_that_cannot_be_used_is_settings_and_exits_2_and_anything_else_is_internal_error_and_exits_70(self) -> None:
         code, _, err = invoke(["build", "--branch", "b"], raising(SettingsError(f"{MARKER} is not set")))
-        self.assertEqual((2, "silver_cases: settings\n"), (code, err))
+        self.assertEqual((2, "silver_cases: settings: failed\n"), (code, err))
         code, _, err = invoke(["build", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "silver_cases: internal_error\n"), (code, err))
+        self.assertEqual((70, "silver_cases: internal_error: failed\n"), (code, err))
 
 
 class DeadlineTest(unittest.TestCase):
@@ -500,6 +523,15 @@ class DeadlineTest(unittest.TestCase):
             timer.join(2)
         self.assertEqual([124], stopped)
         self.assertEqual("silver_cases: timeout\n", err.getvalue())
+
+    def test_the_timer_removes_the_reserved_part_file_before_it_exits(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="cases_deadline_"))
+        self.addCleanup(release_reserved)
+        self.assertIsNotNone(reserve(f"{folder}/result.json"))
+        left: list[list[str]] = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            start_deadline(0.01, lambda code: left.append(os.listdir(folder))).join(2)
+        self.assertEqual([[]], left)
 
     def test_a_job_that_ends_first_cancels_its_timer(self) -> None:
         stopped: list[int] = []

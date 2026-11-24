@@ -32,6 +32,7 @@ from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_cli import EXIT_CODES, code_of, run
 from spark.bronze_clinical_lab_run import CHECK_NAMES, CHECKS_PASSED, JOB, NotABranch, SourceNotInHistory
 from spark.jobs import bronze_clinical_lab as job
+from spark.result_file import release_reserved, reserve
 from spark.session import start_deadline
 from spark.settings import SettingsError
 from tests.fast.test_bronze_job_sequence import BRANCH, HASH, Harness
@@ -75,13 +76,15 @@ class Endings(unittest.TestCase):
             setattr(harness.spark, key, value)
         return harness.run("verify")
 
-    def test_a_clean_run_writes_its_result_with_no_diagnostic_and_prints_one_result_line(self) -> None:
+    def tearDown(self) -> None:
+        release_reserved()
+
+    def test_a_clean_run_writes_its_result_with_no_diagnostic_and_prints_nothing(self) -> None:
         result = self.verified()
         code, out, err = invoke(self.argv, lambda arguments: result)
-        self.assertEqual((0, ""), (code, err))
+        self.assertEqual((0, "", ""), (code, out, err))
         self.assertEqual({**result, "diagnostics": []}, self.written())
         self.assertEqual({"job", "command", "branch", "passed", "diagnostics", *RAN}, set(self.written()))
-        self.assertEqual({**result, "diagnostics": []}, json.loads(out.removeprefix("RESULT ")))
 
     def test_a_failed_check_writes_the_result_with_one_code_and_prints_the_failed_checks_by_name(self) -> None:
         result = self.verified(duplicates=3)
@@ -89,7 +92,7 @@ class Endings(unittest.TestCase):
         self.assertEqual((1, ""), (code, out))
         self.assertEqual({**result, "diagnostics": [{"code": "checks_failed"}]}, self.written())
         self.assertFalse(self.written()["passed"])
-        self.assertEqual(f"{JOB}: checks_failed\n{JOB}: clinical_cases: key unique: failed\n{JOB}: lab_results: key unique: failed\n", err)
+        self.assertEqual(f"{JOB}: checks_failed: failed\n{JOB}: clinical_cases: key unique: failed\n{JOB}: lab_results: key unique: failed\n", err)
 
     def test_every_other_ending_is_one_code_in_the_file_and_the_text_of_the_error_is_in_no_output(self) -> None:
         endings: tuple[tuple[Exception, int, str], ...] = (
@@ -107,7 +110,7 @@ class Endings(unittest.TestCase):
             with self.subTest(expected=expected):
                 code, out, err = invoke(self.argv, raising(error))
                 self.assertEqual((status, ""), (code, out))
-                self.assertEqual(f"{JOB}: {expected}\n", err)
+                self.assertEqual(f"{JOB}: {expected}: failed\n", err)
                 self.assertEqual(
                     {"job": JOB, "command": "verify", "branch": BRANCH, "passed": False, "diagnostics": [{"code": expected}]},
                     self.written(),
@@ -155,13 +158,34 @@ class Endings(unittest.TestCase):
         self.assertEqual((2, "", f"{JOB}: usage\n"), (code, out, err))
         self.assertEqual(([], "old"), (ran, Path(self.path).read_text()))
 
+    def test_a_path_that_cannot_hold_its_part_file_is_usage_and_the_job_does_not_run(self) -> None:
+        ran: list[str] = []
+
+        def execute(arguments: Any) -> dict[str, Any]:
+            ran.append("run")
+            return {}
+
+        argv = ["verify", "--branch", BRANCH, "--source-hash", HASH, "--result", f"{self.folder}/{'r' * 255}"]
+        self.assertEqual((2, "", f"{JOB}: usage\n"), invoke(argv, execute))
+        self.assertEqual(([], []), (ran, os.listdir(self.folder)))
+
+    def test_the_part_file_is_reserved_before_the_job_runs(self) -> None:
+        seen: list[list[str]] = []
+
+        def execute(arguments: Any) -> dict[str, Any]:
+            seen.append(os.listdir(self.folder))
+            return self.verified()
+
+        self.assertEqual(0, invoke(self.argv, execute)[0])
+        self.assertEqual(([["result.json.part"]], ["result.json"]), (seen, os.listdir(self.folder)))
+
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_result_line(self) -> None:
         def refuse(source: str, target: str) -> None:
             raise OSError(f"{MARKER} disk full")
 
         with mock.patch("os.rename", refuse):
             code, out, err = invoke(self.argv, lambda arguments: self.verified())
-        self.assertEqual((70, "", f"{JOB}: internal_error\n"), (code, out, err))
+        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
         self.assertEqual([], os.listdir(self.folder))
 
     def test_the_file_is_the_same_whatever_the_streams_hold(self) -> None:
@@ -224,6 +248,22 @@ class Deadline(unittest.TestCase):
             self.assertTrue(exited.wait(5), "the deadline did not fire within 5 seconds")
         self.assertEqual(([124], f"{JOB}: timeout\n"), (codes, err.getvalue()))
         self.assertNotIn("0.05", err.getvalue())
+
+    def test_the_timer_removes_the_reserved_part_file_before_it_exits(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="bronze_deadline_"))
+        self.addCleanup(release_reserved)
+        self.assertIsNotNone(reserve(f"{folder}/result.json"))
+        exited = threading.Event()
+        left: list[list[str]] = []
+
+        def stop(code: int) -> None:
+            left.append(os.listdir(folder))
+            exited.set()
+
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch("spark.session.os._exit", stop):
+            start_deadline(0.0517, JOB)
+            self.assertTrue(exited.wait(5), "the deadline did not fire within 5 seconds")
+        self.assertEqual([[]], left)
 
 
 class Job(unittest.TestCase):

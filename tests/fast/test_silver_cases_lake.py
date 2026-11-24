@@ -186,7 +186,7 @@ class ExistingRulesTest(unittest.TestCase):
         engine = Lake(Session({"lake.silver.operation_length_measure": frame([("m", 1)], log, [("statistic", "string")])}, {}, log), None, "b")  # type: ignore[arg-type]
         with self.assertRaises(SilverCasesError) as raised:
             engine.existing_rules()
-        self.assertEqual(["inherited_schema: 1 table"], raised.exception.problems)
+        self.assertEqual(["inherited_schema: failed"], raised.exception.problems)
 
     def test_the_held_cutoffs_are_read_back_into_the_rows_the_rules_compare(self) -> None:
         log: list[str] = []

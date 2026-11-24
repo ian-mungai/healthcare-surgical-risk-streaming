@@ -134,11 +134,7 @@ SOURCE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
 
 
 class SilverCasesError(SealedError):
-    """A rule was broken or a check failed. ``problems`` holds one message for each cause, each a code and a flag, or a count of tables."""
-
-
-def unit(count: int, noun: str) -> str:
-    return f"{count} {noun}{'' if count == 1 else 's'}"
+    """A rule was broken or a check failed. ``problems`` holds one message for each cause, each a code and a flag."""
 
 
 def flag(code: str) -> str:
@@ -280,11 +276,11 @@ def split_rule_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
 
 
 def source_schema_problems(found: Mapping[str, Sequence[tuple[str, str]] | None]) -> list[str]:
-    """The tables that are missing and the tables whose columns or types are not the expected ones, each as a code and a count. ``found`` maps a table to its
+    """The tables that are missing and the tables whose columns or types are not the expected ones, each as a code and a flag. ``found`` maps a table to its
     columns, or to ``None`` when the table is not there."""
     missing = sum(1 for table in SOURCE_SCHEMAS if found.get(table) is None)
     wrong = sum(1 for table, fields in SOURCE_SCHEMAS.items() if found.get(table) is not None and list(found[table] or ()) != fields)
-    return [f"{code}: {unit(count, 'table')}" for code, count in (("source_missing", missing), ("source_schema", wrong)) if count]
+    return [flag(code) for code, count in (("source_missing", missing), ("source_schema", wrong)) if count]
 
 
 def input_problems(

@@ -33,7 +33,7 @@ from spark.silver.cli import JOB, run
 from spark.silver.run import BRANCH_MOVED, NUMERIC, WAVEFORM, InputRead, Operations, TableRead, run_build, run_verify
 from spark.silver.tables import NAMESPACE, SILVER_TABLES
 from spark.split_cli import open_client, read_settings, start_deadline
-from spark.split_table import PatientSplitError, schema_problems, unit
+from spark.split_table import PatientSplitError, flag, schema_problems
 
 SOURCES = (bronze.NUMERIC, bronze.WAVEFORM, bronze.TRACKS)
 
@@ -58,7 +58,7 @@ class SignalsLake(Lake):
     def source(self, at: str, spec: bronze.TableSpec) -> tuple[Any, str]:
         table = f"{self.catalog(at)}.{bronze.NAMESPACE}.{spec.name}"
         if not self.session.catalog.tableExists(table):
-            raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
+            raise SilverSignalsError(flag("source_table"))
         frame = self.session.table(table)
         problems = schema_problems(self.fields_of(frame), spec.columns)
         if problems:
@@ -72,7 +72,7 @@ class SignalsLake(Lake):
         held = self.sources(at)
         snapshots = tuple(self.snapshot_id(held[spec.name][1]) for spec in SOURCES)
         if any(snapshot is None for snapshot in snapshots):
-            raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
+            raise SilverSignalsError(flag("source_no_snapshot"))
         facts = frames.bronze_facts(*(held[spec.name][0] for spec in SOURCES))
         return InputRead(facts, (snapshots[0], snapshots[1], snapshots[2]))
 

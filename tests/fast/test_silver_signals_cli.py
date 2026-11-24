@@ -7,7 +7,7 @@ Failure modes covered here:
 - The namespace commit of a branch that moved ends the job with the exception of the patient split, which the command line maps to an internal error
   and not to the refusal ``branch_moved``.
 - The watchdog that stops a job that runs too long names another job, or holds a duration.
-- A failed check prints no line, or prints a line that is not a code and a flag (or, for a count of tables, a code and that count), or the exit code does not
+- A failed check prints no line, or prints a line that is not a code and a flag, or the exit code does not
   tell a failed check from a bad call.
 - A table whose columns are not those of its card prints a count of columns, or the name of a table, and not the code and flag ``schema: failed``.
 """
@@ -89,13 +89,13 @@ class CommandLine(unittest.TestCase):
         for error, expected in ((missing, "branch_missing"), (other, "catalog_error"), (NessieError(MARKER, status=404, error_code="OTHER"), "catalog_error")):
             with self.subTest(expected=expected):
                 code, out, err = invoke(["verify", "--branch", "b"], raising(error))
-                self.assertEqual((1, "", f"silver_signals: {expected}\n"), (code, out, err))
+                self.assertEqual((1, "", f"silver_signals: {expected}: failed\n"), (code, out, err))
 
     def test_a_setting_that_cannot_be_used_and_any_other_error_are_codes(self) -> None:
         code, out, err = invoke(["verify", "--branch", "b"], raising(SettingsError(MARKER)))
-        self.assertEqual((2, "", "silver_signals: settings\n"), (code, out, err))
+        self.assertEqual((2, "", "silver_signals: settings: failed\n"), (code, out, err))
         code, out, err = invoke(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "", "silver_signals: internal_error\n"), (code, out, err))
+        self.assertEqual((70, "", "silver_signals: internal_error: failed\n"), (code, out, err))
 
 
 class Watchdog(unittest.TestCase):
@@ -130,9 +130,9 @@ class NamespaceCommit(unittest.TestCase):
         lake = SignalsLake(Session(), Client(), "branch", {})  # type: ignore[arg-type]
         with self.assertRaises(SilverSignalsError) as caught:
             lake.prepare("a" * 64)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
         code, out, err = invoke(["build", "--branch", "b"], raising(caught.exception))
-        self.assertEqual((1, "", "silver_signals: branch_moved: the branch head is not the one that was checked\n"), (code, out, err))
+        self.assertEqual((1, "", "silver_signals: branch_moved: failed\n"), (code, out, err))
 
 
 if __name__ == "__main__":

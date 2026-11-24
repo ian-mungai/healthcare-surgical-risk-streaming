@@ -22,7 +22,6 @@ from typing import Any
 from spark.silver.checks import FLAG, SilverSignalsError
 from spark.silver.hypotension_checks import CHECK_NAMES, EventFacts, InputFacts, SeriesFacts, event_problems, input_problems, series_problems
 from spark.silver.run import BRANCH_MOVED, Fingerprint
-from spark.split_table import unit
 
 SERIES = "art_mbp_1s"
 EVENTS = "hypotension_events"
@@ -99,10 +98,10 @@ def table_problems(reads: dict[str, TableRead | None]) -> list[str]:
     """The tables that are not there, or else the problems of both tables."""
     missing = sum(1 for read in reads.values() if read is None)
     if missing:
-        return [f"table_missing: {unit(missing, 'table')}"]
+        return [f"table_missing: {FLAG}"]
     series, events = reads[SERIES], reads[EVENTS]
     if series is None or events is None or series.series is None or events.events is None:
-        return [f"table_missing: {unit(1, 'table')}"]
+        return [f"table_missing: {FLAG}"]
     return series_problems(series.series) + event_problems(events.events)
 
 
@@ -119,7 +118,7 @@ def passed_flags(reads: dict[str, TableRead | None], planned: dict[str, Fingerpr
 def events_digest(read: TableRead | None) -> Digest:
     """The digest of the event table that was read, which is of the development cases only."""
     if read is None or not isinstance(read.fingerprint, Digest):
-        raise SilverSignalsError(f"table_missing: {unit(1, 'table')}")
+        raise SilverSignalsError(f"table_missing: {FLAG}")
     return read.fingerprint
 
 
@@ -171,7 +170,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     problems = table_problems(reads)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
-        problems.append(f"readback_differs: {unit(differing, 'table')}")
+        problems.append(f"readback_differs: {FLAG}")
     if problems:
         raise SilverSignalsError(*problems)
     if ops.head() != at:

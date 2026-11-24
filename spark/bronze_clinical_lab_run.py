@@ -121,7 +121,6 @@ class TableReport:
     kidney outcome is built from, so a row count, a digest, a metadata path or a check detail of either changes with a held-out patient. The report holds the
     snapshot IDs, the names of the checks with a flag each and one pass flag."""
 
-    kind: str
     source_table: str
     bronze_table: str
     source_snapshot_id: int | None = None
@@ -176,7 +175,7 @@ def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, k
     The counts that a check reads stay inside this function: the report holds a name and a flag for each check.
     """
     source_table, bronze_table, _ = TABLES[kind]
-    report = TableReport(kind, source_table, bronze_table)
+    report = TableReport(source_table, bronze_table)
     source_key, bronze_key = f"{SOURCE_NAMESPACE}.{source_table}", f"{BRONZE_NAMESPACE}.{bronze_table}"
     on_branch, at_hash = nessie.content(branch, source_key), nessie.content(pinned, source_key)
     report.source_snapshot_id = at_hash.snapshot_id if at_hash else None

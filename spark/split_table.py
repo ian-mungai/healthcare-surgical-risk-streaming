@@ -6,7 +6,7 @@ calls it and keeps no copy.
 
 The test set is sealed until the choice record is frozen, so nothing here may name which set a patient or a case is in, and no count over the patients or the
 cases leaves the job: the table is built from the clinical table, which holds the outcome columns. Every failure is a code and a flag (``two_sets: failed``),
-never an identifier and never a count, except a count of tables (``table_missing: 1 table``). A check returns its problems and never raises for a failed
+never an identifier and never a count. A check returns its problems and never raises for a failed
 check, so that one run names every cause.
 
 A build resolves the branch to one hash and reads only at that hash. It writes only while the branch still has that hash, reads the written table at the
@@ -91,7 +91,7 @@ CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_tabl
 
 
 class PatientSplitError(SealedError):
-    """The split cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a flag, or a count of tables."""
+    """The split cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a flag."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,10 +170,6 @@ class Outcome:
             "checks_run": list(self.checks_run),
             "fixed_sample_cases_checked": self.sample_cases,
         }
-
-
-def unit(count: int, noun: str) -> str:
-    return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
 def flag(code: str) -> str:
@@ -426,7 +422,7 @@ def finish(ops: Operations, hashes: tuple[str, str | None, str], rows: Sequence[
     source = ops.read_source(at)
     state = ops.read_table(at)
     if state is None:
-        raise PatientSplitError(f"table_missing: {unit(0, 'table')}")
+        raise PatientSplitError(flag("table_missing"))
     problems = checks(state.rows, source, sample, pinned=pinned)
     if sorted(state.rows, key=row_order) != sorted(rows, key=row_order):
         problems.append(flag("readback_differs"))
@@ -444,7 +440,7 @@ def run_verify(ops: Operations, head: str, *, pinned: bool, sample: Sequence[Sam
     source = ops.read_source(head)
     state = ops.read_table(head)
     if state is None:
-        raise PatientSplitError(f"table_missing: {unit(0, 'table')}")
+        raise PatientSplitError(flag("table_missing"))
     problems = checks(state.rows, source, sample, pinned=pinned)
     if problems:
         raise PatientSplitError(*problems)

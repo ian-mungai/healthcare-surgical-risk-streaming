@@ -13,6 +13,11 @@ Failure modes covered here:
 - A table with a failed value, row-count or key check passes as equal to the loaded table, whether it is the clinical or the laboratory table.
 - A build that moved the branch passes as a rebuild that wrote nothing, or the reverse.
 - A refusal with another code, another number of codes or a count passes.
+- A result of the split or the Silver cases job passes with text that is not a hash in a hash field, a snapshot ID that is missing, null, a Boolean or text,
+  an empty map of snapshot IDs, an eighth key or a missing one among the seven tables that the cases job reads.
+- The comparison of the snapshot IDs with Nessie is driven by what the document holds, so that a key that the job added is looked up and a key that it dropped
+  is never missed.
+- A job that the watchdog stopped leaves its part file, and a reader refuses the result folder for it.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from tests.fast import test_patient_split as split
 from tests.fast import test_silver_cases_job as cases
 from tests.fast.outcome_accept import (
     BRONZE_COMMANDS,
+    CASES_SNAPSHOT_TABLES,
     all_passed,
     bronze_problem,
     cases_problem,
@@ -54,12 +60,16 @@ from tests.fast.outcome_accept import (
     read_result_file,
     same_source,
     sealed_table,
+    snapshot_ids_are,
     snapshots_are,
     split_problem,
     wrote,
 )
 
 HASH_A, HASH_B = "a" * 64, "b" * 64
+# The fake lake of the split tests names its commits h0, h1, hn; a real Nessie hash is 64 hexadecimal characters.
+HASHES = {"h0": HASH_A, "h1": HASH_B, "hn": "c" * 64, "h2": "d" * 64}
+HASH_FIELDS = ("base_hash", "checked_hash", "write_hash", "branch_hash")
 BRANCH = bronze.BRANCH
 
 
@@ -106,6 +116,16 @@ class ResultFile(unittest.TestCase):
 
     def test_an_empty_folder_is_no_file_and_no_problem(self) -> None:
         self.assertEqual((None, None), read_result_file(self.folder))
+
+    def test_a_part_file_alone_is_a_job_that_did_not_finish_and_is_no_result_and_no_problem(self) -> None:
+        (self.folder / "result.json.part").write_text('{"half')
+        self.assertEqual((None, None), read_result_file(self.folder))
+
+    def test_a_part_file_beside_a_result_is_refused(self) -> None:
+        (self.folder / "result.json.part").write_text("{}")
+        self.put("{}")
+        document, problem = read_result_file(self.folder)
+        self.assertEqual((None, "the result folder holds a file other than the result"), (document, problem))
 
     def test_one_plain_file_with_one_json_document_is_read(self) -> None:
         self.put(json.dumps({"a": 1}))
@@ -372,7 +392,8 @@ def split_run(mode: str = "build") -> tuple[int, dict[str, Any]]:
         facts = split_table.run_verify(
             split.Lake(split.FULL, existing=split.rows_of(split.FULL, snapshot=11)).operations(), "h0", pinned=True, sample=None
         ).facts()
-    return 0, {**split_document(arguments, "h0" if mode == "build" else None, facts), "diagnostics": []}
+    document = {**split_document(arguments, "h0" if mode == "build" else None, facts), "diagnostics": []}
+    return 0, {key: HASHES.get(value, value) if key in HASH_FIELDS else value for key, value in document.items()}
 
 
 def cases_run(mode: str = "build") -> tuple[int, dict[str, Any]]:
@@ -442,6 +463,76 @@ class SealedFile(unittest.TestCase):
     def test_the_cases_result_has_one_flag_for_each_physical_table(self) -> None:
         _, document = cases_run()
         self.assertEqual({"cases", "lab", "operation_length_measure", "score_cutoffs"}, set(document["passed"]))
+
+    def test_a_hash_field_that_is_not_a_hash_fails_in_either_job(self) -> None:
+        for name, checker, run, _ in self.CHECKERS:
+            for mode in ("build", "verify"):
+                status, document = run(mode)
+                for key in (key for key in HASH_FIELDS if document.get(key) is not None and key in document):
+                    for bad in ("checked", "A" * 64, "a" * 63, "a" * 65, "g" * 64, "", 5, True, ["a" * 64]):
+                        with self.subTest(job=name, mode=mode, key=key, bad=str(bad)[:10]):
+                            self.assertIsNotNone(checker({**document, key: bad}, mode, "b", status))
+
+    def test_a_hash_that_is_null_is_accepted_only_where_the_job_writes_none(self) -> None:
+        status, document = split_run("verify")
+        self.assertIsNone(document["base_hash"])
+        self.assertIsNone(split_problem(document, "verify", "b", status))
+        for key in ("checked_hash", "branch_hash"):
+            self.assertIsNotNone(split_problem({**document, key: None}, "verify", "b", status), key)
+        status, document = cases_run("verify")
+        self.assertIsNotNone(cases_problem({**document, "branch_hash": None}, "verify", "b", status))
+
+    def test_a_snapshot_id_of_the_split_that_is_missing_null_text_or_a_boolean_fails(self) -> None:
+        status, document = split_run("build")
+        for key in ("snapshot_id", "source_snapshot_id"):
+            for bad in (None, True, "9", 1.5, [1]):
+                with self.subTest(key=key, bad=repr(bad)):
+                    self.assertIsNotNone(split_problem({**document, key: bad}, "build", "b", status))
+            missing = {name: value for name, value in document.items() if name != key}
+            self.assertIsNotNone(split_problem(missing, "build", "b", status), key)
+
+    def test_the_snapshot_ids_of_the_cases_result_are_exactly_the_seven_tables_each_a_whole_number(self) -> None:
+        status, document = cases_run("build")
+        self.assertEqual(7, len(CASES_SNAPSHOT_TABLES))
+        self.assertEqual(set(CASES_SNAPSHOT_TABLES), set(document["snapshot_ids"]))
+        self.assertIsNone(cases_problem(document, "build", "b", status))
+        first = CASES_SNAPSHOT_TABLES[0]
+        plants: dict[str, Any] = {
+            "an empty map": {},
+            "an eighth key": {**document["snapshot_ids"], "silver.other": 5},
+            "a key missing": {key: value for key, value in document["snapshot_ids"].items() if key != first},
+            "a key renamed": {**{key: value for key, value in document["snapshot_ids"].items() if key != first}, "silver.renamed": 5},
+            "a null value": {**document["snapshot_ids"], first: None},
+            "a Boolean value": {**document["snapshot_ids"], first: True},
+            "a text value": {**document["snapshot_ids"], first: "9"},
+            "a float value": {**document["snapshot_ids"], first: 9.5},
+            "not a map": [5] * 7,
+        }
+        for name, value in plants.items():
+            with self.subTest(name):
+                self.assertIsNotNone(cases_problem({**document, "snapshot_ids": value}, "build", "b", status))
+
+    def test_the_snapshot_ids_are_compared_with_nessie_for_each_expected_table_and_only_those(self) -> None:
+        _, document = cases_run("build")
+        held: dict[str, int] = document["snapshot_ids"]
+        asked: list[str] = []
+
+        def nessie(table: str) -> int | None:
+            asked.append(table)
+            return held.get(table)
+
+        self.assertTrue(snapshot_ids_are(held, nessie))
+        self.assertEqual(list(CASES_SNAPSHOT_TABLES), asked)
+        asked.clear()
+        self.assertFalse(snapshot_ids_are({**held, "silver.other": 5}, nessie))
+        self.assertEqual(list(CASES_SNAPSHOT_TABLES), asked)
+        self.assertFalse(snapshot_ids_are({}, nessie))
+        self.assertFalse(snapshot_ids_are({key: value for key, value in held.items() if key != CASES_SNAPSHOT_TABLES[0]}, nessie))
+        self.assertFalse(snapshot_ids_are({**held, CASES_SNAPSHOT_TABLES[1]: held[CASES_SNAPSHOT_TABLES[1]] + 1}, nessie))
+        self.assertFalse(snapshot_ids_are(held, lambda table: None))
+        self.assertFalse(snapshot_ids_are({key: None for key in held}, lambda table: None))
+        self.assertFalse(snapshot_ids_are({key: True for key in held}, lambda table: True))
+        self.assertFalse(snapshot_ids_are("seven", nessie))
 
     def test_a_number_that_is_text_or_a_boolean_fails(self) -> None:
         status, document = cases_run()

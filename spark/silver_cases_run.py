@@ -6,7 +6,7 @@ that changes nothing writes nothing. ``verify`` runs the same input checks and t
 branch is the caller's step.
 
 The test set is sealed, and the clinical table that the tables come from holds the outcome columns. A message holds a code and a flag (``key_null: failed``)
-and a count of tables at most. The result holds the hashes, the snapshot IDs, the checks that ran, one pass flag for each table and measures of the development
+and no count. The result holds the hashes, the snapshot IDs, the checks that ran, one pass flag for each table and measures of the development
 patients (the cutoffs and their counts), and never a case, a patient, an argument, a count over all cases or a field that says whether a table was written:
 a held-out outcome changes both, and the branch hash against the base hash shows a write. The result is one file at ``--result``
 (``spark/result_file.py``), with one diagnostic for each code of a failed check and no count; the command line prints fixed codes only: ``usage``,
@@ -23,19 +23,19 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
-from spark.result_file import add_result_option, run_sealed
+from spark.result_file import add_result_option, release_reserved, run_sealed
 from spark.silver_cases import (
     FLAG,
     CutoffRow,
     MeasureRow,
     SilverCasesError,
     cutoff_rows,
+    flag,
     frozen_problems,
     input_problems,
     measure_rows,
     output_problems,
     same_rows,
-    unit,
 )
 from spark.split_cli import reference_name
 
@@ -136,7 +136,7 @@ def check_stored_schema(ops: SilverOps) -> None:
     """Refuse a written table with a dropped, extra or retyped column before any query reads a value of it."""
     wrong = ops.output_schema_tables_wrong()
     if wrong:
-        raise SilverCasesError(f"output_schema: {unit(wrong, 'table')}")
+        raise SilverCasesError(flag("output_schema"))
 
 
 def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
@@ -166,7 +166,7 @@ def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
     check_stored_schema(ops)
     held_measure, held_cutoffs = ops.existing_rules()
     missing = (held_measure is None) + (held_cutoffs is None)
-    problems = [f"table_missing: {unit(missing, 'table')}"] if missing else frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
+    problems = [flag("table_missing")] if missing else frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
     output = ops.output_facts()
     problems += output_problems(**output)  # type: ignore[arg-type]
     if problems:
@@ -183,6 +183,7 @@ def start_deadline(seconds: float, exit_with: Callable[[int], object] = os._exit
     def expire() -> None:
         sys.stderr.write(f"{JOB}: timeout\n")
         sys.stderr.flush()
+        release_reserved()
         exit_with(DEADLINE_EXIT_CODE)
 
     timer = threading.Timer(seconds, expire)
