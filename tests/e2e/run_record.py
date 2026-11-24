@@ -43,7 +43,7 @@ class Record:
     cleanup: str = "pending"
 
     def expect(self, case: str, step: str, expected: str, observed: str, passed: bool) -> bool:
-        self.observations.append(Observation(case, step, expected, observed, passed))
+        self.observations.append(Observation(case, step, expected, str(observed), passed))
         return passed
 
     def close_after(self, cleanup: Callable[[], None], log: list[str], *, blocked: str = "") -> int:

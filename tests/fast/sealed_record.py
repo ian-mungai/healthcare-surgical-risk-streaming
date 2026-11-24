@@ -10,7 +10,12 @@ This module makes the only text and the only facts that may reach an observation
   differs, a value that Nessie does not hold, a Boolean and text that is no hash or reference name give ``None``.
 
 The syntax check ``sink_leaks`` of ``tests/fast/outcome_accept.py`` refuses, in the six outcome runners, an f-string, ``str()``, ``repr()``, ``format``, a
-raw variable or a hand-made ``ConfirmedId`` as an observation or a fact: only the output of ``sealed_observed`` reaches them.
+raw variable or a hand-made ``ConfirmedId`` as an observation or a fact: only the output of ``sealed_observed`` reaches them. It also guards every other saved
+field: the expectation of an assertion and each line of the log, the limits, the cleanup and the commands are written text (an f-string may name only module
+constants in capitals) or the output of ``sealed_observed``, and the verdict is an exact Boolean expression. The log keeps the words of a command, its exit code
+and the seconds only through ``words``, ``exit_code`` and ``seconds``.
+
+``Record.expect`` of ``tests/e2e/run_record.py`` saves the text of a ``Sealed`` as plain text, so the record can be copied and written.
 """
 
 from __future__ import annotations
@@ -63,6 +68,9 @@ GENERIC_CODES = frozenset({"settings", "usage", "branch_missing", "catalog_error
 FIXED_CODES = frozenset(SPLIT_CODES) | SIGNALS_CODES | HYPOTENSION_CODES | frozenset(BRONZE_CODES) | CASES_CODES | GENERIC_CODES
 FIXED_REASONS = frozenset(REASONS) | frozenset(REFUSAL_REASONS) | frozenset(USAGE_REASONS)
 FLAG_NAME = re.compile(r"[A-Za-z][A-Za-z0-9 ,'()/:+_-]{0,150}")
+COMMAND_WORD = re.compile(r"(?:--?|/)?[A-Za-z][A-Za-z0-9_.:/=@-]{0,99}")
+OTHER_WORD = "<other>"
+MAX_ATTEMPTS = 20
 ERROR_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,80}")
 HASH = re.compile(r"[0-9a-f]{64}")
 REFERENCE_NAME = re.compile(r"[A-Za-z0-9]+(?:[_.-][A-Za-z0-9]+)+")
@@ -165,12 +173,27 @@ def sealed_observed(
     codes: Sequence[str] | None = None,
     reason: str | None = None,
     error: BaseException | None = None,
+    words: Sequence[str] | None = None,
+    attempt: tuple[int, int] | None = None,
 ) -> Sealed:
     """The observation text and facts of one assertion. Each flag is exactly ``True`` or ``False``, each code one of ``FIXED_CODES``, each ID a
     ``ConfirmedId``, each exit code a whole number of a process, ``seconds`` a finite number of at least 0, ``reason`` one of ``FIXED_REASONS`` and ``error`` an
-    exception, of which only the class name is kept. Anything else raises ``ValueError`` that names the field and never the value."""
+    exception, of which only the class name is kept. ``words`` are the words of a command line: a name, a path or an option that begins with a letter is kept,
+    and any other word (a number, a hash, a sentence) is recorded as ``<other>``, because a line of the log must not stop a long run. ``attempt`` is the number
+    of a try and the number of tries, both whole numbers from 1 to ``MAX_ATTEMPTS``. Anything else raises ``ValueError`` that names the field and never the
+    value."""
     parts: list[str] = []
     facts: dict[str, str] = {}
+    if words is not None:
+        if isinstance(words, str) or not isinstance(words, Sequence):
+            raise ValueError("words is not a list of words")
+        plain = [
+            word if type(word) is str and COMMAND_WORD.fullmatch(word) is not None and HASH.fullmatch(word) is None else OTHER_WORD
+            for word in words
+            if word != ""
+        ]
+        if plain:
+            parts.append(" ".join(plain))
     if error is not None:
         if not isinstance(error, BaseException) or ERROR_CLASS.fullmatch(type(error).__name__) is None:
             raise ValueError("error is not an exception")
@@ -183,6 +206,15 @@ def sealed_observed(
         parts.append(f"exit {exit_number('exit', exit_code)}")
     for name, code in (exits or {}).items():
         parts.append(f"{named('exits', name)} {exit_number(name, code)}")
+    if attempt is not None:
+        if (
+            not isinstance(attempt, tuple)
+            or len(attempt) != 2
+            or any(type(item) is not int for item in attempt)
+            or not 1 <= attempt[0] <= attempt[1] <= MAX_ATTEMPTS
+        ):
+            raise ValueError("attempt is not a number of a try and the number of tries")
+        parts.append(f"attempt {attempt[0]} of {attempt[1]}")
     if seconds is not None:
         if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
             raise ValueError("seconds is not a finite number of at least 0")
