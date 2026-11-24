@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FOLDERS = ("scripts/quality", "scripts/ingestion", "scripts/sample")
 NOT_FILES = {"os", "tarfile", "gzip"}
 
+FILE_FIRST = ("io", "builtins")
+
 
 def is_none(value: ast.expr | None) -> bool:
     return isinstance(value, ast.Constant) and value.value is None
@@ -34,7 +36,7 @@ def argument(node: ast.Call, name: str, position: int) -> ast.expr | None:
 def unnamed_reads(source: str) -> list[int]:
     """The lines of ``read_text``, ``write_text`` and text-mode ``open`` calls that pass no ``encoding`` or pass ``encoding=None``.
 
-    The builtin ``open`` and ``io.open`` take the file first, so their mode and encoding sit one place after those of ``Path.open``.
+    The builtin ``open``, ``builtins.open`` and ``io.open`` take the file first, so their mode and encoding sit one place after those of ``Path.open``.
     """
     found = []
     for node in ast.walk(ast.parse(source)):
@@ -46,7 +48,7 @@ def unnamed_reads(source: str) -> list[int]:
         if name in ("read_text", "write_text") and isinstance(func, ast.Attribute):
             encoding = argument(node, "encoding", 0 if name == "read_text" else 1)
         elif name == "open" and owner not in NOT_FILES:
-            shift = int(not isinstance(func, ast.Attribute) or owner == "io")
+            shift = int(not isinstance(func, ast.Attribute) or owner in FILE_FIRST)
             mode = argument(node, "mode", shift)
             if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and "b" in mode.value:
                 continue
@@ -82,6 +84,8 @@ class TextReadTest(unittest.TestCase):
             "open('input', encoding=None)",
             "path.open('r', -1, None)",
             "open('input', 'r', -1, None)",
+            "builtins.open('input', 'r', -1, None)",
+            "io.open('input', 'r', -1, None)",
         ):
             with self.subTest(source=source):
                 self.assertEqual([1], unnamed_reads(source))
@@ -99,6 +103,7 @@ class TextReadTest(unittest.TestCase):
             "path.open('rb')",
             "path.open(mode='ab')",
             "io.open('input', 'rb')",
+            "builtins.open('input', 'r', -1, 'utf-8')",
             "os.open(path, flags)",
             "tarfile.open(name)",
             "gzip.open(path, 'rb')",
