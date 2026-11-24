@@ -276,7 +276,7 @@ class Declared(unittest.TestCase):
             patch.object(label_frames, "typed", side_effect=lambda frame, columns: frame),
         ):
             label_frames.ownership_flag(cases)
-            label_frames.input_facts(cases, split)
+            label_frames.input_facts(cases, split, lab)
             label_frames.kidney_frame(cases, lab)
             label_frames.icu_frame(cases)
             label_frames.development_values(cases, split)

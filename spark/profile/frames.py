@@ -19,12 +19,13 @@ from typing import Any
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from features.signal_validity import ARTERIAL_WAVEFORM, INVALID_CAUSES
-from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, UnscoredFacts
+from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, SignalProfileError, UnscoredFacts
 from spark.profile.counts import ARTERIAL_TRACK, BY_NAME, FULL_COHORT, NONINVASIVE_TRACK, PRESPECIFIED, SECONDS_PER_HOUR
 from spark.profile.grid_rule import RULE_END, GridRule, RuleRead
 from spark.profile.tables import CAUSE_COLUMNS, COUNTS, DEVELOPMENT_SCOPE, GRID_RULE, KINDS, NUMERIC_KIND, PROFILE, UNSCORED, WAVEFORM_KIND
 from spark.profile.unscored import count_unscored, grid_pair
 from spark.silver.frames import count_where, functions, typed, types
+from spark.split_table import flag
 
 DEVELOPMENT_SETS = ("training", "validation")
 TRACK_KEY = ("kind", "track")
@@ -198,29 +199,41 @@ def profile_facts(frame: Any) -> ProfileFacts:
     )
 
 
+def whole_number(row: Mapping[str, Any], name: str) -> int:
+    """A whole-number column of a stored row, or the fixed refusal ``table_row: failed`` for a null (a stored row that is not in form), never a ``TypeError``
+    and never the column or a value."""
+    value = row[name]
+    if value is None:
+        raise SignalProfileError(flag("table_row"))
+    return int(value)
+
+
+UNSCORED_WHOLE_NUMBERS = (
+    "cutoffs",
+    "waveform",
+    "numeric",
+    "either",
+    "cases",
+    "no_grid",
+    "cutoff_step",
+    "cutoff_offset",
+    "last_margin",
+    "waveform_window",
+    "waveform_limit",
+    "numeric_window",
+    "numeric_limit",
+)
+
+
 def unscored_facts(frame: Any) -> UnscoredFacts:
+    """The facts of ``unscored_share``: the row count and the first row's values. Every whole-number column of every stored row is checked before the first row
+    is chosen, so a row that is not in form gives the one refusal whatever the order of the rows."""
     rows = frame.collect()
     if not rows:
         return UnscoredFacts(0, 0, 0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    one = rows[0]
-    share = one["unscored_share"]
-    return UnscoredFacts(
-        len(rows),
-        int(one["cutoffs"]),
-        int(one["waveform"]),
-        int(one["numeric"]),
-        int(one["either"]),
-        None if share is None else float(share),
-        int(one["cases"]),
-        int(one["no_grid"]),
-        int(one["cutoff_step"]),
-        int(one["cutoff_offset"]),
-        int(one["last_margin"]),
-        int(one["waveform_window"]),
-        int(one["waveform_limit"]),
-        int(one["numeric_window"]),
-        int(one["numeric_limit"]),
-    )
+    held = [{name: whole_number(row, name) for name in UNSCORED_WHOLE_NUMBERS} for row in rows]
+    share = rows[0]["unscored_share"]
+    return UnscoredFacts(rows=len(rows), share=None if share is None else float(share), **held[0])
 
 
 def counts_facts(frame: Any) -> CountsFacts:

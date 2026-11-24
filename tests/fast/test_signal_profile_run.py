@@ -33,10 +33,11 @@ import unittest
 from typing import Any
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
+from spark.jobs.signal_profile import EMPTY_FACTS
 from spark.profile.checks import CountsFacts, InputFacts, ProfileFacts, SignalProfileError, UnscoredFacts
 from spark.profile.counts import PRESPECIFIED
 from spark.profile.grid_rule import FIRST_CUTOFF_OFFSET_SECONDS, GRID_STEP_SECONDS, LAST_CUTOFF_MARGIN_SECONDS, GridRule, RuleRead, planned_rule
-from spark.profile.run import COUNTS, PROFILE, RULE, TABLES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
+from spark.profile.run import COUNTS, PROFILE, RULE, TABLES, UNSCORED, InputRead, Operations, TableRead, input_problems, run_build, run_verify
 from spark.profile.tables import ABSENT, CURRENT, OTHER, PREDECESSOR
 from spark.silver.run import Fingerprint
 
@@ -777,13 +778,41 @@ class Verify(unittest.TestCase):
             self.verify(fake)
         self.assertEqual(["table_missing"], codes(caught.exception))
 
-    def test_a_defect_in_the_input_or_in_a_table_is_named(self) -> None:
+    def test_a_defect_in_a_table_is_named(self) -> None:
         fake = Fake()
         fake.read_back[PROFILE] = TableRead(FINGERPRINTS[PROFILE], 101, profile=dataclasses.replace(PROFILE_FACTS, share_differs=1))
-        fake.input = InputRead(FACTS, (11, 12, 13, 14, 15), ("two_sets: 1 patient",))
         with self.assertRaises(SignalProfileError) as caught:
             self.verify(fake)
-        self.assertEqual(["two_sets", "profile_share"], codes(caught.exception))
+        self.assertEqual(["profile_share"], codes(caught.exception))
+
+    def test_a_refused_input_is_the_whole_refusal_and_no_table_fact_is_read(self) -> None:
+        """A split row that is not in form (a null snapshot ID) makes the input a refusal. The stored row holds a count of cases that differs from the empty
+        development facts, and a table fact that is read after the refusal would print it (``unscored_cases: 3 cases``) and follow the stored row."""
+        for what, refused in (
+            ("a split row that is not in form", InputRead(EMPTY_FACTS, (11, 12, 13, 14, 15), ("table_row: failed",))),
+            ("a split that fails its rule check", InputRead(EMPTY_FACTS, (11, 12, 13, 14, 15), ("rule_mismatch: failed", "two_sets: failed"))),
+            ("no development signal", InputRead(InputFacts(0, 0, 0, 0), (11, 12, 13, 14, 15), ())),
+        ):
+            for cases in (3, 4, 700):
+                with self.subTest(input=what, stored_cases=cases):
+                    fake = Fake()
+                    fake.input = refused
+                    fake.read_back[UNSCORED] = TableRead(FINGERPRINTS[UNSCORED], 102, unscored=dataclasses.replace(UNSCORED_FACTS, cases=cases))
+                    with self.assertRaises(SignalProfileError) as caught:
+                        self.verify(fake)
+                    self.assertEqual(input_problems(refused), caught.exception.problems)
+                    self.assertEqual(["read_input a", "schemas a", "release"], fake.calls)
+
+    def test_a_refused_input_gives_the_same_refusal_whatever_the_stored_tables_hold(self) -> None:
+        refusals = []
+        for stored in (UNSCORED_FACTS, dataclasses.replace(UNSCORED_FACTS, cases=99, cutoffs=1, no_grid=500)):
+            fake = Fake()
+            fake.input = InputRead(EMPTY_FACTS, (11, 12, 13, 14, 15), ("table_row: failed",))
+            fake.read_back[UNSCORED] = TableRead(FINGERPRINTS[UNSCORED], 102, unscored=stored)
+            with self.assertRaises(SignalProfileError) as caught:
+                self.verify(fake)
+            refusals.append(caught.exception.problems)
+        self.assertEqual([["table_row: failed"]] * 2, refusals)
 
     def test_a_branch_that_moved_is_named(self) -> None:
         fake = Fake()

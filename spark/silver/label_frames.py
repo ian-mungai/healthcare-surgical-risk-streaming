@@ -112,10 +112,23 @@ def icu_udf() -> Any:
     return functions().udf(icu_row, struct_type(ICU_LABELS.columns[1:])).asNondeterministic()
 
 
+def wanted_results() -> Any:
+    """A column that is true for a laboratory row that the kidney rule reads: a creatinine result with a value and a time. The one definition of those rows, for
+    the frame and for the check of ``unusable_results``."""
+    f = functions()
+    return (f.col("name") == f.lit(CREATININE)) & f.col("result").isNotNull() & f.col("dt").isNotNull()
+
+
+def unusable_results(lab: Any) -> int:
+    """One flag, 0 or 1: whether a result that the kidney rule reads has a null ``source_occurrence``. The rule function converts it in a Spark worker, where a
+    null is a ``TypeError`` that the job cannot turn into a refusal, so the driver refuses it first (``table_row``)."""
+    return exists(lab.filter(wanted_results() & functions().col("source_occurrence").isNull()))
+
+
 def kidney_frame(cases: Any, lab: Any) -> Any:
     """``silver.kidney_injury_labels``: one row for each case, from the case's times and every creatinine result of the case that has a value."""
     f = functions()
-    wanted = (f.col("name") == f.lit(CREATININE)) & f.col("result").isNotNull() & f.col("dt").isNotNull()
+    wanted = wanted_results()
     result = f.struct(f.col("dt"), f.col("source_occurrence"), f.col("result")).alias("_r")
     per_case = lab.filter(wanted).select(f.col("caseid"), result).groupBy("caseid").agg(f.collect_list("_r").alias("_results"))
     joined = cases.select("caseid", "anestart", "opend").join(per_case, "caseid", "left")
@@ -170,11 +183,12 @@ def measure_frame(session: Any, rows: Sequence[IcuMeasureRow]) -> Any:
     return typed(session.createDataFrame([(row.statistic, row.unit, float(row.value)) for row in rows], schema), ICU_DAYS_MEASURE.columns)
 
 
-def input_facts(cases: Any, split: Any) -> InputFacts:
-    """The facts of the input once the split is trusted. ``cases_without_split`` is a flag: whether any case has a patient that the split lacks."""
+def input_facts(cases: Any, split: Any, lab: Any) -> InputFacts:
+    """The facts of the input once the split is trusted. ``cases_without_split`` and ``unusable_results`` are flags: whether any case has a patient that the
+    split lacks, and whether a result that the kidney rule reads has no ``source_occurrence``."""
     without = cases.join(split.select("subjectid"), "subjectid", "left_anti")
     development = cases.filter(functions().col("caseid").isNotNull()).join(development_sets(split), "subjectid", "inner")
-    return InputFacts(int(cases.count()), 0, exists(without), (), int(development.count()))
+    return InputFacts(int(cases.count()), 0, exists(without), (), int(development.count()), unusable_results(lab))
 
 
 def differing(stored: Any, planned: Any, columns: tuple[tuple[str, str], ...]) -> int:

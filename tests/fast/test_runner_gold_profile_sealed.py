@@ -430,6 +430,25 @@ class ProfileLines(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertTrue(self.module.known_line(line))
 
+    def test_the_refusal_of_a_split_row_that_is_not_in_form_is_kept_as_the_exact_line(self) -> None:
+        """``table_row: failed`` is printed by the job's own split check (``ProfileLake.development_problems``): the adapter keeps it and no other form."""
+        self.assertEqual({"table_row"}, emitted_by_the_job())
+        self.assertIn("table_row", self.module.FLAG_CODES)
+        self.assertTrue(self.module.known_line("table_row: failed"))
+        self.assertEqual(["table_row: failed"], self.module.codes(f"{self.PREFIX}table_row: failed\n"))
+        for line in (
+            "table_row: 1 row",
+            "table_row: 3 rows",
+            "table_row: 0 rows",
+            "table_row: failed 3",
+            "table_row:failed",
+            "table_row: FAILED",
+            "table_rows: failed",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(self.module.known_line(line))
+                self.assertEqual([], self.module.codes(f"{self.PREFIX}{line}\n"))
+
     def test_the_flag_codes_are_the_ones_that_the_profile_job_can_reach(self) -> None:
         reached = reachable_flag_codes()
         self.assertEqual(reached, self.module.FLAG_CODES)
@@ -455,7 +474,23 @@ def reachable_flag_codes() -> set[str]:
             found |= {
                 item.value for item in ast.walk(node) if isinstance(item, ast.Constant) and isinstance(item.value, str) and item.value in split_table.CODES
             }
-    return found | {"plan_differs", "readback_differs"}
+    return found | emitted_by_the_job() | {"plan_differs", "readback_differs"}
+
+
+def emitted_by_the_job() -> set[str]:
+    """The ``<code>: failed`` lines that the job itself builds with ``flag("<code>")`` (``spark/jobs/signal_profile.py``): the codes of its own checks of the
+    split table, which the functions of ``spark/split_table.py`` do not print."""
+    tree = ast.parse((ROOT / "spark" / "jobs" / "signal_profile.py").read_text())
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "flag"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
 
 
 if __name__ == "__main__":

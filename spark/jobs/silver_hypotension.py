@@ -42,7 +42,7 @@ from spark.silver.run import BRANCH_MOVED, Fingerprint
 from spark.silver.tables import HYPOTENSION_TABLES, NAMESPACE, WAVEFORM
 from spark.split_cli import open_client, read_settings, start_deadline
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
-from spark.split_table import PatientSplitError, SplitRow, flag, schema_problems
+from spark.split_table import PatientSplitError, flag, schema_problems, table_rows
 
 JOB = "silver_hypotension"
 WAVEFORM_TABLE = f"{NAMESPACE}.{WAVEFORM.name}"
@@ -98,8 +98,8 @@ class HypotensionLake(Lake):
 
     def split_problems(self, frame: Any) -> list[str]:
         """The patient split table checked by the split job's own rules: a set is trusted only when this is empty."""
-        rows = [SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in frame.collect()]
-        return split_rule_problems(rows)
+        rows, broken = table_rows(frame.collect())
+        return [*([flag("table_row")] if broken else []), *split_rule_problems(rows)]
 
     def read_input(self, at: str) -> InputRead:
         """The three inputs at ``at``. The checks of who owns a case and of the split come first, and the facts that join a case to a set are read only when

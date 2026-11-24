@@ -1,9 +1,9 @@
 """The checks of the label tables, on counts that the Spark job reads from them. No Spark runs here.
 
 ``input_problems`` judges the input before anything is written, in this order, each step alone when it fails: a case with more than one row (an ambiguous
-owner), a patient split that fails the split job's own rule check (a set is trusted only after it), a case with no split row, no case at all, then no
-development case. ``table_problems`` judges a table that was written (or that a branch holds): the measure of ``icu_days``, the intensive care labels and the
-kidney injury labels.
+owner), a patient split that fails the split job's own rule check (a set is trusted only after it), a creatinine result with no ``source_occurrence``
+(``table_row``), a case with no split row, no case at all, then no development case. ``table_problems`` judges a table that was written (or that a branch
+holds): the measure of ``icu_days``, the intensive care labels and the kidney injury labels.
 
 The labels are outcomes and the test set is sealed. Every check about a label table returns a flag, ``code: failed``, and never a count: that holds for the
 check that a label table has a row for every case too, which says that it does not and never by how many. A check returns its problems and never raises, so
@@ -28,7 +28,7 @@ from spark.bronze.checks import GUARD_KEY, GUARD_STRUCTURE, Check
 from spark.silver.checks import FLAG, flagged
 from spark.silver.label_measure import UNITS
 from spark.split_table import CODES as SPLIT_CODES
-from spark.split_table import SplitRow
+from spark.split_table import SplitRow, flag
 from spark.split_table import table_problems as split_table_problems
 
 MEASURE = "icu_days_measure"
@@ -73,7 +73,8 @@ INHERITED = "inherited_problem"
 class InputFacts:
     """What a read of the input at one hash shows: the cases of ``silver.cases``, the patient split and the development cases.
 
-    ``ambiguous_owner`` and ``cases_without_split`` are flags (0 or 1). ``split_problems`` are the problems of the split table by itself
+    ``ambiguous_owner``, ``cases_without_split`` and ``unusable_results`` (a creatinine result of ``silver.lab_results`` with no ``source_occurrence``, which
+    the kidney rule cannot place) are flags (0 or 1). ``split_problems`` are the problems of the split table by itself
     (``split_rule_problems``); when it is not empty the other facts were not read, because a set is not trusted yet.
     """
 
@@ -82,6 +83,7 @@ class InputFacts:
     cases_without_split: int
     split_problems: tuple[str, ...]
     development_cases: int
+    unusable_results: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +118,8 @@ def input_problems(facts: InputFacts) -> list[str]:
         return [f"ambiguous_case_owner: {FLAG}"]
     if facts.split_problems:
         return list(facts.split_problems)
+    if facts.unusable_results:
+        return [flag("table_row")]
     if facts.cases_without_split:
         return [f"case_without_split: {FLAG}"]
     if facts.cases == 0:
