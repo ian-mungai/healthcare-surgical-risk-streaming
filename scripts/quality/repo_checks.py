@@ -129,7 +129,7 @@ def message_findings(location: str, message: str, *, comments: bool = False, rev
 
 
 def commit_message(path: str) -> list[Finding]:
-    return message_findings(path, Path(path).read_text(), comments=True, reveal_subject=True)
+    return message_findings(path, Path(path).read_text(encoding="utf-8"), comments=True, reveal_subject=True)
 
 
 SHORT_SHA = 12
@@ -165,7 +165,7 @@ def read_allowlist(committed: list[tuple[str, bytes]] | None = None) -> tuple[li
     findings: list[Finding] = []
     kinds = [*PRIVACY_PATTERNS, "env-value"]
     if committed is None:
-        source = Path(ALLOWLIST).read_text() if Path(ALLOWLIST).exists() else None
+        source = Path(ALLOWLIST).read_text(encoding="utf-8") if Path(ALLOWLIST).exists() else None
     else:
         source = next((data.decode("utf-8", "replace") for path, data in committed if path == ALLOWLIST), None)
     if source is None:
@@ -189,7 +189,7 @@ def env_values() -> list[str]:
     if not Path(".env").is_file():
         return []
     values = []
-    for line in Path(".env").read_text().splitlines():
+    for line in Path(".env").read_text(encoding="utf-8").splitlines():
         key, _, value = line.partition("=")
         value = value.strip().strip("\"'")
         if ENV_VALUE_KEYS.search(key.strip().upper()) and len(value) >= ENV_VALUE_MINIMUM and not line.lstrip().startswith("#"):

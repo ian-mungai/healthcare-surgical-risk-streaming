@@ -43,6 +43,7 @@ from scripts.ingestion.record_load import (
 from scripts.ingestion.record_state import RunState, StateError
 from scripts.ingestion.table_checks import TableChecksError, parse_load_record
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
+from tests.fast.locale_support import non_utf_8_locale
 from tests.fast.record_support import BASE_HASH, RELEASE_FILES, RUN, FakeAirbyte, FakeCatalog, FakeClock, Stopped, landed_records
 
 ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://nessie.example:19120/api/v2")
@@ -606,6 +607,24 @@ class LoadRecordShapeTest(unittest.TestCase):
         with self.assertRaises(LoadError) as raised:
             read_record(setup.folder, RUN)
         self.assertEqual("the record of this run cannot be read", str(raised.exception))
+
+    def test_a_record_with_a_byte_that_is_not_utf_8_is_refused_and_skipped_under_a_locale_that_would_decode_it(self) -> None:
+        """Join round 3, finding 2: ``read_text()`` used the locale's encoding, so under ``ISO8859-1`` a record with a ``0xff`` byte was accepted."""
+        setup = Setup(self)
+        result = setup.load()
+        record = setup.folder / f"{RUN}.json"
+        document = json.loads(record.read_text(encoding="utf-8"))
+        document["branch"] += "MARK"
+        broken = json.dumps(document).encode().replace(b"MARK", b"\xff")
+        record.write_bytes(broken)
+        (setup.folder / "zzz_other.json").write_bytes(broken)
+        with non_utf_8_locale():
+            self.assertEqual(document["branch"].replace("MARK", "\xff"), LoadResult.from_json(record.read_text()).branch, "the simulation reads the byte")
+            with self.assertRaises(LoadError) as raised:
+                read_record(setup.folder, RUN)
+            self.assertEqual("the record of this run cannot be read", str(raised.exception))
+            self.assertIsNone(earlier_record(setup.folder, setup.reference.sha256), "files that are not UTF-8 text are not records")
+        self.assertIsNotNone(result)
 
     def test_the_run_record_is_written_last_so_a_stop_between_the_two_files_is_an_unfinished_load_that_a_retry_completes(self) -> None:
         setup = Setup(self)

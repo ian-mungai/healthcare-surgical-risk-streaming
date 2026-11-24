@@ -268,7 +268,7 @@ def branch_line(branch: str) -> str:
 def read_track_pin(path: Path = TRACKED_RELEASE_FILE) -> rules.TrackPin:
     """The track list's pinned row count and digest from the tracked release file, whose path is fixed in code. The default is the only caller's path."""
     try:
-        return rules.track_pin(json.loads(path.read_text()))
+        return rules.track_pin(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError) as error:
         raise TableChecksError(f"the release file cannot be used for the track list's pin: {type(error).__name__}") from None
 
@@ -446,7 +446,7 @@ def pending_path(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Pat
 def load_lock(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Iterator[None]:
     """Hold the one lock of a load: a second run of the same load fails at once with a clear message. The lock ends with the process, so a crash leaves none."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    handle = lock_path(manifest_sha256, directory).open("w")
+    handle = lock_path(manifest_sha256, directory).open("w", encoding="utf-8")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -527,7 +527,7 @@ def read_pending(state_directory: Path, record: LoadRecord) -> Pending | None:
         return None
     try:
         pending = closed(
-            json.loads(path.read_text()),
+            json.loads(path.read_text(encoding="utf-8")),
             {"format": str, "manifest": str, "branch": str, "source": str, "started": float, "run_id": str},
             "the pending merge record",
         )
@@ -575,7 +575,7 @@ def write_result(run_folder: Path, document: Mapping[str, Any]) -> None:
     existing = run_folder / RESULT_FILE
     if existing.is_file() and document.get("merged") is not True:
         try:
-            was_merged = json.loads(existing.read_text()).get("merged") is True
+            was_merged = json.loads(existing.read_text(encoding="utf-8")).get("merged") is True
         except ValueError, AttributeError:
             was_merged = False
         if was_merged:
@@ -589,7 +589,7 @@ def saved_result(run_folder: Path, record: LoadRecord) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        document = json.loads(path.read_text())
+        document = json.loads(path.read_text(encoding="utf-8"))
         same = document["manifest"] == asdict(record.manifest) and document["load"] == record.document
     except ValueError, KeyError, TypeError:
         same = False

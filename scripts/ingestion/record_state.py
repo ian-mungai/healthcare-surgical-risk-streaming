@@ -44,7 +44,7 @@ class RunState:
 
     def read(self) -> None:
         try:
-            document = json.loads(self.path.read_text())
+            document = json.loads(self.path.read_text(encoding="utf-8"))
             if type(document) is not dict or set(document) != set(STATE_FIELDS) or document["format"] != STATE_FORMAT or document["run_id"] != self.run_id:
                 raise ValueError
             copies, jobs, branch = document["copies"], document["jobs"], document["branch"]

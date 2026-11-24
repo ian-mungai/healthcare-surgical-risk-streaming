@@ -91,7 +91,7 @@ def seconds(environment: Mapping[str, str], name: str, default: float) -> float:
 def secret_file(environment: Mapping[str, str], name: str) -> str:
     path = Path(setting(environment, name))
     try:
-        value = path.read_text().strip()
+        value = path.read_text(encoding="utf-8").strip()
     except OSError, UnicodeDecodeError:
         raise SettingsError(f"the file named by {name} cannot be read") from None
     if not value:
@@ -109,7 +109,7 @@ def plain_http(name: str, value: str) -> str:
 def api_address(environment: Mapping[str, str]) -> str:
     """The Airbyte address from the file that the deploy wrote, and nowhere else. ``SettingsError`` unless it is ``http://<private IPv4>:<port>``."""
     try:
-        text = Path(setting(environment, "AIRBYTE_API_URL_FILE")).read_text().strip()
+        text = Path(setting(environment, "AIRBYTE_API_URL_FILE")).read_text(encoding="utf-8").strip()
     except OSError, UnicodeDecodeError:
         raise SettingsError("the file named by AIRBYTE_API_URL_FILE cannot be read") from None
     try:
@@ -122,7 +122,7 @@ def api_address(environment: Mapping[str, str]) -> str:
 def nessie_address(environment: Mapping[str, str]) -> str:
     """The Nessie address as Airbyte's pods reach it, from the file that the deploy wrote beside the credentials. It carries no credential."""
     try:
-        text = Path(setting(environment, "AIRBYTE_NESSIE_URL_FILE")).read_text().strip()
+        text = Path(setting(environment, "AIRBYTE_NESSIE_URL_FILE")).read_text(encoding="utf-8").strip()
     except OSError, UnicodeDecodeError:
         raise SettingsError("the file named by AIRBYTE_NESSIE_URL_FILE cannot be read") from None
     try:
@@ -194,7 +194,7 @@ def main(argv: list[str] | None = None, environment: Mapping[str, str] | None = 
     loader.add_argument("--reference", type=Path, required=True, help="the manifest reference file of the passed check")
     arguments = parser.parse_args(argv)
     try:
-        reference = ManifestRef.from_json(arguments.reference.read_text())
+        reference = ManifestRef.from_json(arguments.reference.read_text(encoding="utf-8"))
         result = run_load(settings_from_environment(os.environ if environment is None else environment), arguments.run_id, reference)
     except (SettingsError, LoadError, CopyError, AirbyteError, NessieError, DefinitionError, ClosedError) as error:
         sys.stderr.write(f"{describe_error(error)}\n")

@@ -62,7 +62,7 @@ def rows_digest(rows: Iterable[Sequence[str]]) -> tuple[int, str]:
 def pinned_track_list() -> PinnedTrackList:
     """The pinned address, row count and digest of the tracked release pin. Raise ``TrackListPinError`` when the pin is not valid."""
     try:
-        release = json.loads(RELEASE_FILE.read_text())
+        release = json.loads(RELEASE_FILE.read_text(encoding="utf-8"))
     except OSError, ValueError:
         raise TrackListPinError("the tracked release pin cannot be read") from None
     if release_problems(release):

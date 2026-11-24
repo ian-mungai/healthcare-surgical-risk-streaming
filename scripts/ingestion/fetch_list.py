@@ -36,7 +36,7 @@ class ListPin:
 def tracked_list_pin() -> ListPin:
     """The key, size and SHA-256 of the checksum list in the tracked release pin. Raise ``PublisherError`` when the pin is not valid."""
     try:
-        pin = parse_json(RELEASE_FILE.read_text(), Subject.TRACKED_PIN)
+        pin = parse_json(RELEASE_FILE.read_text(encoding="utf-8"), Subject.TRACKED_PIN)
     except ClosedInputError, OSError, UnicodeDecodeError:
         raise PublisherError(Notice(Code.PIN_UNREADABLE)) from None
     if release_problems(pin):

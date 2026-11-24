@@ -189,7 +189,7 @@ def python_files(changed: list[str]) -> list[str]:
 
 def mypy_folders(root: Path) -> tuple[str, ...]:
     """The folders and files that the project's MyPy configuration checks."""
-    configuration = tomllib.loads((root / "pyproject.toml").read_text()) if (root / "pyproject.toml").is_file() else {}
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8")) if (root / "pyproject.toml").is_file() else {}
     return tuple(configuration.get("tool", {}).get("mypy", {}).get("files", ()))
 
 
@@ -243,7 +243,7 @@ def import_graph(root: Path) -> dict[str, set[str]]:
     direct: dict[str, set[str]] = {}
     for name, file in files.items():
         try:
-            direct[name] = imported_modules((root / file).read_text(), name, files)
+            direct[name] = imported_modules((root / file).read_text(encoding="utf-8"), name, files)
         except SyntaxError, UnicodeDecodeError:
             direct[name] = set()
     graph: dict[str, set[str]] = {}
@@ -272,7 +272,7 @@ def select_tests(root: Path, changed: list[str]) -> list[str]:
     """The quick test modules (dotted names) that cover the changed files: a changed test module, a module that imports a changed file through any depth
     of imports and a module whose text names a changed path, file name or module."""
     graph = import_graph(root)
-    texts = {name: (root / f"{name.replace('.', '/')}.py").read_text() for name in graph}
+    texts = {name: (root / f"{name.replace('.', '/')}.py").read_text(encoding="utf-8") for name in graph}
     selected = set()
     for name, reached in graph.items():
         own = f"{name.replace('.', '/')}.py"

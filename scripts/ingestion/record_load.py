@@ -287,7 +287,7 @@ def record_path(record_dir: Path, run_id: str) -> Path:
 def read_record(record_dir: Path, run_id: str) -> LoadResult | None:
     path = record_path(record_dir, run_id)
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except OSError, UnicodeDecodeError:
@@ -336,7 +336,7 @@ def current_load_record_text(path: Path) -> str:
     mismatch is refused, and the current text is made in memory from the record. A file of the current format is returned as it is, and the table checks'
     parser judges it.
     """
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     try:
         document = json.loads(text)
     except ValueError:
@@ -376,7 +376,7 @@ def earlier_record(record_dir: Path, sha256: str) -> LoadResult | None:
     found: list[tuple[float, str, LoadResult]] = []
     for path in list_files(record_dir, "*.json"):
         try:
-            record = LoadResult.from_json(path.read_text())
+            record = LoadResult.from_json(path.read_text(encoding="utf-8"))
         except LoadError, UnicodeDecodeError:
             continue
         modified = path.stat().st_mtime

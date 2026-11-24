@@ -69,7 +69,7 @@ def refuse(*notices: Notice) -> int:
 
 def read_input(path: Path, role: Subject) -> str:
     try:
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     except OSError, UnicodeDecodeError:
         raise InputError(Notice(Code.CANNOT_READ, subject=role)) from None
 

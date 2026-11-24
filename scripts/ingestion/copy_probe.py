@@ -93,7 +93,7 @@ class Pins:
 def tracked_pins() -> Pins:
     """The pins of the tracked files: the candidate file and the release pin's two tables. Raise ``ProbeRefused`` when the release pin is not valid."""
     try:
-        release = parse_json(RELEASE_FILE.read_text(), Subject.TRACKED_PIN)
+        release = parse_json(RELEASE_FILE.read_text(encoding="utf-8"), Subject.TRACKED_PIN)
     except ClosedInputError, OSError, UnicodeDecodeError:
         raise ProbeRefused(Notice(Code.PIN_UNREADABLE)) from None
     problems = release_problems(release)

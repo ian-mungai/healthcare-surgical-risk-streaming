@@ -17,6 +17,7 @@ from unittest import mock
 from scripts.ingestion import record_run
 from scripts.ingestion.record_run import SECRET_FILES, SettingsError, main, settings_from_environment
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
+from tests.fast.locale_support import non_utf_8_locale
 from tests.fast.record_support import RELEASE_FILES, FakeAirbyte, FakeCatalog, landed_records
 from tests.fast.test_record_catalog import Client, Server
 
@@ -110,16 +111,18 @@ class SettingsTest(EnvironmentCase):
             "AIRBYTE_NESSIE_URL_FILE",
         ):
             path = Path(self.environment[name])
-            with self.subTest(name=name):
-                original = path.read_bytes()
-                path.write_bytes(b"\xff\xfe\n")
-                try:
-                    with self.assertRaises(SettingsError) as raised:
-                        settings_from_environment(self.environment)
-                finally:
-                    path.write_bytes(original)
-                self.assertIn(name, str(raised.exception))
-                self.assertNotIn(str(self.folder), str(raised.exception))
+            original = path.read_bytes()
+            # Under Latin-1 ``0xff`` is a letter and ``0x85`` after an address is white space that ``strip`` removes: only the encoding refuses them.
+            invalid = original.rstrip(b"\n") + b"\x85\n" if name.endswith("_URL_FILE") else b"\xff\xfe\n"
+            for locale_name, locale in (("UTF-8", contextlib.nullcontext()), ("ISO8859-1", non_utf_8_locale())):
+                with self.subTest(name=name, locale=locale_name), locale:
+                    path.write_bytes(invalid)
+                    try:
+                        with self.assertRaises(SettingsError) as raised:
+                            settings_from_environment(self.environment)
+                    finally:
+                        path.write_bytes(original)
+                    self.assertEqual(f"the file named by {name} cannot be read", str(raised.exception))
 
     def test_a_deadline_that_is_not_a_positive_number_is_refused(self) -> None:
         for value in ("0", "-5", "soon", "nan", "inf"):

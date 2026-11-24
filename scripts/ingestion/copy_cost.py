@@ -185,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         check_new_output(arguments.output)
         try:
-            text = arguments.result.read_text()
+            text = arguments.result.read_text(encoding="utf-8")
         except OSError, UnicodeDecodeError:
             raise CostError("the check result cannot be read") from None
         document = estimate(
