@@ -20,7 +20,9 @@ from collections.abc import Callable
 
 from features.sampling import ANONYMISED_START
 from features.signal_validity import FLOAT_FORMATS, GAP_MARKERS
+from replay.events.errors import EventModelError
 from replay.events.identity import Occurrence
+from replay.events.manifest import ManifestError, reference_seconds
 from replay.events.recording import WAVEFORM_FORMATS, CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
 from replay.events.schedule import ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import earliest_due_offset_us, occurrence_events, outgoing
@@ -84,6 +86,17 @@ class WaveformSeconds(unittest.TestCase):
         for rate in (0.0, -1.0, float("inf"), float("nan")):
             with self.subTest(rate=rate), self.assertRaises(ValueError):
                 second_spans(waveform(rate, (0, [1.0])))
+
+    def test_a_track_with_no_packet_and_a_rate_that_cannot_hold_is_refused_with_the_refusal_of_the_manifest(self) -> None:
+        """The loop over the packets did not run for an empty track, so the replay skipped a track that the manifest refuses."""
+        for rate in (0.0, -1.0, float("inf"), float("nan")):
+            track = waveform(rate)
+            with self.subTest(rate=rate):
+                with self.assertRaises(EventModelError) as replay:
+                    second_spans(track)
+                with self.assertRaises(ManifestError) as manifest:
+                    reference_seconds(track)
+                self.assertEqual(str(manifest.exception), str(replay.exception))
 
 
 def keys_of(recording: CaseRecording) -> list[tuple[str, str, int, int, int]]:

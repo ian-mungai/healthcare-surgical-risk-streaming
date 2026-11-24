@@ -9,6 +9,7 @@ sample after the start of the second. The manifest derives the same seconds samp
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from features.sampling import ANONYMISED_START, SamplingError, packet_pieces
@@ -16,6 +17,7 @@ from replay.events.errors import EventModelError
 from replay.events.recording import WaveformTrack
 
 MICROSECONDS = 1_000_000
+RATE_REFUSAL = "a waveform's sample rate must be a positive finite number"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +30,8 @@ class SecondSpan:
 
 
 def second_spans(track: WaveformTrack) -> list[SecondSpan]:
+    if not math.isfinite(track.sample_rate) or track.sample_rate <= 0:
+        raise EventModelError(RATE_REFUSAL)
     pieces: dict[int, list[tuple[int, int, int]]] = {}
     offsets: dict[int, int] = {}
     for index, record in enumerate(track.records):

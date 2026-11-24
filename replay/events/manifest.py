@@ -25,7 +25,7 @@ from replay.events.identity import Marker, marker_event_id, source_event_id
 from replay.events.payload import payload_digest
 from replay.events.recording import CaseRecording, WaveformTrack
 from replay.events.schedule import FrozenSchedule, ScheduledOccurrence, admitted_occurrences
-from replay.events.waveform import MICROSECONDS
+from replay.events.waveform import MICROSECONDS, RATE_REFUSAL
 
 MANIFEST_FORMAT = "replay_manifest_2"
 REPORT_LINES_PER_KIND = 20
@@ -112,7 +112,7 @@ def reference_seconds(track: WaveformTrack) -> dict[int, tuple[int, list[float]]
     rounded before the floor. It shares no step with ``features.sampling.packet_pieces``, which cuts whole packets.
     """
     if not math.isfinite(track.sample_rate) or track.sample_rate <= 0:
-        raise ManifestError("a waveform's sample rate must be a positive finite number")
+        raise ManifestError(RATE_REFUSAL)
     rate, origin = Fraction(track.sample_rate), Fraction(ANONYMISED_START)
     seconds: dict[int, tuple[int, list[float]]] = {}
     for record in track.records:
