@@ -344,6 +344,39 @@ class GroupAccessAloneTest(unittest.TestCase):
         self.assertLess(folder, template)
 
 
+class GroupAccessCheckTest(unittest.TestCase):
+    """`kubectl auth can-i VERB kind/sub` reads `sub` as a resource name, so a subresource check must pass `--subresource` (host run, Nov 23 2026)."""
+
+    def check(self) -> dict[str, Any]:
+        document: Any = load_yaml((ROLE / "tasks" / "group_access.yml").read_text())
+        return next(task for task in document[0]["block"] if task.get("name") == "Check what the account may do and may not do")
+
+    def test_no_check_names_a_subresource_inside_the_resource(self) -> None:
+        for item in self.check()["loop"]:
+            with self.subTest(item=item):
+                self.assertNotIn("/", item["resource"])
+
+    def test_the_scale_and_exec_checks_name_their_subresource_and_the_command_passes_it(self) -> None:
+        task = self.check()
+        subresources = {(item["verb"], item["resource"], item.get("subresource")) for item in task["loop"]}
+        self.assertTrue({("patch", "deployments.apps", "scale"), ("patch", "statefulsets.apps", "scale"), ("create", "pods", "exec")} <= subresources)
+        self.assertIn("--subresource={{ item.subresource | default('') }}", task["ansible.builtin.command"]["argv"])
+
+    def test_every_resource_outside_the_core_group_names_its_group(self) -> None:
+        """Without its group, kubectl resolves a resource through discovery; when discovery fails it falls back to the core group, warns on stderr and answers
+        no, so a denial would pass for the wrong group."""
+        core = {"pods", "secrets", "services", "configmaps", "serviceaccounts", "persistentvolumeclaims", "events", "endpoints"}
+        for item in self.check()["loop"]:
+            with self.subTest(item=item):
+                self.assertTrue(item["resource"] in core or "." in item["resource"], "name the API group, as in deployments.apps")
+
+    def test_any_output_on_stderr_fails_the_check(self) -> None:
+        condition = self.check()["failed_when"]
+        conditions = condition if isinstance(condition, list) else [condition]
+        expected = "airbyte_group_access_checks.stdout | trim != item.answer or airbyte_group_access_checks.stderr | trim | length > 0"
+        self.assertEqual([expected], [" ".join(text.split()) for text in conditions], "one condition, exactly this one: a second clause could pass a warned no")
+
+
 def policies(text: str) -> list[dict[str, Any]]:
     return [mapping(load_yaml(part)) for part in text.split("\n---\n") if part.strip()]
 
