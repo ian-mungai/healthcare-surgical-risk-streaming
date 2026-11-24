@@ -86,7 +86,7 @@ from spark.silver_cases_sql import (
     values_query,
 )
 from spark.split_cli import open_client, read_settings
-from spark.split_table import BRANCH_MOVED, SplitRow
+from spark.split_table import BRANCH_MOVED, table_rows
 
 MEASURE_COLUMNS = (("statistic", "string"), ("unit", "string"), ("value", "bigint"))
 CUTOFF_COLUMNS = (
@@ -142,10 +142,8 @@ class Lake:
 
     def split_problems(self) -> list[str]:
         """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
-        rows = [
-            SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in self.session.table(SPLIT_SOURCE).collect()
-        ]
-        return split_rule_problems(rows, pinned=False)
+        rows, broken = table_rows(self.session.table(SPLIT_SOURCE).collect())
+        return [*([f"table_row: {unit(broken, 'row')}"] if broken else []), *split_rule_problems(rows, pinned=False)]
 
     def input_facts(self) -> dict[str, object]:
         """The counts over the inputs. The outcome columns are counted for development patients only; for the others one flag (0 or 1) says whether any value

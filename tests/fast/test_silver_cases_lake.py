@@ -20,6 +20,8 @@ from typing import Any
 
 from scripts.sample.split import patient_part
 from spark.jobs.silver_cases import CUTOFF_COLUMNS, MEASURE_COLUMNS, Lake
+from spark.jobs.silver_reconcile import ReconcileLake
+from spark.reconcile.checks import SPLIT_REFUSAL
 from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, CutoffRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.split_table import RULE_VERSION, SET_NAMES
 
@@ -196,14 +198,22 @@ class ExistingRulesTest(unittest.TestCase):
         self.assertEqual((None, [CutoffRow("start", "opstart", 0, "fixed", "v", 3, 5400)]), engine.existing_rules())
 
 
-def split_table(count: int, relabel: int | None = None) -> Frame:
+def split_row_dicts(count: int, relabel: int | None = None) -> list[dict[str, Any]]:
     rows = [
         {"subjectid": str(patient), "set": SET_NAMES[patient_part(patient)], "rule_version": RULE_VERSION, "source_snapshot_id": 7}
         for patient in range(1, count + 1)
     ]
     if relabel is not None:
         rows[relabel]["set"] = "training"
+    return rows
+
+
+def split_table_of(rows: list[dict[str, Any]]) -> Frame:
     return Frame([("subjectid", "string")], rows, [])  # type: ignore[arg-type]
+
+
+def split_table(count: int, relabel: int | None = None) -> Frame:
+    return split_table_of(split_row_dicts(count, relabel))
 
 
 class WriteRulesTest(unittest.TestCase):
@@ -301,6 +311,49 @@ class SplitRuleTest(unittest.TestCase):
         held_out = next(patient for patient in range(1, 300) if patient_part(patient) == "test")
         engine = Lake(Session({"lake.silver.patient_split": split_table(300, held_out - 1)}, {}, []), None, "b")  # type: ignore[arg-type]
         self.assertEqual(["rule_mismatch: 1 patient"], engine.split_problems())
+
+
+class SplitRowFormTest(unittest.TestCase):
+    """A split row with no subject or no source snapshot is a broken split table, named by its code, and never an unexpected failure of the job."""
+
+    def engine(self, *changes: dict[str, Any]) -> Lake:
+        """The lake over a split table whose last rows hold the changes."""
+        rows = split_row_dicts(300)
+        for index, change in enumerate(changes):
+            rows[-1 - index] = {**rows[-1 - index], **change}
+        return Lake(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b")  # type: ignore[arg-type]
+
+    def test_a_row_without_a_subject_is_named_and_not_a_failure(self) -> None:
+        self.assertEqual(["table_row: 1 row"], self.engine({"subjectid": None}).split_problems())
+
+    def test_a_row_without_a_source_snapshot_is_named_and_not_a_failure(self) -> None:
+        self.assertEqual(["table_row: 1 row"], self.engine({"source_snapshot_id": None}).split_problems())
+
+    def test_a_subject_or_a_snapshot_of_another_type_is_named_and_not_a_failure(self) -> None:
+        for change in ({"subjectid": 10}, {"source_snapshot_id": "7"}, {"source_snapshot_id": True}):
+            with self.subTest(change=change):
+                self.assertEqual(["table_row: 1 row"], self.engine(change).split_problems())
+
+    def test_every_row_that_is_not_in_form_is_counted(self) -> None:
+        self.assertEqual(["table_row: 2 rows"], self.engine({"subjectid": None}, {"source_snapshot_id": None}).split_problems())
+
+    def test_the_reconciliation_refuses_the_run_with_its_code_for_a_broken_split_and_does_not_fail(self) -> None:
+        rows = split_row_dicts(300)
+        rows[-1] = {**rows[-1], "subjectid": None}
+
+        class Quiet(ReconcileLake):
+            def ownership_problems(self) -> list[str]:
+                return []
+
+        engine = Quiet(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b")  # type: ignore[arg-type]
+        self.assertEqual([SPLIT_REFUSAL], engine.refusals())
+
+    def test_the_other_checks_still_run_on_the_rows_that_are_in_form(self) -> None:
+        held_out = next(patient for patient in range(1, 300) if patient_part(patient) == "test")
+        rows = split_row_dicts(300, held_out - 1)
+        rows[-1] = {**rows[-1], "subjectid": None}
+        problems = Lake(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b").split_problems()  # type: ignore[arg-type]
+        self.assertEqual(["table_row: 1 row", "rule_mismatch: 1 patient"], problems)
 
 
 class OutputSchemaTest(unittest.TestCase):
