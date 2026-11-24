@@ -6,10 +6,15 @@ sealed job: the reserved ``<path>.part`` is the only staging file, and it never 
 command owns and must update (it replaces only a regular file directly inside the state folder that the command created or was given).
 
 ``test_no_call_writes_a_file_outside_the_helpers_or_the_list`` parses every production Python file (``scripts``, ``replay``, ``spark``, ``features``,
-``infra`` and ``orchestration``; not a ``tests`` folder) with ``ast`` and lists each call that writes, moves or links a file. A call fails the test unless
-it sits in one of the helpers or matches an entry of ``ALLOWED`` (file, enclosing function, call text, count, reason). An entry that no longer matches
-a call fails the test too, so the list never keeps a site that was moved onto a helper. The scan tests plant one direct write per pattern and check that
-the scan finds it.
+``infra``, ``orchestration``, ``dagster`` and ``ansible``; not a ``tests`` folder) with ``ast`` and lists each call that writes, moves or links a file.
+A call fails the test unless it sits in one of the helpers or matches an entry of ``ALLOWED`` (file, enclosing function, call text, count, reason). An entry
+that no longer matches a call fails the test too, so the list never keeps a site that was moved onto a helper. The scan tests plant one direct write per
+pattern and check that the scan finds it.
+
+The scan cannot see what a value holds, so it counts a value that it cannot read as a write: a mode or ``os.open`` flags that are a variable, a call or an
+unpacked list (only ``O_*`` constants joined with ``|`` are read-only), and a ``getattr`` of a non-literal name on a module that writes. It follows a name that
+stands for a function or module of another file (``import os as o``, ``from os import replace as swap``, ``move = os.rename``), so the plain forms and
+the renamed ones are one call. The call text in a list entry is the text as it is written in the file.
 
 A second rule covers ``replace_owned_file``: ``state_root`` is the folder that makes a replace safe, so it must come from a fixed source (a module constant, a
 folder the same command made in this run, or a state-folder setting) and never from the path that is replaced. ``test_no_state_root_comes_from_the_path``
@@ -27,7 +32,7 @@ from pathlib import Path
 
 from tests.fast.git_fixture import ROOT
 
-SCANNED = ("scripts", "replay", "spark", "features", "infra", "orchestration", "dagster")
+SCANNED = ("scripts", "replay", "spark", "features", "infra", "orchestration", "dagster", "ansible")
 HELPER_FILE = "scripts/ingestion/output_file.py"
 HELPERS = frozenset({"write_new_file", "publish_reserved", "replace_owned_file"})
 OPEN_MODE = re.compile(r"^[rwxabt+]+(:[A-Za-z0-9*]+)?$")
@@ -39,12 +44,32 @@ SHUTIL_WRITES = frozenset({"copy", "copy2", "copyfile", "copyfileobj", "copytree
 DUMPS = frozenset({"json", "pickle", "marshal", "yaml", "tomli_w", "plistlib"})
 TEMPORARY_FILES = frozenset({"mkstemp", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile"})
 ARCHIVES = frozenset({"gzip", "bz2", "lzma", "tarfile", "codecs"})
+# A name that is looked up with ``getattr`` on one of these modules, and is not a literal, may be any of their writes.
+WRITING_MODULES = frozenset({"os", "posix", "shutil", "tempfile", "io", *DUMPS, *ARCHIVES})
 
 TD_REASON = "Teardown code: phase 13 reviews it; the file is in the removal folder of the run that the teardown created"
+ANSIBLE_PRIVATE_FILE_REASON = (
+    "Ansible module code that runs on the managed host, where scripts/ingestion/output_file.py is not shipped; it makes the file with an exclusive create "
+    "in mode 0400 and renames or links it into place, as replace_owned_file and write_new_file do"
+)
+ANSIBLE_CREDENTIALS_REASON = (
+    "A script that Ansible copies to the managed host, where scripts/ingestion/output_file.py is not shipped; KNOWN GAP reported in round 2b: it writes the "
+    "partial file with the default mode and sets the mode afterwards, and it does not refuse an existing partial file"
+)
 TF_REASON = "A Terraform file in a run folder or work folder that the wrapper itself created; phase 13 reviews the wrapper with the teardown"
 
 # One entry per call site: (file, enclosing function, text of the call) -> (how many such calls, reason). A reason names why the site is not on a helper.
 ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
+    ("replay/service/serve.py", "read_result", "os.open"): (
+        1,
+        "The opener of a read: open(path, 'rb') calls it with the flags for reading, and it adds O_NONBLOCK so that a pipe at the path cannot hold the service",
+    ),
+    ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.open"): (1, ANSIBLE_PRIVATE_FILE_REASON),
+    ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.fdopen"): (1, ANSIBLE_PRIVATE_FILE_REASON),
+    ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.replace"): (1, ANSIBLE_PRIVATE_FILE_REASON),
+    ("ansible/roles/secret_files/module_utils/secret_files.py", "write_private_file", "os.link"): (1, ANSIBLE_PRIVATE_FILE_REASON),
+    ("ansible/roles/workload_access/files/workload_credentials.py", "write_credentials", "partial.write_text"): (1, ANSIBLE_CREDENTIALS_REASON),
+    ("ansible/roles/workload_access/files/workload_credentials.py", "write_credentials", "partial.replace"): (1, ANSIBLE_CREDENTIALS_REASON),
     ("scripts/evidence/export.py", "main", "tarfile.open"): (
         1,
         "The evidence archive is streamed into the export folder that the command made; it is too large to hold in memory for the helper",
@@ -217,6 +242,47 @@ OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
 }
 
 
+def dotted(node: ast.expr) -> str | None:
+    """The text of a plain chain of names (``os``, ``os.path``), or None for anything else."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = dotted(node.value)
+        return None if head is None else f"{head}.{node.attr}"
+    return None
+
+
+def aliases(tree: ast.AST) -> dict[str, str]:
+    """Each name that stands for a module or a function of another module: ``import os as o``, ``from os import replace as swap`` and ``move = os.rename``.
+
+    The map is for the whole file and not by scope, which can only make the scan stricter. A name that is given two meanings keeps the later one.
+    """
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update({item.asname: item.name for item in node.names if item.asname})
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            found.update({item.asname or item.name: f"{node.module}.{item.name}" for item in node.names})
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = dotted(node.value)
+            if value is not None and value != node.targets[0].id:
+                found[node.targets[0].id] = value
+    return found
+
+
+def resolve(node: ast.expr, names: dict[str, str]) -> str:
+    """The text of ``node`` with the first name of a plain chain replaced by what it stands for, until it stands for nothing else."""
+    text = dotted(node)
+    if text is None:
+        return ast.unparse(node)
+    for _ in range(len(names) + 1):
+        head, dot, rest = text.partition(".")
+        if head not in names or names[head] == head:
+            break
+        text = names[head] + dot + rest
+    return text
+
+
 def mode_writes(call: ast.Call, positions: tuple[int, ...], strict: tuple[int, ...] = ()) -> bool:
     """Whether the mode argument of an ``open``-like call may write: a string with ``w``, ``a``, ``x`` or ``+``, or (at a ``strict`` position or by keyword)
     a mode that is not a string literal."""
@@ -231,44 +297,60 @@ def mode_writes(call: ast.Call, positions: tuple[int, ...], strict: tuple[int, .
     return False
 
 
+def read_only_flags(expression: ast.expr) -> bool:
+    """Whether the flags are only ``O_*`` constants (or 0) joined with ``|``, such as ``os.O_RDONLY | os.O_NOFOLLOW``, and none of them writes."""
+    if isinstance(expression, ast.BinOp):
+        return isinstance(expression.op, ast.BitOr) and read_only_flags(expression.left) and read_only_flags(expression.right)
+    if isinstance(expression, ast.Attribute):
+        return isinstance(expression.value, ast.Name) and expression.attr.startswith("O_") and expression.attr not in WRITE_FLAGS
+    if isinstance(expression, ast.Name):
+        return expression.id.startswith("O_") and expression.id not in WRITE_FLAGS
+    return isinstance(expression, ast.Constant) and expression.value == 0 and type(expression.value) is int
+
+
 def flags_write(call: ast.Call) -> bool:
+    """Whether the flags of an ``os.open`` call may write: a write flag, or anything that is not a plain join of ``O_*`` constants (a variable, a call or an
+    unpacked list), because the scan cannot see what it holds. A call without flags writes nothing."""
     flags = [call.args[1]] if len(call.args) > 1 else [item.value for item in call.keywords if item.arg == "flags"]
-    return any(
-        isinstance(part, (ast.Attribute, ast.Name)) and (part.attr if isinstance(part, ast.Attribute) else part.id) in WRITE_FLAGS
-        for item in flags
-        for part in ast.walk(item)
-    )
+    return any(not read_only_flags(item) for item in flags)
 
 
-def writes_a_file(call: ast.Call) -> bool:
+def writes_a_file(call: ast.Call, names: dict[str, str] | None = None) -> bool:
+    """Whether ``call`` writes, moves or links a file. ``names`` are the aliases of the file (see ``aliases``), so ``o.replace`` after ``import os as o`` is
+    ``os.replace`` and ``replace`` after ``from os import replace`` is too."""
+    names = names or {}
     function = call.func
-    if isinstance(function, ast.Attribute):
-        owner = ast.unparse(function.value)
-        name = function.attr
-        if name in WRITE_METHODS:
-            return True
-        if owner in {"os", "posix"} and name in OS_MOVES:
-            return True
-        if owner == "os" and name == "open":
-            return flags_write(call)
-        if owner == "os" and name == "fdopen" or owner == "io" and name == "open":
-            return mode_writes(call, (1,), (1,))
-        if owner == "shutil" and name in SHUTIL_WRITES:
-            return True
-        if name == "dump" and owner in DUMPS and len(call.args) + len(call.keywords) >= 2:
-            return True
-        if owner == "tempfile" and name in TEMPORARY_FILES:
-            return True
-        if name in {"replace", "rename"} and len(call.args) == 1 and not call.keywords:
-            return True
-        if name == "open":
-            return mode_writes(call, (0, 1), (1,) if owner in ARCHIVES else ())
+    if isinstance(function, ast.Call) and dotted(function.func) == "getattr" and len(function.args) >= 2:
+        owner = resolve(function.args[0], names)
+        if not (isinstance(function.args[1], ast.Constant) and isinstance(function.args[1].value, str)):
+            return owner in WRITING_MODULES
+        name = function.args[1].value
+    elif isinstance(function, ast.Attribute):
+        owner, name = resolve(function.value, names), function.attr
+    elif isinstance(function, ast.Name):
+        owner, _, name = resolve(function, names).rpartition(".")
+    else:
         return False
-    if isinstance(function, ast.Name):
-        if function.id == "open":
-            return mode_writes(call, (1,), (1,))
-        if function.id in TEMPORARY_FILES:
-            return True
+    if name in WRITE_METHODS:
+        return True
+    if owner in {"os", "posix"} and name in OS_MOVES:
+        return True
+    if owner == "os" and name == "open":
+        return flags_write(call)
+    if (owner == "os" and name == "fdopen") or (owner == "io" and name == "open"):
+        return mode_writes(call, (1,), (1,))
+    if owner == "shutil" and name in SHUTIL_WRITES:
+        return True
+    if name == "dump" and owner in DUMPS and len(call.args) + len(call.keywords) >= 2:
+        return True
+    if (owner == "tempfile" and name in TEMPORARY_FILES) or (not owner and name in TEMPORARY_FILES):
+        return True
+    if not owner and name == "open":
+        return mode_writes(call, (1,), (1,))
+    if owner and name in {"replace", "rename"} and len(call.args) == 1 and not call.keywords:
+        return True
+    if owner and name == "open":
+        return mode_writes(call, (0, 1), (1,) if owner in ARCHIVES else (0,))
     return False
 
 
@@ -291,7 +373,10 @@ def write_calls(source: str) -> list[tuple[int, str, str]]:
     """The calls in ``source`` that write or move a file, as (line, enclosing function, call text)."""
     tree = ast.parse(source)
     scopes = enclosing(tree)
-    found = [(node.lineno, scopes.get(node, ""), ast.unparse(node.func)) for node in ast.walk(tree) if isinstance(node, ast.Call) and writes_a_file(node)]
+    names = aliases(tree)
+    found = [
+        (node.lineno, scopes.get(node, ""), ast.unparse(node.func)) for node in ast.walk(tree) if isinstance(node, ast.Call) and writes_a_file(node, names)
+    ]
     return sorted(found)
 
 
@@ -404,6 +489,35 @@ PLANTS = {
     "Path.symlink_to": "def f(path, target):\n    path.symlink_to(target)\n",
     "Path.touch": "def f(path):\n    path.touch()\n",
     "tempfile.mkstemp": "import tempfile\n\n\ndef f():\n    tempfile.mkstemp()\n",
+    "os.open with flags in a variable": "import os\n\n\ndef f(path, flags):\n    os.open(path, flags)\n",
+    "os.open with flags from a call": "import os\n\n\ndef f(path):\n    os.open(path, flags_for(path))\n",
+    "os.open with a read flag and a variable": "import os\n\n\ndef f(path, extra):\n    os.open(path, os.O_RDONLY | extra)\n",
+    "os.open with flags unpacked": "import os\n\n\ndef f(path, rest):\n    os.open(path, *rest)\n",
+    "os.open with flags by keyword in a variable": "import os\n\n\ndef f(path, flags):\n    os.open(path, flags=flags)\n",
+    "Path.open with a mode in a variable": "def f(path, mode):\n    path.open(mode)\n",
+    "Path.open with a mode in a variable by keyword": "def f(path, mode):\n    path.open(mode=mode)\n",
+    "Path.open with a mode from a constant": "MODE = 'w'\n\n\ndef f(path):\n    path.open(MODE)\n",
+    "open with a mode built from text": "def f(path, kind):\n    open(path, 'w' + kind)\n",
+    "os.fdopen with a mode in a variable": "import os\n\n\ndef f(descriptor, mode):\n    os.fdopen(descriptor, mode)\n",
+    "gzip.open with a mode in a variable": "import gzip\n\n\ndef f(path, mode):\n    gzip.open(path, mode)\n",
+    "import os as another name": "import os as o\n\n\ndef f(a, b):\n    o.replace(a, b)\n",
+    "import shutil as another name": "import shutil as sh\n\n\ndef f(a, b):\n    sh.move(a, b)\n",
+    "from os import a move": "from os import replace\n\n\ndef f(a, b):\n    replace(a, b)\n",
+    "from os import a move under another name": "from os import rename as shift\n\n\ndef f(a, b):\n    shift(a, b)\n",
+    "from os import link": "from os import link\n\n\ndef f(a, b):\n    link(a, b)\n",
+    "from shutil import a copy": "from shutil import copy2\n\n\ndef f(a, b):\n    copy2(a, b)\n",
+    "from shutil import a copy under another name": "from shutil import copyfile as duplicate\n\n\ndef f(a, b):\n    duplicate(a, b)\n",
+    "from json import dump": "from json import dump\n\n\ndef f(value, handle):\n    dump(value, handle)\n",
+    "from tempfile import a temporary file under another name": "from tempfile import mkstemp as make\n\n\ndef f():\n    make()\n",
+    "from os import open with flags": "from os import O_WRONLY, open as raw_open\n\n\ndef f(path):\n    raw_open(path, O_WRONLY)\n",
+    "from os import open with a mode that is not a flag": "from os import open as raw_open\n\n\ndef f(path, flags):\n    raw_open(path, flags)\n",
+    "from os import fdopen": "from os import fdopen\n\n\ndef f(descriptor):\n    fdopen(descriptor, 'wb')\n",
+    "import gzip as another name with a variable mode": "import gzip as gz\n\n\ndef f(path, mode):\n    gz.open(path, mode)\n",
+    "an alias by assignment": "import os\n\nmove = os.rename\n\n\ndef f(a, b):\n    move(a, b)\n",
+    "an alias by assignment of an alias": "import shutil as sh\n\ncopy = sh.copyfile\n\n\ndef f(a, b):\n    copy(a, b)\n",
+    "the module itself by assignment": "import os\n\nsystem = os\n\n\ndef f(a, b):\n    system.replace(a, b)\n",
+    "getattr with a name": "import os\n\n\ndef f(a, b):\n    getattr(os, 'replace')(a, b)\n",
+    "getattr with a name that is computed": "import os\n\n\ndef f(a, b, name):\n    getattr(os, name)(a, b)\n",
 }
 READS = {
     "open for reading": "def f(path):\n    open(path)\n    open(path, 'rb')\n    path.open('r')\n    path.open(newline='')\n",
@@ -411,6 +525,20 @@ READS = {
     "string replace": "def f(text):\n    return text.replace('a', 'b')\n",
     "json.dumps and loads": "import json\n\n\ndef f(value):\n    return json.loads(json.dumps(value))\n",
     "tarfile for reading": "import tarfile\n\n\ndef f(path):\n    tarfile.open(path, 'r:gz')\n",
+    "os.open for reading with every read flag": "import os\n\n\ndef f(path):\n    os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_DIRECTORY)\n",
+    "os.open for reading with the flags by keyword": "import os\n\n\ndef f(path):\n    os.open(path, flags=os.O_RDONLY)\n",
+    "os.open for reading through an alias": "import os as o\nfrom os import O_RDONLY\n\n\ndef f(path):\n    o.open(path, O_RDONLY | o.O_NONBLOCK)\n",
+    "other members of an aliased module": (
+        "import os as o\nimport shutil as sh\nimport json as j\n\n\ndef f(a):\n    return o.path.join(a), sh.which(a), j.dumps(a), o.getcwd()\n"
+    ),
+    "names imported from a module": (
+        "from os import getcwd, path\nfrom json import dumps, loads\n\n\ndef f(a):\n    return getcwd(), path.join(a), dumps(loads(a))\n"
+    ),
+    "an alias by assignment of a read": "import os\n\njoin = os.path.join\n\n\ndef f(a):\n    return join(a, 'b')\n",
+    "getattr of a read": "import os\n\n\ndef f():\n    return getattr(os, 'getcwd')()\n",
+    "a name that only looks like an import alias": "def f(replace, rename, link):\n    return replace, rename, link\n",
+    "getattr of a computed name on an object that is no writing module": "def f(obj, name):\n    return getattr(obj, name)()\n",
+    "a local name that is also a method of text": "from os import path as p\n\n\ndef f(text):\n    return p.exists(text), text.replace('a', 'b')\n",
 }
 
 
@@ -431,6 +559,25 @@ class ScanFindsEachPatternTests(unittest.TestCase):
         outside, stale = violations({"scripts/new_module.py": PLANTS["write_text"]}, {})
         self.assertEqual(["scripts/new_module.py:2 f: path.write_text"], outside)
         self.assertEqual([], stale)
+
+    def test_a_renamed_write_is_reported_with_the_text_it_has_in_the_file_and_is_listed_by_that_text(self) -> None:
+        source = "from os import rename as shift\n\n\ndef f(a, b):\n    shift(a, b)\n"
+        self.assertEqual(["scripts/a.py:5 f: shift"], violations({"scripts/a.py": source}, {})[0])
+        listed = {("scripts/a.py", "f", "shift"): (1, "a reason")}
+        self.assertEqual(([], []), violations({"scripts/a.py": source}, listed))
+
+    def test_the_names_of_a_file_are_resolved_through_every_step_and_a_name_that_stands_for_itself_ends(self) -> None:
+        tree = ast.parse("import os as o\nsystem = o\nmove = system.rename\nloop = loop\n")
+        names = aliases(tree)
+        self.assertEqual("os.rename", resolve(ast.parse("move", mode="eval").body, names))
+        self.assertEqual("loop", resolve(ast.parse("loop", mode="eval").body, names))
+        self.assertIn(resolve(ast.parse("swap", mode="eval").body, {"swap": "other", "other": "swap"}), ("swap", "other"))
+
+    def test_only_o_constants_are_read_only_flags(self) -> None:
+        read_only = ("os.O_RDONLY", "os.O_RDONLY | os.O_NONBLOCK", "O_RDONLY", "0", "os.O_RDONLY | 0")
+        may_write = ("flags", "os.O_WRONLY", "O_CREAT", "os.O_RDONLY | extra", "f(x)", "1", "os.O_RDONLY & os.O_NONBLOCK", "os.name", "*rest")
+        self.assertEqual([], [text for text in read_only if not read_only_flags(ast.parse(text, mode="eval").body)])
+        self.assertEqual([], [text for text in may_write if text != "*rest" and read_only_flags(ast.parse(text, mode="eval").body)])
 
     def test_a_write_inside_a_helper_is_not_reported_and_the_same_call_elsewhere_in_the_helper_file_is(self) -> None:
         source = "def write_new_file(path):\n    path.write_bytes(b'x')\n\n\ndef other(path):\n    path.write_bytes(b'x')\n"
@@ -522,7 +669,7 @@ class OwnedRootScanTests(unittest.TestCase):
 class ProductionWritesTests(unittest.TestCase):
     def test_the_scan_reaches_every_folder_of_production_code(self) -> None:
         names = production_files()
-        for folder in ("scripts/", "replay/", "spark/", "features/", "infra/", "orchestration/"):
+        for folder in ("scripts/", "replay/", "spark/", "features/", "infra/", "orchestration/", "ansible/"):
             self.assertTrue(any(name.startswith(folder) for name in names), folder)
         self.assertIn(HELPER_FILE, names)
         self.assertFalse([name for name in names if "/tests/" in name or name.startswith("tests/")])
