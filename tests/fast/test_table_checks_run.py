@@ -183,8 +183,8 @@ class FakeNessie(NessieClient):
 PASSING_DETAILS = {
     "columns": rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0),
     "rows digest": rules.detail("digest_compared", equal=1),
-    "key multiset": rules.detail("rows_differ", only_file=0, only_table=0),
-    "row payload": rules.detail("rows_differ", only_file=0, only_table=0),
+    "key multiset": rules.detail("table_compared", equal=1),
+    "row payload": rules.detail("table_compared", equal=1),
 }
 
 
@@ -193,12 +193,18 @@ def result_line(plan: rules.Plan, *, passed: bool = True, change: Callable[[dict
     results = []
     for entry in plan.tables:
         failing_table = not passed and entry.name == "lab_data"
-        rows = entry.rows if entry.rows else 5
+        sealed = rules.SPEC_BY_NAME[entry.name].sealed
         table = rules.TableResult(entry.name, entry.snapshot_id, columns_source=3, columns_table=3)
-        table.rows_source, table.rows_table = (2, 3) if failing_table else (rows, rows)
+        if not sealed:
+            table.rows_source = table.rows_table = entry.rows
         for name in rules.REQUIRED_CHECKS[entry.name][: 4 if failing_table else 99]:
-            counts = rules.detail("row_count", source=table.rows_source, table=table.rows_table)
-            table.add(name, counts if name == "row count" else PASSING_DETAILS.get(name, "ok"))
+            if name == "row count":
+                table.add(
+                    name,
+                    rules.detail("table_compared", equal=int(not failing_table)) if sealed else rules.detail("row_count", source=entry.rows, table=entry.rows),
+                )
+            else:
+                table.add(name, PASSING_DETAILS.get(name, "ok"))
         results.append(table)
     document = json.loads(json.dumps(rules.job_document(plan, results)))
     if change is not None:
@@ -1119,9 +1125,11 @@ class SingleResultTest(unittest.TestCase):
     def test_a_marker_in_a_detail_as_a_word_as_digits_and_as_a_code_like_token_reaches_no_file_and_no_message(self) -> None:
         variants = {
             "a lower-case word": "marker_9d2",
-            "a code-like token": "rows_differ_marker_9d2;only_file=1;only_table=0",
-            "digits in a count": "row_count;source=4719238;table=4719238",
-            "a word where a count goes": "rows_differ;only_file=marker;only_table=0",
+            "a code-like token": "table_compared_marker_9d2;equal=1",
+            "digits in a flag": "table_compared;equal=4719238",
+            "a count code of a sealed table": "row_count;source=4719238;table=4719238",
+            "the counted code of the earlier format": "rows_differ;only_file=0;only_table=0",
+            "a word where a flag goes": "table_compared;equal=marker",
             "a known code with an extra field": "ok;marker=9",
         }
         for label, detail in variants.items():
@@ -1134,6 +1142,23 @@ class SingleResultTest(unittest.TestCase):
                 self.assertNotIn("4719238", str(raised.exception))
                 self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
                 self.assertTrue(case.main_untouched())
+
+    def test_the_saved_result_of_a_failed_run_holds_no_row_count_of_a_sealed_table(self) -> None:
+        case = Case(self)
+        outcome = case.go(Runner(lambda plan: result_line(plan, passed=False), exit_code=1))
+        self.assertFalse(outcome.passed)
+        text = (case.run_folder / run.RESULT_FILE).read_text()
+        tables = {table["table"]: table for table in json.loads(text)["checked"]["tables"]}
+        for name in ("clinical_data", "lab_data"):
+            self.assertEqual((None, None), (tables[name]["rows_source"], tables[name]["rows_table"]))
+            self.assertTrue(
+                all(
+                    check["detail"] in {"ok", "table_compared;equal=0", "table_compared;equal=1"} or check["name"] == "columns"
+                    for check in tables[name]["checks"]
+                )
+            )
+        self.assertNotIn("row_count;source=2", text)
+        self.assertEqual("table_compared;equal=0", tables["lab_data"]["checks"][3]["detail"])
 
     def test_the_saved_result_holds_the_validated_fields_and_a_verdict_derived_by_the_controller_from_the_checks(self) -> None:
         case = Case(self)
@@ -1282,8 +1307,7 @@ class FailedCheckTest(unittest.TestCase):
     def test_a_failed_check_is_a_failed_run_and_merges_nothing(self) -> None:
         def lying(plan: rules.Plan) -> str:
             def flags(document: dict[str, Any]) -> None:
-                document["tables"][1]["checks"][3].update(passed=False, detail="row_count;source=2;table=3")
-                document["tables"][1].update(rows_source=2, rows_table=3)
+                document["tables"][1]["checks"][3].update(passed=False, detail="table_compared;equal=0")
                 del document["tables"][1]["checks"][4:]
 
             return result_line(plan, change=flags)
