@@ -1,8 +1,7 @@
-"""The pass or fail rules that the end-to-end runs of the Bronze clinical, patient split and Silver cases jobs share, as plain functions on a job's output.
+"""The pass or fail rules that the end-to-end runs of the six outcome runners share, as plain functions on a job's output.
 
-Nothing here imports Spark or Docker. The runners ``tests/e2e/bronze_clinical_lab.py``, ``tests/e2e/silver_patient_split.py`` and
-``tests/e2e/silver_cases.py`` stay untracked, so each rule that decides from a job's output lives here, where ``tests/fast/test_outcome_acceptance.py``
-tests it.
+Nothing here imports Spark or Docker. The six runners (``OUTCOME_RUNNERS``) stay untracked, so each rule that decides from a job's output lives here,
+where ``tests/fast/test_outcome_acceptance.py`` tests it.
 
 A runner reads one file with a closed schema and never a line of a job's streams. ``read_result_file`` reads the file, and ``bronze_problem``,
 ``split_problem`` and ``cases_problem`` judge it: exactly the fields that the job writes at every level, Boolean flags, whole-number snapshot IDs, the job,
@@ -14,11 +13,12 @@ compares with Nessie's own (``snapshots_are``).
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import stat
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -257,15 +257,6 @@ def snapshot_map(value: Any) -> bool:
     return isinstance(value, dict) and set(value) == set(CASES_SNAPSHOT_TABLES) and all(snapshot(item) for item in value.values())
 
 
-def snapshot_ids_are(held: Any, lookup: Callable[[str], int | None]) -> bool:
-    """Whether the snapshot IDs of a result are the ones that Nessie holds. The comparison is driven by the seven expected tables, never by the keys of the
-    result: ``lookup`` is asked for each of them, in order, and a result with a key too many, a key too few or an ID that is not a whole number is not equal."""
-    if not isinstance(held, dict):
-        return False
-    expected = {table: lookup(table) for table in CASES_SNAPSHOT_TABLES}
-    return set(held) == set(expected) and all(snapshot(expected[table]) and snapshot(held[table]) and held[table] == expected[table] for table in expected)
-
-
 SPLIT_JOB, CASES_JOB = "patient_split", "silver_cases"
 MODES = frozenset({"build", "verify"})
 SPLIT_SPEC: Spec = {
@@ -438,3 +429,159 @@ def runner_leaks(source: str) -> list[tuple[str, int]]:
                 found.append((name, number))
                 break
     return found
+
+
+# --- The sealed helper: what a runner may print or save
+
+OUTCOME_RUNNERS = (
+    "bronze_clinical_lab.py",
+    "bronze_clinical_lab_container.py",
+    "silver_patient_split.py",
+    "silver_cases.py",
+    "silver_signals.py",
+    "silver_hypotension.py",
+)
+SEALED_CALL = "sealed_observed"
+RAW_TEXT_CALLS = frozenset({"str", "repr", "format"})
+FACT_NAMES = frozenset({"facts", "environment"})
+
+
+def outcome_runner_paths(folder: Path) -> list[Path]:
+    """The files of the six outcome runners that are in ``folder``, by name and in the order of ``OUTCOME_RUNNERS``. Another local runner is not read."""
+    return [folder / name for name in OUTCOME_RUNNERS if (folder / name).is_file()]
+
+
+def call_name(node: ast.AST) -> str | None:
+    """The last name of what a call calls (``expect`` for ``self.record.expect(...)``), or ``None``."""
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+
+
+def is_sealed_call(node: ast.AST) -> bool:
+    return call_name(node) == SEALED_CALL
+
+
+def is_fixed_text(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def is_fixed_choice(node: ast.AST) -> bool:
+    """A text that is written in the runner: a string constant, or a choice between two of them."""
+    return is_fixed_text(node) or (isinstance(node, ast.IfExp) and is_fixed_text(node.body) and is_fixed_text(node.orelse))
+
+
+def fact_target(node: ast.AST) -> str | None:
+    """``facts`` or ``environment`` when the node names one of them, as a variable, an attribute or an item of either."""
+    if isinstance(node, ast.Subscript):
+        return fact_target(node.value)
+    name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+    return name if name in FACT_NAMES else None
+
+
+def sealed_facts(node: ast.AST) -> bool:
+    """The facts of one sealed text (``sealed_observed(...).facts``), or the accumulated facts of the run itself, which hold nothing else by this rule."""
+    if isinstance(node, ast.Attribute) and node.attr == "facts" and is_sealed_call(node.value):
+        return True
+    return fact_target(node) is not None and not isinstance(node, ast.Subscript)
+
+
+def fact_value_problem(target: ast.AST, value: ast.AST | None) -> bool:
+    """Whether the value written to a fact target is anything but written text, empty facts or the facts of the run."""
+    if value is None:
+        return False
+    if isinstance(target, ast.Subscript):
+        return not is_fixed_choice(value)
+    if isinstance(value, ast.Dict):
+        return not all(key is not None and is_fixed_text(key) and is_fixed_choice(item) for key, item in zip(value.keys, value.values, strict=True))
+    if isinstance(value, ast.Call):
+        return not (call_name(value) == "run_local" or (call_name(value) == "dict" and not value.keywords and all(sealed_facts(arg) for arg in value.args)))
+    return not sealed_facts(value)
+
+
+def raw_text_in(node: ast.AST) -> bool:
+    """Whether an f-string, ``str()``, ``repr()`` or ``format`` makes text anywhere under the node."""
+    return any(isinstance(item, ast.JoinedStr) or call_name(item) in RAW_TEXT_CALLS for item in ast.walk(node))
+
+
+def constant_keys(node: ast.AST) -> bool:
+    return isinstance(node, ast.Dict) and all(key is not None and is_fixed_text(key) for key in node.keys)
+
+
+def sealed_call_problem(call: ast.Call) -> str | None:
+    """The rule that a call of ``sealed_observed`` breaks, or ``None``: flags and exit names are constants, a confirmed value is never a constant or text made
+    by the runner, and no text is made inside the call."""
+    flags = call.args[0] if call.args else next((item.value for item in call.keywords if item.arg == "flags"), None)
+    named = {item.arg: item.value for item in call.keywords}
+    if (flags is not None and not constant_keys(flags)) or ("exits" in named and not constant_keys(named["exits"])):
+        return "flag_name_not_constant"
+    confirmed = named.get("confirmed")
+    if confirmed is not None and (
+        isinstance(confirmed, (ast.Constant, ast.JoinedStr, ast.BinOp))
+        or (isinstance(confirmed, ast.Dict) and any(isinstance(item, (ast.Constant, ast.JoinedStr, ast.BinOp)) for item in confirmed.values))
+    ):
+        return "confirmed_not_made"
+    return "raw_in_sealed" if raw_text_in(call) else None
+
+
+def is_print(call: ast.Call) -> bool:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id == "print"
+    return isinstance(func, ast.Attribute) and func.attr == "write" and isinstance(func.value, ast.Attribute) and func.value.attr == "stdout"
+
+
+def sealed_line(node: ast.AST) -> bool:
+    """The printed line of one sealed text: ``sealed_observed(...).line(...)``."""
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "line" and is_sealed_call(node.func.value)
+
+
+def printed_problem(call: ast.Call) -> bool:
+    """Whether a printed line holds anything but written text or the line of a sealed text."""
+    return any(not (is_fixed_choice(arg) or sealed_line(arg)) for arg in call.args)
+
+
+def sink_problem(node: ast.AST) -> str | None:
+    """The rule that a node breaks, or ``None``. A sink is an observation (the fourth argument of ``expect``), a saved fact, a printed line or a
+    ``sealed_observed`` call itself."""
+    if isinstance(node, ast.Call):
+        name = call_name(node)
+        if name == "expect":
+            observed = node.args[3] if len(node.args) > 3 else next((item.value for item in node.keywords if item.arg == "observed"), None)
+            return "observation_not_sealed" if observed is not None and not (is_fixed_text(observed) or is_sealed_call(observed)) else None
+        if name == "ConfirmedId":
+            return "forged_id"
+        if name == SEALED_CALL:
+            return sealed_call_problem(node)
+        if is_print(node):
+            return "printed_raw" if printed_problem(node) else None
+        if name == "update" and isinstance(node.func, ast.Attribute) and fact_target(node.func.value):
+            return "fact_not_sealed" if node.keywords or not all(sealed_facts(arg) for arg in node.args) else None
+    targets: list[tuple[ast.AST, ast.AST | None]] = []
+    if isinstance(node, ast.Assign):
+        targets = [(target, node.value) for target in node.targets]
+    elif isinstance(node, ast.AnnAssign):
+        targets = [(node.target, node.value)]
+    for target, value in targets:
+        if fact_target(target) and fact_value_problem(target, value):
+            return "fact_not_sealed"
+    return None
+
+
+def sink_leaks(source: str) -> list[tuple[str, int]]:
+    """The rule and the 1-based line of each observation, saved fact or printed line of a runner that is not the output of ``sealed_observed``.
+
+    The rules, in line order:
+
+    - ``observation_not_sealed``: an observation that is not written text or a sealed text.
+    - ``fact_not_sealed``: a fact written by hand.
+    - ``printed_raw``: a printed line that is not written text or the line of a sealed text.
+    - ``forged_id``: a ``ConfirmedId`` made by hand.
+    - ``flag_name_not_constant``: a flag or exit name that is not a constant.
+    - ``confirmed_not_made``: a confirmed value that is a constant or made text.
+    - ``raw_in_sealed``: an f-string, ``str()``, ``repr()`` or ``format`` inside a sealed call.
+
+    A source that does not parse raises ``SyntaxError``."""
+    found = [(problem, getattr(node, "lineno", 0)) for node in ast.walk(ast.parse(source)) if (problem := sink_problem(node)) is not None]
+    return sorted(found, key=lambda item: item[1])

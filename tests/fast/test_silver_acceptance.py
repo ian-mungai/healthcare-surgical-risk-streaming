@@ -41,11 +41,13 @@ from typing import Any
 
 from spark.jobs.silver_hypotension import CHECK_NAMES as HYPOTENSION_CHECKS
 from spark.jobs.silver_signals import CHECK_NAMES as SIGNALS_CHECKS
+from tests.fast.sealed_record import sealed_observed
 from tests.fast.silver_accept import (
     AS_KEEP,
     AS_WRITE,
     CHECKS,
     HYPOTENSION_JOB,
+    NOT_CLOSED,
     NOT_EMPTY,
     REASONS,
     REFUSAL_REASONS,
@@ -475,6 +477,20 @@ class ResultKeys(unittest.TestCase):
     def test_an_unknown_job_is_never_sealed(self) -> None:
         self.assertFalse(sealed(written(), "silver_cases"))
 
+    def test_text_that_is_not_a_64_character_lowercase_hash_is_no_hash_in_any_hash_field_of_either_job(self) -> None:
+        for bad in ("reference-text", "g" * 64, "A" * 64, "a" * 63, "a" * 65, " " + "a" * 63, "a" * 63 + "\n"):
+            for field in ("checked_hash", "branch_hash", "write_hash", "base_hash"):
+                with self.subTest(bad=bad[:12], field=field):
+                    self.assertFalse(sealed(written(**{field: bad}), SIGNALS_JOB))
+                    self.assertFalse(sealed(hypotension(**{field: bad}), HYPOTENSION_JOB))
+
+    def test_a_result_and_a_catalog_that_hold_the_same_text_as_a_hash_are_rejected_as_not_closed_and_not_as_a_write(self) -> None:
+        text = "reference-text"
+        catalog = Catalog("b", text, text, text + "-head", SOURCES, AFTER)
+        document = written(checked_hash=text, base_hash=text, branch_hash=text + "-head", write_hash=text + "-head")
+        self.assertEqual(NOT_CLOSED, rejection(document, SIGNALS_JOB, catalog, AS_WRITE))
+        self.assertFalse(accept_write(0, document, SIGNALS_JOB, catalog).ok)
+
 
 class CatalogHolds(unittest.TestCase):
     OTHER = "c" * 64
@@ -594,14 +610,17 @@ class Rejections(unittest.TestCase):
         self.assertIsNotNone(rejection(written(write_hash=HEAD, branch_hash=HEAD), SIGNALS_JOB, KEPT, AS_WRITE))
 
 
-class Evidence(unittest.TestCase):
-    NAMES = ("write_hash", "branch_hash", "passed")
+def printed(accepted: Accepted) -> str:
+    """The text that a runner records for a call: only the fixed phrase of a rejected call and nothing of an accepted one."""
+    return str(sealed_observed(reason=accepted.reason))
 
-    def test_a_result_that_was_accepted_gives_its_named_fields(self) -> None:
-        text = accept_write(0, written(), SIGNALS_JOB, WROTE).facts(*self.NAMES)
-        self.assertIn(f"write hash {WRITE_HASH}", text)
-        self.assertIn(f"branch hash {WRITE_HASH}", text)
-        self.assertIn("passed {'numeric_observations': True, 'waveform_seconds': True}", text)
+
+class Evidence(unittest.TestCase):
+    def test_a_result_that_was_accepted_records_no_value_of_its_file(self) -> None:
+        accepted = accept_write(0, written(), SIGNALS_JOB, WROTE)
+        self.assertTrue(accepted.ok)
+        self.assertEqual("", printed(accepted))
+        self.assertFalse(hasattr(accepted, "facts"))
 
     def test_a_result_that_failed_gives_the_fixed_phrase_and_no_value(self) -> None:
         for name, document in (
@@ -611,21 +630,21 @@ class Evidence(unittest.TestCase):
             ("no file", None),
         ):
             with self.subTest(name):
-                text = accept_write(0, document, SIGNALS_JOB, WROTE).facts(*self.NAMES)
-                self.assertEqual(f"result rejected: {rejection(document, SIGNALS_JOB, WROTE, AS_WRITE)}", text)
+                text = printed(accept_write(0, document, SIGNALS_JOB, WROTE))
+                self.assertEqual(f"rejected: {rejection(document, SIGNALS_JOB, WROTE, AS_WRITE)}", text)
                 for value in ("17", "synthetic", "different_branch", "unexpected", HEAD, WRITE_HASH):
                     self.assertNotIn(value, text)
 
     def test_a_rejected_catalog_gives_the_fixed_phrase(self) -> None:
-        self.assertEqual("result rejected: the catalog was not read", accept_write(0, written(), SIGNALS_JOB, None).facts(*self.NAMES))
+        self.assertEqual("rejected: the catalog was not read", printed(accept_write(0, written(), SIGNALS_JOB, None)))
 
 
 class RefusalEvidence(unittest.TestCase):
     WANTED = ["waveform_duplicate_second: failed"]
 
-    def test_a_refusal_with_the_wanted_codes_gives_its_codes(self) -> None:
+    def test_a_refusal_with_the_wanted_codes_records_no_code(self) -> None:
         self.assertIsNone(refusal_rejection(refusal(), SIGNALS_JOB, "build", self.WANTED))
-        self.assertEqual("refusal ['waveform_duplicate_second: failed']", accept_refusal(1, refusal(), SIGNALS_JOB, "build", self.WANTED).facts())
+        self.assertEqual("", printed(accept_refusal(1, refusal(), SIGNALS_JOB, "build", self.WANTED)))
 
     def test_a_refusal_that_failed_gives_a_fixed_phrase_and_no_code_or_value(self) -> None:
         for name, document, reason in (
@@ -637,8 +656,8 @@ class RefusalEvidence(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertEqual(reason, refusal_rejection(document, SIGNALS_JOB, "build", self.WANTED))
-                text = accept_refusal(1, document, SIGNALS_JOB, "build", self.WANTED).facts()
-                self.assertEqual(f"refusal rejected: {reason}", text)
+                text = printed(accept_refusal(1, document, SIGNALS_JOB, "build", self.WANTED))
+                self.assertEqual(f"rejected: {reason}", text)
                 for value in ("17", "unexpected", "synthetic", HEAD):
                     self.assertNotIn(value, text)
 
@@ -654,8 +673,8 @@ class UsageExit(unittest.TestCase):
         self.assertEqual(NOT_EMPTY, accept_usage(2, True).reason)
         self.assertEqual(WRONG_EXIT, accept_usage(1, False).reason)
         self.assertEqual(WRONG_EXIT, accept_usage(1, True).reason)
-        self.assertEqual("usage exit 2 with an empty result folder", accept_usage(2, False).facts())
-        self.assertEqual(f"usage rejected: {NOT_EMPTY}", accept_usage(2, True).facts())
+        self.assertEqual("", printed(accept_usage(2, False)))
+        self.assertEqual(f"rejected: {NOT_EMPTY}", printed(accept_usage(2, True)))
 
     def test_a_folder_with_anything_in_it_has_a_result_present_before_any_parse(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -695,15 +714,15 @@ class AcceptedCalls(unittest.TestCase):
         self.assertEqual(reason, accepted.reason)
         self.assertIn(reason, reasons)
         self.assertEqual({}, dict(accepted.result))
-        printed = accepted.facts("write_hash", "branch_hash", "snapshots", "checked_hash", "passed") + repr(accepted)
+        recorded = printed(accepted) + repr(accepted)
         for value in forbidden:
-            self.assertNotIn(value, printed)
+            self.assertNotIn(value, recorded)
 
     def test_a_write_that_exited_1_is_rejected_and_its_write_hash_is_neither_printed_nor_kept(self) -> None:
         self.assertTrue(accept_write(0, written(), SIGNALS_JOB, WROTE).ok)
         accepted = accept_write(1, written(), SIGNALS_JOB, WROTE)
         self.assert_closed(accepted, REASONS, WRONG_EXIT, WRITE_HASH, HEAD, "11", "13")
-        self.assertEqual(f"result rejected: {WRONG_EXIT}", accepted.facts("write_hash"))
+        self.assertEqual(f"rejected: {WRONG_EXIT}", printed(accepted))
 
     def test_a_keep_where_a_write_was_expected_is_rejected_and_gives_no_snapshot_ID(self) -> None:
         self.assertTrue(accept_keep(0, unwritten(), SIGNALS_JOB, KEPT).ok)
@@ -718,7 +737,7 @@ class AcceptedCalls(unittest.TestCase):
         self.assertTrue(accept_refusal(1, refusal(), SIGNALS_JOB, "build", self.WANTED).ok)
         accepted = accept_refusal(3, refusal(), SIGNALS_JOB, "build", self.WANTED)
         self.assert_closed(accepted, REFUSAL_REASONS, WRONG_EXIT, "waveform_duplicate_second", "failed")
-        self.assertEqual(f"refusal rejected: {WRONG_EXIT}", accepted.facts())
+        self.assertEqual(f"rejected: {WRONG_EXIT}", printed(accepted))
 
     def test_a_refusal_exit_other_than_the_expected_one_fails_and_a_stated_exit_passes(self) -> None:
         for code in (0, 2, 3, 124, -9):
@@ -756,7 +775,7 @@ class AcceptedCalls(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertFalse(accepted.ok)
-                self.assertNotIn(planted, accepted.facts("write_hash") + repr(accepted))
+                self.assertNotIn(planted, printed(accepted) + repr(accepted))
 
     def test_a_refusal_with_the_right_exit_and_other_codes_is_rejected_and_holds_no_document(self) -> None:
         planted = "unexpected_code_17: failed"
@@ -770,7 +789,7 @@ class AcceptedCalls(unittest.TestCase):
                 self.assertFalse(accepted.ok)
                 self.assertEqual({}, dict(accepted.result))
                 self.assertIsNone(accepted.document)
-                self.assertNotIn(planted, accepted.facts() + repr(accepted))
+                self.assertNotIn(planted, printed(accepted) + repr(accepted))
 
     def test_a_moved_null_needs_an_accepted_write(self) -> None:
         self.assertTrue(moved_null_ok(accept_write(0, written(), SIGNALS_JOB, WROTE), BEFORE))

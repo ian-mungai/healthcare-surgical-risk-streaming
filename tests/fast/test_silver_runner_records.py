@@ -134,8 +134,9 @@ def done_for(module: ModuleType, document: dict[str, Any], catalog: Any, *, job:
 def bind_build_pair(run: Any, module: ModuleType, document: dict[str, Any], catalog: Any) -> None:
     """Make the build of the pair of jobs answer one accepted write, and the snapshot IDs of the tables those that Nessie holds."""
     done = done_for(module, document, catalog, job=module.JOB)
-    run.build_pair = lambda base, label, case: ("b", done)
-    run.table_snapshot = lambda branch, table: {"silver.art_mbp_1s": 11, "silver.hypotension_events": 12}.get(table, 1)
+    run.build_pair = lambda base, label, case: ("hyp_b_1", done)
+    held = {"silver.art_mbp_1s": 11, "silver.hypotension_events": 12, "silver.waveform_seconds": 1, "bronze.clinical_cases": 2, "silver.patient_split": 3}
+    run.table_snapshot = lambda branch, table: held.get(table, 1)
 
 
 def bind_silver(run: Any, module: ModuleType, document: dict[str, Any], catalog: Any) -> None:
@@ -416,6 +417,7 @@ class HypotensionRecord(unittest.TestCase):
         snapshots = {"silver.art_mbp_1s": 11, "silver.hypotension_events": 12, "bronze.numeric_observations": 1}
         clinical = [[str(case), str(9_000_000 + case), "500", "3950"] for case in module.CASES]
         nessie = FakeNessie(snapshots)
+        nessie.heads["hyp_b_1"] = accept.WRITE_HASH
         run = module.Run(stack, nessie, record(), {case: {"sha256": "e" * 64} for case in module.CASES}, clinical)
         nessie.empty.add(run.empty)
         return run, module
@@ -539,7 +541,6 @@ class HypotensionRecord(unittest.TestCase):
                 }
                 kept_catalog = dataclasses.replace(accept.HYPO_KEPT, snapshots=catalog_changes.get("snapshots", accept.HYPO_KEPT.snapshots))
                 bind_silver(run, module, kept, kept_catalog)
-                run.facts["snapshots"] = dict(accept.HYPO_SNAPSHOTS)
                 with mock.patch.object(run, "head", return_value=accept.HEAD):
                     run.merge_tag_rebuild(built)
                 self.assertEqual(passed, run.record.observations[-1].passed)

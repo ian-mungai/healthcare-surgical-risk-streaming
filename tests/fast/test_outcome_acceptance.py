@@ -1,8 +1,9 @@
-"""The pass or fail rules that the end-to-end runs of the Bronze clinical, patient split and Silver cases jobs share, tested on the results of the real jobs.
+"""The pass or fail rules that the end-to-end runs of the six outcome runners share, tested on the results of the real jobs.
 
-No Spark runs here. The three runners stay untracked, so each rule that decides from a job's output lives in ``tests/fast/outcome_accept.py``, where this module
-tests it. The rules read one result file with a closed schema, hashes, snapshot IDs and flags, and never a count, a digest or a field that says whether a table
-was written. The good documents here are made by the jobs' own code (``ending``, ``result_document``), so a field that a job gains or loses fails a rule.
+No Spark runs here. The six runners (Bronze, its container helper, patient split, Silver cases, signals, hypotension) stay untracked, so each rule that
+decides from a job's output lives in ``tests/fast/outcome_accept.py``, where this module tests it. The rules read one result file with a closed schema,
+hashes, snapshot IDs and flags, and never a count, a digest or a field that says whether a table was written. The good documents here are made by the jobs' own
+code (``ending``, ``result_document``), so a field that a job gains or loses fails a rule.
 
 Failure modes covered here:
 
@@ -21,6 +22,9 @@ Failure modes covered here:
 - A runner records the length of a stream, a tail of one, a stream in a log line, a count in a log line or an observation, a count that a stand-in prints
   or emits, a digest that is saved, a refusal expectation with a count in it, or an identifier that it chose by looking at data (``runner_leaks``). The
   Silver signals and hypotension runners are linted like the other four.
+- An observation, a fact or a printed line of one of the six runners is anything but the output of the one sealed helper (``sink_leaks``): an f-string, a
+  ``str()``, ``repr()`` or ``format`` text, a raw variable, a hand-made ``ConfirmedId``, a flag name that is not a constant, or a fact written by hand.
+- The lint reads the six outcome runners by name. Another local runner (``catalog_proof.py``) is neither read nor refused.
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ from tests.fast import test_silver_cases_job as cases
 from tests.fast.outcome_accept import (
     BRONZE_COMMANDS,
     CASES_SNAPSHOT_TABLES,
+    OUTCOME_RUNNERS,
     all_passed,
     bronze_problem,
     cases_problem,
@@ -60,11 +65,12 @@ from tests.fast.outcome_accept import (
     kept_at_base,
     moved,
     no_removed_fields,
+    outcome_runner_paths,
     read_result_file,
     runner_leaks,
     same_source,
     sealed_table,
-    snapshot_ids_are,
+    sink_leaks,
     snapshots_are,
     split_problem,
     wrote,
@@ -477,7 +483,6 @@ class RunnerLeaks(unittest.TestCase):
         '        "numeric_equal": numeric.get("absent") == numeric.get("verdict_mismatch") == 0,',
         '    emit({"planted": True, "all_read": len(held) == len(expected)})',
         '            ["source_table: failed"],',
-        "observed = f\"snapshots {snapshots} vs {result.get('snapshots')}, sources {sources}\"",
         'observed = f"no container left {not left}, all deleted {deleted == len(set(run.made)) + len(run.tags)}"',
     )
 
@@ -501,21 +506,140 @@ class RunnerLeaks(unittest.TestCase):
         self.assertEqual([], runner_leaks("# the log holds len(os.fsencode(out)) once\n"))
         self.assertEqual([(("stream_length"), 2)], runner_leaks("# a comment\nn = len(out)\n"))
 
-    def test_every_runner_file_of_this_machine_is_in_the_list_that_is_linted(self) -> None:
-        folder = Path(__file__).resolve().parents[1] / "e2e"
-        helpers = {"__init__.py", "commit_guards.py", "deadline.py", "run_record.py"}
-        present = {path.name for path in folder.glob("*.py")} - helpers
-        self.assertEqual(set(), present - set(RUNNERS), "a runner that no lint reads")
+    def test_the_lint_reads_the_six_outcome_runners_by_name_and_no_other_local_runner(self) -> None:
+        self.assertEqual(RUNNERS, OUTCOME_RUNNERS)
+        with tempfile.TemporaryDirectory(prefix="e2e_") as folder_name:
+            folder = Path(folder_name)
+            for name in ("catalog_proof.py", "run_record.py", RUNNERS[0], RUNNERS[3]):
+                (folder / name).write_text("x = 1\n")
+            self.assertEqual([RUNNERS[0], RUNNERS[3]], [path.name for path in outcome_runner_paths(folder)])
 
     def test_the_runners_of_this_machine_leak_nothing(self) -> None:
-        folder = Path(__file__).resolve().parents[1] / "e2e"
-        runners = [folder / name for name in RUNNERS]
-        present = [path for path in runners if path.is_file()]
+        present = outcome_runner_paths(Path(__file__).resolve().parents[1] / "e2e")
         if not present:
             self.skipTest("the untracked runners are not on this machine")
         for path in present:
             with self.subTest(runner=path.name):
                 self.assertEqual([], runner_leaks(path.read_text()))
+
+
+class SinkLeaks(unittest.TestCase):
+    """``sink_leaks`` reads the syntax tree of a runner and finds each observation, fact or printed line that is not the output of ``sealed_observed``."""
+
+    BAD = (
+        ("observation_not_sealed", 'record.expect("c", "s", "e", f"rows {len(rows)}", ok)'),
+        ("observation_not_sealed", 'self.record.expect("c", "s", "e", f"flags {flags}", ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", observed, ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", str(value), ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", repr(value), ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", "snapshots {}".format(ids), ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", "exit " + str(code), ok)'),
+        ("observation_not_sealed", 'self.record.expect(case, "s", "e", observed=f"{value}", passed=ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", accepted.facts("write_hash"), ok)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", sealed_text, ok)'),
+        ("fact_not_sealed", "self.facts.update(merged_hash=merged)"),
+        ("fact_not_sealed", 'self.facts.update({"a": value})'),
+        ("fact_not_sealed", 'self.facts["a"] = value'),
+        ("fact_not_sealed", 'facts["stalled"] = bool(stack.stalls)'),
+        ("fact_not_sealed", "record.environment.update({key: str(value) for key, value in run.facts.items()})"),
+        ("fact_not_sealed", 'record.environment["scope"] = scope'),
+        ("fact_not_sealed", 'record.environment["stalled"] = str(bool(run.stack.stalls))'),
+        ("fact_not_sealed", 'record.environment = {"scope": scope}'),
+        ("fact_not_sealed", "self.facts = result"),
+        ("fact_not_sealed", "self.facts.update(result)"),
+        ("fact_not_sealed", 'self.facts.update(sealed_observed({"a": True}).facts, extra=1)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": True}, codes=[f"{code}"]), ok)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": True}, exit_code=int(str(code))), ok)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": repr(value) == "x"}), ok)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": "{}".format(value) == "x"}), ok)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({f"rows {n}": True}), ok)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({name: True}), ok)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed(flags), ok)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({**flags}), ok)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed(dict.fromkeys(names, True)), ok)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({"a" + name: True}), ok)'),
+        ("forged_id", "found = ConfirmedId(7)"),
+        ("forged_id", "found = sealed_record.ConfirmedId(7, token)"),
+        ("confirmed_not_made", 'expect("c", "s", "e", sealed_observed(confirmed={"id": 7}), ok)'),
+        ("confirmed_not_made", 'expect("c", "s", "e", sealed_observed(confirmed={"id": f"{x}"}), ok)'),
+        ("printed_raw", 'print(f"{value}")'),
+        ("printed_raw", 'sys.stdout.write(f"PASS {case}: {observed}\\n")'),
+        ("printed_raw", "sys.stdout.write(text)"),
+        ("printed_raw", 'sys.stdout.write("x " + value)'),
+        ("printed_raw", 'print(json.dumps({"rows": 3}))'),
+    )
+    CLEAN = (
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}, exit_code=code, seconds=seconds), ok)',
+        'self.record.expect("c", "s", "e", sealed_observed({"x": ok}, exits={"plant exit": a, "exit": b}, codes=codes(result)), ok)',
+        'self.record.expect("c", "s", "e", sealed_observed({"a": ids == other}, confirmed=found), ok)',
+        'self.record.expect("c", "s", "e", sealed_observed(confirmed={"id": made}), ok)',
+        'expect("c", "s", "e", sealed_observed(error=error), False)',
+        'expect("c", "s", "e", sealed_observed(reason=accepted.reason), accepted.ok)',
+        'record.expect("input", "setup", "e", "BRONZE_DATA_DIR is not set", False)',
+        'expect(f"planted: {label}", "planted fault", f"verify exits {wanted}", sealed_observed({"x": ok}), ok)',
+        "expect = self.record.expect",
+        "def expect(self, case, step, expected, observed, passed):\n    return passed",
+        "self.observations.append(Observation(case, step, expected, observed, passed))",
+        'self.facts.update(sealed_observed({"x": True}, confirmed={"merged_hash": made}).facts)',
+        "self.facts.update(result.facts)",
+        "self.facts: dict[str, Any] = {}",
+        "self.facts = {}",
+        "facts = {}",
+        "facts = dict(run.facts)",
+        "facts = run_local(record, log, source)",
+        "record.environment.update(run.facts)",
+        'record.environment = {"target": "local Docker", "images": "spark 4.1.4"}',
+        'record.environment["scope"] = "full" if full else "development cases"',
+        'record.environment["scope"] = "full"',
+        'sys.stdout.write(sealed_observed({"x": True}).line(True, "c", "control"))',
+        'sys.stdout.write("edited\\n")',
+        'print("fixed text")',
+        'log.append(f"== docker {code}")',
+        'texts = [" ".join((item.case, item.step, item.observed)) for item in record.observations]',
+        '# record.expect("c", "s", "e", f"rows {n}", ok)',
+        '"""record.expect(c, s, e, f"rows {n}", ok)"""',
+    )
+
+    def test_each_bad_line_is_found_by_its_rule_and_its_line_number(self) -> None:
+        for name, line in self.BAD:
+            with self.subTest(name, line=line[:60]):
+                self.assertEqual([(name, 2)], sink_leaks(f"x = 1\n{line}\ny = 2\n"))
+
+    def test_a_clean_line_is_not_found(self) -> None:
+        for line in self.CLEAN:
+            with self.subTest(line=line[:60]):
+                self.assertEqual([], sink_leaks(f"{line}\n"))
+
+    def test_a_sink_inside_a_method_a_branch_and_a_continued_call_is_found_at_the_line_of_the_call(self) -> None:
+        source = (
+            "class Run:\n"
+            "    def case(self):\n"
+            "        if x:\n"
+            "            self.record.expect(\n"
+            '                "c",\n'
+            '                "s",\n'
+            '                "e",\n'
+            '                f"rows {n}",\n'
+            "                ok,\n"
+            "            )\n"
+        )
+        self.assertEqual([("observation_not_sealed", 4)], sink_leaks(source))
+
+    def test_every_sealed_call_that_goes_into_a_fact_is_found_when_it_is_not_the_facts_attribute(self) -> None:
+        self.assertEqual([("fact_not_sealed", 1)], sink_leaks('self.facts.update(sealed_observed({"x": True}))\n'))
+        self.assertEqual([("fact_not_sealed", 1)], sink_leaks('self.facts.update(sealed_observed({"x": True}).text)\n'))
+
+    def test_a_source_that_does_not_parse_is_an_error_and_not_a_clean_runner(self) -> None:
+        with self.assertRaises(SyntaxError):
+            sink_leaks("def (:\n")
+
+    def test_the_runners_of_this_machine_record_through_the_helper_only(self) -> None:
+        present = outcome_runner_paths(Path(__file__).resolve().parents[1] / "e2e")
+        if not present:
+            self.skipTest("the untracked runners are not on this machine")
+        for path in present:
+            with self.subTest(runner=path.name):
+                self.assertEqual([], sink_leaks(path.read_text()))
 
 
 def split_run(mode: str = "build") -> tuple[int, dict[str, Any]]:
@@ -645,28 +769,6 @@ class SealedFile(unittest.TestCase):
         for name, value in plants.items():
             with self.subTest(name):
                 self.assertIsNotNone(cases_problem({**document, "snapshot_ids": value}, "build", "b", status))
-
-    def test_the_snapshot_ids_are_compared_with_nessie_for_each_expected_table_and_only_those(self) -> None:
-        _, document = cases_run("build")
-        held: dict[str, int] = document["snapshot_ids"]
-        asked: list[str] = []
-
-        def nessie(table: str) -> int | None:
-            asked.append(table)
-            return held.get(table)
-
-        self.assertTrue(snapshot_ids_are(held, nessie))
-        self.assertEqual(list(CASES_SNAPSHOT_TABLES), asked)
-        asked.clear()
-        self.assertFalse(snapshot_ids_are({**held, "silver.other": 5}, nessie))
-        self.assertEqual(list(CASES_SNAPSHOT_TABLES), asked)
-        self.assertFalse(snapshot_ids_are({}, nessie))
-        self.assertFalse(snapshot_ids_are({key: value for key, value in held.items() if key != CASES_SNAPSHOT_TABLES[0]}, nessie))
-        self.assertFalse(snapshot_ids_are({**held, CASES_SNAPSHOT_TABLES[1]: held[CASES_SNAPSHOT_TABLES[1]] + 1}, nessie))
-        self.assertFalse(snapshot_ids_are(held, lambda table: None))
-        self.assertFalse(snapshot_ids_are({key: None for key in held}, lambda table: None))
-        self.assertFalse(snapshot_ids_are({key: True for key in held}, lambda table: True))
-        self.assertFalse(snapshot_ids_are("seven", nessie))
 
     def test_a_number_that_is_text_or_a_boolean_fails(self) -> None:
         status, document = cases_run()

@@ -17,15 +17,17 @@ exit code is judged first. A refusal is judged by the exit code and by the refus
 rules read hashes and snapshot IDs and never ``outcome``: a result that says whether a table was written changes when only a held-out row changes, so no
 result holds it.
 
-A runner reads a field of a result, prints it and caches it only through an ``Accepted`` that passed for the outcome that its call expected. A call that failed
-gives one fixed phrase from ``REASONS``, ``REFUSAL_REASONS`` or ``USAGE_REASONS``: the rule that failed, never a value of the file. A call that exits with a
-usage error passes only when its result folder held nothing, checked before any parse (``result_present``, ``accept_usage``).
+A runner reads a field of a result, and saves an ID of it, only through an ``Accepted`` that passed for the outcome that its call expected and a
+comparison with Nessie (``tests/fast/sealed_record.py``). A call that failed gives one fixed phrase from ``REASONS``, ``REFUSAL_REASONS`` or ``USAGE_REASONS``:
+the rule that failed, never a value of the file. A call that exits with a usage error passes only when its result folder held nothing, checked before any parse
+(``result_present``, ``accept_usage``).
 """
 
 from __future__ import annotations
 
 import builtins
 import json
+import re
 import symtable
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -78,6 +80,7 @@ REFUSAL_OTHER_CODES = "the refusal codes are not the wanted ones"
 REFUSAL_REASONS = (WRONG_EXIT, NO_FILE, REFUSAL_NOT_CLOSED, REFUSAL_OTHER_CODES)
 USAGE_REASONS = (WRONG_EXIT, NOT_EMPTY)
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
+HASH = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +108,11 @@ def refusal_matches(found: Sequence[str], wanted: Sequence[str]) -> bool:
 
 def named(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def hashed(value: Any) -> bool:
+    """Whether the value is a hash: 64 lowercase hexadecimal characters and nothing else."""
+    return isinstance(value, str) and HASH.fullmatch(value) is not None
 
 
 def whole(value: Any) -> bool:
@@ -159,12 +167,12 @@ def sealed(result: Any, job: str) -> bool:
         result["mode"] in MODES
         and named(result["branch"])
         and result["job"] == job
-        and (named(result["base_hash"]) if build else result["base_hash"] is None)
+        and (hashed(result["base_hash"]) if build else result["base_hash"] is None)
         and type(result["tables"]) is list
         and result["tables"] == TABLE_LISTS[job]
-        and named(result["checked_hash"])
-        and named(result["branch_hash"])
-        and (result["write_hash"] is None or named(result["write_hash"]))
+        and hashed(result["checked_hash"])
+        and hashed(result["branch_hash"])
+        and (result["write_hash"] is None or hashed(result["write_hash"]))
         and type(result["checks_run"]) is list
         and result["checks_run"] == list(CHECKS[job])
         and maps_ok(result, job)
@@ -262,17 +270,6 @@ class Accepted:
     def result(self) -> Mapping[str, Any]:
         """The accepted document, and an empty mapping for a call that was not accepted."""
         return self.document if self.document is not None else {}
-
-    def facts(self, *names: str) -> str:
-        """The record line of the call. An accepted result gives its named fields and an accepted refusal its codes. A call that was not accepted gives its
-        fixed phrase and no value of the file."""
-        if self.kind == "usage":
-            return f"usage exit {EXIT_USAGE} with an empty result folder" if self.ok else f"usage rejected: {self.reason}"
-        if not self.ok:
-            return f"{self.kind} rejected: {self.reason}"
-        if self.kind == "refusal":
-            return f"refusal {self.result['refusal']}"
-        return ", ".join(f"{name.replace('_', ' ')} {self.result[name]}" for name in names)
 
 
 def accept_result(code: int, document: Any, job: str, catalog: Catalog | None, outcome: str) -> Accepted:

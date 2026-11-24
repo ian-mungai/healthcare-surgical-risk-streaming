@@ -23,6 +23,7 @@ from typing import Any
 
 from tests.e2e.run_record import Record
 from tests.fast import test_outcome_acceptance as accept
+from tests.fast.outcome_accept import CASES_SNAPSHOT_TABLES
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 BASE, HEAD, OTHER, CHECKED = "a" * 64, "b" * 64, "c" * 64, "e" * 64
@@ -92,7 +93,7 @@ class BronzeFacts(unittest.TestCase):
         result = run.control_write(BASE, BASE)
         self.assertTrue(result)
         self.assertEqual(
-            {"clinical_source_snapshot_id": 7, "lab_source_snapshot_id": 7, "clinical_bronze_snapshot_id": 9, "lab_bronze_snapshot_id": 9},
+            {"clinical_source_snapshot_id": "7", "lab_source_snapshot_id": "7", "clinical_bronze_snapshot_id": "9", "lab_bronze_snapshot_id": "9"},
             {key: value for key, value in run.facts.items() if key.endswith("snapshot_id")},
         )
         self.assertEqual(
@@ -114,6 +115,11 @@ class BronzeFacts(unittest.TestCase):
                 self.assertEqual({}, result)
                 self.assertEqual({}, run.facts, saved(run.facts))
                 self.assertFalse(all(item.passed for item in run.record.observations))
+
+    def test_a_merged_hash_that_main_does_not_hold_saves_nothing(self) -> None:
+        run, _ = self.build()
+        self.assertEqual({}, run.control_write(BASE, WRONG_HASH))
+        self.assertEqual({}, run.facts, saved(run.facts))
 
 
 class SplitFacts(unittest.TestCase):
@@ -155,8 +161,8 @@ class SplitFacts(unittest.TestCase):
                 "branch_hash": HEAD,
                 "checked_hash": BASE,
                 "write_hash": HEAD,
-                "table_snapshot_id": document["snapshot_id"],
-                "source_snapshot_id": document["source_snapshot_id"],
+                "table_snapshot_id": str(document["snapshot_id"]),
+                "source_snapshot_id": str(document["source_snapshot_id"]),
             },
             {key: run.facts[key] for key in ("base_hash", "branch_hash", "checked_hash", "write_hash", "table_snapshot_id", "source_snapshot_id")},
         )
@@ -179,6 +185,13 @@ class SplitFacts(unittest.TestCase):
                 self.assertEqual({}, run.facts, saved(run.facts))
                 self.assertFalse(all(item.passed for item in run.record.observations))
 
+    def test_a_trunk_that_is_not_a_reference_name_saves_nothing(self) -> None:
+        run, _ = self.build()
+        run.trunk = "trunk"
+        run.nessie.heads["trunk"] = BASE
+        self.assertEqual({}, run.first_build())
+        self.assertEqual({}, run.facts, saved(run.facts))
+
     def test_a_checked_hash_that_the_history_does_not_show_is_not_kept(self) -> None:
         run, _ = self.build()
         run.nessie.log = self.history(checked=WRONG_HASH)
@@ -191,16 +204,16 @@ class MergeAndTagFacts(unittest.TestCase):
 
     def test_the_tag_of_the_cases_runner_is_saved_only_when_it_points_at_the_merged_hash(self) -> None:
         module = runner("silver_cases")
-        tables = {table: 3 for table in module.SILVER_TABLES}
+        tables = {table: 3 for table in CASES_SNAPSHOT_TABLES}
         for tag_hash, saved_tag in ((MERGED, True), (WRONG_HASH, False)):
             with self.subTest(tag_hash=tag_hash[:2]):
                 run = module.Run.__new__(module.Run)
-                run.nessie = FakeNessie({"p6_full_run": tag_hash}, {}, [])
+                run.nessie = FakeNessie({"p6_full_run": tag_hash}, dict(tables), [])
                 run.record, run.facts, run.trunk = Record(feature="test", slug="test", rerun="none"), {}, "trunk"
                 run.name = lambda base: "p6_full_run"
                 run.tag(MERGED, "full", tables)
                 self.assertEqual(saved_tag, "full_tag_hash" in run.facts, saved(run.facts))
-                self.assertEqual(saved_tag, "full_snapshot_ids" in run.facts)
+                self.assertEqual(saved_tag, any(key.startswith("full_snapshot_") for key in run.facts))
 
     def test_the_tag_of_the_signals_runner_is_saved_only_when_it_points_at_the_merged_hash(self) -> None:
         module = runner("silver_signals")
@@ -210,7 +223,7 @@ class MergeAndTagFacts(unittest.TestCase):
                 run = module.Run(SimpleNamespace(), nessie, Record(feature="test", slug="test", rerun="none"), {})
                 run.suffix = "x"
                 run.silver = lambda mode, branch, base=None: SimpleNamespace(
-                    keep=lambda: SimpleNamespace(ok=False, result={}, facts=lambda *names: ""), code=1, seconds=1.0
+                    keep=lambda: SimpleNamespace(ok=False, result={}, reason="the exit code is not the expected one"), code=1, seconds=1.0
                 )
                 run.merge_tag_rebuild({"branch": "b"})
                 self.assertEqual(saved_tag, "tag_hash" in run.facts, saved(run.facts))
