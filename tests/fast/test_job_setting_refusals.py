@@ -5,10 +5,11 @@ negative number and a figure of a century without a word. The patient split job 
 and up to a maximum); every job does now, so a bad value is the settings exit (2, or the ``settings`` code in a sealed job's file) and the text of the error
 is never shown.
 
-Three of the four jobs are run here. ``table_checks`` imports ``pyspark``, which the development environment does not hold, so mypy fails when a test imports
-it. Its source is read instead (``Sources``): the deadline comes from ``number_setting`` and from nowhere else, and a ``SettingsError`` ends ``main`` with
-exit 2. ``number_setting`` itself is tested in ``test_patient_split_cli``. The same source check runs on the other three jobs so a ``float(os.environ...)`` that
-comes back is caught in all four.
+Three of the four jobs are imported here. ``table_checks`` is a module of the Spark job image, which imports ``pyspark`` inside the functions that build a
+session, and mypy does not follow ``importlib.import_module``. Its source is read as well (``Sources``): the deadline comes from ``number_setting`` and from
+nowhere else, and a ``SettingsError`` ends ``main`` with exit 2. A source check cannot see what a job writes to its standard error, so ``TableChecksRuntime``
+runs ``table_checks.main`` and compares the exit code and every byte of standard output and error. ``number_setting`` itself is tested in
+``test_patient_split_cli``. The same source check runs on the other three jobs so a ``float(os.environ...)`` that comes back is caught in all four.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import ast
 import contextlib
 import importlib
 import io
+import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,7 @@ BAD = (MARKER, "inf", "-inf", "nan", "-5", "0", "1e400", "1e9", "")
 
 with installed():
     bronze_decode = importlib.import_module("spark.jobs.bronze_decode")
+table_checks: Any = importlib.import_module("spark.jobs.table_checks")
 
 
 def other_uses(source: str, name: str) -> list[int]:
@@ -193,6 +197,68 @@ class Refusals(unittest.TestCase):
                 catalog_proof.main(["--branch", "b", "--rows", "1"])
         deadline.assert_called_once_with(120.5, catalog_proof.JOB)
         self.assertEqual(7.0, client.call_args.args[1])
+
+
+class TableChecksRuntime(unittest.TestCase):
+    """``table_checks.main`` is run here, because the source checks above pass for a job that writes the text of an error to its standard error.
+
+    ``pyspark`` is not needed: a setting or a plan that cannot be used ends ``main`` before a session is built, and ``build_session`` is replaced so that a
+    refusal that did not stop in time would fail the test and not start Spark.
+    """
+
+    def run_main(self, staging: Path, **environment: str) -> tuple[int, str, str, mock.MagicMock]:
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(table_checks, "build_session") as session,
+            mock.patch.object(table_checks, "start_deadline"),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = table_checks.main(["--staging", str(staging)])
+        return code, out.getvalue(), err.getvalue(), session
+
+    def staging_with(self, text: str) -> Path:
+        folder = tempfile.TemporaryDirectory(prefix="table_checks_runtime_")
+        self.addCleanup(folder.cleanup)
+        (Path(folder.name) / table_checks.PLAN_FILE).write_text(text)
+        return Path(folder.name)
+
+    def test_a_deadline_that_cannot_be_used_is_the_settings_exit_with_one_fixed_line_and_no_session(self) -> None:
+        staging = self.staging_with("{}")
+        for value in BAD:
+            if value == "":
+                continue
+            with self.subTest(value=value):
+                code, out, err, session = self.run_main(staging, JOB_DEADLINE_SECONDS=value)
+                self.assertEqual((2, "", "table_checks: SettingsError\n"), (code, out, err))
+                session.assert_not_called()
+
+    def test_a_plan_that_cannot_be_used_ends_with_one_fixed_line_that_holds_no_value_of_the_plan(self) -> None:
+        for text in (json.dumps({"format": MARKER}), "not json " + MARKER, ""):
+            with self.subTest(plan=text[:12]):
+                code, out, err, session = self.run_main(self.staging_with(text))
+                self.assertEqual((2, ""), (code, out))
+                self.assertTrue(err.startswith("table_checks: ") and err.endswith("\n") and err.count("\n") == 1, err)
+                self.assertNotIn(MARKER, err)
+                session.assert_not_called()
+
+    def test_a_plan_that_cannot_be_read_is_one_fixed_line_with_the_error_type_and_no_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=f"{MARKER}_") as folder:
+            code, out, err, session = self.run_main(Path(folder))
+        self.assertEqual((2, "", "table_checks: the plan cannot be read (FileNotFoundError)\n"), (code, out, err))
+        session.assert_not_called()
+
+    def test_a_deadline_that_can_be_used_is_passed_on_to_the_deadline_timer(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"JOB_DEADLINE_SECONDS": "120.5"}),
+            mock.patch.object(table_checks, "start_deadline") as deadline,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            table_checks.main(["--staging", str(self.staging_with("{}"))])
+        deadline.assert_called_once_with(120.5, table_checks.JOB)
 
 
 if __name__ == "__main__":
