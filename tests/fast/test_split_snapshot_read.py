@@ -70,9 +70,17 @@ def label_problems(rows: list[dict[str, Any]]) -> list[str]:
     return LabelsLake(MagicMock(), MagicMock(), "b", SETTINGS).split_problems(Frame(rows))
 
 
-def profile_problems(rows: list[dict[str, Any]]) -> list[str]:
+def clinical_rows(*changes: dict[str, Any]) -> list[dict[str, Any]]:
+    """The rows of a clinical table of the 60 patients of ``split_rows``, one case each, whose last rows hold the changes."""
+    rows = [{"caseid": str(number), "subjectid": str(number)} for number in range(1, 61)]
+    for index, change in enumerate(changes):
+        rows[-1 - index] = {**rows[-1 - index], **change}
+    return rows
+
+
+def profile_problems(rows: list[dict[str, Any]], clinical: list[dict[str, Any]] | None = None) -> list[str]:
     """The problems that the profile finds in the split table when the clinical table holds exactly the patients of the rows that are in form."""
-    clinical = [{"caseid": str(number), "subjectid": str(number)} for number in range(1, 61)]
+    clinical = clinical_rows() if clinical is None else clinical
     held = {"patient_split": (Frame(rows), "s"), "clinical_cases": (Frame(clinical), "c")}
     snapshots = tuple(SNAPSHOT if name == "clinical_cases" else 1 for name in SOURCE_NAMES)
     return ProfileLake(MagicMock(), MagicMock(), "b", SETTINGS).development_problems(held, snapshots)
@@ -124,6 +132,52 @@ class AnOutOfFormRow(unittest.TestCase):
                 named = problems(rows)
                 self.assertIn(CODE, named)
                 self.assertIn("rule_mismatch: failed", named)
+
+
+MALFORMED_CLINICAL = (
+    ("a case number that is null", {"caseid": None}),
+    ("a patient that is null", {"subjectid": None}),
+    ("a case number that is not a number", {"caseid": "x1"}),
+)
+
+
+class AMalformedClinicalRowKeepsTheSplitFlags(unittest.TestCase):
+    """The checks of the split table by itself do not depend on the clinical rows, so a clinical row that cannot be parsed adds its own flag and hides none."""
+
+    def broken_split(self) -> list[dict[str, Any]]:
+        rows = split_rows({"source_snapshot_id": None})
+        wrong = next(index for index, row in enumerate(rows) if row["set"] == "test" and index > 0)
+        rows[wrong] = {**rows[wrong], "set": "training"}
+        return rows
+
+    def test_a_malformed_clinical_row_is_its_own_flag_and_the_split_is_in_form(self) -> None:
+        for what, change in MALFORMED_CLINICAL:
+            with self.subTest(clinical=what):
+                self.assertEqual(["source_row: failed"], profile_problems(split_rows(), clinical_rows(change)))
+
+    def test_a_case_under_two_patients_is_its_own_flag_and_the_split_is_in_form(self) -> None:
+        twice = [*clinical_rows(), {"caseid": "1", "subjectid": "2"}]
+        self.assertEqual(["case_two_patients: failed"], profile_problems(split_rows(), twice))
+
+    def test_a_malformed_clinical_row_hides_no_split_failure(self) -> None:
+        for what, change in MALFORMED_CLINICAL:
+            with self.subTest(clinical=what):
+                named = profile_problems(self.broken_split(), clinical_rows(change))
+                self.assertIn(CODE, named)
+                self.assertIn("rule_mismatch: failed", named)
+                self.assertIn("source_row: failed", named)
+                self.assertEqual(len(named), len(set(named)))
+
+    def test_a_case_under_two_patients_hides_no_split_failure(self) -> None:
+        named = profile_problems(self.broken_split(), [*clinical_rows(), {"caseid": "1", "subjectid": "2"}])
+        self.assertEqual({CODE, "rule_mismatch: failed", "case_two_patients: failed"}, set(named))
+
+    def test_the_flags_of_a_split_that_is_not_in_form_do_not_depend_on_the_clinical_rows(self) -> None:
+        split_only = [line for line in profile_problems(self.broken_split()) if not line.startswith("source_")]
+        for what, change in MALFORMED_CLINICAL:
+            with self.subTest(clinical=what):
+                named = profile_problems(self.broken_split(), clinical_rows(change))
+                self.assertEqual(split_only, [line for line in named if line != "source_row: failed"])
 
 
 class TheRefusalLeavesTheJobAsItsCode(unittest.TestCase):

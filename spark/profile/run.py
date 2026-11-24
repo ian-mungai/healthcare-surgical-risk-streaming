@@ -18,12 +18,14 @@ writes only while the branch still has the checked hash, creates the namespace a
 one commit (a rebuilt table as the drop and then the create) and reads the inputs and the three tables at the hash of the last write. The read-back must be
 the planned tables, with every check passing. The job ends only when the branch still has that hash.
 
-A verify classifies the schemas first (any table that is not its card's, the predecessor included, is ``table_schema``), then builds the same plan on the stored
-rule row and requires the stored tables to be equal to it and the stored rule to be the planned row. The read-back and the verify name a table that differs
-with the flags ``readback_differs: failed`` and ``plan_differs: failed``, never a count of tables, which would count ``source_counts``. A prespecified count
-that the reproduced count does not equal is a finding, not a failure: its flag is in the table and its name is not in the result. The counts of the full cohort
-change with a held-out recording, so the result holds one pass flag for ``source_counts`` and neither its fingerprint nor a name (``Outcome.facts``), and its
-rewrite alone leaves the printed outcome ``unchanged`` (``public_outcome``).
+A verify refuses an input that cannot be profiled and classifies the schemas first (any table that is not its card's, the predecessor included, is
+``table_schema``), both before it reads a fact of a stored table: a count that a refused input would be compared with is not a count of the input, and a number
+printed beside it would follow the stored row. It then builds the same plan on the stored rule row and requires the stored tables to be equal to it and the
+stored rule to be the planned row. The read-back and the verify name a table that differs with the flags ``readback_differs: failed`` and
+``plan_differs: failed``, never a count of tables, which would count ``source_counts``. A prespecified count that the reproduced count does not equal is a
+finding, not a failure: its flag is in the table and its name is not in the result. The counts of the full cohort change with a held-out recording, so the
+result holds one pass flag for ``source_counts`` and neither its fingerprint nor a name (``Outcome.facts``), and its rewrite alone leaves the printed outcome
+``unchanged`` (``public_outcome``).
 """
 
 from __future__ import annotations
@@ -316,13 +318,11 @@ def run_verify(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     """
     try:
         source = ops.read_input(head)
-        problems = input_problems(source)
-        problems += unfit_schemas(ops.schemas(head), rebuildable=False)
-        if problems and any(problem.startswith(f"{SCHEMA_CODE}:") for problem in problems):
+        problems = input_problems(source) + unfit_schemas(ops.schemas(head), rebuildable=False)
+        if problems:
             raise SignalProfileError(*problems)
         rule = ops.read_rule(head)
-        if not problems:
-            problems = stored_rule_problems(rule, wanted_rule(source))
+        problems = stored_rule_problems(rule, wanted_rule(source))
         planned = ops.plan(head, rule.rule) if not problems and rule is not None and rule.rule is not None else {}
         reads = read_tables(ops, head, True)
         problems += table_problems(source, reads, pinned=pinned)

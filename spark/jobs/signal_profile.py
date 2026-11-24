@@ -113,19 +113,17 @@ class ProfileLake(Lake):
         return {name: self.input(at, name) for name in INPUTS}
 
     def development_problems(self, held: dict[str, tuple[Any, str]], snapshots: tuple[int | None, ...]) -> list[str]:
-        """The rule check of the split and its match with the clinical cases, and the list of development case numbers when they pass."""
+        """The rule check of the split and its match with the clinical cases, and the list of development case numbers when they pass. The checks of the split
+        table by itself run before the clinical rows are parsed, so a clinical row that cannot be parsed adds its own flags and hides none of them."""
         rows, broken = table_rows(held["patient_split"][0].collect())
+        problems = [*([flag("table_row")] if broken else []), *table_problems(rows, pinned=self.pinned_release)]
         clinical = held["clinical_cases"][0].select("caseid", "subjectid").collect()
         try:
             cases, patients = source_cases((row["caseid"], row["subjectid"]) for row in clinical)
         except PatientSplitError as error:
-            return error.problems
+            return [*problems, *error.problems]
         clinical_snapshot = snapshots[SOURCE_NAMES.index("clinical_cases")]
-        problems = [
-            *([flag("table_row")] if broken else []),
-            *table_problems(rows, pinned=self.pinned_release),
-            *source_problems(rows, patients, int(clinical_snapshot or 0)),
-        ]
+        problems += source_problems(rows, patients, int(clinical_snapshot or 0))
         if problems:
             return problems
         sets = {row.subjectid: row.set for row in rows}

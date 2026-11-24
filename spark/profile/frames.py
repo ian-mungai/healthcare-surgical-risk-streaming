@@ -19,12 +19,13 @@ from typing import Any
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from features.signal_validity import ARTERIAL_WAVEFORM, INVALID_CAUSES
-from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, UnscoredFacts
+from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, SignalProfileError, UnscoredFacts
 from spark.profile.counts import ARTERIAL_TRACK, BY_NAME, FULL_COHORT, NONINVASIVE_TRACK, PRESPECIFIED, SECONDS_PER_HOUR
 from spark.profile.grid_rule import RULE_END, GridRule, RuleRead
 from spark.profile.tables import CAUSE_COLUMNS, COUNTS, DEVELOPMENT_SCOPE, GRID_RULE, KINDS, NUMERIC_KIND, PROFILE, UNSCORED, WAVEFORM_KIND
 from spark.profile.unscored import count_unscored, grid_pair
 from spark.silver.frames import count_where, functions, typed, types
+from spark.split_table import flag
 
 DEVELOPMENT_SETS = ("training", "validation")
 TRACK_KEY = ("kind", "track")
@@ -198,6 +199,15 @@ def profile_facts(frame: Any) -> ProfileFacts:
     )
 
 
+def whole_number(row: Mapping[str, Any], name: str) -> int:
+    """A whole-number column of a stored row, or the fixed refusal ``table_row: failed`` for a null (a stored row that is not in form), never a ``TypeError``
+    and never the column or a value."""
+    value = row[name]
+    if value is None:
+        raise SignalProfileError(flag("table_row"))
+    return int(value)
+
+
 def unscored_facts(frame: Any) -> UnscoredFacts:
     rows = frame.collect()
     if not rows:
@@ -206,20 +216,20 @@ def unscored_facts(frame: Any) -> UnscoredFacts:
     share = one["unscored_share"]
     return UnscoredFacts(
         len(rows),
-        int(one["cutoffs"]),
-        int(one["waveform"]),
-        int(one["numeric"]),
-        int(one["either"]),
+        whole_number(one, "cutoffs"),
+        whole_number(one, "waveform"),
+        whole_number(one, "numeric"),
+        whole_number(one, "either"),
         None if share is None else float(share),
-        int(one["cases"]),
-        int(one["no_grid"]),
-        int(one["cutoff_step"]),
-        int(one["cutoff_offset"]),
-        int(one["last_margin"]),
-        int(one["waveform_window"]),
-        int(one["waveform_limit"]),
-        int(one["numeric_window"]),
-        int(one["numeric_limit"]),
+        whole_number(one, "cases"),
+        whole_number(one, "no_grid"),
+        whole_number(one, "cutoff_step"),
+        whole_number(one, "cutoff_offset"),
+        whole_number(one, "last_margin"),
+        whole_number(one, "waveform_window"),
+        whole_number(one, "waveform_limit"),
+        whole_number(one, "numeric_window"),
+        whole_number(one, "numeric_limit"),
     )
 
 

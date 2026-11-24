@@ -123,7 +123,7 @@ class LabelsLake(Lake):
         problems = self.split_problems(split)
         if problems:
             return InputRead(InputFacts(0, 0, 0, tuple(problems), 0), held)
-        return InputRead(frames.input_facts(cases, split), held)
+        return InputRead(frames.input_facts(cases, split, lab), held)
 
     def persist(self, table: str, frame: Any) -> Fingerprint:
         """Keep a planned frame on disk for the write and give its fingerprint, which stays inside the run (a digest changes with a held-out row)."""
