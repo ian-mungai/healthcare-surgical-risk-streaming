@@ -3,8 +3,10 @@ that Silver's batch path calls (analysis plan row 4, "Invalid second"), and keep
 
 Failure modes covered here:
 
-- A physical value is not ``raw * gain + offset``, or a raw sample that is not a number is turned into a reading, so the stream and the batch path would
-  disagree on every sample.
+- A physical value is not the one that Silver makes from the track's format, gain and offset, or a raw sample that is not a number is turned into a reading,
+  so the stream and the batch path would disagree on every sample.
+- The gap marker of an integer format is read as a reading, or the gain and the offset of a float format are applied, so a second is valid in the stream and
+  invalid in Silver, or the other way round.
 - The flat rule (a range under 20 mmHg over the 20 seconds that end with the second) is applied to a segment that is not complete, to fewer than 20 seconds, or
   not at all, so the stream marks a second valid that Silver marks invalid or the other way round.
 - The jump across the second boundary reads the last sample of a second that is not the one just before, or of none.
@@ -22,8 +24,8 @@ from fractions import Fraction
 from features.model import SECOND, FeatureInputError, Reading
 from features.registry import ARTERIAL_SERIES, NUMERIC_WINDOW_SECONDS, complete_seconds
 from features.series_input import SeriesReadings
-from features.signal_validity import FLAT, INCOMPLETE, JUMP, MISSING, OUT_OF_RANGE
-from replay.events.recording import physical_value
+from features.signal_validity import FLAT, FLOAT_FORMATS, GAP_MARKERS, INCOMPLETE, JUMP, MISSING, OUT_OF_RANGE
+from features.signal_validity import physical_samples as silver_physical_samples
 from spark.streaming.signals import ARTERIAL_WAVEFORM, ArtSecond, art_second, physical_samples, second_valid, series_window
 
 RATE = 4
@@ -40,13 +42,35 @@ def held_from(seconds: Mapping[int, Sequence[float | None]], rate: int = RATE) -
 
 
 class Physical(unittest.TestCase):
-    def test_a_physical_sample_is_the_one_shared_definition(self) -> None:
+    def test_a_physical_sample_is_the_one_shared_definition_for_every_sample_format(self) -> None:
+        raw = [0.0, 1.0, -3.5, 100.0, -128.0, 255.0, -32768.0, 65535.0]
+        for sample_format in range(1, 9):
+            with self.subTest(sample_format=sample_format):
+                expected = tuple(
+                    None if sample is None or not math.isfinite(sample) else sample for sample in silver_physical_samples(raw, sample_format, 0.25, 4.0)
+                )
+                self.assertEqual(expected, physical_samples(raw, sample_format, 0.25, 4.0))
+
+    def test_an_integer_format_is_calibrated_and_its_gap_marker_is_a_missing_sample(self) -> None:
         raw = [0.0, 1.0, -3.5, 100.0]
-        self.assertEqual([physical_value(value, 0.25, 4.0) for value in raw], list(physical_samples(raw, 0.25, 4.0)))
-        self.assertEqual((4.0, 4.25, 3.125, 29.0), physical_samples(raw, 0.25, 4.0))
+        self.assertEqual((4.0, 4.25, 3.125, 29.0), physical_samples(raw, 5, 0.25, 4.0))
+        for sample_format, marker in GAP_MARKERS.items():
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual((None, 4.25, None), physical_samples([marker, 1.0, marker], sample_format, 0.25, 4.0))
+
+    def test_the_marker_of_one_integer_format_is_a_reading_of_another(self) -> None:
+        self.assertEqual((255.0 * 0.5 + 1.0,), physical_samples([255.0], 5, 0.5, 1.0))
+        self.assertEqual((None,), physical_samples([255.0], 4, 0.5, 1.0))
+
+    def test_a_float_format_ignores_its_gain_and_offset_and_a_marker_value_is_a_reading(self) -> None:
+        for sample_format in FLOAT_FORMATS:
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual((4.0, -3.5, 255.0, -32768.0), physical_samples([4.0, -3.5, 255.0, -32768.0], sample_format, 0.25, 4.0))
 
     def test_a_raw_sample_that_is_not_a_finite_number_is_a_missing_sample_not_a_reading(self) -> None:
-        self.assertEqual((None, 5.0, None, None), physical_samples([math.nan, 5.0, math.inf, -math.inf], 1.0, 0.0))
+        for sample_format in (2, 5):
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual((None, 5.0, None, None), physical_samples([math.nan, 5.0, math.inf, -math.inf], sample_format, 1.0, 0.0))
 
     def test_the_arterial_track_is_the_one_the_feature_registry_names(self) -> None:
         from features.registry import WAVEFORM_TRACKS

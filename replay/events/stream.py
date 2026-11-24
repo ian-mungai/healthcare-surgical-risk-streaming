@@ -136,6 +136,7 @@ def outgoing(run_id: str, scheduled: ScheduledOccurrence, recording: CaseRecordi
             "sample_rate": float(waveform.sample_rate),
             "gain": float(waveform.gain),
             "offset": float(waveform.offset),
+            "sample_format": int(waveform.sample_format),
             "start_offset_us": event.span.start_offset_us,
             "samples": second_samples(waveform, event.span),
         }

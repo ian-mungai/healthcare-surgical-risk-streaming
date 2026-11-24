@@ -13,6 +13,8 @@ Failure modes covered here:
 - Two readings of one track and time give a value that depends on their arrival order.
 - A new case occurrence in a room carries a value of the occurrence before it, or a room's new occurrence or an uneven read discards an in-
   policy event of another room.
+- A waveform track of an integer format keeps its gap marker as a reading, or a track of a float format is calibrated with its gain and offset, so a second
+  is judged valid in the stream and invalid in Silver, or the other way round.
 - A bad input stops the job instead of leaving an error record, an event after the case end changes a row, or a clinical value that is not
   yet available is read.
 """
@@ -237,6 +239,38 @@ class SignalParity(unittest.TestCase):
     def test_a_jump_across_a_second_boundary_and_a_gap_of_a_second_are_judged_as_the_batch_path_judges_them(self) -> None:
         recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, jump_s=170, gap_s=200)
         self.agree(recording, (60 * SECOND, 180 * SECOND, 240 * SECOND, 300 * SECOND))
+
+    def test_an_integer_format_gap_marker_is_a_missing_sample_in_the_stream_as_in_the_batch_path(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, arterial_format=5, arterial_gain=0.01, arterial_offset=382.68, marker_s=(170, 1))
+        marker = recording.waveforms[0].records[0].samples[170 * 4 + 1]
+        self.assertEqual(-32768.0, marker)
+        self.assertAlmostEqual(55.0, marker * 0.01 + 382.68)
+        found = self.agree(recording, (120 * SECOND, 180 * SECOND, 240 * SECOND, 300 * SECOND))
+        self.assertIn(WAVEFORM_INVALID_SECOND, found[180 * SECOND].eligibility_reasons)
+        self.assertNotIn(WAVEFORM_INVALID_SECOND, found[120 * SECOND].eligibility_reasons)
+
+    def test_control_the_same_integer_format_track_with_no_marker_is_valid_in_the_stream_and_in_the_batch_path(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, arterial_format=5, arterial_gain=0.01, arterial_offset=382.68)
+        found = self.agree(recording, (120 * SECOND, 180 * SECOND, 240 * SECOND, 300 * SECOND))
+        self.assertNotIn(WAVEFORM_INVALID_SECOND, found[180 * SECOND].eligibility_reasons)
+
+    def test_a_float_format_track_ignores_its_gain_and_offset_in_the_stream_as_in_the_batch_path(self) -> None:
+        for sample_format in (1, 2):
+            with self.subTest(sample_format=sample_format):
+                recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, arterial_format=sample_format, arterial_gain=0.5, arterial_offset=100.0)
+                found = self.agree(recording, (120 * SECOND, 180 * SECOND, 240 * SECOND, 300 * SECOND))
+                self.assertNotIn(WAVEFORM_INVALID_SECOND, found[180 * SECOND].eligibility_reasons)
+                self.assertEqual(oracle_values(synthetic_recording(caseend_s=400, opend_s=300, rate=4), 180 * SECOND), values_of(found[180 * SECOND]))
+
+    def test_every_sample_format_gives_the_batch_rows_with_and_without_a_gap_marker(self) -> None:
+        scales = {1: (0.5, 100.0), 2: (0.5, 100.0), 3: (2.0, 0.0), 4: (1.0, 0.0), 5: (0.01, 382.68), 6: (0.01, 0.0), 7: (0.001, 0.0), 8: (0.001, 0.0)}
+        for sample_format, (gain, offset) in scales.items():
+            for marker in (None, (170, 1)):
+                with self.subTest(sample_format=sample_format, marker=marker):
+                    recording = synthetic_recording(
+                        caseend_s=300, opend_s=250, rate=4, arterial_format=sample_format, arterial_gain=gain, arterial_offset=offset, marker_s=marker
+                    )
+                    self.agree(recording, (120 * SECOND, 180 * SECOND, 250 * SECOND))
 
     def test_the_rows_do_not_depend_on_the_batch_split_or_a_restart_when_seconds_are_judged_over_20_seconds(self) -> None:
         recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, flat_s=(100, 140), jump_s=170, gap_s=200)

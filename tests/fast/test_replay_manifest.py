@@ -147,7 +147,7 @@ class WaveformCrossCheck(unittest.TestCase):
                 count = draw(f"{rate}:{number}:count", 1, 900)
                 records.append(WaveformRecord(start, array("d", (float(index) for index in range(count)))))
                 start += draw(f"{rate}:{number}:step", -300_000, 1_800_000)
-            track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, tuple(records))
+            track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, 2, tuple(records))
             replay_side = {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)}
             self.assertEqual(reference_seconds(track), replay_side, f"rate {rate}")
 

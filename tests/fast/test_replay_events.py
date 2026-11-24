@@ -8,6 +8,7 @@ Failure modes covered here:
 - A generated marker comes before a reading that is due at the same instant, so the final-score row is built before the cutoff reading arrived.
 - A string event is sent as a reading, loses its text or its stable source ID, or a marker takes the form of a source event.
 - The replay time of an event is not the start of its occurrence plus its due offset, so a room's events leave the replay clock.
+- A waveform second carries no sample format, or the format of another track, so the stream cannot tell a gap marker from a reading or a float from an integer.
 - A reading before the case start or after its whole-second end is due outside its occurrence, so the replay time of a room goes backwards.
 """
 
@@ -17,8 +18,10 @@ import unittest
 from array import array
 from collections.abc import Callable
 
-from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
-from replay.events.schedule import admitted_occurrences
+from features.signal_validity import FLOAT_FORMATS, GAP_MARKERS
+from replay.events.identity import Occurrence
+from replay.events.recording import WAVEFORM_FORMATS, CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
+from replay.events.schedule import ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import earliest_due_offset_us, occurrence_events, outgoing
 from replay.events.waveform import second_samples, second_spans
 from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule
@@ -26,8 +29,8 @@ from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, bound
 WAVE_KEYS = {"event_id", "run_id", "room", "occurrence_id", "case_id", "track", "case_time_us", "discriminator", "replay_time_us"}
 
 
-def waveform(rate: float, *records: tuple[int, list[float]]) -> WaveformTrack:
-    return WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, tuple(WaveformRecord(start, array("d", samples)) for start, samples in records))
+def waveform(rate: float, *records: tuple[int, list[float]], sample_format: int = 2) -> WaveformTrack:
+    return WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, sample_format, tuple(WaveformRecord(start, array("d", samples)) for start, samples in records))
 
 
 def seconds_of(track: WaveformTrack) -> list[tuple[int, int, list[float]]]:
@@ -166,6 +169,31 @@ class EventOrder(unittest.TestCase):
                 build()
 
 
+class SampleFormat(unittest.TestCase):
+    def test_each_sample_format_of_the_file_format_is_accepted(self) -> None:
+        for sample_format in range(1, 9):
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual(sample_format, waveform(4.0, (0, [1.0]), sample_format=sample_format).sample_format)
+
+    def test_a_format_that_is_not_one_of_the_eight_sample_formats_is_refused_when_the_recording_is_built(self) -> None:
+        times = CaseTimes(1, 0, 5, 9)
+        for sample_format in (0, 9, -1, 255):
+            with self.subTest(sample_format=sample_format), self.assertRaises(RecordingError):
+                CaseRecording(times, waveforms=(waveform(4.0, (0, [1.0]), sample_format=sample_format),))
+
+    def test_the_formats_of_the_replay_are_the_formats_that_silver_decodes(self) -> None:
+        self.assertEqual(set(FLOAT_FORMATS) | set(GAP_MARKERS), set(WAVEFORM_FORMATS))
+
+    def test_the_waveform_event_carries_the_format_of_its_own_track_for_every_format(self) -> None:
+        times = CaseTimes(1, 0, 5, 9_000_000)
+        for sample_format in range(1, 9):
+            recording = CaseRecording(times, waveforms=(waveform(4.0, (0, [1.0, 2.0, 3.0, 4.0]), sample_format=sample_format),))
+            scheduled = ScheduledOccurrence(Occurrence(0, 1, 0, 0), times, 0)
+            sent = [outgoing(RUN_ID, scheduled, recording, event).payload for event in occurrence_events(recording) if event.kind == "waveform"]
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual([sample_format], [payload["sample_format"] for payload in sent])
+
+
 class OutgoingEvents(unittest.TestCase):
     def setUp(self) -> None:
         self.recordings = boundary_recordings()
@@ -221,6 +249,7 @@ class OutgoingEvents(unittest.TestCase):
                 "sample_rate": 4.0,
                 "gain": 0.5,
                 "offset": -1.0,
+                "sample_format": 5,
                 "start_offset_us": 150_000,
                 "samples": [31.0, 32.0],
             },

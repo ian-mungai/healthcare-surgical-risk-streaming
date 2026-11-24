@@ -48,6 +48,13 @@ class Events(unittest.TestCase):
         row = event_row(events_for(synthetic_recording(caseend_s=60, opend_s=50))[0])
         self.assertEqual([name for name, _ in INPUT_COLUMNS], list(row))
 
+    def test_a_waveform_row_keeps_the_sample_format_of_its_track_as_an_integer_column(self) -> None:
+        events = events_for(synthetic_recording(caseend_s=60, opend_s=50, arterial_format=5, arterial_gain=0.01, arterial_offset=382.68))
+        formats = {event.track: event_row(event)["sample_format"] for event in events if event.kind == "waveform"}
+        self.assertEqual({"SNUADC/ART": 5, "SNUADC/PLETH": 5}, formats)
+        self.assertEqual(("sample_format", "int"), next(column for column in INPUT_COLUMNS if column[0] == "sample_format"))
+        self.assertEqual(5, event_from_row(event_row(next(event for event in events if event.kind == "waveform"))).sample_format)
+
 
 class Records(unittest.TestCase):
     def test_every_record_survives_an_output_row(self) -> None:

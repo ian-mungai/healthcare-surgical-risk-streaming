@@ -153,7 +153,7 @@ def apply(state: OccurrenceState, event: Event, lateness_us: int, context: Conte
             state.count("ignored")
             return True
         second = event.case_time_us // SECOND
-        samples = physical_samples(event.samples, event.gain, event.physical_offset)
+        samples = physical_samples(event.samples, event.sample_format, event.gain, event.physical_offset)
         state.wave_samples.setdefault(event.track, {})[second] = WaveSecondState(event.sample_rate, event.start_offset_us, samples)
     return True
 

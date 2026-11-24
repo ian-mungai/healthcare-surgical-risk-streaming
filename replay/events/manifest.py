@@ -165,6 +165,7 @@ def expected_events(frozen: FrozenSchedule, scheduled: ScheduledOccurrence, reco
                 "sample_rate": float(waveform.sample_rate),
                 "gain": float(waveform.gain),
                 "offset": float(waveform.offset),
+                "sample_format": int(waveform.sample_format),
                 "start_offset_us": offset,
                 "samples": samples,
             }

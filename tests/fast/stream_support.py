@@ -22,11 +22,20 @@ from features.pressure_series import SecondFacts, second_facts
 from features.registry import ARTERIAL_SERIES, NUMERIC_TRACKS, WAVEFORM_TRACKS
 from features.row import build_row
 from features.series_input import series_readings
-from features.signal_validity import FLAT_WINDOW_SECONDS, combine_extents, numeric_verdict, second_extent, waveform_verdict
+from features.signal_validity import (
+    FLAT_WINDOW_SECONDS,
+    FLOAT_FORMATS,
+    GAP_MARKERS,
+    combine_extents,
+    numeric_verdict,
+    physical_samples,
+    second_extent,
+    waveform_verdict,
+)
 from replay.events.formats import FORMATS, KIND_FORMAT
 from replay.events.identity import Occurrence, source_event_id
 from replay.events.manifest import reference_seconds
-from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, StringTrack, WaveformRecord, WaveformTrack, physical_value
+from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, StringTrack, WaveformRecord, WaveformTrack
 from replay.events.schedule import ScheduledOccurrence
 from replay.events.stream import occurrence_events, outgoing
 from spark.streaming.model import Context, Event, FeatureRecord, Policy, Record
@@ -68,11 +77,17 @@ def synthetic_recording(
     flat_s: tuple[int, int] | None = None,
     jump_s: int | None = None,
     gap_s: int | None = None,
+    arterial_format: int = 2,
+    arterial_gain: float = 1.0,
+    arterial_offset: float = 0.0,
+    marker_s: tuple[int, int] | None = None,
 ) -> CaseRecording:
     """A case with registry tracks: two numeric tracks (one with a duplicate reading and one with a not-a-number reading), an unregistered numeric track, a
     string track, an arterial waveform with one invalid second, and a second waveform with a gain and an offset. ``flat_s`` (the first second and the one after
     the last) makes those arterial seconds a small wave that is flat over 20 seconds, ``jump_s`` starts that second with a sample far from the one before it and
-    ``gap_s`` leaves that arterial second out of the recording."""
+    ``gap_s`` leaves that arterial second out of the recording. The arterial track has the sample format, gain and offset given: its raw samples are the
+    physical ones for a float format and ``(physical - offset) / gain`` rounded for an integer format, and ``marker_s`` (second, position) writes the format's
+    gap marker into that sample."""
     heart = [(second * SECOND, hr_base + (second % 7)) for second in range(1, caseend_s, hr_step_s)]
     heart.append((41 * SECOND, hr_base + 30.0))
     heart.extend((time, value) for time, value in extra_hr)
@@ -85,8 +100,17 @@ def synthetic_recording(
         arterial_seconds[second] = [80.0 + (position + second) % 3 for position in range(rate)]
     if jump_s is not None:
         arterial_seconds[jump_s][0] = 190.0
+
+    def raw_of(second: int, position: int, physical: float) -> float:
+        if marker_s == (second, position):
+            return GAP_MARKERS.get(arterial_format, math.nan)
+        return physical if arterial_format in FLOAT_FORMATS else float(round((physical - arterial_offset) / arterial_gain))
+
     arterial_records = [
-        WaveformRecord(start * SECOND, array("d", [value for second in range(start, end) for value in arterial_seconds[second]]))
+        WaveformRecord(
+            start * SECOND,
+            array("d", [raw_of(second, position, value) for second in range(start, end) for position, value in enumerate(arterial_seconds[second])]),
+        )
         for start, end in (((arterial_start_s, caseend_s),) if gap_s is None else ((arterial_start_s, gap_s), (gap_s + 1, caseend_s)))
         if end > start
     ]
@@ -100,8 +124,8 @@ def synthetic_recording(
         ),
         strings=(StringTrack("Test/EVENT", ((50 * SECOND, "note"),)),),
         waveforms=(
-            WaveformTrack(ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), 1.0, 0.0, tuple(arterial_records)),
-            WaveformTrack("SNUADC/PLETH", "%", float(rate), 0.5, 1.0, (WaveformRecord(0, array("d", pleth_samples)),)),
+            WaveformTrack(ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), arterial_gain, arterial_offset, arterial_format, tuple(arterial_records)),
+            WaveformTrack("SNUADC/PLETH", "%", float(rate), 0.5, 1.0, 5, (WaveformRecord(0, array("d", pleth_samples)),)),
         ),
     )
 
@@ -185,9 +209,9 @@ def values_of(record: FeatureRecord) -> dict[str, object]:
     return features
 
 
-def oracle_physical(raw: Sequence[float], gain: float, offset: float) -> list[float | None]:
-    """The physical samples of a second: a raw sample that is not a finite number is a missing sample."""
-    return [physical_value(value, gain, offset) if math.isfinite(value) else None for value in raw]
+def oracle_physical(raw: Sequence[float], sample_format: int, gain: float, offset: float) -> list[float | None]:
+    """The physical samples of a second as Silver makes them: the track's format decides the gap marker, the gain and the offset."""
+    return physical_samples(raw, sample_format, gain, offset)
 
 
 def oracle_window(recording: CaseRecording, cutoff_us: int, clinical: Mapping[str, ClinicalValue] | None = None) -> WindowInput:
@@ -205,7 +229,7 @@ def oracle_window(recording: CaseRecording, cutoff_us: int, clinical: Mapping[st
     for wave in recording.waveforms:
         if wave.name not in WAVEFORM_TRACKS:
             continue
-        held = {second: (offset, oracle_physical(raw, wave.gain, wave.offset)) for second, (offset, raw) in reference_seconds(wave).items()}
+        held = {second: (offset, oracle_physical(raw, wave.sample_format, wave.gain, wave.offset)) for second, (offset, raw) in reference_seconds(wave).items()}
         seconds = []
         for second, (offset, samples) in sorted(held.items()):
             before = held.get(second - 1)

@@ -9,9 +9,9 @@ that last sample and the facts of the second for the series, so a later second i
 The series of a window is made by ``series_readings`` from those facts, so every reading carries its exact mean and the features
 compare the exact mean with a limit, as for the batch path.
 
-A raw sample that is not a finite number is a missing sample. The replay's event carries no sample format, so a gap marker of an integer format
-(``GAP_MARKERS``) is not recognised here as it is on Silver's path, which reads the format from Bronze. A float format gives its missing sample as not-a-number,
-which is recognised.
+The physical samples of a second are made by ``features.signal_validity.physical_samples``, the function that Silver calls, from the sample format that the
+replay's event carries (the format that Bronze keeps for the track): a gap marker of an integer format (``GAP_MARKERS``) is a missing sample, an integer
+sample is ``raw * gain + offset`` and a float sample ignores the gain and the offset. A raw sample that is not a finite number is a missing sample.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from features.pressure_series import SecondFacts, second_facts
 from features.registry import NUMERIC_WINDOW_SECONDS, complete_seconds
 from features.series_input import SeriesReadings, series_readings
 from features.signal_validity import ARTERIAL_WAVEFORM, FLAT_WINDOW_SECONDS, Extent, combine_extents, second_extent, waveform_verdict
-from replay.events.recording import physical_value
+from features.signal_validity import physical_samples as silver_physical_samples
 
 __all__ = ["ARTERIAL_WAVEFORM", "ArtSecond", "art_second", "physical_samples", "second_valid", "series_window"]
 
@@ -53,9 +53,10 @@ class ArtSecond:
         return SecondFacts(second, self.valid, self.cause, self.count, self.total, self.residual)
 
 
-def physical_samples(raw: Sequence[float], gain: float, offset: float) -> tuple[float | None, ...]:
-    """The physical samples of a raw second: ``raw * gain + offset`` (the replay's definition), and ``None`` for a raw sample that is not a finite number."""
-    return tuple(physical_value(value, gain, offset) if math.isfinite(value) else None for value in raw)
+def physical_samples(raw: Sequence[float], sample_format: int, gain: float, offset: float) -> tuple[float | None, ...]:
+    """The physical samples of a raw second, as Silver makes them (the track's format decides the gap marker, the gain and the offset), with ``None`` for a
+    sample that is missing or not a finite number."""
+    return tuple(None if sample is None or not math.isfinite(sample) else sample for sample in silver_physical_samples(raw, sample_format, gain, offset))
 
 
 def art_second(second: int, samples: Sequence[float | None], sample_rate: float, start_offset_us: int, earlier: Mapping[int, ArtSecond]) -> ArtSecond:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from features.signal_validity import FLOAT_FORMATS, GAP_MARKERS
 from replay.events.errors import EventModelError
 from replay.events.formats import FORMATS
 from replay.events.wire import unframe
@@ -20,6 +21,7 @@ RECORD_KINDS: dict[str, Kind] = {
     FORMATS["waveform"].record_name: "waveform",
     FORMATS["string_event"].record_name: "string",
 }
+WAVEFORM_FORMATS = frozenset(FLOAT_FORMATS) | frozenset(GAP_MARKERS)
 MARKER_KINDS: dict[str, Kind] = {"OP_START": "op_start", "FINAL_SCORE": "final_score", "CASE_END": "case_end"}
 
 
@@ -60,6 +62,9 @@ def event_from_record(record_name: str, payload: dict[str, Any], kafka_partition
     elif kind == "string":
         common |= {"track": payload["track"], "discriminator": payload["discriminator"]}
     elif kind == "waveform":
+        sample_format = payload.get("sample_format", 0)
+        if sample_format not in WAVEFORM_FORMATS:
+            raise StreamEventError(f"the waveform {payload['event_id']} does not state a sample format of the file format (1 to 8): {sample_format!r}")
         common |= {
             "track": payload["track"],
             "discriminator": payload["discriminator"],
@@ -67,6 +72,7 @@ def event_from_record(record_name: str, payload: dict[str, Any], kafka_partition
             "sample_rate": payload["sample_rate"],
             "gain": payload["gain"],
             "physical_offset": payload["offset"],
+            "sample_format": sample_format,
             "start_offset_us": payload["start_offset_us"],
         }
     return Event(**common)

@@ -67,6 +67,7 @@
           "sample_rate": 4.0,
           "gain": 0.5,
           "offset": -1.0,
+          "sample_format": 5,
           "records": [
             [
               250000,
@@ -171,6 +172,7 @@
           "sample_rate": 4.0,
           "gain": 1.0,
           "offset": 0.0,
+          "sample_format": 2,
           "records": [
             [
               9750000,

@@ -70,6 +70,12 @@
       "doc": "See the gain."
     },
     {
+      "name": "sample_format",
+      "type": "int",
+      "default": 0,
+      "doc": "The track's sample format code in the file: 1 and 2 are floats, which are already physical values, and 3 to 8 are integers (int8, uint8, int16, uint16, int32, uint32), whose physical value is the raw value times the gain plus the offset and whose gap marker is a missing sample. 0 means that the sender did not state it, and the stream refuses such a message."
+    },
+    {
       "name": "start_offset_us",
       "type": "long",
       "doc": "The time of the first sample after the start of the second, in microseconds."

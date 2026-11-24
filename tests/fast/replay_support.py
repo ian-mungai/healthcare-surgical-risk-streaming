@@ -41,6 +41,7 @@ def boundary_recordings() -> dict[int, CaseRecording]:
                     body["sample_rate"],
                     body["gain"],
                     body["offset"],
+                    body["sample_format"],
                     tuple(WaveformRecord(start, array("d", samples)) for start, samples in body["records"]),
                 )
                 for track, body in sorted(case["waveform"].items())

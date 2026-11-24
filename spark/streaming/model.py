@@ -57,7 +57,8 @@ class Context:
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    """One decoded input event with the position of its Kafka message. ``physical_offset`` is the offset of a waveform's physical value, not a Kafka offset."""
+    """One decoded input event with the position of its Kafka message. ``physical_offset`` is the offset of a waveform's physical value, not a Kafka offset.
+    ``sample_format`` is the file format code of a waveform track (1 to 8) and 0 for an event that is not a waveform."""
 
     kind: Kind
     event_id: str
@@ -74,6 +75,7 @@ class Event:
     sample_rate: float = 0.0
     gain: float = 1.0
     physical_offset: float = 0.0
+    sample_format: int = 0
     start_offset_us: int = 0
     kafka_partition: int = 0
     kafka_offset: int = 0

@@ -95,7 +95,7 @@ def decode_case(path: Path, times: CaseTimes) -> CaseRecording:
             strings.append(StringTrack(name, tuple((to_microseconds(record["dt"]), str(record["val"])) for record in track.recs)))
         elif track.type == WAVEFORM:
             records = tuple(WaveformRecord(to_microseconds(record["dt"]), samples_of(record["val"])) for record in track.recs)
-            waveforms.append(WaveformTrack(name, track.unit, float(track.srate), float(track.gain), float(track.offset), records))
+            waveforms.append(WaveformTrack(name, track.unit, float(track.srate), float(track.gain), float(track.offset), int(track.fmt), records))
         else:
             raise DecodeError(f"case {case}: the track {name} has a type that the replay does not carry")
     try:

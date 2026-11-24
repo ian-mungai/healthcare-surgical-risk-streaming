@@ -6,6 +6,7 @@ Failure modes covered here:
 - A field of the wrong type is declared, such as a time as a double, so a case time loses its exactness.
 - Two formats share a subject, or a format has no schema file, so a registration overwrites another format.
 - A replayed input is sent to a topic other than the one input topic, so a room's readings and its markers can arrive in another order than they were sent.
+- A field added to a format has no default, so the registry's backward rule refuses the new version and the data of the version before it cannot be read.
 - The compatibility rule that the replay's formats expect of the registry is not the project's backward rule.
 
 The registry's own acceptance and refusal of a change is proved against a real registry by ``tests/e2e/stack_replay.py``.
@@ -102,3 +103,42 @@ class Schemas(unittest.TestCase):
             self.assertTrue(schema.get("doc"), key)
             for field in schema["fields"]:
                 self.assertTrue(field.get("doc"), f"{key}.{field['name']}")
+
+
+def without_field(schema: dict[str, Any], name: str) -> dict[str, Any]:
+    """The schema as it was before ``name`` was added."""
+    return {**schema, "fields": [field for field in schema["fields"] if field["name"] != name]}
+
+
+def fields_without_default(older: dict[str, Any], newer: dict[str, Any]) -> list[str]:
+    """The fields of ``newer`` that ``older`` lacks and that have no default: the fields that stop ``newer`` from reading the data of ``older``.
+
+    This is the Avro schema-resolution rule for a record (specification, "Schema Resolution"): a reader field that the writer lacks takes the reader's
+    default, and it is an error when the reader has none. The registry's BACKWARD rule applies it when it checks a new version against the one before it.
+    The fast tests have no Avro library or registry, so this holds the one rule that a field added to a format meets. ``tests/e2e/stack_replay.py`` proves
+    the registry's own acceptance and refusal of the waveform change.
+    """
+    known = {field["name"] for field in older["fields"]}
+    return [field["name"] for field in newer["fields"] if field["name"] not in known and "default" not in field]
+
+
+class SampleFormatField(unittest.TestCase):
+    def test_the_waveform_format_has_an_integer_sample_format_with_a_default_that_marks_the_format_as_not_stated(self) -> None:
+        field = next(field for field in schema_of("waveform")["fields"] if field["name"] == "sample_format")
+        self.assertEqual(("int", 0), (field["type"], field["default"]))
+
+    def test_the_new_field_is_accepted_because_it_has_a_default(self) -> None:
+        newer = schema_of("waveform")
+        self.assertEqual([], fields_without_default(without_field(newer, "sample_format"), newer))
+
+    def test_the_same_field_with_no_default_is_refused(self) -> None:
+        newer = schema_of("waveform")
+        older = without_field(newer, "sample_format")
+        for field in newer["fields"]:
+            if field["name"] == "sample_format":
+                del field["default"]
+        self.assertEqual(["sample_format"], fields_without_default(older, newer))
+
+    def test_a_field_that_the_older_version_had_needs_no_default(self) -> None:
+        newer = schema_of("waveform")
+        self.assertEqual([], fields_without_default(newer, newer))

@@ -69,10 +69,21 @@ class Events(unittest.TestCase):
             if kind == "waveform":
                 self.assertEqual(tuple(payload["samples"]), event.samples)
                 self.assertEqual(
-                    (payload["sample_rate"], payload["gain"], payload["offset"], payload["start_offset_us"]),
-                    (event.sample_rate, event.gain, event.physical_offset, event.start_offset_us),
+                    (payload["sample_rate"], payload["gain"], payload["offset"], payload["sample_format"], payload["start_offset_us"]),
+                    (event.sample_rate, event.gain, event.physical_offset, event.sample_format, event.start_offset_us),
                 )
         self.assertEqual({"numeric", "waveform", "string", "op_start", "final_score", "case_end"}, kinds)
+
+    def test_a_waveform_with_no_stated_sample_format_or_one_that_is_not_a_format_of_the_file_is_refused(self) -> None:
+        name, payload = next((name, payload) for kind, name, payload in sent_payloads() if kind == "waveform")
+        for sample_format in (0, 9, -1):
+            with self.subTest(sample_format=sample_format), self.assertRaises(StreamEventError):
+                event_from_record(name, payload | {"sample_format": sample_format}, 0, 0)
+        with self.subTest(missing=True), self.assertRaises(StreamEventError):
+            event_from_record(name, {key: value for key, value in payload.items() if key != "sample_format"}, 0, 0)
+        for sample_format in range(1, 9):
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual(sample_format, event_from_record(name, payload | {"sample_format": sample_format}, 0, 0).sample_format)
 
     def test_a_marker_is_a_marker_and_its_id_is_not_a_source_id(self) -> None:
         markers = [event_from_record(name, payload, 0, 0) for kind, name, payload in sent_payloads() if kind in ("op_start", "final_score", "case_end")]
