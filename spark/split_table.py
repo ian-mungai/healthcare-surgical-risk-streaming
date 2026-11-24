@@ -74,6 +74,7 @@ CODES = frozenset(
         "case_two_patients",
         "source_row",
         "unwritable_row",
+        "table_row",
         "readback_differs",
         "table_missing",
         "branch_moved",
@@ -83,7 +84,7 @@ CODES = frozenset(
         "source_table",
     }
 )
-CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_table"})
+CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_table", "table_row"})
 
 
 class PatientSplitError(ValueError):
@@ -100,6 +101,20 @@ class SplitRow:
     set: str
     rule_version: str
     source_snapshot_id: int
+
+
+def table_rows(held: Iterable[Mapping[str, Any]]) -> tuple[list[SplitRow], int]:
+    """The rows of the split table that are in form (a ``subjectid`` that is text and a source snapshot that is a whole number) and the count of the rows that
+    are not. A row that is not in form is counted and never converted, so that a missing value is a ``table_row`` problem and not a failure of the job."""
+    rows: list[SplitRow] = []
+    broken = 0
+    for row in held:
+        subjectid, snapshot = row["subjectid"], row["source_snapshot_id"]
+        if type(subjectid) is not str or type(snapshot) is not int:
+            broken += 1
+            continue
+        rows.append(SplitRow(subjectid, row["set"], row["rule_version"], snapshot))
+    return rows, broken
 
 
 @dataclass(frozen=True, slots=True)

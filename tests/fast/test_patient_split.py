@@ -841,6 +841,27 @@ class CatalogTest(unittest.TestCase):
         self.assertFalse([key for key in session.conf_set if key.startswith("spark.sql.catalog.lake")])
 
 
+class SplitTableRowTest(unittest.TestCase):
+    """A row of the split table with no subject or no snapshot is refused with a code of its own, before any check that reads the row."""
+
+    GOOD = {"subjectid": "10", "set": "training", "rule_version": RULE_VERSION, "source_snapshot_id": 5}
+
+    def read(self, row: dict[str, Any]) -> None:
+        job = importlib.import_module("spark.jobs.patient_split")
+        session = FakeSession()
+        session.table = lambda name: FakeFrame(split_table.COLUMNS, [self.GOOD, row])  # type: ignore[method-assign]
+        job.Lake(session, NessieClient("http://127.0.0.1:1/api/v2"), "b", CatalogTest.SETTINGS).read_table("ab" * 32)
+
+    def test_a_row_that_is_not_in_form_is_refused_by_its_code(self) -> None:
+        for change in ({"subjectid": None}, {"source_snapshot_id": None}, {"subjectid": 10}, {"source_snapshot_id": "5"}, {"source_snapshot_id": False}):
+            with self.subTest(change=change), self.assertRaises(PatientSplitError) as caught:
+                self.read({**self.GOOD, **change})
+            self.assertEqual(["table_row: 1 row"], caught.exception.problems)
+
+    def test_a_row_in_form_is_read(self) -> None:
+        self.read({**self.GOOD, "subjectid": "11"})
+
+
 class FakeFrame:
     def __init__(self, fields: Sequence[tuple[str, str]], rows: list[dict[str, Any]]) -> None:
         self.schema = SimpleNamespace(
