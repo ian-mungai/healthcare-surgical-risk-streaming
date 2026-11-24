@@ -120,3 +120,21 @@ def run_command(
     if check and process.returncode != 0:
         raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
     return CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def run_discarding_output(program: str, args: Sequence[str], *, timeout: float, cwd: Path | None = None, env: Mapping[str, str] | None = None) -> int:
+    """Run ``program`` with ``args`` and return its exit code, and nothing of what it wrote.
+
+    Stdin, standard output and standard error are all ``/dev/null``: there is no pipe to fill, no byte to decode and no length to record, so no stream of the
+    program can change the caller's record or stop the call. The deadline, the process group and the stop are those of ``run_command``. A new function and not
+    an option of ``run_command``, which keeps its behavior for every other caller.
+    """
+    command = [resolve(program, cwd, env), *args]
+    process = subprocess.Popen(  # noqa: S603 - the sole launcher: full path, list arguments, no shell, closed streams and a deadline
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=cwd, env=env, start_new_session=True
+    )
+    process.args = command[0]
+    try:
+        return process.wait(timeout=timeout)
+    finally:
+        stop_group(process)

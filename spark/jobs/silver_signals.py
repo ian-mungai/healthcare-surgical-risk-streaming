@@ -1,7 +1,10 @@
 """The Silver signal tables: ``silver.numeric_observations`` and ``silver.waveform_seconds``, cleaned at their own grain, each value marked valid or invalid.
 
-``python -m spark.jobs.silver_signals build --branch <name> [--base <name>]``
-``python -m spark.jobs.silver_signals verify --branch <name>``
+``python -m spark.jobs.silver_signals build --branch <name> --result <path> [--base <name>]``
+``python -m spark.jobs.silver_signals verify --branch <name> --result <path>``
+
+The result is one JSON file at ``--result`` (an absolute path that does not exist; it is written whole and renamed, see ``spark/silver/cli.py``), also a
+refusal, whose file holds the refusal codes. Standard output stays empty and standard error is for an operator: a caller reads the exit code and the file.
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it.
 It reads ``bronze.numeric_observations``, ``bronze.waveform_seconds`` and ``bronze.tracks`` at that hash and writes the two Silver tables on the
@@ -11,8 +14,9 @@ freeze of a rerun that changes nothing, the writes and the read-back are in ``sp
 are in ``spark/silver/cli.py``. The settings come from the environment, as the patient split's do: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``,
 ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and ``JOB_DEADLINE_SECONDS``.
 
-No rule of the tables is estimated from data, so no patient set is read, and no outcome is read. The result holds hashes, snapshot IDs, counts and the checks
-that ran, and no case, track, time or value.
+No rule of the tables is estimated from data, so no patient set is read, and no outcome is read. The test set is sealed and Bronze holds the held-out cases'
+signals, so a count or a digest over the rows changes with a held-out row: the result holds hashes, snapshot IDs, the checks that ran and one pass flag for
+each table, and no count, digest, case, track, time or value. A refusal is a code and a flag, except a count of tables.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from spark.bronze import tables as bronze
 from spark.jobs.patient_split import WRITE_CATALOG, Lake
 from spark.session import build_session
 from spark.silver import frames
+from spark.silver.checks import CHECK_NAMES as CHECK_NAMES
 from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
 from spark.silver.run import BRANCH_MOVED, NUMERIC, WAVEFORM, InputRead, Operations, TableRead, run_build, run_verify
@@ -59,7 +64,7 @@ class SignalsLake(Lake):
         if not self.session.catalog.tableExists(table):
             raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
         frame = self.session.table(table)
-        problems = schema_problems(self.fields_of(frame), spec.columns, f"bronze {spec.name} table")
+        problems = schema_problems(self.fields_of(frame), spec.columns)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
@@ -76,7 +81,7 @@ class SignalsLake(Lake):
         return InputRead(facts, (snapshots[0], snapshots[1], snapshots[2]))
 
     def plan(self, at: str) -> dict[str, Any]:
-        """Build both frames from Bronze at ``at``, keep them on disk for the write and give their fingerprints."""
+        """Build both frames from Bronze at ``at``, keep them on disk for the write and give their fingerprints, which stay inside the run."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         held = self.sources(at)
         numeric, waveform, tracks = (held[spec.name][0] for spec in SOURCES)
@@ -91,7 +96,7 @@ class SignalsLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), SILVER_TABLES[table].columns, f"{table} table")
+        problems = schema_problems(self.fields_of(frame), SILVER_TABLES[table].columns)
         if problems:
             raise SilverSignalsError(*problems)
         fingerprint, snapshot = frames.fingerprint(frame), self.snapshot_id(name)

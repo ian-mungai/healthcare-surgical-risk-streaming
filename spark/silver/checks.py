@@ -6,15 +6,14 @@ track Bronze does not hold. The other two judge a Silver table that was written 
 each key is once, the kept reading is the first of its time, each kept reading, ledger and stored second is the Bronze row that it came from
 (``source_differs``, found by key against Bronze at the same hash, with the physical samples made again from the raw ones), and each verdict is
 complete and is the one that the single definition in ``features.signal_validity`` gives for the stored samples. A check returns its problems and
-never raises, so that one run names every cause. A problem is a code and a count, and holds no case, track, time or value."""
+never raises, so that one run names every cause. The test set is sealed and Bronze holds the held-out cases' signals, so a problem is a code and a flag
+(``code: failed``) and never a count: a count of rows, readings, seconds or keys changes with a held-out row. A problem holds no case, track, time or value."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from spark.split_table import unit
-
-VALID_LABEL = "valid"
+FLAG = "failed"
 CHECK_NAMES = (
     "numeric_null_key",
     "numeric_occurrence_gap",
@@ -59,7 +58,7 @@ CODES = frozenset(CHECK_NAMES) | JOB_CODES
 
 
 class SilverSignalsError(ValueError):
-    """The tables cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
+    """The tables cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a flag, or a count of tables."""
 
     def __init__(self, *problems: str) -> None:
         super().__init__("; ".join(problems))
@@ -85,8 +84,8 @@ class BronzeFacts:
 class NumericFacts:
     """What a read of ``silver.numeric_observations`` shows. ``ledger_total`` is the number of dropped duplicates that the rows list.
 
-    ``verdict_differs`` counts rows whose stored verdict is not the one that ``numeric_verdict`` gives for the stored value. ``causes`` counts the rows of each
-    cause and of ``valid``.
+    ``verdict_differs`` counts rows whose stored verdict is not the one that ``numeric_verdict`` gives for the stored value. The counts are tested inside the
+    job and never leave it.
     """
 
     rows: int
@@ -98,7 +97,6 @@ class NumericFacts:
     invalid_without_cause: int
     unknown_cause: int
     verdict_differs: int
-    causes: dict[str, int] = field(default_factory=dict)
     source_differs: int = 0
 
 
@@ -114,57 +112,57 @@ class WaveformFacts:
     unknown_cause: int
     shape_differs: int
     verdict_differs: int
-    causes: dict[str, int] = field(default_factory=dict)
     source_differs: int = 0
 
 
-def counted(pairs: list[tuple[str, int, str]]) -> list[str]:
-    return [f"{code}: {unit(count, noun)}" for code, count, noun in pairs if count]
+def flagged(pairs: list[tuple[str, int]]) -> list[str]:
+    """One flag for each failed check: the count is only tested for being positive and is never written."""
+    return [f"{code}: {FLAG}" for code, count in pairs if count]
 
 
 def bronze_problems(facts: BronzeFacts) -> list[str]:
     if facts.numeric_rows == 0 and facts.waveform_rows == 0:
-        return [f"input_empty: {unit(0, 'row')}"]
-    return counted(
+        return [f"input_empty: {FLAG}"]
+    return flagged(
         [
-            ("numeric_null_key", facts.numeric_null_keys, "row"),
-            ("numeric_occurrence_gap", facts.numeric_occurrence_gaps, "key"),
-            ("numeric_without_track", facts.numeric_without_track, "row"),
-            ("waveform_null_key", facts.waveform_null_keys, "row"),
-            ("waveform_duplicate_second", facts.waveform_duplicate_seconds, "row"),
-            ("waveform_without_track", facts.waveform_without_track, "row"),
-            ("track_duplicate", facts.track_duplicates, "key"),
+            ("numeric_null_key", facts.numeric_null_keys),
+            ("numeric_occurrence_gap", facts.numeric_occurrence_gaps),
+            ("numeric_without_track", facts.numeric_without_track),
+            ("waveform_null_key", facts.waveform_null_keys),
+            ("waveform_duplicate_second", facts.waveform_duplicate_seconds),
+            ("waveform_without_track", facts.waveform_without_track),
+            ("track_duplicate", facts.track_duplicates),
         ]
     )
 
 
 def numeric_problems(facts: NumericFacts, bronze_rows: int) -> list[str]:
-    return counted(
+    return flagged(
         [
-            ("numeric_not_every_reading", abs(bronze_rows - (facts.rows + facts.ledger_total)), "reading"),
-            ("numeric_duplicate_key", facts.duplicate_keys, "key"),
-            ("numeric_kept_not_first", facts.not_first, "row"),
-            ("numeric_verdict_null", facts.null_verdict, "row"),
-            ("numeric_valid_with_cause", facts.valid_with_cause, "row"),
-            ("numeric_invalid_without_cause", facts.invalid_without_cause, "row"),
-            ("numeric_unknown_cause", facts.unknown_cause, "row"),
-            ("numeric_verdict_differs", facts.verdict_differs, "row"),
-            ("numeric_source_differs", facts.source_differs, "row"),
+            ("numeric_not_every_reading", int(bronze_rows != facts.rows + facts.ledger_total)),
+            ("numeric_duplicate_key", facts.duplicate_keys),
+            ("numeric_kept_not_first", facts.not_first),
+            ("numeric_verdict_null", facts.null_verdict),
+            ("numeric_valid_with_cause", facts.valid_with_cause),
+            ("numeric_invalid_without_cause", facts.invalid_without_cause),
+            ("numeric_unknown_cause", facts.unknown_cause),
+            ("numeric_verdict_differs", facts.verdict_differs),
+            ("numeric_source_differs", facts.source_differs),
         ]
     )
 
 
 def waveform_problems(facts: WaveformFacts, bronze_rows: int) -> list[str]:
-    return counted(
+    return flagged(
         [
-            ("waveform_not_every_second", abs(bronze_rows - facts.rows), "second"),
-            ("waveform_duplicate_key", facts.duplicate_keys, "key"),
-            ("waveform_shape", facts.shape_differs, "row"),
-            ("waveform_verdict_null", facts.null_verdict, "row"),
-            ("waveform_valid_with_cause", facts.valid_with_cause, "row"),
-            ("waveform_invalid_without_cause", facts.invalid_without_cause, "row"),
-            ("waveform_unknown_cause", facts.unknown_cause, "row"),
-            ("waveform_verdict_differs", facts.verdict_differs, "row"),
-            ("waveform_source_differs", facts.source_differs, "row"),
+            ("waveform_not_every_second", int(bronze_rows != facts.rows)),
+            ("waveform_duplicate_key", facts.duplicate_keys),
+            ("waveform_shape", facts.shape_differs),
+            ("waveform_verdict_null", facts.null_verdict),
+            ("waveform_valid_with_cause", facts.valid_with_cause),
+            ("waveform_invalid_without_cause", facts.invalid_without_cause),
+            ("waveform_unknown_cause", facts.unknown_cause),
+            ("waveform_verdict_differs", facts.verdict_differs),
+            ("waveform_source_differs", facts.source_differs),
         ]
     )
