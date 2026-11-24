@@ -321,5 +321,153 @@ class FailedRewriteTest(unittest.TestCase):
         self.assertEqual([], calls)
 
 
+class VerifiedVerdictTest(unittest.TestCase):
+    """A record that cannot be brought to its final verdict must not keep an earlier pass, and the reporter must say only what is true about the folder.
+
+    A closed stdout and a folder that cannot be changed leave the earlier record in place: the message says so and does not claim that the record is gone. An
+    interrupt in the middle of the rewrite leaves no earlier pass beside a label that says fail, and no part file.
+    """
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        closed = io.StringIO()
+        closed.close()
+        self.errors = io.StringIO()
+        for patcher in (
+            mock.patch.object(run_record, "ROOT", self.root),
+            mock.patch.object(sys, "stdout", closed),
+            mock.patch.object(sys, "stderr", self.errors),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def written(self) -> tuple[run_record.Record, Path]:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle("")
+        return record, record.write(["a line"])
+
+    def claims_pass(self, folder: Path) -> list[str]:
+        found = []
+        if (folder / "record.json").exists() and json.loads((folder / "record.json").read_text())["outcome"] == "pass":
+            found.append("record.json")
+        if (folder / "retention.json").exists() and json.loads((folder / "retention.json").read_text())["end_condition"] == PASSED:
+            found.append("retention.json")
+        return found
+
+    def parts(self, folder: Path) -> list[str]:
+        return sorted(path.name for path in folder.iterdir() if path.name.endswith(".part"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can write into a folder that is made read only")
+    def test_a_folder_that_cannot_be_changed_keeps_the_record_and_the_message_does_not_say_that_the_record_is_gone(self) -> None:
+        record, folder = self.written()
+        folder.chmod(0o555)
+        self.addCleanup(folder.chmod, 0o755)
+        code = record.report(folder)
+        self.assertEqual(1, code)
+        self.assertTrue((folder / "record.json").exists(), "the test needs the record to stay")
+        message = self.errors.getvalue()
+        self.assertNotIn("so there is no record", message)
+        self.assertIn("cannot be removed", message)
+        self.assertIn("pass", message)
+
+    def test_a_removal_that_fails_is_reported_as_a_removal_that_failed(self) -> None:
+        record, folder = self.written()
+        with mock.patch.object(Path, "unlink", side_effect=OSError("planted unlink failure")):
+            self.assertEqual(1, record.report(folder))
+        self.assertTrue((folder / "record.json").exists())
+        self.assertNotIn("so there is no record", self.errors.getvalue())
+        self.assertIn("cannot be removed", self.errors.getvalue())
+
+    def test_a_record_that_is_removed_is_reported_as_gone_after_the_files_are_checked(self) -> None:
+        record, folder = self.written()
+        with mock.patch.object(Path, "write_text", side_effect=OSError("planted write failure")):
+            self.assertEqual(1, record.report(folder))
+        self.assertEqual([], [path.name for path in folder.iterdir() if path.name in ("record.json", "retention.json")])
+        self.assertIn("so there is no record", self.errors.getvalue())
+
+    def test_an_interrupt_in_the_rewrite_leaves_no_file_that_says_pass_and_no_part_file_and_goes_on(self) -> None:
+        real = os.replace
+        for stopped in ("retention.json", "record.json"):
+            with self.subTest(stopped):
+                record, folder = self.written()
+
+                def stop(source: Any, target: Any, stopped: str = stopped) -> None:
+                    if Path(target).name == stopped:
+                        raise KeyboardInterrupt
+                    real(source, target)
+
+                with mock.patch.object(os, "replace", stop), self.assertRaises(KeyboardInterrupt):
+                    record.report(folder)
+                self.assertEqual([], self.claims_pass(folder))
+                self.assertEqual([], self.parts(folder))
+
+    def test_an_interrupt_while_a_file_is_written_leaves_no_part_file(self) -> None:
+        record, folder = self.written()
+        record.settle("interrupted")
+        real = Path.write_text
+
+        def written_then_stopped(path: Path, data: str, *arguments: Any, **keywords: Any) -> int:
+            real(path, data, *arguments, **keywords)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(Path, "write_text", written_then_stopped), self.assertRaises(KeyboardInterrupt):
+            record.write_record(folder)
+        self.assertEqual([], self.parts(folder))
+
+    def test_the_record_that_is_written_again_in_its_folder_never_leaves_the_earlier_pass_beside_a_label_that_says_fail(self) -> None:
+        real = os.replace
+        record, folder = self.written()
+        record.expect("later case", "control", "expected", "observed", False)
+        record.settle("")
+
+        def stop(source: Any, target: Any) -> None:
+            if Path(target).name == "record.json":
+                raise KeyboardInterrupt
+            real(source, target)
+
+        with mock.patch.object(os, "replace", stop), self.assertRaises(KeyboardInterrupt):
+            record.write([], folder)
+        self.assertEqual([], self.claims_pass(folder))
+        self.assertEqual([], self.parts(folder))
+
+    def test_a_custom_rewrite_that_is_interrupted_is_handled_like_the_default_one(self) -> None:
+        record, folder = self.written()
+
+        def rewrite(_: Path) -> None:
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            record.report(folder, rewrite)
+        self.assertEqual([], self.claims_pass(folder))
+
+    def test_the_earlier_verdict_is_removed_before_the_rewrite_starts(self) -> None:
+        record, folder = self.written()
+        seen: list[bool] = []
+        record.report(folder, lambda again: seen.append((again / "record.json").exists() or (again / "retention.json").exists()))
+        self.assertEqual([False], seen)
+
+    def test_a_stray_part_file_of_an_earlier_run_is_removed_before_the_rewrite(self) -> None:
+        record, folder = self.written()
+        for name in ("record.json.part", "retention.json.part"):
+            (folder / name).write_text("stray")
+        seen: list[list[str]] = []
+        record.report(folder, lambda again: seen.append(self.parts(again)))
+        self.assertEqual([[]], seen)
+
+    def test_an_interrupted_rewrite_goes_on_and_leaves_no_file_that_says_pass(self) -> None:
+        record, folder = self.written()
+
+        def rewrite(again: Path) -> None:
+            (again / "retention.json").write_text(json.dumps({"end_condition": FAILED}))
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            record.report(folder, rewrite)
+        self.assertEqual([], self.claims_pass(folder))
+
+
 if __name__ == "__main__":
     unittest.main()

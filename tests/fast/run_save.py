@@ -7,7 +7,9 @@ number beside a set name runs on what the folder holds, and on the record and it
 retention label follows and is read back too; and ``record.json`` is written last, from the final verdict. A failed write or read of an attachment, or of the
 label, therefore gives a failing record. The label and the record are then written from the final verdict by one guarded path, which the reporter also uses
 when a print fails: no file of the folder says pass beside a record that says fail. When ``record.json`` itself cannot be written, there is no record: the
-folder is removed, the reason goes to the error output and the exit code is 1.
+folder is removed, the reason goes to the error output and the exit code is 1. Each removal is checked: a folder or a file that cannot be removed is said to
+stay, and the earlier label and record are removed before a rewrite, so that a stop in the middle leaves no earlier pass. The runners read the fixed-sample
+candidate list once, through ``candidate_numbers``: a list that cannot be read is a failing observation, and the run does not start.
 """
 
 from __future__ import annotations
@@ -23,8 +25,9 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from tests.e2e.run_record import FAILED_END, PASSED_END, ROOT, RUN_PAYLOAD_CLASS, Record
+from tests.e2e.run_record import FAILED_END, PASSED_END, ROOT, RUN_PAYLOAD_CLASS, Record, remove_verified
 from tests.fast.sealed_record import sealed_observed
 
 SET_WORD = re.compile(r"\b(training|validation|test)\b")
@@ -50,6 +53,24 @@ def leaks(texts: Iterable[str], numbers: set[str]) -> int:
     return hits
 
 
+def candidate_numbers(record: Record, read: Callable[[], Iterable[Any]]) -> set[str] | None:
+    """The fixed-sample case and patient numbers of the candidate list, read once for the whole run (``read`` gives its candidates). A list that cannot be read
+    is a failing observation of the record, never an error that stops the runner before it saves: the result is then None, and the run is not started, because
+    its saved texts cannot be scanned for these numbers. Only the class name of the error is recorded."""
+    try:
+        candidates = list(read())
+    except (RuntimeError, ValueError, OSError) as error:
+        record.expect(
+            "the fixed-sample candidate list is read",
+            "setup",
+            "the tracked candidate list is read once, before the run, so that the saved texts are scanned for its numbers",
+            sealed_observed(error=error),
+            False,
+        )
+        return None
+    return {str(item.case) for item in candidates} | {str(item.patient) for item in candidates}
+
+
 def read_back(path: Path, text: str) -> str:
     """The text that ``path`` holds, which must be the text that was written."""
     found = path.read_text()
@@ -69,12 +90,12 @@ def label_text(record: Record, outcome: str) -> str:
 
 
 def stage(path: Path, text: str, put: Callable[[Path, str], None]) -> None:
-    """Write ``text`` to a part file beside ``path`` and replace ``path`` with it whole. A failed write removes the part file and raises ``OSError``."""
+    """Write ``text`` to a part file beside ``path`` and replace ``path`` with it whole. A failed or interrupted write removes the part file and raises."""
     staged = path.with_name(f"{path.name}.part")
     try:
         put(staged, text)
         os.replace(staged, path)
-    except OSError:
+    except BaseException:
         with contextlib.suppress(OSError):
             staged.unlink()
         raise
@@ -82,7 +103,12 @@ def stage(path: Path, text: str, put: Callable[[Path, str], None]) -> None:
 
 def commit(record: Record, folder: Path, put: Callable[[Path, str], None], *, label_file: bool = True, record_file: bool = True) -> None:
     """The one path that writes the final files: the retention label of the record's outcome, then ``record.json``, each unless its flag is false. The reporter
-    calls it with both when a print fails, so the label and the record say fail together. It raises ``OSError`` at the first file that cannot be written."""
+    calls it with both when a print fails, so the label and the record say fail together. The earlier file is removed and checked first, so that a stop in the
+    middle leaves no earlier pass. It raises ``OSError`` at the first file that cannot be written."""
+    names = [name for name, wanted in ((LABEL, label_file), (RECORD, record_file)) if wanted]
+    left = remove_verified(folder, tuple(name for wanted in names for name in (wanted, f"{wanted}.part")))
+    if left:
+        raise OSError(f"cannot remove {', '.join(left)}")
     if label_file:
         stage(folder / LABEL, label_text(record, record.outcome), put)
     if record_file:
@@ -90,8 +116,12 @@ def commit(record: Record, folder: Path, put: Callable[[Path, str], None], *, la
 
 
 def remove_run(folder: Path, record: Record, reason: str) -> int:
+    """Remove the run folder, check that it is gone and say what is true: that there is no record, or that the folder stays and may still say pass."""
     shutil.rmtree(folder, ignore_errors=True)
-    sys.stderr.write(f"{record.slug}: {reason}, so there is no record; outcome would be {record.outcome}\n")
+    if folder.exists():
+        sys.stderr.write(f"{record.slug}: {reason}, and the run folder cannot be removed: its files may still say pass; outcome would be {record.outcome}\n")
+    else:
+        sys.stderr.write(f"{record.slug}: {reason}, so there is no record; outcome would be {record.outcome}\n")
     return 1
 
 
@@ -155,39 +185,44 @@ def save_run(
     def verdict() -> str:
         return "pass" if record.observations and all(item.passed for item in record.observations) else "fail"
 
-    first = verdict()
-    text = label_text(record, first)
     try:
-        put(folder / LABEL, text)
-        read = read_back(folder / LABEL, text)
-        label_held = scan([read]) if scan is not None else 0
-    except (OSError, UnicodeError) as error:
-        label_ok = record.expect(
-            "the retention label is written", "control", "the label is written and read back before the record", sealed_observed(error=error), False
-        )
-    else:
-        label_ok = record.expect(
-            "the retention label is written",
-            "control",
-            "the label is written, read back and holds no fixed-sample number beside a set name, before the record",
-            sealed_observed({"no line holds one": label_held == 0}),
-            label_held == 0,
-        )
-    record.outcome = verdict()
-    if not label_ok or record.outcome != first:
-        # The label on disk was made before its own check and the later observations: it is written again for the final verdict, and a label that cannot be
-        # written again is removed, so that no label says pass beside a record that says fail.
+        first = verdict()
+        text = label_text(record, first)
         try:
-            commit(record, folder, put, record_file=False)
-        except OSError:
-            with contextlib.suppress(OSError):
-                (folder / LABEL).unlink()
-            if (folder / LABEL).exists():
-                return remove_run(folder, record, "the retention label cannot be made to say fail")
-    try:
-        commit(record, folder, put, label_file=False)
-    except OSError as error:
-        return remove_run(folder, record, f"record.json cannot be written ({type(error).__name__})")
+            put(folder / LABEL, text)
+            read = read_back(folder / LABEL, text)
+            label_held = scan([read]) if scan is not None else 0
+        except (OSError, UnicodeError) as error:
+            label_ok = record.expect(
+                "the retention label is written", "control", "the label is written and read back before the record", sealed_observed(error=error), False
+            )
+        else:
+            label_ok = record.expect(
+                "the retention label is written",
+                "control",
+                "the label is written, read back and holds no fixed-sample number beside a set name, before the record",
+                sealed_observed({"no line holds one": label_held == 0}),
+                label_held == 0,
+            )
+        record.outcome = verdict()
+        if not label_ok or record.outcome != first:
+            # The label on disk was made before its own check and the later observations: it is written again for the final verdict, and a label that cannot be
+            # written again is removed, so that no label says pass beside a record that says fail.
+            try:
+                commit(record, folder, put, record_file=False)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    (folder / LABEL).unlink()
+                if (folder / LABEL).exists():
+                    return remove_run(folder, record, "the retention label cannot be made to say fail")
+        try:
+            commit(record, folder, put, label_file=False)
+        except OSError as error:
+            return remove_run(folder, record, f"record.json cannot be written ({type(error).__name__})")
+    except KeyboardInterrupt:
+        # An interrupt before the record is written leaves no label of a pass beside no record.
+        remove_verified(folder, (LABEL, RECORD, f"{LABEL}.part", f"{RECORD}.part"))
+        raise
     if echo and folder.is_relative_to(ROOT):
         record.report(folder, lambda again: commit(record, again, put))
     return 0 if record.outcome == "pass" else 1
