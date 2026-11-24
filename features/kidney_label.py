@@ -4,7 +4,7 @@
 
 **Baseline.** The last dated result before ``anestart`` (strictly before it) that is at most 30 days old, the age being ``anestart`` minus its time. The
 undated ``preop_cr`` is not an input of this module. Two results at the last time give the lower value (the one rule of ``BASELINE_TIE_TAKES_LOWER``, which
-is pending the owner's answer).
+the owner decided).
 
 **Follow-up.** A result after ``opend`` (strictly) through 7 days after it (inclusive). The origin is ``opend`` (a project choice).
 
@@ -27,7 +27,7 @@ occurrence), whatever the label: with the baseline they are the measurements tha
 rule read: the baseline and the follow-up results; a result after day 7 is never read, so a label cannot change with a later result.
 
 **Boundary rules.** Each is a named constant with its status (``BOUNDARY_STATUS``): decided by the plan, a lead assumption in the owner's unattended run, or
-pending the owner. A change of one rule is the change of one constant.
+decided by the owner. A change of one rule is the change of one constant.
 
 A result with no value, or a value that is not a finite number above ``MEASUREMENT_MINIMUM_EXCLUSIVE``, is not a measurement.
 The module uses the standard library only and imports no Spark.
@@ -51,7 +51,7 @@ ABSOLUTE_RISE_MG_DL = Decimal("0.3")
 RELATIVE_RATIO = Decimal("1.5")
 PLAN = "decided by the plan"
 LEAD_ASSUMPTION = "lead assumption in the owner's unattended run, for the owner's review"
-PENDING_OWNER = "pending the owner"
+OWNER = "decided by the owner"
 # Decided by the plan ("Kidney injury after surgery" items 1 to 3): follow-up is after ``opend`` (a result at ``opend`` is not follow-up) through day 7 (day 7
 # counts), the later result of the absolute rise is within the first 48 hours (48 hours count) and a baseline is before ``anestart`` and at most 30 days old
 # (30 days count).
@@ -62,8 +62,7 @@ BASELINE_STRICTLY_BEFORE_ANESTART = True
 BASELINE_MAX_AGE_INCLUSIVE = True
 # Lead assumption in the owner's unattended run, for the owner's review (Jev A 0.96): a creatinine result at or below zero is not a measurement.
 MEASUREMENT_MINIMUM_EXCLUSIVE = Decimal(0)
-# PENDING the owner (Jev A 0.84, below the threshold): two baseline results at the same last time give the lower value. The builder's rule; the owner's answer
-# changes this one line.
+# Decided by the owner (answer A): two baseline results at the same last time give the lower value. A changed answer changes this one line.
 BASELINE_TIE_TAKES_LOWER = True
 BOUNDARY_STATUS = {
     "FOLLOWUP_INCLUDES_OPEND": PLAN,
@@ -72,7 +71,7 @@ BOUNDARY_STATUS = {
     "BASELINE_STRICTLY_BEFORE_ANESTART": PLAN,
     "BASELINE_MAX_AGE_INCLUSIVE": PLAN,
     "MEASUREMENT_MINIMUM_EXCLUSIVE": LEAD_ASSUMPTION,
-    "BASELINE_TIE_TAKES_LOWER": PENDING_OWNER,
+    "BASELINE_TIE_TAKES_LOWER": OWNER,
 }
 CREATININE = "cr"
 ELIGIBLE = "eligible"

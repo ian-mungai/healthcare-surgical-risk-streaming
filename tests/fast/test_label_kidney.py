@@ -16,8 +16,9 @@ Every case here is hand-built and kept apart from published data. Failure modes 
 - A negative keeps only the highest follow-up results, so the 48-hour comparison that decided it is lost: with a baseline of 1.2 and follow-up of 1.25, 1.00
   and 1.24 (the largest rise is 0.24), the same row is stored when 1.00 becomes 1.02 (the largest rise is 0.22) and when 0.90 is the early result (0.34, a
   positive), because the maxima are the same. The row stores the earlier and the later result that give the largest rise, whether or not it reaches 0.3.
-- A boundary rule is an unnamed comparison inside the code, so its status (decided by the plan, a lead assumption, pending the owner) is not recorded and a
-  changed answer of the owner is not one line. Each is a named constant, flipping it changes the result, and the pending one changes one line only.
+- A boundary rule is an unnamed comparison inside the code, so its status (decided by the plan, a lead assumption, decided by the owner) is not recorded and a
+  changed answer of the owner is not one line. Each is a named constant and flipping it changes the result.
+- A rule that the owner decided is still marked as pending, so a reader takes the lower value of a baseline tie for an open question.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from features.kidney_label import (
     NEITHER,
     NO_BASELINE,
     NO_FOLLOWUP,
-    PENDING_OWNER,
+    OWNER,
     PLAN,
     RELATIVE_RATIO,
     Result,
@@ -99,7 +100,7 @@ class BoundaryRules(unittest.TestCase):
                 "BASELINE_STRICTLY_BEFORE_ANESTART": PLAN,
                 "BASELINE_MAX_AGE_INCLUSIVE": PLAN,
                 "MEASUREMENT_MINIMUM_EXCLUSIVE": LEAD_ASSUMPTION,
-                "BASELINE_TIE_TAKES_LOWER": PENDING_OWNER,
+                "BASELINE_TIE_TAKES_LOWER": OWNER,
             },
             BOUNDARY_STATUS,
         )
@@ -115,7 +116,9 @@ class BoundaryRules(unittest.TestCase):
                 BASELINE_TIE_TAKES_LOWER,
             ),
         )
-        self.assertEqual(["BASELINE_TIE_TAKES_LOWER"], [name for name, status in BOUNDARY_STATUS.items() if status == PENDING_OWNER])
+        self.assertEqual(["BASELINE_TIE_TAKES_LOWER"], [name for name, status in BOUNDARY_STATUS.items() if status == OWNER])
+        self.assertFalse([name for name, status in BOUNDARY_STATUS.items() if "pending" in status])
+        self.assertFalse(hasattr(rule, "PENDING_OWNER"))
 
     def test_a_flipped_constant_changes_the_result_at_its_boundary(self) -> None:
         cases = (
@@ -138,7 +141,7 @@ class BoundaryRules(unittest.TestCase):
                 with mock.patch.object(rule, name, flipped):
                     self.assertEqual(changed, label_of(*results))
 
-    def test_the_pending_rule_changes_with_one_constant_and_only_the_baseline_moves(self) -> None:
+    def test_the_owners_rule_changes_with_one_constant_and_only_the_baseline_moves(self) -> None:
         results = (result(ANESTART - HOUR, 1.4, 2), result(ANESTART - HOUR, 1.0, 1), after(HOUR, 1.0))
         self.assertEqual(result(ANESTART - HOUR, 1.0, 1), kidney_label(ANESTART, OPEND, list(results)).baseline)
         with mock.patch.object(rule, "BASELINE_TIE_TAKES_LOWER", False):
