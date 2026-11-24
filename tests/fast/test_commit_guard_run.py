@@ -143,11 +143,12 @@ class ProtectedRunTest(unittest.TestCase):
         self.runs = Path(scratch.name) / "root"
         self.temp = Path(scratch.name) / "temp"
         self.temp.mkdir()
+        self.printed = io.StringIO()
         for patcher in (
             mock.patch.object(run_record, "ROOT", self.runs),
             mock.patch.object(tempfile, "tempdir", str(self.temp)),
             mock.patch.object(sys, "argv", ["commit_guards"]),
-            mock.patch.object(sys, "stdout", io.StringIO()),
+            mock.patch.object(sys, "stdout", self.printed),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -232,9 +233,49 @@ class ProtectedRunTest(unittest.TestCase):
         ):
             commit_guards.main()
         record = self.record()
-        self.assertTrue((next((self.runs / "runs").iterdir()) / "retention.json").is_file(), "the record's retention label is written too")
+        folder = next((self.runs / "runs").iterdir())
+        self.assertTrue((folder / "retention.json").is_file(), "the record's retention label is written too")
         self.assertEqual("temporary repository removed", record["cleanup"])
         self.assertEqual([], list(self.temp.iterdir()))
+        self.assertEqual("blocked: interrupted", record["outcome"], "the interrupt that arrived during the write is in the saved record")
+        self.assertEqual(run_record.FAILED_END, json.loads((folder / "retention.json").read_text())["end_condition"])
+
+    def run_interrupted_after_the_record_write(self, *, which: int) -> Path:
+        """Run with a real SIGINT that arrives right after the ``which``-th write of record.json and its label, then return the run folder."""
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+        real_write_record = run_record.Record.write_record
+        calls: list[int] = []
+
+        def write_record(record: run_record.Record, folder: Path) -> None:
+            real_write_record(record, folder)
+            calls.append(1)
+            if len(calls) == which:
+                self.interrupt()
+
+        with (
+            mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
+            mock.patch.object(commit_guards, "run_cases"),
+            mock.patch.object(run_record.Record, "write_record", autospec=True, side_effect=write_record),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            commit_guards.main()
+        return next((self.runs / "runs").iterdir())
+
+    def test_a_real_interrupt_right_after_the_record_is_written_turns_the_saved_record_and_its_label_into_a_blocked_one(self) -> None:
+        folder = self.run_interrupted_after_the_record_write(which=1)
+        saved = self.record()
+        self.assertEqual("blocked: interrupted", saved["outcome"], "a record that says pass would be accepted by --compare")
+        self.assertEqual(run_record.FAILED_END, json.loads((folder / "retention.json").read_text())["end_condition"])
+        self.assertNotEqual([], commit_guards.record_problems("first", saved), "the compare refuses it")
+        self.assertIn("blocked: interrupted: record in", self.printed.getvalue())
+        self.assertEqual("temporary repository removed", saved["cleanup"])
+        self.assertEqual([], list(self.temp.iterdir()))
+
+    def test_the_saved_record_is_rewritten_once_and_in_the_same_folder(self) -> None:
+        self.run_interrupted_after_the_record_write(which=1)
+        self.assertEqual(1, len(list((self.runs / "runs").iterdir())), "no second folder")
+        self.assertEqual(1, self.printed.getvalue().count(": record in"), "one verdict is printed")
 
     def test_an_unexpected_error_while_the_temporary_repository_is_removed_writes_a_failed_record(self) -> None:
         with (
@@ -329,8 +370,17 @@ class FixtureHookTest(unittest.TestCase):
         for name in ("HOME", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME"):
             self.assertTrue(Path(fixture.env[name]).is_relative_to(fixture.home), name)
         self.assertEqual("1", fixture.env["GIT_CONFIG_NOSYSTEM"])
-        code, output = fixture.run("git", "config", "--global", "--get", "core.hooksPath")
-        self.assertEqual((1, ""), (code, output))
+        result = run_command("git", ["config", "--global", "--get", "core.hooksPath"], cwd=fixture.repo, env=fixture.env, timeout=60)
+        self.assertEqual(1, result.returncode, "Git answers 1 for a setting that is not set")
+        self.assertEqual("", result.stdout, "no value is read from a global file")
+
+    def test_a_warning_on_standard_error_does_not_fail_the_check_of_the_global_settings(self) -> None:
+        """A Git on macOS can print a sandbox warning on standard error; only the exit status and the standard output decide."""
+        fixture = self.fixture()
+        noisy = {**fixture.env, "GIT_TRACE": "1"}
+        result = run_command("git", ["config", "--global", "--get", "core.hooksPath"], cwd=fixture.repo, env=noisy, timeout=60)
+        self.assertNotEqual("", result.stderr, "the trace puts text on standard error")
+        self.assertEqual((1, ""), (result.returncode, result.stdout))
 
 
 class CloseAfterTest(unittest.TestCase):
@@ -370,6 +420,139 @@ class CloseAfterTest(unittest.TestCase):
         ):
             record.close_after(cleanup, [])
         self.assertEqual("blocked: interrupted", record.outcome)
+
+
+class CloseAfterLateReasonTest(unittest.TestCase):
+    """A reason that appears while the record is written (an interrupt that arrives then) is in the saved record, and a run that has none writes it once."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="close_after_late_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        for patcher in (mock.patch.object(run_record, "ROOT", self.root), mock.patch.object(sys, "stdout", io.StringIO())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def close(self, blocked: object) -> tuple[int, run_record.Record, int]:
+        record = run_record.Record(feature="f", slug="s", rerun="r")
+        record.expect("case", "step", "e", "o", True)
+        real_write_record = run_record.Record.write_record
+        writes: list[int] = []
+
+        def write_record(record: run_record.Record, folder: Path) -> None:
+            writes.append(1)
+            real_write_record(record, folder)
+
+        with mock.patch.object(run_record.Record, "write_record", autospec=True, side_effect=write_record):
+            code = record.close_after(lambda: None, [], blocked=blocked)  # type: ignore[arg-type]
+        return code, record, len(writes)
+
+    def saved(self) -> tuple[dict[str, object], dict[str, object]]:
+        (folder,) = (self.root / "runs").iterdir()
+        return json.loads((folder / "record.json").read_text()), json.loads((folder / "retention.json").read_text())
+
+    def test_a_reason_that_appears_during_the_write_blocks_the_saved_record_and_its_label(self) -> None:
+        reasons = iter(["", "interrupted"])
+        code, record, writes = self.close(lambda: next(reasons))
+        self.assertEqual(1, code)
+        self.assertEqual("blocked: interrupted", record.outcome)
+        saved, label = self.saved()
+        self.assertEqual("blocked: interrupted", saved["outcome"])
+        self.assertEqual(run_record.FAILED_END, label["end_condition"])
+        self.assertEqual(2, writes)
+        self.assertEqual(1, len(list((self.root / "runs").iterdir())), "the same folder")
+
+    def test_a_reason_that_is_there_before_the_write_is_written_once(self) -> None:
+        for blocked in ("given", lambda: "given"):
+            with self.subTest(blocked=blocked):
+                shutil.rmtree(self.root / "runs", ignore_errors=True)
+                code, record, writes = self.close(blocked)
+                self.assertEqual((1, "blocked: given", 1), (code, record.outcome, writes))
+
+    def test_a_run_that_never_has_a_reason_is_written_once_and_passes(self) -> None:
+        for blocked in ("", lambda: ""):
+            with self.subTest(blocked=blocked):
+                shutil.rmtree(self.root / "runs", ignore_errors=True)
+                code, record, writes = self.close(blocked)
+                self.assertEqual((0, "pass", 1), (code, record.outcome, writes))
+                self.assertEqual("pass", self.saved()[0]["outcome"])
+
+    def test_a_reason_that_changes_after_the_write_keeps_the_first_reason(self) -> None:
+        reasons = iter(["first", "second"])
+        code, record, writes = self.close(lambda: next(reasons))
+        self.assertEqual((1, "blocked: first", 1), (code, record.outcome, writes))
+
+    def test_a_failed_run_stays_failed_when_the_reason_appears_late(self) -> None:
+        record = run_record.Record(feature="f", slug="s", rerun="r")
+        record.expect("case", "step", "e", "o", False)
+        reasons = iter(["", "interrupted"])
+        record.close_after(lambda: None, [], blocked=lambda: next(reasons))
+        self.assertEqual("blocked: interrupted", self.saved()[0]["outcome"], "an interrupt is the verdict, as it is for a run that passed")
+
+
+class TreeDigestTest(TemporaryRepository):
+    """The digest of the copied files holds each file's Git mode, so two runs of the same bytes with another executable bit are not the same code."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(commit_guards, "ROOT", self.repo)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.script = self.repo / "run.sh"
+        self.script.write_text("#!/bin/sh\necho planted\n")
+        self.script.chmod(0o644)
+
+    def digest(self) -> str:
+        return commit_guards.tree_digest(["run.sh"])
+
+    def test_an_executable_bit_with_the_same_bytes_changes_the_digest(self) -> None:
+        plain = self.digest()
+        self.script.chmod(0o755)
+        self.assertNotEqual(plain, self.digest())
+        self.script.chmod(0o644)
+        self.assertEqual(plain, self.digest())
+
+    def test_only_the_owner_executable_bit_counts_as_git_counts_it(self) -> None:
+        plain = self.digest()
+        for mode in (0o600, 0o664, 0o611, 0o444):
+            with self.subTest(mode=oct(mode)):
+                self.script.chmod(mode)
+                self.assertEqual(plain, self.digest())
+        self.script.chmod(0o700)
+        executable = commit_guards.git_mode(self.script)
+        self.assertEqual("100755", executable)
+        for mode in (0o700, 0o744, 0o755, 0o775):
+            with self.subTest(mode=oct(mode)):
+                self.script.chmod(mode)
+                self.assertEqual(executable, commit_guards.git_mode(self.script))
+        self.assertNotEqual(plain, self.digest())
+
+    def test_the_mode_is_the_one_git_records_for_the_copied_file(self) -> None:
+        for mode, expected in ((0o644, "100644"), (0o755, "100755")):
+            with self.subTest(mode=oct(mode)):
+                self.script.chmod(mode)
+                copy = self.repo / f"copy_{expected}.sh"
+                shutil.copy2(self.script, copy)
+                self.git("add", "--", copy.name)
+                self.assertEqual(expected, commit_guards.git_mode(self.script))
+                self.assertEqual(expected, self.git("ls-files", "--stage", "--", copy.name).stdout.split()[0])
+
+    def test_a_link_to_a_file_counts_as_the_file_that_the_copy_becomes(self) -> None:
+        self.script.chmod(0o755)
+        link = self.repo / "link.sh"
+        link.symlink_to(self.script)
+        self.assertEqual("100755", commit_guards.git_mode(link))
+        self.script.chmod(0o644)
+        self.assertEqual("100644", commit_guards.git_mode(link), "a link itself has mode 777 on this computer; the file it names decides")
+
+    def test_the_path_the_bytes_and_the_mode_each_change_the_digest(self) -> None:
+        base = self.digest()
+        (self.repo / "other.sh").write_text(self.script.read_text())
+        self.assertNotEqual(base, commit_guards.tree_digest(["other.sh"]))
+        self.script.write_text("changed\n")
+        self.assertNotEqual(base, self.digest())
+        self.assertEqual(commit_guards.tree_digest(["run.sh", "other.sh"]), commit_guards.tree_digest(["run.sh", "other.sh"]))
+        self.assertNotEqual(commit_guards.tree_digest(["run.sh", "other.sh"]), commit_guards.tree_digest(["other.sh", "run.sh"]))
 
 
 class RecordFolderTest(unittest.TestCase):

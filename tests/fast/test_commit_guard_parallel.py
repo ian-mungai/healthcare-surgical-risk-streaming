@@ -26,6 +26,7 @@ import fcntl
 import io
 import json
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -166,7 +167,7 @@ class ParallelRecordTest(ParallelRunCase):
         expected = (
             [("baseline", "control")] * 4
             + [(case.name, step) for case in CASES for step in ("control", "fault")]
-            + [("shards", "coverage"), ("source tree", "snapshot")]
+            + [("source tree", "snapshot"), ("shards", "coverage")]
         )
         self.assertEqual(expected, steps)
 
@@ -391,6 +392,63 @@ class WorkerPlanTest(ParallelRunCase):
         without_speculative = "\n".join(line for line in VM_STAT.splitlines() if "speculative" not in line) + "\n"
         self.assertIsNone(commit_guards.vm_stat_available_mib(without_speculative))
         self.assertIsNone(commit_guards.vm_stat_available_mib(VM_STAT.replace("page size of 16384 bytes", "page size unknown")))
+
+
+class EarlyExitCoverageTest(ParallelRunCase):
+    """Every exit of a parallel request saves the coverage observation once: the lock refusal, a source-read failure, an interrupt before the workers, and
+    a failure to make a fixture after the cap to one worker."""
+
+    def coverage(self) -> list[dict[str, Any]]:
+        return [item for item in self.only_record()["observations"] if item["case"] == "shards"]
+
+    def assert_coverage_once_and_failing(self) -> None:
+        coverage = self.coverage()
+        self.assertEqual(1, len(coverage), "exactly one coverage observation")
+        self.assertFalse(coverage[0]["passed"], "no case ran, so the coverage fails")
+        self.assertIn(CASES[0].name, coverage[0]["observed"])
+
+    def test_a_refused_lock_saves_the_coverage(self) -> None:
+        self.hold_lock()
+        self.assertEqual(1, self.run_main("--parallel", "4"))
+        self.assertTrue(self.only_record()["outcome"].startswith("blocked: another guard run"))
+        self.assert_coverage_once_and_failing()
+
+    def test_a_failed_source_read_saves_the_coverage(self) -> None:
+        with mock.patch.object(commit_guards, "source_files", side_effect=OSError("unreadable")):
+            self.assertEqual(1, self.run_main("--parallel", "4"))
+        self.assertEqual("fail", self.only_record()["outcome"])
+        self.assert_coverage_once_and_failing()
+
+    def test_an_interrupt_before_the_workers_saves_the_coverage(self) -> None:
+        with mock.patch.object(commit_guards, "tool_version", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.run_main("--parallel", "4")
+        self.assertEqual("blocked: interrupted", self.only_record()["outcome"])
+        self.assert_coverage_once_and_failing()
+
+    def test_a_failed_fixture_after_the_cap_to_one_worker_saves_the_coverage(self) -> None:
+        self.cores = 2
+        with mock.patch.object(commit_guards, "Fixture", side_effect=OSError("no space")):
+            self.assertEqual(1, self.run_main("--parallel", "8"))
+        self.assertEqual("fail", self.only_record()["outcome"])
+        self.assert_coverage_once_and_failing()
+
+    def test_a_failed_fixture_in_a_worker_saves_the_coverage_once(self) -> None:
+        with mock.patch.object(commit_guards, "Fixture", side_effect=OSError("no space")):
+            self.assertEqual(1, self.run_main("--parallel", "3"))
+        self.assert_coverage_once_and_failing()
+
+    def test_a_complete_run_and_a_capped_run_save_the_coverage_once_and_passing(self) -> None:
+        for requested, cores in (("3", 16), ("8", 2)):
+            with self.subTest(requested=requested, cores=cores):
+                self.cores = cores
+                shutil.rmtree(self.runs / "runs", ignore_errors=True)
+                self.assertEqual(0, self.run_main("--parallel", requested))
+                self.assertEqual([True], [item["passed"] for item in self.coverage()])
+
+    def test_the_coverage_is_computed_from_the_observations_of_the_finished_run(self) -> None:
+        """The coverage is read after the workers' merge, so a case that a worker did run is not reported missing."""
+        self.assertEqual(0, self.run_main("--parallel", "4"))
+        self.assertEqual("every case observed once", self.coverage()[0]["observed"])
 
 
 class StopTest(unittest.TestCase):

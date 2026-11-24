@@ -10,8 +10,10 @@ Each case then makes a passing control commit and a planted-fault commit.
 The control must advance HEAD. The fault must be refused by its named guard alone, with every message that guard is expected
 to print, and leave HEAD unchanged. The planted fast test is proven by its full test name, its assertion message and a
 summary of one failure. Every run, passing, failing, blocked or interrupted, writes one record in a new folder under
-``runs/`` and removes its temporary repository. An interrupt that arrives during the worker shutdown, the merge, the removal or the record write waits until
-they end. The source tree is hashed before and after the run, and a change between the two fails the run. Each fixture reads only its own Git settings.
+``runs/`` and removes its temporary repositories, except one whose worker is still running after the shutdown deadline: that repository is kept, and the
+record names it. A parallel request records the coverage on every exit. An interrupt that arrives during the worker shutdown, the merge, the removal or
+the record write waits until they end. The source tree is hashed before and after the run, and a change between the two fails the run. Each fixture reads
+only its own Git settings.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -231,10 +234,16 @@ def source_files(root: Path = ROOT) -> list[str]:
     return [path for path in visible_files(root) if (root / path).is_file()]
 
 
+def git_mode(path: Path) -> str:
+    """The mode that Git records for the copy of a file: 100755 when the owner may execute it, else 100644. A link to a file counts as its target."""
+    return "100755" if path.stat().st_mode & stat.S_IXUSR else "100644"
+
+
 def tree_digest(paths: list[str]) -> str:
+    """The digest of the copied files: each path, its Git mode and its bytes, so two runs that differ in an executable bit are not the same code."""
     digest = hashlib.sha256()
     for path in paths:
-        digest.update(path.encode() + b"\0" + hashlib.sha256((ROOT / path).read_bytes()).digest())
+        digest.update(path.encode() + b"\0" + git_mode(ROOT / path).encode() + b"\0" + hashlib.sha256((ROOT / path).read_bytes()).digest())
     return digest.hexdigest()
 
 
@@ -567,9 +576,9 @@ def covered(observations: list[Observation]) -> Observation:
 
 
 def record_coverage(record: Record) -> None:
-    """Add the coverage observation once. A parallel request records it on every exit, also when it ran one worker, was interrupted or failed."""
-    if all(item.case != COVERAGE for item in record.observations):
-        record.observations.append(covered(record.observations))
+    """Add the coverage observation. The run's finalizer, its only caller, calls it once on every exit of a parallel request: a lock refusal, a failed source
+    read, an interrupt before the workers, a failed fixture, one worker after the cap, and a complete run."""
+    record.observations.append(covered(record.observations))
 
 
 def merge_workers(record: Record, log: list[str], team: list[Worker]) -> None:
@@ -618,7 +627,6 @@ def run_parallel(paths: list[str], record: Record, log: list[str], fixtures: lis
         join_all(threads, time.monotonic() + SHUTDOWN_SECONDS)
         keep_running_workers(team, threads, fixtures, kept, record, log)
         merge_workers(record, log, team)
-        record_coverage(record)
     interrupts.raise_pending()
 
 
@@ -741,12 +749,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_parallel(paths, record, log, fixtures, kept, workers, interrupts)
             else:
                 fixtures.append(Fixture(record))
-                try:
-                    fixtures[0].populate(paths)
-                    run_cases(fixtures[0], record, log, (index, count))
-                finally:
-                    if requested > 1:
-                        record_coverage(record)
+                fixtures[0].populate(paths)
+                run_cases(fixtures[0], record, log, (index, count))
             unchanged = tree_digest(source_files()) == before
             record.observations.append(Observation("source tree", "snapshot", "unchanged during the run", f"unchanged: {unchanged}", unchanged))
         except KeyboardInterrupt:
@@ -760,6 +764,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             record.expect("run", "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
         finally:
             interrupts.defer()
+            if requested > 1:
+                record_coverage(record)
             code = record.close_after(
                 lambda: remove_fixtures(fixtures, record, kept), log, blocked=lambda: blocked or ("interrupted" if interrupts.seen else "")
             )
