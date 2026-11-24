@@ -154,7 +154,8 @@ class TaskRulesTest(unittest.TestCase):
 # ``execHook(HookPreUpgrade)``), so no stop between the hook and the stored revision exists. Helm refuses an upgrade in two ways before any hook: with
 # "another operation (install/upgrade/rollback) is in progress" when the last revision is pending-install, pending-upgrade or pending-rollback
 # (``Status.IsPending``), and with "has no deployed releases" when the last revision is neither deployed, failed nor superseded and no revision of the
-# release is deployed (``prepareUpgrade``, which an ``uninstalling`` last revision meets). ``upgrade`` and ``rollback`` leave the release deployed, and
+# release is deployed (``prepareUpgrade``, which an ``uninstalling`` last revision meets). An ``uninstalled`` last revision is installed again, as
+# ``upgrade --install`` does (cmd/helm/upgrade.go, ``isReleaseUninstalled``). ``upgrade`` and ``rollback`` leave the release deployed, and
 # ``uninstall`` removes it, as the real commands do. A rollback does not undo the hook's ConfigMap, as the real one does not.
 HELM_STAND_IN = """#!/bin/sh
 echo "$*" >> "$STAND_IN/log"
@@ -174,7 +175,7 @@ history) awk 'BEGIN{printf "["} {printf "%s{\\"revision\\":%d,\\"status\\":\\"%s
 upgrade)
   case "$state" in
     pending-install | pending-upgrade | pending-rollback) refuse_pending ;;
-    "" | deployed | failed | superseded) ;;
+    "" | deployed | failed | superseded | uninstalled) ;;
     *) grep -qx deployed "$STAND_IN/history" || refuse_no_deployed ;;
   esac
   prev=""
@@ -335,7 +336,7 @@ class ReleaseRecoveryTest(unittest.TestCase):
                 self.assertIn("another operation (install/upgrade/rollback) is in progress", error)
 
     def test_the_stand_in_refuses_an_upgrade_when_no_revision_is_deployed_and_the_last_one_is_neither_failed_nor_superseded_as_helm_does(self) -> None:
-        for status in ("uninstalling", "uninstalled", "unknown"):
+        for status in ("uninstalling", "unknown"):
             with self.subTest(status=status):
                 code, error = self.stand_in_upgrade(status, history("superseded", status))
                 self.assertEqual(1, code)
@@ -393,6 +394,14 @@ class ReleaseRecoveryTest(unittest.TestCase):
 
     def test_a_deployed_release_with_changed_inputs_is_upgraded_with_no_recovery(self) -> None:
         code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual([UPGRADE], self.commands(log))
+
+    def test_an_uninstalled_last_revision_is_installed_again_as_helm_does_and_the_playbook_proceeds(self) -> None:
+        """Recheck 3: Helm v3.22.1 ``upgrade --install`` (cmd/helm/upgrade.go, ``isReleaseUninstalled``) runs a replacement install when the last revision is
+        uninstalled, so the stand-in must not refuse it."""
+        self.assertEqual(0, self.stand_in_upgrade("uninstalled", history("superseded", "uninstalled"))[0])
+        code, output, log = self.run_release("uninstalled", history("superseded", "uninstalled"), recorded="match")
         self.assertEqual(0, code, output)
         self.assertEqual([UPGRADE], self.commands(log))
 
