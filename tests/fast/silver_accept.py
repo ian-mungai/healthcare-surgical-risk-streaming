@@ -181,6 +181,11 @@ def sealed(result: Any, job: str) -> bool:
     )
 
 
+def every_flag_true(document: Mapping[str, Any]) -> bool:
+    """Whether every pass flag of a sealed result is the Boolean true."""
+    return all(value is True for value in document["passed"].values())
+
+
 def refusal_rejection(document: Any, job: str, mode: str, wanted: Sequence[str]) -> str | None:
     """The fixed phrase of the rule that a refusal document fails, or ``None`` when it passes as a refusal (``accept_refusal``). A phrase is one of
     ``REFUSAL_REASONS``: it holds no code or other value of the document."""
@@ -236,7 +241,9 @@ def catalog_matches(result: Any, catalog: Catalog) -> bool:
 def rejection(document: Any, job: str, catalog: Catalog | None, outcome: str) -> str | None:
     """The fixed phrase of the first rule that the document fails as the ``outcome`` (``AS_WRITE`` or ``AS_KEEP``) of ``job``, or ``None`` when it passes. The
     rules run in this order: a file that is there, a catalog that was read, the requested branch, the closed schema, the hashes and snapshot IDs of the catalog
-    and then the outcome. A phrase is one of ``REASONS``: it names the rule and holds no value of the file."""
+    and then the outcome. A call that wrote nothing (a verify, or a build that keeps the tables) also needs every pass flag true: a job that exits 0 with a
+    false flag is not a pass, so the merge after a verify never takes an unverified table. A phrase is one of ``REASONS``: it names the rule and holds no value
+    of the file."""
     if not isinstance(document, Mapping):
         return NO_FILE
     if catalog is None:
@@ -249,7 +256,9 @@ def rejection(document: Any, job: str, catalog: Catalog | None, outcome: str) ->
         return OFF_CATALOG
     if outcome == AS_WRITE:
         return None if named(document["write_hash"]) and document["write_hash"] == document["branch_hash"] != document["checked_hash"] else NOT_A_WRITE
-    return None if document["write_hash"] is None and document["branch_hash"] == document["checked_hash"] else NOT_A_KEEP
+    if not (document["write_hash"] is None and document["branch_hash"] == document["checked_hash"]):
+        return NOT_A_KEEP
+    return None if every_flag_true(document) else NOT_PASSED
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,7 +314,7 @@ def setup_rejection(document: Any, job: str) -> str | None:
         return OTHER_MODE
     if not (named(document["write_hash"]) and document["write_hash"] == document["branch_hash"] != document["checked_hash"]):
         return NOT_A_WRITE
-    return None if all(value is True for value in document["passed"].values()) else NOT_PASSED
+    return None if every_flag_true(document) else NOT_PASSED
 
 
 def accept_setup(code: int, document: Any, job: str) -> Accepted:

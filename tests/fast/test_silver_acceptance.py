@@ -686,6 +686,38 @@ class Rejections(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(reason, rejection(document, SIGNALS_JOB, catalog, outcome))
 
+    def test_a_call_that_wrote_nothing_is_rejected_when_any_pass_flag_is_false(self) -> None:
+        """A verify (or a rebuild that keeps the tables) that exits 0 with one false pass flag is not a pass: the merge would take an unverified table."""
+        for job, document, catalog in (
+            (SIGNALS_JOB, verified, VERIFIED),
+            (SIGNALS_JOB, unwritten, KEPT),
+            (
+                HYPOTENSION_JOB,
+                lambda **changes: {**hypotension(), "mode": "verify", "base_hash": None, "write_hash": None, "branch_hash": HEAD, **changes},
+                None,
+            ),
+        ):
+            for table in ("numeric_observations", "waveform_seconds") if job == SIGNALS_JOB else ("art_mbp_1s", "hypotension_events"):
+                with self.subTest(job=job, table=table, call=document.__name__ if hasattr(document, "__name__") else "verify"):
+                    flags = {**(PASSED if job == SIGNALS_JOB else {"art_mbp_1s": True, "hypotension_events": True}), table: False}
+                    catalog = catalog or Catalog("b", HEAD, None, HEAD, HYPO_SOURCES, HYPO_SNAPSHOTS)
+                    self.assertEqual("a pass flag of the result is not true", rejection(document(passed=flags), job, catalog, AS_KEEP))
+                    self.assertFalse(accept_keep(0, document(passed=flags), job, catalog).ok)
+                    self.assertEqual({}, accept_keep(0, document(passed=flags), job, catalog).result)
+
+    def test_a_call_that_wrote_nothing_with_every_pass_flag_true_is_still_accepted(self) -> None:
+        hypo_verify = {**hypotension(), "mode": "verify", "base_hash": None, "write_hash": None, "branch_hash": HEAD}
+        hypo_catalog = Catalog("b", HEAD, None, HEAD, HYPO_SOURCES, HYPO_SNAPSHOTS)
+        self.assertIsNone(rejection(hypo_verify, HYPOTENSION_JOB, hypo_catalog, AS_KEEP))
+        self.assertTrue(accept_keep(0, verified(), SIGNALS_JOB, VERIFIED).ok)
+
+    def test_the_pass_flag_rule_runs_after_the_catalog_rule_so_that_the_first_failed_rule_keeps_its_phrase(self) -> None:
+        flags = {"numeric_observations": False, "waveform_seconds": True}
+        self.assertEqual(
+            "a hash or a snapshot differs from the catalog", rejection(verified(passed=flags, checked_hash="0" * 64), SIGNALS_JOB, VERIFIED, AS_KEEP)
+        )
+        self.assertEqual("the schema is not the job's closed schema", rejection(verified(passed=flags, extra=1), SIGNALS_JOB, VERIFIED, AS_KEEP))
+
     def test_the_branch_is_compared_before_the_schema_and_the_catalog(self) -> None:
         both = written(branch="different_branch", outcome="written", checked_hash="0" * 64)
         self.assertEqual("the branch is not the requested one", rejection(both, SIGNALS_JOB, WROTE, AS_WRITE))

@@ -8,19 +8,28 @@ Failure modes covered here:
 - A runner merged ``nessie.reference(branch).hash`` after the verify, so a branch that moved between the verify and the merge had an unverified commit merged.
 - A runner went on to the merge after a verify that failed, or after a branch that moved, and the merge case still passed.
 - A reply of a verify call that names another mode or another branch than the one that was asked for was accepted by a launcher.
+- The Silver cases runner merged the sample-sized branch (and the full branch) after its head had moved since the verify, the merge taking the verified hash
+  only by name.
+- A verify that exited 0 with a false pass flag was a pass, so the merge that follows took an unverified table (Silver signals and Silver hypotension).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from tests.e2e.run_record import Record
+from tests.fast.silver_accept import Catalog, accept_keep
 from tests.fast.test_outcome_acceptance import split_run
 from tests.fast.test_runner_gold_sealed import runner
 from tests.fast.test_runner_setup_builds import stand_in_stack
+from tests.fast.test_silver_acceptance import HEAD, HYPO_SNAPSHOTS, HYPO_SOURCES, hypotension, verified
+from tests.fast.test_silver_acceptance import VERIFIED as VERIFY_CATALOG
 
 VERIFIED, MOVED, BASE = "b" * 64, "c" * 64, "a" * 64
 BRANCH = "p6_run_branch_x1"
@@ -203,3 +212,117 @@ class VerifyReplies(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as caught:
                     stack.split("verify", BRANCH)
                 self.assertNotIn("other_branch", str(caught.exception))
+
+
+class VerifyFlags(unittest.TestCase):
+    """The verify of Silver signals and Silver hypotension gives true only when every pass flag of the reply is true, judged by the real accept function."""
+
+    def verdict(self, name: str, flags: dict[str, bool] | None) -> bool:
+        module = runner(name)
+        run = flow(module, Nessie(), HEAD)
+        run.head = lambda _: HEAD
+        if name == "silver_signals":
+            job, catalog = module.SIGNALS_JOB, VERIFY_CATALOG
+            document = verified() if flags is None else verified(passed=flags)
+        else:
+            job, catalog = module.HYPOTENSION_JOB, Catalog("b", HEAD, None, HEAD, HYPO_SOURCES, HYPO_SNAPSHOTS)
+            document = {**hypotension(), "mode": "verify", "base_hash": None, "write_hash": None, "branch_hash": HEAD}
+            document = document if flags is None else {**document, "passed": flags}
+        done = SimpleNamespace(keep=lambda: accept_keep(0, document, job, catalog), code=0, seconds=0.1, catalog=catalog)
+        run.silver = lambda *_, **__: done
+        if name == "silver_signals":
+            return bool(run.verify_control({"branch": "b", "branch_hash": HEAD}))
+        return bool(run.verify("b", "the fixed sample", HEAD))
+
+    def test_a_verify_with_every_flag_true_gives_true(self) -> None:
+        for name in ("silver_signals", "silver_hypotension"):
+            with self.subTest(name):
+                self.assertIs(True, self.verdict(name, None))
+
+    def test_a_verify_with_one_false_flag_gives_false_and_the_cases_do_not_go_on_to_the_merge(self) -> None:
+        wrong = {
+            "silver_signals": {"numeric_observations": True, "waveform_seconds": False},
+            "silver_hypotension": {"art_mbp_1s": False, "hypotension_events": True},
+        }
+        for name, flags in wrong.items():
+            with self.subTest(name):
+                self.assertIs(False, self.verdict(name, flags))
+
+
+class CasesMergeOnlyWhileTheBranchIsAtTheVerifiedHash(unittest.TestCase):
+    """The Silver cases runner checks the head of the branch right before each merge of a verified hash, and a branch that moved is not merged."""
+
+    def cases_run(self, module: Any, head_of_branch: str) -> tuple[Any, list[dict[str, Any]]]:
+        merges: list[dict[str, Any]] = []
+        run = module.Run.__new__(module.Run)
+        run.record, run.made, run.trunk, run.facts, run.labels = Record(feature="test", slug="test", rerun="none"), [], "trunk", {}, {}
+        run.nessie = SimpleNamespace(create_branch=lambda *_: None, entries=lambda *_: {})
+        run.staged = contextlib.nullcontext
+        run.name = lambda base: base
+        run.recreate = lambda *_: None
+        run.fork = lambda base, label: label
+        run.tag = lambda *_: None
+        run.candidates = [SimpleNamespace(case=1, slot="a_development")]
+        run.sources = (Path("clinical.csv"), Path("lab.csv"))
+
+        def merge(branch: str, into: str, message: str, *, source_hash: str | None = None) -> str:
+            merges.append({"branch": branch, "message": message, "source_hash": source_hash})
+            return "merged"
+
+        run.merge = merge
+        run.head = lambda branch: head_of_branch if branch in ("samplesilver", BRANCH) else BASE
+        return run, merges
+
+    def sample(self, head_of_branch: str) -> tuple[Any, list[dict[str, Any]]]:
+        module = runner("silver_cases")
+        run, merges = self.cases_run(module, head_of_branch)
+        built = {"checks_run": module.CHECKS_SAMPLE, "branch_hash": VERIFIED}
+        answers = {"build": (0, built, "", 0.1), "verify": (0, {"branch_hash": VERIFIED, "snapshot_ids": {}}, "", 0.1)}
+        run.stack = SimpleNamespace(
+            write_spec=lambda _: None,
+            stand_in=lambda *_, **__: (0, {}, "", 0.1),
+            split=lambda *_, **__: (0, {}, "", 0.1),
+            silver=lambda mode, *_, **__: answers.get(mode, (1, {}, "", 0.1)),
+        )
+        run.lab_rows_of = lambda *_: 0
+        names = ("loader_answered", "split_answered", "wrote", "all_passed", "no_removed_fields")
+        with contextlib.ExitStack() as patches:
+            for name in names:
+                patches.enter_context(mock.patch.object(module, name, lambda *_, **__: True))
+            patches.enter_context(mock.patch.object(module, "lab_rows_of", lambda *_: 0))
+            run.sample_sized()
+        return run, merges
+
+    def test_the_sample_sized_branch_is_merged_by_the_verified_hash_while_it_is_still_at_it(self) -> None:
+        run, merges = self.sample(VERIFIED)
+        silver = [item for item in merges if item["message"] == "sample-sized silver"]
+        self.assertEqual([VERIFIED], [item["source_hash"] for item in silver])
+        self.assertTrue(all(item.passed for item in run.record.observations if "merge" in item.case), [item.observed for item in run.record.observations])
+
+    def test_the_sample_sized_branch_that_moved_after_its_verify_is_not_merged_and_the_case_fails(self) -> None:
+        run, merges = self.sample(MOVED)
+        self.assertEqual([], [item for item in merges if item["message"] == "sample-sized silver"])
+        failed = [item for item in run.record.observations if "merge of the verified hash" in item.case]
+        self.assertEqual([False], [item.passed for item in failed])
+        self.assertIn("still at the verified hash False", failed[0].observed)
+        self.assertNotIn(MOVED, json.dumps([item.observed for item in run.record.observations]))
+
+    def test_the_full_branch_that_moved_after_its_verify_is_not_merged_and_not_tagged(self) -> None:
+        module = runner("silver_cases")
+        tagged: list[str] = []
+        for head, merged in ((VERIFIED, True), (MOVED, False)):
+            with self.subTest(head=head[:1]):
+                tagged.clear()
+                run, merges = self.cases_run(module, head)
+                run.tag = lambda *_: tagged.append("tag")
+                run.suffix = "x1"
+                run.stack = SimpleNamespace(silver=lambda *_, **__: (1, {}, "", 0.1))
+                run.trunk_snapshots = {}
+                run.merge_and_rebuild({"branch": BRANCH, "branch_hash": VERIFIED}, {"branch_hash": VERIFIED, "snapshot_ids": {}})
+                self.assertEqual(merged, bool(merges))
+                self.assertEqual(merged, bool(tagged))
+                if merged:
+                    self.assertEqual([VERIFIED], [item["source_hash"] for item in merges])
+                else:
+                    failed = [item for item in run.record.observations if not item.passed]
+                    self.assertIn("still at the verified hash False", failed[0].observed)
