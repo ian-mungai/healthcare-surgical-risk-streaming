@@ -30,6 +30,9 @@ GROUP_COLUMNS = LAB_COLUMNS[:3]
 CLINICAL_KEY = ("caseid",)
 LAB_KEY = (*GROUP_COLUMNS, OCCURRENCE_COLUMN)
 TABLES = {"clinical": ("clinical_data", "clinical_cases", CLINICAL_KEY), "lab": ("lab_data", "lab_results", LAB_KEY)}
+# The tables that hold an outcome (``icu_days`` and ``death_inhosp``): no count, digest or check detail of them leaves the job, because a held-out patient's
+# outcome can change them. The laboratory table holds no outcome and keeps its counts and digests.
+SEALED_KINDS = frozenset({"clinical"})
 MISSING = "n"
 REPEATED_ROWS_LIMIT = 100_000
 HALF_HEX = 16

@@ -5,9 +5,11 @@ stand-in steps in the fast tests.
 that changes nothing writes nothing. ``verify`` runs the same input checks and the output checks on what a branch holds and writes nothing. The merge of the
 branch is the caller's step.
 
-The test set is sealed. A message or the result holds codes, counts, table names and the cutoffs (measured on development patients), and never a case, a
-patient or an argument. The command line prints fixed codes only: ``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the
-codes of a failed check.
+The test set is sealed, and the clinical table that the tables come from holds the outcome columns. A message holds a code and a flag (``key_null: failed``)
+and a count of tables at most. The result holds the hashes, the snapshot IDs, the checks that ran, one pass flag for each table and measures of the development
+patients (the cutoffs and their counts), and never a case, a patient, an argument, a count over all cases or a field that says whether a table was written:
+a held-out outcome changes both, and the branch hash against the base hash shows a write. The command line prints fixed codes only: ``usage``,
+``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Any, Protocol
 from scripts.stack.nessie import NessieError
 from spark.settings import SettingsError
 from spark.silver_cases import (
+    FLAG,
     CutoffRow,
     MeasureRow,
     SilverCasesError,
@@ -56,13 +59,13 @@ CHECKS_SAMPLE = [
     "cutoffs_read_back",
 ]
 CHECKS_BUILD = [*CHECKS_SAMPLE[:7], "pinned_counts", *CHECKS_SAMPLE[7:]]
-RULES_READ_BACK = "readback_differs: the saved measure or cutoffs are not the ones that were written"
+RULES_READ_BACK = f"readback_differs: {FLAG}"
 
 
 class SilverOps(Protocol):
     """The Spark steps of the job. ``input_facts`` holds the counts over Bronze and the split, ``output_facts`` the counts over the written tables, and
     ``development_lengths`` the operation lengths of the development patients only. A write gives ``True`` when it changed the table and ``False`` when the
-    table already held the rows."""
+    table already held the rows; the sequence does not put that in the result."""
 
     def split_problems(self) -> list[str]: ...
 
@@ -89,8 +92,6 @@ class SilverOps(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    outcome: str
-    written: dict[str, bool]
     pinned: bool
     measure: list[MeasureRow]
     cutoffs: list[CutoffRow]
@@ -98,15 +99,14 @@ class Outcome:
     snapshot_ids: dict[str, int | None]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line holds: the outcome, which tables were written, the checks that ran, counts, the snapshot IDs, the measure and the cutoffs.
+        """What the result line holds: the checks that ran, one pass flag for each table, the snapshot IDs, the measure and the cutoffs and the counts of
+        development patients.
 
-        The laboratory counts are for development patients only.
+        The laboratory counts and the measure are for development patients only. A failed check raises, so each flag is true in every result.
         """
         return {
-            "outcome": self.outcome,
-            "written": self.written,
             "checks_run": CHECKS_BUILD if self.pinned else CHECKS_SAMPLE,
-            "cases": self.output["case_rows"],
+            "passed": {name: True for name in TABLES},
             "development_lab_rows": self.output["lab_rows"],
             "development_lab_copies": self.output["lab_copies"],
             "development_cases": self.cutoffs[0].development_cases,
@@ -147,7 +147,9 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
     problems = frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
     if problems:
         raise SilverCasesError(*problems)
-    written = {"cases": ops.write_cases(), "lab": ops.write_lab(), "rules": ops.write_rules(measure, cutoffs)}
+    ops.write_cases()
+    ops.write_lab()
+    ops.write_rules(measure, cutoffs)
     check_stored_schema(ops)
     saved = ops.existing_rules()
     output = ops.output_facts()
@@ -156,7 +158,7 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
         problems.append(RULES_READ_BACK)
     if problems:
         raise SilverCasesError(*problems)
-    return Outcome("written" if any(written.values()) else "unchanged", written, pinned, measure, cutoffs, output, ops.snapshot_ids())
+    return Outcome(pinned, measure, cutoffs, output, ops.snapshot_ids())
 
 
 def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
@@ -170,7 +172,7 @@ def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
     problems += output_problems(**output)  # type: ignore[arg-type]
     if problems:
         raise SilverCasesError(*problems)
-    return Outcome("verified", {name: False for name in TABLES}, pinned, measure, cutoffs, output, ops.snapshot_ids())
+    return Outcome(pinned, measure, cutoffs, output, ops.snapshot_ids())
 
 
 DEADLINE_EXIT_CODE = 124

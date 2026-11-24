@@ -261,106 +261,94 @@ class FreezeTest(unittest.TestCase):
         self.assertEqual([], frozen_problems(self.measure, self.cutoffs, self.measure, self.cutoffs))
         self.assertEqual([], frozen_problems(self.measure[::-1], self.cutoffs[::-1], self.measure, self.cutoffs))
 
-    def test_a_changed_cutoff_is_refused_with_its_count_and_every_row_carries_the_development_count_and_the_median(self) -> None:
+    def test_a_changed_cutoff_is_refused_as_a_flag_and_every_row_carries_the_development_count_and_the_median(self) -> None:
         other = [*self.lengths, 20000, 20000, 20000]
         problems = frozen_problems(self.measure, self.cutoffs, measure_rows(other), cutoff_rows(other))
-        self.assertIn("changed_cutoff: 5 cutoffs", problems)
-        self.assertTrue(any(problem.startswith("changed_measure: ") for problem in problems))
+        self.assertEqual(["changed_cutoff: failed", "changed_measure: failed"], problems)
 
     def test_a_wrong_development_count_or_median_with_the_same_times_is_refused(self) -> None:
         held = [replace(row, development_cases=row.development_cases + 1) if row.cutoff == "p50_of_median" else row for row in self.cutoffs]
-        self.assertEqual(["changed_cutoff: 1 cutoff"], frozen_problems(self.measure, held, self.measure, self.cutoffs))
+        self.assertEqual(["changed_cutoff: failed"], frozen_problems(self.measure, held, self.measure, self.cutoffs))
         held = [replace(row, median_length_seconds=row.median_length_seconds + 1) if row.cutoff == "final" else row for row in self.cutoffs]
-        self.assertEqual(["changed_cutoff: 1 cutoff"], frozen_problems(self.measure, held, self.measure, self.cutoffs))
+        self.assertEqual(["changed_cutoff: failed"], frozen_problems(self.measure, held, self.measure, self.cutoffs))
 
     def test_a_measure_that_changed_with_the_same_cutoffs_is_still_refused(self) -> None:
         other = [3600, 7200, 5400, 4800, 7300]
         problems = frozen_problems(self.measure, self.cutoffs, measure_rows(other), self.cutoffs)
-        self.assertEqual(1, len(problems))
-        self.assertTrue(problems[0].startswith("changed_measure: "))
+        self.assertEqual(["changed_measure: failed"], problems)
 
     def test_a_held_cutoff_that_is_there_twice_with_another_time_is_refused_as_a_repeated_key(self) -> None:
         twice = [*self.cutoffs, replace(self.cutoffs[2], elapsed_seconds=999)]
-        self.assertEqual(["inherited_duplicates: 1 key"], frozen_problems(self.measure, twice, self.measure, self.cutoffs))
+        self.assertEqual(["inherited_duplicates: failed"], frozen_problems(self.measure, twice, self.measure, self.cutoffs))
 
     def test_a_held_measure_row_that_is_there_twice_is_refused_as_a_repeated_key_even_when_the_copy_is_equal(self) -> None:
         twice = [*self.measure, self.measure[3]]
-        self.assertEqual(["inherited_duplicates: 1 key"], frozen_problems(twice, self.cutoffs, self.measure, self.cutoffs))
-        self.assertEqual(["inherited_duplicates: 1 key"], frozen_problems(self.measure, [*self.cutoffs, self.cutoffs[0]], self.measure, self.cutoffs))
+        self.assertEqual(["inherited_duplicates: failed"], frozen_problems(twice, self.cutoffs, self.measure, self.cutoffs))
+        self.assertEqual(["inherited_duplicates: failed"], frozen_problems(self.measure, [*self.cutoffs, self.cutoffs[0]], self.measure, self.cutoffs))
 
-    def test_a_repeated_key_in_both_tables_counts_each_key_once_per_table(self) -> None:
+    def test_a_repeated_key_in_both_tables_is_one_flag(self) -> None:
         problems = frozen_problems([*self.measure, self.measure[0]], [*self.cutoffs, self.cutoffs[0]], self.measure, self.cutoffs)
-        self.assertEqual(["inherited_duplicates: 2 keys"], problems)
+        self.assertEqual(["inherited_duplicates: failed"], problems)
 
     def test_an_existing_table_with_no_row_is_refused(self) -> None:
         problems = frozen_problems([], self.cutoffs, self.measure, self.cutoffs)
-        self.assertEqual(["inherited_empty: 0 rows"], problems)
+        self.assertEqual(["inherited_empty: failed"], problems)
 
     def test_an_existing_measure_with_no_cutoffs_or_the_reverse_is_refused(self) -> None:
-        self.assertEqual(["inherited_incomplete: the measure and the cutoffs are not both there"], frozen_problems(self.measure, None, [], []))
+        self.assertEqual(["inherited_incomplete: failed"], frozen_problems(self.measure, None, [], []))
 
 
 class InputProblemTest(unittest.TestCase):
     def test_a_clean_input_has_no_problem(self) -> None:
         self.assertEqual([], input_problems(**clean_input(), pinned=True))  # type: ignore[arg-type]
 
-    def test_each_failure_is_one_code_and_a_count_and_never_a_value(self) -> None:
+    def test_each_failure_is_one_code_and_a_flag_and_never_a_count_or_a_value(self) -> None:
         cases = {
-            "case_key_null": ("key_null", "3 rows"),
-            "case_key_duplicates": ("key_duplicate", "2 keys"),
-            "subjectid_form": ("subjectid_form", "4 rows"),
-            "operation_ends_before_it_starts": ("operation_order", "1 row"),
-            "cases_without_one_split_row": ("split_join", "5 cases"),
-            "split_patients_without_case": ("split_patient_without_case", "2 patients"),
-            "lab_key_null": ("lab_key_null", "7 rows"),
+            "case_key_null": "key_null",
+            "case_key_duplicates": "key_duplicate",
+            "subjectid_form": "subjectid_form",
+            "operation_ends_before_it_starts": "operation_order",
+            "cases_without_one_split_row": "split_join",
+            "split_patients_without_case": "split_patient_without_case",
+            "lab_key_null": "lab_key_null",
+            "lab_rows_without_case": "lab_case_missing",
+            "sealed_outcome_form_bad": "sealed_outcome_form",
+            "sealed_lab_form_bad": "sealed_lab_form",
         }
-        for field, (code, count) in cases.items():
-            number = int(count.split()[0])
-            problems = input_problems(**clean_input(**{field: number}), pinned=True)  # type: ignore[arg-type]
-            self.assertEqual([f"{code}: {count}"], problems, field)
+        for field, code in cases.items():
+            for number in (1, 7):
+                problems = input_problems(**clean_input(**{field: number}), pinned=True)  # type: ignore[arg-type]
+                self.assertEqual([f"{code}: failed"], problems, field)
 
-    def test_an_unparsed_value_names_its_columns_and_the_count_of_values(self) -> None:
-        problems = input_problems(**clean_input(unparsed={"height": 2, "age": 1}), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["unparsed: 3 values in 2 columns (age, height)"], problems)
-        problems = input_problems(**clean_input(lab_unparsed={"result": 1}), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["lab_unparsed: 1 value in 1 column (result)"], problems)
-
-    def test_a_value_outside_the_domain_names_its_column(self) -> None:
-        problems = input_problems(**clean_input(domain={"emop": 1, "sex": 2}), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["domain: 3 values in 2 columns (emop, sex)"], problems)
-
-    def test_a_laboratory_row_with_no_case_is_one_flag_with_no_count_because_its_owner_cannot_be_classified(self) -> None:
-        problems = input_problems(**clean_input(lab_rows_without_case=1), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["lab_case_missing: a laboratory row has no case"], problems)
-
-    def test_a_held_out_outcome_value_not_in_its_published_form_is_a_code_with_no_count_and_no_column(self) -> None:
-        problems = input_problems(**clean_input(sealed_outcome_form_bad=1), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["sealed_outcome_form: a held-out outcome value is not in its published form"], problems)
+    def test_an_unparsed_value_and_a_value_outside_the_domain_name_no_column_and_no_count(self) -> None:
+        for field, code in (("unparsed", "unparsed"), ("domain", "domain"), ("lab_unparsed", "lab_unparsed")):
+            for counts in ({"height": 2, "age": 1}, {"result": 1}):
+                problems = input_problems(**clean_input(**{field: counts}), pinned=True)  # type: ignore[arg-type]
+                self.assertEqual([f"{code}: failed"], problems, field)
 
     def test_no_measurement_yet_skips_the_development_count_check(self) -> None:
         self.assertEqual([], input_problems(**clean_input(development_cases=None), pinned=True))  # type: ignore[arg-type]
 
     def test_no_development_case_and_empty_tables_are_refused(self) -> None:
-        self.assertEqual(["no_development_cases: 0 cases"], input_problems(**clean_input(development_cases=0), pinned=True))  # type: ignore[arg-type]
+        self.assertEqual(["no_development_cases: failed"], input_problems(**clean_input(development_cases=0), pinned=True))  # type: ignore[arg-type]
         problems = input_problems(**clean_input(bronze_case_rows=0, lab_source_empty=1), pinned=False)  # type: ignore[arg-type]
-        self.assertIn("empty_cases: 0 rows", problems)
-        self.assertIn("empty_lab: the laboratory table has no row", problems)
+        self.assertIn("empty_cases: failed", problems)
+        self.assertIn("empty_lab: failed", problems)
 
     def test_a_laboratory_table_that_has_rows_only_for_held_out_patients_is_not_empty(self) -> None:
         self.assertEqual([], input_problems(**clean_input(lab_source_empty=0), pinned=True))  # type: ignore[arg-type]
 
     def test_the_pinned_release_demands_its_case_count_and_the_laboratory_total_as_a_flag_and_a_sample_does_not(self) -> None:
         problems = input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["pinned_counts: 13 cases, not 6388", "pinned_counts: the laboratory row count is not the release's"], problems)
+        self.assertEqual(["pinned_counts: failed"], problems)
+        self.assertEqual(["pinned_counts: failed"], input_problems(**clean_input(bronze_case_rows=13), pinned=True))  # type: ignore[arg-type]
+        self.assertEqual(["pinned_counts: failed"], input_problems(**clean_input(lab_pinned_mismatch=1), pinned=True))  # type: ignore[arg-type]
         self.assertEqual([], input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1), pinned=False))  # type: ignore[arg-type]
-
-    def test_a_held_out_laboratory_value_not_in_its_published_form_is_a_code_with_no_count_and_no_column(self) -> None:
-        problems = input_problems(**clean_input(sealed_lab_form_bad=1), pinned=True)  # type: ignore[arg-type]
-        self.assertEqual(["sealed_lab_form: a held-out laboratory value is not in its published form"], problems)
 
     def test_no_laboratory_total_over_all_patients_is_in_any_message(self) -> None:
         problems = input_problems(**clean_input(bronze_case_rows=13, lab_pinned_mismatch=1, sealed_lab_form_bad=1), pinned=True)  # type: ignore[arg-type]
         self.assertNotIn("928448", " ".join(problems))
+        self.assertNotRegex(" ".join(problems), "[0-9]")
 
 
 class OutcomeColumnTest(unittest.TestCase):
@@ -377,18 +365,18 @@ class SplitRuleTest(unittest.TestCase):
     def test_a_split_made_by_the_rule_has_no_problem(self) -> None:
         self.assertEqual([], split_rule_problems(split_rows(300), pinned=False))
 
-    def test_a_held_out_patient_relabelled_training_is_a_rule_mismatch_and_counted_once(self) -> None:
+    def test_a_held_out_patient_relabelled_training_is_a_rule_mismatch_flag(self) -> None:
         rows = split_rows(300)
         held_out = next(index for index, row in enumerate(rows) if row.set == "test")
         rows[held_out] = replace(rows[held_out], set="training")
-        self.assertEqual(["rule_mismatch: 1 patient"], split_rule_problems(rows, pinned=False))
+        self.assertEqual(["rule_mismatch: failed"], split_rule_problems(rows, pinned=False))
 
     def test_a_patient_in_two_sets_an_unknown_set_and_another_rule_version_are_each_refused(self) -> None:
         rows = split_rows(300)
         problems = split_rule_problems([*rows, replace(rows[0], set="validation")], pinned=False)
-        self.assertTrue(any(problem.startswith("two_sets: ") for problem in problems))
-        self.assertIn("unknown_set: 1 row", split_rule_problems([*rows[1:], replace(rows[0], set="holdout")], pinned=False))
-        self.assertIn("rule_version: 1 row", split_rule_problems([*rows[1:], replace(rows[0], rule_version="other")], pinned=False))
+        self.assertIn("two_sets: failed", problems)
+        self.assertIn("unknown_set: failed", split_rule_problems([*rows[1:], replace(rows[0], set="holdout")], pinned=False))
+        self.assertIn("rule_version: failed", split_rule_problems([*rows[1:], replace(rows[0], rule_version="other")], pinned=False))
 
 
 class SourceSchemaTest(unittest.TestCase):
@@ -419,38 +407,35 @@ class SourceSchemaTest(unittest.TestCase):
 
 class OutputProblemTest(unittest.TestCase):
     def test_more_laboratory_rows_than_copies_is_impossible_and_refused(self) -> None:
-        self.assertEqual(["lab_rows: 700001 rows from 700000 copies"], output_problems(**clean_output(lab_rows=700001)))  # type: ignore[arg-type]
+        self.assertEqual(["lab_rows: failed"], output_problems(**clean_output(lab_rows=700001)))  # type: ignore[arg-type]
 
-    def test_a_held_out_outcome_value_that_differs_from_bronze_is_a_code_with_no_count(self) -> None:
-        problems = output_problems(**clean_output(sealed_outcome_differs=1))  # type: ignore[arg-type]
-        self.assertEqual(["sealed_outcome_differs: a held-out outcome value differs from Bronze"], problems)
+    def test_a_held_out_outcome_value_that_differs_from_bronze_is_a_code_with_a_flag(self) -> None:
+        self.assertEqual(["sealed_outcome_differs: failed"], output_problems(**clean_output(sealed_outcome_differs=1)))  # type: ignore[arg-type]
 
-    def test_a_held_out_laboratory_difference_is_a_code_with_no_count_and_silver_rows_with_no_case_are_counted(self) -> None:
-        self.assertEqual(
-            ["sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key"],
-            output_problems(**clean_output(sealed_lab_differs=1)),  # type: ignore[arg-type]
-        )
-        self.assertEqual(["lab_case_missing_in_silver: a written laboratory row has no case"], output_problems(**clean_output(silver_lab_orphans=1)))  # type: ignore[arg-type]
+    def test_a_held_out_laboratory_difference_and_silver_rows_with_no_case_are_each_a_flag(self) -> None:
+        self.assertEqual(["sealed_lab_differs: failed"], output_problems(**clean_output(sealed_lab_differs=1)))  # type: ignore[arg-type]
+        self.assertEqual(["lab_case_missing_in_silver: failed"], output_problems(**clean_output(silver_lab_orphans=1)))  # type: ignore[arg-type]
 
     def test_a_clean_output_has_no_problem(self) -> None:
         self.assertEqual([], output_problems(**clean_output()))  # type: ignore[arg-type]
 
-    def test_a_row_count_that_differs_from_bronze_is_refused_for_both_tables(self) -> None:
+    def test_a_row_count_that_differs_from_bronze_is_refused_for_both_tables_without_either_count(self) -> None:
         problems = output_problems(**clean_output(case_rows=6387, lab_copies=699999))  # type: ignore[arg-type]
-        self.assertEqual(["case_rows: silver 6387, bronze 6388", "lab_rows: the copies add up to 699999, bronze 700000"], problems)
+        self.assertEqual(["case_rows: failed", "lab_rows: failed"], problems)
 
-    def test_a_changed_value_a_repeated_key_and_a_gap_in_the_occurrence_are_each_refused(self) -> None:
+    def test_a_changed_value_a_repeated_key_and_a_gap_in_the_occurrence_are_each_refused_as_a_flag(self) -> None:
         cases = {
-            "case_value_differences": "case_value_differences: 4 rows",
-            "case_key_duplicates": "case_key_duplicate: 4 keys",
-            "lab_value_differences": "lab_value_differences: 4 rows",
-            "lab_key_duplicates": "lab_key_duplicate: 4 keys",
-            "lab_occurrence_gaps": "lab_occurrence_gap: 4 groups",
-            "never_feature_marking_wrong": "never_feature_marking: 4 tables",
-            "case_key_differences": "case_key_differences: 4 keys",
+            "case_value_differences": "case_value_differences",
+            "case_key_duplicates": "case_key_duplicate",
+            "lab_value_differences": "lab_value_differences",
+            "lab_key_duplicates": "lab_key_duplicate",
+            "lab_occurrence_gaps": "lab_occurrence_gap",
+            "never_feature_marking_wrong": "never_feature_marking",
+            "case_key_differences": "case_key_differences",
         }
-        for field, text in cases.items():
-            self.assertEqual([text], output_problems(**clean_output(**{field: 4})), field)  # type: ignore[arg-type]
+        for field, code in cases.items():
+            for number in (1, 4):
+                self.assertEqual([f"{code}: failed"], output_problems(**clean_output(**{field: number})), field)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

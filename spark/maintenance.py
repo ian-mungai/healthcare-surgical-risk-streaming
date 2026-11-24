@@ -17,6 +17,10 @@ from typing import Any
 from scripts.stack.tags import MAX_DEADLINE_SECONDS
 
 TABLE_NAME = re.compile(r"\w+(\.\w+)+", re.ASCII)
+# The tables whose row count and checksum may leave the job: the Bronze signal tables hold no outcome or label, and the catalog proof table holds a few
+# numbers that are not about patients. A table that is not listed (a table with an outcome or a label, or any new one) is sealed.
+OPEN_TABLES = frozenset({"bronze.numeric_observations", "bronze.waveform_seconds", "bronze.tracks", "bronze.string_events", "catalog_proof.numbers"})
+SEALED_FIELDS = ("rows", "checksum")
 DEFAULT_DEADLINE_SECONDS = 900.0
 
 
@@ -98,6 +102,21 @@ def compare_reads(before: Sequence[Mapping[str, Any]], after: Sequence[Mapping[s
             found.append(f"the tag {key[0]} read {key[1]} before the run and has no read of it after")
             continue
         for field in ("snapshot_id", "rows", "checksum"):
-            if later[key].get(field) != item.get(field):
+            if later[key].get(field) == item.get(field):
+                continue
+            if key[1] in OPEN_TABLES or field == "snapshot_id":
                 found.append(f"the tag {key[0]} read {key[1]} with {field} {item.get(field)} before the run and {later[key].get(field)} after")
+            else:
+                found.append(f"the tag {key[0]} read {key[1]} with a {field} that differs after the run")
     return found
+
+
+def public_reads(reads: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The reads for the result: a table that is not open holds its tag, its name and its snapshot ID only, with no row count and no checksum."""
+    return [dict(item) if item["table"] in OPEN_TABLES else {key: value for key, value in item.items() if key not in SEALED_FIELDS} for item in reads]
+
+
+def sealed_report(table: str, report: Mapping[str, Any]) -> dict[str, Any]:
+    """What a compaction reports for the result: the whole report for an open table, and for any other table a flag, because the counts of files and bytes
+    that Iceberg reports follow the rows of the table."""
+    return dict(report) if table in OPEN_TABLES else {"compacted": True}

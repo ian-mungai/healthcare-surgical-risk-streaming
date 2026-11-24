@@ -263,7 +263,7 @@ class OwnershipTest(unittest.TestCase):
         engine = Lake(session, None, "b")  # type: ignore[arg-type]
         self.assertEqual([], engine.ownership_problems())
         session.flag = 1
-        self.assertEqual(["ambiguous_case_owner: a Bronze case has more than one row or more than one patient"], engine.ownership_problems())
+        self.assertEqual(["ambiguous_case_owner: failed"], engine.ownership_problems())
 
 
 class PinnedReadTest(unittest.TestCase):
@@ -300,7 +300,7 @@ class SplitRuleTest(unittest.TestCase):
     def test_a_held_out_patient_relabelled_training_is_refused_before_any_length_is_measured(self) -> None:
         held_out = next(patient for patient in range(1, 300) if patient_part(patient) == "test")
         engine = Lake(Session({"lake.silver.patient_split": split_table(300, held_out - 1)}, {}, []), None, "b")  # type: ignore[arg-type]
-        self.assertEqual(["rule_mismatch: 1 patient"], engine.split_problems())
+        self.assertEqual(["rule_mismatch: failed"], engine.split_problems())
 
 
 class OutputSchemaTest(unittest.TestCase):

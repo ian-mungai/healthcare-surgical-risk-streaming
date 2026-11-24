@@ -221,7 +221,7 @@ def verify_calls(kind: str, reference: str = BRANCH) -> list[str]:
     ]
     if kind == "lab":
         calls += ["occurrence_gaps", "repeated_row_count", f"repeated_rows:{REPEATED_ROWS_LIMIT}"]
-    return [*calls, f"digests:{kind}"]
+    return calls if kind == "clinical" else [*calls, f"digests:{kind}"]  # the digests of the clinical table, which holds the outcome, never leave the job
 
 
 def start_calls(command: str) -> list[str]:

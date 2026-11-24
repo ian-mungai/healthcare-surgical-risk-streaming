@@ -19,6 +19,7 @@ from spark.bronze_clinical_lab import (
     BRONZE_NAMESPACE,
     OCCURRENCE_COLUMN,
     REPEATED_ROWS_LIMIT,
+    SEALED_KINDS,
     SOURCE_NAMESPACE,
     TABLES,
     BronzeRulesError,
@@ -102,11 +103,27 @@ class TableReport:
     def passed(self) -> bool:
         return bool(self.checks) and all(check["passed"] for check in self.checks)
 
+    @property
+    def sealed(self) -> bool:
+        return self.kind in SEALED_KINDS
+
     def add(self, name: str, passed: bool, detail: str) -> bool:
-        self.checks.append({"name": name, "passed": passed, "detail": detail})
+        """Record one check. A sealed table's check holds its name and its flag only: its detail holds counts of rows, which a held-out outcome can change."""
+        self.checks.append({"name": name, "passed": passed} if self.sealed else {"name": name, "passed": passed, "detail": detail})
         return passed
 
     def document(self) -> dict[str, Any]:
+        """What the result holds for this table: the snapshot IDs, the pass flag and the checks. A sealed table holds no row count and no digest."""
+        if self.sealed:
+            return {
+                "source_table": f"{SOURCE_NAMESPACE}.{self.source_table}",
+                "bronze_table": f"{BRONZE_NAMESPACE}.{self.bronze_table}",
+                "source_metadata_location": self.source_metadata_location,
+                "source_snapshot_id": self.source_snapshot_id,
+                "bronze_snapshot_id": self.bronze_snapshot_id,
+                "passed": self.passed,
+                "checks": self.checks,
+            }
         return {
             "source_table": f"{SOURCE_NAMESPACE}.{self.source_table}",
             "bronze_table": f"{BRONZE_NAMESPACE}.{self.bronze_table}",
@@ -192,7 +209,8 @@ def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, k
             f"{len(repeated)} rows collected of {in_groups} rows in repeated groups, "
             f"{'not compared' if differences is None else f'{differences} differ from the Python numbering'}",
         )
-    report.keys_digest, report.rows_digest = spark.digests(kind, columns)
+    if not report.sealed:
+        report.keys_digest, report.rows_digest = spark.digests(kind, columns)
     return report
 
 
@@ -210,12 +228,15 @@ def result_document(command: str, branch: str, branch_hash: str, default_branch:
 
 
 def finish(result: dict[str, Any], branch: str, stdout: TextIO, stderr: TextIO) -> int:
-    """Print the ``RESULT`` line and return the exit code: 0 when every check passed, else 1 with the failed checks (counts only) on ``stderr``."""
+    """Print the ``RESULT`` line and return the exit code: 0 when every check passed, else 1 with the failed checks on ``stderr``.
+
+    A check of a sealed table is a name only. A check of the other table is its name and its detail, which holds counts.
+    """
     stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     if result["passed"]:
         return 0
     failed = [
-        f"{table['bronze_table']}: {check['name']} ({check['detail']})"
+        f"{table['bronze_table']}: {check['name']}" + (f" ({check['detail']})" if "detail" in check else "")
         for table in result["tables"].values()
         for check in table["checks"]
         if not check["passed"]

@@ -14,7 +14,9 @@ the median (``spark/silver_cases.py``). Both are saved as tables. Once a branch 
 Every input check and that freeze come before the first write; the checks of the written tables come after the last. A table that already holds the
 rows is not written again. The merge of the branch is the caller's step. ``verify`` runs the checks on a branch and writes nothing.
 
-The test set is sealed: the result and the messages hold codes, counts, table names and the cutoffs, and never a case or a patient.
+The test set is sealed, and the clinical table holds the outcome columns: a message is a code and a flag (``key_null: failed``) with a count of tables at most,
+and the result holds hashes, snapshot IDs, the checks that ran, one pass flag for each table and measures of the development patients (the cutoffs), never a
+case, a patient, a count over all cases or a field that says whether a table was written.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
 """

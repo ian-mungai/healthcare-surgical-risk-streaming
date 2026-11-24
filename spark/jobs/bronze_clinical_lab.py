@@ -27,10 +27,11 @@ collected to the driver, numbered again by the pure Python rule and compared wit
 are refused.
 
 The job prints one line that starts with ``RESULT `` and holds the branch, its hash, the default branch, the source hash, and for each table
-its row count, the metadata location and snapshot ID of the loaded table at the source hash, Bronze's snapshot ID on the branch, its key
-digest and its row digest, and the checks with their result. It exits 0 when every check passed, 1 when one failed or Nessie refused, and 2
-for a setting or an argument that is wrong. Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for
-an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and ``JOB_DEADLINE_SECONDS``."""
+the metadata location and snapshot ID of the loaded table at the source hash, Bronze's snapshot ID on the branch, a pass flag and the checks with their
+result. The laboratory table also holds its row counts, its key digest and its row digest, and its checks hold their details. The clinical table holds the
+outcome columns, so its entry holds no row count, no digest and no check detail: a held-out patient's outcome can change them. It exits 0 when every
+check passed, 1 when one failed or Nessie refused, and 2 for a setting or an argument that is wrong. Settings come from the environment: ``NESSIE_URI``,
+``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and ``JOB_DEADLINE_SECONDS``."""
 
 from __future__ import annotations
 

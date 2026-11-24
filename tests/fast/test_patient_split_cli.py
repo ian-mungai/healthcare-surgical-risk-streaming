@@ -106,8 +106,8 @@ class CommandLineTest(unittest.TestCase):
                 self.assertEqual((70, "", "patient_split: internal_error\n"), (code, out, err))
 
     def test_a_failed_check_prints_its_codes_one_to_a_line(self) -> None:
-        code, out, err = invoke(["build", "--branch", "b"], raising(PatientSplitError("two_sets: 1 patient", "rule_mismatch: 1 patient")))
-        self.assertEqual((1, "", "patient_split: two_sets: 1 patient\npatient_split: rule_mismatch: 1 patient\n"), (code, out, err))
+        code, out, err = invoke(["build", "--branch", "b"], raising(PatientSplitError("two_sets: failed", "rule_mismatch: failed")))
+        self.assertEqual((1, "", "patient_split: two_sets: failed\npatient_split: rule_mismatch: failed\n"), (code, out, err))
 
 
 class DeadlineTest(unittest.TestCase):

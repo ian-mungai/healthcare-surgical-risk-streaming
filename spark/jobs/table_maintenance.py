@@ -19,7 +19,10 @@ Each run:
 5. lists the tags again and reads every table at every tag again, and exits 1 when a tag vanished or moved or any read differs from the one before.
    A tag made during the run is reported in ``tags_added`` and is read too, and is not a failure: a compaction adds a commit and removes nothing.
 
-The job prints one line that starts with ``RESULT `` and holds the plan, the rewrites and the reads before and after. It reads ``NESSIE_URI``,
+The job prints one line that starts with ``RESULT `` and holds the plan, the rewrites and the reads before and after. A table that holds an outcome or a
+label (every table except the Bronze signal tables and the catalog proof table) is sealed in the result: its read holds the tag, the table and the snapshot
+ID, and its rewrite holds one flag, because a row count, a checksum or a file count of it changes when a held-out outcome does. The job still reads, compares
+and refuses on those counts inside, and a refusal about a sealed table names no value. It reads ``NESSIE_URI``,
 ``WAREHOUSE_LOCATION`` and ``AWS_REGION`` from the environment, like the catalog proof, and ends at ``--deadline-seconds``. With ``--rewrite-all``
 every data file is rewritten, which a small table needs, because Iceberg's size rules leave a few small files as they are.
 """
@@ -34,7 +37,7 @@ from typing import Any
 from scripts.stack.nessie import NessieError
 from scripts.stack.tags import TableSnapshot, TagClient, default_branch, list_references, list_tags, table_snapshots
 from spark.catalog import add_catalog, required_environment
-from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, table_identifier
+from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, public_reads, sealed_report, table_identifier
 from spark.preconditions import PROPERTY_KEYS, precondition_problems
 from spark.session import build_session, start_deadline
 from spark.settings import CATALOG, SettingsError
@@ -154,9 +157,9 @@ def maintain(arguments: Any) -> dict[str, Any]:
         "dry_run": arguments.dry_run,
         "tags": sorted(tags_before),
         "tags_added": added,
-        "tables": compacted,
-        "tagged_reads_before": before,
-        "tagged_reads_after": after,
+        "tables": {table: sealed_report(table, report) for table, report in compacted.items()},
+        "tagged_reads_before": public_reads(before),
+        "tagged_reads_after": public_reads(after),
     }
 
 

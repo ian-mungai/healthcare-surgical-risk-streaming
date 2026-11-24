@@ -13,7 +13,8 @@ The branch is resolved to one hash. Every read and check is at that hash (a read
 still has it. The hash of the write is taken from the branch's log: the head, one commit directly on the checked hash, changing only the table. A new
 table's namespace is a commit of its own, made only after every check passed and the head was confirmed, so a failed check or a moved branch writes
 nothing. The table is read again at that hash, and the job ends with ``branch_moved`` when the branch no longer has the hash that it checked.
-The result names that hash, the hash of the write and nothing derived from the rows.
+The result names that hash, the hash of the write, the snapshot IDs, the checks that ran and one pass flag for the table, and nothing derived from the
+rows: no count of patients, cases or sets and no field that says whether the table was written.
 Every local input is validated before the first call to Nessie, so a bad input never leaves a branch that blocks the retry.
 
 The table is frozen. When the branch already holds the table (merged earlier), that table must be valid by itself (rows, no patient twice, one rule
@@ -22,7 +23,8 @@ nothing. ``--pinned-release`` is the full cohort: it requires the shares of 70, 
 refuses a new patient. ``--fixed-sample`` takes the complete tracked candidate file, refuses any other, and requires every case of it in Bronze in the
 set that its slot expects. The result names the checks that ran.
 
-The test set is sealed: a message or the result holds codes, counts and hashes, and never a patient, a case or a set beside one.
+The test set is sealed: a message or the result holds codes with a flag (``two_sets: failed``), hashes and snapshot IDs, and never a patient, a case, a set
+beside one or a count (the clinical table that the patients come from holds the outcome columns). A count of tables is the one count left.
 The command line prints fixed codes only (``usage``, ``branch_missing``, ``catalog_error``, ``settings``) and the codes of a failed check.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
@@ -50,6 +52,7 @@ from spark.split_table import (
     SplitRow,
     TableState,
     catalog_conf,
+    flag,
     read_fixed_sample,
     run_build,
     run_verify,
@@ -124,10 +127,10 @@ class Lake:
             raise PatientSplitError(*problems)
         snapshot = self.snapshot_id(table)
         if snapshot is None:
-            raise PatientSplitError(f"source_no_snapshot: {unit(0, 'snapshot')}")
+            raise PatientSplitError(flag("source_no_snapshot"))
         cases, patients = source_cases((row["caseid"], row["subjectid"]) for row in frame.select("caseid", "subjectid").collect())
         if not patients:
-            raise PatientSplitError(f"source_empty: {unit(0, 'row')}")
+            raise PatientSplitError(flag("source_empty"))
         return Source(cases, patients, snapshot)
 
     def read_table(self, at: str) -> TableState | None:
