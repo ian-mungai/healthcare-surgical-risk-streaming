@@ -118,9 +118,9 @@ def checked(table: str, read: TableRead | None) -> bool:
 
 def own_problems(source: InputRead, table: str, read: TableRead) -> list[str]:
     if table == NUMERIC and read.numeric is not None:
-        return numeric_problems(read.numeric, source.facts.numeric_rows)
+        return numeric_problems(read.numeric)
     if read.waveform is not None:
-        return waveform_problems(read.waveform, source.facts.waveform_rows)
+        return waveform_problems(read.waveform)
     return []
 
 

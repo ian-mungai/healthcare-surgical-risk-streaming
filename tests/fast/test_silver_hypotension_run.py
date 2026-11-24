@@ -25,7 +25,7 @@ from spark.silver.run import BRANCH_MOVED, Fingerprint
 HEAD, PREPARED, FIRST_WRITE, SECOND_WRITE = "a" * 64, "b" * 64, "c" * 64, "d" * 64
 INPUT = InputRead(InputFacts(5000, 0, 0, 0, 0, ()), (21, 22, 23))
 FINGERPRINTS: dict[str, Fingerprint | Digest] = {SERIES: Fingerprint(5000, 5), EVENTS: Digest(9)}
-SERIES_FACTS = SeriesFacts(5000, 0, 0, 0, 0, 0, 0, 0)
+SERIES_FACTS = SeriesFacts(0, 0, 0, 0, 0, 0, 0)
 EVENT_FACTS = EventFacts(0, 0, 0, 0, 0)
 
 

@@ -70,7 +70,6 @@ class SeriesFacts:
     """What a read of the series table shows. ``value_problem`` counts valid rows with no value and invalid rows with one. ``differs`` counts rows that are not
     the reading that the single definition gives from the stored seconds."""
 
-    rows: int
     duplicate_keys: int
     null_verdict: int
     valid_with_cause: int
@@ -78,6 +77,7 @@ class SeriesFacts:
     unknown_cause: int
     value_problem: int
     differs: int
+    row_count_differs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,10 +115,10 @@ def input_problems(facts: InputFacts) -> list[str]:
     return flagged([("waveform_null_key", facts.null_keys), ("waveform_duplicate_second", facts.duplicate_seconds)])
 
 
-def series_problems(facts: SeriesFacts, art_seconds: int) -> list[str]:
+def series_problems(facts: SeriesFacts) -> list[str]:
     return flagged(
         [
-            ("series_not_every_second", int(art_seconds != facts.rows)),
+            ("series_not_every_second", facts.row_count_differs),
             ("series_duplicate_key", facts.duplicate_keys),
             ("series_verdict_null", facts.null_verdict),
             ("series_valid_with_cause", facts.valid_with_cause),

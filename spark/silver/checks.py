@@ -82,15 +82,14 @@ class BronzeFacts:
 
 @dataclass(frozen=True, slots=True)
 class NumericFacts:
-    """What a read of ``silver.numeric_observations`` shows. ``ledger_total`` is the number of dropped duplicates that the rows list.
+    """What a read of ``silver.numeric_observations`` shows.
 
-    ``verdict_differs`` counts rows whose stored verdict is not the one that ``numeric_verdict`` gives for the stored value. The counts are tested inside the
-    job and never leave it.
+    ``verdict_differs`` counts rows whose stored verdict is not the one that ``numeric_verdict`` gives for the stored value. ``row_count_differs`` is a flag
+    (0 or 1): the rows and the dropped duplicates that they list do not add up to the Bronze rows, as Great Expectations' row-count expectation judges it.
+    The counts are tested inside the job and never leave it.
     """
 
-    rows: int
     duplicate_keys: int
-    ledger_total: int
     not_first: int
     null_verdict: int
     valid_with_cause: int
@@ -98,13 +97,14 @@ class NumericFacts:
     unknown_cause: int
     verdict_differs: int
     source_differs: int = 0
+    row_count_differs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class WaveformFacts:
-    """What a read of ``silver.waveform_seconds`` shows. ``shape_differs`` counts rows whose ``sample_count`` is not the number of their samples."""
+    """What a read of ``silver.waveform_seconds`` shows. ``shape_differs`` counts rows whose ``sample_count`` is not the number of their samples.
+    ``row_count_differs`` is a flag (0 or 1): the rows are not the Bronze rows in number, as Great Expectations' row-count expectation judges it."""
 
-    rows: int
     duplicate_keys: int
     null_verdict: int
     valid_with_cause: int
@@ -113,6 +113,7 @@ class WaveformFacts:
     shape_differs: int
     verdict_differs: int
     source_differs: int = 0
+    row_count_differs: int = 0
 
 
 def flagged(pairs: list[tuple[str, int]]) -> list[str]:
@@ -136,10 +137,10 @@ def bronze_problems(facts: BronzeFacts) -> list[str]:
     )
 
 
-def numeric_problems(facts: NumericFacts, bronze_rows: int) -> list[str]:
+def numeric_problems(facts: NumericFacts) -> list[str]:
     return flagged(
         [
-            ("numeric_not_every_reading", int(bronze_rows != facts.rows + facts.ledger_total)),
+            ("numeric_not_every_reading", facts.row_count_differs),
             ("numeric_duplicate_key", facts.duplicate_keys),
             ("numeric_kept_not_first", facts.not_first),
             ("numeric_verdict_null", facts.null_verdict),
@@ -152,10 +153,10 @@ def numeric_problems(facts: NumericFacts, bronze_rows: int) -> list[str]:
     )
 
 
-def waveform_problems(facts: WaveformFacts, bronze_rows: int) -> list[str]:
+def waveform_problems(facts: WaveformFacts) -> list[str]:
     return flagged(
         [
-            ("waveform_not_every_second", int(bronze_rows != facts.rows)),
+            ("waveform_not_every_second", facts.row_count_differs),
             ("waveform_duplicate_key", facts.duplicate_keys),
             ("waveform_shape", facts.shape_differs),
             ("waveform_verdict_null", facts.null_verdict),

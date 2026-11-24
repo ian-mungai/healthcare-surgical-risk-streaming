@@ -69,6 +69,17 @@ def column_checks(frame: Any, checks: Sequence[Check], context: Any | None = Non
     return results
 
 
+def row_count_is(frame: Any, expected: int, context: Any | None = None) -> bool:
+    """Whether the Spark table ``frame`` has exactly ``expected`` rows, as Great Expectations' row-count expectation judges it. It returns no count."""
+    gx = importlib.import_module("great_expectations")
+    context = context if context is not None else open_context()
+    source = context.data_sources.add_spark(name=f"rows_{next(SOURCE_NUMBERS)}", persist=False)
+    asset = source.add_dataframe_asset(name="table")
+    batch = asset.add_batch_definition_whole_dataframe("whole").get_batch(batch_parameters={"dataframe": frame})
+    expectation = gx.expectations.ExpectTableRowCountToBeBetween(min_value=expected, max_value=expected)
+    return bool(batch.validate(expectation, result_format=RESULT_FORMAT).success)
+
+
 def run_checks(session: Any, checks: list[Check] | None = None) -> Verdict:
     """Run ``checks`` (the whole plan when none are given) on the Bronze tables that the session's catalog reads, and return their verdict.
 

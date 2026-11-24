@@ -27,8 +27,8 @@ SECOND_WRITE = "d" * 64
 BRONZE = BronzeFacts(1000, 300, 0, 0, 0, 0, 0, 0, 0)
 INPUT = InputRead(BRONZE, (11, 12, 13))
 FINGERPRINTS = {NUMERIC: Fingerprint(990, 5), WAVEFORM: Fingerprint(300, 9)}
-NUMERIC_FACTS = NumericFacts(990, 0, 10, 0, 0, 0, 0, 0, 0)
-WAVEFORM_FACTS = WaveformFacts(300, 0, 0, 0, 0, 0, 0, 0)
+NUMERIC_FACTS = NumericFacts(0, 0, 0, 0, 0, 0, 0)
+WAVEFORM_FACTS = WaveformFacts(0, 0, 0, 0, 0, 0, 0)
 
 
 def messages(error: SilverSignalsError) -> list[str]:
@@ -217,7 +217,7 @@ class Build(unittest.TestCase):
     def test_the_checks_of_the_tables_run_on_the_read_back(self) -> None:
         fake = Fake()
         fake.read_back[NUMERIC] = TableRead(FINGERPRINTS[NUMERIC], 101, numeric=dataclasses.replace(NUMERIC_FACTS, verdict_differs=3))
-        fake.read_back[WAVEFORM] = TableRead(FINGERPRINTS[WAVEFORM], 102, waveform=dataclasses.replace(WAVEFORM_FACTS, rows=299))
+        fake.read_back[WAVEFORM] = TableRead(FINGERPRINTS[WAVEFORM], 102, waveform=dataclasses.replace(WAVEFORM_FACTS, row_count_differs=1))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
         self.assertEqual(failed("numeric_verdict_differs", "waveform_not_every_second"), messages(caught.exception))

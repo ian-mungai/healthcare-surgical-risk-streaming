@@ -80,10 +80,8 @@ class SignalsResult(unittest.TestCase):
         fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=1007, waveform_rows=305), (21, 22, 23))
         fake.planned = {signals_run.NUMERIC: Fingerprint(997, 55), signals_run.WAVEFORM: Fingerprint(305, 66)}
         fake.read_back = {
-            signals_run.NUMERIC: signals_run.TableRead(fake.planned[signals_run.NUMERIC], 201, numeric=dataclasses.replace(signals.NUMERIC_FACTS, rows=997)),
-            signals_run.WAVEFORM: signals_run.TableRead(
-                fake.planned[signals_run.WAVEFORM], 202, waveform=dataclasses.replace(signals.WAVEFORM_FACTS, rows=305)
-            ),
+            signals_run.NUMERIC: signals_run.TableRead(fake.planned[signals_run.NUMERIC], 201, numeric=signals.NUMERIC_FACTS),
+            signals_run.WAVEFORM: signals_run.TableRead(fake.planned[signals_run.WAVEFORM], 202, waveform=signals.WAVEFORM_FACTS),
         }
         fake.hashes = {signals_run.NUMERIC: "7" * 64, signals_run.WAVEFORM: "8" * 64}
         return fake
@@ -143,7 +141,7 @@ class SignalsFlags(unittest.TestCase):
         self.assertEqual({signals_run.NUMERIC: True, signals_run.WAVEFORM: False}, signals_run.passed_flags(signals.INPUT, self.reads(), planned))
 
     def test_a_count_that_does_not_add_up_to_bronze_is_false(self) -> None:
-        short = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, rows=989))
+        short = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, row_count_differs=1))
         self.assertFalse(signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: short}), None)[signals_run.NUMERIC])
 
 
@@ -162,10 +160,12 @@ class SignalsMessages(unittest.TestCase):
         fake.read_back[signals_run.NUMERIC] = signals_run.TableRead(
             signals.FINGERPRINTS[signals_run.NUMERIC],
             101,
-            numeric=NumericFacts(990 - size, size, 10 + size, size, size, size, size, size, size, source_differs=size),
+            numeric=NumericFacts(size, size, size, size, size, size, size, source_differs=size, row_count_differs=size),
         )
         fake.read_back[signals_run.WAVEFORM] = signals_run.TableRead(
-            signals.FINGERPRINTS[signals_run.WAVEFORM], 102, waveform=WaveformFacts(300 - size, size, size, size, size, size, size, size, source_differs=size)
+            signals.FINGERPRINTS[signals_run.WAVEFORM],
+            102,
+            waveform=WaveformFacts(size, size, size, size, size, size, size, source_differs=size, row_count_differs=size),
         )
         found += self.build(fake)
         fake = signals.Fake()
@@ -220,7 +220,7 @@ class HypotensionResult(unittest.TestCase):
         fake.input = hypo_run.InputRead(InputFacts(5007, 0, 0, 0, 0, ()), (31, 32, 33))
         fake.planned = {hypo_run.SERIES: Fingerprint(5007, 55), hypo_run.EVENTS: hypo_run.Digest(9)}
         fake.read_back = {
-            hypo_run.SERIES: hypo_run.TableRead(fake.planned[hypo_run.SERIES], 301, series=dataclasses.replace(hypo.SERIES_FACTS, rows=5007)),
+            hypo_run.SERIES: hypo_run.TableRead(fake.planned[hypo_run.SERIES], 301, series=hypo.SERIES_FACTS),
             hypo_run.EVENTS: hypo_run.TableRead(fake.planned[hypo_run.EVENTS], 302, events=hypo.EVENT_FACTS),
         }
         fake.hashes = {hypo_run.SERIES: "7" * 64, hypo_run.EVENTS: "8" * 64}
@@ -295,7 +295,7 @@ class HypotensionMessages(unittest.TestCase):
             found += self.build(fake)
         fake = hypo.Fake()
         fake.read_back[hypo_run.SERIES] = hypo_run.TableRead(
-            hypo.FINGERPRINTS[hypo_run.SERIES], 101, series=SeriesFacts(5000 - size, size, size, size, size, size, size, size)
+            hypo.FINGERPRINTS[hypo_run.SERIES], 101, series=SeriesFacts(size, size, size, size, size, size, size, row_count_differs=size)
         )
         found += self.build(fake)
         fake = hypo.Fake()

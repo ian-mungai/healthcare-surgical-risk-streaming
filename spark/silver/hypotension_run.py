@@ -103,14 +103,14 @@ def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> lis
     series, events = reads[SERIES], reads[EVENTS]
     if series is None or events is None or series.series is None or events.events is None:
         return [f"table_missing: {unit(1, 'table')}"]
-    return series_problems(series.series, source.facts.art_seconds) + event_problems(events.events)
+    return series_problems(series.series) + event_problems(events.events)
 
 
 def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned: dict[str, Fingerprint | Digest] | None) -> dict[str, bool]:
     """One flag for each table: the table is there, every check of it passes and, in a build, it is the planned table."""
     series, events = reads[SERIES], reads[EVENTS]
     held = {
-        SERIES: series is not None and series.series is not None and not series_problems(series.series, source.facts.art_seconds),
+        SERIES: series is not None and series.series is not None and not series_problems(series.series),
         EVENTS: events is not None and events.events is not None and not event_problems(events.events),
     }
     return {table: held[table] and (planned is None or not differs(reads[table], planned[table])) for table in TABLES}
@@ -134,7 +134,7 @@ def read_checked(ops: Operations, at: str, source: InputRead) -> dict[str, Table
     series = ops.read_table(at, SERIES, True)
     if series is None or series.series is None:
         return {SERIES: series, EVENTS: ops.read_table(at, EVENTS, False)}
-    problems = series_problems(series.series, source.facts.art_seconds)
+    problems = series_problems(series.series)
     if problems:
         raise SilverSignalsError(*problems)
     return {SERIES: series, EVENTS: ops.read_table(at, EVENTS, True)}

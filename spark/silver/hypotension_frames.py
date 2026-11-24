@@ -18,6 +18,7 @@ from typing import Any
 from features.hypotension import EVENT_SECONDS, SECOND_US, SeriesPoint, events_of
 from features.pressure_series import SERIES_TRACK, ExactMean, SecondFacts, second_facts, series_second
 from features.signal_validity import INVALID_CAUSES, Verdict
+from spark.bronze.quality import row_count_is
 from spark.bronze.tables import LINEAGE_COLUMNS
 from spark.silver.frames import DIGEST_TYPE, count_where, functions, typed, types, window
 from spark.silver.hypotension_checks import DEVELOPMENT_SETS, EventFacts, InputFacts, SeriesFacts
@@ -235,7 +236,6 @@ def series_facts(stored: Any, waveform: Any) -> SeriesFacts:
     valid, cause, value = f.col("valid"), f.col("invalid_cause"), f.col("value")
     key = f.struct(*[f.col(name) for name in KEY])
     row = stored.agg(
-        f.count(f.lit(1)).alias("rows"),
         (f.count(f.lit(1)) - f.countDistinct(key)).alias("duplicate_keys"),
         count_where(valid.isNull()).alias("null"),
         count_where(valid & cause.isNotNull()).alias("valid_with_cause"),
@@ -251,7 +251,6 @@ def series_facts(stored: Any, waveform: Any) -> SeriesFacts:
     left, right = typed(stored, columns), typed(again, columns)
     differs = int(left.exceptAll(right).count()) + int(right.exceptAll(left).count())
     return SeriesFacts(
-        int(row["rows"]),
         int(row["duplicate_keys"]),
         int(row["null"] or 0),
         int(row["valid_with_cause"] or 0),
@@ -259,6 +258,7 @@ def series_facts(stored: Any, waveform: Any) -> SeriesFacts:
         int(row["unknown"] or 0),
         int(row["value_problem"] or 0),
         differs,
+        int(not row_count_is(stored, arterial(waveform).count())),
     )
 
 
