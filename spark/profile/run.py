@@ -19,9 +19,11 @@ one commit (a rebuilt table as the drop and then the create) and reads the input
 the planned tables, with every check passing. The job ends only when the branch still has that hash.
 
 A verify classifies the schemas first (any table that is not its card's, the predecessor included, is ``table_schema``), then builds the same plan on the stored
-rule row and requires the stored tables to be equal to it and the stored rule to be the planned row. A prespecified count that the reproduced count does not
-equal is a finding, not a failure: its flag is in the table and its name is not in the result. The counts of the full cohort change with a held-out
-recording, so the result holds one pass flag for ``source_counts`` and neither its fingerprint nor a name (``Outcome.facts``).
+rule row and requires the stored tables to be equal to it and the stored rule to be the planned row. The read-back and the verify name a table that differs
+with the flags ``readback_differs: failed`` and ``plan_differs: failed``, never a count of tables, which would count ``source_counts``. A prespecified count
+that the reproduced count does not equal is a finding, not a failure: its flag is in the table and its name is not in the result. The counts of the full cohort
+change with a held-out recording, so the result holds one pass flag for ``source_counts`` and neither its fingerprint nor a name (``Outcome.facts``), and its
+rewrite alone leaves the printed outcome ``unchanged`` (``public_outcome``).
 """
 
 from __future__ import annotations
@@ -58,6 +60,9 @@ OUTPUTS = (*TABLES, RULE)
 SCHEMA_CODE = "table_schema"
 SOURCE_NAMES = ("numeric_observations", "waveform_seconds", "patient_split", "clinical_cases", "track_list")
 BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
+# The read-back and verify codes that a held-out recording can reach through ``source_counts`` carry a flag and no count of tables.
+READBACK_DIFFERS = "readback_differs: failed"
+PLAN_DIFFERS = "plan_differs: failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +226,12 @@ def unfit_schemas(states: dict[str, str], *, rebuildable: bool) -> list[str]:
     return [f"{SCHEMA_CODE}: {unit(len(unfit), 'table')}"] if unfit else []
 
 
+def public_outcome(rule_written: bool, changed: list[str]) -> str:
+    """``written`` when the build wrote the rule or a development table, and ``unchanged`` otherwise. ``source_counts`` is left out: it holds the counts of the
+    full cohort, so a held-out recording rewrites it and would flip the word."""
+    return "written" if rule_written or any(table != COUNTS for table in changed) else "unchanged"
+
+
 def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     source = ops.read_input(head)
     problems = input_problems(source)
@@ -277,16 +288,16 @@ def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     reads = read_tables(ops, at, True)
     back = ops.read_rule(at)
     problems = table_problems(source, reads, pinned=pinned) + stored_rule_problems(back, wanted)
-    differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
+    differing = any(reads[table] is not None and differs(reads[table], planned[table]) for table in TABLES)
     if differing and not problems:
-        problems.append(f"readback_differs: {unit(differing, 'table')}")
+        problems.append(READBACK_DIFFERS)
     if problems or back is None:
         raise SignalProfileError(*problems)
     if ops.head() != at:
         raise SignalProfileError(BRANCH_MOVED)
     tables = {table: read for table, read in reads.items() if read is not None}
     rebuilt = tuple(table for table in changed if states[table] == PREDECESSOR)
-    return Outcome("written" if written else "unchanged", head, written, at, source, tables, planned, pinned, back, stored is None, rebuilt)
+    return Outcome(public_outcome(stored is None, changed), head, written, at, source, tables, planned, pinned, back, stored is None, rebuilt)
 
 
 def run_build(ops: Operations, head: str, *, pinned: bool) -> Outcome:
@@ -315,10 +326,8 @@ def run_verify(ops: Operations, head: str, *, pinned: bool) -> Outcome:
         planned = ops.plan(head, rule.rule) if not problems and rule is not None and rule.rule is not None else {}
         reads = read_tables(ops, head, True)
         problems += table_problems(source, reads, pinned=pinned)
-        if planned and not problems:
-            stale = len([table for table in TABLES if differs(reads[table], planned[table])])
-            if stale:
-                problems.append(f"plan_differs: {unit(stale, 'table')}")
+        if planned and not problems and any(differs(reads[table], planned[table]) for table in TABLES):
+            problems.append(PLAN_DIFFERS)
         if problems or rule is None:
             raise SignalProfileError(*problems)
         if ops.head() != head:
