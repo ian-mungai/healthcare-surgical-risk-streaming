@@ -151,5 +151,55 @@ class StackDiagnostic(unittest.TestCase):
                 self.assertNotIn(planted, json.dumps(kept))
 
 
+class ComposeProgress(unittest.TestCase):
+    """Compose writes its own container progress (``Container x Creating``) to the standard error of ``docker compose run``, before the job's line. The probe
+    asks for no progress, so that the exact-line check sees the job's line alone."""
+
+    PROGRESS = " Container run-postgres-1  Running\n Container run-nessie-1  Running\n"
+
+    def compose_like(self, command: list[str], limit: float, **_: Any) -> tuple[int, str, str]:
+        """A stand-in for ``docker compose``: its global ``--progress quiet`` (before the subcommand ``run``) silences the progress lines."""
+        quiet = "run" in command and any(command[index : index + 2] == ["--progress", "quiet"] for index in range(command.index("run")))
+        return 124, "", ("" if quiet else self.PROGRESS) + LINE + "\n"
+
+    def stack(self) -> tuple[Any, list[list[str]]]:
+        module = runner("silver_cases")
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="compose_progress_")))
+        (folder / "data").mkdir()
+        commands: list[list[str]] = []
+        stack = module.Stack(folder / "compose", "project", folder / "data", Record(feature="t", slug="t", rerun="none"), [])
+
+        def run(command: list[str], limit: float, **keywords: Any) -> tuple[int, str, str]:
+            commands.append(command)
+            return self.compose_like(command, limit, **keywords)
+
+        stack.run = run
+        stack.watch = lambda done, stalled: None
+        return stack, commands
+
+    def test_a_timeout_with_compose_progress_lines_still_gives_the_stop_line(self) -> None:
+        stack, _ = self.stack()
+        answer = stack.job_with_line(["-c", "pass"], None, None, {}, 300, ("cases", "verify", "stalled_catalog"), LINE)
+        self.assertEqual((124, {}, LINE), answer[:3])
+
+    def test_the_run_command_asks_for_no_progress_before_its_subcommand_and_the_exact_line_check_stays(self) -> None:
+        stack, commands = self.stack()
+        stack.job_with_line(["-c", "pass"], None, None, {}, 300, ("cases", "verify", "stalled_catalog"), LINE)
+        (command,) = commands
+        self.assertLess(command.index("--progress"), command.index("run"))
+        self.assertEqual("quiet", command[command.index("--progress") + 1])
+        # The exact-line check is still the one that decides: a stop line with another line beside it gives nothing.
+        stack.run = lambda command, limit, **_: (124, "", LINE + "\nanother line\n")
+        self.assertEqual("", stack.job_with_line(["-c", "pass"], None, None, {}, 300, ("cases", "verify", "stalled_catalog"), LINE)[2])
+
+    def test_every_job_of_the_stack_runs_without_progress(self) -> None:
+        stack, commands = self.stack()
+        stack.job(["-c", "pass"], None, None, {}, 300, ("cases", "verify", "stalled_catalog"))
+        stack.job(["/data/stand_in.py", "x", "y"], None, None, None, 300, None)
+        self.assertEqual(2, len(commands))
+        for command in commands:
+            self.assertIn(["--progress", "quiet"], [command[index : index + 2] for index in range(len(command) - 1)])
+
+
 if __name__ == "__main__":
     unittest.main()
