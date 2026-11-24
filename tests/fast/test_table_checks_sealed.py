@@ -13,6 +13,9 @@ Failure modes covered here:
 - A sealed table's result is written with row counts set by a caller.
 - The track list loses its row counts.
 - A result of the earlier format is accepted.
+- A producer writes a counted flag (``table_compared;equal=23``), a check that its table does not have (``separator_in_field;rows=23`` for a sealed table), a
+  flag its code does not give or a check out of order, and the receiver is the first to refuse it.
+- A saved result of the earlier format, or one with a count of a sealed table, is returned again or written into a new receipt when a run is repeated.
 """
 
 from __future__ import annotations
@@ -36,8 +39,28 @@ FIXED_CODE = re.compile(r"table_compared;equal=[01]")
 ALLOWED_NUMBERS = {"snapshot_id", "columns_source", "columns_table"}
 
 
+def started(name: str, *, upto: str | None = None) -> rules.TableResult:
+    """The result of a file table with every required check before ``upto`` added as passed, or all of them but the comparisons when ``upto`` is None."""
+    result = rules.TableResult(name, 1, columns_source=3, columns_table=3)
+    for check in rules.REQUIRED_CHECKS[name]:
+        if check == (upto or "row count"):
+            break
+        result.add(check, ParserRefusesCounts.detail(check, True, 0))
+    return result
+
+
+def complete(name: str) -> rules.TableResult:
+    """A result with every required check of the table, passed, as the job writes it, and the track list with its row counts."""
+    result = rules.TableResult(name, 1, columns_source=3, columns_table=3)
+    if not rules.SPEC_BY_NAME[name].sealed:
+        result.rows_source = result.rows_table = 7
+    for check in rules.REQUIRED_CHECKS[name]:
+        result.add(check, ParserRefusesCounts.detail(check, rules.SPEC_BY_NAME[name].sealed, 7))
+    return result
+
+
 def compared(name: str, table_rows: Sequence[tuple[str, ...]]) -> rules.TableResult:
-    result = rules.TableResult(name, 1)
+    result = started(name)
     source, table = frames(table_rows)
     job.compare_rows(result, rules.SPEC_BY_NAME[name], COLUMNS, source, table)
     return result
@@ -75,8 +98,8 @@ class JobComparisons(unittest.TestCase):
             for label, rows in cases.items():
                 with self.subTest(table=name, case=label):
                     result = compared(name, rows)
-                    self.assertEqual(list(COMPARISONS), [check.name for check in result.checks])
-                    for check in result.checks:
+                    self.assertEqual(list(COMPARISONS), [check.name for check in result.checks[3:]])
+                    for check in result.checks[3:]:
                         self.assertRegex(check.detail, FIXED_CODE)
                         self.assertEqual(check.detail.endswith("=1"), check.passed)
 
@@ -129,14 +152,177 @@ class RulesRefuseCounts(unittest.TestCase):
     def test_a_sealed_table_that_is_given_row_counts_is_not_written(self) -> None:
         for name in SEALED:
             for fields in ({"rows_source": 5}, {"rows_table": 5}, {"rows_source": 5, "rows_table": 5}):
+                result = complete(name)
+                self.assertEqual(name, result.document()["table"])
+                for field, value in fields.items():
+                    setattr(result, field, value)
                 with self.subTest(table=name, fields=fields), self.assertRaises(rules.RulesError):
-                    rules.TableResult(name, 1, **fields).document()  # type: ignore[arg-type]
+                    result.document()
+
+    def test_a_count_that_is_not_a_whole_number_within_its_bound_is_not_written(self) -> None:
+        for field, value in (
+            ("rows_source", -1),
+            ("rows_table", rules.MAX_ROWS + 1),
+            ("rows_source", True),
+            ("columns_source", rules.MAX_COLUMN_COUNT + 1),
+            ("columns_table", -2),
+        ):
+            result = complete("track_list")
+            self.assertEqual("track_list", result.document()["table"])
+            setattr(result, field, value)
+            with self.subTest(field=field, value=value), self.assertRaises(rules.RulesError):
+                result.document()
 
     def test_a_sealed_table_refuses_a_counted_detail_whatever_its_check(self) -> None:
         result = rules.TableResult("clinical_data", 1)
         for check in COMPARISONS:
             with self.subTest(check=check), self.assertRaises(rules.RulesError):
                 result.add(check, rules.detail("row_count", source=5, table=5))
+
+
+class ProducerRefusesCounts(unittest.TestCase):
+    """The producer holds its own checks to what the receiver accepts: a counted flag or a check of another table fails where it is made."""
+
+    def test_a_sealed_table_refuses_a_flag_that_holds_a_number_whatever_the_check(self) -> None:
+        for name in SEALED:
+            for check in COMPARISONS:
+                for equal in (2, 23, 4719238):
+                    with self.subTest(table=name, check=check, equal=equal), self.assertRaises(rules.RulesError):
+                        started(name, upto=check).add(check, f"table_compared;equal={equal}")
+
+    def test_a_flag_of_0_or_1_is_the_only_flag_that_a_producer_may_write(self) -> None:
+        for name in SEALED:
+            for check in COMPARISONS:
+                for equal in (0, 1):
+                    self.assertEqual(bool(equal), started(name, upto=check).add(check, f"table_compared;equal={equal}"))
+
+    def test_a_check_that_the_table_does_not_have_is_refused(self) -> None:
+        for name in SEALED:
+            for check, detail in (
+                ("rows digest", "separator_in_field;rows=23"),
+                ("rows digest", "digest_compared;equal=1"),
+                ("extra", "ok"),
+            ):
+                with self.subTest(table=name, check=check, detail=detail), self.assertRaises(rules.RulesError):
+                    started(name, upto="row payload").add(check, detail)
+        with self.assertRaises(rules.RulesError):
+            rules.TableResult("track_list", 1, columns_source=3, columns_table=3).add("key multiset", "table_compared;equal=1")
+
+    def test_a_check_that_comes_before_one_already_added_or_is_added_twice_is_refused(self) -> None:
+        for name in SEALED:
+            for again in ("staged file", "snapshot", "columns", "row count", "key multiset"):
+                with self.subTest(table=name, again=again), self.assertRaises(rules.RulesError):
+                    started(name, upto="row payload").add(again, ParserRefusesCounts.detail(again, True, 0))
+
+    def test_the_checks_of_each_table_in_order_are_accepted_as_a_control(self) -> None:
+        for spec in rules.TABLES:
+            result = rules.TableResult(spec.name, 1, columns_source=3, columns_table=3)
+            if not spec.sealed:
+                result.rows_source = result.rows_table = 7
+            for name in rules.REQUIRED_CHECKS[spec.name]:
+                result.add(name, ParserRefusesCounts.detail(name, spec.sealed, 7))
+            self.assertTrue(result.passed)
+            self.assertEqual(list(rules.REQUIRED_CHECKS[spec.name]), [check["name"] for check in result.document()["checks"]])
+
+    def forged(self, table: str, checks: Sequence[tuple[str, bool, str]], **fields: int | None) -> rules.TableResult:
+        result = rules.TableResult(table, 1, columns_source=3, columns_table=3, **fields)  # type: ignore[arg-type]
+        result.checks.extend(rules.Check(*check) for check in checks)
+        return result
+
+    def test_a_document_refuses_a_counted_flag_a_check_of_another_table_a_wrong_pass_flag_and_a_check_out_of_order(self) -> None:
+        columns = ("columns", True, rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0))
+        first = (("staged file", True, "ok"), ("snapshot", True, "ok"), columns)
+        cases = {
+            "a counted flag": [*first, ("row count", False, "table_compared;equal=23")],
+            "a counted flag marked passed": [*first, ("row count", True, "table_compared;equal=23")],
+            "a flag the code does not give": [*first, ("row count", False, "table_compared;equal=1")],
+            "a counted code of the earlier format": [*first, ("row count", True, "row_count;source=5;table=5")],
+            "a check of the track list": [*first, ("row count", True, "table_compared;equal=1"), ("rows digest", False, "separator_in_field;rows=23")],
+            "a check out of order": [("snapshot", True, "ok"), ("staged file", True, "ok")],
+            "a check that is not required": [*first, ("extra", True, "ok")],
+        }
+        for label, checks in cases.items():
+            with self.subTest(label), self.assertRaises(rules.RulesError):
+                self.forged("clinical_data", checks).document()
+
+    def test_a_document_of_the_track_list_refuses_a_count_outside_its_bounds_and_accepts_the_control(self) -> None:
+        columns = ("columns", True, rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0))
+        base = [("snapshot", True, "ok"), columns, ("row count", True, "row_count;source=7;table=7")]
+        control = self.forged("track_list", [*base, ("rows digest", False, "separator_in_field;rows=3")], rows_source=7, rows_table=7)
+        self.assertEqual("separator_in_field;rows=3", control.document()["checks"][3]["detail"])
+        for label, checks in {
+            "more rows than the table holds": [*base, ("rows digest", False, "separator_in_field;rows=23")],
+            "a flag of 23": [*base, ("rows digest", False, "digest_compared;equal=23")],
+            "a count that the table does not have": [*base[:2], ("row count", False, "row_count;source=7;table=9")],
+        }.items():
+            with self.subTest(label), self.assertRaises(rules.RulesError):
+                self.forged("track_list", checks, rows_source=7, rows_table=7).document()
+
+    def test_a_job_document_is_not_built_from_a_result_that_a_receiver_would_refuse(self) -> None:
+        plan = the_plan()
+        results = [
+            self.forged(entry.name, [("staged file", True, "ok"), ("snapshot", True, "ok")] if entry.name != "track_list" else []) for entry in plan.tables
+        ]
+        results[0].checks.append(rules.Check("columns", True, "table_compared;equal=23"))
+        with self.assertRaises(rules.RulesError):
+            rules.job_document(plan, results)
+
+
+class SavedEvidence(unittest.TestCase):
+    """A result that an earlier run saved is read again by the form of the result that the receiver accepts, and any other form is refused."""
+
+    def saved(self) -> dict[str, Any]:
+        return ParserRefusesCounts().parse(ParserRefusesCounts().passing()).document()
+
+    def parse(self, document: Any) -> rules.JobResult:
+        return rules.parse_saved_result(document, the_plan())
+
+    def test_control_the_document_that_the_controller_keeps_is_read_again_and_equal_to_itself(self) -> None:
+        document = self.saved()
+        self.assertEqual(document, self.parse(document).document())
+
+    def test_a_saved_document_of_an_earlier_format_or_with_a_count_of_a_sealed_table_is_refused(self) -> None:
+        def earlier(document: dict[str, Any]) -> None:
+            document["format"] = "table_checks_4"
+
+        def counted(document: dict[str, Any]) -> None:
+            document["tables"][0].update(rows_source=2, rows_table=2)
+
+        def legacy_code(document: dict[str, Any]) -> None:
+            document["tables"][1]["checks"][4].update(detail="rows_differ;only_file=0;only_table=0")
+
+        def counted_flag(document: dict[str, Any]) -> None:
+            document["tables"][0]["checks"][3].update(detail="table_compared;equal=23")
+
+        def row_count_code(document: dict[str, Any]) -> None:
+            document["tables"][1]["checks"][3].update(detail="row_count;source=2;table=2")
+
+        def top_flag(document: dict[str, Any]) -> None:
+            document["passed"] = False
+
+        def table_flag(document: dict[str, Any]) -> None:
+            document["tables"][2]["passed"] = False
+
+        def no_flag(document: dict[str, Any]) -> None:
+            del document["tables"][0]["passed"]
+
+        def extra_field(document: dict[str, Any]) -> None:
+            document["rows"] = 2
+
+        def another_run(document: dict[str, Any]) -> None:
+            document["run_id"] = "b" * 32
+
+        for change in (earlier, counted, legacy_code, counted_flag, row_count_code, top_flag, table_flag, no_flag, extra_field, another_run):
+            document = self.saved()
+            change(document)
+            with self.subTest(change.__name__), self.assertRaises(rules.RulesError):
+                self.parse(document)
+
+    def test_a_saved_value_that_is_not_a_document_is_refused(self) -> None:
+        values: list[Any] = [None, [], "table_checks_5", 5, {}]
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(rules.RulesError):
+                self.parse(value)
 
 
 class ParserRefusesCounts(unittest.TestCase):

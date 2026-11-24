@@ -131,7 +131,10 @@ def snapshot_of(session: Any, name: str) -> int | None:
 
 
 def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> TableResult:
-    """Run the required checks of one table in order and stop at the first that fails. Every detail is a code and counts."""
+    """Run the required checks of one table in order and stop at the first that fails.
+
+    Every detail is a code with its numbers: counts for the track list, and for a sealed table one flag for each comparison.
+    """
     from pyspark.errors import AnalysisException
     from pyspark.sql import functions as F  # noqa: N812
 

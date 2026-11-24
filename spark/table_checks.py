@@ -1,7 +1,7 @@
 """The rules of the table checks that need no Spark: which tables, which columns and keys, what an empty value is, how a result reads.
 
 The Spark job ``spark/jobs/table_checks.py`` applies these rules to the loaded Iceberg tables and the verified files. Each loaded table is compared with its
-verified source on four counts: the column list (exact names, order and the string type; only the connector's own metadata columns, the closed list
+verified source on four comparisons: the column list (exact names, order and the string type; only the connector's own metadata columns, the closed list
 ``CONNECTOR_COLUMNS``, are set aside), the row count, the key multiset and the row payload. The keys and rows are compared as multisets of strings,
 unchanged: a value is never trimmed, cast or case-folded, so a leading zero, a trailing blank or a changed empty value is a difference.
 
@@ -46,7 +46,8 @@ RUN_ID = re.compile(r"[0-9a-f]{32}")
 PLAN_FORMAT = "table_check_plan_2"
 RESULT_FORMAT = "table_checks_5"
 # The details of a check: each is one of these codes with exactly its integer fields, in this order, and one rule that says whether the check passed. The job
-# reports counts only: a check passes if and only if the rule of its code holds for its counts, and a flag that says otherwise refuses the result. A detail is
+# reports numbers only (counts for the track list, one flag for each comparison of a sealed table): a check passes if and only if the rule of its code holds for
+# its numbers, and a flag that says otherwise refuses the result. A detail is
 # built from this table and parsed back against it, so no text of the data can pass as a detail. ``row_count`` is the track list's. ``table_compared`` is the
 # comparison of a sealed table: its one field is a flag of 0 or 1 and no count.
 DETAIL_RULES: Mapping[str, tuple[tuple[str, ...], Callable[[Mapping[str, int]], bool]]] = {
@@ -274,7 +275,8 @@ def parse_plan(text: str) -> Plan:
 
 @dataclass(slots=True)
 class Check:
-    """One check of one table: its name, whether it passed and its detail, which is a code and counts and never a value of the data."""
+    """One check of one table: its name, whether it passed and its detail, which is a code and its numbers and never a value of the data. For a sealed table
+    the numbers of a comparison are one flag of 0 or 1, never a count."""
 
     name: str
     passed: bool
@@ -296,17 +298,24 @@ class TableResult:
         return bool(self.checks) and all(check.passed for check in self.checks)
 
     def add(self, name: str, text: str) -> bool:
-        """Record a check by its detail. It passed if the rule of the detail's code holds. A code that the check may not hold is refused."""
-        code, _ = parse_detail(text)
-        if code not in allowed_codes(self.table, name):
-            raise RulesError("a check may hold only the codes allowed for its name and table")
-        passed = detail_holds(text)
-        self.checks.append(Check(name, passed, text))
-        return passed
+        """Record a check by its detail. It passed if the rule of the detail's code holds.
+
+        The check is held to what the receiver accepts: it is a required check of the table that comes after the checks already added, its code is one that
+        the check and the table may hold, and its counts are within the bounds that the values of this result give them. A flag that holds a number, or a
+        check of another table, fails here.
+        """
+        check = Check(name, detail_holds(text), text)
+        validate_check(self.table, check, self.rows_source, self.rows_table, self.columns_source, self.columns_table)
+        required = REQUIRED_CHECKS[self.table]
+        if self.checks and required.index(name) <= required.index(self.checks[-1].name):
+            raise RulesError("a check is added after a check that comes later in the required order, or twice")
+        self.checks.append(check)
+        return check.passed
 
     def document(self) -> dict[str, Any]:
-        if SPEC_BY_NAME[self.table].sealed and (self.rows_table is not None or self.rows_source is not None):
-            raise RulesError("a sealed table's result holds no row count")
+        """The result as the job prints it, after the same checks of its counts and of each check that the receiver makes. ``RulesError`` otherwise."""
+        check_counts(self.table, self.rows_table, self.rows_source, self.columns_source, self.columns_table)
+        validate_checks(self.table, self.checks, self.rows_source, self.rows_table, self.columns_source, self.columns_table)
         return {
             "table": self.table,
             "snapshot_id": self.snapshot_id,
@@ -427,36 +436,56 @@ def bounded(
     return True
 
 
+def check_counts(table: str, rows_table: int | None, rows_source: int | None, columns_source: int | None, columns_table: int | None) -> None:
+    """The row and column counts of a table's result: each a whole number within its bound or null, and no row count at all for a sealed table."""
+    if any(count is not None and not whole(count, MAX_ROWS) for count in (rows_table, rows_source)):
+        raise RulesError("a row count of the result is not a whole number or null")
+    if any(count is not None and not whole(count, MAX_COLUMN_COUNT) for count in (columns_source, columns_table)):
+        raise RulesError("a column count of the result is not a whole number within its bound or null")
+    if SPEC_BY_NAME[table].sealed and (rows_table is not None or rows_source is not None):
+        raise RulesError("a sealed table of the result holds a row count")
+
+
+def validate_check(table: str, check: Check, rows_source: int | None, rows_table: int | None, columns_source: int | None, columns_table: int | None) -> None:
+    """One check of a table: it is one of the table's required checks, its code is allowed for its name and table, its flag is the one that the rule of its code
+    gives and its counts are within the bounds. The producer and the receiver both use it, so a result that one writes the other accepts."""
+    if check.name not in REQUIRED_CHECKS[table]:
+        raise RulesError("a check is not one of the required checks of its table")
+    code, counts = parse_detail(check.detail)
+    if code not in allowed_codes(table, check.name) or check.passed != DETAIL_RULES[code][1](counts):
+        raise RulesError("a check holds a code that its name may not hold, or a flag that the rule of its code does not give")
+    if not bounded(code, counts, rows_source, rows_table, columns_source, columns_table):
+        raise RulesError("a count of a check is outside the bound that the other values of its table give it")
+
+
+def validate_checks(
+    table: str, checks: Sequence[Check], rows_source: int | None, rows_table: int | None, columns_source: int | None, columns_table: int | None
+) -> None:
+    """The checks of a table: a first part of its required checks in order, each valid, and a failed one last when the part is not all of them."""
+    required = REQUIRED_CHECKS[table]
+    names = tuple(check.name for check in checks)
+    if not names or names != required[: len(names)]:
+        raise RulesError("the checks of a table are not the required checks in order")
+    for check in checks:
+        validate_check(table, check, rows_source, rows_table, columns_source, columns_table)
+    if len(names) < len(required) and checks[-1].passed:
+        raise RulesError("a table stopped before its last required check without a failed check")
+
+
 def table_outcome(entry: Any, expected: PlanTable) -> TableOutcome:
     """One table of a result, held to its shape and to the plan. Every check's flag must be the one that the rule of its code gives for its counts."""
     table = closed(entry, TABLE_RESULT_FIELDS, "a table of the result")
     if table["table"] != expected.name or table["snapshot_id"] != expected.snapshot_id or type(table["snapshot_id"]) is bool:
         raise RulesError("a table of the result is not the planned table at the planned snapshot")
     rows_table, rows_source, columns_source, columns_table = (table[name] for name in ("rows_table", "rows_source", "columns_source", "columns_table"))
-    if any(count is not None and not whole(count, MAX_ROWS) for count in (rows_table, rows_source)):
-        raise RulesError("a row count of the result is not a whole number or null")
-    if any(count is not None and not whole(count, MAX_COLUMN_COUNT) for count in (columns_source, columns_table)):
-        raise RulesError("a column count of the result is not a whole number within its bound or null")
+    check_counts(expected.name, rows_table, rows_source, columns_source, columns_table)
     spec = SPEC_BY_NAME[expected.name]
-    if spec.sealed and (rows_table is not None or rows_source is not None):
-        raise RulesError("a sealed table of the result holds a row count")
     if spec.source == "pin" and rows_source is not None and rows_source != expected.rows:
         raise RulesError("the pinned row count of the result is not the planned one")
     if spec.source == "pin" and columns_source is not None and columns_source != len(spec.pinned_columns):
         raise RulesError("the column count of the track list in the result is not the pinned one")
     checks = tuple(Check(**closed(check, CHECK_FIELDS, "a check of the result")) for check in table["checks"])
-    names = tuple(check.name for check in checks)
-    required = REQUIRED_CHECKS[expected.name]
-    if not names or names != required[: len(names)]:
-        raise RulesError("the checks of a table are not the required checks in order")
-    for check in checks:
-        code, counts = parse_detail(check.detail)
-        if code not in allowed_codes(expected.name, check.name) or check.passed != DETAIL_RULES[code][1](counts):
-            raise RulesError("a check holds a code that its name may not hold, or a flag that the rule of its code does not give")
-        if not bounded(code, counts, rows_source, rows_table, columns_source, columns_table):
-            raise RulesError("a count of a check is outside the bound that the other values of its table give it")
-    if len(names) < len(required) and checks[-1].passed:
-        raise RulesError("a table stopped before its last required check without a failed check")
+    validate_checks(expected.name, checks, rows_source, rows_table, columns_source, columns_table)
     return TableOutcome(expected.name, checks, expected.snapshot_id, rows_table, rows_source, columns_source, columns_table)
 
 
@@ -484,3 +513,24 @@ def parse_result(text: str, plan: Plan) -> JobResult:
         raise RulesError("the result names another number of tables than the plan")
     tables = tuple(table_outcome(entry, expected) for entry, expected in zip(fields["tables"], plan.tables, strict=True))
     return JobResult(plan.run_id, plan.branch, plan.branch_hash, plan.empty_form, tables)
+
+
+SAVED_RESULT_FIELDS: Mapping[str, type] = {**RESULT_FIELDS, "passed": bool}
+
+
+def parse_saved_result(document: Any, plan: Plan) -> JobResult:
+    """The result that the controller kept (``JobResult.document``), held to the form that ``parse_result`` accepts and to the plan, and read again.
+
+    Its verdict and the verdict of each table must be the ones that the checks give. A saved result of the earlier format, one with a count of a sealed table
+    or any field beyond the kept ones is refused with ``RulesError``, so it is never returned again or written into a new receipt.
+    """
+    fields = closed(document, SAVED_RESULT_FIELDS, "the saved result")
+    entries = fields["tables"]
+    if any(type(entry) is not dict or type(entry.get("passed")) is not bool for entry in entries):
+        raise RulesError("a table of the saved result has no verdict")
+    stripped = {name: value for name, value in fields.items() if name != "passed"}
+    stripped["tables"] = [{name: value for name, value in entry.items() if name != "passed"} for entry in entries]
+    result = parse_result(json.dumps(stripped), plan)
+    if fields["passed"] is not result.passed or any(entry["passed"] is not table.passed for entry, table in zip(entries, result.tables, strict=True)):
+        raise RulesError("a verdict of the saved result is not the one that its checks give")
+    return result
