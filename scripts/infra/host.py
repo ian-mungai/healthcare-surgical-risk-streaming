@@ -49,9 +49,10 @@ PEER_DEADLINE_SECONDS = 600
 SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
-# The tasks before the Airbyte release took about 1800 s in the live run of Nov 23 2026, and the release may take its deadline plus a margin.
-# tests/fast/test_host_budget.py holds the sum. The connection step has its own budget, above its own whole-step deadline.
-HOST_SETUP_TIMEOUT_SECONDS = 5400
+# The host setup may take the sum of the deadlines of its serial tasks (three image builds, k3s, the Compose start, the Airbyte release with its recovery, the
+# readiness waits) plus a tenth, in whole five minutes. tests/fast/test_host_budget.py reads each deadline from the task files, works the sum out and fails when
+# this figure is lower. The connection step has its own budget, above its own whole-step deadline.
+HOST_SETUP_TIMEOUT_SECONDS = 13800
 CONNECTION_TIMEOUT_SECONDS = 2400
 PLAYBOOKS = {
     "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),
