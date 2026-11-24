@@ -29,11 +29,10 @@ from scripts.stack.nessie import NessieClient
 from spark.jobs.patient_split import WRITE_CATALOG, Lake
 from spark.session import build_session
 from spark.silver import label_frames as frames
-from spark.silver.checks import SilverSignalsError
+from spark.silver.checks import FLAG, SilverSignalsError
 from spark.silver.cli import run
 from spark.silver.frames import fingerprint as fingerprint_of
 from spark.silver.frames import functions
-from spark.silver.hypotension_checks import FLAG
 from spark.silver.label_checks import ICU, KIDNEY, MEASURE, TABLES, InputFacts, TableFacts, fixed_codes, split_rule_problems
 from spark.silver.label_run import InputRead, MeasurePlan, Operations, TableRead, run_build, run_verify
 from spark.silver.run import BRANCH_MOVED, Fingerprint
@@ -77,11 +76,11 @@ class LabelsLake(Lake):
             raise SilverSignalsError(*fixed_codes([f"source_table: {unit(0, 'table')}"]))
         return self.session.table(table), table
 
-    def checked_frame(self, at: str, name: str, needed: tuple[tuple[str, str], ...], label: str, code: str = "schema") -> tuple[Any, str]:
+    def checked_frame(self, at: str, name: str, needed: tuple[tuple[str, str], ...], code: str = "schema") -> tuple[Any, str]:
         """A source table whose needed columns are there with their types. A table that differs is refused with the fixed code ``code``."""
         frame, table = self.source_frame(at, name)
         held = dict(self.fields_of(frame))
-        problems = schema_problems([(column, held.get(column, "")) for column, _ in needed], needed, label)
+        problems = schema_problems([(column, held.get(column, "")) for column, _ in needed], needed)
         if problems:
             raise SilverSignalsError(f"{code}: {FLAG}")
         return frame, table
@@ -89,14 +88,14 @@ class LabelsLake(Lake):
     def cases(self, at: str) -> tuple[Any, str]:
         """``silver.cases`` at ``at``, only when every column that the labels read has its type. A table of another schema (``icu_days`` as a whole number, the
         schema before the double) is refused as ``cases_schema_changed``: the labels read only the table that Silver cases rebuilt and checked."""
-        return self.checked_frame(at, CASES_TABLE, CASES_NEEDED, "cases table", CASES_CHANGED)
+        return self.checked_frame(at, CASES_TABLE, CASES_NEEDED, CASES_CHANGED)
 
     def lab(self, at: str) -> tuple[Any, str]:
-        return self.checked_frame(at, LAB_TABLE, LAB_NEEDED, "laboratory table")
+        return self.checked_frame(at, LAB_TABLE, LAB_NEEDED)
 
     def split(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, SPLIT_TABLE)
-        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS, "split table")
+        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS)
         if problems:
             raise SilverSignalsError(*fixed_codes(problems))
         return frame, table
@@ -147,7 +146,7 @@ class LabelsLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), LABEL_TABLES[table].columns, f"{table} table")
+        problems = schema_problems(self.fields_of(frame), LABEL_TABLES[table].columns)
         if problems:
             raise SilverSignalsError(*fixed_codes(problems))
         held: Fingerprint = fingerprint_of(frame)

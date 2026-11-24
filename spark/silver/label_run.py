@@ -20,8 +20,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from spark.silver.checks import SilverSignalsError
-from spark.silver.hypotension_checks import FLAG
+from spark.silver.checks import FLAG, SilverSignalsError
 from spark.silver.label_checks import CHECK_NAMES, ICU, KIDNEY, MEASURE, TABLES, InputFacts, TableFacts, input_problems, table_problems
 from spark.silver.label_measure import IcuMeasureRow
 from spark.silver.run import BRANCH_MOVED, Fingerprint

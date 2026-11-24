@@ -103,7 +103,7 @@ class ProfileLake(Lake):
         if subset:
             fields = sorted(field for field in fields if field[0] in dict(columns))
             columns = tuple(sorted(columns))
-        problems = schema_problems(fields, columns, f"{name} table")
+        problems = schema_problems(fields, columns)
         if problems:
             raise SignalProfileError(*problems)
         return frame, qualified
@@ -177,7 +177,7 @@ class ProfileLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), PROFILE_TABLES[table].columns, f"{table} table")
+        problems = schema_problems(self.fields_of(frame), PROFILE_TABLES[table].columns)
         if problems:
             raise SignalProfileError(*problems)
         fingerprint, snapshot = silver_frames.fingerprint(frame), self.snapshot_id(name)
@@ -208,7 +208,7 @@ class ProfileLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), GRID_RULE.columns, f"{RULE} table")
+        problems = schema_problems(self.fields_of(frame), GRID_RULE.columns)
         if problems:
             raise SignalProfileError(*problems)
         return frames.rule_read(frame, self.snapshot_id(name))

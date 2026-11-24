@@ -25,7 +25,7 @@ from features.icu_label import REASONS as ICU_REASONS
 from features.kidney_label import REASONS as KIDNEY_REASONS
 from features.label_values import LABEL_VALUES
 from spark.bronze.checks import GUARD_KEY, GUARD_STRUCTURE, Check
-from spark.silver.hypotension_checks import FLAG, flagged
+from spark.silver.checks import FLAG, flagged
 from spark.silver.label_measure import UNITS
 from spark.split_table import CODES as SPLIT_CODES
 from spark.split_table import SplitRow, unit

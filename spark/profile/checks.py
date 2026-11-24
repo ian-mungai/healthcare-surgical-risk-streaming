@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from spark.profile.counts import PRESPECIFIED
 from spark.profile.grid_rule import FIRST_CUTOFF_OFFSET_SECONDS, GRID_STEP_SECONDS, LAST_CUTOFF_MARGIN_SECONDS
-from spark.silver.checks import counted
+from spark.split_table import unit
 
 CHECK_NAMES = (
     "input_empty",
@@ -73,6 +73,11 @@ JOB_CODES = frozenset(
 )
 CODES = frozenset(CHECK_NAMES) | JOB_CODES
 FLOAT_TOLERANCE = 1e-12
+
+
+def counted(pairs: list[tuple[str, int, str]]) -> list[str]:
+    """One problem for each check that failed, with its count. The profile reads development rows only, so its counts hold no test-set outcome."""
+    return [f"{code}: {unit(count, noun)}" for code, count, noun in pairs if count]
 
 
 class SignalProfileError(ValueError):
