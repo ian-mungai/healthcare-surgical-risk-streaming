@@ -1,8 +1,10 @@
 # Reads airbyte_namespace and, optionally, airbyte_record_client_deadline_seconds (default 120). Airbyte writes the instance administrator's client ID and secret into the secret
 # airbyte-auth-secrets when it first starts. One command waits for both, inside one elapsed-time deadline that the coreutils timeout program enforces around the whole loop, so no
 # attempt has a fresh bound of its own. The two values are read into two variables that hold no more than the next task needs, and never shown. A secret that does not hold them
-# within the deadline stops the run and names the secret. kubectl's own message of the last attempt is kept in a temporary file that the deadline's signal prints to standard
-# error and the exit removes: it holds no value, and it tells a refused call (no permission, no cluster) from a secret that is not filled yet.
+# within the deadline stops the run and names the secret. kubectl's own text is never shown and never written to a file: kubectl prints the path and the token of a malformed
+# kubeconfig, and a file would survive a SIGKILL. Each completed attempt is reduced in memory to one fixed word (refused, not found, unreachable, not filled or failed) that replaces
+# the kept one; an attempt that is still running when the deadline's signal arrives has completed nothing, so the last completed attempt's word is the one printed (none before the
+# first). The stop message takes only a word of that fixed list out of the command's standard error, so no other text there can reach it.
 - name: Wait for and read the administrator's client ID and secret from the namespace's auth secret
   ansible.builtin.command:
     argv:
@@ -11,14 +13,23 @@
       - sh
       - -c
       - |
-        errors=$(mktemp "${TMPDIR:-/tmp}/airbyte_read.XXXXXX") || exit 1
-        trap 'rm -f "$errors"' EXIT
-        trap 'cat "$errors" >&2; exit 1' TERM
+        reason=none
+        trap 'printf "kubectl-reason:%s\n" "$reason" >&2; exit 1' TERM
         while :; do
-          value=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>"$errors") || value=
-          case "$value" in
-            ?*:?*) printf '%s' "$value"; exit 0 ;;
-          esac
+          if output=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>&1); then
+            value=$(printf '%s\n' "$output" | tail -n 1)
+            case "$value" in
+              ?*:?*) printf '%s' "$value"; exit 0 ;;
+            esac
+            reason="not filled"
+          else
+            case "$output" in
+              *orbidden*|*nauthorized*) reason=refused ;;
+              *"(NotFound)"*) reason="not found" ;;
+              *"connection refused"*|*"was refused"*|*"no such host"*|*"i/o timeout"*|*"Unable to connect"*|*"couldn't get current server API"*) reason=unreachable ;;
+              *) reason=failed ;;
+            esac
+          fi
           sleep 2
         done
       - airbyte_record_client_wait
@@ -40,7 +51,7 @@
     quiet: true
     fail_msg: >-
       the secret airbyte-auth-secrets did not give the instance-admin-client-id and instance-admin-client-secret before the deadline.
-      The last message of kubectl: {{ airbyte_record_client_read.stderr | default('') | trim }}
+      The last completed attempt of kubectl found: {{ (airbyte_record_client_read.stderr | default('') | regex_findall('(?m)^kubectl-reason:(refused|not found|unreachable|not filled|failed)$') | last) | default('none') }}.
   no_log: true
 
 - name: Keep the two values for the next task

@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from scripts.process import run_command
+from scripts.process import TimeoutExpired, run_command
 from scripts.stack.yaml_text import load_yaml
 from tests.slow.ansible_support import environment
 from tests.slow.test_airbyte_role import BRIDGE, CHANGED_NONE, ROLE, flatten, run_tasks, values
@@ -360,32 +360,64 @@ class ReadWaitTest(unittest.TestCase):
 
 
 KUBECTL_ERROR = 'Error from server (Forbidden): secrets "airbyte-auth-secrets" is forbidden: User "nobody" cannot get resource'
+NOT_FOUND_ERROR = 'Error from server (NotFound): secrets "airbyte-auth-secrets" not found'
+UNREACHABLE_ERROR = "The connection to the server localhost:6443 was refused - did you specify the right host or port?"
+LEAKED_PATH = "/srv/example.invalid/kube/leaked-config"
+LEAKED_VALUE = "eyJleaked-token-value-7"
+MALFORMED_ERROR = f'error: error loading config file "{LEAKED_PATH}": yaml: line 9: bad token: {LEAKED_VALUE}'
 READ_ID = "read-id-value-5"
 READ_VALUE = "read-value-6"
+REASON_MARK = "kubectl-reason:"
+FAILURES = {
+    "refused": KUBECTL_ERROR,
+    "not found": NOT_FOUND_ERROR,
+    "unreachable": UNREACHABLE_ERROR,
+    "failed": MALFORMED_ERROR,
+}
+FAIL = "echo '{text}' >&2\nexit 1"
+STALL = "exec sleep 100"
 
 
 def encoded(text: str) -> str:
     return base64.b64encode(text.encode()).decode()
 
 
-class ReadFailureTest(unittest.TestCase):
-    """A kubectl failure shows kubectl's own message at the deadline. It was discarded, so a refused call looked like a secret that is not filled yet.
+def reasons(errors: str) -> list[str]:
+    return [line for line in errors.splitlines() if line.startswith(REASON_MARK)]
 
-    The message is no secret: it is the one stream of kubectl that never holds a value. The values themselves stay in the hidden task.
+
+class ReadFailureTest(unittest.TestCase):
+    """A failed read says why in a fixed word and never in kubectl's own text.
+
+    kubectl prints the path and the token of a malformed kubeconfig, and Ansible 2.22 printed that text from a hidden task. The wait keeps the diagnosis of its
+    last completed attempt as one of a few fixed words, in memory only, so no file holds it and no stream carries kubectl's text.
     """
 
     def argv(self, deadline: int) -> list[str]:
         return ReadWaitTest().argv(deadline)
 
     def fake_k3s(self, folder: Path, body: str) -> dict[str, str]:
-        (folder / "bin").mkdir()
+        (folder / "bin").mkdir(exist_ok=True)
         (folder / "bin" / "k3s").write_text(f"#!/bin/sh\n{body}\n")
         (folder / "bin" / "k3s").chmod(0o755)
         return {"PATH": f"{folder / 'bin'}:/usr/bin:/bin"}
 
-    def playbook(self, folder: Path, body: str, **changes: object) -> tuple[int, str]:
-        env = environment(folder) | self.fake_k3s(folder, body)
-        variables = record_values(folder, airbyte_record_client_deadline_seconds=2, **changes)
+    def sequence(self, folder: Path, *steps: str) -> dict[str, str]:
+        """A kubectl whose n-th call runs the n-th step and whose later calls repeat the last one."""
+        count = folder / "count"
+        count.write_text("0")
+        cases = "".join(f"  {number}) {step} ;;\n" for number, step in enumerate(steps[:-1], 1))
+        body = f"n=$(($(cat {count}) + 1))\necho $n > {count}\ncase $n in\n{cases}  *) {steps[-1]} ;;\nesac"
+        return self.fake_k3s(folder, body)
+
+    def run_wait(self, env: dict[str, str], deadline: int = 3) -> tuple[int, str, str]:
+        argv = self.argv(deadline)
+        result = run_command(argv[0], argv[1:], env=env, timeout=30)
+        return result.returncode, result.stdout, result.stderr
+
+    def playbook(self, folder: Path, env: dict[str, str], **changes: object) -> tuple[int, str]:
+        env = environment(folder) | env
+        variables = record_values(folder, airbyte_record_client_deadline_seconds=3, **changes)
         playbook = folder / "check.yml"
         include = f"    - ansible.builtin.include_role:\n        name: {ROLE}\n        tasks_from: record_client_read.yml\n"
         playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{include}")
@@ -398,13 +430,42 @@ class ReadFailureTest(unittest.TestCase):
         )
         return result.returncode, result.stdout + result.stderr
 
-    def test_the_wait_prints_the_last_kubectl_error_at_the_deadline_and_keeps_the_timeout_status(self) -> None:
+    def test_each_kind_of_failure_prints_one_fixed_reason_at_the_deadline_and_none_of_kubectls_text(self) -> None:
+        for reason, text in FAILURES.items():
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as scratch:
+                code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), FAIL.format(text=text)))
+                self.assertEqual((124, "", [f"{REASON_MARK}{reason}"]), (code, output, reasons(errors)))
+                for fragment in (text, "airbyte-auth-secrets", LEAKED_PATH, LEAKED_VALUE, "nobody", "localhost:6443"):
+                    self.assertNotIn(fragment, errors)
+
+    def test_a_refusal_followed_by_a_stalled_retry_keeps_the_refusal_and_the_timeout_status(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            argv = self.argv(2)
-            result = run_command(argv[0], argv[1:], env=self.fake_k3s(folder, f"echo '{KUBECTL_ERROR}' >&2\nexit 1"), timeout=30)
-        self.assertEqual((124, ""), (result.returncode, result.stdout))
-        self.assertEqual(KUBECTL_ERROR, result.stderr.strip().splitlines()[-1], "the shell may add a line about the stopped child before it")
+            code, output, errors = self.run_wait(self.sequence(Path(scratch), FAIL.format(text=KUBECTL_ERROR), STALL))
+        self.assertEqual((124, "", [f"{REASON_MARK}refused"]), (code, output, reasons(errors)))
+        self.assertNotIn(KUBECTL_ERROR, errors)
+
+    def test_a_newer_completed_attempt_replaces_the_kept_reason_and_a_stalled_one_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            steps = (FAIL.format(text=KUBECTL_ERROR), FAIL.format(text=NOT_FOUND_ERROR), STALL)
+            _, _, errors = self.run_wait(self.sequence(Path(scratch), *steps), deadline=6)
+        self.assertEqual([f"{REASON_MARK}not found"], reasons(errors))
+
+    def test_a_first_attempt_that_stalls_leaves_no_reason_to_show(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), STALL))
+        self.assertEqual((124, "", [f"{REASON_MARK}none"]), (code, output, reasons(errors)))
+
+    def test_a_secret_without_both_values_is_reported_as_not_filled(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), "printf ':'"))
+        self.assertEqual((124, "", [f"{REASON_MARK}not filled"]), (code, output, reasons(errors)))
+
+    def test_a_warning_before_the_values_does_not_hide_them(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, errors = self.run_wait(
+                self.fake_k3s(Path(scratch), f"echo 'Warning: deprecated' >&2\nprintf '%s' '{encoded(READ_ID)}:{encoded(READ_VALUE)}'"), 10
+            )
+        self.assertEqual((0, f"{encoded(READ_ID)}:{encoded(READ_VALUE)}", ""), (code, output, errors))
 
     def test_control_a_wait_that_ends_with_both_values_prints_nothing_on_stderr_and_leaves_no_file_behind(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -416,33 +477,73 @@ class ReadFailureTest(unittest.TestCase):
             left = list(temporary.iterdir())
         self.assertEqual((0, "aWQ=:c2VjcmV0", "", []), (result.returncode, result.stdout, result.stderr, left))
 
-    def test_a_wait_that_ends_at_the_deadline_leaves_no_file_behind(self) -> None:
+    def test_no_file_holds_kubectls_text_after_the_wait_is_killed_without_a_signal_to_catch(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder, temporary = Path(scratch), Path(scratch) / "tmp"
             temporary.mkdir()
-            argv = self.argv(2)
-            env = self.fake_k3s(folder, "echo oops >&2\nexit 1") | {"TMPDIR": str(temporary)}
-            run_command(argv[0], argv[1:], env=env, timeout=30)
-            left = list(temporary.iterdir())
-        self.assertEqual([], left)
+            argv = self.argv(60)
+            env = self.sequence(folder, FAIL.format(text=MALFORMED_ERROR)) | {"TMPDIR": str(temporary)}
+            with self.assertRaises(TimeoutExpired):
+                run_command(argv[0], argv[1:], env=env, timeout=3)
+            left = {path.name: path.read_text() for path in temporary.iterdir()}
+        self.assertEqual({}, left)
 
-    def test_the_run_stops_with_the_secret_name_and_kubectls_message_and_shows_no_value(self) -> None:
+    def test_the_run_stops_with_the_secret_name_and_a_fixed_reason_and_not_kubectls_message(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            code, output = self.playbook(Path(scratch), f"echo '{KUBECTL_ERROR}' >&2\nexit 1")
+            folder = Path(scratch)
+            code, output = self.playbook(folder, self.fake_k3s(folder, FAIL.format(text=KUBECTL_ERROR)))
         self.assertNotEqual(0, code, output)
         self.assertIn("airbyte-auth-secrets", output)
-        self.assertIn(KUBECTL_ERROR, output)
+        self.assertIn("refused", output)
+        self.assertNotIn(KUBECTL_ERROR, output)
+        self.assertNotIn("nobody", output)
+
+    def test_a_malformed_kubeconfig_shows_neither_its_path_nor_its_token(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = self.playbook(folder, self.fake_k3s(folder, FAIL.format(text=MALFORMED_ERROR)))
+        self.assertNotEqual(0, code, output)
+        self.assertIn("airbyte-auth-secrets", output)
+        for leaked in (LEAKED_PATH, LEAKED_VALUE, "error loading config"):
+            self.assertNotIn(leaked, output)
+
+    def test_a_refusal_followed_by_a_stalled_retry_still_names_the_refusal_in_the_stop_message(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            code, output = self.playbook(folder, self.sequence(folder, FAIL.format(text=KUBECTL_ERROR), STALL))
+        self.assertNotEqual(0, code, output)
+        self.assertIn("refused", output)
+        self.assertNotIn(KUBECTL_ERROR, output)
+
+    def test_text_that_another_program_writes_on_the_commands_standard_error_never_reaches_a_message(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            env = self.fake_k3s(folder, FAIL.format(text=KUBECTL_ERROR))
+            stray = f"{LEAKED_VALUE} {LEAKED_PATH}"
+            wrapper = (
+                f'#!/bin/sh\necho "{stray}" >&2\necho "{REASON_MARK}{stray}" >&2\n/usr/bin/timeout "$@"\ncode=$?\necho "{REASON_MARK}{stray}" >&2\nexit $code\n'
+            )
+            (folder / "bin" / "timeout").write_text(wrapper)
+            (folder / "bin" / "timeout").chmod(0o755)
+            code, output = self.playbook(folder, env)
+        self.assertNotEqual(0, code, output)
+        self.assertIn("refused", output)
+        for leaked in (LEAKED_VALUE, LEAKED_PATH):
+            self.assertNotIn(leaked, output)
 
     def test_a_secret_that_exists_but_holds_no_values_stops_with_its_name_and_no_message_of_kubectl(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            code, output = self.playbook(Path(scratch), "printf ':'")
+            folder = Path(scratch)
+            code, output = self.playbook(folder, self.fake_k3s(folder, "printf ':'"))
         self.assertNotEqual(0, code, output)
         self.assertIn("airbyte-auth-secrets", output)
+        self.assertIn("not filled", output)
         self.assertNotIn("Error from server", output)
 
     def test_a_half_filled_secret_that_never_completes_shows_no_part_of_its_values(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            code, output = self.playbook(Path(scratch), f"printf '%s:' '{encoded(READ_ID)}'")
+            folder = Path(scratch)
+            code, output = self.playbook(folder, self.fake_k3s(folder, f"printf '%s:' '{encoded(READ_ID)}'"))
         self.assertNotEqual(0, code, output)
         self.assertIn("airbyte-auth-secrets", output)
         for secret in (READ_ID, encoded(READ_ID)):
@@ -450,7 +551,8 @@ class ReadFailureTest(unittest.TestCase):
 
     def test_control_both_values_pass_and_neither_the_encoded_nor_the_decoded_value_is_shown(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            code, output = self.playbook(Path(scratch), f"printf '%s' '{encoded(READ_ID)}:{encoded(READ_VALUE)}'")
+            folder = Path(scratch)
+            code, output = self.playbook(folder, self.fake_k3s(folder, f"printf '%s' '{encoded(READ_ID)}:{encoded(READ_VALUE)}'"))
         self.assertEqual(0, code, output)
         for secret in (READ_ID, READ_VALUE, encoded(READ_ID), encoded(READ_VALUE)):
             self.assertNotIn(secret, output)
