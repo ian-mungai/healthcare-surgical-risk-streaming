@@ -43,7 +43,7 @@ from scripts.infra.host import (
     workload_variables,
 )
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.process import CompletedProcess, TimeoutExpired
+from scripts.process import CompletedProcess, TimeoutExpired, run_command
 from scripts.project_config import ROOT
 from scripts.stack.warehouse import WarehouseError
 
@@ -179,7 +179,8 @@ STATUS_TOOL = (
 )
 SSH_TOOL = (
     '#!/bin/sh\nif [ ! -e "$FAKE_SSH_LOG" ]; then for a in "$@"; do case "$a" in UserKnownHostsFile=*) f="${a#UserKnownHostsFile=}"\n'
-    '{ cat "$f" 2>/dev/null || echo "no saved keys"; cat "${f}_instance" 2>/dev/null || echo "no recorded instance"; } > "$FAKE_FIRST_SSH_SAW" ;;\n'
+    '{ if [ -e "$f" ]; then cat "$f"; else echo "no saved keys"; fi\n'
+    '  if [ -e "${f}_instance" ]; then cat "${f}_instance"; else echo "no recorded instance"; fi; } > "$FAKE_FIRST_SSH_SAW" ;;\n'
     "esac; done; fi\n"
     'printf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\n'
     'case "$*" in *"tailscale logout"*) exit "${FAKE_LOGOUT_EXIT:-0}" ;; esac\nexit "${FAKE_SSH_EXIT:-0}"\n'
@@ -187,6 +188,47 @@ SSH_TOOL = (
 CONNECTED = {"BackendState": "Running"}
 INSTANCE = "i-0123456789abcdef0"
 OTHER_INSTANCE = "i-0fedcba9876543210"
+
+
+class FakeSshRecordTest(unittest.TestCase):
+    """What the stand-in ``ssh`` records that its first call saw. A saved file that cannot be read must not be recorded as an absent one."""
+
+    def first_call(self, folder: Path, make: Callable[[Path], None]) -> tuple[str, str, int]:
+        (folder / "ssh").write_text(SSH_TOOL)
+        known_hosts = folder / "known_hosts"
+        make(known_hosts)
+        env = {"PATH": os.environ["PATH"], "FAKE_SSH_LOG": str(folder / "ssh.log"), "FAKE_FIRST_SSH_SAW": str(folder / "saw"), "FAKE_INSTANCE": INSTANCE}
+        result = run_command("sh", [str(folder / "ssh"), "-o", f"UserKnownHostsFile={known_hosts}"], env=env, timeout=30)
+        saw = folder / "saw"
+        return (saw.read_text() if saw.exists() else ""), result.stderr, result.returncode
+
+    def test_control_absent_files_are_recorded_as_absent_without_a_message(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            saw, errors, code = self.first_call(Path(scratch), lambda known_hosts: None)
+        self.assertEqual(("no saved keys\nno recorded instance\n", "", 0), (saw, errors, code))
+
+    def test_control_saved_files_are_recorded_with_their_text(self) -> None:
+        def make(known_hosts: Path) -> None:
+            known_hosts.write_text(SAVED_KEY)
+            Path(f"{known_hosts}_instance").write_text(f"{INSTANCE}\n")
+
+        with tempfile.TemporaryDirectory() as scratch:
+            saw, errors, _ = self.first_call(Path(scratch), make)
+        self.assertEqual((SAVED_KEY + f"{INSTANCE}\n", ""), (saw, errors))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any file")
+    def test_a_saved_file_that_cannot_be_read_shows_the_error_and_is_not_recorded_as_absent(self) -> None:
+        def make(known_hosts: Path) -> None:
+            known_hosts.write_text(SAVED_KEY)
+            known_hosts.chmod(0)
+            Path(f"{known_hosts}_instance").write_text(f"{INSTANCE}\n")
+            Path(f"{known_hosts}_instance").chmod(0)
+
+        with tempfile.TemporaryDirectory() as scratch:
+            saw, errors, _ = self.first_call(Path(scratch), make)
+        self.assertNotIn("no saved keys", saw)
+        self.assertNotIn("no recorded instance", saw)
+        self.assertEqual(2, errors.count("Permission denied"), errors)
 
 
 @dataclass(frozen=True)
