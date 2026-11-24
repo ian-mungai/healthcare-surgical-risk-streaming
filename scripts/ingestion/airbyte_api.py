@@ -7,9 +7,10 @@ host, not here.
 
 Idempotent: each ``ensure_*`` lists what exists and creates only what is missing, and updates only what lacks a value of the document, so a second call with the
 same arguments makes no create and no update. Airbyte adds fields of its own to an answer, so only the document's values are compared. A connection is created
-without a stream list of its own: Airbyte reads the source's schema when it creates the connection, so each source must read a file that exists. Every later run
-changes only the source's read prefix and the destination's branch. An object that belongs to another definition or joins other objects, and a name that two
-objects hold, are refused and changed nowhere: deleting a connection would delete its sync state.
+with the stream list that ``record_definitions`` renders (``configurations.streams``: one stream of the table's name, a full refresh that overwrites), and
+Airbyte reads the source's schema when it creates the connection, so each source must read a file that exists. Every later run changes only the source's
+read prefix and the destination's branch. An object that belongs to another definition or joins other objects, and a name that two objects hold, are
+refused and changed nowhere: deleting a connection would delete its sync state.
 
 Every answer that the load reads is read through a closed shape: a field that is missing, of another type or outside its closed set refuses the call with an
 error that names the call and the field, never the text of the answer. A job is read through the documented shape of ``JobResponse`` (``jobId`` whole number,
@@ -73,6 +74,9 @@ TERMINAL_STATUSES = ("incomplete", "failed", "succeeded", "cancelled")
 SYNC = "sync"
 # The addresses that the deploy can write: the bridge address that k3s gives the node is a private address, and the code location reaches it through the host.
 PRIVATE_NETWORKS = tuple(ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
+# The form of a bearer token (RFC 6750, b64token), the one that the raw connection's module holds as ``TOKEN_FORM``. A token with a line break or another
+# control character makes the HTTP library's header error carry the token's text, so a token of another form is refused before it is kept or sent.
+TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 ORIGIN = re.compile(r"http://([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})")
 DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
 DEFINITION_NAMES = {
@@ -270,6 +274,8 @@ class HttpAirbyteApi:
         token = document.get("access_token") if isinstance(document, dict) else None
         if status >= 400 or type(token) is not str or not token:
             raise AirbyteError(f"POST applications/token was refused or gave no token (status {status})")
+        if TOKEN_FORM.fullmatch(token) is None:
+            raise AirbyteError("POST applications/token gave a token that is not of the bearer token form")
         self.token = token
 
     def call(self, method: str, path: str, body: Mapping[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
