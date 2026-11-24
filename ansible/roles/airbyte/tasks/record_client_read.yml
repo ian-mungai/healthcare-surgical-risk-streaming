@@ -2,7 +2,8 @@
 # airbyte-auth-secrets when it first starts. One command waits for both, inside one elapsed-time deadline that the coreutils timeout program enforces around the whole loop, so no
 # attempt has a fresh bound of its own. The two values are read into two variables that hold no more than the next task needs, and never shown. A secret that does not hold them
 # within the deadline stops the run and names the secret. kubectl's own text is never shown and never written to a file: kubectl prints the path and the token of a malformed
-# kubeconfig, and a file would survive a SIGKILL. Each completed attempt is reduced in memory to one fixed word (refused, not found, unreachable, not filled or failed) that replaces
+# kubeconfig, and a file would survive a SIGKILL. Each attempt keeps kubectl's standard output and standard error apart in memory: the credentials are read from standard output
+# only, so a warning on standard error never reaches them, and standard error is used only to classify a failed attempt. Each completed attempt is reduced in memory to one fixed word (refused, not found, unreachable, not filled or failed) that replaces
 # the kept one; an attempt that is still running when the deadline's signal arrives has completed nothing, so the last completed attempt's word is the one printed (none before the
 # first). The stop message takes only a word of that fixed list out of the command's standard error, so no other text there can reach it.
 - name: Wait for and read the administrator's client ID and secret from the namespace's auth secret
@@ -15,20 +16,29 @@
       - |
         reason=none
         trap 'printf "kubectl-reason:%s\n" "$reason" >&2; exit 1' TERM
+        classify() {
+          case "$1" in
+            *orbidden*|*nauthorized*) word=refused ;;
+            *"(NotFound)"*) word="not found" ;;
+            *"connection refused"*|*"was refused"*|*"no such host"*|*"i/o timeout"*|*"Unable to connect"*|*"couldn't get current server API"*) word=unreachable ;;
+            *) word=failed ;;
+          esac
+        }
         while :; do
-          if output=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>&1); then
-            value=$(printf '%s\n' "$output" | tail -n 1)
+          result=$( { err=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>&1 1>&3 3>&-)
+            status=$?
+            word=ok
+            if [ "$status" -ne 0 ]; then classify "$err"; fi
+            printf '\nkubectl-result:%s\n' "$word"; } 3>&1 )
+          word=${result##*kubectl-result:}
+          if [ "$word" = ok ]; then
+            value=$(printf '%s' "${result%kubectl-result:*}" | tail -n 1)
             case "$value" in
               ?*:?*) printf '%s' "$value"; exit 0 ;;
             esac
             reason="not filled"
           else
-            case "$output" in
-              *orbidden*|*nauthorized*) reason=refused ;;
-              *"(NotFound)"*) reason="not found" ;;
-              *"connection refused"*|*"was refused"*|*"no such host"*|*"i/o timeout"*|*"Unable to connect"*|*"couldn't get current server API"*) reason=unreachable ;;
-              *) reason=failed ;;
-            esac
+            reason=$word
           fi
           sleep 2
         done

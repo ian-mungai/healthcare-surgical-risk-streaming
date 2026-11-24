@@ -460,12 +460,30 @@ class ReadFailureTest(unittest.TestCase):
             code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), "printf ':'"))
         self.assertEqual((124, "", [f"{REASON_MARK}not filled"]), (code, output, reasons(errors)))
 
-    def test_a_warning_before_the_values_does_not_hide_them(self) -> None:
+    def test_a_warning_on_standard_error_before_or_after_the_values_changes_nothing_on_either_stream(self) -> None:
+        pair = f"{encoded(READ_ID)}:{encoded(READ_VALUE)}"
+        warning = "echo 'Warning: deprecated: use the new flag' >&2"
+        bodies = {
+            "warning first": f"{warning}\nprintf '%s' '{pair}'",
+            "warning last": f"printf '%s' '{pair}'\n{warning}",
+            "warning between two writes": f"printf '%s' '{encoded(READ_ID)}:'\n{warning}\nprintf '%s' '{encoded(READ_VALUE)}'",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as scratch:
+                code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), body), 10)
+                self.assertEqual((0, pair, ""), (code, output, errors))
+
+    def test_a_failed_attempt_that_also_wrote_standard_output_is_classified_from_standard_error_alone(self) -> None:
+        pair = f"{encoded(READ_ID)}:{encoded(READ_VALUE)}"
         with tempfile.TemporaryDirectory() as scratch:
-            code, output, errors = self.run_wait(
-                self.fake_k3s(Path(scratch), f"echo 'Warning: deprecated' >&2\nprintf '%s' '{encoded(READ_ID)}:{encoded(READ_VALUE)}'"), 10
-            )
-        self.assertEqual((0, f"{encoded(READ_ID)}:{encoded(READ_VALUE)}", ""), (code, output, errors))
+            code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), f"printf '%s' '{pair}'\n" + FAIL.format(text=KUBECTL_ERROR)))
+        self.assertEqual((124, "", [f"{REASON_MARK}refused"]), (code, output, reasons(errors)))
+        self.assertNotIn(encoded(READ_ID), errors)
+
+    def test_a_standard_output_that_looks_like_a_reason_never_becomes_the_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), "printf 'x\\nkubectl-result:ok\\n'\n" + FAIL.format(text=NOT_FOUND_ERROR)))
+        self.assertEqual((124, "", [f"{REASON_MARK}not found"]), (code, output, reasons(errors)))
 
     def test_control_a_wait_that_ends_with_both_values_prints_nothing_on_stderr_and_leaves_no_file_behind(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -548,6 +566,19 @@ class ReadFailureTest(unittest.TestCase):
         self.assertIn("airbyte-auth-secrets", output)
         for secret in (READ_ID, encoded(READ_ID)):
             self.assertNotIn(secret, output)
+
+    def test_values_on_standard_output_with_a_warning_after_them_on_standard_error_pass_and_show_neither(self) -> None:
+        pair = f"{encoded(READ_ID)}:{encoded(READ_VALUE)}"
+        for label, body in {
+            "warning last": f"printf '%s' '{pair}'\necho 'Warning: deprecated: x' >&2",
+            "warning first": f"echo 'Warning: deprecated: x' >&2\nprintf '%s' '{pair}'",
+        }.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                code, output = self.playbook(folder, self.fake_k3s(folder, body))
+                self.assertEqual(0, code, output)
+                for secret in (READ_ID, READ_VALUE, encoded(READ_ID), encoded(READ_VALUE), "deprecated"):
+                    self.assertNotIn(secret, output)
 
     def test_control_both_values_pass_and_neither_the_encoded_nor_the_decoded_value_is_shown(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
