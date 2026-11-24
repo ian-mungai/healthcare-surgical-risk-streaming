@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import re
 import unittest
+from typing import Any
 
 from features.signal_validity import INVALID_CAUSES
-from spark.reconcile.checks import JOINS, RECONCILIATIONS, JoinFacts, KeyFacts, ReconcileError
+from spark.reconcile.checks import JOIN_TABLE, JOINS, RECONCILIATIONS, JoinFacts, KeyFacts, ReconcileError, join_problems, key_problems
 from spark.reconcile.sql import (
     BRONZE_CASES,
     BRONZE_LAB,
@@ -32,6 +33,7 @@ from spark.reconcile.sql import (
     key_facts_query,
 )
 from spark.silver_cases_sql import reference
+from tests.fast import reconcile_sqlite as lake
 
 BY_NAME = {reconciliation.name: reconciliation for reconciliation in RECONCILIATIONS}
 SILVER_TABLES = {"numeric_observations": SILVER_NUMERIC, "waveform_seconds": SILVER_WAVEFORM, "cases": SILVER_CASES, "lab_results": SILVER_LAB}
@@ -268,17 +270,18 @@ class Counters(unittest.TestCase):
 
 
 class Joins(unittest.TestCase):
-    def test_every_join_query_returns_the_rows_the_unmatched_and_the_fanned(self) -> None:
+    def test_every_join_query_returns_the_rows_the_unmatched_the_fanned_and_the_wrong_kind(self) -> None:
         for join in JOINS:
             with self.subTest(join=join.name):
-                self.assertEqual(["row_count", "unmatched", "fanned"], aliases(join_query(join.name)))
+                self.assertEqual(["row_count", "unmatched", "fanned", "kind_wrong"], aliases(join_query(join.name)))
 
-    def test_each_signal_joins_the_tracks_of_its_own_kind_by_case_and_track(self) -> None:
+    def test_each_signal_counts_every_track_of_its_key_and_the_tracks_of_its_own_kind_apart(self) -> None:
         for name, silver, kind in (("numeric_track", SILVER_NUMERIC, "numeric"), ("waveform_track", SILVER_WAVEFORM, "waveform")):
             with self.subTest(name=name):
                 query = join_query(name)
                 self.assertIn(silver, query)
-                self.assertIn(f"FROM {BRONZE_TRACKS} WHERE `kind` = '{kind}' GROUP BY `case_id`, `track`", query)
+                self.assertIn(f"SUM(CASE WHEN `kind` = '{kind}' THEN 1 ELSE 0 END) AS `n_kind` FROM {BRONZE_TRACKS} GROUP BY `case_id`, `track`", query)
+                self.assertNotIn("WHERE `kind`", query)
                 self.assertIn("x LEFT JOIN (", query)
                 self.assertTrue(query.endswith(") p ON x.`case_id` = p.`case_id` AND x.`track` = p.`track`"), query)
 
@@ -297,6 +300,7 @@ class Joins(unittest.TestCase):
                 query = join_query(join.name)
                 self.assertIn("COALESCE(SUM(CASE WHEN p.`n` IS NULL THEN 1 ELSE 0 END), 0) AS unmatched", query)
                 self.assertIn("COALESCE(SUM(CASE WHEN p.`n` > 1 THEN 1 ELSE 0 END), 0) AS fanned", query)
+                self.assertIn("COALESCE(SUM(CASE WHEN p.`n` IS NOT NULL AND p.`n_kind` <> p.`n` THEN 1 ELSE 0 END), 0) AS kind_wrong", query)
 
     def test_the_rows_of_a_join_are_the_development_rows_only(self) -> None:
         for join in JOINS:
@@ -314,7 +318,191 @@ class Joins(unittest.TestCase):
                 self.assertNotIn("LEFT SEMI JOIN dev", query)
                 self.assertEqual(["n"], aliases(query))
                 self.assertRegex(select_items(query)[0], r"^CASE WHEN .* > 0 THEN 1 ELSE 0 END AS n$")
-                self.assertTrue(query.endswith("SELECT CASE WHEN unmatched + fanned > 0 THEN 1 ELSE 0 END AS n FROM jc"), query)
+                self.assertTrue(query.endswith("SELECT CASE WHEN unmatched + fanned + kind_wrong > 0 THEN 1 ELSE 0 END AS n FROM jc"), query)
+
+
+DEV, HELD = lake.DEVELOPMENT_CASE, lake.HELD_OUT_CASE
+
+
+def keys(world: lake.World, name: str) -> KeyFacts:
+    return decode_key_facts(lake.one_row(world, key_facts_query(name)))
+
+
+def joined(world: lake.World, name: str) -> JoinFacts:
+    return decode_join_facts(lake.one_row(world, join_query(name)))
+
+
+def held_out_flag(world: lake.World, name: str) -> int:
+    """The flag of a table as the job reads it: a key defect, or a failure of a join that its Silver build makes, outside the development sets."""
+    flags = [lake.flag(world, held_out_query(name))]
+    flags += [lake.flag(world, join_held_out_query(join.name)) for join in JOINS if JOIN_TABLE[join.name] == name]
+    return int(any(flags))
+
+
+def both_cohorts_lose(world: lake.World, table: str, case_column: str = "case_id", **match: object) -> lake.World:
+    """The world with the rows of ``table`` that hold ``match`` removed for the development case and for the held-out case: one defect in each cohort."""
+    for case in (DEV, HELD):
+        world = lake.delete(world, table, **{case_column: case}, **match)
+    return world
+
+
+class Cohorts(unittest.TestCase):
+    """The queries run on a world with two cohorts, development and held-out, that each carry the same defect. Only the development cohort is counted, and the
+    held-out cohort is one flag. A scope that lets the held-out rows in, or one that is empty, changes what these tests read."""
+
+    def test_the_clean_world_has_no_defect_and_no_flag(self) -> None:
+        world = lake.clean_world()
+        for name in BY_NAME:
+            with self.subTest(name=name):
+                self.assertEqual([], key_problems(name, keys(world, name)))
+                self.assertEqual(0, held_out_flag(world, name))
+        for join in JOINS:
+            with self.subTest(join=join.name):
+                self.assertEqual([], join_problems(join.name, joined(world, join.name)))
+
+    def test_a_reading_lost_in_both_cohorts_is_one_key_of_the_development_cohort_and_a_flag(self) -> None:
+        world = both_cohorts_lose(lake.clean_world(), "silver.numeric_observations", case_time_us=200)
+        facts = keys(world, "numeric_observations")
+        self.assertEqual((1, 3), (facts.unaccounted, facts.bronze_keys))
+        self.assertEqual(1, held_out_flag(world, "numeric_observations"))
+        self.assertEqual(["numeric_observations_key_unaccounted: 1 key"], key_problems("numeric_observations", facts))
+
+    def test_a_second_lost_in_both_cohorts_is_one_key_of_the_development_cohort_and_a_flag(self) -> None:
+        world = both_cohorts_lose(lake.clean_world(), "silver.waveform_seconds", case_second=1)
+        facts = keys(world, "waveform_seconds")
+        self.assertEqual((1, 2), (facts.unaccounted, facts.bronze_keys))
+        self.assertEqual(1, held_out_flag(world, "waveform_seconds"))
+
+    def test_a_case_lost_in_both_cohorts_is_one_key_of_the_development_cohort_and_a_flag(self) -> None:
+        world = both_cohorts_lose(lake.clean_world(), "silver.cases", case_column="caseid")
+        facts = keys(world, "cases")
+        self.assertEqual((1, 1), (facts.unaccounted, facts.bronze_keys))
+        self.assertEqual(1, held_out_flag(world, "cases"))
+
+    def test_a_laboratory_group_lost_in_both_cohorts_is_counted_for_the_development_cohort_only(self) -> None:
+        world = both_cohorts_lose(lake.clean_world(), "silver.lab_results", case_column="caseid", name="k")
+        facts = keys(world, "lab_results")
+        self.assertEqual((1, 3), (facts.unaccounted, facts.bronze_keys))
+        self.assertEqual(1, held_out_flag(world, "lab_results"))
+
+    def test_a_defect_of_the_held_out_cohort_alone_changes_no_development_count_and_sets_the_flag(self) -> None:
+        for name, table, match in (
+            ("numeric_observations", "silver.numeric_observations", {"case_id": HELD, "case_time_us": 200}),
+            ("waveform_seconds", "silver.waveform_seconds", {"case_id": HELD, "case_second": 1}),
+            ("cases", "silver.cases", {"caseid": HELD}),
+            ("lab_results", "silver.lab_results", {"caseid": HELD, "name": "k"}),
+        ):
+            with self.subTest(name=name):
+                world = lake.delete(lake.clean_world(), table, **match)
+                self.assertEqual(keys(lake.clean_world(), name), keys(world, name))
+                self.assertEqual(1, held_out_flag(world, name))
+                self.assertEqual(0, held_out_flag(lake.clean_world(), name))
+
+    def test_a_row_of_the_held_out_cohort_that_silver_invented_is_a_flag_and_no_development_count(self) -> None:
+        world = lake.add(lake.clean_world(), "silver.numeric_observations", lake.silver_numeric(HELD, 300))
+        self.assertEqual(keys(lake.clean_world(), "numeric_observations"), keys(world, "numeric_observations"))
+        self.assertEqual(1, held_out_flag(world, "numeric_observations"))
+        world = lake.add(lake.clean_world(), "silver.numeric_observations", lake.silver_numeric(DEV, 300))
+        self.assertEqual(1, keys(world, "numeric_observations").silver_unbacked)
+
+    def test_the_rows_of_a_join_are_the_development_rows_and_a_failure_of_a_held_out_row_is_a_flag(self) -> None:
+        world = lake.delete(lake.clean_world(), "bronze.tracks", case_id=HELD, track="A")
+        self.assertEqual(JoinFacts(2, 0, 0, 0), joined(lake.clean_world(), "numeric_track"))
+        self.assertEqual(JoinFacts(2, 0, 0, 0), joined(world, "numeric_track"))
+        self.assertEqual(1, held_out_flag(world, "numeric_observations"))
+        both = lake.delete(world, "bronze.tracks", case_id=DEV, track="A")
+        self.assertEqual(JoinFacts(2, 2, 0, 0), joined(both, "numeric_track"))
+
+    def test_every_join_counts_the_development_rows_only(self) -> None:
+        world = lake.clean_world()
+        self.assertEqual(
+            {"numeric_track": 2, "waveform_track": 2, "lab_case": 2, "case_split": 1}, {join.name: joined(world, join.name).rows for join in JOINS}
+        )
+
+
+class SilverKeys(unittest.TestCase):
+    """A declared key of a Silver table that two rows have is named by ``<table>_silver_key_repeated``, from the development cohort's counts."""
+
+    PLANTED: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
+        "numeric_observations": ("silver.numeric_observations", {"case_id": DEV, "case_time_us": 200}, {"source_occurrence": 1}),
+        "waveform_seconds": ("silver.waveform_seconds", {"case_id": DEV, "case_second": 1}, {}),
+        "cases": ("silver.cases", {"caseid": DEV}, {}),
+        "lab_results": ("silver.lab_results", {"caseid": DEV, "name": "k"}, {"result": 9.0}),
+    }
+
+    def planted(self, name: str, held: bool = False) -> lake.World:
+        table, match, extra = self.PLANTED[name]
+        if held:
+            match = {column: HELD if column in ("case_id", "caseid") else value for column, value in match.items()}
+        world = lake.clean_world()
+        (row,) = [row for row in world[table] if all(row.get(column) == value for column, value in match.items())]
+        return lake.add(world, table, {**row, **extra})
+
+    def test_a_silver_key_that_two_rows_have_is_named_for_every_table(self) -> None:
+        for name in BY_NAME:
+            with self.subTest(name=name):
+                facts = keys(self.planted(name), name)
+                self.assertEqual(1, facts.silver_repeats)
+                self.assertIn(f"{name}_silver_key_repeated: 1 key", key_problems(name, facts))
+                self.assertEqual(0, keys(lake.clean_world(), name).silver_repeats)
+
+    def test_a_silver_key_that_two_rows_of_the_held_out_cohort_have_is_a_flag_and_no_count(self) -> None:
+        for name in BY_NAME:
+            with self.subTest(name=name):
+                world = self.planted(name, held=True)
+                self.assertEqual(0, keys(world, name).silver_repeats)
+                self.assertEqual(1, held_out_flag(world, name))
+
+
+class Tracks(unittest.TestCase):
+    """The Silver build joins a signal to every track of its key, whatever the kind of the track, so every partner is counted and the kind is checked apart."""
+
+    def plant(self, track: str, kind: str, case: int = DEV) -> dict[str, object]:
+        return {"case_id": case, "track": track, "kind": kind}
+
+    def test_a_clean_world_has_one_partner_of_the_right_kind(self) -> None:
+        world = lake.clean_world()
+        for name in ("numeric_track", "waveform_track"):
+            with self.subTest(name=name):
+                self.assertEqual(JoinFacts(2, 0, 0, 0), joined(world, name))
+
+    def test_a_waveform_and_a_numeric_track_with_one_key_are_two_partners_of_the_waveform_and_one_is_of_the_wrong_kind(self) -> None:
+        world = lake.add(lake.clean_world(), "bronze.tracks", self.plant("W", "numeric"))
+        found = joined(world, "waveform_track")
+        self.assertEqual((2, 2), (found.fanned, found.kind_wrong))
+        self.assertEqual(0, found.unmatched)
+        self.assertEqual(["waveform_track_join_fanned: 2 rows", "waveform_track_join_kind_wrong: 2 rows"], join_problems("waveform_track", found))
+
+    def test_a_numeric_and_a_waveform_track_with_one_key_are_two_partners_of_the_numeric_reading(self) -> None:
+        world = lake.add(lake.clean_world(), "bronze.tracks", self.plant("A", "waveform"))
+        found = joined(world, "numeric_track")
+        self.assertEqual((2, 2, 0), (found.fanned, found.kind_wrong, found.unmatched))
+
+    def test_two_tracks_of_the_right_kind_are_fanned_and_not_of_the_wrong_kind(self) -> None:
+        world = lake.add(lake.clean_world(), "bronze.tracks", self.plant("W", "waveform"))
+        found = joined(world, "waveform_track")
+        self.assertEqual((2, 0, 0), (found.fanned, found.kind_wrong, found.unmatched))
+
+    def test_a_track_whose_only_partner_is_of_the_other_kind_is_found_and_is_not_unmatched(self) -> None:
+        world = lake.change(lake.clean_world(), "bronze.tracks", {"kind": "numeric"}, case_id=DEV, track="W")
+        found = joined(world, "waveform_track")
+        self.assertEqual((0, 0, 2), (found.unmatched, found.fanned, found.kind_wrong))
+
+    def test_a_track_with_no_partner_at_all_is_unmatched_and_not_of_the_wrong_kind(self) -> None:
+        world = lake.delete(lake.clean_world(), "bronze.tracks", case_id=DEV, track="W")
+        found = joined(world, "waveform_track")
+        self.assertEqual((2, 0, 0), (found.unmatched, found.fanned, found.kind_wrong))
+
+    def test_a_track_of_a_held_out_patient_that_has_two_kinds_is_a_flag_and_no_count(self) -> None:
+        world = lake.add(lake.clean_world(), "bronze.tracks", self.plant("W", "numeric", HELD))
+        self.assertEqual(JoinFacts(2, 0, 0, 0), joined(world, "waveform_track"))
+        self.assertEqual(1, held_out_flag(world, "waveform_seconds"))
+        self.assertEqual(0, held_out_flag(world, "numeric_observations"))
+
+    def test_a_join_without_a_kind_never_has_a_row_of_the_wrong_kind(self) -> None:
+        world = lake.add(lake.clean_world(), "silver.cases", {"caseid": DEV, "subjectid": lake.DEVELOPMENT_PATIENT})
+        found = joined(world, "lab_case")
+        self.assertEqual((2, 0), (found.fanned, found.kind_wrong))
 
 
 class Decoding(unittest.TestCase):
@@ -345,9 +533,10 @@ class Decoding(unittest.TestCase):
             decode_key_facts({name: value for name, value in self.ROW.items() if name != "matched"})
 
     def test_a_join_row_is_decoded(self) -> None:
-        self.assertEqual(JoinFacts(5, 1, 2), decode_join_facts({"row_count": 5, "unmatched": 1, "fanned": 2}))
-        with self.assertRaises(ReconcileError):
-            decode_join_facts({"row_count": 5, "unmatched": None, "fanned": 2})
+        self.assertEqual(JoinFacts(5, 1, 2, 3), decode_join_facts({"row_count": 5, "unmatched": 1, "fanned": 2, "kind_wrong": 3}))
+        for name in ("row_count", "unmatched", "fanned", "kind_wrong"):
+            with self.subTest(name=name), self.assertRaises(ReconcileError):
+                decode_join_facts({"row_count": 5, "unmatched": 1, "fanned": 2, "kind_wrong": 3, name: None})
 
 
 if __name__ == "__main__":

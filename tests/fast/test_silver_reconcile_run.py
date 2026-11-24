@@ -2,6 +2,9 @@
 
 Failure modes covered here:
 
+- A patient split that breaks the split rule (a test-set patient labelled training) or a Bronze case with two owners is counted as development, and the run
+  passes.
+- A refusal comes after counts were made, or holds a count, so that a count of a held-out patient leaves the job.
 - A table is compared before its columns are checked, so a table with another shape fails inside a query with text of its own.
 - One defect stops the run, so the next run names the next cause: every table, join and flag is judged before the job refuses.
 - The branch moves while the job reads and the job still reports success, or a result names a hash that the branch no longer has.
@@ -16,7 +19,7 @@ import dataclasses
 import unittest
 from typing import Any
 
-from spark.reconcile.checks import JOINS, RECONCILIATIONS, JoinFacts, KeyFacts, ReconcileError
+from spark.reconcile.checks import JOINS, OWNER_REFUSAL, RECONCILIATIONS, SPLIT_REFUSAL, JoinFacts, KeyFacts, ReconcileError
 from spark.reconcile.run import BRANCH_MOVED, Operations, run_verify
 
 HEAD = "a" * 64
@@ -36,6 +39,7 @@ class Fake:
         self.current = HEAD
         self.moved_after: int | None = None
         self.schema: list[str] = []
+        self.refused: list[str] = []
         self.keys = {name: clean(name) for name in NAMES}
         self.flags = {name: False for name in NAMES}
         self.joins = {join.name: JoinFacts(50, 0, 0) for join in JOINS}
@@ -49,6 +53,10 @@ class Fake:
     def source_problems(self) -> list[str]:
         self.calls.append("source_problems")
         return self.schema
+
+    def refusals(self) -> list[str]:
+        self.calls.append("refusals")
+        return self.refused
 
     def key_facts(self, name: str) -> KeyFacts:
         self.calls.append(f"key_facts {name}")
@@ -67,7 +75,7 @@ class Fake:
         return {"silver.cases": 5, "bronze.clinical_cases": 4}
 
     def operations(self) -> Operations:
-        return Operations(self.head, self.source_problems, self.key_facts, self.held_out_problem, self.join_facts, self.snapshot_ids)
+        return Operations(self.head, self.source_problems, self.refusals, self.key_facts, self.held_out_problem, self.join_facts, self.snapshot_ids)
 
 
 def codes(error: ReconcileError) -> list[str]:
@@ -78,7 +86,7 @@ class Verify(unittest.TestCase):
     def test_a_good_branch_checks_the_columns_first_then_each_table_and_join_and_ends_on_the_head(self) -> None:
         fake = Fake()
         outcome = run_verify(fake.operations(), HEAD)
-        expected = ["source_problems"]
+        expected = ["source_problems", "refusals"]
         for name in NAMES:
             expected += [f"key_facts {name}", f"held_out {name}"]
         expected += [f"join_facts {join.name}" for join in JOINS]
@@ -126,6 +134,42 @@ class Verify(unittest.TestCase):
             ["numeric_observations_key_unaccounted", "lab_results_key_unbacked", "cases_held_out", "case_split_join_unmatched"], codes(caught.exception)
         )
 
+    def test_a_split_that_breaks_the_rule_refuses_the_run_before_any_count_is_made(self) -> None:
+        fake = Fake()
+        fake.refused = [SPLIT_REFUSAL]
+        with self.assertRaises(ReconcileError) as caught:
+            run_verify(fake.operations(), HEAD)
+        self.assertEqual([SPLIT_REFUSAL], caught.exception.problems)
+        self.assertEqual(["source_problems", "refusals"], fake.calls)
+
+    def test_an_ambiguous_owner_refuses_the_run_before_any_count_is_made(self) -> None:
+        fake = Fake()
+        fake.refused = [OWNER_REFUSAL]
+        with self.assertRaises(ReconcileError) as caught:
+            run_verify(fake.operations(), HEAD)
+        self.assertEqual([OWNER_REFUSAL], caught.exception.problems)
+        self.assertEqual(["source_problems", "refusals"], fake.calls)
+
+    def test_both_refusals_are_named_and_a_refusal_holds_no_count_even_when_every_count_is_bad(self) -> None:
+        fake = Fake()
+        fake.refused = [SPLIT_REFUSAL, OWNER_REFUSAL]
+        fake.keys["cases"] = dataclasses.replace(clean("cases"), unaccounted=3)
+        fake.flags["cases"] = True
+        with self.assertRaises(ReconcileError) as caught:
+            run_verify(fake.operations(), HEAD)
+        self.assertEqual(["split_rule_broken", "ambiguous_case_owner"], codes(caught.exception))
+        for problem in caught.exception.problems:
+            self.assertNotRegex(problem, r"[0-9]")
+
+    def test_a_table_with_another_shape_is_refused_before_the_refusals_are_read(self) -> None:
+        fake = Fake()
+        fake.schema = ["source_missing: 1 table"]
+        fake.refused = [SPLIT_REFUSAL]
+        with self.assertRaises(ReconcileError) as caught:
+            run_verify(fake.operations(), HEAD)
+        self.assertEqual(["source_missing"], codes(caught.exception))
+        self.assertEqual(["source_problems"], fake.calls)
+
     def test_a_branch_that_moved_during_the_reads_is_named_and_no_result_is_given(self) -> None:
         fake = Fake()
         fake.moved_after = 0
@@ -143,7 +187,7 @@ class Verify(unittest.TestCase):
 
     def test_the_job_has_no_step_that_writes(self) -> None:
         names = {field.name for field in dataclasses.fields(Operations)}
-        self.assertEqual({"head", "source_problems", "key_facts", "held_out_problem", "join_facts", "snapshot_ids"}, names)
+        self.assertEqual({"head", "source_problems", "refusals", "key_facts", "held_out_problem", "join_facts", "snapshot_ids"}, names)
 
     def test_a_result_is_json_ready(self) -> None:
         import json

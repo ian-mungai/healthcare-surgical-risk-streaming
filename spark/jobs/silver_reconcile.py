@@ -6,10 +6,13 @@ The job resolves the branch to one hash, opens its Spark session pinned to that 
 nothing that it reads. It writes nothing and creates no table. For each of ``silver.numeric_observations``, ``silver.waveform_seconds``,
 ``silver.cases`` and ``silver.lab_results`` it proves that every Bronze key is in Silver or has a recorded disposition (a duplicate in the ledger of a
 reading, a cause of invalidity, a collapsed copy of a laboratory row), that no Silver key is without a Bronze key and that no key is claimed twice,
-and it checks that each join that the Silver build makes gives every row exactly one partner (``spark/reconcile/checks.py``,
+and it checks that each join that the Silver build makes gives every row exactly one partner of its kind (``spark/reconcile/checks.py``,
 ``spark/reconcile/sql.py``). The order is in ``spark/reconcile/run.py`` and the command line in ``spark/reconcile/cli.py``. The settings come from the
 environment, as the patient split's do: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
+
+Before any count it checks the patient split table by the split job's own rules and the owner of each Bronze case by the Silver cases job's own query, and a
+failure of either refuses the whole run with one fixed code (``split_rule_broken``, ``ambiguous_case_owner``) and no count.
 
 The test set is sealed. The counts and dispositions are those of development patients; for every other patient the result holds one flag for each table. The
 result holds hashes, snapshot IDs, counts of keys and the checks that ran, and no case, track, time or value.
@@ -23,7 +26,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from spark.jobs.silver_cases import Lake
-from spark.reconcile.checks import JOINS, SOURCE_TABLES, JoinFacts, KeyFacts, schema_problems
+from spark.reconcile.checks import JOINS, OWNER_REFUSAL, SOURCE_TABLES, SPLIT_REFUSAL, JoinFacts, KeyFacts, schema_problems
 from spark.reconcile.cli import JOB, run
 from spark.reconcile.run import Operations, run_verify
 from spark.reconcile.sql import decode_join_facts, decode_key_facts, held_out_query, join_held_out_query, join_query, key_facts_query
@@ -41,6 +44,11 @@ class ReconcileLake(Lake):
     def source_problems(self) -> list[str]:
         return schema_problems({table: self.columns(f"{CATALOG}.{table}") for table in SOURCE_TABLES})
 
+    def refusals(self) -> list[str]:
+        """The split table checked by the split job's own rules and the owner of each Bronze case by the Silver cases job's own query, each as one fixed
+        code with no count. Both are named in one run, and the run makes no count before they are clear."""
+        return [*([SPLIT_REFUSAL] if self.split_problems() else []), *([OWNER_REFUSAL] if self.ownership_problems() else [])]
+
     def key_facts(self, name: str) -> KeyFacts:
         return decode_key_facts(self.session.sql(key_facts_query(name)).collect()[0].asDict())
 
@@ -55,7 +63,7 @@ class ReconcileLake(Lake):
         return {table: self.snapshot_id(table) for table in SOURCE_TABLES}
 
     def operations(self) -> Operations:
-        return Operations(self.head, self.source_problems, self.key_facts, self.held_out_problem, self.join_facts, self.snapshot_ids)
+        return Operations(self.head, self.source_problems, self.refusals, self.key_facts, self.held_out_problem, self.join_facts, self.snapshot_ids)
 
 
 def execute(arguments: argparse.Namespace) -> dict[str, Any]:

@@ -227,19 +227,20 @@ def held_out_query(name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class JoinSides:
-    """A join: the table whose rows are counted, the column that names their case, the columns that join it and the table that holds the partners (with the
-    condition on a partner, when only some rows of it are partners), as a query of each key and its count."""
+    """A join: the table whose rows are counted, the column that names their case, the columns that join it and the table that holds the partners, as a query of
+    each key with the count of every partner of the key (``n``, of any kind) and of the partners of the kind that the join needs (``n_kind``, the same count
+    when the join has no kind). The Silver build joins to every partner of the key, so a partner of another kind is a partner to it."""
 
     rows: str
     case: str
     keys: tuple[str, ...]
     partners: str
-    partner_where: str = ""
+    kind: str = ""
 
 
 JOIN_SIDES = {
-    "numeric_track": JoinSides(SILVER_NUMERIC, "case_id", ("case_id", "track"), BRONZE_TRACKS, "WHERE `kind` = 'numeric'"),
-    "waveform_track": JoinSides(SILVER_WAVEFORM, "case_id", ("case_id", "track"), BRONZE_TRACKS, "WHERE `kind` = 'waveform'"),
+    "numeric_track": JoinSides(SILVER_NUMERIC, "case_id", ("case_id", "track"), BRONZE_TRACKS, "numeric"),
+    "waveform_track": JoinSides(SILVER_WAVEFORM, "case_id", ("case_id", "track"), BRONZE_TRACKS, "waveform"),
     "lab_case": JoinSides(SILVER_LAB, "caseid", ("caseid",), SILVER_CASES),
     "case_split": JoinSides(SILVER_CASES, "caseid", ("subjectid",), SPLIT),
 }
@@ -251,9 +252,8 @@ def join_clauses(name: str, *, development: bool) -> tuple[JoinSides, str, str]:
         raise ReconcileError("bad_table: a join is not one that is checked")
     side = JOIN_SIDES[name]
     keys = names(side.keys)
-    partners = sql(
-        "SELECT", keys + ", COUNT(*) AS `n` FROM", *([side.partners, side.partner_where] if side.partner_where else [side.partners]), "GROUP BY", keys
-    )
+    of_kind = f"SUM(CASE WHEN `kind` = '{side.kind}' THEN 1 ELSE 0 END) AS `n_kind`" if side.kind else "COUNT(*) AS `n_kind`"
+    partners = sql("SELECT", keys + ", COUNT(*) AS `n`,", of_kind, "FROM", side.partners, "GROUP BY", keys)
     on = " AND ".join(f"x.{reference(column)} = p.{reference(column)}" for column in side.keys)
     scope = "LEFT SEMI JOIN" if development else "LEFT ANTI JOIN"
     rows = cte("j", "SELECT x.* FROM", side.rows, "x", scope, "dev ON x." + reference(side.case) + " = dev.`case_id`")
@@ -262,19 +262,21 @@ def join_clauses(name: str, *, development: bool) -> tuple[JoinSides, str, str]:
 
 UNMATCHED = total("p.`n` IS NULL", "unmatched")
 FANNED = total("p.`n` > 1", "fanned")
+KIND_WRONG = total("p.`n` IS NOT NULL AND p.`n_kind` <> p.`n`", "kind_wrong")
 
 
 def join_query(name: str) -> str:
-    """The development rows of a Silver table, those with no partner row and those with more than one, by the join key that the Silver build uses."""
+    """The development rows of a Silver table, those with no partner of any kind, those with more than one partner and those with a partner of another kind,
+    by the join key that the Silver build uses."""
     _, clause, tail = join_clauses(name, development=True)
-    return sql(clause, "SELECT COUNT(*) AS row_count,", UNMATCHED + ",", FANNED, tail)
+    return sql(clause, "SELECT COUNT(*) AS row_count,", UNMATCHED + ",", FANNED + ",", KIND_WRONG, tail)
 
 
 def join_held_out_query(name: str) -> str:
-    """One flag, 0 or 1, never a count: whether a row of a patient outside the development sets has no partner or more than one."""
+    """One flag, 0 or 1, never a count: whether a row of a patient outside the development sets has no partner, more than one or a partner of another kind."""
     _, clause, tail = join_clauses(name, development=False)
-    counts = cte("jc", "SELECT", UNMATCHED + ",", FANNED, tail)
-    return sql(clause + ",", counts, "SELECT CASE WHEN unmatched + fanned > 0 THEN 1 ELSE 0 END AS n FROM jc")
+    counts = cte("jc", "SELECT", UNMATCHED + ",", FANNED + ",", KIND_WRONG, tail)
+    return sql(clause + ",", counts, "SELECT CASE WHEN unmatched + fanned + kind_wrong > 0 THEN 1 ELSE 0 END AS n FROM jc")
 
 
 def count_of(row: Mapping[str, object], name: str) -> int:
@@ -299,4 +301,4 @@ def decode_key_facts(row: Mapping[str, object]) -> KeyFacts:
 
 
 def decode_join_facts(row: Mapping[str, object]) -> JoinFacts:
-    return JoinFacts(count_of(row, "row_count"), count_of(row, "unmatched"), count_of(row, "fanned"))
+    return JoinFacts(count_of(row, "row_count"), count_of(row, "unmatched"), count_of(row, "fanned"), count_of(row, "kind_wrong"))

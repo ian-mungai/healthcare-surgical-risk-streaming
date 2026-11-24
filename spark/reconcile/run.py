@@ -1,9 +1,11 @@
 """The order of the reconciliation, in plain data with no Spark. The job ``spark/jobs/silver_reconcile.py`` passes its Spark steps to ``run_verify``,
 so that the order runs in the fast tests on stand-in steps.
 
-The job only reads. It resolves the branch to one hash and reads every table at that hash. It checks the columns of every table before it runs a query, compares
-each table's keys (development patients as counts and dispositions, every other patient as one flag), checks the cardinality of each join, reads the snapshot
-IDs and ends only when the branch still has the hash. Every table, join and flag is judged before the job refuses, so that one run names every cause.
+The job only reads. It resolves the branch to one hash and reads every table at that hash. It checks the columns of every table before it runs a query. Then
+it checks the patient split table and the owner of each Bronze case (a development set is only trusted when both pass) and refuses the whole run, with no count
+made, when either fails. It compares each table's keys (development patients as counts and dispositions, every other patient as one flag), checks the
+cardinality of each join, reads the snapshot IDs and ends only when the branch still has the hash. Every table, join and flag is judged before the job refuses,
+so that one run names every cause.
 """
 
 from __future__ import annotations
@@ -29,10 +31,12 @@ BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
 
 @dataclass(frozen=True, slots=True)
 class Operations:
-    """The Spark steps, all reads. ``key_facts`` and ``join_facts`` are given a table or join name. ``held_out_problem`` gives one flag and never a count."""
+    """The Spark steps, all reads. ``refusals`` gives the fixed codes of a split table that breaks the split rule and of a Bronze case with more than one owner.
+    ``key_facts`` and ``join_facts`` are given a table or join name. ``held_out_problem`` gives one flag and never a count."""
 
     head: Callable[[], str]
     source_problems: Callable[[], list[str]]
+    refusals: Callable[[], list[str]]
     key_facts: Callable[[str], KeyFacts]
     held_out_problem: Callable[[str], bool]
     join_facts: Callable[[str], JoinFacts]
@@ -73,6 +77,9 @@ def run_verify(ops: Operations, head: str) -> Outcome:
     problems = list(ops.source_problems())
     if problems:
         raise ReconcileError(*problems)
+    refusals = list(ops.refusals())
+    if refusals:
+        raise ReconcileError(*refusals)
     keys: dict[str, KeyFacts] = {}
     flags: dict[str, bool] = {}
     for reconciliation in RECONCILIATIONS:

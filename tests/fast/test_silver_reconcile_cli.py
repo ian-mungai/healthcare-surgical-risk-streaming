@@ -22,10 +22,12 @@ from typing import Any
 
 from scripts.stack.nessie import NessieError
 from spark.jobs.silver_reconcile import ReconcileLake
-from spark.reconcile.checks import SOURCE_TABLES, ReconcileError
+from spark.reconcile.checks import OWNER_REFUSAL, SOURCE_TABLES, SPLIT_REFUSAL, ReconcileError
 from spark.reconcile.cli import JOB, run
 from spark.settings import SettingsError
+from spark.silver_cases_sql import ownership_query
 from spark.split_cli import start_deadline
+from spark.split_table import RULE_VERSION
 from tests.fast.test_replay_image import ignore_rules, imported_files
 from tests.fast.test_silver_signals_image import ROOT
 from tests.fast.test_spark_bronze_image import DOCKERFILE, IGNORE_FILE, image_problems
@@ -126,6 +128,73 @@ class Reads(unittest.TestCase):
 
         lake = ReconcileLake(Session(), object(), "branch", "a" * 64)  # type: ignore[arg-type]
         self.assertEqual([f"source_missing: {len(SOURCE_TABLES)} tables"], lake.source_problems())
+
+
+class Refusals(unittest.TestCase):
+    """The split table and the owner of each Bronze case are checked by the Silver cases job's own checks before any count, and a refusal is one fixed code."""
+
+    TRAINING_PATIENT, TEST_PATIENT = "3", "1"
+
+    def lake(self, split: list[dict[str, Any]], owner: int = 0) -> tuple[ReconcileLake, list[str]]:
+        asked: list[str] = []
+
+        class Result:
+            def __init__(self, rows: list[dict[str, Any]]) -> None:
+                self.rows = rows
+
+            def collect(self) -> list[dict[str, Any]]:
+                return self.rows
+
+        class Session:
+            @staticmethod
+            def table(name: str) -> Result:
+                asked.append(f"table {name}")
+                return Result(split)
+
+            @staticmethod
+            def sql(query: str) -> Result:
+                asked.append(query)
+                return Result([{"n": owner}])
+
+        return ReconcileLake(Session(), object(), "branch", "a" * 64), asked  # type: ignore[arg-type]
+
+    def row(self, subjectid: str, name: str) -> dict[str, Any]:
+        return {"subjectid": subjectid, "set": name, "rule_version": RULE_VERSION, "source_snapshot_id": 7}
+
+    def good(self) -> list[dict[str, Any]]:
+        return [self.row(self.TRAINING_PATIENT, "training"), self.row(self.TEST_PATIENT, "test")]
+
+    def test_a_split_that_follows_the_rule_and_cases_with_one_owner_are_no_refusal(self) -> None:
+        lake, asked = self.lake(self.good())
+        self.assertEqual([], lake.refusals())
+        self.assertIn("table lake.silver.patient_split", asked)
+        self.assertIn(ownership_query("lake.bronze.clinical_cases"), asked)
+
+    def test_a_test_set_patient_labelled_training_is_refused_with_one_fixed_code(self) -> None:
+        lake, _ = self.lake([self.row(self.TRAINING_PATIENT, "training"), self.row(self.TEST_PATIENT, "training")])
+        self.assertEqual([SPLIT_REFUSAL], lake.refusals())
+
+    def test_every_other_break_of_the_split_rule_is_the_same_code_and_never_a_count(self) -> None:
+        wrong_version = {**self.row(self.TEST_PATIENT, "test"), "rule_version": "another"}
+        twice = [*self.good(), self.row(self.TEST_PATIENT, "training")]
+        for case, rows in (("another rule version", [self.good()[0], wrong_version]), ("a patient in two sets", twice), ("no row", [])):
+            with self.subTest(case=case):
+                lake, _ = self.lake(rows)
+                self.assertEqual([SPLIT_REFUSAL], lake.refusals())
+
+    def test_a_bronze_case_with_two_owners_is_refused_with_one_fixed_code(self) -> None:
+        lake, _ = self.lake(self.good(), owner=1)
+        self.assertEqual([OWNER_REFUSAL], lake.refusals())
+
+    def test_both_refusals_are_named_in_one_run(self) -> None:
+        lake, _ = self.lake([self.row(self.TEST_PATIENT, "training")], owner=1)
+        self.assertEqual([SPLIT_REFUSAL, OWNER_REFUSAL], lake.refusals())
+
+    def test_the_job_gives_its_refusals_to_the_run_in_the_order_that_the_run_reads_them(self) -> None:
+        lake, _ = self.lake(self.good())
+        operations = lake.operations()
+        self.assertEqual(lake.refusals(), operations.refusals())
+        self.assertEqual(lake.head, operations.head)
 
 
 class Flags(unittest.TestCase):

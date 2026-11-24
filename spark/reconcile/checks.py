@@ -6,7 +6,10 @@ case for their own key; a laboratory row for one key for each copy that it colla
 accounted key has a disposition from the closed list of its table. The comparison never reads a count and calls it proof: it finds the Bronze keys
 that no Silver key accounts for (``unaccounted``), the Silver keys that no Bronze key backs (``silver_unbacked``), the Bronze keys that two Silver
 keys claim (``claimed_twice``) and the Bronze keys that Bronze holds twice (``bronze_repeats``). Four joins that the Silver build makes are checked
-for their cardinality: each row must have exactly one partner.
+for their cardinality: each row must have exactly one partner, and a partner of a signal's track is of the signal's kind.
+
+Before any count the job checks the patient split table by the split job's own rules and the owner of each Bronze case by the Silver cases job's own query. A
+development set is only trusted after both pass, and a failure refuses the whole run with one fixed code and no count.
 
 The test set is sealed. The counts and dispositions are those of development patients. For every other patient the job reads one flag for each table, set when
 any key is not accounted for, and never a count. A problem is a code and a count and holds no case, track, time or value.
@@ -22,7 +25,7 @@ from dataclasses import dataclass
 from features.signal_validity import INVALID_CAUSES
 from spark.bronze import tables as bronze
 from spark.silver import tables as silver
-from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, SOURCE_SCHEMAS
+from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, OWNERSHIP_PROBLEM, SOURCE_SCHEMAS
 from spark.split_table import unit
 
 VALID = "valid"
@@ -30,6 +33,8 @@ DUPLICATE = "duplicate"
 KEPT = "kept"
 COLLAPSED_COPY = "collapsed_copy"
 UNRECORDED = "unrecorded"
+SPLIT_REFUSAL = "split_rule_broken: the patient split table does not follow the split rule"
+OWNER_REFUSAL = OWNERSHIP_PROBLEM
 
 
 class ReconcileError(ValueError):
@@ -78,11 +83,13 @@ class KeyFacts:
 
 @dataclass(frozen=True, slots=True)
 class JoinFacts:
-    """What a join shows: the rows of the first table, the rows with no partner and the rows with more than one."""
+    """What a join shows: the rows of the first table, the rows with no partner, the rows with more than one partner and the rows that have a partner of
+    another kind than the join needs (a signal whose track is of the other kind, however many partners it has)."""
 
     rows: int
     unmatched: int
     fanned: int
+    kind_wrong: int = 0
 
 
 RECONCILIATIONS = (
@@ -120,8 +127,10 @@ KEY_CHECKS = (
     ("disposition_total", "key"),
     ("disposition_unknown", "disposition"),
 )
-JOIN_CHECKS = ("join_empty", "join_unmatched", "join_fanned")
+JOIN_CHECKS = ("join_empty", "join_unmatched", "join_fanned", "join_kind_wrong")
+REFUSAL_CHECKS = tuple(message.split(":")[0] for message in (SPLIT_REFUSAL, OWNER_REFUSAL))
 CHECK_NAMES = (
+    *REFUSAL_CHECKS,
     *(f"{reconciliation.name}_{code}" for reconciliation in RECONCILIATIONS for code, _ in KEY_CHECKS),
     *(f"{reconciliation.name}_held_out" for reconciliation in RECONCILIATIONS),
     *(f"{join.name}_{code}" for join in JOINS for code in JOIN_CHECKS),
@@ -160,7 +169,13 @@ def key_problems(name: str, facts: KeyFacts) -> list[str]:
 def join_problems(name: str, facts: JoinFacts) -> list[str]:
     if facts.rows == 0:
         return [f"{name}_join_empty: {unit(0, 'row')}"]
-    return counted([(f"{name}_join_unmatched", facts.unmatched, "row"), (f"{name}_join_fanned", facts.fanned, "row")])
+    return counted(
+        [
+            (f"{name}_join_unmatched", facts.unmatched, "row"),
+            (f"{name}_join_fanned", facts.fanned, "row"),
+            (f"{name}_join_kind_wrong", facts.kind_wrong, "row"),
+        ]
+    )
 
 
 def held_out_problems(flags: Mapping[str, bool]) -> list[str]:

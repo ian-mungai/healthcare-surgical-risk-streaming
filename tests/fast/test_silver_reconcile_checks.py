@@ -25,8 +25,10 @@ from spark.reconcile.checks import (
     CODES,
     JOIN_TABLE,
     JOINS,
+    OWNER_REFUSAL,
     RECONCILIATIONS,
     SOURCE_TABLES,
+    SPLIT_REFUSAL,
     JoinFacts,
     KeyFacts,
     ReconcileError,
@@ -134,15 +136,20 @@ class Joins(unittest.TestCase):
         self.assertEqual(["numeric_track", "waveform_track", "lab_case", "case_split"], [join.name for join in JOINS])
         for join in JOINS:
             with self.subTest(join=join.name):
-                self.assertEqual([], join_problems(join.name, JoinFacts(rows=50, unmatched=0, fanned=0)))
+                self.assertEqual([], join_problems(join.name, JoinFacts(rows=50, unmatched=0, fanned=0, kind_wrong=0)))
 
-    def test_a_row_with_no_partner_and_a_row_with_more_than_one_are_named_apart(self) -> None:
+    def test_a_row_with_no_partner_a_row_with_more_than_one_and_a_row_of_the_wrong_kind_are_named_apart(self) -> None:
         self.assertEqual(
-            ["lab_case_join_unmatched: 3 rows", "lab_case_join_fanned: 1 row"], join_problems("lab_case", JoinFacts(rows=50, unmatched=3, fanned=1))
+            ["lab_case_join_unmatched: 3 rows", "lab_case_join_fanned: 1 row", "lab_case_join_kind_wrong: 2 rows"],
+            join_problems("lab_case", JoinFacts(rows=50, unmatched=3, fanned=1, kind_wrong=2)),
         )
+        self.assertEqual(["numeric_track_join_kind_wrong: 1 row"], join_problems("numeric_track", JoinFacts(rows=50, unmatched=0, fanned=0, kind_wrong=1)))
+
+    def test_a_join_that_is_told_nothing_of_the_kind_has_none_wrong(self) -> None:
+        self.assertEqual(0, JoinFacts(rows=5, unmatched=1, fanned=1).kind_wrong)
 
     def test_a_join_over_no_row_is_named(self) -> None:
-        self.assertEqual(["case_split_join_empty: 0 rows"], join_problems("case_split", JoinFacts(rows=0, unmatched=0, fanned=0)))
+        self.assertEqual(["case_split_join_empty: 0 rows"], join_problems("case_split", JoinFacts(rows=0, unmatched=0, fanned=0, kind_wrong=0)))
 
 
 class JoinOwners(unittest.TestCase):
@@ -188,7 +195,9 @@ class Messages(unittest.TestCase):
         bad = KeyFacts(5, 1, 3, 1, 1, 1, {"kept": 1, "dropped": 1})
         problems = [
             *(problem for reconciliation in RECONCILIATIONS for problem in key_problems(reconciliation.name, bad)),
-            *(problem for join in JOINS for problem in join_problems(join.name, JoinFacts(0, 1, 1))),
+            *(problem for join in JOINS for problem in join_problems(join.name, JoinFacts(5, 1, 1, 1))),
+            SPLIT_REFUSAL,
+            OWNER_REFUSAL,
             *held_out_problems({reconciliation.name: True for reconciliation in RECONCILIATIONS}),
             *schema_problems({}),
         ]
@@ -200,6 +209,15 @@ class Messages(unittest.TestCase):
                     self.fail("a message that is not a code and a count")
                 self.assertIn(matched.group(1), CODES)
                 self.assertNotRegex(problem, r"[0-9]{4,}")
+
+    def test_a_refusal_before_any_count_is_a_fixed_code_with_no_count(self) -> None:
+        self.assertEqual("split_rule_broken: the patient split table does not follow the split rule", SPLIT_REFUSAL)
+        self.assertEqual("ambiguous_case_owner: a Bronze case has more than one row or more than one patient", OWNER_REFUSAL)
+        for message in (SPLIT_REFUSAL, OWNER_REFUSAL):
+            with self.subTest(message=message):
+                self.assertNotRegex(message, r"[0-9]")
+                self.assertIn(message.split(":")[0], CODES)
+                self.assertIn(message.split(":")[0], CHECK_NAMES)
 
     def test_the_error_keeps_one_message_for_each_cause(self) -> None:
         error = ReconcileError("a: 1 key", "b: 2 keys")
