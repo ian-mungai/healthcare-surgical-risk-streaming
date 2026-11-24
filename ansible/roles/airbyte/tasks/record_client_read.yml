@@ -1,7 +1,8 @@
 # Reads airbyte_namespace and, optionally, airbyte_record_client_deadline_seconds (default 120). Airbyte writes the instance administrator's client ID and secret into the secret
 # airbyte-auth-secrets when it first starts. One command waits for both, inside one elapsed-time deadline that the coreutils timeout program enforces around the whole loop, so no
 # attempt has a fresh bound of its own. The two values are read into two variables that hold no more than the next task needs, and never shown. A secret that does not hold them
-# within the deadline stops the run and names the secret.
+# within the deadline stops the run and names the secret. kubectl's own message of the last attempt is kept in a temporary file that the deadline's signal prints to standard
+# error and the exit removes: it holds no value, and it tells a refused call (no permission, no cluster) from a secret that is not filled yet.
 - name: Wait for and read the administrator's client ID and secret from the namespace's auth secret
   ansible.builtin.command:
     argv:
@@ -10,8 +11,11 @@
       - sh
       - -c
       - |
+        errors=$(mktemp "${TMPDIR:-/tmp}/airbyte_read.XXXXXX") || exit 1
+        trap 'rm -f "$errors"' EXIT
+        trap 'cat "$errors" >&2; exit 1' TERM
         while :; do
-          value=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>/dev/null) || value=
+          value=$(k3s kubectl get secret airbyte-auth-secrets --namespace "$1" --output "jsonpath={.data.instance-admin-client-id}:{.data.instance-admin-client-secret}" 2>"$errors") || value=
           case "$value" in
             ?*:?*) printf '%s' "$value"; exit 0 ;;
           esac
@@ -34,7 +38,9 @@
       - (airbyte_record_client_read.stdout.split(':')[0] | length) > 0
       - (airbyte_record_client_read.stdout.split(':')[1] | length) > 0
     quiet: true
-    fail_msg: the secret airbyte-auth-secrets holds no instance-admin-client-id and instance-admin-client-secret yet
+    fail_msg: >-
+      the secret airbyte-auth-secrets did not give the instance-admin-client-id and instance-admin-client-secret before the deadline.
+      The last message of kubectl: {{ airbyte_record_client_read.stderr | default('') | trim }}
   no_log: true
 
 - name: Keep the two values for the next task
