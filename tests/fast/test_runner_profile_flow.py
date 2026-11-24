@@ -182,10 +182,11 @@ class ProfileCases(unittest.TestCase):
 
     def test_the_verify_the_unpinned_verify_and_the_rebuild_pass_on_healthy_replies_and_fail_on_wrong_ones(self) -> None:
         built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
-        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH}
+        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH, "write_hash": None}
         unpinned = f"signal_profile: counts_judged_unpinned: {len(self.module.BY_NAME)} rows\n"
         for label, reply, wanted in (
             ("healthy", verified, True),
+            ("no write hash field in the pinned verify", {key: value for key, value in verified.items() if key != "write_hash"}, False),
             ("another outcome", {**verified, "outcome": "written"}, False),
             ("another hash", {**verified, "branch_hash": "c" * 64}, False),
             ("a write hash in the pinned verify", {**verified, "write_hash": BRANCH_HASH}, False),
@@ -209,9 +210,28 @@ class ProfileCases(unittest.TestCase):
         self.assertEqual({"merged_hash", "tag", "tag_hash"}, set(self.flow.facts))
         self.assertEqual(f"run-prof-{self.flow.suffix}", self.flow.facts["tag"])
 
+    def test_the_rebuild_fails_when_its_reply_has_no_write_hash_field(self) -> None:
+        built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
+        for label, present, wanted in (("the field is null", True, True), ("the field is absent", False, False)):
+            with self.subTest(label):
+                self.setUp()
+                self.flow.kept = {
+                    "grid_rule": self.result()["grid_rule"],
+                    "fingerprints": self.result()["fingerprints"],
+                    "snapshots": self.result()["snapshots"],
+                }
+                again = self.result(outcome="unchanged", write_hash=None, base_hash=BRANCH_HASH, grid_rule={**self.result()["grid_rule"], "written": False})
+                if not present:
+                    del again["write_hash"]
+                self.stack.profile = lambda *_, again=again, **__: (0, again, "", 0.5)
+                self.nessie.tables["p6_prof_trunk_x1"] = {f"silver.{name}" for name in self.module.ALL_TABLE_NAMES}
+                self.flow.head = lambda branch: BRANCH_HASH
+                self.flow.merge_tag_rebuild(built)
+                self.assertIs(wanted, self.record.observations[-1].passed)
+
     def test_the_verify_fails_when_the_branch_moved_during_the_unpinned_verify_and_no_merge_of_the_new_hash_happens(self) -> None:
         built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
-        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH}
+        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH, "write_hash": None}
         unpinned = f"signal_profile: counts_judged_unpinned: {len(self.module.BY_NAME)} rows\n"
         moved = "c" * 64
         calls: list[str] = []
@@ -261,7 +281,7 @@ class ProfileCases(unittest.TestCase):
 
     def test_the_verify_returns_false_when_the_unpinned_check_fails(self) -> None:
         built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
-        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH}
+        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH, "write_hash": None}
         answers = iter([(0, verified, "", 0.5), (1, {}, "signal_profile: usage\n", 0.5)])
         self.stack.profile = lambda *_, **__: next(answers)
         self.assertIs(False, self.flow.verify_control(built))

@@ -262,25 +262,30 @@ class Refusals(unittest.TestCase):
 
     LAB_PAIR = "WARN 4417\ngold_dimensions: empty_source: failed\ngold_dimensions: empty_source: dim_lab_test, 2 members\n"
 
-    def test_a_line_of_the_job_prefix_that_the_adapter_drops_is_counted_and_the_count_is_reset_by_each_job(self) -> None:
+    def test_a_line_of_the_job_prefix_that_the_adapter_drops_is_counted_across_the_attempts_and_reset_by_each_job(self) -> None:
         command = ["docker", "compose", "run", "--entrypoint", "python", "spark"]
-        stack = self.stack([(1, "", self.LAB_PAIR), (1, "", "WARN 4417\ngold_dimensions: empty_source: failed\n"), (1, "", self.LAB_PAIR)])
+        stack = self.stack(
+            [(1, "", self.LAB_PAIR), (1, "", "WARN 4417\ngold_dimensions: empty_source: failed\n"), (1, "", "gold_dimensions: empty_source: failed\n")]
+        )
         self.assertEqual(0, stack.unknown_lines)
         stack.run(command)
         self.assertEqual(1, stack.unknown_lines)
         stack.run(command)
-        self.assertEqual(0, stack.unknown_lines)
-        stack.run(command)
+        self.assertEqual(1, stack.unknown_lines, "a clean attempt after one that dropped a line keeps the count: the job's attempts add up")
         stack.run(["docker", "ps"])
-        self.assertEqual(1, stack.unknown_lines, "a command that is not a job leaves the count of the job before it")
+        self.assertEqual(1, stack.unknown_lines, "a command that is not a job leaves the count")
+        stack.gold("build", "branch", base_branch="trunk")
+        self.assertEqual(0, stack.unknown_lines, "each job starts its count at zero")
 
-    def test_the_count_of_a_stopped_attempt_is_not_kept_for_the_next_job(self) -> None:
-        stack = self.stack([(1, "", self.LAB_PAIR), TimeoutExpired(["x"], 1.0)])
+    def test_a_stopped_attempt_keeps_its_count_for_the_retry_and_the_next_job_starts_at_zero(self) -> None:
+        stack = self.stack([(1, "", self.LAB_PAIR), TimeoutExpired(["x"], 1.0), (1, "", "gold_dimensions: empty_source: failed\n")])
         command = ["docker", "compose", "run", "--entrypoint", "python", "spark"]
         stack.run(command)
         self.assertEqual(1, stack.unknown_lines)
         with self.assertRaises(TimeoutExpired):
             stack.run(command)
+        self.assertEqual(1, stack.unknown_lines)
+        stack.gold("build", "branch", base_branch="trunk")
         self.assertEqual(0, stack.unknown_lines)
 
     def test_a_stream_of_lines_that_do_not_begin_with_the_prefix_drops_nothing_that_is_counted(self) -> None:
