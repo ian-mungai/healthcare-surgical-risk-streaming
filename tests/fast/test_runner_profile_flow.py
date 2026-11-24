@@ -191,7 +191,7 @@ class ProfileCases(unittest.TestCase):
                 answers = iter([(0, reply, "", 0.5), (1, {}, unpinned, 0.5)])
                 self.stack.profile = lambda *_, answers=answers, **__: next(answers)
                 self.stack.unknown_lines = 0
-                self.flow.verify_control(built)
+                self.assertIs(wanted, self.flow.verify_control(built))
                 self.assertEqual([wanted, True], [item.passed for item in self.record.observations])
         self.setUp()
         self.flow.kept = {"grid_rule": self.result()["grid_rule"], "fingerprints": self.result()["fingerprints"], "snapshots": self.result()["snapshots"]}
@@ -204,6 +204,88 @@ class ProfileCases(unittest.TestCase):
         self.assertTrue(all(item.passed for item in self.record.observations), [item.observed for item in self.record.observations])
         self.assertEqual({"merged_hash", "tag", "tag_hash"}, set(self.flow.facts))
         self.assertEqual(f"run-prof-{self.flow.suffix}", self.flow.facts["tag"])
+
+    def test_the_verify_returns_false_when_the_unpinned_check_fails(self) -> None:
+        built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
+        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH}
+        answers = iter([(0, verified, "", 0.5), (1, {}, "signal_profile: usage\n", 0.5)])
+        self.stack.profile = lambda *_, **__: next(answers)
+        self.assertIs(False, self.flow.verify_control(built))
+        self.assertEqual([True, False], [item.passed for item in self.record.observations])
+
+    def healthy_dump(self) -> dict[str, Any]:
+        module = self.module
+        zero = {name: 0 for name in ("cases", "no_grid", "cutoffs", "waveform", "numeric", "either")}
+        rule = {
+            "cutoff_step": 60,
+            "cutoff_offset": 0,
+            "last_margin": 300,
+            "waveform_window": 20,
+            "waveform_limit": 0,
+            "numeric_window": 900,
+            "numeric_limit": 10,
+        }
+        schema = {name: [list(item) for item in module.PROFILE_TABLES[name].columns] for name in module.PROFILE_TABLE_NAMES}
+        schema[module.RULE_TABLE_NAME] = [list(item) for item in module.GRID_RULE.columns]
+        return {
+            "profile": {"absent": 0, "extra": 0, "value_mismatch": 0, "share_mismatch": 0, "expected_rows": 6, "stored_rows": 6},
+            "development": {"numeric_rows": SECRET, "waveform_rows": SECRET + 1, "tracks": 3},
+            "arterial": {},
+            "grid": {},
+            "unscored": [{**zero, **rule, "scope": "development", "unscored_share": None}],
+            "counts": [
+                {"name": count.name, "value": 7.0 if count.name == "development_cases" else None, "expected": float(count.expected)}
+                for count in module.PRESPECIFIED
+            ],
+            "count_flags": ["None"],
+            "rule": [{**asdict(module.planned_rule(5)), "written_at": "2026-11-24"}],
+            "schema": schema,
+        }
+
+    def independent(self, dump: dict[str, Any]) -> bool:
+        built = {
+            "branch": "p6_prof_profile_x1",
+            "rows": {"signal_profile": 6},
+            "development": {"numeric_rows": SECRET, "waveform_rows": SECRET + 1, "tracks": 3, "arterial_cases": 0},
+            "source_snapshots": {"patient_split": 5},
+        }
+        self.stack.write_spec = lambda *_: None
+        self.stack.stand_in = lambda mode, branch: (0, dump, "", 0.1)
+        self.flow.stand = lambda mode, branch, **values: self.stack.stand_in(mode, branch)
+        return bool(self.flow.independent(built, [908], {"development_cases": 7.0}, "", "control", pinned=False, arterial=False))
+
+    def test_the_independent_read_returns_true_when_every_comparison_passes_and_records_flags_only(self) -> None:
+        self.assertIs(True, self.independent(self.healthy_dump()))
+        self.assertEqual(6, len(self.record.observations))
+        self.assertTrue(all(item.passed for item in self.record.observations), [item.observed for item in self.record.observations])
+        self.assertNotIn(str(SECRET), self.saved())
+
+    def test_the_independent_read_returns_false_and_fails_its_case_for_each_wrong_reply(self) -> None:
+        def mutated(**edits: Any) -> dict[str, Any]:
+            return {**self.healthy_dump(), **edits}
+
+        dump = self.healthy_dump()
+        wrong: dict[str, tuple[int, dict[str, Any]]] = {
+            "a profile row left out": (0, mutated(profile={**dump["profile"], "absent": 1})),
+            "rows that differ from the result's": (0, mutated(profile={**dump["profile"], "stored_rows": 7})),
+            "development counts that differ": (0, mutated(development={**dump["development"], "tracks": 4})),
+            "an unscored count that differs": (1, mutated(unscored=[{**dump["unscored"][0], "cutoffs": 1}])),
+            "an unscored share with no cutoff": (1, mutated(unscored=[{**dump["unscored"][0], "unscored_share": 0.5}])),
+            "another rule": (1, mutated(unscored=[{**dump["unscored"][0], "waveform_limit": 1}])),
+            "an arterial second in a development case": (1, mutated(arterial={"908": [[1, True]]})),
+            "a count with another value": (
+                3,
+                mutated(counts=[{**item, "value": 8.0 if item["name"] == "development_cases" else item["value"]} for item in dump["counts"]]),
+            ),
+            "a rule row with another snapshot": (4, mutated(rule=[{**dump["rule"][0], "split_snapshot_id": 6}])),
+            "a table of other columns": (5, mutated(schema={**dump["schema"], "signal_profile": []})),
+        }
+        for label, (position, reply) in wrong.items():
+            with self.subTest(label):
+                self.setUp()
+                self.assertIs(False, self.independent(reply))
+                self.assertFalse(self.record.observations[position].passed, [item.observed for item in self.record.observations])
+                self.assertNotIn(str(SECRET), self.saved())
 
     def test_the_schema_the_mismatch_and_the_bounded_cases_pass_on_healthy_replies(self) -> None:
         self.stack.stand_in = lambda mode, branch: (0, {"as_planted": True}, "", 0.1)
