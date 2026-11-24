@@ -61,6 +61,7 @@ def load_module() -> ModuleType:
 
 
 MODULE_UNDER_TEST = load_module()
+NOT_SET = object()
 
 
 def document() -> dict[str, Any]:
@@ -90,6 +91,7 @@ class FakeAirbyte:
         self.keys: dict[str, str] = dict(KEYS)
         self.recorded: dict[str, str] = {}
         self.limit = 100
+        self.next_of: Any = NOT_SET
         if builtin:
             self.add_definition("source", SOURCE_DEFINITION_ID, "airbyte/source-s3", "4.17.1")
             self.add_definition("destination", DESTINATION_DEFINITION_ID, "airbyte/destination-s3", "1.9.11")
@@ -155,7 +157,8 @@ class FakeAirbyte:
     def listing(self, kind: str, offset: int) -> dict[str, Any]:
         rows = self.damaged(self.KIND_NAMES[kind], [self.masked(copy.deepcopy(row)) for row in self.objects[kind].values()])
         page = rows[offset : offset + self.limit]
-        return {"data": page, "next": "more" if offset + self.limit < len(rows) else None}
+        following = "more" if offset + self.limit < len(rows) else None
+        return {"data": page, "next": following if self.next_of is NOT_SET else self.next_of}
 
     def read(self, parts: list[str], offset: int) -> dict[str, Any]:
         if parts == ["workspaces"]:
@@ -167,7 +170,7 @@ class FakeAirbyte:
 
     def write(self, method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
         """Store the write and answer it. A test can plant a fault in the answer of one call: the object is stored, the answer is faulty."""
-        kind = f"{parts[3][:-1]}_definition" if parts[0] == "workspaces" else self.KIND_NAMES[parts[0]]
+        kind = self.KIND_NAMES[parts[0]]
         self.write_log.append((method, kind))
         answer = copy.deepcopy(self.store(method, parts, body))
         if self.write_damage is not None and self.write_damage[:2] == (method, kind):
@@ -179,11 +182,6 @@ class FakeAirbyte:
         return answer
 
     def store(self, method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
-        if parts[0] == "workspaces":
-            kind, identifier = f"{parts[3][:-1]}_definitions", parts[4] if len(parts) > 4 else None
-            record = self.objects[kind].get(identifier or "", {}) | body | {"id": identifier or self.new_id(), "documentationUrl": "https://example.invalid"}
-            self.objects[kind][record["id"]] = record
-            return record
         kind = parts[0]
         key = {"sources": "sourceId", "destinations": "destinationId", "connections": "connectionId"}[kind]
         identifier = parts[1] if len(parts) > 1 else self.new_id()
@@ -263,6 +261,40 @@ class CreateAndRepeatTest(unittest.TestCase):
         api.writes.clear()
         self.assertEqual([], apply(api))
         self.assertEqual([], api.writes)
+
+
+class PagerTest(unittest.TestCase):
+    """A list call ends at the first reply whose ``next`` is null or empty text. A ``next`` of any other type is refused, as the record pager refuses it."""
+
+    def many_definitions(self) -> FakeAirbyte:
+        api = FakeAirbyte(builtin=False)
+        for index in range(230):
+            api.add_definition("source", f"{index:08d}-5555-5555-5555-555555555555", f"other/source-{index}", "1.0.0", f"other {index}")
+            api.add_definition("destination", f"{index:08d}-4444-4444-4444-444444444444", f"other/destination-{index}", "1.0.0", f"other {index}")
+        api.add_definition("source", SOURCE_DEFINITION_ID, "airbyte/source-s3", "4.17.1")
+        api.add_definition("destination", DESTINATION_DEFINITION_ID, "airbyte/destination-s3", "1.9.11")
+        return api
+
+    def test_a_next_that_is_neither_null_nor_text_is_refused_and_does_not_end_the_list_early(self) -> None:
+        for value in (False, 0, [], {}, 7, ["more"], {"more": 1}, 1.5, True):
+            with self.subTest(next=value):
+                api = self.many_definitions()
+                api.next_of = value
+                with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+                    apply(api)
+                self.assertIn("next", str(raised.exception), "the refusal is the pager's, not a later 'no definition' that page two would have answered")
+                self.assertEqual([], api.writes)
+
+    def test_a_null_next_and_an_empty_next_end_a_list_that_has_one_page(self) -> None:
+        for value in (None, ""):
+            with self.subTest(next=value):
+                api = FakeAirbyte()
+                api.next_of = value
+                self.assertEqual(["source", "destination", "connection"], apply(api))
+
+    def test_a_text_next_on_each_page_but_the_last_reads_every_page(self) -> None:
+        api = self.many_definitions()
+        self.assertEqual(["source", "destination", "connection"], apply(api))
 
 
 class BuiltinDefinitionTest(unittest.TestCase):
@@ -367,6 +399,12 @@ class BuiltinDefinitionTest(unittest.TestCase):
                 self.assertEqual([], [kind for _, kind in api.write_log if kind.endswith("_definition")])
         for method, kind in MODULE_UNDER_TEST.WRITE_CALLS:
             self.assertFalse(kind.endswith("_definition"), f"{method} {kind}")
+
+    def test_the_role_comment_says_that_definitions_are_found_by_image_and_the_other_objects_by_name(self) -> None:
+        header = "".join((ROLES / "airbyte" / "tasks" / "connection.yml").read_text().partition("\n- name:")[0])
+        self.assertNotIn("finds each object by its name", header)
+        self.assertIn("dockerRepository", header)
+        self.assertIn("by their names", header)
 
     def test_the_module_holds_no_function_or_verb_that_writes_a_definition(self) -> None:
         text = MODULE.read_text()

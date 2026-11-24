@@ -266,16 +266,19 @@ def checked(item: Any, kind: str) -> dict[str, Any]:
 
 
 def listing(api: Api, path: str, kind: str) -> list[dict[str, Any]]:
-    """Every object of a list call, page by page, each checked against the table of its kind."""
+    """Every object of a list call, page by page, each checked against the table of its kind. A ``next`` that is neither null nor text is refused."""
     found: list[dict[str, Any]] = []
     separator = "&" if "?" in path else "?"
     for page in range(MAX_PAGES):
         reply = api.request("GET", f"{path}{separator}limit={PAGE_SIZE}&offset={page * PAGE_SIZE}")
         data = reply.get("data")
+        following = reply.get("next")
         if not isinstance(data, list):
             raise ApiError(f"GET {path} answered with no list of objects")
+        if not (following is None or type(following) is str):
+            raise ApiError(f"GET {path} answered with a next that is neither null nor text")
         found += [checked(item, kind) for item in data]
-        if not reply.get("next"):
+        if not following:
             return found
     raise ApiError(f"GET {path} has more pages than {MAX_PAGES}")
 
