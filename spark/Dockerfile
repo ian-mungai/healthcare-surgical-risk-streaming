@@ -48,6 +48,10 @@ COPY features/__init__.py /opt/jobs/features/__init__.py
 COPY features/signal_validity.py /opt/jobs/features/signal_validity.py
 COPY features/pressure_series.py /opt/jobs/features/pressure_series.py
 COPY features/hypotension.py /opt/jobs/features/hypotension.py
+# The signal profile job counts the unscored cutoffs by the sample limits of the feature registry (standard library only).
+COPY features/registry.py /opt/jobs/features/registry.py
+COPY features/model.py /opt/jobs/features/model.py
+COPY features/stats.py /opt/jobs/features/stats.py
 # The Bronze decoder imports the replay's decoder and stores and the ingestion gate, and the gate reads the tracked release pin through ROOT.
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py

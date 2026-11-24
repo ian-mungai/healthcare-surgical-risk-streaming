@@ -9,6 +9,9 @@
 !features/signal_validity.py
 !features/pressure_series.py
 !features/hypotension.py
+!features/registry.py
+!features/model.py
+!features/stats.py
 !spark/requirements.txt
 !replay/__init__.py
 !replay/events/__init__.py
