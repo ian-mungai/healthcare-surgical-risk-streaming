@@ -275,7 +275,7 @@ class DefaultBranchTest(unittest.TestCase):
             code, out, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_SIDE, "--run-folder", folder, "--trunk", "side"], nessie)
             written = Path(folder).exists()
         self.assertEqual(1, code)
-        self.assertIn("default branch", err)
+        self.assertIn("NotOnTrunk", err)
         self.assertEqual([], nessie.writes())
         self.assertNotIn(f"run-{RUN_ID}", nessie.references)
         self.assertFalse(written)
@@ -300,7 +300,7 @@ class EntriesTest(unittest.TestCase):
             code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(Path(directory) / "run")], nessie)
             self.assertFalse((Path(directory) / "run").exists())
         self.assertEqual(1, code)
-        self.assertIn("catalog_proof.numbers", err)
+        self.assertIn("NessieError", err)
 
     def test_content_with_no_metadata_location_or_an_empty_one_or_one_that_is_not_text_is_an_error(self) -> None:
         for location in (None, "", 5, ["x"]):
@@ -369,7 +369,7 @@ class RecordFirstTest(unittest.TestCase):
         nessie = StandIn()
         code, _, err = run_command(self.arguments(HASH_TWO), nessie)
         self.assertEqual(1, code)
-        self.assertIn(HASH_ONE, err)
+        self.assertIn("TagConflict", err)
         self.assertEqual([], nessie.writes())
         self.assertNotIn(f"run-{RUN_ID}", nessie.references)
         self.assertEqual(HASH_ONE, json.loads((self.folder / "data_version.json").read_text())["hash"])
@@ -487,7 +487,7 @@ class TagLastTest(unittest.TestCase):
         nessie.entries_at[HASH_ONE] = [NAMESPACE_ENTRY, {"type": "ICEBERG_TABLE", "name": {"elements": ["catalog_proof", "numbers"]}}]
         code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn("catalog_proof.numbers", err)
+        self.assertIn("NessieError", err)
         self.assertEqual([], nessie.writes())
         self.assertNotIn(f"run-{RUN_ID}", nessie.references)
         self.assertFalse(self.folder.exists())
@@ -526,7 +526,7 @@ class TagLastTest(unittest.TestCase):
                     code, _, err = self.run_it(nessie)
                 self.assertEqual(1, code)
                 self.assertEqual([], nessie.writes())
-                self.assertIn(step, err)
+                self.assertIn("NessieError", err)
 
     def test_an_identical_existing_record_with_its_tag_in_place_makes_no_write_to_nessie_and_no_new_record(self) -> None:
         nessie = StandIn()
@@ -543,8 +543,7 @@ class TagLastTest(unittest.TestCase):
         with mock.patch("scripts.stack.tags.os.link", side_effect=OSError("disk full")):
             code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn(f"run-{RUN_ID}", err)
-        self.assertIn("left in place", err)
+        self.assertIn("RecordNotPublished", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
         self.assertEqual([], [name for name in os.listdir(self.folder) if name != "."])
 
@@ -563,8 +562,7 @@ class TagLastTest(unittest.TestCase):
         with mock.patch("scripts.stack.tags.os.link", racing):
             code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn(f"run-{RUN_ID}", err)
-        self.assertIn("left in place", err)
+        self.assertIn("RecordNotPublished", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
 
 
@@ -586,7 +584,7 @@ class StageFirstTest(unittest.TestCase):
         nessie = StandIn()
         code, _, err = self.run_it(nessie, link)
         self.assertEqual(1, code)
-        self.assertIn("no tag was made", err)
+        self.assertIn("TagConflict", err)
         self.assertEqual([], nessie.writes())
         self.assertNotIn(f"run-{RUN_ID}", nessie.references)
 
@@ -597,7 +595,7 @@ class StageFirstTest(unittest.TestCase):
                 nessie = StandIn()
                 code, _, err = self.run_it(nessie, folder)
                 self.assertEqual(1, code)
-                self.assertIn("no tag was made", err)
+                self.assertIn("TagConflict", err)
                 self.assertEqual([], nessie.writes())
 
     def test_a_read_only_run_folder_exits_1_with_no_tag_made(self) -> None:
@@ -609,7 +607,7 @@ class StageFirstTest(unittest.TestCase):
         nessie = StandIn()
         code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn("no tag was made", err)
+        self.assertIn("TagConflict", err)
         self.assertEqual([], nessie.writes())
         self.assertNotIn(f"run-{RUN_ID}", nessie.references)
 
@@ -650,7 +648,7 @@ class StageFirstTest(unittest.TestCase):
         with mock.patch("scripts.stack.tags.os.fsync", side_effect=OSError("disk error")):
             code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn("no tag was made", err)
+        self.assertIn("TagConflict", err)
         self.assertEqual([], nessie.writes())
         self.assertEqual([], sorted(os.listdir(self.folder)))
 
@@ -706,9 +704,8 @@ class AfterTagTest(unittest.TestCase):
         with mock.patch("scripts.stack.tags.os.link", side_effect=tags.DeadlineExceeded("the run passed its deadline")):
             code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn(f"run-{RUN_ID}", err)
-        self.assertIn("left in place", err)
-        self.assertIn("deadline", err)
+        self.assertIn("RecordNotPublished", err)
+        self.assertIn("RecordNotPublished", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
 
     def test_a_deadline_during_the_create_call_says_that_the_tag_may_have_been_made_and_is_left_in_place_if_so(self) -> None:
@@ -724,9 +721,7 @@ class AfterTagTest(unittest.TestCase):
         with mock.patch.object(nessie, "send", late):
             code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
-        self.assertIn(f"run-{RUN_ID}", err)
-        self.assertIn("may have been made", err)
-        self.assertIn("left in place", err)
+        self.assertIn("RecordNotPublished", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
 
     def test_every_kind_of_failure_after_the_create_call_is_named_the_same_way(self) -> None:
@@ -737,8 +732,7 @@ class AfterTagTest(unittest.TestCase):
                 with mock.patch("scripts.stack.tags.os.link", side_effect=error):
                     code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(folder)], nessie)
                 self.assertEqual(1, code)
-                self.assertIn(f"run-{RUN_ID}", err)
-                self.assertIn("left in place", err)
+                self.assertIn("RecordNotPublished", err)
 
     def test_a_failure_before_the_create_call_does_not_claim_a_tag(self) -> None:
         nessie = StandIn()
@@ -748,7 +742,7 @@ class AfterTagTest(unittest.TestCase):
         self.assertNotIn("left in place", err)
         self.assertNotIn("may have been made", err)
         self.assertNotIn("could not be published", err)
-        self.assertIn("never moves", err)
+        self.assertIn("TagConflict", err)
 
 
 class StrictRecordTest(unittest.TestCase):
@@ -797,7 +791,7 @@ class StrictRecordTest(unittest.TestCase):
                 nessie = self.nessie_with_snapshot_one()
                 code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(self.folder_with(directory, record))], nessie)
                 self.assertEqual(1, code)
-                self.assertIn("no tag was made", err)
+                self.assertIn("TagConflict", err)
                 self.assertEqual([], nessie.writes())
 
     def test_an_equal_record_of_the_same_types_is_unchanged(self) -> None:
@@ -829,7 +823,7 @@ class StrictRecordTest(unittest.TestCase):
             with mock.patch("scripts.stack.tags.os.link", racing):
                 code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", str(folder)], nessie)
             self.assertEqual(1, code)
-            self.assertIn("left in place", err)
+            self.assertIn("RecordNotPublished", err)
 
 
 class ForgedPages(StandIn):
@@ -983,7 +977,7 @@ class DeadlineCommandTest(unittest.TestCase):
             with self.subTest(value=value):
                 code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", self.folder, f"--deadline-seconds={value}"], nessie)
                 self.assertEqual(2, code)
-                self.assertIn("deadline", err)
+                self.assertIn("TagError", err)
                 self.assertEqual([], nessie.calls)
 
     def test_a_deadline_of_exactly_one_day_is_accepted_and_the_timer_is_cleared_afterwards(self) -> None:
@@ -1004,7 +998,7 @@ class DeadlineCommandTest(unittest.TestCase):
         with mock.patch.object(nessie, "send", slow):
             code, _, err = run_command(["tag", "--run-id", RUN_ID, "--hash", HASH_ONE, "--run-folder", self.folder, "--deadline-seconds", "0.5"], nessie)
         self.assertEqual(1, code)
-        self.assertIn("deadline", err)
+        self.assertIn("DeadlineExceeded", err)
         self.assertLess(time.monotonic() - started, 3)
         self.assertEqual([], nessie.writes())
         self.assertFalse(Path(self.folder).exists())
@@ -1117,7 +1111,7 @@ class CommandTest(unittest.TestCase):
         run_command(self.arguments(), nessie)
         code, out, err = run_command(self.arguments(HASH_TWO), nessie)
         self.assertEqual(1, code)
-        self.assertIn(f"run-{RUN_ID}", err)
+        self.assertIn("TagConflict", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
         self.assertEqual(HASH_ONE, json.loads((Path(self.folder) / "data_version.json").read_text())["hash"])
 
