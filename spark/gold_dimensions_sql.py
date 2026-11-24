@@ -6,7 +6,7 @@ patient split or a laboratory result: a dimension reads its source columns only,
 
 from __future__ import annotations
 
-from spark.gold_dimensions import KEY_HEX_DIGITS, KEY_LIMIT, NAMESPACE, UNKNOWN_KEY, Dimension, GoldDimensionsError
+from spark.gold_dimensions import KEY_HEX_DIGITS, KEY_LIMIT, NAMESPACE, UNKNOWN_KEY, Dimension, GoldDimensionsError, version_date
 from spark.settings import CATALOG
 from spark.silver_cases_sql import PLAIN_NAME, sql
 
@@ -39,11 +39,16 @@ def table_name(item: Dimension) -> str:
     return f"{CATALOG}.{NAMESPACE}.{plain(item.name)}"
 
 
-def key_expression(item: Dimension, column: str) -> str:
-    """The surrogate key of the natural key in ``column``: the first ``KEY_HEX_DIGITS`` hex digits of the SHA-256 of ``<dimension>:<natural key as text>``, as a
-    number. It is the rule of ``surrogate_key``, and the job checks every written key against that function."""
-    text = f"CONCAT('{plain(item.name)}:', CAST({quoted(column)} AS STRING))"
+def key_expression(item: Dimension, column: str, valid_from: str) -> str:
+    """The surrogate key of the version of the member whose natural key is in ``column`` and whose version starts at the expression ``valid_from``: the first
+    ``KEY_HEX_DIGITS`` hex digits of the SHA-256 of ``<dimension>:<natural key as text>:<valid_from>``, as a number. It is the rule of ``surrogate_key``:
+    the job checks every written key against it."""
+    text = f"CONCAT('{plain(item.name)}:', CAST({quoted(column)} AS STRING), ':', CAST({valid_from} AS STRING))"
     return f"CAST(CONV(SUBSTRING(SHA2({text}, 256), 1, {KEY_HEX_DIGITS}), 16, 10) AS BIGINT)"
+
+
+def date_literal(as_of: str) -> str:
+    return f"DATE'{version_date(as_of)}'"
 
 
 def members_query(item: Dimension) -> str:
@@ -53,17 +58,83 @@ def members_query(item: Dimension) -> str:
     return sql("SELECT", items, "FROM", source_name(item), "WHERE", quoted(item.source_natural), "IS NOT NULL GROUP BY", groups)
 
 
-def desired_members(item: Dimension) -> str:
-    """The members with their keys, without the unknown member."""
-    names = ", ".join(quoted(column.name) for column in item.columns[1:])
-    return sql("SELECT", key_expression(item, item.natural.name), "AS", quoted(item.key) + ",", names, "FROM (", members_query(item), ")")
+def described(item: Dimension) -> str:
+    return ", ".join(quoted(column.name) for column in item.described)
 
 
-def desired_query(item: Dimension) -> str:
-    """The rows of the dimension: the members and then the unknown member, whose key is ``UNKNOWN_KEY`` and whose other columns are all missing."""
+def new_versions(item: Dimension, as_of: str, members: str) -> str:
+    """The open versions that start on ``as_of`` for the members in the query ``members``, with their keys."""
+    start = date_literal(as_of)
+    key = key_expression(item, item.natural.name, start)
+    return sql(
+        "SELECT",
+        key,
+        "AS",
+        quoted(item.key) + ",",
+        described(item) + ",",
+        start,
+        "AS `valid_from`, CAST(NULL AS DATE) AS `valid_to`, TRUE AS `is_current` FROM (",
+        members,
+        ")",
+    )
+
+
+def unknown_row(item: Dimension) -> str:
+    """The unknown member: the key ``UNKNOWN_KEY``, every other column missing, and ``is_current`` true."""
     unknown = [f"CAST({UNKNOWN_KEY} AS BIGINT) AS {quoted(item.key)}"]
-    unknown += [f"CAST(NULL AS {spark_type(column.type)}) AS {quoted(column.name)}" for column in item.columns[1:]]
-    return sql(desired_members(item), "UNION ALL SELECT", ", ".join(unknown))
+    unknown += [f"CAST(NULL AS {spark_type(column.type)}) AS {quoted(column.name)}" for column in item.described]
+    return ", ".join([*unknown, "CAST(NULL AS DATE) AS `valid_from`", "CAST(NULL AS DATE) AS `valid_to`", "TRUE AS `is_current`"])
+
+
+def desired_query(item: Dimension, as_of: str) -> str:
+    """The rows of a first build: the first version of every member, and then the unknown member."""
+    return sql(new_versions(item, as_of, members_query(item)), "UNION ALL SELECT", unknown_row(item))
+
+
+def held_current(item: Dimension) -> str:
+    key = quoted(item.key)
+    return sql("SELECT * FROM", table_name(item), "WHERE `is_current` AND NOT (" + key, "<=>", f"{UNKNOWN_KEY})")
+
+
+def differs(item: Dimension, left: str, right: str) -> str:
+    """The condition that a descriptive column differs between ``left`` and ``right`` (aliases); false for a dimension that has none."""
+    conditions = [f"NOT ({left}.{quoted(column.name)} <=> {right}.{quoted(column.name)})" for column, _ in item.attributes]
+    return " OR ".join(conditions) if conditions else "FALSE"
+
+
+def changed_members(item: Dimension) -> str:
+    """The members whose descriptive columns differ from their open version: their new description."""
+    natural = quoted(item.natural.name)
+    return sql(
+        "SELECT s.* FROM (", members_query(item), ") s JOIN (", held_current(item), ") c ON", f"s.{natural} = c.{natural}", "WHERE", differs(item, "s", "c")
+    )
+
+
+def fresh_members(item: Dimension) -> str:
+    """The members that the table does not hold."""
+    natural = quoted(item.natural.name)
+    return sql("SELECT s.* FROM (", members_query(item), ") s LEFT ANTI JOIN (", held_current(item), ") c ON", f"s.{natural} = c.{natural}")
+
+
+def next_query(item: Dimension, as_of: str) -> str:
+    """The rows of a later build: every held version as it is, except that the open version of a changed member is closed at ``as_of``, and then the new
+    open versions of the changed members and of the new members. Held versions are never renumbered."""
+    natural, start = quoted(item.natural.name), date_literal(as_of)
+    columns = ", ".join(f"h.{quoted(column.name)}" for column in item.columns[:-2])
+    closing = f"ch.{natural} IS NOT NULL AND h.`is_current`"
+    held = sql(
+        "SELECT",
+        columns + ",",
+        f"CASE WHEN {closing} THEN {start} ELSE h.`valid_to` END AS `valid_to`,",
+        f"CASE WHEN {closing} THEN FALSE ELSE h.`is_current` END AS `is_current` FROM",
+        table_name(item),
+        "h LEFT JOIN (",
+        changed_members(item),
+        ") ch ON",
+        f"h.{natural} = ch.{natural}",
+    )
+    fresh = new_versions(item, as_of, sql("SELECT * FROM (", changed_members(item), ") UNION ALL SELECT * FROM (", fresh_members(item), ")"))
+    return sql(held, "UNION ALL", fresh)
 
 
 def source_facts_query(item: Dimension) -> str:
@@ -80,36 +151,52 @@ def ambiguous_query(item: Dimension) -> str:
 
 
 def output_facts_query(item: Dimension) -> str:
-    """One row of counts over the written table, with the unknown member kept apart from the members."""
+    """One row of counts over the written table, with the unknown member kept apart from the members (the members are the open versions)."""
     key = quoted(item.key)
     member, unknown = f"NOT ({key} <=> {UNKNOWN_KEY})", f"{key} <=> {UNKNOWN_KEY}"
-    holds_a_value = " OR ".join(f"{quoted(column.name)} IS NOT NULL" for column in item.columns[1:])
+    holds_a_value = " OR ".join(f"{quoted(column.name)} IS NOT NULL" for column in (*item.described, *item.columns[-3:-1]))
+    open_version = (
+        "`valid_from` IS NULL OR `is_current` IS NULL OR `is_current` <> (`valid_to` IS NULL) OR (`valid_to` IS NOT NULL AND `valid_to` <= `valid_from`)"
+    )
     items = [
-        SUM_ZERO.format(condition=member, alias="members"),
+        SUM_ZERO.format(condition=f"{member} AND `is_current`", alias="members"),
         SUM_ZERO.format(condition=unknown, alias="unknown_rows"),
         SUM_ZERO.format(condition=f"{unknown} AND ({holds_a_value})", alias="unknown_not_empty"),
         f"COUNT(*) - COUNT(DISTINCT {key}) AS key_duplicates",
         SUM_ZERO.format(condition=f"{member} AND ({key} IS NULL OR {key} <= 0 OR {key} >= {KEY_LIMIT})", alias="key_out_of_range"),
         SUM_ZERO.format(condition=f"{member} AND {quoted(item.natural.name)} IS NULL", alias="natural_null"),
+        SUM_ZERO.format(condition=f"{member} AND ({open_version})", alias="interval_wrong"),
     ]
     return sql("SELECT", ", ".join(items), "FROM", table_name(item))
 
 
 def natural_duplicates_query(item: Dimension) -> str:
-    """The count of natural keys that more than one member of the written table holds."""
+    """The count of natural keys that more than one open version of the written table holds."""
     natural = quoted(item.natural.name)
-    members = f"WHERE NOT ({quoted(item.key)} <=> {UNKNOWN_KEY}) AND {natural} IS NOT NULL"
+    members = f"WHERE `is_current` AND NOT ({quoted(item.key)} <=> {UNKNOWN_KEY}) AND {natural} IS NOT NULL"
     return sql("SELECT COUNT(*) AS n FROM (SELECT", natural, "FROM", table_name(item), members, "GROUP BY", natural, "HAVING COUNT(*) > 1)")
 
 
+def chain_query(item: Dimension) -> str:
+    """The count of closed versions that no version of the same member follows: a version that starts on the day it closes."""
+    natural, key = quoted(item.natural.name), quoted(item.key)
+    closed = sql("SELECT", natural + ", `valid_to` FROM", table_name(item), "WHERE `valid_to` IS NOT NULL AND NOT (" + key, "<=>", f"{UNKNOWN_KEY})")
+    starts = sql("SELECT", natural + ", `valid_from` FROM", table_name(item))
+    return sql("SELECT COUNT(*) AS n FROM (", closed, ") v LEFT ANTI JOIN (", starts, ") w ON", f"v.{natural} = w.{natural} AND v.`valid_to` = w.`valid_from`")
+
+
 def natural_keys_query(item: Dimension) -> str:
-    """The key and the natural key of every member, for the check of the key rule against ``surrogate_key``."""
+    """The key, the natural key and the start of every version, for the check of the key rule against ``surrogate_key``."""
     key = quoted(item.key)
-    return sql("SELECT", key + ",", quoted(item.natural.name), "FROM", table_name(item), "WHERE NOT (" + key, "<=>", f"{UNKNOWN_KEY})")
-
-
-def held_members(item: Dimension) -> str:
-    return sql("SELECT", quoted(item.natural.name), "FROM", table_name(item), "WHERE NOT (" + quoted(item.key), "<=>", f"{UNKNOWN_KEY})")
+    return sql(
+        "SELECT",
+        key + ",",
+        quoted(item.natural.name) + ", CAST(`valid_from` AS STRING) AS `valid_from` FROM",
+        table_name(item),
+        "WHERE NOT (" + key,
+        "<=>",
+        f"{UNKNOWN_KEY})",
+    )
 
 
 def source_distinct(item: Dimension) -> str:
@@ -117,8 +204,12 @@ def source_distinct(item: Dimension) -> str:
     return sql("SELECT DISTINCT", natural, "AS", quoted(item.natural.name), "FROM", source_name(item), "WHERE", natural, "IS NOT NULL")
 
 
+def held_members(item: Dimension) -> str:
+    return sql("SELECT", quoted(item.natural.name), "FROM (", held_current(item), ")")
+
+
 def coverage_queries(item: Dimension) -> tuple[str, str]:
-    """The count of natural keys of the source that the written table has no member for, and of members that the source has no natural key for."""
+    """The count of natural keys of the source that the written table has no open version for, and of open versions that the source has no natural key for."""
     natural = quoted(item.natural.name)
     on = f"ON s.{natural} = t.{natural}"
     missing = sql("SELECT COUNT(*) AS n FROM (", source_distinct(item), ") s LEFT ANTI JOIN (", held_members(item), ") t", on)
@@ -126,11 +217,28 @@ def coverage_queries(item: Dimension) -> tuple[str, str]:
     return missing, extra
 
 
-def held_query(item: Dimension) -> tuple[str, str]:
-    """The counts of the members that the written table holds and a rebuild would remove, and would change: by key, and in any descriptive column."""
-    key = quoted(item.key)
-    held = sql("SELECT", key, "FROM", table_name(item), "WHERE NOT (" + key, "<=>", f"{UNKNOWN_KEY})")
-    removed = sql("SELECT COUNT(*) AS n FROM (", held, ") h LEFT ANTI JOIN (SELECT", key, "FROM (", desired_members(item), ")) d ON", f"h.{key} = d.{key}")
-    differences = " OR ".join(f"NOT (h.{quoted(column.name)} <=> d.{quoted(column.name)})" for column in item.columns[1:])
-    changed = sql("SELECT COUNT(*) AS n FROM", table_name(item), "h JOIN (", desired_members(item), ") d ON", f"h.{key} = d.{key}", "WHERE", differences)
-    return removed, changed
+def member_differs_query(item: Dimension) -> str:
+    """The count of open versions whose descriptive columns are not the source's."""
+    natural = quoted(item.natural.name)
+    return sql(
+        "SELECT COUNT(*) AS n FROM (",
+        held_current(item),
+        ") c JOIN (",
+        members_query(item),
+        ") s ON",
+        f"c.{natural} = s.{natural}",
+        "WHERE",
+        differs(item, "c", "s"),
+    )
+
+
+def held_query(item: Dimension, as_of: str) -> tuple[str, str]:
+    """The counts, before a rebuild writes, of the held members that the source no longer has, and of the changed members whose open version starts on or after
+    ``as_of`` (their new version could not follow it)."""
+    natural = quoted(item.natural.name)
+    removed = sql("SELECT COUNT(*) AS n FROM (", held_current(item), ") h LEFT ANTI JOIN (", source_distinct(item), ") s ON", f"h.{natural} = s.{natural}")
+    not_after = sql(
+        "SELECT COUNT(*) AS n FROM (", held_current(item), ") c JOIN (", members_query(item), ") s ON", f"c.{natural} = s.{natural}",
+        "WHERE (", differs(item, "c", "s"), ") AND c.`valid_from` >=", date_literal(as_of),
+    )  # fmt: skip
+    return removed, not_after

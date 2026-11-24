@@ -33,15 +33,19 @@ from spark.gold_dimensions import (
     count_of,
     source_schema_problems,
     surrogate_key,
+    version_date,
 )
 from spark.gold_dimensions_run import JOB, run, run_build, run_verify
 from spark.gold_dimensions_sql import (
     ambiguous_query,
+    chain_query,
     coverage_queries,
     desired_query,
     held_query,
+    member_differs_query,
     natural_duplicates_query,
     natural_keys_query,
+    next_query,
     output_facts_query,
     source_facts_query,
     table_name,
@@ -65,6 +69,16 @@ class GoldLake(Lake):
     """The Spark steps of a build or a verify, on one branch, through the catalog of the branch (``lake``). The writes, the property steps and the snapshot
     lookup are the Silver job's own."""
 
+    def __init__(self, session: Any, client: Any, branch: str, at: str | None = None, valid_from: str | None = None) -> None:
+        super().__init__(session, client, branch, at)
+        self.valid_from = valid_from
+
+    def version_start(self) -> str:
+        """The version date of this build: it is a build's own argument, and a verify has none."""
+        if self.valid_from is None:
+            raise GoldDimensionsError("bad_date: a build has no version date")
+        return version_date(self.valid_from)
+
     def count(self, query: str) -> int:
         return number(self.session.sql(query).collect()[0], "n")
 
@@ -83,8 +97,8 @@ class GoldLake(Lake):
         return facts
 
     def held_changes(self) -> dict[str, tuple[int, int]]:
-        """For each dimension, the held members that a rebuild would remove and the held members whose descriptive columns it would change. A table that is not
-        there holds none. A table with other columns is never read."""
+        """For each dimension, the held members that the source no longer has and the changed members whose open version starts on or after the version date.
+        A table that is not there holds none. A table with other columns is never read."""
         held: dict[str, tuple[int, int]] = {}
         for item in DIMENSIONS:
             fields = self.columns(table_name(item))
@@ -93,17 +107,20 @@ class GoldLake(Lake):
                 continue
             if fields != self.expected_columns(item):
                 raise GoldDimensionsError(f"inherited_schema: {unit(1, 'table')}")
-            removed, changed = held_query(item)
-            held[item.name] = (self.count(removed), self.count(changed))
+            removed, not_after = held_query(item, self.version_start())
+            held[item.name] = (self.count(removed), self.count(not_after))
         return held
 
     def expected_columns(self, item: Dimension) -> list[tuple[str, str]]:
         return [(column.name, column.type) for column in item.columns]
 
     def write(self, item: Dimension) -> bool:
-        """Write the members and the unknown member of ``item``. True when the table changed."""
+        """Write the versions of ``item``: the first build writes every member and the unknown member, a later build closes and opens versions. True when the
+        table changed."""
         self.session.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{NAMESPACE}")
-        return self.write_frame(self.session.sql(desired_query(item)), table_name(item), {})
+        start = self.version_start()
+        query = next_query(item, start) if self.exists(table_name(item)) else desired_query(item, start)
+        return self.write_frame(self.session.sql(query), table_name(item), {})
 
     def tables_missing(self) -> int:
         return sum(1 for item in DIMENSIONS if not self.exists(table_name(item)))
@@ -118,7 +135,7 @@ class GoldLake(Lake):
         wrong = 0
         for row in self.session.sql(natural_keys_query(item)).collect():
             try:
-                wrong += int(row[item.key] != surrogate_key(item.name, row[item.natural.name]))
+                wrong += int(row[item.key] != surrogate_key(item.name, row[item.natural.name], row["valid_from"]))
             except GoldDimensionsError:
                 wrong += 1
         return wrong
@@ -133,7 +150,9 @@ class GoldLake(Lake):
             found["key_rule_wrong"] = self.key_rule_wrong(item)
             found["source_without_member"] = self.count(missing)
             found["member_without_source"] = self.count(extra)
-            found["member_differs"] = self.count(held_query(item)[1])
+            found["member_differs"] = self.count(member_differs_query(item))
+            found["interval_wrong"] = number(row, "interval_wrong")
+            found["chain_broken"] = self.count(chain_query(item))
             facts[item.name] = found
         return facts
 
@@ -157,7 +176,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         client.config()
         pinned = None if building else client.reference(arguments.branch).hash
         session = build_session(JOB, arguments.branch, pinned)
-        lake = GoldLake(session, client, arguments.branch, pinned)
+        lake = GoldLake(session, client, arguments.branch, pinned, arguments.valid_from if building else None)
         base = client.create_branch(arguments.branch, arguments.base).hash if building else None
         lake.check_sources()
         outcome = (run_build if building else run_verify)(lake)

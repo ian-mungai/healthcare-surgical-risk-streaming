@@ -29,6 +29,7 @@ from spark.gold_dimensions import (
     output_problems,
     source_schema_problems,
     surrogate_key,
+    version_date,
 )
 from spark.silver_cases import NEVER_FEATURE_COLUMNS, OUTCOME_COLUMNS
 
@@ -46,40 +47,42 @@ CLEAN_OUTPUT = {
     "source_without_member": 0,
     "member_without_source": 0,
     "member_differs": 0,
+    "interval_wrong": 0,
+    "chain_broken": 0,
 }
 
 
 class SurrogateKeyTests(unittest.TestCase):
     def test_the_key_is_the_first_fifteen_hex_digits_of_the_sha256_of_the_dimension_and_the_natural_key(self) -> None:
-        # The expected values were computed with `printf '%s' '<dimension>:<natural key>' | shasum -a 256`, not with this code.
+        # The expected values were computed with `printf '%s' '<dimension>:<natural key>:2026-11-23' | shasum -a 256`, not with this code.
         wanted: dict[tuple[str, int | str], int] = {
-            ("dim_case", 1147): 490728173434969448,
-            ("dim_case", 1): 857290165423474409,
-            ("dim_patient", "3333"): 526205457582540561,
-            ("dim_department", "General surgery"): 676727766441803725,
-            ("dim_surgery_type", "Colorectal"): 66628476650243010,
-            ("dim_lab_test", "cr"): 274052057834268368,
-            ("dim_track", "Solar8000/ART_MBP"): 314787920823628088,
-            ("dim_track", "Café/Ünï"): 385790019692443707,
+            ("dim_case", 1147): 422893559182838084,
+            ("dim_case", 1): 197494221555917002,
+            ("dim_patient", "3333"): 986166312712892028,
+            ("dim_department", "General surgery"): 668291668996376548,
+            ("dim_surgery_type", "Colorectal"): 185962443777614359,
+            ("dim_lab_test", "cr"): 434781063390605624,
+            ("dim_track", "Solar8000/ART_MBP"): 1010606676282803311,
+            ("dim_track", "Café/Ünï"): 550888254487257824,
         }
         for (name, natural), key in wanted.items():
             with self.subTest(name=name, natural=natural):
-                self.assertEqual(key, surrogate_key(name, natural))
+                self.assertEqual(key, surrogate_key(name, natural, "2026-11-23"))
 
     def test_a_whole_number_and_its_text_give_the_same_key(self) -> None:
-        self.assertEqual(surrogate_key("dim_case", 1147), surrogate_key("dim_case", "1147"))
+        self.assertEqual(surrogate_key("dim_case", 1147, "2026-11-23"), surrogate_key("dim_case", "1147", "2026-11-23"))
 
     def test_the_same_text_in_two_dimensions_gives_two_keys(self) -> None:
-        self.assertNotEqual(surrogate_key("dim_department", "Other"), surrogate_key("dim_surgery_type", "Other"))
+        self.assertNotEqual(surrogate_key("dim_department", "Other", "2026-11-23"), surrogate_key("dim_surgery_type", "Other", "2026-11-23"))
 
     def test_a_member_keeps_its_key_when_other_members_come_and_go(self) -> None:
-        first = {natural: surrogate_key("dim_case", natural) for natural in (3, 1, 2)}
-        later = {natural: surrogate_key("dim_case", natural) for natural in (9, 2, 8, 3, 1, 7)}
+        first = {natural: surrogate_key("dim_case", natural, "2026-11-23") for natural in (3, 1, 2)}
+        later = {natural: surrogate_key("dim_case", natural, "2026-11-23") for natural in (9, 2, 8, 3, 1, 7)}
         for natural, key in first.items():
             self.assertEqual(key, later[natural])
 
     def test_a_key_is_positive_below_the_limit_and_never_the_unknown_key(self) -> None:
-        keys = [surrogate_key("dim_case", number) for number in range(1, 2001)]
+        keys = [surrogate_key("dim_case", number, "2026-11-23") for number in range(1, 2001)]
         self.assertTrue(all(0 < key < KEY_LIMIT for key in keys))
         self.assertNotIn(UNKNOWN_KEY, keys)
         self.assertEqual(len(keys), len(set(keys)))
@@ -87,11 +90,23 @@ class SurrogateKeyTests(unittest.TestCase):
     def test_a_natural_key_that_is_not_a_whole_number_or_a_text_is_refused(self) -> None:
         for bad in (None, 1.5, True, b"1", ""):
             with self.subTest(bad=bad), self.assertRaises(GoldDimensionsError):
-                surrogate_key("dim_case", bad)  # type: ignore[arg-type]
+                surrogate_key("dim_case", bad, "2026-11-23")  # type: ignore[arg-type]
+
+    def test_a_new_version_of_a_member_has_a_new_key_and_the_old_version_keeps_its_own(self) -> None:
+        self.assertEqual(247720517620395626, surrogate_key("dim_case", 1, "2026-11-24"))
+        self.assertNotEqual(surrogate_key("dim_case", 1, "2026-11-23"), surrogate_key("dim_case", 1, "2026-11-24"))
+
+    def test_a_version_date_that_is_not_a_date_written_year_month_day_is_refused(self) -> None:
+        for bad in ("2026-13-01", "2026-1-1", "20261123", "", "2026-11-23T00:00", None, 20261123):
+            with self.subTest(bad=bad), self.assertRaises(GoldDimensionsError):
+                version_date(bad)  # type: ignore[arg-type]
+            with self.subTest(key=bad), self.assertRaises(GoldDimensionsError):
+                surrogate_key("dim_case", 1, bad)  # type: ignore[arg-type]
+        self.assertEqual("2026-02-28", version_date("2026-02-28"))
 
     def test_a_dimension_that_is_not_one_of_the_six_is_refused(self) -> None:
         with self.assertRaises(GoldDimensionsError):
-            surrogate_key("dim_other", 1)
+            surrogate_key("dim_other", 1, "2026-11-23")
 
 
 class DimensionDefinitionTests(unittest.TestCase):
@@ -109,6 +124,12 @@ class DimensionDefinitionTests(unittest.TestCase):
                 self.assertEqual(item.natural, columns[1])
                 self.assertEqual(len(columns), len({column.name for column in columns}))
 
+    def test_each_dimension_is_type_2_and_ends_with_the_three_version_columns(self) -> None:
+        for item in DIMENSIONS:
+            with self.subTest(name=item.name):
+                self.assertEqual([("valid_from", "date"), ("valid_to", "date"), ("is_current", "boolean")], [(c.name, c.type) for c in item.columns[-3:]])
+                self.assertEqual(("valid_from", "valid_to", "is_current"), tuple(c.name for c in item.columns[-3:]))
+
     def test_no_dimension_holds_an_outcome_a_never_feature_column_an_intraoperative_or_preoperative_value_or_a_laboratory_result(self) -> None:
         banned = {*OUTCOME_COLUMNS, *NEVER_FEATURE_COLUMNS, "result", "value", "samples", "set"}
         for item in DIMENSIONS:
@@ -119,10 +140,12 @@ class DimensionDefinitionTests(unittest.TestCase):
         self.assertTrue({"icu_days", "death_inhosp", "intraop_ebl"} <= banned)
 
     def test_the_patient_dimension_holds_the_patient_number_and_nothing_else(self) -> None:
-        self.assertEqual(["patient_key", "subject_id"], [column.name for column in dimension("dim_patient").columns])
+        self.assertEqual(["patient_key", "subject_id", "valid_from", "valid_to", "is_current"], [column.name for column in dimension("dim_patient").columns])
 
     def test_the_lab_test_dimension_is_the_catalog_of_test_names_and_holds_no_result(self) -> None:
-        self.assertEqual(["lab_test_key", "lab_test_name"], [column.name for column in dimension("dim_lab_test").columns])
+        self.assertEqual(
+            ["lab_test_key", "lab_test_name", "valid_from", "valid_to", "is_current"], [column.name for column in dimension("dim_lab_test").columns]
+        )
 
     def test_a_source_column_exists_in_the_source_table_of_its_dimension(self) -> None:
         from spark.bronze.tables import TRACKS
@@ -225,6 +248,8 @@ class OutputProblemTests(unittest.TestCase):
             "source_without_member": ("source_without_member", 5),
             "member_without_source": ("member_without_source", 6),
             "member_differs": ("member_value_differs", 7),
+            "interval_wrong": ("interval_wrong", 8),
+            "chain_broken": ("version_chain", 9),
         }
         for fact, (code, count) in wanted.items():
             with self.subTest(fact=fact):
@@ -272,7 +297,7 @@ class FrozenProblemTests(unittest.TestCase):
         held = {name: (0, 0) for name in NAMES}
         held["dim_case"] = (2, 0)
         held["dim_track"] = (0, 1)
-        self.assertEqual(["member_removed: dim_case, 2 members", "member_changed: dim_track, 1 member"], frozen_problems(held))
+        self.assertEqual(["member_removed: dim_case, 2 members", "version_date_not_after: dim_track, 1 member"], frozen_problems(held))
 
     def test_a_dimension_that_is_missing_from_the_held_state_is_refused(self) -> None:
         held = {name: (0, 0) for name in NAMES[1:]}

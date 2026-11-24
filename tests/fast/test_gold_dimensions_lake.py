@@ -24,11 +24,14 @@ from unittest import mock
 from spark.gold_dimensions import DIMENSIONS, SOURCE_SCHEMAS, Dimension, GoldDimensionsError, dimension, surrogate_key
 from spark.gold_dimensions_sql import (
     ambiguous_query,
+    chain_query,
     coverage_queries,
     desired_query,
     held_query,
+    member_differs_query,
     natural_duplicates_query,
     natural_keys_query,
+    next_query,
     output_facts_query,
     source_facts_query,
 )
@@ -38,6 +41,7 @@ from spark.settings import CATALOG
 from spark.split_table import BRANCH_MOVED
 
 FIRST, SECOND = "a" * 64, "b" * 64
+DATE, LATER = "2026-11-23", "2026-11-24"
 CASE = dimension("dim_case")
 
 
@@ -144,9 +148,9 @@ def types_of(item: Dimension) -> list[tuple[str, str]]:
     return [(column.name, column.type) for column in item.columns]
 
 
-def lake(tables: dict[str, Frame] | None = None, answers: dict[str, list[Any]] | None = None) -> tuple[GoldLake, list[str]]:
+def lake(tables: dict[str, Frame] | None = None, answers: dict[str, list[Any]] | None = None, valid_from: str | None = DATE) -> tuple[GoldLake, list[str]]:
     log: list[str] = []
-    return GoldLake(Session(tables or {}, answers or {}, log), None, "b"), log  # type: ignore[arg-type]
+    return GoldLake(Session(tables or {}, answers or {}, log), None, "b", None, valid_from), log
 
 
 class SourceTests(unittest.TestCase):
@@ -195,9 +199,9 @@ class FactTests(unittest.TestCase):
 
     def test_a_held_table_is_asked_for_its_removed_and_its_changed_members(self) -> None:
         log: list[str] = []
-        removed, changed = held_query(CASE)
+        removed, changed = held_query(CASE, DATE)
         tables = {f"lake.gold.{item.name}": Frame(types_of(item), [], log) for item in DIMENSIONS}
-        answers = {held_query(item)[0]: [{"n": 0}] for item in DIMENSIONS} | {held_query(item)[1]: [{"n": 0}] for item in DIMENSIONS}
+        answers = {held_query(item, DATE)[0]: [{"n": 0}] for item in DIMENSIONS} | {held_query(item, DATE)[1]: [{"n": 0}] for item in DIMENSIONS}
         answers[removed], answers[changed] = [{"n": 3}], [{"n": 4}]
         job, _ = lake(tables, answers)
         self.assertEqual((3, 4), job.held_changes()["dim_case"])
@@ -226,26 +230,36 @@ class FactTests(unittest.TestCase):
         self.assertEqual(2, job.output_schema_tables_wrong())
 
     def answers_for(self, item: Dimension, stored: list[dict[str, Any]], **counts: int) -> dict[str, list[Any]]:
-        row = {"members": len(stored), "unknown_rows": 1, "unknown_not_empty": 0, "key_duplicates": 0, "key_out_of_range": 0, "natural_null": 0}
+        row = {
+            "members": len(stored),
+            "unknown_rows": 1,
+            "unknown_not_empty": 0,
+            "key_duplicates": 0,
+            "key_out_of_range": 0,
+            "natural_null": 0,
+            "interval_wrong": counts.get("interval_wrong", 0),
+        }
         answers: dict[str, list[Any]] = {output_facts_query(item): [row], natural_keys_query(item): stored}
         missing, extra = coverage_queries(item)
         answers[natural_duplicates_query(item)] = [{"n": counts.get("natural_duplicates", 0)}]
         answers[missing], answers[extra] = [{"n": counts.get("source_without_member", 0)}], [{"n": counts.get("member_without_source", 0)}]
-        answers[held_query(item)[1]] = [{"n": counts.get("member_differs", 0)}]
+        answers[member_differs_query(item)] = [{"n": counts.get("member_differs", 0)}]
+        answers[chain_query(item)] = [{"n": counts.get("chain_broken", 0)}]
         return answers
 
     def facts_of(self, stored_case: list[dict[str, Any]], **counts: int) -> dict[str, dict[str, int]]:
         answers: dict[str, list[Any]] = {}
         for item in DIMENSIONS:
             keyed = [
-                {item.key: surrogate_key(item.name, value), item.natural.name: value} for value in ((1, 2) if item.natural.type == "bigint" else ("a", "b"))
+                {item.key: surrogate_key(item.name, value, DATE), item.natural.name: value, "valid_from": DATE}
+                for value in ((1, 2) if item.natural.type == "bigint" else ("a", "b"))
             ]
             answers |= self.answers_for(item, stored_case if item is CASE else keyed, **(counts if item is CASE else {}))
         job, _ = lake(answers=answers)
         return job.table_facts()
 
     def stored(self, *values: int, wrong: int | None = None) -> list[dict[str, Any]]:
-        rows = [{"case_key": surrogate_key("dim_case", value), "case_id": value} for value in values]
+        rows: list[dict[str, Any]] = [{"case_key": surrogate_key("dim_case", value, DATE), "case_id": value, "valid_from": DATE} for value in values]
         if wrong is not None:
             rows[wrong]["case_key"] += 1
         return rows
@@ -265,6 +279,8 @@ class FactTests(unittest.TestCase):
                 "source_without_member": 0,
                 "member_without_source": 0,
                 "member_differs": 0,
+                "interval_wrong": 0,
+                "chain_broken": 0,
             },
             facts["dim_case"],
         )
@@ -273,14 +289,24 @@ class FactTests(unittest.TestCase):
         self.assertEqual(1, self.facts_of(self.stored(1, 2, 3, wrong=1))["dim_case"]["key_rule_wrong"])
 
     def test_a_member_with_no_natural_key_is_counted_as_a_wrong_key_and_does_not_stop_the_check(self) -> None:
-        stored = [*self.stored(1), {"case_key": 5, "case_id": None}]
+        stored = [*self.stored(1), {"case_key": 5, "case_id": None, "valid_from": DATE}]
         self.assertEqual(1, self.facts_of(stored)["dim_case"]["key_rule_wrong"])
 
     def test_the_counts_of_the_queries_are_carried_into_the_facts(self) -> None:
-        facts = self.facts_of(self.stored(1), natural_duplicates=2, source_without_member=3, member_without_source=4, member_differs=5)["dim_case"]
+        facts = self.facts_of(
+            self.stored(1), natural_duplicates=2, source_without_member=3, member_without_source=4, member_differs=5, interval_wrong=6, chain_broken=7
+        )["dim_case"]
         self.assertEqual(
-            (2, 3, 4, 5), tuple(facts[name] for name in ("natural_duplicates", "source_without_member", "member_without_source", "member_differs"))
+            (2, 3, 4, 5, 6, 7),
+            tuple(
+                facts[name]
+                for name in ("natural_duplicates", "source_without_member", "member_without_source", "member_differs", "interval_wrong", "chain_broken")
+            ),
         )
+
+    def test_a_key_that_is_right_for_another_version_date_is_counted_wrong(self) -> None:
+        stored = [{"case_key": surrogate_key("dim_case", 1, LATER), "case_id": 1, "valid_from": DATE}]
+        self.assertEqual(1, self.facts_of(stored)["dim_case"]["key_rule_wrong"])
 
     def test_the_snapshot_of_each_table_is_asked_by_its_dotted_name(self) -> None:
         job, _ = lake()
@@ -298,28 +324,44 @@ class FactTests(unittest.TestCase):
 class WriteTests(unittest.TestCase):
     def test_a_dimension_that_is_not_there_is_made_from_the_desired_rows_in_the_gold_namespace(self) -> None:
         log: list[str] = []
-        desired = Frame(types_of(CASE), [(1, 1, 0, "a", "b", "c")], log)
-        job, _ = lake(answers={desired_query(CASE): []})
-        job.session.sql = lambda text: desired if text == desired_query(CASE) else log.append(text)
+        desired = Frame(types_of(CASE), [(1, 1, 0, "a", "b", "c", DATE, None, True)], log)
+        job, _ = lake(answers={desired_query(CASE, DATE): []})
+        job.session.sql = lambda text: desired if text == desired_query(CASE, DATE) else log.append(text)
         self.assertTrue(job.write(CASE))
         self.assertEqual(["CREATE NAMESPACE IF NOT EXISTS lake.gold", "property format-version=2", "createOrReplace lake.gold.dim_case"], log)
 
+    def test_a_build_with_no_version_date_writes_nothing(self) -> None:
+        job, log = lake(valid_from=None)
+        with self.assertRaises(GoldDimensionsError):
+            job.write(CASE)
+        self.assertFalse([line for line in log if line.startswith(("createOrReplace", "overwritePartitions"))])
+
     def test_a_dimension_that_already_holds_the_rows_is_not_written_again(self) -> None:
         log: list[str] = []
-        rows = [(1, 1, 0, "a", "b", "c")]
+        rows = [(1, 1, 0, "a", "b", "c", DATE, None, True)]
         tables = {"lake.gold.dim_case": Frame(types_of(CASE), rows, log)}
         job, _ = lake(tables)
-        job.session.sql = lambda text: Frame(types_of(CASE), rows, log) if text == desired_query(CASE) else log.append(text)
+        asked: list[str] = []
+
+        def sql(text: str) -> Any:
+            asked.append(text)
+            return Frame(types_of(CASE), rows, log) if text == next_query(CASE, DATE) else None
+
+        job.session.sql = sql
         job.properties = lambda source: {}  # type: ignore[method-assign]
         self.assertFalse(job.write(CASE))
+        self.assertIn(next_query(CASE, DATE), asked)
+        self.assertNotIn(desired_query(CASE, DATE), asked)
         self.assertFalse([line for line in log if line.startswith(("createOrReplace", "overwritePartitions"))])
 
     def test_a_dimension_with_other_rows_is_overwritten_in_place(self) -> None:
         log: list[str] = []
-        tables = {"lake.gold.dim_case": Frame(types_of(CASE), [(1, 1, 0, "a", "b", "c")], log)}
+        tables = {"lake.gold.dim_case": Frame(types_of(CASE), [(1, 1, 0, "a", "b", "c", DATE, None, True)], log)}
         job, _ = lake(tables)
         job.session.sql = lambda text: (
-            Frame(types_of(CASE), [(1, 1, 0, "a", "b", "c"), (2, 2, 1, "a", "b", "c")], log) if text == desired_query(CASE) else log.append(text)
+            Frame(types_of(CASE), [(1, 1, 0, "a", "b", "c", DATE, None, True), (2, 2, 1, "a", "b", "c", DATE, None, True)], log)
+            if text == next_query(CASE, DATE)
+            else log.append(text)
         )
         job.properties = lambda source: {}  # type: ignore[method-assign]
         self.assertTrue(job.write(CASE))
@@ -363,8 +405,18 @@ class Outcome:
         return {"outcome": "verified"}
 
 
+DATES: list[str | None] = []
+
+
+def seen_outcome(lake: GoldLake) -> Outcome:
+    """The step that records the version date that its lake was given."""
+    DATES.append(lake.valid_from)
+    return Outcome()
+
+
 def call(mode: str, client: Client, sessions: list[StoppableSession]) -> tuple[dict[str, Any], list[tuple[Any, ...]]]:
     calls: list[tuple[Any, ...]] = []
+    DATES.clear()
 
     def build_session(name: str, ref: str, ref_hash: str | None = None) -> StoppableSession:
         calls.append((name, ref, ref_hash))
@@ -379,12 +431,12 @@ def call(mode: str, client: Client, sessions: list[StoppableSession]) -> tuple[d
             open_client=mock.Mock(return_value=client),
             start_deadline=mock.Mock(),
             build_session=build_session,
-            run_verify=mock.Mock(return_value=Outcome()),
-            run_build=mock.Mock(return_value=Outcome()),
+            run_verify=seen_outcome,
+            run_build=seen_outcome,
         ),
         mock.patch.object(GoldLake, "check_sources"),
     ):
-        return gold_dimensions.execute(Namespace(mode=mode, branch="run_b", base="main")), calls
+        return gold_dimensions.execute(Namespace(mode=mode, branch="run_b", base="main", valid_from=DATE)), calls
 
 
 class PinnedVerifyTests(unittest.TestCase):
@@ -406,6 +458,11 @@ class PinnedVerifyTests(unittest.TestCase):
         result, calls = call("build", Client([SECOND]), [])
         self.assertEqual([("gold_dimensions", "run_b", None)], calls)
         self.assertEqual((FIRST, SECOND), (result["base_hash"], result["branch_hash"]))
+        self.assertEqual([DATE], DATES, "a build carries the version date of its run into the lake")
+
+    def test_a_verify_carries_no_version_date(self) -> None:
+        call("verify", Client([FIRST]), [])
+        self.assertEqual([None], DATES)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from scripts.stack.nessie import NessieError
-from spark.gold_dimensions import DIMENSIONS, Dimension, GoldDimensionsError, frozen_problems, input_problems, output_problems
+from spark.gold_dimensions import DIMENSIONS, Dimension, GoldDimensionsError, frozen_problems, input_problems, output_problems, version_date
 from spark.settings import SettingsError
 from spark.silver_cases import unit
 from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, reference_name
@@ -36,6 +36,8 @@ CHECKS = [
     "natural_key",
     "coverage",
     "member_values",
+    "version_chain",
+    "version_intervals",
 ]
 
 
@@ -127,6 +129,14 @@ class QuietParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+def date_argument(text: str) -> str:
+    """A version date. Anything else is a usage error, before anything is called."""
+    try:
+        return version_date(text)
+    except GoldDimensionsError:
+        raise argparse.ArgumentTypeError("not a date") from None
+
+
 def parser() -> argparse.ArgumentParser:
     command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Build or verify the Gold dimensions on a private Nessie branch.")
     modes = command.add_subparsers(dest="mode", required=True)
@@ -138,6 +148,9 @@ def parser() -> argparse.ArgumentParser:
         mode.add_argument("--branch", required=True, type=reference_name, help="the private branch" + (" to create" if name == "build" else " to check"))
         if name == "build":
             mode.add_argument("--base", default="main", type=reference_name, help="the branch to create the private branch from")
+            mode.add_argument(
+                "--valid-from", required=True, type=date_argument, help="the version date of this run, YYYY-MM-DD (the nightly batch passes its data date)"
+            )
     return command
 
 

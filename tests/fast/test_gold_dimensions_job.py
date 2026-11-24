@@ -40,6 +40,8 @@ OUTPUT = {
     "source_without_member": 0,
     "member_without_source": 0,
     "member_differs": 0,
+    "interval_wrong": 0,
+    "chain_broken": 0,
 }
 
 
@@ -110,7 +112,7 @@ class BuildTests(unittest.TestCase):
         ops = Ops(held={**{name: (0, 0) for name in NAMES}, "dim_case": (1, 2)})
         with self.assertRaises(GoldDimensionsError) as caught:
             run_build(ops)
-        self.assertEqual(["member_removed: dim_case, 1 member", "member_changed: dim_case, 2 members"], caught.exception.problems)
+        self.assertEqual(["member_removed: dim_case, 1 member", "version_date_not_after: dim_case, 2 members"], caught.exception.problems)
         self.assertFalse([line for line in ops.log if line.startswith("write")])
 
     def test_every_cause_of_a_failed_input_check_is_named_together(self) -> None:
@@ -198,10 +200,20 @@ class CommandTests(unittest.TestCase):
             seen.append(arguments)
             return {}
 
-        self.call(["build", "--branch", "gold_a"], execute)
-        self.assertEqual("main", seen[0].base)
+        self.call(["build", "--branch", "gold_a", "--valid-from", "2026-11-23"], execute)
+        self.assertEqual(("main", "2026-11-23"), (seen[0].base, seen[0].valid_from))
         code, _, err = self.call(["verify", "--branch", "gold_a", "--base", "main"], lambda arguments: {})
         self.assertEqual((2, f"{JOB}: usage\n"), (code, err))
+
+    def test_a_build_needs_a_real_version_date(self) -> None:
+        for argv in (
+            ["build", "--branch", "gold_a"],
+            ["build", "--branch", "gold_a", "--valid-from", "yesterday"],
+            ["build", "--branch", "g", "--valid-from", "2026-02-30"],
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.call(argv, lambda arguments: {})
+                self.assertEqual((2, "", f"{JOB}: usage\n"), (code, out, err))
 
     def test_a_bad_call_prints_the_code_usage_and_never_the_argument(self) -> None:
         for argv in ([], ["build"], ["build", "--branch", f"bad name {MARKER}"], ["other", "--branch", "x"]):
