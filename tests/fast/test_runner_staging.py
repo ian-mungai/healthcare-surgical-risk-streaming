@@ -131,14 +131,16 @@ def order_problems(source: str) -> list[str]:
         return [*problems, "main or sealed_start is missing"]
     started = call_lines(entry, "sealed_start")
     recorded = call_lines(entry, "recorded_state") + call_lines(entry, "Record") + call_lines(entry, "run_local")
-    if len(started) != 1 or not recorded or started[0] >= min(recorded):
+    if len(started) != 1 or not recorded:
+        return [*problems, "main does not resolve and check the sources once and then record the Git state, make the record and run"]
+    if started[0] >= min(recorded):
         problems.append("main does not resolve and check the sources before it records the Git state, makes the record or runs")
     stops = [
         node
         for node in entry.body
         if isinstance(node, ast.If) and node.body and isinstance(node.body[-1], ast.Return) and node.lineno > started[0] - 1 and node.lineno <= min(recorded)
     ]
-    if len(started) != 1 or len(stops) != 1 or ast.unparse(stops[0].test) != "refused is not None":
+    if len(stops) != 1 or ast.unparse(stops[0].test) != "refused is not None":
         problems.append("main does not return at once when sealed_start refuses")
     resolved, checked = call_lines(start, "resolve_pinned_mounts"), call_lines(start, "check_checkout_source")
     if len(resolved) != 1 or len(checked) != 1 or resolved[0] >= checked[0]:
@@ -241,7 +243,7 @@ class SelectedInputs(unittest.TestCase):
             wrong.append("the selected inputs are not the real paths with their dollars undoubled")
         return wrong
 
-    def test_both_selected_inputs_are_known_to_the_compose_check_by_their_real_paths(self) -> None:
+    def test_both_selected_inputs_are_known_to_the_checkout_check_by_their_real_paths(self) -> None:
         for label, source in (("template", RESOLVE_TEMPLATE), *([("runner", RUNNER.read_text())] if RUNNER.is_file() else [])):
             with self.subTest(source=label):
                 self.assertEqual([], self.wrong(source))
@@ -333,6 +335,8 @@ class Order(unittest.TestCase):
             ("@functools.cache\n", ""),
             ("\n\ndef sealed_start", "\n\nPINS = release_pins()\n\n\ndef sealed_start"),
             ("\n\ndef sealed_start", "\n\nMANIFEST = json.loads(RELEASE_FILE.read_text())\nPINS = None\n\n\ndef sealed_start"),
+            ("    refused = sealed_start()\n", "    refused = None\n"),
+            ("    record = Record()\n    record.revision = recorded_state(ROOT)\n    run_local(record, [], cache)\n", "    pass\n"),
         ):
             with self.subTest(change=new[:50]):
                 self.assertNotEqual(ORDER_GOOD, ORDER_GOOD.replace(old, new), "the change equals the good order")
