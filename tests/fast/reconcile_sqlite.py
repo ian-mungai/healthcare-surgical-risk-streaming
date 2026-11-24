@@ -8,8 +8,9 @@ not one of these is not translated and raises ``ValueError``, so a query that ga
 
 The query is cut once into quoted literals and other text. Every substitution and the join translation read the other text only: a literal is held aside
 and put back unchanged. Only the quoting that the job's queries use is accepted (single-quoted literals, back-quoted plain names, and the backslash pair of the
-typing-rule pattern); a double quote, a comment, a second statement, a bracket name, an escape, a doubled quote, an adjacent pair of quotes or a quote that
-does not close raises. An empty literal (two quotes with a space or a comma after them) is kept.
+typing-rule pattern); a double quote, a comment, a second statement, a bracket name, an escape, a doubled quote, an adjacent pair of quotes, two literals in a
+row (with or without spaces between them) or a quote that does not close raises. An empty literal that stands alone (two quotes with a comma, a space and
+something other than a quote, or the end of the text after them) is kept.
 
 ``World`` holds two cohorts. Case 1 of patient 10 is in the training set, case 2 of patient 20 is in the test set. Each table has the rows of a clean,
 reconciled build for both. A test plants a defect in a cohort and reads what the query counts.
@@ -93,6 +94,8 @@ def hold_literals(query: str) -> tuple[str, list[str]]:
             literal = query[index : end + 1]
             if "\\" in literal.replace(TYPING_PAIR, ""):
                 raise ValueError(f"a backslash escape in a literal is not translated: {literal[:40]!r}")
+            if query[end + 1 :].lstrip(" ").startswith("'"):
+                raise ValueError(f"two literals in a row are not translated (Spark joins them into one, SQLite reads an alias): {query[index:][:40]!r}")
             text += f"{HELD}{len(held)}{HELD}"
             held.append(literal)
             index = end + 1

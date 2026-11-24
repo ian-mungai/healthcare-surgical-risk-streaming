@@ -518,6 +518,12 @@ class Adapter(unittest.TestCase):
             "SELECT ''''",
             "SELECT '''' '' FROM t",
             "SELECT ''''''",
+            "SELECT 'a' 'b' FROM t",
+            "SELECT 'a'   'b' FROM t",
+            "SELECT '' '' FROM t",
+            "SELECT 'a' '' FROM t",
+            "SELECT '' 'b' FROM t",
+            "SELECT 'a' 'b' 'c'",
             "SELECT 'open FROM t",
             "SELECT `open FROM t",
             "SELECT `a b` FROM t",
@@ -532,18 +538,15 @@ class Adapter(unittest.TestCase):
             "SELECT 'a\x00b' FROM t",
             "SELECT \x01 FROM t",
         )
-        self.assertEqual(22, len(forms))
+        self.assertEqual(28, len(forms))
         for text in forms:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 lake.translate(text)
 
-    def test_an_empty_literal_is_kept_and_an_adjacent_pair_of_quotes_is_not_two_empty_literals(self) -> None:
-        for text in ("SELECT '' AS `x` FROM t", "SELECT '', '' FROM t", "SELECT '' '' FROM t", "SELECT ''"):
+    def test_an_empty_literal_that_stands_alone_is_kept(self) -> None:
+        for text in ("SELECT '' AS `x` FROM t", "SELECT '', '' FROM t", "SELECT ''", "SELECT 'a', ''", "SELECT '' , 'b' FROM t"):
             with self.subTest(text=text):
                 self.assertEqual(text, lake.translate(text))
-        for text in ("SELECT '''' FROM t", "SELECT ''''", "SELECT '''' '' FROM t"):
-            with self.subTest(text=text), self.assertRaises(ValueError):
-                lake.translate(text)
 
     def test_the_one_backslash_form_of_the_jobs_own_literals_is_kept(self) -> None:
         text = "SELECT CASE WHEN `c` RLIKE '^-?[0-9]+\\\\z' THEN 1 END AS `n` FROM t"
