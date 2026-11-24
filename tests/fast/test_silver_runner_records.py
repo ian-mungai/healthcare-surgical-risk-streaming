@@ -10,8 +10,10 @@ Failure modes covered here:
 
 - A runner prints a count that the independent read or the decoder answers (the rows of a table, the causes, the arterial seconds), or the rows of a case, or a
   case number in an event list, because a stand-in answered with them.
-- A runner saves the digest of the events (which covers every case that the event table holds, a test-set case too, so it is no development-only value and no
-  Nessie ID) in the facts that go to the record, or prints it.
+- A runner saves a digest of the events (which covers every case that the event table holds, a test-set case too, so it is no development-only value and no
+  Nessie ID) in the facts that go to the record, or prints it, or the job writes one into its result for the runner to read.
+- A rebuild that differs from the tables that the build wrote passes, because the runner no longer compares an events digest and must rest on the job's pass
+  flags and the snapshot IDs.
 - A stand-in answers a count, a list of rows or a list of events where one flag would do: the comparison is made in the container and only the flag leaves it.
 - A refusal that a runner expects is not the line that the real command line prints (``source_table: 0 tables`` for ``source_table: failed``).
 - The spec file of a stand-in (it holds the expected counts and the memberships of the patient sets) leaves the scratch folder that the run removes.
@@ -20,6 +22,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib
 import importlib.util
 import json
@@ -38,7 +41,7 @@ from spark.silver import cli
 from spark.silver.checks import FLAG, SilverSignalsError
 from tests.e2e.run_record import Record
 from tests.fast import test_silver_acceptance as accept
-from tests.fast.silver_accept import HYPOTENSION_JOB, accept_refusal
+from tests.fast.silver_accept import HYPOTENSION_JOB, accept_refusal, accept_write
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 HASH = re.compile(r"[0-9a-f]{64}")
@@ -488,43 +491,58 @@ class HypotensionRecord(unittest.TestCase):
         run.control_events({"branch": "b"})
         self.assertFalse(run.record.observations[-1].passed)
 
-    def hypotension_documents(self) -> tuple[dict[str, Any], Any]:
-        document = accept.hypotension(development_events_digest=90417, branch="b")
+    def hypotension_documents(self, **changes: Any) -> tuple[dict[str, Any], Any]:
+        document = accept.hypotension(branch="b", **changes)
         catalog = accept.HYPO_WROTE
         return document, catalog
 
-    def test_the_digest_of_the_events_is_compared_and_never_saved_or_printed(self) -> None:
+    def test_the_control_records_no_digest_and_a_result_that_holds_one_is_not_accepted(self) -> None:
         run, module = self.run_of({})
         document, catalog = self.hypotension_documents()
         bind_build_pair(run, module, document, catalog)
         run.control()
         self.assertNotIn("digest", facts_text(run))
+        self.assertNotIn("digest", " ".join(observations(run)))
+        self.assertTrue(run.record.observations[-1].passed)
         for marker in MARKERS:
             self.assertNotIn(marker, facts_text(run))
             for text in observations(run):
                 self.assertNotIn(marker, text)
+        document, catalog = self.hypotension_documents(development_events_digest=90417)
+        self.assertFalse(accept_write(0, document, HYPOTENSION_JOB, catalog).ok)
 
-    def test_a_rebuild_with_another_digest_fails_and_the_same_digest_passes(self) -> None:
-        for digest, passed in ((90417, True), (90418, False)):
-            with self.subTest(digest=digest):
+    def test_the_runner_reads_no_digest_from_a_result(self) -> None:
+        source = Path(runner("silver_hypotension").__file__ or "").read_text()
+        reads = [line for line in source.splitlines() if re.search(r"events_digest(?!\": 9)", line) and "extra field" not in line]
+        self.assertEqual([], reads)
+
+    def test_a_rebuild_that_is_the_same_tables_passes_and_a_rebuild_that_differs_fails(self) -> None:
+        both = {"art_mbp_1s": True, "hypotension_events": True}
+        moved = {**accept.HYPO_SNAPSHOTS, "hypotension_events": 13}
+        for label, changes, catalog_changes, passed in (
+            ("the same tables", {}, {}, True),
+            ("the events table differs from the plan", {"passed": {**both, "hypotension_events": False}}, {}, False),
+            ("the series differs from the plan", {"passed": {**both, "art_mbp_1s": False}}, {}, False),
+            ("another snapshot of the events that Nessie holds too", {"snapshots": moved}, {"snapshots": moved}, False),
+        ):
+            with self.subTest(label):
                 run, module = self.run_of({})
                 document, catalog = self.hypotension_documents()
                 bind_build_pair(run, module, document, catalog)
                 built = run.control()
                 kept = {
-                    **accept.hypotension(development_events_digest=digest, branch="b"),
+                    **accept.hypotension(branch="b"),
                     "write_hash": None,
                     "branch_hash": accept.HEAD,
                     "snapshots": dict(accept.HYPO_SNAPSHOTS),
+                    **changes,
                 }
-                kept_catalog = accept.HYPO_KEPT
+                kept_catalog = dataclasses.replace(accept.HYPO_KEPT, snapshots=catalog_changes.get("snapshots", accept.HYPO_KEPT.snapshots))
                 bind_silver(run, module, kept, kept_catalog)
                 run.facts["snapshots"] = dict(accept.HYPO_SNAPSHOTS)
                 with mock.patch.object(run, "head", return_value=accept.HEAD):
                     run.merge_tag_rebuild(built)
                 self.assertEqual(passed, run.record.observations[-1].passed)
-                self.assertNotIn("90417", run.record.observations[-1].observed)
-                self.assertNotIn("90418", run.record.observations[-1].observed)
 
     def test_the_plant_records_flags_for_the_events_and_the_probed_readings(self) -> None:
         run, module = self.run_of({})

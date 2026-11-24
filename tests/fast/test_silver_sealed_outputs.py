@@ -5,7 +5,8 @@ The test set is sealed: a count or a digest over every case changes when one hel
 Failure modes covered here:
 
 - A result holds a row count, a digest, a fingerprint or a count of a cause over every case, held-out cases included.
-- A result holds a number that is not a snapshot ID (or the development events digest of the hypotension job), so a held-out row could change it.
+- A result holds a number that is not a snapshot ID, so a held-out row could change it. The digest of the hypotension job's event table is one: a test-set
+  event row that is inserted changes it, so the job writes no digest of it.
 - Changing one held-out row (its counts, its fingerprint) changes the result in more than the snapshot IDs, the hashes and the pass flags.
 - A refusal or a problem message carries a count of rows, cases, seconds, readings, keys or patients, or the size of a defect changes its text.
 - A result holds the field ``outcome``, which says whether a table was written, so it changes when only a held-out row changes.
@@ -47,6 +48,8 @@ from tests.fast.silver_accept import CHECKS, HYPOTENSION_JOB, RESULT_KEYS, SIGNA
 MESSAGE = re.compile(r"^[a-z_]+: failed$|^" + re.escape(BRANCH_MOVED) + "$")
 VOLATILE = ("snapshots", "source_snapshots", "checked_hash", "write_hash", "branch_hash")
 BANNED_KEYS = ("outcome", "rows", "bronze_rows", "duplicates_dropped", "causes", "fingerprints", "fingerprint", "digest", "count", "counts")
+# A key that holds one of these words is banned too, whatever else its name holds (``development_events_digest`` was one).
+BANNED_WORDS = ("digest", "fingerprint", "count", "cause", "rows", "outcome")
 SNAPSHOT_KEYS = ("snapshots", "source_snapshots")
 
 
@@ -240,10 +243,16 @@ class HypotensionResult(unittest.TestCase):
     def test_the_result_holds_no_key_for_a_count_a_digest_of_every_case_or_a_cause(self) -> None:
         facts = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
         self.assertEqual(set(), keys_of(facts) & set(BANNED_KEYS))
+        self.assertEqual([], [key for key in keys_of(facts) if any(word in key for word in BANNED_WORDS)])
 
-    def test_the_only_numbers_in_the_result_are_snapshot_ids_and_the_development_events_digest(self) -> None:
+    def test_the_only_numbers_in_the_result_are_snapshot_ids(self) -> None:
         for facts in (hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts(), self.verified(hypo.Fake()).facts()):
-            self.assertEqual([], [path for path in numbers(facts) if path[0] not in (*SNAPSHOT_KEYS, "development_events_digest")], facts)
+            self.assertEqual([], [path for path in numbers(facts) if path[0] not in SNAPSHOT_KEYS], facts)
+
+    def test_the_result_holds_exactly_the_hashes_the_snapshot_ids_the_pass_flags_and_the_checks_that_ran(self) -> None:
+        wanted = {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"}
+        for facts in (hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts(), self.verified(hypo.Fake()).facts()):
+            self.assertEqual(wanted, set(facts))
 
     def test_a_held_out_row_that_changes_the_series_changes_only_snapshot_ids_and_hashes(self) -> None:
         first = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
@@ -252,9 +261,25 @@ class HypotensionResult(unittest.TestCase):
         self.assertEqual(stable(first), stable(second))
         self.assertEqual(stable(self.verified(hypo.Fake()).facts()), stable(self.verified(self.other_world(hypo.Fake())).facts()))
 
-    def test_the_events_digest_is_the_only_digest_and_it_is_of_the_development_events(self) -> None:
-        facts = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
-        self.assertEqual(9, facts["development_events_digest"])
+    def inserted_test_set_event(self, fake: hypo.Fake) -> hypo.Fake:
+        """A row of the test set has been inserted into the event table: the digest of that table, which sums a hash of every row, is another one in the plan
+        and in the table that is read back, and the snapshot IDs differ."""
+        fake.planned = {**fake.planned, hypo_run.EVENTS: hypo_run.Digest(77)}
+        fake.read_back = {
+            hypo_run.SERIES: fake.read_back[hypo_run.SERIES],
+            hypo_run.EVENTS: hypo_run.TableRead(hypo_run.Digest(77), 402, events=hypo.EVENT_FACTS),
+        }
+        return fake
+
+    def test_a_test_set_event_row_changes_only_snapshot_ids_and_hashes(self) -> None:
+        first = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
+        second = hypo_run.run_build(self.inserted_test_set_event(hypo.Fake()).operations(), hypo.HEAD).facts()
+        self.assertNotEqual(first["snapshots"], second["snapshots"])
+        self.assertEqual(stable(first), stable(second))
+        self.assertEqual(
+            stable(self.verified(hypo.Fake()).facts()),
+            stable(self.verified(self.inserted_test_set_event(hypo.Fake())).facts()),
+        )
 
     def test_each_table_has_one_pass_flag(self) -> None:
         self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: True}, hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()["passed"])
@@ -451,6 +476,46 @@ class AllowedKeys(unittest.TestCase):
         fake = signals.Fake()
         fake.held = dict(fake.read_back)
         return signals_run.run_verify(fake.operations(), signals.HEAD)
+
+
+def result_field_names(source: str) -> set[str]:
+    """The string keys of every dictionary literal in a source that name a digest, a checksum, a fingerprint or a ``development_`` value."""
+    keys = {
+        node.value
+        for dictionary in ast.walk(ast.parse(source))
+        if isinstance(dictionary, ast.Dict)
+        for node in dictionary.keys
+        if isinstance(node, ast.Constant)
+    }
+    return {
+        key for key in keys if isinstance(key, str) and (key.startswith("development_") or any(word in key for word in ("digest", "checksum", "fingerprint")))
+    }
+
+
+# The only result fields of a Spark job that are named for development cases or that hold a digest, each with its evidence.
+# ``development_*`` of the Silver cases job: the laboratory counts come from ``lab_scope(development=True)`` (the cases of patients in the training and
+# validation sets) and ``development_cases`` is the length of ``development_lengths_query`` (the development sets only). ``checksum`` of the Bronze decoder is a
+# sum over the Bronze signal tables of the cases that the manifest names (its result is not sealed; listed for the lead). ``checksum`` of table
+# maintenance is a sum over a Bronze signal table or the catalog proof table: the result drops it for every other table. The names in the table-check module
+# are the names of a check of the track list's pinned digest, whose detail is one flag (``equal`` 0 or 1).
+RESULT_FIELDS = {
+    "spark/silver_cases_run.py": {"development_cases", "development_lab_rows", "development_lab_copies"},
+    "spark/jobs/bronze_decode.py": {"checksum"},
+    "spark/jobs/table_maintenance.py": {"checksum"},
+    "spark/table_checks.py": {"digest_compared", "rows digest"},
+}
+
+
+class ResultFieldNames(unittest.TestCase):
+    def test_a_job_that_names_a_digest_in_its_result_is_found(self) -> None:
+        self.assertEqual({"development_events_digest"}, result_field_names('def facts():\n    return {"checked_hash": 1, "development_events_digest": 9}\n'))
+        self.assertEqual({"events_checksum", "series_fingerprint"}, result_field_names('x = {"events_checksum": 1, "series_fingerprint": 2, "passed": True}'))
+        self.assertEqual(set(), result_field_names('x = {"passed": True, "snapshots": {}}'))
+
+    def test_the_fields_that_name_a_digest_or_development_cases_are_the_listed_ones_only(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        found = {str(path.relative_to(root)): result_field_names(path.read_text()) for path in sorted((root / "spark").rglob("*.py"))}
+        self.assertEqual(RESULT_FIELDS, {path: names for path, names in found.items() if names})
 
 
 if __name__ == "__main__":

@@ -15,8 +15,9 @@ codes are those of ``spark/silver/cli.py``. The settings come from the environme
 
 The test set is sealed. No rule is estimated from data. The patient split is read after the check of who owns each case and only to find the development cases
 (training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes,
-so the result holds the snapshot IDs, one pass flag for each table and a digest of the event table (no row count; the events are of the development cases
-only), and every check is a flag, and so is every refusal. It never names a count of seconds or of events, a case, a patient, a set, a time or a value.
+so the result holds the snapshot IDs and one pass flag for each table, and no digest of either table (an inserted test-set event row changes the digest of
+the event table too). Every check is a flag, and so is every refusal. It never names a count of seconds or of events, a case, a patient, a set, a time or a
+value.
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ class HypotensionLake(Lake):
 
     def plan(self, at: str) -> dict[str, Fingerprint | Digest]:
         """Build both frames at ``at``, keep them on disk for the write and give their fingerprints. The events are made from the planned series, for the
-        development cases, and their digest has no row count."""
+        development cases, and their digest, which stays in the job to compare with the table that the branch holds, has no row count."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         waveform, _ = self.waveform(at)
         clinical, _ = self.clinical(at)

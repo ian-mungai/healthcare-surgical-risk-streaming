@@ -7,10 +7,10 @@ write is made only while the branch still has the checked hash, each changed tab
 both tables are read again at the hash of the last write. The read-back must be the planned tables, with every check passing.
 
 The test set is sealed. The series holds the held-out cases' seconds and the events are outcomes of the warning, so a count or a digest over the series
-changes with a held-out row and no count of events is ever made. The fingerprint of the series, the counts of the checks and the causes stay inside the job.
-The result holds the hashes, the snapshot IDs, one pass flag for each table, the checks that ran and a digest of the event table (``Digest``, which has no row
-count), which is a measure of the development cases only because the events are made for them only. The checks about events are flags, and every refusal is a
-code and a flag, never a count.
+changes with a held-out row and no count of events is ever made. A digest of the event table changes with an inserted test-set row too, so no digest leaves
+the job. The fingerprint of the series, the digest of the events (``Digest``, which has no row count), the counts of the checks and the causes stay inside the
+job, where they decide the pass flags. The result holds the hashes, the snapshot IDs, one pass flag for each table and the checks that ran. The checks about
+events are flags, and every refusal is a code and a flag, never a count.
 """
 
 from __future__ import annotations
@@ -75,13 +75,12 @@ class Outcome:
     branch_hash: str
     source: InputRead
     tables: dict[str, TableRead]
-    events: Digest
     passed: dict[str, bool]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: hashes, snapshot IDs, one pass flag for each table, the checks that ran and the digest of the development events.
-        It holds no count, no digest of the series and no cause, and no field that says whether a table was written: a held-out row alone changes that, and the
-        write hash and the snapshot IDs show it."""
+        """What the result line may hold: hashes, snapshot IDs, one pass flag for each table and the checks that ran. It holds no count, no digest of either
+        table and no cause, and no field that says whether a table was written: a held-out row alone changes that, and the write hash and the snapshot IDs
+        show it."""
         return {
             "checked_hash": self.checked_hash,
             "write_hash": self.write_hash,
@@ -89,7 +88,6 @@ class Outcome:
             "source_snapshots": dict(zip(("waveform_seconds", "clinical_cases", "patient_split"), self.source.snapshots, strict=True)),
             "snapshots": {table: read.snapshot_id for table, read in self.tables.items()},
             "passed": dict(self.passed),
-            "development_events_digest": self.events.digest,
             "checks_run": list(CHECK_NAMES),
         }
 
@@ -113,13 +111,6 @@ def passed_flags(reads: dict[str, TableRead | None], planned: dict[str, Fingerpr
         EVENTS: events is not None and events.events is not None and not event_problems(events.events),
     }
     return {table: held[table] and (planned is None or not differs(reads[table], planned[table])) for table in TABLES}
-
-
-def events_digest(read: TableRead | None) -> Digest:
-    """The digest of the event table that was read, which is of the development cases only."""
-    if read is None or not isinstance(read.fingerprint, Digest):
-        raise SilverSignalsError(f"table_missing: {FLAG}")
-    return read.fingerprint
 
 
 def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRead | None]:
@@ -181,7 +172,6 @@ def build_inner(ops: Operations, head: str) -> Outcome:
         at,
         source,
         {table: read for table, read in reads.items() if read is not None},
-        events_digest(reads[EVENTS]),
         passed_flags(reads, planned),
     )
 
@@ -209,6 +199,6 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome(head, None, head, source, tables, events_digest(reads[EVENTS]), passed_flags(reads, None))
+        return Outcome(head, None, head, source, tables, passed_flags(reads, None))
     finally:
         ops.release()

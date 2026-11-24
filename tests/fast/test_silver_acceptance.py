@@ -118,7 +118,6 @@ def hypotension(**changes: Any) -> dict[str, Any]:
         "source_snapshots": dict(HYPO_SOURCES),
         "snapshots": dict(HYPO_SNAPSHOTS),
         "passed": {"art_mbp_1s": True, "hypotension_events": True},
-        "development_events_digest": 9,
         **changes,
     }
 
@@ -227,8 +226,8 @@ class ReadResult(unittest.TestCase):
             ("not json", "{"),
             ("a key twice", '{"mode": "build", "mode": "verify"}'),
             ("a key twice inside a map", '{"snapshots": {"a": 1, "a": 2}}'),
-            ("not a number", '{"development_events_digest": NaN}'),
-            ("an infinity", '{"development_events_digest": Infinity}'),
+            ("not a number", '{"snapshots": NaN}'),
+            ("an infinity", '{"snapshots": Infinity}'),
             ("bytes that are not text", b"\xff\xfe{}"),
         ):
             with self.subTest(name):
@@ -357,14 +356,15 @@ class ResultKeys(unittest.TestCase):
         self.assertTrue(sealed(hypotension(mode="verify", base_hash=None, write_hash=None, branch_hash=HEAD), HYPOTENSION_JOB))
 
     def test_one_more_key_at_the_top_fails_every_rule_that_reads_a_result(self) -> None:
-        for extra in ({"outcome": "written"}, {"outcome": "unchanged"}, {"rows": 3}, {"x": None}, {"development_events_digest": 9}):
+        for extra in ({"outcome": "written"}, {"outcome": "unchanged"}, {"rows": 3}, {"x": None}):
             with self.subTest(extra=extra):
                 self.assertFalse(sealed(written(**extra), SIGNALS_JOB))
                 self.assertFalse(wrote(written(**extra), SIGNALS_JOB, WROTE))
                 self.assertFalse(kept(unwritten(**extra), SIGNALS_JOB, KEPT))
                 self.assertFalse(moved(written(**extra), WROTE, BEFORE))
-        for extra in ({"outcome": "written"}, {"count": 1}):
+        for extra in ({"outcome": "written"}, {"count": 1}, {"development_events_digest": 9}):
             with self.subTest(extra=extra):
+                self.assertFalse(sealed(hypotension(**extra), HYPOTENSION_JOB))
                 self.assertFalse(wrote(hypotension(**extra), HYPOTENSION_JOB, HYPO_WROTE))
                 self.assertFalse(kept(hypotension(write_hash=None, branch_hash=HEAD, **extra), HYPOTENSION_JOB, HYPO_KEPT))
 
@@ -372,7 +372,9 @@ class ResultKeys(unittest.TestCase):
         for key in written():
             with self.subTest(missing=key):
                 self.assertFalse(sealed({k: v for k, v in written().items() if k != key}, SIGNALS_JOB))
-        self.assertFalse(sealed({k: v for k, v in hypotension().items() if k != "development_events_digest"}, HYPOTENSION_JOB))
+        for key in hypotension():
+            with self.subTest(missing=key, job=HYPOTENSION_JOB):
+                self.assertFalse(sealed({k: v for k, v in hypotension().items() if k != key}, HYPOTENSION_JOB))
         self.assertFalse(sealed(hypotension(), SIGNALS_JOB))
         self.assertFalse(sealed(written(), HYPOTENSION_JOB))
         self.assertFalse(sealed({}, SIGNALS_JOB))
@@ -410,9 +412,9 @@ class ResultKeys(unittest.TestCase):
                     result = written()
                     result[name] = {**result[name], next(iter(result[name])): value}
                     self.assertFalse(sealed(result, SIGNALS_JOB))
-        self.assertFalse(sealed(hypotension(development_events_digest=True), HYPOTENSION_JOB))
-        self.assertFalse(sealed(hypotension(development_events_digest="9"), HYPOTENSION_JOB))
-        self.assertFalse(sealed(hypotension(development_events_digest=None), HYPOTENSION_JOB))
+        for value in (True, 1.0, "1", None, [1]):
+            with self.subTest(job=HYPOTENSION_JOB, value=value):
+                self.assertFalse(sealed(hypotension(snapshots={"art_mbp_1s": value, "hypotension_events": 12}), HYPOTENSION_JOB))
 
     def test_the_checks_that_ran_are_the_jobs_list_of_check_names(self) -> None:
         self.assertEqual(SIGNALS_CHECKS, CHECKS[SIGNALS_JOB])

@@ -385,7 +385,7 @@ STREAMS = r"(?:out|err|output|stdout|stderr)"
 # The keys of a result or a stand-in's answer that hold a count, a list of rows or causes, a digest or a length: a runner may compare them and never print them.
 COUNT_KEYS = (
     "rows|columns|patients|csv_rows|copies|missing|extra|copies_differ|sampled_cases|sampled_found|cells_wrong|lab_columns|fixed_sample_cases_checked"
-    "|development_cases|development_lab_rows|development_lab_copies|lab_development_rows|lab_development_collapsed|development_events_digest"
+    "|development_cases|development_lab_rows|development_lab_copies|lab_development_rows|lab_development_collapsed"
     "|bronze_numeric|bronze_duplicates|bronze_waveform|silver_numeric|silver_waveform|numeric_causes|waveform_causes|arterial_seconds|series_rows"
     "|series_absent|series_mismatch|clinical_rows|split_rows|waveform_rows|duplicate_keys|seconds|expected_events|stored_events|probes|plant_events"
     "|planted|tracks_added|expected_rows|absent|verdict_mismatch|sample_mismatch|field_mismatch|ledger_mismatch|value_mismatch"

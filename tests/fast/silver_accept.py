@@ -42,7 +42,7 @@ MODES = ("build", "verify")
 ENVELOPE_KEYS = frozenset({"mode", "branch", "base_hash", "job", "tables"})
 FACT_KEYS = frozenset({"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"})
 # The exact keys of the result of each job: any other key, also a harmless one, fails the control.
-RESULT_KEYS = {SIGNALS_JOB: ENVELOPE_KEYS | FACT_KEYS, HYPOTENSION_JOB: ENVELOPE_KEYS | FACT_KEYS | {"development_events_digest"}}
+RESULT_KEYS = {SIGNALS_JOB: ENVELOPE_KEYS | FACT_KEYS, HYPOTENSION_JOB: ENVELOPE_KEYS | FACT_KEYS}
 # The exact keys of the three maps in the result of each job: the tables that it writes, the sources that it reads and the tables with a pass flag.
 TABLE_KEYS = {
     SIGNALS_JOB: {
@@ -168,7 +168,6 @@ def sealed(result: Any, job: str) -> bool:
         and type(result["checks_run"]) is list
         and result["checks_run"] == list(CHECKS[job])
         and maps_ok(result, job)
-        and (whole(result["development_events_digest"]) if job == HYPOTENSION_JOB else True)
     )
 
 

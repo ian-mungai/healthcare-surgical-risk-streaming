@@ -119,14 +119,13 @@ class Build(unittest.TestCase):
         )
         self.assertEqual((HEAD, SECOND_WRITE, SECOND_WRITE), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
 
-    def test_the_result_holds_snapshots_pass_flags_and_the_development_events_digest_and_no_count_or_cause(self) -> None:
+    def test_the_result_holds_snapshots_pass_flags_and_the_checks_that_ran_and_no_digest_count_or_cause(self) -> None:
         facts = run_build(Fake().operations(), HEAD).facts()
         self.assertEqual({SERIES: 101, EVENTS: 102}, facts["snapshots"])
         self.assertEqual({"waveform_seconds": 21, "clinical_cases": 22, "patient_split": 23}, facts["source_snapshots"])
         self.assertEqual({SERIES: True, EVENTS: True}, facts["passed"])
-        self.assertEqual(9, facts["development_events_digest"])
         self.assertEqual(
-            {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "development_events_digest", "checks_run"},
+            {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"},
             set(facts),
         )
         self.assertGreaterEqual(len(facts["checks_run"]), 10)
