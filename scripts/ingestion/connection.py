@@ -221,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         for notice in error.notices:
             sys.stderr.write(f"{render(notice)}\n")
         return 1
-    except OSError:
+    except OSError, UnicodeDecodeError:
         sys.stderr.write("cannot read the selection file\n")
         return 1
 

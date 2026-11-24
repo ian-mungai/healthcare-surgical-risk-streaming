@@ -290,7 +290,7 @@ def read_record(record_dir: Path, run_id: str) -> LoadResult | None:
         text = path.read_text()
     except FileNotFoundError:
         return None
-    except OSError:
+    except OSError, UnicodeDecodeError:
         raise LoadError("the record of this run cannot be read") from None
     return LoadResult.from_json(text)
 
@@ -377,7 +377,7 @@ def earlier_record(record_dir: Path, sha256: str) -> LoadResult | None:
     for path in list_files(record_dir, "*.json"):
         try:
             record = LoadResult.from_json(path.read_text())
-        except LoadError:
+        except LoadError, UnicodeDecodeError:
             continue
         modified = path.stat().st_mtime
         if record.manifest_sha256 == sha256:

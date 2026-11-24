@@ -35,6 +35,7 @@ from scripts.ingestion.record_load import (
     earlier_record,
     load_records,
     manifest_line,
+    read_record,
     recorded_manifest,
     result_tags,
     write_record,
@@ -585,6 +586,26 @@ class LoadRecordShapeTest(unittest.TestCase):
         self.assertIsNone(earlier_record(setup.folder, "0" * 64), "no record holds another manifest")
         self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256))
         self.assertEqual("0" * 64, other.sha256)
+
+    def test_a_record_file_of_invalid_utf_8_is_refused_by_name_when_read_and_is_not_a_record_when_searched(self) -> None:
+        """Join round 2, class of finding 2: ``UnicodeDecodeError`` is not an ``OSError`` or a ``LoadError``, so such a file ended in a traceback."""
+        setup = Setup(self)
+        result = setup.load()
+        (setup.folder / "zzz_not_text.json").write_bytes(b"\xff\xfe")
+        self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256), "a file that is not text is not a record")
+        unreadable = setup.folder / "zzz_unreadable.json"
+        unreadable.write_text("{}")
+        unreadable.chmod(0)
+        try:
+            with self.assertRaises(PermissionError, msg="a file that cannot be opened is an error and is not skipped as not a record"):
+                earlier_record(setup.folder, setup.reference.sha256)
+        finally:
+            unreadable.chmod(0o644)
+        unreadable.unlink()
+        (setup.folder / f"{RUN}.json").write_bytes(b"\xff\xfe")
+        with self.assertRaises(LoadError) as raised:
+            read_record(setup.folder, RUN)
+        self.assertEqual("the record of this run cannot be read", str(raised.exception))
 
     def test_the_run_record_is_written_last_so_a_stop_between_the_two_files_is_an_unfinished_load_that_a_retry_completes(self) -> None:
         setup = Setup(self)

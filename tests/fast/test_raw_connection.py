@@ -230,6 +230,17 @@ class RenderTest(unittest.TestCase):
             code, output, _ = self.render(*self.common(), "--selection", str(path))
         self.assertEqual((1, ""), (code, output))
 
+    def test_a_selection_file_that_cannot_be_read_as_text_or_is_missing_exits_1_with_the_one_fixed_line_and_no_traceback(self) -> None:
+        """Join round 2, finding 2: a file of invalid UTF-8 raised ``UnicodeDecodeError``, which is not an ``OSError``, and ended in a traceback."""
+        with tempfile.TemporaryDirectory() as scratch:
+            invalid = Path(scratch) / "invalid.json"
+            invalid.write_bytes(b'{"name": "\xff\xfe"}')
+            for label, path in (("invalid UTF-8", invalid), ("missing", Path(scratch) / "missing.json"), ("a folder", Path(scratch))):
+                for command in (self.common(), ["selection"]):
+                    with self.subTest(file=label, command=command[0]):
+                        code, output, errors = self.render(*command, "--selection", str(path))
+                        self.assertEqual((1, "", "cannot read the selection file\n"), (code, output, errors))
+
 
 class PinTest(unittest.TestCase):
     def test_each_connector_has_its_amd64_image_digest_recorded_beside_its_version(self) -> None:

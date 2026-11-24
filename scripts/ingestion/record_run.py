@@ -92,7 +92,7 @@ def secret_file(environment: Mapping[str, str], name: str) -> str:
     path = Path(setting(environment, name))
     try:
         value = path.read_text().strip()
-    except OSError:
+    except OSError, UnicodeDecodeError:
         raise SettingsError(f"the file named by {name} cannot be read") from None
     if not value:
         raise SettingsError(f"the file named by {name} is empty")
@@ -110,7 +110,7 @@ def api_address(environment: Mapping[str, str]) -> str:
     """The Airbyte address from the file that the deploy wrote, and nowhere else. ``SettingsError`` unless it is ``http://<private IPv4>:<port>``."""
     try:
         text = Path(setting(environment, "AIRBYTE_API_URL_FILE")).read_text().strip()
-    except OSError:
+    except OSError, UnicodeDecodeError:
         raise SettingsError("the file named by AIRBYTE_API_URL_FILE cannot be read") from None
     try:
         check_api_origin(text)
@@ -123,7 +123,7 @@ def nessie_address(environment: Mapping[str, str]) -> str:
     """The Nessie address as Airbyte's pods reach it, from the file that the deploy wrote beside the credentials. It carries no credential."""
     try:
         text = Path(setting(environment, "AIRBYTE_NESSIE_URL_FILE")).read_text().strip()
-    except OSError:
+    except OSError, UnicodeDecodeError:
         raise SettingsError("the file named by AIRBYTE_NESSIE_URL_FILE cannot be read") from None
     try:
         return plain_http("AIRBYTE_NESSIE_URL_FILE", text)

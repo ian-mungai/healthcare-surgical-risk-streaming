@@ -99,6 +99,28 @@ class SettingsTest(EnvironmentCase):
                     for hidden in (str(self.folder), CLIENT_ID, CLIENT_VALUE, KEY_ID, KEY_VALUE):
                         self.assertNotIn(hidden, str(raised.exception))
 
+    def test_a_file_of_invalid_utf_8_is_named_by_its_setting_like_a_missing_one_and_shows_no_path(self) -> None:
+        """Join round 2, class of finding 2: ``UnicodeDecodeError`` is not an ``OSError``, so a file of invalid UTF-8 ended in a traceback."""
+        for name in (
+            "AIRBYTE_CLIENT_ID_FILE",
+            "AIRBYTE_CLIENT_SECRET_FILE",
+            "AIRBYTE_AWS_ACCESS_KEY_ID_FILE",
+            "AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE",
+            "AIRBYTE_API_URL_FILE",
+            "AIRBYTE_NESSIE_URL_FILE",
+        ):
+            path = Path(self.environment[name])
+            with self.subTest(name=name):
+                original = path.read_bytes()
+                path.write_bytes(b"\xff\xfe\n")
+                try:
+                    with self.assertRaises(SettingsError) as raised:
+                        settings_from_environment(self.environment)
+                finally:
+                    path.write_bytes(original)
+                self.assertIn(name, str(raised.exception))
+                self.assertNotIn(str(self.folder), str(raised.exception))
+
     def test_a_deadline_that_is_not_a_positive_number_is_refused(self) -> None:
         for value in ("0", "-5", "soon", "nan", "inf"):
             with self.subTest(value), self.assertRaises(SettingsError) as raised:
