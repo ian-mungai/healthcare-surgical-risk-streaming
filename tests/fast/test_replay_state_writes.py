@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
@@ -31,6 +32,7 @@ from tests.fast.test_replay_serve import RECORD, REFERENCE, Clock
 REFUSED = render(Notice(Code.OWNED_REFUSED))
 EXISTS = render(Notice(Code.OUTPUT_EXISTS))
 IN_STORE = render(Notice(Code.OUTPUT_IN_STORE))
+RUN_REFUSED = "the run's state folder is not the service's state folder or a folder directly inside it; the run was refused and nothing was written"
 NAME = str(RECORD["run_id"])
 
 
@@ -102,27 +104,31 @@ class HeartbeatTests(Fixture):
         self.assertFalse((self.root / "elsewhere").exists())
 
 
+def serve_until_stopped(harness: ReplayHarness, argv: list[str]) -> tuple[int, str]:
+    """Run the service command line and stop it with SIGTERM from a helper thread that repeats until the command returns, with a deadline."""
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
+    finished = threading.Event()
+
+    def stopper() -> None:
+        deadline = 30.0
+        while not finished.wait(0.2) and (deadline := deadline - 0.2) > 0:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    thread = threading.Thread(target=stopper)
+    thread.start()
+    try:
+        return harness.run_replay(argv)
+    finally:
+        finished.set()
+        thread.join()
+        signal.signal(signal.SIGTERM, previous)
+
+
 class StateFolderCommandTests(ReplayHarness):
     """``serve`` and ``health`` take the state folder, never a file path: the health file is the fixed name ``health.json`` inside it."""
 
     def serve_until_stopped(self, argv: list[str]) -> tuple[int, str]:
-        """Run the service command line and stop it with SIGTERM from a helper thread that repeats until the command returns, with a deadline."""
-        previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
-        finished = threading.Event()
-
-        def stopper() -> None:
-            deadline = 30.0
-            while not finished.wait(0.2) and (deadline := deadline - 0.2) > 0:
-                os.kill(os.getpid(), signal.SIGTERM)
-
-        thread = threading.Thread(target=stopper)
-        thread.start()
-        try:
-            return self.run_replay(argv)
-        finally:
-            finished.set()
-            thread.join()
-            signal.signal(signal.SIGTERM, previous)
+        return serve_until_stopped(self, argv)
 
     def test_serve_with_a_state_folder_writes_health_json_in_it_and_leaves_an_unrelated_file_alone(self) -> None:
         state = self.root / "state"
@@ -156,6 +162,109 @@ class StateFolderCommandTests(ReplayHarness):
         (state / "health.json").write_text(json.dumps({"status": "waiting", "updated": time.time()}))
         code, _ = self.run_replay(["health", "--state", str(state)])
         self.assertEqual(0, code)
+
+
+class QueuedStateFolderTests(ReplayHarness):
+    """A queued run writes its saved position only in the service's state folder or a folder directly inside it. ``replay_record`` is replaced by a run that
+    saves its position through ``StateFile`` in the record's ``state_dir``, as the replayer does."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.inbox = self.state / "inbox"
+        self.saved: list[Path] = []
+
+    def checkpoint_run(self, program: Any) -> Any:
+        def replay(record: Any, flag: object, beat: object) -> int:
+            folder = Path(record.state_dir)
+            self.saved.append(folder)
+            StateFile(folder).save(mock.Mock(to_json=lambda: "saved by the run"))
+            return 0
+
+        return mock.patch.object(program, "replay_record", replay)
+
+    def queue(self, state_dir: Path | str) -> dict[str, Any]:
+        """Queue one run that names ``state_dir``, serve until the service is stopped and return the run's result."""
+        self.inbox.mkdir(exist_ok=True)
+        (self.inbox / "a.json").write_text(json.dumps({**RECORD, "state_dir": str(state_dir)}))
+        (self.inbox / "a.reference").write_text(REFERENCE)
+        code, _ = serve_until_stopped(self, ["serve", "--state", str(self.state), "--inbox", str(self.inbox)])
+        self.assertEqual(0, code)
+        result: dict[str, Any] = json.loads((self.inbox / "results" / "a.json").read_text())
+        return result
+
+    def run_replay(self, argv: list[str], patch: Any = None) -> tuple[int, str]:
+        return super().run_replay(argv, self.checkpoint_run)
+
+    def held_elsewhere(self, folder: Path) -> Path:
+        folder.mkdir(parents=True, exist_ok=True)
+        held = folder / "state.json"
+        held.write_text(ORIGINAL)
+        return held
+
+    def test_a_run_that_names_a_folder_outside_the_state_folder_is_refused_and_the_state_file_there_is_unchanged(self) -> None:
+        held = self.held_elsewhere(self.root / "other")
+        result = self.queue(self.root / "other")
+        self.assertEqual(("failed", 2, RUN_REFUSED), (result["outcome"], result["exit_code"], result["error"]))
+        self.assertEqual(ORIGINAL, held.read_text())
+        self.assertEqual([], self.saved)
+        self.assertEqual(["state.json"], [entry.name for entry in held.parent.iterdir()])
+
+    def test_every_other_form_of_a_folder_outside_is_refused_and_leaves_what_it_names_alone(self) -> None:
+        labels = (
+            "two levels inside",
+            "a sibling that starts with the state folder's name",
+            "the folder above",
+            "a link to a folder outside",
+            "dot dot",
+            "relative",
+        )
+        for label in labels:
+            with self.subTest(named=label):
+                self.setUp()
+                (self.state / "deeper" / "run").mkdir(parents=True)
+                (self.root / "state_sibling").mkdir()
+                (self.state / "linked").symlink_to(self.root / "other")
+                held = self.held_elsewhere(self.root / "other")
+                forms: dict[str, Path | str] = {
+                    "two levels inside": self.state / "deeper" / "run",
+                    "a sibling that starts with the state folder's name": self.root / "state_sibling",
+                    "the folder above": self.root,
+                    "a link to a folder outside": self.state / "linked",
+                    "dot dot": self.state / ".." / "other",
+                    "relative": "other",
+                }
+                named = forms[label]
+                previous = Path.cwd()
+                os.chdir(self.root)
+                try:
+                    result = self.queue(named)
+                finally:
+                    os.chdir(previous)
+                self.assertEqual(RUN_REFUSED, result["error"])
+                self.assertEqual(ORIGINAL, held.read_text())
+                self.assertEqual([], self.saved)
+
+    def test_the_state_folder_itself_and_a_per_run_subfolder_still_work(self) -> None:
+        for name in ("", "replay_0a1b2c3d", "not_made_yet"):
+            with self.subTest(named=name or "the state folder"):
+                self.setUp()
+                named = self.state / name
+                result = self.queue(named)
+                self.assertEqual(("finished", 0, ""), (result["outcome"], result["exit_code"], result["error"]))
+                self.assertEqual([named.resolve()], self.saved)
+                self.assertEqual("saved by the run", (named / "state.json").read_text())
+
+    def test_the_standalone_run_command_keeps_its_folder_whatever_it_is(self) -> None:
+        self.replay_files("run")
+        elsewhere = self.held_elsewhere(self.root / "other")
+        document = json.loads((self.root / "run.json").read_text()) | {"state_dir": str(elsewhere.parent)}
+        (self.root / "run.json").write_text(json.dumps(document))
+        code, _ = self.run_replay(["run", "--run-record", str(self.root / "run.json")])
+        self.assertEqual(0, code)
+        self.assertEqual([elsewhere.parent], self.saved)
+        self.assertEqual("saved by the run", elsewhere.read_text())
 
 
 class QueueWriteTests(Fixture):

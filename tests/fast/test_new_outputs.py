@@ -20,6 +20,7 @@ import types
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from features import batch as features_batch
@@ -203,8 +204,9 @@ class ReplayHarness(Fixture):
         }
         (self.root / "run.json").write_text(json.dumps(document))
 
-    def run_replay(self, argv: list[str]) -> tuple[int, str]:
-        """Run the replay program with the packages that only its image holds replaced by stand-ins, so its own command line and guard run."""
+    def run_replay(self, argv: list[str], patch: Callable[[Any], contextlib.AbstractContextManager[object]] | None = None) -> tuple[int, str]:
+        """Run the replay program with the packages that only its image holds replaced by stand-ins, so its own command line and guard run. ``patch`` gets
+        the program module and returns a context to run it in, for a test that replaces one of its functions."""
         stubs: dict[str, object] = {}
         while True:
             with mock.patch.dict(sys.modules, stubs):
@@ -217,7 +219,7 @@ class ReplayHarness(Fixture):
                         raise
                     stubs[error.name] = mock.MagicMock()
                     continue
-                with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(b""))):
+                with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(b""))), patch(program) if patch else contextlib.nullcontext():
                     return self.run_main(program.main, argv)
 
 

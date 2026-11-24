@@ -7,6 +7,8 @@
 ``compare``   compare the observed file and the saved state with the manifest. Exit 0 only when every expected ID is there with its payload.
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 ``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
+              A record whose ``state_dir`` is not the ``--state`` folder or a folder directly inside it is refused (exit code 2 in its result), so no
+              queued run writes its saved position elsewhere; ``run`` takes the record's ``state_dir`` as it is.
 ``submit``    read a run record on standard input and put it in the inbox under its run ID, with the manifest reference file that ``--manifest-reference``
               names beside it, both as their exact bytes; the same record and reference again change nothing, other bytes under that run ID are
               refused (exit 2), as is a record or reference that is not valid UTF-8 text.
@@ -24,6 +26,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -207,11 +210,22 @@ def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
     return 0
 
 
-def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome:
-    """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text."""
+def inside_state(record: RunRecord, state: Path) -> RunRecord:
+    """The record with its state folder resolved, which must be ``state`` or a folder directly inside it: a run that the service takes keeps its saved
+    position nowhere else. The folder that is checked is the one the run is given, so a link or a ``..`` part cannot lead the run out of it."""
+    folder = Path(record.state_dir).resolve()
+    root = state.resolve()
+    if folder != root and folder.parent != root:
+        raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
+    return replace(record, state_dir=str(folder))
+
+
+def run_request(path: Path, beat: Callable[[], None], flag: StopFlag, state: Path) -> Outcome:
+    """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text. A
+    request whose state folder is not ``state`` or a folder directly inside it fails before anything starts."""
     log("request_start", request=path.stem)
     try:
-        code = replay_record(queued_record(path), flag, beat)
+        code = replay_record(inside_state(queued_record(path), state), flag, beat)
         outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.is_set() else "failed", code)
     except GateRefused as refused:
         outcome = Outcome("failed", 3, describe_error(refused))
@@ -224,7 +238,16 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
 def command_serve(arguments: argparse.Namespace) -> int:
     flag = StopFlag()
     log("serve_start", inbox=str(arguments.inbox))
-    return serve(arguments.inbox, arguments.state, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS, log)
+    return serve(
+        arguments.inbox,
+        arguments.state,
+        lambda path, beat: run_request(path, beat, flag, arguments.state),
+        flag.is_set,
+        time.time,
+        flag.wait,
+        POLL_SECONDS,
+        log,
+    )
 
 
 def command_submit(arguments: argparse.Namespace) -> int:
