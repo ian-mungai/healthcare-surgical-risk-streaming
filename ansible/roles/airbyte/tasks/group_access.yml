@@ -110,14 +110,16 @@
           - "system:serviceaccount:{{ airbyte_namespace }}:{{ airbyte_group_account }}"
       register: airbyte_group_access_checks
       changed_when: false
-      failed_when: airbyte_group_access_checks.stdout | trim != item.answer
+      failed_when:
+        - airbyte_group_access_checks.stdout | trim != item.answer
+          or airbyte_group_access_checks.stderr | trim | length > 0
       check_mode: false
       loop:
-        - {verb: patch, resource: deployments, subresource: scale, answer: "yes"}
-        - {verb: patch, resource: statefulsets, subresource: scale, answer: "yes"}
+        - {verb: patch, resource: deployments.apps, subresource: scale, answer: "yes"}
+        - {verb: patch, resource: statefulsets.apps, subresource: scale, answer: "yes"}
         - {verb: list, resource: pods, answer: "yes"}
-        - {verb: get, resource: deployments, answer: "yes"}
-        - {verb: patch, resource: deployments, answer: "no"}
+        - {verb: get, resource: deployments.apps, answer: "yes"}
+        - {verb: patch, resource: deployments.apps, answer: "no"}
         - {verb: delete, resource: pods, answer: "no"}
         - {verb: create, resource: pods, subresource: exec, answer: "no"}
         - {verb: get, resource: secrets, answer: "no"}
