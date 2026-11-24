@@ -448,9 +448,10 @@ class ServeTest(unittest.TestCase):
         loop.put("a.json", json.dumps(with_read_log("state/reads.log", state_dir="state/replay_0a1b2c3d")))
         with working_in(Path(elsewhere.name)):
             record = queued_record(loop.inbox / "a.json")
-        self.assertEqual(str(loop.root / "state" / "replay_0a1b2c3d"), record.state_dir)
-        self.assertEqual(str(loop.root / "state" / "reads.log"), record.object_store.read_log)
-        self.assertEqual(str(loop.root / "state" / "replay_0a1b2c3d" / "state.json"), str(record.state_path))
+        base = loop.inbox.resolve().parent
+        self.assertEqual(str(base / "state" / "replay_0a1b2c3d"), record.state_dir)
+        self.assertEqual(str(base / "state" / "reads.log"), record.object_store.read_log)
+        self.assertEqual(str(base / "state" / "replay_0a1b2c3d" / "state.json"), str(record.state_path))
 
     def aliased(self, loop: Loop) -> Path:
         """A link to the loop's inbox, in a folder other than the one that holds the inbox."""
@@ -1700,6 +1701,32 @@ class ArchivedRecordTest(unittest.TestCase):
                         self.assertEqual(0, self.cli.main(self.arguments(name, spelled)))
                     self.assertEqual(expected_state, seen[0].state_dir)
                     self.assertEqual(str(self.root / "real" / "state" / "reads.log"), seen[0].object_store.read_log)
+
+    def test_a_record_whose_paths_the_service_refuses_runs_no_command_and_writes_nothing(self) -> None:
+        cases = {
+            "read_log in the inbox": (with_read_log("inbox/next.json", state_dir="state/replay_0a1b2c3d"), "read_log_in_inbox"),
+            "state_dir the inbox": (with_read_log("state/reads.log", state_dir="inbox"), "state_dir_overlaps_inbox"),
+            "state_dir inside the inbox": (with_read_log("state/reads.log", state_dir="inbox/runs/replay_0a1b2c3d"), "state_dir_overlaps_inbox"),
+        }
+        queued = self.inbox / "next.json"
+        queued.write_text('{"queued": true}')
+        for label, (document, code) in cases.items():
+            self.archived.write_text(json.dumps(document))
+            for name in self.cli.COMMANDS:
+                for spelled in (self.inbox, self.link):
+                    with self.subTest(case=label, command=name, inbox=spelled.name):
+                        calls: list[str] = []
+
+                        def capture(record: RunRecord, arguments: Any, calls: list[str] = calls) -> int:
+                            calls.append("called")
+                            return 0
+
+                        stderr = io.StringIO()
+                        with mock.patch.dict(self.cli.COMMANDS, {name: capture}), contextlib.redirect_stderr(stderr):
+                            self.assertEqual(2, self.cli.main(self.arguments(name, spelled)))
+                        self.assertEqual([], calls)
+                        self.assertIn(code, stderr.getvalue())
+                        self.assertEqual('{"queued": true}', queued.read_text())
 
     def test_without_the_inbox_the_record_is_read_as_it_is(self) -> None:
         seen: list[RunRecord] = []
