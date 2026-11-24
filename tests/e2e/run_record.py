@@ -6,10 +6,17 @@ import json
 import re
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+from scripts.aws_cli import AWS_TIMEOUT_SECONDS
+from scripts.infra.host import RELEASE_DEADLINE_SECONDS
+from scripts.infra.teardown import GONE_DEADLINE_SECONDS
+from scripts.infra.terraform_wrapper import APPLY_TIMEOUT_SECONDS, INIT_TIMEOUT_SECONDS, PLAN_TIMEOUT_SECONDS
+from scripts.process import CompletedProcess, TimeoutExpired, run_command, timeout_text
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_PAYLOAD_CLASS = 3
@@ -20,6 +27,40 @@ FAILED_END = "the failure is fixed and the fix is pushed to hosted CI"
 class StopRun(Exception):
     """Raised inside the steps of a run to end them early. The run's own cleanup then runs, and only after it the record is closed, so no record is saved
     with its cleanup still pending."""
+
+
+MARGIN_SECONDS = 10 * AWS_TIMEOUT_SECONDS
+# The seconds that a command's own bounded steps can take in all, counted from the commands' Terraform calls (a drift check in the fast tests counts them
+# again): the wrapper's plan is the init, the workspace check, the plan and two shows; its apply is two shows and the apply; the inventory is the init, the
+# workspace check and a show; the teardown's plan is two state reads and a wrapper plan; its destroy is two reads, the apply, the Tailscale release and the
+# waits for the bucket and for the removal checks.
+STEP_SECONDS: dict[tuple[str, str], int] = {
+    ("scripts.infra.terraform_wrapper", "plan"): INIT_TIMEOUT_SECONDS + 4 * PLAN_TIMEOUT_SECONDS,
+    ("scripts.infra.terraform_wrapper", "apply"): 2 * PLAN_TIMEOUT_SECONDS + APPLY_TIMEOUT_SECONDS,
+    ("scripts.infra.inventory", ""): INIT_TIMEOUT_SECONDS + 2 * PLAN_TIMEOUT_SECONDS,
+    ("scripts.infra.teardown", "plan"): INIT_TIMEOUT_SECONDS + 6 * PLAN_TIMEOUT_SECONDS,
+    ("scripts.infra.teardown", "destroy"): 2 * PLAN_TIMEOUT_SECONDS + APPLY_TIMEOUT_SECONDS + RELEASE_DEADLINE_SECONDS + 2 * GONE_DEADLINE_SECONDS,
+}
+
+
+class StepTimedOut(Exception):
+    """A step's outer deadline passed. It is not a ``RuntimeError``, so no runner's cleanup that catches a failed step removes anything: a child of the step
+    can still run, and what it is changing is not known. The runner records the failed step, keeps the binding of its bucket and closes the record."""
+
+
+def command_deadline(module: str, arguments: Sequence[str], default: float) -> float:
+    """The outer deadline of a command that a runner starts: more than the sum of the command's own bounded steps (``STEP_SECONDS``) by ``MARGIN_SECONDS``,
+    so the runner never stops a command that is still inside its own deadline. A command with no Terraform step keeps the runner's ``default``."""
+    steps = STEP_SECONDS.get((module, arguments[0] if arguments else ""))
+    return default if steps is None else steps + MARGIN_SECONDS
+
+
+def timed_command(step: str, program: str, args: Sequence[str], **options: Any) -> CompletedProcess[str]:
+    """``run_command`` whose timeout is a ``StepTimedOut`` that names ``step`` and the deadline and never the arguments, which can hold private names."""
+    try:
+        return run_command(program, args, **options)
+    except TimeoutExpired:
+        raise StepTimedOut(timeout_text(step, options["timeout"])) from None
 
 
 @dataclass
