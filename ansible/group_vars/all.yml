@@ -85,7 +85,7 @@ compose_stack_built_images:
     dockerfile: spark/Dockerfile
   - tag: surgical-risk-replay:1.7.2
     name: replay
-    sources: [replay, scripts, tests]
+    sources: [replay, scripts, features, tests]
     context: "."
     dockerfile: replay/Dockerfile
 # The namespace of the first commit that the deploy gives Nessie's main branch.
