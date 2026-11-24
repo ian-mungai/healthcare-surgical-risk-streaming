@@ -19,6 +19,12 @@ Failure modes covered here:
 - A result passes with a checked hash, a base hash, a branch hash, a write hash or a snapshot ID (of a source or of an output) that the catalog does not hold
   (another hash, another ID, a table without an ID, a source snapshot 17 where the catalog holds 1).
 - A stand-in script that calls a name nobody defines (a helper that was dropped) passes: it fails only when the container runs it.
+- A result that names another branch than the one that was asked for (``different_branch``) passes when its hashes and snapshot IDs match the catalog: the
+  branch is compared first.
+- The record of a rejected result holds a value of the file (a snapshot 17, a synthetic field, a refusal code that was not wanted): a rejected result gives one
+  fixed phrase of the closed list ``REASONS`` or ``REFUSAL_REASONS`` and no value.
+- A call that exits with a usage error passes when a result file is there, because the parse of a file that holds ``[]`` returns no document: the presence of
+  anything in the result folder is read before any parse, and a folder that cannot be listed counts as holding something.
 """
 
 from __future__ import annotations
@@ -32,33 +38,42 @@ from typing import Any
 from spark.jobs.silver_hypotension import CHECK_NAMES as HYPOTENSION_CHECKS
 from spark.jobs.silver_signals import CHECK_NAMES as SIGNALS_CHECKS
 from tests.fast.silver_accept import (
+    AS_KEEP,
+    AS_WRITE,
     CHECKS,
     HYPOTENSION_JOB,
+    REASONS,
     SIGNALS_JOB,
     Catalog,
     catalog_matches,
+    evidence,
     kept,
     moved_null_ok,
     read_result,
+    refusal_evidence,
     refusal_matches,
+    refusal_rejection,
     refused,
+    rejection,
+    result_present,
     sealed,
     undefined_names,
+    usage_refused,
     wrote,
 )
 
-HEAD, WRITE = "a" * 64, "b" * 64
+HEAD, WRITE_HASH = "a" * 64, "b" * 64
 BEFORE = {"numeric_observations": 11, "waveform_seconds": 12}
 AFTER = {"numeric_observations": 11, "waveform_seconds": 13}
 SOURCES = {"numeric_observations": 1, "waveform_seconds": 2, "tracks": 3}
 PASSED = {"numeric_observations": True, "waveform_seconds": True}
-WROTE = Catalog(checked=HEAD, base=HEAD, head=WRITE, sources=SOURCES, snapshots=AFTER)
-KEPT = Catalog(checked=HEAD, base=HEAD, head=HEAD, sources=SOURCES, snapshots=BEFORE)
-VERIFIED = Catalog(checked=HEAD, base=None, head=HEAD, sources=SOURCES, snapshots=BEFORE)
+WROTE = Catalog(branch="b", checked=HEAD, base=HEAD, head=WRITE_HASH, sources=SOURCES, snapshots=AFTER)
+KEPT = Catalog(branch="b", checked=HEAD, base=HEAD, head=HEAD, sources=SOURCES, snapshots=BEFORE)
+VERIFIED = Catalog(branch="b", checked=HEAD, base=None, head=HEAD, sources=SOURCES, snapshots=BEFORE)
 HYPO_SOURCES = {"waveform_seconds": 1, "clinical_cases": 2, "patient_split": 3}
 HYPO_SNAPSHOTS = {"art_mbp_1s": 11, "hypotension_events": 12}
-HYPO_WROTE = Catalog(checked=HEAD, base=HEAD, head=WRITE, sources=HYPO_SOURCES, snapshots=HYPO_SNAPSHOTS)
-HYPO_KEPT = Catalog(checked=HEAD, base=HEAD, head=HEAD, sources=HYPO_SOURCES, snapshots=HYPO_SNAPSHOTS)
+HYPO_WROTE = Catalog(branch="b", checked=HEAD, base=HEAD, head=WRITE_HASH, sources=HYPO_SOURCES, snapshots=HYPO_SNAPSHOTS)
+HYPO_KEPT = Catalog(branch="b", checked=HEAD, base=HEAD, head=HEAD, sources=HYPO_SOURCES, snapshots=HYPO_SNAPSHOTS)
 
 
 def written(**changes: Any) -> dict[str, Any]:
@@ -70,8 +85,8 @@ def written(**changes: Any) -> dict[str, Any]:
         "tables": ["silver.numeric_observations", "silver.waveform_seconds"],
         "checks_run": list(SIGNALS_CHECKS),
         "checked_hash": HEAD,
-        "write_hash": WRITE,
-        "branch_hash": WRITE,
+        "write_hash": WRITE_HASH,
+        "branch_hash": WRITE_HASH,
         "source_snapshots": dict(SOURCES),
         "snapshots": dict(AFTER),
         "passed": dict(PASSED),
@@ -207,7 +222,7 @@ class Writes(unittest.TestCase):
             {"write_hash": None},
             {"branch_hash": HEAD},
             {"write_hash": HEAD, "branch_hash": HEAD},
-            {"checked_hash": WRITE},
+            {"checked_hash": WRITE_HASH},
             {"checked_hash": None},
             {"write_hash": ""},
         ):
@@ -216,6 +231,11 @@ class Writes(unittest.TestCase):
         self.assertFalse(wrote({}, SIGNALS_JOB, WROTE))
         self.assertFalse(wrote({"outcome": "written"}, SIGNALS_JOB, WROTE))
         self.assertFalse(wrote(None, SIGNALS_JOB, WROTE))
+
+    def test_a_result_that_names_another_branch_is_no_write_and_no_keep_although_every_hash_and_snapshot_agrees(self) -> None:
+        self.assertFalse(wrote(written(branch="different_branch"), SIGNALS_JOB, WROTE))
+        self.assertFalse(kept(unwritten(branch="different_branch"), SIGNALS_JOB, KEPT))
+        self.assertFalse(kept(verified(branch="different_branch"), SIGNALS_JOB, VERIFIED))
 
     def test_a_catalog_that_did_not_move_is_not_a_write(self) -> None:
         self.assertFalse(wrote(written(), SIGNALS_JOB, KEPT))
@@ -229,7 +249,7 @@ class Writes(unittest.TestCase):
         self.assertFalse(wrote(unwritten(), SIGNALS_JOB, KEPT))
 
     def test_a_kept_result_needs_each_hash(self) -> None:
-        for change in ({"write_hash": WRITE}, {"branch_hash": WRITE}, {"checked_hash": None, "branch_hash": None}):
+        for change in ({"write_hash": WRITE_HASH}, {"branch_hash": WRITE_HASH}, {"checked_hash": None, "branch_hash": None}):
             with self.subTest(change=change):
                 self.assertFalse(kept(unwritten(**change), SIGNALS_JOB, KEPT))
         self.assertFalse(kept({}, SIGNALS_JOB, KEPT))
@@ -238,6 +258,11 @@ class Writes(unittest.TestCase):
         missing = unwritten()
         del missing["write_hash"]
         self.assertFalse(kept(missing, SIGNALS_JOB, KEPT))
+
+    def test_a_write_hash_that_is_the_checked_hash_is_no_keep_although_the_catalog_agrees(self) -> None:
+        self.assertTrue(catalog_matches(unwritten(write_hash=HEAD), KEPT))
+        self.assertFalse(kept(unwritten(write_hash=HEAD), SIGNALS_JOB, KEPT))
+        self.assertEqual("the result is not a call that wrote nothing", rejection(unwritten(write_hash=HEAD), SIGNALS_JOB, KEPT, AS_KEEP))
 
     def test_a_catalog_that_moved_is_not_a_kept_result(self) -> None:
         self.assertFalse(kept(unwritten(), SIGNALS_JOB, WROTE))
@@ -283,10 +308,10 @@ class MovedNull(unittest.TestCase):
                 self.assertFalse(moved_null_ok(result, WROTE, BEFORE))
 
     def test_a_snapshot_that_the_catalog_does_not_hold_is_not_a_moved_null(self) -> None:
-        self.assertFalse(moved_null_ok(written(), Catalog(HEAD, HEAD, WRITE, SOURCES, {"numeric_observations": 11, "waveform_seconds": 99}), BEFORE))
+        self.assertFalse(moved_null_ok(written(), Catalog("b", HEAD, HEAD, WRITE_HASH, SOURCES, {"numeric_observations": 11, "waveform_seconds": 99}), BEFORE))
 
     def test_a_waveform_snapshot_that_did_not_change_is_not_a_moved_null_although_the_catalog_agrees(self) -> None:
-        agrees = Catalog(checked=HEAD, base=HEAD, head=WRITE, sources=SOURCES, snapshots=BEFORE)
+        agrees = Catalog(branch="b", checked=HEAD, base=HEAD, head=WRITE_HASH, sources=SOURCES, snapshots=BEFORE)
         self.assertTrue(wrote(written(snapshots=dict(BEFORE)), SIGNALS_JOB, agrees))
         self.assertFalse(moved_null_ok(written(snapshots=dict(BEFORE)), agrees, BEFORE))
 
@@ -434,37 +459,41 @@ class CatalogHolds(unittest.TestCase):
     def test_a_hash_or_a_snapshot_ID_that_the_catalog_does_not_hold_fails(self) -> None:
         other = self.OTHER
         for name, result, catalog in (
-            ("branch hash is not the head", written(), Catalog(HEAD, HEAD, other, SOURCES, AFTER)),
+            ("branch hash is not the head", written(), Catalog("b", HEAD, HEAD, other, SOURCES, AFTER)),
             ("reported branch hash differs", written(branch_hash=other), WROTE),
             ("write hash differs", written(write_hash=other), WROTE),
             ("checked hash differs", written(checked_hash=other), WROTE),
             ("base hash differs", written(base_hash=other), WROTE),
-            ("the catalog's checked hash differs", written(), Catalog(other, HEAD, WRITE, SOURCES, AFTER)),
-            ("the catalog's base differs", written(), Catalog(HEAD, other, WRITE, SOURCES, AFTER)),
+            ("the catalog's checked hash differs", written(), Catalog("b", other, HEAD, WRITE_HASH, SOURCES, AFTER)),
+            ("the catalog's base differs", written(), Catalog("b", HEAD, other, WRITE_HASH, SOURCES, AFTER)),
             ("a verify that names a base hash", verified(base_hash=HEAD), VERIFIED),
             ("a verify of a catalog that has a base", verified(), KEPT),
             ("an output snapshot ID differs", written(snapshots={"numeric_observations": 11, "waveform_seconds": 99}), WROTE),
             (
                 "an output snapshot ID is reported and the catalog holds none",
                 written(),
-                Catalog(HEAD, HEAD, WRITE, SOURCES, {**AFTER, "waveform_seconds": None}),
+                Catalog("b", HEAD, HEAD, WRITE_HASH, SOURCES, {**AFTER, "waveform_seconds": None}),
             ),
-            ("a table that the catalog does not hold", written(), Catalog(HEAD, HEAD, WRITE, SOURCES, {"numeric_observations": 11})),
+            ("a table that the catalog does not hold", written(), Catalog("b", HEAD, HEAD, WRITE_HASH, SOURCES, {"numeric_observations": 11})),
             ("a table that the result does not hold", written(snapshots={"numeric_observations": 11}), WROTE),
-            ("none of either", written(snapshots={}), Catalog(HEAD, HEAD, WRITE, SOURCES, {})),
+            ("none of either", written(snapshots={}), Catalog("b", HEAD, HEAD, WRITE_HASH, SOURCES, {})),
             (
                 "both none",
                 written(snapshots={"numeric_observations": None, "waveform_seconds": None}),
-                Catalog(HEAD, HEAD, WRITE, SOURCES, {"numeric_observations": None, "waveform_seconds": None}),
+                Catalog("b", HEAD, HEAD, WRITE_HASH, SOURCES, {"numeric_observations": None, "waveform_seconds": None}),
             ),
             ("a source snapshot 17 where the catalog holds 1", written(source_snapshots={**SOURCES, "numeric_observations": 17}), WROTE),
             ("every source snapshot differs", written(source_snapshots={"numeric_observations": 7, "waveform_seconds": 8, "tracks": 9}), WROTE),
-            ("a source that the catalog does not hold", written(), Catalog(HEAD, HEAD, WRITE, {"numeric_observations": 1, "waveform_seconds": 2}, AFTER)),
+            (
+                "a source that the catalog does not hold",
+                written(),
+                Catalog("b", HEAD, HEAD, WRITE_HASH, {"numeric_observations": 1, "waveform_seconds": 2}, AFTER),
+            ),
             ("a source that the result does not hold", written(source_snapshots={"numeric_observations": 1, "waveform_seconds": 2}), WROTE),
-            ("a source with no ID in the catalog", written(), Catalog(HEAD, HEAD, WRITE, {**SOURCES, "tracks": None}, AFTER)),
-            ("the kept result's write hash", unwritten(write_hash=WRITE), KEPT),
-            ("no head", written(), Catalog(HEAD, HEAD, "", SOURCES, AFTER)),
-            ("no head and a result with no hash", unwritten(checked_hash="", branch_hash=""), Catalog("", "", "", SOURCES, BEFORE)),
+            ("a source with no ID in the catalog", written(), Catalog("b", HEAD, HEAD, WRITE_HASH, {**SOURCES, "tracks": None}, AFTER)),
+            ("the kept result's write hash", unwritten(write_hash=WRITE_HASH), KEPT),
+            ("no head", written(), Catalog("b", HEAD, HEAD, "", SOURCES, AFTER)),
+            ("no head and a result with no hash", unwritten(checked_hash="", branch_hash=""), Catalog("b", "", "", "", SOURCES, BEFORE)),
             ("no result", None, WROTE),
         ):
             with self.subTest(name):
@@ -478,15 +507,145 @@ class CatalogHolds(unittest.TestCase):
         self.assertFalse(
             catalog_matches(
                 written(snapshots={"numeric_observations": True, "waveform_seconds": 1}),
-                Catalog(HEAD, HEAD, WRITE, SOURCES, {"numeric_observations": 1, "waveform_seconds": 1}),
+                Catalog("b", HEAD, HEAD, WRITE_HASH, SOURCES, {"numeric_observations": 1, "waveform_seconds": 1}),
             )
         )
         self.assertFalse(
             catalog_matches(
                 written(source_snapshots={"numeric_observations": True, "waveform_seconds": 2, "tracks": 3}),
-                Catalog(HEAD, HEAD, WRITE, {**SOURCES, "numeric_observations": 1}, AFTER),
+                Catalog("b", HEAD, HEAD, WRITE_HASH, {**SOURCES, "numeric_observations": 1}, AFTER),
             )
         )
+
+
+class Rejections(unittest.TestCase):
+    """A rejected result gives one fixed phrase from a closed list: the rule that failed, and never a value of the file."""
+
+    def test_a_result_that_passes_its_outcome_has_no_rejection(self) -> None:
+        self.assertIsNone(rejection(written(), SIGNALS_JOB, WROTE, AS_WRITE))
+        self.assertIsNone(rejection(unwritten(), SIGNALS_JOB, KEPT, AS_KEEP))
+        self.assertIsNone(rejection(verified(), SIGNALS_JOB, VERIFIED, AS_KEEP))
+        self.assertIsNone(rejection(hypotension(), HYPOTENSION_JOB, HYPO_WROTE, AS_WRITE))
+
+    def test_each_failed_rule_names_its_own_phrase(self) -> None:
+        for name, document, catalog, outcome, reason in (
+            ("no file", None, WROTE, AS_WRITE, "no result file"),
+            ("no catalog", written(), None, AS_WRITE, "the catalog was not read"),
+            ("another branch", written(branch="different_branch"), WROTE, AS_WRITE, "the branch is not the requested one"),
+            ("an extra key", written(outcome="written"), WROTE, AS_WRITE, "the schema is not the job's closed schema"),
+            ("another source snapshot", written(source_snapshots={**SOURCES, "tracks": 17}), WROTE, AS_WRITE, "a hash or a snapshot differs from the catalog"),
+            ("a keep read as a write", unwritten(), KEPT, AS_WRITE, "the result is not a write"),
+            ("a write read as a keep", written(), WROTE, AS_KEEP, "the result is not a call that wrote nothing"),
+        ):
+            with self.subTest(name):
+                self.assertEqual(reason, rejection(document, SIGNALS_JOB, catalog, outcome))
+
+    def test_the_branch_is_compared_before_the_schema_and_the_catalog(self) -> None:
+        both = written(branch="different_branch", outcome="written", checked_hash="0" * 64)
+        self.assertEqual("the branch is not the requested one", rejection(both, SIGNALS_JOB, WROTE, AS_WRITE))
+        self.assertFalse(catalog_matches(written(branch="different_branch"), WROTE))
+
+    def test_every_phrase_is_in_the_closed_list_and_holds_no_value_of_the_file(self) -> None:
+        planted = "synthetic_value_17"
+        for name, document, catalog in (
+            ("a snapshot 17", written(snapshots={"numeric_observations": 17, "waveform_seconds": 17}), WROTE),
+            ("a synthetic field", written(synthetic=planted), WROTE),
+            ("another branch", written(branch=planted), WROTE),
+            ("a hash", written(checked_hash=planted), WROTE),
+            ("a list", [planted], WROTE),
+        ):
+            with self.subTest(name):
+                reason = rejection(document, SIGNALS_JOB, catalog, AS_WRITE)
+                self.assertIn(reason, REASONS)
+                self.assertNotIn(planted, str(reason))
+                self.assertNotIn("17", str(reason))
+
+    def test_a_check_that_the_rejection_does_not_make_is_caught_by_the_other_rules(self) -> None:
+        self.assertIsNotNone(rejection(written(branch="x"), SIGNALS_JOB, WROTE, AS_WRITE))
+        self.assertIsNotNone(rejection(written(write_hash=HEAD, branch_hash=HEAD), SIGNALS_JOB, KEPT, AS_WRITE))
+
+
+class Evidence(unittest.TestCase):
+    NAMES = ("write_hash", "branch_hash", "passed")
+
+    def test_a_result_that_passed_gives_its_named_fields(self) -> None:
+        text = evidence(written(), SIGNALS_JOB, WROTE, AS_WRITE, self.NAMES)
+        self.assertIn(f"write hash {WRITE_HASH}", text)
+        self.assertIn(f"branch hash {WRITE_HASH}", text)
+        self.assertIn("passed {'numeric_observations': True, 'waveform_seconds': True}", text)
+
+    def test_a_result_that_failed_gives_the_fixed_phrase_and_no_value(self) -> None:
+        for name, document in (
+            ("a snapshot 17 and a synthetic field", written(synthetic="synthetic_value_17", snapshots={"numeric_observations": 17, "waveform_seconds": 17})),
+            ("another branch", written(branch="different_branch")),
+            ("a refusal code in a success result", written(passed={"numeric_observations": "unexpected_code_17", "waveform_seconds": True})),
+            ("no file", None),
+        ):
+            with self.subTest(name):
+                text = evidence(document, SIGNALS_JOB, WROTE, AS_WRITE, self.NAMES)
+                self.assertEqual(f"result rejected: {rejection(document, SIGNALS_JOB, WROTE, AS_WRITE)}", text)
+                for value in ("17", "synthetic", "different_branch", "unexpected", HEAD, WRITE_HASH):
+                    self.assertNotIn(value, text)
+
+    def test_a_rejected_catalog_gives_the_fixed_phrase(self) -> None:
+        self.assertEqual("result rejected: the catalog was not read", evidence(written(), SIGNALS_JOB, None, AS_WRITE, self.NAMES))
+
+
+class RefusalEvidence(unittest.TestCase):
+    WANTED = ["waveform_duplicate_second: failed"]
+
+    def test_a_refusal_with_the_wanted_codes_gives_its_codes(self) -> None:
+        self.assertIsNone(refusal_rejection(refusal(), SIGNALS_JOB, "build", self.WANTED))
+        self.assertEqual("refusal ['waveform_duplicate_second: failed']", refusal_evidence(refusal(), SIGNALS_JOB, "build", self.WANTED))
+
+    def test_a_refusal_that_failed_gives_a_fixed_phrase_and_no_code_or_value(self) -> None:
+        for name, document, reason in (
+            ("no file", None, "no result file"),
+            ("an unexpected code", refusal(refusal=["unexpected_code_17: failed"]), "the refusal codes are not the wanted ones"),
+            ("an extra key", {**refusal(), "synthetic": "synthetic_value_17"}, "the refusal document is not the closed refusal schema"),
+            ("a success result", written(), "the refusal document is not the closed refusal schema"),
+            ("another job", refusal(job=HYPOTENSION_JOB, refusal=["unexpected_code_17: failed"]), "the refusal document is not the closed refusal schema"),
+        ):
+            with self.subTest(name):
+                self.assertEqual(reason, refusal_rejection(document, SIGNALS_JOB, "build", self.WANTED))
+                text = refusal_evidence(document, SIGNALS_JOB, "build", self.WANTED)
+                self.assertEqual(f"refusal rejected: {reason}", text)
+                for value in ("17", "unexpected", "synthetic", HEAD):
+                    self.assertNotIn(value, text)
+
+
+class UsageExit(unittest.TestCase):
+    def test_a_usage_exit_with_no_file_passes_and_with_a_file_fails(self) -> None:
+        self.assertTrue(usage_refused(2, False))
+        self.assertFalse(usage_refused(2, True))
+        self.assertFalse(usage_refused(1, False))
+        self.assertFalse(usage_refused(0, False))
+
+    def test_a_folder_with_anything_in_it_has_a_result_present_before_any_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.assertFalse(result_present(root))
+            (root / "result.json").write_text("[]")
+            self.assertTrue(result_present(root))
+            self.assertIsNone(read_result(root / "result.json"))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "result.json").symlink_to(root / "nowhere")
+            self.assertTrue(result_present(root))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "other.tmp").write_bytes(b"\xff")
+            self.assertTrue(result_present(root))
+
+    def test_a_folder_that_cannot_be_listed_counts_as_present(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertTrue(result_present(Path(folder) / "gone"))
+
+    def test_a_usage_exit_with_the_file_of_an_empty_list_fails_the_check(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "result.json").write_text("[]")
+            self.assertFalse(usage_refused(2, result_present(root)))
 
 
 class StandInNames(unittest.TestCase):
