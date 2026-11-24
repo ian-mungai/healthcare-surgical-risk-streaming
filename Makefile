@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 override TERRAFORM := .tools/bin/terraform
 
-.PHONY: setup lock lock-orchestration lock-replay lock-spark check check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
+.PHONY: setup lock lock-orchestration lock-replay lock-spark check headroom check-terraform check-ansible test-fast test-slow test-guards test-deadline host-up host-stop host-start inventory evidence-export evidence-verify teardown-plan host-destroy group-up group-down
 
 setup:
 	python3.14 -m venv .venv
@@ -23,6 +23,9 @@ lock-spark:
 
 check:
 	.venv/bin/pre-commit run --all-files --hook-stage manual
+
+headroom:
+	$(PYTHON) -m scripts.quality.headroom
 
 check-terraform:
 	@test -f $(TERRAFORM) -a -x $(TERRAFORM) || { echo "the pinned Terraform $(TERRAFORM) is missing or not an executable file; run: make setup" >&2; exit 1; }

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.quality.repo_checks import git
@@ -32,42 +33,55 @@ class KeptHookError(RuntimeError):
     """The older hook that pre-commit moved aside cannot be kept."""
 
 
-def hook_path(root: Path) -> Path:
-    return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip() / HOOK_NAME
+@dataclass(frozen=True)
+class LegacyHook:
+    """A hook that runs from the ``<stage>.legacy`` file that pre-commit calls before it hides anything, with the older hook kept beside it."""
+
+    name: str
+    kept_name: str
+    text: str
+    earlier_texts: tuple[str, ...] = ()
 
 
-def installed(root: Path) -> bool:
-    path = hook_path(root)
-    return path.is_file() and path.read_bytes() == HOOK_TEXT.encode() and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
+SCANNER = LegacyHook(HOOK_NAME, KEPT_NAME, HOOK_TEXT, EARLIER_HOOK_TEXTS)
 
 
-def is_scanner(path: Path) -> bool:
-    """Whether the file holds exactly a scan hook text that this repository has shipped, and so is not the owner's hook."""
-    return path.is_file() and path.read_bytes() in (HOOK_TEXT.encode(), *(text.encode() for text in EARLIER_HOOK_TEXTS))
+def hook_path(root: Path, hook: LegacyHook = SCANNER) -> Path:
+    return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip() / hook.name
 
 
-def install(root: Path) -> bool:
+def installed(root: Path, hook: LegacyHook = SCANNER) -> bool:
+    path = hook_path(root, hook)
+    return path.is_file() and path.read_bytes() == hook.text.encode() and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
+
+
+def is_scanner(path: Path, hook: LegacyHook = SCANNER) -> bool:
+    """Whether the file holds exactly a hook text that this repository has shipped, and so is not the owner's hook."""
+    return path.is_file() and path.read_bytes() in (hook.text.encode(), *(text.encode() for text in hook.earlier_texts))
+
+
+def install(root: Path, hook: LegacyHook = SCANNER) -> bool:
     """Write the hook and return True, or return False when it is already installed.
 
-    An older hook at the hook's path is moved to ``pre-commit.legacy.previous`` first, and ``KeptHookError`` is raised when that name is taken.
+    An older hook at the hook's path is moved to ``<name>.previous`` first, and ``KeptHookError`` is raised when that name is taken.
     """
-    if installed(root):
+    if installed(root, hook):
         return False
-    path = hook_path(root)
+    path = hook_path(root, hook)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if os.path.lexists(path) and not is_scanner(path):
-        kept = path.with_name(KEPT_NAME)
+    if os.path.lexists(path) and not is_scanner(path, hook):
+        kept = path.with_name(hook.kept_name)
         if os.path.lexists(kept):
             raise KeptHookError(
                 f"{path.name} holds an older hook and {kept.name} already holds another: compare the two files in {path.parent}, "
                 f"move one away as the owner, then run setup again; nothing was overwritten"
             )
         os.rename(path, kept)
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f"{HOOK_NAME}.")
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f"{hook.name}.")
     os.close(descriptor)
     pending = Path(name)
     try:
-        pending.write_text(HOOK_TEXT)
+        pending.write_text(hook.text)
         pending.chmod(HOOK_MODE)
         os.replace(pending, path)
     finally:

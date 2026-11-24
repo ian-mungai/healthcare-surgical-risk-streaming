@@ -1,27 +1,35 @@
 name: ci
 
 on:
-  pull_request:
   push:
-    branches: [main]
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main')) && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main') }}
 
-# A push to main has a concurrency group of its own (its run), so no push cancels or replaces another run, even the same commit pushed again; a
-# newer commit of the same pull request cancels the older run.
-# Every pull request and every push to main runs every job: no job has a condition, no step tolerates a failure and no run takes the
-# result of an earlier run. The last job waits for all the others and is the one required check: it fails unless each of them succeeded, so a failed,
-# cancelled or skipped job fails the run. tests/fast/test_ci_workflow.py holds the workflow to this.
+# Check-first CI: every run runs every job in full, with no condition on a job or a step, no tolerated failure and no result taken from an earlier run. A run starts on
+# each push of a work branch, on each pull request, once on the main commit that a squash merge creates (the repository's recorded exception: main moves only
+# through a pull request that is up to date with main), every Monday and on demand. A newer push of a work branch or a newer commit of a pull request cancels
+# the older run of its ref; a run on main, a scheduled run and a manual run have a group of their own (their run) and are never cancelled or replaced.
+# The job "required" waits for all the gating jobs and is the one required check: it fails unless each of them succeeded, so a failed, cancelled or
+# skipped job fails the run, and unless every guard shard set its own success output, because GitHub can report success for a leg that never ran.
+# The job "headroom" is outside the required check and waits for it: it reads the run's jobs, the required job included, and fails any job over 80% of its timeout. Each timeout is at least twice the
+# duration recorded beside it. tests/fast/test_ci_workflow.py holds the workflow to all of this.
+# The manual stage that the hooks job runs also scans every lock file for vulnerabilities (Trivy) and every commit message of the history for secrets. Terraform providers
+# are pinned by hash in infra/.terraform.lock.hcl and are not vulnerability-scanned: Trivy 0.76.2 detects no package in a Terraform lock file.
 jobs:
   hooks:
     name: Hooks on every file and the commit messages
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 10 # measured 3.5 min: make setup about 2 minutes (estimate), make check 76 seconds locally; the first hosted run replaces it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,7 +56,7 @@ jobs:
   infrastructure:
     name: Static checks of the Terraform and Ansible code
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 10 # measured 2.5 min: make setup about 2 minutes (estimate), the two static checks 6 seconds locally; the first hosted run replaces it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,7 +77,7 @@ jobs:
   slow:
     name: "The slow tests: Ansible roles, local servers and stand-ins, and planted workflow faults"
     runs-on: ubuntu-24.04
-    timeout-minutes: 25 # estimate until the first hosted run: make setup about 2 minutes, the slow group about 10.5 minutes locally
+    timeout-minutes: 45 # measured 20.5 min: make setup about 2 minutes (estimate), the slow group 18.5 minutes locally on an idle machine; the first hosted run replaces it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,11 +90,19 @@ jobs:
       - run: make setup
       - run: make test-slow
 
-  # Measured hosted wall time of one shard: 5 to 11 minutes.
   guards:
     name: Planted faults through the real commit path, shard ${{ matrix.shard }} of 8
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25 # measured 11 min: hosted wall time of the slowest shard (the shards take 5 to 11 minutes)
+    outputs:
+      shard_1: ${{ steps.leg.outputs.shard_1 }}
+      shard_2: ${{ steps.leg.outputs.shard_2 }}
+      shard_3: ${{ steps.leg.outputs.shard_3 }}
+      shard_4: ${{ steps.leg.outputs.shard_4 }}
+      shard_5: ${{ steps.leg.outputs.shard_5 }}
+      shard_6: ${{ steps.leg.outputs.shard_6 }}
+      shard_7: ${{ steps.leg.outputs.shard_7 }}
+      shard_8: ${{ steps.leg.outputs.shard_8 }}
     strategy:
       fail-fast: false
       matrix:
@@ -136,11 +152,16 @@ jobs:
             runs/*/retention.json
           if-no-files-found: error
           retention-days: 30
+      - id: leg
+        name: Set this shard's own success output
+        run: echo "shard_${SHARD}=success" >> "${GITHUB_OUTPUT}"
+        env:
+          SHARD: ${{ matrix.shard }}
 
   deadline:
     name: A project wait passes its deadline and fails visibly
     runs-on: ubuntu-24.04
-    timeout-minutes: 5 # estimate until the first hosted run: make setup about 2 minutes, the case 10 seconds
+    timeout-minutes: 5 # measured 2.2 min: make setup about 2 minutes (estimate), the case 9 seconds locally; the first hosted run replaces it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,7 +208,7 @@ jobs:
     needs: [hooks, infrastructure, slow, guards, deadline]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 5 # measured 0.1 min: one short script; the first hosted run replaces it
     steps:
       - name: Check that every needed job succeeded
         shell: bash
@@ -197,6 +218,14 @@ jobs:
           SLOW: ${{ needs.slow.result }}
           GUARDS: ${{ needs.guards.result }}
           DEADLINE: ${{ needs.deadline.result }}
+          GUARD_1: ${{ needs.guards.outputs.shard_1 }}
+          GUARD_2: ${{ needs.guards.outputs.shard_2 }}
+          GUARD_3: ${{ needs.guards.outputs.shard_3 }}
+          GUARD_4: ${{ needs.guards.outputs.shard_4 }}
+          GUARD_5: ${{ needs.guards.outputs.shard_5 }}
+          GUARD_6: ${{ needs.guards.outputs.shard_6 }}
+          GUARD_7: ${{ needs.guards.outputs.shard_7 }}
+          GUARD_8: ${{ needs.guards.outputs.shard_8 }}
         run: |
           failed=0
           check() {
@@ -210,4 +239,41 @@ jobs:
           check slow "${SLOW}"
           check guards "${GUARDS}"
           check deadline "${DEADLINE}"
+          check_leg() {
+            if [ "$2" != success ]; then
+              printf 'The guards shard %s did not set its success output.\n' "$1" | tee -a "${GITHUB_STEP_SUMMARY}"
+              failed=1
+            fi
+          }
+          check_leg 1 "${GUARD_1}"
+          check_leg 2 "${GUARD_2}"
+          check_leg 3 "${GUARD_3}"
+          check_leg 4 "${GUARD_4}"
+          check_leg 5 "${GUARD_5}"
+          check_leg 6 "${GUARD_6}"
+          check_leg 7 "${GUARD_7}"
+          check_leg 8 "${GUARD_8}"
           exit "${failed}"
+
+  headroom:
+    name: No job of this run is near its time limit
+    needs: [hooks, infrastructure, slow, guards, deadline, required]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10 # measured 2.5 min: make setup about 2 minutes (estimate), the check a few seconds; the first hosted run replaces it
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: make setup
+      - run: make headroom
+        env:
+          GH_TOKEN: ${{ github.token }}
