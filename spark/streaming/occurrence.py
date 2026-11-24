@@ -283,13 +283,28 @@ def window_at(state: OccurrenceState, cutoff_us: int, context: Context) -> Windo
     return WindowInput(cutoff_us, numeric, waveforms, dict(clinical))
 
 
+def earliest_future_cutoff(state: OccurrenceState, context: Context, following_us: int) -> int | None:
+    """The earliest case time at which a cutoff still to come can lie, or None when it cannot be told (nothing is pruned then).
+
+    ``following_us`` is the next cutoff that the state already knows. A marker that is not read yet (the start marker adds the cutoff ``opstart`` and the
+    frozen offsets after it, the final-score marker adds ``opend``) can still arrive as late as the limit allows, so it can add a cutoff as early as the
+    case time of the highest applied replay time less the limit. That case time is the highest replay time less the start of the occurrence less the limit.
+    """
+    if state.opstart_us is not None and state.opend_us is not None:
+        return following_us
+    if state.start_us is None or state.high_water_us is None:
+        return None
+    return min(following_us, state.high_water_us - state.start_us - context.policy.late_limit_us)
+
+
 def prune(state: OccurrenceState, context: Context) -> None:
     """Drop the buffered data that no cutoff still to come reads. After the final row nothing is read.
 
     An arterial second is kept until it is judged (``judge_arterial`` judges it at the first cutoff that reads it) and then until it lies outside the waveform
     window of the next cutoff. A cutoff can lie far after an unjudged second, for example when the job is started again on its checkpoint with a larger cutoff
     step, and the numeric window of 900 seconds still reads that second through the series. So an unjudged arterial second is dropped only when it lies before
-    the first second that the series of the next cutoff and its lookback read (``first_series``). A judged record is kept for the same span.
+    the first second that the series of the earliest cutoff to come and its lookback read (``first_series``). That cutoff is the next one that the state knows,
+    or an earlier one that a marker not read yet can still add (``earliest_future_cutoff``). A judged record is kept for the same span.
     """
     following = next_cutoff(state, context, None)
     if following is None:
@@ -297,8 +312,11 @@ def prune(state: OccurrenceState, context: Context) -> None:
         state.wave_samples.clear()
         state.art.clear()
         return
+    earliest = earliest_future_cutoff(state, context, following[0])
+    if earliest is None:
+        return
     margin_us = context.policy.cutoff_step_us + context.policy.late_limit_us
-    cutoff = following[0] - margin_us
+    cutoff = earliest - margin_us
     lower_us = cutoff - NUMERIC_WINDOW_SECONDS * SECOND
     for readings in state.numeric.values():
         for time in [time for time in readings if time <= lower_us]:

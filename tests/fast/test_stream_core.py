@@ -32,8 +32,8 @@ from features.registry import WAVEFORM_INVALID_SECOND
 from replay.events.identity import marker_event_id
 from replay.events.recording import CaseRecording
 from spark.streaming.model import Context, DecisionRecord, ErrorRecord, Event, FeatureRecord, LedgerRecord, Policy, Record
-from spark.streaming.occurrence import process
-from spark.streaming.state import OccurrenceState
+from spark.streaming.occurrence import process, prune
+from spark.streaming.state import OccurrenceState, WaveSecondState
 from tests.fast.stream_support import (
     CONTEXT,
     HEART_RATE,
@@ -55,6 +55,7 @@ from tests.fast.stream_support import (
 )
 
 LIMIT_US = Policy().late_limit_us
+ARTERIAL = "SNUADC/ART"
 MINUTES = [60 * SECOND * minute for minute in range(1, 6)]
 START = 30 * SECOND
 
@@ -97,7 +98,7 @@ class OracleParity(unittest.TestCase):
         _, states = run_stream([event for event in events if event.replay_time_us <= ORIGIN_US + 1_500 * SECOND])
         state = next(iter(states.values()))
         oldest = min(time for readings in state.numeric.values() for time in readings)
-        self.assertGreater(oldest, 510 * SECOND)
+        self.assertGreater(oldest, 480 * SECOND)
         self.assertLess(len(state.art), 1_000)
         self.assertGreater(len(state.numeric), 0)
 
@@ -374,7 +375,35 @@ class ArterialRetention(unittest.TestCase):
         self.assertEqual(oracle_values(recording, 900 * SECOND), values_of(found[900 * SECOND]))
         self.assertEqual(oracle_eligibility(recording, 900 * SECOND), (found[900 * SECOND].warning_eligible, found[900 * SECOND].eligibility_reasons))
 
-    def test_an_unjudged_arterial_second_that_no_remaining_window_reads_is_dropped_so_the_buffer_stays_bounded(self) -> None:
+    def test_a_restart_with_a_larger_step_before_the_op_start_marker_gives_the_batch_valid_readings_and_eligibility_at_every_cutoff(self) -> None:
+        """The marker of the operation start was not read yet, so it could still add a cutoff as early as the late limit allows: its cutoff at 900 s read
+        the arterial seconds from 0 on, and pruning by the next cutoff of the larger step alone had dropped those that were not judged."""
+        recording = synthetic_recording(caseend_s=1_000, opend_s=950, opstart_s=900, rate=4)
+        events = stamp(events_for(recording))
+        small = Context(Policy(LIMIT_US, 60 * SECOND), "features_test", NO_CLINICAL)
+        cut = ORIGIN_US + 160 * SECOND
+        before, after = [event for event in events if event.replay_time_us <= cut], [event for event in events if event.replay_time_us > cut]
+        for step in (300, 600):
+            large = Context(Policy(LIMIT_US, step * SECOND), "features_test", NO_CLINICAL)
+            for size in (1, 7, 64):
+                with self.subTest(step=step, size=size):
+                    state: OccurrenceState | None = None
+                    records: list[Record] = []
+                    for batches, context in ((before, small), (after, large)):
+                        for first in range(0, len(batches), size):
+                            restored = None if state is None else OccurrenceState.from_json(state.to_json())
+                            state, produced = process(restored, batches[first : first + size], context)
+                            records.extend(produced)
+                    found = features_of(records)
+                    self.assertIn(900 * SECOND, found, "the cutoff of the op_start marker is built")
+                    self.assertIn(950 * SECOND, found)
+                    for cutoff, record in found.items():
+                        self.assertEqual(oracle_values(recording, cutoff), values_of(record), f"valid readings at {cutoff}")
+                        self.assertEqual(
+                            oracle_eligibility(recording, cutoff), (record.warning_eligible, record.eligibility_reasons), f"eligibility at {cutoff}"
+                        )
+
+    def test_an_unjudged_arterial_second_is_kept_while_a_marker_that_adds_a_cutoff_is_unread_and_dropped_once_both_are_read(self) -> None:
         recording = synthetic_recording(caseend_s=1_000, opend_s=950, opstart_s=900, rate=4)
         events = stamp(events_for(recording))
         small = Context(Policy(LIMIT_US, 60 * SECOND), "features_test", NO_CLINICAL)
@@ -382,9 +411,42 @@ class ArterialRetention(unittest.TestCase):
         cut = ORIGIN_US + 160 * SECOND
         state, _ = process(None, [event for event in events if event.replay_time_us <= cut], small)
         self.assertTrue(125 in state.wave_samples["SNUADC/ART"] and 125 not in state.art)
-        state, _ = process(state, [event for event in events if event.replay_time_us > cut][:1], far)
-        self.assertFalse(125 in state.wave_samples["SNUADC/ART"], "the next cutoff, at 1800 s, reads the seconds from 900 on, so second 125 is read by none")
-        self.assertLess(len(state.wave_samples["SNUADC/ART"]), 5)
+        for opstart, opend in ((None, None), (30 * SECOND, None), (None, 1_950 * SECOND)):
+            with self.subTest(opstart=opstart, opend=opend):
+                unread = OccurrenceState.from_json(state.to_json())
+                unread.opstart_us, unread.opend_us = opstart, opend
+                prune(unread, far)
+                self.assertIn(125, unread.wave_samples["SNUADC/ART"], "a cutoff of the unread marker can still come as early as the late limit allows")
+        read = OccurrenceState.from_json(state.to_json())
+        read.opstart_us, read.opend_us = 30 * SECOND, 1_950 * SECOND
+        prune(read, far)
+        self.assertNotIn(
+            125,
+            read.wave_samples["SNUADC/ART"],
+            "with both markers read the next cutoff, at 1800 s, reads the seconds from 900 on, so second 125 is read by none",
+        )
+        self.assertLess(len(read.wave_samples["SNUADC/ART"]), 5)
+
+    def test_nothing_is_pruned_while_the_start_of_the_occurrence_is_not_known_and_a_marker_is_unread(self) -> None:
+        """No case time is known yet for the replay time of the watermark, so no earliest cutoff can be told."""
+        recording = synthetic_recording(caseend_s=1_000, opend_s=950, opstart_s=900, rate=4)
+        small = Context(Policy(LIMIT_US, 60 * SECOND), "features_test", NO_CLINICAL)
+        far = Context(Policy(LIMIT_US, 600 * SECOND), "features_test", NO_CLINICAL)
+        cut = ORIGIN_US + 160 * SECOND
+        state, _ = process(None, [event for event in stamp(events_for(recording)) if event.replay_time_us <= cut], small)
+        state.start_us = None
+        prune(state, far)
+        self.assertIn(125, state.wave_samples["SNUADC/ART"])
+        self.assertIn(SECOND, next(iter(state.numeric.values())))
+
+    def test_the_earliest_cutoff_of_an_unread_marker_is_the_watermark_less_the_start_and_less_the_late_limit(self) -> None:
+        """The watermark is 1500 s into the case, the limit 30 s, the step 60 s: a marker can still add a cutoff at 1470 s, so the first second read is 477 and
+        the second 476 is dropped. The next cutoff that the state knows is at 1500 s (first second read 507), so a bound that forgot the limit drops 490."""
+        context = Context(Policy(LIMIT_US, 60 * SECOND), "features_test", NO_CLINICAL)
+        state = OccurrenceState(RUN, 0, "101.0", 101, start_us=ORIGIN_US, high_water_us=ORIGIN_US + 1_500 * SECOND, next_index=25)
+        state.wave_samples[ARTERIAL] = {second: WaveSecondState(4.0, 0, (80.0, 90.0, 100.0, 110.0)) for second in (476, 477, 490, 506, 507)}
+        prune(state, context)
+        self.assertEqual([477, 490, 506, 507], sorted(state.wave_samples[ARTERIAL]))
 
     def test_a_second_that_was_judged_and_lies_outside_the_waveform_window_is_dropped_from_the_buffer_while_the_case_runs(self) -> None:
         events = events_for(synthetic_recording(caseend_s=1_000, opend_s=950, rate=4, gap_s=10))
