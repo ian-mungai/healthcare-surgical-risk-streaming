@@ -199,6 +199,8 @@ def prepared() -> tuple[Api, StandIn]:
 
 
 def ensure_everything(api: Api, run: str = RUN) -> dict[str, str]:
+    """The writes of a load in its order: the load checks the three definitions before its first copy and so before any of these writes."""
+    api.check_definitions()
     api.ensure_destination(definitions.destination_configuration(ENVIRONMENT, definitions.branch_name(run)))
     ids = {}
     for table in definitions.TABLES:
@@ -277,12 +279,30 @@ class EnsureTest(unittest.TestCase):
                     stand_in.definitions[kind][identifier]["dockerImageTag"] = tag
                     with self.assertRaises(AirbyteError) as raised:
                         ensure_everything(api)
-                    self.assertEqual([], [w for w in writes(stand_in) if "definitions" in w])
+                    self.assertEqual([], writes(stand_in), "a refusal comes before the first write of any kind")
                     message = str(raised.exception)
                     self.assertIn(f"{kind} definition", message)
                     for value in (connector.repository, connector.tag, tag, identifier):
                         if value:
                             self.assertNotIn(value, message)
+
+    def test_the_check_of_the_definitions_makes_only_reads_and_checks_all_three_before_it_answers(self) -> None:
+        api, stand_in = prepared()
+        api.check_definitions()
+        self.assertEqual([], [label for label in stand_in.log if not label.startswith("GET ") and label != "POST applications/token"])
+        for kind in ("sources", "destinations"):
+            self.assertTrue(any(label.startswith(f"GET workspaces/workspace1/definitions/{kind}") for label in stand_in.log), kind)
+        for kind, identifier, connector in (
+            ("source", "source_definition1", SOURCE_S3),
+            ("source", "source_definition2", SOURCE_FILE),
+            ("destination", "destination_definition1", DESTINATION),
+        ):
+            with self.subTest(kind=kind, image=connector.repository):
+                api, stand_in = prepared()
+                stand_in.definitions[kind][identifier]["dockerImageTag"] = "0.0.1"
+                with self.assertRaises(AirbyteError):
+                    api.check_definitions()
+                self.assertEqual([], writes(stand_in))
 
     def test_no_definition_or_two_definitions_of_a_pinned_image_are_refused_whatever_their_names_and_tags(self) -> None:
         for kind, identifier, connector in (
@@ -296,7 +316,7 @@ class EnsureTest(unittest.TestCase):
                 with self.assertRaises(AirbyteError) as raised:
                     ensure_everything(api)
                 self.assertNotIn(connector.repository, str(raised.exception))
-                self.assertEqual([], [w for w in writes(stand_in) if "definitions" in w])
+                self.assertEqual([], writes(stand_in), "a refusal comes before the first write of any kind")
             for second_tag, name in ((connector.tag, "Built-in"), (connector.tag, "vitaldb S3 source (pinned)"), ("0.0.1", "older")):
                 with self.subTest(kind=kind, image=connector.repository, case=f"two: {second_tag} {name}"):
                     api, stand_in = prepared()
@@ -304,7 +324,7 @@ class EnsureTest(unittest.TestCase):
                     with self.assertRaises(AirbyteError) as raised:
                         ensure_everything(api)
                     self.assertNotIn(connector.repository, str(raised.exception))
-                    self.assertEqual([], [w for w in writes(stand_in) if "definitions" in w])
+                    self.assertEqual([], writes(stand_in), "a refusal comes before the first write of any kind")
 
     def test_only_the_exact_image_matches_so_a_similar_image_is_neither_taken_nor_counted(self) -> None:
         api, stand_in = prepared()

@@ -196,6 +196,19 @@ class PinTest(unittest.TestCase):
     def test_the_two_s3_connectors_share_the_versions_and_digests_of_the_raw_connection(self) -> None:
         self.assertEqual(("4.17.1", "sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b"), (SOURCE_S3.tag, SOURCE_S3.digest))
 
+    def test_each_pin_is_the_tag_that_airbyte_chart_2_5_0_ships_and_the_file_source_digest_is_the_one_read_from_docker_hub(self) -> None:
+        """Airbyte takes its built-in definition at the tag of its chart, and the load refuses any other tag (tags read on the host on Nov 24 2026)."""
+        self.assertEqual(
+            {"airbyte/source-s3:4.17.1", "airbyte/source-file:0.6.1", "airbyte/destination-s3-data-lake:0.4.2"},
+            {SOURCE_S3.image, SOURCE_FILE.image, DESTINATION.image},
+        )
+        self.assertEqual(
+            "sha256:a732c04bc4581ed11517a515f3673b43b420f1553308037efefdc6c930e20c6d",
+            SOURCE_FILE.digest,
+            "the linux/amd64 manifest of airbyte/source-file:0.6.1",
+        )
+        self.assertEqual(3, len({SOURCE_S3.digest, SOURCE_FILE.digest, DESTINATION.digest}))
+
     def test_the_csv_tables_come_from_the_release_path_of_the_pin(self) -> None:
         for table in CSV_TABLES:
             self.assertTrue(table.source_key and table.source_key.startswith(pinned_release().source_prefix))

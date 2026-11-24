@@ -342,6 +342,15 @@ class HttpAirbyteApi:
             raise AirbyteError(f"the {kind} definition of a pinned image is at another version than the pin; upgrade Airbyte or change the pin")
         return text(matches[0], "id", what)
 
+    def check_definitions(self) -> None:
+        """Check the three definitions of the load before any write: each of its pinned images has exactly one definition, and its tag is the pin.
+
+        The load calls this before its first copy, so a connector that Airbyte holds at another version stops the run with no input copied and no source,
+        destination or connection created or patched. Only reads are made. The refusal is the one of ``definition_id``.
+        """
+        for kind, connector in (("source", definitions.SOURCE_S3), ("source", definitions.SOURCE_FILE), ("destination", definitions.DESTINATION)):
+            self.definition_id(kind, connector)
+
     def actors(self, kind: str) -> list[dict[str, Any]]:
         return self.listing(f"/{kind}s?workspaceIds={quote(self.workspace_id(), safe='')}")
 

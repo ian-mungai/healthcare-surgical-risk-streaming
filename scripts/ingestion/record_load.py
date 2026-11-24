@@ -152,6 +152,10 @@ class Catalog(Protocol):
 
 
 class RecordAirbyte(Protocol):
+    def check_definitions(self) -> None:
+        """Raise ``AirbyteError`` unless Airbyte holds exactly one definition of each of the three pinned images, at the pinned tag. Only reads are made."""
+        ...
+
     def find_connection_ids(self) -> dict[str, str]:
         """The connections of the three tables that exist now, by table name. Nothing is created or changed."""
         ...
@@ -519,6 +523,7 @@ def load_records(
             raise LoadError("the default branch records this manifest but this host keeps no record of its load")
         return earlier
     leftover = owned_leftover(catalog, state, branch)
+    airbyte.check_definitions()
     if any(airbyte.running_jobs(identity) for identity in airbyte.find_connection_ids().values()):
         raise LoadError("a sync of a record connection is already running")
     copies = copy_bound_versions(store, reference, run_id, state, entries)

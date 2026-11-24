@@ -132,6 +132,27 @@ class OrderTest(unittest.TestCase):
 
 
 class FaultBeforeTheCopyTest(unittest.TestCase):
+    def test_the_three_definitions_are_checked_before_the_first_copy_and_before_any_other_airbyte_call(self) -> None:
+        setup = Setup(self)
+        seen: list[int] = []
+        setup.airbyte.on_check_definitions = lambda: seen.append(len(setup.store.copies))
+        setup.load()
+        self.assertEqual([0], seen, "no copy had been made when the definitions were checked")
+        self.assertEqual("check_definitions", setup.airbyte.calls[0])
+        self.assertEqual(1, setup.airbyte.calls.count("check_definitions"))
+
+    def test_a_connector_definition_that_does_not_match_its_pin_leaves_the_copies_airbyte_and_the_catalog_untouched(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.refuse_definitions = True
+        written = list(setup.store.writes)
+        with self.assertRaises(AirbyteError):
+            setup.load()
+        self.assertEqual([], setup.store.copies, "no input was copied")
+        self.assertEqual(written, setup.store.writes, "the store was not written")
+        self.assertEqual(["check_definitions"], setup.airbyte.calls, "Airbyte was asked nothing else: no actor was created or patched")
+        self.assertEqual(["has_recorded_manifest", f"reference {BRANCH}"], setup.catalog.calls, "the catalog made no branch")
+        self.assertEqual([], setup.records())
+
     def test_a_manifest_that_does_not_exist_leaves_everything_untouched(self) -> None:
         setup = Setup(self)
         absent = ManifestRef(setup.reference.bucket, f"manifests/probe_set/{'0' * 64}.json", "version9999", "0" * 64)
@@ -158,7 +179,9 @@ class FaultBeforeTheCopyTest(unittest.TestCase):
         setup.store.corrupt.add(setup.landed.keys["clinical_data.csv"])
         with self.assertRaises(CopyError):
             setup.load()
-        self.assertEqual(["find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked which connections exist")
+        self.assertEqual(
+            ["check_definitions", "find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked about its definitions and which connections exist"
+        )
         self.assertEqual(["has_recorded_manifest", f"reference {BRANCH}"], setup.catalog.calls, "the catalog was asked two questions and made no branch")
         self.assertEqual([], setup.records())
 
@@ -339,7 +362,7 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(TABLES, sorted(document["snapshots"]))
         self.assertTrue(all(isinstance(snapshot, int) for snapshot in document["snapshots"].values()))
         self.assertEqual(["clinical_data", "lab_data"], [copy["table"] for copy in document["copies"]])
-        self.assertEqual({"airbyte/destination-s3-data-lake:0.4.2", "airbyte/source-s3:4.17.1", "airbyte/source-file:0.6.2"}, set(document["connectors"]))
+        self.assertEqual({"airbyte/destination-s3-data-lake:0.4.2", "airbyte/source-s3:4.17.1", "airbyte/source-file:0.6.1"}, set(document["connectors"]))
 
     def test_the_record_holds_no_secret_and_no_object_key_outside_the_read_prefix(self) -> None:
         setup = Setup(self)
