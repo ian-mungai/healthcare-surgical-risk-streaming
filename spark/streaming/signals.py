@@ -1,75 +1,84 @@
-"""The signal rules of one waveform second, and the per-second arterial series built from them.
+"""The signal rules of one waveform second and the per-second arterial series built from them.
 
-Analysis plan row 4, "Invalid second", for the arterial pressure waveform: a second is invalid when it is not a whole block of finite samples,
-when a sample is outside 20 to 200 mmHg, when its range is under 20 mmHg, or when a sample jumps by more than 30 mmHg from the one before it,
-also across the second boundary. The stream applies these rules to each second and builds the series ``Silver/ART_MBP_1S`` as the trailing
-2-second average of the arterial waveform. Every other waveform second is valid when it is a whole block of finite samples. The plan does not say
-how long "the segment that ends at the second under test" is: the second itself is used here.
+The streaming job calls the one definition that Silver's batch path calls: ``features.signal_validity`` for the verdict of a second, and
+``features.pressure_series`` and ``features.series_input`` for the series. It keeps only what a later second needs of each arterial second.
 
-TEMPORARY. ``features/signal_validity.py`` is the one definition of signal validity and source deduplication (the owner set the segment to the trailing
-20 seconds), and it replaces this module: the stream calls it when that slice is accepted. Until then these rules must not be taken as Silver's.
+A second of the arterial pressure is judged by its own samples, the last sample of the second just before it and the extent (the complete seconds and the least
+and most valid sample) of the 19 seconds before it: the flat rule reads the 20 seconds that end with the second. ``ArtSecond`` keeps that extent,
+that last sample and the facts of the second for the series, so a later second is judged without the samples of an earlier one.
+The series of a window is made by ``series_readings`` from those facts, so every reading carries its exact mean and the features
+compare the exact mean with a limit, as for the batch path.
+
+A raw sample that is not a finite number is a missing sample. The replay's event carries no sample format, so a gap marker of an integer format
+(``GAP_MARKERS``) is not recognised here as it is on Silver's path, which reads the format from Bronze. A float format gives its missing sample as not-a-number,
+which is recognised.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from features.model import SECOND
+from features.pressure_series import SecondFacts, second_facts
+from features.registry import NUMERIC_WINDOW_SECONDS, complete_seconds
+from features.series_input import SeriesReadings, series_readings
+from features.signal_validity import ARTERIAL_WAVEFORM, FLAT_WINDOW_SECONDS, Extent, combine_extents, second_extent, waveform_verdict
 from replay.events.recording import physical_value
 
-ARTERIAL_WAVEFORM = "SNUADC/ART"
-MIN_PRESSURE_MMHG = 20.0
-MAX_PRESSURE_MMHG = 200.0
-MIN_RANGE_MMHG = 20.0
-MAX_JUMP_MMHG = 30.0
+__all__ = ["ARTERIAL_WAVEFORM", "ArtSecond", "art_second", "physical_samples", "second_valid", "series_window"]
 
 
 @dataclass(frozen=True, slots=True)
-class SecondSummary:
-    """What later windows need of one second: whether it is valid on its own, its first and last sample, the sum of its samples and their count."""
+class ArtSecond:
+    """What later seconds and the series need of one arterial second: its verdict, the exact sum of its samples (as ``SecondFacts``), its last sample and its
+    extent. ``last`` is ``None`` for a second with no sample or whose last sample is missing."""
 
     valid: bool
-    first: float
-    last: float
-    total: float
+    cause: str | None
     count: int
+    total: float
+    residual: float
+    last: float | None
+    seconds: int
+    low: float | None
+    high: float | None
+
+    @property
+    def extent(self) -> Extent:
+        return Extent(self.seconds, self.low, self.high)
+
+    def facts(self, second: int) -> SecondFacts:
+        return SecondFacts(second, self.valid, self.cause, self.count, self.total, self.residual)
 
 
-def physical_samples(raw: Sequence[float], gain: float, offset: float) -> tuple[float, ...]:
-    return tuple(physical_value(value, gain, offset) for value in raw)
+def physical_samples(raw: Sequence[float], gain: float, offset: float) -> tuple[float | None, ...]:
+    """The physical samples of a raw second: ``raw * gain + offset`` (the replay's definition), and ``None`` for a raw sample that is not a finite number."""
+    return tuple(physical_value(value, gain, offset) if math.isfinite(value) else None for value in raw)
 
 
-def whole_block(samples: Sequence[float], rate: int, start_offset_us: int) -> bool:
-    """A second that starts on its boundary and holds exactly ``rate`` finite samples."""
-    return start_offset_us == 0 and rate > 0 and len(samples) == rate and all(math.isfinite(sample) for sample in samples)
+def art_second(second: int, samples: Sequence[float | None], sample_rate: float, start_offset_us: int, earlier: Mapping[int, ArtSecond]) -> ArtSecond:
+    """The record of an arterial second from its physical samples and the records of the seconds before it (only those of the seconds ``second - 1`` to
+    ``second - 19`` are read, and a second that is absent adds nothing)."""
+    previous = earlier.get(second - 1)
+    prior = combine_extents(earlier[before].extent for before in range(second - FLAT_WINDOW_SECONDS + 1, second) if before in earlier)
+    verdict = waveform_verdict(ARTERIAL_WAVEFORM, samples, sample_rate, start_offset_us, None if previous is None else previous.last, prior)
+    facts = second_facts(second, verdict, samples)
+    extent = second_extent(samples, sample_rate, start_offset_us)
+    return ArtSecond(
+        verdict.valid, verdict.cause, facts.count, facts.total, facts.residual, samples[-1] if samples else None, extent.seconds, extent.low, extent.high
+    )
 
 
-def arterial_pressure_ok(samples: Sequence[float]) -> bool:
-    if any(not MIN_PRESSURE_MMHG <= sample <= MAX_PRESSURE_MMHG for sample in samples):
-        return False
-    if max(samples) - min(samples) < MIN_RANGE_MMHG:
-        return False
-    return all(abs(after - before) <= MAX_JUMP_MMHG for before, after in zip(samples, samples[1:], strict=False))
+def second_valid(track: str, samples: Sequence[float | None], sample_rate: float, start_offset_us: int) -> bool:
+    """Whether a second of a track other than the arterial pressure is valid: a whole block of present samples (no pressure rule applies to it)."""
+    return waveform_verdict(track, samples, sample_rate, start_offset_us, None).valid
 
 
-def summarise_second(samples: Sequence[float], rate: int, start_offset_us: int, *, arterial: bool) -> SecondSummary:
-    """The summary of a second. The values of an invalid second are never read, so its numbers are zero when they cannot be taken."""
-    if not whole_block(samples, rate, start_offset_us):
-        return SecondSummary(False, 0.0, 0.0, 0.0, len(samples))
-    valid = arterial_pressure_ok(samples) if arterial else True
-    return SecondSummary(valid, samples[0], samples[-1], math.fsum(samples), len(samples))
-
-
-def boundary_ok(before: SecondSummary, current: SecondSummary) -> bool:
-    return abs(current.first - before.last) <= MAX_JUMP_MMHG
-
-
-def series_reading(before: SecondSummary | None, current: SecondSummary) -> tuple[float, bool]:
-    """The value of the per-second series at a second and whether it is valid: the mean of that second and the one before it.
-
-    It is valid only when both seconds are valid and the jump across their boundary is at most 30 mmHg. An invalid reading has the value not-a-number.
-    """
-    if before is None or not before.valid or not current.valid or not boundary_ok(before, current):
-        return math.nan, False
-    return (before.total + current.total) / (before.count + current.count), True
+def series_window(held: Mapping[int, ArtSecond], cutoff_us: int) -> SeriesReadings:
+    """The readings of the per-second arterial series inside the window at the cutoff (``complete_seconds``). The second before the window is read for the
+    reading of the first second, and the readings of the seconds that the window does not hold are left out."""
+    window = complete_seconds(cutoff_us, NUMERIC_WINDOW_SECONDS)
+    facts = [held[second].facts(second) for second in range(window[0] - 1, window[-1] + 1) if second in held]
+    return SeriesReadings(reading for reading in series_readings(facts) if reading.time_us >= window[0] * SECOND)

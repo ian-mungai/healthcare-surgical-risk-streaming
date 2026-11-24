@@ -2,8 +2,9 @@
 
 A new occurrence has a new key and so an empty state: a rolling feature of it never holds a value of the case before it in the room. The buffers
 hold only what a later cutoff can still read: the readings of the last 15 minutes before the next cutoff, the last 20 seconds of each waveform
-and the summary of each arterial second of the series window. The recent event suffixes are the events of the last late-limit span, which a
-re-sent event is checked against. The state is plain data, so a restart that reads it back from JSON gives the same rows.
+and the record of each arterial second of the series window (its verdict, last sample, extent and the facts of the series). The recent event suffixes are the
+events of the last late-limit span, which a re-sent event is checked against.
+The state is plain data, so a restart that reads it back from JSON gives the same rows.
 """
 
 from __future__ import annotations
@@ -12,16 +13,16 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from spark.streaming.signals import SecondSummary
+from spark.streaming.signals import ArtSecond
 
-STATE_FORMAT = "stream_state_2"
+STATE_FORMAT = "stream_state_3"
 
 
 @dataclass(slots=True)
 class WaveSecondState:
     sample_rate: float
     start_offset_us: int
-    samples: tuple[float, ...]
+    samples: tuple[float | None, ...]
 
 
 @dataclass(slots=True)
@@ -41,7 +42,7 @@ class OccurrenceState:
     closed: bool = False
     numeric: dict[str, dict[int, tuple[int, float]]] = field(default_factory=dict)
     wave_samples: dict[str, dict[int, WaveSecondState]] = field(default_factory=dict)
-    art_summary: dict[int, SecondSummary] = field(default_factory=dict)
+    art: dict[int, ArtSecond] = field(default_factory=dict)
     recent: dict[str, int] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -69,7 +70,7 @@ class OccurrenceState:
                 track: [[second, item.sample_rate, item.start_offset_us, list(item.samples)] for second, item in sorted(seconds.items())]
                 for track, seconds in sorted(self.wave_samples.items())
             },
-            "art_summary": [[second, s.valid, s.first, s.last, s.total, s.count] for second, s in sorted(self.art_summary.items())],
+            "art": [[second, a.valid, a.cause, a.count, a.total, a.residual, a.last, a.seconds, a.low, a.high] for second, a in sorted(self.art.items())],
             "recent": self.recent,
             "counts": self.counts,
         }
@@ -99,7 +100,7 @@ class OccurrenceState:
                 track: {second: WaveSecondState(rate, offset, tuple(samples)) for second, rate, offset, samples in seconds}
                 for track, seconds in document["wave_samples"].items()
             },
-            {second: SecondSummary(valid, first, last, total, count) for second, valid, first, last, total, count in document["art_summary"]},
+            {second: ArtSecond(*fields) for second, *fields in document["art"]},
             {suffix: int(time) for suffix, time in document["recent"].items()},
             {name: int(number) for name, number in document["counts"].items()},
         )

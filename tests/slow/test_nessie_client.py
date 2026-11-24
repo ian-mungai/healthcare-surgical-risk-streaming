@@ -158,7 +158,7 @@ def recording_handler(answers: list[tuple[str, str, dict[str, Any] | None]]) -> 
             self.end_headers()
             self.wfile.write(payload)
 
-        do_GET = do_POST = respond
+        do_GET = do_POST = do_PUT = respond
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -199,6 +199,25 @@ class MergeRequestTest(unittest.TestCase):
         for value in ("", "main", "a" * 63, "A" * 64):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 NessieClient("http://127.0.0.1:1/api/v2").merge("feature", "main", "b" * 64, "m", source_hash=value)
+
+
+class AssignRequestTest(unittest.TestCase):
+    """The assignment of a branch goes over the wire as Nessie 0.110.1 API v2 defines it: ``PUT /trees/{name}@{hash}?type=BRANCH``, the target as the body."""
+
+    def test_the_request_names_the_branch_and_its_expected_head_in_the_path_and_the_reference_to_assign_to_in_the_body(self) -> None:
+        seen: list[tuple[str, str, dict[str, Any] | None]] = []
+        server = HTTPServer(("127.0.0.1", 0), recording_handler(seen))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/api/v2"
+            answered = NessieClient(url, timeout_seconds=5).assign_branch("main", "b" * 64, Reference("BRANCH", "feature", "a" * 64))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=10)
+        self.assertEqual(BRANCH, {"type": answered.kind, "name": answered.name, "hash": answered.hash})
+        self.assertEqual([("PUT", "/api/v2/trees/main@" + "b" * 64 + "?type=BRANCH", {"type": "BRANCH", "name": "feature", "hash": "a" * 64})], seen)
 
 
 def raw_handler(status: int, body: bytes) -> Any:

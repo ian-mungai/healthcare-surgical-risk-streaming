@@ -18,17 +18,20 @@ from dataclasses import replace
 from features.batch import row_document
 from features.eligibility import warning_eligibility
 from features.model import ClinicalValue, FeatureRow, Reading, WaveformSecond, WaveformWindow, WindowInput
+from features.pressure_series import SecondFacts, second_facts
 from features.registry import ARTERIAL_SERIES, NUMERIC_TRACKS, WAVEFORM_TRACKS
 from features.row import build_row
+from features.series_input import series_readings
+from features.signal_validity import FLAT_WINDOW_SECONDS, combine_extents, numeric_verdict, second_extent, waveform_verdict
 from replay.events.formats import FORMATS, KIND_FORMAT
 from replay.events.identity import Occurrence, source_event_id
 from replay.events.manifest import reference_seconds
-from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, StringTrack, WaveformRecord, WaveformTrack
+from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, StringTrack, WaveformRecord, WaveformTrack, physical_value
 from replay.events.schedule import ScheduledOccurrence
 from replay.events.stream import occurrence_events, outgoing
 from spark.streaming.model import Context, Event, FeatureRecord, Policy, Record
 from spark.streaming.occurrence import process
-from spark.streaming.signals import ARTERIAL_WAVEFORM, physical_samples, series_reading, summarise_second
+from spark.streaming.signals import ARTERIAL_WAVEFORM
 from spark.streaming.state import OccurrenceState
 from spark.streaming.wire import event_from_record
 
@@ -62,9 +65,14 @@ def synthetic_recording(
     arterial_rate: float | None = None,
     arterial_start_s: int = 0,
     extra_hr: Sequence[tuple[int, float]] = (),
+    flat_s: tuple[int, int] | None = None,
+    jump_s: int | None = None,
+    gap_s: int | None = None,
 ) -> CaseRecording:
     """A case with registry tracks: two numeric tracks (one with a duplicate reading and one with a not-a-number reading), an unregistered numeric track, a
-    string track, an arterial waveform with one invalid second, and a second waveform with a gain and an offset."""
+    string track, an arterial waveform with one invalid second, and a second waveform with a gain and an offset. ``flat_s`` (the first second and the one after
+    the last) makes those arterial seconds a small wave that is flat over 20 seconds, ``jump_s`` starts that second with a sample far from the one before it and
+    ``gap_s`` leaves that arterial second out of the recording."""
     heart = [(second * SECOND, hr_base + (second % 7)) for second in range(1, caseend_s, hr_step_s)]
     heart.append((41 * SECOND, hr_base + 30.0))
     heart.extend((time, value) for time, value in extra_hr)
@@ -72,7 +80,16 @@ def synthetic_recording(
     mean_pressure = [(second * SECOND, 70.0 + (second % 5) * 2.0) for second in range(1, caseend_s, 2)]
     middle = min(49, len(mean_pressure) - 1)
     mean_pressure[middle] = (mean_pressure[middle][0], float("nan"))
-    arterial_samples = [value for second in range(arterial_start_s, caseend_s) for value in second_wave(second, rate, second == 150)]
+    arterial_seconds = {second: second_wave(second, rate, second == 150) for second in range(arterial_start_s, caseend_s)}
+    for second in range(*(flat_s or (0, 0))):
+        arterial_seconds[second] = [80.0 + (position + second) % 3 for position in range(rate)]
+    if jump_s is not None:
+        arterial_seconds[jump_s][0] = 190.0
+    arterial_records = [
+        WaveformRecord(start * SECOND, array("d", [value for second in range(start, end) for value in arterial_seconds[second]]))
+        for start, end in (((arterial_start_s, caseend_s),) if gap_s is None else ((arterial_start_s, gap_s), (gap_s + 1, caseend_s)))
+        if end > start
+    ]
     pleth_samples = [float((second * rate + position) % 50) for second in range(caseend_s) for position in range(rate)]
     return CaseRecording(
         CaseTimes(case_id, opstart_s * SECOND, opend_s * SECOND, caseend_s * SECOND),
@@ -83,9 +100,7 @@ def synthetic_recording(
         ),
         strings=(StringTrack("Test/EVENT", ((50 * SECOND, "note"),)),),
         waveforms=(
-            WaveformTrack(
-                ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), 1.0, 0.0, (WaveformRecord(arterial_start_s * SECOND, array("d", arterial_samples)),)
-            ),
+            WaveformTrack(ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), 1.0, 0.0, tuple(arterial_records)),
             WaveformTrack("SNUADC/PLETH", "%", float(rate), 0.5, 1.0, (WaveformRecord(0, array("d", pleth_samples)),)),
         ),
     )
@@ -170,35 +185,42 @@ def values_of(record: FeatureRecord) -> dict[str, object]:
     return features
 
 
+def oracle_physical(raw: Sequence[float], gain: float, offset: float) -> list[float | None]:
+    """The physical samples of a second: a raw sample that is not a finite number is a missing sample."""
+    return [physical_value(value, gain, offset) if math.isfinite(value) else None for value in raw]
+
+
 def oracle_window(recording: CaseRecording, cutoff_us: int, clinical: Mapping[str, ClinicalValue] | None = None) -> WindowInput:
-    """The window of a cutoff from the whole recording: the first reading of a track and time, every waveform second and the series built from them."""
+    """The window of a cutoff from the whole recording, as Silver's batch path makes it: the first reading of a track and time judged by ``numeric_verdict``,
+    every waveform second judged by ``waveform_verdict`` with the extent of the 19 seconds before it, and the series made of the arterial seconds' facts."""
     numeric: dict[str, list[Reading]] = {}
     for track in recording.numeric:
         if track.name in NUMERIC_TRACKS:
             first: dict[int, float] = {}
             for time, value in track.readings:
                 first.setdefault(time, value)
-            numeric[track.name] = [Reading(time, value, math.isfinite(value)) for time, value in sorted(first.items())]
+            numeric[track.name] = [Reading(time, value, numeric_verdict(track.name, value).valid) for time, value in sorted(first.items())]
     waveforms: dict[str, WaveformWindow] = {}
-    summaries = {}
+    facts: list[SecondFacts] = []
     for wave in recording.waveforms:
         if wave.name not in WAVEFORM_TRACKS:
             continue
-        rate = int(wave.sample_rate)
+        held = {second: (offset, oracle_physical(raw, wave.gain, wave.offset)) for second, (offset, raw) in reference_seconds(wave).items()}
         seconds = []
-        for second, (offset, raw) in sorted(reference_seconds(wave).items()):
-            samples = physical_samples(raw, wave.gain, wave.offset)
-            summary = summarise_second(samples, rate, offset, arterial=wave.name == ARTERIAL_WAVEFORM)
-            seconds.append(WaveformSecond(second, samples, summary.valid, offset))
+        for second, (offset, samples) in sorted(held.items()):
+            before = held.get(second - 1)
+            prior = combine_extents(
+                second_extent(held[earlier][1], wave.sample_rate, held[earlier][0])
+                for earlier in range(second - FLAT_WINDOW_SECONDS + 1, second)
+                if earlier in held
+            )
+            verdict = waveform_verdict(wave.name, samples, wave.sample_rate, offset, None if before is None else before[1][-1], prior)
+            seconds.append(WaveformSecond(second, tuple(sample for sample in samples if sample is not None) if verdict.valid else (), verdict.valid, offset))
             if wave.name == ARTERIAL_WAVEFORM:
-                summaries[second] = summary
+                facts.append(second_facts(second, verdict, samples))
         waveforms[wave.name] = WaveformWindow(wave.sample_rate, tuple(seconds))
-    if summaries:
-        series = []
-        for second, summary in sorted(summaries.items()):
-            value, valid = series_reading(summaries.get(second - 1), summary)
-            series.append(Reading(second * SECOND, value, valid))
-        numeric[ARTERIAL_SERIES] = series
+    if facts:
+        numeric[ARTERIAL_SERIES] = series_readings(facts)
     return WindowInput(cutoff_us, numeric, waveforms, dict(clinical or {}))
 
 

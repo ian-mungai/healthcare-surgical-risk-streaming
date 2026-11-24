@@ -72,11 +72,12 @@ PLANTED_TEST = "tests.fast.test_planted.PlantedTest.test_planted"
 PLANTED_FAILURE = (
     'FAIL: test_planted ({name})\n----------\nTraceback (most recent call last):\n  File "x.py", line 6, in test_planted\nAssertionError: {detail}\n'
 )
-FAST_SUMMARY = "Ran 312 tests in 60.0s\n\nFAILED (failures={count})\n"
+FAST_SUMMARY = "Ran 312 tests in 60.0s\n\nFAILED ({counts})\n"
 
 
-def fast_test_output(*failures: str, count: int = 1) -> str:
-    return HOOK_FAILURE.format(hook="fast-tests", detail="\n".join(failures) + "\n" + FAST_SUMMARY.format(count=count))
+def fast_test_output(*failures: str, count: int = 1, rest: str = "") -> str:
+    summary = FAST_SUMMARY.format(counts=f"failures={count}{rest}")
+    return HOOK_FAILURE.format(hook="fast-tests", detail="\n".join(failures) + "\n" + summary)
 
 
 class FastTestFaultJudgementTest(unittest.TestCase):
@@ -101,6 +102,29 @@ class FastTestFaultJudgementTest(unittest.TestCase):
 
     def test_the_planted_message_from_another_test_is_not_proof(self) -> None:
         self.assertFalse(self.judge(fast_test_output(self.planted(name="tests.fast.test_other.OtherTest.test_other"))))
+
+    def test_skipped_tests_in_the_summary_do_not_hide_the_proof(self) -> None:
+        """The suite has skipped tests, so unittest's summary reads ``FAILED (failures=1, skipped=2)``."""
+        self.assertTrue(self.judge(fast_test_output(self.planted(), rest=", skipped=2")))
+
+    def test_a_summary_quoted_inside_a_failure_message_does_not_stand_for_the_run(self) -> None:
+        """Only the run's last summary line counts: a one-failure summary quoted in a message must not hide a second failure."""
+        quoted = PLANTED_FAILURE.format(
+            name="tests.fast.test_other.OtherTest.test_other", detail="'FAILED (failures=1, skipped=2)'\nFAILED (failures=1, skipped=2)"
+        )
+        self.assertFalse(self.judge(fast_test_output(self.planted(), quoted, count=2, rest=", skipped=2")))
+
+    def test_a_buffered_summary_printed_after_the_real_footer_does_not_stand_for_the_run(self) -> None:
+        """Pre-commit can emit a test's printed text after unittest's footer; only the status paired with the `Ran N tests` line counts."""
+        other = PLANTED_FAILURE.format(name="tests.fast.test_other.OtherTest.test_other", detail="3 != 4")
+        output = fast_test_output(self.planted(), other, count=2, rest=", skipped=2") + "FAILED (failures=1, skipped=2)\n"
+        self.assertFalse(self.judge(output))
+        errored = fast_test_output(self.planted(), rest=", errors=1, skipped=2") + "FAILED (failures=1, skipped=2)\n"
+        self.assertFalse(self.judge(errored))
+
+    def test_an_error_beside_the_planted_failure_is_not_proof(self) -> None:
+        self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1")))
+        self.assertFalse(self.judge(fast_test_output(self.planted(), rest=", errors=1, skipped=2")))
 
     def test_a_second_failure_beside_the_planted_one_is_not_proof(self) -> None:
         other = PLANTED_FAILURE.format(name="tests.fast.test_other.OtherTest.test_other", detail="3 != 4")

@@ -61,8 +61,26 @@ COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
 COPY scripts/stack/tags.py /opt/jobs/scripts/stack/tags.py
-# The streaming job reads the feature code from features/.
-COPY features /opt/jobs/features
+# The Silver jobs call the one definition of validity, of the pressure series and of the events that the feature code shares (standard library only).
+COPY features/__init__.py /opt/jobs/features/__init__.py
+COPY features/signal_validity.py /opt/jobs/features/signal_validity.py
+COPY features/pressure_series.py /opt/jobs/features/pressure_series.py
+COPY features/hypotension.py /opt/jobs/features/hypotension.py
+# The signal profile job counts the unscored cutoffs by the sample limits of the feature registry (standard library only).
+COPY features/registry.py /opt/jobs/features/registry.py
+COPY features/model.py /opt/jobs/features/model.py
+COPY features/stats.py /opt/jobs/features/stats.py
+# The streaming job builds each feature row with the feature code, as the batch job does: the row builder, its groups, the eligibility limits and the leakage check (standard library only).
+COPY features/batch.py /opt/jobs/features/batch.py
+COPY features/clinical.py /opt/jobs/features/clinical.py
+COPY features/document.py /opt/jobs/features/document.py
+COPY features/eligibility.py /opt/jobs/features/eligibility.py
+COPY features/leakage.py /opt/jobs/features/leakage.py
+COPY features/numeric.py /opt/jobs/features/numeric.py
+COPY features/row.py /opt/jobs/features/row.py
+COPY features/series_input.py /opt/jobs/features/series_input.py
+COPY features/validate.py /opt/jobs/features/validate.py
+COPY features/waveform.py /opt/jobs/features/waveform.py
 # The Bronze decoder and the streaming job import the replay's decoder, stores, event model and wire codec and the ingestion gate, and the gate reads the tracked release pin through ROOT.
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py

@@ -20,7 +20,6 @@ from spark.bronze_clinical_lab import (
     LAB_COLUMNS,
     REPEATED_ROWS_LIMIT,
     BronzeRulesError,
-    KeyStatistics,
     TableContent,
     assign_occurrences,
 )
@@ -28,6 +27,7 @@ from spark.bronze_clinical_lab_run import RESULT_PREFIX, finish, parser, run_job
 from spark.settings import SettingsError
 
 HASH = "a" * 64
+HEAD_B = "b" * 64
 TRUNK = "trunk"
 BRANCH = "bronze_run"
 STRING = "string"
@@ -71,7 +71,8 @@ class FakeNessie:
 
     def content(self, reference: str, table: str) -> TableContent | None:
         self.calls.append(f"content:{reference.replace(HASH, 'H')}:{table}")
-        return self.contents.get((reference, table))
+        found = self.contents.get((reference, table))
+        return self.contents.get((BRANCH, table)) if found is None and reference == f"{BRANCH}@{HEAD_B}" else found
 
     def create_branch(self, name: str, from_branch: str, source_hash: str) -> None:
         self.calls.append(f"create_branch:{name}:{from_branch}:{source_hash[:4]}")
@@ -83,7 +84,7 @@ class FakeNessie:
 
     def head(self, branch: str) -> str:
         self.calls.append(f"head:{branch}")
-        return "b" * 64
+        return HEAD_B
 
 
 def correct_numbers(rows: Sequence[tuple[str | None, str | None, str | None, str | None]]) -> list[tuple[Any, ...]]:
@@ -113,9 +114,10 @@ class FakeSpark:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
         self.opened: tuple[str, str, str] | None = None
+        self.pinned: str | None = None
         self.numbering: Callable[[Sequence[tuple[str | None, str | None, str | None, str | None]]], list[tuple[Any, ...]]] = correct_numbers
         self.difference_counts = (0, 0)
-        self.statistics = KeyStatistics(6, 6)
+        self.duplicates = 0
         self.null_counts = (0, 0)
         self.collect_nothing = False
         self.numbering_forbidden = False
@@ -154,9 +156,9 @@ class FakeSpark:
         self.calls.append(f"null_keys:{kind}")
         return self.null_counts
 
-    def key_statistics(self, kind: str) -> KeyStatistics:
-        self.calls.append(f"key_statistics:{kind}")
-        return self.statistics
+    def key_duplicates(self, kind: str) -> int:
+        self.calls.append(f"key_duplicates:{kind}")
+        return self.duplicates
 
     def occurrence_gaps(self) -> int:
         self.calls.append("occurrence_gaps")
@@ -191,30 +193,31 @@ class Harness:
         self.nessie = FakeNessie(self.calls)
         self.spark = FakeSpark(self.calls)
 
-    def open_spark(self, branch: str, default_branch: str, source_hash: str) -> FakeSpark:
-        self.calls.append(f"open:{branch}:{default_branch}:{source_hash[:4]}")
+    def open_spark(self, branch: str, default_branch: str, source_hash: str, branch_hash: str | None = None) -> FakeSpark:
+        self.calls.append(f"open:{branch}:{default_branch}:{source_hash[:4]}" + (f":{branch_hash[:4]}" if branch_hash else ""))
         self.spark.opened = (branch, default_branch, source_hash)
+        self.spark.pinned = branch_hash
         return self.spark
 
-    def run(self, command: str = "write", source_hash: str = HASH) -> dict[str, Any]:
-        return run_job(command, BRANCH, source_hash, self.nessie, self.open_spark)
+    def run(self, command: str = "write", source_hash: str = HASH, branch_hash: str | None = None) -> dict[str, Any]:
+        return run_job(command, BRANCH, source_hash, self.nessie, self.open_spark, branch_hash)
 
     def failed(self, result: dict[str, Any]) -> set[str]:
         return {check["name"] for table in result["tables"].values() for check in table["checks"] if not check["passed"]}
 
 
-def verify_calls(kind: str) -> list[str]:
+def verify_calls(kind: str, reference: str = BRANCH) -> list[str]:
     source = SOURCES[0] if kind == "clinical" else SOURCES[1]
     calls = [
-        f"content:{BRANCH}:{source}",
+        f"content:{reference}:{source}",
         f"content:{TRUNK}@H:{source}",
-        f"content:{BRANCH}:{BRONZE[kind]}",
+        f"content:{reference}:{BRONZE[kind]}",
         f"bronze_columns:{kind}",
         f"null_keys:{kind}",
         f"source_count:{kind}",
         f"bronze_count:{kind}",
         f"difference:{kind}",
-        f"key_statistics:{kind}",
+        f"key_duplicates:{kind}",
     ]
     if kind == "lab":
         calls += ["occurrence_gaps", "repeated_row_count", f"repeated_rows:{REPEATED_ROWS_LIMIT}"]
@@ -225,9 +228,9 @@ def start_calls(command: str) -> list[str]:
     calls = ["default_branch", f"history_contains:{TRUNK}:aaaa"]
     if command == "write":
         calls += [f"content:{TRUNK}@H:{SOURCES[0]}", f"content:{TRUNK}@H:{SOURCES[1]}", f"create_branch:{BRANCH}:{TRUNK}:aaaa"]
-    else:
-        calls += [f"is_branch:{BRANCH}"]
-    return [*calls, f"open:{BRANCH}:{TRUNK}:aaaa", "source_columns:clinical", "source_columns:lab"]
+        return [*calls, f"open:{BRANCH}:{TRUNK}:aaaa", "source_columns:clinical", "source_columns:lab"]
+    calls += [f"is_branch:{BRANCH}", f"head:{BRANCH}"]
+    return [*calls, f"open:{BRANCH}:{TRUNK}:aaaa:bbbb", "source_columns:clinical", "source_columns:lab"]
 
 
 class SequenceTest(unittest.TestCase):
@@ -250,7 +253,8 @@ class SequenceTest(unittest.TestCase):
     def test_verify_runs_every_check_and_writes_nothing(self) -> None:
         harness = Harness()
         result = harness.run("verify")
-        expected = [*start_calls("verify"), *verify_calls("clinical"), *verify_calls("lab"), "close", f"head:{BRANCH}"]
+        pinned = f"{BRANCH}@{HEAD_B}"
+        expected = [*start_calls("verify"), *verify_calls("clinical", pinned), *verify_calls("lab", pinned), "close"]
         self.assertEqual(expected, harness.calls)
         self.assertTrue(result["passed"])
         self.assertFalse([call for call in harness.calls if call.startswith(("write", "prepare", "create_branch"))])
@@ -265,6 +269,66 @@ class SequenceTest(unittest.TestCase):
         harness = Harness()
         harness.run("write")
         self.assertEqual((BRANCH, TRUNK, HASH), harness.spark.opened)
+
+
+class PinnedBranchTest(unittest.TestCase):
+    """A check at a given hash of the branch reads that hash for Nessie's metadata and for Spark, and never the branch by its name."""
+
+    PINNED = "c" * 64
+
+    def pinned_harness(self) -> Harness:
+        harness = Harness()
+        for table in (*SOURCES, *BRONZE.values()):
+            harness.nessie.contents[(f"{BRANCH}@{self.PINNED}", table)] = harness.nessie.contents[(BRANCH, table)]
+        return harness
+
+    def test_the_metadata_of_each_table_is_read_at_the_hash_and_not_through_the_branch_name(self) -> None:
+        harness = self.pinned_harness()
+        result = harness.run("verify", branch_hash=self.PINNED)
+        contents = [call for call in harness.calls if call.startswith("content:")]
+        self.assertTrue(contents)
+        self.assertEqual([], [call for call in contents if call.startswith(f"content:{BRANCH}:")])
+        self.assertTrue(all(call.startswith((f"content:{BRANCH}@{self.PINNED}:", f"content:{TRUNK}@H:")) for call in contents), contents)
+        self.assertTrue(result["passed"])
+
+    def test_the_spark_session_is_opened_pinned_to_the_hash(self) -> None:
+        harness = self.pinned_harness()
+        harness.run("verify", branch_hash=self.PINNED)
+        self.assertEqual(self.PINNED, harness.spark.pinned)
+        self.assertIn(f"open:{BRANCH}:{TRUNK}:aaaa:cccc", harness.calls)
+
+    def test_the_result_names_the_hash_that_was_checked_and_does_not_read_the_head_again(self) -> None:
+        harness = self.pinned_harness()
+        result = harness.run("verify", branch_hash=self.PINNED)
+        self.assertEqual(self.PINNED, result["branch_hash"])
+        self.assertNotIn(f"head:{BRANCH}", harness.calls)
+
+    def test_a_table_that_is_not_there_at_the_hash_fails_even_when_the_branch_head_holds_it(self) -> None:
+        harness = Harness()
+        result = harness.run("verify", branch_hash=self.PINNED)
+        self.assertFalse(result["passed"])
+        self.assertIn("source_changed", harness.failed(result))
+
+    def test_a_verify_with_no_hash_resolves_the_head_once_at_its_start_and_uses_it_for_every_read_and_the_result(self) -> None:
+        harness = Harness()
+        result = harness.run("verify")
+        self.assertEqual(1, harness.calls.count(f"head:{BRANCH}"))
+        self.assertLess(harness.calls.index(f"head:{BRANCH}"), next(i for i, call in enumerate(harness.calls) if call.startswith("open:")))
+        self.assertEqual(HEAD_B, harness.spark.pinned)
+        self.assertEqual(HEAD_B, result["branch_hash"])
+        reads = [call for call in harness.calls if call.startswith(f"content:{BRANCH}")]
+        self.assertTrue(reads)
+        self.assertTrue(all(call.startswith(f"content:{BRANCH}@{HEAD_B}:") for call in reads), reads)
+
+    def test_a_write_reads_the_head_by_the_branch_name_because_it_writes_there(self) -> None:
+        harness = Harness()
+        harness.run("write")
+        self.assertIsNone(harness.spark.pinned)
+        self.assertIn(f"content:{BRANCH}:{SOURCES[0]}", harness.calls)
+
+    def test_a_write_cannot_be_pinned_because_it_writes_to_the_head(self) -> None:
+        with self.assertRaises(SettingsError):
+            Harness().run("write", branch_hash=self.PINNED)
 
 
 class DefaultBranchTest(unittest.TestCase):
@@ -355,7 +419,7 @@ class TableCheckTest(unittest.TestCase):
 
     def test_a_key_that_repeats_fails_the_unique_check(self) -> None:
         harness = Harness()
-        harness.spark.statistics = KeyStatistics(6, 5)
+        harness.spark.duplicates = 2
         self.assertEqual({"key unique"}, harness.failed(harness.run("verify")))
 
     def test_a_gap_in_the_occurrence_numbers_fails_the_gap_check(self) -> None:
@@ -382,7 +446,7 @@ class NullKeyTest(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertEqual({"key not null"}, harness.failed(result))
                 self.assertTrue(out.startswith(RESULT_PREFIX))
-                for later in ("occurrence_gaps", "repeated_row_count", "repeated_rows", "source_count", "difference", "digests", "key_statistics"):
+                for later in ("occurrence_gaps", "repeated_row_count", "repeated_rows", "source_count", "difference", "digests", "key_duplicates"):
                     self.assertFalse([call for call in harness.calls if call.startswith(later)], later)
 
     def test_the_key_check_runs_before_every_check_that_reads_the_rows_and_after_the_column_check(self) -> None:

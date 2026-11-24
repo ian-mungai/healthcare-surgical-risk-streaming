@@ -12,7 +12,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from features.model import ClinicalValue, FeatureInputError, Reading, WaveformSecond, WaveformWindow, WindowInput
-from features.registry import INPUT_OBJECTS
+from features.registry import ARTERIAL_SERIES, INPUT_OBJECTS
+from features.series_input import series_readings_from_json
 
 
 def reject_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -62,6 +63,9 @@ def parse_window(value: object, path: str = "the window") -> WindowInput:
     numeric: dict[str, list[Reading]] = {}
     for track, readings in as_object(body["numeric"], f"{path}.numeric").items():
         where = f"{path}.numeric[{track}]"
+        if track == ARTERIAL_SERIES:
+            numeric[track] = series_readings_from_json(as_array(readings, where), where, body["cutoff_us"])
+            continue
         numeric[track] = []
         for index, reading in enumerate(as_array(readings, where)):
             triple = as_array(reading, f"{where}[{index}]")

@@ -26,7 +26,9 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 from features.model import ClinicalValue
+from features.registry import WAVEFORM_INVALID_SECOND
 from replay.events.identity import marker_event_id
+from replay.events.recording import CaseRecording
 from spark.streaming.model import Context, DecisionRecord, ErrorRecord, Event, FeatureRecord, LedgerRecord, Policy, Record
 from spark.streaming.occurrence import process
 from spark.streaming.state import OccurrenceState
@@ -92,7 +94,7 @@ class OracleParity(unittest.TestCase):
         state = next(iter(states.values()))
         oldest = min(time for readings in state.numeric.values() for time in readings)
         self.assertGreater(oldest, 510 * SECOND)
-        self.assertLess(len(state.art_summary), 1_000)
+        self.assertLess(len(state.art), 1_000)
         self.assertGreater(len(state.numeric), 0)
 
     def test_the_eligibility_of_a_row_is_the_feature_codes_eligibility_at_its_cutoff(self) -> None:
@@ -192,9 +194,84 @@ class SavedState(unittest.TestCase):
     def test_a_state_of_an_earlier_format_is_refused_not_read_with_missing_fields(self) -> None:
         _, states = run_stream(events_for(synthetic_recording())[:50])
         saved = json.loads(next(iter(states.values())).to_json())
-        saved["format"] = "stream_state_1"
-        with self.assertRaises(ValueError):
-            OccurrenceState.from_json(json.dumps(saved))
+        for earlier in ("stream_state_1", "stream_state_2"):
+            with self.subTest(earlier=earlier), self.assertRaises(ValueError):
+                OccurrenceState.from_json(json.dumps(saved | {"format": earlier}))
+
+    def test_a_state_with_a_missing_sample_and_a_judged_arterial_second_is_read_back_as_it_was(self) -> None:
+        events = events_for(synthetic_recording(caseend_s=200, opend_s=190, rate=4))
+        hole = (float("nan"), *next(event for event in events if event.kind == "waveform" and event.case_time_us == 50 * SECOND).samples[1:])
+        broken = [
+            replace(event, samples=hole) if event.kind == "waveform" and event.case_time_us == 50 * SECOND and event.track == "SNUADC/ART" else event
+            for event in events
+        ]
+        _, states = run_stream([event for event in broken if event.replay_time_us <= ORIGIN_US + 100 * SECOND])
+        state = next(iter(states.values()))
+        self.assertIsNone(state.wave_samples["SNUADC/ART"][50].samples[0])
+        self.assertEqual("missing", state.art[50].cause)
+        again = OccurrenceState.from_json(state.to_json())
+        self.assertEqual((state.art, state.wave_samples), (again.art, again.wave_samples))
+        self.assertEqual(state.to_json(), again.to_json())
+
+
+class SignalParity(unittest.TestCase):
+    """The stream judges each second and each reading by the one definition that Silver's batch path calls, so every row equals the oracle's."""
+
+    def agree(self, recording: CaseRecording, cutoffs: Sequence[int], *, batch_size: int = 10_000, restart: bool = False) -> dict[int, FeatureRecord]:
+        records, _ = run_stream(events_for(recording), batch_size=batch_size, restart=restart)
+        found = features_of(records)
+        self.assertEqual([], [record for record in records if isinstance(record, ErrorRecord)])
+        for cutoff in cutoffs:
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
+                eligible, reasons = oracle_eligibility(recording, cutoff)
+                self.assertEqual((eligible, reasons), (found[cutoff].warning_eligible, found[cutoff].eligibility_reasons))
+        return found
+
+    def test_a_flat_segment_of_20_seconds_makes_the_second_that_ends_it_invalid_in_the_stream_as_in_the_batch_path(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, flat_s=(100, 140))
+        found = self.agree(recording, (60 * SECOND, 120 * SECOND, 180 * SECOND, 300 * SECOND))
+        self.assertIn(WAVEFORM_INVALID_SECOND, found[120 * SECOND].eligibility_reasons)
+        self.assertNotIn(WAVEFORM_INVALID_SECOND, found[60 * SECOND].eligibility_reasons)
+
+    def test_a_jump_across_a_second_boundary_and_a_gap_of_a_second_are_judged_as_the_batch_path_judges_them(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, jump_s=170, gap_s=200)
+        self.agree(recording, (60 * SECOND, 180 * SECOND, 240 * SECOND, 300 * SECOND))
+
+    def test_the_rows_do_not_depend_on_the_batch_split_or_a_restart_when_seconds_are_judged_over_20_seconds(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, flat_s=(100, 140), jump_s=170, gap_s=200)
+        whole = self.agree(recording, (120 * SECOND, 180 * SECOND, 240 * SECOND))
+        for size in (1, 7, 250):
+            with self.subTest(size=size):
+                self.assertEqual(whole, self.agree(recording, (120 * SECOND, 240 * SECOND), batch_size=size, restart=True))
+
+    def test_arterial_seconds_that_arrive_out_of_order_inside_the_limit_are_judged_after_the_seconds_before_them(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, flat_s=(100, 140), jump_s=170)
+        events = events_for(recording)
+        arterial = [index for index, event in enumerate(events) if event.kind == "waveform" and event.track == "SNUADC/ART"]
+        swapped = list(events)
+        for first, second in zip(arterial[0::2], arterial[1::2], strict=False):
+            swapped[first], swapped[second] = events[second], events[first]
+        records, _ = run_stream(swapped, batch_size=1)
+        found = features_of(records)
+        for cutoff in (120 * SECOND, 180 * SECOND, 240 * SECOND, 300 * SECOND):
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(oracle_values(recording, cutoff), values_of(found[cutoff]))
+                self.assertEqual(oracle_eligibility(recording, cutoff), (found[cutoff].warning_eligible, found[cutoff].eligibility_reasons))
+
+    def test_only_the_arterial_seconds_that_a_closed_cutoff_reads_are_judged_so_a_later_second_never_waits_on_one_not_yet_arrived(self) -> None:
+        events = events_for(synthetic_recording(caseend_s=400, opend_s=300, rate=4))
+        _, states = run_stream([event for event in events if event.replay_time_us <= ORIGIN_US + 100 * SECOND])
+        state = next(iter(states.values()))
+        self.assertEqual(59, max(state.art))
+        self.assertGreater(max(state.wave_samples["SNUADC/ART"]), 59)
+
+    def test_a_reading_of_a_limited_numeric_track_outside_its_limits_is_not_valid(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4)
+        wide = [(time, 250.0 if time == 51 * SECOND else value) for time, value in recording.numeric[1].readings]
+        changed = replace(recording, numeric=(recording.numeric[0], replace(recording.numeric[1], readings=tuple(wide)), recording.numeric[2]))
+        self.agree(changed, (60 * SECOND, 120 * SECOND))
+        self.assertNotEqual(oracle_values(recording, 60 * SECOND), oracle_values(changed, 60 * SECOND))
 
 
 class BatchIndependence(unittest.TestCase):
@@ -455,7 +532,7 @@ class CaseEnd(unittest.TestCase):
         self.assertEqual(f"{RUN}|0|101.0|ledger", ledger[0].ledger_id)
         state = next(iter(states.values()))
         self.assertTrue(state.closed)
-        self.assertEqual(({}, {}, {}), (state.numeric, state.wave_samples, state.art_summary))
+        self.assertEqual(({}, {}, {}), (state.numeric, state.wave_samples, state.art))
 
     def test_an_event_after_the_case_end_is_recorded_and_changes_no_row(self) -> None:
         recording = synthetic_recording()

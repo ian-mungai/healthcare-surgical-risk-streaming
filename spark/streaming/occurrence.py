@@ -19,13 +19,13 @@ arrival order.
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping, Sequence
 
 from features.batch import compute_rows, row_document
 from features.eligibility import warning_eligibility
 from features.model import ClinicalValue, Reading, WaveformSecond, WaveformWindow, WindowInput
 from features.registry import ARTERIAL_SERIES, NUMERIC_TRACKS, NUMERIC_WINDOW_SECONDS, WAVEFORM_TRACKS, WAVEFORM_WINDOW_SECONDS, complete_seconds
+from features.signal_validity import numeric_verdict
 from spark.streaming.model import (
     AFTER_CASE_END,
     DUPLICATE,
@@ -42,7 +42,7 @@ from spark.streaming.model import (
     LedgerRecord,
     Record,
 )
-from spark.streaming.signals import ARTERIAL_WAVEFORM, physical_samples, series_reading, summarise_second
+from spark.streaming.signals import ARTERIAL_WAVEFORM, art_second, physical_samples, second_valid, series_window
 from spark.streaming.state import OccurrenceState, WaveSecondState
 from spark.streaming.version import error_id, feature_id, ledger_id
 
@@ -51,11 +51,6 @@ PRUNE_SLACK_SECONDS = 2
 
 def new_state(event: Event) -> OccurrenceState:
     return OccurrenceState(event.run_id, event.room, event.occurrence_id, event.case_id)
-
-
-def whole_rate(sample_rate: float) -> int:
-    """The sample rate as a whole number, or 0 when it is not one: a second of such a track is never valid, and the feature code names the rate."""
-    return int(sample_rate) if math.isfinite(sample_rate) and sample_rate > 0 and sample_rate == int(sample_rate) else 0
 
 
 def process(state: OccurrenceState | None, events: Sequence[Event], context: Context) -> tuple[OccurrenceState, list[Record]]:
@@ -160,8 +155,6 @@ def apply(state: OccurrenceState, event: Event, lateness_us: int, context: Conte
         second = event.case_time_us // SECOND
         samples = physical_samples(event.samples, event.gain, event.physical_offset)
         state.wave_samples.setdefault(event.track, {})[second] = WaveSecondState(event.sample_rate, event.start_offset_us, samples)
-        if event.track == ARTERIAL_WAVEFORM:
-            state.art_summary[second] = summarise_second(samples, whole_rate(event.sample_rate), event.start_offset_us, arterial=True)
     return True
 
 
@@ -215,6 +208,7 @@ def emit_due(state: OccurrenceState, context: Context, records: list[Record], fo
 
 def row_record(state: OccurrenceState, context: Context, cutoff_us: int, final: bool) -> Record:
     identity = feature_id(state.run_id, state.room, state.occurrence_id, cutoff_us, context.version)
+    judge_arterial(state, cutoff_us)
     window = window_at(state, cutoff_us, context)
     try:
         row = compute_rows([window])[0]
@@ -247,21 +241,29 @@ def row_record(state: OccurrenceState, context: Context, cutoff_us: int, final: 
     )
 
 
+def judge_arterial(state: OccurrenceState, cutoff_us: int) -> None:
+    """Judge each arterial second that is complete at the cutoff and has no record yet, oldest first, so a record is made once from the seconds before it.
+
+    The cutoff is closed, so no in-policy event for a second before it can still arrive, and the buffers hold every second that is not yet judged (``prune``).
+    """
+    held = state.wave_samples.get(ARTERIAL_WAVEFORM, {})
+    for second in sorted(held):
+        if (second + 1) * SECOND > cutoff_us:
+            break
+        if second not in state.art:
+            item = held[second]
+            state.art[second] = art_second(second, item.samples, item.sample_rate, item.start_offset_us, state.art)
+
+
 def window_at(state: OccurrenceState, cutoff_us: int, context: Context) -> WindowInput:
     """The window of a cutoff from the buffers: only what the feature code reads at that cutoff."""
     numeric: dict[str, list[Reading]] = {}
     lower = cutoff_us - NUMERIC_WINDOW_SECONDS * SECOND
     for track, readings in state.numeric.items():
         inside = sorted((time, value) for time, (_, value) in readings.items() if lower < time <= cutoff_us)
-        numeric[track] = [Reading(time, value, math.isfinite(value)) for time, value in inside]
-    if state.art_summary:
-        series = []
-        for second in complete_seconds(cutoff_us, NUMERIC_WINDOW_SECONDS):
-            summary = state.art_summary.get(second)
-            if summary is not None:
-                value, valid = series_reading(state.art_summary.get(second - 1), summary)
-                series.append(Reading(second * SECOND, value, valid))
-        numeric[ARTERIAL_SERIES] = series
+        numeric[track] = [Reading(time, value, numeric_verdict(track, value).valid) for time, value in inside]
+    if state.art:
+        numeric[ARTERIAL_SERIES] = series_window(state.art, cutoff_us)
     waveforms: dict[str, WaveformWindow] = {}
     span = complete_seconds(cutoff_us, WAVEFORM_WINDOW_SECONDS)
     for track, held in state.wave_samples.items():
@@ -270,11 +272,10 @@ def window_at(state: OccurrenceState, cutoff_us: int, context: Context) -> Windo
             item = held.get(second)
             if item is None:
                 continue
-            if track == ARTERIAL_WAVEFORM:
-                valid = state.art_summary[second].valid
-            else:
-                valid = summarise_second(item.samples, whole_rate(item.sample_rate), item.start_offset_us, arterial=False).valid
-            seconds.append(WaveformSecond(second, item.samples, valid, item.start_offset_us))
+            arterial = track == ARTERIAL_WAVEFORM
+            valid = state.art[second].valid if arterial else second_valid(track, item.samples, item.sample_rate, item.start_offset_us)
+            samples = tuple(sample for sample in item.samples if sample is not None) if valid else ()
+            seconds.append(WaveformSecond(second, samples, valid, item.start_offset_us))
         if not seconds:
             continue
         waveforms[track] = WaveformWindow(held[seconds[0].second].sample_rate, tuple(seconds))
@@ -288,7 +289,7 @@ def prune(state: OccurrenceState, context: Context) -> None:
     if following is None:
         state.numeric.clear()
         state.wave_samples.clear()
-        state.art_summary.clear()
+        state.art.clear()
         return
     margin_us = context.policy.cutoff_step_us + context.policy.late_limit_us
     cutoff = following[0] - margin_us
@@ -297,8 +298,8 @@ def prune(state: OccurrenceState, context: Context) -> None:
         for time in [time for time in readings if time <= lower_us]:
             del readings[time]
     first_series = (cutoff // SECOND) - 1 - NUMERIC_WINDOW_SECONDS - PRUNE_SLACK_SECONDS
-    for second in [second for second in state.art_summary if second < first_series]:
-        del state.art_summary[second]
+    for second in [second for second in state.art if second < first_series]:
+        del state.art[second]
     first_wave = (cutoff // SECOND) - 1 - WAVEFORM_WINDOW_SECONDS - PRUNE_SLACK_SECONDS
     for seconds in state.wave_samples.values():
         for second in [second for second in seconds if second < first_wave]:
@@ -330,4 +331,4 @@ def finish(state: OccurrenceState, event: Event, context: Context, records: list
     state.closed = True
     state.numeric.clear()
     state.wave_samples.clear()
-    state.art_summary.clear()
+    state.art.clear()

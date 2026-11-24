@@ -124,6 +124,10 @@ def prepare(secrets_directory: Path, unlock_key_file: Path | None, owner: tuple[
             write_private_file(path, secrets.token_urlsafe(SECRET_BYTES), replace=False, owner=owner)
         return True
     read_file(path, "admin secret ID file")
+    if path.read_bytes().endswith((b"\n", b"\r")):
+        raise BootstrapError(
+            "the admin secret ID file ends with a line break; the first start keeps the file's content and the login trims it, so remove the break"
+        )
     if not access_differs(path, owner):
         return False
     if not check_only:

@@ -97,6 +97,40 @@ class TemplateTest(unittest.TestCase):
             render_template(template({"Sid": "A", "Effect": "Allow", "Action": actions, "Resource": "arn:aws:s3:::x/*"}), VALUES)
 
 
+class CostReadTest(unittest.TestCase):
+    """The project profile may read the cost and usage of its account, to read the copy's bill, and may do nothing else with Cost Explorer.
+
+    AWS's service authorization reference for AWS Cost Explorer lists ``ce:GetCostAndUsage`` at the Read access level, with the optional resource type
+    ``billingview`` and no required one, so a call that names no billing view is allowed only on ``*``
+    (https://docs.aws.amazon.com/service-authorization/latest/reference/list_ce.html, read Nov 23 2026).
+    """
+
+    def statements(self) -> list[dict[str, Any]]:
+        documents = load_documents(VALUES)
+        self.assertIn("ce", documents, "a Cost Explorer policy template exists")
+        return list(documents["ce"]["Statement"])
+
+    def test_one_statement_allows_only_the_read_of_cost_and_usage_on_every_resource(self) -> None:
+        statements = self.statements()
+        self.assertEqual(1, len(statements))
+        self.assertEqual(
+            {"Sid": "ReadCostAndUsage", "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*"},
+            statements[0],
+        )
+
+    def test_the_grant_passes_the_scope_rules_because_the_action_is_a_read(self) -> None:
+        document = load_documents(VALUES)["ce"]
+        self.assertEqual([], scope_problems(document))
+        self.assertEqual(["ce:GetCostAndUsage"], [action for statement in document["Statement"] for action in as_list(statement["Action"])])
+
+    def test_no_other_template_and_no_boundary_statement_grants_a_cost_explorer_action(self) -> None:
+        others = {name: document for name, document in load_documents(VALUES).items() if name != "ce"}
+        boundary = load_documents(VALUES, BOUNDARY_DIRECTORY, suffix="_boundary")
+        for name, document in {**others, **boundary}.items():
+            with self.subTest(template=name):
+                self.assertEqual([], [a for s in document["Statement"] for a in as_list(s.get("Action", [])) if str(a).startswith("ce:") or a == "*"])
+
+
 def resources(document: Mapping[str, Any], *sids: str) -> list[str]:
     found: list[str] = []
     for statement in document["Statement"]:

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -131,6 +133,46 @@ class PasswordOwnerTest(unittest.TestCase):
 
     def test_the_server_is_always_for_the_root_owner_even_if_a_tool_is_named_for_it(self) -> None:
         self.assertEqual((7, 8), accounts.password_owners(["nessie"], self.entries, (7, 8))["postgres"])
+
+
+class ReaderCharacterTest(unittest.TestCase):
+    """SmallRye Config 3.17.2 expands ``${...}`` and drops a backslash before ``$`` after the parse, so Nessie's reader takes neither character."""
+
+    def made(self, folder: Path, content: str, *, check_only: bool = False) -> tuple[Any, Path]:
+        store = store_module.PasswordStore.in_secrets(folder)
+        path = store.path("nessie")
+        path.parent.mkdir(parents=True)
+        path.write_text(content)
+        path.chmod(0o600)
+        accounts.make_password_files(store, {"nessie": (os.getuid(), os.getgid())}, check_only=check_only)
+        return store, path
+
+    def test_a_nessie_password_with_a_dollar_sign_or_a_backslash_is_refused_by_name_and_the_value_is_not_shown(self) -> None:
+        for content in ("pre$fix-value-0123456789", "pre\\fix-value-0123456789", "${HOME}-value-0123456789", "tail-value-0123456789\\"):
+            for check_only in (False, True):
+                with self.subTest(content=content, check_only=check_only), tempfile.TemporaryDirectory() as scratch:
+                    with self.assertRaises(accounts.AccountError) as caught:
+                        self.made(Path(scratch), content, check_only=check_only)
+                    self.assertIn("password file of nessie", str(caught.exception))
+                    self.assertNotIn("value-0123456789", str(caught.exception))
+                    self.assertEqual(content, (Path(scratch) / "postgres" / "nessie.password").read_text(), "the file is left as it was")
+
+    def test_a_nessie_password_without_them_and_another_tools_password_with_them_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            self.made(Path(scratch), "plain-value_0123456789")
+        with tempfile.TemporaryDirectory() as scratch:
+            store = store_module.PasswordStore.in_secrets(Path(scratch))
+            store.path("airbyte").parent.mkdir(parents=True)
+            store.path("airbyte").write_text("a$b\\c-value-0123456789")
+            store.path("airbyte").chmod(0o600)
+            accounts.make_password_files(store, {"airbyte": (os.getuid(), os.getgid())}, check_only=False)
+
+    def test_a_password_that_the_step_generates_never_holds_them(self) -> None:
+        for _ in range(50):
+            with tempfile.TemporaryDirectory() as scratch:
+                store = store_module.PasswordStore.in_secrets(Path(scratch))
+                accounts.make_password_files(store, {"nessie": (os.getuid(), os.getgid())}, check_only=False)
+                self.assertNotRegex(store.read("nessie"), r"[$\\]")
 
 
 PASSWORDS = {"nessie": "n-secret-value", "airbyte": "a-secret-value", "extra": "e-secret-value"}

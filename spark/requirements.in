@@ -1,7 +1,14 @@
-# The packages of the Spark image that the Bronze decoder and the streaming job need, in spark/Dockerfile. `make lock-spark` writes requirements.txt with hashes.
+# The packages of the Spark image that the Bronze decoder, its checks and the streaming job need, in spark/Dockerfile. `make lock-spark` writes requirements.txt with hashes.
 # vitaldb decodes the publisher's case files. boto3 reads the landed object versions from S3 on the host. Both are the replay's pins.
 vitaldb==1.7.2
 boto3==1.43.126
+# Great Expectations runs the column-level checks of the Bronze tables (spark/bronze/quality.py). Release 1.24.1 is 32 days old on 2026-11-23, supports Python 3.14 and Spark below 4.2.
+great-expectations==1.24.1
+# Its dependencies below are held at releases that were at least 14 days old on 2026-11-23: the newest releases of each were published after 2026-11-09.
+marshmallow==4.3.1
+narwhals==2.28.0
+pydantic==2.14.3
+pydantic-core==2.50.4
 # The streaming job: fastavro reads and writes the Avro wire bytes (the replay's pin). pyarrow and protobuf are what Spark 4.1.4's Python transformWithState
 # needs, and protobuf is Spark's own pin (dev/requirements.txt of the 4.1.4 tag, the version of its generated code). Each was released at least two weeks before.
 fastavro==1.13.1

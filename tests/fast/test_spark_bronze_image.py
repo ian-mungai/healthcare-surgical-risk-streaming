@@ -33,6 +33,7 @@ SCHEMAS = ("numeric", "waveform", "string_event", "case_lifecycle", "feature_rea
 READ_FILES = ("tests/fixtures/vitaldb/release.json", *(f"replay/events/schemas/{name}.avsc" for name in SCHEMAS))
 PACKAGES = ("vitaldb", "boto3", "fastavro")
 STREAM_ONLY_PACKAGES = ("pyarrow", "protobuf")
+CHECK_PACKAGES = {"great-expectations": "1.24.1", "marshmallow": "4.3.1", "narwhals": "2.28.0", "pydantic": "2.14.3", "pydantic-core": "2.50.4"}
 INSTALL_FLAGS = ("--require-hashes", "--only-binary :all:", "--no-deps")
 LOCK_ENTRY = re.compile(r"^([A-Za-z0-9_.-]+)==(\S+) \\$", re.MULTILINE)
 
@@ -139,6 +140,17 @@ class Image(unittest.TestCase):
                 without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
                 self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, rules, needed))
 
+    def test_the_image_holds_every_file_of_the_feature_package_so_its_version_is_the_hosts(self) -> None:
+        """``spark.streaming.version.feature_version`` is the digest of every ``features/*.py`` file, and the batch path and the acceptance run compute it on
+        the host: an image with fewer files gives the job another version and other feature IDs."""
+        every = {str(path.relative_to(ROOT)) for path in (ROOT / "features").glob("*.py")}
+        self.assertEqual([], image_problems(DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text()), every))
+        text = DOCKERFILE.read_text()
+        for path in sorted(every):
+            with self.subTest(left_out=path):
+                without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
+                self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, ignore_rules(IGNORE_FILE.read_text()), every))
+
     def test_the_image_copies_no_replay_module_that_no_job_imports(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         for source, _ in copied_pairs(DOCKERFILE.read_text()):
@@ -178,12 +190,26 @@ class Packages(unittest.TestCase):
 
     def test_the_replays_packages_are_pinned_where_the_replay_pins_them(self) -> None:
         source, replay = requested(REQUIREMENTS_IN.read_text()), requested(REPLAY_IN.read_text())
-        self.assertEqual({*PACKAGES, *STREAM_ONLY_PACKAGES}, set(source))
+        self.assertEqual({*PACKAGES, *STREAM_ONLY_PACKAGES, *CHECK_PACKAGES}, set(source))
         for name in STREAM_ONLY_PACKAGES:
             self.assertEqual(source[name], locked(LOCK.read_text()).get(name), f"{name} is pinned in the requirements and not at that version in the lock")
         for name in PACKAGES:
             self.assertEqual(replay[name], source[name], name)
             self.assertEqual(replay[name], locked(LOCK.read_text())[name], name)
+
+    def test_the_checks_package_and_the_dependencies_held_back_are_pinned_in_the_input_and_the_lock_at_one_version(self) -> None:
+        source, lock = requested(REQUIREMENTS_IN.read_text()), locked(LOCK.read_text())
+        for name, version in CHECK_PACKAGES.items():
+            self.assertEqual(version, source[name], name)
+            self.assertEqual(version, lock[name], name)
+
+    def test_the_checks_packages_are_locked_for_the_hash_checked_wheel_install_and_the_job_imports_them_by_name_only(self) -> None:
+        text = LOCK.read_text()
+        for name in ("great-expectations", "pydantic", "pydantic-core", "narwhals", "marshmallow"):
+            self.assertIn(f"\n{name}=={CHECK_PACKAGES[name]} \\\n    --hash=sha256:", text)
+        quality = (ROOT / "spark" / "bronze" / "quality.py").read_text()
+        self.assertNotIn("\nimport great_expectations", quality)
+        self.assertNotIn("\nfrom great_expectations", quality)
 
     def test_a_package_that_both_locks_hold_has_one_version(self) -> None:
         ours, replay = locked(LOCK.read_text()), locked(REPLAY_LOCK.read_text())

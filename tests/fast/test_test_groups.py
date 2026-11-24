@@ -1,78 +1,36 @@
-"""The commit hook runs the quick group under ``tests/fast``; the slow group under ``tests/slow`` runs with ``make test-slow`` and its own CI job.
+"""The commit hook and ``make test-fast`` run the quick group, ``tests/fast``, with stock ``unittest`` discovery; the slow group,
+``tests/slow`` (Ansible playbook runs, tests that bind a local server or start a stand-in program, and the planted workflow faults), runs
+with ``make test-slow`` and in its own CI job.
 
-A quick test that imports the slow group in any form (absolute, relative, ``from tests import slow`` or at run time while loading) would bring its
-playbook runs, local servers or planted loops back into every commit. The check loads the quick group the way ``unittest discover`` does, in a fresh
-interpreter, and reads which modules that loaded and which modules the collected tests come from.
+The split is by folder. Accepted limit (owner, Nov 23 2026: "simplest redesign fix", after seven review rounds of an import blocker): no
+check stops a quick test from importing or running slow code; the guard is the run time itself, which the hosted hooks job and the guard
+harness bound with their deadlines, and review of each change that adds a test.
 """
 
 from __future__ import annotations
 
-import json
-import sys
-import tempfile
-import textwrap
 import unittest
 from pathlib import Path
+from typing import Any
 
-from scripts.process import run_command
+from scripts.stack.yaml_text import load_yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-LOAD_SECONDS = 120
-# Loads tests/fast from the given top-level folder and prints the slow-group modules it imported and the modules its tests come from.
-PROBE = textwrap.dedent(
-    """
-    import json, sys, unittest
-    top = sys.argv[1]
-    sys.path.insert(0, top)
-    suite = unittest.TestLoader().discover(top + "/tests/fast", top_level_dir=top)
-    def cases(item):
-        for child in item:
-            yield from cases(child) if isinstance(child, unittest.TestSuite) else [child]
-    slow = lambda name: name == "tests.slow" or name.startswith("tests.slow.")
-    imported = sorted(name for name in sys.modules if slow(name))
-    collected = sorted({type(case).__module__ for case in cases(suite) if slow(type(case).__module__)})
-    print(json.dumps({"imported": imported, "collected": collected}))
-    """
-)
-
-
-def slow_reach(top: Path) -> dict[str, list[str]]:
-    """The slow-group modules that loading the quick group under ``top`` imports, and the slow-group modules its collected tests come from."""
-    result = run_command(sys.executable, ["-I", "-c", PROBE, str(top)], cwd=top, timeout=LOAD_SECONDS)
-    if result.returncode != 0:
-        raise AssertionError(f"loading the quick group failed: {result.stderr[-2000:]}")
-    reach = json.loads(result.stdout.strip().splitlines()[-1])
-    return {"imported": [str(name) for name in reach["imported"]], "collected": [str(name) for name in reach["collected"]]}
+QUICK_ARGUMENTS = "-m unittest discover --start-directory tests/fast --top-level-directory ."
 
 
 class TestGroupsTest(unittest.TestCase):
-    def test_the_quick_group_loads_nothing_of_the_slow_group(self) -> None:
-        self.assertEqual(slow_reach(ROOT), {"imported": [], "collected": []}, "a quick test reaches the slow group, so the commit hook would run its work")
+    def test_the_commit_hook_and_make_run_the_quick_folder_only(self) -> None:
+        config: Any = load_yaml((ROOT / ".pre-commit-config.yaml").read_text())
+        hooks = [hook for repo in config["repos"] for hook in repo["hooks"]]
+        self.assertEqual([hook["entry"] for hook in hooks if hook["id"] == "fast-tests"], [f".venv/bin/python {QUICK_ARGUMENTS}"])
+        makefile = (ROOT / "Makefile").read_text()
+        self.assertEqual(makefile.split("\ntest-fast:\n", 1)[1].split("\n\n", 1)[0].strip(), f"$(PYTHON) {QUICK_ARGUMENTS}")
+        self.assertEqual(
+            makefile.split("\ntest-slow:\n", 1)[1].split("\n\n", 1)[0].strip(),
+            "$(PYTHON) -m unittest discover --start-directory tests/slow --top-level-directory .",
+        )
 
     def test_the_slow_group_is_a_package_that_discovery_finds(self) -> None:
         self.assertTrue((ROOT / "tests" / "slow" / "__init__.py").is_file())
         self.assertTrue(any((ROOT / "tests" / "slow").glob("test_*.py")))
-
-    def test_each_planted_form_of_import_is_found(self) -> None:
-        """The control: in a copy with a slow module, each import form in a quick module is seen as an import, and a planted class as collected."""
-        forms = {
-            "absolute": "import tests.slow.test_planted_slow\n",
-            "from absolute": "from tests.slow.test_planted_slow import VALUE\n",
-            "from package": "from tests import slow\n",
-            "relative": "from ..slow.test_planted_slow import PlantedSlowTest\n",
-            "run time": "import importlib\nimportlib.import_module('tests.slow.test_planted_slow')\n",
-        }
-        for label, source in forms.items():
-            with self.subTest(form=label):
-                top = Path(self.enterContext(tempfile.TemporaryDirectory()))
-                for package in ("tests", "tests/fast", "tests/slow"):
-                    (top / package).mkdir(parents=True, exist_ok=True)
-                    (top / package / "__init__.py").write_text("")
-                (top / "tests/slow/test_planted_slow.py").write_text(
-                    "import unittest\nVALUE = 1\nclass PlantedSlowTest(unittest.TestCase):\n    def test_x(self):\n        pass\n"
-                )
-                (top / "tests/fast/test_planted_quick.py").write_text(source)
-                reach = slow_reach(top)
-                self.assertNotEqual(reach["imported"], [], f"the {label} import was not seen")
-                if label == "relative":
-                    self.assertEqual(reach["collected"], ["tests.slow.test_planted_slow"])

@@ -30,7 +30,7 @@ from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.landing import LANDING_PREFIX
 from scripts.ingestion.notice import ClosedError, Code, Notice, render
 from scripts.ingestion.selection import FULL_RELEASE, FULL_RELEASE_TABLES, Selection, full_release_files, pinned_release
-from scripts.sample.candidates import CANDIDATES_FILE, read_candidates
+from scripts.sample.candidates import CANDIDATES_FILE, development_candidates, read_candidates
 from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
 SOURCE_REPOSITORY = "airbyte/source-s3"
@@ -69,9 +69,12 @@ def full_release_selection() -> Selection:
 
 
 def fixed_sample_selection() -> Selection:
-    """The fixed sample: the tracked candidate cases and the two tables, all of the pinned release, so a later full copy adds only the rest."""
+    """The fixed sample: the development candidate cases and the two tables, all of the pinned release, so a later full copy adds only the rest.
+
+    The candidates of test patients are never selected: no fixed-sample job reads them.
+    """
     pin = pinned_release()
-    cases = [candidate.key.removeprefix(pin.source_prefix) for candidate in read_candidates(CANDIDATES_FILE)]
+    cases = [candidate.key.removeprefix(pin.source_prefix) for candidate in development_candidates(read_candidates(CANDIDATES_FILE))]
     return Selection(
         FIXED_SAMPLE,
         pin.release,
