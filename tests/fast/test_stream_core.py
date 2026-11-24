@@ -37,6 +37,7 @@ from spark.streaming.state import OccurrenceState
 from tests.fast.stream_support import (
     CONTEXT,
     HEART_RATE,
+    NO_CLINICAL,
     ORIGIN_US,
     RUN,
     SECOND,
@@ -337,6 +338,66 @@ class PacketBoundary(unittest.TestCase):
     def test_control_packets_that_start_exactly_on_each_second_give_the_batch_rows_and_the_stream_rows_alike(self) -> None:
         recording = synthetic_recording(caseend_s=1_000, opend_s=990, opstart_s=30, rate=4, packet_s=1)
         self.agree(recording, (120 * SECOND, 960 * SECOND))
+
+
+class ArterialRetention(unittest.TestCase):
+    """An arterial second is judged at the first cutoff that reads it, so its samples stay until then. A cutoff can be much later than the second: the job can
+    be started again on its checkpoint with a larger cutoff step, and the numeric window of 900 seconds still reads each second that no cutoff has judged."""
+
+    def test_no_feature_value_depends_on_the_micro_batch_size_or_a_restart_between_batches_for_any_late_limit_and_cutoff_step(self) -> None:
+        recording = synthetic_recording(caseend_s=400, opend_s=300, rate=4, flat_s=(100, 140), jump_s=170, gap_s=200)
+        events = events_for(recording)
+        for late, step in ((30, 60), (0, 10), (5, 45)):
+            context = Context(Policy(late * SECOND, step * SECOND), "features_test", NO_CLINICAL)
+            whole = sorted(map(repr, run_stream(events, context)[0]))
+            for size in (1, 7, 64):
+                with self.subTest(late=late, step=step, size=size):
+                    self.assertEqual(whole, sorted(map(repr, run_stream(events, context, batch_size=size, restart=True)[0])))
+
+    def test_the_unjudged_arterial_seconds_are_kept_when_the_next_cutoff_is_far_after_them(self) -> None:
+        recording = synthetic_recording(caseend_s=1_000, opend_s=950, opstart_s=30, rate=4)
+        events = stamp(events_for(recording))
+        small = Context(Policy(LIMIT_US, 60 * SECOND), "features_test", NO_CLINICAL)
+        large = Context(Policy(LIMIT_US, 300 * SECOND), "features_test", NO_CLINICAL)
+        cut = ORIGIN_US + 160 * SECOND
+        state, records = process(None, [event for event in events if event.replay_time_us <= cut], small)
+        self.assertEqual([START, 60 * SECOND, 120 * SECOND], sorted(features_of(records)))
+        self.assertIn(125, state.wave_samples["SNUADC/ART"])
+        self.assertNotIn(125, state.art)
+        state = OccurrenceState.from_json(state.to_json())
+        for event in events:
+            if event.replay_time_us > cut:
+                state, produced = process(state, [event], large)
+                records.extend(produced)
+        found = features_of(records)
+        self.assertIn(900 * SECOND, found)
+        self.assertEqual(oracle_values(recording, 900 * SECOND), values_of(found[900 * SECOND]))
+        self.assertEqual(oracle_eligibility(recording, 900 * SECOND), (found[900 * SECOND].warning_eligible, found[900 * SECOND].eligibility_reasons))
+
+    def test_an_unjudged_arterial_second_that_no_remaining_window_reads_is_dropped_so_the_buffer_stays_bounded(self) -> None:
+        recording = synthetic_recording(caseend_s=1_000, opend_s=950, opstart_s=900, rate=4)
+        events = stamp(events_for(recording))
+        small = Context(Policy(LIMIT_US, 60 * SECOND), "features_test", NO_CLINICAL)
+        far = Context(Policy(LIMIT_US, 600 * SECOND), "features_test", NO_CLINICAL)
+        cut = ORIGIN_US + 160 * SECOND
+        state, _ = process(None, [event for event in events if event.replay_time_us <= cut], small)
+        self.assertTrue(125 in state.wave_samples["SNUADC/ART"] and 125 not in state.art)
+        state, _ = process(state, [event for event in events if event.replay_time_us > cut][:1], far)
+        self.assertFalse(125 in state.wave_samples["SNUADC/ART"], "the next cutoff, at 1800 s, reads the seconds from 900 on, so second 125 is read by none")
+        self.assertLess(len(state.wave_samples["SNUADC/ART"]), 5)
+
+    def test_a_second_that_was_judged_and_lies_outside_the_waveform_window_is_dropped_from_the_buffer_while_the_case_runs(self) -> None:
+        events = events_for(synthetic_recording(caseend_s=1_000, opend_s=950, rate=4, gap_s=10))
+        _, states = run_stream([event for event in events if event.replay_time_us <= ORIGIN_US + 500 * SECOND])
+        state = next(iter(states.values()))
+        self.assertNotIn(20, state.wave_samples["SNUADC/ART"])
+        self.assertIn(20, state.art)
+        self.assertNotIn(10, state.art)
+        self.assertEqual(
+            [],
+            [second for second in (10, 20) if second in state.wave_samples["SNUADC/PLETH"]],
+            "a track with no verdict to wait for is dropped by the window alone",
+        )
 
 
 class BatchIndependence(unittest.TestCase):

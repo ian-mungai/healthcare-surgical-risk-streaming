@@ -284,7 +284,13 @@ def window_at(state: OccurrenceState, cutoff_us: int, context: Context) -> Windo
 
 
 def prune(state: OccurrenceState, context: Context) -> None:
-    """Drop the buffered data that no cutoff still to come reads. After the final row nothing is read."""
+    """Drop the buffered data that no cutoff still to come reads. After the final row nothing is read.
+
+    An arterial second is kept until it is judged (``judge_arterial`` judges it at the first cutoff that reads it) and then until it lies outside the waveform
+    window of the next cutoff. A cutoff can lie far after an unjudged second, for example when the job is started again on its checkpoint with a larger cutoff
+    step, and the numeric window of 900 seconds still reads that second through the series. So an unjudged arterial second is dropped only when it lies before
+    the first second that the series of the next cutoff and its lookback read (``first_series``). A judged record is kept for the same span.
+    """
     following = next_cutoff(state, context, None)
     if following is None:
         state.numeric.clear()
@@ -301,8 +307,8 @@ def prune(state: OccurrenceState, context: Context) -> None:
     for second in [second for second in state.art if second < first_series]:
         del state.art[second]
     first_wave = (cutoff // SECOND) - 1 - WAVEFORM_WINDOW_SECONDS - PRUNE_SLACK_SECONDS
-    for seconds in state.wave_samples.values():
-        for second in [second for second in seconds if second < first_wave]:
+    for track, seconds in state.wave_samples.items():
+        for second in [second for second in seconds if second < first_series or (second < first_wave and (track != ARTERIAL_WAVEFORM or second in state.art))]:
             del seconds[second]
 
 
