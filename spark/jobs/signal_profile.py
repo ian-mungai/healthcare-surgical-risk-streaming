@@ -5,18 +5,23 @@
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it.
 It reads ``silver.numeric_observations``, ``silver.waveform_seconds``, ``silver.patient_split``, ``bronze.clinical_cases`` and
-``raw_records.track_list`` at that hash and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). It never writes to
-the base: the merge is the caller's step after its checks.
+``raw_records.track_list`` at that hash and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). Before it measures the
+unscored share, it writes the one-row table ``silver.warning_grid_rule`` (the warning grid rule and the snapshot ID of the patient split that it read,
+``spark/profile/grid_rule.py``) and refuses a stored rule or split snapshot that differs. It reads that row back and plans the unscored share on the saved
+row, not on the constants. Before its first commit it classifies the schema of every output table: the predecessor 12-column ``unscored_share`` is rebuilt on
+the job's own branch by a drop and a create (never a replace), and any other schema refuses with ``table_schema`` before anything is written. It never writes
+to the split or to the base: the merge is the caller's step after its checks.
 ``verify`` runs the checks on the tables that a branch holds and writes nothing. The order, the freeze of a rerun that changes nothing, the writes and the
 read-back are in ``spark/profile/run.py``. The command line, its codes and its exit codes are in ``spark/profile/cli.py``. The settings come from the
 environment, as the Silver signals job's do.
 
 The profile is of development patients only: the training and validation sets of the patient split. The split is trusted only after its rule check (the one
 of the patient split job: every patient once, the rule's set, one rule version, one source snapshot, exactly the patients of ``bronze.clinical_cases``), and no
-signal row of a test patient enters a profile. ``--pinned-release`` is the full cohort: the split's shares and counts are required, every prespecified source
-count is reproduced from the case and track tables (totals only, never an outcome) and judged, and a count of the full cohort is saved as a flag only. Without
-it, nothing is judged. The result holds hashes, snapshot IDs, counts of development data and the names of the counts that do not match, and no case, track, time
-or value.
+signal row of a test patient enters a profile. The unscored share is measured on the saved warning grid: the ``opstart`` and ``opend`` of the development
+cases are read from ``bronze.clinical_cases``, and the grid is the rule's (``spark/profile/unscored.py``). ``--pinned-release`` is the full cohort: the split's
+shares and counts are required, every prespecified source count is reproduced from the case and track tables (totals only, never an outcome) and judged, and
+a count of the full cohort is saved as a flag only. Without it, nothing is judged. The result holds hashes, snapshot IDs, counts of development data and the
+names of the counts that do not match, and no case, track, time or value.
 """
 
 from __future__ import annotations
@@ -25,15 +30,18 @@ import importlib
 import sys
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import quote
 
 from scripts.stack.nessie import NessieClient
 from spark.jobs.patient_split import SOURCE_NAME, TARGET_NAME, WRITE_CATALOG, Lake
 from spark.profile import frames
 from spark.profile.checks import InputFacts, SignalProfileError
 from spark.profile.cli import JOB, run
+from spark.profile.commits import drop_commit
 from spark.profile.counts import count_rows
-from spark.profile.run import BRANCH_MOVED, COUNTS, PROFILE, SOURCE_NAMES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
-from spark.profile.tables import PROFILE_TABLES
+from spark.profile.grid_rule import GRID_ORIGIN, RULE_END, GridRule, RuleRead
+from spark.profile.run import BRANCH_MOVED, COUNTS, PROFILE, RULE, SOURCE_NAMES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
+from spark.profile.tables import GRID_RULE, PROFILE_TABLES, schema_state
 from spark.session import build_session
 from spark.silver import frames as silver_frames
 from spark.silver.tables import NAMESPACE, NUMERIC, WAVEFORM
@@ -50,7 +58,7 @@ from spark.split_table import (
     unit,
 )
 
-CLINICAL_COLUMNS = (*SOURCE_COLUMNS, ("caseend", "string"))
+CLINICAL_COLUMNS = (*SOURCE_COLUMNS, ("caseend", "string"), (GRID_ORIGIN, "string"), (RULE_END, "string"))
 TRACK_LIST_COLUMNS = (("caseid", "string"), ("tname", "string"), ("tid", "string"))
 EMPTY_FACTS = InputFacts(0, 0, 0, 0)
 NO_INPUT_FACTS = "development_empty: 0 cases"
@@ -61,6 +69,7 @@ INPUTS = {
     "clinical_cases": (SOURCE_NAME, CLINICAL_COLUMNS, True),
     "track_list": ("raw_records.track_list", TRACK_LIST_COLUMNS, True),
 }
+OUTPUT_TABLES = {**PROFILE_TABLES, RULE: GRID_RULE}
 
 
 class ProfileLake(Lake):
@@ -130,8 +139,17 @@ class ProfileLake(Lake):
         facts = frames.input_facts(held["numeric_observations"][0], held["waveform_seconds"][0], self.development_ids)
         return InputRead(facts, snapshots, ())
 
-    def plan(self, at: str) -> dict[str, Any]:
-        """Build the three frames at ``at``, keep the two that need a pass over Silver on disk for the write and give their fingerprints."""
+    def schemas(self, at: str) -> dict[str, str]:
+        """The state of the columns of each output table (the rule table too) at ``at``: absent, the card's, the predecessor's or another. It reads no row."""
+        states = {}
+        for name, table in OUTPUT_TABLES.items():
+            qualified = f"{self.catalog(at)}.{NAMESPACE}.{name}"
+            held = self.session.table(qualified) if self.session.catalog.tableExists(qualified) else None
+            states[name] = schema_state(table, None if held is None else self.fields_of(held))
+        return states
+
+    def plan(self, at: str, rule: GridRule) -> dict[str, Any]:
+        """Build the three frames at ``at`` on the saved rule row ``rule``, keep the two that need a pass over Silver on disk and give their fingerprints."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         held = self.inputs(at)
         numeric, waveform = held["numeric_observations"][0], held["waveform_seconds"][0]
@@ -149,7 +167,7 @@ class ProfileLake(Lake):
             values |= frames.fixed_counts(clinical, track_list)
         self.planned = {
             PROFILE: frames.profile_frame(numeric, waveform, development).persist(disk),
-            UNSCORED: frames.unscored_frame(waveform, development).persist(disk),
+            UNSCORED: frames.unscored_frame(waveform, frames.development_grid(clinical, split, rule), rule).persist(disk),
             COUNTS: frames.counts_frame(self.session, count_rows(values, compared=self.pinned_release)),
         }
         return {table: silver_frames.fingerprint(frame) for table, frame in self.planned.items()}
@@ -184,8 +202,33 @@ class ProfileLake(Lake):
             return
         writer.tableProperty("format-version", "2").create()
 
+    def read_rule_table(self, at: str) -> RuleRead | None:
+        """The warning grid rule table at ``at``, or ``None`` when the hash holds none."""
+        name = f"{self.catalog(at)}.{NAMESPACE}.{RULE}"
+        if not self.session.catalog.tableExists(name):
+            return None
+        frame = self.session.table(name)
+        problems = schema_problems(self.fields_of(frame), GRID_RULE.columns, f"{RULE} table")
+        if problems:
+            raise SignalProfileError(*problems)
+        return frames.rule_read(frame, self.snapshot_id(name))
+
+    def write_rule_table(self, rule: GridRule) -> None:
+        """Create the warning grid rule table with its one row, as one commit. A table that exists is never written: the build refuses it before this step."""
+        frames.rule_frame(self.session, rule).writeTo(f"{WRITE_CATALOG}.{NAMESPACE}.{RULE}").tableProperty("format-version", "2").create()
+
+    def drop_table(self, table: str) -> None:
+        """Drop a table of the job's own branch (the predecessor ``unscored_share``). The base keeps its table until the caller merges, after the checks. The
+        new table is created as a new one by ``write_profile_table``: a replace of a table that exists stalls in Spark with the Nessie catalog."""
+        self.session.sql(f"DROP TABLE {WRITE_CATALOG}.{NAMESPACE}.{OUTPUT_TABLES[table].name}")
+
+    def drop_hash_of(self, checked: str, table: str) -> str | None:
+        """The hash of the drop, from the branch's log: the head, one commit directly on ``checked`` that deletes only the key of ``table``."""
+        log = self.client.request("GET", f"/trees/{quote(self.branch, safe='')}/history", query={"fetch": "ALL", "max-records": "2"}) or {}
+        return drop_commit(log.get("logEntries", []), checked, OUTPUT_TABLES[table].table_key)
+
     def write_hash_of(self, checked: str, table: str) -> str | None:
-        return self.write_commit(checked, (PROFILE_TABLES[table].table_key,))
+        return self.write_commit(checked, ((GRID_RULE if table == RULE else PROFILE_TABLES[table]).table_key,))
 
     def release(self) -> None:
         for frame in self.planned.values():
@@ -194,7 +237,19 @@ class ProfileLake(Lake):
 
     def operations(self) -> Operations:
         return Operations(
-            self.head, self.read_input, self.plan, self.read_profile_table, self.write_profile_table, self.write_hash_of, self.prepare, self.release
+            self.head,
+            self.read_input,
+            self.schemas,
+            self.plan,
+            self.read_profile_table,
+            self.write_profile_table,
+            self.write_hash_of,
+            self.prepare,
+            self.release,
+            self.read_rule_table,
+            self.write_rule_table,
+            self.drop_table,
+            self.drop_hash_of,
         )
 
 
@@ -224,7 +279,7 @@ def execute(arguments: Any) -> dict[str, Any]:
             "base_hash": base if building else None,
             "pinned_release": arguments.pinned_release,
             "job": JOB,
-            "tables": [f"{NAMESPACE}.{table}" for table in PROFILE_TABLES],
+            "tables": [f"{NAMESPACE}.{table}" for table in (RULE, *PROFILE_TABLES)],
             **outcome.facts(),
         }
     finally:

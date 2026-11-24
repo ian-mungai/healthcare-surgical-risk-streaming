@@ -1,20 +1,32 @@
 """The signal profile tables: their names, columns and keys, as data. Nothing here imports Spark.
 
-The namespace ``silver`` of the catalog ``lake`` holds, besides the patient split and the two signal tables, three tables that this module defines. All of
+The namespace ``silver`` of the catalog ``lake`` holds, besides the patient split and the two signal tables, four tables that this module defines. Three of
 them are measures of development patients (the training and validation sets of ``silver.patient_split``) and no row of any of them is a function of a test
-patient, with the one exception that the sealed source counts say.
+patient, with the one exception that the sealed source counts say. The fourth, ``warning_grid_rule``, holds no case, patient or count.
+
+- ``warning_grid_rule``: one row, the rule that sets the one-minute warning grid of a case (``spark.profile.grid_rule``): its version and text, each of its
+  constants as a column, the snapshot ID of the frozen patient split that the job read and the time of the write. The job writes it before it measures the
+  unscored share and never changes it: a rerun whose rule or split snapshot differs refuses.
+
+- Schema states (``schema_state``): before the job's first commit each output table is ``absent``, ``current`` (the columns of its card), ``predecessor``
+  (only the unscored share's 12 columns from before the warning grid: the job rebuilds it on its own branch) or ``other`` (the job refuses: ``table_schema``).
 
 - ``signal_profile``: one row for each track of the development cases, by kind (``numeric`` or ``waveform``). ``rows`` are the readings or the seconds
   that Silver holds for the track, ``valid_rows`` those marked valid and each ``cause_*`` column those marked invalid with that cause, so that the valid
   rows and the cause columns add up to the rows. ``valid_share`` is ``valid_rows / rows``. ``cases`` is the number of development cases that hold the track.
-- ``unscored_share``: one row, ``scope = development``. The cutoffs are the whole minutes of the arterial waveform's recorded span with a full 15-minute
-  history (``spark.profile.unscored``). ``waveform`` and ``numeric`` count the cutoffs that break the limit of analysis decision 5 for that window, ``either``
-  those that break one, and ``unscored_share`` is ``either / cutoffs``. The rule columns hold the limits that the count used.
+- ``unscored_share``: one row, ``scope = development``, of the development cases that hold the arterial waveform. The cutoffs are those of the saved warning
+  grid of each case (``warning_grid_rule``: from ``opstart`` in 60-second steps through the latest at or before ``opend`` minus 300 seconds), and a cutoff
+  whose history is not recorded is unscored (``spark.profile.unscored``). ``waveform`` and ``numeric`` count the cutoffs that break the limit of analysis
+  decision 5 for that window, ``either`` those that break one, and ``unscored_share`` is ``either / cutoffs``. ``no_grid`` counts the cases (of ``cases``) with
+  no ``opstart``, no ``opend`` or an ``opend`` that is not after ``opstart``: they hold no cutoff. The rule columns hold the grid's step, first cutoff
+  offset and last cutoff margin and the limits that the count used.
 - ``source_counts``: one row for each prespecified source count (``spark.profile.counts``): the value that the guide or the standard names, whether the
   reproduced count equals it, and its input, method and denominator. A count of the full cohort is sealed: it is saved as a flag only and its ``value`` is null.
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 from features.signal_validity import INVALID_CAUSES
 from spark.silver.tables import SilverTable
@@ -43,12 +55,15 @@ UNSCORED = SilverTable(
     (
         ("scope", "string"),
         ("cases", "bigint"),
+        ("no_grid", "bigint"),
         ("cutoffs", "bigint"),
         ("waveform", "bigint"),
         ("numeric", "bigint"),
         ("either", "bigint"),
         ("unscored_share", "double"),
         ("cutoff_step", "int"),
+        ("cutoff_offset", "int"),
+        ("last_margin", "int"),
         ("waveform_window", "int"),
         ("waveform_limit", "int"),
         ("numeric_window", "int"),
@@ -71,4 +86,51 @@ COUNTS = SilverTable(
     ),
     ("name",),
 )
+GRID_RULE = SilverTable(
+    "warning_grid_rule",
+    (
+        ("rule_version", "string"),
+        ("rule_text", "string"),
+        ("grid_origin", "string"),
+        ("grid_step_seconds", "int"),
+        ("first_cutoff_offset_seconds", "int"),
+        ("last_cutoff_margin_seconds", "int"),
+        ("split_snapshot_id", "bigint"),
+        ("written_at", "timestamp"),
+    ),
+    ("rule_version",),
+)
 PROFILE_TABLES = {table.name: table for table in (PROFILE, UNSCORED, COUNTS)}
+
+ABSENT = "absent"
+CURRENT = "current"
+PREDECESSOR = "predecessor"
+OTHER = "other"
+PREDECESSOR_COLUMNS = {
+    UNSCORED.name: (
+        ("scope", "string"),
+        ("cases", "bigint"),
+        ("cutoffs", "bigint"),
+        ("waveform", "bigint"),
+        ("numeric", "bigint"),
+        ("either", "bigint"),
+        ("unscored_share", "double"),
+        ("cutoff_step", "int"),
+        ("waveform_window", "int"),
+        ("waveform_limit", "int"),
+        ("numeric_window", "int"),
+        ("numeric_limit", "int"),
+    )
+}
+
+
+def schema_state(table: SilverTable, fields: Sequence[tuple[str, str]] | None) -> str:
+    """The state of a stored table's columns (``None`` for a table that is not there): ``absent``, ``current`` (the card's columns, in order), ``predecessor``
+    (the columns that the table had before the warning grid, for the one table that has such a card) or ``other``."""
+    if fields is None:
+        return ABSENT
+    held = list(fields)
+    if held == list(table.columns):
+        return CURRENT
+    predecessor = PREDECESSOR_COLUMNS.get(table.name)
+    return PREDECESSOR if predecessor is not None and held == list(predecessor) else OTHER
