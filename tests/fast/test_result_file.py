@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -358,6 +359,19 @@ class Sealed(unittest.TestCase):
         self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
         self.assertIs(result_file.INTERNAL_EXIT_CODE, 70)
         self.assertEqual([], os.listdir(self.folder))
+
+    def test_a_part_name_that_cannot_be_removed_after_the_link_is_internal_error_and_exit_70_not_a_clean_end(self) -> None:
+        real = os.unlink
+
+        def unlink(target: object, *arguments: Any, **keywords: Any) -> None:
+            if str(target) == f"{self.path}.part":
+                raise OSError(errno.EIO, f"{MARKER} input output error")
+            real(target, *arguments, **keywords)  # type: ignore[arg-type]
+
+        with mock.patch("os.unlink", unlink):
+            code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
+        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual(["result.json", "result.json.part"], sorted(os.listdir(self.folder)))
 
     def test_a_sealed_error_keeps_its_problems_in_order(self) -> None:
         self.assertEqual(["a: failed", "b: failed"], SealedError("a: failed", "b: failed").problems)

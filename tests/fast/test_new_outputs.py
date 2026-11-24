@@ -13,6 +13,7 @@ name removes every staged byte.
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib
 import io
 import json
@@ -130,6 +131,34 @@ class WriteNewFileTests(Fixture):
                 unchanged()
                 self.assert_nothing_left()
                 shutil_rmtree(self.root / "forms")
+
+    def test_a_temporary_name_that_cannot_be_removed_after_the_link_is_refused_with_fixed_text(self) -> None:
+        path = self.root / "new.json"
+        real = os.unlink
+
+        def unlink(target: Any, *arguments: Any, **keywords: Any) -> None:
+            if str(target).endswith(".part"):
+                raise OSError(errno.EIO, "MARKER_91 input output error")
+            real(target, *arguments, **keywords)
+
+        with mock.patch("os.unlink", unlink), self.assertRaises(ClosedInputError) as caught:
+            write_new_file(path, "text\n")
+        self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
+        self.assertNotIn("MARKER_91", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual("text\n", path.read_text())
+
+    def test_a_temporary_name_that_cannot_be_removed_after_a_refusal_keeps_the_first_refusal(self) -> None:
+        path = self.root / "late.json"
+        path.write_text(ORIGINAL)
+
+        def unlink(target: Any, *arguments: Any, **keywords: Any) -> None:
+            raise OSError(errno.EIO, "MARKER_91 input output error")
+
+        with mock.patch("scripts.ingestion.output_file.check_new_output"), mock.patch("os.unlink", unlink), self.assertRaises(ClosedInputError) as caught:
+            write_new_file(path, "new\n")
+        self.assertEqual(EXISTS, str(caught.exception))
+        self.assertEqual(ORIGINAL, path.read_text())
 
     def test_a_case_variant_is_refused_on_a_folder_that_tells_the_two_names_apart(self) -> None:
         (self.root / "Result.json").write_text(ORIGINAL)
@@ -309,6 +338,50 @@ class PublishReservedTests(Fixture):
         self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
         self.assertEqual(ORIGINAL, other.read_text())
         self.assertEqual(["other.txt"], self.names())
+
+    def refuse_removal(self, error: OSError) -> Any:
+        """A patch of ``os.unlink`` that fails for the reserved name only and leaves every other call as it is."""
+        real = os.unlink
+
+        def unlink(target: Any, *arguments: Any, **keywords: Any) -> None:
+            if Path(target) == self.reserved:
+                raise error
+            real(target, *arguments, **keywords)
+
+        return mock.patch("os.unlink", unlink)
+
+    def test_a_reserved_name_that_cannot_be_removed_after_the_link_is_refused_with_fixed_text_and_both_names_stay(self) -> None:
+        for error in (OSError(errno.EIO, "MARKER_91 input output error"), PermissionError(errno.EPERM, "MARKER_91"), OSError(errno.EBUSY, "MARKER_91")):
+            with self.subTest(error=type(error).__name__, number=error.errno):
+                with self.refuse_removal(error), self.assertRaises(ClosedInputError) as caught:
+                    publish_reserved(self.reserved, self.path, "text\n")
+                self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
+                self.assertNotIn("MARKER_91", str(caught.exception))
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(caught.exception.__suppress_context__)
+                self.assertEqual(["result.json", "result.json.part"], self.names())
+                self.assertEqual("text\n", self.path.read_text())
+                self.path.unlink()
+                self.reserved.write_text("")
+
+    def test_a_reserved_name_that_is_gone_after_the_link_is_a_clean_end(self) -> None:
+        real = os.link
+
+        def link_and_release(source: str, target: str) -> None:
+            real(source, target)
+            os.unlink(source)
+
+        with mock.patch("os.link", link_and_release):
+            publish_reserved(self.reserved, self.path, "text\n")
+        self.assertEqual(["result.json"], self.names())
+        self.assertEqual("text\n", self.path.read_text())
+
+    def test_a_removal_that_fails_after_a_refusal_keeps_the_first_refusal(self) -> None:
+        self.path.write_text(ORIGINAL)
+        with self.refuse_removal(OSError(errno.EIO, "MARKER_91")), self.assertRaises(ClosedInputError) as caught:
+            publish_reserved(self.reserved, self.path, "new\n")
+        self.assertEqual(EXISTS, str(caught.exception))
+        self.assertEqual(ORIGINAL, self.path.read_text())
 
     def test_a_path_in_another_folder_than_the_reserved_file_is_refused_and_the_reserved_name_is_removed(self) -> None:
         (self.root / "other").mkdir()

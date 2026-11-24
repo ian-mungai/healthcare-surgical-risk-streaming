@@ -7,6 +7,7 @@ and a folder are refused with fixed text and nothing is written. ``write_new_fil
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
@@ -16,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.ingestion.closed import ClosedInputError
-from scripts.ingestion.notice import Code, Notice, render
+from scripts.ingestion.notice import Code, Notice, Subject, render
 from scripts.ingestion.output_file import replace_owned_file, write_new_file
 
 ORIGINAL = "original\n"
@@ -55,6 +56,22 @@ class ReplaceOwnedFileTests(Fixture):
         self.assertEqual(ORIGINAL, path.read_text())
         self.assertEqual([], self.left())
         self.assertEqual(["health.json"], [entry.name for entry in self.state.iterdir()])
+
+    def test_a_temporary_name_that_cannot_be_removed_after_a_failed_replace_keeps_the_refusal_and_shows_no_text_of_the_error(self) -> None:
+        path = self.state / "health.json"
+        path.write_text(ORIGINAL)
+
+        def unlink(target: object, *arguments: object, **keywords: object) -> None:
+            raise OSError(errno.EIO, "MARKER_91 input output error")
+
+        with (
+            mock.patch("scripts.ingestion.output_file.os.replace", side_effect=OSError),
+            mock.patch("os.unlink", unlink),
+            self.assertRaises(ClosedInputError) as caught,
+        ):
+            replace_owned_file(path, "new\n", state_root=self.state)
+        self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
+        self.assertEqual(ORIGINAL, path.read_text())
 
     def test_a_path_outside_the_state_folder_is_refused_and_nothing_is_written(self) -> None:
         (self.state / "deeper").mkdir()

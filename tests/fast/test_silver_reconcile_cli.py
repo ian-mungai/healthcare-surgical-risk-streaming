@@ -10,7 +10,7 @@ Failure modes covered here:
 - The job is told to read a table at the head of the branch instead of the hash that it resolved, so a branch that moves changes what it reads.
 - A module that the job imports, directly or through another, is left out of the image or of the build context.
 - The result reaches the caller through the free text of the job's two streams, so that a line of them can carry a value or be read as a result. It is one
-  file at a path on the command line, written whole and then renamed into place, with a closed schema, and it never overwrites a file.
+  file at a path on the command line, written whole into its part file and then linked, with a closed schema, and it never overwrites a file.
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ def read_file(folder: str) -> Any:
 
 
 class ResultFile(unittest.TestCase):
-    """The result is one file at ``--result``: the closed schema, written whole and renamed into place, for every ending that the job maps to a code."""
+    """The result is one file at ``--result``: the closed schema, written whole and linked into place, for every ending that the job maps to a code."""
 
     def setUp(self) -> None:
         self.folder = self.enterContext(tempfile.TemporaryDirectory(prefix="reconcile_result_"))

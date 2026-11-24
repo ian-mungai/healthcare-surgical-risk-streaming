@@ -7,7 +7,7 @@ Failure modes covered here:
 - The call takes no ``--result`` path, a relative one, or one that exists, and the job runs and writes over it or beside it.
 - The result file is seen half written, holds a document that is not the result, is written over a file that is there, or leaves a temporary file behind.
 - A refusal, a failed upstream, a bad setting or an internal error leaves no result file, or one whose codes are not the codes printed on standard error.
-- A result that cannot be written (a value that is not JSON, a rename that fails) ends the job with exit 0 and no file.
+- A result that cannot be written (a value that is not JSON, a link that fails, a part file that stays after the link) ends the job with exit 0.
 - A path that cannot hold its part file (a folder that is not there, a name of 255 bytes) is found only after the job ran, and the job's work is lost. The
   part file is reserved before ``execute``, and a failed reservation is a bad call: ``usage``, exit 2, and nothing runs.
 - A job that the watchdog stops, or a file that appears while the job runs, leaves a part file or is written over.
