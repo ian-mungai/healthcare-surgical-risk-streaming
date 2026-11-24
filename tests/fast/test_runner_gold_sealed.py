@@ -350,8 +350,8 @@ class SilverLoaderFlags(unittest.TestCase):
 
 
 class SilverMergeOrder(unittest.TestCase):
-    """The Silver cases runner merges a sealed job's branch only after every flag of the job's answer is true: the patient split and the sample-sized loader
-    (fix round 5, the same order as the loader of the setup)."""
+    """The Silver cases runner merges a sealed job's branch only after every flag of the job's answer is true: the patient split (fix round 5, the same order
+    as the loader of the setup). The sample-sized setup is in ``tests/fast/test_runner_reply_checks.py``."""
 
     GOOD_SPLIT = {"base_hash": "a" * 64, "branch_hash": "b" * 64, "passed": {"patient_split": True}}
 
@@ -401,35 +401,6 @@ class SilverMergeOrder(unittest.TestCase):
 
     def test_a_patient_split_with_every_flag_true_is_merged(self) -> None:
         self.assertEqual(["stand-in bronze tables", "patient split"], self.patient_split(self.GOOD_SPLIT))
-
-    def sample_sized(self, loader: dict[str, Any], split: dict[str, Any], split_code: int = 0) -> list[str]:
-        run, merges = self.run_of()
-        run.candidates = [SimpleNamespace(case=1, slot="a_development")]
-        calls = {"split": 0}
-
-        def stand_split(*_: Any, **__: Any) -> tuple[int, dict[str, Any], str, float]:
-            calls["split"] += 1
-            return split_code, split, "", 0.1
-
-        run.stack = SimpleNamespace(
-            write_spec=lambda *_: None, stand_in=lambda *_, **__: (0, loader, "", 0.1), split=stand_split, silver=lambda *_, **__: (1, {}, "", 0.1)
-        )
-        run.head = lambda branch: "h"
-        run.table_snapshot = lambda *_: 1
-        with contextlib.suppress(Exception):
-            run.sample_sized()
-        return [arguments[2] for arguments in merges]
-
-    def test_the_sample_sized_loader_is_merged_only_when_its_flag_is_true(self) -> None:
-        for flag in (False, None, 1, "True"):
-            with self.subTest(flag=flag):
-                self.assertEqual([], self.sample_sized({"cases_as_expected": flag}, self.GOOD_SPLIT))
-        self.assertEqual(["sample-sized bronze", "sample-sized split"], self.sample_sized({"cases_as_expected": True}, self.GOOD_SPLIT))
-
-    def test_the_sample_sized_split_is_merged_only_when_its_pass_flag_is_true(self) -> None:
-        loader = {"cases_as_expected": True}
-        self.assertEqual(["sample-sized bronze"], self.sample_sized(loader, {**self.GOOD_SPLIT, "passed": {"patient_split": False}}))
-        self.assertEqual(["sample-sized bronze"], self.sample_sized(loader, self.GOOD_SPLIT, split_code=1))
 
 
 def healthy_result(module: ModuleType) -> dict[str, Any]:
@@ -685,7 +656,7 @@ class DumpShape(unittest.TestCase):
         run.dump = lambda branch: replies
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            run.independent_read({"branch": "built"})
+            run.read_dimensions({"branch": "built"})
         return record, out.getvalue()
 
     def test_the_independent_read_records_a_fixed_error_for_columns_and_types_of_the_wrong_shape(self) -> None:
