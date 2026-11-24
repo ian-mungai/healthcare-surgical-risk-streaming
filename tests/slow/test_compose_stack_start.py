@@ -696,9 +696,9 @@ class BuiltImagesTest(unittest.TestCase):
         images: Any = load_variable(ROOT / "ansible" / "group_vars" / "all.yml", "compose_stack_built_images")
         sources = {image["name"]: image["sources"] for image in images}
         self.assertEqual(["tests/fixtures/vitaldb"], [source for source in sources["spark"] if source.split("/")[0] == "tests"])
-        self.assertEqual(["spark", "scripts", "replay", "features"], [source for source in sources["spark"] if source.split("/")[0] != "tests"])
+        self.assertEqual(["spark", "scripts", "replay", "casefile", "features"], [source for source in sources["spark"] if source.split("/")[0] != "tests"])
         self.assertEqual(["orchestration", "scripts", "compose", "spark", "tests/fixtures/vitaldb"], sources["dagster"])
-        self.assertEqual(["replay", "scripts", "features", "tests"], sources["replay"])
+        self.assertEqual(["replay", "casefile", "scripts", "features", "tests"], sources["replay"])
         self.assertTrue((ROOT / "tests" / "fixtures" / "vitaldb" / "release.json").is_file())
 
     def test_the_dagster_image_gets_the_scripts_and_compose_folders_and_the_spark_image_is_built_from_the_folder_above_its_dockerfile(self) -> None:
