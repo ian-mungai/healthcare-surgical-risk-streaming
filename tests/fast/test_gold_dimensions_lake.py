@@ -381,6 +381,7 @@ class Client:
         self.asked = 0
 
     def config(self) -> dict[str, Any]:
+        EVENTS.append("catalog_config")
         return {}
 
     def reference(self, name: str) -> Reference:
@@ -406,6 +407,7 @@ class Outcome:
 
 
 DATES: list[str | None] = []
+EVENTS: list[str] = []
 
 
 def seen_outcome(lake: GoldLake) -> Outcome:
@@ -417,6 +419,7 @@ def seen_outcome(lake: GoldLake) -> Outcome:
 def call(mode: str, client: Client, sessions: list[StoppableSession]) -> tuple[dict[str, Any], list[tuple[Any, ...]]]:
     calls: list[tuple[Any, ...]] = []
     DATES.clear()
+    EVENTS.clear()
 
     def build_session(name: str, ref: str, ref_hash: str | None = None) -> StoppableSession:
         calls.append((name, ref, ref_hash))
@@ -429,7 +432,7 @@ def call(mode: str, client: Client, sessions: list[StoppableSession]) -> tuple[d
             gold_dimensions,
             read_settings=mock.Mock(return_value=settings),
             open_client=mock.Mock(return_value=client),
-            start_deadline=mock.Mock(),
+            start_deadline=mock.Mock(side_effect=lambda *args, **kwargs: EVENTS.append(f"deadline {args} {sorted(kwargs.items())}")),
             build_session=build_session,
             run_verify=seen_outcome,
             run_build=seen_outcome,
@@ -459,6 +462,12 @@ class PinnedVerifyTests(unittest.TestCase):
         self.assertEqual([("gold_dimensions", "run_b", None)], calls)
         self.assertEqual((FIRST, SECOND), (result["base_hash"], result["branch_hash"]))
         self.assertEqual([DATE], DATES, "a build carries the version date of its run into the lake")
+
+    def test_the_job_starts_its_own_deadline_from_its_setting_before_its_first_call_to_the_catalog(self) -> None:
+        for mode in ("build", "verify"):
+            with self.subTest(mode=mode):
+                call(mode, Client([FIRST]), [])
+                self.assertEqual(["deadline (60.0,) [('job', 'gold_dimensions')]", "catalog_config"], EVENTS)
 
     def test_a_verify_carries_no_version_date(self) -> None:
         call("verify", Client([FIRST]), [])

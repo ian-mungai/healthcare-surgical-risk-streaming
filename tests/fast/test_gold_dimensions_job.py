@@ -23,6 +23,7 @@ from typing import Any
 from scripts.stack.nessie import NessieError
 from spark.gold_dimensions import DIMENSIONS, Dimension, GoldDimensionsError
 from spark.gold_dimensions_run import CHECKS, JOB, run, run_build, run_verify
+from spark.jobs import gold_dimensions
 from spark.settings import SettingsError
 
 NAMES = tuple(item.name for item in DIMENSIONS)
@@ -176,6 +177,24 @@ class VerifyTests(unittest.TestCase):
         with self.assertRaises(GoldDimensionsError) as caught:
             run_verify(ops)
         self.assertEqual(["key_null: dim_patient, 4 rows"], caught.exception.problems)
+
+
+class UsageTests(unittest.TestCase):
+    def test_the_usage_in_the_text_of_the_job_is_the_command_line_that_the_parser_accepts(self) -> None:
+        lines = [line for line in (gold_dimensions.__doc__ or "").splitlines() if line.startswith("``python -m spark.jobs.gold_dimensions")]
+        self.assertEqual(
+            [
+                "``python -m spark.jobs.gold_dimensions build --branch <name> [--base <name>] --valid-from <YYYY-MM-DD>``",
+                "``python -m spark.jobs.gold_dimensions verify --branch <name>``",
+            ],
+            lines,
+        )
+
+    def test_the_text_of_the_job_describes_versions_and_not_one_row_for_each_member(self) -> None:
+        text = " ".join((gold_dimensions.__doc__ or "").split())
+        self.assertNotIn("one row for each member", text)
+        for word in ("version", "valid_from", "is_current"):
+            self.assertIn(word, text)
 
 
 class CommandTests(unittest.TestCase):

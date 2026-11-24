@@ -1,15 +1,18 @@
 """The Gold job for the six dimensions: ``gold.dim_case``, ``gold.dim_patient``, ``gold.dim_track``, ``gold.dim_department``, ``gold.dim_surgery_type`` and
 ``gold.dim_lab_test``, on a private Nessie branch.
 
-``python -m spark.jobs.gold_dimensions build --branch <name> [--base <name>]``
+``python -m spark.jobs.gold_dimensions build --branch <name> [--base <name>] --valid-from <YYYY-MM-DD>``
 ``python -m spark.jobs.gold_dimensions verify --branch <name>``
 
 ``build`` creates the branch from ``main`` (or ``--base``) and refuses a branch that exists. It reads ``silver.cases``, ``silver.lab_results`` and
-``bronze.tracks`` on that branch and writes each dimension: one row for each member, with a surrogate key, the natural key, a few descriptive columns and one
-unknown member (``spark/gold_dimensions.py`` has the rules). The surrogate key is a function of the member alone, so a rebuild, and a later build that finds
-new cases, keep every key they already gave. A table that already holds the rows is not written again. A rebuild that would remove a held member or change
-its descriptive columns fails before it writes. Every input check and that check come before the first write; the checks of the written tables come after the
-last. The merge of the branch is the caller's step. ``verify`` runs the checks on a branch and writes nothing.
+``bronze.tracks`` on that branch and writes each dimension as type 2: one row for each version of a member, with a surrogate key, the natural key, a few
+descriptive columns, ``valid_from``, ``valid_to`` and ``is_current``, and one unknown member (``spark/gold_dimensions.py`` has the rules). ``--valid-from`` is
+the version date of the run (the nightly batch passes its data date): a new member's first version starts on it, and a member whose descriptive columns
+changed has its open version closed on it and a new version opened. The surrogate key is a function of the version alone, so a rebuild, and a later build that
+finds new or changed cases, keep every key they already gave and never change a version that is closed. A table that already holds the rows is not written
+again. A rebuild that would remove a held member, or change a member whose open version starts on or after the version date, fails before it writes. Every
+input check and that check come before the first write; the checks of the written tables come after the last. The merge of the branch is the caller's step.
+``verify`` runs the checks on a branch and writes nothing.
 
 No dimension holds an outcome, a laboratory result or the patient split, and no query reads one, so the job reads no held-out value: the test set is sealed.
 The result and the messages hold codes, dimension names, counts and snapshot IDs.
