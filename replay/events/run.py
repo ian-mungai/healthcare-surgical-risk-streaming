@@ -34,7 +34,10 @@ from replay.events.stream import CaseEvent, OutgoingEvent, occurrence_events, ou
 
 STATE_FORMAT = "replay_state_2"
 OLD_STATE_FORMATS = ("replay_state_1",)
-EVENT_LIST_VERSION = "events_2"
+# Bump this when the events of a case change in content, order or count (events_3: exact sampling changed the waveform seconds).
+# A saved position counts the old list.
+EVENT_LIST_VERSION = "events_3"
+EVENT_LIST_REFUSAL_CODE = "replay_event_list_refused"
 DEFAULT_CHECKPOINT_EVENTS = 100
 DEFAULT_IDLE_CHECKPOINT_US = 5_000_000
 MIN_SPEED = 0.01
@@ -108,8 +111,8 @@ class RunState:
                 raise ReplayError("the saved state is not of this format")
             if document["event_list"] != EVENT_LIST_VERSION:
                 raise ReplayError(
-                    f"the saved state counts the event list {document['event_list']} and this replay sends {EVENT_LIST_VERSION}: it is not resumed, "
-                    "start the run again under a new run ID"
+                    f"{EVENT_LIST_REFUSAL_CODE}: the saved state counts the event list {document['event_list']} and this replay sends "
+                    f"{EVENT_LIST_VERSION}: it is not resumed, start the run again under a new run ID"
                 )
             first = document["first_send"]
             return cls(

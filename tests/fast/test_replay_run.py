@@ -173,8 +173,35 @@ class Positions(unittest.TestCase):
         replayer.run()
         other = json.loads(saved_state(store).to_json())
         other["event_list"] = "events_0"
-        with self.assertRaisesRegex(ReplayError, "event list.*new run ID"):
+        with self.assertRaisesRegex(ReplayError, "replay_event_list_refused.*event list.*new run ID"):
             RunState.from_json(json.dumps(other))
+
+    def test_a_checkpoint_of_the_list_events_2_is_refused_before_anything_is_sent_and_the_current_list_resumes(self) -> None:
+        """``events_2`` counted a list that exact sampling then changed: resuming its position skipped a second and sent the next one twice."""
+        options = {"rooms": 2, "window_us": 40_000_000}
+        _, written, _, first = run_once(options, RunSettings(speed=1000.0, checkpoint_every=5))
+        first.run()
+        document = json.loads(saved_state(written).to_json())
+        document["finished"] = False
+        document["event_list"] = "events_2"
+
+        class TextStore(MemoryStore):
+            def __init__(self, text: str) -> None:
+                super().__init__()
+                self.text = text
+
+            def load(self) -> RunState:
+                return RunState.from_json(self.text)
+
+        sink, clock = MemorySink(), FakeClock()
+        old = Replayer(boundary_schedule(**options), FAST, RecordingSource(boundary_recordings()), sink, TextStore(json.dumps(document)), clock)
+        with self.assertRaisesRegex(ReplayError, "replay_event_list_refused.*events_2"):
+            old.run()
+        self.assertEqual(([], 0), (sink.sent, sink.acknowledged))
+        self.assertNotEqual("events_2", EVENT_LIST_VERSION)
+        document["event_list"] = EVENT_LIST_VERSION
+        again = Replayer(boundary_schedule(**options), FAST, RecordingSource(boundary_recordings()), sink, TextStore(json.dumps(document)), clock)
+        self.assertTrue(again.run().finished)
 
     def test_the_state_names_the_event_list_it_was_saved_for(self) -> None:
         _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
