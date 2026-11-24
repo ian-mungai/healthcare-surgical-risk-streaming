@@ -18,10 +18,14 @@ and a failed run's to ``failed/``, with its reference and ``results/<name>.json`
 reference fails at once with its reason, and so does one with a path that would put a file where the loop takes it for a request, each with a fixed code
 that names no path: a ``state_dir`` that is the inbox, inside it or a folder that holds it (``state_dir_overlaps_inbox``: the replay's checkpoint would sit
 among the requests and be archived as a failed one), a ``read_log`` inside the inbox (``read_log_in_inbox``: the run would append to a request) and a path with
-a NUL or a character that no file name holds (``invalid_path``). A relative ``state_dir`` or ``read_log`` is taken from the folder that holds the inbox, by
-``submit``, by the check and by the run alike. Every such path is compared with the inbox in ``places.py`` by what the file system says: links and ``..``
-resolved, and the same device and inode counting as the same place, so two spellings of one folder on a case-insensitive volume are caught. The check comes
-before the start count and the retry cap, so no request-specific file is written for a refused request. ``submit`` refuses the same records with the same codes.
+a NUL or a character that no file name holds (``invalid_path``). A relative ``state_dir`` or ``read_log`` is taken from the folder that holds the resolved
+inbox, by ``submit``, by the check, by the run and by the commands that read an archived record (``--inbox``) alike, so every spelling of the inbox gives one
+place. Only these two paths of a record are compared with the inbox (the object store's root and the manifest reference are not), in ``places.py``, by what
+the file system says: links and ``..`` resolved, and the same device and inode counting as the same place, so two spellings of one folder on a
+case-insensitive volume are caught. The check comes before the start count and the retry cap, so no start count is written for a refused request and the cap
+never hides the reason. The loop still writes the refusal's result in ``results/`` and archives the request in ``failed/``, as for any failed request. An
+error of the check that nothing handles (a defect, not a refusal) counts as a start, so a service that restarts on it fails the request after the third start
+like any other. ``submit`` refuses the same records with the same codes.
 ``serve`` returns 2 at start, before it writes anything, and ``submit`` refuses everything, when a folder of the service (``results``, ``done``, ``failed``,
 ``reserved`` or ``locks``) is the inbox itself (``service_folder_is_inbox``). ``serve`` returns 2 at start too when its health file is inside the inbox
 (``health_file_in_inbox``), by the folder that the write renames into, so a link in the inbox that points out counts, and when its path is malformed
@@ -255,17 +259,23 @@ def keep(inbox: Path, request: Path, outcome: Outcome) -> dict[str, Any]:
     return result
 
 
+def anchor_record(record: RunRecord, inbox: Path) -> RunRecord:
+    """The run record with its relative ``state_dir`` and ``read_log`` taken from the folder that holds the resolved inbox: the one base of ``submit``, of the
+    check, of the run and of the commands that read an archived record."""
+    store = record.object_store
+    if store.read_log is not None:
+        store = replace(store, read_log=str(places.anchored(store.read_log, inbox)))
+    return replace(record, state_dir=str(places.anchored(record.state_dir, inbox)), object_store=store)
+
+
 def queued_record(request: Path) -> RunRecord:
     """The run record of a request, with its manifest reference taken from the file that ``submit`` wrote beside it and its relative ``state_dir`` and
-    ``read_log`` taken from the folder that holds the inbox (the base that ``submit`` uses too). A request without the reference is refused."""
+    ``read_log`` taken from the folder that holds the resolved inbox (``anchor_record``). A request without the reference is refused."""
     record = parse_run_record(request.read_text())
     reference = reference_of(request)
     if not reference.is_file():
         raise RunRecordError("the manifest reference that was submitted with this record is missing")
-    store = record.object_store
-    if store.read_log is not None:
-        store = replace(store, read_log=str(places.anchored(store.read_log, request.parent)))
-    return replace(record, manifest_reference=str(reference), state_dir=str(places.anchored(record.state_dir, request.parent)), object_store=store)
+    return replace(anchor_record(record, request.parent), manifest_reference=str(reference))
 
 
 def path_refusal(record: RunRecord, inbox: Path) -> str | None:
@@ -339,7 +349,17 @@ def serve(
         if (earlier := kept_outcome(inbox, request, log)) is not None:
             archive(inbox, request, earlier)
             continue
-        if (refused := unusable(request)) is not None:
+        try:
+            refused = unusable(request)
+        except Exception as error:
+            # A defect in the check, not a refusal of the record: it counts as a start, so a service that restarts on it stops after MAX_ATTEMPTS starts.
+            started = started_count(request)
+            if started < MAX_ATTEMPTS:
+                atomic_write(attempts_of(request), f"{started + 1}\n")
+                log("request_check_failed", request=request.stem, error=type(error).__name__)
+                raise
+            refused = Outcome("failed", 2, f"the service stopped during this request {MAX_ATTEMPTS} times")
+        if refused is not None:
             health.last = keep(inbox, request, refused)
             health.beat("waiting", force=True)
             continue

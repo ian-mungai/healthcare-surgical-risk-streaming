@@ -1,12 +1,14 @@
 """Where a path of a run record is, compared with the inbox by what the file system says it is.
 
 The service takes every ``*.json`` file in the inbox for a request, so a file that the service or a run writes there (a checkpoint, a read log, a result) is
-taken for one. Every path that a run record names, and every folder that the service writes, is compared with the inbox here and nowhere else.
+taken for one. The two paths of a run record that the run writes to, ``state_dir`` and ``object_store.read_log``, and the health file and the service folders
+are compared with the inbox here. The other paths of a record (the object store's root, the manifest reference) are not checked.
 
-A path is first made absolute: a relative one is taken from the folder that holds the inbox, so ``submit`` and ``serve`` read it alike whatever their working
-folders are. Then links and ``..`` are resolved without creating or reading anything. Two places are the same when their resolved names are the same or when the
-file system gives them one device and one inode, so two spellings of one folder on a case-insensitive volume are caught. A path with a NUL or a character that
-no file name holds is not a place: ``PathError``.
+A relative path is taken from the folder that holds the resolved inbox (the inbox with its links and ``..`` resolved), so ``submit``, ``serve`` and the
+commands that read an archived record all give it one place, whatever the spelling of the inbox and the working folders are. Then links and ``..`` of the path
+are resolved without creating or reading anything. Two places are the same when their resolved names are the same or when the file system gives them one device
+and one inode, so two spellings of one folder on a case-insensitive volume are caught. A path with a NUL or a character that no file name holds is not a
+place: ``PathError``.
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ def absolute(path: str | Path) -> Path:
 
 
 def anchored(text: str, inbox: Path) -> Path:
-    """The path ``text``, taken from the folder that holds the inbox when it is relative."""
-    return absolute(absolute(inbox).parent / text)
+    """The path ``text``, taken from the folder that holds the resolved inbox when it is relative: one base for every spelling of the inbox."""
+    return absolute(resolved(inbox).parent / text)
 
 
 def resolved(path: str | Path) -> Path:

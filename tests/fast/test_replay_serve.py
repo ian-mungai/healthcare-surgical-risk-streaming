@@ -22,9 +22,11 @@ spellings of one folder resolved), a health file or a service folder that is the
 from __future__ import annotations
 
 import contextlib
+import importlib
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -35,6 +37,7 @@ from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
+from replay.service.run_record import RunRecord, parse_run_record
 from replay.service.serve import (
     Outcome,
     SubmitError,
@@ -55,6 +58,7 @@ from replay.service.state_file import atomic_write
 from scripts.ingestion.gate import GateRefused, Problem
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.notice import Cause, Code, Notice
+from tests.fast.fake_vitaldb import installed
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
 OTHER_REFERENCE = ManifestRef("bucket", "manifests/replay/" + "c" * 64 + ".json", "version_2", "d" * 64).to_json()
@@ -447,6 +451,35 @@ class ServeTest(unittest.TestCase):
         self.assertEqual(str(loop.root / "state" / "replay_0a1b2c3d"), record.state_dir)
         self.assertEqual(str(loop.root / "state" / "reads.log"), record.object_store.read_log)
         self.assertEqual(str(loop.root / "state" / "replay_0a1b2c3d" / "state.json"), str(record.state_path))
+
+    def aliased(self, loop: Loop) -> Path:
+        """A link to the loop's inbox, in a folder other than the one that holds the inbox."""
+        folder = loop.root / "aliases"
+        folder.mkdir()
+        link = folder / "alias"
+        link.symlink_to(loop.inbox, target_is_directory=True)
+        return link
+
+    def test_the_inbox_spelled_through_a_link_gives_a_relative_path_the_same_base_as_its_real_path(self) -> None:
+        loop = self.loop({})
+        link = self.aliased(loop)
+        loop.put("a.json", json.dumps(with_read_log("state/reads.log", state_dir="state/replay_0a1b2c3d")))
+        through_link, through_real = queued_record(link / "a.json"), queued_record(loop.inbox / "a.json")
+        self.assertEqual(str(loop.root.resolve() / "state" / "replay_0a1b2c3d"), through_real.state_dir)
+        self.assertEqual(through_real.state_dir, through_link.state_dir)
+        self.assertEqual(through_real.object_store.read_log, through_link.object_store.read_log)
+        self.assertEqual(str(loop.root.resolve() / "state" / "reads.log"), through_link.object_store.read_log)
+
+    def test_a_state_folder_that_is_in_the_inbox_by_the_real_base_is_refused_when_the_service_names_the_inbox_by_a_link(self) -> None:
+        loop = self.loop({"a.json": Outcome("finished", 0), "b.json": Outcome("finished", 0)})
+        link = self.aliased(loop)
+        loop.put("a.json", json.dumps({**RECORD, "state_dir": "inbox/runs/replay_0a1b2c3d"}))
+        loop.put("b.json", json.dumps(RECORD))
+        loop.inbox = link
+        self.assertEqual(0, loop.serve())
+        self.assertEqual(["b.json"], loop.ran, "the request whose state folder is in the inbox must not run")
+        result = json.loads((link / "results" / "a.json").read_text())
+        self.assertTrue(result["error"].startswith(f"{STATE_DIR_CODE}: "), result["error"])
 
     def test_a_refused_record_is_refused_before_its_start_count_is_written_and_before_the_retry_cap(self) -> None:
         refused: dict[str, Callable[[Path], dict[str, Any]]] = {
@@ -964,6 +997,49 @@ class CrashLoopTest(unittest.TestCase):
         self.assertTrue((self.inbox / "done" / "b.json").is_file())
         self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
 
+    def fail_checking_a(self) -> Any:
+        """Make the check of the request ``a.json`` raise an error that nothing handles, as a defect in the check would."""
+        original = serve_module.queued_record
+
+        def queued(request: Path) -> RunRecord:
+            if request.name == "a.json":
+                raise KeyError("an error that nothing handles")
+            return original(request)
+
+        return mock.patch.object(serve_module, "queued_record", queued)
+
+    def test_an_unexpected_error_while_a_request_is_checked_counts_as_a_start_so_three_in_a_row_fail_it_on_the_fourth_and_the_next_request_runs(self) -> None:
+        self.put("a")
+        self.put("b")
+        with self.fail_checking_a():
+            for count in (1, 2, 3):
+                with self.assertRaises(KeyError):
+                    self.start(lambda path, beat: Outcome("finished", 0))
+                self.assertEqual(str(count), (self.inbox / "a.attempts").read_text().strip())
+            self.assertEqual(0, self.start(self.crash_on_a))
+        self.assertEqual(["b.json"], self.ran)
+        result = json.loads((self.inbox / "results" / "a.json").read_text())
+        self.assertEqual(("failed", "the service stopped during this request 3 times"), (result["outcome"], result["error"]))
+        self.assertTrue((self.inbox / "failed" / "a.json").is_file())
+        self.assertTrue((self.inbox / "done" / "b.json").is_file())
+        self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+
+    def test_an_ordinary_refusal_is_not_counted_however_often_it_is_met(self) -> None:
+        (self.inbox / "a.json").write_text("not json")
+        (self.inbox / "a.reference").write_text(REFERENCE)
+        written: list[str] = []
+
+        def recording(path: Path, data: str | bytes) -> None:
+            written.append(path.name)
+            atomic_write(path, data)
+
+        with mock.patch.object(serve_module, "atomic_write", recording):
+            self.assertEqual(0, self.start(self.crash_on_a))
+        self.assertEqual([], [name for name in written if name.endswith(".attempts")], written)
+        self.assertEqual([], self.ran)
+        self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+        self.assertTrue((self.inbox / "failed" / "a.json").is_file())
+
     def test_two_stops_then_a_finish_is_not_a_failure_and_the_count_goes_with_the_archived_request(self) -> None:
         self.put("a")
         for _ in range(2):
@@ -1247,6 +1323,16 @@ class SubmitTest(unittest.TestCase):
                     self.refused({**RECORD, "state_dir": relative}, STATE_DIR_CODE)
             self.refused(with_read_log("inbox/reads.log"), READ_LOG_CODE)
             self.assertEqual("submitted", submit(self.inbox, json.dumps({**RECORD, "state_dir": "state/replay_0a1b2c3d"}), REFERENCE))
+
+    def test_a_relative_state_folder_is_taken_from_the_folder_that_holds_the_real_inbox_when_the_inbox_is_given_as_a_link(self) -> None:
+        self.inbox.mkdir()
+        (self.inbox.parent / "aliases").mkdir()
+        link = self.inbox.parent / "aliases" / "alias"
+        link.symlink_to(self.inbox, target_is_directory=True)
+        with self.assertRaisesRegex(SubmitError, f"^{STATE_DIR_CODE}: "):
+            submit(link, json.dumps({**RECORD, "state_dir": "inbox/runs/replay_0a1b2c3d"}), REFERENCE)
+        self.assertEqual([], self.files())
+        self.assertEqual("submitted", submit(link, json.dumps({**RECORD, "state_dir": "state/replay_0a1b2c3d"}), REFERENCE))
 
     def test_a_service_folder_that_is_the_inbox_refuses_the_submission_with_a_fixed_code_and_writes_nothing(self) -> None:
         for name in SERVICE_FOLDERS:
@@ -1566,6 +1652,79 @@ class SubmitTest(unittest.TestCase):
         with self.assertRaises(SubmitError) as caught:
             read_submission(missing, io.BytesIO(b"{}"))
         self.assertIn("reference", str(caught.exception))
+
+
+def program() -> Any:
+    """The program module with stand-ins for the libraries that only the replay image holds (the publisher's, and Avro), which are dropped again from the
+    modules that Python has loaded, so no other test sees them. The tests here call the program's own ``main`` and commands' wiring, never those libraries."""
+    with installed(), mock.patch.dict(sys.modules, {"fastavro": mock.MagicMock()}):
+        return importlib.import_module("replay.service.__main__")
+
+
+class ArchivedRecordTest(unittest.TestCase):
+    """A command that reads a record the service archived takes its relative paths from the folder that holds the resolved inbox, as the run did."""
+
+    def setUp(self) -> None:
+        self.cli = program()
+        folder = tempfile.TemporaryDirectory(prefix="replay_archived_")
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        self.inbox = self.root / "real" / "inbox"
+        (self.inbox / "done").mkdir(parents=True)
+        self.archived = self.inbox / "done" / "a.json"
+        self.archived.write_text(json.dumps(with_read_log("state/reads.log", state_dir="state/replay_0a1b2c3d")))
+        (self.root / "aliases").mkdir()
+        self.link = self.root / "aliases" / "alias"
+        self.link.symlink_to(self.inbox, target_is_directory=True)
+
+    def arguments(self, name: str, *inbox: Path) -> list[str]:
+        extra = {
+            "manifest": ["--out", str(self.root / "manifest.json")],
+            "observe": ["--out", str(self.root / "observed.json")],
+            "compare": ["--manifest", str(self.root / "manifest.json"), "--observed", str(self.root / "observed.json")],
+        }
+        return [name, "--run-record", str(self.archived), *[item for place in inbox for item in ("--inbox", str(place))], *extra.get(name, [])]
+
+    def test_every_command_that_takes_a_run_record_takes_the_inbox_and_resolves_the_relative_paths_from_the_folder_that_holds_it(self) -> None:
+        expected_state = str(self.root / "real" / "state" / "replay_0a1b2c3d")
+        for name in self.cli.COMMANDS:
+            for spelled in (self.inbox, self.link):
+                with self.subTest(command=name, inbox=spelled.name):
+                    seen: list[RunRecord] = []
+
+                    def capture(record: RunRecord, arguments: Any, seen: list[RunRecord] = seen) -> int:
+                        seen.append(record)
+                        return 0
+
+                    with mock.patch.dict(self.cli.COMMANDS, {name: capture}):
+                        self.assertEqual(0, self.cli.main(self.arguments(name, spelled)))
+                    self.assertEqual(expected_state, seen[0].state_dir)
+                    self.assertEqual(str(self.root / "real" / "state" / "reads.log"), seen[0].object_store.read_log)
+
+    def test_without_the_inbox_the_record_is_read_as_it_is(self) -> None:
+        seen: list[RunRecord] = []
+
+        def capture(record: RunRecord, arguments: Any) -> int:
+            seen.append(record)
+            return 0
+
+        with mock.patch.dict(self.cli.COMMANDS, {"run": capture}):
+            self.assertEqual(0, self.cli.main(self.arguments("run")))
+        self.assertEqual(parse_run_record(self.archived.read_text()), seen[0])
+
+    def test_manifest_looks_for_the_frozen_schedule_where_the_run_froze_it(self) -> None:
+        looked: list[str] = []
+
+        class Nothing:
+            def __init__(self, path: Path) -> None:
+                looked.append(str(path))
+
+            def load(self) -> None:
+                return None
+
+        with mock.patch.object(self.cli, "ScheduleFile", Nothing), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, self.cli.main(self.arguments("manifest", self.link)))
+        self.assertEqual([str(self.root / "real" / "state" / "replay_0a1b2c3d" / "schedule.json")], looked)
 
 
 if __name__ == "__main__":
