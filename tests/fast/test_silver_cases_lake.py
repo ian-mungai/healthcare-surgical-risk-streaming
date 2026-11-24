@@ -1,13 +1,17 @@
 """How the Spark steps of the Silver cases job decide to write a table, on a stand-in for the Spark session.
 
 A stand-in cannot show that Spark does what the calls ask: the acceptance run does. These tests hold the decisions of the job: a table that already holds the
-rows is not written again, a table with the same columns is overwritten in place, any other table is replaced, and a table with other columns is never read
-as if it had the expected ones.
+rows is not written again, a table with the same columns is overwritten in place, a table with other columns (a schema change of the job's own output, such
+as ``icu_days`` from a whole number to a double) is dropped on the private branch and made again as a new table, and a table with other columns is never read as
+if it had the expected ones.
 
 Failure modes covered here:
 
 - A rerun that writes a new snapshot of an unchanged table.
-- A replace of an existing table that has the same columns, which stalls in Spark with the Nessie catalog.
+- A replace of an existing table, which stalls in Spark with the Nessie catalog: ``createOrReplace`` is never called, not for a table with the same columns and
+  not for a table whose columns changed (the inherited ``silver.cases`` with ``icu_days`` as ``bigint``).
+- A table with changed columns that is overwritten in place, so rows of one schema are written into the other, or that is dropped after the new rows were
+  planned but made again with the old properties or format version.
 - A property that is lost or never set, so the never-feature marking is missing.
 - An inherited measure or cutoff table with other columns, read as if it were the frozen one.
 """
@@ -57,6 +61,9 @@ class Writer:
 
     def createOrReplace(self) -> None:
         self.log.append(f"createOrReplace {self.table}")
+
+    def create(self) -> None:
+        self.log.append(f"create {self.table}")
 
     def overwritePartitions(self) -> None:
         self.log.append(f"overwritePartitions {self.table}")
@@ -166,14 +173,35 @@ class WriteFrameTest(unittest.TestCase):
     def test_a_table_that_is_not_there_is_created_with_the_format_version_and_every_property(self) -> None:
         engine, log = lake(None)
         self.assertTrue(engine.write_frame(frame([("x", 1)], log), TABLE, PROPERTIES))
-        self.assertEqual(["property format-version=2", "property never_feature_columns=x,y", f"createOrReplace {TABLE}"], log)
+        self.assertEqual(["property format-version=2", "property never_feature_columns=x,y", f"create {TABLE}"], log)
 
-    def test_a_table_with_other_columns_or_types_is_replaced(self) -> None:
+    def test_a_table_with_other_columns_or_types_is_dropped_and_made_again_and_never_replaced(self) -> None:
         engine, log = lake(None)
         held = frame([("x", 1)], log, [("a", "string"), ("b", "int")])
         engine, log = lake(held, PROPERTIES)
         self.assertTrue(engine.write_frame(frame([("x", 1)], log), TABLE, PROPERTIES))
-        self.assertEqual(["property format-version=2", "property never_feature_columns=x,y", f"createOrReplace {TABLE}"], log)
+        self.assertEqual([f"DROP TABLE {TABLE}", "property format-version=2", "property never_feature_columns=x,y", f"create {TABLE}"], log)
+
+    def test_the_inherited_cases_table_with_icu_days_as_a_whole_number_is_rebuilt_without_a_replace(self) -> None:
+        old = [(name, "bigint" if name == "icu_days" else kind) for name, kind in ((column.name, column.type) for column in CASE_COLUMNS)]
+        new = [(column.name, column.type) for column in CASE_COLUMNS]
+        self.assertEqual("double", dict(new)["icu_days"])
+        self.assertNotEqual(old, new)
+        engine, log = lake(None)
+        held = frame([("x", 1)], log, old)
+        engine, log = lake(held, PROPERTIES)
+        self.assertTrue(engine.write_frame(frame([("x", 1)], log, new), TABLE, PROPERTIES))
+        self.assertNotIn(f"createOrReplace {TABLE}", log)
+        self.assertNotIn(f"overwritePartitions {TABLE}", log)
+        self.assertEqual([f"DROP TABLE {TABLE}", f"create {TABLE}"], [line for line in log if line.startswith(("DROP", "create", "overwrite"))])
+        self.assertLess(log.index(f"DROP TABLE {TABLE}"), log.index(f"create {TABLE}"))
+
+    def test_no_write_of_the_job_calls_a_replace(self) -> None:
+        import inspect
+
+        from spark.jobs import silver_cases
+
+        self.assertNotIn(".createOrReplace(", inspect.getsource(silver_cases))
 
 
 class ExistingRulesTest(unittest.TestCase):

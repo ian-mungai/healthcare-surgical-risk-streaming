@@ -12,7 +12,10 @@ row, and the fields that are never features stay in the table, named in its prop
 It also measures the operation lengths (``opend`` minus ``opstart``) of the development patients (training and validation) and sets the score cutoffs from
 the median (``spark/silver_cases.py``). Both are saved as tables. Once a branch holds them, a rebuild that would change either fails before it writes.
 Every input check and that freeze come before the first write; the checks of the written tables come after the last. A table that already holds the
-rows is not written again. The merge of the branch is the caller's step. ``verify`` runs the checks on a branch and writes nothing.
+rows is not written again. A table whose columns or types changed (``icu_days`` from a whole number to a double) is a schema change of this job's own output:
+on the private branch the old table is dropped and the new one is made as a new table, never replaced (a replace of an existing table stalls with the Nessie
+catalog), and the checks of the written tables (every published value kept, the column types) run before any merge, which is the caller's step. ``verify``
+runs the checks on a branch and writes nothing.
 
 The test set is sealed: the result and the messages hold codes, counts, table names and the cutoffs, and never a case or a patient.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
@@ -175,7 +178,10 @@ class Lake:
         """Write the rows of ``frame`` to the table ``source``. True when the table changed: it was made, its rows differ or its properties differ.
 
         A table that holds exactly the rows (same columns and types, no row of one missing from the other) is left as it is. A table with the same columns
-        is overwritten in place, because a replace of an existing table stalls in Spark with the Nessie catalog. One partition gives one data file.
+        is overwritten in place, because a replace of an existing table stalls in Spark with the Nessie catalog. A table with other columns or types is a schema
+        change of this job's own output (``icu_days`` from a whole number to a double): the job runs on a private branch that it just made, so the old table is
+        dropped there (the base keeps it until the caller merges, after the checks of the written tables) and the new table is made as a new one. No write
+        replaces a table that exists. One partition gives one data file.
         """
         held = self.session.table(source) if self.exists(source) else None
         same_columns = held is not None and held.dtypes == frame.dtypes
@@ -185,10 +191,12 @@ class Lake:
             frame.coalesce(1).writeTo(source).overwritePartitions()
             self.set_properties(source, properties)
             return True
+        if held is not None:
+            self.session.sql(f"DROP TABLE {source}")
         writer = frame.coalesce(1).writeTo(source).tableProperty("format-version", "2")
         for key, value in properties.items():
             writer = writer.tableProperty(key, value)
-        writer.createOrReplace()
+        writer.create()
         return True
 
     def set_properties(self, source: str, wanted: dict[str, str]) -> bool:
