@@ -155,7 +155,8 @@ class TaskRulesTest(unittest.TestCase):
 # "another operation (install/upgrade/rollback) is in progress" when the last revision is pending-install, pending-upgrade or pending-rollback
 # (``Status.IsPending``), and with "has no deployed releases" when the last revision is neither deployed, failed nor superseded and no revision of the
 # release is deployed (``prepareUpgrade``, which an ``uninstalling`` last revision meets). An ``uninstalled`` last revision is installed again, as
-# ``upgrade --install`` does (cmd/helm/upgrade.go, ``isReleaseUninstalled``). ``upgrade`` and ``rollback`` leave the release deployed, and
+# ``upgrade --install`` does (cmd/helm/upgrade.go, ``isReleaseUninstalled``); without ``--install`` an absent or uninstalled release is refused.
+# ``upgrade`` and ``rollback`` leave the release deployed, and
 # ``uninstall`` removes it, as the real commands do. A rollback does not undo the hook's ConfigMap, as the real one does not.
 HELM_STAND_IN = """#!/bin/sh
 echo "$*" >> "$STAND_IN/log"
@@ -175,7 +176,8 @@ history) awk 'BEGIN{printf "["} {printf "%s{\\"revision\\":%d,\\"status\\":\\"%s
 upgrade)
   case "$state" in
     pending-install | pending-upgrade | pending-rollback) refuse_pending ;;
-    "" | deployed | failed | superseded | uninstalled) ;;
+    "" | uninstalled) case " $* " in *" --install "*) ;; *) refuse_no_deployed ;; esac ;;
+    deployed | failed | superseded) ;;
     *) grep -qx deployed "$STAND_IN/history" || refuse_no_deployed ;;
   esac
   prev=""
@@ -272,7 +274,7 @@ class ReleaseSandbox:
 
 def commands(log: list[str]) -> list[str]:
     """The Helm and k3s calls of a run in order, without each one's namespace and values arguments that the cases do not look at."""
-    return [line.split(" --namespace")[0] if not line.startswith("upgrade") else UPGRADE for line in log]
+    return [UPGRADE if line.startswith(UPGRADE + " ") else line.split(" --namespace")[0] for line in log]
 
 
 class ReleaseRecoveryTest(unittest.TestCase):
@@ -397,6 +399,18 @@ class ReleaseRecoveryTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertEqual([UPGRADE], self.commands(log))
 
+    def test_an_upgrade_without_install_is_refused_for_a_release_that_is_absent_or_uninstalled_and_is_not_counted_as_one(self) -> None:
+        """Recheck 4: only ``upgrade --install`` installs a release that is not there, and the log keeps a bare upgrade as it was called."""
+        for status, past in ((NOT_INSTALLED, []), ("uninstalled", history("superseded", "uninstalled"))):
+            with self.subTest(status=status or "not installed"), tempfile.TemporaryDirectory() as scratch:
+                box = ReleaseSandbox(scratch, status, past, "none", {})
+                helm = str(box.env["PATH"].split(":")[0]) + "/helm"
+                result = run_command(helm, ["upgrade", "airbyte", "chart"], cwd=box.folder, env=box.env, timeout=30)
+                self.assertEqual(1, result.returncode)
+                self.assertIn("has no deployed releases", result.stderr)
+        self.assertEqual(["upgrade airbyte chart"], commands(["upgrade airbyte chart --namespace airbyte"]))
+        self.assertEqual([UPGRADE], commands(["upgrade --install airbyte chart --namespace airbyte"]))
+
     def test_an_uninstalled_last_revision_is_installed_again_as_helm_does_and_the_playbook_proceeds(self) -> None:
         """Recheck 3: Helm v3.22.1 ``upgrade --install`` (cmd/helm/upgrade.go, ``isReleaseUninstalled``) runs a replacement install when the last revision is
         uninstalled, so the stand-in must not refuse it."""
@@ -406,7 +420,7 @@ class ReleaseRecoveryTest(unittest.TestCase):
         self.assertEqual([UPGRADE], self.commands(log))
 
     def test_each_other_state_passes_on_to_the_install_with_no_recovery(self) -> None:
-        for status in ("failed", "superseded", "unknown", "uninstalled", NOT_INSTALLED):
+        for status in ("failed", "superseded", "unknown", NOT_INSTALLED):
             with self.subTest(status=status or "not installed"):
                 code, output, log = self.run_release(status, history("deployed", "failed"), recorded="match")
                 self.assertEqual(0, code, output)
