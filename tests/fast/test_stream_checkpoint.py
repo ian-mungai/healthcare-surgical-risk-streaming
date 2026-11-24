@@ -90,8 +90,12 @@ class CheckpointFolder(unittest.TestCase):
         self.refused()
 
     def test_a_path_that_is_not_a_local_folder_is_refused_because_its_format_cannot_be_read(self) -> None:
+        here = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, here)
         with self.assertRaises(CheckpointFormatError):
             check_checkpoint("s3a://bucket/checkpoint")
+        self.assertEqual([], list(self.root.iterdir()), "a refused path leaves nothing behind")
 
     def test_the_refusal_carries_the_fixed_code(self) -> None:
         (self.checkpoint / "state").mkdir(parents=True)
