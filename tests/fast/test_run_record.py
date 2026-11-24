@@ -480,10 +480,6 @@ class VerifiedVerdictTest(unittest.TestCase):
         self.assertEqual([], self.claims_pass(folder))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ProvenAbsent(unittest.TestCase):
     """``proven_absent`` is True only when the path is shown not to be there: a check that fails is not a removal that worked."""
 
@@ -529,3 +525,7 @@ class ProvenAbsent(unittest.TestCase):
         (self.folder / "record.json").write_text("{}")
         self.assertEqual([], run_record.remove_verified(self.folder))
         self.assertFalse((self.folder / "record.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

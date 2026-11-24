@@ -578,7 +578,7 @@ class SilverRunners(unittest.TestCase):
                 self.assertLessEqual({script, environment, "log.txt", "retention.json", "record.json"}, saved)
 
     def test_the_runners_with_a_scan_scan_what_they_save_and_a_hit_fails_their_record(self) -> None:
-        for name in ("silver_cases", "silver_signals"):
+        for name in ("silver_cases", "silver_signals", "silver_patient_split"):
             with self.subTest(name):
                 module = runner(name)
                 seen: list[str] = []
@@ -599,8 +599,12 @@ class SilverRunners(unittest.TestCase):
                     def unreadable(_: Path, path: Path = path) -> list[Any]:
                         return read_candidates(path)
 
-                    code, folder = self.main(name, None, unreadable, ran)
+                    scanned: list[object] = []
+                    with mock.patch.object(runner(name), "leaks", lambda texts, numbers, into=scanned: into.append(numbers) or 0):
+                        code, folder = self.main(name, None, unreadable, ran)
                     stored = self.stored(folder)
+                    self.assertEqual([], scanned, "no scan over an empty set of numbers is recorded as passed: the scan is unavailable")
+                    self.assertNotIn("no identifier beside a set name", [item["case"] for item in stored["observations"]])
                     self.assertEqual(1, code)
                     self.assertEqual("fail", stored["outcome"])
                     self.assertEqual([], ran, "a run that cannot scan for identifiers is not started")
