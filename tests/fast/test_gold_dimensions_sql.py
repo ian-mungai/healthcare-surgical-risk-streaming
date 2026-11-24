@@ -157,6 +157,19 @@ class LaterBuildTests(unittest.TestCase):
                 self.assertIn("SHA2", fresh)
                 self.assertIn(f"DATE'{DATE}' AS `valid_from`, CAST(NULL AS DATE) AS `valid_to`, TRUE AS `is_current`", fresh)
 
+    def test_a_held_version_keeps_every_column_as_it_is_but_its_end_and_its_flag(self) -> None:
+        for item in DIMENSIONS:
+            with self.subTest(name=item.name):
+                held = next_query(item, DATE).split(" UNION ALL SELECT ", 1)[0]
+                items = held[len("SELECT ") : held.index(" FROM ")]
+                kept = ", ".join(f"h.`{column.name}`" for column in item.columns[:-2])
+                closing = f"ch.`{item.natural.name}` IS NOT NULL AND h.`is_current`"
+                self.assertEqual(
+                    f"{kept}, CASE WHEN {closing} THEN DATE'{DATE}' ELSE h.`valid_to` END AS `valid_to`, "
+                    f"CASE WHEN {closing} THEN FALSE ELSE h.`is_current` END AS `is_current`",
+                    items,
+                )
+
     def test_a_new_version_is_opened_for_a_changed_member_and_for_a_new_member_only(self) -> None:
         text = next_query(CASE, DATE)
         self.assertIn("NOT (s.`emop` <=> c.`emop`) OR NOT (s.`approach` <=> c.`approach`)", text)
@@ -206,12 +219,44 @@ class FactTests(unittest.TestCase):
         self.assertIn("`is_current` <> (`valid_to` IS NULL)", text)
         self.assertIn("`valid_to` <= `valid_from`", text)
 
-    def test_a_closed_version_must_be_followed_by_a_version_that_starts_on_its_closing_date(self) -> None:
+    def test_the_chain_of_a_member_is_ordered_by_its_starts_and_each_version_is_judged_against_the_next_start(self) -> None:
+        for item in DIMENSIONS:
+            with self.subTest(name=item.name):
+                natural, key = item.natural.name, item.key
+                text = chain_query(item)
+                self.assertTrue(text.startswith("SELECT COUNT(*) AS n FROM ("), text)
+                self.assertIn(f"LEAD(`valid_from`) OVER (PARTITION BY `{natural}` ORDER BY `valid_from`) AS next_start", text)
+                self.assertIn(f"COUNT(*) OVER (PARTITION BY `{natural}`, `valid_from`) AS same_start", text)
+                self.assertIn(f"FROM lake.gold.{item.name} WHERE NOT (`{key}` <=> -1) AND `{natural}` IS NOT NULL", text)
+
+    def test_a_version_that_is_not_the_last_must_close_exactly_at_the_next_start_and_not_be_current(self) -> None:
         text = chain_query(CASE)
-        self.assertTrue(text.startswith("SELECT COUNT(*) AS n FROM"))
-        self.assertIn("LEFT ANTI JOIN", text)
-        self.assertIn("v.`valid_to` = w.`valid_from`", text)
-        self.assertIn("`valid_to` IS NOT NULL", text)
+        self.assertIn("(next_start IS NOT NULL AND NOT (`valid_to` <=> next_start AND `is_current` <=> FALSE))", text)
+
+    def test_the_last_version_must_be_open_and_current(self) -> None:
+        text = chain_query(CASE)
+        self.assertIn("(next_start IS NULL AND NOT (`valid_to` IS NULL AND `is_current` <=> TRUE))", text)
+
+    def test_two_versions_of_one_member_that_start_on_the_same_day_and_a_version_with_no_start_are_broken(self) -> None:
+        text = chain_query(CASE)
+        self.assertIn("same_start > 1", text)
+        self.assertIn("`valid_from` IS NULL", text.split("WHERE", 2)[2])
+
+    def test_every_broken_condition_of_the_chain_is_one_alternative_of_one_filter(self) -> None:
+        tail = chain_query(CASE).rsplit(") WHERE ", 1)[1]
+        self.assertEqual(
+            "same_start > 1 OR `valid_from` IS NULL "
+            "OR (next_start IS NOT NULL AND NOT (`valid_to` <=> next_start AND `is_current` <=> FALSE)) "
+            "OR (next_start IS NULL AND NOT (`valid_to` IS NULL AND `is_current` <=> TRUE))",
+            tail,
+        )
+
+    def test_the_unknown_member_must_be_current_and_empty_so_a_closed_or_missing_flag_is_counted(self) -> None:
+        for item in DIMENSIONS:
+            with self.subTest(name=item.name):
+                found = re.search(r"CASE WHEN (.*?) THEN 1 ELSE 0 END\), 0\) AS unknown_not_empty", output_facts_query(item))
+                self.assertIsNotNone(found)
+                self.assertIn("NOT (`is_current` <=> TRUE)", found.group(1))  # type: ignore[union-attr]
 
     def test_the_natural_duplicates_are_counted_among_the_open_members_only(self) -> None:
         text = natural_duplicates_query(dimension("dim_department"))

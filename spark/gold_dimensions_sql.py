@@ -151,17 +151,19 @@ def ambiguous_query(item: Dimension) -> str:
 
 
 def output_facts_query(item: Dimension) -> str:
-    """One row of counts over the written table, with the unknown member kept apart from the members (the members are the open versions)."""
+    """One row of counts over the written table, with the unknown member kept apart from the members (the members are the open versions). The unknown
+    member must hold no value and be current."""
     key = quoted(item.key)
     member, unknown = f"NOT ({key} <=> {UNKNOWN_KEY})", f"{key} <=> {UNKNOWN_KEY}"
     holds_a_value = " OR ".join(f"{quoted(column.name)} IS NOT NULL" for column in (*item.described, *item.columns[-3:-1]))
+    not_open = "NOT (`is_current` <=> TRUE)"
     open_version = (
         "`valid_from` IS NULL OR `is_current` IS NULL OR `is_current` <> (`valid_to` IS NULL) OR (`valid_to` IS NOT NULL AND `valid_to` <= `valid_from`)"
     )
     items = [
         SUM_ZERO.format(condition=f"{member} AND `is_current`", alias="members"),
         SUM_ZERO.format(condition=unknown, alias="unknown_rows"),
-        SUM_ZERO.format(condition=f"{unknown} AND ({holds_a_value})", alias="unknown_not_empty"),
+        SUM_ZERO.format(condition=f"{unknown} AND ({holds_a_value} OR {not_open})", alias="unknown_not_empty"),
         f"COUNT(*) - COUNT(DISTINCT {key}) AS key_duplicates",
         SUM_ZERO.format(condition=f"{member} AND ({key} IS NULL OR {key} <= 0 OR {key} >= {KEY_LIMIT})", alias="key_out_of_range"),
         SUM_ZERO.format(condition=f"{member} AND {quoted(item.natural.name)} IS NULL", alias="natural_null"),
@@ -178,11 +180,20 @@ def natural_duplicates_query(item: Dimension) -> str:
 
 
 def chain_query(item: Dimension) -> str:
-    """The count of closed versions that no version of the same member follows: a version that starts on the day it closes."""
+    """The count of versions that break the chain of their member. The versions of one natural key, ordered by ``valid_from``, form a chain: every version but
+    the last closes on the start of the next one and is not current; the last is open and current; no two start on the same day; every version has a start."""
     natural, key = quoted(item.natural.name), quoted(item.key)
-    closed = sql("SELECT", natural + ", `valid_to` FROM", table_name(item), "WHERE `valid_to` IS NOT NULL AND NOT (" + key, "<=>", f"{UNKNOWN_KEY})")
-    starts = sql("SELECT", natural + ", `valid_from` FROM", table_name(item))
-    return sql("SELECT COUNT(*) AS n FROM (", closed, ") v LEFT ANTI JOIN (", starts, ") w ON", f"v.{natural} = w.{natural} AND v.`valid_to` = w.`valid_from`")
+    window = f"OVER (PARTITION BY {natural} ORDER BY `valid_from`)"
+    ordered = sql(
+        "SELECT `valid_from`, `valid_to`, `is_current`,",
+        f"LEAD(`valid_from`) {window} AS next_start,",
+        f"COUNT(*) OVER (PARTITION BY {natural}, `valid_from`) AS same_start FROM",
+        table_name(item),
+        f"WHERE NOT ({key} <=> {UNKNOWN_KEY}) AND {natural} IS NOT NULL",
+    )
+    not_last = "(next_start IS NOT NULL AND NOT (`valid_to` <=> next_start AND `is_current` <=> FALSE))"
+    last = "(next_start IS NULL AND NOT (`valid_to` IS NULL AND `is_current` <=> TRUE))"
+    return sql("SELECT COUNT(*) AS n FROM (", ordered, ") WHERE same_start > 1 OR `valid_from` IS NULL OR", not_last, "OR", last)
 
 
 def natural_keys_query(item: Dimension) -> str:
