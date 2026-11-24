@@ -71,6 +71,15 @@ class RaisedTextTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "names no frame of other_function"):
             raised_text(refuse, ValueError, "other_function")
 
+    def test_a_name_that_only_the_text_of_the_error_gives_fails_the_case(self) -> None:
+        def refuse() -> None:
+            error = ValueError('File "x.py", line 1, in absent_function\n')
+            error.add_note('File "x.py", line 1, in absent_function\n')
+            raise error
+
+        with self.assertRaisesRegex(AssertionError, "names no frame of absent_function"):
+            raised_text(refuse, ValueError, "absent_function")
+
     def test_a_call_that_raises_nothing_or_another_error_fails_the_case(self) -> None:
         with self.assertRaisesRegex(AssertionError, "raised nothing"):
             raised_text(lambda: None, ValueError, "anything")

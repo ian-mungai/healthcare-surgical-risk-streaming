@@ -52,7 +52,7 @@ def raised_text[Raised: BaseException](call: Callable[[], object], kind: type[Ra
         call()
     except kind as error:
         text = everything_said_about(error)
-        if f", in {raiser}\n" not in "".join(traceback.format_exception(error)):
+        if error.__traceback__ is None or all(frame.name != raiser for frame in traceback.extract_tb(error.__traceback__)):
             raise AssertionError(f"the traceback of the {kind.__name__} names no frame of {raiser}") from None
         return error, text
     raise AssertionError(f"the call raised nothing: expected {kind.__name__}")

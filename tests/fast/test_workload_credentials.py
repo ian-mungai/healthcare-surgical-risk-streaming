@@ -110,6 +110,7 @@ class ExpirationTest(unittest.TestCase):
         "2026-01-01T13:00:00Z": datetime(2026, 1, 1, 13, 0, 0, tzinfo=UTC),
         "2026-01-01T13:00:00.500Z": datetime(2026, 1, 1, 13, 0, 0, 500000, tzinfo=UTC),
         "2026-01-01T13:00:00.5Z": datetime(2026, 1, 1, 13, 0, 0, 500000, tzinfo=UTC),
+        "2026-01-01T13:00:00.123456789Z": datetime(2026, 1, 1, 13, 0, 0, 123456, tzinfo=UTC),
         "2028-02-29T00:00:00.000Z": datetime(2028, 2, 29, tzinfo=UTC),
     }
     INVALID = (
