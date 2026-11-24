@@ -410,8 +410,10 @@ class ReadFailureTest(unittest.TestCase):
         body = f"n=$(($(cat {count}) + 1))\necho $n > {count}\ncase $n in\n{cases}  *) {steps[-1]} ;;\nesac"
         return self.fake_k3s(folder, body)
 
-    def run_wait(self, env: dict[str, str], deadline: int = 3) -> tuple[int, str, str]:
+    def run_wait(self, env: dict[str, str], deadline: int = 3, shell: str = "sh") -> tuple[int, str, str]:
         argv = self.argv(deadline)
+        self.assertEqual("sh", argv[2])
+        argv[2] = shell
         result = run_command(argv[0], argv[1:], env=env, timeout=30)
         return result.returncode, result.stdout, result.stderr
 
@@ -458,10 +460,19 @@ class ReadFailureTest(unittest.TestCase):
     def test_an_attempt_killed_after_it_wrote_the_values_keeps_the_last_completed_reason_and_shows_no_value(self) -> None:
         """The attempt's own subshell is killed after kubectl wrote both values: what it captured is not a completed attempt, so it never becomes the reason."""
         pair = f"{encoded(READ_ID)}:{encoded(READ_VALUE)}"
-        killed = f"printf '%s' '{pair}'\nkill -9 $(ps -o ppid= -p $PPID)\nsleep 1"
-        for label, steps in {"first attempt": (killed, STALL), "after a refusal": (FAIL.format(text=KUBECTL_ERROR), killed, STALL)}.items():
-            with self.subTest(label), tempfile.TemporaryDirectory() as scratch:
-                code, output, errors = self.run_wait(self.sequence(Path(scratch), *steps), deadline=6)
+        # The waiter is the shell whose parent is ``timeout``; the attempt's subshell is the waiter's direct child in this stand-in's ancestry, at the depth
+        # that the shell puts it. At most 10 steps up, so a changed layout fails the case instead of killing the waiter.
+        child_of_waiter = (
+            "p=$$; i=0; while [ $i -lt 10 ]; do pp=$(ps -o ppid= -p $p | tr -d ' '); ppp=$(ps -o ppid= -p $pp | tr -d ' '); "
+            'case "$(ps -o comm= -p $ppp)" in *timeout) kill -9 $p; break ;; esac; p=$pp; i=$((i + 1)); done'
+        )
+        killed = f"printf '%s' '{pair}'\n{child_of_waiter}\nsleep 1"
+        # The Ubuntu CI job's /bin/sh is dash, whose subshells differ from bash's in depth: the case runs under each shell that this computer has.
+        shells = ["sh", *(["/bin/dash"] if Path("/bin/dash").exists() else [])]
+        cases = {"first attempt": (killed, STALL), "after a refusal": (FAIL.format(text=KUBECTL_ERROR), killed, STALL)}
+        for shell, (label, steps) in ((shell, case) for shell in shells for case in cases.items()):
+            with self.subTest(label, shell=shell), tempfile.TemporaryDirectory() as scratch:
+                code, output, errors = self.run_wait(self.sequence(Path(scratch), *steps), deadline=6, shell=shell)
                 expected = "none" if label == "first attempt" else "refused"
                 self.assertEqual((124, "", [f"{REASON_MARK}{expected}"]), (code, output, reasons(errors)))
                 for fragment in (encoded(READ_ID), encoded(READ_VALUE), READ_ID, READ_VALUE):
