@@ -12,6 +12,10 @@ Failure modes covered here:
 - A change of the held-out patients' ``icu_days`` passes when the measure or the kidney labels got a new snapshot, when the intensive care labels kept theirs,
   or when the build wrote more than the intensive care labels.
 - A rebuild after the merge passes when it wrote, when the branch is not the checked hash or when a snapshot ID differs from the build's.
+- A result file is read for a call that did not exit 0, or that names another job, another mode or another branch than the one that was asked for, or that is
+  not a document.
+- A refusal passes on the exit code or the codes of another call, on a refusal that holds a count or another key, or on the text of a stream.
+- A bad call or a stopped job passes when its result folder holds a file or when it exits with another code.
 """
 
 from __future__ import annotations
@@ -20,7 +24,19 @@ import unittest
 from typing import Any
 
 from spark.silver.label_checks import CHECK_NAMES, TABLES
-from tests.fast.label_accept import SEALED_KEYS, build_ok, icu_change_ok, kept, rebuild_ok, sealed_keys_only, verify_ok, wrote
+from tests.fast.label_accept import (
+    SEALED_KEYS,
+    accepted,
+    build_ok,
+    empty_exit_ok,
+    icu_change_ok,
+    kept,
+    rebuild_ok,
+    refusal_ok,
+    sealed_keys_only,
+    verify_ok,
+    wrote,
+)
 
 HEAD, WRITE = "a" * 64, "b" * 64
 MEASURE, ICU, KIDNEY = TABLES
@@ -186,6 +202,80 @@ class HeldOutIcuChange(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertFalse(icu_change_ok(result, SNAPSHOTS, last))
+
+
+class AcceptedFile(unittest.TestCase):
+    def test_a_file_of_a_call_that_exited_0_for_the_job_the_mode_and_the_branch_is_the_result(self) -> None:
+        self.assertEqual(written(), accepted(0, written(), "build", "x"))
+        self.assertEqual(unwritten(mode="verify"), accepted(0, unwritten(mode="verify"), "verify", "x"))
+
+    def test_each_part_is_needed(self) -> None:
+        for name, code, document, mode, branch in (
+            ("exit 1", 1, written(), "build", "x"),
+            ("exit 124", 124, written(), "build", "x"),
+            ("no file", 0, None, "build", "x"),
+            ("another branch", 0, written(), "build", "y"),
+            ("another mode", 0, written(), "verify", "x"),
+            ("another job", 0, written(job="silver_cases"), "build", "x"),
+            ("no job", 0, without(written(), "job"), "build", "x"),
+            ("a list", 0, [], "build", "x"),
+        ):
+            with self.subTest(name):
+                self.assertEqual({}, accepted(code, document, mode, branch))
+
+    def test_a_file_that_is_accepted_still_has_to_pass_its_own_rule(self) -> None:
+        self.assertFalse(build_ok(accepted(0, written(outcome="written"), "build", "x")))
+        self.assertFalse(build_ok(accepted(1, written(), "build", "x")))
+
+
+class Refusals(unittest.TestCase):
+    def refusal(self, **changes: Any) -> dict[str, Any]:
+        return {"job": "silver_labels", "mode": "verify", "refusal": ["kidney_rule: failed", "kidney_differs: failed"], **changes}
+
+    def test_the_wanted_codes_in_order_with_exit_1_pass(self) -> None:
+        self.assertTrue(refusal_ok(1, self.refusal(), "verify", ["kidney_rule: failed", "kidney_differs: failed"]))
+        self.assertTrue(refusal_ok(1, self.refusal(refusal=["branch_missing: failed"], mode="build"), "build", ["branch_missing: failed"]))
+
+    def test_each_part_is_needed(self) -> None:
+        wanted = ["kidney_rule: failed", "kidney_differs: failed"]
+        for name, code, document in (
+            ("exit 0", 0, self.refusal()),
+            ("exit 2", 2, self.refusal()),
+            ("no file", 1, None),
+            ("other codes", 1, self.refusal(refusal=["kidney_rule: failed"])),
+            ("codes in another order", 1, self.refusal(refusal=list(reversed(wanted)))),
+            ("an extra code", 1, self.refusal(refusal=[*wanted, "icu_differs: failed"])),
+            ("a code with a count", 1, self.refusal(refusal=["kidney_rule: 3 rows", "kidney_differs: failed"])),
+            ("another job", 1, self.refusal(job="silver_cases")),
+            ("another mode", 1, self.refusal(mode="build")),
+            ("an extra key", 1, {**self.refusal(), "count": 3}),
+            ("a result file", 1, written()),
+        ):
+            with self.subTest(name):
+                self.assertFalse(refusal_ok(code, document, "verify", wanted))
+
+    def test_a_refusal_with_another_expected_exit_code_passes_only_for_that_code(self) -> None:
+        document = self.refusal(refusal=["settings: failed"])
+        self.assertTrue(refusal_ok(2, document, "verify", ["settings: failed"], expected=2))
+        self.assertFalse(refusal_ok(1, document, "verify", ["settings: failed"], expected=2))
+
+
+class EmptyExits(unittest.TestCase):
+    def test_a_bad_call_or_a_stopped_job_leaves_the_folder_empty_and_exits_with_the_expected_code(self) -> None:
+        self.assertTrue(empty_exit_ok(2, False, 2))
+        self.assertTrue(empty_exit_ok(124, False, 124))
+
+    def test_each_part_is_needed(self) -> None:
+        for name, code, present, expected in (
+            ("a file in the folder after a bad call", 2, True, 2),
+            ("a file in the folder after a timeout", 124, True, 124),
+            ("a timeout code for a bad call", 124, False, 2),
+            ("a usage code for a timeout", 2, False, 124),
+            ("exit 0", 0, False, 2),
+            ("exit 1", 1, False, 124),
+        ):
+            with self.subTest(name):
+                self.assertFalse(empty_exit_ok(code, present, expected))
 
 
 if __name__ == "__main__":
