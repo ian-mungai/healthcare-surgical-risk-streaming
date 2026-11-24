@@ -17,6 +17,7 @@ DEFAULT_DEADLINE_SECONDS = 120.0
 CALL_TIMEOUT_SECONDS = 30.0
 POLL_SECONDS = 0.2
 BODY_LIMIT_BYTES = 50_000_000
+ADDRESS_TEXT = "the Trino address must be a plain http URL with a host, no path and a port from 0 to 65535 if it has one, such as http://127.0.0.1:8080"
 DEFAULT_USER = "catalog_proof"
 
 
@@ -32,13 +33,13 @@ class TrinoClient:
     """Queries to one Trino server whose ``base_url`` is a plain http address such as ``http://127.0.0.1:8080``."""
 
     def __init__(self, base_url: str, user: str = DEFAULT_USER, deadline_seconds: float = DEFAULT_DEADLINE_SECONDS) -> None:
-        parts = urlsplit(base_url)
-        if parts.scheme != "http" or not parts.hostname or parts.path not in ("", "/") or parts.query or parts.fragment:
-            raise TrinoError("the Trino address must be a plain http URL with a host and no path, such as http://127.0.0.1:8080")
         try:
+            parts = urlsplit(base_url)
             port = parts.port
         except ValueError:
-            raise TrinoError("the Trino address has a port that is not a number from 0 to 65535") from None
+            raise TrinoError(ADDRESS_TEXT) from None
+        if parts.scheme != "http" or not parts.hostname or parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise TrinoError(ADDRESS_TEXT)
         self.host = parts.hostname
         self.port = port or 80
         self.user = user
@@ -55,7 +56,7 @@ class TrinoClient:
             connection.close()
 
     def call(self, method: str, target: str, payload: bytes | None, deadline: float) -> dict[str, Any]:
-        label = f"{method} {urlsplit(target).path.rsplit('/', 2)[0]} on {self.host}:{self.port}"
+        label = f"{method} {target.partition('?')[0].rsplit('/', 2)[0]} on {self.host}:{self.port}"
         headers = {"X-Trino-User": self.user, "X-Trino-Source": "catalog_proof", "Accept": "application/json"}
         timeout = max(0.1, min(CALL_TIMEOUT_SECONDS, deadline - time.monotonic()))
         try:
@@ -87,7 +88,10 @@ class TrinoClient:
             next_uri = document.get("nextUri")
             if not isinstance(next_uri, str):
                 return rows
-            target = urlsplit(next_uri)
+            try:
+                target = urlsplit(next_uri)
+            except ValueError:
+                raise TrinoError("Trino answered with a next address that cannot be read") from None
             path = target.path + (f"?{target.query}" if target.query else "")
             if time.monotonic() >= deadline:
                 self.cancel(path)

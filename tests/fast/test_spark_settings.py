@@ -116,6 +116,21 @@ class CatalogTest(unittest.TestCase):
             with self.subTest(uri=uri):
                 self.assertIn("api/v2", refused(nessie_uri=uri))
 
+    def test_an_address_or_a_warehouse_that_urlsplit_refuses_is_a_settings_error_that_shows_no_value(self) -> None:
+        marker = "marker_value_x9"
+        for name, value in (
+            ("nessie_uri", f"http://[{marker}:19120/api/v2"),
+            ("nessie_uri", "http://[::1:19120/api/v2"),
+            ("nessie_uri", f"http://nes\u2100{marker}:19120/api/v2"),
+            ("warehouse", f"s3://[{marker}/warehouse/"),
+            ("warehouse", f"s3://buck\u2100{marker}/warehouse/"),
+        ):
+            with self.subTest(name=name, value=value), self.assertRaises(SettingsError) as caught:
+                catalog_options(**{**GOOD, name: value})
+            self.assertNotIn(marker, str(caught.exception))
+            self.assertNotIn("NFKC", str(caught.exception))
+            self.assertIsNone(caught.exception.__cause__)
+
     def test_a_warehouse_outside_the_two_known_file_systems_is_refused(self) -> None:
         for warehouse in ("gs://bucket/warehouse/", "http://host/warehouse/", "/warehouse/", "s3://", ""):
             with self.subTest(warehouse=warehouse):

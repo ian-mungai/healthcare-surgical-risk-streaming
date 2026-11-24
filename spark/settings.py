@@ -77,11 +77,15 @@ def catalog_options(*, nessie_uri: str, warehouse: str, ref: str, region: str, c
 
     With ``ref_hash`` the catalog reads ``ref`` as it was at that commit, whatever its head is now.
     """
-    parts = urlsplit(nessie_uri)
+    try:
+        parts = urlsplit(nessie_uri)
+        warehouse_parts = urlsplit(warehouse)
+    except ValueError:
+        raise SettingsError("the Nessie address or the warehouse location cannot be read as a URL") from None
     if parts.scheme != "http" or not parts.hostname or parts.path != "/api/v2" or parts.query or parts.fragment:
         raise SettingsError("the Nessie address must be a plain http URL ending in /api/v2, such as http://nessie:19120/api/v2")
-    scheme = urlsplit(warehouse).scheme
-    if scheme not in FILE_IO or not urlsplit(warehouse).path.strip("/") or (scheme == "s3" and not urlsplit(warehouse).netloc):
+    scheme = warehouse_parts.scheme
+    if scheme not in FILE_IO or not warehouse_parts.path.strip("/") or (scheme == "s3" and not warehouse_parts.netloc):
         raise SettingsError("the warehouse location must be s3://<bucket>/<prefix>/ or file:///<folder>/")
     if not ref:
         raise SettingsError("the Nessie reference is empty: a job names the branch it writes to")

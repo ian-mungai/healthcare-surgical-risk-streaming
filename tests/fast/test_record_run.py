@@ -130,11 +130,19 @@ class SettingsTest(EnvironmentCase):
                 settings_from_environment({**self.environment, "RECORD_SYNC_DEADLINE_SECONDS": value})
             self.assertIn("RECORD_SYNC_DEADLINE_SECONDS", str(raised.exception))
 
+    def test_a_catalog_address_that_urlsplit_refuses_is_a_settings_error_that_names_the_variable_and_shows_no_value(self) -> None:
+        for text in ("http://[marker_value_x9:19120/api/v2", "http://nes\u2100marker_value_x9:19120/api/v2"):
+            with self.subTest(text), self.assertRaises(SettingsError) as raised:
+                settings_from_environment({**self.environment, "NESSIE_URI": text})
+            self.assertIn("NESSIE_URI", str(raised.exception))
+            self.assertNotIn("marker_value_x9", str(raised.exception))
+            self.assertIsNone(raised.exception.__cause__)
+
     def test_the_airbyte_address_and_the_catalog_address_must_be_plain_http_urls(self) -> None:
         with self.assertRaises(SettingsError) as raised:
             settings_from_environment({**self.environment, "NESSIE_URI": "https://elsewhere.example"})
         self.assertIn("NESSIE_URI", str(raised.exception))
-        for text in ("https://10.42.0.1:19120/api/v2", "10.42.0.1:19120", "", "http://"):
+        for text in ("https://10.42.0.1:19120/api/v2", "10.42.0.1:19120", "", "http://", "http://[10.42.0.1:19120/api/v2", "http://nes\u2100sie:19120/api/v2"):
             with self.subTest(text):
                 (self.folder / "nessie_url").write_text(text + "\n")
                 with self.assertRaises(SettingsError) as raised:

@@ -100,7 +100,10 @@ def secret_file(environment: Mapping[str, str], name: str) -> str:
 
 
 def plain_http(name: str, value: str) -> str:
-    parts = urlsplit(value)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise SettingsError(f"the setting {name} must be a plain http URL with a host") from None
     if parts.scheme != "http" or not parts.hostname:
         raise SettingsError(f"the setting {name} must be a plain http URL with a host")
     return value

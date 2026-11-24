@@ -36,6 +36,7 @@ HASH = re.compile(r"[0-9a-f]{64}")
 CONFLICT_STATUS = 409
 CONFLICT_TEXT = "Nessie refused the branch: the reference or its content changed (a conflict)"
 BODY_LIMIT_BYTES = 1_000_000
+ADDRESS_TEXT = "the Nessie address must be a plain http URL with a host and a port from 0 to 65535 if it has one, such as http://127.0.0.1:19120/api/v2"
 
 
 class PlainText(str):
@@ -85,13 +86,13 @@ class NessieClient:
     """Calls to one Nessie server. ``base_url`` ends in ``/api/v2``. Every call ends within ``timeout_seconds``."""
 
     def __init__(self, base_url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
-        parts = urlsplit(base_url)
-        if parts.scheme != "http" or not parts.hostname or parts.query or parts.fragment:
-            raise NessieError("the Nessie address must be a plain http URL with a host, such as http://127.0.0.1:19120/api/v2")
         try:
+            parts = urlsplit(base_url)
             port = parts.port
         except ValueError:
-            raise NessieError("the Nessie address has a port that is not a number from 0 to 65535") from None
+            raise NessieError(ADDRESS_TEXT) from None
+        if parts.scheme != "http" or not parts.hostname or parts.query or parts.fragment:
+            raise NessieError(ADDRESS_TEXT)
         self.host = parts.hostname
         self.port = port or 80
         self.prefix = parts.path.rstrip("/")
