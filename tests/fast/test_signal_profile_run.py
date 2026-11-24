@@ -25,6 +25,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import dataclasses
+import json
 import unittest
 from typing import Any
 
@@ -227,9 +228,9 @@ class Build(unittest.TestCase):
                 "rows": {PROFILE: 12, UNSCORED: 1, COUNTS: len(PRESPECIFIED)},
                 "development": {"numeric_rows": 500, "waveform_rows": 300, "tracks": 12, "arterial_cases": 3},
                 "unscored": {"cutoffs": 100, "waveform": 10, "numeric": 5, "either": 12, "no_grid": 1},
-                "source_counts": {"pinned": False, "mismatched": []},
+                "source_counts": {"pinned": False, "passed": True},
                 "rebuilt": [],
-                "fingerprints": {PROFILE: [12, 5], UNSCORED: [1, 6], COUNTS: [len(PRESPECIFIED), 7]},
+                "fingerprints": {PROFILE: [12, 5], UNSCORED: [1, 6]},
                 "checks_run": facts["checks_run"],
             },
             facts,
@@ -316,11 +317,28 @@ class Build(unittest.TestCase):
             run_build(again.operations(), HEAD, pinned=True)
         self.assertEqual(["counts_not_judged"], codes(caught.exception))
 
-    def test_a_count_that_does_not_match_is_named_in_the_result_and_does_not_fail_the_job(self) -> None:
+    def test_a_count_that_does_not_match_does_not_fail_the_job_and_is_not_in_the_result(self) -> None:
+        """The mismatch is a flag in the table. A held-out recording changes it (the track total and the arterial case count are over the full cohort), so the
+        result holds one pass flag for the table and no name."""
         fake = Fake()
-        fake.read_back[COUNTS] = TableRead(FINGERPRINTS[COUNTS], 103, counts=COUNTS_FACTS, mismatched=("tracks",))
+        fake.read_back[COUNTS] = TableRead(FINGERPRINTS[COUNTS], 103, counts=COUNTS_FACTS)
         facts = run_build(fake.operations(), HEAD, pinned=True).facts()
-        self.assertEqual({"pinned": True, "mismatched": ["tracks"]}, facts["source_counts"])
+        self.assertEqual({"pinned": True, "passed": True}, facts["source_counts"])
+        self.assertNotIn("mismatched", json.dumps(facts))
+
+    def test_a_held_out_recording_that_changes_the_counts_table_leaves_the_result_identical_apart_from_the_snapshot_id(self) -> None:
+        """The counts table holds flags over the full cohort, so its fingerprint (rows and digest) and its flags change with a held-out recording."""
+        before = Fake()
+        after = Fake()
+        changed = Fingerprint(len(PRESPECIFIED), 99)
+        after.planned[COUNTS] = changed
+        after.read_back[COUNTS] = TableRead(changed, 777, counts=COUNTS_FACTS)
+        one = run_build(before.operations(), HEAD, pinned=True).facts()
+        two = run_build(after.operations(), HEAD, pinned=True).facts()
+        self.assertEqual(777, two["snapshots"].pop(COUNTS))
+        one["snapshots"].pop(COUNTS)
+        self.assertEqual(one, two)
+        self.assertEqual({PROFILE, UNSCORED}, set(two["fingerprints"]))
 
     def test_an_input_that_changed_between_the_reads_is_named(self) -> None:
         for later in (
@@ -694,7 +712,7 @@ class Verify(unittest.TestCase):
     def test_a_good_branch_is_verified_in_either_mode(self) -> None:
         for pinned in (False, True):
             with self.subTest(pinned=pinned):
-                self.assertEqual({"pinned": pinned, "mismatched": []}, self.verify(Fake(), pinned).facts()["source_counts"])
+                self.assertEqual({"pinned": pinned, "passed": True}, self.verify(Fake(), pinned).facts()["source_counts"])
 
     def test_a_branch_without_a_table_is_named(self) -> None:
         fake = Fake()

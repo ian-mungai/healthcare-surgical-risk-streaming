@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import json
 import re
 import unittest
 from pathlib import Path
@@ -33,6 +34,8 @@ from spark.jobs import silver_signals as signals_job
 from spark.jobs.patient_split import Lake
 from spark.jobs.silver_hypotension import HypotensionLake
 from spark.jobs.silver_signals import SOURCES, SignalsLake
+from spark.profile.run import PROFILE, UNSCORED
+from spark.profile.run import run_build as run_profile_build
 from spark.silver import hypotension_run as hypo_run
 from spark.silver import run as signals_run
 from spark.silver.checks import BronzeFacts, NumericFacts, SilverSignalsError, WaveformFacts
@@ -44,6 +47,8 @@ from spark.split_table import COLUMNS, PatientSplitError, schema_problems
 from tests.fast import test_silver_hypotension_run as hypo
 from tests.fast import test_silver_signals_run as signals
 from tests.fast.silver_accept import CHECKS, HYPOTENSION_JOB, RESULT_KEYS, SIGNALS_JOB, TABLE_KEYS, sealed
+from tests.fast.test_signal_profile_run import HEAD as PROFILE_HEAD
+from tests.fast.test_signal_profile_run import Fake as ProfileFake
 
 MESSAGE = re.compile(r"^[a-z_]+: failed$|^" + re.escape(BRANCH_MOVED) + "$")
 VOLATILE = ("snapshots", "source_snapshots", "checked_hash", "write_hash", "branch_hash")
@@ -500,8 +505,9 @@ def result_field_names(source: str) -> set[str]:
 # are the names of a check of the track list's pinned digest, whose detail is one flag (``equal`` 0 or 1).
 # The signal profile job (``spark/jobs/signal_profile.py``) names ``development_cases`` and ``development_patients_*``: its counts of the cases in the
 # training and validation sets (``frames.development_cases``). The ``fingerprints`` of its result (``spark/profile/run.py``) are the row count and digest of
-# the three profile tables, each built from the signal tables of development cases only (``profile_frame``, ``unscored_frame``) and from counts that are
-# written as development counts; a count of the full cohort is a flag.
+# the two development tables, ``signal_profile`` and ``unscored_share``, each built from the signal tables of development cases only (``profile_frame``,
+# ``unscored_frame``). The ``source_counts`` table holds a flag over the full cohort for some counts, so a held-out recording changes its fingerprint and the
+# name of a count that does not match: the result holds neither (one pass flag, ``ProfileResultIsSealed``).
 RESULT_FIELDS = {
     "spark/jobs/signal_profile.py": {"development_cases", "development_patients_training", "development_patients_validation"},
     "spark/profile/run.py": {"fingerprints"},
@@ -510,6 +516,18 @@ RESULT_FIELDS = {
     "spark/jobs/table_maintenance.py": {"checksum"},
     "spark/table_checks.py": {"digest_compared", "rows digest"},
 }
+
+
+class ProfileResultIsSealed(unittest.TestCase):
+    """The profile job's result: its fingerprints are the two development tables' and the source counts table is one pass flag."""
+
+    def test_the_fingerprints_are_the_two_development_tables_and_the_source_counts_table_is_a_pass_flag(self) -> None:
+        for pinned in (False, True):
+            with self.subTest(pinned=pinned):
+                facts = run_profile_build(ProfileFake().operations(), PROFILE_HEAD, pinned=pinned).facts()
+                self.assertEqual({PROFILE, UNSCORED}, set(facts["fingerprints"]))
+                self.assertEqual({"pinned": pinned, "passed": True}, facts["source_counts"])
+                self.assertNotIn("mismatched", json.dumps(facts))
 
 
 class ResultFieldNames(unittest.TestCase):

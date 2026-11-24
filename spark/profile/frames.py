@@ -223,8 +223,8 @@ def unscored_facts(frame: Any) -> UnscoredFacts:
     )
 
 
-def counts_facts(frame: Any) -> tuple[CountsFacts, tuple[str, ...]]:
-    """The facts of ``source_counts`` and the names of the counts whose flag is false. The table is a dozen rows, so it is read whole."""
+def counts_facts(frame: Any) -> CountsFacts:
+    """The facts of ``source_counts``: counts of rows and of flags, never a name that fails. The table is a dozen rows, so it is read whole."""
     held = [row.asDict() for row in frame.collect()]
     names = [row["name"] for row in held]
     expected = {count.name for count in PRESPECIFIED}
@@ -232,7 +232,7 @@ def counts_facts(frame: Any) -> tuple[CountsFacts, tuple[str, ...]]:
     sealed_with_value = sum(1 for row in held if row["name"] in sealed and row["value"] is not None)
     expected_differs = sum(1 for row in held if row["name"] in BY_NAME and row["expected"] != float(BY_NAME[row["name"]].expected))
     flags = [row["matches"] for row in held]
-    facts = CountsFacts(
+    return CountsFacts(
         len(held),
         len(set(names) ^ expected),
         sealed_with_value,
@@ -240,4 +240,3 @@ def counts_facts(frame: Any) -> tuple[CountsFacts, tuple[str, ...]]:
         sum(1 for flag in flags if flag is None),
         sum(1 for flag in flags if flag is not None),
     )
-    return facts, tuple(sorted(row["name"] for row in held if row["matches"] is False))

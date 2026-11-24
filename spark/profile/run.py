@@ -20,7 +20,8 @@ the planned tables, with every check passing. The job ends only when the branch 
 
 A verify classifies the schemas first (any table that is not its card's, the predecessor included, is ``table_schema``), then builds the same plan on the stored
 rule row and requires the stored tables to be equal to it and the stored rule to be the planned row. A prespecified count that the reproduced count does not
-equal is a finding, not a failure: its name is in the result (``source_counts.mismatched``).
+equal is a finding, not a failure: its flag is in the table and its name is not in the result. The counts of the full cohort change with a held-out
+recording, so the result holds one pass flag for ``source_counts`` and neither its fingerprint nor a name (``Outcome.facts``).
 """
 
 from __future__ import annotations
@@ -71,17 +72,13 @@ class InputRead:
 
 @dataclass(frozen=True, slots=True)
 class TableRead:
-    """A table at one hash: its fingerprint, its snapshot ID and, when asked for, the counts of its checks.
-
-    ``mismatched`` names the source counts whose flag is false.
-    """
+    """A table at one hash: its fingerprint, its snapshot ID and, when asked for, the counts of its checks."""
 
     fingerprint: Fingerprint
     snapshot_id: int | None
     profile: ProfileFacts | None = None
     unscored: UnscoredFacts | None = None
     counts: CountsFacts | None = None
-    mismatched: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +124,9 @@ class Outcome:
     rebuilt: tuple[str, ...] = ()
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: hashes, snapshot IDs, counts of development data, the names of the source counts that do not match and the checks
-        that ran. A count of the full cohort is a flag in the table and is not in the result."""
+        """What the result line may hold: hashes, snapshot IDs, counts of development data, the fingerprints of the two development tables, one pass flag for
+        the source counts and the checks that ran. A count of the full cohort is a flag in the table and is not in the result, and neither is the name of a
+        count that does not match nor the fingerprint of the table, which a held-out recording changes. The pass flag is true: a failed check raises."""
         unscored = self.tables[UNSCORED].unscored
         facts = self.source.facts
         return {
@@ -160,9 +158,9 @@ class Outcome:
             }
             if unscored
             else {},
-            "source_counts": {"pinned": self.pinned, "mismatched": list(self.tables[COUNTS].mismatched)},
+            "source_counts": {"pinned": self.pinned, "passed": True},
             "rebuilt": list(self.rebuilt),
-            "fingerprints": {table: [value.rows, value.digest] for table, value in self.fingerprints.items()},
+            "fingerprints": {table: [value.rows, value.digest] for table, value in self.fingerprints.items() if table != COUNTS},
             "checks_run": list(CHECK_NAMES),
         }
 
