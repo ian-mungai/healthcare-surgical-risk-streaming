@@ -3,8 +3,8 @@
 Failure modes covered here:
 
 - A value of the rule is written in two places (the saved row and the grid of the unscored share), so a change of one leaves the other: the step, the first
-  cutoff and the last cutoff margin of the unscored cutoffs come from the same constants as the saved row, and the columns that the measure reads are the
-  rule's origin and end.
+  cutoff and the last cutoff margin of the unscored cutoffs come from the saved row that the planner is given and not from the constants, the measure holds
+  no copy of the constants, and the columns that it reads are the rule's origin and end.
 - A status comment still says that the owner has not decided the values.
 - The rule text says something other than the constants (a constant that changes does not change the text, or the text holds a value that no constant holds).
 - The row holds a case, a patient or a count, or lacks a constant, or holds another split snapshot than the one that was read.
