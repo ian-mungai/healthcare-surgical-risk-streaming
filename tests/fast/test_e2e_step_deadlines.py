@@ -59,6 +59,34 @@ def calls_of(path: str, function: str, name: str) -> int:
     return sum(1 for call in ast.walk(node) if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == name)
 
 
+def request_sites(path: str, function: str, names: set[str]) -> tuple[int, list[int]]:
+    """The request call sites of a function outside its loops, and for each loop the number of request call sites in it. A request is ``aws.call`` or a
+    call of one of ``names``."""
+    tree = ast.parse((REPOSITORY / path).read_text())
+    (node,) = (item for item in ast.walk(tree) if isinstance(item, ast.FunctionDef) and item.name == function)
+
+    def is_request(call: ast.Call) -> bool:
+        target = call.func
+        if isinstance(target, ast.Attribute):
+            return target.attr == "call" and isinstance(target.value, ast.Name) and target.value.id == "aws"
+        return isinstance(target, ast.Name) and target.id in names
+
+    outside = 0
+    loops: list[int] = []
+
+    def walk(parent: ast.AST) -> None:
+        nonlocal outside
+        for child in ast.iter_child_nodes(parent):
+            if isinstance(child, ast.For | ast.While):
+                loops.append(sum(1 for call in ast.walk(child) if isinstance(call, ast.Call) and is_request(call)))
+                continue
+            outside += isinstance(child, ast.Call) and is_request(child)
+            walk(child)
+
+    walk(node)
+    return outside, loops
+
+
 class DeadlineTableTest(unittest.TestCase):
     def test_each_command_that_runs_terraform_gets_more_than_the_sum_of_its_own_bounded_steps(self) -> None:
         sums = {
@@ -69,13 +97,45 @@ class DeadlineTableTest(unittest.TestCase):
             ("scripts.infra.teardown", "destroy"): 2 * PLAN_TIMEOUT_SECONDS
             + APPLY_TIMEOUT_SECONDS
             + RELEASE_DEADLINE_SECONDS
-            + 2 * teardown.GONE_DEADLINE_SECONDS,
+            + 2 * teardown.GONE_DEADLINE_SECONDS
+            + (run_record.S3_FIXED_CALLS + run_record.S3_CALLS_PER_VERSION * run_record.DESTROY_WRITTEN_VERSIONS) * AWS_TIMEOUT_SECONDS,
         }
         for (module, command), steps in sums.items():
             with self.subTest(module=module, command=command):
                 arguments = [command] if command else []
                 self.assertEqual(steps + MARGIN, command_deadline(module, arguments, DEFAULT))
                 self.assertGreater(command_deadline(module, [*arguments, *(["--confirm", "x"] if arguments else [])], DEFAULT), steps)
+
+    def test_the_destroy_deadline_grows_by_the_s3_calls_of_each_version_in_the_bucket_and_no_other_command_grows(self) -> None:
+        destroy = ("scripts.infra.teardown", ["destroy"])
+        base = command_deadline(*destroy, DEFAULT)
+        for versions in (1, 5, 40):
+            with self.subTest(versions=versions):
+                self.assertEqual(
+                    versions * run_record.S3_CALLS_PER_VERSION * AWS_TIMEOUT_SECONDS, command_deadline(*destroy, DEFAULT, versions=versions) - base
+                )
+        for module, arguments in (("scripts.infra.terraform_wrapper", ["apply"]), ("scripts.infra.teardown", ["plan"]), ("scripts.evidence.export", [])):
+            with self.subTest(module=module):
+                self.assertEqual(command_deadline(module, arguments, DEFAULT), command_deadline(module, arguments, DEFAULT, versions=5))
+
+    def test_a_five_version_fixture_s_worst_case_destroy_fits_inside_its_deadline(self) -> None:
+        own_steps = 2 * PLAN_TIMEOUT_SECONDS + APPLY_TIMEOUT_SECONDS + RELEASE_DEADLINE_SECONDS + 2 * teardown.GONE_DEADLINE_SECONDS
+        calls = run_record.S3_FIXED_CALLS + run_record.S3_CALLS_PER_VERSION * (5 + run_record.DESTROY_WRITTEN_VERSIONS)
+        self.assertGreater(command_deadline("scripts.infra.teardown", ["destroy"], DEFAULT, versions=5), own_steps + calls * AWS_TIMEOUT_SECONDS)
+
+    def test_the_destroy_counts_the_versions_that_it_writes_itself(self) -> None:
+        self.assertGreaterEqual(run_record.DESTROY_WRITTEN_VERSIONS, 3, "the state version, a lock version and the lock's delete marker")
+
+    def test_the_counted_s3_calls_are_the_s3_calls_that_the_teardown_cleanup_holds(self) -> None:
+        names = {"delete_entry", "entry_content", "bucket_entries", "bucket_exists", "owned"}
+        fixed = per_version = 0
+        for function, loops in (("purge", 1), ("clean_bucket", 2), ("hold_state_lock", 0), ("guard_problems", 0), ("owner_problem", 0)):
+            outside, inside = request_sites("scripts/infra/teardown.py", function, names)
+            fixed += outside
+            self.assertEqual(loops, len(inside), function)
+            per_version = max(per_version, sum(inside))
+        self.assertEqual(fixed, run_record.S3_FIXED_CALLS)
+        self.assertEqual(per_version, run_record.S3_CALLS_PER_VERSION)
 
     def test_a_command_without_a_terraform_step_keeps_the_deadline_the_runner_gives_it(self) -> None:
         for module, arguments in (("scripts.evidence.export", []), ("scripts.infra.state_bootstrap", ["create"]), ("scripts.infra.teardown", ["other"])):
@@ -287,7 +347,7 @@ class IngestionRunnerTest(RunnerCase):
 
     def test_a_publish_timeout_is_a_failed_step_in_the_saved_record_and_the_cleanup_still_runs(self) -> None:
         version = self.module.ObjectVersion("landing/k", "v1", 1, "2026-01-01T00:00:00Z", True, False)
-        cleanup = mock.Mock(return_value="removed")
+        cleanup = mock.Mock(return_value=("removed", True))
         with (
             mock.patch.object(self.module, "read_sample", lambda scratch: ({"a/1.vital": b"x", "a/2.vital": b"y"}, {"a/3.vital": b"z"})),
             mock.patch.object(self.module, "put_version", lambda *arguments: version),
@@ -339,7 +399,7 @@ class StateBootstrapRunnerTest(RunnerCase):
         with (
             mock.patch.object(self.module, "readback", lambda aws, bucket: first),
             mock.patch.object(self.module, "pinned_terraform", pinned),
-            mock.patch.object(self.module, "remove_test_bucket", lambda aws, bucket, record: "removed"),
+            mock.patch.object(self.module, "remove_test_bucket", lambda aws, bucket, record: ("removed", True)),
         ):
             return self.run_main()
 
@@ -373,7 +433,7 @@ class EnvironmentPlanRunnerTest(RunnerCase):
         raise TimeoutExpired(program, options["timeout"])
 
     def test_a_plan_timeout_is_a_failed_step_that_keeps_the_binding_and_removes_no_bucket(self) -> None:
-        cleanup = mock.Mock(return_value="removed")
+        cleanup = mock.Mock(return_value=("removed", True))
         with mock.patch.object(self.module, "expected_creates", lambda environment: []), mock.patch.object(self.module, "remove_test_bucket", cleanup):
             code = self.run_main()
         self.assertEqual(1, code)

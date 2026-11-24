@@ -29,30 +29,50 @@ class StopRun(Exception):
     with its cleanup still pending."""
 
 
+CREATE_STEP = "scripts.infra.state_bootstrap create"
 MARGIN_SECONDS = 10 * AWS_TIMEOUT_SECONDS
+# The S3 requests of the teardown's data and state cleanup, each of which can take ``AWS_TIMEOUT_SECONDS`` (a drift check in the fast tests counts them again
+# in ``scripts/infra/teardown.py``): the requests that do not depend on the bucket's contents (the listings, the lock, the owner checks, the bucket's
+# deletion), and the most requests that one object version can cost (a state version is read and then deleted). The destroy itself writes the state version
+# and Terraform's lock cycle (a lock version and its delete marker) into the bucket.
+S3_FIXED_CALLS = 12
+S3_CALLS_PER_VERSION = 2
+DESTROY_WRITTEN_VERSIONS = 3
 # The seconds that a command's own bounded steps can take in all, counted from the commands' Terraform calls (a drift check in the fast tests counts them
 # again): the wrapper's plan is the init, the workspace check, the plan and two shows; its apply is two shows and the apply; the inventory is the init, the
 # workspace check and a show; the teardown's plan is two state reads and a wrapper plan; its destroy is two reads, the apply, the Tailscale release and the
-# waits for the bucket and for the removal checks.
+# waits for the bucket and for the removal checks, and the S3 requests that do not depend on the bucket's contents. The requests for each version in the
+# bucket come on top (``command_deadline``).
 STEP_SECONDS: dict[tuple[str, str], int] = {
     ("scripts.infra.terraform_wrapper", "plan"): INIT_TIMEOUT_SECONDS + 4 * PLAN_TIMEOUT_SECONDS,
     ("scripts.infra.terraform_wrapper", "apply"): 2 * PLAN_TIMEOUT_SECONDS + APPLY_TIMEOUT_SECONDS,
     ("scripts.infra.inventory", ""): INIT_TIMEOUT_SECONDS + 2 * PLAN_TIMEOUT_SECONDS,
     ("scripts.infra.teardown", "plan"): INIT_TIMEOUT_SECONDS + 6 * PLAN_TIMEOUT_SECONDS,
-    ("scripts.infra.teardown", "destroy"): 2 * PLAN_TIMEOUT_SECONDS + APPLY_TIMEOUT_SECONDS + RELEASE_DEADLINE_SECONDS + 2 * GONE_DEADLINE_SECONDS,
+    ("scripts.infra.teardown", "destroy"): 2 * PLAN_TIMEOUT_SECONDS
+    + APPLY_TIMEOUT_SECONDS
+    + RELEASE_DEADLINE_SECONDS
+    + 2 * GONE_DEADLINE_SECONDS
+    + (S3_FIXED_CALLS + S3_CALLS_PER_VERSION * DESTROY_WRITTEN_VERSIONS) * AWS_TIMEOUT_SECONDS,
 }
 
 
 class StepTimedOut(Exception):
     """A step's outer deadline passed. It is not a ``RuntimeError``, so no runner's cleanup that catches a failed step removes anything: a child of the step
-    can still run, and what it is changing is not known. The runner records the failed step, keeps the binding of its bucket and closes the record."""
+    can still run, and what it is changing is not known. The runner records the failed step, keeps the binding of its bucket and closes the record. ``step``
+    names the step that timed out."""
+
+    step: str = ""
 
 
-def command_deadline(module: str, arguments: Sequence[str], default: float) -> float:
+def command_deadline(module: str, arguments: Sequence[str], default: float, versions: int = 0) -> float:
     """The outer deadline of a command that a runner starts: more than the sum of the command's own bounded steps (``STEP_SECONDS``) by ``MARGIN_SECONDS``,
-    so the runner never stops a command that is still inside its own deadline. A command with no Terraform step keeps the runner's ``default``."""
-    steps = STEP_SECONDS.get((module, arguments[0] if arguments else ""))
-    return default if steps is None else steps + MARGIN_SECONDS
+    so the runner never stops a command that is still inside its own deadline. The teardown's destroy also counts the S3 requests of each of the
+    ``versions`` object versions that its bucket holds. A command with no Terraform step keeps the runner's ``default``."""
+    key = (module, arguments[0] if arguments else "")
+    steps = STEP_SECONDS.get(key)
+    if steps is None:
+        return default
+    return steps + MARGIN_SECONDS + (versions * S3_CALLS_PER_VERSION * AWS_TIMEOUT_SECONDS if key == ("scripts.infra.teardown", "destroy") else 0)
 
 
 def timed_command(step: str, program: str, args: Sequence[str], **options: Any) -> CompletedProcess[str]:
@@ -60,7 +80,57 @@ def timed_command(step: str, program: str, args: Sequence[str], **options: Any) 
     try:
         return run_command(program, args, **options)
     except TimeoutExpired:
-        raise StepTimedOut(timeout_text(step, options["timeout"])) from None
+        failure = StepTimedOut(timeout_text(step, options["timeout"]))
+        failure.step = step
+        raise failure from None
+
+
+def read_binding(path: Path) -> dict[str, Any] | None:
+    """The run binding that a runner's command wrote at ``path``: None when there is no file, and an empty dict when the file cannot be read as a JSON object,
+    so a corrupt binding is still told apart from an absent one."""
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text())
+    except OSError, ValueError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def named_bucket(path: Path) -> str | None:
+    """The bucket that the binding at ``path`` names. None when there is no file: the commands write the binding before they create anything, so a finished
+    command that left no file created no bucket. An empty string when the file exists and names none that can be read: what it names is not known."""
+    binding = read_binding(path)
+    if binding is None:
+        return None
+    bucket = binding.get("bucket")
+    return bucket if isinstance(bucket, str) else ""
+
+
+def settle_binding(
+    binding_path: Path, project_bucket: str, remove: Callable[[str], tuple[str, bool]], *, started: bool, timed_out: StepTimedOut | None = None
+) -> tuple[str, bool]:
+    """What a runner records as its cleanup when it closes, and whether its recovery binding at ``binding_path`` can be removed.
+
+    The binding goes only when every resource that it names is confirmed gone: nothing was started, a finished create step left no binding (the commands write
+    the binding before they create anything), or ``remove`` (the runner's removal of the bucket named by the binding, returning its text and whether S3
+    reported the bucket gone) confirmed it. Every other path keeps the binding and says that resources may remain: a create step that timed out, because a
+    child of it may still be creating the bucket, so no removal is tried; a binding that cannot be read or names a bucket that is no short-lived test bucket
+    of this project; a removal that could not confirm. No path claims that no bucket was created unless it confirmed that.
+    """
+    if not started:
+        return "no bucket was created", True
+    name = binding_path.name
+    named = named_bucket(binding_path)
+    if timed_out is not None and timed_out.step == CREATE_STEP:
+        where = f"the binding {name} is kept" if named is not None else "no binding was written"
+        return f"the create step timed out and a child of it may still run, so no removal was tried: the test bucket may remain ({where})", False
+    if named is None:
+        return "no bucket was created: the create step finished and wrote no binding", True
+    if not named.startswith(f"{project_bucket}-test-"):
+        return f"the binding {name} names no short-lived test bucket that can be read: nothing was removed and resources may remain; binding kept", False
+    text, gone = remove(named)
+    return (text, True) if gone else (f"{text}; resources may remain; the binding {name} is kept", False)
 
 
 @dataclass
