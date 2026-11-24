@@ -71,9 +71,14 @@ def state_keys(environment: str) -> list[str]:
     return [key, f"{key}.tflock"]
 
 
+def run_suffix(run_id: str) -> str:
+    """The run ID without its year and separators: the part that names a test run's own bucket and deploy role."""
+    return run_id[4:].replace("t", "").replace("-", "")
+
+
 def short_lived_bucket_name(project_bucket: str, run_id: str) -> str:
     """A test's own bucket: the project's bucket name, the test suffix and the run ID without its year and separators, to fit an S3 name."""
-    name = f"{project_bucket}-test-{run_id[4:].replace('t', '').replace('-', '')}"
+    name = f"{project_bucket}-test-{run_suffix(run_id)}"
     if len(name) > BUCKET_NAME_LIMIT:
         raise ConfigurationError(f"the test bucket name would be longer than {BUCKET_NAME_LIMIT} characters; shorten S3_BUCKET")
     return name

@@ -175,9 +175,11 @@ class OneNamedExecutableTest(unittest.TestCase):
         self.assertEqual(["scripts/x.py:3"], file_problems("scripts/x.py", 'import x\n\nrun_command("terraform", [])\n'))
         self.assertEqual(["Makefile:1"], file_problems("Makefile", "\tterraform fmt\n"))
 
-    def test_no_fast_test_starts_the_bare_command(self) -> None:
+    def test_no_test_or_runner_starts_the_bare_command_tracked_or_not(self) -> None:
+        """Runners under ``tests/e2e`` may stay untracked, so every Python file on disk under ``tests`` is scanned as well as every tracked one."""
         found = []
-        for name in tracked_files():
+        on_disk = {path.relative_to(ROOT).as_posix() for path in (ROOT / "tests").rglob("*.py")}
+        for name in sorted({*tracked_files(), *on_disk}):
             if name.startswith("tests/") and name.endswith(".py"):
                 found += [f"{name}:{line}" for line in bare_calls_in_python((ROOT / name).read_text())]
         self.assertEqual([], found)

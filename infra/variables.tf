@@ -33,6 +33,17 @@ variable "environment" {
   }
 }
 
+variable "test_run_id" {
+  description = "Set only by a short-lived test run: the run's ID without its year and separators. The deploy role then gets a name of its own, so the apply never meets the permanent role."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^([0-9a-f]{1,20})?$", var.test_run_id))
+    error_message = "Use up to 20 lower-case hexadecimal characters, or leave it empty."
+  }
+}
+
 variable "data_bucket_name" {
   description = "Name of the project's one bucket, from the run binding. The state bootstrap step creates it; this configuration creates no bucket."
   type        = string

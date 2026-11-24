@@ -96,6 +96,13 @@ class PlanBindingTest(unittest.TestCase):
             run_variables(RUN, {"AWS_PROFILE": "example_project_dev"}),
         )
 
+    def test_a_short_lived_test_run_is_given_its_own_run_suffix_for_its_deploy_role_and_a_permanent_run_is_not(self) -> None:
+        test_run = RunBinding(**{**RUN.__dict__, "bucket_mode": "short_lived"})
+        values = run_variables(test_run, {"AWS_PROFILE": "example_project_dev"})
+        self.assertEqual("01010000abcdef", values["test_run_id"])
+        self.assertNotIn("test_run_id", run_variables(RUN, {"AWS_PROFILE": "example_project_dev"}))
+        self.assertNotIn("test_run_id", run_variables(LOCAL, {"AWS_PROFILE": "example_project_dev"}))
+
     def test_plan_saved_for_the_s3_backend_is_refused_under_the_local_backend(self) -> None:
         self.assertEqual(
             ["the plan was saved for a different state location than this run's"],

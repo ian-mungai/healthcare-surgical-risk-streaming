@@ -13,6 +13,8 @@ provider "aws" {
 locals {
   data_prefixes = ["landing", "warehouse"]
   read_prefixes = ["manifests"]
+
+  deploy_role_name = var.test_run_id == "" ? "${var.project_name}_deploy_${var.environment}" : "${var.project_name}_deploy_t${var.test_run_id}"
 }
 
 module "host" {
@@ -41,7 +43,7 @@ module "host" {
 module "deploy" {
   source = "./modules/deploy"
 
-  name                 = "${var.project_name}_deploy_${var.environment}"
+  name                 = local.deploy_role_name
   boundary_name        = "${var.project_name}_role_boundary"
   github_repository    = var.github_repository
   github_owner_id      = var.github_owner_id

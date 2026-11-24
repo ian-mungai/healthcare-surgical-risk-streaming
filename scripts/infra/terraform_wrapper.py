@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.infra.created import created_entries, merge_created
-from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem
+from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem, run_suffix
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
@@ -103,7 +103,10 @@ def backend_override(run: RunBinding) -> str | None:
 
 def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, str]:
     """The Terraform variables that come from the run and not from the environment's variable file."""
-    return {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    values = {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    if run.bucket_mode == "short_lived":
+        values["test_run_id"] = run_suffix(run.run_id)
+    return values
 
 
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:
