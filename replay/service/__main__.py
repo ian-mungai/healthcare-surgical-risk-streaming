@@ -8,7 +8,8 @@
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 ``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
               A record whose ``state_dir`` is not the ``--state`` folder or a folder directly inside it is refused (exit code 2 in its result), so no
-              queued run writes its saved position elsewhere; ``run`` takes the record's ``state_dir`` as it is.
+              queued run writes its saved position elsewhere; ``run`` takes the record's ``state_dir`` as it is. The same refusal covers a folder store
+              read log (when non-empty) that is not a regular file or absent directly inside that folder, or is a file the replay writes there.
 ``submit``    read a run record on standard input and put it in the inbox under its run ID, with the manifest reference file that ``--manifest-reference``
               names beside it, both as their exact bytes; the same record and reference again change nothing, other bytes under that run ID are
               refused (exit 2), as is a record or reference that is not valid UTF-8 text.
@@ -23,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 import time
 from collections.abc import Callable
@@ -41,9 +44,9 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.output_guard import refuse_inside_store
 from replay.service.registry import RegistryClient, RegistryError
-from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
+from replay.service.run_record import SCHEDULE_NAME, RunRecord, RunRecordError, parse_run_record
 from replay.service.serve import HEALTH_NAME, Outcome, healthy, queued_record, serve, submit_command
-from replay.service.state_file import ScheduleFile, StateFile
+from replay.service.state_file import STATE_NAME, ScheduleFile, StateFile
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
 from scripts.ingestion.closed import ClosedInputError, QuietParser
@@ -59,6 +62,8 @@ STATE_FOLDER = Path("/opt/replay/state")
 POLL_SECONDS = 1.0
 STOPPED_CODE = 2
 HEALTH_MAX_AGE_SECONDS = 600.0
+# Every file the replay writes in a state folder: a read log of a queued run never takes one of these names
+STATE_FOLDER_FILES = frozenset({STATE_NAME, SCHEDULE_NAME, HEALTH_NAME})
 
 
 def log(event: str, **fields: Any) -> None:
@@ -210,19 +215,41 @@ def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
     return 0
 
 
+def is_replay_file(read_log: Path) -> bool:
+    """Whether ``read_log`` is, by name (also in another letter case) or by identity, a file the replay writes in its state folder."""
+    if read_log.name.casefold() in {name.casefold() for name in STATE_FOLDER_FILES}:
+        return True
+    for name in STATE_FOLDER_FILES:
+        held = read_log.parent / name
+        if held.exists() and read_log.exists() and held.samefile(read_log):
+            return True
+    return False
+
+
+def is_regular_or_absent(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def inside_state(record: RunRecord, state: Path) -> RunRecord:
     """The record with its state folder resolved, which must be ``state`` or a folder directly inside it, and its folder store's read log, when it
-    has one, resolved too, which must be a file directly inside that folder: a run that the service takes keeps its saved position and appends its reads
-    nowhere else. What is checked is what the run is given, so a link or a ``..`` part cannot lead the run out of it."""
+    has a non-empty one, resolved too. The log must be a file directly inside that folder, must not be a file the replay writes there (the saved state, the
+    frozen schedule or the health file, also by another letter case or a hard link) and must be a regular file or absent as it is given, so a link, a
+    folder or a named pipe is refused: a run that the service takes keeps its saved position and appends its reads nowhere else. What is checked is what
+    the run is given, so a link or a ``..`` part cannot lead the run out of it. An empty read log means no log, as in the standalone run."""
     folder = Path(record.state_dir).resolve()
     root = state.resolve()
     if folder != root and folder.parent != root:
         raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
     store = record.object_store
-    if store.read_log is None:
+    if not store.read_log:
         return replace(record, state_dir=str(folder))
     read_log = Path(store.read_log).resolve()
-    if read_log.parent != folder:
+    if read_log.parent != folder or is_replay_file(read_log) or not is_regular_or_absent(Path(store.read_log)):
         raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
     return replace(record, state_dir=str(folder), object_store=replace(store, read_log=str(read_log)))
 

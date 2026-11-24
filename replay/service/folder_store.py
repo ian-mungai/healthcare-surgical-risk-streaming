@@ -10,13 +10,15 @@ credentials and the role that reach the bucket, and the latency of a real networ
 from __future__ import annotations
 
 import glob
+import os
 import re
+import stat
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.ingestion.folder import list_files, list_folder
-from scripts.ingestion.notice import Code, Notice
+from scripts.ingestion.notice import Code, Notice, Subject
 from scripts.ingestion.output_file import write_new_file
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
@@ -30,10 +32,21 @@ class FolderStore:
         self.read_log = read_log
 
     def note_read(self, version: ObjectVersion) -> None:
-        """Append the key and version ID of a read to the read log, so a test can show which versions were read."""
-        if self.read_log is not None:
-            with self.read_log.open("a") as handle:
-                handle.write(f"{version.key} {version.version_id}\n")
+        """Append the key and version ID of a read to the read log, so a test can show which versions were read. The log is opened without following a
+        link and without waiting for a reader, and it is refused unless the open entry is a regular file: a link, a folder or a named pipe in its place
+        is a closed error and nothing is written to it."""
+        if self.read_log is None:
+            return
+        try:
+            descriptor = os.open(self.read_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+        except OSError:
+            raise StoreError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)) from None
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise StoreError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT))
+            os.write(descriptor, f"{version.key} {version.version_id}\n".encode())
+        finally:
+            os.close(descriptor)
 
     def entries(self, key: str) -> list[tuple[int, bool, Path]]:
         folder = self.root

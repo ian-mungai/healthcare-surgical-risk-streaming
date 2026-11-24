@@ -48,9 +48,10 @@ class RunRecord:
 
     @property
     def schedule_path(self) -> Path:
-        return Path(self.state_dir) / "schedule.json"
+        return Path(self.state_dir) / SCHEDULE_NAME
 
 
+SCHEDULE_NAME = "schedule.json"
 REQUIRED: dict[str, type | tuple[type, ...]] = {
     "run_id": str,
     "rooms": int,

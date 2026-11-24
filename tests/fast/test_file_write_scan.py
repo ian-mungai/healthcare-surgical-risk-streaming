@@ -99,9 +99,9 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "Publishes the staged record with a hard link, which fails when the name exists, so it never replaces a file",
     ),
-    ("replay/service/folder_store.py", "FolderStore.note_read", "self.read_log.open"): (
+    ("replay/service/folder_store.py", "FolderStore.note_read", "os.open"): (
         1,
-        "Appends one line to the read log that a test of the folder store names; the log is evidence of the reads and is never replaced",
+        "Appends one line to the read log of a test, opened without following a link and refused unless a regular file; the log is never replaced",
     ),
     ("replay/service/inputs.py", "VerifiedInputs.decode", "target.open"): (
         1,
