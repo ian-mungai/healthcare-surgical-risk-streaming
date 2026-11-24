@@ -85,7 +85,7 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
     ),
     ("scripts/quality/push_hook.py", "install", "orphan.rename"): (
         1,
-        "Moves the owner's hook that an earlier guard kept aside to the kept name, and only when that name is free (checked before); it replaces nothing",
+        "Moves the owner's hook that a guard kept to the kept name; install refuses first when that name exists (a link too) or another move needs it",
     ),
     ("scripts/quality/worktree_scan_hook.py", "install", "os.rename"): (
         1,

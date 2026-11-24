@@ -66,6 +66,12 @@ def is_scanner(path: Path, hook: LegacyHook = SCANNER) -> bool:
     return path.is_file() and path.read_bytes() in (hook.text.encode(), *(text.encode() for text in hook.earlier_texts))
 
 
+def would_keep(root: Path, hook: LegacyHook = SCANNER) -> bool:
+    """Whether ``install`` would move a file of the owner at the hook's path to the kept name."""
+    path = hook_path(root, hook)
+    return os.path.lexists(path) and not is_scanner(path, hook)
+
+
 def install(root: Path, hook: LegacyHook = SCANNER) -> bool:
     """Write the hook and return True, or return False when it is already installed.
 

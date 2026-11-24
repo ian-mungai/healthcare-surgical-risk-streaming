@@ -18,6 +18,7 @@ import hashlib
 import io
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -286,6 +287,47 @@ class RepositoryWalkTest(unittest.TestCase):
                 push_gate.repository_python_files.cache_clear()
 
 
+class UnreadableFolderTest(TemporaryRepository):
+    """Join round 1, finding 2: a folder that cannot be read stops the gate with one fixed line, never a traceback that prints the folder's path."""
+
+    def test_the_gate_command_names_an_unreadable_folder_by_a_fixed_line_and_prints_no_path_or_traceback(self) -> None:
+        (self.repo / "locked_folder_name").mkdir()
+        (self.repo / "locked_folder_name" / "hidden.py").write_text("Y = 1\n")
+        (self.repo / "changed.py").write_text("X = 1\n")
+        (self.repo / push_gate.QUICK_FOLDER).mkdir(parents=True)
+        (self.repo / push_gate.QUICK_FOLDER / "test_one.py").write_text("X = 1\n")
+        self.git("add", "--", "changed.py", push_gate.QUICK_FOLDER)
+        self.git("commit", "--quiet", "-m", "feat: add a module")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "locked_folder_name").chmod(0)
+        try:
+            run = run_command(
+                sys.executable,
+                ["-m", "scripts.quality.push_gate", "origin", "url"],
+                cwd=self.repo,
+                env=self.env,
+                timeout=TIMEOUT_SECONDS,
+                input_text=f"refs/heads/main {head} refs/heads/main {ZERO}\n",
+            )
+        finally:
+            (self.repo / "locked_folder_name").chmod(0o755)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(run.stderr, f"{push_gate.UNREADABLE}\n")
+        self.assertNotIn("Traceback", run.stderr)
+        self.assertNotIn("locked_folder_name", run.stdout + run.stderr)
+
+    def test_a_filesystem_error_at_the_command_boundary_prints_the_fixed_line_and_returns_1(self) -> None:
+        error = PermissionError(13, "Permission denied", "/private/folder")
+        err = io.StringIO()
+        with mock.patch.object(push_gate, "main", side_effect=error), contextlib.redirect_stderr(err):
+            self.assertEqual(push_gate.command("", by_hook=True), 1)
+        self.assertEqual(err.getvalue(), f"{push_gate.UNREADABLE}\n")
+
+    def test_a_failure_that_is_not_a_filesystem_error_is_not_hidden(self) -> None:
+        with mock.patch.object(push_gate, "main", side_effect=ValueError("a defect")), self.assertRaises(ValueError):
+            push_gate.command("", by_hook=True)
+
+
 class PredecessorGuardTest(TemporaryRepository):
     """Round 2, finding 4: the guards of earlier versions sit in ``pre-push.legacy`` and refuse a push that sends only deletes; the installer removes them."""
 
@@ -411,6 +453,108 @@ class PushHookTest(TemporaryRepository):
         run = self.run_hook("line\n")
         self.assertEqual(run.returncode, 9, run.stderr)
         self.assertEqual((self.repo / "owner_input").read_text(), "line\n")
+
+    def hooks_state(self) -> dict[str, tuple[str, str | bytes]]:
+        """Every entry of the hooks folder with its kind and content, a link by its target, so that a change of any name shows."""
+        state: dict[str, tuple[str, str | bytes]] = {}
+        for path in sorted((self.repo / ".git" / "hooks").iterdir()):
+            state[path.name] = ("link", os.readlink(path)) if path.is_symlink() else ("file", path.read_bytes())
+        return state
+
+    def assert_refused_and_untouched(self) -> None:
+        before = self.hooks_state()
+        with self.assertRaises(worktree_scan_hook.KeptHookError) as refusal:
+            push_hook.install(self.repo)
+        self.assertEqual(before, self.hooks_state(), "a refused setup changes no entry of the hooks folder")
+        self.assertEqual(str(refusal.exception), push_hook.KEPT_REFUSAL)
+        err = io.StringIO()
+        with mock.patch.object(install_tools, "ROOT", self.repo), contextlib.redirect_stderr(err):
+            self.assertFalse(install_tools.settle_push_guard(check=False))
+        self.assertEqual("push hook: KeptHookError\n", err.getvalue())
+        self.assertEqual(before, self.hooks_state())
+
+    def test_two_different_owner_hooks_at_pre_push_and_pre_push_legacy_previous_are_refused_and_neither_changes(self) -> None:
+        """Join round 1, finding 1: the first move took the kept name after the check, and the second move overwrote it."""
+        hooks = self.repo / ".git" / "hooks"
+        for name, text in ((push_hook.HOOK_NAME, "#!/bin/sh\necho first owner hook\n"), (push_hook.ORPHAN_NAME, "#!/bin/sh\necho second owner hook\n")):
+            (hooks / name).write_text(text)
+            (hooks / name).chmod(0o755)
+        self.assert_refused_and_untouched()
+
+    def test_the_same_two_owner_hooks_with_a_shipped_guard_between_them_are_refused_and_nothing_changes(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / push_hook.HOOK_NAME).write_text("#!/bin/sh\necho first owner hook\n")
+        (hooks / push_hook.PREDECESSOR_NAME).write_text(push_hook.PREDECESSOR_TEXTS[0])
+        (hooks / push_hook.ORPHAN_NAME).write_text("#!/bin/sh\necho second owner hook\n")
+        self.assert_refused_and_untouched()
+
+    def test_a_dangling_link_at_the_kept_name_is_a_taken_name_and_is_never_overwritten_by_the_orphan_move(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / push_hook.PREDECESSOR_NAME).write_text(push_hook.PREDECESSOR_TEXTS[0])
+        (hooks / push_hook.ORPHAN_NAME).write_text("#!/bin/sh\necho owner hook\n")
+        (hooks / push_hook.KEPT_NAME).symlink_to(self.repo / "missing_target")
+        self.assert_refused_and_untouched()
+
+    def test_a_dangling_link_at_the_kept_name_is_a_taken_name_for_an_owner_hook_at_pre_push(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / push_hook.HOOK_NAME).write_text("#!/bin/sh\necho owner hook\n")
+        (hooks / push_hook.KEPT_NAME).symlink_to(self.repo / "missing_target")
+        self.assert_refused_and_untouched()
+
+    def test_a_dangling_link_at_pre_push_is_an_owner_hook_that_needs_the_kept_name_like_the_orphan_does(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / push_hook.HOOK_NAME).symlink_to(self.repo / "missing_target")
+        (hooks / push_hook.ORPHAN_NAME).write_text("#!/bin/sh\necho owner hook\n")
+        self.assert_refused_and_untouched()
+
+    def test_a_dangling_link_at_pre_push_alone_is_kept_as_it_is(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        target = self.repo / "missing_target"
+        (hooks / push_hook.HOOK_NAME).symlink_to(target)
+        push_hook.install(self.repo)
+        self.assertEqual(os.readlink(hooks / push_hook.KEPT_NAME), str(target))
+        self.assertTrue(push_hook.installed(self.repo))
+
+    def test_a_pre_commit_script_at_pre_push_is_replaced_in_place_and_does_not_need_the_kept_name_for_the_orphan_move(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / push_hook.HOOK_NAME).write_text("#!/bin/sh\n# File generated by pre-commit\n")
+        (hooks / push_hook.ORPHAN_NAME).write_text("#!/bin/sh\necho owner hook\n")
+        self.assertTrue(push_hook.install(self.repo))
+        self.assertEqual((hooks / push_hook.KEPT_NAME).read_text(), "#!/bin/sh\necho owner hook\n")
+        self.assertEqual((hooks / push_hook.HOOK_NAME).read_text(), push_hook.HOOK_TEXT)
+        self.assertFalse(os.path.lexists(hooks / push_hook.ORPHAN_NAME))
+
+    def test_the_installed_hook_is_not_an_owner_hook_so_an_orphan_beside_it_is_moved_to_the_kept_name(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        push_hook.install(self.repo)
+        (hooks / push_hook.ORPHAN_NAME).write_text("#!/bin/sh\necho owner hook\n")
+        self.assertTrue(push_hook.install(self.repo))
+        self.assertEqual((hooks / push_hook.KEPT_NAME).read_text(), "#!/bin/sh\necho owner hook\n")
+        self.assertEqual((hooks / push_hook.HOOK_NAME).read_text(), push_hook.HOOK_TEXT)
+
+    def test_a_dangling_link_at_pre_push_legacy_is_the_owners_and_the_orphan_beside_it_stays(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        (hooks / push_hook.PREDECESSOR_NAME).symlink_to(self.repo / "missing_target")
+        (hooks / push_hook.ORPHAN_NAME).write_text("#!/bin/sh\necho owner hook\n")
+        push_hook.install(self.repo)
+        self.assertFalse(os.path.lexists(hooks / push_hook.KEPT_NAME))
+        self.assertTrue((hooks / push_hook.ORPHAN_NAME).is_file())
+
+    def test_an_orphan_that_is_a_dangling_link_is_moved_to_the_kept_name_as_it_is_and_the_hook_is_not_installed_while_it_stays(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        target = self.repo / "missing_target"
+        (hooks / push_hook.ORPHAN_NAME).symlink_to(target)
+        push_hook.install(self.repo)
+        self.assertTrue((hooks / push_hook.KEPT_NAME).is_symlink())
+        self.assertEqual(os.readlink(hooks / push_hook.KEPT_NAME), str(target))
+        self.assertFalse(os.path.lexists(hooks / push_hook.ORPHAN_NAME))
+        self.assertTrue(push_hook.installed(self.repo))
+
+    def test_an_orphan_link_that_is_left_means_the_hook_is_not_installed(self) -> None:
+        hooks = self.repo / ".git" / "hooks"
+        push_hook.install(self.repo)
+        (hooks / push_hook.ORPHAN_NAME).symlink_to(self.repo / "missing_target")
+        self.assertFalse(push_hook.installed(self.repo))
 
     def test_the_hook_refuses_a_gate_that_is_older_than_the_version_it_was_installed_for(self) -> None:
         push_hook.install(self.repo)

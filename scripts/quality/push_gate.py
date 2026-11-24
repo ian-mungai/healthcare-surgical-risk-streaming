@@ -428,5 +428,20 @@ def main(stdin: str, *, by_hook: bool = False) -> int:
     return 0
 
 
+UNREADABLE = (
+    "push gate stopped by the file system: a file or folder of the repository could not be read, so the checks that apply are unknown: "
+    "fix its access, then push again"
+)
+
+
+def command(stdin: str, *, by_hook: bool = False) -> int:
+    """Run the gate for the command line and turn a file system error into one fixed line: the error text names the path of an unreadable folder."""
+    try:
+        return main(stdin, by_hook=by_hook)
+    except OSError:
+        sys.stderr.write(f"{UNREADABLE}\n")
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main("" if sys.stdin.isatty() else sys.stdin.read(), by_hook=len(sys.argv) > 1))
+    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else command("" if sys.stdin.isatty() else sys.stdin.read(), by_hook=len(sys.argv) > 1))
