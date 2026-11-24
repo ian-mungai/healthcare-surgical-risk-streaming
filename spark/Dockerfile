@@ -43,11 +43,14 @@ COPY scripts/__init__.py /opt/jobs/scripts/__init__.py
 COPY scripts/stack/__init__.py /opt/jobs/scripts/stack/__init__.py
 COPY scripts/stack/nessie.py /opt/jobs/scripts/stack/nessie.py
 COPY scripts/stack/tags.py /opt/jobs/scripts/stack/tags.py
-# The Silver jobs call the one definition of validity, of the pressure series and of the events that the feature code shares (standard library only).
+# The Silver jobs call the one definition of validity, of the pressure series, of the events and of the labels that the feature code shares (standard library only).
 COPY features/__init__.py /opt/jobs/features/__init__.py
 COPY features/signal_validity.py /opt/jobs/features/signal_validity.py
 COPY features/pressure_series.py /opt/jobs/features/pressure_series.py
 COPY features/hypotension.py /opt/jobs/features/hypotension.py
+COPY features/label_values.py /opt/jobs/features/label_values.py
+COPY features/icu_label.py /opt/jobs/features/icu_label.py
+COPY features/kidney_label.py /opt/jobs/features/kidney_label.py
 # The Bronze decoder imports the replay's decoder and stores and the ingestion gate, and the gate reads the tracked release pin through ROOT.
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py
