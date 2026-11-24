@@ -75,6 +75,32 @@ class Settings(unittest.TestCase):
                 self.assertEqual(wanted, from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text}).max_offsets_per_trigger)
         self.assertEqual(50_000, from_environment(BASE).max_offsets_per_trigger)
 
+    def test_an_offset_count_that_a_float_would_round_to_a_whole_number_is_refused_and_one_that_is_exact_is_kept(self) -> None:
+        for text in (
+            "1.0000000000000001",
+            "1.00000000000000000001",
+            "0.99999999999999999",
+            "2.0000000000000001",
+            "49999.99999999999999",
+            "2147483647.0000000001",
+            "2147483647.5",
+            "2147483648",
+            "nan",
+            "NaN",
+            "sNaN",
+            "inf",
+            "-inf",
+            "Infinity",
+            "1e999999999999999999999",
+            "\u0661\u0662",
+        ):
+            with self.subTest(value=text), self.assertRaisesRegex(StreamSettingsError, "STREAM_MAX_OFFSETS_PER_TRIGGER") as caught:
+                from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text})
+            self.assertNotIn(text, str(caught.exception))
+        for text, expected in (("1.0000000000", 1), ("1e3", 1_000), ("1E+3", 1_000), ("00050000", 50_000), ("2147483647.0", 2_147_483_647), ("5.00", 5)):
+            with self.subTest(value=text):
+                self.assertEqual(expected, from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text}).max_offsets_per_trigger)
+
     def test_the_test_input_counts_sink_commits_from_one(self) -> None:
         self.assertEqual(1, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "1"}).test_exit_after_sink)
         self.assertEqual(7, from_environment({**BASE, "STREAM_TEST_EXIT_AFTER_SINK": "7"}).test_exit_after_sink)
