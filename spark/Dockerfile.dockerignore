@@ -27,6 +27,7 @@
 !replay/__init__.py
 !replay/events/__init__.py
 !replay/events/errors.py
+!replay/events/event_list.py
 !replay/events/formats.py
 !replay/events/schemas
 !replay/events/wire.py

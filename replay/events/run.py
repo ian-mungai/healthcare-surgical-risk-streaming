@@ -28,16 +28,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from replay.events.event_list import EVENT_LIST_REFUSAL_CODE, EVENT_LIST_VERSION
 from replay.events.recording import CaseRecording
 from replay.events.schedule import FrozenSchedule, ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import CaseEvent, OutgoingEvent, occurrence_events, outgoing
 
 STATE_FORMAT = "replay_state_2"
 OLD_STATE_FORMATS = ("replay_state_1",)
-# Bump this when the events of a case change in content, order or count (events_3: exact sampling changed the waveform seconds).
-# A saved position counts the old list.
-EVENT_LIST_VERSION = "events_3"
-EVENT_LIST_REFUSAL_CODE = "replay_event_list_refused"
 DEFAULT_CHECKPOINT_EVENTS = 100
 DEFAULT_IDLE_CHECKPOINT_US = 5_000_000
 MIN_SPEED = 0.01
@@ -104,8 +101,8 @@ class RunState:
             document = json.loads(text)
             if document["format"] in OLD_STATE_FORMATS:
                 raise ReplayError(
-                    "the saved state was written before the start marker joined the events of a case, so its position counts another list "
-                    "of events and is not resumed: start the run again under a new run ID"
+                    f"{EVENT_LIST_REFUSAL_CODE}: the saved state was written before the start marker joined the events of a case, so its position "
+                    "counts another list of events and is not resumed: start the run again under a new run ID"
                 )
             if document["format"] != STATE_FORMAT:
                 raise ReplayError("the saved state is not of this format")

@@ -25,9 +25,10 @@ import unittest
 from collections import Counter
 from typing import Any
 
+from replay.events.event_list import EVENT_LIST_VERSION
 from replay.events.manifest import Observed, build_manifest, compare
 from replay.events.payload import payload_digest
-from replay.events.run import EVENT_LIST_VERSION, Replayer, ReplayError, RunSettings, RunState
+from replay.events.run import Replayer, ReplayError, RunSettings, RunState
 from replay.events.schedule import admitted_occurrences
 from tests.fast.replay_support import FakeClock, MemorySink, MemoryStore, RecordingSource, StopHere, boundary_recordings, boundary_schedule, saved_state
 
@@ -165,7 +166,7 @@ class Positions(unittest.TestCase):
         old = json.loads(saved_state(store).to_json())
         old["format"] = "replay_state_1"
         del old["event_list"]
-        with self.assertRaisesRegex(ReplayError, "before the start marker"):
+        with self.assertRaisesRegex(ReplayError, "replay_event_list_refused.*before the start marker.*new run ID"):
             RunState.from_json(json.dumps(old))
 
     def test_a_state_of_another_event_list_is_refused(self) -> None:

@@ -86,6 +86,7 @@ COPY features/waveform.py /opt/jobs/features/waveform.py
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py
 COPY replay/events/errors.py /opt/jobs/replay/events/errors.py
+COPY replay/events/event_list.py /opt/jobs/replay/events/event_list.py
 COPY replay/events/formats.py /opt/jobs/replay/events/formats.py
 COPY replay/events/schemas /opt/jobs/replay/events/schemas
 COPY replay/events/wire.py /opt/jobs/replay/events/wire.py
