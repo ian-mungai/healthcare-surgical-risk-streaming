@@ -47,15 +47,17 @@ class Record:
         self.observations.append(Observation(case, step, expected, str(observed), passed))
         return passed
 
-    def close_after(self, cleanup: Callable[[], None], log: list[str], *, blocked: str = "") -> int:
+    def close_after(self, cleanup: Callable[[], None], log: list[str], *, blocked: str | Callable[[], str] = "") -> int:
         """Run the cleanup, then close the record, also when the cleanup fails or is interrupted.
 
-        A failed cleanup is a failed assertion. An interrupt marks the run blocked, and the interrupt propagates after the record is written.
+        A failed cleanup is a failed assertion. An interrupt marks the run blocked, and the interrupt propagates after the record is written. ``blocked`` may be
+        a function, read after the cleanup, for a reason that the cleanup itself can set.
         """
+        interrupted = False
         try:
             cleanup()
         except KeyboardInterrupt:
-            blocked = blocked or "interrupted"
+            interrupted = True
             self.cleanup = "cleanup interrupted"
             self.expect("cleanup", "stop", "the cleanup completes", self.cleanup, False)
             raise
@@ -63,7 +65,8 @@ class Record:
             self.cleanup = f"cleanup failed: {type(error).__name__}"
             self.expect("cleanup", "stop", "the cleanup completes", self.cleanup, False)
         finally:
-            code = self.close(log, blocked=blocked)
+            reason = (blocked() if callable(blocked) else blocked) or ("interrupted" if interrupted else "")
+            code = self.close(log, blocked=reason)
         return code
 
     def settle(self, blocked: str = "") -> None:

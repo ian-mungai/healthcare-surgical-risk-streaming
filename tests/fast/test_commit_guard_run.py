@@ -7,6 +7,9 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` makes the real commits. 
 - A real interrupt (SIGINT) or an unexpected error while the temporary repository is removed leaves no record.
 - Two runs or two shards that start in the same second write into one record folder.
 - The source list reads a path that Git quotes, or one that holds a carriage return, as a missing file and drops it from the copy.
+- A global ``core.hooksPath`` (or a global Git config at all) sends a fixture's hook install outside its scratch repository, where workers overwrite one
+  shared hook.
+- A SIGINT during the removal of the temporary repository leaves it behind.
 """
 
 from __future__ import annotations
@@ -19,12 +22,14 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from subprocess import CalledProcessError, TimeoutExpired
 from unittest import mock
 
 from scripts.process import run_command
+from scripts.quality import worktree_scan_hook
 from tests.e2e import commit_guards, run_record
 from tests.fast.git_fixture import TemporaryRepository
 
@@ -188,20 +193,48 @@ class ProtectedRunTest(unittest.TestCase):
     def interrupt(self) -> None:
         os.kill(os.getpid(), signal.SIGINT)
 
-    def test_a_real_interrupt_while_the_temporary_repository_is_removed_writes_a_blocked_record_and_propagates(self) -> None:
+    def test_a_real_interrupt_while_the_temporary_repository_is_removed_lets_the_removal_end_then_writes_a_blocked_record_and_propagates(self) -> None:
         previous = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, previous)
+        real_remove = commit_guards.Fixture.remove
+
+        def remove(fixture: commit_guards.Fixture) -> None:
+            self.interrupt()
+            real_remove(fixture)
+
         with (
             mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
             mock.patch.object(commit_guards, "run_cases"),
-            mock.patch.object(commit_guards.Fixture, "remove", side_effect=self.interrupt),
+            mock.patch.object(commit_guards.Fixture, "remove", autospec=True, side_effect=remove),
             self.assertRaises(KeyboardInterrupt),
         ):
             commit_guards.main()
         record = self.record()
         self.assertEqual("blocked: interrupted", record["outcome"])
-        self.assertEqual("cleanup interrupted", record["cleanup"])
-        self.assertIn("cleanup", [item["case"] for item in record["observations"] if not item["passed"]])  # type: ignore[attr-defined]
+        self.assertEqual("temporary repository removed", record["cleanup"])
+        self.assertEqual([], list(self.temp.iterdir()), "the interrupted removal must not leave the repository")
+        self.assertIs(signal.default_int_handler, signal.getsignal(signal.SIGINT))
+
+    def test_a_real_interrupt_while_the_record_is_written_is_deferred_until_the_record_is_complete(self) -> None:
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+        real_write = run_record.Record.write
+
+        def write(record: run_record.Record, log: list[str], folder: Path | None = None) -> Path:
+            self.interrupt()
+            return real_write(record, log, folder)
+
+        with (
+            mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
+            mock.patch.object(commit_guards, "run_cases"),
+            mock.patch.object(run_record.Record, "write", autospec=True, side_effect=write),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            commit_guards.main()
+        record = self.record()
+        self.assertTrue((next((self.runs / "runs").iterdir()) / "retention.json").is_file(), "the record's retention label is written too")
+        self.assertEqual("temporary repository removed", record["cleanup"])
+        self.assertEqual([], list(self.temp.iterdir()))
 
     def test_an_unexpected_error_while_the_temporary_repository_is_removed_writes_a_failed_record(self) -> None:
         with (
@@ -235,6 +268,108 @@ class ProtectedRunTest(unittest.TestCase):
         paths = commit_guards.source_files()
         self.assertEqual(1, self.run_without_cases([paths[:-1], paths]))
         self.assertIn('"observed": "unchanged: False"', json.dumps(self.record()["observations"]))
+
+
+class FixtureHookTest(unittest.TestCase):
+    """The hook install of a fixture resolves its hook folder in the fixture's own Git environment, so a global ``core.hooksPath`` cannot redirect it."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="commit_guard_hooks_")
+        self.addCleanup(scratch.cleanup)
+        self.shared = Path(scratch.name) / "shared_hooks"
+        self.shared.mkdir()
+        self.original = "#!/bin/sh\n# the shared hook of the owner\n"
+        (self.shared / worktree_scan_hook.HOOK_NAME).write_text(self.original)
+        home = Path(scratch.name) / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(f"[core]\n\thooksPath = {self.shared}\n")
+        poisoned = {"HOME": str(home), "GIT_CONFIG_GLOBAL": str(home / ".gitconfig"), "XDG_CONFIG_HOME": str(home / ".config")}
+        patcher = mock.patch.dict(os.environ, poisoned)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        temp = Path(scratch.name) / "temp"
+        temp.mkdir()
+        tempdir = mock.patch.object(tempfile, "tempdir", str(temp))
+        tempdir.start()
+        self.addCleanup(tempdir.stop)
+        self.fixtures: list[commit_guards.Fixture] = []
+        self.assertEqual(str(self.shared), run_command("git", ["config", "--global", "core.hooksPath"], timeout=60, check=True).stdout.strip())
+
+    def fixture(self) -> commit_guards.Fixture:
+        fixture = commit_guards.Fixture(run_record.Record(feature="f", slug="s", rerun="r"))
+        self.addCleanup(fixture.remove)
+        fixture.repo.mkdir()
+        fixture.must("git", "init", "--quiet", "--initial-branch", "main")
+        self.fixtures.append(fixture)
+        return fixture
+
+    def test_the_hook_is_written_in_the_fixtures_own_hook_folder_and_not_in_the_global_one(self) -> None:
+        fixture = self.fixture()
+        fixture.install_scan_hook()
+        own = fixture.repo / ".git" / "hooks" / worktree_scan_hook.HOOK_NAME
+        self.assertEqual(worktree_scan_hook.HOOK_TEXT, own.read_text())
+        self.assertEqual(self.original, (self.shared / worktree_scan_hook.HOOK_NAME).read_text(), "the shared hook is not overwritten")
+        self.assertEqual([worktree_scan_hook.HOOK_NAME], sorted(path.name for path in self.shared.iterdir()), "nothing else is written there")
+
+    def test_two_fixtures_never_touch_the_shared_hook(self) -> None:
+        first, second = self.fixture(), self.fixture()
+        threads = [threading.Thread(target=fixture.install_scan_hook) for fixture in (first, second)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        for fixture in (first, second):
+            self.assertEqual(worktree_scan_hook.HOOK_TEXT, (fixture.repo / ".git" / "hooks" / worktree_scan_hook.HOOK_NAME).read_text())
+            self.assertFalse((fixture.repo / ".git" / "hooks" / worktree_scan_hook.KEPT_NAME).exists())
+        self.assertEqual(self.original, (self.shared / worktree_scan_hook.HOOK_NAME).read_text())
+        self.assertFalse((self.shared / worktree_scan_hook.KEPT_NAME).exists(), "the shared hook is not moved aside")
+
+    def test_the_fixture_reads_no_global_git_setting_of_the_caller(self) -> None:
+        fixture = self.fixture()
+        for name in ("HOME", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME"):
+            self.assertTrue(Path(fixture.env[name]).is_relative_to(fixture.home), name)
+        self.assertEqual("1", fixture.env["GIT_CONFIG_NOSYSTEM"])
+        code, output = fixture.run("git", "config", "--global", "--get", "core.hooksPath")
+        self.assertEqual((1, ""), (code, output))
+
+
+class CloseAfterTest(unittest.TestCase):
+    """The blocked reason of ``close_after`` may be a function that is read after the cleanup, so the cleanup can set it."""
+
+    def close(self, blocked: object, cleanup: object = lambda: None) -> run_record.Record:
+        record = run_record.Record(feature="f", slug="s", rerun="r")
+        record.expect("case", "step", "e", "o", True)
+        with (
+            tempfile.TemporaryDirectory(prefix="close_after_") as root,
+            mock.patch.object(run_record, "ROOT", Path(root)),
+            mock.patch.object(sys, "stdout", io.StringIO()),
+        ):
+            record.close_after(cleanup, [], blocked=blocked)  # type: ignore[arg-type]
+        return record
+
+    def test_a_reason_set_by_the_cleanup_blocks_the_run(self) -> None:
+        reasons: list[str] = []
+        record = self.close(lambda: reasons[0] if reasons else "", lambda: reasons.append("set by the cleanup"))
+        self.assertEqual("blocked: set by the cleanup", record.outcome)
+
+    def test_a_text_reason_and_no_reason_keep_their_meaning(self) -> None:
+        self.assertEqual("blocked: given", self.close("given").outcome)
+        self.assertEqual("pass", self.close("").outcome)
+        self.assertEqual("pass", self.close(lambda: "").outcome)
+
+    def test_a_keyboard_interrupt_of_the_cleanup_blocks_the_run_as_interrupted(self) -> None:
+        def cleanup() -> None:
+            raise KeyboardInterrupt
+
+        record = run_record.Record(feature="f", slug="s", rerun="r")
+        with (
+            tempfile.TemporaryDirectory(prefix="close_after_") as root,
+            mock.patch.object(run_record, "ROOT", Path(root)),
+            mock.patch.object(sys, "stdout", io.StringIO()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            record.close_after(cleanup, [])
+        self.assertEqual("blocked: interrupted", record.outcome)
 
 
 class RecordFolderTest(unittest.TestCase):

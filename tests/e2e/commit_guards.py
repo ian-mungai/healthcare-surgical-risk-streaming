@@ -2,34 +2,41 @@
 
 Run from the repository root: ``.venv/bin/python -m tests.e2e.commit_guards``. ``--shard INDEX/COUNT`` runs one share
 of the cases, for parallel jobs. ``--parallel N`` runs the shards ``1/N`` to ``N/N`` at the same time in one process, each in its own temporary
-repository, within the free cores and memory, and writes one record that lists every observation. ``--compare FIRST SECOND`` compares the records of two
-runs of the same code. The run copies every file Git does not ignore into a temporary repository, installs
-the hooks there and makes a baseline commit. Each case then makes a passing control commit and a planted-fault commit.
+repository, within the free cores and memory (one worker when the memory is unknown), and writes one record that lists every observation and checks that every
+case ran once. A parallel run holds one lock for the whole computer from before its worker plan until its repositories are removed, and a second one fails
+at once. ``--compare FIRST SECOND`` compares the records of two complete passing runs of the same code and of the same copied files.
+The run copies every file Git does not ignore into a temporary repository, installs the hooks there and makes a baseline commit.
+Each case then makes a passing control commit and a planted-fault commit.
 The control must advance HEAD. The fault must be refused by its named guard alone, with every message that guard is expected
 to print, and leave HEAD unchanged. The planted fast test is proven by its full test name, its assertion message and a
 summary of one failure. Every run, passing, failing, blocked or interrupted, writes one record in a new folder under
-``runs/`` and removes its temporary repository. The source tree is hashed before and after the run, and a change between
-the two fails the run.
+``runs/`` and removes its temporary repository. An interrupt that arrives during the worker shutdown, the merge, the removal or the record write waits until
+they end. The source tree is hashed before and after the run, and a change between the two fails the run. Each fixture reads only its own Git settings.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import threading
+import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from subprocess import CalledProcessError, TimeoutExpired
+from types import FrameType
 from typing import Any
 
 from scripts.process import run_command
@@ -43,8 +50,13 @@ COMMAND_TIMEOUT_SECONDS = 300
 # An estimate, not a measurement, of the memory that one worker's commits use. It caps the workers by free memory.
 WORKER_MIB = 2048
 MEMINFO = Path("/proc/meminfo")
+# One lock file for the whole computer: a parallel run holds it from before the worker plan to after the cleanup.
+MACHINE_LOCK = Path(tempfile.gettempdir()) / "healthcare_surgical_risk_streaming_commit_guards.lock"
+# The time that the workers have to end after a stop: one command's deadline, plus a minute for the reset that follows it.
+SHUTDOWN_SECONDS = COMMAND_TIMEOUT_SECONDS + 60
 BASELINE = "baseline"
 COVERAGE = "shards"
+COPIED_DIGEST = "copied_files_sha256"
 LINKED_FOLDERS = (".venv", ".tools")
 FAILED_HOOK = re.compile(r"\.Failed\n- hook id: (\S+)")
 GOOD_MESSAGE = "docs: add a planted note"
@@ -275,11 +287,78 @@ def available_memory_mib() -> int | None:
 
 
 def plan_workers(requested: int, case_count: int, cores: int, available_mib: int | None) -> int:
-    """The workers to start: the request, capped by the cases, by the cores less one for the computer's other work and by the free memory. At least one."""
-    limits = [requested, case_count, cores - 1]
-    if available_mib is not None:
-        limits.append(available_mib // WORKER_MIB)
-    return max(1, min(limits))
+    """The workers to start: the request, capped by the cases, by the cores less one for the computer's other work and by the free memory. At least one.
+
+    A computer that gives no memory figure gets one worker: nothing shows that a second one fits.
+    """
+    memory_limit = 1 if available_mib is None else available_mib // WORKER_MIB
+    return max(1, min(requested, case_count, cores - 1, memory_limit))
+
+
+class MachineLockError(RuntimeError):
+    """Another guard run holds the machine-wide lock."""
+
+
+@contextlib.contextmanager
+def machine_lock() -> Iterator[None]:
+    """Hold the one lock of this computer's parallel guard runs, or fail at once when another run holds it. The lock ends with the process.
+
+    Two runs that each read the free memory and each admit all their workers would use twice the memory that the plan counted, so a parallel run reads the
+    memory only under this lock and keeps the lock until its repositories are removed.
+    """
+    descriptor = os.open(MACHINE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise MachineLockError(f"another guard run holds the machine-wide lock {MACHINE_LOCK}, so this run did nothing") from None
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+
+
+class Interrupts:
+    """The SIGINTs of one run. The first raises ``KeyboardInterrupt`` as usual, in the main thread. From then on, or from ``defer``, a SIGINT is only counted.
+
+    The worker shutdown, the merge, the removal of the repositories and the writing of the record then end before the run raises its ``KeyboardInterrupt``.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.deferring = False
+
+    @property
+    def seen(self) -> bool:
+        return self.count > 0
+
+    def defer(self) -> None:
+        self.deferring = True
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
+        self.count += 1
+        if not self.deferring:
+            self.deferring = True
+            raise KeyboardInterrupt
+
+    def raise_pending(self) -> None:
+        """Raise the ``KeyboardInterrupt`` that was deferred, once the work that it must not cut short has ended."""
+        if self.seen:
+            raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def interrupt_control() -> Iterator[Interrupts]:
+    """Install the run's SIGINT handler and put the previous one back. Outside the main thread no handler can be installed, and the SIGINT reaches no worker."""
+    interrupts = Interrupts()
+    if threading.current_thread() is not threading.main_thread():
+        yield interrupts
+        return
+    previous = signal.signal(signal.SIGINT, interrupts.handle)
+    try:
+        yield interrupts
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
 
 
 class Fixture:
@@ -289,10 +368,12 @@ class Fixture:
         self.record = record
         self.home = Path(tempfile.mkdtemp(prefix="commit_guards_"))
         self.repo = self.home / "repo"
+        # Every Git setting is read from the fixture: a global core.hooksPath of the caller must not send a hook outside the repository.
         self.env = {
             "PATH": os.environ["PATH"],
             "HOME": str(self.home),
-            "GIT_CONFIG_GLOBAL": os.devnull,
+            "XDG_CONFIG_HOME": str(self.home / "xdg_config"),
+            "GIT_CONFIG_GLOBAL": str(self.home / "gitconfig"),
             "GIT_CONFIG_NOSYSTEM": "1",
             "PRE_COMMIT_HOME": str(self.home / "pre_commit"),
             "GIT_AUTHOR_NAME": "Fixture",
@@ -321,6 +402,10 @@ class Fixture:
         if code != 0:
             raise RuntimeError(f"fixture command failed: {program} {' '.join(args)}\n{output}")
         return output
+
+    def install_scan_hook(self) -> None:
+        """Install the working-tree privacy hook into this repository's own hook folder, resolved in the fixture's Git environment."""
+        worktree_scan_hook.install(self.repo, env=self.env)
 
     def head(self) -> str:
         return self.must("git", "rev-parse", "HEAD").strip()
@@ -359,17 +444,24 @@ def judge_fault(case: Case, code: int, output: str, advanced: bool) -> Observati
     return Observation(case.name, "fault", expected, observed, code != 0 and failed == sorted(case.hooks) and found and not advanced)
 
 
-def run_case(fixture: Fixture, case: Case, log: list[str]) -> list[Observation]:
+def run_case(fixture: Fixture, case: Case, log: list[str], stop: threading.Event | None = None) -> None:
+    """Run one case and record each step in the fixture's record when it ends, so a later step that raises keeps the steps before it.
+
+    A set ``stop`` starts no fault commit after the control.
+    """
     start = fixture.head()
     code, output, advanced = fixture.attempt(case.control)
     log.append(f"== {case.name}: control\n{output}")
-    control = Observation(case.name, "control", "exit 0 and HEAD advanced", f"exit {code}, HEAD advanced: {advanced}", code == 0 and advanced)
+    fixture.record.observations.append(
+        Observation(case.name, "control", "exit 0 and HEAD advanced", f"exit {code}, HEAD advanced: {advanced}", code == 0 and advanced)
+    )
     fixture.reset(start)
+    if stop is not None and stop.is_set():
+        return
     code, output, advanced = fixture.attempt(case.fault)
     log.append(f"== {case.name}: fault\n{output}")
-    fault = judge_fault(case, code, output, advanced)
+    fixture.record.observations.append(judge_fault(case, code, output, advanced))
     fixture.reset(start)
-    return [control, fault]
 
 
 def parse_shard(text: str) -> tuple[int, int]:
@@ -396,7 +488,7 @@ def run_cases(fixture: Fixture, record: Record, log: list[str], shard: tuple[int
     index, count = shard
     fixture.must("git", "init", "--quiet", "--initial-branch", "main")
     fixture.must(".venv/bin/pre-commit", "install")
-    worktree_scan_hook.install(fixture.repo)
+    fixture.install_scan_hook()
     fixture.must("git", "add", "--all")
     code, output = fixture.run("git", "commit", "-m", "chore: add the source tree")
     log.append(f"== baseline\n{output}")
@@ -406,23 +498,24 @@ def run_cases(fixture: Fixture, record: Record, log: list[str], shard: tuple[int
             if stop is not None and stop.is_set():
                 break
             if number % count == index - 1:
-                record.observations.extend(run_case(fixture, case, log))
+                run_case(fixture, case, log, stop)
 
 
-def remove_fixtures(fixtures: list[Fixture], record: Record) -> None:
-    """Remove every temporary repository. A removal that fails or is interrupted does not leave the others behind."""
+def remove_fixtures(fixtures: list[Fixture], record: Record, kept: Sequence[Fixture] = ()) -> None:
+    """Remove every temporary repository except those in ``kept``, whose workers are still running. A removal that fails does not leave the others behind."""
+    note = f", {len(kept)} kept because its worker is still running" if kept else ""
     if not fixtures:
-        record.cleanup = "no temporary repository was made"
+        record.cleanup = "no temporary repository was made" if not kept else f"no temporary repository was removed{note}"
         return
     try:
         with ExitStack() as stack:
             for fixture in fixtures:
                 stack.callback(fixture.remove)
     except OSError as error:
-        record.cleanup = f"removal failed: {type(error).__name__}"
+        record.cleanup = f"removal failed: {type(error).__name__}{note}"
         record.expect("cleanup", "remove", "temporary repository removed", record.cleanup, False)
     else:
-        record.cleanup = "temporary repository removed" if len(fixtures) == 1 else f"{len(fixtures)} temporary repositories removed"
+        record.cleanup = ("temporary repository removed" if len(fixtures) == 1 else f"{len(fixtures)} temporary repositories removed") + note
 
 
 @dataclass
@@ -433,6 +526,7 @@ class Worker:
     count: int
     record: Record
     log: list[str] = field(default_factory=list)
+    fixture: Fixture | None = None
 
     @property
     def label(self) -> str:
@@ -443,6 +537,7 @@ def work(worker: Worker, paths: list[str], fixtures: list[Fixture], stop: thread
     """The body of a worker's thread: its fixture, filled and run for its shard. A failure is the worker's own failed observation."""
     try:
         fixture = Fixture(worker.record)
+        worker.fixture = fixture
         fixtures.append(fixture)
         fixture.populate(paths)
         run_cases(fixture, worker.record, worker.log, (worker.index, worker.count), stop)
@@ -451,26 +546,36 @@ def work(worker: Worker, paths: list[str], fixtures: list[Fixture], stop: thread
         worker.record.expect(worker.label, "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
 
 
-def join_all(threads: list[threading.Thread]) -> None:
+def join_all(threads: list[threading.Thread], deadline: float | None = None) -> None:
+    """Wait for every started thread, or until ``deadline`` on the monotonic clock. Without a deadline the wait is bounded by the deadlines of the commands."""
     for thread in threads:
         if thread.ident is not None:
-            thread.join()
+            thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+
+
+def case_gaps(seen: Counter[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """The cases and steps of the case list that ``seen`` lacks, and those that it holds more than once."""
+    wanted = [(case.name, step) for case in planted_cases() for step in ("control", "fault")]
+    return [f"{case} ({step})" for case, step in wanted if seen[(case, step)] == 0], [f"{case} ({step})" for case, step in wanted if seen[(case, step)] > 1]
 
 
 def covered(observations: list[Observation]) -> Observation:
     """Every case once, control and fault, in the merged observations of the workers."""
-    seen = Counter((item.case, item.step) for item in observations)
-    wanted = [(case.name, step) for case in planted_cases() for step in ("control", "fault")]
-    missing = [f"{case} ({step})" for case, step in wanted if seen[(case, step)] == 0]
-    repeated = [f"{case} ({step})" for case, step in wanted if seen[(case, step)] > 1]
+    missing, repeated = case_gaps(Counter((item.case, item.step) for item in observations))
     observed = f"missing: {missing}, repeated: {repeated}" if missing or repeated else "every case observed once"
     return Observation(COVERAGE, "coverage", "every case observed once, control and fault", observed, not missing and not repeated)
+
+
+def record_coverage(record: Record) -> None:
+    """Add the coverage observation once. A parallel request records it on every exit, also when it ran one worker, was interrupted or failed."""
+    if all(item.case != COVERAGE for item in record.observations):
+        record.observations.append(covered(record.observations))
 
 
 def merge_workers(record: Record, log: list[str], team: list[Worker]) -> None:
     """Put the workers' baselines, then their case observations in the order of the case list, then their commands and logs into the one record."""
     order = {case.name: number for number, case in enumerate(planted_cases())}
-    every = [item for worker in team for item in worker.record.observations]
+    every = [item for worker in team for item in list(worker.record.observations)]
     record.observations.extend(item for item in every if item.case == BASELINE)
     record.observations.extend(sorted((item for item in every if item.case != BASELINE), key=lambda item: order.get(item.case, len(order))))
     for worker in team:
@@ -478,31 +583,79 @@ def merge_workers(record: Record, log: list[str], team: list[Worker]) -> None:
         log.extend(worker.log)
 
 
-def run_parallel(paths: list[str], record: Record, log: list[str], fixtures: list[Fixture], workers: int) -> None:
+def keep_running_workers(
+    team: list[Worker], threads: list[threading.Thread], fixtures: list[Fixture], kept: list[Fixture], record: Record, log: list[str]
+) -> None:
+    """Name each worker that did not end in time, and keep its repository out of the removal: no repository is removed under a running worker."""
+    for worker, thread in zip(team, threads, strict=True):
+        if not thread.is_alive():
+            continue
+        if worker.fixture is not None and worker.fixture in fixtures:
+            fixtures.remove(worker.fixture)
+            kept.append(worker.fixture)
+        record.expect(
+            worker.label, "shutdown", f"the worker ends within {SHUTDOWN_SECONDS:g} seconds of the stop", "still running; its repository is kept", False
+        )
+        log.append(f"{worker.label} was still running after the stop; its repository stays at {getattr(worker.fixture, 'home', 'an unknown place')}")
+
+
+def run_parallel(paths: list[str], record: Record, log: list[str], fixtures: list[Fixture], kept: list[Fixture], workers: int, interrupts: Interrupts) -> None:
     """Run the shards ``1/workers`` to ``workers/workers`` at the same time and merge them into ``record``.
 
-    An interrupt stops the workers before any repository is removed: no case starts after it, and each running commit ends first.
+    An interrupt stops the workers before any repository is removed: no case or fault starts after it, and each running commit ends first. The shutdown wait
+    has a deadline, a repository whose worker is still running is kept, and a further interrupt waits until the merge has ended.
     """
     team = [Worker(index, workers, Record(feature=record.feature, slug=record.slug, rerun=record.rerun)) for index in range(1, workers + 1)]
     stop = threading.Event()
-    threads = [threading.Thread(target=work, args=(worker, paths, fixtures, stop), name=f"guard_shard_{worker.index}") for worker in team]
+    threads = [threading.Thread(target=work, args=(worker, paths, fixtures, stop), name=f"guard_shard_{worker.index}", daemon=True) for worker in team]
     try:
         for thread in threads:
             thread.start()
         join_all(threads)
     finally:
+        interrupts.defer()
         stop.set()
-        join_all(threads)
+        join_all(threads, time.monotonic() + SHUTDOWN_SECONDS)
+        keep_running_workers(team, threads, fixtures, kept, record, log)
         merge_workers(record, log, team)
-    record.observations.append(covered([item for item in record.observations if item.case != BASELINE]))
+        record_coverage(record)
+    interrupts.raise_pending()
+
+
+OBSERVATION_KEYS = {"case", "step", "expected", "observed", "passed"}
+
+
+def record_problems(label: str, loaded: dict[str, Any]) -> list[str]:
+    """Why a record cannot be compared: it did not pass, lacks a case or holds one twice, holds an observation that did not pass (the coverage observation of
+    a parallel run is one), or names no digest of the copied files. A record that is not a list of observations is the only problem that is reported alone."""
+    observations = loaded.get("observations")
+    if not isinstance(observations, list) or not all(isinstance(item, dict) and item.keys() >= OBSERVATION_KEYS for item in observations):
+        return [f"the {label} record holds no list of observations"]
+    problems = [f"the {label} record's outcome is {loaded.get('outcome')!r}, not 'pass'"] if loaded.get("outcome") != "pass" else []
+    missing, repeated = case_gaps(Counter((item["case"], item["step"]) for item in observations))
+    problems += [f"{name} is missing from the {label} record" for name in missing]
+    problems += [f"{name} is observed more than once in the {label} record" for name in repeated]
+    problems += [f"{item['case']} ({item['step']}) did not pass in the {label} record" for item in observations if item["passed"] is not True]
+    environment = loaded.get("environment")
+    digest = environment.get(COPIED_DIGEST) if isinstance(environment, dict) else None
+    if not isinstance(digest, str) or not digest:
+        problems.append(f"the {label} record names no {COPIED_DIGEST}")
+    return problems
 
 
 def compare_records(first: dict[str, Any], second: dict[str, Any]) -> list[str]:
-    """What differs between two run records of the same code: the code's revision and tree, and each case's expected text, observed text and result.
+    """What stops two run records of the same code from agreeing: a record that is partial, interrupted, failed or without a digest of its copied files, and
+    what differs: the code's revision and tree, the digest of the files that each run copied, and each case's expected text, observed text and result.
 
     Each worker of a parallel run has its own baseline, and only a parallel run has the coverage observation, so those are not compared.
     """
-    problems = [f"{key} differs: {first.get(key)!r} and {second.get(key)!r}" for key in ("revision", "tree_sha256") if first.get(key) != second.get(key)]
+    problems = record_problems("first", first) + record_problems("second", second)
+    if any("holds no list of observations" in problem for problem in problems):
+        return problems
+    problems += [f"{key} differs: {first.get(key)!r} and {second.get(key)!r}" for key in ("revision", "tree_sha256") if first.get(key) != second.get(key)]
+    digests = [loaded["environment"].get(COPIED_DIGEST) if isinstance(loaded.get("environment"), dict) else None for loaded in (first, second)]
+    if digests[0] != digests[1] and all(isinstance(digest, str) and digest for digest in digests):
+        problems.append(f"{COPIED_DIGEST} differs: {digests[0]!r} and {digests[1]!r}")
 
     def keyed(loaded: dict[str, Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
         found: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -530,6 +683,8 @@ def compare_command(first: str, second: str) -> int:
     """Print what differs between the records in two run folders and return 1, or print that they agree and return 0."""
     try:
         records = [json.loads((Path(folder) / "record.json").read_text()) for folder in (first, second)]
+        if not all(isinstance(loaded, dict) for loaded in records):
+            raise ValueError("a record is not an object")
     except (OSError, ValueError) as error:
         sys.stdout.write(f"cannot read a record: {type(error).__name__}\n")
         return 1
@@ -561,36 +716,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         return compare_command(*args.compare)
     index, count = args.shard or (1, 1)
     cores = os.cpu_count() or 1
-    available = available_memory_mib() if args.parallel and args.parallel > 1 else None
-    workers = plan_workers(args.parallel, len(planted_cases()), cores, available) if args.parallel and args.parallel > 1 else 1
-    mode = "full" if count == 1 and workers == 1 else f"shard {index} of {count}" if count > 1 else f"parallel {workers}"
-    record = Record(feature="commit guards, local commit path", slug="commit_guards", rerun=RERUN, mode=mode)
+    requested = args.parallel or 1
+    record = Record(feature="commit guards, local commit path", slug="commit_guards", rerun=RERUN, mode="parallel not started" if requested > 1 else "full")
     record.limits = ["local commit path only: the hosted CI path has its own run", "the planted token and account reference are fake values built at run time"]
-    if args.parallel and args.parallel > 1:
-        record.limits.append(worker_plan(args.parallel, cores, available, workers))
     log: list[str] = []
     fixtures: list[Fixture] = []
+    kept: list[Fixture] = []
+    workers = 1
     blocked = ""
-    try:
-        paths = source_files()
-        before = tree_digest(paths)
-        describe_run(record)
-        if workers > 1:
-            run_parallel(paths, record, log, fixtures, workers)
-        else:
-            fixtures.append(Fixture(record))
-            fixtures[0].populate(paths)
-            run_cases(fixtures[0], record, log, (index, count))
-        unchanged = tree_digest(source_files()) == before
-        record.observations.append(Observation("source tree", "snapshot", "unchanged during the run", f"unchanged: {unchanged}", unchanged))
-    except KeyboardInterrupt:
-        blocked = "interrupted"
-        raise
-    except Exception as error:
-        log.append(f"{type(error).__name__}: {error}")
-        record.expect("run", "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
-    finally:
-        code = record.close_after(lambda: remove_fixtures(fixtures, record), log, blocked=blocked)
+    with ExitStack() as held:
+        interrupts = held.enter_context(interrupt_control())
+        try:
+            if requested > 1:
+                held.enter_context(machine_lock())
+                available = available_memory_mib()
+                workers = plan_workers(requested, len(planted_cases()), cores, available)
+                record.limits.append(worker_plan(requested, cores, available, workers))
+            record.mode = "full" if count == 1 and workers == 1 else f"shard {index} of {count}" if count > 1 else f"parallel {workers}"
+            paths = source_files()
+            before = tree_digest(paths)
+            describe_run(record)
+            record.environment[COPIED_DIGEST] = before
+            if workers > 1:
+                run_parallel(paths, record, log, fixtures, kept, workers, interrupts)
+            else:
+                fixtures.append(Fixture(record))
+                try:
+                    fixtures[0].populate(paths)
+                    run_cases(fixtures[0], record, log, (index, count))
+                finally:
+                    if requested > 1:
+                        record_coverage(record)
+            unchanged = tree_digest(source_files()) == before
+            record.observations.append(Observation("source tree", "snapshot", "unchanged during the run", f"unchanged: {unchanged}", unchanged))
+        except KeyboardInterrupt:
+            blocked = "interrupted"
+            raise
+        except MachineLockError as error:
+            blocked = str(error)
+            log.append(blocked)
+        except Exception as error:
+            log.append(f"{type(error).__name__}: {error}")
+            record.expect("run", "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
+        finally:
+            interrupts.defer()
+            code = record.close_after(
+                lambda: remove_fixtures(fixtures, record, kept), log, blocked=lambda: blocked or ("interrupted" if interrupts.seen else "")
+            )
+        interrupts.raise_pending()
     return code
 
 
