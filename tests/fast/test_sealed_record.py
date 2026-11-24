@@ -14,12 +14,17 @@ Failure modes covered here:
 - An error is recorded with its message instead of its class name.
 - A rejected call is recorded with a phrase that is not one of the fixed phrases.
 - The helper's text or facts hold a value that the caller did not pass as a flag, an ID or a fixed code.
-- A record that holds a sealed text cannot be written (``dataclasses.asdict`` cannot copy a ``Sealed``), so no record is saved for a pass or a fail.
+- A record that holds a sealed text cannot be written (``dataclasses.asdict`` cannot copy a ``Sealed``), so no record is saved for a pass or a fail. This
+  holds for the expectation, the observation, the limits, the cleanup, the environment and the commands, not for the observation alone.
+- A word of a command keeps a value: an option value (``--rows=4417``), a word with a digit, or a run of 8 or more hexadecimal characters in either case.
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
+import dataclasses
+import functools
 import io
 import json
 import tempfile
@@ -102,7 +107,7 @@ class WordsAndAttempts(unittest.TestCase):
 
     def test_the_words_of_a_command_are_recorded_in_order_before_the_rest(self) -> None:
         self.assertEqual("docker compose up, exit 0", str(sealed_observed(words=["docker", "compose", "up"], exit_code=0)))
-        self.assertEqual("docker run --rm spark_job_x1 -m", str(sealed_observed(words=["docker", "run", "--rm", "spark_job_x1", "-m"])))
+        self.assertEqual("docker run --rm spark_job_x -m", str(sealed_observed(words=["docker", "run", "--rm", "spark_job_x", "-m"])))
 
     def test_a_word_that_is_a_number_a_hash_a_sentence_or_long_is_recorded_as_a_placeholder_and_never_as_itself(self) -> None:
         for bad in ("4417", "a" * 64, "two words", "a\nb", "x" * 101, "-", "=4417", 5, True, None, "{rows}", "SECRET 4417", "--rows=4417 left"):
@@ -114,10 +119,41 @@ class WordsAndAttempts(unittest.TestCase):
         self.assertEqual("job write, exit 0", str(sealed_observed(words=["job", "", "write"], exit_code=0)))
         self.assertEqual("exit 0", str(sealed_observed(words=[""], exit_code=0)))
 
-    def test_a_path_and_an_option_with_a_value_that_begin_with_a_letter_are_plain_words(self) -> None:
-        self.assertEqual(
-            "docker cp /opt/e2e/helper.py --name=spark_job", str(sealed_observed(words=["docker", "cp", "/opt/e2e/helper.py", "--name=spark_job"]))
-        )
+    def test_a_path_and_an_option_are_plain_words(self) -> None:
+        self.assertEqual("docker cp /opt/helper.py --rm -f", str(sealed_observed(words=["docker", "cp", "/opt/helper.py", "--rm", "-f"])))
+
+    def test_every_option_with_a_value_keeps_its_name_and_records_the_value_as_a_placeholder(self) -> None:
+        for word, expected in (
+            ("--name=spark_job", "--name=<other>"),
+            ("--rows=4417", "--rows=<other>"),
+            ("--label=a-b", "--label=<other>"),
+            ("-p=x", "-p=<other>"),
+            ("--env=", "--env=<other>"),
+            ("--k=v=w", "--k=<other>"),
+            ("name=value", "name=<other>"),
+            ("--rows4=x", "<other>"),
+            ("--deadbeef12=x", "<other>"),
+            ("--abcdefab=x", "<other>"),
+        ):
+            with self.subTest(word=word):
+                self.assertEqual(f"docker {expected}", str(sealed_observed(words=["docker", word])))
+
+    def test_every_word_with_a_digit_is_recorded_as_a_placeholder(self) -> None:
+        for word in ("spark_job_x1", "proj1", "9lives", "a1", "/opt/e2e/helper.py", "v1.2", "x_4"):
+            with self.subTest(word=word):
+                self.assertEqual("docker <other>", str(sealed_observed(words=["docker", word])))
+
+    def test_every_run_of_eight_or_more_hexadecimal_characters_in_either_case_is_recorded_as_a_placeholder(self) -> None:
+        for word in ("deadbeef", "DEADBEEF", "DeadBeef", "abcdefab", "ABCDEFAB", "xx_deadbeef_yy", "/opt/FACEBEAD/x", "--name=ok_deadbeef", "ABCDEFABCDEF"):
+            with self.subTest(word=word):
+                self.assertNotIn("deadbeef", str(sealed_observed(words=["docker", word])).lower())
+                self.assertNotIn("abcdefab", str(sealed_observed(words=["docker", word])).lower())
+                self.assertNotIn("facebead", str(sealed_observed(words=["docker", word])).lower())
+        self.assertEqual("docker <other>", str(sealed_observed(words=["docker", "DEADBEEF"])))
+        self.assertEqual("docker <other>", str(sealed_observed(words=["docker", "xx_abcdefab_yy"])))
+        self.assertEqual("docker --name=<other>", str(sealed_observed(words=["docker", "--name=ABCDEFAB"])))
+        self.assertEqual("docker feedbac", str(sealed_observed(words=["docker", "feedbac"])))
+        self.assertEqual("docker fedbackk", str(sealed_observed(words=["docker", "fedbackk"])))
 
     def test_the_words_must_be_a_list_of_text_and_not_one_text(self) -> None:
         for bad in ("docker compose", 5, {"a": "b"}):
@@ -248,6 +284,39 @@ class Line(unittest.TestCase):
             Sealed("rows 4417")  # type: ignore[call-arg]
 
 
+class SealedCopies(unittest.TestCase):
+    """A ``Sealed`` is copied, pickled and written as plain text wherever it sits, so ``dataclasses.asdict`` of a record never raises."""
+
+    def test_a_sealed_text_is_copied_and_deep_copied_without_error(self) -> None:
+        sealed = sealed_observed({"x": True}, exit_code=0)
+        for copied in (copy.copy(sealed), copy.deepcopy(sealed), copy.deepcopy([sealed])[0], copy.deepcopy({"a": sealed})["a"]):
+            self.assertEqual("exit 0, x True", str(copied))
+            self.assertIsInstance(copied, str)
+
+    def test_a_sealed_text_is_reduced_to_plain_text(self) -> None:
+        function, arguments = sealed_observed({"x": True}).__reduce__()[:2]
+        self.assertIs(str, function)
+        self.assertEqual(("x True",), arguments)
+        self.assertIs(str, type(function(*arguments)))
+
+    def test_a_sealed_text_is_written_as_json_text(self) -> None:
+        self.assertEqual('"x True"', json.dumps(sealed_observed({"x": True})))
+
+    def test_a_sealed_text_in_every_saved_field_of_a_record_is_copied_by_asdict(self) -> None:
+        record = run_record.Record(feature="f", slug="s", rerun="r")
+        record.commands.append(sealed_observed(words=["docker", "ps"]))
+        record.limits.append(sealed_observed({"stalled": True}))
+        record.cleanup = sealed_observed({"scratch folder removed": True})
+        record.environment["k"] = sealed_observed({"x": True})
+        record.expect(sealed_observed({"a": True}), sealed_observed({"b": True}), sealed_observed({"c": True}), sealed_observed({"d": True}), True)
+        document = json.loads(json.dumps(dataclasses.asdict(record)))
+        self.assertEqual(["docker ps"], document["commands"])
+        self.assertEqual(["stalled True"], document["limits"])
+        self.assertEqual("scratch folder removed True", document["cleanup"])
+        self.assertEqual("x True", document["environment"]["k"])
+        self.assertEqual(["a True", "b True", "c True", "d True"], list(document["observations"][0].values())[:4])
+
+
 class RecordClose(unittest.TestCase):
     """``Record.close()`` writes the record, the log and the label when an observation holds the output of ``sealed_observed``."""
 
@@ -267,6 +336,28 @@ class RecordClose(unittest.TestCase):
                 self.assertEqual(f"exit 0, x {passed}, branch hash {HASH}", document["observations"][0]["observed"])
                 self.assertEqual("== a log line\n", (folders[0] / "log.txt").read_text())
                 self.assertTrue((folders[0] / "retention.json").is_file())
+
+    def test_a_sealed_text_in_the_commands_limits_cleanup_and_expectation_is_written_through_close_and_close_after(self) -> None:
+        for closer in ("close", "close_after"):
+            with self.subTest(closer), tempfile.TemporaryDirectory(prefix="sealed_close_") as root, mock.patch.object(run_record, "ROOT", Path(root)):
+                record = run_record.Record(feature="feature", slug="slug", rerun="rerun", started_utc="2026-01-01T00:00:00Z")
+                record.commands.append(sealed_observed(words=["docker", "compose", "up"]))
+                record.limits.append(sealed_observed({"stalled": False}))
+                record.environment["flag"] = sealed_observed({"x": True})
+                record.expect("a case", "a step", sealed_observed({"expected flag": True}), sealed_observed({"x": True}), True)
+
+                clean = functools.partial(setattr, record, "cleanup", sealed_observed({"scratch folder removed": True}))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = record.close(["== a log line"]) if closer == "close" else record.close_after(clean, ["== a log line"])
+                (folder,) = list((Path(root) / "runs").iterdir())
+                document = json.loads((folder / "record.json").read_text())
+                self.assertEqual(0, code)
+                self.assertEqual(["docker compose up"], document["commands"])
+                self.assertEqual(["stalled False"], document["limits"])
+                self.assertEqual("x True", document["environment"]["flag"])
+                self.assertEqual("expected flag True", document["observations"][0]["expected"])
+                if closer == "close_after":
+                    self.assertEqual("scratch folder removed True", document["cleanup"])
 
     def test_the_saved_observation_is_plain_text_that_carries_no_facts(self) -> None:
         record = run_record.Record(feature="feature", slug="slug", rerun="rerun")

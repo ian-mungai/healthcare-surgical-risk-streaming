@@ -15,7 +15,8 @@ field: the expectation of an assertion and each line of the log, the limits, the
 constants in capitals) or the output of ``sealed_observed``, and the verdict is an exact Boolean expression. The log keeps the words of a command, its exit code
 and the seconds only through ``words``, ``exit_code`` and ``seconds``.
 
-``Record.expect`` of ``tests/e2e/run_record.py`` saves the text of a ``Sealed`` as plain text, so the record can be copied and written.
+A ``Sealed`` copies as itself and reduces to plain text, so ``dataclasses.asdict`` of a ``Record`` copies it wherever it sits in a saved field and the record
+is written.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ FIXED_CODES = frozenset(SPLIT_CODES) | SIGNALS_CODES | HYPOTENSION_CODES | froze
 FIXED_REASONS = frozenset(REASONS) | frozenset(REFUSAL_REASONS) | frozenset(USAGE_REASONS)
 FLAG_NAME = re.compile(r"[A-Za-z][A-Za-z0-9 ,'()/:+_-]{0,150}")
 COMMAND_WORD = re.compile(r"(?:--?|/)?[A-Za-z][A-Za-z0-9_.:/=@-]{0,99}")
+HEX_RUN = re.compile(r"[0-9A-Fa-f]{8,}")
 OTHER_WORD = "<other>"
 MAX_ATTEMPTS = 20
 ERROR_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,80}")
@@ -139,6 +141,15 @@ class Sealed(str):
 
     facts: dict[str, str]
 
+    def __copy__(self) -> Sealed:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Sealed:
+        return self
+
+    def __reduce__(self) -> tuple[type[str], tuple[str]]:
+        return (str, (str(self),))
+
     def __new__(cls, text: str, facts: dict[str, str], token: object) -> Sealed:
         if token is not _MINT:
             raise TypeError("a sealed text is made by sealed_observed only")
@@ -149,6 +160,17 @@ class Sealed(str):
     def line(self, passed: bool, case: str, step: str) -> str:
         """The printed line of one assertion, as the record prints it."""
         return f"{'PASS' if passed else 'FAIL'} {case} ({step}): {self}\n"
+
+
+def command_word(word: object) -> str:
+    """The word of a command line as the log keeps it: ``name=value`` keeps the name and gives ``<other>`` for the value. A word that is not a plain name,
+    path or option, that holds a digit or that holds a run of 8 or more hexadecimal digits in either case is ``<other>``."""
+    if type(word) is not str or COMMAND_WORD.fullmatch(word) is None:
+        return OTHER_WORD
+    name, equals, _ = word.partition("=")
+    if re.search(r"\d", name) or HEX_RUN.search(name) is not None:
+        return OTHER_WORD
+    return f"{name}={OTHER_WORD}" if equals else name
 
 
 def named(field: str, value: object) -> str:
@@ -179,7 +201,8 @@ def sealed_observed(
     """The observation text and facts of one assertion. Each flag is exactly ``True`` or ``False``, each code one of ``FIXED_CODES``, each ID a
     ``ConfirmedId``, each exit code a whole number of a process, ``seconds`` a finite number of at least 0, ``reason`` one of ``FIXED_REASONS`` and ``error`` an
     exception, of which only the class name is kept. ``words`` are the words of a command line: a name, a path or an option that begins with a letter is kept,
-    and any other word (a number, a hash, a sentence) is recorded as ``<other>``, because a line of the log must not stop a long run. ``attempt`` is the number
+    the value of ``name=value`` is recorded as ``<other>``, and any other word (a number, a word with a digit, a run of 8 or more hexadecimal characters, a
+    sentence) is recorded as ``<other>``, because a line of the log must not stop a long run. ``attempt`` is the number
     of a try and the number of tries, both whole numbers from 1 to ``MAX_ATTEMPTS``. Anything else raises ``ValueError`` that names the field and never the
     value."""
     parts: list[str] = []
@@ -187,11 +210,7 @@ def sealed_observed(
     if words is not None:
         if isinstance(words, str) or not isinstance(words, Sequence):
             raise ValueError("words is not a list of words")
-        plain = [
-            word if type(word) is str and COMMAND_WORD.fullmatch(word) is not None and HASH.fullmatch(word) is None else OTHER_WORD
-            for word in words
-            if word != ""
-        ]
+        plain = [command_word(word) for word in words if word != ""]
         if plain:
             parts.append(" ".join(plain))
     if error is not None:

@@ -15,18 +15,23 @@ Failure modes covered here (fix round 4, owner decision D):
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import importlib
+import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from tests.e2e import run_record
 from tests.e2e.run_record import Record
 from tests.fast import test_silver_acceptance as accept
 from tests.fast.outcome_accept import CASES_SNAPSHOT_TABLES
-from tests.fast.sealed_record import Sealed
+from tests.fast.sealed_record import Sealed, sealed_observed
 from tests.fast.silver_accept import Catalog
 from tests.fast.test_runner_catalog_facts import FakeNessie as TaggedNessie
 from tests.fast.test_silver_runner_records import FakeNessie, FakeStack, bind_build_pair, done_for
@@ -237,6 +242,59 @@ class StackLines(unittest.TestCase):
                 for item in log:
                     self.assertNotIn("4417", str(item))
                     self.assertIs(Sealed, type(item), str(item))
+
+
+class SavedRecord(unittest.TestCase):
+    """After the runner's own ``docker`` and ``compose_run`` wrappers, the record is saved and read back, with sealed text in every saved field."""
+
+    ALL = ("silver_patient_split", "silver_cases", "silver_signals", "silver_hypotension", "bronze_clinical_lab")
+
+    def save(self, record: Record, log: list[str]) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="sealed_runner_") as root, mock.patch.object(run_record, "ROOT", Path(root)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                record.close(log)
+            (folder,) = list((Path(root) / "runs").iterdir())
+            self.assertTrue((folder / "retention.json").is_file())
+            self.assertEqual(len(log) > 0, bool((folder / "log.txt").read_text().strip()))
+            document: dict[str, Any] = json.loads((folder / "record.json").read_text())
+            return document
+
+    def test_each_runner_saves_its_record_after_its_own_command_wrappers_with_sealed_text_in_every_field(self) -> None:
+        for name in self.ALL:
+            with self.subTest(name):
+                module = runner(name)
+                record, log = Record(feature="test", slug="test", rerun="none"), list[str]()
+                if name == "bronze_clinical_lab":
+                    stack = module.Stack(Path("compose"), record, log)
+                else:
+                    stack = module.Stack(Path("compose"), "proj_x1", Path("data"), record, log)
+                stack.run = lambda *arguments, **keywords: (3, "SECRET_4417 out", "SECRET_4417 err")
+                if name != "bronze_clinical_lab":
+                    stack.docker("rm", "-f", "4417", "SECRET_4417 x")
+                stack.compose_run("up", "--detach", "--rows=4417")
+                record.limits.append(sealed_observed({"stalled": False}))
+                record.environment["flag"] = sealed_observed({"x": True})
+                record.cleanup = sealed_observed({"scratch folder removed": True})
+                record.expect("a case", "a step", sealed_observed({"expected flag": True}), sealed_observed({"x": True}, exit_code=3), False)
+                document = self.save(record, log)
+                self.assertTrue(all(type(item) is str for item in document["commands"]))
+                self.assertIn("docker compose up --detach --rows=<other>", document["commands"])
+                self.assertEqual(["stalled False"], document["limits"])
+                self.assertEqual("scratch folder removed True", document["cleanup"])
+                self.assertEqual("expected flag True", document["observations"][0]["expected"])
+                self.assertNotIn("4417", json.dumps(document))
+
+    def test_the_cleanup_of_each_runner_closes_with_a_sealed_cleanup_text(self) -> None:
+        for name in self.ALL:
+            with self.subTest(name):
+                runner(name)
+                record = Record(feature="test", slug="test", rerun="none")
+                clean = functools.partial(setattr, record, "cleanup", sealed_observed({"scratch folder removed": True}))
+                with tempfile.TemporaryDirectory(prefix="sealed_runner_") as root, mock.patch.object(run_record, "ROOT", Path(root)):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        record.close_after(clean, [])
+                    (folder,) = list((Path(root) / "runs").iterdir())
+                    self.assertEqual("scratch folder removed True", json.loads((folder / "record.json").read_text())["cleanup"])
 
 
 class LimitsText(unittest.TestCase):
