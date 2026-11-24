@@ -14,10 +14,15 @@ import contextlib
 import http.client
 import io
 import json
+import pathlib
+import re
 import socket
 import threading
 import time
+import traceback
 import unittest
+from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -449,6 +454,140 @@ class TokenTest(unittest.TestCase):
         stand_in.failures["GET jobs"] = (401, b"{}")
         with self.assertRaises(AirbyteError):
             api.running_jobs("connection1")
+
+
+PLANTED = "tokenvalue_5b7e91"
+MALFORMED_TOKENS = {
+    "a trailing line feed": f"{PLANTED}\n",
+    "a trailing carriage return and line feed": f"{PLANTED}\r\n",
+    "a space inside": f"{PLANTED} more",
+    "a leading space": f" {PLANTED}",
+    "a NUL byte": f"{PLANTED}\x00",
+    "a tab": f"{PLANTED}\t",
+    "a letter outside ASCII": f"{PLANTED}\u00e9",
+    "an equals sign before other characters": f"{PLANTED}=x",
+    "an opening bracket": f"{PLANTED}[",
+    "a second line": f"{PLANTED}\nInjected: yes",
+}
+VALID_TOKENS = ("abc", "A-b.c_d~e+f/g", "abc=", "abc==", PLANTED, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln")
+
+
+def whole_text(error: BaseException) -> str:
+    """The message, the traceback with its causes and contexts, and the arguments of the error."""
+    return "".join(traceback.format_exception(error)) + repr(error.args)
+
+
+def raised_text(call: Callable[[], object]) -> tuple[AirbyteError, str]:
+    """The error that the call raises and its whole text, formatted inside the handler: ``assertRaises`` clears the traceback before the test can read it."""
+    try:
+        call()
+    except AirbyteError as error:
+        return error, whole_text(error)
+    raise AssertionError("the call raised no AirbyteError")
+
+
+class TokenFormTest(unittest.TestCase):
+    """A token that is not of the bearer form (RFC 6750 b64token, as the Ansible client reads it) is refused before it is cached or put in a header."""
+
+    def refused(self, token: str) -> tuple[Api, StandIn, AirbyteError, str]:
+        api, stand_in = prepared()
+        stand_in.mutations["POST applications/token"] = lambda answer: answer.update({"access_token": token})
+        error, text = raised_text(lambda: api.running_jobs("connection1"))
+        return api, stand_in, error, text
+
+    def assert_text_is_clean(self, text: str) -> None:
+        self.assertIn("renew_token", text, "the text holds the traceback, which names the function that refused the token")
+        self.assertNotIn(PLANTED, text)
+
+    def test_a_malformed_token_is_refused_with_a_fixed_message_that_holds_no_part_of_it(self) -> None:
+        messages = set()
+        for what, token in MALFORMED_TOKENS.items():
+            with self.subTest(what):
+                _, _, error, text = self.refused(token)
+                self.assert_text_is_clean(text)
+                self.assertIn("POST applications/token", str(error))
+                messages.add(str(error))
+        self.assertEqual(1, len(messages), "the message is one fixed text, whatever the token held")
+
+    def test_a_malformed_token_is_not_cached_and_no_call_follows_the_token_call(self) -> None:
+        self.assertGreaterEqual(len(MALFORMED_TOKENS), 10)
+        for what, token in MALFORMED_TOKENS.items():
+            with self.subTest(what):
+                api, stand_in, _, _ = self.refused(token)
+                self.assertIsNone(api.token)
+                self.assertEqual(["POST applications/token"], stand_in.log)
+
+    def test_a_malformed_token_that_comes_with_a_renewal_is_refused_the_same_way(self) -> None:
+        api, stand_in = prepared()
+        api.running_jobs("connection1")
+        stand_in.expire_next_token = True
+        stand_in.mutations["POST applications/token"] = lambda answer: answer.update({"access_token": f"{PLANTED}\n"})
+        _, text = raised_text(lambda: api.running_jobs("connection1"))
+        self.assert_text_is_clean(text)
+        self.assertEqual(["GET jobs", "GET jobs", "POST applications/token"], stand_in.log[-3:])
+
+    def test_control_each_character_that_the_form_allows_is_accepted(self) -> None:
+        self.assertGreaterEqual(len(VALID_TOKENS), 6)
+        for token in VALID_TOKENS:
+            with self.subTest(token):
+                api, stand_in = prepared()
+                stand_in.mutations["POST applications/token"] = lambda answer, token=token: answer.update({"access_token": token})
+                api.renew_token(1.0)
+                self.assertEqual(token, api.token)
+
+    def test_control_the_text_check_sees_a_token_in_a_message_in_a_cause_and_in_arguments(self) -> None:
+        in_message = AirbyteError(f"bad {PLANTED}")
+        in_cause = AirbyteError("fixed")
+        in_cause.__cause__ = ValueError(PLANTED)
+        in_arguments = AirbyteError("fixed", PLANTED)
+        for error in (in_message, in_cause, in_arguments):
+            self.assertIn(PLANTED, whole_text(error))
+        self.assertNotIn(PLANTED, whole_text(AirbyteError("fixed")))
+
+    def test_the_form_is_the_one_that_the_ansible_client_holds(self) -> None:
+        source = (pathlib.Path(__file__).resolve().parents[2] / "ansible/roles/airbyte/library/airbyte_connection.py").read_text(encoding="utf-8")
+        found = re.search(r'^TOKEN_FORM = re\.compile\(r"(.*)"\)$', source, re.MULTILINE)
+        self.assertIsNotNone(found, "the Ansible client's TOKEN_FORM line was not found")
+        self.assertEqual(found.group(1) if found else None, airbyte_api.TOKEN_FORM.pattern)
+
+    def test_the_whole_client_over_http_refuses_a_token_with_a_line_break_before_it_goes_into_a_header(self) -> None:
+        seen: list[str | None] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:  # noqa: N802
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = json.dumps({"access_token": f"{PLANTED}\n"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            api = HttpAirbyteApi(ORIGIN, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
+            api.host, api.port = "127.0.0.1", server.server_address[1]
+            _, text = raised_text(lambda: api.call("GET", "/workspaces", timeout=5.0))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assert_text_is_clean(text)
+        self.assertEqual([], seen)
+        self.assertIsNone(api.token)
 
 
 class FindConnectionsTest(unittest.TestCase):
