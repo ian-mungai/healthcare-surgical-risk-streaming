@@ -8,11 +8,14 @@ change under its reference.
 from __future__ import annotations
 
 import os
+import signal
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from replay.service.folder_store import FolderStore
+from replay.service.folder_store import FolderStore, ReadLog
 from scripts.ingestion.notice import Code
 from scripts.ingestion.store import ObjectVersion, StoreError
 
@@ -69,8 +72,8 @@ class FolderStoreTest(unittest.TestCase):
 
 
 class ReadLogTest(unittest.TestCase):
-    """The read log is appended to only when it is a regular file: a named pipe, a folder or a link in its place is refused with a closed error, and
-    nothing blocks."""
+    """The read log is always a new file: ``ReadLog.create`` makes it exclusively when the run opens its store, an existing path of any kind is refused with
+    ``CANNOT_WRITE`` before a read and stays as it was, and every read appends one whole line to the open file."""
 
     def setUp(self) -> None:
         folder = tempfile.TemporaryDirectory(prefix="replay_read_log_")
@@ -78,41 +81,158 @@ class ReadLogTest(unittest.TestCase):
         self.root = Path(folder.name)
         self.version = ObjectVersion(KEY, "v0001", 4, "2026-11-21T00:00:00Z", True, False)
 
-    def note(self, log: Path) -> None:
-        FolderStore(self.root / "store", read_log=log).note_read(self.version)
+    def created(self, log: Path) -> ReadLog:
+        opened = ReadLog.create(log)
+        self.addCleanup(opened.close)
+        return opened
 
-    def test_a_regular_file_gets_one_line_per_read_and_is_made_when_absent(self) -> None:
+    def codes(self, error: StoreError) -> list[Code]:
+        return [notice.code for notice in error.notices]
+
+    def test_a_new_file_is_made_when_the_log_is_created_and_gets_one_line_per_read(self) -> None:
         log = self.root / "reads.log"
-        self.note(log)
-        self.note(log)
+        store = FolderStore(self.root / "store", read_log=self.created(log))
+        self.assertEqual("", log.read_text())
+        store.note_read(self.version)
+        store.note_read(self.version)
         self.assertEqual(f"{KEY} v0001\n" * 2, log.read_text())
 
-    def test_a_named_pipe_with_a_reader_is_refused_after_open_and_nothing_is_written_to_it(self) -> None:
+    def test_the_new_file_is_readable_by_others_and_writable_by_its_owner_alone_whatever_the_umask(self) -> None:
+        previous = os.umask(0)
+        self.addCleanup(os.umask, previous)
         log = self.root / "reads.log"
-        os.mkfifo(log)
-        reader = os.open(log, os.O_RDONLY | os.O_NONBLOCK)
-        self.addCleanup(os.close, reader)
-        with self.assertRaises(StoreError):
-            self.note(log)
-        self.assertEqual(b"", os.read(reader, 10))
+        self.created(log)
+        self.assertEqual(0o644, log.stat().st_mode & 0o777)
 
-    def test_a_named_pipe_without_a_reader_is_refused_and_does_not_block(self) -> None:
+    def test_a_read_is_appended_after_what_another_writer_added_and_never_over_it(self) -> None:
         log = self.root / "reads.log"
-        os.mkfifo(log)
-        with self.assertRaises(StoreError):
-            self.note(log)
+        store = FolderStore(self.root / "store", read_log=self.created(log))
+        store.note_read(self.version)
+        with log.open("ab") as other:
+            other.write(b"added by another writer\n")
+        store.note_read(self.version)
+        self.assertEqual(f"{KEY} v0001\nadded by another writer\n{KEY} v0001\n", log.read_text())
 
-    def test_a_folder_and_a_link_are_refused_and_the_file_a_link_names_is_unchanged(self) -> None:
+    def test_a_path_that_exists_in_any_form_is_refused_before_any_read_and_what_it_names_is_unchanged(self) -> None:
         target = self.root / "target.txt"
-        target.write_text("kept\n")
-        folder = self.root / "folder.log"
-        folder.mkdir()
+        target.write_bytes(b"kept\n")
+        regular = self.root / "regular.log"
+        regular.write_bytes(b"a record\n")
+        empty = self.root / "empty.log"
+        empty.write_bytes(b"")
+        hard = self.root / "hard.log"
+        os.link(target, hard)
         link = self.root / "link.log"
         link.symlink_to(target)
-        for log in (folder, link):
-            with self.subTest(log=log.name), self.assertRaises(StoreError):
-                self.note(log)
-        self.assertEqual("kept\n", target.read_text())
+        dangling = self.root / "dangling.log"
+        dangling.symlink_to(self.root / "nowhere.txt")
+        folder = self.root / "folder.log"
+        folder.mkdir()
+        pipe = self.root / "pipe.log"
+        os.mkfifo(pipe)
+        before = {path: path.read_bytes() for path in (target, regular, empty, hard)}
+        for log in (target, regular, empty, hard, link, dangling, folder, pipe):
+            with self.subTest(log=log.name), self.assertRaises(StoreError) as caught:
+                ReadLog.create(log)
+            self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+        self.assertFalse((self.root / "nowhere.txt").exists())
+        self.assertTrue(folder.is_dir())
+        self.assertTrue(stat.S_ISFIFO(pipe.lstat().st_mode))
+
+    def test_a_second_log_that_names_the_same_path_is_refused_and_the_first_keeps_its_lines(self) -> None:
+        log = self.root / "reads.log"
+        FolderStore(self.root / "store", read_log=self.created(log)).note_read(self.version)
+        with self.assertRaises(StoreError) as caught:
+            ReadLog.create(log)
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+        self.assertEqual(f"{KEY} v0001\n", log.read_text())
+
+    def test_a_path_in_a_folder_that_does_not_exist_is_refused_and_makes_no_folder(self) -> None:
+        with self.assertRaises(StoreError) as caught:
+            ReadLog.create(self.root / "absent" / "reads.log")
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+        self.assertFalse((self.root / "absent").exists())
+
+    def test_a_short_write_is_a_closed_cannot_write_error(self) -> None:
+        log = self.root / "reads.log"
+        store = FolderStore(self.root / "store", read_log=self.created(log))
+        real_write = os.write
+
+        def short(descriptor: int, data: bytes) -> int:
+            return real_write(descriptor, data[:-1])
+
+        with mock.patch.object(os, "write", short), self.assertRaises(StoreError) as caught:
+            store.note_read(self.version)
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+
+    def test_a_short_write_that_writes_nothing_is_the_same_error(self) -> None:
+        store = FolderStore(self.root / "store", read_log=self.created(self.root / "reads.log"))
+        with mock.patch.object(os, "write", lambda descriptor, data: 0), self.assertRaises(StoreError) as caught:
+            store.note_read(self.version)
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+
+    def test_a_write_that_fails_is_a_closed_cannot_write_error(self) -> None:
+        store = FolderStore(self.root / "store", read_log=self.created(self.root / "reads.log"))
+        with mock.patch.object(os, "write", side_effect=OSError(28, "no space left")), self.assertRaises(StoreError) as caught:
+            store.note_read(self.version)
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+
+    def test_a_whole_write_is_not_an_error(self) -> None:
+        log = self.root / "reads.log"
+        store = FolderStore(self.root / "store", read_log=self.created(log))
+        with mock.patch.object(os, "write", wraps=os.write) as written:
+            store.note_read(self.version)
+        written.assert_called_once()
+        self.assertEqual(f"{KEY} v0001\n", log.read_text())
+
+    def test_a_job_worker_attaches_to_the_log_that_its_driver_created_and_only_to_a_regular_file(self) -> None:
+        log = self.root / "reads.log"
+        self.created(log)
+        attached = ReadLog.attach(log)
+        self.addCleanup(attached.close)
+        FolderStore(self.root / "store", read_log=attached).note_read(self.version)
+        self.assertEqual(f"{KEY} v0001\n", log.read_text())
+        target = self.root / "target.txt"
+        target.write_bytes(b"kept\n")
+        link = self.root / "link.log"
+        link.symlink_to(target)
+        folder = self.root / "folder.log"
+        folder.mkdir()
+        pipe = self.root / "pipe.log"
+        os.mkfifo(pipe)
+        reader = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        for refused in (link, folder, pipe, self.root / "absent.log"):
+            with self.subTest(attach=refused.name), self.assertRaises(StoreError) as caught:
+                ReadLog.attach(refused)
+            self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+        self.assertEqual(b"kept\n", target.read_bytes())
+        self.assertFalse((self.root / "absent.log").exists())
+        self.assertEqual(b"", os.read(reader, 10))
+
+    def test_a_named_pipe_without_a_reader_is_refused_by_attach_and_does_not_block(self) -> None:
+        pipe = self.root / "pipe.log"
+        os.mkfifo(pipe)
+
+        def blocked(signum: int, frame: object) -> None:
+            raise AssertionError("attach waited for a reader")
+
+        previous = signal.signal(signal.SIGALRM, blocked)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        signal.alarm(5)
+        self.addCleanup(signal.alarm, 0)
+        with self.assertRaises(StoreError) as caught:
+            ReadLog.attach(pipe)
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
+
+    def test_a_closed_log_is_a_closed_error_on_the_next_read(self) -> None:
+        opened = ReadLog.create(self.root / "reads.log")
+        opened.close()
+        opened.close()
+        with self.assertRaises(StoreError) as caught:
+            FolderStore(self.root / "store", read_log=opened).note_read(self.version)
+        self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
 
 
 if __name__ == "__main__":

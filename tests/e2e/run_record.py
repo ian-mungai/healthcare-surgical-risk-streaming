@@ -17,6 +17,11 @@ PASSED_END = "the result is verified and its work is pushed to hosted CI"
 FAILED_END = "the failure is fixed and the fix is pushed to hosted CI"
 
 
+class StopRun(Exception):
+    """Raised inside the steps of a run to end them early. The run's own cleanup then runs, and only after it the record is closed, so no record is saved
+    with its cleanup still pending."""
+
+
 @dataclass
 class Observation:
     case: str

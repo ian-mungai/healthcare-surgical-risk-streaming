@@ -15,7 +15,7 @@ from pathlib import Path
 from replay.events.recording import CaseRecording, CaseTimes
 from replay.events.schedule import Plan
 from replay.service.decode import clinical_times, decode_case
-from replay.service.folder_store import FolderStore
+from replay.service.folder_store import FolderStore, ReadLog
 from replay.service.run_record import RunRecord
 from scripts.ingestion.check import CheckedFile
 from scripts.ingestion.gate import verify_before_read
@@ -32,8 +32,10 @@ class InputError(RuntimeError):
 
 
 def open_store(record: RunRecord, reference: ManifestRef) -> ObjectStore:
+    """The object store of a run. A folder store's read log, when the record names one, is created here, once, as a new file: a path that exists in any form
+    is refused with ``CANNOT_WRITE`` before any read."""
     if record.object_store.kind == "folder" and record.object_store.root is not None:
-        read_log = Path(record.object_store.read_log) if record.object_store.read_log else None
+        read_log = ReadLog.create(Path(record.object_store.read_log)) if record.object_store.read_log else None
         return FolderStore(Path(record.object_store.root), reference.bucket, read_log)
     from replay.service.s3_store import S3ReadStore  # the folder store needs no boto3, and the host's store is only loaded on the host
 

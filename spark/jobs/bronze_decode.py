@@ -40,11 +40,12 @@ from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError, ManifestRef
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.store import StoreError
 from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
 from spark.bronze.passes import MaxParameter, SumByName, partition_problems, partition_rows
 from spark.bronze.plan import GROUPED, MODES
-from spark.bronze.readers import caseend_times, open_store
+from spark.bronze.readers import caseend_times, create_read_log, open_store
 from spark.bronze.rows import StructureError
 from spark.bronze.tables import KIND_TABLE, NAMESPACE, TABLES, TableSpec
 from spark.catalog import required_environment
@@ -74,7 +75,11 @@ def parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--parallelism", type=int, default=1, help="how many cases are decoded at once")
     command.add_argument("--landed-folder", default="", help="a folder of object versions that stands in for the bucket, for a local run")
-    command.add_argument("--read-log", default="", help="with --landed-folder: a file that gets the key and version of every object read")
+    command.add_argument(
+        "--read-log",
+        default="",
+        help="with --landed-folder: a new file (a path that exists in any form is refused) that gets the key and version of every object read",
+    )
     return command
 
 
@@ -118,6 +123,8 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
         if arguments.landed_folder
         else StoreSpec("s3", reference.bucket, "", required_environment("AWS_REGION"))
     )
+    if arguments.read_log:
+        create_read_log(Path(arguments.read_log))
     store = open_store(spec)
     wanted = [int(text) for text in arguments.cases.split(",") if text] or None
     inputs = verify_inputs(store, reference, wanted)
@@ -187,7 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ManifestError as error:
         sys.stderr.write(f"{JOB}: the manifest cannot be trusted: {describe_error(error)}\n")
         return 1
-    except (InputError, StructureError) as error:
+    except (InputError, StructureError, StoreError) as error:
         sys.stderr.write(f"{JOB}: refused: {describe_error(error)}\n")
         return 1
     except NessieConflict as error:

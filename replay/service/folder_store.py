@@ -25,28 +25,71 @@ from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 VERSION_FILE = re.compile(r"v(\d{4})(\.deleted)?")
 
 
+def refused() -> StoreError:
+    return StoreError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT))
+
+
+class ReadLog:
+    """The read log of a test run: a file that gets the key and version ID of every read, so a test can show which versions were read.
+
+    The log is always a new file. ``create`` opens it once, when the run opens its folder store, with ``O_CREAT | O_EXCL | O_NOFOLLOW``: a path that exists in
+    any form (a file, an empty file, a link, a dangling link, a folder, a named pipe, a hard link) is refused with ``CANNOT_WRITE`` before any read and what it
+    names stays as it was. Every read then appends one whole line to that open file; a write that stores fewer bytes than the line is ``CANNOT_WRITE`` too.
+    ``attach`` is for a job worker (a Spark partition) that gets the path of the log that its driver created: it opens that file again for appending, without
+    following a link or waiting for a reader, and refuses everything that is not a regular file.
+    """
+
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor: int | None = descriptor
+
+    @classmethod
+    def create(cls, path: Path) -> ReadLog:
+        try:
+            return cls(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o644))
+        except OSError:
+            raise refused() from None
+
+    @classmethod
+    def attach(cls, path: Path) -> ReadLog:
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            raise refused() from None
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise refused()
+        return cls(descriptor)
+
+    def append(self, line: str) -> None:
+        data = line.encode()
+        if self.descriptor is None:
+            raise refused()
+        try:
+            written = os.write(self.descriptor, data)
+        except OSError:
+            raise refused() from None
+        if written != len(data):
+            raise refused()
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class FolderStore:
-    def __init__(self, root: Path, bucket: str = "local-landed-copy", read_log: Path | None = None) -> None:
+    def __init__(self, root: Path, bucket: str = "local-landed-copy", read_log: ReadLog | None = None) -> None:
         self.root = root
         self.bucket = bucket
         self.read_log = read_log
 
     def note_read(self, version: ObjectVersion) -> None:
-        """Append the key and version ID of a read to the read log, so a test can show which versions were read. The log is opened without following a
-        link and without waiting for a reader, and it is refused unless the open entry is a regular file: a link, a folder or a named pipe in its place
-        is a closed error and nothing is written to it."""
-        if self.read_log is None:
-            return
-        try:
-            descriptor = os.open(self.read_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
-        except OSError:
-            raise StoreError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)) from None
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise StoreError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT))
-            os.write(descriptor, f"{version.key} {version.version_id}\n".encode())
-        finally:
-            os.close(descriptor)
+        """Append the key and version ID of a read to the read log, when the store has one."""
+        if self.read_log is not None:
+            self.read_log.append(f"{version.key} {version.version_id}\n")
 
     def entries(self, key: str) -> list[tuple[int, bool, Path]]:
         folder = self.root

@@ -9,11 +9,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
+import stat
+import sys
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from typing import Any
@@ -24,7 +28,8 @@ from replay.service.output_guard import refuse_inside_store
 from replay.service.serve import Health, Outcome, SubmitError, serve, submit
 from replay.service.state_file import ScheduleFile, StateFile
 from scripts.ingestion.closed import ClosedInputError
-from scripts.ingestion.notice import Code, Notice, render
+from scripts.ingestion.manifest import ManifestRef
+from scripts.ingestion.notice import Code, Notice, Subject, render
 from scripts.ingestion.output_file import replace_owned_file
 from tests.fast.test_new_outputs import ORIGINAL, Fixture, ReplayHarness
 from tests.fast.test_replay_serve import RECORD, REFERENCE, Clock
@@ -32,6 +37,7 @@ from tests.fast.test_replay_serve import RECORD, REFERENCE, Clock
 REFUSED = render(Notice(Code.OWNED_REFUSED))
 EXISTS = render(Notice(Code.OUTPUT_EXISTS))
 IN_STORE = render(Notice(Code.OUTPUT_IN_STORE))
+CANNOT_WRITE = render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT))
 RUN_REFUSED = "the run's state folder is not the service's state folder or a folder directly inside it; the run was refused and nothing was written"
 NAME = str(RECORD["run_id"])
 
@@ -174,19 +180,25 @@ class QueuedStateFolderTests(ReplayHarness):
         self.state.mkdir()
         self.inbox = self.state / "inbox"
         self.saved: list[Path] = []
+        self.opens_store = False
 
     def checkpoint_run(self, program: Any) -> Any:
+        opens_store = self.opens_store
+
         def replay(record: Any, flag: object, beat: object) -> int:
             folder = Path(record.state_dir)
             self.saved.append(folder)
+            if opens_store:
+                sys.modules[program.verify_inputs.__module__].open_store(record, ManifestRef.from_json(REFERENCE))
             StateFile(folder).save(mock.Mock(to_json=lambda: "saved by the run"))
             return 0
 
         return mock.patch.object(program, "replay_record", replay)
 
-    def queue(self, state_dir: Path | str, read_log: Path | str | None = None) -> dict[str, Any]:
+    def queue(self, state_dir: Path | str, read_log: Path | str | None = None, *, opens_store: bool = False) -> dict[str, Any]:
         """Queue one run that names ``state_dir`` (and, when given, the ``read_log`` of its folder store), serve until the service is stopped and return the
-        run's result."""
+        run's result. The run opens its folder store as the replay does when ``opens_store`` is true."""
+        self.opens_store = opens_store
         self.inbox.mkdir(exist_ok=True)
         store = dict(RECORD["object_store"]) | ({"read_log": str(read_log)} if read_log is not None else {})  # type: ignore[call-overload]
         (self.inbox / "a.json").write_text(json.dumps({**RECORD, "state_dir": str(state_dir), "object_store": store}))
@@ -197,7 +209,30 @@ class QueuedStateFolderTests(ReplayHarness):
         return result
 
     def run_replay(self, argv: list[str], patch: Any = None) -> tuple[int, str]:
-        return super().run_replay(argv, self.checkpoint_run)
+        return super().run_replay(argv, patch or self.checkpoint_run)
+
+    def standalone_freeze(self, read_log: Path) -> tuple[int, str]:
+        """Run the standalone ``freeze`` command for a record that names ``read_log``, with the inputs' checks and the freezing replaced by a run that opens
+        the folder store as the command does."""
+        self.replay_files("freeze")
+        document = json.loads((self.root / "run.json").read_text())
+        document["object_store"]["read_log"] = str(read_log)
+        (self.root / "run.json").write_text(json.dumps(document))
+        (self.root / "reference.json").write_text(REFERENCE)
+
+        def opened(program: Any) -> Any:
+            inputs_module = sys.modules[program.verify_inputs.__module__]
+
+            def verify(record: Any) -> None:
+                inputs_module.open_store(record, ManifestRef.from_json(REFERENCE))
+
+            frozen = types.SimpleNamespace(schedule=types.SimpleNamespace(sha256="s", first_due_us=1, window_end_us=2))
+            stack = contextlib.ExitStack()
+            stack.enter_context(mock.patch.object(program, "verify_inputs", verify))
+            stack.enter_context(mock.patch.object(program, "freeze_run", lambda record, inputs: frozen))
+            return stack
+
+        return super().run_replay(["freeze", "--run-record", str(self.root / "run.json")], opened)
 
     def held_elsewhere(self, folder: Path) -> Path:
         folder.mkdir(parents=True, exist_ok=True)
@@ -276,61 +311,86 @@ class QueuedStateFolderTests(ReplayHarness):
         result = self.queue(named, read_log=named / "reads.log")
         self.assertEqual(("finished", 0, ""), (result["outcome"], result["exit_code"], result["error"]))
 
-    def test_a_read_log_named_like_a_file_the_replay_writes_in_its_state_folder_is_refused_and_the_file_is_unchanged(self) -> None:
-        for name in ("state.json", "schedule.json", "health.json"):
+    def test_a_read_log_that_exists_in_any_form_is_refused_by_the_run_that_opens_its_store_and_every_byte_is_unchanged(self) -> None:
+        kinds = ("the replay's state file", "the frozen schedule", "a file with text", "an empty file", "a hard link", "a link", "a folder", "a named pipe")
+        for kind in kinds:
             for folder_label in ("a per-run folder", "the state folder itself"):
-                for held_before in (True, False):
-                    with self.subTest(read_log=name, folder=folder_label, the_file_exists=held_before):
-                        self.setUp()
-                        named = self.state / "replay_0a1b2c3d" if folder_label == "a per-run folder" else self.state
-                        named.mkdir(exist_ok=True)
-                        held = named / name
-                        if held_before:
-                            held.write_text(ORIGINAL)
-                        result = self.queue(named, read_log=held)
-                        self.assertEqual(RUN_REFUSED, result["error"])
-                        if held_before and (name != "health.json" or folder_label == "a per-run folder"):  # the service itself replaces its own health file
-                            self.assertEqual(ORIGINAL, held.read_text())
-                        if not held_before and folder_label == "a per-run folder":
-                            self.assertFalse(held.exists())
-                        self.assertEqual([], self.saved)
+                with self.subTest(read_log=kind, folder=folder_label):
+                    self.setUp()
+                    named = self.state / "replay_0a1b2c3d" if folder_label == "a per-run folder" else self.state
+                    named.mkdir(exist_ok=True)
+                    other = named / "other.txt"
+                    other.write_text(ORIGINAL)
+                    log = named / {"the replay's state file": "state.json", "the frozen schedule": "schedule.json"}.get(kind, "reads.log")
+                    if kind in ("the replay's state file", "the frozen schedule", "a file with text"):
+                        log.write_text(ORIGINAL)
+                    elif kind == "an empty file":
+                        log.write_bytes(b"")
+                    elif kind == "a hard link":
+                        os.link(other, log)
+                    elif kind == "a link":
+                        log.symlink_to(other)
+                    elif kind == "a folder":
+                        log.mkdir()
+                    else:
+                        os.mkfifo(log)
+                    mode = log.lstat().st_mode
+                    held = log.read_bytes() if stat.S_ISREG(mode) else None
+                    result = self.queue(named, read_log=log, opens_store=True)
+                    self.assertEqual(("failed", 2, CANNOT_WRITE), (result["outcome"], result["exit_code"], result["error"]))
+                    self.assertEqual(mode, log.lstat().st_mode)
+                    self.assertEqual(held, log.read_bytes() if stat.S_ISREG(mode) else None)
+                    self.assertEqual(ORIGINAL, other.read_text())
+                    self.assertEqual([], [entry.name for entry in named.iterdir() if entry.name not in {"other.txt", log.name, "inbox", "health.json"}])
 
-    def test_a_read_log_in_another_letter_case_or_a_hard_link_of_a_file_the_replay_writes_is_refused_and_the_file_is_unchanged(self) -> None:
-        for label in ("another letter case, the file absent", "a hard link"):
-            with self.subTest(read_log=label):
-                self.setUp()
-                named = self.state / "replay_0a1b2c3d"
-                named.mkdir()
-                held = named / "state.json"
-                log = named / "STATE.JSON"
-                if label == "a hard link":
-                    held.write_text(ORIGINAL)
-                    log = named / "reads.log"
-                    os.link(held, log)
-                result = self.queue(named, read_log=log)
-                self.assertEqual(RUN_REFUSED, result["error"])
-                self.assertEqual(ORIGINAL if held.exists() else None, held.read_text() if held.exists() else None)
-                self.assertEqual([], self.saved)
+    def test_a_queued_run_whose_state_folder_is_the_inbox_and_whose_read_log_is_its_own_queued_record_leaves_every_byte_unchanged(self) -> None:
+        self.inbox.mkdir()
+        record = self.inbox / "a.json"
+        text = json.dumps({**RECORD, "state_dir": str(self.inbox), "object_store": dict(RECORD["object_store"]) | {"read_log": str(record)}})  # type: ignore[call-overload]
+        record.write_text(text)
+        (self.inbox / "a.reference").write_text(REFERENCE)
+        self.opens_store = True
+        code, _ = serve_until_stopped(self, ["serve", "--state", str(self.state), "--inbox", str(self.inbox)])
+        self.assertEqual(0, code)
+        result: dict[str, Any] = json.loads((self.inbox / "results" / "a.json").read_text())
+        self.assertEqual(("failed", 2, CANNOT_WRITE), (result["outcome"], result["exit_code"], result["error"]))
+        kept = [entry for entry in self.inbox.rglob("a.json") if entry.read_text() == text]
+        self.assertTrue(kept, "the queued record's bytes were changed")
 
-    def test_a_read_log_that_is_a_named_pipe_a_folder_or_a_link_is_refused_and_what_it_names_is_unchanged(self) -> None:
-        for kind in ("named pipe", "folder", "link to a file in the run folder"):
-            with self.subTest(read_log=kind):
-                self.setUp()
-                named = self.state / "replay_0a1b2c3d"
-                named.mkdir()
-                log = named / "reads.log"
-                target = named / "target.txt"
-                target.write_text(ORIGINAL)
-                if kind == "named pipe":
-                    os.mkfifo(log)
-                elif kind == "folder":
-                    log.mkdir()
-                else:
-                    log.symlink_to(target)
-                result = self.queue(named, read_log=log)
-                self.assertEqual(RUN_REFUSED, result["error"])
-                self.assertEqual(ORIGINAL, target.read_text())
-                self.assertEqual([], self.saved)
+    def test_a_new_read_log_directly_inside_the_run_folder_is_made_by_the_run_that_opens_its_store_and_a_second_run_that_names_it_is_refused(self) -> None:
+        named = self.state / "replay_0a1b2c3d"
+        named.mkdir()
+        log = named / "reads.log"
+        first = self.queue(named, read_log=log, opens_store=True)
+        self.assertEqual(("finished", 0, ""), (first["outcome"], first["exit_code"], first["error"]))
+        self.assertEqual(b"", log.read_bytes())
+        log.write_text("a line that a read added\n")
+        (self.inbox / "results" / "a.json").unlink()
+        for entry in [*self.inbox.glob("a.*"), *(self.inbox / "archive").glob("a.*")]:
+            entry.unlink()
+        second = self.queue(named, read_log=log, opens_store=True)
+        self.assertEqual(("failed", 2, CANNOT_WRITE), (second["outcome"], second["exit_code"], second["error"]))
+        self.assertEqual("a line that a read added\n", log.read_text())
+
+    def test_the_standalone_freeze_whose_read_log_names_a_valid_schedule_leaves_the_schedule_unchanged(self) -> None:
+        schedule = self.root / "state" / "schedule.json"
+        (self.root / "state").mkdir(exist_ok=True)
+        schedule.write_text(ORIGINAL)
+        code, error = self.standalone_freeze(schedule)
+        self.assertEqual(2, code)
+        self.assertIn(CANNOT_WRITE + "\n", error)
+        self.assertEqual(ORIGINAL, schedule.read_text())
+
+    def test_the_standalone_freeze_makes_a_new_read_log_once_and_refuses_a_second_run_that_names_it(self) -> None:
+        log = self.root / "state" / "reads.log"
+        (self.root / "state").mkdir(exist_ok=True)
+        code, error = self.standalone_freeze(log)
+        self.assertEqual((0, b""), (code, log.read_bytes()), error)
+        log.write_text("kept\n")
+        code, error = self.standalone_freeze(log)
+        self.assertEqual(2, code)
+        self.assertIn(CANNOT_WRITE + "\n", error)
+        self.assertEqual("kept\n", log.read_text())
 
     def test_an_empty_read_log_means_no_log_and_a_queued_run_with_it_is_not_refused(self) -> None:
         for label in ("a per-run folder", "the state folder itself"):
