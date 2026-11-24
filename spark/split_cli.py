@@ -104,11 +104,11 @@ def read_settings() -> Settings:
     return Settings(uri, warehouse, region, deadline, timeout)
 
 
-def start_deadline(seconds: float, exit_with: Callable[[int], object] = os._exit) -> threading.Timer:
-    """Stop the whole process, with the fixed code ``timeout`` and exit 124, when the job runs past ``seconds``. The message holds no duration."""
+def start_deadline(seconds: float, exit_with: Callable[[int], object] = os._exit, job: str = JOB) -> threading.Timer:
+    """Stop the whole process, with the fixed code ``timeout`` and exit 124, when the job runs past ``seconds``. The message names ``job``, not a duration."""
 
     def expire() -> None:
-        sys.stderr.write(f"{JOB}: timeout\n")
+        sys.stderr.write(f"{job}: timeout\n")
         sys.stderr.flush()
         exit_with(DEADLINE_EXIT_CODE)
 

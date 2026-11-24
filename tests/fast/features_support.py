@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from fractions import Fraction
 
 from features.model import Reading, WaveformSecond, WaveformWindow
+from features.series_input import SeriesReadings
 
 SECOND = 1_000_000
 CUTOFF_US = 3_600 * SECOND
@@ -21,11 +23,19 @@ def numeric_window(values: Sequence[float], cutoff_us: int = CUTOFF_US, valid: C
     return [Reading(cutoff_us - (count - 1 - index) * SECOND, value, valid(index)) for index, value in enumerate(values)]
 
 
-def series_window(values: Sequence[float], cutoff_us: int = CUTOFF_US, valid: Callable[[int], bool] = lambda index: True) -> list[Reading]:
-    """A per-second series: one reading for each of the newest complete seconds, the last for the newest complete second of the cutoff."""
+def series_window(values: Sequence[float], cutoff_us: int = CUTOFF_US, valid: Callable[[int], bool] = lambda index: True) -> SeriesReadings:
+    """A per-second series: one reading for each of the newest complete seconds, the last for the newest complete second of the cutoff.
+
+    It is bound to the one definition (``features.series_input``), as the batch input of the series must be: each value is the exact value of its reading.
+    """
     newest = cutoff_us // SECOND - 1
     count = len(values)
-    return [Reading((newest - (count - 1 - index)) * SECOND, value, valid(index)) for index, value in enumerate(values)]
+    return exact_series([((newest - (count - 1 - index)) * SECOND, value, valid(index)) for index, value in enumerate(values)])
+
+
+def exact_series(rows: Sequence[tuple[int, float, bool]]) -> SeriesReadings:
+    """The readings of ``(time, value, valid)`` rows as a bound series: a valid reading carries the exact value of its float, an invalid one keeps its value."""
+    return SeriesReadings(Reading(time, value, valid, Fraction(value) if valid else None) for time, value, valid in rows)
 
 
 def spaced_window(values: Sequence[float], step_seconds: int, cutoff_us: int = CUTOFF_US, valid: Callable[[int], bool] = lambda index: True) -> list[Reading]:

@@ -43,14 +43,6 @@ class TableContent:
     snapshot_id: int
 
 
-@dataclass(frozen=True)
-class KeyStatistics:
-    """The rows of a Bronze table and its distinct keys."""
-
-    rows: int
-    distinct: int
-
-
 class BronzeRulesError(ValueError):
     """A loaded table does not have the form that Bronze accepts. The message names the table's column and never holds a data value."""
 

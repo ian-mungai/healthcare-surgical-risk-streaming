@@ -30,6 +30,7 @@ REPLAY_LOCK = ROOT / "replay" / "requirements.txt"
 JOBS = "/opt/jobs"
 READ_FILES = ("tests/fixtures/vitaldb/release.json",)
 PACKAGES = ("vitaldb", "boto3")
+CHECK_PACKAGES = {"great-expectations": "1.24.1", "marshmallow": "4.3.1", "narwhals": "2.28.0", "pydantic": "2.14.3", "pydantic-core": "2.50.4"}
 INSTALL_FLAGS = ("--require-hashes", "--only-binary :all:", "--no-deps")
 LOCK_ENTRY = re.compile(r"^([A-Za-z0-9_.-]+)==(\S+) \\$", re.MULTILINE)
 
@@ -166,10 +167,24 @@ class Packages(unittest.TestCase):
 
     def test_the_two_packages_are_pinned_where_the_replay_pins_them(self) -> None:
         source, replay = requested(REQUIREMENTS_IN.read_text()), requested(REPLAY_IN.read_text())
-        self.assertEqual(set(PACKAGES), set(source))
+        self.assertEqual(set(PACKAGES) | set(CHECK_PACKAGES), set(source))
         for name in PACKAGES:
             self.assertEqual(replay[name], source[name], name)
             self.assertEqual(replay[name], locked(LOCK.read_text())[name], name)
+
+    def test_the_checks_package_and_the_dependencies_held_back_are_pinned_in_the_input_and_the_lock_at_one_version(self) -> None:
+        source, lock = requested(REQUIREMENTS_IN.read_text()), locked(LOCK.read_text())
+        for name, version in CHECK_PACKAGES.items():
+            self.assertEqual(version, source[name], name)
+            self.assertEqual(version, lock[name], name)
+
+    def test_the_checks_packages_are_locked_for_the_hash_checked_wheel_install_and_the_job_imports_them_by_name_only(self) -> None:
+        text = LOCK.read_text()
+        for name in ("great-expectations", "pydantic", "pydantic-core", "narwhals", "marshmallow"):
+            self.assertIn(f"\n{name}=={CHECK_PACKAGES[name]} \\\n    --hash=sha256:", text)
+        quality = (ROOT / "spark" / "bronze" / "quality.py").read_text()
+        self.assertNotIn("\nimport great_expectations", quality)
+        self.assertNotIn("\nfrom great_expectations", quality)
 
     def test_a_package_that_both_locks_hold_has_one_version(self) -> None:
         ours, replay = locked(LOCK.read_text()), locked(REPLAY_LOCK.read_text())

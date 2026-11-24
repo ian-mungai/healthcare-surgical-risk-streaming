@@ -32,7 +32,7 @@ module "host" {
   workload_role_pattern = "${var.project_name}_workload_*"
 
   tailscale = {
-    client_id = var.tailscale_client_id
+    client_id = nonsensitive(var.tailscale_client_id)
     audience  = var.tailscale_audience
     tag       = var.tailscale_host_tag
     host_name = "platform-${var.environment}"

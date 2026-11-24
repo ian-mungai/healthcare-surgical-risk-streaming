@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.ingestion.closed import ClosedInputError
@@ -38,32 +39,45 @@ def hooks_folder(root: Path) -> Path:
     return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip()
 
 
-def hook_path(root: Path) -> Path:
-    return hooks_folder(root) / HOOK_NAME
+@dataclass(frozen=True)
+class LegacyHook:
+    """A hook that runs from the ``<stage>.legacy`` file that pre-commit calls before it hides anything, with the older hook kept beside it."""
+
+    name: str
+    kept_name: str
+    text: str
+    earlier_texts: tuple[str, ...] = ()
 
 
-def installed(root: Path) -> bool:
-    path = hook_path(root)
-    return path.is_file() and path.read_bytes() == HOOK_TEXT.encode() and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
+SCANNER = LegacyHook(HOOK_NAME, KEPT_NAME, HOOK_TEXT, EARLIER_HOOK_TEXTS)
 
 
-def is_scanner(path: Path) -> bool:
-    """Whether the file holds exactly a scan hook text that this repository has shipped, and so is not the owner's hook."""
-    return path.is_file() and path.read_bytes() in (HOOK_TEXT.encode(), *(text.encode() for text in EARLIER_HOOK_TEXTS))
+def hook_path(root: Path, hook: LegacyHook = SCANNER) -> Path:
+    return hooks_folder(root) / hook.name
 
 
-def install(root: Path) -> bool:
+def installed(root: Path, hook: LegacyHook = SCANNER) -> bool:
+    path = hook_path(root, hook)
+    return path.is_file() and path.read_bytes() == hook.text.encode() and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
+
+
+def is_scanner(path: Path, hook: LegacyHook = SCANNER) -> bool:
+    """Whether the file holds exactly a hook text that this repository has shipped, and so is not the owner's hook."""
+    return path.is_file() and path.read_bytes() in (hook.text.encode(), *(text.encode() for text in hook.earlier_texts))
+
+
+def install(root: Path, hook: LegacyHook = SCANNER) -> bool:
     """Write the hook and return True, or return False when it is already installed.
 
-    An older hook at the hook's path is moved to ``pre-commit.legacy.previous`` first, and ``KeptHookError`` is raised when that name is taken.
+    An older hook at the hook's path is moved to ``<name>.previous`` first, and ``KeptHookError`` is raised when that name is taken.
     """
-    if installed(root):
+    if installed(root, hook):
         return False
     folder = hooks_folder(root)
-    path = folder / HOOK_NAME
+    path = folder / hook.name
     folder.mkdir(parents=True, exist_ok=True)
-    if os.path.lexists(path) and not is_scanner(path):
-        kept = path.with_name(KEPT_NAME)
+    if os.path.lexists(path) and not is_scanner(path, hook):
+        kept = path.with_name(hook.kept_name)
         if os.path.lexists(kept):
             raise KeptHookError(
                 f"{path.name} holds an older hook and {kept.name} already holds another: compare the two files in {path.parent}, "
@@ -71,7 +85,7 @@ def install(root: Path) -> bool:
             )
         os.rename(path, kept)
     try:
-        replace_owned_file(path, HOOK_TEXT, state_root=folder, mode=HOOK_MODE)
+        replace_owned_file(path, hook.text, state_root=folder, mode=HOOK_MODE)
     except ClosedInputError:
         raise OSError("the hook could not be written") from None
     return True

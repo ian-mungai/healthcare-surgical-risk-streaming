@@ -229,7 +229,7 @@ class HostCallTest(Boundary):
         ):
             error = raised(lambda: host.run_ansible(RUN.run_id, "100.64.0.1", {"bucket": BUCKET, "role": ROLE}))
         self.assertIsInstance(error, host.HostError)
-        deadline = f"{host.ANSIBLE_TIMEOUT_SECONDS:g}"
+        deadline = f"{host.HOST_SETUP_TIMEOUT_SECONDS:g}"
         self.assertEqual(
             f"ansible-playbook host.yml timed out after {deadline} seconds; its partial output is in runs/{RUN.run_id}/raw/ansible_output.txt", str(error)
         )

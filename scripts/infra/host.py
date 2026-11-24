@@ -51,8 +51,16 @@ PEER_DEADLINE_SECONDS = 600
 SSH_DEADLINE_SECONDS = 300
 POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
-ANSIBLE_TIMEOUT_SECONDS = 2400
-PLAYBOOKS = {"host.yml": ("host setup", "ansible_output.txt"), "connection.yml": ("connection step", "ansible_connection_output.txt")}
+# The host setup may take the sum of the deadlines of every task on the path of ansible/host.yml (each include counted once per call, each retried task once
+# per attempt, each loop once per item) plus a tenth, in whole five minutes. tests/fast/test_host_budget.py walks the playbook, works the sum out from the task
+# files and fails when this figure is lower. The connection step has its own budget from the same sum over ansible/connection.yml (the Airbyte connection step
+# and the start of the orchestration services).
+HOST_SETUP_TIMEOUT_SECONDS = 24600
+CONNECTION_TIMEOUT_SECONDS = 4800
+PLAYBOOKS = {
+    "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),
+    "connection.yml": ("connection step", "ansible_connection_output.txt", CONNECTION_TIMEOUT_SECONDS),
+}
 KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
 # The remote command: the host's interpreter in isolated mode and the installed script. This command line is the one that sudo matches, and the sudoers drop-in
 # (the file named below, which the role installs and this program compares by its SHA-256) turns input recording off for it.
@@ -378,7 +386,7 @@ def ansible_recap(stdout: str) -> str:
 
 def run_ansible(run_id: str, address: str, variables: dict[str, Any], playbook: str = "host.yml") -> None:
     """Run one playbook on the host and keep its whole output privately. Only the recap counts are printed, because task output can hold variable values."""
-    label, output_name = PLAYBOOKS[playbook]
+    label, output_name, budget = PLAYBOOKS[playbook]
     home = ROOT / ".tools" / "ansible"
     settings = {"ANSIBLE_CONFIG": "ansible.cfg", "ANSIBLE_HOME": str(home), "ANSIBLE_LOCAL_TEMP": str(home / "tmp")}
     environment = os.environ | settings | {"PLATFORM_HOST": address, "ANSIBLE_SSH_COMMON_ARGS": " ".join(ssh_arguments(run_id))}
@@ -388,12 +396,12 @@ def run_ansible(run_id: str, address: str, variables: dict[str, Any], playbook: 
             [playbook, "--extra-vars", json.dumps(variables)],
             cwd=ROOT / "ansible",
             env=environment,
-            timeout=ANSIBLE_TIMEOUT_SECONDS,
+            timeout=budget,
         )
     except TimeoutExpired as error:
         partial = partial_text(error.stdout) + partial_text(error.stderr)
         note = f"; {kept_note(run_id, output_name, partial, 'partial output')}" if partial else ""
-        raise HostError(timeout_text(f"ansible-playbook {playbook}", ANSIBLE_TIMEOUT_SECONDS) + note) from None
+        raise HostError(timeout_text(f"ansible-playbook {playbook}", budget) + note) from None
     kept = kept_note(run_id, output_name, result.stdout + result.stderr, "full output")
     sys.stdout.write(ansible_recap(result.stdout))
     if result.returncode != 0:

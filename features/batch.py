@@ -1,10 +1,12 @@
 """The batch entry point: windows from a plain JSON file in, feature rows in a plain JSON file out.
 
 ``python -m features.batch WINDOWS.json ROWS.json``. The input is ``{"windows": [...]}``, a non-empty array. A window holds ``window_id`` (a text, distinct in
-the file, that the output repeats), ``cutoff_us``, ``numeric`` (a track to a list of ``[time_us, value, valid]``), ``waveforms`` (a track to ``{"sample_rate",
-"seconds": [{"second", "samples", "valid", "start_offset_us"}]}``) and ``clinical`` (a field to ``{"value", "available_us"}``). Every key is required and no
-other key is accepted: the key sets are ``INPUT_OBJECTS`` in the registry, read by ``features.document``. A member that appears twice in one object is
-refused. The output is ``{"rows": [...]}``, in window order.
+the file, that the output repeats), ``cutoff_us``, ``numeric`` (a track to a list of ``[time_us, value, valid]``, except the per-second arterial series
+``Silver/ART_MBP_1S``, whose reading is ``[time_us, value, valid, sample_count, sum_high, sum_low]``: its exact mean is the count and the two floats of the
+exact sum of its samples, as ``features.series_input`` makes them, and a valid reading inside the window with no exact mean is refused), ``waveforms`` (a track
+to ``{"sample_rate", "seconds": [{"second", "samples", "valid", "start_offset_us"}]}``) and ``clinical`` (a field to ``{"value", "available_us"}``). Every key
+is required and no other key is accepted: the key sets are ``INPUT_OBJECTS`` in the registry, read by ``features.document``. A member that appears twice in
+one object is refused. The output is ``{"rows": [...]}``, in window order.
 Spark wiring comes with the Silver and streaming jobs: they read their windows elsewhere and call ``features.row.build_row``, as this entry point does.
 """
 

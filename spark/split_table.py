@@ -5,7 +5,8 @@ and the order of a build run in the fast tests on plain rows and stand-in steps.
 calls it and keeps no copy.
 
 The test set is sealed until the choice record is frozen, so nothing here may name which set a patient or a case is in. Every failure is a code and a count
-(``two_sets: 1 patient``), never an identifier. A check returns its problems and never raises for a failed check, so that one run names every cause.
+(``two_sets: 1 patient``), never an identifier, except a table whose columns are not those of its card, which is ``schema: failed``. A check returns its
+problems and never raises for a failed check, so that one run names every cause.
 
 A build resolves the branch to one hash and reads only at that hash. It writes only while the branch still has that hash, reads the written table at the
 hash of the write and checks it, and ends only when the branch still has that hash.
@@ -74,6 +75,7 @@ CODES = frozenset(
         "case_two_patients",
         "source_row",
         "unwritable_row",
+        "table_row",
         "readback_differs",
         "table_missing",
         "branch_moved",
@@ -83,11 +85,12 @@ CODES = frozenset(
         "source_table",
     }
 )
-CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_table"})
+CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_table", "table_row"})
 
 
 class PatientSplitError(ValueError):
-    """The split cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
+    """The split cannot be built or a check failed. ``problems`` holds one message for each cause: a code and a count (``two_sets: 1 patient``), a code and
+    a flag (``schema: failed``) or a code and a fixed sentence that names no size (``sample_file: a line is not a candidate line``)."""
 
     def __init__(self, *problems: str) -> None:
         super().__init__("; ".join(problems))
@@ -100,6 +103,20 @@ class SplitRow:
     set: str
     rule_version: str
     source_snapshot_id: int
+
+
+def table_rows(held: Iterable[Mapping[str, Any]]) -> tuple[list[SplitRow], int]:
+    """The rows of the split table that are in form (a ``subjectid`` that is text and a source snapshot that is a whole number) and the count of the rows that
+    are not. A row that is not in form is counted and never converted, so that a missing value is a ``table_row`` problem and not a failure of the job."""
+    rows: list[SplitRow] = []
+    broken = 0
+    for row in held:
+        subjectid, snapshot = row["subjectid"], row["source_snapshot_id"]
+        if type(subjectid) is not str or type(snapshot) is not int:
+            broken += 1
+            continue
+        rows.append(SplitRow(subjectid, row["set"], row["rule_version"], snapshot))
+    return rows, broken
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,10 +326,11 @@ def source_problems(rows: Sequence[SplitRow], source_subjects: set[str], source_
     return problems
 
 
-def schema_problems(fields: Sequence[tuple[str, str]], expected: Sequence[tuple[str, str]], label: str) -> list[str]:
+def schema_problems(fields: Sequence[tuple[str, str]], expected: Sequence[tuple[str, str]]) -> list[str]:
+    """The refusal of a table whose columns are not those of its card: the code and a flag, with no table and no count of columns."""
     if list(fields) == list(expected):
         return []
-    return [f"schema: the {label} has {unit(len(fields), 'column')} that differ from the {len(expected)} of the card"]
+    return ["schema: failed"]
 
 
 def fixed_sample_problems(assignments: Mapping[str, str], cases: Mapping[int, str], sample: Sequence[SampleCase]) -> list[str]:

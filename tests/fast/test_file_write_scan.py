@@ -75,9 +75,17 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "The lock file of a load is opened to take a lock and holds no data; it is never replaced and is created in the state folder",
     ),
+    ("scripts/quality/headroom.py", "main", "Path(os.environ['GITHUB_STEP_SUMMARY']).open"): (
+        1,
+        "Appends the headroom table to the job summary file that the hosted runner names in GITHUB_STEP_SUMMARY; the runner owns it and every step appends",
+    ),
     ("scripts/quality/install_tools.py", "verified_archive", "partial.replace"): (
         1,
         "Renames the download that curl wrote into a partial file of the tools folder, after its SHA-256 matched the pinned value",
+    ),
+    ("scripts/quality/push_hook.py", "install", "orphan.rename"): (
+        1,
+        "Moves the owner's hook that an earlier guard kept aside to the kept name, and only when that name is free (checked before); it replaces nothing",
     ),
     ("scripts/quality/worktree_scan_hook.py", "install", "os.rename"): (
         1,
@@ -195,6 +203,10 @@ OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
     ("scripts/quality/install_tools.py", "settle", "tool.folder"): (
         1,
         "The folder of a pinned tool: the module constant TOOLS plus the folder part of the tool's pinned target",
+    ),
+    ("scripts/quality/push_hook.py", "install", "hooks"): (
+        1,
+        "The hooks folder that git reports for the repository (git rev-parse --git-path hooks); the name is the fixed HOOK_NAME",
     ),
     ("scripts/quality/worktree_scan_hook.py", "install", "folder"): (
         1,

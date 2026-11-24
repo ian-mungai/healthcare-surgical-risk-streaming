@@ -5,6 +5,16 @@
 !scripts/stack/__init__.py
 !scripts/stack/nessie.py
 !scripts/stack/tags.py
+!features/__init__.py
+!features/signal_validity.py
+!features/pressure_series.py
+!features/hypotension.py
+!features/registry.py
+!features/model.py
+!features/stats.py
+!features/label_values.py
+!features/icu_label.py
+!features/kidney_label.py
 !spark/requirements.txt
 !replay/__init__.py
 !replay/events/__init__.py

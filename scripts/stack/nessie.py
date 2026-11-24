@@ -224,6 +224,24 @@ class NessieClient:
         """
         self.request("DELETE", f"/trees/{quote(f'{name}@{hash_value}', safe='@')}", None, None if kind is None else {"type": kind})
 
+    def assign_branch(self, name: str, expected_hash: str, source: Reference) -> Reference:
+        """Assign the branch ``name`` to the commit that ``source`` names while the branch is still at ``expected_hash``. Returns the branch as Nessie answers.
+
+        Nessie 0.110.1, API version 2, ``PUT /trees/{name}@{hash}?type=BRANCH`` with the reference to assign to as the body (``assignReferenceV2`` in its
+        OpenAPI file: "The specified 'hash' must be the value of the current HEAD of the branch ... at execution time"). Nessie applies it at once or refuses
+        with status 409, which is a ``NessieConflict``, and then the branch is as it was. The commit that ``source`` names becomes the branch's head as it
+        is: no commit is made.
+        """
+        if not HASH.fullmatch(expected_hash) or not HASH.fullmatch(source.hash):
+            raise ValueError("the expected hash and the hash to assign must be 64 lower-case hex digits")
+        document = self.request(
+            "PUT",
+            f"/trees/{quote(f'{name}@{expected_hash}', safe='@')}",
+            {"type": source.kind, "name": source.name, "hash": source.hash},
+            {"type": "BRANCH"},
+        )
+        return reference_from(document.get("reference", document) if isinstance(document, dict) else document)
+
     def merge(self, source: str, target: str, expected_target_hash: str, message: str, *, source_hash: str) -> str:
         """Merge ``source`` as it was at ``source_hash`` into ``target``, which the caller expects at ``expected_target_hash``. Returns ``target``'s new hash.
 

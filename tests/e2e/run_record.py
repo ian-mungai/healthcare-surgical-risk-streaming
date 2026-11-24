@@ -197,14 +197,19 @@ class Record:
             code = self.close(log, blocked=blocked)
         return code
 
-    def close(self, log: list[str], *, blocked: str = "") -> int:
-        """Set the outcome, write the record, its log and its retention label in a new folder, print each assertion and return the exit code."""
+    def settle(self, blocked: str = "") -> None:
+        """Set the outcome from the observations so far: blocked with its reason, else pass when every observation passed, else fail."""
         self.outcome = f"blocked: {blocked}" if blocked else ("pass" if self.observations and all(item.passed for item in self.observations) else "fail")
-        stamp = self.started_utc.replace(":", "").replace("-", "")
-        runs = ROOT / "runs"
-        runs.mkdir(parents=True, exist_ok=True)
-        mode = re.sub(r"[^a-z0-9]+", "_", self.mode.lower()).strip("_")
-        folder = Path(tempfile.mkdtemp(prefix=f"{stamp}_{self.slug}_{mode}_", dir=runs))
+
+    def write(self, log: list[str], folder: Path | None = None) -> Path:
+        """Write the record, its log and its retention label, in ``folder`` or in a new folder, and return the folder. Written again in the same folder, they
+        hold the outcome and the observations as they are now."""
+        if folder is None:
+            stamp = self.started_utc.replace(":", "").replace("-", "")
+            runs = ROOT / "runs"
+            runs.mkdir(parents=True, exist_ok=True)
+            mode = re.sub(r"[^a-z0-9]+", "_", self.mode.lower()).strip("_")
+            folder = Path(tempfile.mkdtemp(prefix=f"{stamp}_{self.slug}_{mode}_", dir=runs))
         (folder / "record.json").write_text(json.dumps(asdict(self), indent=2) + "\n")
         (folder / "log.txt").write_text("\n".join(log) + "\n")
         label = {
@@ -214,7 +219,16 @@ class Record:
             "end_condition": PASSED_END if self.outcome == "pass" else FAILED_END,
         }
         (folder / "retention.json").write_text(json.dumps(label, indent=2) + "\n")
+        return folder
+
+    def report(self, folder: Path) -> int:
+        """Print each assertion and the outcome and return the exit code."""
         for item in self.observations:
             sys.stdout.write(f"{'PASS' if item.passed else 'FAIL'} {item.case} ({item.step}): {item.observed}\n")
         sys.stdout.write(f"{self.outcome}: record in {folder.relative_to(ROOT)}\n")
         return 0 if self.outcome == "pass" else 1
+
+    def close(self, log: list[str], *, blocked: str = "") -> int:
+        """Set the outcome, write the record, its log and its retention label in a new folder, print each assertion and return the exit code."""
+        self.settle(blocked)
+        return self.report(self.write(log))

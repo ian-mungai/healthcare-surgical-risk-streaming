@@ -292,10 +292,10 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(["source_extra: 1 patient"], source_problems(rows_of(FULL), set(short), SNAPSHOT))
 
     def test_the_columns_are_the_four_of_the_card_in_order(self) -> None:
-        self.assertEqual([], schema_problems(list(COLUMNS), COLUMNS, "table"))
+        self.assertEqual([], schema_problems(list(COLUMNS), COLUMNS))
         self.assertEqual((("subjectid", "string"), ("set", "string"), ("rule_version", "string"), ("source_snapshot_id", "bigint")), COLUMNS)
-        self.assertTrue(schema_problems([("subjectid", "bigint"), *COLUMNS[1:]], COLUMNS, "table"))
-        self.assertTrue(schema_problems(list(COLUMNS[:3]), COLUMNS, "table"))
+        self.assertEqual(["schema: failed"], schema_problems([("subjectid", "bigint"), *COLUMNS[1:]], COLUMNS))
+        self.assertEqual(["schema: failed"], schema_problems(list(COLUMNS[:3]), COLUMNS))
 
     def test_source_rows_give_the_patient_of_each_case_and_refuse_bad_rows_with_counts_only(self) -> None:
         cases, patients = source_cases([("1", "10"), ("2", "10"), ("3", "11")])
@@ -841,6 +841,27 @@ class CatalogTest(unittest.TestCase):
         self.assertFalse([key for key in session.conf_set if key.startswith("spark.sql.catalog.lake")])
 
 
+class SplitTableRowTest(unittest.TestCase):
+    """A row of the split table with no subject or no snapshot is refused with a code of its own, before any check that reads the row."""
+
+    GOOD = {"subjectid": "10", "set": "training", "rule_version": RULE_VERSION, "source_snapshot_id": 5}
+
+    def read(self, row: dict[str, Any]) -> None:
+        job = importlib.import_module("spark.jobs.patient_split")
+        session = FakeSession()
+        session.table = lambda name: FakeFrame(split_table.COLUMNS, [self.GOOD, row])  # type: ignore[method-assign]
+        job.Lake(session, NessieClient("http://127.0.0.1:1/api/v2"), "b", CatalogTest.SETTINGS).read_table("ab" * 32)
+
+    def test_a_row_that_is_not_in_form_is_refused_by_its_code(self) -> None:
+        for change in ({"subjectid": None}, {"source_snapshot_id": None}, {"subjectid": 10}, {"source_snapshot_id": "5"}, {"source_snapshot_id": False}):
+            with self.subTest(change=change), self.assertRaises(PatientSplitError) as caught:
+                self.read({**self.GOOD, **change})
+            self.assertEqual(["table_row: 1 row"], caught.exception.problems)
+
+    def test_a_row_in_form_is_read(self) -> None:
+        self.read({**self.GOOD, "subjectid": "11"})
+
+
 class FakeFrame:
     def __init__(self, fields: Sequence[tuple[str, str]], rows: list[dict[str, Any]]) -> None:
         self.schema = SimpleNamespace(
@@ -1182,7 +1203,7 @@ def all_messages() -> list[str]:
     messages += frozen_problems(rows_of(base, version="v9"), base, pinned=True)
     messages += source_problems(rows, set(base) - {patient}, SNAPSHOT + 1)
     messages += source_problems(rows, set(base) | {"9" + patient}, SNAPSHOT)
-    messages += schema_problems([(patient, "string")], COLUMNS, "table")
+    messages += schema_problems([(patient, "string")], COLUMNS)
     sample = [
         SampleCase(int(case), int(patient), "repeat_test"),
         SampleCase(int(case) + 1, int(patient) + 1, "odd"),

@@ -91,8 +91,9 @@ variable "github_environment" {
 }
 
 variable "tailscale_client_id" {
-  description = "Client ID of the Tailscale federated identity for the host. It is not a secret."
+  description = "Client ID of the Tailscale federated identity for the host. It is not a secret. The variable is sensitive only so that a refused value is never printed."
   type        = string
+  sensitive   = true
 
   validation {
     condition     = length(var.tailscale_client_id) > 0 && !startswith(var.tailscale_client_id, "tskey")
