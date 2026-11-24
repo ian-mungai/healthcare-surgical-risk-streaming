@@ -97,10 +97,12 @@ class Record:
     def report(self, folder: Path) -> int:
         """Print each assertion and the outcome, flushed, and return the exit code.
 
-        A print or flush that fails (a closed or broken stdout) is itself a failed assertion: the record and its label in ``folder`` are written again and
+        A print or flush that fails (stdout closed, broken or None) is itself a failed assertion: the record and its label in ``folder`` are written again and
         say fail (or keep their blocked reason), so a record never claims a pass that the run could not print.
         """
         try:
+            if sys.stdout is None:
+                raise OSError("standard output is closed")
             for item in self.observations:
                 sys.stdout.write(f"{'PASS' if item.passed else 'FAIL'} {item.case} ({item.step}): {item.observed}\n")
             sys.stdout.write(f"{self.outcome}: record in {folder.relative_to(ROOT)}\n")

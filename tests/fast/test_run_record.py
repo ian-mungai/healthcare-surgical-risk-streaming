@@ -195,6 +195,12 @@ class ReportAloneTest(unittest.TestCase):
         self.assertEqual((1, "fail", FAILED), (code, written["outcome"], label["end_condition"]))
         self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
 
+    def test_a_stdout_that_python_set_to_none_gives_a_record_that_says_fail(self) -> None:
+        """Recheck: a runner started with its standard output closed (``1>&-``) has ``sys.stdout`` set to ``None``."""
+        with mock.patch.object(sys, "stdout", None):
+            code, written, label = self.written("")
+        self.assertEqual((1, "fail", FAILED), (code, written["outcome"], label["end_condition"]))
+
     def test_a_failed_print_keeps_the_blocked_reason(self) -> None:
         code, written, _ = self.written("interrupted")
         self.assertEqual((1, "blocked: interrupted"), (code, written["outcome"]))
