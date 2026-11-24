@@ -8,8 +8,9 @@ PST: "B").
 
 **Status: decided.** The owner decided the values below on Nov 23 2026 PST ("A"; project standard, Data, "Warning grid rule"). They come from the approved
 analysis plan ("Sample grid": one sample at each fixed 1-minute elapsed time; "Eligible monitored time": between ``opstart`` and ``opend``; the primary label
-window is 5 minutes). The unscored share is measured on this grid and reads these constants and no copy of them: the cutoffs, the step, the first cutoff, the
-last cutoff margin and the names of the origin and end columns (``spark.profile.unscored``, ``spark.profile.frames``).
+window is 5 minutes). The job plans the rule from these constants and saves it as one row. The unscored share is measured on that saved
+row (``GridRule``), not on the constants: the step, the first cutoff, the last cutoff margin and the name of the origin column come from the row
+(``spark.profile.unscored``, ``spark.profile.frames``). The end column is the constant ``RULE_END``.
 """
 
 from __future__ import annotations
