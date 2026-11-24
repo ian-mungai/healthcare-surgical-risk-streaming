@@ -12,6 +12,11 @@ key to the same member, and a new member never changes another member's key. The
 natural key and missing descriptive columns: a fact whose natural key is missing, or that names a member the dimension does not hold, takes the key -1.
 A built dimension keeps every member it held: a member that disappears from the source or whose descriptive columns change is refused, not written.
 
+``dim_track`` has one row for each distinct track name (``bronze.tracks.track``, the device, a slash and the track's own name). The publisher's track list
+repeats some track names within a case under different track IDs; the track ID is no column of Bronze or of this dimension, and the members are the distinct
+names, so a repeated name adds no member and changes neither the natural key nor the grain. If the descriptive columns of one name differ between rows, the
+build refuses it as ``ambiguous_members`` instead of choosing a row.
+
 The test set is sealed: nothing here names a case, a patient or a value. Every failure is a code, a dimension and a count.
 """
 
