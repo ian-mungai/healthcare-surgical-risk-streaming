@@ -192,8 +192,8 @@ def settle_push_guard(*, check: bool) -> bool:
         return False
     try:
         push_hook.install(ROOT)
-    except worktree_scan_hook.KeptHookError as error:
-        sys.stderr.write(f"push hook: {describe_error(error)}\n")
+    except worktree_scan_hook.KeptHookError:
+        sys.stderr.write(f"push hook: {push_hook.KEPT_REFUSAL}\n")
         return False
     sys.stdout.write("push hook: installed\n")
     return True

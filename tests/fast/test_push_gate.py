@@ -422,13 +422,31 @@ class PushHookTest(TemporaryRepository):
         with self.assertRaises(worktree_scan_hook.KeptHookError):
             push_hook.install(self.repo)
 
-    def test_a_kept_hook_that_cannot_be_kept_shows_the_type_name_and_no_word_of_the_error(self) -> None:
+    def test_a_kept_hook_that_cannot_be_kept_shows_the_fixed_repair_message(self) -> None:
         for name in (push_hook.HOOK_NAME, push_hook.KEPT_NAME):
             (self.repo / ".git" / "hooks" / name).write_text("#!/bin/sh\n")
         err = io.StringIO()
         with mock.patch.object(install_tools, "ROOT", self.repo), contextlib.redirect_stderr(err):
             self.assertFalse(install_tools.settle_push_guard(check=False))
-        self.assertEqual("push hook: KeptHookError\n", err.getvalue())
+        self.assertEqual(f"push hook: {push_hook.KEPT_REFUSAL}\n", err.getvalue())
+
+    def test_the_setup_entry_point_prints_the_fixed_repair_message_and_fails_when_an_owner_hook_cannot_be_kept(self) -> None:
+        """Join round 4, finding 2: the line that setup printed was only ``push hook: KeptHookError``, which names no repair."""
+        for name in (push_hook.HOOK_NAME, push_hook.KEPT_NAME):
+            (self.repo / ".git" / "hooks" / name).write_text("#!/bin/sh\n")
+        before = self.hooks_state()
+        err = io.StringIO()
+        with (
+            mock.patch.object(install_tools, "ROOT", self.repo),
+            mock.patch.object(install_tools, "settle", return_value=True),
+            mock.patch.object(install_tools, "settle_hook", return_value=True),
+            mock.patch.object(sys, "argv", ["install_tools"]),
+            contextlib.redirect_stderr(err),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(1, install_tools.main())
+        self.assertEqual(f"push hook: {push_hook.KEPT_REFUSAL}\n", err.getvalue())
+        self.assertEqual(before, self.hooks_state())
 
     def test_a_pre_push_script_that_is_a_link_is_refused_and_neither_the_link_nor_its_target_changes(self) -> None:
         """The replacement of an earlier hook is the owned-file write: a link is not a regular file, so it is never followed or replaced."""
@@ -472,7 +490,7 @@ class PushHookTest(TemporaryRepository):
         err = io.StringIO()
         with mock.patch.object(install_tools, "ROOT", self.repo), contextlib.redirect_stderr(err):
             self.assertFalse(install_tools.settle_push_guard(check=False))
-        self.assertEqual("push hook: KeptHookError\n", err.getvalue())
+        self.assertEqual(f"push hook: {push_hook.KEPT_REFUSAL}\n", err.getvalue())
         self.assertEqual(before, self.hooks_state())
 
     def test_two_different_owner_hooks_at_pre_push_and_pre_push_legacy_previous_are_refused_and_neither_changes(self) -> None:
@@ -672,7 +690,7 @@ class PushHookTest(TemporaryRepository):
                 self.assertEqual(self.must_refuse(layout), not settled, "the setup is refused exactly when an owner hook or its name would be lost")
                 if not settled:
                     failures += 1
-                    self.assertEqual("push hook: KeptHookError\n", err.getvalue())
+                    self.assertEqual(f"push hook: {push_hook.KEPT_REFUSAL}\n", err.getvalue())
                     self.assertEqual(before, self.hooks_state(), "a refused setup changes no entry of the hooks folder")
                     continue
                 runs += 1

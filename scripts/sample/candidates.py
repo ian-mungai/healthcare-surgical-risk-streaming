@@ -138,7 +138,7 @@ def case_key(case: int) -> str:
 def read_text(path: Path, role: Subject) -> str:
     """The text of a file the command reads. Raise ``PublisherError`` that names the file by its role, never by its path."""
     try:
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     except OSError, UnicodeDecodeError:
         raise PublisherError(Notice(Code.CANNOT_READ, subject=role)) from None
 
@@ -323,7 +323,7 @@ def read_inputs(release: dict[str, Any], workdir: Path) -> tuple[list[CaseFacts]
     sums_path = workdir / "SHA256SUMS.txt"
     download_key(checksum_list["key"], sums_path)
     read_pinned(Subject.CHECKSUM_LIST, sums_path, checksum_list["size_bytes"], checksum_list["sha256"])
-    sums = parse_checksum_list(sums_path.read_text())
+    sums = parse_checksum_list(read_text(sums_path, Subject.CHECKSUM_LIST))
     for table in release["tables"]:
         if sums.get(table["key"]) != table["sha256"]:
             raise PublisherError(Notice(Code.TABLE_NOT_IN_LIST, subject=TABLE_SUBJECTS[table["key"]]))
