@@ -68,6 +68,14 @@ def number(env: Mapping[str, str], name: str, default: float, *, minimum: float,
     return value
 
 
+def offset_count(env: Mapping[str, str], name: str, default: int) -> int:
+    """The number of offsets per trigger: a whole number from 1 to ``MAXIMUM_OFFSETS``. A fraction is refused and never cut to a whole number."""
+    value = number(env, name, float(default), minimum=0, maximum=MAXIMUM_OFFSETS)
+    if value < 1 or not value.is_integer():
+        raise StreamSettingsError(f"{name} must be a whole number from 1")
+    return int(value)
+
+
 def from_environment(env: Mapping[str, str]) -> StreamSettings:
     test_exit: int | None = None
     if env.get("STREAM_TEST_EXIT_AFTER_SINK", ""):
@@ -75,6 +83,9 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
         if not text.isdigit() or int(text) < 1:
             raise StreamSettingsError("STREAM_TEST_EXIT_AFTER_SINK must be a whole number from 1")
         test_exit = int(text)
+    cutoff_step_us = round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND)
+    if cutoff_step_us < 1:
+        raise StreamSettingsError("STREAM_CUTOFF_STEP_SECONDS must be at least one microsecond")
     return StreamSettings(
         bootstrap=required(env, "KAFKA_BOOTSTRAP"),
         registry_url=required(env, "REGISTRY_URL"),
@@ -83,9 +94,9 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
         output_topic=env.get("STREAM_OUTPUT_TOPIC", "") or FEATURE_READY_TOPIC,
         branch=env.get("STREAM_BRANCH", "") or DEFAULT_BRANCH,
         late_limit_us=round(number(env, "STREAM_LATE_LIMIT_SECONDS", DEFAULT_LATE_LIMIT_SECONDS, minimum=0, allow_zero=True) * SECOND),
-        cutoff_step_us=round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND),
+        cutoff_step_us=cutoff_step_us,
         trigger_seconds=number(env, "STREAM_TRIGGER_SECONDS", DEFAULT_TRIGGER_SECONDS, minimum=0),
-        max_offsets_per_trigger=int(number(env, "STREAM_MAX_OFFSETS_PER_TRIGGER", DEFAULT_MAX_OFFSETS, minimum=0, maximum=MAXIMUM_OFFSETS)),
+        max_offsets_per_trigger=offset_count(env, "STREAM_MAX_OFFSETS_PER_TRIGGER", DEFAULT_MAX_OFFSETS),
         max_seconds=number(env, "STREAM_MAX_SECONDS", 0.0, minimum=0, allow_zero=True),
         clinical_file=env.get("STREAM_CLINICAL_FILE", ""),
         test_exit_after_sink=test_exit,

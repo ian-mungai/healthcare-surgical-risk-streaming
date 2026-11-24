@@ -95,6 +95,22 @@ class StartupRefusals(unittest.TestCase):
                 self.checkpoint = self.root / f"ck_{port}"
                 self.assert_fixed(*self.run_main(REGISTRY_URL=f"http://registry:{port}/apis/registry/v3"), 2, "stream_features: SettingsError\n")
 
+    def test_an_address_that_urlsplit_refuses_is_the_settings_exit_and_shows_no_value(self) -> None:
+        for host in ("[::1", f"[{MARKER}", f"nes\u2100{MARKER}"):
+            for name, path in (("NESSIE_URI", "/api/v2"), ("REGISTRY_URL", "/apis/registry/v3")):
+                with self.subTest(name=name, host=host):
+                    self.checkpoint = self.root / f"ck_{name}"
+                    self.assert_fixed(*self.run_main(**{name: f"http://{host}:80{path}"}), 2, "stream_features: SettingsError\n")
+
+    def test_an_offsets_setting_with_a_fraction_or_below_one_is_the_settings_exit_and_shows_no_value(self) -> None:
+        for value in ("0.5", "1.5", "0.9999999"):
+            with self.subTest(value=value):
+                self.checkpoint = self.root / f"ck_{value}"
+                self.assert_fixed(*self.run_main(STREAM_MAX_OFFSETS_PER_TRIGGER=value), 2, "stream_features: StreamSettingsError\n")
+
+    def test_a_cutoff_step_that_rounds_to_zero_is_the_settings_exit(self) -> None:
+        self.assert_fixed(*self.run_main(STREAM_CUTOFF_STEP_SECONDS="1e-7"), 2, "stream_features: StreamSettingsError\n")
+
     def test_a_number_setting_that_is_not_finite_or_not_in_range_is_the_settings_exit_and_shows_no_value(self) -> None:
         names = (
             "STREAM_LATE_LIMIT_SECONDS",
