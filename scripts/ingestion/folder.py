@@ -8,10 +8,13 @@ at any folder above or below it, raises ``OSError``. That includes a link to not
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import os
 import stat
 from pathlib import Path
+
+MAX_LINKS = 40
 
 
 def raise_error(error: OSError) -> None:
@@ -32,12 +35,50 @@ def exists(folder: Path) -> bool:
     return True
 
 
+def searched_folders(path: Path) -> list[Path]:
+    """Every folder that looking up ``path`` searches, found one link at a time: the folders of the path as it is followed, and the folder of each link that is
+    read on the way, whatever the link points at (a link in a folder that can be searched but not read is still in that folder). At most ``MAX_LINKS`` links
+    are followed; one more is an ``OSError`` (``ELOOP``), as for the system's own lookup. Nothing is resolved by ``realpath``, which hides each hop."""
+    found: list[Path] = []
+    start = path if path.is_absolute() else Path.cwd() / path
+    here = Path(start.anchor)
+    pending = list(reversed(start.parts[1:]))
+    links = 0
+    while pending:
+        name = pending.pop()
+        if name == "..":
+            here = here.parent
+            continue
+        found.append(here)
+        step = here / name
+        try:
+            target = Path(os.readlink(step))
+        except OSError as error:
+            if error.errno not in {errno.EINVAL, errno.ENOENT, errno.ENOTDIR}:
+                raise
+            here = step
+            continue
+        links += 1
+        if links > MAX_LINKS:
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
+        if target.is_absolute():
+            here = Path(target.anchor)
+            pending.extend(reversed(target.parts[1:]))
+        else:
+            pending.extend(reversed(target.parts))
+    return found
+
+
 def refuse_unreadable_ancestors(folder: Path) -> None:
-    """Raise ``PermissionError`` unless every existing ancestor of ``folder`` allows read and search: a missing folder is empty only under a chain that could
-    have shown it, and an ancestor that can be searched but not read hides what its folder holds. Both chains are checked, the one as written and the one of the
-    real path, so a link that skips an unreadable folder gives no other answer than the real path does."""
-    real = Path(os.path.realpath(folder))
-    for ancestor in dict.fromkeys((*folder.parents, *real.parents)):
+    """Raise ``PermissionError`` unless every existing folder that the lookup of ``folder`` passes through allows read and search: a missing folder is empty
+    only under a chain that could have shown it, and a folder that can be searched but not read hides what it holds. The chain as written and every folder
+    that is searched hop by hop (``searched_folders``, the folder of each link included) are checked, so a link that skips an unreadable folder, in one hop
+    or in several, gives no other answer than the real path does."""
+    for ancestor in dict.fromkeys((*folder.parents, *searched_folders(folder))):
+        try:
+            os.lstat(ancestor)
+        except FileNotFoundError:
+            continue
         if not os.access(ancestor, os.R_OK | os.X_OK):
             raise PermissionError(f"{ancestor.name or ancestor} cannot be read and searched")
 

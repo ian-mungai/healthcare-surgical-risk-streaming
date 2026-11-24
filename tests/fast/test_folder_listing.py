@@ -7,6 +7,7 @@ run ID was chosen twice. ``list_folder`` raises instead, and the scan below hold
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import re
 import tempfile
@@ -15,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from replay.service.serve import next_request
-from scripts.ingestion.folder import list_files, list_folder
+from scripts.ingestion.folder import MAX_LINKS, list_files, list_folder, searched_folders
 from scripts.ingestion.record_load import earlier_record
 from scripts.process import run_command
 from scripts.stack.lifecycle import declared_problems
@@ -153,6 +154,74 @@ class ListFolderTests(unittest.TestCase):
         for recursive in (False, True):
             with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
                 list_folder(locked / "alias" / "absent", recursive=recursive)
+
+    def two_hop_alias(self, *, relative: bool) -> Path:
+        """``alias`` links to ``hidden/hop`` and ``hidden/hop`` links to ``real/inner``: ``hidden`` is on neither the path as written nor the real path."""
+        base = self.root / ("relative" if relative else "absolute")
+        (base / "real" / "inner").mkdir(parents=True)
+        (base / "hidden").mkdir()
+        (base / "hidden" / "hop").symlink_to("../real/inner" if relative else base / "real" / "inner")
+        (base / "alias").symlink_to("hidden/hop" if relative else base / "hidden" / "hop")
+        return base / "alias" / "absent"
+
+    def test_a_missing_folder_reached_through_two_links_is_an_error_when_the_folder_of_a_link_can_be_searched_but_not_read(self) -> None:
+        for relative in (False, True):
+            with self.subTest(relative=relative):
+                missing = self.two_hop_alias(relative=relative)
+                hidden = missing.parent.parent / "hidden"
+                hidden.chmod(0o100)
+                self.addCleanup(hidden.chmod, 0o700)
+                if os.access(hidden, os.R_OK):
+                    self.skipTest("this account reads every folder")
+                for recursive in (False, True):
+                    with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
+                        list_folder(missing, recursive=recursive)
+                    with self.subTest(recursive=recursive, files=True), self.assertRaises(PermissionError):
+                        list_files(missing, recursive=recursive)
+                hidden.chmod(0o700)
+
+    def test_a_missing_folder_reached_through_two_links_under_readable_folders_stays_empty(self) -> None:
+        for relative in (False, True):
+            with self.subTest(relative=relative):
+                missing = self.two_hop_alias(relative=relative)
+                for recursive in (False, True):
+                    self.assertEqual([], list_folder(missing, recursive=recursive))
+                    self.assertEqual([], list_files(missing, recursive=recursive))
+
+    def test_a_chain_of_more_than_forty_links_is_an_error_and_not_an_empty_listing(self) -> None:
+        (self.root / "real").mkdir()
+        previous = self.root / "real"
+        for number in range(41):
+            link = self.root / f"link{number}"
+            link.symlink_to(previous)
+            previous = link
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(OSError):
+                list_folder(previous / "absent", recursive=recursive)
+        shorter = self.root / "link5" / "absent"
+        self.assertEqual([], list_folder(shorter))
+
+    def test_the_hop_by_hop_search_names_every_folder_and_stops_after_the_limit_of_links(self) -> None:
+        base = self.root.resolve()
+        (base / "real").mkdir()
+        previous = base / "real"
+        chain: list[Path] = []
+        for number in range(MAX_LINKS + 1):
+            link = base / f"hop{number}"
+            link.symlink_to(previous)
+            chain.append(link)
+            previous = link
+        self.assertEqual(40, MAX_LINKS)
+        self.assertIn(base, searched_folders(chain[MAX_LINKS - 1] / "absent"))
+        with self.assertRaises(OSError) as caught:
+            searched_folders(chain[MAX_LINKS] / "absent")
+        self.assertEqual(errno.ELOOP, caught.exception.errno)
+
+    def test_a_link_that_loops_is_an_error_and_not_an_empty_listing(self) -> None:
+        (self.root / "loop").symlink_to("loop")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(OSError):
+                list_folder(self.root / "loop" / "absent", recursive=recursive)
 
     def test_a_missing_folder_reached_through_a_link_under_readable_ancestors_on_both_routes_stays_empty(self) -> None:
         (self.root / "real" / "inner").mkdir(parents=True)
