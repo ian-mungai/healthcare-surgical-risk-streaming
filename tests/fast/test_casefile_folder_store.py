@@ -1,4 +1,5 @@
-"""The replay's folder store keeps the ingestion store's contract: closed errors only, and one version for a created key.
+"""The shared folder store (``casefile/folder_store.py``, used by the replay and the Bronze decoder) keeps the ingestion
+store's contract: closed errors only, and one version for a created key.
 
 The folder store stands in for the landed copy when the replay runs without a bucket, and the project's own check, manifest and gate run against it. A
 plain-text error would stop them with a ``TypeError`` instead of the refusal they report, and a create that adds a second version would let a manifest key
@@ -11,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from replay.service.folder_store import FolderStore
+from casefile.folder_store import FolderStore
 from scripts.ingestion.notice import Code
 from scripts.ingestion.store import ObjectVersion, StoreError
 

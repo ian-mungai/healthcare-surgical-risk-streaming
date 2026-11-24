@@ -20,7 +20,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from spark.bronze.structure import END_TOLERANCE_SECONDS, recording_problem, walk_file
+from casefile.decoding import END_TOLERANCE_SECONDS
+from spark.bronze.structure import recording_problem, walk_file
 from tests.fast.vital_support import START, packet, record_packet, track_packet, vital
 
 

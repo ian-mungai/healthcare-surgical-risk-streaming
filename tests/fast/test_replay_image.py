@@ -99,7 +99,7 @@ def ignore_rules(text: str) -> list[str]:
 
 
 def replay_sources() -> list[str]:
-    return sorted(str(path.relative_to(ROOT)) for folder in ("replay/service", "replay/events") for path in (ROOT / folder).glob("*.py"))
+    return sorted(str(path.relative_to(ROOT)) for folder in ("replay/service", "replay/events", "casefile") for path in (ROOT / folder).glob("*.py"))
 
 
 class RealImageTest(unittest.TestCase):
@@ -107,6 +107,7 @@ class RealImageTest(unittest.TestCase):
         needed = imported_files(replay_sources()) | set(READ_FILES)
         self.assertIn("scripts/ingestion/gate.py", needed)
         self.assertIn("scripts/sample/candidates.py", needed)
+        self.assertTrue({"casefile/decoding.py", "casefile/folder_store.py", "casefile/s3_store.py"} <= needed)
         self.assertEqual([], problems(DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text()), needed))
 
 
@@ -147,11 +148,17 @@ class PlantedDefectTest(unittest.TestCase):
     def test_a_module_or_the_pin_left_out_is_named(self) -> None:
         needed = imported_files(replay_sources()) | set(READ_FILES)
         text, rules = DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text())
-        for path in ("scripts/sample/candidates.py", "scripts/project_config.py", "tests/fixtures/vitaldb/release.json"):
+        for path in ("scripts/sample/candidates.py", "scripts/project_config.py", "tests/fixtures/vitaldb/release.json", "casefile/decoding.py"):
             with self.subTest(left_out=path):
                 self.assertIn(f"{path}: the build's ignore file leaves it out", problems(text, [*rules, path], needed))
         without = "\n".join(line for line in text.splitlines() if "scripts/ingestion" not in line)
         self.assertIn(f"scripts/ingestion/gate.py: no COPY line puts it at {APP}/scripts/ingestion/gate.py", problems(without, rules, needed))
+
+
+class NoOtherImageTest(unittest.TestCase):
+    def test_the_replay_image_copies_nothing_of_the_spark_jobs(self) -> None:
+        self.assertEqual([], [source for source, _ in copies(DOCKERFILE.read_text()) if source == "spark" or source.startswith("spark/")])
+        self.assertFalse([rule for rule in ignore_rules(IGNORE_FILE.read_text()) if rule.removeprefix("!").startswith("spark")])
 
 
 class HostSourcesTest(unittest.TestCase):

@@ -5,8 +5,8 @@ version of its passed manifest, and refuses a missing or substituted version for
 manifest binds into a scratch file and compares its SHA-256 with the manifest's before anything is decoded, so a version that changed after the gate cannot be
 read by mistake.
 
-The object store is the replay's: the project's bucket read with boto3 on the host, or a folder of object versions in a local run
-(``replay/service/folder_store.py``).
+The object store is the shared package's read-only store (``casefile``), which the replay uses too: the project's bucket read with boto3 on the host
+(``casefile/s3_store.py``), or a folder of object versions in a local run (``casefile/folder_store.py``).
 """
 
 from __future__ import annotations

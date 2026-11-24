@@ -6,6 +6,8 @@ Failure modes covered here:
 
 - The decoder drops the sample format, so a waveform second reaches the stream with no way to tell a gap marker from a reading or a float from an integer.
 - The decoder reads the format from another field than Bronze does, so the stream and Silver decode one track by two formats.
+- Either decoder rounds a packet's start before the sample is placed, so the replay's ``decode_case`` and Bronze's ``case_rows`` put one
+  sample of the same file in different seconds. The test runs both on one file and holds each to the exact seconds.
 - The decoder changes the raw samples, so a gap marker of an integer format is no longer the raw value that the format's marker names.
 
 The stand-in gives the four-byte integer formats (7 and 8) a type character that the decoder reads as another dtype than the real library's, so these tests run
@@ -24,12 +26,14 @@ from typing import Any
 from unittest import mock
 
 from replay.events.recording import CaseTimes
+from replay.events.waveform import second_samples, second_spans
 from tests.fast.fake_vitaldb import FakeVitalFile, installed
 from tests.fast.vital_support import START, track_packet, vital, waveform_record
 
 TIMES = CaseTimes(7, 0, 1_000_000, 2_000_000)
 decoder: Any
 rows_module: Any
+library_module: Any
 
 
 class PathFile(FakeVitalFile):
@@ -41,11 +45,12 @@ class PathFile(FakeVitalFile):
 
 
 def setUpModule() -> None:
-    global decoder, rows_module
+    global decoder, rows_module, library_module
     unittest.enterModuleContext(installed())
     decoder = importlib.import_module("replay.service.decode")
     unittest.enterModuleContext(mock.patch.object(decoder, "vitaldb", types.SimpleNamespace(VitalFile=PathFile)))
     rows_module = importlib.import_module("spark.bronze.rows")
+    library_module = importlib.import_module("spark.bronze.library")
 
 
 class SampleFormat(unittest.TestCase):
@@ -87,3 +92,20 @@ class PacketStart(unittest.TestCase):
         decoded = decoder.decode_case(path, CaseTimes(7, 0, 940_000_000, 941_000_000)).waveforms[0]
         self.assertEqual([START, start], [record.start_s for record in decoded.records])
         self.assertNotEqual(START + round((start - START) * 1_000_000) / 1_000_000, decoded.records[1].start_s)
+
+    def test_the_replay_and_bronze_place_a_sample_half_a_microsecond_before_a_boundary_in_the_same_second(self) -> None:
+        """The cases that moved one sample across a second boundary when the start was rounded first (cases 565 and 5754): the replay's ``decode_case`` and
+        Bronze's ``case_rows`` each read the same file with the stand-in library, and each takes the exact start, so a rounding in either path fails."""
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        start = START + 940.0 - 2.0**-21
+        path = Path(folder.name) / "case.vital"
+        packets = (waveform_record(1, 2, [9, 9, 9, 9], dt=START), waveform_record(1, 2, [1, 2, 3, 4], dt=start))
+        path.write_bytes(gzip.compress(vital(track_packet(1, name="WAVE", kind=1, fmt=2, rate=4.0), *packets)))
+        track = decoder.decode_case(path, CaseTimes(7, 0, 940_000_000, 941_000_000)).waveforms[0]
+        replay_seconds = [(span.second, span.start_offset_us, second_samples(track, span)) for span in second_spans(track)]
+        bronze_seconds = [(row[2], row[3], row[4]) for row in library_module.case_rows(path, 7, "waveform", rows_module.Lineage("v0001", "ab" * 32))]
+        expected = [(939, 999_999, [1.0]), (940, 249_999, [2.0, 3.0, 4.0])]
+        self.assertEqual(expected, replay_seconds[-2:])
+        self.assertEqual(expected, bronze_seconds[-2:])
+        self.assertEqual(replay_seconds, bronze_seconds)

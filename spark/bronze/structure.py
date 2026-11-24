@@ -30,9 +30,10 @@ from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-END_TOLERANCE_SECONDS = 2.0
-CARRIED_TYPES = (1, 2, 5)
-WAVEFORM, NUMERIC, TEXT = CARRIED_TYPES
+from casefile.decoding import NUMERIC, WAVEFORM
+from casefile.decoding import STRING as TEXT
+
+CARRIED_TYPES = (WAVEFORM, NUMERIC, TEXT)
 MARK = b"VITA"
 CUT_SHORT = "the file ends inside its header or inside a packet, so it is cut short"
 PACKET_HEAD_BYTES = 5

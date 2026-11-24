@@ -15,6 +15,7 @@ The wheels for Python 3.14 on linux/amd64 and the hashes are proved by the build
 
 from __future__ import annotations
 
+import posixpath
 import re
 import unittest
 from pathlib import Path
@@ -55,6 +56,11 @@ def copied_pairs(dockerfile: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def covers(line: str, path: str) -> bool:
+    """Whether a ``COPY`` line copies ``path``: it names the file, or a folder that holds it."""
+    return any(path == source or path.startswith(source + "/") for source, _ in copied_pairs(line))
+
+
 def image_problems(dockerfile: str, rules: list[str], needed: set[str]) -> list[str]:
     """Each needed file that no ``COPY`` line puts at its own path below ``/opt/jobs``, or that the build's ignore file leaves out."""
     found = []
@@ -65,6 +71,29 @@ def image_problems(dockerfile: str, rules: list[str], needed: set[str]) -> list[
             found.append(f"{path}: no COPY line puts it at {JOBS}/{path}")
         elif ignored(path, rules):
             found.append(f"{path}: the build's ignore file leaves it out")
+    return found
+
+
+FOREIGN = ("replay/service/decode.py", "replay/service/folder_store.py", "replay/service/s3_store.py")
+
+
+def context_path(path: str) -> str:
+    """A path of the build context as Docker resolves it: relative to the context root, with ``.``, ``..`` and repeated or trailing slashes resolved
+    (``spark/../replay/service`` is ``replay/service``; ``/replay`` and ``./replay`` are ``replay``; the root is ``.``)."""
+    return posixpath.normpath(path.lstrip("/") or ".")
+
+
+def foreign_problems(dockerfile: str, rules: list[str], banned: tuple[str, ...]) -> list[str]:
+    """Each banned file that the image could still hold: a ``COPY`` of it or of a folder above it, or an ignore file whose last matching rule lets it in."""
+    found = []
+    sources = [context_path(source) for source, _ in copied_pairs(dockerfile)]
+    rules = [("!" if rule.startswith("!") else "") + context_path(rule.removeprefix("!")) for rule in rules]
+    for path in banned:
+        found += [
+            f"{path}: a COPY line copies {source}, which holds it" for source in sources if source == "." or path == source or path.startswith(source + "/")
+        ]
+        if not ignored(path, rules):
+            found.append(f"{path}: the build's ignore file lets it in")
     return found
 
 
@@ -116,7 +145,9 @@ class Image(unittest.TestCase):
     def test_every_module_that_the_decoder_imports_and_the_pin_are_in_the_image(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         for path in (
-            "replay/service/decode.py",
+            "casefile/decoding.py",
+            "casefile/folder_store.py",
+            "casefile/s3_store.py",
             "replay/events/waveform.py",
             "scripts/ingestion/gate.py",
             "scripts/sample/candidates.py",
@@ -133,11 +164,11 @@ class Image(unittest.TestCase):
     def test_a_module_or_the_pin_left_out_is_named(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         text, rules = DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text())
-        for path in ("replay/service/decode.py", "replay/events/stream.py", "scripts/process.py", "tests/fixtures/vitaldb/release.json"):
+        for path in ("casefile/decoding.py", "replay/events/stream.py", "scripts/process.py", "tests/fixtures/vitaldb/release.json"):
             with self.subTest(ignored=path):
                 self.assertIn(f"{path}: the build's ignore file leaves it out", image_problems(text, [*rules, path], needed))
             with self.subTest(not_copied=path):
-                without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
+                without = "\n".join(line for line in text.splitlines() if not covers(line, path))
                 self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, rules, needed))
 
     def test_the_image_holds_every_file_of_the_feature_package_so_its_version_is_the_hosts(self) -> None:
@@ -150,6 +181,43 @@ class Image(unittest.TestCase):
             with self.subTest(left_out=path):
                 without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
                 self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, ignore_rules(IGNORE_FILE.read_text()), every))
+
+    def test_the_image_copies_none_of_the_replay_services_decoder_or_stores_which_the_shared_package_holds(self) -> None:
+        """The Bronze job and the replay each copy the shared ``casefile`` package, and neither copies the other's files for it: the replay's decoder module
+        imports the publisher's library, which the replay image holds for the replay alone."""
+        self.assertEqual([], foreign_problems(DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text()), FOREIGN))
+
+    def test_a_copy_of_the_file_or_of_a_folder_above_it_and_an_ignore_rule_that_lets_it_in_are_named(self) -> None:
+        text, rules = DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text())
+        path = "replay/service/decode.py"
+        for source in (path, "replay/service", "replay/service/", "replay", "."):
+            with self.subTest(copy=source):
+                self.assertIn(
+                    f"{path}: a COPY line copies {source.rstrip('/') or '.'}, which holds it",
+                    foreign_problems(f"{text}\nCOPY {source} /opt/jobs/x", rules, FOREIGN),
+                )
+        for rule in ("!replay/service", "!replay/service/decode.py", "!replay", "!replay/service/*.py", "!**/decode.py"):
+            with self.subTest(rule=rule):
+                self.assertIn(f"{path}: the build's ignore file lets it in", foreign_problems(text, [*rules, rule], FOREIGN))
+        for spelled, named in (
+            ("spark/../replay/service", "replay/service"),
+            ("./replay/service", "replay/service"),
+            ("/replay", "replay"),
+            ("replay/./service/", "replay/service"),
+        ):
+            with self.subTest(copy=spelled):
+                self.assertIn(f"{path}: a COPY line copies {named}, which holds it", foreign_problems(f"{text}\nCOPY {spelled} /opt/jobs/x", rules, FOREIGN))
+        for rule in ("!spark/../replay/service", "!./replay/service", "!/replay/service/decode.py"):
+            with self.subTest(rule=rule):
+                self.assertIn(f"{path}: the build's ignore file lets it in", foreign_problems(text, [*rules, rule], FOREIGN))
+        with self.subTest("a folder copy with a folder rule, as the review planted"):
+            self.assertEqual(
+                [f"{p}: a COPY line copies replay/service, which holds it" for p in FOREIGN] + [f"{p}: the build's ignore file lets it in" for p in FOREIGN],
+                sorted(
+                    foreign_problems(f"{text}\nCOPY replay/service /opt/jobs/replay/service", [*rules, "!replay/service"], FOREIGN),
+                    key=lambda found: "lets" in found,
+                ),
+            )
 
     def test_the_image_copies_no_replay_module_that_no_job_imports(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)

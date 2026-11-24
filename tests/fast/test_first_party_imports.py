@@ -24,7 +24,7 @@ from pathlib import Path
 from tests.fast.git_fixture import git_in
 
 ROOT = Path(__file__).resolve().parents[2]
-FIRST_PARTY = ("spark", "scripts", "features", "orchestration", "replay", "tests")
+FIRST_PARTY = ("spark", "scripts", "features", "orchestration", "replay", "casefile", "tests")
 
 
 def tracked_python(root: Path) -> set[Path]:
@@ -104,6 +104,10 @@ class RepositoryImports(unittest.TestCase):
         self.assertGreater(len(files), 200)
         self.assertTrue(all(file in tracked for file in files))
         self.assertEqual([], unresolved_imports(ROOT, files, tracked))
+
+    def test_the_shared_case_file_package_is_one_of_the_checked_roots(self) -> None:
+        files = first_party_python(tracked_python(ROOT))
+        self.assertIn(ROOT / "casefile" / "decoding.py", files)
 
 
 class Resolver(unittest.TestCase):

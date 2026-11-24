@@ -1,8 +1,8 @@
-"""The object store of the replay on the host: the landed object versions in the project's bucket, read with boto3.
+"""The object store that the replay and the Bronze job share on the host: the landed object versions in the project's bucket, read with boto3.
 
-It implements the ``ObjectStore`` of the ingestion checks, for reads only: its ``create_object`` refuses. The replay reads a version by its ID, so a version
-that was substituted after the gate cannot be read by mistake. The credentials come from the standard AWS credential chain of the container: the replay's
-own short-lived workload access. Nothing in this module writes.
+It implements the ``ObjectStore`` of the ingestion checks, for reads only: its ``create_object`` refuses. A caller reads a version by its ID, so a version
+that was substituted after the gate cannot be read by mistake. The credentials come from the standard AWS credential chain of the container: the short-lived
+workload access of the job that runs it. Nothing in this module writes.
 """
 
 from __future__ import annotations
