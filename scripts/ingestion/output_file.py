@@ -9,10 +9,12 @@ leads nowhere), a folder and a name that differs from an existing one only in le
 path. An output that a command appends to as it runs calls ``check_new_output`` first and creates the file with an exclusive open of its own. The
 temporary name is a dot, eight hex digits and ``.part``, never the name of the output, so an output name of 255 bytes works.
 
-``replace_owned_file`` is for the state that a long-running command owns and must update (a heartbeat, a queue count, a saved position). ``state_root`` is the
-folder that the command created or was given as its state folder. The path must lie directly inside it; the entry that is there, if any, must be a regular file
-and not a link; the write is a private temporary file in that folder, then ``os.replace``, so a reader sees the old file or the new one whole. A path outside
-the folder, a link, a folder and any other kind of entry are refused with fixed text and nothing is written.
+``replace_owned_file`` is for the state that a long-running command owns and must update (a heartbeat, a queue count, a saved position). ``state_root`` is a
+folder from a fixed source: a module constant, a folder that the same command created in this run, or the service's state-folder setting. It is never built
+from the path that is replaced (``path.parent``), because that check passes for every path; a scan test fails for such a call. The path must lie directly
+inside it; the entry that is there, if any, must be a regular file and not a link; the write is a private temporary file in that folder, then ``os.replace``,
+so a reader sees the old file or the new one whole. A path outside the folder, a link, a folder and any other kind of entry are refused with fixed text and
+nothing is written.
 """
 
 from __future__ import annotations

@@ -512,7 +512,7 @@ CONFIGURATION = {
 def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     path = folder / "run_binding.json"
     RunBinding("20260101t0000-abcdef", "0" * 40, backend, "us-west-2", "example-project", "default", ["terraform.tfstate"], "verified", provision_host).write(
-        path
+        path, state_root=folder
     )
     return path
 

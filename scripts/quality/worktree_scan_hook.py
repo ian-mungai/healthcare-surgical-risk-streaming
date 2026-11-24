@@ -33,8 +33,13 @@ class KeptHookError(RuntimeError):
     """The older hook that pre-commit moved aside cannot be kept."""
 
 
+def hooks_folder(root: Path) -> Path:
+    """The hooks folder that Git reports for the repository."""
+    return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip()
+
+
 def hook_path(root: Path) -> Path:
-    return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip() / HOOK_NAME
+    return hooks_folder(root) / HOOK_NAME
 
 
 def installed(root: Path) -> bool:
@@ -54,8 +59,9 @@ def install(root: Path) -> bool:
     """
     if installed(root):
         return False
-    path = hook_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    folder = hooks_folder(root)
+    path = folder / HOOK_NAME
+    folder.mkdir(parents=True, exist_ok=True)
     if os.path.lexists(path) and not is_scanner(path):
         kept = path.with_name(KEPT_NAME)
         if os.path.lexists(kept):
@@ -65,7 +71,7 @@ def install(root: Path) -> bool:
             )
         os.rename(path, kept)
     try:
-        replace_owned_file(path, HOOK_TEXT, state_root=path.parent, mode=HOOK_MODE)
+        replace_owned_file(path, HOOK_TEXT, state_root=folder, mode=HOOK_MODE)
     except ClosedInputError:
         raise OSError("the hook could not be written") from None
     return True

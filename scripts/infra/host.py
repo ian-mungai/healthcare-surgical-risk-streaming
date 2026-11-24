@@ -176,9 +176,10 @@ def tailscale_device_id(host_name: str) -> str:
 
 def record_tailscale_device(run_id: str, host_name: str, device_id: str) -> Path:
     """Write the host's current Tailscale device to the run folder, over any earlier record: a host that left the network and rejoined has a new device."""
-    target = ROOT / "runs" / run_id / DEVICE_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    replace_owned_file(target, json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n", state_root=target.parent, mode=0o644)
+    folder = ROOT / "runs" / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / DEVICE_FILE
+    replace_owned_file(target, json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n", state_root=folder, mode=0o644)
     return target
 
 

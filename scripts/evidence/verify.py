@@ -79,7 +79,7 @@ def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -
     partial.replace(readback)
     record = {"run_id": run.run_id, "commit": run.commit, "manifest_sha256": manifest_sha256(manifest), "files": len(manifest["files"])}
     text = json.dumps(record | {"verified_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}, indent=2) + "\n"
-    replace_owned_file(receipt, text, state_root=receipt.parent, mode=0o644)
+    replace_owned_file(receipt, text, state_root=export, mode=0o644)
     if not sign(receipt):
         receipt.unlink()
         receipt.with_name("receipt.json.sig").unlink(missing_ok=True)

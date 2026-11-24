@@ -9,6 +9,12 @@ regular file directly inside the state folder that the command created or was gi
 it sits in one of the two helpers or matches an entry of ``ALLOWED`` (file, enclosing function, call text, count, reason). An entry that no longer matches
 a call fails the test too, so the list never keeps a site that was moved onto a helper. The scan tests plant one direct write per pattern and check that
 the scan finds it.
+
+A second rule covers ``replace_owned_file``: ``state_root`` is the folder that makes a replace safe, so it must come from a fixed source (a module constant, a
+folder the same command made in this run, or a state-folder setting) and never from the path that is replaced. ``test_no_state_root_comes_from_the_path``
+fails for any ``state_root`` that is built with ``.parent``, ``.parents`` or ``dirname`` (``x.parent``, ``Path(x).parent``, ``os.path.dirname(x)``), because
+that check passes for every path. ``OWNED_ROOTS`` lists every call with the text of its ``state_root`` and the fixed source that the text stands for.
+A call that is not listed, and a listed call that is gone, fail the test.
 """
 
 from __future__ import annotations
@@ -132,6 +138,68 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
 }
 
 
+OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
+    ("replay/service/serve.py", "Health.beat", "self.state"): (
+        1,
+        "The service's state folder: --state, default STATE_FOLDER; serve makes it before the first beat",
+    ),
+    ("replay/service/serve.py", "serve", "inbox"): (
+        2,
+        "The service's inbox folder: --inbox, default INBOX; serve makes it first. The path is a fixed suffix of a request name",
+    ),
+    ("replay/service/state_file.py", "StateFile.save", "self.state"): (
+        1,
+        "The state folder of the run record (state_dir); save makes it. The file name is the fixed STATE_NAME",
+    ),
+    ("scripts/ingestion/record_state.py", "RunState.save", "self.directory"): (
+        1,
+        "The state folder that the caller names for the run; save makes it. The file name is the run ID plus a fixed suffix",
+    ),
+    ("scripts/ingestion/record_load.py", "write_load_record", "record_dir"): (
+        1,
+        "The record folder that the caller names for the run; the file name is a fixed pattern of the run ID",
+    ),
+    ("scripts/ingestion/table_checks.py", "stage_verified_files", "staging"): (
+        1,
+        "The staging folder that stage_verified_files makes and secures in this call; the name is a fixed table name plus .csv",
+    ),
+    ("scripts/ingestion/table_checks.py", "write_plan", "staging"): (
+        1,
+        "The staging folder of the load, made by stage_verified_files; the name is the fixed PLAN_FILE",
+    ),
+    ("scripts/ingestion/table_checks.py", "keep_output", "run_folder"): (1, "The run folder that keep_output makes; the name is the fixed JOB_OUTPUT_FILE"),
+    ("scripts/ingestion/table_checks.py", "write_pending", "state_directory"): (
+        1,
+        "The state folder of the load (STATE_DIRECTORY, a module constant by default); the name is a fixed pattern of the manifest hash",
+    ),
+    ("scripts/ingestion/table_checks.py", "write_result", "run_folder"): (1, "The run folder of the load; the name is the fixed RESULT_FILE"),
+    ("scripts/infra/inventory.py", "write_inventory", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed inventory.json"),
+    ("scripts/infra/host.py", "record_tailscale_device", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed DEVICE_FILE"),
+    ("scripts/infra/host.py", "keep_host_keys_of", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed known_hosts_instance"),
+    ("scripts/infra/state_bootstrap.py", "RunBinding.write", "state_root"): (
+        1,
+        "The parameter state_root, which defaults to the module constant RUNS; a binding outside it is refused",
+    ),
+    ("scripts/evidence/export.py", "main", "export"): (
+        1,
+        "The export folder of the run, RUNS / run ID / export, made in this call; the name is the fixed manifest.json",
+    ),
+    ("scripts/evidence/verify.py", "verify_export", "export"): (
+        1,
+        "The export folder of the run, which the export command made and export_problem checks; the name is the fixed receipt.json",
+    ),
+    ("scripts/quality/install_tools.py", "settle", "tool.folder"): (
+        1,
+        "The folder of a pinned tool: the module constant TOOLS plus the folder part of the tool's pinned target",
+    ),
+    ("scripts/quality/worktree_scan_hook.py", "install", "folder"): (
+        1,
+        "The hooks folder that git reports for the repository (git rev-parse --git-path hooks); the name is the fixed HOOK_NAME",
+    ),
+    ("scripts/stack/caddy.py", "main", "CADDY_FOLDER"): (1, "The module constant CADDY_FOLDER; the name is the fixed Caddyfile"),
+}
+
+
 def mode_writes(call: ast.Call, positions: tuple[int, ...], strict: tuple[int, ...] = ()) -> bool:
     """Whether the mode argument of an ``open``-like call may write: a string with ``w``, ``a``, ``x`` or ``+``, or (at a ``strict`` position or by keyword)
     a mode that is not a string literal."""
@@ -241,6 +309,52 @@ def violations(files: dict[str, str], allowed: dict[tuple[str, str, str], tuple[
     return outside, stale
 
 
+def state_root_expression(call: ast.Call) -> ast.expr | None:
+    return next((item.value for item in call.keywords if item.arg == "state_root"), None)
+
+
+def comes_from_a_path(expression: ast.expr) -> bool:
+    """Whether the expression is built with ``.parent``, ``.parents`` or ``dirname``, which derives a folder from a path."""
+    for node in ast.walk(expression):
+        if isinstance(node, ast.Attribute) and node.attr in {"parent", "parents"}:
+            return True
+        if isinstance(node, ast.Call):
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ""
+            if name == "dirname":
+                return True
+    return False
+
+
+def owned_calls(source: str) -> list[tuple[int, str, str, bool]]:
+    """Each ``replace_owned_file`` call in ``source`` as (line, enclosing function, text of its ``state_root``, whether that comes from a path)."""
+    tree = ast.parse(source)
+    scopes = enclosing(tree)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and (node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")) == "replace_owned_file":
+            root = state_root_expression(node)
+            found.append((node.lineno, scopes.get(node, ""), "<missing>" if root is None else ast.unparse(root), root is None or comes_from_a_path(root)))
+    return sorted(found)
+
+
+def owned_violations(files: dict[str, str], listed: dict[tuple[str, str, str], tuple[int, str]]) -> tuple[list[str], list[str], list[str]]:
+    """The calls whose ``state_root`` comes from a path, the calls that are not listed with their ``state_root`` text, and the entries with a wrong count."""
+    counts: dict[tuple[str, str, str], int] = {}
+    derived, unlisted = [], []
+    for name, source in files.items():
+        if name == HELPER_FILE:
+            continue
+        for line, scope, text, from_a_path in owned_calls(source):
+            key = (name, scope, text)
+            counts[key] = counts.get(key, 0) + 1
+            if from_a_path:
+                derived.append(f"{name}:{line} {scope or '<module>'}: state_root={text}")
+            elif key not in listed:
+                unlisted.append(f"{name}:{line} {scope or '<module>'}: state_root={text}")
+    stale = [f"{key}: says {count}, found {counts.get(key, 0)}" for key, (count, _) in listed.items() if counts.get(key, 0) != count]
+    return derived, unlisted, stale
+
+
 PLANTS = {
     "write_text": "def f(path):\n    path.write_text('x')\n",
     "write_bytes": "def f(path):\n    path.write_bytes(b'x')\n",
@@ -335,6 +449,59 @@ class ScanFindsEachPatternTests(unittest.TestCase):
         self.assertEqual(1, len(stale))
 
 
+OWNED_PLANTS = {
+    "x.parent": "def f(path, data):\n    replace_owned_file(path, data, state_root=path.parent)\n",
+    "Path(x).parent": "def f(path, data):\n    replace_owned_file(path, data, state_root=Path(path).parent)\n",
+    "os.path.dirname(x)": "import os\n\n\ndef f(path, data):\n    replace_owned_file(path, data, state_root=Path(os.path.dirname(path)))\n",
+    "dirname alone": "def f(path, data):\n    replace_owned_file(path, data, state_root=dirname(path))\n",
+    "a parent inside a longer expression": "def f(path, data):\n    replace_owned_file(path, data, state_root=(path / 'a').parents[0])\n",
+    "the method by attribute": "def f(self, data):\n    self.helper.replace_owned_file(self.path, data, state_root=self.path.parent)\n",
+}
+OWNED_FIXED = {
+    "a name": "def f(folder, data):\n    replace_owned_file(folder / 'a.json', data, state_root=folder)\n",
+    "a constant": "def f(data):\n    replace_owned_file(RUNS / 'a.json', data, state_root=RUNS)\n",
+    "a folder joined with a run ID": "def f(run_id, data):\n    folder = RUNS / run_id\n    replace_owned_file(folder / 'a', data, state_root=folder)\n",
+    "an attribute that is not the path": "def f(self, data):\n    replace_owned_file(self.path, data, state_root=self.state)\n",
+}
+
+
+class OwnedRootScanTests(unittest.TestCase):
+    def test_a_state_root_built_from_the_path_is_reported_in_every_form(self) -> None:
+        missed = [name for name, source in OWNED_PLANTS.items() if len(owned_violations({"scripts/a.py": source}, {})[0]) != 1]
+        self.assertEqual([], missed)
+
+    def test_a_state_root_from_a_fixed_source_is_not_reported_as_derived(self) -> None:
+        wrongly = [name for name, source in OWNED_FIXED.items() if owned_violations({"scripts/a.py": source}, {})[0]]
+        self.assertEqual([], wrongly)
+
+    def test_a_call_that_is_not_listed_is_reported_with_its_state_root_text(self) -> None:
+        derived, unlisted, stale = owned_violations({"scripts/a.py": OWNED_FIXED["a name"]}, {})
+        self.assertEqual(([], ["scripts/a.py:2 f: state_root=folder"], []), (derived, unlisted, stale))
+
+    def test_a_listed_call_passes_only_for_its_function_state_root_and_count(self) -> None:
+        source = OWNED_FIXED["a name"]
+        listed = {("scripts/a.py", "f", "folder"): (1, "a source")}
+        self.assertEqual(([], [], []), owned_violations({"scripts/a.py": source}, listed))
+        other_function = source.replace("def f(", "def g(")
+        self.assertEqual(["scripts/a.py:2 g: state_root=folder"], owned_violations({"scripts/a.py": other_function}, listed)[1])
+        other_root = source.replace("state_root=folder", "state_root=other")
+        self.assertEqual(["scripts/a.py:2 f: state_root=other"], owned_violations({"scripts/a.py": other_root}, listed)[1])
+        other_file = owned_violations({"scripts/b.py": source}, listed)
+        self.assertEqual(["scripts/b.py:2 f: state_root=folder"], other_file[1])
+        twice = source + "    replace_owned_file(a, b, state_root=folder)\n"
+        self.assertEqual(1, len(owned_violations({"scripts/a.py": twice}, listed)[2]))
+
+    def test_a_listed_entry_that_matches_no_call_is_stale(self) -> None:
+        listed = {("scripts/a.py", "f", "folder"): (1, "a source")}
+        _, _, stale = owned_violations({"scripts/a.py": "def f(folder):\n    return folder\n"}, listed)
+        self.assertEqual(1, len(stale))
+
+    def test_a_derived_root_is_reported_even_when_it_is_listed(self) -> None:
+        listed = {("scripts/a.py", "f", "path.parent"): (1, "a source")}
+        derived, _, _ = owned_violations({"scripts/a.py": OWNED_PLANTS["x.parent"]}, listed)
+        self.assertEqual(["scripts/a.py:2 f: state_root=path.parent"], derived)
+
+
 class ProductionWritesTests(unittest.TestCase):
     def test_the_scan_reaches_every_folder_of_production_code(self) -> None:
         names = production_files()
@@ -348,6 +515,19 @@ class ProductionWritesTests(unittest.TestCase):
         outside, stale = violations(files, ALLOWED)
         self.assertEqual([], outside)
         self.assertEqual([], stale)
+
+    def test_no_state_root_comes_from_the_path(self) -> None:
+        files = {name: Path(ROOT / name).read_text() for name in production_files()}
+        derived, _, _ = owned_violations(files, OWNED_ROOTS)
+        self.assertEqual([], derived)
+
+    def test_every_replace_owned_file_call_is_listed_with_its_state_root_and_nothing_stale_stays(self) -> None:
+        files = {name: Path(ROOT / name).read_text() for name in production_files()}
+        _, unlisted, stale = owned_violations(files, OWNED_ROOTS)
+        self.assertEqual(([], []), (unlisted, stale))
+
+    def test_every_owned_root_entry_names_its_fixed_source(self) -> None:
+        self.assertEqual([], [key for key, (count, source) in OWNED_ROOTS.items() if count < 1 or len(source.split()) < 4])
 
     def test_every_list_entry_gives_a_reason(self) -> None:
         self.assertEqual([], [key for key, (count, reason) in ALLOWED.items() if count < 1 or len(reason.split()) < 4])

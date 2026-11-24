@@ -32,7 +32,8 @@ from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
-DEFAULT_BINDING = ROOT / "runs" / "run_binding.json"
+RUNS = ROOT / "runs"
+DEFAULT_BINDING = RUNS / "run_binding.json"
 STATE_PREFIX = "state"
 BUCKET_NAME_LIMIT = 63
 WORKSPACE = "default"
@@ -55,9 +56,11 @@ class RunBinding:
     bucket_creation: str = "none"
     bucket_mode: str = "permanent"
 
-    def write(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        replace_owned_file(path, json.dumps(asdict(self), indent=2) + "\n", state_root=path.parent, mode=0o644)
+    def write(self, path: Path, *, state_root: Path = RUNS) -> None:
+        """Replace the binding file, which must lie directly inside ``state_root`` (the runs folder unless a caller names its own state folder)."""
+        if path.parent == state_root:
+            state_root.mkdir(parents=True, exist_ok=True)
+        replace_owned_file(path, json.dumps(asdict(self), indent=2) + "\n", state_root=state_root, mode=0o644)
 
 
 def state_keys(environment: str) -> list[str]:

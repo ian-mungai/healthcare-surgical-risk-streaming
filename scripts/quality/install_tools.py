@@ -16,7 +16,7 @@ import sys
 import tarfile
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
@@ -40,6 +40,15 @@ class Tool:
     member: str
     target: str
     assets: dict[Platform, tuple[str, str]]
+
+    @property
+    def folder(self) -> Path:
+        """The folder of the installed file: the tools folder constant plus the folder part of the pinned target."""
+        return TOOLS / PurePosixPath(self.target).parent
+
+    @property
+    def path(self) -> Path:
+        return self.folder / PurePosixPath(self.target).name
 
 
 GITLEAKS = Tool(
@@ -144,15 +153,15 @@ def settle(tool: Tool, *, check: bool) -> bool:
         sys.stderr.write(f"{label}: no verified archive in .tools/downloads; run the installer without --check\n")
         return False
     binary = pinned_binary(tool, archive)
-    target = TOOLS / tool.target
+    target = tool.path
     if target.is_file() and target.read_bytes() == binary and (target.stat().st_mode & 0o777) == BINARY_MODE:
         sys.stdout.write(f"{label}: installed and verified\n")
         return True
     if check:
         sys.stderr.write(f"{label}: the installed binary is missing or differs from the pinned archive\n")
         return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    replace_owned_file(target, binary, state_root=target.parent, mode=BINARY_MODE)
+    tool.folder.mkdir(parents=True, exist_ok=True)
+    replace_owned_file(target, binary, state_root=tool.folder, mode=BINARY_MODE)
     sys.stdout.write(f"{label}: installed from the verified archive\n")
     return True
 

@@ -34,7 +34,9 @@ class ReceiptInvalidationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.binding = self.root / "run_binding.json"
-        RunBinding(RUN_ID, "0" * 40, "s3", "us-west-2", "example-project", "default", ["terraform.tfstate"], "verified", True).write(self.binding)
+        RunBinding(RUN_ID, "0" * 40, "s3", "us-west-2", "example-project", "default", ["terraform.tfstate"], "verified", True).write(
+            self.binding, state_root=self.root
+        )
         self.export = self.root / "runs" / RUN_ID / "export"
         self.export.mkdir(parents=True)
         self.receipt = self.export / "receipt.json"
