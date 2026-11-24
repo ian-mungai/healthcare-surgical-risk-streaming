@@ -494,13 +494,13 @@ class SealedResult(unittest.TestCase):
     def run_of(self, answer: dict[str, Any], code: int = 0) -> tuple[Any, Record]:
         record = Record(feature="test", slug="test", rerun="none")
         run = self.module.GoldRun.__new__(self.module.GoldRun)
-        run.record, run.trunk, run.facts = record, "trunk", {}
+        run.record, run.trunk, run.facts = record, "p7_trunk_x1", {}
         run.gold = SimpleNamespace(gold=lambda *_, **__: (code, answer, "", 0.1))
         run.stack = SimpleNamespace(spark_containers=lambda: [])
         run.nessie = SimpleNamespace(entries=lambda branch: {item.table: 1 for item in self.module.DIMENSIONS})
-        run.head = lambda branch: "b" * 64 if branch != "trunk" else "a" * 64
+        run.head = lambda branch: "b" * 64 if branch != "p7_trunk_x1" else "a" * 64
         run.table_snapshot = lambda branch, table: 7
-        run.name = lambda base: base
+        run.name = lambda base: f"p7_{base}_x1"
         run.merge = lambda *_, **__: "merged"
         return run, record
 
@@ -540,8 +540,7 @@ class SealedResult(unittest.TestCase):
                     run.control()
                 self.assertFalse(record.observations[0].passed)
                 self.assert_sealed(record, out.getvalue())
-                self.assertIn("the result is not the sealed shape", record.observations[0].observed)
-                self.assertNotIn("written", record.observations[0].observed)
+                self.assertIn("the result has the sealed shape False", record.observations[0].observed)
 
     def test_the_verify_the_rebuild_and_the_nights_record_a_pre_seal_result_as_a_fixed_error(self) -> None:
         pre = pre_seal_result(self.module)

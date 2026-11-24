@@ -22,9 +22,11 @@ Failure modes covered here:
 - A runner records the length of a stream, a tail of one, a stream in a log line, a count in a log line or an observation, a count that a stand-in prints
   or emits, a digest that is saved, a refusal expectation with a count in it, or an identifier that it chose by looking at data (``runner_leaks``). The
   Silver signals and hypotension runners are linted like the other four.
-- An observation, a fact or a printed line of one of the six runners is anything but the output of the one sealed helper (``sink_leaks``): an f-string, a
-  ``str()``, ``repr()`` or ``format`` text, a raw variable, a hand-made ``ConfirmedId``, a flag name that is not a constant, or a fact written by hand.
-- The lint reads the six outcome runners by name. Another local runner (``catalog_proof.py``) is neither read nor refused.
+- An observation, a fact or a printed line of one of the eight runners (the six above, the Gold dimensions runner and the signal profile runner) is anything
+  but the output of the one sealed helper (``sink_leaks``): an f-string, a ``str()``, ``repr()`` or ``format`` text, a raw variable, a hand-made
+  ``ConfirmedId``, a flag name that is not a constant, or a fact written by hand.
+- The sink check reads the eight outcome runners by name and the count lint the first six. Another local runner (``catalog_proof.py``) is neither read nor
+  refused.
 """
 
 from __future__ import annotations
@@ -55,11 +57,13 @@ from tests.fast import test_silver_cases_job as cases
 from tests.fast.outcome_accept import (
     BRONZE_COMMANDS,
     CASES_SNAPSHOT_TABLES,
+    COUNT_LINTED_RUNNERS,
     OUTCOME_RUNNERS,
     all_passed,
     bronze_problem,
     cases_problem,
     codes_are,
+    count_linted_paths,
     equals_loaded,
     fits,
     kept_at_base,
@@ -114,7 +118,7 @@ WRITTEN_COUNT_KEYS = (
     "numeric",
     "waveform",
 )
-RUNNERS = (
+COUNT_LINTED = (
     "bronze_clinical_lab.py",
     "bronze_clinical_lab_container.py",
     "silver_patient_split.py",
@@ -122,6 +126,7 @@ RUNNERS = (
     "silver_signals.py",
     "silver_hypotension.py",
 )
+RUNNERS = (*COUNT_LINTED, "gold_dimensions.py", "signal_profile.py")
 
 
 def bronze_run(command: str = "verify", **plant: Any) -> tuple[int, dict[str, Any]]:
@@ -506,16 +511,27 @@ class RunnerLeaks(unittest.TestCase):
         self.assertEqual([], runner_leaks("# the log holds len(os.fsencode(out)) once\n"))
         self.assertEqual([(("stream_length"), 2)], runner_leaks("# a comment\nn = len(out)\n"))
 
-    def test_the_lint_reads_the_six_outcome_runners_by_name_and_no_other_local_runner(self) -> None:
+    def test_the_lint_reads_the_eight_outcome_runners_by_name_and_no_other_local_runner(self) -> None:
         self.assertEqual(RUNNERS, OUTCOME_RUNNERS)
+        self.assertEqual(COUNT_LINTED, COUNT_LINTED_RUNNERS)
+        self.assertEqual(("gold_dimensions.py", "signal_profile.py"), OUTCOME_RUNNERS[-2:])
         with tempfile.TemporaryDirectory(prefix="e2e_") as folder_name:
             folder = Path(folder_name)
-            for name in ("catalog_proof.py", "run_record.py", RUNNERS[0], RUNNERS[3]):
+            for name in ("catalog_proof.py", "run_record.py", RUNNERS[0], RUNNERS[3], RUNNERS[6], RUNNERS[7]):
                 (folder / name).write_text("x = 1\n")
-            self.assertEqual([RUNNERS[0], RUNNERS[3]], [path.name for path in outcome_runner_paths(folder)])
+            self.assertEqual([RUNNERS[0], RUNNERS[3], RUNNERS[6], RUNNERS[7]], [path.name for path in outcome_runner_paths(folder)])
+
+    def test_the_count_lint_reads_the_first_six_runners_only(self) -> None:
+        """The Gold and profile runners hold Spark programs that count rows inside the container and compare the counts there, so the line lint of what a
+        runner prints reads the six older runners. The sink check reads all eight."""
+        with tempfile.TemporaryDirectory(prefix="e2e_") as folder_name:
+            folder = Path(folder_name)
+            for name in RUNNERS:
+                (folder / name).write_text("x = 1\n")
+            self.assertEqual(list(COUNT_LINTED), [path.name for path in count_linted_paths(folder)])
 
     def test_the_runners_of_this_machine_leak_nothing(self) -> None:
-        present = outcome_runner_paths(Path(__file__).resolve().parents[1] / "e2e")
+        present = count_linted_paths(Path(__file__).resolve().parents[1] / "e2e")
         if not present:
             self.skipTest("the untracked runners are not on this machine")
         for path in present:

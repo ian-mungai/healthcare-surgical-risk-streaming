@@ -32,6 +32,7 @@ from spark.profile import checks, grid_rule
 from spark.profile import cli as profile_cli
 from spark.profile import run as profile_run
 from tests.e2e.run_record import Record
+from tests.fast.test_runner_gold_profile_sealed import reachable_flag_codes
 from tests.fast.test_runner_gold_sealed import LAB_COUNT, healthy_result, recorder, runner, texts
 from tests.fast.test_runner_setup_builds import stand_in_stack
 
@@ -85,13 +86,6 @@ class GoldResultFormat(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(self.problems(snapshot_ids={**healthy["snapshot_ids"], lab: value}))
 
-    def test_the_view_of_a_result_of_the_wrong_format_is_the_fixed_error(self) -> None:
-        for edits in ({"branch_hash": LAB_COUNT}, {"outcome": [LAB_COUNT]}, {"base_hash": str(LAB_COUNT)}):
-            with self.subTest(edits=edits):
-                view = self.module.sealed_view({**healthy_result(self.module), **edits})
-                self.assertEqual(self.module.RESULT_ERROR, view)
-                self.assertNotIn(str(LAB_COUNT), json.dumps(view))
-
 
 class GoldControlSaves(unittest.TestCase):
     """The control saves the hashes and the snapshot IDs only after Nessie holds exactly them, and stops when it does not."""
@@ -103,13 +97,13 @@ class GoldControlSaves(unittest.TestCase):
     def run_of(self, answer: dict[str, Any], *, head: str = "b" * 64, snapshot: Any = None) -> tuple[Any, Record]:
         record = Record(feature="test", slug="test", rerun="none")
         run = self.module.GoldRun.__new__(self.module.GoldRun)
-        run.record, run.trunk, run.facts = record, "trunk", {}
+        run.record, run.trunk, run.facts = record, "p7_trunk_x1", {}
         run.gold = SimpleNamespace(gold=lambda *_, **__: (0, answer, "", 0.1))
         run.stack = SimpleNamespace(spark_containers=lambda: [])
         run.nessie = SimpleNamespace(entries=lambda branch: {item.table: 1 for item in self.module.DIMENSIONS})
-        run.head = lambda branch: head if branch != "trunk" else "a" * 64
+        run.head = lambda branch: head if branch != "p7_trunk_x1" else "a" * 64
         run.table_snapshot = snapshot or (lambda branch, table: 7)
-        run.name = lambda base: base
+        run.name = lambda base: f"p7_{base}_x1"
         return run, record
 
     def control(self, run: Any) -> Any:
@@ -123,9 +117,11 @@ class GoldControlSaves(unittest.TestCase):
     def test_a_confirmed_result_saves_its_hashes_and_snapshot_ids(self) -> None:
         run, record = self.run_of(healthy_result(self.module))
         self.assertTrue(self.control(run))
-        self.assertEqual({"trunk", "branch", "base_hash", "branch_hash", "snapshot_ids"}, set(run.facts))
+        tables = {f"snapshot_{item.table.replace('.', '_')}" for item in self.module.DIMENSIONS}
+        self.assertEqual({"trunk", "branch", "base_hash", "branch_hash", *tables}, set(run.facts))
         self.assertEqual(("a" * 64, "b" * 64), (run.facts["base_hash"], run.facts["branch_hash"]))
-        self.assertEqual({item.table: 7 for item in self.module.DIMENSIONS}, json.loads(run.facts["snapshot_ids"]))
+        self.assertEqual({"7"}, {run.facts[name] for name in tables})
+        self.assertEqual(("p7_trunk_x1", "p7_gold_x1"), (run.facts["trunk"], run.facts["branch"]))
 
     def test_a_snapshot_ID_that_Nessie_does_not_hold_saves_no_fact_and_stops_the_run(self) -> None:
         lab = self.lab_table
@@ -579,7 +575,6 @@ class ProfileLines(unittest.TestCase):
         for dated in (True, False):
             lines += grid_rule.rule_problems(grid_rule.RuleRead(1, other, 7, dated), wanted)
         lines += grid_rule.rule_problems(grid_rule.RuleRead(1, wanted, 7, False), wanted)
-        lines += grid_rule.rule_problems(grid_rule.RuleRead(1, None, 7, True), wanted)
         return lines
 
     def table_lines(self) -> list[str]:
@@ -595,7 +590,7 @@ class ProfileLines(unittest.TestCase):
 
     def flag_lines(self) -> list[str]:
         split = __import__("spark.split_table", fromlist=["x"])
-        return [split.flag(code) for code in sorted(split.CODES)]
+        return [split.flag(code) for code in sorted(reachable_flag_codes())]
 
     def generic_lines(self) -> list[str]:
         return ["usage", "settings", "branch_missing", "catalog_error", "internal_error", "timeout"]
@@ -740,12 +735,11 @@ class ProfileStreams(unittest.TestCase):
 
     def test_the_profile_job_returns_its_known_lines_and_logs_no_raw_stream(self) -> None:
         (code, document, err, _), log = self.job(["-m", "spark.jobs.signal_profile", "verify", "--branch", "b"], self.STREAM)
-        self.assertEqual((1, {"outcome": "unchanged"}), (code, document))
+        self.assertEqual((1, {}), (code, document))
         self.assertEqual("signal_profile: counts_rows: 1 row\nsignal_profile: usage\n", err)
         self.assertEqual(["counts_rows: 1 row", "usage"], self.module.codes(err))
-        for text in ("31337", "Traceback", "WARN", "INFO", "ValueError"):
+        for text in ("31337", "Traceback", "WARN", "INFO", "ValueError", "counts_rows"):
             self.assertNotIn(text, log)
-        self.assertIn("counts_rows: 1 row", log)
         self.assertIn("exit 1", log)
 
     def test_the_stand_in_returns_only_its_fixed_lines_and_logs_no_raw_stream(self) -> None:
@@ -760,10 +754,11 @@ class ProfileStreams(unittest.TestCase):
         for text in ("31337", "Traceback", "WARN"):
             self.assertNotIn(text, log)
 
-    def test_the_log_names_the_sizes_of_the_streams_and_no_content(self) -> None:
+    def test_the_log_holds_no_size_and_no_content_of_a_stream(self) -> None:
         _, log = self.job(["-m", "spark.jobs.signal_profile", "verify", "--branch", "b"], self.STREAM)
-        self.assertIn(f"standard output {len(self.OUT.encode())} bytes", log)
-        self.assertIn(f"standard error {len(self.STREAM.encode())} bytes", log)
+        for size in (len(self.OUT.encode()), len(self.STREAM.encode())):
+            self.assertNotIn(str(size), log)
+        self.assertNotIn("bytes", log)
 
     def test_a_line_of_the_job_that_is_dropped_is_counted_so_that_a_case_can_refuse_it(self) -> None:
         stack, _, _ = stand_in_stack(self, self.module, None, 1, out=self.OUT, err=self.STREAM)

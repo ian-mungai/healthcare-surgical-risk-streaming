@@ -1,6 +1,6 @@
-"""The pass or fail rules that the end-to-end runs of the six outcome runners share, as plain functions on a job's output.
+"""The pass or fail rules that the end-to-end runs of the outcome runners share, as plain functions on a job's output.
 
-Nothing here imports Spark or Docker. The six runners (``OUTCOME_RUNNERS``) stay untracked, so each rule that decides from a job's output lives here,
+Nothing here imports Spark or Docker. The eight runners (``OUTCOME_RUNNERS``) stay untracked, so each rule that decides from a job's output lives here,
 where ``tests/fast/test_outcome_acceptance.py`` tests it.
 
 A runner reads one file with a closed schema and never a line of a job's streams. ``read_result_file`` reads the file, and ``bronze_problem``,
@@ -440,7 +440,12 @@ OUTCOME_RUNNERS = (
     "silver_cases.py",
     "silver_signals.py",
     "silver_hypotension.py",
+    "gold_dimensions.py",
+    "signal_profile.py",
 )
+# The runners that the line lint of printed counts reads: the first six. The Gold and profile runners hold Spark programs that count rows inside the container
+# and compare the counts there, so they are read by the sink check only.
+COUNT_LINTED_RUNNERS = OUTCOME_RUNNERS[:6]
 SEALED_CALL = "sealed_observed"
 RAW_TEXT_CALLS = frozenset({"str", "repr", "format"})
 FACT_NAMES = frozenset({"facts", "environment"})
@@ -452,8 +457,13 @@ SAVED_LISTS = {"log": "log_not_sealed", "limits": "limits_not_fixed", "cleanup":
 
 
 def outcome_runner_paths(folder: Path) -> list[Path]:
-    """The files of the six outcome runners that are in ``folder``, by name and in the order of ``OUTCOME_RUNNERS``. Another local runner is not read."""
+    """The files of the eight outcome runners that are in ``folder``, by name and in the order of ``OUTCOME_RUNNERS``. Another local runner is not read."""
     return [folder / name for name in OUTCOME_RUNNERS if (folder / name).is_file()]
+
+
+def count_linted_paths(folder: Path) -> list[Path]:
+    """The files of the first six outcome runners (``COUNT_LINTED_RUNNERS``) that are in ``folder``: the ones that ``runner_leaks`` reads."""
+    return [folder / name for name in COUNT_LINTED_RUNNERS if (folder / name).is_file()]
 
 
 def call_name(node: ast.AST) -> str | None:

@@ -9,7 +9,7 @@ This module makes the only text and the only facts that may reach an observation
 - ``ConfirmedId`` is made only by ``confirm_id`` and ``confirm_ids``, which compare an ID that a job reported with the value that Nessie holds. A value that
   differs, a value that Nessie does not hold, a Boolean and text that is no hash or reference name give ``None``.
 
-The syntax check ``sink_leaks`` of ``tests/fast/outcome_accept.py`` refuses, in the six outcome runners, an f-string, ``str()``, ``repr()``, ``format``, a
+The syntax check ``sink_leaks`` of ``tests/fast/outcome_accept.py`` refuses, in the eight outcome runners, an f-string, ``str()``, ``repr()``, ``format``, a
 raw variable or a hand-made ``ConfirmedId`` as an observation or a fact: only the output of ``sealed_observed`` reaches them. It also guards every other saved
 field: the expectation of an assertion and each line of the log, the limits, the cleanup and the commands are written text (an f-string may name only module
 constants in capitals) or the output of ``sealed_observed``, and the verdict is an exact Boolean expression. The log keeps the words of a command, its exit code
