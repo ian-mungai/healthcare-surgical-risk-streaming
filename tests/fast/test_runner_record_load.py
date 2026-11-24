@@ -14,6 +14,7 @@ The runner is untracked, so the tests run only where it is on disk. A stand-in `
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib
 import io
@@ -136,6 +137,25 @@ class ContainerCleanup(unittest.TestCase):
         _, record = self.run_main()
         self.assertNotEqual("pending", record["cleanup"])
         self.assertIn(IDENTITY[:12], record["cleanup"])
+
+
+@unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
+class RunnerSites(unittest.TestCase):
+    """The checks of the real run read their values through the exact comparisons above, at the two sites that were weak."""
+
+    def calls(self) -> list[ast.Call]:
+        tree = ast.parse(RUNNER.read_text())
+        run_cases = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run_cases")
+        return [node for node in ast.walk(run_cases) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+
+    def test_a_refused_load_is_checked_for_a_table_on_the_load_branch_and_on_main(self) -> None:
+        sites = [call for call in self.calls() if call.func.id == "expect_no_raw_table"]  # type: ignore[attr-defined]
+        self.assertEqual(["destination on main"], [ast.literal_eval(call.args[1]) for call in sites])
+
+    def test_a_branch_of_another_owner_is_checked_at_the_head_recorded_before_the_load(self) -> None:
+        sites = [call for call in self.calls() if call.func.id == "expect_branch_head"]  # type: ignore[attr-defined]
+        self.assertEqual(1, len(sites))
+        self.assertEqual(["load_run_stranger", "stranger_head"], [ast.literal_eval(sites[0].args[3]), sites[0].args[4].id])  # type: ignore[attr-defined]
 
 
 class FakeCatalog:

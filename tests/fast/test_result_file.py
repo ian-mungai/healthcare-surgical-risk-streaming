@@ -8,7 +8,8 @@ Failure modes covered here:
   file is replaced or a caller reads another one.
 - A file that appears at the path while the job runs is replaced, so a result that a caller already holds is overwritten. The document is put in place with
   ``publish_reserved`` (a hard link, which fails when the path exists), so nothing is replaced even by a late writer.
-- A reader sees half a file: the document is written whole into the reserved part file and linked into place, and a failure leaves no part file.
+- A reader sees half a file: the document is written whole into the reserved part file and linked into place. A write or link that fails leaves neither
+  file. A part name that cannot be removed after the link leaves both names (the result is whole) and ends as ``internal_error``, exit 70.
 - A path that passes the preflight but cannot hold its part file (a name of 255 bytes: ``<name>.part`` is too long) fails only after the job ran. The part
   file is reserved (created exclusively) before any work, and a reservation that fails is a bad call: ``usage``, exit 2, and nothing runs.
 - A job that the watchdog stops leaves its reserved part file, or a second staging file that holds the whole result, for a reader to take for a result. The

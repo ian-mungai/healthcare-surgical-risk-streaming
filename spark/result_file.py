@@ -92,7 +92,8 @@ def release_reserved() -> None:
 def write_reserved(path: str, document: dict[str, Any]) -> None:
     """Write the whole document into the reserved part file and link it to ``path`` (``publish_reserved``: the part file is the only staging file, so a reader
     sees no file or the whole file and the watchdog's release of the part file removes every staged byte), then release the reserved name. A file that
-    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A failure leaves no part file."""
+    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A write or link that fails leaves no part file and no result
+    file. A part name that cannot be removed after the link leaves both names: the result file is whole and the call raises."""
     try:
         publish_reserved(Path(path + ".part"), Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
     finally:
