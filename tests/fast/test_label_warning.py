@@ -5,7 +5,8 @@ modes covered here:
 
 - An onset at the cutoff or after the end of the horizon is positive, or one just after the cutoff or at the end of the horizon is dropped.
 - A run that an invalid second, a gap in the series or the end of the operation cut short is called negative, though the observations cannot establish that
-  it was not the start of an event, or a run that really ended (a valid second at or above 65) is called unknown.
+  it was not the start of an event, or it is called unknown though a valid second at or above 65 within 60 seconds of its first second rules an event out
+  (30 valid low seconds, one invalid second, then continuous valid high pressure is negative): the coverage check decides before any unknown.
 - A window that the operation does not cover (the case ends before the horizon) or that the signal does not cover is called negative.
 - One invalid second among valid seconds at or above 65 makes every sample unknown, or a window with no reading at all is called negative.
 - A run that began before the cutoff makes the sample positive, so a drop that is already going on is a drop to predict.
@@ -75,12 +76,35 @@ class Positive(unittest.TestCase):
 
 
 class Unknown(unittest.TestCase):
-    def test_a_short_run_that_an_invalid_second_cut_is_unknown(self) -> None:
+    def test_a_short_run_that_an_invalid_second_cut_is_negative_when_valid_high_pressure_follows(self) -> None:
         points = steady(900, 1_099) + low(1_100, 30) + bad(1_130) + steady(1_131, 1_500)
+        self.assertEqual((NEGATIVE, COVERED), label_of(points))
+
+    def test_30_valid_low_seconds_one_invalid_second_then_continuous_valid_high_pressure_is_negative_with_no_history_before(self) -> None:
+        points = low(1_100, 30) + bad(1_130) + steady(1_131, 1_500)
+        self.assertEqual((NEGATIVE, COVERED), label_of(points, cutoff=1_100))
+
+    def test_a_short_run_that_a_gap_in_the_series_cut_is_negative_when_valid_high_pressure_follows(self) -> None:
+        points = steady(900, 1_099) + low(1_100, 30) + steady(1_140, 1_500)
+        self.assertEqual((NEGATIVE, COVERED), label_of(points))
+
+    def test_a_short_run_that_an_invalid_second_cut_is_unknown_when_no_valid_high_second_follows_within_60_seconds(self) -> None:
+        points = steady(900, 1_099) + low(1_100, 30) + bad(1_130, 40) + steady(1_170, 1_500)
         self.assertEqual((UNKNOWN, OPEN_RUN), label_of(points))
 
-    def test_a_short_run_that_a_gap_in_the_series_cut_is_unknown(self) -> None:
-        points = steady(900, 1_099) + low(1_100, 30) + steady(1_140, 1_500)
+    def test_the_valid_high_second_must_be_inside_the_59_seconds_after_the_candidate(self) -> None:
+        for high_at, expected in ((1_159, (NEGATIVE, COVERED)), (1_160, (UNKNOWN, OPEN_RUN))):
+            with self.subTest(high_at=high_at):
+                points = low(1_100, 30) + bad(1_130, high_at - 1_130) + high(high_at, 1)
+                self.assertEqual(expected, label_of(points, cutoff=1_100, horizon=60))
+
+    def test_the_last_candidate_of_the_window_is_established_by_a_valid_high_second_exactly_59_seconds_after_it(self) -> None:
+        points = high(1_100, 59) + low(1_159, 59) + high(1_218, 1)
+        self.assertEqual((NEGATIVE, COVERED), label_of(points, cutoff=1_100, horizon=60))
+        self.assertEqual((UNKNOWN, OPEN_RUN), label_of(points[:-1] + bad(1_218), cutoff=1_100, horizon=60))
+
+    def test_an_invalid_second_after_the_run_with_a_lost_signal_after_it_is_still_unknown(self) -> None:
+        points = steady(900, 1_099) + low(1_100, 30) + bad(1_130) + steady(1_131, 1_150) + bad(1_151, 400)
         self.assertEqual((UNKNOWN, OPEN_RUN), label_of(points))
 
     def test_a_short_run_at_the_end_of_the_operation_is_unknown(self) -> None:

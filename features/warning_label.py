@@ -7,16 +7,14 @@ A sample is a cutoff (microseconds from the case start) and a horizon (seconds).
 
 **Positive.** An event (a run of 60 valid low seconds inside the operation) has its onset in the window. Its 60 confirming seconds may end after the horizon.
 
-**Unknown.** Otherwise the observations cannot establish a negative when either holds, and the reason names the first:
+**Unknown.** Otherwise the observations cannot establish a negative when some second of the window is a candidate onset (the second before it is not low)
+that is not established as no onset. A candidate is established as no onset when a valid second inside the operation at or above 65 mmHg lies in it or in the
+59 seconds after it: no run of 60 valid low seconds can begin there. A candidate with no such second is a lost signal, a second the series lacks, or the end of
+the case before the horizon. The reason names the cause: ``open_run`` when a run of fewer than 60 seconds with its onset in the window was ended by an invalid
+second, a second the series lacks or the end of the operation (``features.hypotension.low_runs``), and else ``uncovered``. A run that an invalid second ended
+is not unknown by itself: when valid high pressure follows within 60 seconds of its first second, the observations rule an event out, and the label is negative.
 
-- ``open_run``: a run of fewer than 60 seconds with its onset in the window ended by an invalid second, a second the series lacks or the end of the operation
-  (``features.hypotension.low_runs``): by the observations it cannot be told from the start of an event.
-- ``uncovered``: some second of the window is a candidate onset (the second before it is not low) that is not established as no onset. A candidate is
-  established as no onset when a valid second inside the operation at or above 65 mmHg lies in it or in the 59 seconds after it. A candidate with no such
-  second is a lost signal, a second the series lacks, or the end of the case before the horizon.
-
-**Negative.** Every run that has its onset in the window ended by a valid second at or above 65 mmHg, and every candidate is established as no onset
-(``covered``).
+**Negative.** Every candidate is established as no onset (``covered``).
 
 The module uses the standard library and ``features.hypotension`` only and imports no Spark.
 """
@@ -75,9 +73,7 @@ def warning_label(points: Iterable[SeriesPoint], opstart: float, opend: float, c
     events = [run for run in runs if run.is_event]
     if events:
         return WarningLabel(POSITIVE, EVENT, (events[0].first_second + 1) * SECOND_US)
-    if any(run.end_reason != END_RECOVERED for run in runs):
-        return WarningLabel(UNKNOWN, OPEN_RUN, None)
     first, last = cutoff_us // SECOND_US, end_us // SECOND_US - 1
     if candidates_unestablished({point.second: point for point in held}, first, last, opstart, opend):
-        return WarningLabel(UNKNOWN, UNCOVERED, None)
+        return WarningLabel(UNKNOWN, OPEN_RUN if any(run.end_reason != END_RECOVERED for run in runs) else UNCOVERED, None)
     return WarningLabel(NEGATIVE, COVERED, None)
