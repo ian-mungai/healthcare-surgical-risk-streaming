@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_cli import EXIT_CODES, code_of, run
 from spark.bronze_clinical_lab_run import CHECK_NAMES, CHECKS_PASSED, JOB, NotABranch, SourceNotInHistory
 from spark.jobs import bronze_clinical_lab as job
+from spark.session import start_deadline
 from spark.settings import SettingsError
 from tests.fast.test_bronze_job_sequence import BRANCH, HASH, Harness
 
@@ -203,6 +205,25 @@ class Codes(unittest.TestCase):
         added = set(re.findall(r'report\.add\(\s*"([^"]+)"', source))
         self.assertEqual(added, set(CHECK_NAMES))
         self.assertTrue(set(CHECKS_PASSED["clinical"]) | set(CHECKS_PASSED["lab"]) <= set(CHECK_NAMES))
+
+
+class Deadline(unittest.TestCase):
+    """The watchdog of the job ends the process with the fixed code ``timeout`` and exit 124, and names no duration. It writes no result file."""
+
+    def test_the_timer_prints_the_fixed_code_and_exits_124_without_the_duration(self) -> None:
+        exited = threading.Event()
+        codes: list[int] = []
+
+        def stop(code: int) -> None:
+            codes.append(code)
+            exited.set()
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch("spark.session.os._exit", stop):
+            start_deadline(0.0517, JOB)
+            self.assertTrue(exited.wait(5), "the deadline did not fire within 5 seconds")
+        self.assertEqual(([124], f"{JOB}: timeout\n"), (codes, err.getvalue()))
+        self.assertNotIn("0.05", err.getvalue())
 
 
 class Job(unittest.TestCase):

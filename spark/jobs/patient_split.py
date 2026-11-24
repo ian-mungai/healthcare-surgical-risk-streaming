@@ -1,7 +1,7 @@
 """The patient split table: each patient with its set, frozen before any rule is estimated.
 
-``python -m spark.jobs.patient_split build --branch <name> [--base <name>] [--pinned-release] [--fixed-sample <candidates.tsv>]``
-``python -m spark.jobs.patient_split verify --branch <name> [--pinned-release] [--fixed-sample <candidates.tsv>]``
+``python -m spark.jobs.patient_split build --branch <name> [--base <name>] [--pinned-release] [--fixed-sample <candidates.tsv>] --result <path>``
+``python -m spark.jobs.patient_split verify --branch <name> [--pinned-release] [--fixed-sample <candidates.tsv>] --result <path>``
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it. It
 reads ``bronze.clinical_cases``, gives each distinct ``subjectid`` its set from the one assignment rule in ``scripts/sample/split.py`` and writes
@@ -26,6 +26,8 @@ set that its slot expects. The result names the checks that ran.
 The test set is sealed: a message or the result holds codes with a flag (``two_sets: failed``), hashes and snapshot IDs, and never a patient, a case, a set
 beside one or a count (the clinical table that the patients come from holds the outcome columns). A count of tables is the one count left.
 The command line prints fixed codes only (``usage``, ``branch_missing``, ``catalog_error``, ``settings``) and the codes of a failed check.
+The result is one file at ``--result`` (an absolute path that must not exist, ``spark/result_file.py``). A refusal writes the file too, with one diagnostic for
+each code and no count, and a bad call writes none.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
 """

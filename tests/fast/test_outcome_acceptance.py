@@ -277,6 +277,16 @@ class EqualsLoaded(unittest.TestCase):
             for check in ("row count", "no value changed", "key unique", "key not null"):
                 self.assertFalse(equals_loaded(fail(table_of(name), check)), f"{name} {check}")
 
+    def test_each_of_the_four_checks_is_needed_on_its_own_even_when_the_table_flag_says_passed(self) -> None:
+        for name in ("clinical_cases", "lab_results"):
+            for check in ("row count", "no value changed", "key unique", "key not null"):
+                table = table_of(name)
+                for item in table["checks"]:
+                    if item["name"] == check:
+                        item["passed"] = False
+                self.assertTrue(table["passed"])
+                self.assertFalse(equals_loaded(table), f"{name} {check}")
+
     def test_a_check_or_a_snapshot_that_is_missing_is_not_equality(self) -> None:
         missing = table_of()
         missing["checks"] = [check for check in missing["checks"] if check["name"] != "no value changed"]

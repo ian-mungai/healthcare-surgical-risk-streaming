@@ -20,10 +20,11 @@ DEADLINE_EXIT_CODE = 124
 
 
 def start_deadline(seconds: float, job: str) -> threading.Timer:
-    """Kill the whole process when the job runs past ``seconds``. The JVM child ends with it, and so does the container."""
+    """Kill the whole process when the job runs past ``seconds``. The JVM child ends with it, and so does the container. The message is the fixed code
+    ``timeout`` and holds no duration."""
 
     def expire() -> None:
-        sys.stderr.write(f"{job}: did not finish within {seconds:g} seconds and was stopped\n")
+        sys.stderr.write(f"{job}: timeout\n")
         sys.stderr.flush()
         os._exit(DEADLINE_EXIT_CODE)
 

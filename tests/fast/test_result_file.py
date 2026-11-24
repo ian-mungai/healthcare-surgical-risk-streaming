@@ -84,7 +84,8 @@ class Writing(unittest.TestCase):
     def test_the_document_is_written_whole_with_sorted_keys_and_the_file_is_not_executable(self) -> None:
         write_result(self.path, DOCUMENT)
         self.assertEqual(DOCUMENT, json.loads(Path(self.path).read_text()))
-        self.assertEqual(FILE_MODE, os.stat(self.path).st_mode & 0o777)
+        self.assertEqual(0o644, os.stat(self.path).st_mode & 0o777)
+        self.assertEqual(0o644, FILE_MODE)
         self.assertEqual(["result.json"], os.listdir(self.folder))
 
     def test_the_file_appears_whole_in_one_rename_from_the_part_file(self) -> None:
