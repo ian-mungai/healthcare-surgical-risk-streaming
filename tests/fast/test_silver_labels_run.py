@@ -134,7 +134,7 @@ class Build(unittest.TestCase):
             ],
             fake.calls,
         )
-        self.assertEqual(("written", HEAD, THIRD_WRITE), (outcome.outcome, outcome.checked_hash, outcome.write_hash))
+        self.assertEqual((HEAD, THIRD_WRITE), (outcome.checked_hash, outcome.write_hash))
 
     def test_the_labels_are_planned_only_after_the_measure_was_read_back_with_every_check_passing(self) -> None:
         for broken, wanted in (
@@ -168,10 +168,26 @@ class Build(unittest.TestCase):
         self.assertEqual(
             [{"statistic": "cases", "unit": "cases", "value": 5000.0}, {"statistic": "zero", "unit": "cases", "value": 4000.0}], facts_line["icu_measure"]
         )
-        self.assertEqual(
-            {"outcome", "checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "icu_measure", "checks_run"}, set(facts_line)
-        )
+        self.assertEqual({"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "icu_measure", "checks_run"}, set(facts_line))
         self.assertGreaterEqual(len(facts_line["checks_run"]), 15)
+
+    def test_no_result_names_an_outcome_because_a_held_out_row_alone_would_flip_it(self) -> None:
+        fake = Fake()
+        written = run_build(fake.operations(), HEAD)
+        kept_fake = Fake()
+        kept_fake.held = dict(kept_fake.read_back)
+        kept = run_build(kept_fake.operations(), HEAD)
+        verify_fake = Fake()
+        verify_fake.held = dict(verify_fake.read_back)
+        verify_fake.read_back = verify_fake.held
+        verified = run_verify(verify_fake.operations(), HEAD)
+        for outcome in (written, kept, verified):
+            self.assertFalse(hasattr(outcome, "outcome"))
+            self.assertNotIn("outcome", outcome.facts())
+            self.assertNotIn("written", json.dumps(outcome.facts()))
+            self.assertNotIn("unchanged", json.dumps(outcome.facts()))
+        self.assertEqual((THIRD_WRITE, THIRD_WRITE), (written.facts()["write_hash"], written.facts()["branch_hash"]))
+        self.assertEqual((None, HEAD), (kept.facts()["write_hash"], kept.facts()["branch_hash"]))
 
     def test_the_result_holds_no_digest_no_row_count_and_no_case_count(self) -> None:
         text = json.dumps(run_build(Fake().operations(), HEAD).facts())
@@ -185,9 +201,7 @@ class Build(unittest.TestCase):
         fake.held = dict(fake.read_back)
         fake.read_back = fake.held
         facts_line = run_verify(fake.operations(), HEAD).facts()
-        self.assertEqual(
-            {"outcome", "checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "icu_measure", "checks_run"}, set(facts_line)
-        )
+        self.assertEqual({"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "icu_measure", "checks_run"}, set(facts_line))
         self.assertEqual({MEASURE: True, ICU: True, KIDNEY: True}, facts_line["passed"])
         for number in (7_000_001, 8_000_002, 9_000_003, 6388):
             self.assertNotIn(str(number), json.dumps(facts_line))
@@ -212,7 +226,7 @@ class Build(unittest.TestCase):
         fake = Fake()
         fake.held = dict(fake.read_back)
         outcome = run_build(fake.operations(), HEAD)
-        self.assertEqual(("unchanged", None), (outcome.outcome, outcome.write_hash))
+        self.assertIsNone(outcome.write_hash)
         self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
         self.assertIn(f"read_table a {KIDNEY} facts=True", fake.calls)
         self.assertEqual({MEASURE: 100, ICU: 101, KIDNEY: 102}, outcome.facts()["snapshots"])
@@ -317,23 +331,23 @@ class PassFlags(unittest.TestCase):
 
     def test_a_good_read_back_is_true_for_every_table_with_or_without_a_plan(self) -> None:
         for planned in (None, FINGERPRINTS):
-            self.assertEqual({MEASURE: True, ICU: True, KIDNEY: True}, passed_flags(INPUT, self.reads(), planned))
+            self.assertEqual({MEASURE: True, ICU: True, KIDNEY: True}, passed_flags(self.reads(), planned))
 
     def test_a_table_that_is_missing_has_no_facts_or_fails_a_check_is_false_and_the_others_stay_true(self) -> None:
         reads = self.reads()
         reads[MEASURE] = None
         reads[ICU] = TableRead(FINGERPRINTS[ICU], 101, None)
         reads[KIDNEY] = TableRead(FINGERPRINTS[KIDNEY], 102, TableFacts({**facts(KIDNEY).flags, "kidney_rule": 1}))
-        self.assertEqual({MEASURE: False, ICU: False, KIDNEY: False}, passed_flags(INPUT, reads, None))
+        self.assertEqual({MEASURE: False, ICU: False, KIDNEY: False}, passed_flags(reads, None))
         reads = self.reads()
         reads[ICU] = TableRead(FINGERPRINTS[ICU], 101, TableFacts({**facts(ICU).flags, "icu_not_every_case": 1}))
-        self.assertEqual({MEASURE: True, ICU: False, KIDNEY: True}, passed_flags(INPUT, reads, None))
+        self.assertEqual({MEASURE: True, ICU: False, KIDNEY: True}, passed_flags(reads, None))
 
     def test_a_table_that_is_not_the_planned_one_is_false_in_a_build_only(self) -> None:
         reads = self.reads()
         reads[KIDNEY] = TableRead(Fingerprint(6388, 1), 102, facts(KIDNEY))
-        self.assertEqual({MEASURE: True, ICU: True, KIDNEY: False}, passed_flags(INPUT, reads, FINGERPRINTS))
-        self.assertEqual({MEASURE: True, ICU: True, KIDNEY: True}, passed_flags(INPUT, reads, None))
+        self.assertEqual({MEASURE: True, ICU: True, KIDNEY: False}, passed_flags(reads, FINGERPRINTS))
+        self.assertEqual({MEASURE: True, ICU: True, KIDNEY: True}, passed_flags(reads, None))
 
 
 class Verify(unittest.TestCase):
@@ -342,7 +356,7 @@ class Verify(unittest.TestCase):
         fake.held = dict(fake.read_back)
         fake.read_back = fake.held
         outcome = run_verify(fake.operations(), HEAD)
-        self.assertEqual("verified", outcome.outcome)
+        self.assertIsNone(outcome.write_hash)
         self.assertEqual(
             ["read_input a", f"read_table a {MEASURE} facts=True", f"read_table a {ICU} facts=True", f"read_table a {KIDNEY} facts=True", "head", "release"],
             fake.calls,

@@ -80,7 +80,6 @@ class Operations:
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    outcome: str
     checked_hash: str
     write_hash: str | None
     branch_hash: str
@@ -91,9 +90,9 @@ class Outcome:
 
     def facts(self) -> dict[str, Any]:
         """What the result line may hold: hashes, snapshot IDs, one pass flag for each table, the checks that ran and the measure of ``icu_days`` of the
-        development patients. It holds no count, no digest and no value of a label."""
+        development patients. It holds no count, no digest and no value of a label, and no word that says whether the build wrote ("written" or "unchanged"): a
+        reader judges a write by the hashes and the snapshot IDs."""
         return {
-            "outcome": self.outcome,
             "checked_hash": self.checked_hash,
             "write_hash": self.write_hash,
             "branch_hash": self.branch_hash,
@@ -109,7 +108,7 @@ def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRe
     return {table: ops.read_table(at, table, with_facts) for table in TABLES}
 
 
-def read_problems(source: InputRead, reads: dict[str, TableRead | None]) -> list[str]:
+def read_problems(reads: dict[str, TableRead | None]) -> list[str]:
     """The tables that are not there, or else the problems of each table."""
     if any(read is None or read.facts is None for read in reads.values()):
         return [f"table_missing: {FLAG}"]
@@ -147,7 +146,7 @@ class Chain:
         self.on = self.written
 
 
-def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned: dict[str, Fingerprint] | None) -> dict[str, bool]:
+def passed_flags(reads: dict[str, TableRead | None], planned: dict[str, Fingerprint] | None) -> dict[str, bool]:
     """One flag for each table: the table is there, every check of it passes and, in a build, it is the planned table."""
     flags = {}
     for table in TABLES:
@@ -168,7 +167,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     if differs(held_measure, measure.fingerprint):
         chain.write(ops, MEASURE, held_measure is not None)
     first = ops.read_table(chain.on, MEASURE, True)
-    problems = read_problems(source, {MEASURE: first})
+    problems = read_problems({MEASURE: first})
     if not problems and differs(first, measure.fingerprint):
         problems = [f"readback_differs: {FLAG}"]
     if problems:
@@ -183,7 +182,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     if ops.read_input(at) != source:
         raise SilverSignalsError(f"source_changed: {FLAG}")
     reads = read_tables(ops, at, True)
-    problems = read_problems(source, reads)
+    problems = read_problems(reads)
     differing = any(reads[table] is not None and differs(reads[table], planned[table]) for table in TABLES)
     if differing and not problems:
         problems.append(f"readback_differs: {FLAG}")
@@ -192,8 +191,8 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     if ops.head() != at:
         raise SilverSignalsError(BRANCH_MOVED)
     written = chain.written
-    flags = passed_flags(source, reads, planned)
-    return Outcome("written" if written else "unchanged", head, written, at, source, {t: r for t, r in reads.items() if r is not None}, measure.rows, flags)
+    flags = passed_flags(reads, planned)
+    return Outcome(head, written, at, source, {t: r for t, r in reads.items() if r is not None}, measure.rows, flags)
 
 
 def run_build(ops: Operations, head: str) -> Outcome:
@@ -213,12 +212,12 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         if problems:
             raise SilverSignalsError(*problems)
         reads = read_tables(ops, head, True)
-        problems = read_problems(source, reads)
+        problems = read_problems(reads)
         if problems:
             raise SilverSignalsError(*problems)
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome("verified", head, None, head, source, tables, (), passed_flags(source, reads, None))
+        return Outcome(head, None, head, source, tables, (), passed_flags(reads, None))
     finally:
         ops.release()
