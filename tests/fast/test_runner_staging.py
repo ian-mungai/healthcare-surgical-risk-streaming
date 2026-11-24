@@ -201,11 +201,18 @@ def order_problems(source: str) -> list[str]:
     local, prepared = functions.get("run_local"), functions.get("run_prepared")
     if local is None or prepared is None:
         return ["run_local or run_prepared is missing"]
-    resolved = call_lines(local, "resolve_pinned_mounts")
-    made = call_lines(local, "mkdtemp")
-    ran = call_lines(local, "run_prepared")
-    if len(resolved) != 1 or not made or not ran or resolved[0] >= min(made) or resolved[0] >= min(ran):
-        problems.append("run_local does not resolve both pinned sources before it makes the scratch folder and runs")
+    if call_lines(local, "resolve_pinned_mounts") or call_lines(local, "check_compose_source"):
+        problems.append("run_local resolves or checks the sources again: that is done once, at the entry")
+    entry, start = functions.get("main"), functions.get("sealed_start")
+    if entry is None or start is None:
+        return [*problems, "main or sealed_start is missing"]
+    started = call_lines(entry, "sealed_start")
+    recorded = call_lines(entry, "recorded_state") + call_lines(entry, "Record") + call_lines(entry, "run_local")
+    if len(started) != 1 or not recorded or started[0] >= min(recorded):
+        problems.append("main does not resolve and check the sources before it records the Git state, makes the record or runs")
+    resolved, checked = call_lines(start, "resolve_pinned_mounts"), call_lines(start, "check_compose_source")
+    if len(resolved) != 1 or len(checked) != 1 or resolved[0] >= checked[0]:
+        problems.append("sealed_start does not resolve both sources and then check the compose folder, once each")
     copies = [part for part in ast.walk(prepared) if isinstance(part, ast.Call) and getattr(part.func, "attr", "") == "copytree"]
     if len(copies) != 1:
         problems.append("run_prepared does not copy the Compose tree exactly once")
@@ -224,8 +231,19 @@ def order_problems(source: str) -> list[str]:
 
 
 ORDER_GOOD = """
-def run_local(record, log, cache):
+def sealed_start():
     resolve_pinned_mounts()
+    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)
+
+
+def main():
+    sealed_start()
+    record = Record()
+    record.revision = recorded_state(ROOT)
+    run_local(record, [], cache)
+
+
+def run_local(record, log, cache):
     scratch = Path(tempfile.mkdtemp())
     run_prepared(record, log, cache, scratch)
 
@@ -353,8 +371,25 @@ class Order(unittest.TestCase):
 
     def test_each_other_order_is_refused(self) -> None:
         for old, new in (
-            ("    resolve_pinned_mounts()\n    scratch = Path(tempfile.mkdtemp())\n", "    scratch = Path(tempfile.mkdtemp())\n    resolve_pinned_mounts()\n"),
-            ("    resolve_pinned_mounts()\n", ""),
+            (
+                "    sealed_start()\n    record = Record()\n    record.revision = recorded_state(ROOT)\n",
+                "    record = Record()\n    record.revision = recorded_state(ROOT)\n    sealed_start()\n",
+            ),
+            (
+                "    sealed_start()\n    record = Record()\n    record.revision = recorded_state(ROOT)\n",
+                "    record = Record()\n    sealed_start()\n    record.revision = recorded_state(ROOT)\n",
+            ),
+            ("    sealed_start()\n    record = Record()\n", "    record = Record()\n"),
+            ("def run_local(record, log, cache):\n", "def run_local(record, log, cache):\n    resolve_pinned_mounts()\n"),
+            ("def run_local(record, log, cache):\n", 'def run_local(record, log, cache):\n    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n'),
+            (
+                '    resolve_pinned_mounts()\n    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n\n\ndef main',
+                '    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n    resolve_pinned_mounts()\n\n\ndef main',
+            ),
+            (
+                '    resolve_pinned_mounts()\n    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n\n\ndef main',
+                "    resolve_pinned_mounts()\n\n\ndef main",
+            ),
             ("symlinks=True, ", ""),
             ("symlinks=True, ", "symlinks=False, "),
             ("    check_tree_links(scratch)\n", ""),
