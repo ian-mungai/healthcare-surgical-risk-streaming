@@ -44,18 +44,30 @@ def ensure_branch(client: NessieClient, branch: str) -> None:
             raise NessieError(f"{branch} exists and is not a branch") from None
 
 
+def open_client(uri: str) -> NessieClient:
+    """The Nessie client for ``uri``. An address that cannot be used, such as a port that is not a number, is a ``SettingsError`` that names no value."""
+    try:
+        return NessieClient(uri, NESSIE_TIMEOUT_SECONDS)
+    except NessieError:
+        raise SettingsError("the Nessie address cannot be used") from None
+
+
 def main() -> int:
     try:
         settings = from_environment(os.environ)
         check_checkpoint(settings.checkpoint_dir)
         load_clinical(settings.clinical_file)
-        client = NessieClient(required_environment("NESSIE_URI"), NESSIE_TIMEOUT_SECONDS)
+        client = open_client(required_environment("NESSIE_URI"))
         client.config()
         ensure_branch(client, settings.branch)
-        from replay.service.registry import RegistryClient
+        from replay.service.registry import RegistryClient, RegistryError
         from replay.service.wire_codec import Writer
 
-        writer = Writer(RegistryClient(settings.registry_url))
+        try:
+            registry = RegistryClient(settings.registry_url)
+        except RegistryError:
+            raise SettingsError("the registry address cannot be used") from None
+        writer = Writer(registry)
     except (StreamSettingsError, SettingsError, ClinicalFileError) as error:
         sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2

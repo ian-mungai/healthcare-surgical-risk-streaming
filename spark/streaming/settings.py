@@ -8,6 +8,7 @@ test can stop the job after its first sink commit. It is off unless set.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -18,6 +19,8 @@ DEFAULT_LATE_LIMIT_SECONDS = 30.0
 DEFAULT_TRIGGER_SECONDS = 2.0
 DEFAULT_MAX_OFFSETS = 50_000
 DEFAULT_BRANCH = "stream"
+MAXIMUM_SECONDS = 31_536_000.0
+MAXIMUM_OFFSETS = 2_147_483_647.0
 
 
 class StreamSettingsError(ValueError):
@@ -48,7 +51,9 @@ def required(env: Mapping[str, str], name: str) -> str:
     return value
 
 
-def number(env: Mapping[str, str], name: str, default: float, *, minimum: float, allow_zero: bool = False) -> float:
+def number(env: Mapping[str, str], name: str, default: float, *, minimum: float, allow_zero: bool = False, maximum: float = MAXIMUM_SECONDS) -> float:
+    """The number in ``name``, or ``default`` when it is not set: finite, at least ``minimum`` (more than zero unless ``allow_zero``) and at most ``maximum``
+    (a year in seconds unless given). Any other value is a ``StreamSettingsError`` that names the variable and not the value."""
     text = env.get(name, "")
     if not text:
         return default
@@ -56,8 +61,10 @@ def number(env: Mapping[str, str], name: str, default: float, *, minimum: float,
         value = float(text)
     except ValueError:
         raise StreamSettingsError(f"{name} is not a number") from None
-    if value < minimum or (value == 0 and not allow_zero):
+    if not math.isfinite(value) or value < minimum or (value == 0 and not allow_zero):
         raise StreamSettingsError(f"{name} must be {'zero or more' if allow_zero else 'more than zero'}")
+    if value > maximum:
+        raise StreamSettingsError(f"{name} must be at most {maximum:g}")
     return value
 
 
@@ -78,7 +85,7 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
         late_limit_us=round(number(env, "STREAM_LATE_LIMIT_SECONDS", DEFAULT_LATE_LIMIT_SECONDS, minimum=0, allow_zero=True) * SECOND),
         cutoff_step_us=round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND),
         trigger_seconds=number(env, "STREAM_TRIGGER_SECONDS", DEFAULT_TRIGGER_SECONDS, minimum=0),
-        max_offsets_per_trigger=int(number(env, "STREAM_MAX_OFFSETS_PER_TRIGGER", DEFAULT_MAX_OFFSETS, minimum=0)),
+        max_offsets_per_trigger=int(number(env, "STREAM_MAX_OFFSETS_PER_TRIGGER", DEFAULT_MAX_OFFSETS, minimum=0, maximum=MAXIMUM_OFFSETS)),
         max_seconds=number(env, "STREAM_MAX_SECONDS", 0.0, minimum=0, allow_zero=True),
         clinical_file=env.get("STREAM_CLINICAL_FILE", ""),
         test_exit_after_sink=test_exit,

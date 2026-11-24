@@ -48,7 +48,15 @@ def write_marker(folder: Path, expected: str) -> None:
 
 
 def check_checkpoint(checkpoint: str | Path, expected: str = STATE_FORMAT) -> None:
-    """Mark a new checkpoint folder with ``expected`` and pass, pass a folder marked with ``expected``, and refuse any other folder."""
+    """Mark a new checkpoint folder with ``expected`` and pass, pass a folder marked with ``expected``, and refuse any other folder. A folder that cannot be
+    listed, made or marked (a file-system error of any kind) is the same fixed refusal: the error text holds the path, so it is never shown."""
+    try:
+        check_folder(checkpoint, expected)
+    except OSError:
+        raise CheckpointFormatError("the checkpoint folder cannot be read or marked, so its state format cannot be checked before the query starts") from None
+
+
+def check_folder(checkpoint: str | Path, expected: str) -> None:
     text = str(checkpoint)
     if URI_SCHEME.match(text):
         raise CheckpointFormatError("the checkpoint is not a local folder, so its state format cannot be read before the query starts")

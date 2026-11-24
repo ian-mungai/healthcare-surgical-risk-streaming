@@ -53,7 +53,9 @@ class MainMessages(Folder):
                 stack.enter_context(mock.patch.object(stream_features, "from_environment", side_effect=patches["settings"]))
             stack.enter_context(mock.patch.object(stream_features, "check_checkpoint"))
             stack.enter_context(mock.patch.object(stream_features, "load_clinical", side_effect=patches.get("clinical")))
-            stack.enter_context(mock.patch.object(stream_features, "NessieClient", side_effect=patches.get("nessie")))
+            stack.enter_context(mock.patch.object(stream_features, "NessieClient", side_effect=patches.get("constructor")))
+            if "nessie" in patches:
+                stack.enter_context(mock.patch.object(stream_features, "ensure_branch", side_effect=patches["nessie"]))
             code = stream_features.main()
         return code, errors.getvalue()
 
@@ -70,6 +72,10 @@ class MainMessages(Folder):
     def test_a_nessie_error_shows_the_type_name_and_none_of_its_text(self) -> None:
         code, err = self.run_main(nessie=NessieError(MARKER))
         self.assertEqual((1, "stream_features: cannot work with Nessie: NessieError\n"), (code, err))
+
+    def test_an_address_that_nessie_refuses_to_build_is_a_setting_and_shows_no_text(self) -> None:
+        code, err = self.run_main(constructor=NessieError(MARKER))
+        self.assertEqual((2, "stream_features: SettingsError\n"), (code, err))
 
     def test_a_failed_query_shows_the_type_name_and_none_of_its_text(self) -> None:
         session, writer = mock.Mock(), mock.Mock()
@@ -166,8 +172,9 @@ class CheckpointRefusals(Folder):
         (folder / "offsets").mkdir()
         folder.chmod(0)
         self.addCleanup(folder.chmod, 0o755)
-        with self.assertRaises(OSError):
+        with self.assertRaises(CheckpointFormatError) as caught:
             check_checkpoint(folder)
+        self.assertNotIn(str(folder), str(caught.exception))
         self.assertFalse(any(name == STATE_FORMAT_FILE for name in os.listdir(self.root)))
 
 

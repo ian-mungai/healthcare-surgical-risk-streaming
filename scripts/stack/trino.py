@@ -35,8 +35,12 @@ class TrinoClient:
         parts = urlsplit(base_url)
         if parts.scheme != "http" or not parts.hostname or parts.path not in ("", "/") or parts.query or parts.fragment:
             raise TrinoError("the Trino address must be a plain http URL with a host and no path, such as http://127.0.0.1:8080")
+        try:
+            port = parts.port
+        except ValueError:
+            raise TrinoError("the Trino address has a port that is not a number from 0 to 65535") from None
         self.host = parts.hostname
-        self.port = parts.port or 80
+        self.port = port or 80
         self.user = user
         self.deadline_seconds = deadline_seconds
 

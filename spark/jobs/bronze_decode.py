@@ -69,7 +69,7 @@ from spark.bronze.rows import StructureError
 from spark.bronze.tables import KIND_TABLE, NAMESPACE, TABLES, TableSpec
 from spark.catalog import required_environment
 from spark.session import build_session, start_deadline
-from spark.settings import BYTES_PER_MIB, SettingsError, read_memory_limit_mib
+from spark.settings import BYTES_PER_MIB, MAX_DEADLINE_SECONDS, MAX_NESSIE_TIMEOUT_SECONDS, SettingsError, number_setting, read_memory_limit_mib
 
 JOB = "bronze_decode"
 RESULT_PREFIX = "RESULT "
@@ -158,7 +158,7 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
     store = open_store(spec)
     inputs = verify_inputs(store, reference, wanted)
     caseends = caseend_times(store, inputs)
-    client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
+    client = nessie_client()
     client.config()
     session = build_session(JOB, arguments.base)
     try:
@@ -220,7 +220,9 @@ def branch_checker(branch: str) -> Callable[[str], Verdict]:
 
 
 def nessie_client() -> NessieClient:
-    return NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
+    return NessieClient(
+        required_environment("NESSIE_URI"), number_setting("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS, MAX_NESSIE_TIMEOUT_SECONDS)
+    )
 
 
 def run_command(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -246,7 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"{JOB}: --parallelism must be at least 1\n")
         return 2
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
+        start_deadline(number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS), JOB)
         result = run_command(arguments)
     except GateRefused as error:
         sys.stderr.write(f"{JOB}: the gate refused the inputs before any payload was read: {describe_error(error)}\n")

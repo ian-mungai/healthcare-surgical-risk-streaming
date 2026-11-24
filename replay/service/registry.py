@@ -48,8 +48,12 @@ class RegistryClient:
         parts = urlsplit(base_url)
         if parts.scheme != "http" or not parts.hostname or parts.query or parts.fragment:
             raise RegistryError("the registry address must be a plain http URL with a host, such as http://127.0.0.1:8080/apis/registry/v3")
+        try:
+            port = parts.port
+        except ValueError:
+            raise RegistryError("the registry address has a port that is not a number from 0 to 65535") from None
         self.host = parts.hostname
-        self.port = parts.port or 80
+        self.port = port or 80
         self.prefix = parts.path.rstrip("/")
         self.timeout_seconds = timeout_seconds
 

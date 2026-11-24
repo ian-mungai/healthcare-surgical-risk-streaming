@@ -7,6 +7,7 @@ the file system: ``s3://`` opens Iceberg's S3 file system and ``file:`` its Hado
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -19,11 +20,29 @@ UNLIMITED_BYTES = 2**62
 OVERHEAD_FLOOR_MIB = 384
 MINIMUM_HEAP_MIB = 512
 COMMIT_HASH = re.compile(r"[0-9a-f]{64}")
+DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
+MAX_NESSIE_TIMEOUT_SECONDS = 600.0
+MAX_DEADLINE_SECONDS = 86_400.0
 FILE_IO = {"s3": "org.apache.iceberg.aws.s3.S3FileIO", "file": "org.apache.iceberg.hadoop.HadoopFileIO"}
 
 
 class SettingsError(ValueError):
     """A setting is missing or cannot be used, and the message names it and never holds a secret."""
+
+
+def number_setting(name: str, default: float, maximum: float) -> float:
+    """The number above 0 and up to ``maximum`` in the variable ``name``, or ``default`` when it is not set. Any other value (text, ``inf``, ``nan``, zero,
+    a negative number, one above ``maximum``) is a ``SettingsError`` that names the variable and never shows the value."""
+    text = os.environ.get(name)
+    if text is None:
+        return default
+    try:
+        value = float(text)
+    except ValueError:
+        raise SettingsError(f"{name} is not a number") from None
+    if not 0 < value <= maximum:
+        raise SettingsError(f"{name} is not a number from 0 to {maximum:g}")
+    return value
 
 
 def driver_memory_mib(limit_mib: int) -> int:

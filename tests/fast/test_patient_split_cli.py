@@ -27,8 +27,8 @@ from scripts.ingestion.notice import Code, Notice, render
 from scripts.stack.nessie import NessieConflict, NessieError
 from spark.jobs.patient_split import result_document
 from spark.result_file import release_reserved, reserve
-from spark.settings import SettingsError
-from spark.split_cli import number_setting, open_client, run, start_deadline
+from spark.settings import SettingsError, number_setting
+from spark.split_cli import open_client, run, start_deadline
 from spark.split_table import PatientSplitError
 
 MARKER = "MARKER_8731"

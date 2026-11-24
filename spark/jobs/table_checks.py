@@ -20,7 +20,6 @@ import functools
 import hashlib
 import json
 import operator
-import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -30,7 +29,7 @@ from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
 from spark import table_checks as rules
 from spark.session import build_session, start_deadline
-from spark.settings import SettingsError
+from spark.settings import MAX_DEADLINE_SECONDS, SettingsError, number_setting
 from spark.table_checks import Plan, PlanTable, RulesError, TableResult, TableSpec
 
 JOB = "table_checks"
@@ -176,7 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     staging = Path(arguments.staging)
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
+        start_deadline(number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS), JOB)
         plan = rules.parse_plan((staging / PLAN_FILE).read_text())
         session = build_session(JOB, plan.branch, plan.branch_hash)
     except OSError as error:
