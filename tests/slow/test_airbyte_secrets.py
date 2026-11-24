@@ -253,7 +253,35 @@ class ClusterStepTest(unittest.TestCase):
 
             with self.assertRaises(secrets.SecretError) as caught:
                 secrets.apply_secrets(unreachable, KUBECTL, "airbyte", secrets.SecretFiles(folder / "secrets"), "airbyte")
-        self.assertIn("refused", str(caught.exception))
+        self.assertIn("unreachable", str(caught.exception))
+
+    def test_a_failed_call_shows_a_fixed_reason_and_none_of_kubectls_text_that_the_known_values_do_not_cover(self) -> None:
+        """kubectl prints the path and the token of a malformed kubeconfig. Neither is a secret file's value, so hiding known values is not enough."""
+        leaked_path, leaked_token = "/srv/example.invalid/kube/leaked-config", "eyJleaked-token-value-7"
+        texts = {
+            "failed": f'error: error loading config file "{leaked_path}": yaml: line 9: bad token: {leaked_token}',
+            "refused": 'Error from server (Forbidden): secrets "airbyte-auth-secrets" is forbidden: User "nobody" cannot get resource',
+            "unreachable": f"Unable to connect to the server: dial tcp: lookup {leaked_path}: no such host",
+            "not found": f'Error from server (NotFound): namespaces "{leaked_path}" not found',
+        }
+        for reason, text in texts.items():
+            for step in ("apply",) if reason == "not found" else ("read", "apply"):
+                with self.subTest(reason=reason, step=step), tempfile.TemporaryDirectory() as scratch:
+                    folder = Path(scratch)
+                    store_with_files(folder)
+                    cluster = FakeCluster()
+
+                    def call(args: list[str], data: str | None, cluster: FakeCluster = cluster, step: str = step, text: str = text) -> tuple[int, str, str]:
+                        if args[len(KUBECTL)] == ("get" if step == "read" else "apply"):
+                            return 1, "", text
+                        return cluster(args, data)
+
+                    with self.assertRaises(secrets.SecretError) as caught:
+                        secrets.apply_secrets(call, KUBECTL, "airbyte", secrets.SecretFiles(folder / "secrets"), "airbyte")
+                message = str(caught.exception)
+                self.assertRegex(message, rf"^cannot {step} the secret airbyte-[a-z-]+ \(reason: {reason}\)$")
+                for leaked in (leaked_path, leaked_token, "nobody", "yaml", "bad token", text):
+                    self.assertNotIn(leaked, message)
 
 
 if __name__ == "__main__":
