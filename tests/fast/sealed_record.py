@@ -56,6 +56,7 @@ CASES_CODES = frozenset(
         "inherited_duplicates",
         "inherited_empty",
         "inherited_incomplete",
+        "inherited_row",
         "table_missing",
         "output_schema",
         "bad_length",

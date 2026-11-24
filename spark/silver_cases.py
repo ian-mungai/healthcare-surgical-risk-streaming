@@ -15,9 +15,10 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import Any
 
 from spark.result_file import SealedError
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
@@ -192,6 +193,35 @@ class CutoffRow:
     rule_version: str
     development_cases: int
     median_length_seconds: int
+
+
+def measure_table_rows(held: Iterable[Mapping[str, Any]]) -> tuple[list[MeasureRow], int]:
+    """The rows of the held measure table that are in form (text for the statistic and the unit, a whole number for the value) and the count of the rows that
+    are not. A row that is not in form is counted and never converted, so that a missing value is a refusal and not a failure of the job."""
+    rows: list[MeasureRow] = []
+    broken = 0
+    for row in held:
+        statistic, unit, value = row["statistic"], row["unit"], row["value"]
+        if type(statistic) is not str or type(unit) is not str or type(value) is not int:
+            broken += 1
+            continue
+        rows.append(MeasureRow(statistic, unit, value))
+    return rows, broken
+
+
+def cutoff_table_rows(held: Iterable[Mapping[str, Any]]) -> tuple[list[CutoffRow], int]:
+    """The rows of the held cutoff table that are in form (text, a whole number, and a whole number or no value for the elapsed time) and the count of the
+    rows that are not. A row that is not in form is counted and never converted."""
+    rows: list[CutoffRow] = []
+    broken = 0
+    for row in held:
+        texts = (row["cutoff"], row["anchor"], row["basis"], row["rule_version"])
+        elapsed, cases, median = row["elapsed_seconds"], row["development_cases"], row["median_length_seconds"]
+        if any(type(text) is not str for text in texts) or type(cases) is not int or type(median) is not int or not (elapsed is None or type(elapsed) is int):
+            broken += 1
+            continue
+        rows.append(CutoffRow(row["cutoff"], row["anchor"], elapsed, row["basis"], row["rule_version"], cases, median))
+    return rows, broken
 
 
 def check_lengths(lengths: Sequence[int]) -> None:

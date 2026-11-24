@@ -26,8 +26,9 @@ from scripts.sample.split import patient_part
 from spark.jobs.silver_cases import CUTOFF_COLUMNS, MEASURE_COLUMNS, Lake
 from spark.jobs.silver_reconcile import ReconcileLake
 from spark.reconcile.checks import SPLIT_REFUSAL
-from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, CutoffRow, SilverCasesError, cutoff_rows, measure_rows
+from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, CutoffRow, MeasureRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.split_table import RULE_VERSION, SET_NAMES
+from tests.fast.sealed_record import FIXED_CODES
 
 
 class Rows:
@@ -206,6 +207,40 @@ class WriteFrameTest(unittest.TestCase):
         self.assertNotIn(".createOrReplace(", inspect.getsource(silver_cases))
 
 
+MEASURE_ROW = {"statistic": "median", "unit": "seconds", "value": 5400}
+CUTOFF_ROW = dict(
+    zip((name for name, _ in CUTOFF_COLUMNS), ("start", "opstart", 0, "fixed", "v", 3, 5400), strict=True),
+)
+# A value that a bigint or string column of the held table never gives: a missing value, a text where a number belongs, a number where a text belongs, a
+# decimal number and a truth value (``True`` is an ``int`` in Python and must not pass as a number).
+BAD_MEASURE_VALUES = (
+    ("value", None),
+    ("value", "5400"),
+    ("value", 5400.0),
+    ("value", True),
+    ("statistic", None),
+    ("statistic", 7),
+    ("unit", None),
+    ("unit", 7),
+)
+BAD_CUTOFF_VALUES = (
+    ("cutoff", None),
+    ("cutoff", 7),
+    ("anchor", None),
+    ("basis", None),
+    ("rule_version", None),
+    ("rule_version", 7),
+    ("elapsed_seconds", "0"),
+    ("elapsed_seconds", 1.5),
+    ("elapsed_seconds", False),
+    ("development_cases", None),
+    ("development_cases", "3"),
+    ("development_cases", True),
+    ("median_length_seconds", None),
+    ("median_length_seconds", 5400.0),
+)
+
+
 class ExistingRulesTest(unittest.TestCase):
     def test_a_table_that_is_not_there_is_none(self) -> None:
         engine, _ = lake(None)
@@ -224,6 +259,50 @@ class ExistingRulesTest(unittest.TestCase):
         rows = [dict(zip((name for name, _ in CUTOFF_COLUMNS), row, strict=True))]
         engine = Lake(Session({"lake.silver.score_cutoffs": frame(rows, log, list(CUTOFF_COLUMNS))}, {}, log), None, "b")  # type: ignore[arg-type]
         self.assertEqual((None, [CutoffRow("start", "opstart", 0, "fixed", "v", 3, 5400)]), engine.existing_rules())
+
+    def test_the_held_measure_is_read_back_into_the_rows_the_rules_compare(self) -> None:
+        engine = self.engine_with(MEASURE_COLUMNS, "lake.silver.operation_length_measure", [MEASURE_ROW])
+        self.assertEqual(([MeasureRow("median", "seconds", 5400)], None), engine.existing_rules())
+
+    def test_a_held_cutoff_without_a_time_is_still_a_row_in_form(self) -> None:
+        row = dict(CUTOFF_ROW, elapsed_seconds=None)
+        engine = self.engine_with(CUTOFF_COLUMNS, "lake.silver.score_cutoffs", [row])
+        self.assertEqual((None, [CutoffRow("start", "opstart", None, "fixed", "v", 3, 5400)]), engine.existing_rules())
+
+    def test_a_held_measure_row_that_is_not_in_form_is_a_fixed_refusal_and_never_a_failure_of_the_job(self) -> None:
+        for field, value in BAD_MEASURE_VALUES:
+            with self.subTest(field=field, value=value):
+                engine = self.engine_with(MEASURE_COLUMNS, "lake.silver.operation_length_measure", [MEASURE_ROW, dict(MEASURE_ROW, **{field: value})])
+                self.assertRefused(engine)
+
+    def test_a_held_cutoff_row_that_is_not_in_form_is_a_fixed_refusal_and_never_a_failure_of_the_job(self) -> None:
+        for field, value in BAD_CUTOFF_VALUES:
+            with self.subTest(field=field, value=value):
+                engine = self.engine_with(CUTOFF_COLUMNS, "lake.silver.score_cutoffs", [CUTOFF_ROW, dict(CUTOFF_ROW, **{field: value})])
+                self.assertRefused(engine)
+
+    def test_the_refusal_holds_no_value_of_the_held_row(self) -> None:
+        engine = self.engine_with(MEASURE_COLUMNS, "lake.silver.operation_length_measure", [dict(MEASURE_ROW, statistic="secret-name", value=None)])
+        with self.assertRaises(SilverCasesError) as raised:
+            engine.existing_rules()
+        self.assertNotIn("secret-name", str(raised.exception))
+        self.assertEqual(["inherited_row: failed"], raised.exception.problems)
+
+    def test_the_code_of_the_refusal_is_one_the_sealed_record_accepts(self) -> None:
+        self.assertIn("inherited_row", FIXED_CODES)
+
+    def test_a_table_with_no_row_is_not_a_row_that_is_out_of_form(self) -> None:
+        engine = self.engine_with(MEASURE_COLUMNS, "lake.silver.operation_length_measure", [])
+        self.assertEqual(([], None), engine.existing_rules())
+
+    def engine_with(self, columns: tuple[tuple[str, str], ...], table: str, rows: list[dict[str, Any]]) -> Lake:
+        log: list[str] = []
+        return Lake(Session({table: frame(rows, log, list(columns))}, {}, log), None, "b")  # type: ignore[arg-type]
+
+    def assertRefused(self, engine: Lake) -> None:
+        with self.assertRaises(SilverCasesError) as raised:
+            engine.existing_rules()
+        self.assertEqual(["inherited_row: failed"], raised.exception.problems)
 
 
 def split_row_dicts(count: int, relabel: int | None = None) -> list[dict[str, Any]]:
