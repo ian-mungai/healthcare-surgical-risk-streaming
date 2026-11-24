@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from features.icu_label import is_valid
-from spark.silver_cases import PERCENTILES, SilverCasesError, unit
+from spark.silver_cases import PERCENTILES, SilverCasesError
 
 UNITS = ("cases", "days")
 
@@ -33,7 +33,7 @@ def nearest_rank_of(values: Sequence[float], percent: int) -> float:
 def icu_measure_rows(values: Sequence[float | None]) -> list[IcuMeasureRow]:
     """The measured values of ``icu_days`` of the development cases, one value (or ``None``) for each case. The order of ``values`` does not matter."""
     if not values:
-        raise SilverCasesError(f"no_development_cases: {unit(0, 'case')}")
+        raise SilverCasesError("no_development_cases: 0 cases")
     recorded = sorted(value for value in values if value is not None and is_valid(value))
     missing = sum(1 for value in values if value is None)
     rows = [

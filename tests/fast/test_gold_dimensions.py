@@ -139,6 +139,22 @@ class DimensionDefinitionTests(unittest.TestCase):
                     self.assertFalse(column.name.startswith(("intraop_", "preop_")))
         self.assertTrue({"icu_days", "death_inhosp", "intraop_ebl"} <= banned)
 
+    def test_no_dimension_reads_an_outcome_or_a_never_feature_column_from_its_source(self) -> None:
+        """The counts of this job's messages (members, rows and keys of a source) stay counts only because no dimension reads a field that a held-out patient's
+        outcome can change: a dimension that read one would have to refuse as ``code: failed`` and never as a count."""
+        banned = {*OUTCOME_COLUMNS, *NEVER_FEATURE_COLUMNS}
+        for item in DIMENSIONS:
+            for _, source_column in item.source_columns:
+                with self.subTest(name=item.name, source_column=source_column):
+                    self.assertNotIn(source_column, banned)
+        self.assertEqual({"icu_days", "death_inhosp"}, set(OUTCOME_COLUMNS))
+
+    def test_a_dimension_is_sealed_exactly_when_it_reads_the_laboratory_table_that_holds_held_out_patients_results(self) -> None:
+        self.assertEqual({"dim_lab_test"}, {item.name for item in DIMENSIONS if item.sealed})
+        for item in DIMENSIONS:
+            with self.subTest(name=item.name):
+                self.assertEqual(item.source == "silver.lab_results", item.sealed)
+
     def test_the_patient_dimension_holds_the_patient_number_and_nothing_else(self) -> None:
         self.assertEqual(["patient_key", "subject_id", "valid_from", "valid_to", "is_current"], [column.name for column in dimension("dim_patient").columns])
 
@@ -198,7 +214,7 @@ class InputProblemTests(unittest.TestCase):
     def test_an_empty_source_is_refused_and_names_its_dimension(self) -> None:
         facts = self.facts()
         facts["dim_lab_test"] = CLEAN_INPUT | {"source_members": 0}
-        self.assertEqual(["empty_source: dim_lab_test, 0 members"], input_problems(facts))
+        self.assertEqual(["empty_source: failed"], input_problems(facts))
 
     def test_a_member_with_two_sets_of_attributes_is_refused(self) -> None:
         facts = self.facts()
@@ -274,13 +290,26 @@ class OutputProblemTests(unittest.TestCase):
         facts = self.facts()
         facts["dim_lab_test"] = CLEAN_OUTPUT | {"key_duplicates": 1}
         facts["dim_case"] = CLEAN_OUTPUT | {"key_duplicates": 1}
-        self.assertEqual(["key_duplicate: dim_case, 1 key", "key_duplicate: dim_lab_test, 1 key"], output_problems(facts))
+        self.assertEqual(["key_duplicate: dim_case, 1 key", "key_duplicate: failed"], output_problems(facts))
 
     def test_a_missing_fact_is_refused_and_never_taken_for_zero(self) -> None:
         facts = self.facts()
         del facts["dim_case"]["key_duplicates"]
         with self.assertRaises(GoldDimensionsError):
             output_problems(facts)
+
+    def test_a_sealed_dimension_fails_as_its_code_and_failed_whatever_the_count(self) -> None:
+        for fact, code, bad in (("unknown_rows", "unknown_member", (0, 2, 9)), ("key_rule_wrong", "key_rule", (1, 9)), ("members", "no_members", (0,))):
+            for count in bad:
+                with self.subTest(fact=fact, count=count):
+                    facts = self.facts()
+                    facts["dim_lab_test"] = CLEAN_OUTPUT | {fact: count}
+                    self.assertEqual([f"{code}: failed"], output_problems(facts))
+
+    def test_a_held_member_that_a_sealed_dimension_lost_fails_as_its_code_and_failed(self) -> None:
+        held = {name: (0, 0) for name in NAMES}
+        held["dim_lab_test"] = (4, 5)
+        self.assertEqual(["member_removed: failed", "version_date_not_after: failed"], frozen_problems(held))
 
     def test_a_problem_names_no_value(self) -> None:
         facts = self.facts()

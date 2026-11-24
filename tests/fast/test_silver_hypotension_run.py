@@ -23,9 +23,9 @@ from spark.silver.hypotension_run import EVENTS, SERIES, Digest, InputRead, Oper
 from spark.silver.run import BRANCH_MOVED, Fingerprint
 
 HEAD, PREPARED, FIRST_WRITE, SECOND_WRITE = "a" * 64, "b" * 64, "c" * 64, "d" * 64
-INPUT = InputRead(InputFacts(5000, 0, 0, 0, 0, ()), (21, 22, 23))
+INPUT = InputRead(InputFacts(0, 0, 0, 0, 0, ()), (21, 22, 23))
 FINGERPRINTS: dict[str, Fingerprint | Digest] = {SERIES: Fingerprint(5000, 5), EVENTS: Digest(9)}
-SERIES_FACTS = SeriesFacts(5000, 0, 0, 0, 0, 0, 0, 0)
+SERIES_FACTS = SeriesFacts(0, 0, 0, 0, 0, 0, 0)
 EVENT_FACTS = EventFacts(0, 0, 0, 0, 0)
 
 
@@ -119,23 +119,22 @@ class Build(unittest.TestCase):
         )
         self.assertEqual((HEAD, SECOND_WRITE, SECOND_WRITE), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
 
-    def test_the_result_holds_snapshots_pass_flags_and_the_development_events_digest_and_no_count_or_cause(self) -> None:
+    def test_the_result_holds_snapshots_pass_flags_and_the_checks_that_ran_and_no_digest_count_or_cause(self) -> None:
         facts = run_build(Fake().operations(), HEAD).facts()
         self.assertEqual({SERIES: 101, EVENTS: 102}, facts["snapshots"])
         self.assertEqual({"waveform_seconds": 21, "clinical_cases": 22, "patient_split": 23}, facts["source_snapshots"])
         self.assertEqual({SERIES: True, EVENTS: True}, facts["passed"])
-        self.assertEqual(9, facts["development_events_digest"])
         self.assertEqual(
-            {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "development_events_digest", "checks_run"},
+            {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"},
             set(facts),
         )
         self.assertGreaterEqual(len(facts["checks_run"]), 10)
 
     def test_a_split_that_fails_its_rule_or_a_case_with_two_owners_writes_nothing_and_stops_before_any_plan(self) -> None:
         for facts, wanted in (
-            (InputFacts(5000, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
-            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
-            (InputFacts(5000, 0, 0, 0, 1, ()), failed("case_without_split")),
+            (InputFacts(0, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
+            (InputFacts(0, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
+            (InputFacts(0, 0, 0, 0, 1, ()), failed("case_without_split")),
         ):
             with self.subTest(wanted=wanted):
                 fake = Fake()
@@ -147,7 +146,7 @@ class Build(unittest.TestCase):
 
     def test_an_input_defect_writes_nothing_and_releases(self) -> None:
         fake = Fake()
-        fake.input = InputRead(InputFacts(0, 0, 0, 0, 0, ()), (21, 22, 23))
+        fake.input = InputRead(InputFacts(1, 0, 0, 0, 0, ()), (21, 22, 23))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
         self.assertEqual(failed("input_empty"), messages(caught.exception))
@@ -188,28 +187,28 @@ class Build(unittest.TestCase):
         fake.read_back[EVENTS] = TableRead(Digest(10), 102, events=EVENT_FACTS)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["readback_differs: 1 table"], messages(caught.exception))
+        self.assertEqual(["readback_differs: failed"], messages(caught.exception))
 
     def test_a_table_that_is_not_there_at_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_a_series_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = TableRead(FINGERPRINTS[SERIES], 101)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_an_event_table_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
         fake = Fake()
         fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_the_checks_of_the_series_run_on_the_read_back_and_come_first(self) -> None:
         fake = Fake()
@@ -227,7 +226,7 @@ class Build(unittest.TestCase):
         self.assertEqual(failed("event_short"), messages(caught.exception))
 
     def test_an_input_that_changed_between_the_reads_is_named(self) -> None:
-        for later in (InputRead(INPUT.facts, (21, 22, 24)), InputRead(dataclasses.replace(INPUT.facts, art_seconds=5001), (21, 22, 23))):
+        for later in (InputRead(INPUT.facts, (21, 22, 24)), InputRead(dataclasses.replace(INPUT.facts, null_keys=1), (21, 22, 23))):
             with self.subTest(later=later):
                 fake = Fake()
                 fake.later_input = later
@@ -284,7 +283,7 @@ class SeriesFirst(unittest.TestCase):
         fake.held = dict(fake.read_back)
         with self.assertRaises(SilverSignalsError) as caught:
             run_verify(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
 
 class MissingTables(unittest.TestCase):
@@ -304,15 +303,15 @@ class MissingTables(unittest.TestCase):
 
     def test_only_the_series_missing_is_one_table_and_the_events_are_found_without_their_facts(self) -> None:
         problems, calls = self.missing(series=True, events=False)
-        self.assertEqual(["table_missing: 1 table"], problems)
+        self.assertEqual(["table_missing: failed"], problems)
         self.assertIn(f"read_table a {EVENTS} facts=False", calls)
         self.assertNotIn(f"read_table a {EVENTS} facts=True", calls)
 
     def test_only_the_events_missing_is_one_table(self) -> None:
-        self.assertEqual(["table_missing: 1 table"], self.missing(series=False, events=True)[0])
+        self.assertEqual(["table_missing: failed"], self.missing(series=False, events=True)[0])
 
     def test_both_tables_missing_are_two_tables(self) -> None:
-        self.assertEqual(["table_missing: 2 tables"], self.missing(series=True, events=True)[0])
+        self.assertEqual(["table_missing: failed"], self.missing(series=True, events=True)[0])
 
 
 class Verify(unittest.TestCase):
@@ -329,8 +328,8 @@ class Verify(unittest.TestCase):
 
     def test_a_split_that_fails_its_rule_stops_a_verify_before_any_table_is_read(self) -> None:
         for facts, wanted in (
-            (InputFacts(5000, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
-            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
+            (InputFacts(0, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
+            (InputFacts(0, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
         ):
             with self.subTest(wanted=wanted):
                 fake = Fake()
@@ -345,7 +344,7 @@ class Verify(unittest.TestCase):
         fake.read_back[EVENTS] = None
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_a_defect_in_a_table_is_named(self) -> None:
         fake = Fake()

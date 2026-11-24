@@ -1,7 +1,7 @@
 """The patient split table: each patient with its set, frozen before any rule is estimated.
 
-``python -m spark.jobs.patient_split build --branch <name> [--base <name>] [--pinned-release] [--fixed-sample <candidates.tsv>]``
-``python -m spark.jobs.patient_split verify --branch <name> [--pinned-release] [--fixed-sample <candidates.tsv>]``
+``python -m spark.jobs.patient_split build --branch <name> [--base <name>] [--pinned-release] [--fixed-sample <candidates.tsv>] --result <path>``
+``python -m spark.jobs.patient_split verify --branch <name> [--pinned-release] [--fixed-sample <candidates.tsv>] --result <path>``
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it. It
 reads ``bronze.clinical_cases``, gives each distinct ``subjectid`` its set from the one assignment rule in ``scripts/sample/split.py`` and writes
@@ -13,7 +13,8 @@ The branch is resolved to one hash. Every read and check is at that hash (a read
 still has it. The hash of the write is taken from the branch's log: the head, one commit directly on the checked hash, changing only the table. A new
 table's namespace is a commit of its own, made only after every check passed and the head was confirmed, so a failed check or a moved branch writes
 nothing. The table is read again at that hash, and the job ends with ``branch_moved`` when the branch no longer has the hash that it checked.
-The result names that hash, the hash of the write and nothing derived from the rows.
+The result names that hash, the hash of the write, the snapshot IDs, the checks that ran and one pass flag for the table, and nothing derived from the
+rows: no count of patients, cases or sets and no field that says whether the table was written.
 Every local input is validated before the first call to Nessie, so a bad input never leaves a branch that blocks the retry.
 
 The table is frozen. When the branch already holds the table (merged earlier), that table must be valid by itself (rows, no patient twice, one rule
@@ -22,8 +23,11 @@ nothing. ``--pinned-release`` is the full cohort: it requires the shares of 70, 
 refuses a new patient. ``--fixed-sample`` takes the complete tracked candidate file, refuses any other, and requires every case of it in Bronze in the
 set that its slot expects. The result names the checks that ran.
 
-The test set is sealed: a message or the result holds codes, counts and hashes, and never a patient, a case or a set beside one.
+The test set is sealed: a message or the result holds codes with a flag (``two_sets: failed``), hashes and snapshot IDs, and never a patient, a case, a set
+beside one or a count (the clinical table that the patients come from holds the outcome columns).
 The command line prints fixed codes only (``usage``, ``branch_missing``, ``catalog_error``, ``settings``) and the codes of a failed check.
+The result is one file at ``--result`` (an absolute path that must not exist, ``spark/result_file.py``). A refusal writes the file too, with one diagnostic for
+each code and no count, and a bad call writes none.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
 """
@@ -50,13 +54,13 @@ from spark.split_table import (
     SplitRow,
     TableState,
     catalog_conf,
+    flag,
     read_fixed_sample,
     run_build,
     run_verify,
     schema_problems,
     source_cases,
     table_rows,
-    unit,
     values_query,
 )
 from spark.split_table import write_commit as write_commit_of
@@ -117,7 +121,7 @@ class Lake:
     def read_source(self, at: str) -> Source:
         table = f"{self.catalog(at)}.{SOURCE_NAME}"
         if not self.session.catalog.tableExists(table):
-            raise PatientSplitError(f"source_table: {unit(0, 'table')}")
+            raise PatientSplitError(flag("source_table"))
         frame = self.session.table(table)
         fields = [(field.name, field.dataType.simpleString()) for field in frame.schema.fields if field.name in dict(SOURCE_COLUMNS)]
         problems = schema_problems(sorted(fields), sorted(SOURCE_COLUMNS))
@@ -125,10 +129,10 @@ class Lake:
             raise PatientSplitError(*problems)
         snapshot = self.snapshot_id(table)
         if snapshot is None:
-            raise PatientSplitError(f"source_no_snapshot: {unit(0, 'snapshot')}")
+            raise PatientSplitError(flag("source_no_snapshot"))
         cases, patients = source_cases((row["caseid"], row["subjectid"]) for row in frame.select("caseid", "subjectid").collect())
         if not patients:
-            raise PatientSplitError(f"source_empty: {unit(0, 'row')}")
+            raise PatientSplitError(flag("source_empty"))
         return Source(cases, patients, snapshot)
 
     def read_table(self, at: str) -> TableState | None:
@@ -141,7 +145,7 @@ class Lake:
             raise PatientSplitError(*problems)
         rows, broken = table_rows(frame.collect())
         if broken:
-            raise PatientSplitError(f"table_row: {unit(broken, 'row')}")
+            raise PatientSplitError(flag("table_row"))
         return TableState(rows, self.snapshot_id(table))
 
     def write(self, rows: Sequence[SplitRow], *, exists: bool) -> None:
@@ -157,6 +161,19 @@ class Lake:
             frame.writeTo(table).overwritePartitions()
             return
         frame.writeTo(table).tableProperty("format-version", "2").create()
+
+
+def result_document(arguments: argparse.Namespace, base: str | None, facts: dict[str, Any]) -> dict[str, Any]:
+    """The result of a clean call: the mode and the branch that the caller asked for, the base hash of a build, the two tables and the facts of the outcome."""
+    return {
+        "mode": arguments.mode,
+        "branch": arguments.branch,
+        "base_hash": base,
+        "pinned_release": arguments.pinned_release,
+        "table": TARGET_NAME,
+        "source_table": SOURCE_NAME,
+        **facts,
+    }
 
 
 def execute(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -175,15 +192,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         base = client.create_branch(arguments.branch, arguments.base).hash if building else client.reference(arguments.branch).hash
         operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash, lake.prepare)
         outcome = (run_build if building else run_verify)(operations, base, pinned=arguments.pinned_release, sample=sample)
-        return {
-            "mode": arguments.mode,
-            "branch": arguments.branch,
-            "base_hash": base if building else None,
-            "pinned_release": arguments.pinned_release,
-            "table": TARGET_NAME,
-            "source_table": SOURCE_NAME,
-            **outcome.facts(),
-        }
+        return result_document(arguments, base if building else None, outcome.facts())
     finally:
         if session is not None:
             session.stop()

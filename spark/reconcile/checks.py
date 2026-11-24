@@ -26,7 +26,6 @@ from features.signal_validity import INVALID_CAUSES
 from spark.bronze import tables as bronze
 from spark.silver import tables as silver
 from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, OWNERSHIP_PROBLEM, SOURCE_SCHEMAS
-from spark.split_table import unit
 
 VALID = "valid"
 DUPLICATE = "duplicate"
@@ -141,6 +140,12 @@ CHECK_NAMES = (
 )
 JOB_CODES = frozenset({"branch_moved", "bad_fact", "catalog_hash"})
 CODES = frozenset(CHECK_NAMES) | JOB_CODES
+
+
+def unit(count: int, noun: str) -> str:
+    """A count and its noun. These are counts of the development patients' keys and rows only: the held-out patients are one flag for each table
+    (``held_out_problems``), and the checks that read every patient (the split table and the owner of a case) refuse with one fixed code and no count."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
 def counted(pairs: Sequence[tuple[str, int, str]]) -> list[str]:

@@ -1,8 +1,8 @@
 """The Silver job for the clinical and laboratory tables: ``silver.cases`` and ``silver.lab_results``, with the measured operation lengths and the score
 cutoffs, on a private Nessie branch.
 
-``python -m spark.jobs.silver_cases build --branch <name> [--base <name>] [--pinned-release]``
-``python -m spark.jobs.silver_cases verify --branch <name> [--pinned-release]``
+``python -m spark.jobs.silver_cases build --branch <name> [--base <name>] [--pinned-release] --result <path>``
+``python -m spark.jobs.silver_cases verify --branch <name> [--pinned-release] --result <path>``
 
 ``build`` creates the branch from ``main`` (or ``--base``) and refuses a branch that exists. It reads ``bronze.clinical_cases``, ``bronze.lab_results`` and
 ``silver.patient_split`` on that branch. Silver does the standard steps only: it enforces types, keeps a missing value missing, collapses laboratory rows
@@ -23,7 +23,11 @@ that its old schema and snapshot stay readable through the tag after the merge; 
 that branch and makes the new one; (3) ``verify`` the new branch; (4) merge it into the base. A ``build`` on a branch that exists is refused, so a rebuild
 always needs a new branch name.
 
-The test set is sealed: the result and the messages hold codes, counts, table names and the cutoffs, and never a case or a patient.
+The test set is sealed, and the clinical table holds the outcome columns: a message is a code and a flag (``key_null: failed``) and never a count,
+and the result holds hashes, snapshot IDs, the checks that ran, one pass flag for each of the four tables and measures of the development patients (the
+cutoffs), never a case, a patient, a count over all cases or a field that says whether a table was written.
+The result is one file at ``--result`` (an absolute path that must not exist, ``spark/result_file.py``). A refusal writes the file too, with one diagnostic for
+each code and no count, and a bad call writes none.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
 """
@@ -53,12 +57,12 @@ from spark.silver_cases import (
     CutoffRow,
     MeasureRow,
     SilverCasesError,
+    flag,
     same_rows,
     source_schema_problems,
     split_rule_problems,
-    unit,
 )
-from spark.silver_cases_run import JOB, run, run_build, run_verify, start_deadline
+from spark.silver_cases_run import JOB, result_document, run, run_build, run_verify, start_deadline
 from spark.silver_cases_sql import (
     BRONZE_CASES_SOURCE,
     BRONZE_LAB_SOURCE,
@@ -153,7 +157,7 @@ class Lake:
     def split_problems(self) -> list[str]:
         """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
         rows, broken = table_rows(self.session.table(SPLIT_SOURCE).collect())
-        return [*([f"table_row: {unit(broken, 'row')}"] if broken else []), *split_rule_problems(rows, pinned=False)]
+        return [*([flag("table_row")] if broken else []), *split_rule_problems(rows, pinned=False)]
 
     def input_facts(self) -> dict[str, object]:
         """The counts over the inputs. The outcome columns are counted for development patients only; for the others one flag (0 or 1) says whether any value
@@ -225,7 +229,7 @@ class Lake:
         if fields is None:
             return None
         if fields != list(expected):
-            raise SilverCasesError(f"inherited_schema: {unit(1, 'table')}")
+            raise SilverCasesError(flag("inherited_schema"))
         return list(self.session.table(source).collect())
 
     def existing_rules(self) -> tuple[list[MeasureRow] | None, list[CutoffRow] | None]:
@@ -337,14 +341,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         head = client.reference(arguments.branch).hash
         if pinned is not None and head != pinned:
             raise SilverCasesError(BRANCH_MOVED)
-        return {
-            "mode": arguments.mode,
-            "branch": arguments.branch,
-            "base_hash": base,
-            "branch_hash": head,
-            "pinned_release": arguments.pinned_release,
-            **outcome.facts(),
-        }
+        return result_document(arguments, base, head, outcome)
     finally:
         if session is not None:
             session.stop()

@@ -171,6 +171,8 @@ class FakeNessie:
 class FakeStack:
     """The first pinned build answers with ``build``; any other build is refused with one schema line; a verify passes."""
 
+    unknown_lines = 0
+
     def __init__(self, build: dict[str, Any]) -> None:
         self.build = build
 

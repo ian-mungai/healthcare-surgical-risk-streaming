@@ -1,5 +1,4 @@
-"""The rules of the Bronze clinical and laboratory tables that need no Spark: which columns pass through, how the source occurrence is numbered
-and how a table is digested.
+"""The rules of the Bronze clinical and laboratory tables that need no Spark: which columns pass through and how the source occurrence is numbered.
 
 The Spark job ``spark/jobs/bronze_clinical_lab.py`` copies the loaded tables ``raw_records.clinical_data`` and ``raw_records.lab_data`` into
 ``bronze.clinical_cases`` and ``bronze.lab_results``. Every published column stays a string and no value is changed, trimmed or cast: an
@@ -15,7 +14,6 @@ never on the order in which a load wrote the rows.
 
 from __future__ import annotations
 
-import hashlib
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -30,9 +28,8 @@ GROUP_COLUMNS = LAB_COLUMNS[:3]
 CLINICAL_KEY = ("caseid",)
 LAB_KEY = (*GROUP_COLUMNS, OCCURRENCE_COLUMN)
 TABLES = {"clinical": ("clinical_data", "clinical_cases", CLINICAL_KEY), "lab": ("lab_data", "lab_results", LAB_KEY)}
-MISSING = "n"
 REPEATED_ROWS_LIMIT = 100_000
-HALF_HEX = 16
+COLUMNS_REFUSED = "columns_refused"
 
 
 @dataclass(frozen=True)
@@ -44,7 +41,12 @@ class TableContent:
 
 
 class BronzeRulesError(ValueError):
-    """A loaded table does not have the form that Bronze accepts. The message names the table's column and never holds a data value."""
+    """A loaded table does not have the form that Bronze accepts. The message is for the code that raises it and for its tests: the job's output holds ``code``,
+    a fixed word, and nothing of the message."""
+
+    def __init__(self, message: str, *, code: str = "rules_broken") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def payload_columns(kind: str, found: Sequence[tuple[str, str]]) -> list[str]:
@@ -56,16 +58,18 @@ def payload_columns(kind: str, found: Sequence[tuple[str, str]]) -> list[str]:
     own = [(name, column_type) for name, column_type in found if not name.startswith(AIRBYTE_PREFIX)]
     names = [name for name, _ in own]
     if len(set(names)) != len(names):
-        raise BronzeRulesError("a column name is repeated in the loaded table")
+        raise BronzeRulesError("a column name is repeated in the loaded table", code=COLUMNS_REFUSED)
     if OCCURRENCE_COLUMN in names:
-        raise BronzeRulesError(f"the loaded table has a column named {OCCURRENCE_COLUMN}, which Bronze adds itself")
+        raise BronzeRulesError(f"the loaded table has a column named {OCCURRENCE_COLUMN}, which Bronze adds itself", code=COLUMNS_REFUSED)
     wrong = [name for name, column_type in own if column_type != STRING_TYPE]
     if wrong:
-        raise BronzeRulesError(f"{len(wrong)} column(s) are not string columns, and a copy would have to cast them: {', '.join(wrong[:3])}")
+        raise BronzeRulesError(
+            f"{len(wrong)} column(s) are not string columns, and a copy would have to cast them: {', '.join(wrong[:3])}", code=COLUMNS_REFUSED
+        )
     if kind == "lab" and names != list(LAB_COLUMNS):
-        raise BronzeRulesError(f"the laboratory table must hold exactly the columns {', '.join(LAB_COLUMNS)}")
+        raise BronzeRulesError(f"the laboratory table must hold exactly the columns {', '.join(LAB_COLUMNS)}", code=COLUMNS_REFUSED)
     if kind == "clinical" and any(name not in names for name in CLINICAL_KEY):
-        raise BronzeRulesError(f"the clinical table has no column {', '.join(CLINICAL_KEY)}")
+        raise BronzeRulesError(f"the clinical table has no column {', '.join(CLINICAL_KEY)}", code=COLUMNS_REFUSED)
     return names
 
 
@@ -85,28 +89,6 @@ def assign_occurrences(
         previous = row[:3]
         numbered.append((*row, occurrence))
     return numbered
-
-
-def row_text(values: Iterable[str | None]) -> str:
-    """One row as text for a digest. A value is its length, a colon and itself, a missing value is ``n``, and the fields are joined by ``|``.
-
-    The length makes the text unambiguous for any value, and a missing value differs from an empty one.
-    """
-    return "|".join(MISSING if value is None else f"{len(value)}:{value}" for value in values)
-
-
-def digest_of(lines: Iterable[str]) -> str:
-    """The digest of a table that does not depend on the order of its rows: ``<rows>:<sum of the high halves>:<sum of the low halves>``.
-
-    Each line gives the SHA-256 of its text, read as two unsigned 64-bit numbers. A changed, moved, missing or repeated row changes the count or a sum.
-    """
-    rows = high = low = 0
-    for line in lines:
-        hexadecimal = hashlib.sha256(line.encode()).hexdigest()
-        rows += 1
-        high += int(hexadecimal[:HALF_HEX], 16)
-        low += int(hexadecimal[HALF_HEX : 2 * HALF_HEX], 16)
-    return f"{rows}:{high}:{low}"
 
 
 def occurrence_differences(rows: Iterable[tuple[str | None, str | None, str | None, str | None, int]]) -> int:

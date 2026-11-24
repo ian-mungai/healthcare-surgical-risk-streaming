@@ -24,6 +24,7 @@ from features.signal_validity import (
     second_extent,
     waveform_verdict,
 )
+from spark.bronze.quality import row_count_at_least, row_count_is
 from spark.silver.checks import BronzeFacts, NumericFacts, WaveformFacts
 from spark.silver.run import Fingerprint
 from spark.silver.tables import NUMERIC, WAVEFORM
@@ -225,7 +226,6 @@ def numeric_facts(frame: Any, bronze: Any) -> NumericFacts:
     key = f.struct(*[f.col(name) for name in NUMERIC_KEY])
     ledger = f.coalesce(f.size("duplicate_source_occurrences"), f.lit(0)).cast("long")
     row = again.agg(
-        f.count(f.lit(1)).alias("rows"),
         (f.count(f.lit(1)) - f.countDistinct(key)).alias("duplicate_keys"),
         f.sum(ledger).alias("ledger_total"),
         count_where(f.col("source_occurrence") != f.lit(FIRST_OCCURRENCE)).alias("not_first"),
@@ -234,10 +234,9 @@ def numeric_facts(frame: Any, bronze: Any) -> NumericFacts:
             for column, name in zip(verdict_columns(again), ("null", "valid_with_cause", "invalid_without_cause", "unknown", "differs"), strict=True)
         ],
     ).first()
+    every_reading = row_count_is(frame, bronze.count() - int(row["ledger_total"] or 0))
     return NumericFacts(
-        int(row["rows"]),
         int(row["duplicate_keys"]),
-        int(row["ledger_total"] or 0),
         int(row["not_first"] or 0),
         int(row["null"] or 0),
         int(row["valid_with_cause"] or 0),
@@ -245,6 +244,7 @@ def numeric_facts(frame: Any, bronze: Any) -> NumericFacts:
         int(row["unknown"] or 0),
         int(row["differs"] or 0),
         source_differences(frame, numeric_kept(bronze), NUMERIC.columns),
+        int(not every_reading),
     )
 
 
@@ -254,7 +254,6 @@ def waveform_facts(frame: Any, bronze: Any, tracks: Any) -> WaveformFacts:
     key = f.struct(*[f.col(name) for name in WAVEFORM_KEY])
     stored = f.coalesce(f.size("samples"), f.lit(0))
     row = again.agg(
-        f.count(f.lit(1)).alias("rows"),
         (f.count(f.lit(1)) - f.countDistinct(key)).alias("duplicate_keys"),
         count_where(~f.col("sample_count").eqNullSafe(stored)).alias("shape"),
         *[
@@ -263,7 +262,6 @@ def waveform_facts(frame: Any, bronze: Any, tracks: Any) -> WaveformFacts:
         ],
     ).first()
     return WaveformFacts(
-        int(row["rows"]),
         int(row["duplicate_keys"]),
         int(row["null"] or 0),
         int(row["valid_with_cause"] or 0),
@@ -272,6 +270,7 @@ def waveform_facts(frame: Any, bronze: Any, tracks: Any) -> WaveformFacts:
         int(row["shape"] or 0),
         int(row["differs"] or 0),
         source_differences(frame, waveform_physical(bronze, tracks), WAVEFORM.columns),
+        int(not row_count_is(frame, bronze.count())),
     )
 
 
@@ -300,8 +299,7 @@ def bronze_facts(numeric: Any, waveform: Any, tracks: Any) -> BronzeFacts:
     twice = waveform.groupBy(*WAVEFORM_KEY).agg(f.count(f.lit(1)).alias("n")).agg(f.sum(f.col("n") - f.lit(1)).alias("extra")).first()["extra"]
     doubled = tracks.groupBy(*TRACK_KEY).agg(f.count(f.lit(1)).alias("n")).filter(f.col("n") > 1).count()
     return BronzeFacts(
-        numeric.count(),
-        waveform.count(),
+        int(not (row_count_at_least(numeric, 1) or row_count_at_least(waveform, 1))),
         null_rows(numeric, (*NUMERIC_KEY, "source_occurrence")),
         gaps,
         numeric.join(present("numeric"), list(TRACK_KEY), "left_anti").count(),

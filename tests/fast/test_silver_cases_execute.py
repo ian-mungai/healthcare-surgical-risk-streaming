@@ -59,7 +59,7 @@ class Session:
 
 class Outcome:
     def facts(self) -> dict[str, Any]:
-        return {"outcome": "verified"}
+        return {"passed": {"cases": True}}
 
 
 def call(mode: str, client: Client, sessions: list[Session]) -> tuple[dict[str, Any], list[tuple[Any, ...]]]:

@@ -386,8 +386,9 @@ class ReadsAndWritesTest(QuietCase):
     def test_a_loaded_table_that_the_pinned_catalog_does_not_have_is_refused_by_name(self) -> None:
         session = RecordingSession()
         session.missing = {"source.raw_records.lab_data"}
-        with self.assertRaisesRegex(BronzeRulesError, "raw_records.lab_data"):
+        with self.assertRaisesRegex(BronzeRulesError, "raw_records.lab_data") as raised:
             adapter(session).source_columns("lab")
+        self.assertEqual("source_table_missing", raised.exception.code)
 
     def test_the_laboratory_table_is_written_from_the_loaded_table_with_the_rank_and_replaces_the_bronze_table(self) -> None:
         session = RecordingSession()

@@ -5,16 +5,19 @@ stand-in steps in the fast tests.
 that changes nothing writes nothing. ``verify`` runs the same input checks and the output checks on what a branch holds and writes nothing. The merge of the
 branch is the caller's step.
 
-The test set is sealed. A message or the result holds codes, counts, table names and the cutoffs (measured on development patients), and never a case, a
-patient or an argument. The command line prints fixed codes only: ``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the
-codes of a failed check. A ``silver.cases`` table of the schema before the double (``icu_days`` as a whole number) is refused by the code
-``cases_schema_legacy: failed``: only a ``build`` on a new branch rebuilds it.
+The test set is sealed, and the clinical table that the tables come from holds the outcome columns. A message holds a code and a flag (``key_null: failed``)
+and no count. The result holds the hashes, the snapshot IDs, the checks that ran, one pass flag for each table and measures of the development
+patients (the cutoffs and their counts), and never a case, a patient, an argument, a count over all cases or a field that says whether a table was written:
+a held-out outcome changes both, and the branch hash against the base hash shows a write. The result is one file at ``--result``
+(``spark/result_file.py``), with one diagnostic for each code of a failed check and no count; the command line prints fixed codes only: ``usage``,
+``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check.
+A ``silver.cases`` table of the schema before the double (``icu_days`` as a whole number) is refused by the code ``cases_schema_legacy: failed``:
+only a ``build`` on a new branch rebuilds it.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import threading
@@ -22,24 +25,24 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
-from scripts.stack.nessie import NessieError
-from spark.settings import SettingsError
+from spark.result_file import add_result_option, release_reserved, run_sealed
 from spark.silver_cases import (
+    FLAG,
     CutoffRow,
     MeasureRow,
     SilverCasesError,
     cutoff_rows,
+    flag,
     frozen_problems,
     input_problems,
     measure_rows,
     output_problems,
     same_rows,
-    unit,
 )
-from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, reference_name
+from spark.split_cli import reference_name
 
 JOB = "silver_cases"
-TABLES = ("cases", "lab", "rules")
+TABLES = ("cases", "lab", "operation_length_measure", "score_cutoffs")
 CHECKS_SAMPLE = [
     "key_not_null",
     "key_unique",
@@ -57,14 +60,14 @@ CHECKS_SAMPLE = [
     "cutoffs_read_back",
 ]
 CHECKS_BUILD = [*CHECKS_SAMPLE[:7], "pinned_counts", *CHECKS_SAMPLE[7:]]
-CASES_SCHEMA_LEGACY = "cases_schema_legacy: failed"
-RULES_READ_BACK = "readback_differs: the saved measure or cutoffs are not the ones that were written"
+CASES_SCHEMA_LEGACY = f"cases_schema_legacy: {FLAG}"
+RULES_READ_BACK = f"readback_differs: {FLAG}"
 
 
 class SilverOps(Protocol):
     """The Spark steps of the job. ``input_facts`` holds the counts over Bronze and the split, ``output_facts`` the counts over the written tables, and
     ``development_lengths`` the operation lengths of the development patients only. A write gives ``True`` when it changed the table and ``False`` when the
-    table already held the rows."""
+    table already held the rows; the sequence does not put that in the result."""
 
     def split_problems(self) -> list[str]: ...
 
@@ -93,8 +96,6 @@ class SilverOps(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    outcome: str
-    written: dict[str, bool]
     pinned: bool
     measure: list[MeasureRow]
     cutoffs: list[CutoffRow]
@@ -102,15 +103,14 @@ class Outcome:
     snapshot_ids: dict[str, int | None]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line holds: the outcome, which tables were written, the checks that ran, counts, the snapshot IDs, the measure and the cutoffs.
+        """What the result file holds: the checks that ran, one pass flag for each table, the snapshot IDs, the measure and the cutoffs and the counts of
+        development patients.
 
-        The laboratory counts are for development patients only.
+        The laboratory counts and the measure are for development patients only. A failed check raises, so each flag is true in every result.
         """
         return {
-            "outcome": self.outcome,
-            "written": self.written,
-            "checks_run": CHECKS_BUILD if self.pinned else CHECKS_SAMPLE,
-            "cases": self.output["case_rows"],
+            "checks_run": list(CHECKS_BUILD if self.pinned else CHECKS_SAMPLE),
+            "passed": {name: True for name in TABLES},
             "development_lab_rows": self.output["lab_rows"],
             "development_lab_copies": self.output["lab_copies"],
             "development_cases": self.cutoffs[0].development_cases,
@@ -144,7 +144,7 @@ def check_stored_schema(ops: SilverOps) -> None:
     if wrong:
         if ops.cases_schema_legacy():
             raise SilverCasesError(CASES_SCHEMA_LEGACY)
-        raise SilverCasesError(f"output_schema: {unit(wrong, 'table')}")
+        raise SilverCasesError(flag("output_schema"))
 
 
 def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
@@ -154,7 +154,9 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
     problems = frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
     if problems:
         raise SilverCasesError(*problems)
-    written = {"cases": ops.write_cases(), "lab": ops.write_lab(), "rules": ops.write_rules(measure, cutoffs)}
+    ops.write_cases()
+    ops.write_lab()
+    ops.write_rules(measure, cutoffs)
     check_stored_schema(ops)
     saved = ops.existing_rules()
     output = ops.output_facts()
@@ -163,7 +165,7 @@ def run_build(ops: SilverOps, *, pinned: bool) -> Outcome:
         problems.append(RULES_READ_BACK)
     if problems:
         raise SilverCasesError(*problems)
-    return Outcome("written" if any(written.values()) else "unchanged", written, pinned, measure, cutoffs, output, ops.snapshot_ids())
+    return Outcome(pinned, measure, cutoffs, output, ops.snapshot_ids())
 
 
 def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
@@ -172,12 +174,12 @@ def run_verify(ops: SilverOps, *, pinned: bool) -> Outcome:
     check_stored_schema(ops)
     held_measure, held_cutoffs = ops.existing_rules()
     missing = (held_measure is None) + (held_cutoffs is None)
-    problems = [f"table_missing: {unit(missing, 'table')}"] if missing else frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
+    problems = [flag("table_missing")] if missing else frozen_problems(held_measure, held_cutoffs, measure, cutoffs)
     output = ops.output_facts()
     problems += output_problems(**output)  # type: ignore[arg-type]
     if problems:
         raise SilverCasesError(*problems)
-    return Outcome("verified", {name: False for name in TABLES}, pinned, measure, cutoffs, output, ops.snapshot_ids())
+    return Outcome(pinned, measure, cutoffs, output, ops.snapshot_ids())
 
 
 DEADLINE_EXIT_CODE = 124
@@ -189,6 +191,7 @@ def start_deadline(seconds: float, exit_with: Callable[[int], object] = os._exit
     def expire() -> None:
         sys.stderr.write(f"{JOB}: timeout\n")
         sys.stderr.flush()
+        release_reserved()
         exit_with(DEADLINE_EXIT_CODE)
 
     timer = threading.Timer(seconds, expire)
@@ -217,33 +220,25 @@ def parser() -> argparse.ArgumentParser:
         mode.add_argument("--pinned-release", action="store_true", help="the full release: require its exact row counts")
         if name == "build":
             mode.add_argument("--base", default="main", type=reference_name, help="the branch to create the private branch from")
+        add_result_option(mode)
     return command
 
 
-def report(message: str) -> None:
-    sys.stderr.write(f"{JOB}: {message}\n")
+def result_document(arguments: argparse.Namespace, base: str | None, head: str, outcome: Outcome) -> dict[str, Any]:
+    """The result of a clean call: the mode and the branch that the caller asked for, the base hash and the branch hash, and the facts of the outcome."""
+    return {
+        "mode": arguments.mode,
+        "branch": arguments.branch,
+        "base_hash": base,
+        "branch_hash": head,
+        "pinned_release": arguments.pinned_release,
+        **outcome.facts(),
+    }
 
 
 def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict[str, Any]]) -> int:
-    """Parse the call, run ``execute`` and print its result line.
+    """Parse the call, run ``execute`` and write its result to the file at ``--result`` (``spark/result_file.py``).
 
     Exit 0 on success, 1 on a failed check or a failed upstream, 2 on a bad call or setting, 70 on anything else.
     """
-    arguments = parser().parse_args(argv)
-    try:
-        result = execute(arguments)
-    except SilverCasesError as error:
-        for problem in error.problems:
-            report(problem)
-        return 1
-    except NessieError as error:
-        report("branch_missing" if error.status == NOT_FOUND and error.error_code == REFERENCE_NOT_FOUND else "catalog_error")
-        return 1
-    except SettingsError:
-        report("settings")
-        return 2
-    except Exception:
-        report("internal_error")
-        return INTERNAL_EXIT_CODE
-    sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
-    return 0
+    return run_sealed(parser(), argv, execute, JOB)

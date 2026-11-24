@@ -62,12 +62,18 @@
     {
       "name": "gain",
       "type": "double",
-      "doc": "The physical value of a sample is its raw value times the gain plus the offset."
+      "doc": "For a track of an integer sample format (3 to 8) the physical value of a sample is its raw value times the gain plus the offset, so the calibration applies to integer formats only. A float format (1 and 2) holds physical values already, and the gain and the offset do not apply to it."
     },
     {
       "name": "offset",
       "type": "double",
       "doc": "See the gain."
+    },
+    {
+      "name": "sample_format",
+      "type": "int",
+      "default": 0,
+      "doc": "The track's sample format code in the file: 1 and 2 are floats, which are already physical values, and 3 to 8 are integers (int8, uint8, int16, uint16, int32, uint32), whose physical value is the raw value times the gain plus the offset and whose gap marker is a missing sample. 0 means that the sender did not state it, and the stream refuses such a message."
     },
     {
       "name": "start_offset_us",

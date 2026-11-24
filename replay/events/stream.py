@@ -1,16 +1,17 @@
 """The events of one case occurrence, in the order in which the replay sends them, and the payload of each.
 
-Every numeric reading is one event, every waveform second is one event, every published string event is one event, and the occurrence ends with two generated
-markers: the final-score marker, due at ``opend``, and the case-end marker, due at ``caseend``.
+Every numeric reading is one event, every waveform second is one event, every published string event is one event, and the occurrence holds three
+generated markers: the start marker, due at ``opstart``, the final-score marker, due at ``opend``, and the case-end marker, due at ``caseend``.
 
-**Due instant.** A reading is due at its own case time. A waveform second is due at the end of the second, when all its samples exist. A marker is due at the
-time its name says. The replay time of an event is the start of its occurrence plus its due offset. A due offset is held inside the case, between zero and the
-``caseend``: the published recordings end within a second of the whole-second ``caseend``, so a reading or a waveform second can lie just outside it, and an
-event that the replay sent outside its occurrence would break the order of replay time in its room. The event keeps its true case time.
+**Due instant.** A reading is due at its own case time. A waveform second is due at the end of the second, when all its samples exist. A marker
+is due at the time its name says. The replay time of an event is the start of its occurrence plus its due offset. A due offset is held inside the
+case, between zero and the ``caseend``: the published recordings end within a second of the whole-second ``caseend``, so a reading or a waveform
+second can lie just outside it, and an event that the replay sent outside its occurrence would break the order of replay time in its room. The
+event keeps its true case time.
 
-**Order.** By due offset. At one due offset the source events come first, in the order of their track names, case times and discriminators, then the
-final-score marker, then the case-end marker. So a marker comes after every reading that is due at its instant, and the order does not depend on the order
-of the file.
+**Order.** By due offset. At one due offset the source events come first, in the order of their track names, case times and discriminators, then
+the start marker, the final-score marker and the case-end marker. So a marker comes after every reading that is due at its instant, and the order
+does not depend on the order of the file.
 
 **Discriminator.** The position of a reading among the readings of its track that share its case time, in the order of the file.
 """
@@ -21,13 +22,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from replay.events.identity import CASE_END_TRACK, FINAL_SCORE_TRACK, marker_event_id, source_event_id
+from replay.events.identity import CASE_END_TRACK, FINAL_SCORE_TRACK, OP_START_TRACK, marker_event_id, source_event_id
 from replay.events.recording import CaseRecording, NumericTrack, StringTrack, WaveformTrack
 from replay.events.schedule import ScheduledOccurrence
 from replay.events.waveform import MICROSECONDS, SecondSpan, second_samples, second_spans
 
-EventKind = Literal["numeric", "waveform", "string", "final_score", "case_end"]
-MARKER_RANK: dict[str, int] = {"numeric": 0, "waveform": 0, "string": 0, "final_score": 1, "case_end": 2}
+EventKind = Literal["numeric", "waveform", "string", "op_start", "final_score", "case_end"]
+MARKER_RANK: dict[str, int] = {"numeric": 0, "waveform": 0, "string": 0, "op_start": 1, "final_score": 2, "case_end": 3}
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,7 @@ def occurrence_events(recording: CaseRecording) -> list[CaseEvent]:
             for span in second_spans(waveform)
         ]
     times = recording.times
+    events.append(CaseEvent("op_start", OP_START_TRACK, times.opstart_us, times.opstart_us, 0))
     events.append(CaseEvent("final_score", FINAL_SCORE_TRACK, times.opend_us, times.opend_us, 0))
     events.append(CaseEvent("case_end", CASE_END_TRACK, times.caseend_us, times.caseend_us, 0))
     return sorted(events, key=lambda event: event.order_key)
@@ -116,7 +118,7 @@ def outgoing(run_id: str, scheduled: ScheduledOccurrence, recording: CaseRecordi
     occurrence = scheduled.occurrence
     due_us = scheduled.start_us + event.due_offset_us
     common = {"run_id": run_id, "room": occurrence.room, "occurrence_id": occurrence.id, "case_id": occurrence.case_id, "replay_time_us": due_us}
-    if event.kind in ("final_score", "case_end"):
+    if event.kind in ("op_start", "final_score", "case_end"):
         identity = marker_event_id(run_id, occurrence.room, occurrence.id, event.kind, event.case_time_us)
         payload: dict[str, Any] = {"event_id": identity} | common | {"marker": event.kind.upper(), "case_time_us": event.case_time_us}
         return OutgoingEvent(event.kind, occurrence.room, occurrence.id, identity, due_us, payload)
@@ -134,6 +136,7 @@ def outgoing(run_id: str, scheduled: ScheduledOccurrence, recording: CaseRecordi
             "sample_rate": float(waveform.sample_rate),
             "gain": float(waveform.gain),
             "offset": float(waveform.offset),
+            "sample_format": int(waveform.sample_format),
             "start_offset_us": event.span.start_offset_us,
             "samples": second_samples(waveform, event.span),
         }

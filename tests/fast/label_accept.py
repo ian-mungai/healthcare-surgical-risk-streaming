@@ -3,6 +3,11 @@
 The runner ``tests/e2e/silver_labels.py`` stays untracked, so each rule that decides from the job's result lives here, where
 ``tests/fast/test_silver_labels_acceptance.py`` tests it. The rules read hashes, snapshot IDs and pass flags and never ``outcome``: a result that says whether a
 table was written changes when only a held-out row changes, so no result holds it.
+
+A call of the job is read from its one result file (``--result``) and never from a stream: ``accepted`` returns the file of a call that exited 0 and names the
+job, the mode and the branch that were asked for, ``refusal_ok`` judges the refusal file of a call that was to be refused (the closed refusal schema of
+``tests/fast/silver_accept.py`` with exactly the wanted codes) and ``empty_exit_ok`` judges a call that writes no file (a bad call, a job that its deadline
+stopped).
 """
 
 from __future__ import annotations
@@ -11,6 +16,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from spark.silver.label_checks import CHECK_NAMES, ICU, KIDNEY, MEASURE, TABLES
+from tests.fast.silver_accept import EXIT_OK, EXIT_REFUSED, accept_refusal
+
+JOB = "silver_labels"
 
 CALL_KEYS = frozenset({"mode", "branch", "base_hash", "job", "tables"})
 SEALED_KEYS = frozenset({"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "icu_measure", "checks_run"})
@@ -22,6 +30,26 @@ def named(value: Any) -> bool:
 
 def whole(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def accepted(code: int, document: Any, mode: str, branch: str) -> dict[str, Any]:
+    """The document of a call that exited 0 and whose file names this job, the mode that was asked for and the branch that was asked for, and an empty one for
+    any other call. The rules below then judge it."""
+    if code != EXIT_OK or not isinstance(document, Mapping):
+        return {}
+    return dict(document) if document.get("job") == JOB and document.get("mode") == mode and document.get("branch") == branch else {}
+
+
+def refusal_ok(code: int, document: Any, mode: str, wanted: Sequence[str], expected: int = EXIT_REFUSED) -> bool:
+    """Whether the call was the wanted refusal: it exited with ``expected`` and its file is the closed refusal document of this job in this mode, with exactly
+    the wanted codes (each ``code: failed``) in order. The text of standard error is never read."""
+    return accept_refusal(code, document, JOB, mode, wanted, expected).ok
+
+
+def empty_exit_ok(code: int, present: bool, expected: int) -> bool:
+    """Whether a call that writes no file (a bad call, ``usage``, exit 2; a job that its deadline stopped, exit 124) exited with ``expected`` and left its
+    result folder empty, read before any parse."""
+    return code == expected and not present
 
 
 def wrote(result: Mapping[str, Any]) -> bool:

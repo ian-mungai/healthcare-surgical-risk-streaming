@@ -36,9 +36,10 @@
         "name": "Marker",
         "symbols": [
           "FINAL_SCORE",
-          "CASE_END"
+          "CASE_END",
+          "OP_START"
         ],
-        "doc": "FINAL_SCORE is due at opend. CASE_END is due at caseend."
+        "doc": "OP_START is due at opstart. FINAL_SCORE is due at opend. CASE_END is due at caseend. OP_START is the last symbol so that a reader of the earlier version still reads every earlier message."
       },
       "doc": "Which marker this is."
     },

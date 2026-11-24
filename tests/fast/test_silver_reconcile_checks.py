@@ -212,7 +212,7 @@ class Messages(unittest.TestCase):
 
     def test_a_refusal_before_any_count_is_a_fixed_code_with_no_count(self) -> None:
         self.assertEqual("split_rule_broken: the patient split table does not follow the split rule", SPLIT_REFUSAL)
-        self.assertEqual("ambiguous_case_owner: a Bronze case has more than one row or more than one patient", OWNER_REFUSAL)
+        self.assertEqual("ambiguous_case_owner: failed", OWNER_REFUSAL)
         for message in (SPLIT_REFUSAL, OWNER_REFUSAL):
             with self.subTest(message=message):
                 self.assertNotRegex(message, r"[0-9]")

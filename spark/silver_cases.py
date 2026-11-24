@@ -5,8 +5,9 @@ The Spark job ``spark/jobs/silver_cases.py`` reads ``bronze.clinical_cases`` and
 Silver does the standard steps only: it enforces types, keeps a missing value missing, deduplicates and checks. It fills nothing, converts no unit and
 builds no join that Gold does not need. A value keeps the unit that the publisher gave it, and a time is in seconds from the start of its case.
 
-The test set is sealed: nothing here names a case or a patient. Every failure is a code and a count, and the operation lengths that set the cutoffs come
-from development patients only.
+The test set is sealed: nothing here names a case or a patient. The clinical table holds the outcome columns, so no count over the cases leaves the job: every
+failure is a code and a flag (``key_null: failed``), never a count. The operation lengths that set the cutoffs come from
+development patients only.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
+from spark.result_file import SealedError
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
 from spark.split_table import SplitRow, table_problems
 
@@ -48,7 +50,8 @@ FLAG_COLUMNS = ("emop", "preop_htn", "preop_dm", "death_inhosp")
 # The outcome columns: the stay in intensive care and the death. Their values are checked and counted for development patients only; for the held-out
 # patients the job checks their form inside the job and reports one flag, never a count.
 OUTCOME_COLUMNS = ("icu_days", "death_inhosp")
-OWNERSHIP_PROBLEM = "ambiguous_case_owner: a Bronze case has more than one row or more than one patient"
+FLAG = "failed"
+OWNERSHIP_PROBLEM = f"ambiguous_case_owner: {FLAG}"
 SEX_VALUES = ("F", "M")
 ASA_VALUES = (1, 2, 3, 4, 5, 6)
 
@@ -132,16 +135,13 @@ SOURCE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
 }
 
 
-class SilverCasesError(ValueError):
-    """A rule was broken or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
-
-    def __init__(self, *problems: str) -> None:
-        super().__init__("; ".join(problems))
-        self.problems = list(problems)
+class SilverCasesError(SealedError):
+    """A rule was broken or a check failed. ``problems`` holds one message for each cause, each a code and a flag."""
 
 
-def unit(count: int, noun: str) -> str:
-    return f"{count} {noun}{'' if count == 1 else 's'}"
+def flag(code: str) -> str:
+    """The one form of a refusal: the code and a flag. It never holds a count, a name or a value."""
+    return f"{code}: {FLAG}"
 
 
 def typed_value(kind: str, raw: str | None) -> int | float | str | None:
@@ -160,7 +160,7 @@ def typed_value(kind: str, raw: str | None) -> int | float | str | None:
         return int(raw)
     if kind == DOUBLE and NUMBER_FORMAT.fullmatch(raw):
         return float(raw)
-    raise SilverCasesError(f"unparsed: a value is not a {kind} in its published form")
+    raise SilverCasesError(flag("unparsed"))
 
 
 def age_over_89_value(raw: str | None) -> bool | None:
@@ -196,9 +196,9 @@ class CutoffRow:
 
 def check_lengths(lengths: Sequence[int]) -> None:
     if not lengths:
-        raise SilverCasesError(f"no_development_cases: {unit(0, 'case')}")
+        raise SilverCasesError(flag("no_development_cases"))
     if any(length < 0 for length in lengths):
-        raise SilverCasesError(f"bad_length: {unit(sum(1 for length in lengths if length < 0), 'length')} below zero")
+        raise SilverCasesError(flag("bad_length"))
 
 
 def measure_rows(lengths: Sequence[int]) -> list[MeasureRow]:
@@ -226,7 +226,7 @@ def cutoff_rows(lengths: Sequence[int]) -> list[CutoffRow]:
     median = median_of(lengths)
     elapsed = [math.floor(median * percent / (100 * SECONDS_PER_MINUTE)) * SECONDS_PER_MINUTE for percent in CUTOFF_FRACTIONS]
     if [0, *elapsed] != sorted({0, *elapsed}):
-        raise SilverCasesError(f"cutoffs_not_increasing: {unit(len(CUTOFF_FRACTIONS), 'cutoff')} that are not after one another")
+        raise SilverCasesError(flag("cutoffs_not_increasing"))
     common = (CUTOFF_RULE_VERSION, len(lengths), math.floor(median))
     rows = [CutoffRow("start", "opstart", 0, "fixed", *common)]
     rows += [
@@ -261,20 +261,14 @@ def frozen_problems(
     if existing_measure is None and existing_cutoffs is None:
         return []
     if existing_measure is None or existing_cutoffs is None:
-        return ["inherited_incomplete: the measure and the cutoffs are not both there"]
+        return [flag("inherited_incomplete")]
     if not existing_measure or not existing_cutoffs:
-        return [f"inherited_empty: {unit(0, 'row')}"]
-    repeated = repeated_keys([row.statistic for row in existing_measure]) + repeated_keys([row.cutoff for row in existing_cutoffs])
-    if repeated:
-        return [f"inherited_duplicates: {unit(repeated, 'key')}"]
+        return [flag("inherited_empty")]
+    if repeated_keys([row.statistic for row in existing_measure]) + repeated_keys([row.cutoff for row in existing_cutoffs]):
+        return [flag("inherited_duplicates")]
     changed_cutoffs = changed_count({row.cutoff: row for row in existing_cutoffs}, {row.cutoff: row for row in cutoffs})
     changed_measure = changed_count({row.statistic: row for row in existing_measure}, {row.statistic: row for row in measure})
-    problems = []
-    if changed_cutoffs:
-        problems.append(f"changed_cutoff: {unit(changed_cutoffs, 'cutoff')}")
-    if changed_measure:
-        problems.append(f"changed_measure: {unit(changed_measure, 'statistic')}")
-    return problems
+    return [flag(code) for code, count in (("changed_cutoff", changed_cutoffs), ("changed_measure", changed_measure)) if count]
 
 
 def split_rule_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
@@ -284,16 +278,11 @@ def split_rule_problems(rows: Sequence[SplitRow], *, pinned: bool) -> list[str]:
 
 
 def source_schema_problems(found: Mapping[str, Sequence[tuple[str, str]] | None]) -> list[str]:
-    """The tables that are missing and the tables whose columns or types are not the expected ones, each as a code and a count. ``found`` maps a table to its
+    """The tables that are missing and the tables whose columns or types are not the expected ones, each as a code and a flag. ``found`` maps a table to its
     columns, or to ``None`` when the table is not there."""
     missing = sum(1 for table in SOURCE_SCHEMAS if found.get(table) is None)
     wrong = sum(1 for table, fields in SOURCE_SCHEMAS.items() if found.get(table) is not None and list(found[table] or ()) != fields)
-    return [f"{code}: {unit(count, 'table')}" for code, count in (("source_missing", missing), ("source_schema", wrong)) if count]
-
-
-def columns_text(counts: Mapping[str, int]) -> str:
-    total = sum(counts.values())
-    return f"{unit(total, 'value')} in {unit(len(counts), 'column')} ({', '.join(sorted(counts))})"
+    return [flag(code) for code, count in (("source_missing", missing), ("source_schema", wrong)) if count]
 
 
 def input_problems(
@@ -317,39 +306,31 @@ def input_problems(
     development_cases: int | None,
     pinned: bool,
 ) -> list[str]:
-    """What is wrong with the inputs, found before anything is written. Each cause is one code and a count, and no value or identifier is named."""
-    problems: list[str] = []
-    if bronze_case_rows == 0:
-        problems.append(f"empty_cases: {unit(0, 'row')}")
-    if lab_source_empty:
-        problems.append("empty_lab: the laboratory table has no row")
-    for code, count, noun in (
-        ("key_null", case_key_null, "row"),
-        ("key_duplicate", case_key_duplicates, "key"),
-        ("subjectid_form", subjectid_form, "row"),
-        ("operation_order", operation_ends_before_it_starts, "row"),
-        ("split_join", cases_without_one_split_row, "case"),
-        ("split_patient_without_case", split_patients_without_case, "patient"),
-        ("lab_key_null", lab_key_null, "row"),
-    ):
-        if count:
-            problems.append(f"{code}: {unit(count, noun)}")
-    if lab_rows_without_case:
-        problems.append("lab_case_missing: a laboratory row has no case")
-    for code, counts in (("unparsed", unparsed), ("domain", domain), ("lab_unparsed", lab_unparsed)):
-        counted = {name: count for name, count in counts.items() if count}
-        if counted:
-            problems.append(f"{code}: {columns_text(counted)}")
-    if sealed_outcome_form_bad:
-        problems.append("sealed_outcome_form: a held-out outcome value is not in its published form")
-    if sealed_lab_form_bad:
-        problems.append("sealed_lab_form: a held-out laboratory value is not in its published form")
-    if development_cases == 0:
-        problems.append(f"no_development_cases: {unit(0, 'case')}")
-    if pinned and bronze_case_rows != PINNED_CASES:
-        problems.append(f"pinned_counts: {unit(bronze_case_rows, 'case')}, not {PINNED_CASES}")
-    if pinned and lab_pinned_mismatch:
-        problems.append("pinned_counts: the laboratory row count is not the release's")
+    """What is wrong with the inputs, found before anything is written. Each cause is one code and a flag. No count, value or identifier is named."""
+    problems = [
+        flag(code)
+        for code, bad in (
+            ("empty_cases", bronze_case_rows == 0),
+            ("empty_lab", lab_source_empty),
+            ("key_null", case_key_null),
+            ("key_duplicate", case_key_duplicates),
+            ("subjectid_form", subjectid_form),
+            ("operation_order", operation_ends_before_it_starts),
+            ("split_join", cases_without_one_split_row),
+            ("split_patient_without_case", split_patients_without_case),
+            ("lab_key_null", lab_key_null),
+            ("lab_case_missing", lab_rows_without_case),
+            ("unparsed", any(unparsed.values())),
+            ("domain", any(domain.values())),
+            ("lab_unparsed", any(lab_unparsed.values())),
+            ("sealed_outcome_form", sealed_outcome_form_bad),
+            ("sealed_lab_form", sealed_lab_form_bad),
+            ("no_development_cases", development_cases == 0),
+        )
+        if bad
+    ]
+    if pinned and (bronze_case_rows != PINNED_CASES or lab_pinned_mismatch):
+        problems.append(flag("pinned_counts"))
     return problems
 
 
@@ -371,29 +352,24 @@ def output_problems(
     silver_lab_orphans: int,
     sealed_lab_differs: int,
 ) -> list[str]:
-    """What is wrong with the tables that were written, against Bronze: a row count that differs, a changed value, a repeated key or a gap in the occurrence."""
-    problems: list[str] = []
-    if case_rows != bronze_case_rows:
-        problems.append(f"case_rows: silver {case_rows}, bronze {bronze_case_rows}")
-    if lab_copies != bronze_lab_rows:
-        problems.append(f"lab_rows: the copies add up to {lab_copies}, bronze {bronze_lab_rows}")
-    if lab_rows > lab_copies:
-        problems.append(f"lab_rows: {lab_rows} rows from {lab_copies} copies")
-    for code, count, noun in (
-        ("case_value_differences", case_value_differences, "row"),
-        ("case_key_duplicate", case_key_duplicates, "key"),
-        ("case_key_differences", case_key_differences, "key"),
-        ("lab_value_differences", lab_value_differences, "row"),
-        ("lab_key_duplicate", lab_key_duplicates, "key"),
-        ("lab_occurrence_gap", lab_occurrence_gaps, "group"),
-        ("never_feature_marking", never_feature_marking_wrong, "table"),
-    ):
-        if count:
-            problems.append(f"{code}: {unit(count, noun)}")
-    if sealed_outcome_differs:
-        problems.append("sealed_outcome_differs: a held-out outcome value differs from Bronze")
-    if silver_lab_orphans:
-        problems.append("lab_case_missing_in_silver: a written laboratory row has no case")
-    if sealed_lab_differs:
-        problems.append("sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key")
-    return problems
+    """What is wrong with the tables that were written, against Bronze: a row count that differs, a changed value, a repeated key or a gap in the occurrence.
+
+    Each cause is one code and a flag. The counts are compared here and never written."""
+    return [
+        flag(code)
+        for code, bad in (
+            ("case_rows", case_rows != bronze_case_rows),
+            ("lab_rows", lab_copies != bronze_lab_rows or lab_rows > lab_copies),
+            ("case_value_differences", case_value_differences),
+            ("case_key_duplicate", case_key_duplicates),
+            ("case_key_differences", case_key_differences),
+            ("lab_value_differences", lab_value_differences),
+            ("lab_key_duplicate", lab_key_duplicates),
+            ("lab_occurrence_gap", lab_occurrence_gaps),
+            ("never_feature_marking", never_feature_marking_wrong),
+            ("sealed_outcome_differs", sealed_outcome_differs),
+            ("lab_case_missing_in_silver", silver_lab_orphans),
+            ("sealed_lab_differs", sealed_lab_differs),
+        )
+        if bad
+    ]

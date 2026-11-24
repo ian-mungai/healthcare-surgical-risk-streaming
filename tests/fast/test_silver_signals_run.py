@@ -24,11 +24,11 @@ HEAD = "a" * 64
 PREPARED = "b" * 64
 FIRST_WRITE = "c" * 64
 SECOND_WRITE = "d" * 64
-BRONZE = BronzeFacts(1000, 300, 0, 0, 0, 0, 0, 0, 0)
+BRONZE = BronzeFacts(0, 0, 0, 0, 0, 0, 0, 0)
 INPUT = InputRead(BRONZE, (11, 12, 13))
 FINGERPRINTS = {NUMERIC: Fingerprint(990, 5), WAVEFORM: Fingerprint(300, 9)}
-NUMERIC_FACTS = NumericFacts(990, 0, 10, 0, 0, 0, 0, 0, 0)
-WAVEFORM_FACTS = WaveformFacts(300, 0, 0, 0, 0, 0, 0, 0)
+NUMERIC_FACTS = NumericFacts(0, 0, 0, 0, 0, 0, 0)
+WAVEFORM_FACTS = WaveformFacts(0, 0, 0, 0, 0, 0, 0)
 
 
 def messages(error: SilverSignalsError) -> list[str]:
@@ -198,32 +198,32 @@ class Build(unittest.TestCase):
         fake.read_back[WAVEFORM] = TableRead(Fingerprint(300, 10), 102, waveform=WAVEFORM_FACTS)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["readback_differs: 1 table"], messages(caught.exception))
+        self.assertEqual(["readback_differs: failed"], messages(caught.exception))
 
     def test_a_table_that_is_not_there_at_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.read_back[NUMERIC] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_a_table_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
         fake = Fake()
         fake.read_back[NUMERIC] = TableRead(FINGERPRINTS[NUMERIC], 101)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_the_checks_of_the_tables_run_on_the_read_back(self) -> None:
         fake = Fake()
         fake.read_back[NUMERIC] = TableRead(FINGERPRINTS[NUMERIC], 101, numeric=dataclasses.replace(NUMERIC_FACTS, verdict_differs=3))
-        fake.read_back[WAVEFORM] = TableRead(FINGERPRINTS[WAVEFORM], 102, waveform=dataclasses.replace(WAVEFORM_FACTS, rows=299))
+        fake.read_back[WAVEFORM] = TableRead(FINGERPRINTS[WAVEFORM], 102, waveform=dataclasses.replace(WAVEFORM_FACTS, row_count_differs=1))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
         self.assertEqual(failed("numeric_verdict_differs", "waveform_not_every_second"), messages(caught.exception))
 
     def test_bronze_that_changed_between_the_reads_is_named(self) -> None:
-        for later in (InputRead(BRONZE, (11, 12, 14)), InputRead(dataclasses.replace(BRONZE, numeric_rows=1001), (11, 12, 13))):
+        for later in (InputRead(BRONZE, (11, 12, 14)), InputRead(dataclasses.replace(BRONZE, numeric_null_keys=1), (11, 12, 13))):
             with self.subTest(later=later):
                 fake = Fake()
                 fake.later_input = later
@@ -269,7 +269,7 @@ class Verify(unittest.TestCase):
         fake.read_back[WAVEFORM] = None
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+        self.assertEqual(["table_missing: failed"], messages(caught.exception))
 
     def test_a_defect_in_a_table_or_in_bronze_is_named(self) -> None:
         fake = Fake()

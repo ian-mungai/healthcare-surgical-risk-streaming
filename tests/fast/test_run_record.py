@@ -11,13 +11,16 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from tests.e2e import run_record
@@ -116,6 +119,91 @@ class WriteAgainTest(unittest.TestCase):
         (folder,) = (self.root / "runs").iterdir()
         self.assertEqual("a\n", (folder / "log.txt").read_text())
         self.assertEqual("pass", json.loads((folder / "record.json").read_text())["outcome"])
+
+
+class ClosedOutputTest(unittest.TestCase):
+    """A record that is written while stdout is closed must say fail, so it never claims a pass that the run could not print."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        closed = io.StringIO()
+        closed.close()
+        for patcher in (mock.patch.object(run_record, "ROOT", self.root), mock.patch.object(sys, "stdout", closed)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_closed_stdout_gives_a_record_that_says_fail_and_exit_status_1(self) -> None:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        code = record.close([])
+        (folder,) = (self.root / "runs").iterdir()
+        written = json.loads((folder / "record.json").read_text())
+        self.assertEqual(1, code)
+        self.assertEqual("fail", written["outcome"])
+        self.assertEqual(FAILED, json.loads((folder / "retention.json").read_text())["end_condition"])
+        self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+
+class BrokenPipeTest(unittest.TestCase):
+    """A write to a pipe whose reader is gone only fails when the buffer is flushed, so a flush that fails after the write rewrites the record to say fail."""
+
+    def test_a_pipe_with_no_reader_gives_a_record_that_says_fail_and_exit_status_1(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        stream = os.fdopen(write_end, "w", buffering=8192)
+        with mock.patch.object(run_record, "ROOT", root), mock.patch.object(sys, "stdout", stream):
+            record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+            record.expect("case", "step", "expected", "observed", True)
+            code = record.close([])
+        with contextlib.suppress(OSError):
+            stream.close()
+        (folder,) = (root / "runs").iterdir()
+        written = json.loads((folder / "record.json").read_text())
+        self.assertEqual(1, code)
+        self.assertEqual("fail", written["outcome"])
+        self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+
+class ReportAloneTest(unittest.TestCase):
+    """A runner that writes its record and then calls ``report`` itself (Silver cases, Silver labels) must also save a failed print as a failed record."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        closed = io.StringIO()
+        closed.close()
+        for patcher in (mock.patch.object(run_record, "ROOT", self.root), mock.patch.object(sys, "stdout", closed)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def written(self, blocked: str) -> tuple[int, dict[str, Any], dict[str, Any]]:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle(blocked)
+        folder = record.write(["a line"])
+        code = record.report(folder)
+        return code, json.loads((folder / "record.json").read_text()), json.loads((folder / "retention.json").read_text())
+
+    def test_a_failed_print_after_write_gives_a_record_that_says_fail(self) -> None:
+        code, written, label = self.written("")
+        self.assertEqual((1, "fail", FAILED), (code, written["outcome"], label["end_condition"]))
+        self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+    def test_a_stdout_that_python_set_to_none_gives_a_record_that_says_fail(self) -> None:
+        """Recheck: a runner started with its standard output closed (``1>&-``) has ``sys.stdout`` set to ``None``."""
+        with mock.patch.object(sys, "stdout", None):
+            code, written, label = self.written("")
+        self.assertEqual((1, "fail", FAILED), (code, written["outcome"], label["end_condition"]))
+
+    def test_a_failed_print_keeps_the_blocked_reason(self) -> None:
+        code, written, _ = self.written("interrupted")
+        self.assertEqual((1, "blocked: interrupted"), (code, written["outcome"]))
 
 
 if __name__ == "__main__":

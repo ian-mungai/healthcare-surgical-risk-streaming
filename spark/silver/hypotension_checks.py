@@ -52,12 +52,13 @@ CODES = frozenset(CHECK_NAMES) | JOB_CODES
 class InputFacts:
     """What a read of the input at one hash shows: the arterial seconds of ``silver.waveform_seconds``, the clinical table and the patient split.
 
-    ``ambiguous_owner`` and ``cases_without_split`` are flags (0 or 1). ``split_problems`` are the problems of the split table by itself
+    ``input_empty``, ``ambiguous_owner`` and ``cases_without_split`` are flags (0 or 1): ``input_empty`` says that no arterial second has a row, as Great
+    Expectations' row-count expectation judges it. ``split_problems`` are the problems of the split table by itself
     (``split_rule_problems``); when it is not empty the other facts were not read, because a set is not trusted yet. The counts are tested inside the job and
     never leave it.
     """
 
-    art_seconds: int
+    input_empty: int
     null_keys: int
     duplicate_seconds: int
     ambiguous_owner: int
@@ -70,7 +71,6 @@ class SeriesFacts:
     """What a read of the series table shows. ``value_problem`` counts valid rows with no value and invalid rows with one. ``differs`` counts rows that are not
     the reading that the single definition gives from the stored seconds."""
 
-    rows: int
     duplicate_keys: int
     null_verdict: int
     valid_with_cause: int
@@ -78,6 +78,7 @@ class SeriesFacts:
     unknown_cause: int
     value_problem: int
     differs: int
+    row_count_differs: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,15 +111,15 @@ def input_problems(facts: InputFacts) -> list[str]:
         return [code_only(problem) for problem in facts.split_problems]
     if facts.cases_without_split:
         return [f"case_without_split: {FLAG}"]
-    if facts.art_seconds == 0:
+    if facts.input_empty:
         return [f"input_empty: {FLAG}"]
     return flagged([("waveform_null_key", facts.null_keys), ("waveform_duplicate_second", facts.duplicate_seconds)])
 
 
-def series_problems(facts: SeriesFacts, art_seconds: int) -> list[str]:
+def series_problems(facts: SeriesFacts) -> list[str]:
     return flagged(
         [
-            ("series_not_every_second", int(art_seconds != facts.rows)),
+            ("series_not_every_second", facts.row_count_differs),
             ("series_duplicate_key", facts.duplicate_keys),
             ("series_verdict_null", facts.null_verdict),
             ("series_valid_with_cause", facts.valid_with_cause),

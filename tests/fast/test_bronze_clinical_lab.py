@@ -1,5 +1,5 @@
 """The rules of the Bronze clinical and laboratory tables: which columns pass through, how the source occurrence of a laboratory row is
-numbered and how a table is digested.
+numbered.
 
 The Spark job applies these rules to the loaded tables. A wrong rule here changes a value in Bronze without a failure, so each test holds
 one way that could happen.
@@ -15,10 +15,8 @@ from spark.bronze_clinical_lab import (
     OCCURRENCE_COLUMN,
     BronzeRulesError,
     assign_occurrences,
-    digest_of,
     occurrence_differences,
     payload_columns,
-    row_text,
 )
 
 STRING = "string"
@@ -118,40 +116,29 @@ class IndependentOccurrenceCheckTest(unittest.TestCase):
                 self.assertGreater(occurrence_differences(rows), 0)
 
 
-class DigestTest(unittest.TestCase):
-    def test_the_digest_does_not_depend_on_row_order(self) -> None:
-        lines = [row_text(("1", "a", None)), row_text(("2", "b", "")), row_text(("3", "c", "x"))]
-        self.assertEqual(digest_of(lines), digest_of(lines[::-1]))
+class CodeTest(unittest.TestCase):
+    """A refusal carries a fixed code for the output boundary, so that no column name or count has to leave the job."""
 
-    def test_a_changed_value_a_dropped_zero_a_missing_row_and_a_duplicate_each_change_the_digest(self) -> None:
-        base = [row_text(("1", "0.82")), row_text(("2", "0.86")), row_text(("3", "1.00"))]
-        original = digest_of(base)
-        for name, changed in {
-            "changed value": [base[0], row_text(("2", "0.87")), base[2]],
-            "dropped leading zero": [row_text(("1", ".82")), base[1], base[2]],
-            "missing row": base[:2],
-            "duplicate row": [*base, base[0]],
-            "moved value": [row_text(("2", "0.82")), row_text(("1", "0.86")), base[2]],
-        }.items():
-            with self.subTest(name):
-                self.assertNotEqual(original, digest_of(changed))
+    def code(self, call: object) -> str:
+        try:
+            call()  # type: ignore[operator]
+        except BronzeRulesError as error:
+            return error.code
+        raise AssertionError("the rules accepted a table that they must refuse")
 
-    def test_a_missing_value_and_an_empty_string_are_different_values(self) -> None:
-        self.assertNotEqual(row_text(("1", None)), row_text(("1", "")))
-        self.assertNotEqual(digest_of([row_text(("1", None))]), digest_of([row_text(("1", ""))]))
+    def test_a_refused_table_has_the_code_columns_refused(self) -> None:
+        for call in (
+            lambda: payload_columns("clinical", [("caseid", "bigint")]),
+            lambda: payload_columns("clinical", [("subjectid", STRING)]),
+            lambda: payload_columns("lab", LAB_FOUND[:3]),
+            lambda: payload_columns("clinical", [("caseid", STRING), (OCCURRENCE_COLUMN, STRING)]),
+            lambda: payload_columns("clinical", [("caseid", STRING), ("caseid", STRING)]),
+        ):
+            self.assertEqual("columns_refused", self.code(call))
 
-    def test_a_value_that_holds_the_field_separator_cannot_pass_for_two_fields(self) -> None:
-        self.assertNotEqual(row_text(("a|b", "c")), row_text(("a", "b|c")))
-        self.assertNotEqual(row_text(("ab", "c")), row_text(("a", "bc")))
-
-    def test_the_row_text_and_the_digest_have_the_form_that_the_spark_job_computes(self) -> None:
-        self.assertEqual("1:a|n|0:", row_text(("a", None, "")))
-        self.assertEqual("1:16416469243125891297:8840890222998694089", digest_of([row_text(("a", None))]))
-
-    def test_the_digest_states_its_row_count_and_is_stable(self) -> None:
-        self.assertTrue(digest_of([row_text(("1",))]).startswith("1:"))
-        self.assertEqual(digest_of([]), "0:0:0")
-        self.assertEqual(digest_of([row_text(("1",))]), digest_of([row_text(("1",))]))
+    def test_an_error_without_a_code_is_rules_broken_and_a_code_is_kept(self) -> None:
+        self.assertEqual("rules_broken", BronzeRulesError("x").code)
+        self.assertEqual("source_table_missing", BronzeRulesError("x", code="source_table_missing").code)
 
 
 if __name__ == "__main__":

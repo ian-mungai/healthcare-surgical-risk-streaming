@@ -20,8 +20,9 @@ of the patient split job: every patient once, the rule's set, one rule version, 
 signal row of a test patient enters a profile. The unscored share is measured on the saved warning grid: the ``opstart`` and ``opend`` of the development
 cases are read from ``bronze.clinical_cases``, and the grid is the rule's (``spark/profile/unscored.py``). ``--pinned-release`` is the full cohort: the split's
 shares and counts are required, every prespecified source count is reproduced from the case and track tables (totals only, never an outcome) and judged, and
-a count of the full cohort is saved as a flag only. Without it, nothing is judged. The result holds hashes, snapshot IDs, counts of development data and the
-names of the counts that do not match, and no case, track, time or value.
+a count of the full cohort is saved as a flag only. Without it, nothing is judged. The result holds hashes, snapshot IDs, counts of development data, the
+fingerprints of the two development tables and one pass flag for the source counts, and no case, track, time or value. A count that does not match is a flag
+in the table: a held-out recording changes it, so its name is not in the result.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from spark.profile.checks import InputFacts, SignalProfileError
 from spark.profile.cli import JOB, run
 from spark.profile.commits import drop_commit
 from spark.profile.counts import count_rows
-from spark.profile.grid_rule import GRID_ORIGIN, RULE_END, GridRule, RuleRead
+from spark.profile.grid_rule import GRID_ORIGIN, RULE_END, GridRule, RuleRead, unit
 from spark.profile.run import BRANCH_MOVED, COUNTS, PROFILE, RULE, SOURCE_NAMES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
 from spark.profile.tables import GRID_RULE, PROFILE_TABLES, schema_state
 from spark.session import build_session
@@ -55,7 +56,6 @@ from spark.split_table import (
     source_cases,
     source_problems,
     table_problems,
-    unit,
 )
 
 CLINICAL_COLUMNS = (*SOURCE_COLUMNS, ("caseend", "string"), (GRID_ORIGIN, "string"), (RULE_END, "string"))
@@ -187,8 +187,7 @@ class ProfileLake(Lake):
             return TableRead(fingerprint, snapshot, profile=frames.profile_facts(frame))
         if table == UNSCORED:
             return TableRead(fingerprint, snapshot, unscored=frames.unscored_facts(frame))
-        facts, mismatched = frames.counts_facts(frame)
-        return TableRead(fingerprint, snapshot, counts=facts, mismatched=mismatched)
+        return TableRead(fingerprint, snapshot, counts=frames.counts_facts(frame))
 
     def write_profile_table(self, table: str, exists: bool) -> None:
         """Write the planned frame as the whole table, as one commit: create it, or overwrite every row of the table that exists.

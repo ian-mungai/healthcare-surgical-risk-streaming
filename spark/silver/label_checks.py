@@ -28,7 +28,7 @@ from spark.bronze.checks import GUARD_KEY, GUARD_STRUCTURE, Check
 from spark.silver.checks import FLAG, flagged
 from spark.silver.label_measure import UNITS
 from spark.split_table import CODES as SPLIT_CODES
-from spark.split_table import SplitRow, unit
+from spark.split_table import SplitRow
 from spark.split_table import table_problems as split_table_problems
 
 MEASURE = "icu_days_measure"
@@ -121,7 +121,7 @@ def input_problems(facts: InputFacts) -> list[str]:
     if facts.cases == 0:
         return ["input_empty: 0 rows"]
     if facts.development_cases == 0:
-        return [f"development_empty: {unit(0, 'case')}"]
+        return ["development_empty: 0 cases"]
     return []
 
 

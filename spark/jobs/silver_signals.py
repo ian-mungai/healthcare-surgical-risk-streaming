@@ -3,7 +3,7 @@
 ``python -m spark.jobs.silver_signals build --branch <name> --result <path> [--base <name>]``
 ``python -m spark.jobs.silver_signals verify --branch <name> --result <path>``
 
-The result is one JSON file at ``--result`` (an absolute path that does not exist; it is written whole and renamed, see ``spark/silver/cli.py``), also a
+The result is one JSON file at ``--result`` (an absolute path that does not exist; it is written whole and linked in, see ``spark/silver/cli.py``), also a
 refusal, whose file holds the refusal codes. Standard output stays empty and standard error is for an operator: a caller reads the exit code and the file.
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it.
@@ -16,7 +16,7 @@ are in ``spark/silver/cli.py``. The settings come from the environment, as the p
 
 No rule of the tables is estimated from data, so no patient set is read, and no outcome is read. The test set is sealed and Bronze holds the held-out cases'
 signals, so a count or a digest over the rows changes with a held-out row: the result holds hashes, snapshot IDs, the checks that ran and one pass flag for
-each table, and no count, digest, case, track, time or value. A refusal is a code and a flag, except a count of tables.
+each table, and no count, digest, case, track, time or value. A refusal is a code and a flag, never a count.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from spark.silver.cli import JOB, run
 from spark.silver.run import BRANCH_MOVED, NUMERIC, WAVEFORM, InputRead, Operations, TableRead, run_build, run_verify
 from spark.silver.tables import NAMESPACE, SILVER_TABLES
 from spark.split_cli import open_client, read_settings, start_deadline
-from spark.split_table import PatientSplitError, schema_problems, unit
+from spark.split_table import PatientSplitError, flag, schema_problems
 
 SOURCES = (bronze.NUMERIC, bronze.WAVEFORM, bronze.TRACKS)
 
@@ -62,7 +62,7 @@ class SignalsLake(Lake):
     def source(self, at: str, spec: bronze.TableSpec) -> tuple[Any, str]:
         table = f"{self.catalog(at)}.{bronze.NAMESPACE}.{spec.name}"
         if not self.session.catalog.tableExists(table):
-            raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
+            raise SilverSignalsError(flag("source_table"))
         frame = self.session.table(table)
         problems = schema_problems(self.fields_of(frame), spec.columns)
         if problems:
@@ -76,7 +76,7 @@ class SignalsLake(Lake):
         held = self.sources(at)
         snapshots = tuple(self.snapshot_id(held[spec.name][1]) for spec in SOURCES)
         if any(snapshot is None for snapshot in snapshots):
-            raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
+            raise SilverSignalsError(flag("source_no_snapshot"))
         facts = frames.bronze_facts(*(held[spec.name][0] for spec in SOURCES))
         return InputRead(facts, (snapshots[0], snapshots[1], snapshots[2]))
 

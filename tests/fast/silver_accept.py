@@ -17,15 +17,17 @@ exit code is judged first. A refusal is judged by the exit code and by the refus
 rules read hashes and snapshot IDs and never ``outcome``: a result that says whether a table was written changes when only a held-out row changes, so no
 result holds it.
 
-A runner reads a field of a result, prints it and caches it only through an ``Accepted`` that passed for the outcome that its call expected. A call that failed
-gives one fixed phrase from ``REASONS``, ``REFUSAL_REASONS`` or ``USAGE_REASONS``: the rule that failed, never a value of the file. A call that exits with a
-usage error passes only when its result folder held nothing, checked before any parse (``result_present``, ``accept_usage``).
+A runner reads a field of a result, and saves an ID of it, only through an ``Accepted`` that passed for the outcome that its call expected and a
+comparison with Nessie (``tests/fast/sealed_record.py``). A call that failed gives one fixed phrase from ``REASONS``, ``REFUSAL_REASONS`` or ``USAGE_REASONS``:
+the rule that failed, never a value of the file. A call that exits with a usage error passes only when its result folder held nothing, checked before any parse
+(``result_present``, ``accept_usage``).
 """
 
 from __future__ import annotations
 
 import builtins
 import json
+import re
 import symtable
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -42,7 +44,7 @@ MODES = ("build", "verify")
 ENVELOPE_KEYS = frozenset({"mode", "branch", "base_hash", "job", "tables"})
 FACT_KEYS = frozenset({"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"})
 # The exact keys of the result of each job: any other key, also a harmless one, fails the control.
-RESULT_KEYS = {SIGNALS_JOB: ENVELOPE_KEYS | FACT_KEYS, HYPOTENSION_JOB: ENVELOPE_KEYS | FACT_KEYS | {"development_events_digest"}}
+RESULT_KEYS = {SIGNALS_JOB: ENVELOPE_KEYS | FACT_KEYS, HYPOTENSION_JOB: ENVELOPE_KEYS | FACT_KEYS}
 # The exact keys of the three maps in the result of each job: the tables that it writes, the sources that it reads and the tables with a pass flag.
 TABLE_KEYS = {
     SIGNALS_JOB: {
@@ -70,14 +72,16 @@ NOT_CLOSED = "the schema is not the job's closed schema"
 OFF_CATALOG = "a hash or a snapshot differs from the catalog"
 NOT_A_WRITE = "the result is not a write"
 NOT_A_KEEP = "the result is not a call that wrote nothing"
+NOT_PASSED = "a pass flag of the result is not true"
 WRONG_EXIT = "the exit code is not the expected one"
 NOT_EMPTY = "the result folder held something"
-REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP)
+REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP, NOT_PASSED)
 REFUSAL_NOT_CLOSED = "the refusal document is not the closed refusal schema"
 REFUSAL_OTHER_CODES = "the refusal codes are not the wanted ones"
 REFUSAL_REASONS = (WRONG_EXIT, NO_FILE, REFUSAL_NOT_CLOSED, REFUSAL_OTHER_CODES)
 USAGE_REASONS = (WRONG_EXIT, NOT_EMPTY)
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
+HASH = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +109,11 @@ def refusal_matches(found: Sequence[str], wanted: Sequence[str]) -> bool:
 
 def named(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def hashed(value: Any) -> bool:
+    """Whether the value is a hash: 64 lowercase hexadecimal characters and nothing else."""
+    return isinstance(value, str) and HASH.fullmatch(value) is not None
 
 
 def whole(value: Any) -> bool:
@@ -159,16 +168,15 @@ def sealed(result: Any, job: str) -> bool:
         result["mode"] in MODES
         and named(result["branch"])
         and result["job"] == job
-        and (named(result["base_hash"]) if build else result["base_hash"] is None)
+        and (hashed(result["base_hash"]) if build else result["base_hash"] is None)
         and type(result["tables"]) is list
         and result["tables"] == TABLE_LISTS[job]
-        and named(result["checked_hash"])
-        and named(result["branch_hash"])
-        and (result["write_hash"] is None or named(result["write_hash"]))
+        and hashed(result["checked_hash"])
+        and hashed(result["branch_hash"])
+        and (result["write_hash"] is None or hashed(result["write_hash"]))
         and type(result["checks_run"]) is list
         and result["checks_run"] == list(CHECKS[job])
         and maps_ok(result, job)
-        and (whole(result["development_events_digest"]) if job == HYPOTENSION_JOB else True)
     )
 
 
@@ -264,17 +272,6 @@ class Accepted:
         """The accepted document, and an empty mapping for a call that was not accepted."""
         return self.document if self.document is not None else {}
 
-    def facts(self, *names: str) -> str:
-        """The record line of the call. An accepted result gives its named fields and an accepted refusal its codes. A call that was not accepted gives its
-        fixed phrase and no value of the file."""
-        if self.kind == "usage":
-            return f"usage exit {EXIT_USAGE} with an empty result folder" if self.ok else f"usage rejected: {self.reason}"
-        if not self.ok:
-            return f"{self.kind} rejected: {self.reason}"
-        if self.kind == "refusal":
-            return f"refusal {self.result['refusal']}"
-        return ", ".join(f"{name.replace('_', ' ')} {self.result[name]}" for name in names)
-
 
 def accept_result(code: int, document: Any, job: str, catalog: Catalog | None, outcome: str) -> Accepted:
     """The call as the ``outcome`` (``AS_WRITE`` or ``AS_KEEP``) that it expected: it exited 0 and its file passes ``rejection`` for that outcome."""
@@ -293,6 +290,28 @@ def accept_write(code: int, document: Any, job: str, catalog: Catalog | None) ->
 def accept_keep(code: int, document: Any, job: str, catalog: Catalog | None) -> Accepted:
     """The call as one that wrote nothing: exit 0, the same rules, no write hash and the branch at the checked hash."""
     return accept_result(code, document, job, catalog, AS_KEEP)
+
+
+def setup_rejection(document: Any, job: str) -> str | None:
+    """The fixed phrase of the first rule that a document fails as the result of a setup build of ``job``, or ``None``: the closed schema of the job, a write
+    (a write hash that is the branch hash and not the checked hash) and a Boolean true for every pass flag. No catalog is compared: a setup step is
+    judged by the runner's own later reads of the tables that it made."""
+    if not isinstance(document, Mapping):
+        return NO_FILE
+    if not sealed(document, job):
+        return NOT_CLOSED
+    if not (named(document["write_hash"]) and document["write_hash"] == document["branch_hash"] != document["checked_hash"]):
+        return NOT_A_WRITE
+    return None if all(value is True for value in document["passed"].values()) else NOT_PASSED
+
+
+def accept_setup(code: int, document: Any, job: str) -> Accepted:
+    """A setup build of ``job`` as the runner needs it: exit 0 and a result file that passes ``setup_rejection``. A runner reads nothing else of a setup call
+    (no ``outcome``, which a sealed job does not write) and saves none of it."""
+    if code != EXIT_OK:
+        return Accepted("result", WRONG_EXIT, job=job, outcome=AS_WRITE)
+    reason = setup_rejection(document, job)
+    return Accepted("result", reason, job=job, outcome=AS_WRITE) if reason is not None else Accepted("result", None, document, job, AS_WRITE)
 
 
 def accept_refusal(code: int, document: Any, job: str, mode: str, wanted: Sequence[str], expected: int = EXIT_REFUSED) -> Accepted:

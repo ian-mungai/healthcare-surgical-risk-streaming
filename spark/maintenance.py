@@ -11,18 +11,34 @@ from __future__ import annotations
 import argparse
 import math
 import re
+import sys
 from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
-from scripts.ingestion.closed import QuietParser
 from scripts.stack.tags import MAX_DEADLINE_SECONDS
 
 TABLE_NAME = re.compile(r"\w+(\.\w+)+", re.ASCII)
+# The tables whose row count and checksum may leave the job: the Bronze signal tables hold no outcome or label, and the catalog proof table holds a few
+# numbers that are not about patients. A table that is not listed (a table with an outcome or a label, or any new one) is sealed.
+OPEN_TABLES = frozenset({"bronze.numeric_observations", "bronze.waveform_seconds", "bronze.tracks", "bronze.string_events", "catalog_proof.numbers"})
+SEALED_FIELDS = ("rows", "checksum")
+# The checks that every run makes, in order, named in the result: the trunk is Nessie's default branch, no other branch exists, the tables asked for are on it,
+# no table could lose a file that a tag needs, every tag is as it was and every tagged read is as it was.
+CHECKS_RUN = ("trunk_is_default", "no_branch_in_flight", "tables_on_trunk", "table_properties_safe", "tags_unchanged", "tagged_reads_unchanged")
+JOB = "table_maintenance"
 DEFAULT_DEADLINE_SECONDS = 900.0
 
 
 class RetentionError(RuntimeError):
-    """The job refuses to start or to finish: a tag does not read as it did, a table could lose files, or a run may be writing."""
+    """The job refuses to start or to finish: a tag does not read as it did, a table could lose files, or a run may be writing.
+
+    The message is for the code that raises it and for its tests. The job's output holds ``code``, a fixed word, and nothing of the message, which can name a
+    table, a tag, a branch or the text of an upstream error.
+    """
+
+    def __init__(self, message: str, *, code: str = "refused") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def finite_seconds(text: str) -> float:
@@ -39,7 +55,7 @@ def finite_seconds(text: str) -> float:
 def table_identifier(table: str) -> str:
     """``table`` when it is plain names joined by dots, which a statement can hold safely, else ``RetentionError``."""
     if TABLE_NAME.fullmatch(table) is None:
-        raise RetentionError("a table name must be plain letters, digits and underscores joined by dots")
+        raise RetentionError("a table name must be plain letters, digits and underscores joined by dots", code="table_name")
     return table
 
 
@@ -48,6 +64,14 @@ def table_argument(text: str) -> str:
         return table_identifier(text)
     except RetentionError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
+
+
+class QuietParser(argparse.ArgumentParser):
+    """An argument parser whose only error output is the code ``usage``: it never echoes an argument."""
+
+    def error(self, message: str) -> Any:
+        sys.stderr.write(f"{JOB}: usage\n")
+        raise SystemExit(2)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -99,6 +123,23 @@ def compare_reads(before: Sequence[Mapping[str, Any]], after: Sequence[Mapping[s
             found.append(f"the tag {key[0]} read {key[1]} before the run and has no read of it after")
             continue
         for field in ("snapshot_id", "rows", "checksum"):
-            if later[key].get(field) != item.get(field):
+            if later[key].get(field) == item.get(field):
+                continue
+            if key[1] in OPEN_TABLES or field == "snapshot_id":
                 found.append(f"the tag {key[0]} read {key[1]} with {field} {item.get(field)} before the run and {later[key].get(field)} after")
+            else:
+                found.append(f"the tag {key[0]} read {key[1]} with a {field} that differs after the run")
     return found
+
+
+def public_reads(reads: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The reads for the result: a table that is not open holds its tag, its name and its snapshot ID only, with no row count and no checksum."""
+    return [dict(item) if item["table"] in OPEN_TABLES else {key: value for key, value in item.items() if key not in SEALED_FIELDS} for item in reads]
+
+
+def sealed_report(table: str, report: Mapping[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    """What a compaction reports for the result: the whole report for an open table, and for any other table one flag, because the counts of files and bytes
+    that Iceberg reports follow the rows of the table. The flag says what happened: ``compacted`` after a rewrite and ``dry_run`` when nothing was rewritten."""
+    if table in OPEN_TABLES:
+        return dict(report)
+    return {"dry_run": True} if dry_run else {"compacted": True}

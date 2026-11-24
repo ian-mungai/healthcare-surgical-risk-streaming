@@ -251,7 +251,13 @@ class MaintainTest(unittest.TestCase):
         result = rewrites.run(["--rewrite-all"], stand_in())
         self.assertEqual(["a.one", "b.two"], rewrites.compacted)
         self.assertEqual("main", result["trunk"])
-        self.assertTrue(result["tables"]["a.one"]["rewrite_all"])
+        self.assertEqual({"compacted": True}, result["tables"]["a.one"])
+
+    def test_the_report_of_an_open_table_is_kept_and_the_report_of_any_other_table_is_one_flag(self) -> None:
+        rewrites = Rewrites({"bronze.tracks": SAFE, "silver.cases": SAFE})
+        result = rewrites.run(["--rewrite-all"], stand_in(("bronze.tracks", "silver.cases")))
+        self.assertTrue(result["tables"]["bronze.tracks"]["rewrite_all"])
+        self.assertEqual({"compacted": True}, result["tables"]["silver.cases"])
 
     def test_only_the_tables_that_are_asked_for_are_checked_and_rewritten(self) -> None:
         rewrites = Rewrites({"a.one": SAFE, "b.two": UNSAFE_GC})

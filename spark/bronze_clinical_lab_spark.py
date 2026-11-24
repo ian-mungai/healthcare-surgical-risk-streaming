@@ -16,7 +16,6 @@ from spark.bronze.checks import Check, CheckResult, key_checks
 from spark.bronze_clinical_lab import (
     BRONZE_NAMESPACE,
     GROUP_COLUMNS,
-    MISSING,
     OCCURRENCE_COLUMN,
     SOURCE_NAMESPACE,
     TABLES,
@@ -27,9 +26,6 @@ from spark.settings import CATALOG, catalog_options
 
 SOURCE_CATALOG = "source"
 RUN_CATALOG = CATALOG
-FIELD_SEPARATOR = "|"
-HALF_HEX = 16
-DIGEST_TYPE = "decimal(38,0)"
 GROUP_ROWS = "group_rows"
 
 
@@ -52,22 +48,6 @@ def job_session_settings(
         "spark.local.dir": scratch,
         "spark.ui.enabled": "false",
     }
-
-
-def text_of(column: Any, functions: Any) -> Any:
-    """The digest text of one column, the same as ``row_text`` in ``spark/bronze_clinical_lab.py`` gives for a value."""
-    as_text = column.cast("string")
-    return functions.coalesce(functions.concat(functions.length(as_text).cast("string"), functions.lit(":"), as_text), functions.lit(MISSING))
-
-
-def digest(frame: Any, columns: Sequence[str], functions: Any) -> str:
-    """The order-free digest of ``frame`` over ``columns``, equal to ``digest_of`` of the same rows in ``spark/bronze_clinical_lab.py``."""
-    line = functions.concat_ws(FIELD_SEPARATOR, *[text_of(functions.col(name), functions) for name in columns])
-    hashed = functions.sha2(line, 256)
-    high = functions.conv(functions.substring(hashed, 1, HALF_HEX), 16, 10).cast(DIGEST_TYPE)
-    low = functions.conv(functions.substring(hashed, HALF_HEX + 1, HALF_HEX), 16, 10).cast(DIGEST_TYPE)
-    row = frame.agg(functions.count(functions.lit(1)), functions.sum(high), functions.sum(low)).collect()[0]
-    return f"{int(row[0])}:{int(row[1] or 0)}:{int(row[2] or 0)}"
 
 
 def occurrences(frame: Any, functions: Any, window: Any) -> Any:
@@ -113,7 +93,7 @@ class SparkAdapter:
         try:
             return self.session.table(f"{SOURCE_CATALOG}.{SOURCE_NAMESPACE}.{source_table}")
         except self.analysis_error as error:
-            raise BronzeRulesError(f"the loaded table {SOURCE_NAMESPACE}.{source_table} is not at the source hash") from error
+            raise BronzeRulesError(f"the loaded table {SOURCE_NAMESPACE}.{source_table} is not at the source hash", code="source_table_missing") from error
 
     def expected(self, kind: str, columns: list[str]) -> Any:
         """The loaded table at the source hash as Bronze must hold it."""
@@ -194,12 +174,6 @@ class SparkAdapter:
         """The rows of the repeated groups, at most ``limit`` and one more, collected to the driver."""
         rows = self.repeated_frame().drop(GROUP_ROWS).limit(limit + 1).collect()
         return [(row["caseid"], row["dt"], row["name"], row["result"], int(row[OCCURRENCE_COLUMN])) for row in rows]
-
-    @timed
-    def digests(self, kind: str, columns: list[str]) -> tuple[str, str]:
-        wanted = [*columns, OCCURRENCE_COLUMN] if kind == "lab" else columns
-        bronze = self.bronze(kind)
-        return digest(bronze, TABLES[kind][2], self.functions), digest(bronze, wanted, self.functions)
 
     def close(self) -> None:
         self.session.stop()

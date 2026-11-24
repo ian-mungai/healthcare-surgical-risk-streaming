@@ -119,9 +119,10 @@ class MeasureTable(unittest.TestCase):
         self.assertNotIn("min", counts)
         self.assertNotIn("max", counts)
 
-    def test_no_case_is_refused_by_name(self) -> None:
-        with self.assertRaises(ValueError):
+    def test_no_case_is_refused_by_name_with_the_constant_zero_and_no_count_of_any_patient(self) -> None:
+        with self.assertRaises(ValueError) as caught:
             icu_measure_rows([])
+        self.assertEqual(["no_development_cases: 0 cases"], caught.exception.problems)  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

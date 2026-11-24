@@ -15,8 +15,9 @@ codes are those of ``spark/silver/cli.py``. The settings come from the environme
 
 The test set is sealed. No rule is estimated from data. The patient split is read after the check of who owns each case and only to find the development cases
 (training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes,
-so the result holds the snapshot IDs, one pass flag for each table and a digest of the event table (no row count; the events are of the development cases
-only), and every check is a flag, and so is every refusal. It never names a count of seconds or of events, a case, a patient, a set, a time or a value.
+so the result holds the snapshot IDs and one pass flag for each table, and no digest of either table (an inserted test-set event row changes the digest of
+the event table too). Every check is a flag, and so is every refusal. It never names a count of seconds or of events, a case, a patient, a set, a time or a
+value.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from spark.silver.run import BRANCH_MOVED, Fingerprint
 from spark.silver.tables import HYPOTENSION_TABLES, NAMESPACE, WAVEFORM
 from spark.split_cli import open_client, read_settings, start_deadline
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
-from spark.split_table import PatientSplitError, SplitRow, schema_problems, unit
+from spark.split_table import PatientSplitError, SplitRow, flag, schema_problems
 
 JOB = "silver_hypotension"
 WAVEFORM_TABLE = f"{NAMESPACE}.{WAVEFORM.name}"
@@ -70,7 +71,7 @@ class HypotensionLake(Lake):
     def source_frame(self, at: str, name: str) -> tuple[Any, str]:
         table = f"{self.catalog(at)}.{name}"
         if not self.session.catalog.tableExists(table):
-            raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
+            raise SilverSignalsError(flag("source_table"))
         return self.session.table(table), table
 
     def waveform(self, at: str) -> tuple[Any, str]:
@@ -108,7 +109,7 @@ class HypotensionLake(Lake):
         split, split_table = self.split(at)
         snapshots = (self.snapshot_id(waveform_table), self.snapshot_id(clinical_table), self.snapshot_id(split_table))
         if any(snapshot is None for snapshot in snapshots):
-            raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
+            raise SilverSignalsError(flag("source_no_snapshot"))
         held = (snapshots[0], snapshots[1], snapshots[2])
         if frames.ownership_flag(clinical):
             return InputRead(InputFacts(0, 0, 0, 1, 0, ()), held)
@@ -119,7 +120,7 @@ class HypotensionLake(Lake):
 
     def plan(self, at: str) -> dict[str, Fingerprint | Digest]:
         """Build both frames at ``at``, keep them on disk for the write and give their fingerprints. The events are made from the planned series, for the
-        development cases, and their digest has no row count."""
+        development cases, and their digest, which stays in the job to compare with the table that the branch holds, has no row count."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         waveform, _ = self.waveform(at)
         clinical, _ = self.clinical(at)

@@ -4,7 +4,7 @@ Failure modes covered here:
 
 - The job carries its own copy of the assignment rule, so the table and the stream can disagree about a patient.
 - A patient number that is not in its published form is accepted and gets a set.
-- A message, a result or a record names a patient or a case, or a set beside one. The test set is sealed: only codes and counts may leave the job.
+- A message, a result or a record names a patient or a case, or a set beside one. The test set is sealed: only codes and flags may leave the job.
 - A patient is in two sets, or twice in one, and the table is still taken as good.
 - A table that differs from the rule for one patient passes, or the pinned release's shares and exact counts are not held, or they are demanded of a
   sample-sized source.
@@ -124,12 +124,12 @@ class AssignmentTest(unittest.TestCase):
         for text in ("", "0", "007", " 7", "7 ", "7.0", "-3", "abc", "1e3", "١٢", "+5"):
             with self.subTest(text=text), self.assertRaises(PatientSplitError) as caught:
                 patient_number(text)
-            self.assertEqual(["bad_subjectid: 1 subjectid"], caught.exception.problems)
+            self.assertEqual(["bad_subjectid: failed"], caught.exception.problems)
 
     def test_a_cohort_with_a_bad_subject_id_is_refused_with_the_count_only(self) -> None:
         with self.assertRaises(PatientSplitError) as caught:
             build_assignments(["1", "007", "3", "0"])
-        self.assertEqual(["bad_subjectid: 2 subjectids"], caught.exception.problems)
+        self.assertEqual(["bad_subjectid: failed"], caught.exception.problems)
 
 
 class TableTest(unittest.TestCase):
@@ -138,37 +138,37 @@ class TableTest(unittest.TestCase):
 
     def test_a_patient_in_two_sets_is_counted(self) -> None:
         rows = rows_of(FULL) + [SplitRow("25", other_set(FULL["25"]), RULE_VERSION, SNAPSHOT)]
-        self.assertIn("two_sets: 1 patient", table_problems(rows, pinned=False))
+        self.assertIn("two_sets: failed", table_problems(rows, pinned=False))
 
     def test_a_patient_twice_in_one_set_is_counted(self) -> None:
         rows = rows_of(FULL) + [SplitRow("25", FULL["25"], RULE_VERSION, SNAPSHOT)]
-        self.assertIn("repeated_patient: 1 patient", table_problems(rows, pinned=False))
+        self.assertIn("repeated_patient: failed", table_problems(rows, pinned=False))
 
     def test_a_set_the_card_does_not_name_is_counted(self) -> None:
         rows = [SplitRow("1", "train", RULE_VERSION, SNAPSHOT), *rows_of(FULL)[1:]]
-        self.assertIn("unknown_set: 1 row", table_problems(rows, pinned=False))
+        self.assertIn("unknown_set: failed", table_problems(rows, pinned=False))
 
     def test_a_patient_whose_set_differs_from_the_rule_is_counted_even_when_the_counts_hold(self) -> None:
         # Swap the sets of one training and one test patient: every count and share stays the same.
         training = next(subjectid for subjectid, name in FULL.items() if name == "training")
         test = next(subjectid for subjectid, name in FULL.items() if name == "test")
         problems = table_problems(rows_of({**FULL, training: "test", test: "training"}), pinned=True)
-        self.assertEqual(["rule_mismatch: 2 patients"], problems)
+        self.assertEqual(["rule_mismatch: failed"], problems)
 
     def test_a_table_built_with_another_version_of_the_rule_is_counted(self) -> None:
         problems = table_problems(rows_of(FULL, version="patient_split:seed=2"), pinned=True)
-        self.assertEqual([f"rule_version: {len(FULL)} rows"], problems)
+        self.assertEqual(["rule_version: failed"], problems)
 
     def test_a_subject_id_not_in_its_published_form_is_counted(self) -> None:
         rows = [*rows_of(FULL), SplitRow("007", "training", RULE_VERSION, SNAPSHOT)]
-        self.assertIn("bad_subjectid: 1 subjectid", table_problems(rows, pinned=False))
+        self.assertIn("bad_subjectid: failed", table_problems(rows, pinned=False))
 
     def test_an_empty_table_is_a_problem(self) -> None:
-        self.assertEqual(["empty_table: 0 rows"], table_problems([], pinned=False))
+        self.assertEqual(["empty_table: failed"], table_problems([], pinned=False))
 
     def test_a_table_from_more_than_one_snapshot_is_counted(self) -> None:
         rows = [SplitRow("1", FULL["1"], RULE_VERSION, 1), SplitRow("2", FULL["2"], RULE_VERSION, 2)]
-        self.assertIn("mixed_snapshots: 2 snapshots", table_problems(rows, pinned=False))
+        self.assertIn("mixed_snapshots: failed", table_problems(rows, pinned=False))
 
     def test_the_pinned_release_needs_its_exact_counts(self) -> None:
         one_missing = {subjectid: name for subjectid, name in FULL.items() if subjectid != "1"}
@@ -211,7 +211,7 @@ class InheritedTest(unittest.TestCase):
         self.assertEqual([], split_table.inherited_problems(rows_of(FULL)))
 
     def test_an_empty_inherited_table_is_refused(self) -> None:
-        self.assertEqual(["inherited_empty: 0 rows"], split_table.inherited_problems([]))
+        self.assertEqual(["inherited_empty: failed"], split_table.inherited_problems([]))
 
     def test_a_patient_twice_in_the_inherited_table_is_refused_whatever_the_order(self) -> None:
         wrong, right = other_set(FULL["25"]), FULL["25"]
@@ -219,16 +219,16 @@ class InheritedTest(unittest.TestCase):
             with self.subTest(order=order):
                 rows = [row for row in rows_of(FULL) if row.subjectid != "25"]
                 rows += [SplitRow("25", name, RULE_VERSION, SNAPSHOT) for name in order]
-                self.assertEqual(["inherited_duplicates: 1 patient"], split_table.inherited_problems(rows))
+                self.assertEqual(["inherited_duplicates: failed"], split_table.inherited_problems(rows))
 
     def test_an_inherited_table_of_two_rule_versions_is_refused(self) -> None:
         rows = [*rows_of(FULL)[:-1], SplitRow("6090", FULL["6090"], "patient_split:seed=2", SNAPSHOT)]
-        self.assertEqual(["inherited_versions: 2 rule versions"], split_table.inherited_problems(rows))
+        self.assertEqual(["inherited_versions: failed"], split_table.inherited_problems(rows))
 
     def test_the_freeze_runs_the_inherited_checks_itself(self) -> None:
-        self.assertEqual(["inherited_empty: 0 rows"], frozen_problems([], FULL, pinned=True))
+        self.assertEqual(["inherited_empty: failed"], frozen_problems([], FULL, pinned=True))
         rows = [*rows_of(FULL), SplitRow("25", other_set(FULL["25"]), RULE_VERSION, SNAPSHOT)]
-        self.assertEqual(["inherited_duplicates: 1 patient"], frozen_problems(rows, FULL, pinned=True))
+        self.assertEqual(["inherited_duplicates: failed"], frozen_problems(rows, FULL, pinned=True))
 
 
 class FrozenTest(unittest.TestCase):
@@ -237,15 +237,15 @@ class FrozenTest(unittest.TestCase):
 
     def test_a_changed_set_is_counted_without_naming_the_patient_or_the_sets(self) -> None:
         existing = rows_of({**FULL, "30": other_set(FULL["30"]), "31": other_set(FULL["31"])})
-        self.assertEqual(["changed_set: 2 patients"], frozen_problems(existing, FULL, pinned=False))
+        self.assertEqual(["changed_set: failed"], frozen_problems(existing, FULL, pinned=False))
 
     def test_a_patient_that_left_the_source_is_counted(self) -> None:
         rebuilt = {subjectid: name for subjectid, name in FULL.items() if subjectid != "5"}
-        self.assertEqual(["left_source: 1 patient"], frozen_problems(rows_of(FULL), rebuilt, pinned=False))
+        self.assertEqual(["left_source: failed"], frozen_problems(rows_of(FULL), rebuilt, pinned=False))
 
     def test_a_new_patient_is_refused_for_a_pinned_release_and_allowed_otherwise(self) -> None:
         existing = {subjectid: name for subjectid, name in FULL.items() if subjectid != "5"}
-        self.assertEqual(["new_patient: 1 patient"], frozen_problems(rows_of(existing), FULL, pinned=True))
+        self.assertEqual(["new_patient: failed"], frozen_problems(rows_of(existing), FULL, pinned=True))
         self.assertEqual([], frozen_problems(rows_of(existing), FULL, pinned=False))
 
     def test_a_first_build_has_nothing_to_freeze_even_for_a_pinned_release(self) -> None:
@@ -253,7 +253,7 @@ class FrozenTest(unittest.TestCase):
 
     def test_an_existing_table_of_another_rule_version_is_counted(self) -> None:
         problems = frozen_problems(rows_of(FULL, version="patient_split:seed=2"), FULL, pinned=False)
-        self.assertEqual([f"inherited_rule_version: {len(FULL)} rows"], problems)
+        self.assertEqual(["inherited_rule_version: failed"], problems)
 
 
 class ValuesQueryTest(unittest.TestCase):
@@ -284,12 +284,12 @@ class SourceTest(unittest.TestCase):
         self.assertEqual([], source_problems(rows_of(FULL), set(FULL), SNAPSHOT))
 
     def test_a_table_built_from_another_snapshot_is_counted(self) -> None:
-        self.assertEqual(["source_snapshot: the table was built from another source snapshot"], source_problems(rows_of(FULL), set(FULL), SNAPSHOT + 1))
+        self.assertEqual(["source_snapshot: failed"], source_problems(rows_of(FULL), set(FULL), SNAPSHOT + 1))
 
     def test_a_patient_of_the_source_with_no_row_and_a_row_with_no_patient_are_counted(self) -> None:
         short = {subjectid: name for subjectid, name in FULL.items() if subjectid != "9"}
-        self.assertEqual(["source_missing: 1 patient"], source_problems(rows_of(short), set(FULL), SNAPSHOT))
-        self.assertEqual(["source_extra: 1 patient"], source_problems(rows_of(FULL), set(short), SNAPSHOT))
+        self.assertEqual(["source_missing: failed"], source_problems(rows_of(short), set(FULL), SNAPSHOT))
+        self.assertEqual(["source_extra: failed"], source_problems(rows_of(FULL), set(short), SNAPSHOT))
 
     def test_the_columns_are_the_four_of_the_card_in_order(self) -> None:
         self.assertEqual([], schema_problems(list(COLUMNS), COLUMNS))
@@ -301,10 +301,10 @@ class SourceTest(unittest.TestCase):
         cases, patients = source_cases([("1", "10"), ("2", "10"), ("3", "11")])
         self.assertEqual(({1: "10", 2: "10", 3: "11"}, {"10", "11"}), (cases, patients))
         for rows, code in (
-            ([("1", "10"), ("1", "11")], "case_two_patients: 1 case"),
-            ([("1", None)], "source_row: 1 row"),
-            ([(None, "10")], "source_row: 1 row"),
-            ([("x", "10"), ("y", "11")], "source_row: 2 rows"),
+            ([("1", "10"), ("1", "11")], "case_two_patients: failed"),
+            ([("1", None)], "source_row: failed"),
+            ([(None, "10")], "source_row: failed"),
+            ([("x", "10"), ("y", "11")], "source_row: failed"),
         ):
             with self.subTest(rows=rows), self.assertRaises(PatientSplitError) as caught:
                 source_cases(rows)
@@ -329,37 +329,37 @@ class FixedSampleTest(unittest.TestCase):
         sample = tracked_sample()
         assignments, cases = sample_cohort(sample)
         assignments[str(next(item for item in sample if item.slot == "short_development").patient)] = "test"
-        self.assertEqual(["sample_mismatch: 1 case"], fixed_sample_problems(assignments, cases, sample))
+        self.assertEqual(["sample_mismatch: failed"], fixed_sample_problems(assignments, cases, sample))
 
     def test_a_test_case_in_training_is_counted(self) -> None:
         sample = tracked_sample()
         assignments, cases = sample_cohort(sample)
         assignments[str(next(item for item in sample if item.slot == "arterial_test").patient)] = "training"
-        self.assertEqual(["sample_mismatch: 1 case"], fixed_sample_problems(assignments, cases, sample))
+        self.assertEqual(["sample_mismatch: failed"], fixed_sample_problems(assignments, cases, sample))
 
     def test_a_case_that_bronze_lacks_is_counted(self) -> None:
         sample = tracked_sample()
         assignments, cases = sample_cohort(sample)
         del cases[sample[0].case]
-        self.assertEqual(["sample_missing_case: 1 case"], fixed_sample_problems(assignments, cases, sample))
+        self.assertEqual(["sample_missing_case: failed"], fixed_sample_problems(assignments, cases, sample))
 
     def test_a_case_listed_under_another_patient_is_counted(self) -> None:
         sample = tracked_sample()
         assignments, cases = sample_cohort(sample)
         cases[sample[0].case] = str(sample[0].patient + 1)
-        self.assertEqual(["sample_wrong_patient: 1 case"], fixed_sample_problems(assignments, cases, sample))
+        self.assertEqual(["sample_wrong_patient: failed"], fixed_sample_problems(assignments, cases, sample))
 
     def test_a_patient_missing_from_the_table_is_counted(self) -> None:
         sample = tracked_sample()
         assignments, cases = sample_cohort(sample)
         del assignments[str(sample[0].patient)]
-        self.assertEqual(["sample_missing_patient: 1 case"], fixed_sample_problems(assignments, cases, sample))
+        self.assertEqual(["sample_missing_patient: failed"], fixed_sample_problems(assignments, cases, sample))
 
     def test_a_slot_of_no_known_kind_is_counted(self) -> None:
-        self.assertEqual(["sample_bad_slot: 1 case"], fixed_sample_problems({"1": "training"}, {1: "1"}, [SampleCase(case=1, patient=1, slot="odd_slot")]))
+        self.assertEqual(["sample_bad_slot: failed"], fixed_sample_problems({"1": "training"}, {1: "1"}, [SampleCase(case=1, patient=1, slot="odd_slot")]))
 
     def test_an_empty_sample_is_a_problem_so_that_the_check_never_passes_on_nothing(self) -> None:
-        self.assertEqual(["sample_empty: 0 cases"], fixed_sample_problems(FULL, {}, []))
+        self.assertEqual(["sample_empty: failed"], fixed_sample_problems(FULL, {}, []))
 
     def test_only_the_complete_tracked_file_is_accepted(self) -> None:
         lines = CANDIDATES_FILE.read_text().splitlines()
@@ -485,7 +485,8 @@ class BuildSequenceTest(unittest.TestCase):
             ],
             lake.calls,
         )
-        self.assertEqual(("written", "h1", 6), (outcome.outcome, outcome.head, outcome.table_snapshot_id))
+        self.assertEqual(("h1", 6), (outcome.head, outcome.table_snapshot_id))
+        self.assertIn(("write", False), lake.calls)
         self.assertEqual(rows_of(FULL, snapshot=11), outcome.rows)
 
     def test_the_namespace_is_prepared_after_every_check_and_the_head_check_and_before_the_write(self) -> None:
@@ -499,7 +500,7 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL, new_namespace=True, write_parent="h0")
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
 
     def test_nothing_is_prepared_or_written_when_a_check_fails_the_branch_moved_or_nothing_changes(self) -> None:
         cases = {
@@ -518,14 +519,14 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL, existing=rows_of(FULL, snapshot=11))
         outcome = build_with(lake)
         self.assertNotIn("write", lake.names())
-        self.assertEqual(("unchanged", "h0"), (outcome.outcome, outcome.head))
+        self.assertEqual(("h0", None), (outcome.head, outcome.write_hash))
         self.assertEqual({("read_source", "h0"), ("read_table", "h0")}, {call for call in lake.calls if call[0] != "head"})
 
     def test_a_rebuild_over_a_new_source_snapshot_overwrites_the_table(self) -> None:
         lake = Lake(FULL, existing=rows_of(FULL, snapshot=3))
         outcome = build_with(lake)
         self.assertIn(("write", True), lake.calls)
-        self.assertEqual("written", outcome.outcome)
+        self.assertEqual("h1", outcome.write_hash)
 
     def test_every_read_before_the_write_is_at_the_resolved_hash_and_every_read_after_it_at_the_write_hash(self) -> None:
         lake = Lake(FULL)
@@ -539,7 +540,7 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL, existing=rows_of({**FULL, "30": other_set(FULL["30"])}, snapshot=11))
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["changed_set: 1 patient"], caught.exception.problems)
+        self.assertEqual(["changed_set: failed"], caught.exception.problems)
         self.assertNotIn("write", lake.names())
 
     def test_an_empty_inherited_table_refuses_a_pinned_cohort_with_a_patient_replaced(self) -> None:
@@ -550,7 +551,7 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(replaced, existing=[])
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["inherited_empty: 0 rows"], caught.exception.problems)
+        self.assertEqual(["inherited_empty: failed"], caught.exception.problems)
         self.assertNotIn("write", lake.names())
 
     def test_an_inherited_table_with_a_wrong_row_then_the_right_one_refuses_before_any_write(self) -> None:
@@ -559,7 +560,7 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL, existing=existing)
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["inherited_duplicates: 1 patient"], caught.exception.problems)
+        self.assertEqual(["inherited_duplicates: failed"], caught.exception.problems)
         self.assertNotIn("write", lake.names())
 
     def test_a_failed_check_of_the_rows_to_write_refuses_before_any_write(self) -> None:
@@ -573,7 +574,7 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(FULL, script=["h9"])
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
         self.assertNotIn("write", lake.names())
 
     def test_a_table_that_reads_back_other_than_it_was_written_is_refused(self) -> None:
@@ -590,33 +591,33 @@ class BuildSequenceTest(unittest.TestCase):
 
     def test_a_read_back_that_differs_only_in_order_is_the_same_table(self) -> None:
         lake = Lake(FULL, corrupt=lambda rows: list(reversed(rows)))
-        self.assertEqual("written", build_with(lake).outcome)
+        self.assertEqual("h1", build_with(lake).write_hash)
 
     def test_an_unrelated_commit_after_the_write_is_not_taken_as_the_write_and_nothing_is_read_at_it(self) -> None:
         lake = Lake(FULL, unrelated=True)
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
         self.assertEqual([], [call for call in lake.calls[lake.names().index("write_hash") :] if call[0].startswith("read")])
 
     def test_a_write_whose_commit_is_not_directly_on_the_checked_hash_is_refused(self) -> None:
         lake = Lake(FULL, write_parent="h7")
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
 
     def test_a_branch_that_moves_after_the_write_is_refused_whatever_the_table_holds(self) -> None:
         lake = Lake(FULL, script=["h0", "h5"])
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
 
     def test_a_source_that_is_not_the_one_that_was_checked_is_refused_at_the_write_hash(self) -> None:
         # The branch holds another Bronze snapshot at the hash of the write: the table that was written no longer matches the source it is checked against.
         lake = Lake(FULL, source_after_write=source_of(FULL, snapshot=12))
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake)
-        self.assertEqual(["source_snapshot: the table was built from another source snapshot"], caught.exception.problems)
+        self.assertEqual(["source_snapshot: failed"], caught.exception.problems)
 
     def test_a_fixed_sample_case_that_bronze_lists_under_another_patient_is_refused_by_the_sample_check_alone(self) -> None:
         sample = tracked_sample()
@@ -624,7 +625,7 @@ class BuildSequenceTest(unittest.TestCase):
         lake = Lake(assignments, cases={**cases, sample[0].case: str(sample[0].patient + 1)})
         with self.assertRaises(PatientSplitError) as caught:
             build_with(lake, pinned=False, sample=sample)
-        self.assertEqual(["sample_wrong_patient: 1 case"], caught.exception.problems)
+        self.assertEqual(["sample_wrong_patient: failed"], caught.exception.problems)
         self.assertNotIn("write", lake.names())
 
     def test_a_fixed_sample_case_in_the_wrong_set_at_the_write_hash_is_refused_by_the_sample_check_alone(self) -> None:
@@ -634,7 +635,7 @@ class BuildSequenceTest(unittest.TestCase):
         after = source_of(assignments, cases={**cases, sample[1].case: str(sample[1].patient + 1)})
         with self.assertRaises(PatientSplitError) as caught:
             build_with(Lake(assignments, cases=cases, source_after_write=after), pinned=False, sample=sample)
-        self.assertEqual(["sample_wrong_patient: 1 case"], caught.exception.problems)
+        self.assertEqual(["sample_wrong_patient: failed"], caught.exception.problems)
 
     def test_the_fixed_sample_is_checked_on_the_rows_and_on_the_table_read_back(self) -> None:
         sample = tracked_sample()
@@ -656,40 +657,34 @@ class BuildSequenceTest(unittest.TestCase):
         outcome = build_with(Lake(assignments, cases=cases), pinned=False, sample=sample)
         self.assertNotIn("shares", outcome.checks_run)
         self.assertNotIn("pinned_counts", outcome.checks_run)
-        self.assertEqual({"training": 7, "validation": 0, "test": 3}, outcome.facts()["counts"])
+        self.assertNotIn("counts", outcome.facts())
 
     def test_the_facts_are_exactly_these_keys_and_nothing_derived_from_the_rows(self) -> None:
         facts = build_with(Lake(FULL)).facts()
         self.assertEqual(
             {
-                "outcome",
                 "checked_hash",
                 "write_hash",
                 "branch_hash",
                 "snapshot_id",
                 "source_snapshot_id",
                 "rule_version",
-                "patients",
-                "cases",
-                "counts",
+                "passed",
                 "checks_run",
                 "fixed_sample_cases_checked",
             },
             set(facts),
         )
-        self.assertEqual(PINNED_COUNTS, facts["counts"])
-        self.assertEqual(("h0", "h1", "h1", 6090, 6090), (facts["checked_hash"], facts["write_hash"], facts["branch_hash"], facts["patients"], facts["cases"]))
+        self.assertEqual(("h0", "h1", "h1"), (facts["checked_hash"], facts["write_hash"], facts["branch_hash"]))
         self.assertEqual(["two_sets", "rule_match", "rule_version", "source_snapshot", "source_patients", "shares", "pinned_counts"], facts["checks_run"])
 
     def test_a_result_for_a_one_patient_cohort_holds_nothing_that_tells_the_patients_apart(self) -> None:
-        # Two cohorts of one patient, one patient in test and one in training: every key but the counts must be equal, and the counts say only how many.
+        # Two cohorts of one patient, one patient in test and one in training: every key of the result must be equal.
         test_patient = next(subjectid for subjectid, name in FULL.items() if name == "test")
         training_patient = next(subjectid for subjectid, name in FULL.items() if name == "training")
         first = build_with(Lake({test_patient: "test"}), pinned=False).facts()
         second = build_with(Lake({training_patient: "training"}), pinned=False).facts()
-        differing = {key for key in first if first[key] != second[key]}
-        self.assertEqual({"counts"}, differing)
-        self.assertEqual(first["cases"], second["cases"])
+        self.assertEqual(first, second)
 
     def test_a_result_without_a_write_has_no_write_hash(self) -> None:
         facts = build_with(Lake(FULL, existing=rows_of(FULL, snapshot=11))).facts()
@@ -704,18 +699,18 @@ class VerifySequenceTest(unittest.TestCase):
         lake = Lake(FULL, existing=rows_of(FULL, snapshot=11))
         outcome = self.verify_with(lake)
         self.assertEqual([("read_source", "h0"), ("read_table", "h0"), ("head",)], lake.calls)
-        self.assertEqual(("verified", "h0", 5), (outcome.outcome, outcome.head, outcome.table_snapshot_id))
+        self.assertEqual(("h0", 5, None), (outcome.head, outcome.table_snapshot_id, outcome.write_hash))
 
     def test_a_branch_with_no_table_is_refused(self) -> None:
         with self.assertRaises(PatientSplitError) as caught:
             self.verify_with(Lake(FULL))
-        self.assertEqual(["table_missing: 0 tables"], caught.exception.problems)
+        self.assertEqual(["table_missing: failed"], caught.exception.problems)
 
     def test_a_branch_that_moved_during_the_check_is_refused(self) -> None:
         lake = Lake(FULL, existing=rows_of(FULL, snapshot=11), script=["h4"])
         with self.assertRaises(PatientSplitError) as caught:
             self.verify_with(lake)
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
 
     def test_a_fixed_sample_case_under_another_patient_is_refused_by_the_sample_check_alone(self) -> None:
         sample = tracked_sample()
@@ -723,7 +718,7 @@ class VerifySequenceTest(unittest.TestCase):
         lake = Lake(assignments, existing=rows_of(assignments, snapshot=11), cases={**cases, sample[0].case: str(sample[0].patient + 1)})
         with self.assertRaises(PatientSplitError) as caught:
             self.verify_with(lake, pinned=False, sample=sample)
-        self.assertEqual(["sample_wrong_patient: 1 case"], caught.exception.problems)
+        self.assertEqual(["sample_wrong_patient: failed"], caught.exception.problems)
 
     def test_each_failed_check_is_refused(self) -> None:
         cases = {
@@ -741,28 +736,28 @@ class DistinctCountTest(unittest.TestCase):
 
     def test_a_bad_subject_id_that_repeats_is_one_subject_id(self) -> None:
         rows = [*rows_of(FULL), SplitRow("007", "training", RULE_VERSION, SNAPSHOT), SplitRow("007", "training", RULE_VERSION, SNAPSHOT)]
-        self.assertIn("bad_subjectid: 1 subjectid", table_problems(rows, pinned=False))
+        self.assertIn("bad_subjectid: failed", table_problems(rows, pinned=False))
         with self.assertRaises(PatientSplitError) as caught:
             build_assignments(["007", "007", "1"])
-        self.assertEqual(["bad_subjectid: 1 subjectid"], caught.exception.problems)
+        self.assertEqual(["bad_subjectid: failed"], caught.exception.problems)
 
     def test_a_patient_that_repeats_with_the_wrong_set_is_one_patient_off_the_rule(self) -> None:
         wrong = other_set(FULL["25"])
         rows = [row for row in rows_of(FULL) if row.subjectid != "25"] + [SplitRow("25", wrong, RULE_VERSION, SNAPSHOT) for _ in range(3)]
-        self.assertIn("rule_mismatch: 1 patient", table_problems(rows, pinned=False))
-        self.assertIn("repeated_patient: 1 patient", table_problems(rows, pinned=False))
+        self.assertIn("rule_mismatch: failed", table_problems(rows, pinned=False))
+        self.assertIn("repeated_patient: failed", table_problems(rows, pinned=False))
 
     def test_a_case_under_three_patients_is_one_case_and_a_repeat_of_the_same_pair_is_none(self) -> None:
         with self.assertRaises(PatientSplitError) as caught:
             source_cases([("1", "10"), ("1", "11"), ("1", "12")])
-        self.assertEqual(["case_two_patients: 1 case"], caught.exception.problems)
+        self.assertEqual(["case_two_patients: failed"], caught.exception.problems)
         self.assertEqual(({1: "10"}, {"10"}), source_cases([("1", "10"), ("1", "10")]))
 
     def test_a_sample_case_that_repeats_is_one_case(self) -> None:
         twice = [SampleCase(case=1, patient=1, slot="odd"), SampleCase(case=1, patient=1, slot="odd")]
-        self.assertEqual(["sample_bad_slot: 1 case"], fixed_sample_problems({"1": "training"}, {1: "1"}, twice))
+        self.assertEqual(["sample_bad_slot: failed"], fixed_sample_problems({"1": "training"}, {1: "1"}, twice))
         missing = [SampleCase(case=1, patient=1, slot="repeat_test"), SampleCase(case=1, patient=1, slot="repeat_test")]
-        self.assertEqual(["sample_missing_case: 1 case"], fixed_sample_problems({}, {}, missing))
+        self.assertEqual(["sample_missing_case: failed"], fixed_sample_problems({}, {}, missing))
 
 
 class WriteCommitTest(unittest.TestCase):
@@ -856,7 +851,7 @@ class SplitTableRowTest(unittest.TestCase):
         for change in ({"subjectid": None}, {"source_snapshot_id": None}, {"subjectid": 10}, {"source_snapshot_id": "5"}, {"source_snapshot_id": False}):
             with self.subTest(change=change), self.assertRaises(PatientSplitError) as caught:
                 self.read({**self.GOOD, **change})
-            self.assertEqual(["table_row: 1 row"], caught.exception.problems)
+            self.assertEqual(["table_row: failed"], caught.exception.problems)
 
     def test_a_row_in_form_is_read(self) -> None:
         self.read({**self.GOOD, "subjectid": "11"})
@@ -1012,7 +1007,7 @@ class LakeAdapterTest(unittest.TestCase):
             lake = self.lake(FakeSession(), AnsweringNessie(NAMESPACE_COMMIT, log=log))
             with self.subTest(label), self.assertRaises(PatientSplitError) as caught:
                 lake.prepare(BASE)
-            self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+            self.assertEqual(["branch_moved: failed"], caught.exception.problems)
 
     def build(self, session: FakeSession, client: AnsweringNessie) -> None:
         lake = self.lake(session, client)
@@ -1023,14 +1018,14 @@ class LakeAdapterTest(unittest.TestCase):
         session = FakeSession(missing=("clinical_cases",))
         with self.assertRaises(PatientSplitError) as caught:
             self.build(session, AnsweringNessie(BASE))
-        self.assertEqual(["source_table: 0 tables"], caught.exception.problems)
+        self.assertEqual(["source_table: failed"], caught.exception.problems)
         self.assertEqual(([], []), (session.sql_calls, session.writes))
 
     def test_a_branch_that_moved_before_the_write_is_refused_before_any_statement_or_write(self) -> None:
         session = FakeSession(missing=("patient_split",))
         with self.assertRaises(PatientSplitError) as caught:
             self.build(session, AnsweringNessie("12" * 32))
-        self.assertEqual(["branch_moved: the branch head is not the one that was checked"], caught.exception.problems)
+        self.assertEqual(["branch_moved: failed"], caught.exception.problems)
         self.assertEqual(([], []), (session.sql_calls, session.writes))
 
     def test_a_failed_check_of_the_inherited_table_is_refused_before_any_statement_or_write(self) -> None:
@@ -1041,7 +1036,7 @@ class LakeAdapterTest(unittest.TestCase):
         )
         with self.assertRaises(PatientSplitError) as caught:
             self.build(session, AnsweringNessie(BASE))
-        self.assertEqual(["inherited_empty: 0 rows"], caught.exception.problems)
+        self.assertEqual(["inherited_empty: failed"], caught.exception.problems)
         self.assertEqual(([], []), (session.sql_calls, session.writes))
 
 
@@ -1139,7 +1134,7 @@ class EntryPointTest(unittest.TestCase):
                     session = FakeSession()
                     with self.subTest(setting=name, case=case, mode=mode[0]):
                         code, out, err, built, timer = self.drive(session, wire, mode, case)
-                        self.assertEqual((2, "", "patient_split: settings\n"), (code, out, err))
+                        self.assertEqual((2, "", "patient_split: settings: failed\n"), (code, out, err))
                         self.assertEqual(([], [], False, False), (wire.requests, events, built.called, timer.called))
 
     def test_every_local_step_is_done_before_the_first_remote_call(self) -> None:
@@ -1156,7 +1151,7 @@ class EntryPointTest(unittest.TestCase):
         wire = Wire([])
         session = FakeSession(missing=("clinical_cases",))
         code, out, err, _, _ = self.drive(session, wire, ["build", "--branch", "b"])
-        self.assertEqual((1, "", "patient_split: source_table: 0 tables\n"), (code, out, err))
+        self.assertEqual((1, "", "patient_split: source_table: failed\n"), (code, out, err))
         self.assertEqual(([], []), (session.sql_calls, session.writes))
         self.assertEqual(["POST"], [method for method, _ in wire.requests if method != "GET"])
 
@@ -1164,16 +1159,18 @@ class EntryPointTest(unittest.TestCase):
         wire = Wire([], heads=(BASE, "12" * 32))
         session = FakeSession(missing=("patient_split",))
         code, out, err, _, _ = self.drive(session, wire, ["build", "--branch", "b"])
-        self.assertEqual((1, "", "patient_split: branch_moved: the branch head is not the one that was checked\n"), (code, out, err))
+        self.assertEqual((1, "", "patient_split: branch_moved: failed\n"), (code, out, err))
         self.assertEqual(([], []), (session.sql_calls, session.writes))
 
 
 def call_main(main: Callable[[list[str]], int], argv: list[str]) -> tuple[int, str, str]:
+    """Run ``main``. A ``build`` or ``verify`` call with no ``--result`` gets one in a fresh folder, so that it is judged for its own arguments."""
     out, err = io.StringIO(), io.StringIO()
     code = 0
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with tempfile.TemporaryDirectory(prefix="split_main_") as folder, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        call = [*argv, "--result", f"{folder}/result.json"] if ({"build", "verify"} & set(argv)) and "--result" not in argv else argv
         try:
-            code = main(argv)
+            code = main(call)
         except SystemExit as stop:
             code = int(stop.code or 0)
     return code, out.getvalue(), err.getvalue()

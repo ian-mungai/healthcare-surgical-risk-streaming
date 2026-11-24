@@ -131,6 +131,21 @@ def development_candidates(items: Sequence[Candidate]) -> list[Candidate]:
     return [item for item in items if is_development_candidate(item)]
 
 
+def plan_case_problems(cases: Sequence[int], candidates: Sequence[Candidate], *, arterial: bool = True) -> list[str]:
+    """The reasons a replay plan cannot stand as the streaming control, as messages that name a case but never a fact of a test patient.
+
+    Every case is a development candidate, and, unless ``arterial`` is false, at least one development case has ``SNUADC/ART``: with none, no compared window
+    holds an invalid arterial second and the parity gate cannot pass.
+    """
+    known = {item.case: item for item in candidates}
+    problems = [f"case {case} is not a candidate of the fixed sample" for case in cases if case not in known]
+    members = [known[case] for case in cases if case in known]
+    problems += [f"case {item.case} is not a development case" for item in members if not is_development_candidate(item)]
+    if arterial and not any(item.arterial_waveform for item in members if is_development_candidate(item)):
+        problems.append(f"no development case of the plan has {ARTERIAL_TRACK}")
+    return problems
+
+
 def case_key(case: int) -> str:
     return f"{CASE_PREFIX}{case:04d}.vital"
 

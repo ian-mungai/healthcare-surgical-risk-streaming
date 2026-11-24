@@ -17,9 +17,10 @@ from typing import Any
 from scripts.stack.nessie import NessieError
 from spark.profile.checks import SignalProfileError
 from spark.settings import SettingsError
-from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, reference_name
+from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, reference_name
 
 JOB = "signal_profile"
+RESULT_PREFIX = "RESULT "
 
 
 class QuietParser(argparse.ArgumentParser):

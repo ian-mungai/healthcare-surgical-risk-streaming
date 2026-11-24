@@ -5,7 +5,8 @@ The test set is sealed: a count or a digest over every case changes when one hel
 Failure modes covered here:
 
 - A result holds a row count, a digest, a fingerprint or a count of a cause over every case, held-out cases included.
-- A result holds a number that is not a snapshot ID (or the development events digest of the hypotension job), so a held-out row could change it.
+- A result holds a number that is not a snapshot ID, so a held-out row could change it. The digest of the hypotension job's event table is one: a test-set
+  event row that is inserted changes it, so the job writes no digest of it.
 - Changing one held-out row (its counts, its fingerprint) changes the result in more than the snapshot IDs, the hashes and the pass flags.
 - A refusal or a problem message carries a count of rows, cases, seconds, readings, keys or patients, or the size of a defect changes its text.
 - A result holds the field ``outcome``, which says whether a table was written, so it changes when only a held-out row changes.
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import json
 import re
 import unittest
 from pathlib import Path
@@ -32,6 +34,8 @@ from spark.jobs import silver_signals as signals_job
 from spark.jobs.patient_split import Lake
 from spark.jobs.silver_hypotension import HypotensionLake
 from spark.jobs.silver_signals import SOURCES, SignalsLake
+from spark.profile.run import PROFILE, UNSCORED
+from spark.profile.run import run_build as run_profile_build
 from spark.silver import hypotension_run as hypo_run
 from spark.silver import run as signals_run
 from spark.silver.checks import BronzeFacts, NumericFacts, SilverSignalsError, WaveformFacts
@@ -43,11 +47,14 @@ from spark.split_table import COLUMNS, PatientSplitError, schema_problems
 from tests.fast import test_silver_hypotension_run as hypo
 from tests.fast import test_silver_signals_run as signals
 from tests.fast.silver_accept import CHECKS, HYPOTENSION_JOB, RESULT_KEYS, SIGNALS_JOB, TABLE_KEYS, sealed
+from tests.fast.test_signal_profile_run import HEAD as PROFILE_HEAD
+from tests.fast.test_signal_profile_run import Fake as ProfileFake
 
-TABLE_COUNT_CODES = ("table_missing", "readback_differs", "source_no_snapshot", "source_table")
-MESSAGE = re.compile(r"^[a-z_]+: failed$|^(" + "|".join(TABLE_COUNT_CODES) + r"): [0-9]+ tables?$|^" + re.escape(BRANCH_MOVED) + "$")
+MESSAGE = re.compile(r"^[a-z_]+: failed$|^" + re.escape(BRANCH_MOVED) + "$")
 VOLATILE = ("snapshots", "source_snapshots", "checked_hash", "write_hash", "branch_hash")
 BANNED_KEYS = ("outcome", "rows", "bronze_rows", "duplicates_dropped", "causes", "fingerprints", "fingerprint", "digest", "count", "counts")
+# A key that holds one of these words is banned too, whatever else its name holds (``development_events_digest`` was one).
+BANNED_WORDS = ("digest", "fingerprint", "count", "cause", "rows", "outcome")
 SNAPSHOT_KEYS = ("snapshots", "source_snapshots")
 
 
@@ -87,13 +94,11 @@ def refusal(call: Any) -> list[str]:
 class SignalsResult(unittest.TestCase):
     def other_world(self, fake: signals.Fake) -> signals.Fake:
         """The same job on an input with more rows, another fingerprint and another snapshot: a held-out row has changed."""
-        fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=1007, waveform_rows=305), (21, 22, 23))
+        fake.input = signals_run.InputRead(signals.BRONZE, (21, 22, 23))
         fake.planned = {signals_run.NUMERIC: Fingerprint(997, 55), signals_run.WAVEFORM: Fingerprint(305, 66)}
         fake.read_back = {
-            signals_run.NUMERIC: signals_run.TableRead(fake.planned[signals_run.NUMERIC], 201, numeric=dataclasses.replace(signals.NUMERIC_FACTS, rows=997)),
-            signals_run.WAVEFORM: signals_run.TableRead(
-                fake.planned[signals_run.WAVEFORM], 202, waveform=dataclasses.replace(signals.WAVEFORM_FACTS, rows=305)
-            ),
+            signals_run.NUMERIC: signals_run.TableRead(fake.planned[signals_run.NUMERIC], 201, numeric=signals.NUMERIC_FACTS),
+            signals_run.WAVEFORM: signals_run.TableRead(fake.planned[signals_run.WAVEFORM], 202, waveform=signals.WAVEFORM_FACTS),
         }
         fake.hashes = {signals_run.NUMERIC: "7" * 64, signals_run.WAVEFORM: "8" * 64}
         return fake
@@ -140,21 +145,21 @@ class SignalsFlags(unittest.TestCase):
 
     def test_a_table_that_fails_a_check_is_false_and_the_other_stays_true(self) -> None:
         bad = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, verdict_differs=3))
-        got = signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: bad}), None)
+        got = signals_run.passed_flags(self.reads(**{signals_run.NUMERIC: bad}), None)
         self.assertEqual({signals_run.NUMERIC: False, signals_run.WAVEFORM: True}, got)
 
     def test_a_table_that_is_missing_or_read_without_its_checks_is_false(self) -> None:
         bare = signals_run.TableRead(signals.FINGERPRINTS[signals_run.WAVEFORM], 102)
-        got = signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: None, signals_run.WAVEFORM: bare}), None)
+        got = signals_run.passed_flags(self.reads(**{signals_run.NUMERIC: None, signals_run.WAVEFORM: bare}), None)
         self.assertEqual({signals_run.NUMERIC: False, signals_run.WAVEFORM: False}, got)
 
     def test_a_build_needs_the_table_to_be_the_planned_one(self) -> None:
         planned = {**signals.FINGERPRINTS, signals_run.WAVEFORM: Fingerprint(300, 10)}
-        self.assertEqual({signals_run.NUMERIC: True, signals_run.WAVEFORM: False}, signals_run.passed_flags(signals.INPUT, self.reads(), planned))
+        self.assertEqual({signals_run.NUMERIC: True, signals_run.WAVEFORM: False}, signals_run.passed_flags(self.reads(), planned))
 
     def test_a_count_that_does_not_add_up_to_bronze_is_false(self) -> None:
-        short = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, rows=989))
-        self.assertFalse(signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: short}), None)[signals_run.NUMERIC])
+        short = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, row_count_differs=1))
+        self.assertFalse(signals_run.passed_flags(self.reads(**{signals_run.NUMERIC: short}), None)[signals_run.NUMERIC])
 
 
 class SignalsMessages(unittest.TestCase):
@@ -165,21 +170,23 @@ class SignalsMessages(unittest.TestCase):
         """Every refusal that the job can make, each with a defect of the given size."""
         found: list[str] = []
         fake = signals.Fake()
-        fake.input = signals_run.InputRead(BronzeFacts(10 * size, 3 * size, size, size, size, size, size, size, size), (11, 12, 13))
+        fake.input = signals_run.InputRead(BronzeFacts(0, size, size, size, size, size, size, size), (11, 12, 13))
         found += self.build(fake)
         found += refusal(lambda: signals_run.run_build(self.empty_input().operations(), signals.HEAD))
         fake = signals.Fake()
         fake.read_back[signals_run.NUMERIC] = signals_run.TableRead(
             signals.FINGERPRINTS[signals_run.NUMERIC],
             101,
-            numeric=NumericFacts(990 - size, size, 10 + size, size, size, size, size, size, size, source_differs=size),
+            numeric=NumericFacts(size, size, size, size, size, size, size, source_differs=size, row_count_differs=size),
         )
         fake.read_back[signals_run.WAVEFORM] = signals_run.TableRead(
-            signals.FINGERPRINTS[signals_run.WAVEFORM], 102, waveform=WaveformFacts(300 - size, size, size, size, size, size, size, size, source_differs=size)
+            signals.FINGERPRINTS[signals_run.WAVEFORM],
+            102,
+            waveform=WaveformFacts(size, size, size, size, size, size, size, source_differs=size, row_count_differs=size),
         )
         found += self.build(fake)
         fake = signals.Fake()
-        fake.later_input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=1000 + size), (11, 12, 13))
+        fake.later_input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_null_keys=size), (11, 12, 13))
         found += self.build(fake)
         fake = signals.Fake()
         fake.read_back[signals_run.WAVEFORM] = signals_run.TableRead(Fingerprint(300 + size, 10), 102, waveform=signals.WAVEFORM_FACTS)
@@ -194,10 +201,10 @@ class SignalsMessages(unittest.TestCase):
 
     def empty_input(self) -> signals.Fake:
         fake = signals.Fake()
-        fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=0, waveform_rows=0), (11, 12, 13))
+        fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, input_empty=1), (11, 12, 13))
         return fake
 
-    def test_every_message_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
+    def test_every_message_is_a_code_and_a_flag(self) -> None:
         found = self.messages(1)
         self.assertGreaterEqual(len(found), 25)
         for message in found:
@@ -207,17 +214,15 @@ class SignalsMessages(unittest.TestCase):
     def test_the_size_of_a_defect_never_changes_a_message(self) -> None:
         self.assertEqual(self.messages(1), self.messages(40))
 
-    def test_no_digit_follows_a_code_unless_it_counts_tables(self) -> None:
+    def test_no_digit_follows_a_code(self) -> None:
         for message in self.messages(7):
-            code, _, rest = message.partition(": ")
+            _, _, rest = message.partition(": ")
             with self.subTest(message=message):
-                if re.search(r"[0-9]", rest):
-                    self.assertIn(code, TABLE_COUNT_CODES)
-                    self.assertRegex(rest, r"^[0-9]+ tables?$")
+                self.assertEqual(("failed", None), (rest, re.search(r"[0-9]", rest)))
 
     def test_a_verify_refuses_in_the_same_form(self) -> None:
         fake = signals.Fake()
-        fake.input = signals_run.InputRead(BronzeFacts(10, 3, 5, 5, 5, 5, 5, 5, 5), (11, 12, 13))
+        fake.input = signals_run.InputRead(BronzeFacts(0, 5, 5, 5, 5, 5, 5, 5), (11, 12, 13))
         fake.held = dict(fake.read_back)
         for message in refusal(lambda: signals_run.run_verify(fake.operations(), signals.HEAD)):
             self.assertRegex(message, MESSAGE)
@@ -227,10 +232,10 @@ class HypotensionResult(unittest.TestCase):
     def other_world(self, fake: hypo.Fake) -> hypo.Fake:
         """A held-out row has changed: the series has more seconds and another fingerprint, the snapshots differ, and the events of the development cases are
         the same."""
-        fake.input = hypo_run.InputRead(InputFacts(5007, 0, 0, 0, 0, ()), (31, 32, 33))
+        fake.input = hypo_run.InputRead(InputFacts(0, 0, 0, 0, 0, ()), (31, 32, 33))
         fake.planned = {hypo_run.SERIES: Fingerprint(5007, 55), hypo_run.EVENTS: hypo_run.Digest(9)}
         fake.read_back = {
-            hypo_run.SERIES: hypo_run.TableRead(fake.planned[hypo_run.SERIES], 301, series=dataclasses.replace(hypo.SERIES_FACTS, rows=5007)),
+            hypo_run.SERIES: hypo_run.TableRead(fake.planned[hypo_run.SERIES], 301, series=hypo.SERIES_FACTS),
             hypo_run.EVENTS: hypo_run.TableRead(fake.planned[hypo_run.EVENTS], 302, events=hypo.EVENT_FACTS),
         }
         fake.hashes = {hypo_run.SERIES: "7" * 64, hypo_run.EVENTS: "8" * 64}
@@ -243,10 +248,16 @@ class HypotensionResult(unittest.TestCase):
     def test_the_result_holds_no_key_for_a_count_a_digest_of_every_case_or_a_cause(self) -> None:
         facts = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
         self.assertEqual(set(), keys_of(facts) & set(BANNED_KEYS))
+        self.assertEqual([], [key for key in keys_of(facts) if any(word in key for word in BANNED_WORDS)])
 
-    def test_the_only_numbers_in_the_result_are_snapshot_ids_and_the_development_events_digest(self) -> None:
+    def test_the_only_numbers_in_the_result_are_snapshot_ids(self) -> None:
         for facts in (hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts(), self.verified(hypo.Fake()).facts()):
-            self.assertEqual([], [path for path in numbers(facts) if path[0] not in (*SNAPSHOT_KEYS, "development_events_digest")], facts)
+            self.assertEqual([], [path for path in numbers(facts) if path[0] not in SNAPSHOT_KEYS], facts)
+
+    def test_the_result_holds_exactly_the_hashes_the_snapshot_ids_the_pass_flags_and_the_checks_that_ran(self) -> None:
+        wanted = {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"}
+        for facts in (hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts(), self.verified(hypo.Fake()).facts()):
+            self.assertEqual(wanted, set(facts))
 
     def test_a_held_out_row_that_changes_the_series_changes_only_snapshot_ids_and_hashes(self) -> None:
         first = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
@@ -255,9 +266,25 @@ class HypotensionResult(unittest.TestCase):
         self.assertEqual(stable(first), stable(second))
         self.assertEqual(stable(self.verified(hypo.Fake()).facts()), stable(self.verified(self.other_world(hypo.Fake())).facts()))
 
-    def test_the_events_digest_is_the_only_digest_and_it_is_of_the_development_events(self) -> None:
-        facts = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
-        self.assertEqual(9, facts["development_events_digest"])
+    def inserted_test_set_event(self, fake: hypo.Fake) -> hypo.Fake:
+        """A row of the test set has been inserted into the event table: the digest of that table, which sums a hash of every row, is another one in the plan
+        and in the table that is read back, and the snapshot IDs differ."""
+        fake.planned = {**fake.planned, hypo_run.EVENTS: hypo_run.Digest(77)}
+        fake.read_back = {
+            hypo_run.SERIES: fake.read_back[hypo_run.SERIES],
+            hypo_run.EVENTS: hypo_run.TableRead(hypo_run.Digest(77), 402, events=hypo.EVENT_FACTS),
+        }
+        return fake
+
+    def test_a_test_set_event_row_changes_only_snapshot_ids_and_hashes(self) -> None:
+        first = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
+        second = hypo_run.run_build(self.inserted_test_set_event(hypo.Fake()).operations(), hypo.HEAD).facts()
+        self.assertNotEqual(first["snapshots"], second["snapshots"])
+        self.assertEqual(stable(first), stable(second))
+        self.assertEqual(
+            stable(self.verified(hypo.Fake()).facts()),
+            stable(self.verified(self.inserted_test_set_event(hypo.Fake())).facts()),
+        )
 
     def test_each_table_has_one_pass_flag(self) -> None:
         self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: True}, hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()["passed"])
@@ -272,17 +299,17 @@ class HypotensionFlags(unittest.TestCase):
     def test_a_table_that_fails_a_check_is_false_and_the_other_stays_true(self) -> None:
         bad_series = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.SERIES], 101, series=dataclasses.replace(hypo.SERIES_FACTS, differs=2))
         bad_events = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.EVENTS], 102, events=dataclasses.replace(hypo.EVENT_FACTS, held_out_events=1))
-        self.assertEqual({hypo_run.SERIES: False, hypo_run.EVENTS: True}, hypo_run.passed_flags(hypo.INPUT, self.reads(**{hypo_run.SERIES: bad_series}), None))
-        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(hypo.INPUT, self.reads(**{hypo_run.EVENTS: bad_events}), None))
+        self.assertEqual({hypo_run.SERIES: False, hypo_run.EVENTS: True}, hypo_run.passed_flags(self.reads(**{hypo_run.SERIES: bad_series}), None))
+        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(self.reads(**{hypo_run.EVENTS: bad_events}), None))
 
     def test_a_table_that_is_missing_or_read_without_its_checks_is_false(self) -> None:
         bare = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.EVENTS], 102)
-        got = hypo_run.passed_flags(hypo.INPUT, self.reads(**{hypo_run.SERIES: None, hypo_run.EVENTS: bare}), None)
+        got = hypo_run.passed_flags(self.reads(**{hypo_run.SERIES: None, hypo_run.EVENTS: bare}), None)
         self.assertEqual({hypo_run.SERIES: False, hypo_run.EVENTS: False}, got)
 
     def test_a_build_needs_the_table_to_be_the_planned_one(self) -> None:
         planned = {**hypo.FINGERPRINTS, hypo_run.EVENTS: hypo_run.Digest(10)}
-        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(hypo.INPUT, self.reads(), planned))
+        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(self.reads(), planned))
 
 
 class HypotensionMessages(unittest.TestCase):
@@ -292,12 +319,12 @@ class HypotensionMessages(unittest.TestCase):
     def messages(self, size: int) -> list[str]:
         found: list[str] = []
         for facts in (
-            InputFacts(5000 + size, size, size, 0, 0, ()),
-            InputFacts(0, 0, 0, 0, 0, ()),
-            InputFacts(5000, 0, 0, 1, 0, ()),
-            InputFacts(5000, 0, 0, 0, size, ()),
+            InputFacts(0, size, size, 0, 0, ()),
+            InputFacts(1, 0, 0, 0, 0, ()),
+            InputFacts(0, 0, 0, 1, 0, ()),
+            InputFacts(0, 0, 0, 0, size, ()),
             InputFacts(
-                5000, 0, 0, 0, 0, (f"two_sets: {size} patients", f"pinned_counts: counts a {size} are not exactly a {size + 1}", f"empty_table: {size} rows")
+                0, 0, 0, 0, 0, (f"two_sets: {size} patients", f"pinned_counts: counts a {size} are not exactly a {size + 1}", f"empty_table: {size} rows")
             ),
         ):
             fake = hypo.Fake()
@@ -305,14 +332,14 @@ class HypotensionMessages(unittest.TestCase):
             found += self.build(fake)
         fake = hypo.Fake()
         fake.read_back[hypo_run.SERIES] = hypo_run.TableRead(
-            hypo.FINGERPRINTS[hypo_run.SERIES], 101, series=SeriesFacts(5000 - size, size, size, size, size, size, size, size)
+            hypo.FINGERPRINTS[hypo_run.SERIES], 101, series=SeriesFacts(size, size, size, size, size, size, size, row_count_differs=size)
         )
         found += self.build(fake)
         fake = hypo.Fake()
         fake.read_back[hypo_run.EVENTS] = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.EVENTS], 102, events=EventFacts(size, size, size, size, size))
         found += self.build(fake)
         fake = hypo.Fake()
-        fake.later_input = hypo_run.InputRead(InputFacts(5000 + size, 0, 0, 0, 0, ()), (21, 22, 23))
+        fake.later_input = hypo_run.InputRead(InputFacts(0, size, 0, 0, 0, ()), (21, 22, 23))
         found += self.build(fake)
         fake = hypo.Fake()
         fake.read_back[hypo_run.EVENTS] = hypo_run.TableRead(hypo_run.Digest(10 + size), 102, events=hypo.EVENT_FACTS)
@@ -323,7 +350,7 @@ class HypotensionMessages(unittest.TestCase):
         found += self.build(fake)
         return found
 
-    def test_every_message_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
+    def test_every_message_is_a_code_and_a_flag(self) -> None:
         found = self.messages(1)
         self.assertGreaterEqual(len(found), 22)
         for message in found:
@@ -333,16 +360,15 @@ class HypotensionMessages(unittest.TestCase):
     def test_the_size_of_a_defect_never_changes_a_message(self) -> None:
         self.assertEqual(self.messages(1), self.messages(40))
 
-    def test_no_digit_follows_a_code_unless_it_counts_tables(self) -> None:
+    def test_no_digit_follows_a_code(self) -> None:
         for message in self.messages(7):
-            code, _, rest = message.partition(": ")
+            _, _, rest = message.partition(": ")
             with self.subTest(message=message):
-                if re.search(r"[0-9]", rest):
-                    self.assertIn(code, TABLE_COUNT_CODES)
+                self.assertEqual(("failed", None), (rest, re.search(r"[0-9]", rest)))
 
     def test_a_split_problem_reaches_the_caller_as_its_code_only(self) -> None:
         fake = hypo.Fake()
-        fake.input = hypo_run.InputRead(InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient", "unknown_set: 2 rows")), (21, 22, 23))
+        fake.input = hypo_run.InputRead(InputFacts(0, 0, 0, 0, 0, ("two_sets: 1 patient", "unknown_set: 2 rows")), (21, 22, 23))
         self.assertEqual(["two_sets: failed", "unknown_set: failed"], self.build(fake))
 
 
@@ -455,6 +481,65 @@ class AllowedKeys(unittest.TestCase):
         fake = signals.Fake()
         fake.held = dict(fake.read_back)
         return signals_run.run_verify(fake.operations(), signals.HEAD)
+
+
+def result_field_names(source: str) -> set[str]:
+    """The string keys of every dictionary literal in a source that name a digest, a checksum, a fingerprint or a ``development_`` value."""
+    keys = {
+        node.value
+        for dictionary in ast.walk(ast.parse(source))
+        if isinstance(dictionary, ast.Dict)
+        for node in dictionary.keys
+        if isinstance(node, ast.Constant)
+    }
+    return {
+        key for key in keys if isinstance(key, str) and (key.startswith("development_") or any(word in key for word in ("digest", "checksum", "fingerprint")))
+    }
+
+
+# The only result fields of a Spark job that are named for development cases or that hold a digest, each with its evidence.
+# ``development_*`` of the Silver cases job: the laboratory counts come from ``lab_scope(development=True)`` (the cases of patients in the training and
+# validation sets) and ``development_cases`` is the length of ``development_lengths_query`` (the development sets only). ``checksum`` of the Bronze decoder is a
+# sum over the Bronze signal tables of the cases that the manifest names (its result is not sealed; listed for the lead). ``checksum`` of table
+# maintenance is a sum over a Bronze signal table or the catalog proof table: the result drops it for every other table. The names in the table-check module
+# are the names of a check of the track list's pinned digest, whose detail is one flag (``equal`` 0 or 1).
+# The signal profile job (``spark/jobs/signal_profile.py``) names ``development_cases`` and ``development_patients_*``: its counts of the cases in the
+# training and validation sets (``frames.development_cases``). The ``fingerprints`` of its result (``spark/profile/run.py``) are the row count and digest of
+# the two development tables, ``signal_profile`` and ``unscored_share``, each built from the signal tables of development cases only (``profile_frame``,
+# ``unscored_frame``). The ``source_counts`` table holds a flag over the full cohort for some counts, so a held-out recording changes its fingerprint and the
+# name of a count that does not match: the result holds neither (one pass flag, ``ProfileResultIsSealed``).
+RESULT_FIELDS = {
+    "spark/jobs/signal_profile.py": {"development_cases", "development_patients_training", "development_patients_validation"},
+    "spark/profile/run.py": {"fingerprints"},
+    "spark/silver_cases_run.py": {"development_cases", "development_lab_rows", "development_lab_copies"},
+    "spark/jobs/bronze_decode.py": {"checksum"},
+    "spark/jobs/table_maintenance.py": {"checksum"},
+    "spark/table_checks.py": {"digest_compared", "rows digest"},
+}
+
+
+class ProfileResultIsSealed(unittest.TestCase):
+    """The profile job's result: its fingerprints are the two development tables' and the source counts table is one pass flag."""
+
+    def test_the_fingerprints_are_the_two_development_tables_and_the_source_counts_table_is_a_pass_flag(self) -> None:
+        for pinned in (False, True):
+            with self.subTest(pinned=pinned):
+                facts = run_profile_build(ProfileFake().operations(), PROFILE_HEAD, pinned=pinned).facts()
+                self.assertEqual({PROFILE, UNSCORED}, set(facts["fingerprints"]))
+                self.assertEqual({"pinned": pinned, "passed": True}, facts["source_counts"])
+                self.assertNotIn("mismatched", json.dumps(facts))
+
+
+class ResultFieldNames(unittest.TestCase):
+    def test_a_job_that_names_a_digest_in_its_result_is_found(self) -> None:
+        self.assertEqual({"development_events_digest"}, result_field_names('def facts():\n    return {"checked_hash": 1, "development_events_digest": 9}\n'))
+        self.assertEqual({"events_checksum", "series_fingerprint"}, result_field_names('x = {"events_checksum": 1, "series_fingerprint": 2, "passed": True}'))
+        self.assertEqual(set(), result_field_names('x = {"passed": True, "snapshots": {}}'))
+
+    def test_the_fields_that_name_a_digest_or_development_cases_are_the_listed_ones_only(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        found = {str(path.relative_to(root)): result_field_names(path.read_text()) for path in sorted((root / "spark").rglob("*.py"))}
+        self.assertEqual(RESULT_FIELDS, {path: names for path, names in found.items() if names})
 
 
 if __name__ == "__main__":

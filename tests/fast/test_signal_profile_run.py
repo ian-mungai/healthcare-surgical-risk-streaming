@@ -20,11 +20,15 @@ Failure modes covered here:
   Every output table's schema is classified before the first commit, the predecessor 12-column ``unscored_share`` is rebuilt on the job's branch by a drop and a
   create (never a replace, never an overwrite of other columns), and any other schema refuses with ``table_schema`` before anything is written.
 - The drop of a table that is rebuilt is not the one commit directly on the checked hash, or the create is made on another hash than the drop's.
+- A held-out change reaches the result through the full-cohort table ``source_counts``: its rewrite flips the printed outcome from ``unchanged`` to ``written``,
+  and a diagnostic of the read-back or of the verify counts the stale tables (``1 table`` or ``2 tables``) and so counts that table among them. The outcome
+  is a write of the rule or of a development table only, and the read-back and verify codes are ``<code>: failed``.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import unittest
 from typing import Any
 
@@ -227,9 +231,9 @@ class Build(unittest.TestCase):
                 "rows": {PROFILE: 12, UNSCORED: 1, COUNTS: len(PRESPECIFIED)},
                 "development": {"numeric_rows": 500, "waveform_rows": 300, "tracks": 12, "arterial_cases": 3},
                 "unscored": {"cutoffs": 100, "waveform": 10, "numeric": 5, "either": 12, "no_grid": 1},
-                "source_counts": {"pinned": False, "mismatched": []},
+                "source_counts": {"pinned": False, "passed": True},
                 "rebuilt": [],
-                "fingerprints": {PROFILE: [12, 5], UNSCORED: [1, 6], COUNTS: [len(PRESPECIFIED), 7]},
+                "fingerprints": {PROFILE: [12, 5], UNSCORED: [1, 6]},
                 "checks_run": facts["checks_run"],
             },
             facts,
@@ -260,6 +264,35 @@ class Build(unittest.TestCase):
         self.assertIn("read_table a signal_profile facts=True", fake.calls)
         self.assertEqual((HEAD, None, HEAD), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
 
+    def test_a_held_out_change_that_rewrites_only_the_source_counts_is_an_unchanged_outcome(self) -> None:
+        fake = Fake().settled()
+        fake.held[COUNTS] = TableRead(Fingerprint(len(PRESPECIFIED), 99), 90)
+        outcome = run_build(fake.operations(), HEAD, pinned=False)
+        self.assertEqual(["write source_counts exists=True"], [call for call in fake.calls if call.startswith("write ")])
+        self.assertEqual("unchanged", outcome.outcome)
+        self.assertEqual("unchanged", outcome.facts()["outcome"])
+
+    def test_the_outcome_is_the_same_whether_or_not_the_source_counts_were_rewritten(self) -> None:
+        settled = run_build(Fake().settled().operations(), HEAD, pinned=False).facts()
+        fake = Fake().settled()
+        fake.held[COUNTS] = TableRead(Fingerprint(len(PRESPECIFIED), 99), 90)
+        counted = run_build(fake.operations(), HEAD, pinned=False).facts()
+        self.assertEqual(settled["outcome"], counted["outcome"])
+
+    def test_a_rewrite_of_a_development_table_with_the_source_counts_is_a_written_outcome(self) -> None:
+        for table in (PROFILE, UNSCORED):
+            with self.subTest(table=table):
+                fake = Fake().settled()
+                fake.held[table] = TableRead(Fingerprint(FINGERPRINTS[table].rows, 99), 90)
+                fake.held[COUNTS] = TableRead(Fingerprint(len(PRESPECIFIED), 99), 90)
+                self.assertEqual("written", run_build(fake.operations(), HEAD, pinned=False).outcome)
+
+    def test_a_rebuild_that_writes_the_rule_only_is_a_written_outcome(self) -> None:
+        fake = Fake().settled()
+        fake.held_rule = None
+        fake.states[RULE] = ABSENT
+        self.assertEqual("written", run_build(fake.operations(), HEAD, pinned=False).outcome)
+
     def test_a_rebuild_that_changes_one_table_rewrites_that_table_only_and_in_place(self) -> None:
         fake = Fake().settled()
         fake.held[UNSCORED] = TableRead(Fingerprint(1, 99), 90)
@@ -288,7 +321,20 @@ class Build(unittest.TestCase):
         fake.read_back[UNSCORED] = TableRead(Fingerprint(1, 10), 102, unscored=UNSCORED_FACTS)
         with self.assertRaises(SignalProfileError) as caught:
             run_build(fake.operations(), HEAD, pinned=False)
-        self.assertEqual(["readback_differs"], codes(caught.exception))
+        self.assertEqual(["readback_differs: failed"], caught.exception.problems)
+
+    def test_a_read_back_that_differs_names_no_count_of_tables(self) -> None:
+        for differing in ((UNSCORED,), (UNSCORED, COUNTS), (PROFILE, UNSCORED, COUNTS)):
+            with self.subTest(differing=differing):
+                fake = Fake()
+                for table in differing:
+                    held = fake.read_back[table]
+                    if held is None:
+                        self.fail("the stand-in holds every table")
+                    fake.read_back[table] = dataclasses.replace(held, fingerprint=Fingerprint(99, 99))
+                with self.assertRaises(SignalProfileError) as caught:
+                    run_build(fake.operations(), HEAD, pinned=False)
+                self.assertEqual(["readback_differs: failed"], caught.exception.problems)
 
     def test_a_table_that_is_not_there_at_the_read_back_is_named(self) -> None:
         fake = Fake()
@@ -316,11 +362,28 @@ class Build(unittest.TestCase):
             run_build(again.operations(), HEAD, pinned=True)
         self.assertEqual(["counts_not_judged"], codes(caught.exception))
 
-    def test_a_count_that_does_not_match_is_named_in_the_result_and_does_not_fail_the_job(self) -> None:
+    def test_a_count_that_does_not_match_does_not_fail_the_job_and_is_not_in_the_result(self) -> None:
+        """The mismatch is a flag in the table. A held-out recording changes it (the track total and the arterial case count are over the full cohort), so the
+        result holds one pass flag for the table and no name."""
         fake = Fake()
-        fake.read_back[COUNTS] = TableRead(FINGERPRINTS[COUNTS], 103, counts=COUNTS_FACTS, mismatched=("tracks",))
+        fake.read_back[COUNTS] = TableRead(FINGERPRINTS[COUNTS], 103, counts=COUNTS_FACTS)
         facts = run_build(fake.operations(), HEAD, pinned=True).facts()
-        self.assertEqual({"pinned": True, "mismatched": ["tracks"]}, facts["source_counts"])
+        self.assertEqual({"pinned": True, "passed": True}, facts["source_counts"])
+        self.assertNotIn("mismatched", json.dumps(facts))
+
+    def test_a_held_out_recording_that_changes_the_counts_table_leaves_the_result_identical_apart_from_the_snapshot_id(self) -> None:
+        """The counts table holds flags over the full cohort, so its fingerprint (rows and digest) and its flags change with a held-out recording."""
+        before = Fake()
+        after = Fake()
+        changed = Fingerprint(len(PRESPECIFIED), 99)
+        after.planned[COUNTS] = changed
+        after.read_back[COUNTS] = TableRead(changed, 777, counts=COUNTS_FACTS)
+        one = run_build(before.operations(), HEAD, pinned=True).facts()
+        two = run_build(after.operations(), HEAD, pinned=True).facts()
+        self.assertEqual(777, two["snapshots"].pop(COUNTS))
+        one["snapshots"].pop(COUNTS)
+        self.assertEqual(one, two)
+        self.assertEqual({PROFILE, UNSCORED}, set(two["fingerprints"]))
 
     def test_an_input_that_changed_between_the_reads_is_named(self) -> None:
         for later in (
@@ -678,9 +741,20 @@ class Verify(unittest.TestCase):
                     fake.planned[table] = Fingerprint(FINGERPRINTS[table].rows, FINGERPRINTS[table].digest + 1)
                     with self.assertRaises(SignalProfileError) as caught:
                         self.verify(fake, pinned)
-                    self.assertEqual(["plan_differs"], codes(caught.exception))
-                    self.assertEqual("1 table", caught.exception.problems[0].split(": ")[1])
+                    self.assertEqual(["plan_differs: failed"], caught.exception.problems)
                     self.assertEqual("release", fake.calls[-1])
+
+    def test_the_diagnostic_of_a_stale_plan_does_not_count_the_stale_tables(self) -> None:
+        """One stale table and two give the same line, so the held-out ``source_counts`` table is not counted among them."""
+        lines = []
+        for stale in ((PROFILE,), (PROFILE, COUNTS), (UNSCORED, COUNTS), tuple(TABLES)):
+            fake = Fake()
+            for table in stale:
+                fake.planned[table] = Fingerprint(FINGERPRINTS[table].rows, FINGERPRINTS[table].digest + 1)
+            with self.assertRaises(SignalProfileError) as caught:
+                self.verify(fake)
+            lines.append(caught.exception.problems)
+        self.assertEqual([["plan_differs: failed"]] * 4, lines)
 
     def test_a_stale_profile_with_the_same_counts_is_not_verified(self) -> None:
         for pinned in (False, True):
@@ -694,7 +768,7 @@ class Verify(unittest.TestCase):
     def test_a_good_branch_is_verified_in_either_mode(self) -> None:
         for pinned in (False, True):
             with self.subTest(pinned=pinned):
-                self.assertEqual({"pinned": pinned, "mismatched": []}, self.verify(Fake(), pinned).facts()["source_counts"])
+                self.assertEqual({"pinned": pinned, "passed": True}, self.verify(Fake(), pinned).facts()["source_counts"])
 
     def test_a_branch_without_a_table_is_named(self) -> None:
         fake = Fake()

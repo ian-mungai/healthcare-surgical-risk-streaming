@@ -26,9 +26,10 @@ import time
 import unittest
 from fractions import Fraction
 
-from spark.bronze.sampling import SamplingError, SecondPiece, packet_pieces
+from features.sampling import ANONYMISED_START, SamplingError, SecondPiece, packet_pieces
 
-ORIGIN = 4102444800.0
+ORIGIN = ANONYMISED_START
+HALF_MICROSECOND_BEFORE = 2.0**-21
 MICROSECONDS = 1_000_000
 
 
@@ -83,6 +84,16 @@ class Boundaries(unittest.TestCase):
 
     def test_a_packet_inside_one_second_is_one_piece(self) -> None:
         self.assertEqual([SecondPiece(7, 0, 3, 250_000)], packet_pieces(ORIGIN + 7.25, 3, 4.0, ORIGIN))
+
+    def test_the_reviewers_packet_of_4_hz_at_939_999999523_seconds_is_cut_at_940_and_not_rounded_into_it(self) -> None:
+        start = ORIGIN + 940.0 - HALF_MICROSECOND_BEFORE
+        self.assertEqual(939.999999523162842, start - ORIGIN)
+        pieces = packet_pieces(start, 4, 4.0, ORIGIN)
+        self.assertEqual([(939, 0, 1, 999_999), (940, 1, 4, 249_999)], [(p.second, p.first, p.end, p.offset_us) for p in pieces])
+
+    def test_control_the_same_packet_exactly_on_940_seconds_is_one_whole_second_with_no_offset(self) -> None:
+        pieces = packet_pieces(ORIGIN + 940.0, 4, 4.0, ORIGIN)
+        self.assertEqual([SecondPiece(940, 0, 4, 0)], pieces)
 
     def test_a_start_before_the_origin_has_negative_seconds(self) -> None:
         pieces = packet_pieces(ORIGIN - 0.25, 3, 4.0, ORIGIN)

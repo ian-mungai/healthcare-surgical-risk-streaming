@@ -8,6 +8,7 @@ Failure modes covered here:
 - A generated marker comes before a reading that is due at the same instant, so the final-score row is built before the cutoff reading arrived.
 - A string event is sent as a reading, loses its text or its stable source ID, or a marker takes the form of a source event.
 - The replay time of an event is not the start of its occurrence plus its due offset, so a room's events leave the replay clock.
+- A waveform second carries no sample format, or the format of another track, so the stream cannot tell a gap marker from a reading or a float from an integer.
 - A reading before the case start or after its whole-second end is due outside its occurrence, so the replay time of a room goes backwards.
 """
 
@@ -17,17 +18,24 @@ import unittest
 from array import array
 from collections.abc import Callable
 
-from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
-from replay.events.schedule import admitted_occurrences
+from features.sampling import ANONYMISED_START
+from features.signal_validity import FLOAT_FORMATS, GAP_MARKERS
+from replay.events.errors import EventModelError
+from replay.events.identity import Occurrence
+from replay.events.manifest import ManifestError, reference_seconds
+from replay.events.recording import WAVEFORM_FORMATS, CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
+from replay.events.schedule import ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import earliest_due_offset_us, occurrence_events, outgoing
 from replay.events.waveform import second_samples, second_spans
-from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule
+from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule, encoded
 
 WAVE_KEYS = {"event_id", "run_id", "room", "occurrence_id", "case_id", "track", "case_time_us", "discriminator", "replay_time_us"}
 
 
-def waveform(rate: float, *records: tuple[int, list[float]]) -> WaveformTrack:
-    return WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, tuple(WaveformRecord(start, array("d", samples)) for start, samples in records))
+def waveform(rate: float, *records: tuple[int, list[float]], sample_format: int = 2) -> WaveformTrack:
+    return WaveformTrack(
+        "Test/W", "mV", rate, 1.0, 0.0, sample_format, tuple(WaveformRecord(encoded(start), array("d", samples)) for start, samples in records)
+    )
 
 
 def seconds_of(track: WaveformTrack) -> list[tuple[int, int, list[float]]]:
@@ -38,13 +46,22 @@ class WaveformSeconds(unittest.TestCase):
     def test_each_sample_belongs_to_the_second_in_which_its_own_time_falls(self) -> None:
         track = boundary_recordings()[9001].waveforms[0]
         self.assertEqual(
-            [(0, 250_000, [10, 11, 12]), (1, 0, [13, 14, 15]), (3, 250_000, [20, 21, 22]), (4, 0, [23]), (6, 900_000, [30]), (7, 150_000, [31, 32])],
+            [(0, 250_000, [10, 11, 12]), (1, 0, [13, 14, 15]), (3, 250_000, [20, 21, 22]), (4, 0, [23]), (6, 906_250, [30]), (7, 156_250, [31, 32])],
             seconds_of(track),
         )
 
     def test_a_sample_exactly_on_a_second_boundary_opens_the_next_second(self) -> None:
         track = waveform(4.0, (0, [1, 2, 3, 4, 5]))
         self.assertEqual([(0, 0, [1, 2, 3, 4]), (1, 0, [5])], seconds_of(track))
+
+    def test_a_packet_that_starts_half_a_microsecond_before_a_boundary_keeps_its_first_sample_in_the_second_before_it(self) -> None:
+        packet = WaveformRecord(ANONYMISED_START + 940.0 - 2.0**-21, array("d", [1.0, 2.0, 3.0, 4.0]))
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (packet,))
+        self.assertEqual([(939, 999_999, [1.0]), (940, 249_999, [2.0, 3.0, 4.0])], seconds_of(track))
+
+    def test_control_a_packet_that_starts_exactly_on_the_boundary_is_one_whole_second(self) -> None:
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (WaveformRecord(ANONYMISED_START + 940.0, array("d", [1.0, 2.0, 3.0, 4.0])),))
+        self.assertEqual([(940, 0, [1.0, 2.0, 3.0, 4.0])], seconds_of(track))
 
     def test_a_second_with_no_sample_has_no_message(self) -> None:
         self.assertEqual([0, 1, 3, 4, 6, 7], [item[0] for item in seconds_of(boundary_recordings()[9001].waveforms[0])])
@@ -70,6 +87,17 @@ class WaveformSeconds(unittest.TestCase):
             with self.subTest(rate=rate), self.assertRaises(ValueError):
                 second_spans(waveform(rate, (0, [1.0])))
 
+    def test_a_track_with_no_packet_and_a_rate_that_cannot_hold_is_refused_with_the_refusal_of_the_manifest(self) -> None:
+        """The loop over the packets did not run for an empty track, so the replay skipped a track that the manifest refuses."""
+        for rate in (0.0, -1.0, float("inf"), float("nan")):
+            track = waveform(rate)
+            with self.subTest(rate=rate):
+                with self.assertRaises(EventModelError) as replay:
+                    second_spans(track)
+                with self.assertRaises(ManifestError) as manifest:
+                    reference_seconds(track)
+                self.assertEqual(str(manifest.exception), str(replay.exception))
+
 
 def keys_of(recording: CaseRecording) -> list[tuple[str, str, int, int, int]]:
     return [(event.kind, event.track, event.case_time_us, event.due_offset_us, event.discriminator) for event in occurrence_events(recording)]
@@ -90,6 +118,7 @@ class EventOrder(unittest.TestCase):
                 ("numeric", "Test/NIBP", 2 * SECOND, 2 * SECOND, 0),
                 ("waveform", wave, 1 * SECOND, 2 * SECOND, 0),
                 ("waveform", wave, 3 * SECOND, 4 * SECOND, 0),
+                ("op_start", "!op_start", 4 * SECOND, 4 * SECOND, 0),
                 ("waveform", wave, 4 * SECOND, 5 * SECOND, 0),
                 ("waveform", wave, 6 * SECOND, 7 * SECOND, 0),
                 ("numeric", "Test/HR", 7_250_000, 7_250_000, 0),
@@ -112,24 +141,33 @@ class EventOrder(unittest.TestCase):
         )
         self.assertEqual(keys_of(recording), keys_of(shuffled))
 
-    def test_every_reading_is_one_event_and_each_case_has_one_final_score_marker_and_one_case_end_marker(self) -> None:
+    def test_every_reading_is_one_event_and_each_case_has_one_op_start_one_final_score_and_one_case_end_marker(self) -> None:
         kinds = [key[0] for key in keys_of(boundary_recordings()[9001])]
-        self.assertEqual({"numeric": 6, "string": 4, "waveform": 6, "final_score": 1, "case_end": 1}, {kind: kinds.count(kind) for kind in set(kinds)})
+        self.assertEqual(
+            {"numeric": 6, "string": 4, "waveform": 6, "op_start": 1, "final_score": 1, "case_end": 1}, {kind: kinds.count(kind) for kind in set(kinds)}
+        )
 
     def test_a_case_with_no_waveform_has_no_waveform_event(self) -> None:
         self.assertNotIn("waveform", {key[0] for key in keys_of(boundary_recordings()[9002])})
 
-    def test_the_final_score_marker_is_due_at_the_opend_and_the_case_end_marker_at_the_caseend(self) -> None:
+    def test_the_op_start_marker_is_due_at_the_opstart_the_final_score_marker_at_the_opend_and_the_case_end_marker_at_the_caseend(self) -> None:
         for case_id, recording in boundary_recordings().items():
             with self.subTest(case=case_id):
-                marks = {event.kind: event.due_offset_us for event in occurrence_events(recording) if event.kind in ("final_score", "case_end")}
-                self.assertEqual({"final_score": recording.times.opend_us, "case_end": recording.times.caseend_us}, marks)
+                marks = {event.kind: event.due_offset_us for event in occurrence_events(recording) if event.kind in ("op_start", "final_score", "case_end")}
+                times = recording.times
+                self.assertEqual({"op_start": times.opstart_us, "final_score": times.opend_us, "case_end": times.caseend_us}, marks)
+
+    def test_markers_that_are_due_together_come_in_the_order_start_final_end(self) -> None:
+        times = CaseTimes(9100, 5 * SECOND, 5 * SECOND, 5 * SECOND)
+        recording = CaseRecording(times, numeric=(NumericTrack("Test/HR", "", ((5 * SECOND, 1.0),)),))
+        self.assertEqual(["numeric", "op_start", "final_score", "case_end"], [event.kind for event in occurrence_events(recording)])
 
     def test_a_reading_or_a_waveform_second_outside_the_case_is_due_inside_it_and_keeps_its_case_time(self) -> None:
         self.assertEqual(
             [
                 ("numeric", "Test/HR", -500_000, 0, 0),
                 ("numeric", "Test/HR", 0, 0, 0),
+                ("op_start", "!op_start", 2 * SECOND, 2 * SECOND, 0),
                 ("final_score", "!final_score", 6 * SECOND, 6 * SECOND, 0),
                 ("numeric", "Test/HR", 10_400_000, 10 * SECOND, 0),
                 ("waveform", "Test/WAVE", 9 * SECOND, 10 * SECOND, 0),
@@ -154,6 +192,31 @@ class EventOrder(unittest.TestCase):
         for build in bad:
             with self.subTest(), self.assertRaises(RecordingError):
                 build()
+
+
+class SampleFormat(unittest.TestCase):
+    def test_each_sample_format_of_the_file_format_is_accepted(self) -> None:
+        for sample_format in range(1, 9):
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual(sample_format, waveform(4.0, (0, [1.0]), sample_format=sample_format).sample_format)
+
+    def test_a_format_that_is_not_one_of_the_eight_sample_formats_is_refused_when_the_recording_is_built(self) -> None:
+        times = CaseTimes(1, 0, 5, 9)
+        for sample_format in (0, 9, -1, 255):
+            with self.subTest(sample_format=sample_format), self.assertRaises(RecordingError):
+                CaseRecording(times, waveforms=(waveform(4.0, (0, [1.0]), sample_format=sample_format),))
+
+    def test_the_formats_of_the_replay_are_the_formats_that_silver_decodes(self) -> None:
+        self.assertEqual(set(FLOAT_FORMATS) | set(GAP_MARKERS), set(WAVEFORM_FORMATS))
+
+    def test_the_waveform_event_carries_the_format_of_its_own_track_for_every_format(self) -> None:
+        times = CaseTimes(1, 0, 5, 9_000_000)
+        for sample_format in range(1, 9):
+            recording = CaseRecording(times, waveforms=(waveform(4.0, (0, [1.0, 2.0, 3.0, 4.0]), sample_format=sample_format),))
+            scheduled = ScheduledOccurrence(Occurrence(0, 1, 0, 0), times, 0)
+            sent = [outgoing(RUN_ID, scheduled, recording, event).payload for event in occurrence_events(recording) if event.kind == "waveform"]
+            with self.subTest(sample_format=sample_format):
+                self.assertEqual([sample_format], [payload["sample_format"] for payload in sent])
 
 
 class OutgoingEvents(unittest.TestCase):
@@ -211,7 +274,8 @@ class OutgoingEvents(unittest.TestCase):
                 "sample_rate": 4.0,
                 "gain": 0.5,
                 "offset": -1.0,
-                "start_offset_us": 150_000,
+                "sample_format": 5,
+                "start_offset_us": 156_250,
                 "samples": [31.0, 32.0],
             },
             payload,
@@ -241,6 +305,13 @@ class OutgoingEvents(unittest.TestCase):
         again = self.events("9001.1")[("string", "Test/EVENT", 13 * SECOND, 0)]
         self.assertEqual(first["source_id"], again["source_id"])
         self.assertNotEqual(first["event_id"], again["event_id"])
+
+    def test_the_op_start_marker_names_its_kind_and_its_instant_and_has_the_reserved_track(self) -> None:
+        marker = self.events("9002.0")[("op_start", "!op_start", 6 * SECOND, 0)]
+        self.assertEqual(
+            (f"{RUN_ID}|1|9002.0|!op_start|6000000|0", "OP_START", 6 * SECOND, 6 * SECOND),
+            (marker["event_id"], marker["marker"], marker["case_time_us"], marker["replay_time_us"]),
+        )
 
     def test_the_two_markers_name_their_kind_and_their_instants_and_have_no_track(self) -> None:
         events = self.events("9002.0")

@@ -20,10 +20,12 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import json
 import unittest
 from collections import Counter
 from typing import Any
 
+from replay.events.event_list import EVENT_LIST_VERSION
 from replay.events.manifest import Observed, build_manifest, compare
 from replay.events.payload import payload_digest
 from replay.events.run import Replayer, ReplayError, RunSettings, RunState
@@ -157,6 +159,55 @@ class Positions(unittest.TestCase):
         replayer.run()
         state = saved_state(store)
         self.assertEqual(state, RunState.from_json(state.to_json()))
+
+    def test_a_state_saved_before_the_start_marker_is_refused_with_its_reason_and_never_resumed(self) -> None:
+        _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
+        replayer.run()
+        old = json.loads(saved_state(store).to_json())
+        old["format"] = "replay_state_1"
+        del old["event_list"]
+        with self.assertRaisesRegex(ReplayError, "replay_event_list_refused.*before the start marker.*new run ID"):
+            RunState.from_json(json.dumps(old))
+
+    def test_a_state_of_another_event_list_is_refused(self) -> None:
+        _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
+        replayer.run()
+        other = json.loads(saved_state(store).to_json())
+        other["event_list"] = "events_0"
+        with self.assertRaisesRegex(ReplayError, "replay_event_list_refused.*event list.*new run ID"):
+            RunState.from_json(json.dumps(other))
+
+    def test_a_checkpoint_of_the_list_events_2_is_refused_before_anything_is_sent_and_the_current_list_resumes(self) -> None:
+        """``events_2`` counted a list that exact sampling then changed: resuming its position skipped a second and sent the next one twice."""
+        options = {"rooms": 2, "window_us": 40_000_000}
+        _, written, _, first = run_once(options, RunSettings(speed=1000.0, checkpoint_every=5))
+        first.run()
+        document = json.loads(saved_state(written).to_json())
+        document["finished"] = False
+        document["event_list"] = "events_2"
+
+        class TextStore(MemoryStore):
+            def __init__(self, text: str) -> None:
+                super().__init__()
+                self.text = text
+
+            def load(self) -> RunState:
+                return RunState.from_json(self.text)
+
+        sink, clock = MemorySink(), FakeClock()
+        old = Replayer(boundary_schedule(**options), FAST, RecordingSource(boundary_recordings()), sink, TextStore(json.dumps(document)), clock)
+        with self.assertRaisesRegex(ReplayError, "replay_event_list_refused.*events_2"):
+            old.run()
+        self.assertEqual(([], 0), (sink.sent, sink.acknowledged))
+        self.assertNotEqual("events_2", EVENT_LIST_VERSION)
+        document["event_list"] = EVENT_LIST_VERSION
+        again = Replayer(boundary_schedule(**options), FAST, RecordingSource(boundary_recordings()), sink, TextStore(json.dumps(document)), clock)
+        self.assertTrue(again.run().finished)
+
+    def test_the_state_names_the_event_list_it_was_saved_for(self) -> None:
+        _, store, _, replayer = run_once({"rooms": 2, "window_us": 40_000_000})
+        replayer.run()
+        self.assertEqual(EVENT_LIST_VERSION, json.loads(saved_state(store).to_json())["event_list"])
 
 
 class Restart(unittest.TestCase):

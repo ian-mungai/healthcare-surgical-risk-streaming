@@ -216,7 +216,7 @@ class ExistingRulesTest(unittest.TestCase):
         engine = Lake(Session({"lake.silver.operation_length_measure": frame([("m", 1)], log, [("statistic", "string")])}, {}, log), None, "b")  # type: ignore[arg-type]
         with self.assertRaises(SilverCasesError) as raised:
             engine.existing_rules()
-        self.assertEqual(["inherited_schema: 1 table"], raised.exception.problems)
+        self.assertEqual(["inherited_schema: failed"], raised.exception.problems)
 
     def test_the_held_cutoffs_are_read_back_into_the_rows_the_rules_compare(self) -> None:
         log: list[str] = []
@@ -301,7 +301,7 @@ class OwnershipTest(unittest.TestCase):
         engine = Lake(session, None, "b")  # type: ignore[arg-type]
         self.assertEqual([], engine.ownership_problems())
         session.flag = 1
-        self.assertEqual(["ambiguous_case_owner: a Bronze case has more than one row or more than one patient"], engine.ownership_problems())
+        self.assertEqual(["ambiguous_case_owner: failed"], engine.ownership_problems())
 
 
 class PinnedReadTest(unittest.TestCase):
@@ -338,7 +338,7 @@ class SplitRuleTest(unittest.TestCase):
     def test_a_held_out_patient_relabelled_training_is_refused_before_any_length_is_measured(self) -> None:
         held_out = next(patient for patient in range(1, 300) if patient_part(patient) == "test")
         engine = Lake(Session({"lake.silver.patient_split": split_table(300, held_out - 1)}, {}, []), None, "b")  # type: ignore[arg-type]
-        self.assertEqual(["rule_mismatch: 1 patient"], engine.split_problems())
+        self.assertEqual(["rule_mismatch: failed"], engine.split_problems())
 
 
 class SplitRowFormTest(unittest.TestCase):
@@ -352,18 +352,21 @@ class SplitRowFormTest(unittest.TestCase):
         return Lake(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b")  # type: ignore[arg-type]
 
     def test_a_row_without_a_subject_is_named_and_not_a_failure(self) -> None:
-        self.assertEqual(["table_row: 1 row"], self.engine({"subjectid": None}).split_problems())
+        self.assertEqual(["table_row: failed"], self.engine({"subjectid": None}).split_problems())
 
     def test_a_row_without_a_source_snapshot_is_named_and_not_a_failure(self) -> None:
-        self.assertEqual(["table_row: 1 row"], self.engine({"source_snapshot_id": None}).split_problems())
+        self.assertEqual(["table_row: failed"], self.engine({"source_snapshot_id": None}).split_problems())
 
     def test_a_subject_or_a_snapshot_of_another_type_is_named_and_not_a_failure(self) -> None:
         for change in ({"subjectid": 10}, {"source_snapshot_id": "7"}, {"source_snapshot_id": True}):
             with self.subTest(change=change):
-                self.assertEqual(["table_row: 1 row"], self.engine(change).split_problems())
+                self.assertEqual(["table_row: failed"], self.engine(change).split_problems())
 
-    def test_every_row_that_is_not_in_form_is_counted(self) -> None:
-        self.assertEqual(["table_row: 2 rows"], self.engine({"subjectid": None}, {"source_snapshot_id": None}).split_problems())
+    def test_two_rows_that_are_not_in_form_give_the_same_one_flag_and_no_count(self) -> None:
+        """The split table holds the test set's rows: how many rows are broken is a fact about it, so the problem is a code and a flag, never a count."""
+        one = self.engine({"subjectid": None}).split_problems()
+        self.assertEqual(one, self.engine({"subjectid": None}, {"source_snapshot_id": None}).split_problems())
+        self.assertEqual(["table_row: failed"], one)
 
     def test_the_reconciliation_refuses_the_run_with_its_code_for_a_broken_split_and_does_not_fail(self) -> None:
         rows = split_row_dicts(300)
@@ -381,7 +384,7 @@ class SplitRowFormTest(unittest.TestCase):
         rows = split_row_dicts(300, held_out - 1)
         rows[-1] = {**rows[-1], "subjectid": None}
         problems = Lake(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b").split_problems()  # type: ignore[arg-type]
-        self.assertEqual(["table_row: 1 row", "rule_mismatch: 1 patient"], problems)
+        self.assertEqual(["table_row: failed", "rule_mismatch: failed"], problems)
 
 
 class OutputSchemaTest(unittest.TestCase):

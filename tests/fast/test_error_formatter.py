@@ -69,7 +69,7 @@ def exception_uses(source: str) -> list[int]:
     return sorted(lines)
 
 
-MARKED = {"infra.iam.scripts.manage_policies.KeyAdviceError", "scripts.stack.tags.RecordNotPublished"}
+MARKED = {"infra.iam.scripts.manage_policies.KeyAdviceError", "scripts.stack.tags.RecordNotPublished", "spark.streaming.checkpoint.CheckpointFormatError"}
 
 
 def marked_classes() -> set[str]:

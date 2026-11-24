@@ -28,7 +28,7 @@ from scripts.ingestion.output_file import write_new_file
 from scripts.stack.nessie import NessieError
 from spark.reconcile.checks import ReconcileError
 from spark.settings import SettingsError
-from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, reference_name
+from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, reference_name
 
 JOB = "silver_reconcile"
 
@@ -132,6 +132,4 @@ def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict
         return INTERNAL_EXIT_CODE
     for problem in problems:
         sys.stderr.write(f"{JOB}: {problem}\n")
-    if code == 0:
-        sys.stdout.write(RESULT_PREFIX + json.dumps(document, sort_keys=True) + "\n")
     return code

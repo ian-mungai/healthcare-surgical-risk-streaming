@@ -18,16 +18,22 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 from scripts.stack.nessie import NessieError
+from spark.jobs.silver_cases import READ_TABLES
+from spark.result_file import release_reserved, reserve
 from spark.settings import SettingsError
 from spark.silver_cases import CutoffRow, MeasureRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.silver_cases_run import (
     CASES_SCHEMA_LEGACY,
     CHECKS_BUILD,
+    result_document,
     run,
     run_build,
     run_verify,
@@ -35,6 +41,8 @@ from spark.silver_cases_run import (
 )
 
 LENGTHS = [3600, 7200, 5400, 4800, 9000, 1800]
+# The job reads three Bronze and Silver inputs and writes four tables, and names the snapshot of each of the seven.
+SNAPSHOTS = {table: 11 + index for index, table in enumerate(READ_TABLES)}
 MARKER = "MARKER_4417"
 
 
@@ -150,7 +158,7 @@ class FakeOps:
 
     def snapshot_ids(self) -> dict[str, int | None]:
         self.calls.append("snapshot_ids")
-        return {"silver.cases": 11, "silver.lab_results": 12, "silver.operation_length_measure": 13, "silver.score_cutoffs": 14}
+        return dict(SNAPSHOTS)
 
 
 def build(ops: FakeOps, *, pinned: bool = True) -> dict[str, Any]:
@@ -187,18 +195,14 @@ class BuildOrderTest(unittest.TestCase):
             ops.calls,
         )
 
-    def test_the_result_names_what_was_written_the_counts_the_cutoffs_and_every_check_that_ran(self) -> None:
+    def test_the_result_names_the_pass_flags_the_development_counts_the_cutoffs_and_every_check_that_ran(self) -> None:
         facts = build(FakeOps())
-        self.assertEqual("written", facts["outcome"])
-        self.assertEqual({"cases": True, "lab": True, "rules": True}, facts["written"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, facts["passed"])
         self.assertEqual(CHECKS_BUILD, facts["checks_run"])
-        self.assertEqual(6388, facts["cases"])
         self.assertEqual(690000, facts["development_lab_rows"])
         self.assertEqual(700000, facts["development_lab_copies"])
         self.assertEqual(len(LENGTHS), facts["development_cases"])
-        self.assertEqual(
-            {"silver.cases": 11, "silver.lab_results": 12, "silver.operation_length_measure": 13, "silver.score_cutoffs": 14}, facts["snapshot_ids"]
-        )
+        self.assertEqual(SNAPSHOTS, facts["snapshot_ids"])
         self.assertEqual(
             [(row.cutoff, row.elapsed_seconds) for row in cutoff_rows(LENGTHS)], [(item["cutoff"], item["elapsed_seconds"]) for item in facts["cutoffs"]]
         )
@@ -208,23 +212,27 @@ class BuildOrderTest(unittest.TestCase):
         for word in ("subjectid", "caseid", "training", "validation", "test"):
             self.assertNotIn(word, facts)
 
-    def test_a_rerun_that_changes_nothing_writes_nothing_and_says_unchanged(self) -> None:
-        ops = FakeOps(writes={"cases": False, "lab": False, "rules": False}, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
-        facts = build(ops)
-        self.assertEqual("unchanged", facts["outcome"])
-        self.assertEqual({"cases": False, "lab": False, "rules": False}, facts["written"])
-        self.assertIn("output_facts", ops.calls)
+    def test_a_rerun_that_changes_nothing_gives_the_same_result_as_one_that_writes_and_still_checks_the_output(self) -> None:
+        held = (measure_rows(LENGTHS), cutoff_rows(LENGTHS))
+        quiet = FakeOps(writes={"cases": False, "lab": False, "rules": False}, held=held)
+        facts = build(quiet)
+        self.assertEqual(build(FakeOps(held=held)), facts)
+        self.assertNotIn("written", facts)
+        self.assertNotIn("outcome", facts)
+        self.assertIn("output_facts", quiet.calls)
 
-    def test_one_written_table_makes_the_outcome_written(self) -> None:
-        ops = FakeOps(writes={"cases": False, "lab": True, "rules": False}, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
-        self.assertEqual("written", build(ops)["outcome"])
+    def test_a_result_that_wrote_one_table_is_the_result_of_a_run_that_wrote_none(self) -> None:
+        held = (measure_rows(LENGTHS), cutoff_rows(LENGTHS))
+        one = FakeOps(writes={"cases": False, "lab": True, "rules": False}, held=held)
+        none = FakeOps(writes={"cases": False, "lab": False, "rules": False}, held=held)
+        self.assertEqual(build(none), build(one))
 
 
 class InputFailureTest(unittest.TestCase):
     def test_a_failed_input_check_stops_before_any_write_and_names_every_cause_once(self) -> None:
         ops = FakeOps(input=clean_input_facts(case_key_duplicates=2, lab_rows_without_case=1, unparsed={"height": 1}))
         problems = refused(lambda: run_build(ops, pinned=True))
-        self.assertEqual(["key_duplicate: 2 keys", "lab_case_missing: a laboratory row has no case", "unparsed: 1 value in 1 column (height)"], problems)
+        self.assertEqual(["key_duplicate: failed", "lab_case_missing: failed", "unparsed: failed"], problems)
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
 
     def test_a_split_that_breaks_the_rule_stops_before_any_fact_that_depends_on_it_and_reports_only_the_split_codes(self) -> None:
@@ -252,19 +260,19 @@ class InputFailureTest(unittest.TestCase):
     def test_a_held_out_outcome_value_not_in_its_published_form_stops_before_any_write_and_names_no_count(self) -> None:
         ops = FakeOps(input=clean_input_facts(sealed_outcome_form_bad=1))
         problems = refused(lambda: run_build(ops, pinned=True))
-        self.assertEqual(["sealed_outcome_form: a held-out outcome value is not in its published form"], problems)
+        self.assertEqual(["sealed_outcome_form: failed"], problems)
         self.assertNotIn("write_cases", ops.calls)
 
     def test_a_held_out_laboratory_value_not_in_its_published_form_stops_before_any_write_and_names_no_count(self) -> None:
         ops = FakeOps(input=clean_input_facts(sealed_lab_form_bad=1))
         problems = refused(lambda: run_build(ops, pinned=True))
-        self.assertEqual(["sealed_lab_form: a held-out laboratory value is not in its published form"], problems)
+        self.assertEqual(["sealed_lab_form: failed"], problems)
         self.assertNotIn("write_cases", ops.calls)
 
     def test_no_development_case_stops_before_any_write(self) -> None:
         ops = FakeOps(lengths=[])
         problems = refused(lambda: run_build(ops, pinned=True))
-        self.assertEqual(["no_development_cases: 0 cases"], problems)
+        self.assertEqual(["no_development_cases: failed"], problems)
         self.assertNotIn("write_cases", ops.calls)
 
     def test_a_median_too_short_for_the_cutoffs_stops_before_any_write(self) -> None:
@@ -275,13 +283,13 @@ class InputFailureTest(unittest.TestCase):
 
     def test_the_pinned_release_demands_its_counts_before_a_write_and_a_sample_does_not(self) -> None:
         ops = FakeOps(input=clean_input_facts(bronze_case_rows=13, lab_pinned_mismatch=1))
-        self.assertTrue(refused(lambda: run_build(ops, pinned=True))[0].startswith("pinned_counts: "))
+        self.assertEqual(["pinned_counts: failed"], refused(lambda: run_build(ops, pinned=True)))
         self.assertNotIn("write_cases", ops.calls)
         sample = FakeOps(
             input=clean_input_facts(bronze_case_rows=13),
             output=clean_output_facts(case_rows=13, bronze_case_rows=13, lab_rows=90, lab_copies=100, bronze_lab_rows=100),
         )
-        self.assertEqual("written", build(sample, pinned=False)["outcome"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, build(sample, pinned=False)["passed"])
 
 
 class FreezeTest(unittest.TestCase):
@@ -289,20 +297,19 @@ class FreezeTest(unittest.TestCase):
         held = (measure_rows([3000, 3000, 3000, 3000]), cutoff_rows([3000, 3000, 3000, 3000]))
         ops = FakeOps(held=held)
         problems = refused(lambda: run_build(ops, pinned=True))
-        self.assertTrue(any(problem.startswith("changed_cutoff: ") for problem in problems))
-        self.assertTrue(any(problem.startswith("changed_measure: ") for problem in problems))
+        self.assertEqual(["changed_cutoff: failed", "changed_measure: failed"], problems)
         self.assertNotIn("write_cases", ops.calls)
         self.assertNotIn("write_rules", ops.calls)
 
     def test_a_held_cutoff_table_with_a_repeated_key_stops_before_any_write(self) -> None:
         rows = cutoff_rows(LENGTHS)
         ops = FakeOps(held=(measure_rows(LENGTHS), [*rows, rows[1]]))
-        self.assertEqual(["inherited_duplicates: 1 key"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["inherited_duplicates: failed"], refused(lambda: run_build(ops, pinned=True)))
         self.assertNotIn("write_cases", ops.calls)
 
     def test_held_rows_in_another_order_are_the_same_rows_and_the_rebuild_goes_on(self) -> None:
         ops = FakeOps(writes={"cases": False, "lab": False, "rules": False}, held=(measure_rows(LENGTHS)[::-1], cutoff_rows(LENGTHS)[::-1]))
-        self.assertEqual("unchanged", build(ops)["outcome"])
+        self.assertEqual(build(FakeOps(held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))), build(ops))
 
     def test_a_held_table_that_is_empty_or_half_there_stops_before_any_write(self) -> None:
         for held, code in (((measure_rows(LENGTHS), None), "inherited_incomplete"), (([], []), "inherited_empty")):
@@ -314,7 +321,7 @@ class FreezeTest(unittest.TestCase):
 class OutputFailureTest(unittest.TestCase):
     def test_a_held_out_laboratory_difference_ends_the_job_with_one_code_and_no_count(self) -> None:
         ops = FakeOps(output=clean_output_facts(sealed_lab_differs=1))
-        self.assertEqual(["sealed_lab_differs: a held-out laboratory row differs from Bronze or breaks its key"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["sealed_lab_differs: failed"], refused(lambda: run_build(ops, pinned=True)))
 
     def test_the_result_names_development_laboratory_counts_only(self) -> None:
         facts = build(FakeOps())
@@ -324,19 +331,19 @@ class OutputFailureTest(unittest.TestCase):
     def test_a_replaced_case_key_or_a_held_out_outcome_difference_ends_the_job(self) -> None:
         ops = FakeOps(output=clean_output_facts(case_key_differences=2, sealed_outcome_differs=1))
         self.assertEqual(
-            ["case_key_differences: 2 keys", "sealed_outcome_differs: a held-out outcome value differs from Bronze"],
+            ["case_key_differences: failed", "sealed_outcome_differs: failed"],
             refused(lambda: run_build(ops, pinned=True)),
         )
 
     def test_a_dropped_or_retyped_column_stops_the_job_before_any_value_query_and_reports_only_the_schema(self) -> None:
         ops = FakeOps(schema_wrong=2, output=clean_output_facts(case_key_differences=2, sealed_outcome_differs=1))
-        self.assertEqual(["output_schema: 2 tables"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_build(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
         self.assertNotIn("existing_rules", ops.calls[ops.calls.index("write_rules") :])
 
     def test_verify_checks_the_stored_schema_before_it_reads_the_saved_rules_or_any_value(self) -> None:
         ops = FakeOps(schema_wrong=1, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
-        self.assertEqual(["output_schema: 1 table"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
         self.assertNotIn("existing_rules", ops.calls)
 
@@ -351,9 +358,11 @@ class OutputFailureTest(unittest.TestCase):
         self.assertEqual(["cases_schema_legacy: failed"], refused(lambda: run_build(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
 
-    def test_another_wrong_schema_keeps_the_table_count_and_a_right_schema_never_asks_for_the_legacy_check(self) -> None:
+    def test_another_wrong_schema_is_a_flag_and_a_right_schema_never_asks_for_the_legacy_check(self) -> None:
         wrong = FakeOps(schema_wrong=1, legacy=False, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
-        self.assertEqual(["output_schema: 1 table"], refused(lambda: run_verify(wrong, pinned=True)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(wrong, pinned=True)))
+        two = FakeOps(schema_wrong=2, legacy=False, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(two, pinned=True)))
         right = FakeOps(held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)), legacy=True)
         run_verify(right, pinned=True)
         self.assertNotIn("cases_schema_legacy", right.calls)
@@ -363,12 +372,12 @@ class OutputFailureTest(unittest.TestCase):
 
     def test_a_check_of_a_written_table_that_fails_ends_the_job_with_its_code(self) -> None:
         ops = FakeOps(output=clean_output_facts(lab_value_differences=3, case_key_duplicates=1))
-        self.assertEqual(["case_key_duplicate: 1 key", "lab_value_differences: 3 rows"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["case_key_duplicate: failed", "lab_value_differences: failed"], refused(lambda: run_build(ops, pinned=True)))
         self.assertLess(ops.calls.index("write_rules"), ops.calls.index("output_facts"))
 
     def test_a_table_not_marked_with_its_never_feature_columns_fails(self) -> None:
         ops = FakeOps(output=clean_output_facts(never_feature_marking_wrong=1))
-        self.assertEqual(["never_feature_marking: 1 table"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertEqual(["never_feature_marking: failed"], refused(lambda: run_build(ops, pinned=True)))
 
     def test_cutoffs_read_back_that_differ_from_the_ones_written_fail(self) -> None:
         other = (measure_rows([100, 200, 300]), cutoff_rows([6000, 6000, 6000]))
@@ -377,7 +386,9 @@ class OutputFailureTest(unittest.TestCase):
 
     def test_cutoffs_read_back_in_another_order_are_the_same_cutoffs(self) -> None:
         reordered = (measure_rows(LENGTHS)[::-1], cutoff_rows(LENGTHS)[::-1])
-        self.assertEqual("written", build(FakeOps(after_write_rules=reordered))["outcome"])
+        self.assertEqual(
+            {"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, build(FakeOps(after_write_rules=reordered))["passed"]
+        )
 
     def test_cutoffs_read_back_with_a_repeated_row_fail_even_when_every_row_is_one_that_was_written(self) -> None:
         rows = cutoff_rows(LENGTHS)
@@ -393,7 +404,7 @@ class VerifyTest(unittest.TestCase):
     def test_verify_writes_nothing_and_runs_the_input_and_output_checks_and_the_rules_comparison(self) -> None:
         ops = FakeOps(held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
         facts = run_verify(ops, pinned=True).facts()
-        self.assertEqual("verified", facts["outcome"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, facts["passed"])
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
         self.assertEqual(
             ["split_problems", "ownership_problems", "input_facts", "development_lengths", "output_schema", "existing_rules", "output_facts", "snapshot_ids"],
@@ -402,7 +413,7 @@ class VerifyTest(unittest.TestCase):
 
     def test_verify_fails_when_the_cutoffs_were_never_saved(self) -> None:
         ops = FakeOps(held=(None, None))
-        self.assertEqual(["table_missing: 2 tables"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertEqual(["table_missing: failed"], refused(lambda: run_verify(ops, pinned=True)))
 
     def test_verify_fails_when_the_saved_cutoffs_are_not_the_ones_the_development_data_gives(self) -> None:
         ops = FakeOps(held=(measure_rows([9000, 9000]), cutoff_rows([9000, 9000])))
@@ -410,15 +421,17 @@ class VerifyTest(unittest.TestCase):
 
     def test_verify_fails_on_a_changed_value_in_a_written_table(self) -> None:
         ops = FakeOps(held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)), output=clean_output_facts(case_value_differences=1))
-        self.assertEqual(["case_value_differences: 1 row"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertEqual(["case_value_differences: failed"], refused(lambda: run_verify(ops, pinned=True)))
 
 
 def invoke(argv: list[str], execute: Any = None) -> tuple[int, str, str]:
+    """Run the command line. A ``build`` or ``verify`` call with no ``--result`` gets one in a fresh folder, so that it is judged for its own arguments."""
     out, err = io.StringIO(), io.StringIO()
     code = 0
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with tempfile.TemporaryDirectory(prefix="cases_cli_") as folder, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        call = [*argv, "--result", f"{folder}/result.json"] if ({"build", "verify"} & set(argv)) and "--result" not in argv else argv
         try:
-            code = run(argv, execute or (lambda arguments: {"mode": arguments.mode}))
+            code = run(call, execute or (lambda arguments: {"mode": arguments.mode}))
         except SystemExit as stop:
             code = int(stop.code or 0)
     return code, out.getvalue(), err.getvalue()
@@ -440,10 +453,31 @@ def raising(error: Exception) -> Any:
 
 
 class CommandLineTest(unittest.TestCase):
-    def test_a_good_call_prints_one_result_line_and_exits_0(self) -> None:
-        code, out, err = invoke(["build", "--branch", "b", "--pinned-release"])
-        self.assertEqual((0, ""), (code, err))
-        self.assertEqual({"mode": "build"}, json.loads(out.removeprefix("RESULT ")))
+    def test_a_good_call_writes_its_file_prints_nothing_and_exits_0(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="cases_good_"))
+        code, out, err = invoke(["build", "--branch", "b", "--pinned-release", "--result", f"{folder}/result.json"])
+        self.assertEqual((0, "", ""), (code, out, err))
+        self.assertEqual({"mode": "build", "diagnostics": []}, json.loads(Path(f"{folder}/result.json").read_text()))
+
+    def test_a_path_that_cannot_hold_its_part_file_is_usage_and_the_job_does_not_run(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="cases_long_"))
+        seen: list[Namespace] = []
+        self.assertEqual((2, "", "silver_cases: usage\n"), invoke(["build", "--branch", "b", "--result", f"{folder}/{'r' * 255}"], recording(seen)))
+        self.assertEqual(([], []), (seen, os.listdir(folder)))
+
+    def test_every_refusal_is_a_fixed_code_and_the_flag_through_the_command_line(self) -> None:
+        refusals = (
+            (SilverCasesError("output_schema: failed"), 1, "output_schema"),
+            (SilverCasesError("table_missing: failed"), 1, "table_missing"),
+            (SilverCasesError("source_table: failed"), 1, "source_table"),
+            (SettingsError(MARKER), 2, "settings"),
+            (NessieError(MARKER, status=404, error_code="REFERENCE_NOT_FOUND"), 1, "branch_missing"),
+            (NessieError(MARKER, status=500), 1, "catalog_error"),
+            (RuntimeError(MARKER), 70, "internal_error"),
+        )
+        for error, status, code in refusals:
+            with self.subTest(code=code):
+                self.assertEqual((status, "", f"silver_cases: {code}: failed\n"), invoke(["build", "--branch", "b"], raising(error)))
 
     def test_the_arguments_are_a_mode_a_branch_a_base_for_build_and_the_pinned_flag(self) -> None:
         seen: list[Namespace] = []
@@ -458,22 +492,57 @@ class CommandLineTest(unittest.TestCase):
             code, out, err = invoke(argv)
             self.assertEqual((2, "", "silver_cases: usage\n"), (code, out, err), argv)
 
-    def test_a_failed_check_prints_each_code_and_a_count_and_exits_1(self) -> None:
+    def test_a_failed_check_prints_each_code_and_the_flag_and_no_count_and_exits_1(self) -> None:
         code, out, err = invoke(["build", "--branch", "b"], raising(SilverCasesError("key_duplicate: 2 keys", "unparsed: 1 value in 1 column (height)")))
         self.assertEqual((1, ""), (code, out))
-        self.assertEqual("silver_cases: key_duplicate: 2 keys\nsilver_cases: unparsed: 1 value in 1 column (height)\n", err)
+        self.assertEqual("silver_cases: key_duplicate: failed\nsilver_cases: unparsed: failed\n", err)
+
+    def test_the_result_is_one_file_and_a_failed_check_writes_its_codes_and_no_count(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cases_file_") as folder:
+            path = f"{folder}/result.json"
+            argv = ["build", "--branch", "b", "--result", path]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(1, run(argv, raising(SilverCasesError("key_duplicate: failed", "source_table: failed"))))
+            self.assertEqual(
+                {"mode": "build", "branch": "b", "job": "silver_cases", "diagnostics": [{"code": "key_duplicate"}, {"code": "source_table"}]},
+                json.loads(Path(path).read_text()),
+            )
+            self.assertEqual(["result.json"], os.listdir(folder))
+
+    def test_a_result_file_that_is_there_is_never_replaced_and_the_job_does_not_run(self) -> None:
+        seen: list[Namespace] = []
+        with tempfile.TemporaryDirectory(prefix="cases_file_") as folder:
+            path = Path(f"{folder}/result.json")
+            path.write_text("old")
+            self.assertEqual((2, "", "silver_cases: usage\n"), invoke(["verify", "--branch", "b", "--result", str(path)], recording(seen)))
+            self.assertEqual(([], "old"), (seen, path.read_text()))
+
+    def test_the_result_option_is_required(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            run(["build", "--branch", "b"], recording([]))
+        self.assertEqual("silver_cases: usage\n", err.getvalue())
+
+    def test_the_result_document_of_a_run_holds_the_asked_mode_and_branch_the_hashes_and_the_facts_and_no_other_field(self) -> None:
+        arguments = Namespace(mode="build", branch="b", pinned_release=True)
+        document = result_document(arguments, "a" * 64, "c" * 64, run_build(FakeOps(), pinned=True))
+        self.assertEqual(
+            {"mode", "branch", "base_hash", "branch_hash", "pinned_release", "checks_run", "passed", "development_lab_rows", "development_lab_copies"}
+            | {"development_cases", "snapshot_ids", "measure", "cutoffs"},
+            set(document),
+        )
+        self.assertEqual(("build", "b", True), (document["mode"], document["branch"], document["pinned_release"]))
 
     def test_nessie_is_a_fixed_code_whatever_its_message_holds(self) -> None:
         code, _, err = invoke(["build", "--branch", "b"], raising(NessieError(f"cannot work with {MARKER}", status=409)))
-        self.assertEqual((1, "silver_cases: catalog_error\n"), (code, err))
+        self.assertEqual((1, "silver_cases: catalog_error: failed\n"), (code, err))
         code, _, err = invoke(["verify", "--branch", "b"], raising(NessieError(f"missing {MARKER}", status=404, error_code="REFERENCE_NOT_FOUND")))
-        self.assertEqual((1, "silver_cases: branch_missing\n"), (code, err))
+        self.assertEqual((1, "silver_cases: branch_missing: failed\n"), (code, err))
 
     def test_a_setting_that_cannot_be_used_is_settings_and_exits_2_and_anything_else_is_internal_error_and_exits_70(self) -> None:
         code, _, err = invoke(["build", "--branch", "b"], raising(SettingsError(f"{MARKER} is not set")))
-        self.assertEqual((2, "silver_cases: settings\n"), (code, err))
+        self.assertEqual((2, "silver_cases: settings: failed\n"), (code, err))
         code, _, err = invoke(["build", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "silver_cases: internal_error\n"), (code, err))
+        self.assertEqual((70, "silver_cases: internal_error: failed\n"), (code, err))
 
 
 class DeadlineTest(unittest.TestCase):
@@ -485,6 +554,15 @@ class DeadlineTest(unittest.TestCase):
             timer.join(2)
         self.assertEqual([124], stopped)
         self.assertEqual("silver_cases: timeout\n", err.getvalue())
+
+    def test_the_timer_removes_the_reserved_part_file_before_it_exits(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory(prefix="cases_deadline_"))
+        self.addCleanup(release_reserved)
+        self.assertIsNotNone(reserve(f"{folder}/result.json"))
+        left: list[list[str]] = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            start_deadline(0.01, lambda code: left.append(os.listdir(folder))).join(2)
+        self.assertEqual([[]], left)
 
     def test_a_job_that_ends_first_cancels_its_timer(self) -> None:
         stopped: list[int] = []

@@ -14,7 +14,7 @@ select = ["E", "F", "I", "B", "UP", "S", "SIM", "T20"]
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["infra", "scripts", "tests", "replay/events", "replay/service", "features"]
+files = ["infra", "scripts", "tests", "replay/events", "replay/service", "features", "spark/streaming"]
 
 # The replay image's decoding and Avro libraries are not in the development environment (owner, Nov 22 2026: only the boto3 stubs and confluent-kafka are installed), so they are read as untyped.
 [[tool.mypy.overrides]]

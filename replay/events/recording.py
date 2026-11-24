@@ -1,6 +1,8 @@
 """A decoded case recording as the event model sees it: plain data with no decoder in it.
 
-A time is a whole number of microseconds from the start of the case, so a case time never passes through a float on its way into an event ID. A numeric
+A time is a whole number of microseconds from the start of the case, so a case time never passes through a float on its way into an event ID. The one
+exception is the start of a waveform packet: it stays the file's own float of seconds since the epoch, with no rounding, because the second of each of its
+samples is decided from that exact value (``features/sampling.py``, the function that Bronze calls too). A numeric
 reading, a string event and a waveform record keep their order in the file: the position of a reading among the readings of its track is part of how a
 discriminator is chosen. The decoder (``replay/service/decode.py``) makes these objects from a verified ``.vital`` file.
 """
@@ -12,6 +14,8 @@ from dataclasses import dataclass, field
 
 from replay.events.errors import EventModelError
 from replay.events.identity import DELIMITER, RESERVED_PREFIX
+
+WAVEFORM_FORMATS = frozenset(range(1, 9))
 
 
 class RecordingError(EventModelError):
@@ -49,22 +53,35 @@ class StringTrack:
 
 @dataclass(frozen=True, slots=True)
 class WaveformRecord:
-    """One record of a waveform track: the case time of its first sample and its raw samples."""
+    """One packet of a waveform track: its encoded start, as the file holds it (a float of seconds since the epoch, kept exactly), and its raw samples."""
 
-    start_us: int
+    start_s: float
     samples: Sequence[float]
 
 
 @dataclass(frozen=True, slots=True)
 class WaveformTrack:
-    """A waveform track. A sample's physical value is ``raw * gain + offset``. Its time is its record's start plus its index over ``sample_rate``."""
+    """A waveform track. The time of a sample is its packet's encoded start plus its index over ``sample_rate``.
+
+    ``sample_format`` is the track's format code in the file, the one that Bronze keeps as ``sample_format``. It decides what a sample is: a sample of an
+    integer format (3 to 8) is a raw count with a physical value of ``raw * gain + offset`` and a gap marker of the format, and a sample of a float format
+    (1 and 2) is already physical, so the gain and the offset do not apply. The replay sends the code, and the stream and Silver read a sample by the same
+    function.
+    """
 
     name: str
     unit: str
     sample_rate: float
     gain: float
     offset: float
+    sample_format: int
     records: tuple[WaveformRecord, ...]
+
+    def __post_init__(self) -> None:
+        if self.sample_format not in WAVEFORM_FORMATS:
+            raise RecordingError(
+                f"the waveform track {self.name} has the sample format {self.sample_format}, which is not one of the formats 1 to 8 of the file format"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,8 +98,3 @@ class CaseRecording:
         for name in names:
             if not name or name.startswith(RESERVED_PREFIX) or DELIMITER in name:
                 raise RecordingError(f"case {self.times.case_id}: a track name is empty, starts with {RESERVED_PREFIX!r} or holds {DELIMITER!r}")
-
-
-def physical_value(raw: float, gain: float, offset: float) -> float:
-    """The physical value of a raw waveform sample: the one definition that the batch path and the stream path share."""
-    return raw * gain + offset

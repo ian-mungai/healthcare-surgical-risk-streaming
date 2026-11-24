@@ -70,10 +70,10 @@ class CommandLine(unittest.TestCase):
     def call(self, argv: list[str], execute: Any = None) -> tuple[int, str, str]:
         return invoke(argv, execute, self.folder)
 
-    def test_a_good_call_prints_one_result_line_and_nothing_else(self) -> None:
+    def test_a_good_call_prints_nothing_and_the_result_is_the_file(self) -> None:
         code, out, err = self.call(["verify", "--branch", "b"])
-        self.assertEqual((0, ""), (code, err))
-        self.assertEqual({"mode": "verify", "branch": "b", "diagnostics": []}, json.loads(out.removeprefix("RESULT ")))
+        self.assertEqual((0, "", ""), (code, out, err))
+        self.assertEqual({"mode": "verify", "branch": "b", "diagnostics": []}, read_file(self.folder))
 
     def test_a_bad_call_prints_the_code_usage_and_does_not_echo_the_argument(self) -> None:
         for argv in (
@@ -136,7 +136,7 @@ class ResultFile(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual({"mode": "verify", "branch": "b", **facts, "diagnostics": []}, read_file(self.folder))
         self.assertEqual(["result.json"], os.listdir(self.folder))
-        self.assertTrue(out.startswith("RESULT "))
+        self.assertEqual("", out)
 
     def test_the_file_is_the_same_whatever_the_streams_hold(self) -> None:
         def noisy(arguments: Namespace) -> dict[str, Any]:
