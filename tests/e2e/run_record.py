@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -84,21 +86,38 @@ class Record:
         return folder
 
     def write_record(self, folder: Path) -> None:
-        """Write the record and its retention label in ``folder`` as they are now."""
-        (folder / "record.json").write_text(json.dumps(asdict(self), indent=2) + "\n")
+        """Write the retention label and then the record in ``folder`` as they are now. Each file goes through a part file that replaces the earlier file
+        whole, so a failed write never leaves half a file. An ``OSError`` is raised at the first file that cannot be written."""
         label = {
             "class": RUN_PAYLOAD_CLASS,
             "purpose": self.feature,
             "created": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_condition": PASSED_END if self.outcome == "pass" else FAILED_END,
         }
-        (folder / "retention.json").write_text(json.dumps(label, indent=2) + "\n")
+        for name, document in (("retention.json", label), ("record.json", asdict(self))):
+            staged = folder / f"{name}.part"
+            try:
+                staged.write_text(json.dumps(document, indent=2) + "\n")
+                os.replace(staged, folder / name)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    staged.unlink()
+                raise
 
-    def report(self, folder: Path) -> int:
+    def discard(self, folder: Path) -> None:
+        """Remove the record and the label of ``folder``: a record that cannot be brought to its final verdict must not stay with an earlier pass."""
+        for name in ("record.json", "retention.json"):
+            with contextlib.suppress(OSError):
+                (folder / name).unlink()
+        with contextlib.suppress(OSError, ValueError):
+            sys.stderr.write(f"{self.slug}: the record cannot be written again after a failed print, so there is no record\n")
+
+    def report(self, folder: Path, rewrite: Callable[[Path], None] | None = None) -> int:
         """Print each assertion and the outcome, flushed, and return the exit code.
 
-        A print or flush that fails (stdout closed, broken or None) is itself a failed assertion: the record and its label in ``folder`` are written again and
-        say fail (or keep their blocked reason), so a record never claims a pass that the run could not print.
+        A print or flush that fails (stdout closed, broken or None) is itself a failed assertion. One guarded path then saves the result: ``rewrite`` (this
+        record's ``write_record`` when not given) writes the label and the record again in ``folder`` and says fail (or keeps the blocked reason), so a record
+        never claims a pass that the run could not print. When that rewrite fails too, the record and the label are removed: no file of the folder says pass.
         """
         try:
             if sys.stdout is None:
@@ -111,7 +130,10 @@ class Record:
             blocked = self.outcome.removeprefix(BLOCKED_PREFIX) if self.outcome.startswith(BLOCKED_PREFIX) else ""
             self.expect("run", "output", "the result is printed", type(error).__name__, False)
             self.settle(blocked)
-            self.write_record(folder)
+            try:
+                (rewrite or self.write_record)(folder)
+            except OSError, ValueError:
+                self.discard(folder)
             return 1
         return 0 if self.outcome == "pass" else 1
 

@@ -7,6 +7,7 @@ Failure modes covered here:
 - A failed or blocked run gets the end condition of a passing run, so its folder is swept before its failure is fixed.
 - A record that is written again in its folder (after a scan that came later) keeps the earlier outcome and label, or makes a second folder, or prints the
   outcome before the final verdict.
+- A failed print is followed by a rewrite that fails: the original record (and its label) that says pass stays in the folder, or the rewrite raises.
 """
 
 from __future__ import annotations
@@ -204,6 +205,120 @@ class ReportAloneTest(unittest.TestCase):
     def test_a_failed_print_keeps_the_blocked_reason(self) -> None:
         code, written, _ = self.written("interrupted")
         self.assertEqual((1, "blocked: interrupted"), (code, written["outcome"]))
+
+
+class FailedRewriteTest(unittest.TestCase):
+    """A print that fails is followed by a rewrite of the record and its label. When that rewrite fails, no file of the folder may say pass."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        closed = io.StringIO()
+        closed.close()
+        for patcher in (
+            mock.patch.object(run_record, "ROOT", self.root),
+            mock.patch.object(sys, "stdout", closed),
+            mock.patch.object(sys, "stderr", io.StringIO()),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def claims_pass(self, folder: Path) -> list[str]:
+        """The files of the folder that say pass: a record whose outcome is pass, a label with the end condition of a passing run."""
+        found = []
+        if (folder / "record.json").exists() and json.loads((folder / "record.json").read_text())["outcome"] == "pass":
+            found.append("record.json")
+        if (folder / "retention.json").exists() and json.loads((folder / "retention.json").read_text())["end_condition"] == PASSED:
+            found.append("retention.json")
+        return found
+
+    def written(self) -> tuple[run_record.Record, Path]:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle("")
+        return record, record.write(["a line"])
+
+    def report_with_failing(self, failing: tuple[str, ...]) -> tuple[int, Path]:
+        record, folder = self.written()
+        real = Path.write_text
+
+        def broken(path: Path, data: str, *arguments: Any, **keywords: Any) -> int:
+            if path.name.removesuffix(".part") in failing:
+                raise OSError("planted write failure")
+            return real(path, data, *arguments, **keywords)
+
+        with mock.patch.object(Path, "write_text", broken):
+            return record.report(folder), folder
+
+    def test_a_rewrite_of_the_record_that_fails_leaves_no_file_that_says_pass_and_the_report_does_not_raise(self) -> None:
+        code, folder = self.report_with_failing(("record.json",))
+        self.assertEqual(1, code)
+        self.assertEqual([], self.claims_pass(folder))
+
+    def test_a_rewrite_of_the_label_that_fails_leaves_no_file_that_says_pass(self) -> None:
+        code, folder = self.report_with_failing(("retention.json",))
+        self.assertEqual(1, code)
+        self.assertEqual([], self.claims_pass(folder))
+
+    def test_both_rewrites_that_fail_leave_no_file_that_says_pass(self) -> None:
+        code, folder = self.report_with_failing(("record.json", "retention.json"))
+        self.assertEqual(1, code)
+        self.assertEqual([], self.claims_pass(folder))
+
+    def test_the_label_is_replaced_before_the_record_so_that_a_stop_between_them_leaves_the_label_of_a_failed_run(self) -> None:
+        record, folder = self.written()
+        replaced: list[str] = []
+        real = os.replace
+
+        def spy(source: Any, target: Any) -> None:
+            replaced.append(Path(target).name)
+            real(source, target)
+
+        with mock.patch.object(os, "replace", spy):
+            record.report(folder)
+        self.assertEqual(["retention.json", "record.json"], replaced)
+
+    def test_a_part_file_that_is_written_but_cannot_replace_its_file_is_removed(self) -> None:
+        record, folder = self.written()
+        with mock.patch.object(os, "replace", side_effect=OSError("planted replace failure")):
+            self.assertEqual(1, record.report(folder))
+        self.assertEqual([], sorted(path.name for path in folder.iterdir() if path.name.endswith(".part")))
+        self.assertEqual([], self.claims_pass(folder))
+
+    def test_a_failed_rewrite_leaves_no_part_file(self) -> None:
+        for failing in (("record.json",), ("retention.json",)):
+            with self.subTest(failing):
+                _, folder = self.report_with_failing(failing)
+                self.assertEqual([], sorted(path.name for path in folder.iterdir() if path.name.endswith(".part")))
+
+    def test_a_rewrite_that_works_leaves_a_failing_record_and_a_failing_label_and_no_part_file(self) -> None:
+        code, folder = self.report_with_failing(())
+        self.assertEqual(1, code)
+        self.assertEqual([], self.claims_pass(folder))
+        self.assertEqual("fail", json.loads((folder / "record.json").read_text())["outcome"])
+        self.assertEqual(FAILED, json.loads((folder / "retention.json").read_text())["end_condition"])
+        self.assertEqual([], sorted(path.name for path in folder.iterdir() if path.name.endswith(".part")))
+
+    def test_a_given_rewrite_replaces_the_default_one_and_its_failure_is_handled_the_same_way(self) -> None:
+        record, folder = self.written()
+
+        def rewrite(_: Path) -> None:
+            raise OSError("planted failure of the caller's own rewrite")
+
+        self.assertEqual(1, record.report(folder, rewrite))
+        self.assertEqual([], self.claims_pass(folder))
+        calls: list[Path] = []
+        record, folder = self.written()
+        self.assertEqual(1, record.report(folder, calls.append))
+        self.assertEqual([folder], calls)
+
+    def test_a_clean_print_never_calls_the_rewrite(self) -> None:
+        record, folder = self.written()
+        calls: list[Path] = []
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(0, record.report(folder, calls.append))
+        self.assertEqual([], calls)
 
 
 if __name__ == "__main__":

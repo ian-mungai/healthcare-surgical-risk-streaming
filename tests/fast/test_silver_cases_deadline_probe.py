@@ -1,104 +1,155 @@
-"""The Silver cases runner's deadline probe does not depend on how fast the catalog answers.
+"""The Silver cases runner's deadline probe passes only on the job's own stop line, and only a flag of the match is recorded.
 
-The probe drives the job's own command line in the container with a Nessie address that accepts a connection and never answers, a deadline of 2 seconds and a
-Nessie timeout of 100 seconds. Only the job's own timer can then stop it, with exit 124. The runner is untracked, so each test skips when it is not on this
-machine. The program runs here on the host as it runs in the container (the job reads its settings and starts its timer before its first call to Nessie, and
-needs no Spark for that), so no Docker runs.
+The server that stalls the catalog and the program that waits for it run in the slow group (``tests/slow/test_silver_cases_stalled_catalog.py``, project
+standard Q39). Here the probe case runs on a stack that answers what the test says, and the stack's call is checked with a stand-in for the command that it
+starts. Nothing binds a port. The runner is untracked, so each test skips when it is not on this machine.
 
 Failure modes covered here:
 
-- The probe set ``JOB_DEADLINE_SECONDS=1`` and asked a live Nessie, so whether the deadline or an answer came first depended on the speed of the catalog.
-- A job whose timer was removed or does not start still passed the probe, because the catalog answered before the deadline or the call failed on its own.
+- The probe passed on a job that exited 124 with any other diagnostic, or with none, because it never looked at the line that the job writes.
+- The text of the diagnostic was kept: the stack gives back the one fixed line when standard error is exactly that line and nothing otherwise, and the run
+  records only whether it matched.
 - The probe passed on a job that exited 124 and left a result file or a container, or on a job that exited with another code.
 """
 
 from __future__ import annotations
 
-import os
-import sys
+import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from scripts.process import CompletedProcess, TimeoutExpired, run_command
-from tests.e2e.run_record import ROOT, Record
+from tests.e2e.run_record import Record
 from tests.fast.test_runner_gold_sealed import runner
 
-ENVIRONMENT = {"WAREHOUSE_LOCATION": "file:///warehouse/", "AWS_PROFILE": "no-such-profile", "AWS_CONFIG_FILE": os.devnull}
-LIMIT_SECONDS = 30
-
-
-def on_host(program: str, folder: Path, environment: dict[str, str], seconds: float) -> CompletedProcess[str]:
-    """The program of the probe, run as ``python -c`` from the repository root with its result file in ``folder`` (the container mounts ``/result``)."""
-    target = str(folder / "result.json")
-    env = {"PATH": os.environ.get("PATH", ""), **ENVIRONMENT, **environment}
-    return run_command(sys.executable, ["-c", program.replace("/result/result.json", target)], timeout=seconds, cwd=ROOT, env=env)
-
-
-class StalledCatalog(unittest.TestCase):
-    def test_the_job_stops_itself_at_its_deadline_with_exit_124_and_no_result_file(self) -> None:
-        module = runner("silver_cases")
-        with tempfile.TemporaryDirectory(prefix="deadline_probe_") as folder:
-            started = time.monotonic()
-            done = on_host(module.STALL, Path(folder), module.STALL_ENV, LIMIT_SECONDS)
-            seconds = time.monotonic() - started
-            self.assertEqual(124, done.returncode, done.stderr)
-            self.assertIn("silver_cases: timeout", done.stderr.splitlines())
-            self.assertEqual([], list(Path(folder).iterdir()))
-            self.assertLess(seconds, LIMIT_SECONDS / 2)
-
-    def test_the_same_program_without_a_timer_that_fires_is_still_waiting_after_the_deadline_has_passed(self) -> None:
-        """The probe is only a proof of the timer when the Nessie timeout (100 seconds) is longer than the wait: a job without its timer waits for it."""
-        module = runner("silver_cases")
-        self.assertEqual("2", module.STALL_ENV["JOB_DEADLINE_SECONDS"])
-        self.assertGreaterEqual(float(module.STALL_ENV["NESSIE_TIMEOUT_SECONDS"]), 100)
-        with tempfile.TemporaryDirectory(prefix="deadline_probe_") as folder, self.assertRaises(TimeoutExpired):
-            on_host(module.STALL, Path(folder), {**module.STALL_ENV, "JOB_DEADLINE_SECONDS": "2000"}, 8)
+LINE = "silver_cases: timeout"
 
 
 class Probe(unittest.TestCase):
     """The case of ``bounded_failure`` that holds the probe, on a stack that answers what the test says."""
 
-    def run_probe(self, answer: tuple[int, dict[str, Any]], left: list[str]) -> tuple[bool, list[Any]]:
-        module = runner("silver_cases")
-        calls: list[Any] = []
+    def stack_of(self, answer: tuple[int, dict[str, Any], str], left: list[str], calls: list[dict[str, Any]]) -> Any:
+        def job_with_line(
+            module_arguments: list[str],
+            mounts: Any,
+            reset: Any,
+            env: dict[str, str] | None,
+            limit: float,
+            sealed: tuple[str, str, str] | None,
+            stderr_is: str | None,
+        ) -> tuple[int, dict[str, Any], str, float]:
+            calls.append({"module_arguments": module_arguments, "env": env, "sealed": sealed, "stderr_is": stderr_is})
+            return answer[0], answer[1], answer[2], 2.5
 
-        def job(*arguments: Any, **keywords: Any) -> tuple[int, dict[str, Any], str, float]:
-            calls.append((arguments, keywords))
-            if arguments[0][:1] == ["-c"]:
-                return answer[0], answer[1], "", 2.5
-            return 2, {}, "", 0.1
-
-        stack = SimpleNamespace(
+        return SimpleNamespace(
             silver=lambda *_, **__: (1, {"diagnostics": [{"code": "branch_missing"}]}, "", 0.1),
-            job=job,
+            job=lambda *_, **__: (2, {}, "", 0.1),
+            job_with_line=job_with_line,
             spark_containers=lambda: left,
         )
+
+    def run_probe(self, answer: tuple[int, dict[str, Any], str], left: list[str]) -> tuple[bool, list[dict[str, Any]], Record]:
+        module = runner("silver_cases")
+        calls: list[dict[str, Any]] = []
         run = module.Run.__new__(module.Run)
-        run.record, run.stack, run.labels, run.suffix, run.made, run.trunk = Record(feature="t", slug="t", rerun="none"), stack, {}, "x1", [], "trunk_x1"
+        run.record, run.labels, run.suffix, run.made, run.trunk = Record(feature="t", slug="t", rerun="none"), {}, "x1", [], "trunk_x1"
+        run.stack = self.stack_of(answer, left, calls)
         run.bounded_failure()
-        return run.record.observations[-1].passed, calls
+        return run.record.observations[-1].passed, calls, run.record
 
     def test_the_probe_runs_the_job_command_line_with_a_deadline_of_2_seconds_and_a_nessie_timeout_of_100_seconds(self) -> None:
         module = runner("silver_cases")
-        _, calls = self.run_probe((124, {}), [])
-        probe = [(arguments, keywords) for arguments, keywords in calls if arguments[0][:1] == ["-c"]]
-        self.assertEqual(1, len(probe))
-        arguments, keywords = probe[0]
-        self.assertEqual(module.STALL, arguments[0][1])
+        _, calls, _ = self.run_probe((124, {}, LINE), [])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(["-c", module.STALL], calls[0]["module_arguments"])
         self.assertEqual({"JOB_DEADLINE_SECONDS": "2", "NESSIE_TIMEOUT_SECONDS": "100"}, module.STALL_ENV)
-        self.assertEqual(module.STALL_ENV, keywords.get("env", arguments[3] if len(arguments) > 3 else None))
-        self.assertIsNotNone(keywords.get("sealed"))
+        self.assertEqual(module.STALL_ENV, calls[0]["env"])
+        self.assertIsNotNone(calls[0]["sealed"])
 
-    def test_the_probe_passes_only_on_exit_124_with_no_result_file_and_no_container(self) -> None:
+    def test_the_probe_asks_the_stack_to_compare_standard_error_with_the_one_stop_line(self) -> None:
+        module = runner("silver_cases")
+        self.assertEqual(LINE, module.DEADLINE_LINE)
+        _, calls, _ = self.run_probe((124, {}, LINE), [])
+        self.assertEqual([LINE], [call["stderr_is"] for call in calls])
+
+    def test_the_probe_passes_only_on_exit_124_with_the_stop_line_no_result_file_and_no_container(self) -> None:
         for label, answer, left, wanted in (
-            ("a stop at the deadline", (124, {}), [], True),
-            ("another exit code", (1, {}), [], False),
-            ("a result file", (124, {"diagnostics": []}), [], False),
-            ("a container left", (124, {}), ["spark"], False),
+            ("a stop at the deadline", (124, {}, LINE), [], True),
+            ("another exit code", (1, {}, LINE), [], False),
+            ("a result file", (124, {"diagnostics": []}, LINE), [], False),
+            ("a container left", (124, {}, LINE), ["spark"], False),
+            ("an unrelated diagnostic", (124, {}, ""), [], False),
+            ("a diagnostic that only starts with the line", (124, {}, LINE + " and more"), [], False),
+            ("another line", (124, {}, "silver_cases: failed"), [], False),
         ):
             with self.subTest(label):
                 self.assertIs(wanted, self.run_probe(answer, left)[0])
+
+    def test_the_record_holds_whether_the_line_matched_and_never_a_text_of_standard_error(self) -> None:
+        planted = "planted diagnostic text that names another place"
+        answers: list[tuple[tuple[int, dict[str, Any], str], str]] = [((124, {}, LINE), "True"), ((124, {}, planted), "False")]
+        for answer, matched in answers:
+            with self.subTest(matched):
+                _, _, record = self.run_probe(answer, [])
+                self.assertNotIn(planted, json.dumps([item.observed for item in record.observations]))
+                self.assertIn(f"the diagnostic is the stop line {matched}", record.observations[-1].observed)
+
+
+class StackDiagnostic(unittest.TestCase):
+    """``Stack.job_with_line`` gives back that line only when standard error is exactly it, and keeps no other text of the stream."""
+
+    def job(self, error: str, **keywords: Any) -> tuple[tuple[int, dict[str, Any], str, float], list[str]]:
+        module = runner("silver_cases")
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="stack_diagnostic_")))
+        (folder / "data").mkdir()
+        log: list[str] = []
+        record = Record(feature="t", slug="t", rerun="none")
+        stack = module.Stack(folder / "compose", "project", folder / "data", record, log)
+        stack.run = lambda command, limit, **_: (124, "", error)
+        stack.watch = lambda done, stalled: None
+        sealed = ("cases", "verify", "stalled_catalog")
+        answer: tuple[int, dict[str, Any], str, float]
+        if keywords:
+            answer = stack.job_with_line(["-c", "pass"], None, None, {}, 300, sealed, keywords["stderr_is"])
+        else:
+            answer = stack.job(["-c", "pass"], None, None, {}, 300, sealed)
+        return answer, [*log, *record.commands]
+
+    def test_standard_error_that_is_exactly_the_line_gives_the_line(self) -> None:
+        for error in (LINE + "\n", LINE, LINE + "\r\n"):
+            with self.subTest(error=repr(error)):
+                answer, _ = self.job(error, stderr_is=LINE)
+                self.assertEqual((124, {}, LINE), answer[:3])
+
+    def test_any_other_standard_error_gives_nothing(self) -> None:
+        for error in (
+            "",
+            "\n",
+            LINE + "\nanother line\n",
+            "another line\n" + LINE + "\n",
+            "x" + LINE,
+            LINE + " x",
+            "silver_labels: timeout\n",
+            "Traceback: boom\n",
+        ):
+            with self.subTest(error=repr(error)):
+                answer, _ = self.job(error, stderr_is=LINE)
+                self.assertEqual((124, {}, ""), answer[:3])
+
+    def test_a_call_without_the_line_gives_no_text_even_when_standard_error_holds_the_line(self) -> None:
+        answer, _ = self.job(LINE + "\n")
+        self.assertEqual("", answer[2])
+
+    def test_the_log_and_the_commands_never_hold_a_text_of_standard_error(self) -> None:
+        planted = "planted diagnostic text that names another place"
+        for keywords in ({"stderr_is": LINE}, {}):
+            with self.subTest(keywords):
+                answer, kept = self.job(planted + "\n", **keywords)
+                self.assertEqual("", answer[2])
+                self.assertNotIn(planted, json.dumps(kept))
+
+
+if __name__ == "__main__":
+    unittest.main()
