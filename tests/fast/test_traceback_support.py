@@ -130,10 +130,9 @@ class FramesAreReadFromTheStructureTest(unittest.TestCase):
             refuse_with_hidden_context()
         except KeyError as error:
             kept = error
-        self.assertNotIn(", in refuse\n", "".join(traceback.format_exception(kept)).split("KeyError")[-1])
         with self.assertRaisesRegex(AssertionError, "refuse"):
             traceback_text(kept, "refuse")
-        traceback_text(kept, "refuse_with_hidden_context")
+        self.assertNotIn(", in refuse\n", traceback_text(kept, "refuse_with_hidden_context"))
 
     def test_every_named_frame_is_required_and_not_only_the_first(self) -> None:
         with self.assertRaisesRegex(AssertionError, "no_such_function"):
