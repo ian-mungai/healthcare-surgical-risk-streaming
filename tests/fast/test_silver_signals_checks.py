@@ -19,7 +19,6 @@ import re
 import unittest
 from typing import Any
 
-from features.signal_validity import FLAT, MISSING
 from spark.silver.checks import (
     CHECK_NAMES,
     CODES,
@@ -54,7 +53,6 @@ NUMERIC = NumericFacts(
     invalid_without_cause=0,
     unknown_cause=0,
     verdict_differs=0,
-    causes={MISSING: 4, "valid": 986},
 )
 WAVEFORM = WaveformFacts(
     rows=300,
@@ -65,7 +63,6 @@ WAVEFORM = WaveformFacts(
     unknown_cause=0,
     shape_differs=0,
     verdict_differs=0,
-    causes={FLAT: 3, "valid": 297},
 )
 
 
@@ -92,17 +89,31 @@ class Controls(unittest.TestCase):
         self.assertEqual([], numeric_problems(NUMERIC, BRONZE.numeric_rows))
         self.assertEqual([], waveform_problems(WAVEFORM, BRONZE.waveform_rows))
 
-    def test_every_message_is_a_known_code_and_a_count(self) -> None:
+    def test_every_message_is_a_known_code_and_a_flag_with_no_count(self) -> None:
         planted = [
             *bronze_problems(BronzeFacts(1, 1, 1, 1, 1, 1, 1, 1, 1)),
-            *numeric_problems(NumericFacts(1, 1, 1, 1, 1, 1, 1, 1, 1, {"x": 1}, source_differs=1), 5),
-            *waveform_problems(WaveformFacts(1, 1, 1, 1, 1, 1, 1, 1, {"x": 1}, source_differs=1), 5),
+            *bronze_problems(BronzeFacts(0, 0, 0, 0, 0, 0, 0, 0, 0)),
+            *numeric_problems(NumericFacts(1, 1, 1, 1, 1, 1, 1, 1, 1, source_differs=1), 5),
+            *waveform_problems(WaveformFacts(1, 1, 1, 1, 1, 1, 1, 1, source_differs=1), 5),
         ]
-        self.assertGreaterEqual(len(planted), 15)
+        self.assertGreaterEqual(len(planted), 16)
         for problem in planted:
             with self.subTest(problem=problem):
                 self.assertIn(code_of(problem), CODES)
-                self.assertRegex(problem, r"^[a-z_]+: [0-9]+ [a-z ]+$")
+                self.assertEqual(f"{code_of(problem)}: failed", problem)
+
+    def test_a_larger_count_gives_the_same_message_as_a_smaller_one(self) -> None:
+        few = [*bronze_problems(BronzeFacts(9, 9, 1, 1, 1, 1, 1, 1, 1)), *numeric_problems(NumericFacts(1, 1, 1, 1, 1, 1, 1, 1, 1, source_differs=1), 5)]
+        many = [*bronze_problems(BronzeFacts(99, 99, 8, 8, 8, 8, 8, 8, 8)), *numeric_problems(NumericFacts(1, 7, 1, 6, 5, 4, 3, 2, 9, source_differs=8), 90)]
+        self.assertEqual(few, many)
+        self.assertEqual(
+            numeric_problems(dataclasses.replace(NUMERIC, rows=989), BRONZE.numeric_rows),
+            numeric_problems(dataclasses.replace(NUMERIC, rows=10), BRONZE.numeric_rows),
+        )
+
+    def test_the_facts_hold_no_count_of_a_cause(self) -> None:
+        for facts in (NUMERIC, WAVEFORM):
+            self.assertNotIn("causes", {field.name for field in dataclasses.fields(facts)})
 
     def test_the_result_names_the_checks_that_ran(self) -> None:
         self.assertEqual(len(CHECK_NAMES), len(set(CHECK_NAMES)))
@@ -130,7 +141,8 @@ class Inputs(unittest.TestCase):
 
 class Numeric(unittest.TestCase):
     def test_a_reading_lost_or_counted_twice_breaks_the_sum_of_rows_and_ledger(self) -> None:
-        self.assertEqual("numeric_not_every_reading", one(numeric_problems(dataclasses.replace(NUMERIC, rows=989), BRONZE.numeric_rows)))
+        for rows in (989, 991, 1, 5000):
+            self.assertEqual("numeric_not_every_reading", one(numeric_problems(dataclasses.replace(NUMERIC, rows=rows), BRONZE.numeric_rows)))
         self.assertEqual("numeric_not_every_reading", one(numeric_problems(dataclasses.replace(NUMERIC, ledger_total=11), BRONZE.numeric_rows)))
 
     def test_a_key_twice_or_a_kept_reading_that_is_not_the_first_is_counted(self) -> None:
@@ -152,7 +164,8 @@ class Numeric(unittest.TestCase):
 
 class Waveform(unittest.TestCase):
     def test_a_second_lost_is_counted(self) -> None:
-        self.assertEqual("waveform_not_every_second", one(waveform_problems(dataclasses.replace(WAVEFORM, rows=299), BRONZE.waveform_rows)))
+        for rows in (299, 301, 1, 900):
+            self.assertEqual("waveform_not_every_second", one(waveform_problems(dataclasses.replace(WAVEFORM, rows=rows), BRONZE.waveform_rows)))
 
     def test_a_key_twice_or_a_wrong_sample_count_is_counted(self) -> None:
         self.assertEqual("waveform_duplicate_key", one(waveform_problems(dataclasses.replace(WAVEFORM, duplicate_keys=1), BRONZE.waveform_rows)))

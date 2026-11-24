@@ -12,6 +12,10 @@
 !features/registry.py
 !features/model.py
 !features/stats.py
+!features/label_values.py
+!features/icu_label.py
+!features/kidney_label.py
+!features/warning_label.py
 !features/batch.py
 !features/clinical.py
 !features/document.py

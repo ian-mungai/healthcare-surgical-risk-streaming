@@ -24,7 +24,7 @@ from features.signal_validity import (
     second_extent,
     waveform_verdict,
 )
-from spark.silver.checks import VALID_LABEL, BronzeFacts, NumericFacts, WaveformFacts
+from spark.silver.checks import BronzeFacts, NumericFacts, WaveformFacts
 from spark.silver.run import Fingerprint
 from spark.silver.tables import NUMERIC, WAVEFORM
 
@@ -193,12 +193,6 @@ def count_where(condition: Any) -> Any:
     return f.sum(f.when(condition, f.lit(1)).otherwise(f.lit(0)))
 
 
-def causes_of(frame: Any) -> dict[str, int]:
-    f = functions()
-    label = f.when(f.col("valid"), f.lit(VALID_LABEL)).otherwise(f.coalesce(f.col("invalid_cause"), f.lit("none")))
-    return {str(row["cause"]): int(row["n"]) for row in frame.groupBy(label.alias("cause")).agg(f.count(f.lit(1)).alias("n")).collect()}
-
-
 def verdict_columns(frame: Any) -> tuple[Any, Any, Any, Any, Any]:
     """The counts of a verdict that is not complete, for both tables.
 
@@ -250,7 +244,6 @@ def numeric_facts(frame: Any, bronze: Any) -> NumericFacts:
         int(row["invalid_without_cause"] or 0),
         int(row["unknown"] or 0),
         int(row["differs"] or 0),
-        causes_of(frame),
         source_differences(frame, numeric_kept(bronze), NUMERIC.columns),
     )
 
@@ -278,7 +271,6 @@ def waveform_facts(frame: Any, bronze: Any, tracks: Any) -> WaveformFacts:
         int(row["unknown"] or 0),
         int(row["shape"] or 0),
         int(row["differs"] or 0),
-        causes_of(frame),
         source_differences(frame, waveform_physical(bronze, tracks), WAVEFORM.columns),
     )
 

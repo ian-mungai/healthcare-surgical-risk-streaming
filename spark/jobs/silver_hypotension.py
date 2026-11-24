@@ -1,7 +1,10 @@
 """The Silver pressure series and hypotension events: ``silver.art_mbp_1s`` and ``silver.hypotension_events``.
 
-``python -m spark.jobs.silver_hypotension build --branch <name> [--base <name>]``
-``python -m spark.jobs.silver_hypotension verify --branch <name>``
+``python -m spark.jobs.silver_hypotension build --branch <name> --result <path> [--base <name>]``
+``python -m spark.jobs.silver_hypotension verify --branch <name> --result <path>``
+
+The result is one JSON file at ``--result``, as the Silver signals job's is (an absolute path that does not exist; also a refusal, whose file holds the
+refusal codes). Standard output stays empty and standard error is for an operator: a caller reads the exit code and the file.
 
 ``build`` creates the branch from ``main`` (or from ``--base``, which must hold ``silver.waveform_seconds``), refuses a branch that exists and takes the base
 hash from the answer that created it. It reads ``silver.waveform_seconds``, ``bronze.clinical_cases`` and ``silver.patient_split`` at that hash and writes the
@@ -11,9 +14,9 @@ the freeze of a rerun that changes nothing, the writes and the read-back are in 
 codes are those of ``spark/silver/cli.py``. The settings come from the environment, as the Silver signals job's do.
 
 The test set is sealed. No rule is estimated from data. The patient split is read after the check of who owns each case and only to find the development cases
-(training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes, so
-the result holds the series' counts and a digest of the event table (no row count), and every check about events is a flag. It never names a count of events, a
-case, a patient, a set, a time or a value.
+(training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes,
+so the result holds the snapshot IDs, one pass flag for each table and a digest of the event table (no row count; the events are of the development cases
+only), and every check is a flag, and so is every refusal. It never names a count of seconds or of events, a case, a patient, a set, a time or a value.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from spark.silver.frames import fingerprint as fingerprint_of
 from spark.silver.frames import functions
+from spark.silver.hypotension_checks import CHECK_NAMES as CHECK_NAMES
 from spark.silver.hypotension_checks import InputFacts, split_rule_problems
 from spark.silver.hypotension_run import EVENTS, SERIES, Digest, InputRead, Operations, TableRead, run_build, run_verify
 from spark.silver.run import BRANCH_MOVED, Fingerprint
@@ -71,7 +75,7 @@ class HypotensionLake(Lake):
 
     def waveform(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, WAVEFORM_TABLE)
-        problems = schema_problems(self.fields_of(frame), WAVEFORM.columns, f"{WAVEFORM.name} table")
+        problems = schema_problems(self.fields_of(frame), WAVEFORM.columns)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
@@ -79,14 +83,14 @@ class HypotensionLake(Lake):
     def clinical(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, CLINICAL_TABLE)
         held = dict(self.fields_of(frame))
-        problems = schema_problems([(name, held.get(name, "")) for name, _ in CLINICAL_COLUMNS], CLINICAL_COLUMNS, "clinical table")
+        problems = schema_problems([(name, held.get(name, "")) for name, _ in CLINICAL_COLUMNS], CLINICAL_COLUMNS)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
 
     def split(self, at: str) -> tuple[Any, str]:
         frame, table = self.source_frame(at, SPLIT_TABLE)
-        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS, "split table")
+        problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS)
         if problems:
             raise SilverSignalsError(*problems)
         return frame, table
@@ -129,7 +133,7 @@ class HypotensionLake(Lake):
         if not self.session.catalog.tableExists(name):
             return None
         frame = self.session.table(name)
-        problems = schema_problems(self.fields_of(frame), HYPOTENSION_TABLES[table].columns, f"{table} table")
+        problems = schema_problems(self.fields_of(frame), HYPOTENSION_TABLES[table].columns)
         if problems:
             raise SilverSignalsError(*problems)
         held: Fingerprint | Digest = fingerprint_of(frame) if table == SERIES else frames.digest_of(frame)

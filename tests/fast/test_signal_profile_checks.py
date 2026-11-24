@@ -5,8 +5,9 @@ Failure modes covered here:
 - A profile table whose causes and valid rows do not add up to its rows, whose share is not valid rows over rows, whose key is twice, or whose rows differ
   from the development rows of Silver, is accepted.
 - A table is built with a column that is not the declared one, or the cause columns drift from the causes of the validity definition.
-- The unscored row is not one row, is out of order (more unscored than cutoffs, either below one limit), has a share that is not its count over its cutoffs, or
-  holds a rule that is not the registry's.
+- The unscored row is not one row, is out of order (more unscored than cutoffs, either below one limit), has a share that is not its count over its cutoffs,
+  counts more cases with no grid than cases, or holds a rule that is not the registry's and the warning grid rule's (step, first cutoff, last margin).
+- A column of the unscored table is not read back by the check, so a change of it passes.
 - A prespecified count is changed without a test failing, a count of the full cohort is saved with its value (the check is sealed: a flag only) or a count of
   development data is saved without its value.
 - A count that matches is judged as not matching, or the reverse, or a rounded count is compared exactly.
@@ -15,12 +16,14 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from typing import Any
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from features.signal_validity import ARTERIAL_WAVEFORM, INVALID_CAUSES
 from spark.profile.checks import (
+    CHECK_NAMES,
     CODES,
     CountsFacts,
     InputFacts,
@@ -31,8 +34,8 @@ from spark.profile.checks import (
     unscored_problems,
 )
 from spark.profile.counts import ARTERIAL_TRACK, BY_NAME, DEVELOPMENT, FULL_COHORT, NONINVASIVE_TRACK, PRESPECIFIED, count_rows, judged
+from spark.profile.grid_rule import FIRST_CUTOFF_OFFSET_SECONDS, GRID_STEP_SECONDS, LAST_CUTOFF_MARGIN_SECONDS
 from spark.profile.tables import CAUSE_COLUMNS, COUNTS, PROFILE, PROFILE_TABLES, UNSCORED
-from spark.profile.unscored import CUTOFF_STEP_SECONDS
 
 INPUT = InputFacts(numeric_rows=500, waveform_rows=300, tracks=12, arterial_cases=3)
 GOOD = ProfileFacts(rows=12, duplicate_keys=0, partition_differs=0, share_differs=0, unknown_kind=0, numeric_rows=500, waveform_rows=300, tracks=12)
@@ -104,7 +107,10 @@ def unscored(**changes: float | None) -> UnscoredFacts:
         "either": 12,
         "share": 0.12,
         "cases": 3,
-        "cutoff_step": CUTOFF_STEP_SECONDS,
+        "no_grid": 1,
+        "cutoff_step": GRID_STEP_SECONDS,
+        "cutoff_offset": FIRST_CUTOFF_OFFSET_SECONDS,
+        "last_margin": LAST_CUTOFF_MARGIN_SECONDS,
         "waveform_window": WAVEFORM_WINDOW_SECONDS,
         "waveform_limit": MAX_INVALID_WAVEFORM_SECONDS,
         "numeric_window": NUMERIC_WINDOW_SECONDS,
@@ -128,6 +134,7 @@ class UnscoredChecks(unittest.TestCase):
             "unscored_share": unscored(share=0.13),
             "unscored_rule": unscored(waveform_limit=1),
             "unscored_cases": unscored(cases=4),
+            "unscored_no_grid": unscored(no_grid=4),
         }
         for code, facts in cases.items():
             with self.subTest(code=code):
@@ -142,9 +149,25 @@ class UnscoredChecks(unittest.TestCase):
                 self.assertEqual([], unscored_problems(unscored(either=either, share=either / 100), INPUT))
 
     def test_every_rule_column_is_held_to_the_registry(self) -> None:
-        for column in ("cutoff_step", "waveform_window", "waveform_limit", "numeric_window", "numeric_limit"):
+        for column in ("cutoff_step", "cutoff_offset", "last_margin", "waveform_window", "waveform_limit", "numeric_window", "numeric_limit"):
             with self.subTest(column=column):
                 self.assertEqual(["unscored_rule"], names(unscored_problems(unscored(**{column: 7}), INPUT)))
+
+    def test_a_case_with_no_grid_is_one_of_the_cases_and_none_is_allowed_too(self) -> None:
+        self.assertEqual([], unscored_problems(unscored(no_grid=0), INPUT))
+        self.assertEqual([], unscored_problems(unscored(no_grid=3), INPUT))
+        self.assertEqual([], unscored_problems(unscored(cutoffs=0, waveform=0, numeric=0, either=0, share=None, no_grid=3), INPUT))
+        self.assertEqual(["unscored_no_grid"], names(unscored_problems(unscored(no_grid=4), INPUT)))
+
+    def test_every_column_of_the_unscored_table_is_a_fact_that_the_check_reads(self) -> None:
+        table = {name for name, _ in UNSCORED.columns} - {"scope", "unscored_share"}
+        facts = {field.name for field in dataclasses.fields(UnscoredFacts)} - {"rows", "share"}
+        self.assertEqual(table, facts)
+
+    def test_the_check_names_include_every_unscored_check(self) -> None:
+        for code in ("unscored_rows", "unscored_order", "unscored_share", "unscored_rule", "unscored_cases", "unscored_no_grid"):
+            with self.subTest(code=code):
+                self.assertIn(code, CHECK_NAMES)
 
 
 class SourceCounts(unittest.TestCase):
@@ -273,6 +296,9 @@ class Codes(unittest.TestCase):
             "input_empty",
             "source_table",
             "source_no_snapshot",
+            "table_schema",
+            "grid_rule_changed",
+            "grid_rule_rows",
         ):
             with self.subTest(code=code):
                 self.assertIn(code, CODES)

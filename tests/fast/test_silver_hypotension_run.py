@@ -20,17 +20,22 @@ from typing import Any
 from spark.silver.checks import SilverSignalsError
 from spark.silver.hypotension_checks import EventFacts, InputFacts, SeriesFacts
 from spark.silver.hypotension_run import EVENTS, SERIES, Digest, InputRead, Operations, TableRead, run_build, run_verify
-from spark.silver.run import Fingerprint
+from spark.silver.run import BRANCH_MOVED, Fingerprint
 
 HEAD, PREPARED, FIRST_WRITE, SECOND_WRITE = "a" * 64, "b" * 64, "c" * 64, "d" * 64
 INPUT = InputRead(InputFacts(5000, 0, 0, 0, 0, ()), (21, 22, 23))
 FINGERPRINTS: dict[str, Fingerprint | Digest] = {SERIES: Fingerprint(5000, 5), EVENTS: Digest(9)}
-SERIES_FACTS = SeriesFacts(5000, 0, 0, 0, 0, 0, 0, 0, {"valid": 4990, "missing": 10})
+SERIES_FACTS = SeriesFacts(5000, 0, 0, 0, 0, 0, 0, 0)
 EVENT_FACTS = EventFacts(0, 0, 0, 0, 0)
 
 
-def codes(error: SilverSignalsError) -> list[str]:
-    return [problem.split(":")[0] for problem in error.problems]
+def messages(error: SilverSignalsError) -> list[str]:
+    """The complete messages of a refusal: a code is not enough, because its text could carry a count."""
+    return error.problems
+
+
+def failed(*names: str) -> list[str]:
+    return [f"{name}: failed" for name in names]
 
 
 class Fake:
@@ -112,30 +117,32 @@ class Build(unittest.TestCase):
             ],
             fake.calls,
         )
-        self.assertEqual(("written", HEAD, SECOND_WRITE), (outcome.outcome, outcome.checked_hash, outcome.write_hash))
+        self.assertEqual((HEAD, SECOND_WRITE, SECOND_WRITE), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
 
-    def test_the_result_holds_no_count_and_no_cause_of_an_event(self) -> None:
+    def test_the_result_holds_snapshots_pass_flags_and_the_development_events_digest_and_no_count_or_cause(self) -> None:
         facts = run_build(Fake().operations(), HEAD).facts()
-        self.assertEqual({SERIES: 5000}, facts["rows"])
-        self.assertEqual({SERIES: {"valid": 4990, "missing": 10}}, facts["causes"])
-        self.assertEqual({SERIES: [5000, 5], EVENTS: [9]}, facts["fingerprints"])
         self.assertEqual({SERIES: 101, EVENTS: 102}, facts["snapshots"])
         self.assertEqual({"waveform_seconds": 21, "clinical_cases": 22, "patient_split": 23}, facts["source_snapshots"])
-        self.assertEqual([9], facts["fingerprints"][EVENTS])
+        self.assertEqual({SERIES: True, EVENTS: True}, facts["passed"])
+        self.assertEqual(9, facts["development_events_digest"])
+        self.assertEqual(
+            {"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "development_events_digest", "checks_run"},
+            set(facts),
+        )
         self.assertGreaterEqual(len(facts["checks_run"]), 10)
 
     def test_a_split_that_fails_its_rule_or_a_case_with_two_owners_writes_nothing_and_stops_before_any_plan(self) -> None:
         for facts, wanted in (
-            (InputFacts(5000, 0, 0, 1, 0, ()), ["ambiguous_case_owner"]),
-            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), ["two_sets"]),
-            (InputFacts(5000, 0, 0, 0, 1, ()), ["case_without_split"]),
+            (InputFacts(5000, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
+            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
+            (InputFacts(5000, 0, 0, 0, 1, ()), failed("case_without_split")),
         ):
             with self.subTest(wanted=wanted):
                 fake = Fake()
                 fake.input = InputRead(facts, (21, 22, 23))
                 with self.assertRaises(SilverSignalsError) as caught:
                     run_build(fake.operations(), HEAD)
-                self.assertEqual(wanted, codes(caught.exception))
+                self.assertEqual(wanted, messages(caught.exception))
                 self.assertEqual(["read_input a", "release"], fake.calls)
 
     def test_an_input_defect_writes_nothing_and_releases(self) -> None:
@@ -143,14 +150,15 @@ class Build(unittest.TestCase):
         fake.input = InputRead(InputFacts(0, 0, 0, 0, 0, ()), (21, 22, 23))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["input_empty"], codes(caught.exception))
+        self.assertEqual(failed("input_empty"), messages(caught.exception))
         self.assertEqual(["read_input a", "release"], fake.calls)
 
     def test_a_rebuild_that_changes_nothing_writes_nothing_and_still_reads_back_and_checks(self) -> None:
         fake = Fake()
         fake.held = dict(fake.read_back)
         outcome = run_build(fake.operations(), HEAD)
-        self.assertEqual(("unchanged", None), (outcome.outcome, outcome.write_hash))
+        self.assertNotIn("outcome", outcome.facts())
+        self.assertEqual((HEAD, None, HEAD), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
         self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
 
     def test_a_rebuild_that_changes_one_table_rewrites_that_table_only_and_in_place(self) -> None:
@@ -164,7 +172,7 @@ class Build(unittest.TestCase):
         fake.moved_after = 0
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
         self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
 
     def test_a_write_that_is_not_the_one_commit_on_the_checked_hash_stops_before_the_next_write(self) -> None:
@@ -172,7 +180,7 @@ class Build(unittest.TestCase):
         fake.hashes[SERIES] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
         self.assertNotIn(f"write {EVENTS} exists=False", fake.calls)
 
     def test_a_read_back_that_is_not_the_planned_table_is_named(self) -> None:
@@ -180,14 +188,28 @@ class Build(unittest.TestCase):
         fake.read_back[EVENTS] = TableRead(Digest(10), 102, events=EVENT_FACTS)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["readback_differs"], codes(caught.exception))
+        self.assertEqual(["readback_differs: 1 table"], messages(caught.exception))
 
     def test_a_table_that_is_not_there_at_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing"], codes(caught.exception))
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+
+    def test_a_series_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
+        fake = Fake()
+        fake.read_back[SERIES] = TableRead(FINGERPRINTS[SERIES], 101)
+        with self.assertRaises(SilverSignalsError) as caught:
+            run_build(fake.operations(), HEAD)
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+
+    def test_an_event_table_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
+        fake = Fake()
+        fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102)
+        with self.assertRaises(SilverSignalsError) as caught:
+            run_build(fake.operations(), HEAD)
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
 
     def test_the_checks_of_the_series_run_on_the_read_back_and_come_first(self) -> None:
         fake = Fake()
@@ -195,14 +217,14 @@ class Build(unittest.TestCase):
         fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102, events=dataclasses.replace(EVENT_FACTS, short=1))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["series_differs"], codes(caught.exception))
+        self.assertEqual(failed("series_differs"), messages(caught.exception))
 
     def test_the_checks_of_the_events_run_on_the_read_back_when_the_series_passes(self) -> None:
         fake = Fake()
         fake.read_back[EVENTS] = TableRead(FINGERPRINTS[EVENTS], 102, events=dataclasses.replace(EVENT_FACTS, short=1))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["event_short"], codes(caught.exception))
+        self.assertEqual(failed("event_short"), messages(caught.exception))
 
     def test_an_input_that_changed_between_the_reads_is_named(self) -> None:
         for later in (InputRead(INPUT.facts, (21, 22, 24)), InputRead(dataclasses.replace(INPUT.facts, art_seconds=5001), (21, 22, 23))):
@@ -211,14 +233,14 @@ class Build(unittest.TestCase):
                 fake.later_input = later
                 with self.assertRaises(SilverSignalsError) as caught:
                     run_build(fake.operations(), HEAD)
-                self.assertEqual(["source_changed"], codes(caught.exception))
+                self.assertEqual(failed("source_changed"), messages(caught.exception))
 
     def test_a_branch_that_moved_during_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.moved_after = 1
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
 
     def test_a_failure_that_is_not_a_check_still_releases_the_plan(self) -> None:
         fake = Fake()
@@ -246,14 +268,14 @@ class SeriesFirst(unittest.TestCase):
         fake.held = dict(fake.read_back)
         with self.assertRaises(SilverSignalsError) as caught:
             run_verify(fake.operations(), HEAD)
-        self.assertEqual(["series_value", "series_differs"], codes(caught.exception))
+        self.assertEqual(failed("series_value", "series_differs"), messages(caught.exception))
         self.assertNotIn(f"read_table a {EVENTS} facts=True", fake.calls)
 
     def test_a_build_reports_a_damaged_series_at_the_read_back_with_its_codes_and_never_reads_the_event_facts(self) -> None:
         fake = self.damaged()
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["series_value", "series_differs"], codes(caught.exception))
+        self.assertEqual(failed("series_value", "series_differs"), messages(caught.exception))
         self.assertNotIn(f"read_table d {EVENTS} facts=True", fake.calls)
 
     def test_a_missing_series_table_is_named_without_reading_the_events(self) -> None:
@@ -262,7 +284,7 @@ class SeriesFirst(unittest.TestCase):
         fake.held = dict(fake.read_back)
         with self.assertRaises(SilverSignalsError) as caught:
             run_verify(fake.operations(), HEAD)
-        self.assertEqual(["table_missing"], codes(caught.exception))
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
 
 
 class MissingTables(unittest.TestCase):
@@ -300,20 +322,22 @@ class Verify(unittest.TestCase):
 
     def test_a_good_branch_is_verified_and_nothing_is_written(self) -> None:
         fake = Fake()
-        self.assertEqual("verified", self.verify(fake).outcome)
+        outcome = self.verify(fake)
+        self.assertNotIn("outcome", outcome.facts())
+        self.assertEqual((HEAD, None, HEAD), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
         self.assertEqual(["read_input a", f"read_table a {SERIES} facts=True", f"read_table a {EVENTS} facts=True", "head", "release"], fake.calls)
 
     def test_a_split_that_fails_its_rule_stops_a_verify_before_any_table_is_read(self) -> None:
         for facts, wanted in (
-            (InputFacts(5000, 0, 0, 1, 0, ()), ["ambiguous_case_owner"]),
-            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), ["two_sets"]),
+            (InputFacts(5000, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
+            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
         ):
             with self.subTest(wanted=wanted):
                 fake = Fake()
                 fake.input = InputRead(facts, (21, 22, 23))
                 with self.assertRaises(SilverSignalsError) as caught:
                     self.verify(fake)
-                self.assertEqual(wanted, codes(caught.exception))
+                self.assertEqual(wanted, messages(caught.exception))
                 self.assertEqual(["read_input a", "release"], fake.calls)
 
     def test_a_branch_without_a_table_is_named(self) -> None:
@@ -321,14 +345,14 @@ class Verify(unittest.TestCase):
         fake.read_back[EVENTS] = None
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["table_missing"], codes(caught.exception))
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
 
     def test_a_defect_in_a_table_is_named(self) -> None:
         fake = Fake()
         fake.read_back[SERIES] = TableRead(FINGERPRINTS[SERIES], 101, series=dataclasses.replace(SERIES_FACTS, valid_with_cause=1))
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["series_valid_with_cause"], codes(caught.exception))
+        self.assertEqual(failed("series_valid_with_cause"), messages(caught.exception))
 
     def test_a_defect_in_the_input_is_named_alone_and_no_table_is_judged(self) -> None:
         fake = Fake()
@@ -336,14 +360,14 @@ class Verify(unittest.TestCase):
         fake.input = InputRead(dataclasses.replace(INPUT.facts, cases_without_split=1), (21, 22, 23))
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["case_without_split"], codes(caught.exception))
+        self.assertEqual(failed("case_without_split"), messages(caught.exception))
 
     def test_a_branch_that_moved_is_named(self) -> None:
         fake = Fake()
         fake.moved_after = 0
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
 
 
 if __name__ == "__main__":

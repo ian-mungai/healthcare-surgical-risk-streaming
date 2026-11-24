@@ -250,8 +250,6 @@ def series_facts(stored: Any, waveform: Any) -> SeriesFacts:
     columns = tuple((name, kind) for name, kind in ART_MBP_1S.columns)
     left, right = typed(stored, columns), typed(again, columns)
     differs = int(left.exceptAll(right).count()) + int(right.exceptAll(left).count())
-    labelled = f.when(valid, f.lit("valid")).otherwise(f.coalesce(cause, f.lit("none")))
-    causes = {str(r["cause"]): int(r["n"]) for r in stored.groupBy(labelled.alias("cause")).agg(f.count(f.lit(1)).alias("n")).collect()}
     return SeriesFacts(
         int(row["rows"]),
         int(row["duplicate_keys"]),
@@ -261,7 +259,6 @@ def series_facts(stored: Any, waveform: Any) -> SeriesFacts:
         int(row["unknown"] or 0),
         int(row["value_problem"] or 0),
         differs,
-        causes,
     )
 
 

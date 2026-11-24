@@ -7,14 +7,18 @@ Failure modes covered here:
 - The worker's row function reads the row before as the second ``s - 1`` without asking whether it is, or treats a null verdict as valid.
 - The event row function gives events for a case whose operation start or end is null, not finite or after its end, or reads the points in the wrong columns.
 - The command line prints the name of another job on its codes, so a failed check of this job is named as the Silver signals job's, also for a bad subcommand.
+- The result file names another job than the one that ran, so a refusal of this job reads as the Silver signals job's.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
+import tempfile
 import unittest
 from fractions import Fraction
+from pathlib import Path
 
 from features.signal_validity import FLAT, MISSING
 from spark.silver.checks import SilverSignalsError
@@ -96,14 +100,28 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(2, stop.exception.code)
         self.assertEqual("silver_hypotension: usage\n", err.getvalue())
 
-    def test_a_failed_check_is_printed_with_the_name_of_the_job_that_the_caller_gives(self) -> None:
+    def test_a_failed_check_is_printed_with_the_name_of_the_job_that_the_caller_gives_and_is_in_the_result_file(self) -> None:
         def failing(arguments: object) -> dict[str, object]:
-            raise SilverSignalsError("series_differs: 1 row")
+            raise SilverSignalsError("series_differs: failed")
 
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code = run(["verify", "--branch", "b"], failing, "silver_hypotension")
-        self.assertEqual((1, "silver_hypotension: series_differs: 1 row\n"), (code, err.getvalue()))
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stderr(err):
+            path = Path(folder) / "result.json"
+            code = run(["verify", "--branch", "b", "--result", str(path)], failing, "silver_hypotension")
+            document = json.loads(path.read_text())
+        self.assertEqual((1, "silver_hypotension: series_differs: failed\n"), (code, err.getvalue()))
+        self.assertEqual({"job": "silver_hypotension", "mode": "verify", "refusal": ["series_differs: failed"]}, document)
+
+    def test_a_good_call_writes_the_result_to_the_file_and_prints_nothing(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            path = Path(folder) / "result.json"
+            code = run(
+                ["build", "--branch", "b", "--result", str(path)], lambda arguments: {"job": "silver_hypotension", "mode": arguments.mode}, "silver_hypotension"
+            )
+            document = json.loads(path.read_text())
+        self.assertEqual((0, "", ""), (code, out.getvalue(), err.getvalue()))
+        self.assertEqual({"job": "silver_hypotension", "mode": "build"}, document)
 
 
 if __name__ == "__main__":

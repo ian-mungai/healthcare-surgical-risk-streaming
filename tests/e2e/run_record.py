@@ -65,26 +65,19 @@ class Record:
             code = self.close(log, blocked=blocked)
         return code
 
-    def close(self, log: list[str], *, blocked: str = "") -> int:
-        """Print each assertion, set the outcome, write the record, its log and its retention label in a new folder and return the exit code.
+    def settle(self, blocked: str = "") -> None:
+        """Set the outcome from the observations so far: blocked with its reason, else pass when every observation passed, else fail."""
+        self.outcome = f"blocked: {blocked}" if blocked else ("pass" if self.observations and all(item.passed for item in self.observations) else "fail")
 
-        The result is printed and flushed before the files are written. A print or flush that fails (a closed or broken stdout) is itself a failed
-        assertion, so the record never says pass for a run whose result could not be printed.
-        """
-        stamp = self.started_utc.replace(":", "").replace("-", "")
-        runs = ROOT / "runs"
-        runs.mkdir(parents=True, exist_ok=True)
-        mode = re.sub(r"[^a-z0-9]+", "_", self.mode.lower()).strip("_")
-        folder = Path(tempfile.mkdtemp(prefix=f"{stamp}_{self.slug}_{mode}_", dir=runs))
-        try:
-            for item in self.observations:
-                sys.stdout.write(f"{'PASS' if item.passed else 'FAIL'} {item.case} ({item.step}): {item.observed}\n")
-            self.outcome = self.verdict(blocked)
-            sys.stdout.write(f"{self.outcome}: record in {folder.relative_to(ROOT)}\n")
-            sys.stdout.flush()
-        except (OSError, ValueError) as error:
-            self.expect("run", "output", "the result is printed", f"{type(error).__name__}: {str(error)[:120]}", False)
-        self.outcome = self.verdict(blocked)
+    def write(self, log: list[str], folder: Path | None = None) -> Path:
+        """Write the record, its log and its retention label, in ``folder`` or in a new folder, and return the folder. Written again in the same folder, they
+        hold the outcome and the observations as they are now."""
+        if folder is None:
+            stamp = self.started_utc.replace(":", "").replace("-", "")
+            runs = ROOT / "runs"
+            runs.mkdir(parents=True, exist_ok=True)
+            mode = re.sub(r"[^a-z0-9]+", "_", self.mode.lower()).strip("_")
+            folder = Path(tempfile.mkdtemp(prefix=f"{stamp}_{self.slug}_{mode}_", dir=runs))
         (folder / "record.json").write_text(json.dumps(asdict(self), indent=2) + "\n")
         (folder / "log.txt").write_text("\n".join(log) + "\n")
         label = {
@@ -94,7 +87,28 @@ class Record:
             "end_condition": PASSED_END if self.outcome == "pass" else FAILED_END,
         }
         (folder / "retention.json").write_text(json.dumps(label, indent=2) + "\n")
+        return folder
+
+    def report(self, folder: Path) -> int:
+        """Print each assertion and the outcome, flushed, and return the exit code."""
+        for item in self.observations:
+            sys.stdout.write(f"{'PASS' if item.passed else 'FAIL'} {item.case} ({item.step}): {item.observed}\n")
+        sys.stdout.write(f"{self.outcome}: record in {folder.relative_to(ROOT)}\n")
+        sys.stdout.flush()
         return 0 if self.outcome == "pass" else 1
 
-    def verdict(self, blocked: str) -> str:
-        return f"blocked: {blocked}" if blocked else ("pass" if self.observations and all(item.passed for item in self.observations) else "fail")
+    def close(self, log: list[str], *, blocked: str = "") -> int:
+        """Set the outcome, write the record, its log and its retention label in a new folder, print each assertion and return the exit code.
+
+        A print or flush that fails (a closed or broken stdout) is itself a failed assertion: the record is written again in its folder and says fail, so it
+        never claims a pass that the run could not print.
+        """
+        self.settle(blocked)
+        folder = self.write(log)
+        try:
+            return self.report(folder)
+        except (OSError, ValueError) as error:
+            self.expect("run", "output", "the result is printed", type(error).__name__, False)
+            self.settle(blocked)
+            self.write(log, folder)
+            return 1

@@ -17,9 +17,8 @@ import dataclasses
 import unittest
 from typing import Any
 
-from features.signal_validity import FLAT, MISSING
 from spark.silver.checks import BronzeFacts, NumericFacts, SilverSignalsError, WaveformFacts
-from spark.silver.run import NUMERIC, WAVEFORM, Fingerprint, InputRead, Operations, TableRead, run_build, run_verify
+from spark.silver.run import BRANCH_MOVED, NUMERIC, WAVEFORM, Fingerprint, InputRead, Operations, TableRead, run_build, run_verify
 
 HEAD = "a" * 64
 PREPARED = "b" * 64
@@ -28,12 +27,17 @@ SECOND_WRITE = "d" * 64
 BRONZE = BronzeFacts(1000, 300, 0, 0, 0, 0, 0, 0, 0)
 INPUT = InputRead(BRONZE, (11, 12, 13))
 FINGERPRINTS = {NUMERIC: Fingerprint(990, 5), WAVEFORM: Fingerprint(300, 9)}
-NUMERIC_FACTS = NumericFacts(990, 0, 10, 0, 0, 0, 0, 0, 0, {MISSING: 4, "valid": 986})
-WAVEFORM_FACTS = WaveformFacts(300, 0, 0, 0, 0, 0, 0, 0, {FLAT: 3, "valid": 297})
+NUMERIC_FACTS = NumericFacts(990, 0, 10, 0, 0, 0, 0, 0, 0)
+WAVEFORM_FACTS = WaveformFacts(300, 0, 0, 0, 0, 0, 0, 0)
 
 
-def codes(error: SilverSignalsError) -> list[str]:
-    return [problem.split(":")[0] for problem in error.problems]
+def messages(error: SilverSignalsError) -> list[str]:
+    """The complete messages of a refusal: a code is not enough, because its text could carry a count."""
+    return error.problems
+
+
+def failed(*names: str) -> list[str]:
+    return [f"{name}: failed" for name in names]
 
 
 class Fake:
@@ -117,42 +121,42 @@ class Build(unittest.TestCase):
             ],
             fake.calls,
         )
-        self.assertEqual(("written", HEAD, SECOND_WRITE), (outcome.outcome, outcome.checked_hash, outcome.write_hash))
+        self.assertEqual((HEAD, SECOND_WRITE, SECOND_WRITE), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
 
-    def test_the_result_holds_hashes_snapshots_and_counts_and_nothing_of_a_row(self) -> None:
+    def test_the_result_holds_hashes_snapshots_and_one_pass_flag_for_each_table_and_no_count_or_digest(self) -> None:
         facts = run_build(Fake().operations(), HEAD).facts()
         self.assertEqual(
             {
-                "outcome": "written",
                 "checked_hash": HEAD,
                 "write_hash": SECOND_WRITE,
                 "branch_hash": SECOND_WRITE,
                 "source_snapshots": {"numeric_observations": 11, "waveform_seconds": 12, "tracks": 13},
                 "snapshots": {NUMERIC: 101, WAVEFORM: 102},
-                "rows": {NUMERIC: 990, WAVEFORM: 300},
-                "bronze_rows": {NUMERIC: 1000, WAVEFORM: 300},
-                "duplicates_dropped": 10,
-                "causes": {NUMERIC: {MISSING: 4, "valid": 986}, WAVEFORM: {FLAT: 3, "valid": 297}},
-                "fingerprints": {NUMERIC: [990, 5], WAVEFORM: [300, 9]},
+                "passed": {NUMERIC: True, WAVEFORM: True},
                 "checks_run": facts["checks_run"],
             },
             facts,
         )
         self.assertGreaterEqual(len(facts["checks_run"]), 20)
 
+    def test_a_verify_gives_one_pass_flag_for_each_table(self) -> None:
+        fake = Fake()
+        fake.held = {NUMERIC: fake.read_back[NUMERIC], WAVEFORM: fake.read_back[WAVEFORM]}
+        self.assertEqual({NUMERIC: True, WAVEFORM: True}, run_verify(fake.operations(), HEAD).facts()["passed"])
+
     def test_a_bronze_defect_writes_nothing_and_releases(self) -> None:
         fake = Fake()
         fake.input = InputRead(dataclasses.replace(BRONZE, waveform_duplicate_seconds=2, numeric_occurrence_gaps=1), (11, 12, 13))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["numeric_occurrence_gap", "waveform_duplicate_second"], codes(caught.exception))
+        self.assertEqual(failed("numeric_occurrence_gap", "waveform_duplicate_second"), messages(caught.exception))
         self.assertEqual(["read_input a", "release"], fake.calls)
 
     def test_a_rebuild_that_changes_nothing_writes_nothing_and_still_reads_back_and_checks(self) -> None:
         fake = Fake()
         fake.held = {NUMERIC: fake.read_back[NUMERIC], WAVEFORM: fake.read_back[WAVEFORM]}
         outcome = run_build(fake.operations(), HEAD)
-        self.assertEqual("unchanged", outcome.outcome)
+        self.assertNotIn("outcome", outcome.facts())
         self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
         self.assertIn("read_table a numeric_observations facts=True", fake.calls)
         self.assertEqual((HEAD, None), (outcome.checked_hash, outcome.write_hash))
@@ -177,7 +181,7 @@ class Build(unittest.TestCase):
         fake.moved_after = 0
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
         self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
         self.assertEqual("release", fake.calls[-1])
 
@@ -186,7 +190,7 @@ class Build(unittest.TestCase):
         fake.hashes[NUMERIC] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
         self.assertNotIn("write waveform_seconds exists=False", fake.calls)
 
     def test_a_read_back_that_is_not_the_planned_table_is_named(self) -> None:
@@ -194,14 +198,21 @@ class Build(unittest.TestCase):
         fake.read_back[WAVEFORM] = TableRead(Fingerprint(300, 10), 102, waveform=WAVEFORM_FACTS)
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["readback_differs"], codes(caught.exception))
+        self.assertEqual(["readback_differs: 1 table"], messages(caught.exception))
 
     def test_a_table_that_is_not_there_at_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.read_back[NUMERIC] = None
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["table_missing"], codes(caught.exception))
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
+
+    def test_a_table_that_is_read_back_without_its_checks_is_named_as_a_missing_table(self) -> None:
+        fake = Fake()
+        fake.read_back[NUMERIC] = TableRead(FINGERPRINTS[NUMERIC], 101)
+        with self.assertRaises(SilverSignalsError) as caught:
+            run_build(fake.operations(), HEAD)
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
 
     def test_the_checks_of_the_tables_run_on_the_read_back(self) -> None:
         fake = Fake()
@@ -209,7 +220,7 @@ class Build(unittest.TestCase):
         fake.read_back[WAVEFORM] = TableRead(FINGERPRINTS[WAVEFORM], 102, waveform=dataclasses.replace(WAVEFORM_FACTS, rows=299))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["numeric_verdict_differs", "waveform_not_every_second"], codes(caught.exception))
+        self.assertEqual(failed("numeric_verdict_differs", "waveform_not_every_second"), messages(caught.exception))
 
     def test_bronze_that_changed_between_the_reads_is_named(self) -> None:
         for later in (InputRead(BRONZE, (11, 12, 14)), InputRead(dataclasses.replace(BRONZE, numeric_rows=1001), (11, 12, 13))):
@@ -218,14 +229,14 @@ class Build(unittest.TestCase):
                 fake.later_input = later
                 with self.assertRaises(SilverSignalsError) as caught:
                     run_build(fake.operations(), HEAD)
-                self.assertEqual(["source_changed"], codes(caught.exception))
+                self.assertEqual(failed("source_changed"), messages(caught.exception))
 
     def test_a_branch_that_moved_during_the_read_back_is_named(self) -> None:
         fake = Fake()
         fake.moved_after = 1
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
 
     def test_a_failure_that_is_not_a_check_still_releases_the_plan(self) -> None:
         fake = Fake()
@@ -247,7 +258,8 @@ class Verify(unittest.TestCase):
     def test_a_good_branch_is_verified_and_nothing_is_written(self) -> None:
         fake = Fake()
         outcome = self.verify(fake)
-        self.assertEqual("verified", outcome.outcome)
+        self.assertNotIn("outcome", outcome.facts())
+        self.assertEqual((HEAD, None, HEAD), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
         self.assertEqual(
             ["read_input a", "read_table a numeric_observations facts=True", "read_table a waveform_seconds facts=True", "head", "release"], fake.calls
         )
@@ -257,7 +269,7 @@ class Verify(unittest.TestCase):
         fake.read_back[WAVEFORM] = None
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["table_missing"], codes(caught.exception))
+        self.assertEqual(["table_missing: 1 table"], messages(caught.exception))
 
     def test_a_defect_in_a_table_or_in_bronze_is_named(self) -> None:
         fake = Fake()
@@ -265,14 +277,14 @@ class Verify(unittest.TestCase):
         fake.input = InputRead(dataclasses.replace(BRONZE, track_duplicates=1), (11, 12, 13))
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["track_duplicate", "numeric_valid_with_cause"], codes(caught.exception))
+        self.assertEqual(failed("track_duplicate", "numeric_valid_with_cause"), messages(caught.exception))
 
     def test_a_branch_that_moved_is_named(self) -> None:
         fake = Fake()
         fake.moved_after = 0
         with self.assertRaises(SilverSignalsError) as caught:
             self.verify(fake)
-        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([BRANCH_MOVED], messages(caught.exception))
 
 
 if __name__ == "__main__":

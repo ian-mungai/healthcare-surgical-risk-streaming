@@ -1,13 +1,17 @@
 """How the Spark steps of the Silver cases job decide to write a table, on a stand-in for the Spark session.
 
 A stand-in cannot show that Spark does what the calls ask: the acceptance run does. These tests hold the decisions of the job: a table that already holds the
-rows is not written again, a table with the same columns is overwritten in place, any other table is replaced, and a table with other columns is never read
-as if it had the expected ones.
+rows is not written again, a table with the same columns is overwritten in place, a table with other columns (a schema change of the job's own output, such
+as ``icu_days`` from a whole number to a double) is dropped on the private branch and made again as a new table, and a table with other columns is never read as
+if it had the expected ones.
 
 Failure modes covered here:
 
 - A rerun that writes a new snapshot of an unchanged table.
-- A replace of an existing table that has the same columns, which stalls in Spark with the Nessie catalog.
+- A replace of an existing table, which stalls in Spark with the Nessie catalog: ``createOrReplace`` is never called, not for a table with the same columns and
+  not for a table whose columns changed (the inherited ``silver.cases`` with ``icu_days`` as ``bigint``).
+- A table with changed columns that is overwritten in place, so rows of one schema are written into the other, or that is dropped after the new rows were
+  planned but made again with the old properties or format version.
 - A property that is lost or never set, so the never-feature marking is missing.
 - An inherited measure or cutoff table with other columns, read as if it were the frozen one.
 """
@@ -20,6 +24,8 @@ from typing import Any
 
 from scripts.sample.split import patient_part
 from spark.jobs.silver_cases import CUTOFF_COLUMNS, MEASURE_COLUMNS, Lake
+from spark.jobs.silver_reconcile import ReconcileLake
+from spark.reconcile.checks import SPLIT_REFUSAL
 from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS, CutoffRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.split_table import RULE_VERSION, SET_NAMES
 
@@ -57,6 +63,9 @@ class Writer:
 
     def createOrReplace(self) -> None:
         self.log.append(f"createOrReplace {self.table}")
+
+    def create(self) -> None:
+        self.log.append(f"create {self.table}")
 
     def overwritePartitions(self) -> None:
         self.log.append(f"overwritePartitions {self.table}")
@@ -166,14 +175,35 @@ class WriteFrameTest(unittest.TestCase):
     def test_a_table_that_is_not_there_is_created_with_the_format_version_and_every_property(self) -> None:
         engine, log = lake(None)
         self.assertTrue(engine.write_frame(frame([("x", 1)], log), TABLE, PROPERTIES))
-        self.assertEqual(["property format-version=2", "property never_feature_columns=x,y", f"createOrReplace {TABLE}"], log)
+        self.assertEqual(["property format-version=2", "property never_feature_columns=x,y", f"create {TABLE}"], log)
 
-    def test_a_table_with_other_columns_or_types_is_replaced(self) -> None:
+    def test_a_table_with_other_columns_or_types_is_dropped_and_made_again_and_never_replaced(self) -> None:
         engine, log = lake(None)
         held = frame([("x", 1)], log, [("a", "string"), ("b", "int")])
         engine, log = lake(held, PROPERTIES)
         self.assertTrue(engine.write_frame(frame([("x", 1)], log), TABLE, PROPERTIES))
-        self.assertEqual(["property format-version=2", "property never_feature_columns=x,y", f"createOrReplace {TABLE}"], log)
+        self.assertEqual([f"DROP TABLE {TABLE}", "property format-version=2", "property never_feature_columns=x,y", f"create {TABLE}"], log)
+
+    def test_the_inherited_cases_table_with_icu_days_as_a_whole_number_is_rebuilt_without_a_replace(self) -> None:
+        old = [(name, "bigint" if name == "icu_days" else kind) for name, kind in ((column.name, column.type) for column in CASE_COLUMNS)]
+        new = [(column.name, column.type) for column in CASE_COLUMNS]
+        self.assertEqual("double", dict(new)["icu_days"])
+        self.assertNotEqual(old, new)
+        engine, log = lake(None)
+        held = frame([("x", 1)], log, old)
+        engine, log = lake(held, PROPERTIES)
+        self.assertTrue(engine.write_frame(frame([("x", 1)], log, new), TABLE, PROPERTIES))
+        self.assertNotIn(f"createOrReplace {TABLE}", log)
+        self.assertNotIn(f"overwritePartitions {TABLE}", log)
+        self.assertEqual([f"DROP TABLE {TABLE}", f"create {TABLE}"], [line for line in log if line.startswith(("DROP", "create", "overwrite"))])
+        self.assertLess(log.index(f"DROP TABLE {TABLE}"), log.index(f"create {TABLE}"))
+
+    def test_no_write_of_the_job_calls_a_replace(self) -> None:
+        import inspect
+
+        from spark.jobs import silver_cases
+
+        self.assertNotIn(".createOrReplace(", inspect.getsource(silver_cases))
 
 
 class ExistingRulesTest(unittest.TestCase):
@@ -196,14 +226,22 @@ class ExistingRulesTest(unittest.TestCase):
         self.assertEqual((None, [CutoffRow("start", "opstart", 0, "fixed", "v", 3, 5400)]), engine.existing_rules())
 
 
-def split_table(count: int, relabel: int | None = None) -> Frame:
+def split_row_dicts(count: int, relabel: int | None = None) -> list[dict[str, Any]]:
     rows = [
         {"subjectid": str(patient), "set": SET_NAMES[patient_part(patient)], "rule_version": RULE_VERSION, "source_snapshot_id": 7}
         for patient in range(1, count + 1)
     ]
     if relabel is not None:
         rows[relabel]["set"] = "training"
+    return rows
+
+
+def split_table_of(rows: list[dict[str, Any]]) -> Frame:
     return Frame([("subjectid", "string")], rows, [])  # type: ignore[arg-type]
+
+
+def split_table(count: int, relabel: int | None = None) -> Frame:
+    return split_table_of(split_row_dicts(count, relabel))
 
 
 class WriteRulesTest(unittest.TestCase):
@@ -303,6 +341,49 @@ class SplitRuleTest(unittest.TestCase):
         self.assertEqual(["rule_mismatch: 1 patient"], engine.split_problems())
 
 
+class SplitRowFormTest(unittest.TestCase):
+    """A split row with no subject or no source snapshot is a broken split table, named by its code, and never an unexpected failure of the job."""
+
+    def engine(self, *changes: dict[str, Any]) -> Lake:
+        """The lake over a split table whose last rows hold the changes."""
+        rows = split_row_dicts(300)
+        for index, change in enumerate(changes):
+            rows[-1 - index] = {**rows[-1 - index], **change}
+        return Lake(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b")  # type: ignore[arg-type]
+
+    def test_a_row_without_a_subject_is_named_and_not_a_failure(self) -> None:
+        self.assertEqual(["table_row: 1 row"], self.engine({"subjectid": None}).split_problems())
+
+    def test_a_row_without_a_source_snapshot_is_named_and_not_a_failure(self) -> None:
+        self.assertEqual(["table_row: 1 row"], self.engine({"source_snapshot_id": None}).split_problems())
+
+    def test_a_subject_or_a_snapshot_of_another_type_is_named_and_not_a_failure(self) -> None:
+        for change in ({"subjectid": 10}, {"source_snapshot_id": "7"}, {"source_snapshot_id": True}):
+            with self.subTest(change=change):
+                self.assertEqual(["table_row: 1 row"], self.engine(change).split_problems())
+
+    def test_every_row_that_is_not_in_form_is_counted(self) -> None:
+        self.assertEqual(["table_row: 2 rows"], self.engine({"subjectid": None}, {"source_snapshot_id": None}).split_problems())
+
+    def test_the_reconciliation_refuses_the_run_with_its_code_for_a_broken_split_and_does_not_fail(self) -> None:
+        rows = split_row_dicts(300)
+        rows[-1] = {**rows[-1], "subjectid": None}
+
+        class Quiet(ReconcileLake):
+            def ownership_problems(self) -> list[str]:
+                return []
+
+        engine = Quiet(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b")  # type: ignore[arg-type]
+        self.assertEqual([SPLIT_REFUSAL], engine.refusals())
+
+    def test_the_other_checks_still_run_on_the_rows_that_are_in_form(self) -> None:
+        held_out = next(patient for patient in range(1, 300) if patient_part(patient) == "test")
+        rows = split_row_dicts(300, held_out - 1)
+        rows[-1] = {**rows[-1], "subjectid": None}
+        problems = Lake(Session({"lake.silver.patient_split": split_table_of(rows)}, {}, []), None, "b").split_problems()  # type: ignore[arg-type]
+        self.assertEqual(["table_row: 1 row", "rule_mismatch: 1 patient"], problems)
+
+
 class OutputSchemaTest(unittest.TestCase):
     def tables(self, cases: list[tuple[str, str]], lab: list[tuple[str, str]]) -> Lake:
         log: list[str] = []
@@ -319,6 +400,23 @@ class OutputSchemaTest(unittest.TestCase):
         self.assertEqual(2, self.tables(cases, lab).output_schema_tables_wrong())
         engine = Lake(Session({}, {}, []), None, "b")  # type: ignore[arg-type]
         self.assertEqual(2, engine.output_schema_tables_wrong())
+
+    def test_a_cases_table_of_the_schema_before_the_double_is_legacy_and_nothing_else_is(self) -> None:
+        lab = [(c.name, c.type) for c in LAB_COLUMNS]
+        legacy = [(c.name, "bigint" if c.name == "icu_days" else c.type) for c in CASE_COLUMNS]
+        current = [(c.name, c.type) for c in CASE_COLUMNS]
+        self.assertTrue(self.tables(legacy, lab).cases_schema_legacy())
+        self.assertFalse(self.tables(current, lab).cases_schema_legacy())
+        self.assertFalse(self.tables([(name, "string" if name == "height" else kind) for name, kind in legacy], lab).cases_schema_legacy())
+        self.assertFalse(self.tables([*legacy, ("extra", "string")], lab).cases_schema_legacy())
+        self.assertFalse(self.tables(legacy[:-1], lab).cases_schema_legacy())
+        self.assertFalse(self.tables([(name, "string" if name == "icu_days" else kind) for name, kind in current], lab).cases_schema_legacy())
+        self.assertFalse(Lake(Session({}, {}, []), None, "b").cases_schema_legacy())  # type: ignore[arg-type]
+
+    def test_a_legacy_cases_table_is_still_counted_as_a_wrong_table(self) -> None:
+        lab = [(c.name, c.type) for c in LAB_COLUMNS]
+        legacy = [(c.name, "bigint" if c.name == "icu_days" else c.type) for c in CASE_COLUMNS]
+        self.assertEqual(1, self.tables(legacy, lab).output_schema_tables_wrong())
 
 
 if __name__ == "__main__":
