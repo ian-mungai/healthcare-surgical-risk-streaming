@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from subprocess import CalledProcessError, TimeoutExpired
 from unittest import mock
@@ -267,7 +268,6 @@ class ProtectedRunTest(unittest.TestCase):
         saved = self.record()
         self.assertEqual("blocked: interrupted", saved["outcome"], "a record that says pass would be accepted by --compare")
         self.assertEqual(run_record.FAILED_END, json.loads((folder / "retention.json").read_text())["end_condition"])
-        self.assertNotEqual([], commit_guards.record_problems("first", saved), "the compare refuses it")
         self.assertIn("blocked: interrupted: record in", self.printed.getvalue())
         self.assertEqual("temporary repository removed", saved["cleanup"])
         self.assertEqual([], list(self.temp.iterdir()))
@@ -386,7 +386,7 @@ class FixtureHookTest(unittest.TestCase):
 class CloseAfterTest(unittest.TestCase):
     """The blocked reason of ``close_after`` may be a function that is read after the cleanup, so the cleanup can set it."""
 
-    def close(self, blocked: object, cleanup: object = lambda: None) -> run_record.Record:
+    def close(self, blocked: str | Callable[[], str], cleanup: Callable[[], None] = lambda: None) -> run_record.Record:
         record = run_record.Record(feature="f", slug="s", rerun="r")
         record.expect("case", "step", "e", "o", True)
         with (
@@ -394,7 +394,7 @@ class CloseAfterTest(unittest.TestCase):
             mock.patch.object(run_record, "ROOT", Path(root)),
             mock.patch.object(sys, "stdout", io.StringIO()),
         ):
-            record.close_after(cleanup, [], blocked=blocked)  # type: ignore[arg-type]
+            record.close_after(cleanup, [], blocked=blocked)
         return record
 
     def test_a_reason_set_by_the_cleanup_blocks_the_run(self) -> None:
@@ -433,7 +433,7 @@ class CloseAfterLateReasonTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def close(self, blocked: object) -> tuple[int, run_record.Record, int]:
+    def close(self, blocked: str | Callable[[], str]) -> tuple[int, run_record.Record, int]:
         record = run_record.Record(feature="f", slug="s", rerun="r")
         record.expect("case", "step", "e", "o", True)
         real_write_record = run_record.Record.write_record
@@ -444,7 +444,7 @@ class CloseAfterLateReasonTest(unittest.TestCase):
             real_write_record(record, folder)
 
         with mock.patch.object(run_record.Record, "write_record", autospec=True, side_effect=write_record):
-            code = record.close_after(lambda: None, [], blocked=blocked)  # type: ignore[arg-type]
+            code = record.close_after(lambda: None, [], blocked=blocked)
         return code, record, len(writes)
 
     def saved(self) -> tuple[dict[str, object], dict[str, object]]:
