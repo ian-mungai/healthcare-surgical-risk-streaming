@@ -69,10 +69,10 @@ class CommandLine(unittest.TestCase):
                 code, out, err = invoke(argv)
                 self.assertEqual((2, "", "silver_signals: usage\n"), (code, out, err))
 
-    def test_a_failed_check_prints_each_problem_as_a_code_and_a_count_and_exits_1(self) -> None:
-        code, out, err = invoke(["build", "--branch", "b"], raising(SilverSignalsError("numeric_verdict_differs: 3 rows", "waveform_shape: 1 row")))
+    def test_a_failed_check_prints_each_problem_as_a_code_and_a_flag_and_exits_1(self) -> None:
+        code, out, err = invoke(["build", "--branch", "b"], raising(SilverSignalsError("numeric_verdict_differs: failed", "waveform_shape: failed")))
         self.assertEqual((1, ""), (code, out))
-        self.assertEqual("silver_signals: numeric_verdict_differs: 3 rows\nsilver_signals: waveform_shape: 1 row\n", err)
+        self.assertEqual("silver_signals: numeric_verdict_differs: failed\nsilver_signals: waveform_shape: failed\n", err)
 
     def test_an_error_of_nessie_is_a_code_and_never_its_text(self) -> None:
         missing = NessieError(f"{MARKER} not found", status=404, error_code="REFERENCE_NOT_FOUND")

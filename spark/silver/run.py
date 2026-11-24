@@ -3,12 +3,16 @@
 The job ``spark/jobs/silver_signals.py`` passes its Spark steps to ``run_build`` and ``run_verify``, so that the order runs in the fast tests on stand-in steps.
 
 A build resolves the branch to one hash. It reads Bronze at that hash and refuses an input that cannot be cleaned (``bronze_problems``) before it plans or
-writes anything. It plans both tables (each as a frame and a fingerprint: the number of rows and the sum of a hash of each row) and compares each with the table
-that the branch holds. A table whose fingerprint is the planned one is left as it is, so a rerun that changes nothing writes no snapshot. It writes only while
-the branch still has the checked hash, creates the namespace as a commit of its own when the branch has none, writes each changed table as one commit (the hash
-of the write is taken from the branch's log: the head, one commit directly on the hash that the write was made on, changing only that table) and reads Bronze
-and both tables at the hash of the last write. The read-back must be the planned tables, with every check passing. The job ends only when the branch still has
-that hash.
+writes anything. It plans both tables (each as a frame and a fingerprint: the number of rows and the sum of a hash of each row, which never leaves the job)
+and compares each with the table that the branch holds. A table whose fingerprint is the planned one is left as it is, so a rerun that changes nothing writes
+no snapshot. It writes only while the branch still has the checked hash, creates the namespace as a commit of its own when the branch has none, writes each
+changed table as one commit (the hash of the write is taken from the branch's log: the head, one commit directly on the hash that the write was made on,
+changing only that table) and reads Bronze and both tables at the hash of the last write. The read-back must be the planned tables, with every check passing.
+The job ends only when the branch still has that hash.
+
+The test set is sealed and the signals of the held-out cases are in these tables, so a count or a digest over the rows changes with a held-out row. The
+fingerprints, the counts of the checks and the causes stay inside the job. The result holds the hashes, the snapshot IDs, the checks that ran and one pass flag
+for each table, and every refusal is a code and a flag, except a count of tables.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from typing import Any
 
 from spark.silver.checks import (
     CHECK_NAMES,
+    FLAG,
     BronzeFacts,
     NumericFacts,
     SilverSignalsError,
@@ -90,11 +95,11 @@ class Outcome:
     branch_hash: str
     source: InputRead
     tables: dict[str, TableRead]
-    fingerprints: dict[str, Fingerprint]
+    passed: dict[str, bool]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: hashes, snapshot IDs, counts and the checks that ran. Nothing in it names a case, a track, a time or a value."""
-        numeric, waveform = self.tables[NUMERIC], self.tables[WAVEFORM]
+        """What the result line may hold: hashes, snapshot IDs, one pass flag for each table and the checks that ran. It holds no count, no digest and no
+        cause, and nothing in it names a case, a track, a time or a value."""
         return {
             "outcome": self.outcome,
             "checked_hash": self.checked_hash,
@@ -102,13 +107,22 @@ class Outcome:
             "branch_hash": self.branch_hash,
             "source_snapshots": dict(zip(("numeric_observations", "waveform_seconds", "tracks"), self.source.snapshots, strict=True)),
             "snapshots": {table: read.snapshot_id for table, read in self.tables.items()},
-            "rows": {table: read.fingerprint.rows for table, read in self.tables.items()},
-            "bronze_rows": {NUMERIC: self.source.facts.numeric_rows, WAVEFORM: self.source.facts.waveform_rows},
-            "duplicates_dropped": numeric.numeric.ledger_total if numeric.numeric else 0,
-            "causes": {NUMERIC: dict(numeric.numeric.causes) if numeric.numeric else {}, WAVEFORM: dict(waveform.waveform.causes) if waveform.waveform else {}},
-            "fingerprints": {table: [value.rows, value.digest] for table, value in self.fingerprints.items()},
+            "passed": dict(self.passed),
             "checks_run": list(CHECK_NAMES),
         }
+
+
+def checked(table: str, read: TableRead | None) -> bool:
+    """Whether the table is there with the counts of its checks."""
+    return read is not None and (read.numeric if table == NUMERIC else read.waveform) is not None
+
+
+def own_problems(source: InputRead, table: str, read: TableRead) -> list[str]:
+    if table == NUMERIC and read.numeric is not None:
+        return numeric_problems(read.numeric, source.facts.numeric_rows)
+    if read.waveform is not None:
+        return waveform_problems(read.waveform, source.facts.waveform_rows)
+    return []
 
 
 def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> list[str]:
@@ -116,10 +130,25 @@ def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> lis
     missing = sum(1 for read in reads.values() if read is None)
     if missing:
         return [f"table_missing: {unit(missing, 'table')}"]
-    numeric, waveform = reads[NUMERIC], reads[WAVEFORM]
-    if numeric is None or waveform is None or numeric.numeric is None or waveform.waveform is None:
+    if not all(checked(table, reads[table]) for table in TABLES):
         return [f"table_missing: {unit(1, 'table')}"]
-    return numeric_problems(numeric.numeric, source.facts.numeric_rows) + waveform_problems(waveform.waveform, source.facts.waveform_rows)
+    problems: list[str] = []
+    for table in TABLES:
+        read = reads[table]
+        if read is not None:
+            problems += own_problems(source, table, read)
+    return problems
+
+
+def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned: dict[str, Fingerprint] | None) -> dict[str, bool]:
+    """One flag for each table: the table is there, every check of it passes and, in a build, it is the planned table."""
+    flags = {}
+    for table in TABLES:
+        read = reads[table]
+        flags[table] = (
+            read is not None and checked(table, read) and not own_problems(source, table, read) and (planned is None or not differs(read, planned[table]))
+        )
+    return flags
 
 
 def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRead | None]:
@@ -153,7 +182,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
         at = on
     later = ops.read_input(at)
     if later != source:
-        raise SilverSignalsError(f"source_changed: {unit(1, 'read')} of Bronze differs")
+        raise SilverSignalsError(f"source_changed: {FLAG}")
     reads = read_tables(ops, at, True)
     problems = table_problems(source, reads)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
@@ -164,7 +193,13 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     if ops.head() != at:
         raise SilverSignalsError(BRANCH_MOVED)
     return Outcome(
-        "written" if changed else "unchanged", head, written, at, source, {table: read for table, read in reads.items() if read is not None}, planned
+        "written" if changed else "unchanged",
+        head,
+        written,
+        at,
+        source,
+        {table: read for table, read in reads.items() if read is not None},
+        passed_flags(source, reads, planned),
     )
 
 
@@ -187,6 +222,6 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome("verified", head, None, head, source, tables, {table: read.fingerprint for table, read in tables.items()})
+        return Outcome("verified", head, None, head, source, tables, passed_flags(source, reads, None))
     finally:
         ops.release()

@@ -8,21 +8,21 @@ is the one that ``features.pressure_series`` gives from the stored seconds. The 
 duration give, are the events that ``features.hypotension`` gives from the stored series and the operation times of the development cases, and none is of a
 case outside the development sets.
 
-The events are outcomes and the test set is sealed. Every check about events returns a flag, ``code: failed``, and never a count; a check that reads the
-patients outside the development sets is one flag too. A check returns its problems and never raises, so that one run names every cause. A problem is a code
-with a count (only for the signal tables, which are inputs) or a flag, and holds no case, track, time, value or set.
+The test set is sealed. Every check returns a flag, ``code: failed``, and never a count: the series holds the held-out cases' seconds, and the events are
+outcomes, so a count of either changes with a held-out row. A check that reads the patients outside the development sets is one flag too. A check returns its
+problems and never raises, so that one run names every cause. A problem holds no case, track, time, value or set. A problem of the split table reaches a
+caller as its code only (``code_only``).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from spark.silver.checks import counted
+from spark.silver.checks import FLAG, flagged
 from spark.split_table import SET_NAMES, SplitRow, table_problems
 
 DEVELOPMENT_SETS = (SET_NAMES["train"], SET_NAMES["validation"])
-FLAG = "failed"
 
 CHECK_NAMES = (
     "ambiguous_case_owner",
@@ -53,7 +53,8 @@ class InputFacts:
     """What a read of the input at one hash shows: the arterial seconds of ``silver.waveform_seconds``, the clinical table and the patient split.
 
     ``ambiguous_owner`` and ``cases_without_split`` are flags (0 or 1). ``split_problems`` are the problems of the split table by itself
-    (``split_rule_problems``); when it is not empty the other facts were not read, because a set is not trusted yet.
+    (``split_rule_problems``); when it is not empty the other facts were not read, because a set is not trusted yet. The counts are tested inside the job and
+    never leave it.
     """
 
     art_seconds: int
@@ -67,7 +68,7 @@ class InputFacts:
 @dataclass(frozen=True, slots=True)
 class SeriesFacts:
     """What a read of the series table shows. ``value_problem`` counts valid rows with no value and invalid rows with one. ``differs`` counts rows that are not
-    the reading that the single definition gives from the stored seconds. ``causes`` counts the rows of each cause and of ``valid``."""
+    the reading that the single definition gives from the stored seconds."""
 
     rows: int
     duplicate_keys: int
@@ -77,7 +78,6 @@ class SeriesFacts:
     unknown_cause: int
     value_problem: int
     differs: int
-    causes: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,36 +98,36 @@ def split_rule_problems(rows: Sequence[SplitRow]) -> list[str]:
     return table_problems(rows, pinned=False)
 
 
+def code_only(problem: str) -> str:
+    """A problem of another check as its code and a flag: the count that it names (``two_sets: 1 patient``) is never passed on."""
+    return f"{problem.partition(':')[0]}: {FLAG}"
+
+
 def input_problems(facts: InputFacts) -> list[str]:
     if facts.ambiguous_owner:
         return [f"ambiguous_case_owner: {FLAG}"]
     if facts.split_problems:
-        return list(facts.split_problems)
+        return [code_only(problem) for problem in facts.split_problems]
     if facts.cases_without_split:
         return [f"case_without_split: {FLAG}"]
     if facts.art_seconds == 0:
-        return ["input_empty: 0 rows"]
-    return counted([("waveform_null_key", facts.null_keys, "row"), ("waveform_duplicate_second", facts.duplicate_seconds, "row")])
+        return [f"input_empty: {FLAG}"]
+    return flagged([("waveform_null_key", facts.null_keys), ("waveform_duplicate_second", facts.duplicate_seconds)])
 
 
 def series_problems(facts: SeriesFacts, art_seconds: int) -> list[str]:
-    return counted(
+    return flagged(
         [
-            ("series_not_every_second", abs(art_seconds - facts.rows), "second"),
-            ("series_duplicate_key", facts.duplicate_keys, "key"),
-            ("series_verdict_null", facts.null_verdict, "row"),
-            ("series_valid_with_cause", facts.valid_with_cause, "row"),
-            ("series_invalid_without_cause", facts.invalid_without_cause, "row"),
-            ("series_unknown_cause", facts.unknown_cause, "row"),
-            ("series_value", facts.value_problem, "row"),
-            ("series_differs", facts.differs, "row"),
+            ("series_not_every_second", int(art_seconds != facts.rows)),
+            ("series_duplicate_key", facts.duplicate_keys),
+            ("series_verdict_null", facts.null_verdict),
+            ("series_valid_with_cause", facts.valid_with_cause),
+            ("series_invalid_without_cause", facts.invalid_without_cause),
+            ("series_unknown_cause", facts.unknown_cause),
+            ("series_value", facts.value_problem),
+            ("series_differs", facts.differs),
         ]
     )
-
-
-def flagged(pairs: list[tuple[str, int]]) -> list[str]:
-    """One flag for each failed check: the count is only tested for being positive and is never written."""
-    return [f"{code}: {FLAG}" for code, count in pairs if count]
 
 
 def event_problems(facts: EventFacts) -> list[str]:

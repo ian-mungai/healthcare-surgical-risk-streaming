@@ -98,12 +98,12 @@ class CommandLine(unittest.TestCase):
 
     def test_a_failed_check_is_printed_with_the_name_of_the_job_that_the_caller_gives(self) -> None:
         def failing(arguments: object) -> dict[str, object]:
-            raise SilverSignalsError("series_differs: 1 row")
+            raise SilverSignalsError("series_differs: failed")
 
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = run(["verify", "--branch", "b"], failing, "silver_hypotension")
-        self.assertEqual((1, "silver_hypotension: series_differs: 1 row\n"), (code, err.getvalue()))
+        self.assertEqual((1, "silver_hypotension: series_differs: failed\n"), (code, err.getvalue()))
 
 
 if __name__ == "__main__":

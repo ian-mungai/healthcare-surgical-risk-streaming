@@ -17,7 +17,6 @@ import dataclasses
 import unittest
 from typing import Any
 
-from features.signal_validity import FLAT, MISSING
 from spark.silver.checks import BronzeFacts, NumericFacts, SilverSignalsError, WaveformFacts
 from spark.silver.run import NUMERIC, WAVEFORM, Fingerprint, InputRead, Operations, TableRead, run_build, run_verify
 
@@ -28,8 +27,8 @@ SECOND_WRITE = "d" * 64
 BRONZE = BronzeFacts(1000, 300, 0, 0, 0, 0, 0, 0, 0)
 INPUT = InputRead(BRONZE, (11, 12, 13))
 FINGERPRINTS = {NUMERIC: Fingerprint(990, 5), WAVEFORM: Fingerprint(300, 9)}
-NUMERIC_FACTS = NumericFacts(990, 0, 10, 0, 0, 0, 0, 0, 0, {MISSING: 4, "valid": 986})
-WAVEFORM_FACTS = WaveformFacts(300, 0, 0, 0, 0, 0, 0, 0, {FLAT: 3, "valid": 297})
+NUMERIC_FACTS = NumericFacts(990, 0, 10, 0, 0, 0, 0, 0, 0)
+WAVEFORM_FACTS = WaveformFacts(300, 0, 0, 0, 0, 0, 0, 0)
 
 
 def codes(error: SilverSignalsError) -> list[str]:
@@ -119,7 +118,7 @@ class Build(unittest.TestCase):
         )
         self.assertEqual(("written", HEAD, SECOND_WRITE), (outcome.outcome, outcome.checked_hash, outcome.write_hash))
 
-    def test_the_result_holds_hashes_snapshots_and_counts_and_nothing_of_a_row(self) -> None:
+    def test_the_result_holds_hashes_snapshots_and_one_pass_flag_for_each_table_and_no_count_or_digest(self) -> None:
         facts = run_build(Fake().operations(), HEAD).facts()
         self.assertEqual(
             {
@@ -129,16 +128,17 @@ class Build(unittest.TestCase):
                 "branch_hash": SECOND_WRITE,
                 "source_snapshots": {"numeric_observations": 11, "waveform_seconds": 12, "tracks": 13},
                 "snapshots": {NUMERIC: 101, WAVEFORM: 102},
-                "rows": {NUMERIC: 990, WAVEFORM: 300},
-                "bronze_rows": {NUMERIC: 1000, WAVEFORM: 300},
-                "duplicates_dropped": 10,
-                "causes": {NUMERIC: {MISSING: 4, "valid": 986}, WAVEFORM: {FLAT: 3, "valid": 297}},
-                "fingerprints": {NUMERIC: [990, 5], WAVEFORM: [300, 9]},
+                "passed": {NUMERIC: True, WAVEFORM: True},
                 "checks_run": facts["checks_run"],
             },
             facts,
         )
         self.assertGreaterEqual(len(facts["checks_run"]), 20)
+
+    def test_a_verify_gives_one_pass_flag_for_each_table(self) -> None:
+        fake = Fake()
+        fake.held = {NUMERIC: fake.read_back[NUMERIC], WAVEFORM: fake.read_back[WAVEFORM]}
+        self.assertEqual({NUMERIC: True, WAVEFORM: True}, run_verify(fake.operations(), HEAD).facts()["passed"])
 
     def test_a_bronze_defect_writes_nothing_and_releases(self) -> None:
         fake = Fake()

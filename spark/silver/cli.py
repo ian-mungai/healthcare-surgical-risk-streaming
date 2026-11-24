@@ -2,7 +2,8 @@
 
 The rules are those of the patient split job (``spark/split_cli.py``, whose settings, deadline and Nessie client this job also uses): the parser prints
 ``usage`` for any bad call, a setting that cannot be used is ``settings``, an error from Nessie or from anything else that is not mapped is one of
-``branch_missing``, ``catalog_error`` and ``internal_error``, and a failed check prints one line for each problem, each a code and a count.
+``branch_missing``, ``catalog_error`` and ``internal_error``, and a failed check prints one line for each problem, each a code and a flag (``code: failed``),
+except a count of tables.
 Exit 0 on success, 1 on a failed check or a failed upstream, 2 on a bad call or setting, 70 on anything else.
 """
 

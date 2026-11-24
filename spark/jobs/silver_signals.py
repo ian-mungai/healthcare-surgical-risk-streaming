@@ -11,8 +11,9 @@ freeze of a rerun that changes nothing, the writes and the read-back are in ``sp
 are in ``spark/silver/cli.py``. The settings come from the environment, as the patient split's do: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``,
 ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and ``JOB_DEADLINE_SECONDS``.
 
-No rule of the tables is estimated from data, so no patient set is read, and no outcome is read. The result holds hashes, snapshot IDs, counts and the checks
-that ran, and no case, track, time or value.
+No rule of the tables is estimated from data, so no patient set is read, and no outcome is read. The test set is sealed and Bronze holds the held-out cases'
+signals, so a count or a digest over the rows changes with a held-out row: the result holds hashes, snapshot IDs, the checks that ran and one pass flag for
+each table, and no count, digest, case, track, time or value. A refusal is a code and a flag, except a count of tables.
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ class SignalsLake(Lake):
         return InputRead(facts, (snapshots[0], snapshots[1], snapshots[2]))
 
     def plan(self, at: str) -> dict[str, Any]:
-        """Build both frames from Bronze at ``at``, keep them on disk for the write and give their fingerprints."""
+        """Build both frames from Bronze at ``at``, keep them on disk for the write and give their fingerprints, which stay inside the run."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         held = self.sources(at)
         numeric, waveform, tracks = (held[spec.name][0] for spec in SOURCES)

@@ -25,7 +25,7 @@ from spark.silver.run import Fingerprint
 HEAD, PREPARED, FIRST_WRITE, SECOND_WRITE = "a" * 64, "b" * 64, "c" * 64, "d" * 64
 INPUT = InputRead(InputFacts(5000, 0, 0, 0, 0, ()), (21, 22, 23))
 FINGERPRINTS: dict[str, Fingerprint | Digest] = {SERIES: Fingerprint(5000, 5), EVENTS: Digest(9)}
-SERIES_FACTS = SeriesFacts(5000, 0, 0, 0, 0, 0, 0, 0, {"valid": 4990, "missing": 10})
+SERIES_FACTS = SeriesFacts(5000, 0, 0, 0, 0, 0, 0, 0)
 EVENT_FACTS = EventFacts(0, 0, 0, 0, 0)
 
 
@@ -114,14 +114,16 @@ class Build(unittest.TestCase):
         )
         self.assertEqual(("written", HEAD, SECOND_WRITE), (outcome.outcome, outcome.checked_hash, outcome.write_hash))
 
-    def test_the_result_holds_no_count_and_no_cause_of_an_event(self) -> None:
+    def test_the_result_holds_snapshots_pass_flags_and_the_development_events_digest_and_no_count_or_cause(self) -> None:
         facts = run_build(Fake().operations(), HEAD).facts()
-        self.assertEqual({SERIES: 5000}, facts["rows"])
-        self.assertEqual({SERIES: {"valid": 4990, "missing": 10}}, facts["causes"])
-        self.assertEqual({SERIES: [5000, 5], EVENTS: [9]}, facts["fingerprints"])
         self.assertEqual({SERIES: 101, EVENTS: 102}, facts["snapshots"])
         self.assertEqual({"waveform_seconds": 21, "clinical_cases": 22, "patient_split": 23}, facts["source_snapshots"])
-        self.assertEqual([9], facts["fingerprints"][EVENTS])
+        self.assertEqual({SERIES: True, EVENTS: True}, facts["passed"])
+        self.assertEqual(9, facts["development_events_digest"])
+        self.assertEqual(
+            {"outcome", "checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "development_events_digest", "checks_run"},
+            set(facts),
+        )
         self.assertGreaterEqual(len(facts["checks_run"]), 10)
 
     def test_a_split_that_fails_its_rule_or_a_case_with_two_owners_writes_nothing_and_stops_before_any_plan(self) -> None:

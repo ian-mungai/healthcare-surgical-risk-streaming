@@ -11,9 +11,9 @@ the freeze of a rerun that changes nothing, the writes and the read-back are in 
 codes are those of ``spark/silver/cli.py``. The settings come from the environment, as the Silver signals job's do.
 
 The test set is sealed. No rule is estimated from data. The patient split is read after the check of who owns each case and only to find the development cases
-(training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes, so
-the result holds the series' counts and a digest of the event table (no row count), and every check about events is a flag. It never names a count of events, a
-case, a patient, a set, a time or a value.
+(training and validation): it is trusted after its own rule check, which comes first, and the events are made for those cases only. The events are outcomes,
+so the result holds the snapshot IDs, one pass flag for each table and a digest of the event table (no row count; the events are of the development cases
+only), and every check is a flag, and so is every refusal. It never names a count of seconds or of events, a case, a patient, a set, a time or a value.
 """
 
 from __future__ import annotations

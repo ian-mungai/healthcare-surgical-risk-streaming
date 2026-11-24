@@ -21,7 +21,6 @@ import re
 import unittest
 from typing import Any
 
-from features.signal_validity import FLAT, MISSING
 from scripts.sample.split import patient_part
 from spark.silver.hypotension_checks import (
     CHECK_NAMES,
@@ -46,10 +45,9 @@ SERIES = SeriesFacts(
     unknown_cause=0,
     value_problem=0,
     differs=0,
-    causes={MISSING: 3, FLAT: 7, "valid": 4990},
 )
 EVENTS = EventFacts(duplicate_keys=0, short=0, times_differ=0, differs=0, held_out_events=0)
-MESSAGE = re.compile(r"[a-z_]+: (\d+ [a-z]+s?|failed)")
+MESSAGE = re.compile(r"[a-z_]+: failed")
 
 
 class Input(unittest.TestCase):
@@ -57,11 +55,12 @@ class Input(unittest.TestCase):
         self.assertEqual([], input_problems(INPUT))
 
     def test_an_input_with_no_arterial_second_is_empty(self) -> None:
-        self.assertEqual(["input_empty: 0 rows"], input_problems(dataclasses.replace(INPUT, art_seconds=0)))
+        self.assertEqual(["input_empty: failed"], input_problems(dataclasses.replace(INPUT, art_seconds=0)))
 
-    def test_each_defect_is_named_once_with_its_count(self) -> None:
-        got = input_problems(dataclasses.replace(INPUT, null_keys=2, duplicate_seconds=1))
-        self.assertEqual(["waveform_null_key: 2 rows", "waveform_duplicate_second: 1 row"], got)
+    def test_each_defect_is_named_once_as_a_flag_whatever_its_count(self) -> None:
+        for null_keys, duplicate_seconds in ((2, 1), (200, 70)):
+            got = input_problems(dataclasses.replace(INPUT, null_keys=null_keys, duplicate_seconds=duplicate_seconds))
+            self.assertEqual(["waveform_null_key: failed", "waveform_duplicate_second: failed"], got)
 
     def test_a_case_with_more_than_one_owner_is_one_flag_and_comes_before_every_other_problem(self) -> None:
         got = input_problems(dataclasses.replace(INPUT, ambiguous_owner=1, cases_without_split=1, null_keys=2, split_problems=("two_sets: 1 patient",)))
@@ -69,7 +68,18 @@ class Input(unittest.TestCase):
 
     def test_a_split_table_that_fails_its_own_rule_is_named_alone_before_any_dependent_check(self) -> None:
         got = input_problems(dataclasses.replace(INPUT, split_problems=("two_sets: 1 patient", "unknown_set: 2 patients"), cases_without_split=1, null_keys=2))
-        self.assertEqual(["two_sets: 1 patient", "unknown_set: 2 patients"], got)
+        self.assertEqual(["two_sets: failed", "unknown_set: failed"], got)
+
+    def test_a_split_problem_that_names_a_count_is_passed_on_as_its_code_only(self) -> None:
+        for problem in (
+            "two_sets: 1 patient",
+            "pinned_counts: counts a 5, b 6 are not exactly a 7, b 8",
+            "empty_table: 0 rows",
+            "mixed_snapshots: 2 snapshots",
+        ):
+            with self.subTest(problem=problem):
+                got = input_problems(dataclasses.replace(INPUT, split_problems=(problem,)))
+                self.assertEqual([f"{problem.split(':')[0]}: failed"], got)
 
     def test_a_case_with_no_split_row_is_one_flag(self) -> None:
         self.assertEqual(["case_without_split: failed"], input_problems(dataclasses.replace(INPUT, cases_without_split=1)))
@@ -108,9 +118,9 @@ class Series(unittest.TestCase):
     def test_a_good_table_has_no_problem(self) -> None:
         self.assertEqual([], series_problems(SERIES, INPUT.art_seconds))
 
-    def test_a_lost_or_added_second_is_named_either_way(self) -> None:
-        for rows in (4999, 5001):
-            self.assertEqual(["series_not_every_second: 1 second"], series_problems(dataclasses.replace(SERIES, rows=rows), INPUT.art_seconds))
+    def test_a_lost_or_added_second_is_named_either_way_as_a_flag_with_no_count(self) -> None:
+        for rows in (4999, 5001, 10, 9000):
+            self.assertEqual(["series_not_every_second: failed"], series_problems(dataclasses.replace(SERIES, rows=rows), INPUT.art_seconds))
 
     def test_each_defect_is_named_by_its_own_code(self) -> None:
         for field, code in (
@@ -125,7 +135,10 @@ class Series(unittest.TestCase):
             with self.subTest(field=field):
                 change: dict[str, Any] = {field: 1}
                 (problem,) = series_problems(dataclasses.replace(SERIES, **change), INPUT.art_seconds)
-                self.assertTrue(problem.startswith(code + ": 1 "), problem)
+                self.assertEqual(f"{code}: failed", problem)
+
+    def test_the_facts_hold_no_count_of_a_cause(self) -> None:
+        self.assertNotIn("causes", {field.name for field in dataclasses.fields(SERIES)})
 
 
 class Events(unittest.TestCase):
@@ -151,9 +164,9 @@ class Events(unittest.TestCase):
 
 
 class Names(unittest.TestCase):
-    def test_every_problem_is_a_code_with_a_count_or_a_flag_and_every_code_is_a_check_name(self) -> None:
+    def test_every_problem_is_a_code_and_a_flag_and_every_code_is_a_check_name(self) -> None:
         bad_input = dataclasses.replace(INPUT, art_seconds=7, null_keys=1, duplicate_seconds=1)
-        bad_series = SeriesFacts(1, 1, 1, 1, 1, 1, 1, 1, {})
+        bad_series = SeriesFacts(1, 1, 1, 1, 1, 1, 1, 1)
         bad_events = EventFacts(1, 1, 1, 1, 1)
         problems = (
             input_problems(bad_input)
@@ -166,6 +179,7 @@ class Names(unittest.TestCase):
         self.assertEqual(set(CHECK_NAMES) - {"input_empty"}, names)
         for problem in problems:
             self.assertRegex(problem, MESSAGE)
+            self.assertFalse(any(char.isdigit() for char in problem), problem)
 
 
 if __name__ == "__main__":
