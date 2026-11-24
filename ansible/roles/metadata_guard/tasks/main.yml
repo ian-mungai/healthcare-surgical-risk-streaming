@@ -7,6 +7,7 @@
     update_cache: true
     cache_valid_time: 3600
     lock_timeout: 300
+  timeout: 600
 
 - name: Create the metadata guard configuration folder
   ansible.builtin.file:

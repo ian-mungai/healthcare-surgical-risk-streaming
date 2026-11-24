@@ -498,7 +498,13 @@ def result_field_names(source: str) -> set[str]:
 # sum over the Bronze signal tables of the cases that the manifest names (its result is not sealed; listed for the lead). ``checksum`` of table
 # maintenance is a sum over a Bronze signal table or the catalog proof table: the result drops it for every other table. The names in the table-check module
 # are the names of a check of the track list's pinned digest, whose detail is one flag (``equal`` 0 or 1).
+# The signal profile job (``spark/jobs/signal_profile.py``) names ``development_cases`` and ``development_patients_*``: its counts of the cases in the
+# training and validation sets (``frames.development_cases``). The ``fingerprints`` of its result (``spark/profile/run.py``) are the row count and digest of
+# the three profile tables, each built from the signal tables of development cases only (``profile_frame``, ``unscored_frame``) and from counts that are
+# written as development counts; a count of the full cohort is a flag.
 RESULT_FIELDS = {
+    "spark/jobs/signal_profile.py": {"development_cases", "development_patients_training", "development_patients_validation"},
+    "spark/profile/run.py": {"fingerprints"},
     "spark/silver_cases_run.py": {"development_cases", "development_lab_rows", "development_lab_copies"},
     "spark/jobs/bronze_decode.py": {"checksum"},
     "spark/jobs/table_maintenance.py": {"checksum"},

@@ -11,6 +11,8 @@ patients (the cutoffs and their counts), and never a case, a patient, an argumen
 a held-out outcome changes both, and the branch hash against the base hash shows a write. The result is one file at ``--result``
 (``spark/result_file.py``), with one diagnostic for each code of a failed check and no count; the command line prints fixed codes only: ``usage``,
 ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check.
+A ``silver.cases`` table of the schema before the double (``icu_days`` as a whole number) is refused by the code ``cases_schema_legacy: failed``:
+only a ``build`` on a new branch rebuilds it.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ CHECKS_SAMPLE = [
     "cutoffs_read_back",
 ]
 CHECKS_BUILD = [*CHECKS_SAMPLE[:7], "pinned_counts", *CHECKS_SAMPLE[7:]]
+CASES_SCHEMA_LEGACY = f"cases_schema_legacy: {FLAG}"
 RULES_READ_BACK = f"readback_differs: {FLAG}"
 
 
@@ -83,6 +86,8 @@ class SilverOps(Protocol):
     def write_rules(self, measure: list[MeasureRow], cutoffs: list[CutoffRow]) -> bool: ...
 
     def output_schema_tables_wrong(self) -> int: ...
+
+    def cases_schema_legacy(self) -> bool: ...
 
     def output_facts(self) -> dict[str, object]: ...
 
@@ -133,9 +138,12 @@ def checked_inputs(ops: SilverOps, *, pinned: bool) -> tuple[list[MeasureRow], l
 
 
 def check_stored_schema(ops: SilverOps) -> None:
-    """Refuse a written table with a dropped, extra or retyped column before any query reads a value of it."""
+    """Refuse a written table with a dropped, extra or retyped column before any query reads a value of it. A cases table of the legacy schema is refused by
+    its own code, so the cause is named: the table must be rebuilt by a ``build`` on a new branch."""
     wrong = ops.output_schema_tables_wrong()
     if wrong:
+        if ops.cases_schema_legacy():
+            raise SilverCasesError(CASES_SCHEMA_LEGACY)
         raise SilverCasesError(flag("output_schema"))
 
 

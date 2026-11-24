@@ -12,7 +12,16 @@ row, and the fields that are never features stay in the table, named in its prop
 It also measures the operation lengths (``opend`` minus ``opstart``) of the development patients (training and validation) and sets the score cutoffs from
 the median (``spark/silver_cases.py``). Both are saved as tables. Once a branch holds them, a rebuild that would change either fails before it writes.
 Every input check and that freeze come before the first write; the checks of the written tables come after the last. A table that already holds the
-rows is not written again. The merge of the branch is the caller's step. ``verify`` runs the checks on a branch and writes nothing.
+rows is not written again. A table whose columns or types changed (``icu_days`` from a whole number to a double) is a schema change of this job's own output:
+on the private branch the old table is dropped and the new one is made as a new table, never replaced (a replace of an existing table stalls with the Nessie
+catalog), and the checks of the written tables (every published value kept, the column types) run before any merge, which is the caller's step. ``verify``
+runs the checks on a branch and writes nothing.
+
+A ``silver.cases`` table of the legacy schema (``icu_days`` as a whole number, before the double) is never repaired in place and ``verify`` refuses it with the
+fixed code ``cases_schema_legacy: failed``. Its rebuild needs this order, and the caller owns each step: (1) tag the base hash that holds the legacy table, so
+that its old schema and snapshot stay readable through the tag after the merge; (2) ``build`` on a new branch from that base, which drops the legacy table on
+that branch and makes the new one; (3) ``verify`` the new branch; (4) merge it into the base. A ``build`` on a branch that exists is refused, so a rebuild
+always needs a new branch name.
 
 The test set is sealed, and the clinical table holds the outcome columns: a message is a code and a flag (``key_null: failed``) and never a count,
 and the result holds hashes, snapshot IDs, the checks that ran, one pass flag for each of the four tables and measures of the development patients (the
@@ -90,7 +99,7 @@ from spark.silver_cases_sql import (
     values_query,
 )
 from spark.split_cli import open_client, read_settings
-from spark.split_table import BRANCH_MOVED, SplitRow
+from spark.split_table import BRANCH_MOVED, table_rows
 
 MEASURE_COLUMNS = (("statistic", "string"), ("unit", "string"), ("value", "bigint"))
 CUTOFF_COLUMNS = (
@@ -105,6 +114,7 @@ CUTOFF_COLUMNS = (
 NEVER_FEATURE_VALUE = ",".join(NEVER_FEATURE_COLUMNS)
 READ_TABLES = (*SOURCE_SCHEMAS, CASES_TABLE, LAB_TABLE, MEASURE_TABLE, CUTOFFS_TABLE)
 NOT_FOUND = 404
+LEGACY_ICU_DAYS = "bigint"
 
 
 class Lake:
@@ -146,10 +156,8 @@ class Lake:
 
     def split_problems(self) -> list[str]:
         """The patient split table checked by the split job's own rules: a development patient's set is only trusted when this is empty."""
-        rows = [
-            SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in self.session.table(SPLIT_SOURCE).collect()
-        ]
-        return split_rule_problems(rows, pinned=False)
+        rows, broken = table_rows(self.session.table(SPLIT_SOURCE).collect())
+        return [*([flag("table_row")] if broken else []), *split_rule_problems(rows, pinned=False)]
 
     def input_facts(self) -> dict[str, object]:
         """The counts over the inputs. The outcome columns are counted for development patients only; for the others one flag (0 or 1) says whether any value
@@ -179,7 +187,10 @@ class Lake:
         """Write the rows of ``frame`` to the table ``source``. True when the table changed: it was made, its rows differ or its properties differ.
 
         A table that holds exactly the rows (same columns and types, no row of one missing from the other) is left as it is. A table with the same columns
-        is overwritten in place, because a replace of an existing table stalls in Spark with the Nessie catalog. One partition gives one data file.
+        is overwritten in place, because a replace of an existing table stalls in Spark with the Nessie catalog. A table with other columns or types is a schema
+        change of this job's own output (``icu_days`` from a whole number to a double): the job runs on a private branch that it just made, so the old table is
+        dropped there (the base keeps it until the caller merges, after the checks of the written tables) and the new table is made as a new one. No write
+        replaces a table that exists. One partition gives one data file.
         """
         held = self.session.table(source) if self.exists(source) else None
         same_columns = held is not None and held.dtypes == frame.dtypes
@@ -189,10 +200,12 @@ class Lake:
             frame.coalesce(1).writeTo(source).overwritePartitions()
             self.set_properties(source, properties)
             return True
+        if held is not None:
+            self.session.sql(f"DROP TABLE {source}")
         writer = frame.coalesce(1).writeTo(source).tableProperty("format-version", "2")
         for key, value in properties.items():
             writer = writer.tableProperty(key, value)
-        writer.createOrReplace()
+        writer.create()
         return True
 
     def set_properties(self, source: str, wanted: dict[str, str]) -> bool:
@@ -255,6 +268,10 @@ class Lake:
             ]
             changed |= self.write_values(CUTOFFS_SOURCE, CUTOFF_COLUMNS, rows)
         return changed
+
+    def cases_schema_legacy(self) -> bool:
+        """Whether ``silver.cases`` is exactly the schema before the double: the columns of the rules with ``icu_days`` as a whole number."""
+        return self.columns(CASES_SOURCE) == [(column.name, LEGACY_ICU_DAYS if column.name == "icu_days" else column.type) for column in CASE_COLUMNS]
 
     def output_schema_tables_wrong(self) -> int:
         """How many of the two written tables have other columns or types than the rules give, or are not there."""

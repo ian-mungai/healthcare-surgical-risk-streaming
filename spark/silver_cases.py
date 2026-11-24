@@ -66,15 +66,17 @@ CLINICAL_HEADER = (
 )
 PUBLISHED_CLINICAL_COLUMNS = tuple(CLINICAL_HEADER.split(","))
 WHOLE_NUMBER_TEXT = (
-    "caseid casestart caseend anestart opstart opend adm dis icu_days death_inhosp asa emop preop_htn preop_dm preop_plt "
+    "caseid casestart caseend anestart opstart opend adm dis death_inhosp asa emop preop_htn preop_dm preop_plt "
     "preop_pt preop_na preop_gluc preop_ast preop_alt preop_bun lmasize intraop_ebl intraop_uo intraop_rbc intraop_ffp "
     "intraop_crystalloid intraop_colloid intraop_ppf intraop_ftn intraop_rocu intraop_vecu intraop_eph intraop_phe "
     "intraop_epi intraop_ca"
 )
 WHOLE_NUMBER_COLUMNS = frozenset(WHOLE_NUMBER_TEXT.split())
+# `icu_days` is a number with a decimal part as published: a stay of half a day is 0.5, and a whole number such as 3 is read as 3.0. Typed as a whole number it
+# would lose every fraction before the intensive care label reads it.
 DECIMAL_TEXT = (
-    "aneend age height weight bmi preop_hb preop_aptt preop_k preop_alb preop_cr preop_ph preop_hco3 preop_be preop_pao2 preop_paco2 preop_sao2 tubesize "
-    "intraop_mdz"
+    "aneend icu_days age height weight bmi preop_hb preop_aptt preop_k preop_alb preop_cr preop_ph preop_hco3 preop_be preop_pao2 preop_paco2 preop_sao2 "
+    "tubesize intraop_mdz"
 )
 DECIMAL_COLUMNS = frozenset(DECIMAL_TEXT.split())
 AGE_COLUMN = "age"

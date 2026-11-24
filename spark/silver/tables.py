@@ -22,6 +22,23 @@ The job ``spark/jobs/silver_hypotension.py`` builds two more tables from ``wavef
   (``features.hypotension``), for the cases of the development patients only (the training and validation sets of ``silver.patient_split``, trusted after its
   rule check). Key: case and onset second. It holds every time the event used: the onset and confirmation times, the end of the run and the
   operation start and end that bounded it, and why the run ended.
+
+The job ``spark/jobs/silver_labels.py`` builds three more tables from ``silver.cases``, ``silver.lab_results`` and the patient split (``LABEL_TABLES``), in this
+order, the first before the others:
+
+- ``icu_days_measure``: the measured values of ``icu_days`` of the development patients only (how many are missing, invalid and recorded, how many are zero,
+  above zero and a fraction of a day, the least, the greatest and the percentiles), recorded before the intensive care label is built. Key: statistic.
+- ``icu_labels``: one row for each case, the held-out patients' included. It records the case's ``icu_days`` as published (a missing value stays missing), the
+  end of the operation that the stay follows, the label (``positive``, ``negative`` or ``unknown``), its eligibility and why (``features.icu_label``).
+  Key: case.
+- ``kidney_injury_labels``: one row for each case. It records the baseline (value, time and its number among the results of that case, time and test: with the
+  case and the test ``cr`` they name the row of ``silver.lab_results``), the baseline, 48-hour and 7-day windows, how many results fell in each follow-up
+  window, the two measurements of the absolute rise and the result of the relative rise, the highest follow-up result of the first 48 hours and of the 7 days
+  (each with its value, time and number, so that a negative can be reproduced), the latest time that the rule read, the label and its eligibility reason
+  (``features.kidney_label``). Times are seconds from the start of the case. Key: case.
+
+The labels are outcomes and the test set is sealed: a label table is complete (every case has a row), but no check, log or result shows a label value of a
+held-out patient. The undated baseline (``preop_cr``) and the sensitivity analyses are not built here.
 """
 
 from __future__ import annotations
@@ -110,5 +127,57 @@ HYPOTENSION_EVENTS = SilverTable(
     ),
     ("case_id", "onset_second"),
 )
+ICU_DAYS_MEASURE = SilverTable("icu_days_measure", (("statistic", "string"), ("unit", "string"), ("value", "double")), ("statistic",))
+ICU_LABELS = SilverTable(
+    "icu_labels",
+    (
+        ("case_id", "bigint"),
+        ("opend_s", "bigint"),
+        ("icu_days", "double"),
+        ("label", "string"),
+        ("eligible", "boolean"),
+        ("eligibility_reason", "string"),
+    ),
+    ("case_id",),
+)
+KIDNEY_INJURY_LABELS = SilverTable(
+    "kidney_injury_labels",
+    (
+        ("case_id", "bigint"),
+        ("baseline_value", "double"),
+        ("baseline_time_s", "bigint"),
+        ("baseline_occurrence", "int"),
+        ("baseline_window_start_s", "bigint"),
+        ("baseline_window_end_s", "bigint"),
+        ("followup_start_s", "bigint"),
+        ("absolute_window_end_s", "bigint"),
+        ("relative_window_end_s", "bigint"),
+        ("early_results", "int"),
+        ("late_results", "int"),
+        ("absolute_rise", "boolean"),
+        ("earlier_value", "double"),
+        ("earlier_time_s", "bigint"),
+        ("earlier_occurrence", "int"),
+        ("later_value", "double"),
+        ("later_time_s", "bigint"),
+        ("later_occurrence", "int"),
+        ("relative_rise", "boolean"),
+        ("relative_value", "double"),
+        ("relative_time_s", "bigint"),
+        ("relative_occurrence", "int"),
+        ("early_highest_value", "double"),
+        ("early_highest_time_s", "bigint"),
+        ("early_highest_occurrence", "int"),
+        ("followup_highest_value", "double"),
+        ("followup_highest_time_s", "bigint"),
+        ("followup_highest_occurrence", "int"),
+        ("latest_time_s", "bigint"),
+        ("label", "string"),
+        ("eligible", "boolean"),
+        ("eligibility_reason", "string"),
+    ),
+    ("case_id",),
+)
 SILVER_TABLES = {NUMERIC.name: NUMERIC, WAVEFORM.name: WAVEFORM}
 HYPOTENSION_TABLES = {ART_MBP_1S.name: ART_MBP_1S, HYPOTENSION_EVENTS.name: HYPOTENSION_EVENTS}
+LABEL_TABLES = {ICU_DAYS_MEASURE.name: ICU_DAYS_MEASURE, ICU_LABELS.name: ICU_LABELS, KIDNEY_INJURY_LABELS.name: KIDNEY_INJURY_LABELS}

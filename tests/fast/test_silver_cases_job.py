@@ -9,6 +9,8 @@ Failure modes covered here:
 - A written table that is not checked, or a check that is skipped on a rerun that writes nothing.
 - A verify that writes, or that passes when the cutoffs were never saved.
 - A message that echoes an argument, a branch name or an upstream error.
+- A verify of a table with the schema before the double (``icu_days`` as a whole number) is refused as the table count (``output_schema: 1 table``), which does
+  not name the cause or say that the table must be rebuilt, or the legacy code is given for another wrong schema, or the legacy check runs on a right schema.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from spark.result_file import release_reserved, reserve
 from spark.settings import SettingsError
 from spark.silver_cases import CutoffRow, MeasureRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.silver_cases_run import (
+    CASES_SCHEMA_LEGACY,
     CHECKS_BUILD,
     result_document,
     run,
@@ -100,6 +103,7 @@ class FakeOps:
         self.split: list[str] = []
         self.owner: list[str] = []
         self.schema_wrong = 0
+        self.legacy = False
         for name, value in changes.items():
             setattr(self, name, value)
 
@@ -114,6 +118,10 @@ class FakeOps:
     def output_schema_tables_wrong(self) -> int:
         self.calls.append("output_schema")
         return self.schema_wrong
+
+    def cases_schema_legacy(self) -> bool:
+        self.calls.append("cases_schema_legacy")
+        return self.legacy
 
     def input_facts(self) -> dict[str, object]:
         self.calls.append("input_facts")
@@ -338,6 +346,29 @@ class OutputFailureTest(unittest.TestCase):
         self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(ops, pinned=True)))
         self.assertNotIn("output_facts", ops.calls)
         self.assertNotIn("existing_rules", ops.calls)
+
+    def test_a_legacy_cases_schema_is_refused_by_a_fixed_code_that_names_the_cause_in_a_verify(self) -> None:
+        ops = FakeOps(schema_wrong=1, legacy=True, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
+        self.assertEqual(["cases_schema_legacy: failed"], refused(lambda: run_verify(ops, pinned=True)))
+        self.assertNotIn("output_facts", ops.calls)
+        self.assertNotIn("existing_rules", ops.calls)
+
+    def test_a_legacy_cases_schema_is_refused_by_the_same_code_after_a_build_and_before_any_value_query(self) -> None:
+        ops = FakeOps(schema_wrong=1, legacy=True)
+        self.assertEqual(["cases_schema_legacy: failed"], refused(lambda: run_build(ops, pinned=True)))
+        self.assertNotIn("output_facts", ops.calls)
+
+    def test_another_wrong_schema_is_a_flag_and_a_right_schema_never_asks_for_the_legacy_check(self) -> None:
+        wrong = FakeOps(schema_wrong=1, legacy=False, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(wrong, pinned=True)))
+        two = FakeOps(schema_wrong=2, legacy=False, held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
+        self.assertEqual(["output_schema: failed"], refused(lambda: run_verify(two, pinned=True)))
+        right = FakeOps(held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)), legacy=True)
+        run_verify(right, pinned=True)
+        self.assertNotIn("cases_schema_legacy", right.calls)
+
+    def test_the_legacy_code_is_fixed_text_with_a_flag_and_no_count(self) -> None:
+        self.assertEqual("cases_schema_legacy: failed", CASES_SCHEMA_LEGACY)
 
     def test_a_check_of_a_written_table_that_fails_ends_the_job_with_its_code(self) -> None:
         ops = FakeOps(output=clean_output_facts(lab_value_differences=3, case_key_duplicates=1))

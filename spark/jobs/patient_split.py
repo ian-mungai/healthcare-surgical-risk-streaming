@@ -60,6 +60,7 @@ from spark.split_table import (
     run_verify,
     schema_problems,
     source_cases,
+    table_rows,
     values_query,
 )
 from spark.split_table import write_commit as write_commit_of
@@ -142,7 +143,9 @@ class Lake:
         problems = schema_problems([(field.name, field.dataType.simpleString()) for field in frame.schema.fields], COLUMNS)
         if problems:
             raise PatientSplitError(*problems)
-        rows = [SplitRow(row["subjectid"], row["set"], row["rule_version"], int(row["source_snapshot_id"])) for row in frame.collect()]
+        rows, broken = table_rows(frame.collect())
+        if broken:
+            raise PatientSplitError(flag("table_row"))
         return TableState(rows, self.snapshot_id(table))
 
     def write(self, rows: Sequence[SplitRow], *, exists: bool) -> None:
