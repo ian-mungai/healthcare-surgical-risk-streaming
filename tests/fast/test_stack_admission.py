@@ -199,7 +199,10 @@ class HostReadingTest(unittest.TestCase):
 
     def test_the_compose_project_is_the_one_the_compose_file_names(self) -> None:
         text = (LIMITS_FILE.parent / "compose.yml").read_text()
-        self.assertEqual(COMPOSE_PROJECT, re.search(r"^name: (\S+)$", text, re.MULTILINE).group(1))  # type: ignore[union-attr]
+        found = re.search(r"^name: (\S+)$", text, re.MULTILINE)
+        if found is None:
+            self.fail("the Compose file names no project")
+        self.assertEqual(COMPOSE_PROJECT, found.group(1))
 
 
 def run(*arguments: str) -> tuple[int, str, str]:

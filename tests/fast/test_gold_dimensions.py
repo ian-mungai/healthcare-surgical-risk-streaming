@@ -180,8 +180,8 @@ class SourceSchemaTests(unittest.TestCase):
     def test_a_missing_table_and_a_table_with_other_columns_are_two_codes_with_a_count(self) -> None:
         found = self.found()
         found["bronze.tracks"] = None
-        found["silver.cases"] = found["silver.cases"][:-1]  # type: ignore[index]
-        found["silver.lab_results"] = [(name, "string") for name, _ in found["silver.lab_results"]]  # type: ignore[union-attr]
+        found["silver.cases"] = list(SOURCE_SCHEMAS["silver.cases"])[:-1]
+        found["silver.lab_results"] = [(name, "string") for name, _ in SOURCE_SCHEMAS["silver.lab_results"]]
         self.assertEqual(["source_missing: 1 table", "source_schema: 2 tables"], source_schema_problems(found))
 
     def test_a_table_that_was_not_looked_up_counts_as_missing(self) -> None:

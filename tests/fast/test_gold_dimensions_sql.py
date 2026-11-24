@@ -255,8 +255,9 @@ class FactTests(unittest.TestCase):
         for item in DIMENSIONS:
             with self.subTest(name=item.name):
                 found = re.search(r"CASE WHEN (.*?) THEN 1 ELSE 0 END\), 0\) AS unknown_not_empty", output_facts_query(item))
-                self.assertIsNotNone(found)
-                self.assertIn("NOT (`is_current` <=> TRUE)", found.group(1))  # type: ignore[union-attr]
+                if found is None:
+                    self.fail(f"{item.name}: the unknown-member count has no CASE WHEN condition")
+                self.assertIn("NOT (`is_current` <=> TRUE)", found.group(1))
 
     def test_the_natural_duplicates_are_counted_among_the_open_members_only(self) -> None:
         text = natural_duplicates_query(dimension("dim_department"))

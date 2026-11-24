@@ -146,7 +146,10 @@ class LabQueryTest(unittest.TestCase):
         self.assertIn("GROUP BY caseid, dt, name, result", query)
         self.assertIn("COUNT(*) AS INT) AS source_copies", query)
         self.assertIn("ROW_NUMBER() OVER (PARTITION BY caseid, dt, name ORDER BY result ASC NULLS FIRST)", query)
-        self.assertEqual("FROM " + BRONZE_LAB_SOURCE, re.search(r"FROM " + re.escape(BRONZE_LAB_SOURCE), query).group(0))  # type: ignore[union-attr]
+        found = re.search(r"FROM " + re.escape(BRONZE_LAB_SOURCE), query)
+        if found is None:
+            self.fail("the laboratory query reads no FROM line of the Bronze source")
+        self.assertEqual("FROM " + BRONZE_LAB_SOURCE, found.group(0))
 
     def test_the_laboratory_result_is_a_double_and_the_time_and_case_are_whole_numbers(self) -> None:
         query = lab_query(BRONZE_LAB_SOURCE)
