@@ -41,6 +41,7 @@ make test-fast        # run the fast tests
 make test-slow        # run the slow tests: Ansible playbook runs, local servers and stand-ins, and the planted workflow faults (on demand; the hosted run runs them too)
 make headroom         # in a hosted run only: check every job of the run against its timeout (GH_TOKEN, GITHUB_REPOSITORY and GITHUB_RUN_ID are set there)
 make test-guards      # commit planted faults in a temporary repository and confirm each guard refuses its own
+make test-guards PARALLEL=8  # the same, as 8 shards at once in one process within the free cores and memory, with one run record (SHARD=1/8 runs one share)
 make test-deadline    # run a wait that passes its deadline and confirm it fails visibly
 make check-terraform  # check the Terraform code with its plan tests, tflint and Trivy
 make check-ansible    # check the Ansible playbook syntax

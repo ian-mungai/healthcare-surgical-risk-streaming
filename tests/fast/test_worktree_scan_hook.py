@@ -7,6 +7,7 @@ The planted-fault run in ``tests/e2e/commit_guards.py`` proves the hook through 
 - The check reports a missing or changed hook as installed.
 - The hook is written to the wrong repository, when run from a linked worktree or from inside another Git command's hook
   environment (``GIT_DIR`` is set).
+- A repository with its own Git environment (``env``) writes its hook where that environment says, not where the caller's global ``core.hooksPath`` says.
 - A write that stops before the hook is complete leaves the earlier hook in place, and the next setup succeeds. It never treats the
   half-written file as the owner's own hook.
 """
@@ -33,6 +34,30 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue(worktree_scan_hook.installed(self.repo))
         self.assertTrue(self.hook().stat().st_mode & stat.S_IXUSR)
         self.assertIn("-m scripts.quality.repo_checks privacy-scan --all", self.hook().read_text())
+
+    def global_hooks_path(self) -> Path:
+        """Point the caller's global Git config at a shared hook folder, as a developer's does, and return the folder."""
+        shared = self.repo.parent / "shared_hooks"
+        shared.mkdir()
+        home = self.repo.parent / "caller_home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(f"[core]\n\thooksPath = {shared}\n")
+        patcher = mock.patch.dict(os.environ, {"HOME": str(home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return shared
+
+    def test_a_repository_with_its_own_environment_ignores_the_callers_global_hooks_path(self) -> None:
+        shared = self.global_hooks_path()
+        self.assertTrue(worktree_scan_hook.install(self.repo, env=self.env))
+        self.assertTrue(self.hook().is_file())
+        self.assertTrue(worktree_scan_hook.installed(self.repo, env=self.env))
+        self.assertEqual(self.hook(), worktree_scan_hook.hook_path(self.repo, env=self.env))
+        self.assertEqual([], list(shared.iterdir()))
+
+    def test_without_an_environment_the_callers_global_hooks_path_is_followed(self) -> None:
+        shared = self.global_hooks_path()
+        self.assertEqual(shared / "pre-commit.legacy", worktree_scan_hook.hook_path(self.repo))
 
     def test_a_rerun_changes_nothing(self) -> None:
         worktree_scan_hook.install(self.repo)

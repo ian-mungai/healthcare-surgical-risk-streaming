@@ -11,7 +11,7 @@ import fnmatch
 import os
 import re
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,9 +68,13 @@ class Finding:
     fix: str
 
 
-def git(*args: str, cwd: Path | None = None, keep_newlines: bool = False) -> str:
-    """Run Git. A call that names a repository by ``cwd`` ignores the caller's Git environment, such as ``GIT_DIR`` inside a hook."""
-    env = None if cwd is None else {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+def git(*args: str, cwd: Path | None = None, keep_newlines: bool = False, env: Mapping[str, str] | None = None) -> str:
+    """Run Git. A call that names a repository by ``cwd`` ignores the caller's Git environment, such as ``GIT_DIR`` inside a hook.
+
+    A call with ``env`` runs in exactly that environment, for a repository that must not read the caller's global Git settings.
+    """
+    if env is None and cwd is not None:
+        env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     return run_command("git", args, cwd=cwd, env=env, timeout=GIT_TIMEOUT_SECONDS, check=True, keep_newlines=keep_newlines).stdout
 
 

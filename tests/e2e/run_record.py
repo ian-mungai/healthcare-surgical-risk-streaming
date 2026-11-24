@@ -47,15 +47,18 @@ class Record:
         self.observations.append(Observation(case, step, expected, str(observed), passed))
         return passed
 
-    def close_after(self, cleanup: Callable[[], None], log: list[str], *, blocked: str = "") -> int:
+    def close_after(self, cleanup: Callable[[], None], log: list[str], *, blocked: str | Callable[[], str] = "") -> int:
         """Run the cleanup, then close the record, also when the cleanup fails or is interrupted.
 
-        A failed cleanup is a failed assertion. An interrupt marks the run blocked, and the interrupt propagates after the record is written.
+        A failed cleanup is a failed assertion. An interrupt marks the run blocked, and the interrupt propagates after the record is written. ``blocked`` may be
+        a function, read after the cleanup, for a reason that the cleanup itself can set. A function is read again after the record is written: a reason that
+        appeared during the write (an interrupt that arrived then) is written into the same folder before the result is printed.
         """
+        interrupted = False
         try:
             cleanup()
         except KeyboardInterrupt:
-            blocked = blocked or "interrupted"
+            interrupted = True
             self.cleanup = "cleanup interrupted"
             self.expect("cleanup", "stop", "the cleanup completes", self.cleanup, False)
             raise
@@ -63,7 +66,11 @@ class Record:
             self.cleanup = f"cleanup failed: {type(error).__name__}"
             self.expect("cleanup", "stop", "the cleanup completes", self.cleanup, False)
         finally:
-            code = self.close(log, blocked=blocked)
+
+            def reason() -> str:
+                return (blocked() if callable(blocked) else blocked) or ("interrupted" if interrupted else "")
+
+            code = self.close(log, blocked=reason(), recheck=reason)
         return code
 
     def settle(self, blocked: str = "") -> None:
@@ -115,8 +122,17 @@ class Record:
             return 1
         return 0 if self.outcome == "pass" else 1
 
-    def close(self, log: list[str], *, blocked: str = "") -> int:
+    def close(self, log: list[str], *, blocked: str = "", recheck: Callable[[], str] | None = None) -> int:
         """Set the outcome, write the record, its log and its retention label in a new folder, print each assertion and return the exit code (``report``
-        saves a failed print as a failed record)."""
+        saves a failed print as a failed record).
+
+        ``recheck`` is read once after the write. A reason that it gives for a record that is not yet blocked is set and written again in the same folder,
+        so the saved record never says pass for a run that an interrupt reached during its write.
+        """
         self.settle(blocked)
-        return self.report(self.write(log))
+        folder = self.write(log)
+        late = recheck() if recheck is not None else ""
+        if late and not self.outcome.startswith(BLOCKED_PREFIX):
+            self.settle(late)
+            self.write_record(folder)
+        return self.report(folder)

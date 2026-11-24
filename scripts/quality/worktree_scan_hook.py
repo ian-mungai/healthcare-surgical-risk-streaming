@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,12 +47,14 @@ class LegacyHook:
 SCANNER = LegacyHook(HOOK_NAME, KEPT_NAME, HOOK_TEXT, EARLIER_HOOK_TEXTS)
 
 
-def hook_path(root: Path, hook: LegacyHook = SCANNER) -> Path:
-    return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip() / hook.name
+def hook_path(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> Path:
+    """The hook's file. With ``env``, Git resolves the hook folder in that environment alone, so a repository with its own Git environment, such as a scratch
+    repository, does not read the caller's global ``core.hooksPath``."""
+    return root / git("rev-parse", "--git-path", "hooks", cwd=root, env=env).strip() / hook.name
 
 
-def installed(root: Path, hook: LegacyHook = SCANNER) -> bool:
-    path = hook_path(root, hook)
+def installed(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> bool:
+    path = hook_path(root, hook, env)
     return path.is_file() and path.read_bytes() == hook.text.encode() and stat.S_IMODE(path.stat().st_mode) == HOOK_MODE
 
 
@@ -60,14 +63,14 @@ def is_scanner(path: Path, hook: LegacyHook = SCANNER) -> bool:
     return path.is_file() and path.read_bytes() in (hook.text.encode(), *(text.encode() for text in hook.earlier_texts))
 
 
-def install(root: Path, hook: LegacyHook = SCANNER) -> bool:
+def install(root: Path, hook: LegacyHook = SCANNER, env: Mapping[str, str] | None = None) -> bool:
     """Write the hook and return True, or return False when it is already installed.
 
     An older hook at the hook's path is moved to ``<name>.previous`` first, and ``KeptHookError`` is raised when that name is taken.
     """
-    if installed(root, hook):
+    if installed(root, hook, env):
         return False
-    path = hook_path(root, hook)
+    path = hook_path(root, hook, env)
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.path.lexists(path) and not is_scanner(path, hook):
         kept = path.with_name(hook.kept_name)

@@ -46,7 +46,7 @@ test-slow:
 	$(PYTHON) -m unittest discover --start-directory tests/slow --top-level-directory .
 
 test-guards:
-	$(PYTHON) -m tests.e2e.commit_guards $(if $(SHARD),--shard $(SHARD))
+	$(PYTHON) -m tests.e2e.commit_guards $(if $(SHARD),--shard $(SHARD)) $(if $(PARALLEL),--parallel $(PARALLEL))
 
 test-deadline:
 	$(PYTHON) -m tests.e2e.deadline
