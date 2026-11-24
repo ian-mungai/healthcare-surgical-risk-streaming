@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import stat
 import tempfile
-import traceback
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -30,6 +29,7 @@ from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.terraform_wrapper import WrapperError
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.project_config import ConfigurationError
+from tests.fast.traceback_support import traceback_text
 
 BUCKET = "example-private-bucket"
 ROLE = "private_role_name"
@@ -47,8 +47,8 @@ def raised(call: Callable[[], Any]) -> Exception:
 
 
 def printed(error: BaseException) -> str:
-    """Everything a terminal shows for the exception: its text and its whole chain."""
-    return "".join(traceback.format_exception(error))
+    """Everything a terminal shows for the exception: its traceback, its text and its whole chain. Fails for an exception that has no traceback."""
+    return traceback_text(error)
 
 
 class Boundary(unittest.TestCase):
