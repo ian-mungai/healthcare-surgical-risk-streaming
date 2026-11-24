@@ -541,7 +541,7 @@ class HypotensionRecord(unittest.TestCase):
                 kept_catalog = dataclasses.replace(accept.HYPO_KEPT, snapshots=catalog_changes.get("snapshots", accept.HYPO_KEPT.snapshots))
                 bind_silver(run, module, kept, kept_catalog)
                 with mock.patch.object(run, "head", return_value=accept.HEAD):
-                    run.merge_tag_rebuild(built)
+                    run.merge_tag_rebuild({**built, "branch_hash": accept.HEAD})
                 self.assertEqual(passed, run.record.observations[-1].passed)
 
     def test_the_plant_records_flags_for_the_events_and_the_probed_readings(self) -> None:

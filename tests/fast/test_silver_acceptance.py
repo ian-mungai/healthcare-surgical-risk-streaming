@@ -50,6 +50,8 @@ from tests.fast.silver_accept import (
     NOT_CLOSED,
     NOT_EMPTY,
     NOT_PASSED,
+    OTHER_BRANCH,
+    OTHER_MODE,
     REASONS,
     REFUSAL_REASONS,
     SIGNALS_JOB,
@@ -313,6 +315,48 @@ class Writes(unittest.TestCase):
         self.assertFalse(wrote(hypotension(), SIGNALS_JOB, HYPO_WROTE))
 
 
+class RequestedMode(unittest.TestCase):
+    """A reply that names another mode than the one that the runner asked for is refused, as a write and as a call that wrote nothing, for both jobs. The
+    mode is held by the rule that a build names its base hash and a verify names none, compared with the catalog (a verify has no base)."""
+
+    def cases(self) -> list[tuple[str, Catalog, Catalog, Any, Any]]:
+        hypo_verified = Catalog(branch="b", checked=HEAD, base=None, head=HEAD, sources=HYPO_SOURCES, snapshots=HYPO_SNAPSHOTS)
+        return [
+            (SIGNALS_JOB, WROTE, VERIFIED, written, verified),
+            (HYPOTENSION_JOB, HYPO_WROTE, hypo_verified, hypotension, lambda **edits: hypotension(**{**unwritten_hypo(), "mode": "verify", **edits})),
+        ]
+
+    def test_a_verify_reply_to_a_build_request_is_refused(self) -> None:
+        for job, build_catalog, _, build, _ in self.cases():
+            with self.subTest(job):
+                self.assertTrue(accept_write(0, build(), job, build_catalog).ok)
+                self.assertFalse(accept_write(0, build(mode="verify", base_hash=None), job, build_catalog).ok)
+
+    def test_a_build_reply_to_a_verify_request_is_refused(self) -> None:
+        for job, _, verify_catalog, _, verify in self.cases():
+            with self.subTest(job):
+                self.assertTrue(accept_keep(0, verify(), job, verify_catalog).ok)
+                self.assertFalse(accept_keep(0, verify(mode="build", base_hash=HEAD), job, verify_catalog).ok)
+
+    def test_a_reply_that_names_the_other_mode_with_the_hashes_of_the_requested_one_is_refused(self) -> None:
+        """The closed schema ties the mode to the base hash (a build names one, a verify none), and the catalog ties the base hash to the request: a reply of
+        the other mode with the requested mode's hashes fails as not closed, whatever job it is."""
+        for job, build_catalog, verify_catalog, build, verify in self.cases():
+            with self.subTest(job):
+                self.assertEqual(NOT_CLOSED, accept_write(0, build(mode="verify"), job, build_catalog).reason)
+                self.assertEqual(NOT_CLOSED, accept_keep(0, verify(mode="build"), job, verify_catalog).reason)
+
+    def test_a_reply_of_another_branch_or_of_a_mode_that_is_not_known_is_refused_with_its_own_phrase(self) -> None:
+        for job, _, verify_catalog, _, verify in self.cases():
+            with self.subTest(job):
+                self.assertEqual(OTHER_BRANCH, accept_keep(0, verify(branch="other"), job, verify_catalog).reason)
+                self.assertEqual(NOT_CLOSED, accept_keep(0, verify(mode="reconcile"), job, verify_catalog).reason)
+
+
+def unwritten_hypo() -> dict[str, Any]:
+    return hypotension(write_hash=None, branch_hash=HEAD, base_hash=None)
+
+
 class SetupCalls(unittest.TestCase):
     """A runner that builds Silver tables as a setup step reads the job's result file through ``accept_setup``: exit 0, the closed schema, a build that wrote
     and every pass flag true. The old setup read ``outcome == "written"``, a field that the sealed jobs do not write, and called the job without ``--result``,
@@ -341,11 +385,20 @@ class SetupCalls(unittest.TestCase):
             ("a false flag", 0, written(passed={"numeric_observations": True, "waveform_seconds": False}), NOT_PASSED),
             ("another job's document", 0, hypotension(), NOT_CLOSED),
             ("a call that wrote nothing", 0, unwritten(), "the result is not a write"),
-            ("a verify", 0, verified(), "the result is not a write"),
+            ("a verify", 0, verified(), OTHER_MODE),
         ):
             with self.subTest(name):
                 accepted = accept_setup(code, document, SIGNALS_JOB)
                 self.assertEqual(reason, accepted.reason)
+                self.assertEqual({}, dict(accepted.result))
+                self.assertIn(accepted.reason, REASONS)
+
+    def test_a_setup_build_refuses_a_reply_of_the_verify_mode_even_when_it_looks_like_a_write(self) -> None:
+        edits = {"mode": "verify", "base_hash": None}
+        for job, document in ((SIGNALS_JOB, written(**edits)), (HYPOTENSION_JOB, hypotension(**edits))):
+            with self.subTest(job):
+                accepted = accept_setup(0, document, job)
+                self.assertFalse(accepted.ok)
                 self.assertEqual({}, dict(accepted.result))
                 self.assertIn(accepted.reason, REASONS)
 

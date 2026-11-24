@@ -68,6 +68,7 @@ AS_WRITE, AS_KEEP = "write", "keep"
 NO_FILE = "no result file"
 NO_CATALOG = "the catalog was not read"
 OTHER_BRANCH = "the branch is not the requested one"
+OTHER_MODE = "the mode is not the requested one"
 NOT_CLOSED = "the schema is not the job's closed schema"
 OFF_CATALOG = "a hash or a snapshot differs from the catalog"
 NOT_A_WRITE = "the result is not a write"
@@ -75,7 +76,7 @@ NOT_A_KEEP = "the result is not a call that wrote nothing"
 NOT_PASSED = "a pass flag of the result is not true"
 WRONG_EXIT = "the exit code is not the expected one"
 NOT_EMPTY = "the result folder held something"
-REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP, NOT_PASSED)
+REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, OTHER_MODE, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP, NOT_PASSED)
 REFUSAL_NOT_CLOSED = "the refusal document is not the closed refusal schema"
 REFUSAL_OTHER_CODES = "the refusal codes are not the wanted ones"
 REFUSAL_REASONS = (WRONG_EXIT, NO_FILE, REFUSAL_NOT_CLOSED, REFUSAL_OTHER_CODES)
@@ -293,13 +294,15 @@ def accept_keep(code: int, document: Any, job: str, catalog: Catalog | None) -> 
 
 
 def setup_rejection(document: Any, job: str) -> str | None:
-    """The fixed phrase of the first rule that a document fails as the result of a setup build of ``job``, or ``None``: the closed schema of the job, a write
-    (a write hash that is the branch hash and not the checked hash) and a Boolean true for every pass flag. No catalog is compared: a setup step is
-    judged by the runner's own later reads of the tables that it made."""
+    """The fixed phrase of the first rule that a document fails as the result of a setup build of ``job``, or ``None``: the closed schema of the job, the mode
+    ``build`` (a setup step asks for nothing else), a write (a write hash that is the branch hash and not the checked hash) and a Boolean true for every pass
+    flag. No catalog is compared: a setup step is judged by the runner's own later reads of the tables that it made."""
     if not isinstance(document, Mapping):
         return NO_FILE
     if not sealed(document, job):
         return NOT_CLOSED
+    if document["mode"] != "build":
+        return OTHER_MODE
     if not (named(document["write_hash"]) and document["write_hash"] == document["branch_hash"] != document["checked_hash"]):
         return NOT_A_WRITE
     return None if all(value is True for value in document["passed"].values()) else NOT_PASSED
