@@ -21,6 +21,7 @@ import threading
 import time
 import traceback
 import unittest
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from unittest import mock
@@ -374,22 +375,34 @@ def whole_text(error: BaseException) -> str:
     return "".join(traceback.format_exception(error)) + repr(error.args)
 
 
+def raised_text(call: Callable[[], object]) -> tuple[AirbyteError, str]:
+    """The error that the call raises and its whole text, formatted inside the handler: ``assertRaises`` clears the traceback before the test can read it."""
+    try:
+        call()
+    except AirbyteError as error:
+        return error, whole_text(error)
+    raise AssertionError("the call raised no AirbyteError")
+
+
 class TokenFormTest(unittest.TestCase):
     """A token that is not of the bearer form (RFC 6750 b64token, as the Ansible client reads it) is refused before it is cached or put in a header."""
 
-    def refused(self, token: str) -> tuple[Api, StandIn, AirbyteError]:
+    def refused(self, token: str) -> tuple[Api, StandIn, AirbyteError, str]:
         api, stand_in = prepared()
         stand_in.mutations["POST applications/token"] = lambda answer: answer.update({"access_token": token})
-        with self.assertRaises(AirbyteError) as raised:
-            api.running_jobs("connection1")
-        return api, stand_in, raised.exception
+        error, text = raised_text(lambda: api.running_jobs("connection1"))
+        return api, stand_in, error, text
+
+    def assert_text_is_clean(self, text: str) -> None:
+        self.assertIn("renew_token", text, "the text holds the traceback, which names the function that refused the token")
+        self.assertNotIn(PLANTED, text)
 
     def test_a_malformed_token_is_refused_with_a_fixed_message_that_holds_no_part_of_it(self) -> None:
         messages = set()
         for what, token in MALFORMED_TOKENS.items():
             with self.subTest(what):
-                _, _, error = self.refused(token)
-                self.assertNotIn(PLANTED, whole_text(error))
+                _, _, error, text = self.refused(token)
+                self.assert_text_is_clean(text)
                 self.assertIn("POST applications/token", str(error))
                 messages.add(str(error))
         self.assertEqual(1, len(messages), "the message is one fixed text, whatever the token held")
@@ -398,7 +411,7 @@ class TokenFormTest(unittest.TestCase):
         self.assertGreaterEqual(len(MALFORMED_TOKENS), 10)
         for what, token in MALFORMED_TOKENS.items():
             with self.subTest(what):
-                api, stand_in, _ = self.refused(token)
+                api, stand_in, _, _ = self.refused(token)
                 self.assertIsNone(api.token)
                 self.assertEqual(["POST applications/token"], stand_in.log)
 
@@ -407,9 +420,8 @@ class TokenFormTest(unittest.TestCase):
         api.running_jobs("connection1")
         stand_in.expire_next_token = True
         stand_in.mutations["POST applications/token"] = lambda answer: answer.update({"access_token": f"{PLANTED}\n"})
-        with self.assertRaises(AirbyteError) as raised:
-            api.running_jobs("connection1")
-        self.assertNotIn(PLANTED, whole_text(raised.exception))
+        _, text = raised_text(lambda: api.running_jobs("connection1"))
+        self.assert_text_is_clean(text)
         self.assertEqual(["GET jobs", "GET jobs", "POST applications/token"], stand_in.log[-3:])
 
     def test_control_each_character_that_the_form_allows_is_accepted(self) -> None:
@@ -466,13 +478,12 @@ class TokenFormTest(unittest.TestCase):
         try:
             api = HttpAirbyteApi(ORIGIN, "client", "client_value", ACCESS_ID, ACCESS_VALUE)
             api.host, api.port = "127.0.0.1", server.server_address[1]
-            with self.assertRaises(AirbyteError) as raised:
-                api.call("GET", "/workspaces", timeout=5.0)
+            _, text = raised_text(lambda: api.call("GET", "/workspaces", timeout=5.0))
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
-        self.assertNotIn(PLANTED, whole_text(raised.exception))
+        self.assert_text_is_clean(text)
         self.assertEqual([], seen)
         self.assertIsNone(api.token)
 
