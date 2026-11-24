@@ -37,7 +37,14 @@ ROUND_TWO_TEXT = (
 )
 _VERSION_CHECK = (
     f"{OWN_MARKER}@VERSION@\n"
-    f"version=\"$(sed -n 's/^GATE_VERSION = \\([0-9][0-9]*\\)$/\\1/p' {GATE_FILE} 2>/dev/null)\"\n"
+    "version=\n"
+    f"if [ -e {GATE_FILE} ]; then\n"
+    f"  version=\"$(sed -n 's/^GATE_VERSION = \\([0-9][0-9]*\\)$/\\1/p' {GATE_FILE})\" || {{\n"
+    f'    echo "push gate stopped by sed: sed failed while it read the gate version from {GATE_FILE} (its own error is above), '
+    'so the version is unknown: make the file readable, then push again" >&2\n'
+    "    exit 1\n"
+    "  }\n"
+    "fi\n"
     'if [ -z "$version" ] || [ "$version" -lt @VERSION@ ]; then\n'
     "  echo \"push gate stopped by gate version: this worktree's gate is missing, has no version or is older than version @VERSION@, "
     'which the installed hook requires: run make setup in the main checkout, or rebase this branch on the one that holds the gate" >&2\n'

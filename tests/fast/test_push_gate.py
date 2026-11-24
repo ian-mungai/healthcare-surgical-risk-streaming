@@ -366,6 +366,57 @@ class PushHookTest(TemporaryRepository):
         self.assertIn(f"-lt {push_hook.REQUIRED_GATE_VERSION}", self.hook().read_text())
         self.assertEqual(push_gate.GATE_VERSION, push_hook.REQUIRED_GATE_VERSION, "the setup installs the hook for the gate that it ships")
 
+    def test_the_hook_text_does_not_discard_the_error_of_sed(self) -> None:
+        self.assertNotIn("2>/dev/null", push_hook.HOOK_TEXT)
+
+    def test_a_gate_file_that_sed_cannot_read_is_reported_as_a_sed_failure_and_not_as_a_missing_gate(self) -> None:
+        push_hook.install(self.repo)
+        self.stub_gate(0)
+        gate = self.repo / "scripts" / "quality" / "push_gate.py"
+        gate.chmod(0)
+        self.addCleanup(gate.chmod, 0o644)
+        if os.access(gate, os.R_OK):
+            self.skipTest("this user reads any file, so no permission error can be planted")
+        run = self.run_hook("line\n")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("push gate stopped by sed", run.stderr)
+        self.assertIn("Permission denied", run.stderr, "the error of sed itself is shown")
+        self.assertIn(f"sed failed while it read the gate version from {push_hook.GATE_FILE} (its own error is above)", run.stderr, "the fixed message")
+        self.assertNotIn("stopped by gate version", run.stderr)
+        self.assertFalse((self.repo / "gate_input").exists(), "the gate did not run")
+
+    def test_a_missing_gate_file_is_still_reported_as_a_gate_version_stop(self) -> None:
+        push_hook.install(self.repo)
+        self.stub_gate(0)
+        (self.repo / "scripts" / "quality" / "push_gate.py").unlink()
+        run = self.run_hook("line\n")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("push gate stopped by gate version", run.stderr)
+        self.assertNotIn("stopped by sed", run.stderr)
+
+    def test_the_hook_of_gate_version_5_is_replaced_by_the_current_hook_and_not_kept(self) -> None:
+        """The hook text of version 5, byte for byte: it hid the error of sed, so the current gate version is above it."""
+        version_5 = (
+            "#!/bin/sh\n# project push hook, gate version 5\n"
+            "version=\"$(sed -n 's/^GATE_VERSION = \\([0-9][0-9]*\\)$/\\1/p' scripts/quality/push_gate.py 2>/dev/null)\"\n"
+            'if [ -z "$version" ] || [ "$version" -lt 5 ]; then\n'
+            "  echo \"push gate stopped by gate version: this worktree's gate is missing, has no version or is older than version 5, "
+            'which the installed hook requires: run make setup in the main checkout, or rebase this branch on the one that holds the gate" >&2\n'
+            "  exit 1\nfi\n"
+            'refs="$(cat)" || {\n  echo "push gate stopped by input: the list of refs that Git sends could not be read, '
+            'so what is sent is unknown" >&2\n  exit 1\n}\n'
+            'printf \'%s\\n\' "$refs" | .venv/bin/python -m scripts.quality.push_gate "$@" || exit $?\n'
+            'previous="$(dirname "$0")/pre-push.previous"\n'
+            'if [ -x "$previous" ]; then printf \'%s\\n\' "$refs" | "$previous" "$@"; exit $?; fi\n'
+        )
+        self.assertGreater(push_hook.REQUIRED_GATE_VERSION, 5)
+        self.hook().write_text(version_5)
+        self.hook().chmod(0o755)
+        self.assertFalse(push_hook.installed(self.repo))
+        self.assertTrue(push_hook.install(self.repo))
+        self.assertEqual(self.hook().read_text(), push_hook.HOOK_TEXT)
+        self.assertFalse(self.hook().with_name(push_hook.KEPT_NAME).exists())
+
     def test_a_failed_write_of_the_new_hook_leaves_the_old_hook_active(self) -> None:
         """Round 4, finding 1: every old form of the hook stays in place, whole and executable, until the new one has replaced it."""
         older = push_hook.HOOK_TEXT.replace(f"-lt {push_hook.REQUIRED_GATE_VERSION}", "-lt 1").replace(

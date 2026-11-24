@@ -37,7 +37,7 @@ from scripts.quality import repo_checks
 
 ROOT = Path(__file__).resolve().parents[2]
 # The version of this gate. ``make setup`` installs the shared pre-push hook for it, and the hook refuses a worktree whose gate is older or missing.
-GATE_VERSION = 5
+GATE_VERSION = 6
 TRACKED = "tracked changes"
 SECRETS = "secret scan"
 MESSAGES = "commit messages"
