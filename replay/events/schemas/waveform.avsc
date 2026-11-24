@@ -62,7 +62,7 @@
     {
       "name": "gain",
       "type": "double",
-      "doc": "The physical value of a sample is its raw value times the gain plus the offset."
+      "doc": "For a track of an integer sample format (3 to 8) the physical value of a sample is its raw value times the gain plus the offset, so the calibration applies to integer formats only. A float format (1 and 2) holds physical values already, and the gain and the offset do not apply to it."
     },
     {
       "name": "offset",

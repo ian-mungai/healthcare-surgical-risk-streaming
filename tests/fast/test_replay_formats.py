@@ -122,6 +122,22 @@ def fields_without_default(older: dict[str, Any], newer: dict[str, Any]) -> list
     return [field["name"] for field in newer["fields"] if field["name"] not in known and "default" not in field]
 
 
+class CalibrationDocument(unittest.TestCase):
+    def doc_of(self, name: str) -> str:
+        return str(next(field for field in schema_of("waveform")["fields"] if field["name"] == name)["doc"])
+
+    def test_the_gain_says_that_the_calibration_applies_to_the_integer_formats_only_and_a_float_format_is_already_physical(self) -> None:
+        gain = self.doc_of("gain")
+        self.assertIn("integer formats only", gain)
+        self.assertIn("float", gain)
+        self.assertNotIn("The physical value of a sample is its raw value times the gain plus the offset.", gain)
+
+    def test_the_offset_points_to_the_gain_and_the_sample_format_names_the_same_split(self) -> None:
+        self.assertEqual("See the gain.", self.doc_of("offset"))
+        self.assertIn("floats", self.doc_of("sample_format"))
+        self.assertIn("integers", self.doc_of("sample_format"))
+
+
 class SampleFormatField(unittest.TestCase):
     def test_the_waveform_format_has_an_integer_sample_format_with_a_default_that_marks_the_format_as_not_stated(self) -> None:
         field = next(field for field in schema_of("waveform")["fields"] if field["name"] == "sample_format")
