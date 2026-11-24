@@ -1,6 +1,9 @@
 # Reads airbyte_directory, airbyte_chart_version, airbyte_chart_sha256, airbyte_namespace, airbyte_release, airbyte_kubeconfig and
 # airbyte_release_deadline_seconds. The release is installed or upgraded only when it is not deployed or when the chart or a values file changed since
 # the last success, so a second run starts no migration and changes nothing. A failure shows each pod's phase and why it waits, and never a log or a value.
+# A run that was stopped inside Helm leaves the release with an operation pending, and Helm refuses to install over it. Before the decision, a pending upgrade
+# or rollback is rolled back to the last deployed revision and a pending first install is uninstalled (Helm keeps the volume claims of stateful sets, and
+# Airbyte's database is on the stack's PostgreSQL, which neither command touches). Every other state goes on to the decision as it is.
 - name: Read the checksum of each values file
   ansible.builtin.stat:
     path: "{{ airbyte_directory }}/{{ item }}"
@@ -32,12 +35,83 @@
   check_mode: false
   timeout: 60
 
+- name: Note the release's state
+  ansible.builtin.set_fact:
+    airbyte_release_state: "{{ (airbyte_release_status.stdout | from_json).info.status if airbyte_release_status.rc == 0 else 'not installed' }}"
+
+- name: Read the release's history
+  when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
+  ansible.builtin.command:
+    argv: [helm, history, "{{ airbyte_release }}", --namespace, "{{ airbyte_namespace }}", --output, json]
+  environment:
+    KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  register: airbyte_release_history
+  changed_when: false
+  check_mode: false
+  timeout: 60
+
+- name: Pick the last revision that was deployed
+  when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
+  ansible.builtin.set_fact:
+    airbyte_release_good_revision: "{{ (airbyte_release_history.stdout | from_json) | selectattr('status', 'eq', 'deployed') | map(attribute='revision') | list | sort | last | default(0) }}"
+
+- name: Stop when no revision was ever deployed to roll back to
+  when: airbyte_release_state in ['pending-upgrade', 'pending-rollback'] and airbyte_release_good_revision | int == 0
+  ansible.builtin.fail:
+    msg: The Airbyte release is {{ airbyte_release_state }} and has no deployed revision to roll back to.
+
+- name: Roll the release back to its last deployed revision
+  when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
+  ansible.builtin.command:
+    argv:
+      - helm
+      - rollback
+      - "{{ airbyte_release }}"
+      - "{{ airbyte_release_good_revision }}"
+      - --namespace
+      - "{{ airbyte_namespace }}"
+      - --wait
+      - --timeout
+      - "{{ airbyte_release_deadline_seconds }}s"
+  environment:
+    KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  changed_when: true
+  timeout: "{{ airbyte_release_deadline_seconds | int + 120 }}"
+
+- name: Uninstall the release that never finished its first install
+  when: airbyte_release_state == 'pending-install'
+  ansible.builtin.command:
+    argv:
+      - helm
+      - uninstall
+      - "{{ airbyte_release }}"
+      - --namespace
+      - "{{ airbyte_namespace }}"
+      - --wait
+      - --timeout
+      - "{{ airbyte_release_deadline_seconds }}s"
+  environment:
+    KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  changed_when: true
+  timeout: "{{ airbyte_release_deadline_seconds | int + 120 }}"
+
+- name: Read the release's status again
+  ansible.builtin.command:
+    argv: [helm, status, "{{ airbyte_release }}", --namespace, "{{ airbyte_namespace }}", --output, json]
+  environment:
+    KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  register: airbyte_release_status_now
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  timeout: 60
+
 - name: Decide whether the release must be installed or upgraded
   ansible.builtin.set_fact:
     airbyte_release_needed: >-
-      {{ airbyte_release_status.rc != 0
-         or (airbyte_release_status.stdout | from_json).info.status != 'deployed'
-         or (airbyte_release_recorded.content | default('') | b64decode) != airbyte_release_inputs }}
+      {{ airbyte_release_status_now.rc != 0
+         or (airbyte_release_status_now.stdout | from_json).info.status != 'deployed'
+         or (airbyte_release_recorded.content | default('') | b64decode | trim) != airbyte_release_inputs }}
 
 - name: Install or upgrade the release and wait for it
   when: airbyte_release_needed | bool

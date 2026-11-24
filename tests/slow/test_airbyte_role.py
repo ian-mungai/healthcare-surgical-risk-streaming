@@ -7,21 +7,24 @@ the pinned downloads, the placed values and their idempotence, the web forwarder
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import pwd
 import re
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from scripts.process import run_command
 from scripts.stack.k3s_limits import CHART_WORKLOAD_KEYS
 from scripts.stack.limits import load_limits
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import GROUP_VARIABLES, group_variables
 from tests.fast.test_postgres_accounts import TOOLS_FILE, accounts
-from tests.slow.ansible_support import ROLES, run_playbook
+from tests.slow.ansible_support import ROLES, environment, run_playbook
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROLES / "airbyte"
@@ -141,6 +144,199 @@ class TaskRulesTest(unittest.TestCase):
         self.assertIn("--wait", arguments)
         self.assertIn("--timeout", arguments)
         self.assertIn("timeout", release)
+
+
+# A ``helm`` that keeps one release in files: its status (empty when none is installed) and its history. Each call is logged as one line of arguments.
+# ``upgrade`` and ``rollback`` leave the release deployed, and ``uninstall`` removes it, as the real commands do when they succeed.
+HELM_STAND_IN = """#!/bin/sh
+echo "$*" >> "$STAND_IN/log"
+case "$1" in
+status)
+  if [ ! -s "$STAND_IN/status" ]; then echo "Error: release: not found" >&2; exit 1; fi
+  printf '{"name":"airbyte","info":{"status":"%s"}}' "$(cat "$STAND_IN/status")" ;;
+history) cat "$STAND_IN/history.json" ;;
+upgrade | rollback) printf deployed > "$STAND_IN/status" ;;
+uninstall) : > "$STAND_IN/status" ;;
+*) echo "unexpected: $*" >&2; exit 9 ;;
+esac
+"""
+K3S_STAND_IN = '#!/bin/sh\necho "$*" >> "$STAND_IN/log"\n'
+CHART_SHA = "c" * 64
+DEADLINE = 600
+UPGRADE = "upgrade --install"
+NOT_INSTALLED = ""
+
+
+def history(*states: str) -> list[dict[str, object]]:
+    return [{"revision": number, "status": state} for number, state in enumerate(states, start=1)]
+
+
+class ReleaseRecoveryTest(unittest.TestCase):
+    """A run that was stopped inside Helm leaves a release with an operation pending, and ``helm upgrade --install`` refuses it (host run, Nov 23 2026).
+    The role first brings such a release to a state that Helm accepts, with ``helm`` run by a stand-in program that keeps the release in files."""
+
+    def run_release(
+        self, status: str, past: list[dict[str, object]] | None = None, recorded: str = "match", twice: bool = False, **changes: object
+    ) -> tuple[int, str, list[str]]:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in = folder / "stand_in"
+            programs = folder / "bin"
+            for directory in (stand_in, programs):
+                directory.mkdir()
+            for name, text in (("helm", HELM_STAND_IN), ("k3s", K3S_STAND_IN)):
+                (programs / name).write_text(text)
+                (programs / name).chmod(stat.S_IRWXU)
+            (stand_in / "status").write_text(status)
+            (stand_in / "history.json").write_text(json.dumps(past or []))
+            variables = (
+                values(folder) | {"airbyte_chart_version": "1.2.3", "airbyte_chart_sha256": CHART_SHA, "airbyte_release_deadline_seconds": DEADLINE} | changes
+            )
+            directory = Path(str(variables["airbyte_directory"]))
+            directory.mkdir()
+            sums = []
+            for name in ("values.yaml", "limits.values.yaml", "host.values.yaml"):
+                (directory / name).write_text(f"{name}\n")
+                sums.append(hashlib.sha256((directory / name).read_bytes()).hexdigest())
+            inputs = hashlib.sha256(":".join([CHART_SHA, *sums]).encode()).hexdigest()
+            if recorded == "match":
+                (directory / "release_inputs.sha256").write_text(f"{inputs}\n")
+            elif recorded == "other":
+                (directory / "release_inputs.sha256").write_text("0" * 64 + "\n")
+            playbook = folder / "check.yml"
+            include = f"    - ansible.builtin.include_role:\n        name: {ROLE}\n        tasks_from: release.yml\n"
+            playbook.write_text(f"- hosts: localhost\n  connection: local\n  gather_facts: false\n  tasks:\n{include}")
+            env = environment(folder) | {"PATH": f"{programs}:/usr/bin:/bin", "STAND_IN": str(stand_in)}
+            for _ in range(2 if twice else 1):
+                (stand_in / "log").unlink(missing_ok=True)
+                result = run_command(
+                    str(ROOT / ".venv" / "bin" / "ansible-playbook"),
+                    ["-i", "localhost,", "--extra-vars", json.dumps(variables), str(playbook)],
+                    cwd=folder,
+                    env=env,
+                    timeout=120,
+                )
+            log = (stand_in / "log").read_text().splitlines() if (stand_in / "log").exists() else []
+            return result.returncode, result.stdout + result.stderr, [line for line in log if not line.startswith("status")]
+
+    def commands(self, log: list[str]) -> list[str]:
+        """The Helm and k3s calls of a run in order, without each one's namespace and values arguments that the cases do not look at."""
+        return [line.split(" --namespace")[0] if not line.startswith("upgrade") else UPGRADE for line in log]
+
+    def test_a_release_with_an_upgrade_pending_is_rolled_back_to_its_last_deployed_revision_before_the_install(self) -> None:
+        code, output, log = self.run_release("pending-upgrade", history("superseded", "deployed", "pending-upgrade"), recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE], self.commands(log))
+        self.assertIn(f"rollback airbyte 2 --namespace airbyte --wait --timeout {DEADLINE}s", log)
+
+    def test_a_release_with_a_rollback_pending_is_rolled_back_to_the_last_deployed_revision_and_not_to_a_failed_one(self) -> None:
+        past = history("superseded", "deployed", "failed", "pending-rollback")
+        code, output, log = self.run_release("pending-rollback", past, recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE], self.commands(log))
+
+    def test_with_two_deployed_revisions_in_the_history_the_later_one_is_the_target(self) -> None:
+        code, output, log = self.run_release("pending-upgrade", history("deployed", "deployed", "pending-upgrade"), recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual(["history airbyte", "rollback airbyte 2", UPGRADE], self.commands(log))
+
+    def test_a_first_install_that_is_pending_is_uninstalled_before_the_install_with_the_same_deadline(self) -> None:
+        code, output, log = self.run_release("pending-install", history("pending-install"), recorded="none")
+        self.assertEqual(0, code, output)
+        self.assertEqual(["uninstall airbyte", UPGRADE], self.commands(log))
+        self.assertIn(f"uninstall airbyte --namespace airbyte --wait --timeout {DEADLINE}s", log)
+
+    def test_the_recovery_commands_follow_the_release_namespace_and_deadline_they_are_given(self) -> None:
+        _, _, log = self.run_release(
+            "pending-upgrade", history("deployed", "pending-upgrade"), recorded="other", airbyte_release="named", airbyte_namespace="space"
+        )
+        self.assertIn("rollback named 1 --namespace space --wait --timeout 600s", log)
+        _, _, log = self.run_release(
+            "pending-install", None, recorded="none", airbyte_release="named", airbyte_namespace="space", airbyte_release_deadline_seconds=90
+        )
+        self.assertIn("uninstall named --namespace space --wait --timeout 90s", log)
+
+    def test_a_pending_upgrade_with_no_deployed_revision_stops_before_any_change_and_names_the_status(self) -> None:
+        code, output, log = self.run_release("pending-upgrade", history("failed", "pending-upgrade"), recorded="other")
+        self.assertNotEqual(0, code)
+        self.assertIn("pending-upgrade", output)
+        self.assertEqual(["history airbyte"], self.commands(log))
+
+    def test_a_deployed_release_with_unchanged_inputs_runs_no_helm_command_but_the_status_read(self) -> None:
+        code, output, log = self.run_release("deployed", history("deployed"))
+        self.assertEqual(0, code, output)
+        self.assertEqual([], log)
+
+    def test_a_second_run_after_a_successful_install_runs_no_helm_command_but_the_status_read(self) -> None:
+        code, output, log = self.run_release(NOT_INSTALLED, recorded="none", twice=True)
+        self.assertEqual(0, code, output)
+        self.assertEqual([], log, "the first run recorded its inputs in the form that the second run reads")
+
+    def test_a_deployed_release_with_changed_inputs_is_upgraded_with_no_recovery(self) -> None:
+        code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual([UPGRADE], self.commands(log))
+
+    def test_each_other_state_passes_on_to_the_install_with_no_recovery(self) -> None:
+        for status in ("failed", "superseded", "unknown", "uninstalled", "uninstalling", NOT_INSTALLED):
+            with self.subTest(status=status or "not installed"):
+                code, output, log = self.run_release(status, history("deployed", "failed"), recorded="match")
+                self.assertEqual(0, code, output)
+                self.assertEqual([UPGRADE], self.commands(log))
+
+
+class ReleaseRecoveryStructureTest(unittest.TestCase):
+    def tasks(self) -> list[dict[str, Any]]:
+        return role_tasks()["release.yml"]
+
+    def index(self, name: str) -> int:
+        return next(index for index, task in enumerate(self.tasks()) if task.get("name") == name)
+
+    def test_the_status_is_read_then_each_recovery_then_the_status_again_and_only_then_the_decision(self) -> None:
+        names = [
+            "Read the release's status",
+            "Read the release's history",
+            "Roll the release back to its last deployed revision",
+            "Uninstall the release that never finished its first install",
+            "Read the release's status again",
+            "Decide whether the release must be installed or upgraded",
+            "Install or upgrade the release from the pinned chart archive",
+        ]
+        positions = [self.index(name) for name in names]
+        self.assertEqual(sorted(positions), positions)
+
+    def test_the_decision_reads_the_status_that_was_read_after_the_recovery_and_no_other(self) -> None:
+        task = self.tasks()[self.index("Decide whether the release must be installed or upgraded")]
+        text = str(task["ansible.builtin.set_fact"])
+        self.assertIn("airbyte_release_status_now", text)
+        self.assertNotRegex(text, r"airbyte_release_status\b(?!_now)")
+        self.assertEqual("airbyte_release_status_now", self.tasks()[self.index("Read the release's status again")]["register"])
+
+    def test_each_recovery_command_runs_only_for_its_states_changes_only_when_it_runs_and_has_a_deadline(self) -> None:
+        for name, argument in (
+            ("Roll the release back to its last deployed revision", "rollback"),
+            ("Uninstall the release that never finished its first install", "uninstall"),
+        ):
+            task = self.tasks()[self.index(name)]
+            with self.subTest(task=name):
+                argv = [str(item) for item in task["ansible.builtin.command"]["argv"]]
+                self.assertEqual("helm", argv[0])
+                self.assertEqual(argument, argv[1])
+                for flag in ("--namespace", "--wait", "--timeout"):
+                    self.assertIn(flag, argv)
+                self.assertIn("{{ airbyte_release_deadline_seconds }}s", argv)
+                self.assertIs(True, task["changed_when"])
+                self.assertIn("airbyte_release_deadline_seconds", str(task["timeout"]))
+                self.assertIn("when", task)
+                self.assertNotIn("failed_when", task)
+
+    def test_the_rollback_is_for_the_two_pending_states_of_an_existing_release_and_the_uninstall_for_the_first_install(self) -> None:
+        rollback = self.tasks()[self.index("Roll the release back to its last deployed revision")]["when"]
+        uninstall = self.tasks()[self.index("Uninstall the release that never finished its first install")]["when"]
+        self.assertTrue(all(state in str(rollback) for state in ("pending-upgrade", "pending-rollback")))
+        self.assertNotIn("pending-install", str(rollback))
+        self.assertIn("pending-install", str(uninstall))
+        self.assertNotRegex(str(uninstall), r"pending-(upgrade|rollback)")
 
 
 class PlacementTest(unittest.TestCase):
