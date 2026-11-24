@@ -21,10 +21,12 @@ import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from tests.e2e.run_record import Record
 from tests.fast import test_silver_acceptance as accept
 from tests.fast.outcome_accept import CASES_SNAPSHOT_TABLES
+from tests.fast.sealed_record import Sealed
 from tests.fast.silver_accept import Catalog
 from tests.fast.test_runner_catalog_facts import FakeNessie as TaggedNessie
 from tests.fast.test_silver_runner_records import FakeNessie, FakeStack, bind_build_pair, done_for
@@ -189,6 +191,63 @@ class StandInFlagFields(unittest.TestCase):
         self.assertNotIn("True", run.record.observations[0].observed)
         for marker in MARKERS:
             self.assertNotIn(marker, texts(run))
+
+
+class StackLines(unittest.TestCase):
+    """The log lines and the commands that the runners' own command code writes are the helper's text, with process answers that carry values."""
+
+    SILVER = ("silver_patient_split", "silver_cases", "silver_signals", "silver_hypotension")
+
+    def stack_of(self, module: ModuleType) -> Any:
+        record, log = Record(feature="test", slug="test", rerun="none"), list[str]()
+        if module.__name__.endswith("bronze_clinical_lab"):
+            stack = module.Stack(Path("compose"), record, log)
+        else:
+            stack = module.Stack(Path("compose"), "proj_x1", Path("data"), record, log)
+        stack.run = lambda *arguments, **keywords: (3, "SECRET_4417 out", "SECRET_4417 err")
+        return stack
+
+    def test_the_docker_and_compose_lines_hold_the_command_words_and_the_exit_code_only(self) -> None:
+        for name in self.SILVER:
+            with self.subTest(name):
+                stack = self.stack_of(runner(name))
+                stack.docker("rm", "-f", "4417", "SECRET_4417 x")
+                stack.compose_run("up", "--detach", "--wait", "SECRET_4417")
+                self.assertEqual(["docker rm -f <other>, exit 3", "compose up --detach --wait, exit 3"], [str(item) for item in stack.log])
+                self.assertEqual(["docker rm -f", "docker compose up --detach --wait"], [str(item) for item in stack.record.commands])
+                self.assertNotIn("4417", json.dumps([stack.log, stack.record.commands]))
+
+    def test_the_bronze_compose_line_holds_the_command_words_and_the_exit_code_only(self) -> None:
+        stack = self.stack_of(runner("bronze_clinical_lab"))
+        stack.compose_run("up", "--detach", "SECRET_4417 x")
+        self.assertEqual(["compose up --detach <other>, exit 3"], [str(item) for item in stack.log])
+        self.assertEqual(["docker compose up --detach <other>"], [str(item) for item in stack.record.commands])
+
+    def test_the_removal_of_a_project_logs_the_words_and_the_exit_code_only(self) -> None:
+        for name in self.SILVER:
+            with self.subTest(name):
+                module = runner(name)
+                answers = iter(
+                    [SimpleNamespace(returncode=0, stdout="SECRET_4417 4417\n", stderr="")] * 3 + [SimpleNamespace(returncode=5, stdout="", stderr="")] * 9
+                )
+                log: list[str] = []
+                with mock.patch.object(module, "run_command", side_effect=answers):
+                    module.remove_project("proj_x1", log)
+                self.assertTrue(log, name)
+                for item in log:
+                    self.assertNotIn("4417", str(item))
+                    self.assertIs(Sealed, type(item), str(item))
+
+
+class LimitsText(unittest.TestCase):
+    """The limits that a runner saves say nothing that its record does not do."""
+
+    def test_the_hypotension_limits_do_not_say_that_the_expected_event_list_is_saved(self) -> None:
+        source = (E2E / "silver_hypotension.py").read_text() if (E2E / "silver_hypotension.py").is_file() else ""
+        if not source:
+            raise unittest.SkipTest("the untracked runners are not on this machine")
+        self.assertNotIn("kept in the record", source)
+        self.assertIn("never the list", source)
 
 
 class DryRun(unittest.TestCase):

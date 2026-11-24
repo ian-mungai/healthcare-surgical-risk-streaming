@@ -527,16 +527,16 @@ class SinkLeaks(unittest.TestCase):
     """``sink_leaks`` reads the syntax tree of a runner and finds each observation, fact or printed line that is not the output of ``sealed_observed``."""
 
     BAD = (
-        ("observation_not_sealed", 'record.expect("c", "s", "e", f"rows {len(rows)}", ok)'),
-        ("observation_not_sealed", 'self.record.expect("c", "s", "e", f"flags {flags}", ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", observed, ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", str(value), ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", repr(value), ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", "snapshots {}".format(ids), ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", "exit " + str(code), ok)'),
-        ("observation_not_sealed", 'self.record.expect(case, "s", "e", observed=f"{value}", passed=ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", accepted.facts("write_hash"), ok)'),
-        ("observation_not_sealed", 'expect("c", "s", "e", sealed_text, ok)'),
+        ("observation_not_sealed", 'record.expect("c", "s", "e", f"rows {len(rows)}", ok is True)'),
+        ("observation_not_sealed", 'self.record.expect("c", "s", "e", f"flags {flags}", ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", observed, ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", str(value), ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", repr(value), ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", "snapshots {}".format(ids), ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", "exit " + str(code), ok is True)'),
+        ("observation_not_sealed", 'self.record.expect(case, "s", "e", observed=f"{value}", passed=ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", accepted.facts("write_hash"), ok is True)'),
+        ("observation_not_sealed", 'expect("c", "s", "e", sealed_text, ok is True)'),
         ("fact_not_sealed", "self.facts.update(merged_hash=merged)"),
         ("fact_not_sealed", 'self.facts.update({"a": value})'),
         ("fact_not_sealed", 'self.facts["a"] = value'),
@@ -548,35 +548,101 @@ class SinkLeaks(unittest.TestCase):
         ("fact_not_sealed", "self.facts = result"),
         ("fact_not_sealed", "self.facts.update(result)"),
         ("fact_not_sealed", 'self.facts.update(sealed_observed({"a": True}).facts, extra=1)'),
-        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": True}, codes=[f"{code}"]), ok)'),
-        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": True}, exit_code=int(str(code))), ok)'),
-        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": repr(value) == "x"}), ok)'),
-        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": "{}".format(value) == "x"}), ok)'),
-        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({f"rows {n}": True}), ok)'),
-        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({name: True}), ok)'),
-        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed(flags), ok)'),
-        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({**flags}), ok)'),
-        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed(dict.fromkeys(names, True)), ok)'),
-        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({"a" + name: True}), ok)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": True}, codes=[f"{code}"]), ok is True)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": True}, exit_code=int(str(code))), ok is True)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": repr(value) == "x"}), ok is True)'),
+        ("raw_in_sealed", 'expect("c", "s", "e", sealed_observed({"a": "{}".format(value) == "x"}), ok is True)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({f"rows {n}": True}), ok is True)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({name: True}), ok is True)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed(flags), ok is True)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({**flags}), ok is True)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed(dict.fromkeys(names, True)), ok is True)'),
+        ("flag_name_not_constant", 'expect("c", "s", "e", sealed_observed({"a" + name: True}), ok is True)'),
         ("forged_id", "found = ConfirmedId(7)"),
         ("forged_id", "found = sealed_record.ConfirmedId(7, token)"),
-        ("confirmed_not_made", 'expect("c", "s", "e", sealed_observed(confirmed={"id": 7}), ok)'),
-        ("confirmed_not_made", 'expect("c", "s", "e", sealed_observed(confirmed={"id": f"{x}"}), ok)'),
+        ("confirmed_not_made", 'expect("c", "s", "e", sealed_observed(confirmed={"id": 7}), ok is True)'),
+        ("confirmed_not_made", 'expect("c", "s", "e", sealed_observed(confirmed={"id": f"{x}"}), ok is True)'),
         ("printed_raw", 'print(f"{value}")'),
         ("printed_raw", 'sys.stdout.write(f"PASS {case}: {observed}\\n")'),
         ("printed_raw", "sys.stdout.write(text)"),
         ("printed_raw", 'sys.stdout.write("x " + value)'),
         ("printed_raw", 'print(json.dumps({"rows": 3}))'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"rows {len(rows)}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"the job exits {wanted}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'self.record.expect("c", "s", expected, sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", str(count), sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", "rows " + count, sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", expected=what, observed="x", passed=ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN} and {rows}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN[0]}", sealed_observed({"a": True}), ok is True)'),
+        ("expected_not_fixed", 'record.expect("c", "s", f"{FROZEN!r:>{width}}", sealed_observed({"a": True}), ok is True)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), ok)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), accepted.ok)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), code == 0 and ok)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), ok or count)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), len(rows))'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), result.get("passed"))'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), passes_as_write(a, b))'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), 1)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), None)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), count if ok else code == 0)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), passed=count)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), (ok is True) + count)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), [ok])'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), code == 0 if ok else count)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), -count)'),
+        ("passed_not_boolean", 'record.expect("c", "s", "e", sealed_observed({"a": True}), ~count)'),
+        ("limits_not_fixed", 'record.limits.insert("a fixed text")'),
+        ("limits_not_fixed", 'record.limits.insert(0, "a fixed text", "another")'),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["nessie", seen.stdout.strip()]))'),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["nessie", out]))'),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["nessie", *err]))'),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["nessie", result.stdout]))'),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["nessie", " ".join(parts)]))'),
+        ("raw_in_sealed", "log.append(sealed_observed(words=words))"),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["a"] + parts))'),
+        ("raw_in_sealed", 'log.append(sealed_observed(words=["a", *parts.split()]))'),
+        ("log_not_sealed", 'log.append(f"== docker {code}")'),
+        ("log_not_sealed", 'self.log.append(f"== spark: exit {code} after {seconds:.0f} seconds")'),
+        ("log_not_sealed", "self.log.append(text)"),
+        ("log_not_sealed", "log.append(seen.stdout.strip())"),
+        ("log_not_sealed", 'log.append("== a " + value)'),
+        ("log_not_sealed", 'log.extend([f"== {x}"])'),
+        ("log_not_sealed", "log.insert(0, value)"),
+        ("log_not_sealed", 'log.append(f"== stat {seen.stdout}")'),
+        ("log_not_sealed", 'log.append(sealed_observed({"a": True}).facts)'),
+        ("log_not_sealed", 'log.append(sealed_observed({"a": True}) + value)'),
+        ("log_not_sealed", 'log += [f"{x}"]'),
+        ("limits_not_fixed", 'record.limits.append(f"stalled {len(steps)} times")'),
+        ("limits_not_fixed", "record.limits.append(value)"),
+        ("limits_not_fixed", 'record.limits = ["fixed", f"rows {n}"]'),
+        ("limits_not_fixed", "record.limits = values"),
+        ("limits_not_fixed", 'record.limits.insert(0, f"{count}")'),
+        ("limits_not_fixed", "record.limits.extend([value])"),
+        ("limits_not_fixed", "record.limits.extend(values)"),
+        ("limits_not_fixed", "record.limits += [value]"),
+        ("limits_not_fixed", 'self.record.limits.append(f"steps {run.stack.stalls}")'),
+        ("cleanup_not_fixed", 'record.cleanup = f"cleanup failed: {error}"'),
+        ("cleanup_not_fixed", "record.cleanup = text"),
+        ("cleanup_not_fixed", 'record.cleanup = "; ".join(other)'),
+        ("cleanup_not_fixed", 'record.cleanup = ", ".join(cleanup)'),
+        ("cleanup_not_fixed", "self.cleanup = str(error)"),
+        ("cleanup_not_fixed", 'cleanup.append(f"scratch removed: {gone}")'),
+        ("cleanup_not_fixed", "cleanup.append(finish(run, record))"),
+        ("cleanup_not_fixed", 'cleanup += [f"{x}"]'),
+        ("command_not_sealed", "self.record.commands.append(f\"docker {' '.join(arguments[:2])} ...\")"),
+        ("command_not_sealed", "record.commands.append(command)"),
+        ("command_not_sealed", 'record.commands.append("docker " + value)'),
     )
     CLEAN = (
-        'record.expect("c", "s", "e", sealed_observed({"x": ok}, exit_code=code, seconds=seconds), ok)',
-        'self.record.expect("c", "s", "e", sealed_observed({"x": ok}, exits={"plant exit": a, "exit": b}, codes=codes(result)), ok)',
-        'self.record.expect("c", "s", "e", sealed_observed({"a": ids == other}, confirmed=found), ok)',
-        'self.record.expect("c", "s", "e", sealed_observed(confirmed={"id": made}), ok)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}, exit_code=code, seconds=seconds), ok is True)',
+        'self.record.expect("c", "s", "e", sealed_observed({"x": ok}, exits={"plant exit": a, "exit": b}, codes=codes(result)), ok is True)',
+        'self.record.expect("c", "s", "e", sealed_observed({"a": ids == other}, confirmed=found), ok is True)',
+        'self.record.expect("c", "s", "e", sealed_observed(confirmed={"id": made}), ok is True)',
         'expect("c", "s", "e", sealed_observed(error=error), False)',
-        'expect("c", "s", "e", sealed_observed(reason=accepted.reason), accepted.ok)',
+        'expect("c", "s", "e", sealed_observed(reason=accepted.reason), accepted.ok is True)',
         'record.expect("input", "setup", "e", "BRONZE_DATA_DIR is not set", False)',
-        'expect(f"planted: {label}", "planted fault", f"verify exits {wanted}", sealed_observed({"x": ok}), ok)',
+        'expect(f"planted: {label}", "planted fault", "verify exits", sealed_observed({"x": ok}), ok is True)',
         "expect = self.record.expect",
         "def expect(self, case, step, expected, observed, passed):\n    return passed",
         "self.observations.append(Observation(case, step, expected, observed, passed))",
@@ -594,9 +660,47 @@ class SinkLeaks(unittest.TestCase):
         'sys.stdout.write(sealed_observed({"x": True}).line(True, "c", "control"))',
         'sys.stdout.write("edited\\n")',
         'print("fixed text")',
-        'log.append(f"== docker {code}")',
         'texts = [" ".join((item.case, item.step, item.observed)) for item in record.observations]',
-        '# record.expect("c", "s", "e", f"rows {n}", ok)',
+        'record.expect("c", "s", "the file has the size of the pin", sealed_observed({"x": ok}), ok is True)',
+        'record.expect("c", "s", f"the file has the pinned size {PIN_SIZE} and owner {NESSIE_USER}", sealed_observed({"x": ok}), ok is True)',
+        'record.expect("c", "s", "a" if full else "b", sealed_observed({"x": ok}), ok is True)',
+        'record.expect("c", "s", sealed_observed({"x": True}), sealed_observed({"x": ok}), ok is True)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), code == 0 and bool(merged) and all(done.values()) and failure is None)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), not twice)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), True)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), False)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), any(x) or isinstance(y, int))',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), (a == 1 if b else c == 1) and 0 < n <= 3)',
+        'record.expect("c", "s", "e", sealed_observed({"x": ok}), passed=held is None)',
+        'log.append(sealed_observed(words=["docker", *arguments[:3]], exit_code=code))',
+        'self.log.append(sealed_observed(words=["spark", *arguments], exit_code=code, seconds=seconds, flags={"result file refused": bool(problem)}))',
+        'self.log.append("== a fixed line")',
+        'log.append("== a " if x else "== b")',
+        'log.extend([sealed_observed({"x": ok}), "fixed"])',
+        'record.limits.append(sealed_observed({"x": ok}))',
+        'record.limits.append(f"a step that gives no result within {JOB_SECONDS} seconds fails the run")',
+        'record.limits = ["a fixed", f"a step within {JOB_SECONDS} seconds", sealed_observed({"x": ok})]',
+        'record.limits.insert(0, "fixed")',
+        "record.limits = []",
+        'record.limits += ["fixed"]',
+        'record.limits.extend(["fixed", sealed_observed({"x": ok})])',
+        "limits: list[str] = []",
+        "self.log = log",
+        "log: list[str] = []",
+        'commands = parser.add_subparsers(dest="command", required=True)',
+        "commands: list[str] = []",
+        'record.cleanup = "; ".join(cleanup)',
+        'record.cleanup = "pending"',
+        'record.cleanup = sealed_observed({"x": ok})',
+        'cleanup.append(sealed_observed({"x": ok}))',
+        'cleanup.append("fixed")',
+        "cleanup: list[str] = []",
+        'self.record.commands.append(sealed_observed(words=["docker", *arguments[:2]]))',
+        'record.commands.append("docker compose up")',
+        'log.append(sealed_observed(words=["removed", "the", kind, "of", PROJECT, *arguments[:3], *arguments], exit_code=code))',
+        "log.append(sealed_observed(words=(label, step, *arguments[:1])))",
+        "texts = [*log, *record.limits, *record.commands, record.cleanup]",
+        '# record.expect("c", "s", "e", f"rows {n}", ok is True)',
         '"""record.expect(c, s, e, f"rows {n}", ok)"""',
     )
 
@@ -628,6 +732,76 @@ class SinkLeaks(unittest.TestCase):
     def test_every_sealed_call_that_goes_into_a_fact_is_found_when_it_is_not_the_facts_attribute(self) -> None:
         self.assertEqual([("fact_not_sealed", 1)], sink_leaks('self.facts.update(sealed_observed({"x": True}))\n'))
         self.assertEqual([("fact_not_sealed", 1)], sink_leaks('self.facts.update(sealed_observed({"x": True}).text)\n'))
+
+    FORWARD = (
+        "class Run:\n"
+        "    def refused(self, case, expected, observed, ok):\n"
+        "        return self.record.expect(case, 'planted', expected, sealed_observed({'a': ok}), ok is True)\n"
+        "\n"
+        "    def go(self):\n"
+        "@CALLS@"
+    )
+
+    def forward(self, *calls: str) -> list[tuple[str, int]]:
+        return sink_leaks(self.FORWARD.replace("@CALLS@", "".join(f"        {call}\n" for call in calls)))
+
+    def test_an_expectation_that_is_a_parameter_is_checked_where_the_function_is_called(self) -> None:
+        self.assertEqual([], self.forward('self.refused("c", "the job exits 1", result, True)', 'self.refused("c", f"the job exits {JOB_CODE}", result, True)'))
+        self.assertEqual([("expected_not_fixed", 6)], self.forward('self.refused("c", f"rows {len(rows)}", result, True)'))
+        self.assertEqual([("expected_not_fixed", 6)], self.forward('self.refused("c", expected=f"rows {len(rows)}", observed=result, ok=True)'))
+        self.assertEqual([("expected_not_fixed", 6)], self.forward('self.refused("c", wanted, result, True)'))
+        self.assertEqual([("expected_not_fixed", 7)], self.forward('self.refused("c", "fixed", result, True)', 'self.refused("c", str(count), result, True)'))
+        self.assertEqual(
+            [("expected_not_fixed", 6), ("expected_not_fixed", 7)],
+            self.forward('self.refused("c", text, result, True)', 'self.refused("c", text, result, False)'),
+        )
+
+    CHAIN = (
+        "class Run:\n"
+        "    def refused(self, case, expected, ok):\n"
+        "        return self.record.expect(case, 'planted', expected, sealed_observed({'a': ok}), ok is True)\n"
+        "\n"
+        "    def build(self, case, wanted, expected, ok):\n"
+        "        self.refused(case, expected, ok)\n"
+        "\n"
+        "    def go(self):\n"
+        "@CALLS@"
+    )
+
+    def test_an_expectation_that_goes_through_two_functions_is_checked_where_the_first_one_is_called(self) -> None:
+        def chain(*calls: str) -> list[tuple[str, int]]:
+            return sink_leaks(self.CHAIN.replace("@CALLS@", "".join(f"        {call}\n" for call in calls)))
+
+        self.assertEqual([], chain('self.build("c", [], "the job exits 1", True)'))
+        self.assertEqual([("expected_not_fixed", 9)], chain('self.build("c", [], f"rows {len(rows)}", True)'))
+        self.assertEqual([("expected_not_fixed", 9)], chain('self.build("c", [], expected=what, ok=True)'))
+        self.assertEqual([("expected_not_fixed", 10)], chain('self.build("c", [], "fixed", True)', 'self.build("c", [], str(n), True)'))
+
+    DEEP = (
+        "class Run:\n"
+        "    def top(self, case, text):\n"
+        "        self.mid(case, text)\n"
+        "\n"
+        "    def mid(self, case, text):\n"
+        "        self.low(case, text)\n"
+        "\n"
+        "    def low(self, case, expected):\n"
+        "        return self.record.expect(case, 'planted', expected, sealed_observed({'a': True}), True)\n"
+        "\n"
+        "    def go(self):\n"
+        "@CALLS@"
+    )
+
+    def test_an_expectation_that_goes_through_three_functions_is_checked_where_the_first_one_is_called(self) -> None:
+        def deep(*calls: str) -> list[tuple[str, int]]:
+            return sink_leaks(self.DEEP.replace("@CALLS@", "".join(f"        {call}\n" for call in calls)))
+
+        self.assertEqual([], deep('self.top("c", "fixed")'))
+        self.assertEqual([("expected_not_fixed", 12)], deep('self.top("c", f"rows {len(rows)}")'))
+
+    def test_an_expectation_that_is_a_name_that_is_no_parameter_of_the_function_is_found(self) -> None:
+        source = "def go(self, expected):\n    expected = f'rows {n}'\n    self.record.expect('c', 's', other, sealed_observed({'a': True}), True)\n"
+        self.assertEqual([("expected_not_fixed", 3)], sink_leaks(source))
 
     def test_a_source_that_does_not_parse_is_an_error_and_not_a_clean_runner(self) -> None:
         with self.assertRaises(SyntaxError):

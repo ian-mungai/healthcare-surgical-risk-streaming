@@ -444,6 +444,11 @@ OUTCOME_RUNNERS = (
 SEALED_CALL = "sealed_observed"
 RAW_TEXT_CALLS = frozenset({"str", "repr", "format"})
 FACT_NAMES = frozenset({"facts", "environment"})
+STREAM_NAMES = frozenset({"out", "err", "output", "stdout", "stderr"})
+CONSTANT_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+BOOLEAN_CALLS = frozenset({"bool", "all", "any", "isinstance"})
+# The lists and texts that the record saves besides the observations and the facts, with the rule that each one breaks.
+SAVED_LISTS = {"log": "log_not_sealed", "limits": "limits_not_fixed", "cleanup": "cleanup_not_fixed", "commands": "command_not_sealed"}
 
 
 def outcome_runner_paths(folder: Path) -> list[Path]:
@@ -509,6 +514,19 @@ def constant_keys(node: ast.AST) -> bool:
     return isinstance(node, ast.Dict) and all(key is not None and is_fixed_text(key) for key in node.keys)
 
 
+def plain_word(node: ast.AST) -> bool:
+    """A word of a command line that the runner wrote or took from its own arguments: a string constant, a name (never one that holds a stream), or the
+    words of a name or a slice of one (``*arguments[:3]``). A call, an attribute, an f-string or a sum is not."""
+    if isinstance(node, ast.Starred):
+        node = node.value.value if isinstance(node.value, ast.Subscript) else node.value
+    return is_fixed_text(node) or (isinstance(node, ast.Name) and node.id not in STREAM_NAMES)
+
+
+def plain_words(node: ast.AST) -> bool:
+    """Whether the ``words`` of a sealed call are a written list or tuple of plain words."""
+    return isinstance(node, ast.List | ast.Tuple) and all(plain_word(item) for item in node.elts)
+
+
 def sealed_call_problem(call: ast.Call) -> str | None:
     """The rule that a call of ``sealed_observed`` breaks, or ``None``: flags and exit names are constants, a confirmed value is never a constant or text made
     by the runner, and no text is made inside the call."""
@@ -516,6 +534,9 @@ def sealed_call_problem(call: ast.Call) -> str | None:
     named = {item.arg: item.value for item in call.keywords}
     if (flags is not None and not constant_keys(flags)) or ("exits" in named and not constant_keys(named["exits"])):
         return "flag_name_not_constant"
+    words = named.get("words")
+    if words is not None and not plain_words(words):
+        return "raw_in_sealed"
     confirmed = named.get("confirmed")
     if confirmed is not None and (
         isinstance(confirmed, (ast.Constant, ast.JoinedStr, ast.BinOp))
@@ -542,14 +563,117 @@ def printed_problem(call: ast.Call) -> bool:
     return any(not (is_fixed_choice(arg) or sealed_line(arg)) for arg in call.args)
 
 
-def sink_problem(node: ast.AST) -> str | None:
-    """The rule that a node breaks, or ``None``. A sink is an observation (the fourth argument of ``expect``), a saved fact, a printed line or a
-    ``sealed_observed`` call itself."""
+def is_constant_name(node: ast.AST) -> bool:
+    """A module constant: a name in capitals, as ``JOB_SECONDS`` or ``PROJECT``."""
+    return isinstance(node, ast.Name) and CONSTANT_NAME.fullmatch(node.id) is not None
+
+
+def is_constant_text(node: ast.AST) -> bool:
+    """Text that the runner writes: a string constant, an f-string whose only fields are module constants (no conversion, no format), or a choice between two
+    of them."""
+    if is_fixed_text(node):
+        return True
+    if isinstance(node, ast.JoinedStr):
+        return all(
+            is_fixed_text(item)
+            or (isinstance(item, ast.FormattedValue) and item.conversion == -1 and item.format_spec is None and is_constant_name(item.value))
+            for item in node.values
+        )
+    return isinstance(node, ast.IfExp) and is_constant_text(node.body) and is_constant_text(node.orelse)
+
+
+def is_saved_text(node: ast.AST) -> bool:
+    """Text that may be saved or logged: written text, or the output of ``sealed_observed`` itself."""
+    return is_constant_text(node) or is_sealed_call(node)
+
+
+def is_exact_boolean(node: ast.AST) -> bool:
+    """An expression that is always exactly ``True`` or ``False``: a Boolean constant, ``not``, a comparison, ``bool()``, ``all()``, ``any()`` or
+    ``isinstance()``, and ``and``, ``or`` and a choice between such expressions (``and`` and ``or`` give one of their operands, so each operand counts). A name,
+    an attribute, a call of anything else, a number or a list is not."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, bool)
+    if isinstance(node, ast.UnaryOp):
+        return isinstance(node.op, ast.Not)
+    if isinstance(node, ast.Compare):
+        return True
+    if isinstance(node, ast.BoolOp):
+        return all(is_exact_boolean(item) for item in node.values)
+    if isinstance(node, ast.IfExp):
+        return is_exact_boolean(node.body) and is_exact_boolean(node.orelse)
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in BOOLEAN_CALLS
+
+
+def terminal_name(node: ast.AST) -> str | None:
+    """The last name of a variable or an attribute (``limits`` for ``self.record.limits``), or ``None``."""
+    return node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+
+
+def call_argument(call: ast.Call, position: int, name: str) -> ast.AST | None:
+    return call.args[position] if len(call.args) > position else next((item.value for item in call.keywords if item.arg == name), None)
+
+
+def saved_list(node: ast.AST | None) -> bool:
+    """Whether the value of a saved list is a written list of saved texts."""
+    return isinstance(node, ast.List) and all(is_saved_text(item) for item in node.elts)
+
+
+def joined_cleanup(node: ast.AST | None) -> bool:
+    """Whether the value is ``"; ".join(cleanup)``: the join of the list that holds the cleanup lines, each of which is checked where it is added."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and isinstance(node.func.value, ast.Constant)
+        and node.func.value.value == "; "
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "cleanup"
+    )
+
+
+def list_sink_problem(call: ast.Call) -> str | None:
+    """The rule that an item put into a saved list breaks (``log``, ``limits``, ``cleanup`` or ``commands``), or ``None``."""
+    if not isinstance(call.func, ast.Attribute) or (rule := SAVED_LISTS.get(terminal_name(call.func.value) or "")) is None:
+        return None
+    if call.func.attr in ("append", "insert", "extend") and not call.keywords:
+        item = call.args[-1] if call.args else None
+        wrong = item is None or not (saved_list(item) if call.func.attr == "extend" else is_saved_text(item))
+        return rule if wrong or len(call.args) != (2 if call.func.attr == "insert" else 1) else None
+    return None
+
+
+def saved_assignment_problem(target: ast.AST, value: ast.AST | None, augmented: bool = False) -> str | None:
+    """The rule that a value written to a saved list or to the cleanup text breaks, or ``None``."""
+    rule = SAVED_LISTS.get(terminal_name(target) or "")
+    if rule is None or value is None or (not augmented and rule not in ("limits_not_fixed", "cleanup_not_fixed")):
+        return None
+    if rule == "cleanup_not_fixed" and not augmented and not isinstance(target, ast.Name):
+        return None if is_saved_text(value) or joined_cleanup(value) else rule
+    return None if saved_list(value) else rule
+
+
+def expect_problem(call: ast.Call, forwarded: frozenset[int] = frozenset()) -> str | None:
+    """The rule that a call of ``expect`` breaks, or ``None``: the expectation is written text or a sealed text, the observation is a sealed text or written
+    text and the verdict is an exact Boolean."""
+    observed, expected, passed = call_argument(call, 3, "observed"), call_argument(call, 2, "expected"), call_argument(call, 4, "passed")
+    if observed is not None and not (is_fixed_text(observed) or is_sealed_call(observed)):
+        return "observation_not_sealed"
+    if expected is not None and not is_saved_text(expected) and id(call) not in forwarded:
+        return "expected_not_fixed"
+    return "passed_not_boolean" if passed is not None and not is_exact_boolean(passed) else None
+
+
+def sink_problem(node: ast.AST, forwarded: frozenset[int] = frozenset()) -> str | None:
+    """The rule that a node breaks, or ``None``. A sink is an observation, its expectation or its verdict (``expect``), a saved fact, a printed line, a line of
+    the log, a limit, a cleanup line, a command or a ``sealed_observed`` call itself."""
     if isinstance(node, ast.Call):
         name = call_name(node)
         if name == "expect":
-            observed = node.args[3] if len(node.args) > 3 else next((item.value for item in node.keywords if item.arg == "observed"), None)
-            return "observation_not_sealed" if observed is not None and not (is_fixed_text(observed) or is_sealed_call(observed)) else None
+            return expect_problem(node, forwarded)
+        if (problem := list_sink_problem(node)) is not None:
+            return problem
         if name == "ConfirmedId":
             return "forged_id"
         if name == SEALED_CALL:
@@ -563,10 +687,93 @@ def sink_problem(node: ast.AST) -> str | None:
         targets = [(target, node.value) for target in node.targets]
     elif isinstance(node, ast.AnnAssign):
         targets = [(node.target, node.value)]
+    elif isinstance(node, ast.AugAssign):
+        return saved_assignment_problem(node.target, node.value, augmented=True)
     for target, value in targets:
         if fact_target(target) and fact_value_problem(target, value):
             return "fact_not_sealed"
+        if (problem := saved_assignment_problem(target, value)) is not None:
+            return problem
     return None
+
+
+def parameters(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    arguments = function.args
+    return [item.arg for item in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)]
+
+
+def innermost_functions(tree: ast.AST) -> dict[ast.Call, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """The function that holds each call (the innermost one); a call outside every function is not in the map."""
+    holder: dict[ast.Call, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+
+    def visit(node: ast.AST, function: ast.FunctionDef | ast.AsyncFunctionDef | None) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            function = node
+        if isinstance(node, ast.Call) and function is not None:
+            holder[node] = function
+        for child in ast.iter_child_nodes(node):
+            visit(child, function)
+
+    visit(tree, None)
+    return holder
+
+
+def forwarded_expectations(tree: ast.AST) -> tuple[frozenset[int], dict[ast.Call, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]]:
+    """The calls that pass a parameter of their function on as an expectation, and the calls of the functions that receive one, in the same source.
+
+    A call of ``expect`` whose expectation is a parameter of its function makes that function a forwarder of that parameter. A call of a forwarder that
+    gives one of its own parameters makes its function a forwarder too (the text passes through any number of functions). The text is checked where it
+    enters: each call of a forwarder that gives anything but a parameter must give written text or a sealed text (``forwarded_text_ok``)."""
+    holder = innermost_functions(tree)
+    calls = [item for item in ast.walk(tree) if isinstance(item, ast.Call)]
+    forwarded: set[int] = set()
+    forwarders: dict[str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = {}
+    for call in calls:
+        function = holder.get(call)
+        expected = call_argument(call, 2, "expected") if call_name(call) == "expect" else None
+        if function is not None and isinstance(expected, ast.Name) and expected.id in parameters(function):
+            forwarded.add(id(call))
+            forwarders[function.name] = (function, expected.id)
+    changed = True
+    while changed:
+        changed = False
+        for call in calls:
+            name = call_name(call)
+            if name not in forwarders or name == "expect":
+                continue
+            given = forwarded_argument(call, forwarders[name])
+            function = holder.get(call)
+            if function is not None and isinstance(given, ast.Name) and given.id in parameters(function) and function.name not in forwarders:
+                forwarders[function.name] = (function, given.id)
+                changed = True
+    called = {
+        call: forwarders[name]
+        for call in calls
+        if (name := call_name(call)) in forwarders and name != "expect" and not forwarded_parameter(call, forwarders[name], holder.get(call))
+    }
+    return frozenset(forwarded), called
+
+
+def forwarded_argument(call: ast.Call, forwarder: tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]) -> ast.AST | None:
+    """The argument that a call of a forwarder gives for the forwarded parameter."""
+    function, name = forwarder
+    names = parameters(function)
+    position = names.index(name) - (1 if names and names[0] in ("self", "cls") and isinstance(call.func, ast.Attribute) else 0)
+    return call_argument(call, position, name)
+
+
+def forwarded_parameter(
+    call: ast.Call, forwarder: tuple[ast.FunctionDef | ast.AsyncFunctionDef, str], holder: ast.FunctionDef | ast.AsyncFunctionDef | None
+) -> bool:
+    """Whether a call of a forwarder gives a parameter of its own function, which makes that function a forwarder, so the text is checked at its calls."""
+    given = forwarded_argument(call, forwarder)
+    return holder is not None and isinstance(given, ast.Name) and given.id in parameters(holder)
+
+
+def forwarded_text_ok(call: ast.Call, forwarder: tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]) -> bool:
+    """Whether a call of a function that passes a parameter on as the expectation gives written text for it."""
+    given = forwarded_argument(call, forwarder)
+    return given is not None and is_saved_text(given)
 
 
 def sink_leaks(source: str) -> list[tuple[str, int]]:
@@ -580,8 +787,17 @@ def sink_leaks(source: str) -> list[tuple[str, int]]:
     - ``forged_id``: a ``ConfirmedId`` made by hand.
     - ``flag_name_not_constant``: a flag or exit name that is not a constant.
     - ``confirmed_not_made``: a confirmed value that is a constant or made text.
-    - ``raw_in_sealed``: an f-string, ``str()``, ``repr()`` or ``format`` inside a sealed call.
+    - ``raw_in_sealed``: an f-string, ``str()``, ``repr()`` or ``format`` inside a sealed call, or ``words`` that are not a written list of constants and
+      names (a call, an attribute or the name of a stream is not one).
+    - ``expected_not_fixed``: an expectation that is not written text or a sealed text, or a call that gives such a text to a function that passes it on as
+      the expectation of ``expect`` (a parameter of that function).
+    - ``passed_not_boolean``: a verdict that is not an exact Boolean expression (``and`` and ``or`` count each operand).
+    - ``log_not_sealed``, ``limits_not_fixed``, ``cleanup_not_fixed`` and ``command_not_sealed``: a line of the log, a limit, a cleanup line or a command that
+      is not written text or a sealed text. Written text may name module constants in capitals in an f-string, and nothing else.
 
     A source that does not parse raises ``SyntaxError``."""
-    found = [(problem, getattr(node, "lineno", 0)) for node in ast.walk(ast.parse(source)) if (problem := sink_problem(node)) is not None]
+    tree = ast.parse(source)
+    forwarded, called = forwarded_expectations(tree)
+    found = [(problem, getattr(node, "lineno", 0)) for node in ast.walk(tree) if (problem := sink_problem(node, forwarded)) is not None]
+    found += [("expected_not_fixed", call.lineno) for call in called if not forwarded_text_ok(call, called[call])]
     return sorted(found, key=lambda item: item[1])

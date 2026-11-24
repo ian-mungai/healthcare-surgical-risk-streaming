@@ -392,7 +392,6 @@ class SignalsRecord(unittest.TestCase):
             }
         )
         write = written_signals()
-        run.facts["snapshots"] = {"numeric_observations": 11}
         run.silver = lambda mode, branch, base=None: done_for(module, write, accept.WROTE)
         run.empty_rebuild()
         text = observations(run)[0]
