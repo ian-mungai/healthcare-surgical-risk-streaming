@@ -12,6 +12,9 @@
 !features/registry.py
 !features/model.py
 !features/stats.py
+!features/label_values.py
+!features/icu_label.py
+!features/kidney_label.py
 !spark/requirements.txt
 !replay/__init__.py
 !replay/events/__init__.py

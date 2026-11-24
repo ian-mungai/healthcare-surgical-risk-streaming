@@ -7,7 +7,8 @@ branch is the caller's step.
 
 The test set is sealed. A message or the result holds codes, counts, table names and the cutoffs (measured on development patients), and never a case, a
 patient or an argument. The command line prints fixed codes only: ``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the
-codes of a failed check.
+codes of a failed check. A ``silver.cases`` table of the schema before the double (``icu_days`` as a whole number) is refused by the code
+``cases_schema_legacy: failed``: only a ``build`` on a new branch rebuilds it.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ CHECKS_SAMPLE = [
     "cutoffs_read_back",
 ]
 CHECKS_BUILD = [*CHECKS_SAMPLE[:7], "pinned_counts", *CHECKS_SAMPLE[7:]]
+CASES_SCHEMA_LEGACY = "cases_schema_legacy: failed"
 RULES_READ_BACK = "readback_differs: the saved measure or cutoffs are not the ones that were written"
 
 
@@ -81,6 +83,8 @@ class SilverOps(Protocol):
     def write_rules(self, measure: list[MeasureRow], cutoffs: list[CutoffRow]) -> bool: ...
 
     def output_schema_tables_wrong(self) -> int: ...
+
+    def cases_schema_legacy(self) -> bool: ...
 
     def output_facts(self) -> dict[str, object]: ...
 
@@ -134,9 +138,12 @@ def checked_inputs(ops: SilverOps, *, pinned: bool) -> tuple[list[MeasureRow], l
 
 
 def check_stored_schema(ops: SilverOps) -> None:
-    """Refuse a written table with a dropped, extra or retyped column before any query reads a value of it."""
+    """Refuse a written table with a dropped, extra or retyped column before any query reads a value of it. A cases table of the legacy schema is refused by
+    its own code, so the cause is named: the table must be rebuilt by a ``build`` on a new branch."""
     wrong = ops.output_schema_tables_wrong()
     if wrong:
+        if ops.cases_schema_legacy():
+            raise SilverCasesError(CASES_SCHEMA_LEGACY)
         raise SilverCasesError(f"output_schema: {unit(wrong, 'table')}")
 
 

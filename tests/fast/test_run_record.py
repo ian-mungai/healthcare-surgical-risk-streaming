@@ -5,6 +5,8 @@ Failure modes covered here:
 - A run folder has no ``retention.json``, so nothing says why it is kept or when it goes.
 - The label lacks a required field, or holds a class that is not an integer from 1 to 9, or a time that is not UTC ISO 8601.
 - A failed or blocked run gets the end condition of a passing run, so its folder is swept before its failure is fixed.
+- A record that is written again in its folder (after a scan that came later) keeps the earlier outcome and label, or makes a second folder, or prints the
+  outcome before the final verdict.
 """
 
 from __future__ import annotations
@@ -58,6 +60,62 @@ class RetentionLabelTest(unittest.TestCase):
 
     def test_a_blocked_run_ends_when_its_fix_is_pushed(self) -> None:
         self.assertEqual(FAILED, self.close(blocked="interrupted")["end_condition"])
+
+
+class WriteAgainTest(unittest.TestCase):
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.printed = io.StringIO()
+        for patcher in (mock.patch.object(run_record, "ROOT", self.root), mock.patch.object(sys, "stdout", self.printed)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_record_written_again_in_its_folder_holds_the_final_verdict_in_the_record_and_the_label(self) -> None:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle("")
+        folder = record.write(["one line"])
+        self.assertEqual("pass", json.loads((folder / "record.json").read_text())["outcome"])
+        self.assertEqual(PASSED, json.loads((folder / "retention.json").read_text())["end_condition"])
+        record.expect("later case", "control", "expected", "observed", False)
+        record.settle("")
+        again = record.write(["one line"], folder)
+        self.assertEqual(folder, again)
+        self.assertEqual("fail", json.loads((folder / "record.json").read_text())["outcome"])
+        self.assertEqual(2, len(json.loads((folder / "record.json").read_text())["observations"]))
+        self.assertEqual(FAILED, json.loads((folder / "retention.json").read_text())["end_condition"])
+        self.assertEqual(1, len(list((self.root / "runs").iterdir())))
+
+    def test_a_late_interrupt_turns_a_passing_record_into_a_blocked_one(self) -> None:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle("")
+        folder = record.write([])
+        record.settle("interrupted")
+        record.write([], folder)
+        self.assertEqual("blocked: interrupted", json.loads((folder / "record.json").read_text())["outcome"])
+        self.assertEqual(FAILED, json.loads((folder / "retention.json").read_text())["end_condition"])
+
+    def test_the_report_prints_each_assertion_and_the_final_outcome_once_and_gives_the_exit_code(self) -> None:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle("")
+        folder = record.write([])
+        self.assertEqual("", self.printed.getvalue())
+        self.assertEqual(0, record.report(folder))
+        self.assertEqual(1, self.printed.getvalue().count("pass: record in"))
+        record.settle("interrupted")
+        self.assertEqual(1, record.report(folder))
+
+    def test_close_still_does_all_three_steps_in_one_new_folder(self) -> None:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        self.assertEqual(0, record.close(["a"]))
+        (folder,) = (self.root / "runs").iterdir()
+        self.assertEqual("a\n", (folder / "log.txt").read_text())
+        self.assertEqual("pass", json.loads((folder / "record.json").read_text())["outcome"])
 
 
 if __name__ == "__main__":

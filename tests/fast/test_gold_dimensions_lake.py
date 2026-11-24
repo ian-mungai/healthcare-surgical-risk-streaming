@@ -73,8 +73,8 @@ class Writer:
         self.log.append(f"property {key}={value}")
         return self
 
-    def createOrReplace(self) -> None:
-        self.log.append(f"createOrReplace {self.table}")
+    def create(self) -> None:
+        self.log.append(f"create {self.table}")
 
     def overwritePartitions(self) -> None:
         self.log.append(f"overwritePartitions {self.table}")
@@ -328,13 +328,13 @@ class WriteTests(unittest.TestCase):
         job, _ = lake(answers={desired_query(CASE, DATE): []})
         job.session.sql = lambda text: desired if text == desired_query(CASE, DATE) else log.append(text)
         self.assertTrue(job.write(CASE))
-        self.assertEqual(["CREATE NAMESPACE IF NOT EXISTS lake.gold", "property format-version=2", "createOrReplace lake.gold.dim_case"], log)
+        self.assertEqual(["CREATE NAMESPACE IF NOT EXISTS lake.gold", "property format-version=2", "create lake.gold.dim_case"], log)
 
     def test_a_build_with_no_version_date_writes_nothing(self) -> None:
         job, log = lake(valid_from=None)
         with self.assertRaises(GoldDimensionsError):
             job.write(CASE)
-        self.assertFalse([line for line in log if line.startswith(("createOrReplace", "overwritePartitions"))])
+        self.assertFalse([line for line in log if line.startswith(("create", "overwritePartitions"))])
 
     def test_a_dimension_that_already_holds_the_rows_is_not_written_again(self) -> None:
         log: list[str] = []
@@ -352,7 +352,7 @@ class WriteTests(unittest.TestCase):
         self.assertFalse(job.write(CASE))
         self.assertIn(next_query(CASE, DATE), asked)
         self.assertNotIn(desired_query(CASE, DATE), asked)
-        self.assertFalse([line for line in log if line.startswith(("createOrReplace", "overwritePartitions"))])
+        self.assertFalse([line for line in log if line.startswith(("create", "overwritePartitions"))])
 
     def test_a_dimension_with_other_rows_is_overwritten_in_place(self) -> None:
         log: list[str] = []

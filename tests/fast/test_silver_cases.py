@@ -112,6 +112,16 @@ class ColumnListTest(unittest.TestCase):
         types = {column.name: column.type for column in CASE_COLUMNS}
         self.assertEqual(("bigint", "string"), (types["caseid"], types["subjectid"]))
 
+    def test_the_stay_in_intensive_care_is_a_double_so_a_fraction_of_a_day_reaches_the_label_and_the_death_flag_stays_a_whole_number(self) -> None:
+        types = {column.name: column.type for column in CASE_COLUMNS}
+        self.assertEqual(("double", "bigint"), (types["icu_days"], types["death_inhosp"]))
+        for text, value in (("0.5", 0.5), ("0", 0.0), ("3", 3.0), ("-1", -1.0), ("0.25", 0.25), ("12.75", 12.75)):
+            with self.subTest(text=text):
+                self.assertEqual(value, typed_value(types["icu_days"], text))
+        for text in ("1e2", "+1", " 1", "NaN", "1.", ".5"):
+            with self.subTest(refused=text), self.assertRaises(SilverCasesError):
+                typed_value(types["icu_days"], text)
+
     def test_the_laboratory_table_keeps_the_published_columns_and_adds_the_copy_count_and_the_occurrence(self) -> None:
         self.assertEqual(
             [("caseid", "bigint"), ("dt", "bigint"), ("name", "string"), ("result", "double"), ("source_copies", "int"), ("source_occurrence", "int")],
