@@ -18,6 +18,7 @@ object to the bucket.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sys
 from dataclasses import asdict, dataclass
@@ -40,6 +41,7 @@ WORKSPACE = "default"
 BLOCK_NAMES = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
 MISSING_BUCKET = ("(404)", "NoSuchBucket")
 GIT_TIMEOUT_SECONDS = 60
+BINDING_REFUSED = "the run binding file must lie directly inside the runs folder of the repository; nothing was written"
 
 
 @dataclass
@@ -174,7 +176,19 @@ def repair(aws: Aws, bucket: str, name: str, tags: dict[str, str]) -> None:
         aws.call("s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging", tag_set)
 
 
+def binding_path(path: Path) -> Path | None:
+    """The binding file that ``path`` names: a relative path is read from the repository root, never from the working folder, and ``..`` parts are folded
+    out. None when the file does not lie directly inside the runs folder, the only place a binding is written."""
+    resolved = Path(os.path.normpath(ROOT / path))
+    return resolved if resolved.parent == RUNS else None
+
+
 def create(aws: Aws, configuration: dict[str, str], path: Path, backend: str = "s3", provision_host: bool = True, short_lived: bool = False) -> int:
+    named = binding_path(path)
+    if named is None:
+        sys.stderr.write(f"{BINDING_REFUSED}\n")
+        return 1
+    path = named
     binding = RunBinding(**json.loads(path.read_text())) if path.is_file() else new_binding(configuration, backend, provision_host, short_lived)
     if binding.backend != backend:
         sys.stderr.write(f"the run is bound to the {binding.backend} backend, not {backend}\n")
