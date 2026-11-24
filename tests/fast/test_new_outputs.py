@@ -12,6 +12,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -152,6 +153,25 @@ class WriteNewFileTests(Fixture):
         self.assertEqual(EXISTS, str(caught.exception))
         self.assertEqual(ORIGINAL, path.read_text())
         self.assert_nothing_left()
+
+    def test_the_check_alone_refuses_a_path_that_something_holds_in_any_form(self) -> None:
+        for form in FORMS:
+            with self.subTest(form=form):
+                path, unchanged = self.existing(form)
+                with self.assertRaises(ClosedInputError) as caught:
+                    check_new_output(path)
+                self.assertEqual(EXISTS, str(caught.exception))
+                unchanged()
+                shutil_rmtree(self.root / "forms")
+
+    def test_the_mode_that_is_asked_for_is_the_mode_of_the_file_whatever_the_mask_of_the_process(self) -> None:
+        path = self.root / "readable.json"
+        previous = os.umask(0o077)
+        try:
+            write_new_file(path, "text\n", mode=0o644)
+        finally:
+            os.umask(previous)
+        self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
 
     def test_the_check_alone_creates_nothing(self) -> None:
         check_new_output(self.root / "new.json")

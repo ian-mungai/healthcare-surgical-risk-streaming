@@ -14,7 +14,7 @@ import os
 import unittest
 from unittest import mock
 
-from scripts.ingestion.notice import ClosedError, Code, FixedTextError, Notice, Subject, describe_error, render
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, describe_error, render
 from scripts.process import run_command
 from scripts.stack.nessie import NessieError
 from spark.jobs import catalog_proof
@@ -73,13 +73,12 @@ MARKED = {"infra.iam.scripts.manage_policies.KeyAdviceError"}
 
 
 def marked_classes() -> set[str]:
-    """Every class below ``FixedTextError`` in the modules that the commands load, named by module and class."""
+    """Every class in the source that has ``FixedTextError`` among its bases, named by module path and class."""
     found: set[str] = set()
-    pending = list(FixedTextError.__subclasses__())
-    while pending:
-        item = pending.pop()
-        found.add(f"{item.__module__}.{item.__qualname__}")
-        pending.extend(item.__subclasses__())
+    for name in tracked_python():
+        for node in ast.walk(ast.parse((ROOT / name).read_text())):
+            if isinstance(node, ast.ClassDef) and any(ast.unparse(base).endswith("FixedTextError") for base in node.bases):
+                found.add(f"{name.removesuffix('.py').replace('/', '.')}.{node.name}")
     return found
 
 
