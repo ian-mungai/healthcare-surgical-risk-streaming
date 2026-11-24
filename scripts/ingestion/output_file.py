@@ -1,4 +1,4 @@
-"""The two ways that production code writes a file: ``write_new_file`` and ``replace_owned_file``. A scan test fails for any other write.
+"""The three ways that production code writes a file: ``write_new_file``, ``publish_reserved`` and ``replace_owned_file``. A scan test fails for any other.
 
 Create an output file that did not exist, and never replace one that did.
 
@@ -8,6 +8,12 @@ leads nowhere), a folder and a name that differs from an existing one only in le
 ``os.link``, which fails when the path has appeared since the check, so nothing is replaced even by a late writer. The temporary file is removed on every
 path. An output that a command appends to as it runs calls ``check_new_output`` first and creates the file with an exclusive open of its own. The
 temporary name is a dot, eight hex digits and ``.part``, never the name of the output, so an output name of 255 bytes works.
+
+``publish_reserved`` is for an output whose staging file the caller reserved first (the result file of a sealed job: ``<path>.part`` is made before any work, so
+that a path that cannot hold it is a bad call, and a watchdog removes it by name). The reserved file is the only staging file: the text is written into it, and
+it is linked to the output with ``os.link``, which fails when the output exists, and then its name is removed. The reserved name is removed on every path, a
+refusal too, so removing that one name (the watchdog does) removes every staged byte. It must lie in the folder of the output and be a plain file with no
+other name. A link or any other kind of entry at the reserved name is refused with fixed text.
 
 ``replace_owned_file`` is for the state that a long-running command owns and must update (a heartbeat, a queue count, a saved position). ``state_root`` is a
 folder from a fixed source: a module constant, a folder that the same command created in this run, or the service's state-folder setting. It is never built
@@ -19,6 +25,7 @@ nothing is written.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import stat
@@ -77,6 +84,39 @@ def write_new_file(path: Path, data: str | bytes, *, mode: int = 0o600) -> None:
             raise ClosedInputError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)) from None
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def publish_reserved(reserved: Path, path: Path, data: str | bytes, *, mode: int = 0o600) -> None:
+    """Write ``data`` into the reserved file ``reserved`` and link it to ``path``, whole or not at all, then remove the reserved name. ``reserved`` is the only
+    staging file. Raise ``ClosedInputError`` for a path that is not free, a reserved file that is not a plain file of its own in the folder of ``path``, or a
+    write that fails. The reserved name is gone afterwards on every path."""
+    try:
+        check_new_output(path)
+        if reserved.parent != path.parent:
+            raise ClosedInputError(Notice(Code.OUTPUT_FOLDER))
+        content = data.encode() if isinstance(data, str) else data
+        try:
+            descriptor = os.open(reserved, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            raise ClosedInputError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)) from None
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                held = os.fstat(handle.fileno())
+                if not stat.S_ISREG(held.st_mode) or held.st_nlink != 1:
+                    raise ClosedInputError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT))
+                os.ftruncate(handle.fileno(), 0)
+                os.fchmod(handle.fileno(), mode)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(reserved, path)
+        except FileExistsError:
+            raise ClosedInputError(Notice(Code.OUTPUT_EXISTS)) from None
+        except OSError:
+            raise ClosedInputError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)) from None
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(reserved)
 
 
 def replace_owned_file(path: Path, data: str | bytes, *, state_root: Path, mode: int = 0o600) -> None:

@@ -1,12 +1,13 @@
-"""Every file write in production code goes through one of two helpers, or is on the explicit list below with its reason.
+"""Every file write in production code goes through one of three helpers, or is on the explicit list below with its reason.
 
-The two helpers live in ``scripts/ingestion/output_file.py``: ``write_new_file`` for every output that a command line names and for every receipt, sidecar
-or checksum file (it never replaces a path), and ``replace_owned_file`` for state that a long-running command owns and must update (it replaces only a
-regular file directly inside the state folder that the command created or was given).
+The three helpers live in ``scripts/ingestion/output_file.py``: ``write_new_file`` for every output that a command line names and for every receipt,
+sidecar or checksum file (it never replaces a path), ``publish_reserved`` for an output whose staging file the caller reserved first (the result file of a
+sealed job: the reserved ``<path>.part`` is the only staging file, and it never replaces a path), and ``replace_owned_file`` for state that a long-running
+command owns and must update (it replaces only a regular file directly inside the state folder that the command created or was given).
 
 ``test_no_call_writes_a_file_outside_the_helpers_or_the_list`` parses every production Python file (``scripts``, ``replay``, ``spark``, ``features``,
 ``infra`` and ``orchestration``; not a ``tests`` folder) with ``ast`` and lists each call that writes, moves or links a file. A call fails the test unless
-it sits in one of the two helpers or matches an entry of ``ALLOWED`` (file, enclosing function, call text, count, reason). An entry that no longer matches
+it sits in one of the helpers or matches an entry of ``ALLOWED`` (file, enclosing function, call text, count, reason). An entry that no longer matches
 a call fails the test too, so the list never keeps a site that was moved onto a helper. The scan tests plant one direct write per pattern and check that
 the scan finds it.
 
@@ -28,7 +29,7 @@ from tests.fast.git_fixture import ROOT
 
 SCANNED = ("scripts", "replay", "spark", "features", "infra", "orchestration", "dagster")
 HELPER_FILE = "scripts/ingestion/output_file.py"
-HELPERS = frozenset({"write_new_file", "replace_owned_file"})
+HELPERS = frozenset({"write_new_file", "publish_reserved", "replace_owned_file"})
 OPEN_MODE = re.compile(r"^[rwxabt+]+(:[A-Za-z0-9*]+)?$")
 WRITE_LETTERS = frozenset("wax+")
 WRITE_FLAGS = frozenset({"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC", "O_EXCL"})

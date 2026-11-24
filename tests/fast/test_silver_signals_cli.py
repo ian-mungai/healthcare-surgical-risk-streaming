@@ -104,7 +104,7 @@ class CommandLine(InFolder):
         self.assertTrue(text.endswith("\n"))
         self.assertEqual(0o644, stat.S_IMODE(self.path.stat().st_mode))
 
-    def test_the_file_is_written_whole_to_a_private_file_and_then_linked_into_place(self) -> None:
+    def test_the_file_is_written_whole_to_the_reserved_part_file_in_the_same_folder_and_then_linked_into_place(self) -> None:
         seen: list[tuple[str, str, Any, bool]] = []
         link = os.link
 
@@ -119,7 +119,9 @@ class CommandLine(InFolder):
         self.assertEqual(1, len(seen))
         source, target, whole, existed = seen[0]
         self.assertEqual(str(self.path), target)
-        self.assertRegex(Path(source).name, r"\.[0-9a-f]{8}\.part")
+        self.assertNotEqual(str(self.path), source)
+        self.assertEqual(self.folder, Path(source).parent)
+        self.assertEqual(str(self.path) + ".part", source)
         self.assertEqual({"mode": "build", "branch": "b"}, whole)
         self.assertFalse(existed)
         self.assertEqual(["result.json"], self.left())

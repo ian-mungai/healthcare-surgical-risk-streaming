@@ -3,8 +3,9 @@
 The caller reads that file with a closed schema and no line of the job's standard output or standard error, which stay for the operator (the Spark launcher
 writes its own lines to them). The path is absolute, its folder is there, and neither the path nor ``<path>.part`` exists, so a file is never replaced. The job
 reserves ``<path>.part`` (a new file, made with ``write_new_file``) before any work, so a path that cannot hold it (a name of 255 bytes) is a bad call,
-``usage``, and nothing runs. It writes the whole document with ``write_new_file`` (a private file in the folder, flushed and linked to ``<path>``, which fails
-when the path exists), so that a reader sees no file or the whole file. A watchdog calls ``release_reserved`` so that the job it stops leaves no part file.
+``usage``, and nothing runs. It writes the whole document into that reserved file with ``publish_reserved`` (flushed, then linked to ``<path>``, which
+fails when the path exists), so that a reader sees no file or the whole file and the reserved file is the only staging file. A watchdog calls
+``release_reserved`` so that the job it stops leaves no part file, not even one that holds a result (the stop may come right before the link).
 ``run_sealed`` is the whole ending of a job whose failures are problems of the form ``code: failed`` (the patient split job and the Silver cases job; the Silver
 signals and hypotension jobs use the same reserve, write and release in ``spark/silver/cli.py``): every line that it prints for a refusal is a fixed code and
 the flag, never a count. This module imports no Spark.
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.ingestion.closed import ClosedInputError
-from scripts.ingestion.output_file import check_new_output, write_new_file
+from scripts.ingestion.output_file import check_new_output, publish_reserved, write_new_file
 from scripts.stack.nessie import NessieError
 from spark.settings import SettingsError
 
@@ -89,11 +90,11 @@ def release_reserved() -> None:
 
 
 def write_reserved(path: str, document: dict[str, Any]) -> None:
-    """Write the whole document to ``path`` with ``write_new_file`` (a private file in the folder, flushed, then linked into place, so a reader sees no file or
-    the whole file) and release the reserved part file. A file that appeared at ``path`` after the reservation is never replaced: that is a
-    ``ClosedInputError``. A failure leaves no part file."""
+    """Write the whole document into the reserved part file and link it to ``path`` (``publish_reserved``: the part file is the only staging file, so a reader
+    sees no file or the whole file and the watchdog's release of the part file removes every staged byte), then release the reserved name. A file that
+    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A failure leaves no part file."""
     try:
-        write_new_file(Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
+        publish_reserved(Path(path + ".part"), Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
     finally:
         release_reserved()
 

@@ -4,6 +4,10 @@
 case, and a path whose folder does not exist. It writes a private temporary file in the folder of the output, then puts it in place with ``os.link``, which
 fails when the path has appeared since: nothing is replaced, and no temporary file stays. Every command that writes an output named on its command line
 goes through it, or through ``check_new_output`` for an output that it appends to as it runs.
+
+``publish_reserved`` is the same for a file that the caller reserved first: the reserved file is the only staging file. It receives the text, is linked to the
+output (the link fails when the output exists, so nothing is replaced even by a late writer) and its name is removed on every path, so releasing the reserved
+name removes every staged byte.
 """
 
 from __future__ import annotations
@@ -26,8 +30,8 @@ from unittest import mock
 from features import batch as features_batch
 from scripts.ingestion import cli, copy_cost, copy_probe, staging_peak
 from scripts.ingestion.closed import ClosedInputError
-from scripts.ingestion.notice import Code, Notice, render
-from scripts.ingestion.output_file import check_new_output, write_new_file
+from scripts.ingestion.notice import Code, Notice, Subject, render
+from scripts.ingestion.output_file import check_new_output, publish_reserved, write_new_file
 from scripts.sample import candidates
 
 ORIGINAL = "original text\n"
@@ -177,6 +181,140 @@ class WriteNewFileTests(Fixture):
     def test_the_check_alone_creates_nothing(self) -> None:
         check_new_output(self.root / "new.json")
         self.assertEqual([], list(self.root.iterdir()))
+
+
+class PublishReservedTests(Fixture):
+    """``publish_reserved``: the reserved file is the only staging file, so that releasing its name removes every staged byte."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.path = self.root / "result.json"
+        self.reserved = self.root / "result.json.part"
+        self.reserved.write_text("")
+
+    def names(self) -> list[str]:
+        return sorted(entry.name for entry in self.root.iterdir())
+
+    def test_the_text_is_written_into_the_reserved_file_and_linked_and_no_other_file_is_made(self) -> None:
+        seen: dict[str, Any] = {}
+        real = os.link
+
+        def link(source: str, target: str) -> None:
+            seen["names"] = self.names()
+            seen["source"] = Path(source).name
+            seen["whole"] = Path(source).read_text()
+            seen["target_before"] = os.path.lexists(target)
+            real(source, target)
+
+        with mock.patch("os.link", link):
+            publish_reserved(self.reserved, self.path, "text\n", mode=0o644)
+        self.assertEqual((["result.json.part"], "result.json.part", "text\n", False), (seen["names"], seen["source"], seen["whole"], seen["target_before"]))
+        self.assertEqual("text\n", self.path.read_text())
+        self.assertEqual(0o644, stat.S_IMODE(self.path.stat().st_mode))
+        self.assertEqual(["result.json"], self.names())
+
+    def test_bytes_are_written_as_they_are(self) -> None:
+        publish_reserved(self.reserved, self.path, b"\x00\x01")
+        self.assertEqual(b"\x00\x01", self.path.read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE(self.path.stat().st_mode))
+
+    def test_the_text_is_flushed_to_disk_before_the_link(self) -> None:
+        order: list[str] = []
+        real_fsync, real_link = os.fsync, os.link
+
+        def fsync(descriptor: int) -> None:
+            order.append("fsync")
+            real_fsync(descriptor)
+
+        def link(source: str, target: str) -> None:
+            order.append("link")
+            real_link(source, target)
+
+        with mock.patch("os.fsync", fsync), mock.patch("os.link", link):
+            publish_reserved(self.reserved, self.path, "text\n")
+        self.assertEqual(["fsync", "link"], order)
+
+    def test_a_path_that_something_holds_in_any_form_is_refused_and_the_holder_is_left_as_it_was(self) -> None:
+        self.reserved.unlink()
+        for form in FORMS:
+            with self.subTest(form=form):
+                path, unchanged = self.existing(form)
+                reserved = path.with_name(path.name + ".part")
+                reserved.write_text("")
+                with mock.patch("os.fsync") as flushed, self.assertRaises(ClosedInputError) as caught:
+                    publish_reserved(reserved, path, "new\n")
+                self.assertEqual(EXISTS, str(caught.exception))
+                flushed.assert_not_called()
+                unchanged()
+                self.assertFalse(os.path.lexists(reserved))
+                self.assert_nothing_left()
+                shutil_rmtree(self.root / "forms")
+
+    def test_a_path_that_appears_before_the_link_is_never_written_over(self) -> None:
+        real = os.link
+
+        def late(source: str, target: str) -> None:
+            self.path.write_text(ORIGINAL)
+            real(source, target)
+
+        with mock.patch("os.link", late), self.assertRaises(ClosedInputError) as caught:
+            publish_reserved(self.reserved, self.path, "new\n")
+        self.assertEqual(EXISTS, str(caught.exception))
+        self.assertEqual(ORIGINAL, self.path.read_text())
+        self.assertEqual(["result.json"], self.names())
+
+    def test_a_link_that_fails_leaves_nothing_and_shows_no_text_of_the_error(self) -> None:
+        def refuse(source: str, target: str) -> None:
+            raise OSError("MARKER_91 disk full")
+
+        with mock.patch("os.link", refuse), self.assertRaises(ClosedInputError) as caught:
+            publish_reserved(self.reserved, self.path, "new\n")
+        self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
+        self.assertNotIn("MARKER_91", str(caught.exception))
+        self.assertEqual([], self.names())
+
+    def test_a_reserved_file_that_is_gone_or_is_not_a_plain_file_is_refused_and_nothing_else_is_touched(self) -> None:
+        other = self.root / "other.txt"
+        other.write_text(ORIGINAL)
+        self.reserved.unlink()
+        for form in ("missing", "link", "folder"):
+            with self.subTest(form=form):
+                if form == "link":
+                    self.reserved.symlink_to(other)
+                elif form == "folder":
+                    self.reserved.mkdir()
+                with self.assertRaises(ClosedInputError) as caught:
+                    publish_reserved(self.reserved, self.path, "new\n")
+                self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
+                self.assertEqual(ORIGINAL, other.read_text())
+                self.assertFalse(self.path.exists())
+                if form == "folder":
+                    self.reserved.rmdir()
+                else:
+                    self.reserved.unlink(missing_ok=True)
+        self.assertEqual(["other.txt"], self.names())
+
+    def test_a_reserved_file_that_holds_old_bytes_is_cut_to_the_new_text(self) -> None:
+        self.reserved.write_text("a much longer text than the new one\n")
+        publish_reserved(self.reserved, self.path, "new\n")
+        self.assertEqual("new\n", self.path.read_text())
+
+    def test_a_reserved_file_that_has_another_name_is_refused_and_the_other_name_keeps_its_bytes(self) -> None:
+        other = self.root / "other.txt"
+        other.write_text(ORIGINAL)
+        self.reserved.unlink()
+        os.link(other, self.reserved)
+        with self.assertRaises(ClosedInputError) as caught:
+            publish_reserved(self.reserved, self.path, "new\n")
+        self.assertEqual(render(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT)), str(caught.exception))
+        self.assertEqual(ORIGINAL, other.read_text())
+        self.assertEqual(["other.txt"], self.names())
+
+    def test_a_path_in_another_folder_than_the_reserved_file_is_refused_and_the_reserved_name_is_removed(self) -> None:
+        (self.root / "other").mkdir()
+        with self.assertRaises(ClosedInputError):
+            publish_reserved(self.reserved, self.root / "other" / "result.json", "new\n")
+        self.assertEqual(["other"], self.names())
 
 
 def shutil_rmtree(path: Path) -> None:

@@ -7,11 +7,12 @@ Failure modes covered here:
 - A path that is not absolute, a path with a NUL, a folder that is missing, a file or a part file that exists, or a second ``--result`` is taken, so that a
   file is replaced or a caller reads another one.
 - A file that appears at the path while the job runs is replaced, so a result that a caller already holds is overwritten. The document is put in place with
-  ``write_new_file`` (a hard link, which fails when the path exists), so nothing is replaced even by a late writer.
-- A reader sees half a file: the document is written whole to a private file in the same folder and linked into place, and a failure leaves no part file.
+  ``publish_reserved`` (a hard link, which fails when the path exists), so nothing is replaced even by a late writer.
+- A reader sees half a file: the document is written whole into the reserved part file and linked into place, and a failure leaves no part file.
 - A path that passes the preflight but cannot hold its part file (a name of 255 bytes: ``<name>.part`` is too long) fails only after the job ran. The part
   file is reserved (created exclusively) before any work, and a reservation that fails is a bad call: ``usage``, exit 2, and nothing runs.
-- A job that the watchdog stops leaves its reserved part file for a reader to take for a result.
+- A job that the watchdog stops leaves its reserved part file, or a second staging file that holds the whole result, for a reader to take for a result. The
+  reserved part file is the only staging file (``test_result_watchdog.py`` stops a real process right before the link).
 - The file is not readable by the caller or is executable.
 - An ending that the job maps to a code writes no file, or a failure writes the text of its error, a count or an argument into the file or a stream.
 """
@@ -23,7 +24,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import sys
 import tempfile
 import unittest
@@ -117,7 +117,7 @@ class Writing(unittest.TestCase):
         self.assertEqual(0o644, FILE_MODE)
         self.assertEqual(["result.json"], os.listdir(self.folder))
 
-    def test_the_file_appears_whole_in_one_link_from_a_private_file_and_never_over_another(self) -> None:
+    def test_the_file_appears_whole_in_one_link_from_the_reserved_part_file_and_never_over_another(self) -> None:
         seen: dict[str, object] = {}
         real = os.link
         self.assertIsNotNone(reserve(self.path))
@@ -125,12 +125,14 @@ class Writing(unittest.TestCase):
         def link(source: str, target: str) -> None:
             seen["target_before"] = os.path.lexists(target)
             seen["whole"] = json.loads(Path(source).read_text())
-            seen["names"] = (re.fullmatch(r"\.[0-9a-f]{8}\.part", os.path.basename(source)) is not None, os.path.basename(target))
+            seen["names"] = (os.path.basename(source), os.path.basename(target))
+            seen["folder"] = os.listdir(self.folder)
             real(source, target)
 
         with mock.patch("os.link", link):
             write_reserved(self.path, DOCUMENT)
-        self.assertEqual((False, DOCUMENT, (True, "result.json")), (seen["target_before"], seen["whole"], seen["names"]))
+        self.assertEqual((False, DOCUMENT, ("result.json.part", "result.json")), (seen["target_before"], seen["whole"], seen["names"]))
+        self.assertEqual(["result.json.part"], seen["folder"])
         self.assertEqual(["result.json"], os.listdir(self.folder))
 
     def test_the_document_is_flushed_to_disk_before_the_file_is_put_in_place(self) -> None:
