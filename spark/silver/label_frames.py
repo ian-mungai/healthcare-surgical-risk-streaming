@@ -5,9 +5,9 @@ Python only to call the label rules: ``features.kidney_label`` decides every kid
 batch and any later path cannot differ. The two row functions below are thin adapters that flatten a rule's answer into the columns of its table.
 
 The labels are outcomes and the test set is sealed. A label table has a row for every case, but the values read from it are flags (``exists``), never a count:
-the facts of a label table hold its rows (compared with the cases inside the run, never printed) and one number for each check that is only tested for being
-positive. The column checks (a key null or twice, a null in a column, a value outside its domain) are Great Expectations checks (``quality_flags``); the exact
-comparison with the rebuilt table and the rules that join several columns are Spark. The measure of
+the facts of a label table hold one number for each check that is only tested for being positive. The column checks (a key null or twice, a null in a column, a
+value outside its domain, and the row count, which must equal the number of cases) are Great Expectations checks (``quality_flags``); the exact comparison with
+the rebuilt table and the rules that join several columns are Spark. The measure of
 ``icu_days`` is made from the development patients' values only: a case joins to the patient split by its patient, and only a set of ``DEVELOPMENT_SETS``
 counts. The split is used only after its own rule check (the job runs it first).
 """
@@ -183,11 +183,12 @@ def differing(stored: Any, planned: Any, columns: tuple[tuple[str, str], ...]) -
     return int(exists(left.exceptAll(right)) or exists(right.exceptAll(left)))
 
 
-def quality_flags(frame: Any, table: str, run: Callable[[Any, Sequence[Check]], list[CheckResult]] = column_checks) -> dict[str, int]:
-    """The column checks of a table (``column_plan``) run in Great Expectations on the stored ``frame``: one flag, 0 or 1, for each group of checks, that is 1
+def quality_flags(frame: Any, table: str, cases: int, run: Callable[[Any, Sequence[Check]], list[CheckResult]] = column_checks) -> dict[str, int]:
+    """The column checks of a table (``column_plan``, with the row count of a label table, which must be ``cases``) run in Great Expectations on the stored
+    ``frame``: one flag, 0 or 1, for each group of checks, that is 1
     when any check of the group failed. The count that the library found never leaves this function. A check that the runner leaves out counts as failed, and a
     result for a check that the plan does not hold is an error (``verdict``)."""
-    plan = column_plan(table)
+    plan = column_plan(table, cases)
     checks = [check for flag in COLUMN_FLAGS[table] for check in plan[flag]]
     failed = {failure.name for failure in verdict(checks, run(frame, checks)).failed}
     return {flag: int(any(check.name in failed for check in plan[flag])) for flag in COLUMN_FLAGS[table]}
@@ -201,10 +202,10 @@ def implies(present: Any, condition: Any) -> Any:
 
 def measure_facts(stored: Any, session: Any, cases: Any, split: Any, run: Callable[..., list[CheckResult]] = column_checks) -> TableFacts:
     flags = {
-        **quality_flags(stored, MEASURE, run),
+        **quality_flags(stored, MEASURE, 0, run),
         "icu_measure_differs": differing(stored, measure_frame(session, measure_rows(cases, split)), ICU_DAYS_MEASURE.columns),
     }
-    return TableFacts(int(stored.count()), flags)
+    return TableFacts(flags)
 
 
 def icu_facts(stored: Any, cases: Any, run: Callable[..., list[CheckResult]] = column_checks) -> TableFacts:
@@ -215,12 +216,12 @@ def icu_facts(stored: Any, cases: Any, run: Callable[..., list[CheckResult]] = c
     wanted = f.when(value.isNull(), f.lit(UNKNOWN)).when(invalid, f.lit(UNKNOWN)).when(value > f.lit(STAY_ABOVE), f.lit(POSITIVE)).otherwise(f.lit(NEGATIVE))
     why = f.when(value.isNull(), f.lit("missing")).when(invalid, f.lit("invalid")).otherwise(f.lit("recorded"))
     flags = {
-        **quality_flags(stored, ICU, run),
+        **quality_flags(stored, ICU, int(cases.count()), run),
         "icu_eligibility": exists(stored.filter(~eligible.eqNullSafe(label != f.lit(UNKNOWN)))),
         "icu_value_rule": exists(stored.filter(~(label.eqNullSafe(wanted) & reason.eqNullSafe(why)))),
         "icu_differs": differing(stored, icu_frame(cases), ICU_LABELS.columns),
     }
-    return TableFacts(int(stored.count()), flags)
+    return TableFacts(flags)
 
 
 def kidney_times_ok() -> Any:
@@ -254,8 +255,9 @@ def kidney_times_ok() -> Any:
 
 
 def kidney_rule_bad() -> Any:
-    """A column that is true for a row whose label, rises, measurements and reason disagree. The rise tests use a tolerance of a billionth: this check reads
-    the stored doubles, and the exact decimal rule is the one the rebuild is compared with (``kidney_differs``)."""
+    """A column that is true for a row whose label, rises, measurements and reason disagree: a row that has no absolute rise keeps the pair of its largest
+    difference, which must be under the limit. The rise tests use a tolerance of a
+    billionth: this check reads the stored doubles, and the exact decimal rule is the one the rebuild is compared with (``kidney_differs``)."""
     f = functions()
     c = f.col
     label, reason, absolute, relative = c("label"), c("eligibility_reason"), c("absolute_rise"), c("relative_rise")
@@ -277,7 +279,10 @@ def kidney_rule_bad() -> Any:
         .when(label == f.lit(UNKNOWN), nothing_read & ~c("eligible").eqNullSafe(f.lit(True)))
         .otherwise(f.lit(False))
     )
-    absolute_ok = implies(absolute.eqNullSafe(f.lit(True)), c("later_value") - c("earlier_value") >= f.lit(ABSOLUTE_RISE - TOLERANCE))
+    rise_value = c("later_value") - c("earlier_value")
+    absolute_ok = implies(absolute.eqNullSafe(f.lit(True)), rise_value >= f.lit(ABSOLUTE_RISE - TOLERANCE)) & implies(
+        absolute.eqNullSafe(f.lit(False)) & c("earlier_time_s").isNotNull(), rise_value < f.lit(ABSOLUTE_RISE + TOLERANCE)
+    )
     relative_ok = implies(relative.eqNullSafe(f.lit(True)), c("relative_value") >= f.lit(RELATIVE_RATIO) * c("baseline_value") - f.lit(TOLERANCE))
     highest_ok = (
         (c("early_highest_time_s").isNotNull() == (c("early_results") > 0))
@@ -294,10 +299,10 @@ def kidney_facts(stored: Any, cases: Any, lab: Any, run: Callable[..., list[Chec
     f = functions()
     label, reason, eligible = f.col("label"), f.col("eligibility_reason"), f.col("eligible")
     flags = {
-        **quality_flags(stored, KIDNEY, run),
+        **quality_flags(stored, KIDNEY, int(cases.count()), run),
         "kidney_eligibility": exists(stored.filter(~(eligible.eqNullSafe(label != f.lit(UNKNOWN)) & eligible.eqNullSafe(reason == f.lit(ELIGIBLE))))),
         "kidney_times": exists(stored.filter(~kidney_times_ok())),
         "kidney_rule": exists(stored.filter(kidney_rule_bad())),
         "kidney_differs": differing(stored, kidney_frame(cases, lab), KIDNEY_INJURY_LABELS.columns),
     }
-    return TableFacts(int(stored.count()), flags)
+    return TableFacts(flags)

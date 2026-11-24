@@ -37,7 +37,7 @@ LABEL_TABLES = (ICU, KIDNEY)
 
 
 def facts(table: str) -> TableFacts:
-    return TableFacts(2 if table == MEASURE else 6388, {name: 0 for name in TABLE_CHECKS[table]})
+    return TableFacts({name: 0 for name in TABLE_CHECKS[table]})
 
 
 def codes(error: SilverSignalsError) -> list[str]:
@@ -138,7 +138,7 @@ class Build(unittest.TestCase):
 
     def test_the_labels_are_planned_only_after_the_measure_was_read_back_with_every_check_passing(self) -> None:
         for broken, wanted in (
-            (TableRead(FINGERPRINTS[MEASURE], 100, TableFacts(2, {"icu_measure_columns": 0, "icu_measure_differs": 1})), ["icu_measure_differs: failed"]),
+            (TableRead(FINGERPRINTS[MEASURE], 100, TableFacts({"icu_measure_columns": 0, "icu_measure_differs": 1})), ["icu_measure_differs: failed"]),
             (TableRead(Fingerprint(2, 99), 100, facts(MEASURE)), ["readback_differs: failed"]),
             (None, ["table_missing: failed"]),
         ):
@@ -280,8 +280,8 @@ class Build(unittest.TestCase):
 
     def test_the_checks_of_every_table_run_on_the_read_back_and_a_failed_check_is_a_flag(self) -> None:
         fake = Fake()
-        fake.read_back[KIDNEY] = TableRead(FINGERPRINTS[KIDNEY], 102, TableFacts(6388, {**facts(KIDNEY).flags, "kidney_rule": 12}))
-        fake.read_back[ICU] = TableRead(FINGERPRINTS[ICU], 101, TableFacts(6380, facts(ICU).flags))
+        fake.read_back[KIDNEY] = TableRead(FINGERPRINTS[KIDNEY], 102, TableFacts({**facts(KIDNEY).flags, "kidney_rule": 12}))
+        fake.read_back[ICU] = TableRead(FINGERPRINTS[ICU], 101, TableFacts({**facts(ICU).flags, "icu_not_every_case": 1}))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
         self.assertEqual(["icu_not_every_case: failed", "kidney_rule: failed"], caught.exception.problems)
@@ -323,10 +323,10 @@ class PassFlags(unittest.TestCase):
         reads = self.reads()
         reads[MEASURE] = None
         reads[ICU] = TableRead(FINGERPRINTS[ICU], 101, None)
-        reads[KIDNEY] = TableRead(FINGERPRINTS[KIDNEY], 102, TableFacts(6388, {**facts(KIDNEY).flags, "kidney_rule": 1}))
+        reads[KIDNEY] = TableRead(FINGERPRINTS[KIDNEY], 102, TableFacts({**facts(KIDNEY).flags, "kidney_rule": 1}))
         self.assertEqual({MEASURE: False, ICU: False, KIDNEY: False}, passed_flags(INPUT, reads, None))
         reads = self.reads()
-        reads[ICU] = TableRead(FINGERPRINTS[ICU], 101, TableFacts(6380, facts(ICU).flags))
+        reads[ICU] = TableRead(FINGERPRINTS[ICU], 101, TableFacts({**facts(ICU).flags, "icu_not_every_case": 1}))
         self.assertEqual({MEASURE: True, ICU: False, KIDNEY: True}, passed_flags(INPUT, reads, None))
 
     def test_a_table_that_is_not_the_planned_one_is_false_in_a_build_only(self) -> None:

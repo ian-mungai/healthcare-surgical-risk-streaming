@@ -7,6 +7,7 @@ Failure modes covered here:
   passes.
 - A failed check sets another table flag than its own, or two flags, so the name of a defect in a message is wrong.
 - A flag holds the count that the library found: the labels are outcomes, so a flag is 0 or 1 and the count never leaves the adapter.
+- The row count of a label table is not a check that the runner runs, or it runs with other bounds than the number of cases.
 - A check that the runner leaves out counts as passed, or a result for a check that the plan does not hold is accepted.
 """
 
@@ -17,7 +18,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from spark.bronze.checks import Check, CheckError, CheckResult
-from spark.silver.label_checks import COLUMN_FLAGS, ICU, KIDNEY, MEASURE, column_plan
+from spark.silver.label_checks import COLUMN_FLAGS, ICU, KIDNEY, MEASURE, ROW_CHECKS, column_plan
 from spark.silver.label_frames import quality_flags
 
 
@@ -38,8 +39,11 @@ class Runner:
         return results
 
 
+CASES = 6388
+
+
 def names(table: str, flag: str) -> list[str]:
-    return [check.name for check in column_plan(table)[flag]]
+    return [check.name for check in column_plan(table, CASES)[flag]]
 
 
 class Flags(unittest.TestCase):
@@ -47,7 +51,7 @@ class Flags(unittest.TestCase):
         for table in (MEASURE, ICU, KIDNEY):
             with self.subTest(table=table):
                 runner, frame = Runner(), object()
-                flags = quality_flags(frame, table, runner)
+                flags = quality_flags(frame, table, CASES, runner)
                 self.assertEqual({flag: 0 for flag in COLUMN_FLAGS[table]}, flags)
                 expected = [name for flag in COLUMN_FLAGS[table] for name in names(table, flag)]
                 self.assertEqual([(frame, expected)], runner.calls)
@@ -57,7 +61,7 @@ class Flags(unittest.TestCase):
             for flag in COLUMN_FLAGS[table]:
                 for name in names(table, flag):
                     with self.subTest(table=table, flag=flag, check=name):
-                        flags = quality_flags(object(), table, Runner({name}))
+                        flags = quality_flags(object(), table, CASES, Runner({name}))
                         self.assertEqual({other: int(other == flag) for other in COLUMN_FLAGS[table]}, flags)
 
     def test_a_check_that_the_runner_leaves_out_is_a_failure_of_its_flag(self) -> None:
@@ -65,18 +69,33 @@ class Flags(unittest.TestCase):
             for flag in COLUMN_FLAGS[table]:
                 for name in names(table, flag):
                     with self.subTest(table=table, check=name):
-                        flags = quality_flags(object(), table, Runner(drop={name}))
+                        flags = quality_flags(object(), table, CASES, Runner(drop={name}))
                         self.assertEqual({other: int(other == flag) for other in COLUMN_FLAGS[table]}, flags)
+
+    def test_the_row_count_check_of_a_label_table_goes_to_the_runner_with_both_bounds_equal_to_the_cases(self) -> None:
+        seen: list[Check] = []
+
+        def run(frame: Any, checks: Sequence[Check]) -> list[CheckResult]:
+            seen.extend(checks)
+            return [CheckResult(check, True, 0) for check in checks]
+
+        for table in ROW_CHECKS:
+            with self.subTest(table=table):
+                seen.clear()
+                quality_flags(object(), table, CASES, run)
+                counted = [check for check in seen if check.expectation == "ExpectTableRowCountToBeBetween"]
+                self.assertEqual(1, len(counted))
+                self.assertEqual(("ExpectTableRowCountToBeBetween", {"min_value": CASES, "max_value": CASES}), (counted[0].expectation, counted[0].kwargs))
 
     def test_a_result_for_a_check_that_the_plan_does_not_hold_is_refused(self) -> None:
         other = Check("elsewhere", "key", "stray", "ExpectColumnValuesToNotBeNull", {"column": "x"})
         with self.assertRaises(CheckError):
-            quality_flags(object(), ICU, Runner(extra=other))
+            quality_flags(object(), ICU, CASES, Runner(extra=other))
 
     def test_the_two_label_tables_have_their_own_checks_on_the_same_columns(self) -> None:
-        self.assertEqual({"icu_labels"}, {check.table for checks in column_plan(ICU).values() for check in checks})
-        self.assertEqual({"kidney_injury_labels"}, {check.table for checks in column_plan(KIDNEY).values() for check in checks})
-        self.assertEqual({"icu_days_measure"}, {check.table for checks in column_plan(MEASURE).values() for check in checks})
+        self.assertEqual({"icu_labels"}, {check.table for checks in column_plan(ICU, CASES).values() for check in checks})
+        self.assertEqual({"kidney_injury_labels"}, {check.table for checks in column_plan(KIDNEY, CASES).values() for check in checks})
+        self.assertEqual({"icu_days_measure"}, {check.table for checks in column_plan(MEASURE, CASES).values() for check in checks})
 
 
 if __name__ == "__main__":

@@ -13,6 +13,9 @@ Every case here is hand-built and kept apart from published data. Failure modes 
 - A label row does not carry the baseline with its time and source, the windows, the measurements and the times that the rule read.
 - A negative keeps no measurement that it used: with one baseline, follow-up values of 1.1 and of 1.2 give the same label, so a later check cannot
   reproduce it. The row records the highest follow-up result of the first 48 hours and of the 7 days, each with its value, time and number.
+- A negative keeps only the highest follow-up results, so the 48-hour comparison that decided it is lost: with a baseline of 1.2 and follow-up of 1.25, 1.00
+  and 1.24 (the largest rise is 0.24), the same row is stored when 1.00 becomes 1.02 (the largest rise is 0.22) and when 0.90 is the early result (0.34, a
+  positive), because the maxima are the same. The row stores the earlier and the later result that give the largest rise, whether or not it reaches 0.3.
 - A boundary rule is an unnamed comparison inside the code, so its status (decided by the plan, a lead assumption, pending the owner) is not recorded and a
   changed answer of the owner is not one line. Each is a named constant, flipping it changes the result, and the pending one changes one line only.
 """
@@ -173,10 +176,18 @@ class Positives(unittest.TestCase):
         self.assertEqual((NEGATIVE, ELIGIBLE), label_of(before(HOUR, 1.0), after(HOUR, 1.29)))
         self.assertEqual((NEGATIVE, ELIGIBLE), label_of(before(20 * DAY, 1.0), after(5 * DAY, 1.49)))
 
-    def test_the_first_qualifying_pair_is_reported_in_a_fixed_order(self) -> None:
+    def test_the_pair_of_the_largest_rise_is_reported_in_a_fixed_order(self) -> None:
         outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), before(2 * HOUR, 0.8), after(HOUR, 1.4), after(2 * HOUR, 1.5)])
-        self.assertEqual((before(2 * HOUR, 0.8), after(HOUR, 1.4)), (outcome.earlier, outcome.later))
+        self.assertEqual((before(2 * HOUR, 0.8), after(2 * HOUR, 1.5)), (outcome.earlier, outcome.later))
         self.assertEqual(after(2 * HOUR, 1.5), outcome.relative_result)
+
+    def test_equal_largest_rises_give_the_earliest_later_result_then_the_lowest_earlier_value_then_the_latest_then_the_lowest_number(self) -> None:
+        tie = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(HOUR, 1.4), after(2 * HOUR, 1.4)])
+        self.assertEqual((before(HOUR, 1.0), after(HOUR, 1.4)), (tie.earlier, tie.later))
+        same_value = kidney_label(ANESTART, OPEND, [before(2 * HOUR, 1.0), before(HOUR, 1.0), after(HOUR, 1.4)])
+        self.assertEqual(before(HOUR, 1.0), same_value.earlier)
+        same_time = kidney_label(ANESTART, OPEND, [result(ANESTART - HOUR, 1.0, 2), result(ANESTART - HOUR, 1.0, 1), after(HOUR, 1.4)])
+        self.assertEqual(result(ANESTART - HOUR, 1.0, 1), same_time.earlier)
 
 
 class Windows(unittest.TestCase):
@@ -329,6 +340,50 @@ class Measurements(unittest.TestCase):
     def test_the_baseline_is_recorded_with_its_value_and_time_for_a_negative(self) -> None:
         outcome = kidney_label(ANESTART, OPEND, [result(ANESTART - 2 * HOUR, 0.9, 3), after(DAY, 1.0)])
         self.assertEqual((NEGATIVE, result(ANESTART - 2 * HOUR, 0.9, 3)), (outcome.label, outcome.baseline))
+
+
+class Comparison(unittest.TestCase):
+    """The row keeps the 48-hour comparison that decided the absolute rule, whether or not it reached 0.3."""
+
+    BASELINE = before(2 * DAY, 1.2)
+
+    def row(self, early: float) -> rule.KidneyLabel:
+        return kidney_label(ANESTART, OPEND, [self.BASELINE, after(HOUR, 1.25), after(10 * HOUR, early), after(20 * HOUR, 1.24)])
+
+    def test_a_negative_stores_the_pair_of_the_largest_rise_even_below_the_limit(self) -> None:
+        outcome = self.row(1.00)
+        self.assertEqual((NEGATIVE, False), (outcome.label, outcome.absolute_rise))
+        self.assertEqual((after(10 * HOUR, 1.00), after(20 * HOUR, 1.24)), (outcome.earlier, outcome.later))
+
+    def test_the_three_variants_of_the_reviewer_are_three_different_rows_or_labels(self) -> None:
+        base, nearer, deeper = self.row(1.00), self.row(1.02), self.row(0.90)
+        # The maxima that the old row kept are the same in all three.
+        self.assertEqual((base.early_highest, base.followup_highest), (nearer.early_highest, nearer.followup_highest))
+        self.assertEqual((base.early_highest, base.followup_highest), (deeper.early_highest, deeper.followup_highest))
+        self.assertEqual((NEGATIVE, NEGATIVE, POSITIVE), (base.label, nearer.label, deeper.label))
+        self.assertEqual(3, len({base, nearer, deeper}))
+        self.assertEqual(after(10 * HOUR, 1.02), nearer.earlier)
+        self.assertEqual(after(10 * HOUR, 0.90), deeper.earlier)
+
+    def test_the_earlier_result_may_be_the_baseline_or_any_result_before_the_later_one_within_48_hours(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(HOUR, 1.1)])
+        self.assertEqual((NEGATIVE, before(HOUR, 1.0), after(HOUR, 1.1)), (outcome.label, outcome.earlier, outcome.later))
+
+    def test_an_earlier_result_more_than_48_hours_before_the_later_one_is_not_paired(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 0.5), after(48 * HOUR, 1.4), after(HOUR, 1.4)])
+        self.assertEqual((POSITIVE, before(HOUR, 0.5), after(HOUR, 1.4)), (outcome.label, outcome.earlier, outcome.later))
+        far = kidney_label(ANESTART, OPEND, [before(30 * DAY - 1, 1.0), after(HOUR, 1.4)])
+        self.assertEqual((NEGATIVE, False, None, None), (far.label, far.absolute_rise, far.earlier, far.later))
+
+    def test_the_pair_of_the_largest_difference_is_stored_even_when_every_difference_is_a_fall(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.5), after(HOUR, 1.4), after(2 * HOUR, 1.45)])
+        self.assertEqual((NEGATIVE, False, after(HOUR, 1.4), after(2 * HOUR, 1.45)), (outcome.label, outcome.absolute_rise, outcome.earlier, outcome.later))
+        down = kidney_label(ANESTART, OPEND, [before(HOUR, 1.5), after(HOUR, 1.4)])
+        self.assertEqual((NEGATIVE, before(HOUR, 1.5), after(HOUR, 1.4)), (down.label, down.earlier, down.later))
+
+    def test_the_unknown_label_stores_no_pair(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0)])
+        self.assertEqual((None, None, None), (outcome.absolute_rise, outcome.earlier, outcome.later))
 
 
 class Times(unittest.TestCase):

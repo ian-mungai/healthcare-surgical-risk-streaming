@@ -33,7 +33,8 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from spark.silver.frames import fingerprint as fingerprint_of
 from spark.silver.frames import functions
-from spark.silver.label_checks import ICU, KIDNEY, MEASURE, TABLES, InputFacts, TableFacts, split_rule_problems
+from spark.silver.hypotension_checks import FLAG
+from spark.silver.label_checks import ICU, KIDNEY, MEASURE, TABLES, InputFacts, TableFacts, fixed_codes, split_rule_problems
 from spark.silver.label_run import InputRead, MeasurePlan, Operations, TableRead, run_build, run_verify
 from spark.silver.run import BRANCH_MOVED, Fingerprint
 from spark.silver.tables import LABEL_TABLES, NAMESPACE
@@ -49,6 +50,7 @@ SPLIT_TABLE = f"{NAMESPACE}.patient_split"
 CASE_FIELDS = ("caseid", "subjectid", "anestart", "opend", "icu_days")  # every published column of the cases that the label frames read
 CASE_TYPES = {column.name: column.type for column in CASE_COLUMNS}
 CASES_NEEDED = tuple((name, CASE_TYPES[name]) for name in CASE_FIELDS)
+CASES_CHANGED = "cases_schema_changed"
 LAB_NEEDED = tuple((column.name, column.type) for column in LAB_COLUMNS)
 
 
@@ -72,20 +74,22 @@ class LabelsLake(Lake):
     def source_frame(self, at: str, name: str) -> tuple[Any, str]:
         table = f"{self.catalog(at)}.{name}"
         if not self.session.catalog.tableExists(table):
-            raise SilverSignalsError(f"source_table: {unit(0, 'table')}")
+            raise SilverSignalsError(*fixed_codes([f"source_table: {unit(0, 'table')}"]))
         return self.session.table(table), table
 
-    def checked_frame(self, at: str, name: str, needed: tuple[tuple[str, str], ...], label: str) -> tuple[Any, str]:
-        """A source table whose needed columns are there with their types."""
+    def checked_frame(self, at: str, name: str, needed: tuple[tuple[str, str], ...], label: str, code: str = "schema") -> tuple[Any, str]:
+        """A source table whose needed columns are there with their types. A table that differs is refused with the fixed code ``code``."""
         frame, table = self.source_frame(at, name)
         held = dict(self.fields_of(frame))
         problems = schema_problems([(column, held.get(column, "")) for column, _ in needed], needed, label)
         if problems:
-            raise SilverSignalsError(*problems)
+            raise SilverSignalsError(f"{code}: {FLAG}")
         return frame, table
 
     def cases(self, at: str) -> tuple[Any, str]:
-        return self.checked_frame(at, CASES_TABLE, CASES_NEEDED, "cases table")
+        """``silver.cases`` at ``at``, only when every column that the labels read has its type. A table of another schema (``icu_days`` as a whole number, the
+        schema before the double) is refused as ``cases_schema_changed``: the labels read only the table that Silver cases rebuilt and checked."""
+        return self.checked_frame(at, CASES_TABLE, CASES_NEEDED, "cases table", CASES_CHANGED)
 
     def lab(self, at: str) -> tuple[Any, str]:
         return self.checked_frame(at, LAB_TABLE, LAB_NEEDED, "laboratory table")
@@ -94,7 +98,7 @@ class LabelsLake(Lake):
         frame, table = self.source_frame(at, SPLIT_TABLE)
         problems = schema_problems(self.fields_of(frame), SPLIT_COLUMNS, "split table")
         if problems:
-            raise SilverSignalsError(*problems)
+            raise SilverSignalsError(*fixed_codes(problems))
         return frame, table
 
     def split_problems(self, frame: Any) -> list[str]:
@@ -110,7 +114,7 @@ class LabelsLake(Lake):
         split, split_table = self.split(at)
         snapshots = (self.snapshot_id(cases_table), self.snapshot_id(lab_table), self.snapshot_id(split_table))
         if any(snapshot is None for snapshot in snapshots):
-            raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
+            raise SilverSignalsError(*fixed_codes(["source_no_snapshot: failed"]))
         held = (snapshots[0], snapshots[1], snapshots[2])
         if frames.ownership_flag(cases):
             return InputRead(InputFacts(0, 1, 0, (), 0), held)
@@ -145,7 +149,7 @@ class LabelsLake(Lake):
         frame = self.session.table(name)
         problems = schema_problems(self.fields_of(frame), LABEL_TABLES[table].columns, f"{table} table")
         if problems:
-            raise SilverSignalsError(*problems)
+            raise SilverSignalsError(*fixed_codes(problems))
         held: Fingerprint = fingerprint_of(frame)
         snapshot = self.snapshot_id(name)
         if not with_facts:

@@ -117,7 +117,7 @@ def read_problems(source: InputRead, reads: dict[str, TableRead | None]) -> list
     for table in reads:
         read = reads[table]
         if read is not None and read.facts is not None:
-            problems += table_problems(source.facts.cases, table, read.facts)
+            problems += table_problems(table, read.facts)
     return problems
 
 
@@ -152,7 +152,7 @@ def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned:
     flags = {}
     for table in TABLES:
         read = reads.get(table)
-        ok = read is not None and read.facts is not None and not table_problems(source.facts.cases, table, read.facts)
+        ok = read is not None and read.facts is not None and not table_problems(table, read.facts)
         flags[table] = bool(ok) and (planned is None or not differs(read, planned[table]))
     return flags
 

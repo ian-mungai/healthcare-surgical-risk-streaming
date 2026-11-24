@@ -11,6 +11,9 @@ Every case here is hand-built and kept apart from published data. Failure modes 
 - The tables name their columns and keys twice (in the table module and in the row functions) and the two lists differ.
 - A negative row keeps no measurement that it used: one baseline with follow-up of 1.1 and of 1.2 gives the same row, or a recorded measurement does not name a
   row of the laboratory table (its time, its number among the results of that case, time and test, and its value) so that a later check cannot reproduce it.
+- A negative row keeps only the highest follow-up results, not the 48-hour comparison that decided it: a baseline of 1.2 with follow-up of 1.25, 1.00 and 1.24
+  gives the same row when 1.00 becomes 1.02, and the label turns positive with 0.90 while the stored maxima stay the same. The row stores the earlier and the
+  later result of the largest rise, below the limit too, and the rule check reads them.
 - A cases frame that holds only the declared input columns fails in a function that reads another column of the cases (the ownership check read ``opstart``).
 """
 
@@ -152,6 +155,17 @@ class Kidney(unittest.TestCase):
         self.assertEqual((NEGATIVE, NEGATIVE), (low["label"], high["label"]))
         self.assertNotEqual(low, high)
         self.assertEqual((1.1, 1.2), (low["followup_highest_value"], high["followup_highest_value"]))
+
+    def test_the_three_variants_of_one_negative_are_three_different_rows(self) -> None:
+        def variant(early: float) -> dict[str, Any]:
+            return row_of(ANESTART, OPEND, [lab(ANESTART - 2 * DAY, 1.2), lab(OPEND + HOUR, 1.25), lab(OPEND + 10 * HOUR, early), lab(OPEND + 20 * HOUR, 1.24)])
+
+        base, nearer, deeper = variant(1.00), variant(1.02), variant(0.90)
+        self.assertEqual((NEGATIVE, NEGATIVE, POSITIVE), (base["label"], nearer["label"], deeper["label"]))
+        self.assertEqual((False, 1.00, 1.24), (base["absolute_rise"], base["earlier_value"], base["later_value"]))
+        self.assertEqual((False, 1.02, 1.24), (nearer["absolute_rise"], nearer["earlier_value"], nearer["later_value"]))
+        self.assertEqual((True, 0.90, 1.24), (deeper["absolute_rise"], deeper["earlier_value"], deeper["later_value"]))
+        self.assertEqual(3, len({tuple(row.items()) for row in (base, nearer, deeper)}))
 
     def test_every_measurement_a_row_records_names_one_row_of_the_laboratory_table(self) -> None:
         table = [
@@ -312,6 +326,43 @@ class Facts(unittest.TestCase):
                 self.assertTrue(all(value in (0, 1) for value in facts.flags.values()))
 
 
+class RowCount(unittest.TestCase):
+    """The row count of a label table is checked against the number of cases of the input that the facts function is given, by the library expectation."""
+
+    def bounds(self, table: str) -> list[dict[str, Any]]:
+        from unittest.mock import MagicMock, patch
+
+        from spark.bronze.checks import CheckResult
+        from spark.silver import label_frames
+
+        seen: list[Any] = []
+
+        def runner(_frame: Any, checks: Any) -> list[CheckResult]:
+            seen.extend(checks)
+            return [CheckResult(check, True, 0) for check in checks]
+
+        functions = MagicMock()
+        functions.col.side_effect = lambda _name: Column()
+        stored, cases, lab = MagicMock(), MagicMock(), MagicMock()
+        cases.count.return_value = 77
+        with (
+            patch.object(label_frames, "functions", return_value=functions),
+            patch.object(label_frames, "types", return_value=MagicMock()),
+            patch.object(label_frames, "typed", side_effect=lambda frame, columns: frame),
+        ):
+            if table == "icu":
+                label_frames.icu_facts(stored, cases, runner)
+            else:
+                label_frames.kidney_facts(stored, cases, lab, runner)
+        return [check.kwargs for check in seen if check.expectation == "ExpectTableRowCountToBeBetween"]
+
+    def test_the_intensive_care_labels_are_checked_for_exactly_as_many_rows_as_the_cases_frame_holds(self) -> None:
+        self.assertEqual([{"min_value": 77, "max_value": 77}], self.bounds("icu"))
+
+    def test_the_kidney_injury_labels_are_checked_for_exactly_as_many_rows_as_the_cases_frame_holds(self) -> None:
+        self.assertEqual([{"min_value": 77, "max_value": 77}], self.bounds("kidney"))
+
+
 class Wiring(unittest.TestCase):
     """The Spark checks cannot run here (their meaning is proved by the acceptance run), but what they are made of can be read: they are made of the rule's
     constants and of the columns that the row records."""
@@ -351,6 +402,14 @@ class Wiring(unittest.TestCase):
         for column in KIDNEY_ROW_COLUMNS:
             if column.startswith(("early_highest_", "followup_highest_")) and not column.endswith("_occurrence"):
                 self.assertIn(column, names)
+
+    def test_the_kidney_rule_check_reads_the_pair_of_the_largest_rise_of_a_negative(self) -> None:
+        from spark.silver import label_frames
+
+        names, literals = self.recorded(label_frames.kidney_facts, MagicMock(), MagicMock())
+        for column in ("earlier_value", "earlier_time_s", "later_value", "later_time_s"):
+            self.assertIn(column, names)
+        self.assertIn(label_frames.ABSOLUTE_RISE + label_frames.TOLERANCE, literals)
 
 
 class CommandLine(unittest.TestCase):

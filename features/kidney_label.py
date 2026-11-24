@@ -16,12 +16,15 @@ both. An unknown label holds no rise.
 result of the case that is before it, or (2) a follow-up result of at least 1.5 times the baseline. A rise whose later result is outside its window does not
 make a positive. Both tests are made with exact decimals, never floats: 1.2 minus 0.9 is not 0.3 in a float.
 
-**What is reported.** The reported earlier and later result of the absolute rise are those of the first later result in time order (then by occurrence) that
-has a rise, with the earlier result of the lowest value (then the latest, then the lowest occurrence); the reported result of the relative rise is the first
-follow-up result in time order (then by occurrence) that reaches 1.5 times the baseline. So that a negative can be reproduced, the highest follow-up result of
-the first 48 hours and of the whole 7 days is reported too (the highest value, then the earliest, then the lowest occurrence), whatever the label: with the
-baseline they are the measurements that the rule compared. ``latest_time_s`` is the latest time of any result the rule read: the baseline and the follow-up
-results; a result after day 7 is never read, so a label cannot change with a later result.
+**What is reported.** The reported earlier and later result of the absolute rule are the pair that gives the largest difference (later minus earlier, exact)
+among the pairs that the rule allows, whether or not the difference reaches 0.3 and whatever the label, so that a negative keeps the comparison that decided
+it: with a baseline of 1.2 and follow-up of 1.25, 1.00 and 1.24, the stored pair is 1.00 and 1.24 (0.24), and 1.02 or 0.90 in place of 1.00 changes the row or
+the label. Equal differences give the first later result in time order (then by occurrence), then the earlier result of the lowest value (then the latest,
+then the lowest occurrence). No pair is stored when the rule allows none. ``absolute_rise`` is true when that difference is at least 0.3. The reported
+result of the relative rise is the first follow-up result in time order (then by occurrence) that reaches 1.5 times the baseline. So that a negative can be
+reproduced, the highest follow-up result of the first 48 hours and of the whole 7 days is reported too (the highest value, then the earliest, then the lowest
+occurrence), whatever the label: with the baseline they are the measurements that the rule compared. ``latest_time_s`` is the latest time of any result the
+rule read: the baseline and the follow-up results; a result after day 7 is never read, so a label cannot change with a later result.
 
 **Boundary rules.** Each is a named constant with its status (``BOUNDARY_STATUS``): decided by the plan, a lead assumption in the owner's unattended run, or
 pending the owner. A change of one rule is the change of one constant.
@@ -151,18 +154,26 @@ def baseline_of(results: list[Result], start: int, end: int) -> Result | None:
 
 
 def absolute_pair(results: list[Result], opend: int) -> tuple[Result, Result] | None:
+    """The earlier and the later result that give the largest difference under the absolute rule, whether or not it reaches the limit: the later result is in
+    the first 48 hours after ``opend`` and the earlier one is before it and at most 48 hours earlier. Equal differences give the first later result in time
+    order (then by occurrence), then the earlier result of the lowest value, then the latest, then the lowest occurrence. ``None`` when no pair exists."""
     end = opend + ABSOLUTE_HOURS * SECONDS_PER_HOUR
+    best: tuple[Decimal, Result, Result] | None = None
     for later in sorted(
         (result for result in results if after_origin(result.time_s, opend) and up_to(result.time_s, end, ABSOLUTE_WINDOW_END_INCLUSIVE)), key=order
     ):
-        near = [
-            earlier
-            for earlier in results
-            if 0 < later.time_s - earlier.time_s <= ABSOLUTE_HOURS * SECONDS_PER_HOUR and exact(later.value) - exact(earlier.value) >= ABSOLUTE_RISE_MG_DL
-        ]
-        if near:
-            return min(near, key=lambda earlier: (exact(earlier.value), -earlier.time_s, earlier.occurrence)), later
-    return None
+        near = [earlier for earlier in results if 0 < later.time_s - earlier.time_s <= ABSOLUTE_HOURS * SECONDS_PER_HOUR]
+        if not near:
+            continue
+        earlier = min(near, key=lambda result: (exact(result.value), -result.time_s, result.occurrence))
+        rise = exact(later.value) - exact(earlier.value)
+        if best is None or rise > best[0]:
+            best = (rise, earlier, later)
+    return None if best is None else (best[1], best[2])
+
+
+def reaches_absolute(pair: tuple[Result, Result] | None) -> bool:
+    return pair is not None and exact(pair[1].value) - exact(pair[0].value) >= ABSOLUTE_RISE_MG_DL
 
 
 def relative_result(followup: list[Result], baseline: Result) -> Result | None:
@@ -198,8 +209,8 @@ def kidney_label(anestart: int | None, opend: int | None, results: Iterable[Resu
         return KidneyLabel(UNKNOWN, False, unknown_reason(baseline, followup), baseline, *windows, None, None, None, None, None, *marks)
     pair = absolute_pair(held, opend) if opend is not None else None
     reaching = relative_result(followup, baseline)
-    positive = pair is not None or reaching is not None
+    rise = reaches_absolute(pair)
     earlier, later = pair if pair else (None, None)
     return KidneyLabel(
-        POSITIVE if positive else NEGATIVE, True, ELIGIBLE, baseline, *windows, pair is not None, earlier, later, reaching is not None, reaching, *marks
+        POSITIVE if rise or reaching is not None else NEGATIVE, True, ELIGIBLE, baseline, *windows, rise, earlier, later, reaching is not None, reaching, *marks
     )
