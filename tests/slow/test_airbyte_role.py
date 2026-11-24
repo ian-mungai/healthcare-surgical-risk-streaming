@@ -674,11 +674,12 @@ class PlacementTest(unittest.TestCase):
             "Temporal user": temporal.get("userSecretKey") or user,
             "Temporal password": temporal.get("passwordSecretKey") or password,
         }
-        files = type("Files", (), {"read": lambda self, name: "value"})()
-        written = secrets.wanted_secrets(files, "user")[database["secretName"]]
+        files = type("Files", (), {"read": lambda self, name: "synthetic-password"})()
+        written = secrets.wanted_secrets(files, "synthetic-user")[database["secretName"]]
         for role, key in read.items():
+            wanted = "synthetic-password" if role.endswith("password") else "synthetic-user"
             with self.subTest(role):
-                self.assertIn(key, written, f"the {role} key {key!r} is not written to {database['secretName']}")
+                self.assertEqual(wanted, written.get(key), f"the {role} key {key!r} does not hold the {role.split()[-1]} in {database['secretName']}")
 
     def test_temporal_keeps_its_two_databases_apart_and_creates_none(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
