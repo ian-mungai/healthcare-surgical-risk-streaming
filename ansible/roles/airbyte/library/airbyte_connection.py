@@ -1,15 +1,21 @@
 """Ansible module: make the raw connection in a running Airbyte match a document, and change nothing when it already does.
 
-The document is what ``scripts.ingestion.connection render`` prints: a pinned definition, a source and a destination, and one connection. The module
-reads the instance administrator's client credentials from the namespace's secret, asks Airbyte's public API for a token and then makes the definition
-of each connector (the pinned version), the source, the destination and the connection match. An object is found by its name, created when it is
-missing, and updated when its answer does not hold every value of the document. The platform adds fields of its own to an answer, so only the
-document's values are compared. A drifted setting, a schedule that was switched on, a changed connector version and a dropped selected file are
-repaired.
+The document is what ``scripts.ingestion.connection render`` prints: a pinned connector image and tag for the source and for the destination, a source and a
+destination, and one connection. The module reads the instance administrator's client credentials from the namespace's secret, asks Airbyte's public API for
+a token and then makes the source, the destination and the connection match. An object is found by its name, created when it is missing, and updated when
+its answer does not hold every value of the document. The platform adds fields of its own to an answer, so only the document's values are compared. A
+drifted setting, a schedule that was switched on and a dropped selected file are repaired.
+
+The module creates no connector definition and updates none. Airbyte 2.5.0 refuses a custom definition for an image that one of its built-in definitions uses
+(it answers 409), and its workspace already holds the built-in definition of each pinned image. The module takes the definition of the image by its
+``dockerRepository`` (exactly one among the listed definitions) and requires its ``dockerImageTag`` to equal the pinned tag, so the connection runs exactly the
+pinned connector version. A listing with none or with several definitions of the image, or one at another tag, is refused with a fixed message that names no
+value: the operator upgrades Airbyte or changes the pin.
 
 The run has two phases. It first reads every object, checks every item of every answer against a closed table of required keys and types
-(``ANSWER_SHAPES``), and decides the whole plan: identities, definitions, links and drift. Anything that no update can repair (an object that belongs
-to another definition, source or destination, a name that two objects hold, a workspace count other than one, an answer of the wrong form) is refused
+(``ANSWER_SHAPES``), and decides the whole plan: identities, definitions, links and drift. Anything that no update can repair (a definition that is missing,
+doubled or at another tag, an object that belongs to another definition, source or destination, a name that two objects hold, a workspace count other than
+one, an answer of the wrong form) is refused
 there, before any write. Deleting a connection would delete its sync state, so such a drift is refused and never repaired. Only then are the writes
 made, in order.
 
@@ -72,7 +78,7 @@ CONNECTOR_KEY_FIELDS: dict[str, dict[str, Any]] = {
     },
 }
 ID_FORM = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-DEFINITION_SHAPE: dict[str, type] = {"id": str, "name": str, "dockerRepository": str, "dockerImageTag": str}
+DEFINITION_SHAPE: dict[str, type] = {"id": str, "dockerRepository": str, "dockerImageTag": str}
 ANSWER_SHAPES: dict[str, dict[str, type]] = {
     "workspace": {"workspaceId": str},
     "source_definition": DEFINITION_SHAPE,
@@ -90,17 +96,11 @@ ID_KEYS: dict[str, tuple[str, ...]] = {
     "connection": ("connectionId", "sourceId", "destinationId"),
 }
 ID_OF: dict[str, str] = {
-    "source_definition": "id",
-    "destination_definition": "id",
     "source": "sourceId",
     "destination": "destinationId",
     "connection": "connectionId",
 }
 WRITE_CALLS: tuple[tuple[str, str], ...] = (
-    ("POST", "source_definition"),
-    ("PUT", "source_definition"),
-    ("POST", "destination_definition"),
-    ("PUT", "destination_definition"),
     ("POST", "source"),
     ("PATCH", "source"),
     ("POST", "destination"),
@@ -113,7 +113,7 @@ KUBECTL_KILL_SECONDS = 5
 TIMED_OUT = (124, 137)
 PAGE_SIZE = 100
 MAX_PAGES = 1000
-DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
+DEFINITION_FIELDS = ("dockerRepository", "dockerImageTag")
 CONNECTION_FIELDS = ("name", "status", "schedule", "namespaceDefinition", "configurations")
 Runner = Callable[[list[str]], "tuple[int, str, str]"]
 
@@ -308,7 +308,9 @@ def check_document(wanted: dict[str, Any]) -> None:
         for part in ("source", "destination"):
             if not all(isinstance(wanted[part][field], dict if field != "name" else str) for field in ("name", "definition", "configuration")):
                 raise KeyError(part)
-            if any(not isinstance(wanted[part]["definition"].get(field), str) for field in DEFINITION_FIELDS):
+            if set(wanted[part]["definition"]) != set(DEFINITION_FIELDS) or any(
+                not isinstance(wanted[part]["definition"][field], str) for field in DEFINITION_FIELDS
+            ):
                 raise KeyError(part)
         if any(field not in wanted["connection"] for field in CONNECTION_FIELDS):
             raise KeyError("connection")
@@ -438,52 +440,39 @@ def plan(api: Api, wanted: dict[str, Any], secrets: Mapping[str, str], recorded:
     """Read every object and decide the whole plan, with no write. Raise ``ApiError`` for anything that no update can repair, before any step is made.
 
     The plan covers the document, the outgoing configurations, the shape of every answer, the identities (a name that two objects hold, a workspace
-    count other than one), the definitions, the objects' links and the drift. Every ID that a write needs is read here. A step runs after the steps
-    before it and takes the IDs that they made. ``recorded`` is updated by a step after its call succeeds."""
+    count other than one), the definitions, the objects' links and the drift. Every ID that a write needs is read here, and the definitions are only taken,
+    never written. A step runs after the steps before it and takes the IDs that they made. ``recorded`` is updated by a step after its call succeeds."""
     check_document(wanted)
     if any(name not in secrets or not secrets[name] for name in KEY_FILES):
         raise ApiError("the access key is not available to the module")
     sent = {kind: outgoing_configuration(kind, wanted[kind], secrets) for kind in ("source", "destination")}
     workspace = one_workspace(api)
     definitions = {
-        kind: named(
-            listing(api, f"/workspaces/{workspace}/definitions/{kind}s", f"{kind}_definition"), wanted[kind]["definition"]["name"], f"{kind} definition"
-        )
+        kind: built_in(listing(api, f"/workspaces/{workspace}/definitions/{kind}s", f"{kind}_definition"), wanted[kind]["definition"], kind)
         for kind in ("source", "destination")
     }
     actors = {kind: named(listing(api, f"/{kind}s?workspaceIds={workspace}", kind), wanted[kind]["name"], kind) for kind in ("source", "destination")}
     connection = named(listing(api, f"/connections?workspaceIds={workspace}", "connection"), wanted["connection"]["name"], "connection")
     steps: list[Step] = []
-    ids: dict[str, str] = {}
-    for kind in ("source", "destination"):
-        steps += plan_definition(workspace, kind, wanted[kind]["definition"], definitions[kind], ids)
+    ids = {f"{kind}_definition": definitions[kind]["id"] for kind in ("source", "destination")}
     for kind in ("source", "destination"):
         steps += plan_actor(workspace, kind, wanted[kind], sent[kind], actors[kind], ids, secrets, recorded)
     steps += plan_connection(wanted["connection"], connection, ids)
     return steps
 
 
-def plan_definition(workspace: str, kind: str, wanted: dict[str, Any], current: dict[str, Any] | None, ids: dict[str, str]) -> list[Step]:
-    path = f"/workspaces/{workspace}/definitions/{kind}s"
-    if current is None:
+def built_in(objects: list[dict[str, Any]], wanted: dict[str, Any], kind: str) -> dict[str, Any]:
+    """The one definition that Airbyte holds for the pinned image, when its tag is the pinned one. Nothing is created or updated.
 
-        def create(api: Api) -> None:
-            answer = written(api, "POST", path, {field: wanted[field] for field in DEFINITION_FIELDS}, f"{kind}_definition")
-            ids[f"{kind}_definition"] = answer["id"]
-
-        return [Step(f"{kind} definition", create)]
-    if current["dockerRepository"] != wanted["dockerRepository"]:
-        raise ApiError(f"the {kind} definition {wanted['name']} runs another image than the document's")
-    ids[f"{kind}_definition"] = current["id"]
-    if current["dockerImageTag"] == wanted["dockerImageTag"]:
-        return []
-    body = {"name": wanted["name"], "dockerImageTag": wanted["dockerImageTag"]}
-    definition_id = current["id"]
-
-    def update_definition(api: Api) -> None:
-        written(api, "PUT", f"{path}/{definition_id}", body, f"{kind}_definition", definition_id)
-
-    return [Step(f"{kind} definition", update_definition)]
+    A custom definition cannot be made for an image that a built-in definition uses, so the definition is taken by its ``dockerRepository`` and not by a name.
+    None or several of the image, and a tag other than the pin, are refused with a fixed message: it names no image, tag, ID or count.
+    """
+    matches = [item for item in objects if item["dockerRepository"] == wanted["dockerRepository"]]
+    if len(matches) != 1:
+        raise ApiError(f"Airbyte does not hold exactly one {kind} definition of the pinned image; the connection needs the one that Airbyte provides")
+    if matches[0]["dockerImageTag"] != wanted["dockerImageTag"]:
+        raise ApiError(f"the {kind} definition of the pinned image is at another version than the pin; upgrade Airbyte or change the pin")
+    return matches[0]
 
 
 def plan_actor(

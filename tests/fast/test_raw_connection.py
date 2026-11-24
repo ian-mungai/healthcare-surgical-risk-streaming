@@ -137,11 +137,14 @@ class SourceAndDestinationTest(unittest.TestCase):
             self.assertNotIn("secret_fields", document[part], "the module holds the one table of the fields that take the key; the document names none")
         self.assertNotIn("secret_fields", json.dumps(document))
 
-    def test_the_source_definition_is_one_shared_pinned_definition_that_another_connection_can_reuse(self) -> None:
+    def test_the_definition_entries_hold_the_image_and_the_tag_and_no_name_that_could_select_a_definition(self) -> None:
         shared = connection.source_definition(SOURCE_TAG)
-        self.assertEqual({"name": connection.SOURCE_DEFINITION_NAME, "dockerRepository": "airbyte/source-s3", "dockerImageTag": SOURCE_TAG}, shared)
+        self.assertEqual({"dockerRepository": "airbyte/source-s3", "dockerImageTag": SOURCE_TAG}, shared)
         self.assertEqual(shared, state()["source"]["definition"])
-        self.assertEqual("s3_source_pinned", connection.SOURCE_DEFINITION_NAME, "the name is the one that the record connection takes the definition by")
+        self.assertEqual({"dockerRepository": "airbyte/destination-s3", "dockerImageTag": DESTINATION_TAG}, state()["destination"]["definition"])
+        self.assertFalse(hasattr(connection, "SOURCE_DEFINITION_NAME"), "no name selects a definition: Airbyte's built-in one is taken by its image")
+        self.assertFalse(hasattr(connection, "DESTINATION_DEFINITION_NAME"))
+        self.assertNotIn("_pinned", json.dumps(state()))
         with self.assertRaises(ConnectionDefinitionError):
             connection.source_definition("latest")
 

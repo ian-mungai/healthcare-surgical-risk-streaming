@@ -43,7 +43,8 @@ READ_PREFIX = "records_input/"
 MAIN_BRANCH = "main"
 # Read on Nov 22 2026 (PST): the destination from the S3 Data Lake page of docs.airbyte.com and from its metadata.yaml and Kotlin specification on the master
 # branch of github.com/airbytehq/airbyte, the file source from its metadata.yaml and spec.json there, and the three linux/amd64 image digests from Docker Hub
-# (``docker buildx imagetools inspect <image> --raw``, the manifest of platform linux/amd64). source-s3 is the raw connection's pin, one shared definition.
+# (``docker buildx imagetools inspect <image> --raw``, the manifest of platform linux/amd64). source-s3 is the raw connection's pin.
+# Every connection takes Airbyte's one definition of an image and requires its tag to equal the pin; the client creates no definition.
 PINNED_ON = "2026-11-22"
 
 

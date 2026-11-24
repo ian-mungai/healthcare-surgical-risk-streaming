@@ -152,8 +152,9 @@ airbyte_staging_size: 5G
 # The connectors of the raw connection, each at the newest stable version of the OSS connector registry on Nov 22 2026 that has the delivery method "Copy raw files" (source
 # 4.10.1 and later), a file of up to 1.5 GB (source 4.11.0) and the sub-folders kept (source 4.12.0) and, for the destination, file transfer (1.4.0 and later).
 # The digests are the linux/amd64 image digests on Docker Hub (read Nov 22 2026). Airbyte pulls a connector by its tag, so a digest is a record for the reader of
-# the pin and not an input. Every connection that reads S3 takes the one pinned source definition, ``s3_source_pinned`` (scripts.ingestion.connection.source_definition),
-# so all of them run this version. Change a pin only after reading the connector's changelog.
+# the pin and not an input. Every connection that reads S3 takes the one definition that Airbyte holds for ``airbyte/source-s3`` and requires its tag to equal this pin
+# (scripts.ingestion.connection.source_definition; the module creates no definition), so all of them run this version. The destination is taken the same way.
+# Change a pin only after reading the connector's changelog.
 airbyte_source_s3_version: 4.17.1
 airbyte_source_s3_digest: sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b
 airbyte_destination_s3_version: 1.9.11
