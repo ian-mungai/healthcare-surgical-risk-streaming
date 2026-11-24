@@ -25,7 +25,8 @@ repeats some track names within a case under different track IDs; the track ID i
 names, so a repeated name adds no member and changes neither the natural key nor the grain. If the descriptive columns of one name differ between rows, the
 build refuses it as ``ambiguous_members`` instead of choosing a row.
 
-The test set is sealed: nothing here names a case, a patient or a value. Every failure is a code, a dimension and a count.
+The test set is sealed: nothing here names a case, a patient or a value. Every failure is a code, a dimension and a count, except a failure of the lab test
+dimension, which is ``<code>: failed``: the laboratory table holds the results of held-out patients, so a count over it can reflect one.
 """
 
 from __future__ import annotations
@@ -50,8 +51,9 @@ TRACKS_SOURCE = "bronze.tracks"
 
 def unit(count: int, noun: str) -> str:
     """A count and its noun. The counts of this job are counts of members, rows, keys and tables of the sources and of the dimensions, and no dimension reads an
-    outcome or a never-feature column (``tests/fast/test_gold_dimensions.py`` holds that), so no held-out outcome can change one. A source that did would
-    need a ``code: failed`` message instead."""
+    outcome or a never-feature column (``tests/fast/test_gold_dimensions.py`` holds that), so no held-out outcome can change one, except through a sealed
+    dimension: a source that holds the results of held-out patients (``silver.lab_results``) changes the members of its dimension, so its counts stay inside
+    the job and its failures print as ``code: failed`` (``problem``)."""
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
@@ -69,6 +71,9 @@ class Dimension:
 
     ``refuse_null_key`` is for a dimension whose source row is the member itself (a case, a patient): a row with no natural key there is a broken source.
     For the others, a row with no natural key (no department, no type) has no member and takes the unknown member.
+
+    ``sealed`` is for a dimension whose source holds the results of held-out patients (the laboratory table): a held-out laboratory change changes its members,
+    so neither its counts nor its write indicator leave the job, and every one of its failures is ``<code>: failed``.
     """
 
     name: str
@@ -77,6 +82,7 @@ class Dimension:
     source_natural: str
     attributes: tuple[tuple[Column, str], ...] = ()
     refuse_null_key: bool = False
+    sealed: bool = False
 
     @property
     def key(self) -> str:
@@ -130,7 +136,7 @@ DIMENSIONS = (
     ),
     Dimension("dim_department", Column("department_name", STRING), CASES_SOURCE, "department"),
     Dimension("dim_surgery_type", Column("surgery_type_name", STRING), CASES_SOURCE, "optype"),
-    Dimension("dim_lab_test", Column("lab_test_name", STRING), LAB_SOURCE, "name"),
+    Dimension("dim_lab_test", Column("lab_test_name", STRING), LAB_SOURCE, "name", sealed=True),
 )
 BY_NAME = {item.name: item for item in DIMENSIONS}
 # The columns and types of the three tables that the job reads, as Silver and Bronze write them.
@@ -155,6 +161,12 @@ OUTPUT_FACTS = (
     "interval_wrong",
     "chain_broken",
 )
+
+
+def problem(item: Dimension, code: str, count: int, noun: str) -> str:
+    """The message of a failed check: the code, the dimension and the count, or only ``<code>: failed`` for a sealed dimension, whose counts reflect held-out
+    results."""
+    return f"{code}: failed" if item.sealed else f"{code}: {item.name}, {unit(count, noun)}"
 
 
 def dimension(name: str) -> Dimension:
@@ -219,11 +231,11 @@ def input_problems(found: Mapping[str, Mapping[str, int]]) -> list[str]:
         facts = facts_of(found, item)
         members, ambiguous, null_rows = (count_of(facts, name) for name in INPUT_FACTS)
         if members == 0:
-            problems.append(f"empty_source: {item.name}, {unit(0, 'member')}")
+            problems.append(problem(item, "empty_source", 0, "member"))
         if ambiguous:
-            problems.append(f"ambiguous_members: {item.name}, {unit(ambiguous, 'member')}")
+            problems.append(problem(item, "ambiguous_members", ambiguous, "member"))
         if item.refuse_null_key and null_rows:
-            problems.append(f"key_null: {item.name}, {unit(null_rows, 'row')}")
+            problems.append(problem(item, "key_null", null_rows, "row"))
     return problems
 
 
@@ -234,9 +246,9 @@ def output_problems(found: Mapping[str, Mapping[str, int]]) -> list[str]:
         facts = facts_of(found, item)
         counts = {name: count_of(facts, name) for name in OUTPUT_FACTS}
         if counts["members"] == 0:
-            problems.append(f"no_members: {item.name}, {unit(0, 'member')}")
+            problems.append(problem(item, "no_members", 0, "member"))
         if counts["unknown_rows"] != 1:
-            problems.append(f"unknown_member: {item.name}, {unit(counts['unknown_rows'], 'row')}")
+            problems.append(problem(item, "unknown_member", counts["unknown_rows"], "row"))
         for code, name, noun in (
             ("unknown_member_not_empty", "unknown_not_empty", "row"),
             ("key_duplicate", "key_duplicates", "key"),
@@ -251,7 +263,7 @@ def output_problems(found: Mapping[str, Mapping[str, int]]) -> list[str]:
             ("version_chain", "chain_broken", "version"),
         ):
             if counts[name]:
-                problems.append(f"{code}: {item.name}, {unit(counts[name], noun)}")
+                problems.append(problem(item, code, counts[name], noun))
     return problems
 
 
@@ -266,7 +278,7 @@ def frozen_problems(held: Mapping[str, tuple[int, int]]) -> list[str]:
             raise GoldDimensionsError("bad_fact: a dimension has no held state")
         removed, not_after = counts
         if removed:
-            problems.append(f"member_removed: {item.name}, {unit(removed, 'member')}")
+            problems.append(problem(item, "member_removed", removed, "member"))
         if not_after:
-            problems.append(f"version_date_not_after: {item.name}, {unit(not_after, 'member')}")
+            problems.append(problem(item, "version_date_not_after", not_after, "member"))
     return problems

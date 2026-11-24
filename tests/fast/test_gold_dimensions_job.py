@@ -27,6 +27,7 @@ from spark.jobs import gold_dimensions
 from spark.settings import SettingsError
 
 NAMES = tuple(item.name for item in DIMENSIONS)
+OPEN_NAMES = tuple(item.name for item in DIMENSIONS if item.name != "dim_lab_test")
 MARKER = "MARKER_4417"
 INPUT = {"source_members": 12, "ambiguous_members": 0, "key_null_rows": 0}
 OUTPUT = {
@@ -57,6 +58,8 @@ class Ops:
         self.output = {name: dict(OUTPUT) for name in NAMES}
         self.held = held or {name: (0, 0) for name in NAMES}
         self.wrong_schema = 0
+        self.written_by_name: dict[str, bool] = {}
+        self.snapshots: dict[str, int] = {}
 
     def source_facts(self) -> dict[str, dict[str, int]]:
         self.log.append("source_facts")
@@ -68,7 +71,7 @@ class Ops:
 
     def write(self, item: Dimension) -> bool:
         self.log.append(f"write {item.name}")
-        return self.writes
+        return self.written_by_name.get(item.name, self.writes)
 
     def tables_missing(self) -> int:
         self.log.append("tables_missing")
@@ -84,7 +87,7 @@ class Ops:
 
     def snapshot_ids(self) -> dict[str, int | None]:
         self.log.append("snapshot_ids")
-        return {item.table: 1000 + number for number, item in enumerate(DIMENSIONS)}
+        return {item.table: self.snapshots.get(item.table, 1000 + number) for number, item in enumerate(DIMENSIONS)}
 
 
 class BuildTests(unittest.TestCase):
@@ -94,6 +97,7 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(["source_facts", "held_changes", *(f"write {name}" for name in NAMES), "output_schema", "table_facts", "snapshot_ids"], ops.log)
         self.assertEqual("written", outcome.outcome)
         self.assertEqual({name: True for name in NAMES}, outcome.written)
+        self.assertEqual({name: True for name in OPEN_NAMES}, outcome.facts()["written"])
 
     def test_a_rerun_that_changes_nothing_writes_nothing_and_is_still_checked(self) -> None:
         ops = Ops(writes=False)
@@ -122,7 +126,7 @@ class BuildTests(unittest.TestCase):
         ops.input["dim_lab_test"] = INPUT | {"source_members": 0}
         with self.assertRaises(GoldDimensionsError) as caught:
             run_build(ops)
-        self.assertEqual(["key_null: dim_case, 1 row", "empty_source: dim_lab_test, 0 members"], caught.exception.problems)
+        self.assertEqual(["key_null: dim_case, 1 row", "empty_source: failed"], caught.exception.problems)
 
     def test_a_written_table_with_another_schema_is_refused_before_any_value_is_read(self) -> None:
         ops = Ops()
@@ -141,11 +145,84 @@ class BuildTests(unittest.TestCase):
 
     def test_the_result_holds_counts_and_snapshot_ids_and_no_key_or_natural_key(self) -> None:
         facts = run_build(Ops()).facts()
-        self.assertEqual({"outcome", "written", "checks_run", "members", "snapshot_ids"}, set(facts))
-        self.assertEqual({name: 12 for name in NAMES}, facts["members"])
+        self.assertEqual({"outcome", "written", "checks_run", "members", "passed", "snapshot_ids"}, set(facts))
+        self.assertEqual({name: 12 for name in OPEN_NAMES}, facts["members"])
+        self.assertEqual({name: True for name in OPEN_NAMES}, facts["written"])
+        self.assertEqual({name: True for name in NAMES}, facts["passed"])
         self.assertEqual(CHECKS, facts["checks_run"])
         self.assertEqual(len(DIMENSIONS), len(facts["snapshot_ids"]))
         json.dumps(facts)
+
+
+class SealedLabTests(unittest.TestCase):
+    """The laboratory table holds the results of held-out patients, so a held-out laboratory change can change what the lab dimension holds: its members, its
+    write and every count that a check makes over it. None of these leaves the job: the result holds one pass flag for the dimension, and a lab failure is
+    ``<code>: failed``.
+
+    Failure modes covered here:
+
+    - A member count or a write indicator of the lab dimension in the result, or in the overall outcome.
+    - A count in a failure message that comes from the lab dimension.
+    - A lab change that changes the printed result apart from the snapshot IDs.
+    """
+
+    def lab_changed(self) -> Ops:
+        """The run in which a held-out case gained a laboratory test: the lab dimension has one more member and is written, the other tables are unchanged."""
+        ops = Ops(writes=False)
+        ops.output["dim_lab_test"] = OUTPUT | {"members": OUTPUT["members"] + 1}
+        ops.written_by_name = {"dim_lab_test": True}
+        return ops
+
+    def printed(self, ops: Ops, mode: str = "build") -> dict[str, Any]:
+        outcome = run_build(ops) if mode == "build" else run_verify(ops)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = run(["verify", "--branch", "b"], lambda arguments: {"mode": mode, **outcome.facts()})
+        self.assertEqual(0, code)
+        document: dict[str, Any] = json.loads(out.getvalue().removeprefix("RESULT "))
+        return document
+
+    def test_a_held_out_lab_change_leaves_the_printed_result_identical_apart_from_the_snapshot_ids(self) -> None:
+        before, after = Ops(writes=False), self.lab_changed()
+        after.snapshots = {"gold.dim_lab_test": 9999}
+        one, two = self.printed(before), self.printed(after)
+        self.assertNotEqual(one["snapshot_ids"], two["snapshot_ids"])
+        one.pop("snapshot_ids")
+        two.pop("snapshot_ids")
+        self.assertEqual(one, two)
+        self.assertEqual("unchanged", two["outcome"])
+
+    def test_a_held_out_lab_change_leaves_a_verify_result_identical_too(self) -> None:
+        before, after = Ops(), self.lab_changed()
+        self.assertEqual(self.printed(before, "verify"), self.printed(after, "verify"))
+
+    def test_the_lab_dimension_has_no_member_count_and_no_write_indicator_in_the_result(self) -> None:
+        facts = run_build(Ops()).facts()
+        self.assertNotIn("dim_lab_test", facts["members"])
+        self.assertNotIn("dim_lab_test", facts["written"])
+        self.assertTrue(facts["passed"]["dim_lab_test"])
+
+    def test_the_lab_write_has_no_effect_on_the_overall_outcome(self) -> None:
+        self.assertEqual("unchanged", run_build(self.lab_changed()).facts()["outcome"])
+        self.assertEqual("written", run_build(Ops()).facts()["outcome"])
+
+    def test_every_lab_failure_is_the_code_and_failed_whatever_the_count(self) -> None:
+        for count in (1, 7):
+            with self.subTest(count=count):
+                ops = Ops()
+                ops.input["dim_lab_test"] = INPUT | {"source_members": 0, "ambiguous_members": count, "key_null_rows": count}
+                with self.assertRaises(GoldDimensionsError) as caught:
+                    run_build(ops)
+                self.assertEqual(["empty_source: failed", "ambiguous_members: failed"], caught.exception.problems)
+                ops = Ops(held={**{name: (0, 0) for name in NAMES}, "dim_lab_test": (count, count)})
+                with self.assertRaises(GoldDimensionsError) as caught:
+                    run_build(ops)
+                self.assertEqual(["member_removed: failed", "version_date_not_after: failed"], caught.exception.problems)
+                ops = Ops()
+                ops.output["dim_lab_test"] = OUTPUT | {"key_duplicates": count, "member_without_source": count}
+                with self.assertRaises(GoldDimensionsError) as caught:
+                    run_build(ops)
+                self.assertEqual(["key_duplicate: failed", "member_without_source: failed"], caught.exception.problems)
 
 
 class VerifyTests(unittest.TestCase):
@@ -154,6 +231,7 @@ class VerifyTests(unittest.TestCase):
         outcome = run_verify(ops)
         self.assertEqual("verified", outcome.outcome)
         self.assertEqual({name: False for name in NAMES}, outcome.written)
+        self.assertEqual({name: False for name in OPEN_NAMES}, outcome.facts()["written"])
         self.assertFalse([line for line in ops.log if line.startswith("write")])
         self.assertEqual(["source_facts", "tables_missing", "output_schema", "table_facts", "snapshot_ids"], ops.log)
 

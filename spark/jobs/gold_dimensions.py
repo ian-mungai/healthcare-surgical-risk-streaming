@@ -15,7 +15,9 @@ input check and that check come before the first write; the checks of the writte
 ``verify`` runs the checks on a branch and writes nothing.
 
 No dimension holds an outcome, a laboratory result or the patient split, and no query reads one, so the job reads no held-out value: the test set is sealed.
-The result and the messages hold codes, dimension names, counts and snapshot IDs.
+The result and the messages hold codes, dimension names, counts and snapshot IDs, except for ``dim_lab_test``: the laboratory table holds the results of
+held-out patients, so a held-out change adds or removes a test name. The member count and the write indicator of ``dim_lab_test`` stay inside the job (its
+write does not change the outcome), the result holds one pass flag for each dimension, and a failure of ``dim_lab_test`` prints as ``<code>: failed``.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
 """
