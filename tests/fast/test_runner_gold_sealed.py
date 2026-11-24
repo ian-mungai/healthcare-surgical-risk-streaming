@@ -260,6 +260,49 @@ class Refusals(unittest.TestCase):
         run.refused_from("an empty laboratory table", "built", "source", self.module.PLANTED_LAB_CODES)
         self.assertTrue(record.observations[0].passed, texts(record))
 
+    LAB_PAIR = "WARN 4417\ngold_dimensions: empty_source: failed\ngold_dimensions: empty_source: dim_lab_test, 2 members\n"
+
+    def test_a_line_of_the_job_prefix_that_the_adapter_drops_is_counted_and_the_count_is_reset_by_each_job(self) -> None:
+        command = ["docker", "compose", "run", "--entrypoint", "python", "spark"]
+        stack = self.stack([(1, "", self.LAB_PAIR), (1, "", "WARN 4417\ngold_dimensions: empty_source: failed\n"), (1, "", self.LAB_PAIR)])
+        self.assertEqual(0, stack.unknown_lines)
+        stack.run(command)
+        self.assertEqual(1, stack.unknown_lines)
+        stack.run(command)
+        self.assertEqual(0, stack.unknown_lines)
+        stack.run(command)
+        stack.run(["docker", "ps"])
+        self.assertEqual(1, stack.unknown_lines, "a command that is not a job leaves the count of the job before it")
+
+    def test_the_count_of_a_stopped_attempt_is_not_kept_for_the_next_job(self) -> None:
+        stack = self.stack([(1, "", self.LAB_PAIR), TimeoutExpired(["x"], 1.0)])
+        command = ["docker", "compose", "run", "--entrypoint", "python", "spark"]
+        stack.run(command)
+        self.assertEqual(1, stack.unknown_lines)
+        with self.assertRaises(TimeoutExpired):
+            stack.run(command)
+        self.assertEqual(0, stack.unknown_lines)
+
+    def test_a_stream_of_lines_that_do_not_begin_with_the_prefix_drops_nothing_that_is_counted(self) -> None:
+        stack = self.stack([(1, "", "WARN 4417\nTraceback 4417\ngold_dimensions: key_null: dim_case, 1 row\n")])
+        stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
+        self.assertEqual(0, stack.unknown_lines)
+
+    def test_the_lab_refusal_that_also_prints_a_sealed_count_fails_the_case_end_to_end(self) -> None:
+        for stream, wanted in (("gold_dimensions: empty_source: failed\n", True), (self.LAB_PAIR, False)):
+            with self.subTest(stream=stream[-40:]):
+                stack = self.stack([(1, "", stream)])
+                record = Record(feature="test", slug="test", rerun="none")
+                run = self.module.GoldRun.__new__(self.module.GoldRun)
+                run.record, run.gold, run.trunk = record, stack, "trunk"
+                run.stack = SimpleNamespace(spark_containers=lambda: [])
+                run.head = lambda branch: "h"
+                run.name = lambda base: base
+                run.refused_from("an empty laboratory table", "built", "source", self.module.PLANTED_LAB_CODES)
+                self.assertEqual(wanted, record.observations[0].passed, texts(record))
+                self.assertNotIn("dim_lab_test", texts(record))
+                self.assertNotIn("2 members", texts(record))
+
     def test_the_stream_of_a_stopped_attempt_is_not_kept_for_the_next_job(self) -> None:
         stack = self.stack([(1, "", "gold_dimensions: key_null: dim_case, 1 row\n"), TimeoutExpired(["x"], 1.0)])
         command = ["docker", "compose", "run", "--entrypoint", "python", "spark"]
@@ -1266,8 +1309,11 @@ class ProfileDump(unittest.TestCase):
     def setUp(self) -> None:
         self.module = runner("signal_profile")
 
-    def tables(self, extra: bool = False) -> dict[str, tuple[list[dict[str, Any]], list[str]]]:
-        """The dump's input tables. With ``extra`` the held-out cases change: one case has more rows, another has none, and a row has no case at all."""
+    FULL = None
+
+    def tables(self, extra: bool = False, full: float | None = None) -> dict[str, tuple[list[dict[str, Any]], list[str]]]:
+        """The dump's input tables. With ``extra`` the held-out cases change: one case has more rows, another has none, and a row has no case at all.
+        ``full`` is the value that the table holds for the one count of the full cohort."""
         held = [9] if extra else [7, 9]
         loose = [None] if extra else []
         copies = 3 if extra else 1
@@ -1292,11 +1338,21 @@ class ProfileDump(unittest.TestCase):
             "lake.bronze.clinical_cases": (clinical, ["caseid", "opstart", "opend"]),
             "lake.silver.signal_profile": ([stored], list(stored)),
             "lake.silver.unscored_share": ([{"a": 1}], ["a"]),
-            "lake.silver.source_counts": ([{"name": "n", "value": 1.0, "expected": 1.0, "matches": True}], ["name", "value", "expected", "matches"]),
+            "lake.silver.source_counts": (
+                [
+                    {"name": "n", "value": 1.0, "expected": 1.0, "matches": True},
+                    {"name": "whole_cohort_count", "value": self.FULL if full is None else full, "expected": 5.0, "matches": True},
+                ],
+                ["name", "value", "expected", "matches"],
+            ),
             "lake.silver.warning_grid_rule": ([{"rule": "r", "written_at": None}], ["rule", "written_at"]),
         }
 
-    def run_dump(self, tables: dict[str, tuple[list[dict[str, Any]], list[str]]], source: str | None = None) -> dict[str, Any]:
+    printed = ""
+
+    def run_dump(
+        self, tables: dict[str, tuple[list[dict[str, Any]], list[str]]], source: str | None = None, sealed: tuple[str, ...] = ("whole_cohort_count",)
+    ) -> dict[str, Any]:
         """Run the stand-in's own ``dump`` (and the two functions it calls) on ``tables``, with Spark stood in, and return what it printed."""
         tree = ast.parse(source or self.module.STAND_IN)
         keep: list[ast.stmt] = [
@@ -1306,11 +1362,12 @@ class ProfileDump(unittest.TestCase):
             or (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant | ast.Tuple))
         ]
         names = namespace(ast.unparse(ast.Module(body=keep, type_ignores=[])), F=FakeFunctions)
-        spec = {"dev_cases": self.DEV, "causes": self.CAUSES}
+        spec = {"dev_cases": self.DEV, "causes": self.CAUSES, "sealed": list(sealed)}
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             names["dump"](FakeSession(tables), spec)
-        line = printed.getvalue().strip()
+        self.printed = printed.getvalue()
+        line = self.printed.strip()
         self.assertTrue(line.startswith("RESULT "), line)
         document: dict[str, Any] = json.loads(line[len("RESULT ") :])
         return document
@@ -1318,6 +1375,23 @@ class ProfileDump(unittest.TestCase):
     def test_the_dump_reads_the_development_rows(self) -> None:
         found = self.run_dump(self.tables())
         self.assertEqual({"numeric_rows": 2, "waveform_rows": 2, "tracks": 2}, found["development"])
+
+    def test_a_value_of_a_full_cohort_count_never_leaves_the_container_and_only_a_flag_says_it_was_there(self) -> None:
+        planted = self.run_dump(self.tables(full=424242.5))
+        self.assertNotIn("424242", self.printed)
+        self.assertIs(False, planted["sealed_values_empty"])
+        row = next(item for item in planted["counts"] if item["name"] == "whole_cohort_count")
+        self.assertNotIn("value", row)
+        self.assertEqual(5.0, row["expected"])
+
+    def test_a_full_cohort_count_with_no_value_gives_a_true_flag_and_a_development_count_keeps_its_value(self) -> None:
+        found = self.run_dump(self.tables())
+        self.assertIs(True, found["sealed_values_empty"])
+        self.assertEqual(1.0, next(item for item in found["counts"] if item["name"] == "n")["value"])
+
+    def test_the_flag_looks_at_the_names_that_the_runner_sends_and_a_zero_value_is_a_value(self) -> None:
+        self.assertIs(False, self.run_dump(self.tables(full=0.0))["sealed_values_empty"])
+        self.assertIs(True, self.run_dump(self.tables(full=424242.5), sealed=())["sealed_values_empty"])
 
     def test_a_change_of_held_out_rows_alone_leaves_the_dump_identical(self) -> None:
         self.assertEqual(self.run_dump(self.tables()), self.run_dump(self.tables(extra=True)))

@@ -140,7 +140,9 @@ class GoldFailedReplies(unittest.TestCase):
         def answer(program: str, arguments: list[str], **_: Any) -> Any:
             if "--entrypoint" not in arguments:
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
-            return SimpleNamespace(returncode=code, stdout=f'RESULT {{"members": {MEMBERS}}}\n', stderr="gold_dimensions: branch_missing\n")
+            return SimpleNamespace(
+                returncode=code, stdout=f'RESULT {{"mode": "verify", "branch": "b", "members": {MEMBERS}}}\n', stderr="gold_dimensions: branch_missing\n"
+            )
 
         with mock.patch.object(self.module.base, "run_command", side_effect=answer):
             return stack.gold("verify", "b")  # type: ignore[no-any-return]
@@ -152,7 +154,97 @@ class GoldFailedReplies(unittest.TestCase):
 
     def test_the_result_line_of_a_job_that_exited_0_is_returned(self) -> None:
         code, result, _, _ = self.job(0)
-        self.assertEqual((0, {"members": MEMBERS}), (code, result))
+        self.assertEqual((0, {"mode": "verify", "branch": "b", "members": MEMBERS}), (code, result))
+
+
+def verify_reply(module: Any, **edits: Any) -> dict[str, Any]:
+    """The result of a Gold verify of the branch ``b`` as the job prints it."""
+    open_names = [item.name for item in module.DIMENSIONS if not item.sealed]
+    return {
+        **healthy_result(module),
+        "mode": "verify",
+        "branch": "b",
+        "outcome": "verified",
+        "base_hash": None,
+        "written": {n: False for n in open_names},
+        **edits,
+    }
+
+
+class GoldContradictoryReplies(unittest.TestCase):
+    """A reply that names another mode or another branch than the one that was asked is discarded at the launcher (the code is kept), so no verify gate
+    accepts it and nothing is merged."""
+
+    def setUp(self) -> None:
+        self.module = runner("gold_dimensions")
+
+    def stack(self, reply: dict[str, Any], code: int = 0) -> Any:
+        record, log = Record(feature="test", slug="test", rerun="none"), list[str]()
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="gold_contra_")))
+        stack = self.module.GoldStack(Path("compose"), "proj_x1", directory, record, log)
+
+        def answer(program: str, arguments: list[str], **_: Any) -> Any:
+            if "--entrypoint" not in arguments:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=code, stdout="RESULT " + json.dumps(reply) + "\n", stderr="")
+
+        self.enterContext(mock.patch.object(self.module.base, "run_command", side_effect=answer))
+        return stack
+
+    def test_a_reply_of_another_mode_or_another_branch_is_discarded_and_the_code_is_kept(self) -> None:
+        healthy = verify_reply(self.module)
+        for label, reply, wanted in (
+            ("healthy", healthy, True),
+            ("another mode", {**healthy, "mode": "build"}, False),
+            ("another branch", {**healthy, "branch": "other"}, False),
+            ("no mode", {key: value for key, value in healthy.items() if key != "mode"}, False),
+            ("no branch", {key: value for key, value in healthy.items() if key != "branch"}, False),
+        ):
+            with self.subTest(label):
+                code, result, _, _ = self.stack(reply).gold("verify", "b")
+                self.assertEqual(0, code)
+                self.assertEqual(reply if wanted else {}, result)
+
+    def test_the_branch_that_was_passed_to_the_job_is_the_one_that_the_reply_must_name(self) -> None:
+        stack = self.stack(verify_reply(self.module, branch="argument"))
+        self.assertEqual({}, stack.gold("verify", "b")[1])
+        stack = self.stack(verify_reply(self.module, branch="argument"))
+        self.assertEqual("argument", stack.gold("verify", "b", branch_argument="argument")[1]["branch"])
+        stack = self.stack(verify_reply(self.module, branch="b"))
+        self.assertEqual({}, stack.gold("verify", "b", branch_argument="argument")[1])
+
+    def test_a_build_reply_of_another_mode_is_discarded_too(self) -> None:
+        reply = {**healthy_result(self.module), "mode": "verify"}
+        self.assertEqual({}, self.stack(reply).gold("build", "branch", base_branch="trunk")[1])
+        self.assertEqual(healthy_result(self.module), self.stack(healthy_result(self.module)).gold("build", "branch", base_branch="trunk")[1])
+
+    def verified(self, reply: dict[str, Any]) -> tuple[Any, list[Any], Record]:
+        stack = self.stack(reply)
+        record = stack.record
+        run = self.module.GoldRun.__new__(self.module.GoldRun)
+        merges: list[Any] = []
+        run.record, run.gold, run.trunk = record, stack, "p7_trunk_x1"
+        run.head = lambda branch: "b" * 64
+
+        def merge(*arguments: Any, **keywords: Any) -> str:
+            merges.append((arguments, keywords))
+            return "m" * 64
+
+        run.merge = merge
+        return run, merges, record
+
+    def test_a_verify_gate_merges_a_healthy_reply_and_merges_nothing_for_a_contradictory_one(self) -> None:
+        healthy = verify_reply(self.module)
+        for label, reply, wanted in (
+            ("healthy", healthy, True),
+            ("a build reply to a verify", {**healthy, "mode": "build"}, False),
+            ("a reply for another branch", {**healthy, "branch": "other"}, False),
+        ):
+            with self.subTest(label):
+                run, merges, record = self.verified(reply)
+                self.assertEqual("m" * 64 if wanted else None, run.verify_and_merge("b", "message"))
+                self.assertEqual(1 if wanted else 0, len(merges))
+                self.assertEqual(wanted, record.observations[0].passed, texts(record))
 
 
 class GoldLines(unittest.TestCase):
@@ -215,6 +307,23 @@ class ProfileFailedReplies(unittest.TestCase):
         stack, _, _ = stand_in_stack(self, self.module, None, 0, out=self.OUT, err="")
         _, result, _, _ = stack.job(["/data/stand_in.py", "load", "b"])
         self.assertEqual(31337, result["rows"]["signal_profile"])
+
+    def test_a_reply_of_another_mode_or_another_branch_is_discarded_by_the_profile_launcher_and_the_code_is_kept(self) -> None:
+        healthy = {"mode": "verify", "branch": "b", "outcome": "verified"}
+        for label, reply, wanted in (
+            ("healthy", healthy, True),
+            ("another mode", {**healthy, "mode": "build"}, False),
+            ("another branch", {**healthy, "branch": "other"}, False),
+            ("no mode", {"branch": "b"}, False),
+            ("no branch", {"mode": "verify"}, False),
+        ):
+            with self.subTest(label):
+                stack, _, _ = stand_in_stack(self, self.module, None, 0, out="RESULT " + json.dumps(reply) + "\n", err="")
+                code, result, _, _ = stack.profile("verify", "b", pinned=True)
+                self.assertEqual(0, code)
+                self.assertEqual(reply if wanted else {}, result)
+        stack, _, _ = stand_in_stack(self, self.module, None, 0, out='RESULT {"mode": "build", "branch": "b"}\n', err="")
+        self.assertEqual({"mode": "build", "branch": "b"}, stack.profile("build", "b", base="trunk")[1])
 
     def test_an_observation_of_a_failed_build_holds_no_field_of_its_reply(self) -> None:
         record = Record(feature="test", slug="test", rerun="none")

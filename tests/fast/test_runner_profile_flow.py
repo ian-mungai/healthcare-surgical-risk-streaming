@@ -41,16 +41,19 @@ class Nessie:
     def __init__(self, tables: dict[str, set[str]] | None = None) -> None:
         self.tables = tables or {}
         self.merged: list[Any] = []
+        self.merge_keywords: list[dict[str, Any]] = []
+        self.moved: dict[str, str] = {}
         self.tags: list[Any] = []
 
     def entries(self, branch: str) -> dict[str, int]:
         return {name: 1 for name in self.tables.get(branch, set())}
 
     def reference(self, name: str) -> SimpleNamespace:
-        return SimpleNamespace(hash=BRANCH_HASH, kind="TAG" if name.startswith("run-") else "BRANCH")
+        return SimpleNamespace(hash=self.moved.get(name, BRANCH_HASH), kind="TAG" if name.startswith("run-") else "BRANCH")
 
-    def merge(self, *arguments: Any, **_: Any) -> str:
+    def merge(self, *arguments: Any, **keywords: Any) -> str:
         self.merged.append(arguments)
+        self.merge_keywords.append(keywords)
         return BRANCH_HASH
 
     def create_tag(self, *arguments: Any) -> None:
@@ -185,6 +188,7 @@ class ProfileCases(unittest.TestCase):
             ("healthy", verified, True),
             ("another outcome", {**verified, "outcome": "written"}, False),
             ("another hash", {**verified, "branch_hash": "c" * 64}, False),
+            ("a write hash in the pinned verify", {**verified, "write_hash": BRANCH_HASH}, False),
         ):
             with self.subTest(label):
                 self.setUp()
@@ -204,6 +208,56 @@ class ProfileCases(unittest.TestCase):
         self.assertTrue(all(item.passed for item in self.record.observations), [item.observed for item in self.record.observations])
         self.assertEqual({"merged_hash", "tag", "tag_hash"}, set(self.flow.facts))
         self.assertEqual(f"run-prof-{self.flow.suffix}", self.flow.facts["tag"])
+
+    def test_the_verify_fails_when_the_branch_moved_during_the_unpinned_verify_and_no_merge_of_the_new_hash_happens(self) -> None:
+        built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
+        verified = {"outcome": "verified", "source_counts": {"pinned": True, "passed": True}, "branch_hash": BRANCH_HASH}
+        unpinned = f"signal_profile: counts_judged_unpinned: {len(self.module.BY_NAME)} rows\n"
+        moved = "c" * 64
+        calls: list[str] = []
+
+        def profile(mode: str, branch: str, base: str | None = None, pinned: bool = False) -> tuple[int, dict[str, Any], str, float]:
+            calls.append("pinned" if pinned else "unpinned")
+            return (0, verified, "", 0.5) if pinned else (1, {}, unpinned, 0.5)
+
+        self.stack.profile = profile
+        self.flow.head = lambda branch: moved if "unpinned" in calls else BRANCH_HASH
+        self.nessie.moved["p6_prof_profile_x1"] = moved
+        self.assertIs(False, self.flow.verify_control(built))
+        self.assertEqual([True, False], [item.passed for item in self.record.observations])
+        self.assertIn("the branch is still at the verified hash False", self.record.observations[1].observed)
+        self.assertEqual([], self.nessie.merged)
+        run = SimpleNamespace(
+            setup=lambda: True,
+            control=lambda: built,
+            independent=lambda *_, **__: True,
+            verify_control=lambda built: self.flow.verify_control(built),
+            held_out=lambda: "held",
+            merge_tag_rebuild=lambda built: self.nessie.merged.append(built),
+            rule_refusals=lambda *_: None,
+            schema_cases=lambda *_: None,
+            wrong_pin=lambda *_: None,
+            mismatch=lambda *_: None,
+            tampers=lambda *_: None,
+            input_faults=lambda *_: None,
+            bounded_failure=lambda *_: None,
+        )
+        self.record.observations.clear()
+        calls.clear()
+        self.module.cases(run)
+        self.assertEqual([], self.nessie.merged)
+
+    def test_the_merge_names_the_verified_hash_and_not_the_hash_that_the_branch_holds_now(self) -> None:
+        built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
+        self.nessie.moved["p6_prof_profile_x1"] = "c" * 64
+        self.nessie.tables["p6_prof_trunk_x1"] = {f"silver.{name}" for name in self.module.ALL_TABLE_NAMES}
+        self.stack.profile = lambda *_, **__: (0, self.result(outcome="unchanged", write_hash=None), "", 0.5)
+        self.flow.head = lambda branch: BRANCH_HASH
+        with self.quiet():
+            self.flow.merge_tag_rebuild(built)
+        self.assertEqual(1, len(self.nessie.merge_keywords))
+        self.assertEqual(BRANCH_HASH, self.nessie.merge_keywords[0]["source_hash"])
+        self.assertNotIn("c" * 64, [str(item) for item in self.nessie.merge_keywords[0].values()])
 
     def test_the_verify_returns_false_when_the_unpinned_check_fails(self) -> None:
         built = {"branch": "p6_prof_profile_x1", "branch_hash": BRANCH_HASH}
@@ -234,9 +288,10 @@ class ProfileCases(unittest.TestCase):
             "grid": {},
             "unscored": [{**zero, **rule, "scope": "development", "unscored_share": None}],
             "counts": [
-                {"name": count.name, "value": 7.0 if count.name == "development_cases" else None, "expected": float(count.expected)}
+                {"name": count.name, "expected": float(count.expected), **({"value": 7.0} if count.scope != "full cohort" else {})}
                 for count in module.PRESPECIFIED
             ],
+            "sealed_values_empty": True,
             "count_flags": ["None"],
             "rule": [{**asdict(module.planned_rule(5)), "written_at": "2026-11-24"}],
             "schema": schema,
@@ -253,6 +308,22 @@ class ProfileCases(unittest.TestCase):
         self.stack.stand_in = lambda mode, branch: (0, dump, "", 0.1)
         self.flow.stand = lambda mode, branch, **values: self.stack.stand_in(mode, branch)
         return bool(self.flow.independent(built, [908], {"development_cases": 7.0}, "", "control", pinned=False, arterial=False))
+
+    def test_the_independent_read_asks_the_container_for_the_names_of_the_full_cohort_counts_and_reads_no_value_of_them(self) -> None:
+        asked: list[dict[str, Any]] = []
+        self.stack.write_spec = lambda *_: None
+
+        def stand(mode: str, branch: str, **values: Any) -> tuple[int, dict[str, Any], str, float]:
+            asked.append(values)
+            return 0, {**self.healthy_dump(), "counts": [{"name": "x", "value": 1}]}, "", 0.1
+
+        self.flow.stand = stand
+        built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
+        self.flow.independent(built, [908], {"development_cases": 7.0}, "", "control", pinned=False, arterial=False)
+        wanted = sorted(count.name for count in self.module.PRESPECIFIED if count.scope == "full cohort")
+        self.assertEqual([wanted], [values["sealed"] for values in asked])
+        self.assertGreater(len(wanted), 0)
+        self.assertNotIn("development_cases", wanted)
 
     def test_the_independent_read_returns_true_when_every_comparison_passes_and_records_flags_only(self) -> None:
         self.assertIs(True, self.independent(self.healthy_dump()))
@@ -275,8 +346,11 @@ class ProfileCases(unittest.TestCase):
             "an arterial second in a development case": (1, mutated(arterial={"908": [[1, True]]})),
             "a count with another value": (
                 3,
-                mutated(counts=[{**item, "value": 8.0 if item["name"] == "development_cases" else item["value"]} for item in dump["counts"]]),
+                mutated(counts=[{**item, "value": 8.0} if item["name"] == "development_cases" else item for item in dump["counts"]]),
             ),
+            "a sealed count that held a value": (3, mutated(sealed_values_empty=False)),
+            "no flag of the sealed counts": (3, {key: value for key, value in self.healthy_dump().items() if key != "sealed_values_empty"}),
+            "a flag of the sealed counts that is a text": (3, mutated(sealed_values_empty="True")),
             "a rule row with another snapshot": (4, mutated(rule=[{**dump["rule"][0], "split_snapshot_id": 6}])),
             "a table of other columns": (5, mutated(schema={**dump["schema"], "signal_profile": []})),
         }
@@ -386,7 +460,7 @@ class GoldCases(unittest.TestCase):
         self.record = Record(feature="test", slug="test", rerun="none")
         run = self.module.GoldRun.__new__(self.module.GoldRun)
         run.record, run.trunk, run.facts, run.suffix = self.record, "p7_trunk_x1", {}, "x1"
-        run.stack = SimpleNamespace(spark_containers=lambda: [], job=lambda *_, **__: (124, {}, "gold_dimensions: timeout\n", 0.1))
+        run.stack = SimpleNamespace(spark_containers=lambda: [], job=lambda *_, **__: (124, {}, "gold_dimensions: timeout\n", 0.1), unknown_lines=0)
         run.head = lambda branch: BASE_HASH
         run.name = lambda base: f"p7_{base}_x1"
         run.fork = lambda base, label: f"p7_{label}_x1"
@@ -400,7 +474,7 @@ class GoldCases(unittest.TestCase):
         for lines, wanted in (("gold_dimensions: key_rule: dim_case, 1 member\n", True), ("gold_dimensions: usage\n", False)):
             with self.subTest(lines=lines):
                 self.setUp()
-                self.flow.gold = SimpleNamespace(gold=lambda *_, lines=lines, **__: (1, {}, lines, 0.1))
+                self.flow.gold = SimpleNamespace(gold=lambda *_, lines=lines, **__: (1, {}, lines, 0.1), unknown_lines=0)
                 self.flow.refused_verify("planted", "branch", ["key_rule: dim_case, 1 member"])
                 self.flow.refused_from("planted", "built", "source", ["key_rule: dim_case, 1 member"])
                 self.assertEqual([wanted, wanted], [item.passed for item in self.record.observations])
@@ -412,9 +486,34 @@ class GoldCases(unittest.TestCase):
         answers: Iterator[tuple[int, dict[str, Any], str, float]] = iter(
             [(1, {}, "gold_dimensions: branch_missing\n", 0.1), (2, {}, "gold_dimensions: usage\n", 0.1)]
         )
-        self.flow.gold = SimpleNamespace(gold=lambda *_, **__: next(answers))
+        self.flow.gold = SimpleNamespace(gold=lambda *_, **__: next(answers), unknown_lines=0)
         self.flow.bounded()
         self.assertEqual([True, True, True], [item.passed for item in self.record.observations], [item.observed for item in self.record.observations])
+
+    def test_every_refusal_case_that_reads_codes_fails_when_the_adapter_dropped_a_line_of_the_job(self) -> None:
+        """The lab refusal that also prints a sealed count: the adapter keeps ``empty_source: failed`` and drops ``empty_source: dim_lab_test, 2 members``."""
+        wanted = ["key_rule: dim_case, 1 member"]
+        for dropped in (0, 1):
+            with self.subTest(dropped=dropped):
+                self.setUp()
+                self.flow.gold = SimpleNamespace(gold=lambda *_, **__: (1, {}, "gold_dimensions: key_rule: dim_case, 1 member\n", 0.1), unknown_lines=dropped)
+                self.flow.refused_verify("planted", "branch", wanted)
+                self.flow.refused_from("planted", "built", "source", wanted)
+                self.assertEqual([dropped == 0] * 2, [item.passed for item in self.record.observations])
+                for item in self.record.observations:
+                    self.assertIn(f"no line was dropped {dropped == 0}", item.observed)
+        for dropped in (0, 1):
+            with self.subTest(case="bounded", dropped=dropped):
+                self.setUp()
+                answers: Iterator[tuple[int, dict[str, Any], str, float]] = iter(
+                    [(1, {}, "gold_dimensions: branch_missing\n", 0.1), (2, {}, "gold_dimensions: usage\n", 0.1)]
+                )
+                self.flow.gold = SimpleNamespace(gold=lambda *_, answers=answers, **__: next(answers), unknown_lines=dropped)
+                self.flow.stack = SimpleNamespace(
+                    job=lambda *_, **__: (124, {}, "gold_dimensions: timeout\n", 0.1), spark_containers=lambda: [], unknown_lines=dropped
+                )
+                self.flow.bounded()
+                self.assertEqual([dropped == 0] * 3, [item.passed for item in self.record.observations])
 
     def test_the_planted_history_cases_pass_only_when_the_history_names_the_control(self) -> None:
         night = self.module.NIGHTS[-1]

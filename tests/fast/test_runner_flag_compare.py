@@ -218,8 +218,14 @@ class ProfileMismatch(unittest.TestCase):
         )
         values = {getattr(key, "value", ""): value for key, value in zip(result.keys, result.values, strict=True)}
         row = values["counts"].elt  # type: ignore[attr-defined]
-        self.assertEqual({"name", "value", "expected"}, {key.value for key in row.keys})
+        self.assertEqual({"name", "expected"}, {key.value for key in row.keys if key is not None})
+        spread = [value for key, value in zip(row.keys, row.values, strict=True) if key is None]
+        self.assertEqual(1, len(spread))
+        self.assertIsInstance(spread[0], ast.IfExp)
+        self.assertEqual({"value"}, {key.value for key in spread[0].orelse.keys}, "the value is held for a count that is not sealed only")
+        self.assertEqual([], spread[0].body.keys, "a sealed count holds no value field")
         self.assertIn("count_flags", values)
+        self.assertIn("sealed_values_empty", values)
 
     def test_the_dump_holds_no_row_total_of_the_silver_tables(self) -> None:
         source = runner("signal_profile").STAND_IN
