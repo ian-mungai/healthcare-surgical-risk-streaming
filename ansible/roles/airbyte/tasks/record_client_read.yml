@@ -5,7 +5,9 @@
 # kubeconfig, and a file would survive a SIGKILL. Each attempt keeps kubectl's standard output and standard error apart in memory: the credentials are read from standard output
 # only, so a warning on standard error never reaches them, and standard error is used only to classify a failed attempt. Each completed attempt is reduced in memory to one fixed word (refused, not found, unreachable, not filled or failed) that replaces
 # the kept one; an attempt that is still running when the deadline's signal arrives has completed nothing, so the last completed attempt's word is the one printed (none before the
-# first). The stop message takes only a word of that fixed list out of the command's standard error, so no other text there can reach it.
+# first). An attempt whose result is not one of those words (its subshell was killed before it finished, so what it captured may be the values) is not a
+# completed attempt: it is dropped and the kept word stays. Trailing newlines of the values are dropped before the last line is taken. The stop message takes
+# only a word of that fixed list out of the command's standard error, so no other text there can reach it.
 - name: Wait for and read the administrator's client ID and secret from the namespace's auth secret
   ansible.builtin.command:
     argv:
@@ -31,8 +33,13 @@
             if [ "$status" -ne 0 ]; then classify "$err"; fi
             printf '\nkubectl-result:%s\n' "$word"; } 3>&1 )
           word=${result##*kubectl-result:}
+          case "$word" in
+            ok|refused|"not found"|unreachable|failed) ;;
+            *) sleep 2; continue ;;
+          esac
           if [ "$word" = ok ]; then
-            value=$(printf '%s' "${result%kubectl-result:*}" | tail -n 1)
+            captured=$(printf '%s' "${result%kubectl-result:*}")
+            value=$(printf '%s\n' "$captured" | tail -n 1)
             case "$value" in
               ?*:?*) printf '%s' "$value"; exit 0 ;;
             esac

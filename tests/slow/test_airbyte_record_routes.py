@@ -455,6 +455,24 @@ class ReadFailureTest(unittest.TestCase):
             code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), STALL))
         self.assertEqual((124, "", [f"{REASON_MARK}none"]), (code, output, reasons(errors)))
 
+    def test_an_attempt_killed_after_it_wrote_the_values_keeps_the_last_completed_reason_and_shows_no_value(self) -> None:
+        """The attempt's own subshell is killed after kubectl wrote both values: what it captured is not a completed attempt, so it never becomes the reason."""
+        pair = f"{encoded(READ_ID)}:{encoded(READ_VALUE)}"
+        killed = f"printf '%s' '{pair}'\nkill -9 $(ps -o ppid= -p $PPID)\nsleep 1"
+        for label, steps in {"first attempt": (killed, STALL), "after a refusal": (FAIL.format(text=KUBECTL_ERROR), killed, STALL)}.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as scratch:
+                code, output, errors = self.run_wait(self.sequence(Path(scratch), *steps), deadline=6)
+                expected = "none" if label == "first attempt" else "refused"
+                self.assertEqual((124, "", [f"{REASON_MARK}{expected}"]), (code, output, reasons(errors)))
+                for fragment in (encoded(READ_ID), encoded(READ_VALUE), READ_ID, READ_VALUE):
+                    self.assertNotIn(fragment, errors)
+
+    def test_values_that_end_with_a_newline_are_read(self) -> None:
+        pair = f"{encoded(READ_ID)}:{encoded(READ_VALUE)}"
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), f"printf '%s\\n' '{pair}'"))
+        self.assertEqual((0, pair, ""), (code, output, errors))
+
     def test_a_secret_without_both_values_is_reported_as_not_filled(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             code, output, errors = self.run_wait(self.fake_k3s(Path(scratch), "printf ':'"))
