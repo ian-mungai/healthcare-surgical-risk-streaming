@@ -17,7 +17,9 @@ Failure modes covered here (fix round 3, owner decision D):
   that table alone never changes the printed outcome), so the case fails on a correct build. The runner expects ``unchanged`` and reads the rewrite from the
   snapshot ID of ``source_counts`` in Nessie, which must be a whole number on the base and another one on the built branch.
 - The runner records a pass when the comparison read printed ``as_planted: true`` and then exited 1: the read needs exit 0 and the true flag.
-- The profile dump prints and logs the row totals of the numeric and waveform tables, which a held-out change moves.
+- The profile dump prints and logs the row totals of the numeric and waveform tables, which a held-out change moves. ``tests/fast/test_runner_gold_sealed.py``
+  runs the dump on stand-in tables where only held-out rows change and requires an identical dump (fix round 4: the syntax guard that stood here missed a count
+  through a variable and a filter on a non-null case).
 """
 
 from __future__ import annotations
@@ -208,7 +210,7 @@ class ProfileMismatch(unittest.TestCase):
         self.assertEqual({"name", "value", "expected"}, {key.value for key in row.keys})
         self.assertIn("count_flags", values)
 
-    def test_the_dump_prints_no_total_of_a_waveform_or_numeric_table_that_a_held_out_change_moves(self) -> None:
+    def test_the_dump_holds_no_row_total_of_the_silver_tables(self) -> None:
         source = runner("signal_profile").STAND_IN
         dump = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "dump")
         result = next(
@@ -217,40 +219,6 @@ class ProfileMismatch(unittest.TestCase):
             if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "result" and isinstance(node.value, ast.Dict)
         )
         self.assertNotIn("silver_rows", {getattr(key, "value", "") for key in result.keys})
-        self.assertEqual([], whole_table_counts(dump, ("SNUM", "SWAV")))
-
-
-def whole_table_counts(function: ast.FunctionDef, tables: tuple[str, ...]) -> list[str]:
-    """The tables of ``tables`` that ``function`` counts with no ``filter`` between ``session.table(<name>)`` and ``.count()``: a total of every case."""
-    found: list[str] = []
-    for call in (node for node in ast.walk(function) if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "count"):
-        chain: ast.expr = call.func.value  # type: ignore[attr-defined]
-        filtered, table = False, None
-        while True:
-            if isinstance(chain, ast.Call) and isinstance(chain.func, ast.Attribute):
-                if chain.func.attr == "table" and chain.args and isinstance(chain.args[0], ast.Name) and chain.args[0].id in tables:
-                    table = chain.args[0].id
-                filtered = filtered or chain.func.attr == "filter"
-                chain = chain.func.value
-            elif isinstance(chain, ast.Attribute):
-                chain = chain.value
-            else:
-                break
-        if table is not None and not filtered:
-            found.append(table)
-    return sorted(found)
-
-
-class WholeTableCounts(unittest.TestCase):
-    def found(self, body: str) -> list[str]:
-        function = next(node for node in ast.parse(f"def dump(session, spec):\n    {body}\n").body if isinstance(node, ast.FunctionDef))
-        return whole_table_counts(function, ("SNUM", "SWAV"))
-
-    def test_a_count_of_a_whole_table_is_found_and_a_count_of_chosen_cases_is_not(self) -> None:
-        self.assertEqual(["SNUM"], self.found("n = session.table(SNUM).count()"))
-        self.assertEqual(["SNUM", "SWAV"], self.found('n = {"a": session.table(SNUM).count(), "b": session.table(SWAV).count()}'))
-        self.assertEqual([], self.found('n = session.table(SNUM).filter(F.col("case_id").isin(ids)).count()'))
-        self.assertEqual([], self.found("n = session.table(CNT).count()"))
 
 
 class ProfileLoads(unittest.TestCase):

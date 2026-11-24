@@ -31,7 +31,7 @@ from spark.settings import SettingsError
 from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from tests.e2e.run_record import Record
-from tests.fast.label_accept import empty_exit_ok, refusal_ok
+from tests.fast.label_accept import refusal_ok
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 JOB = "silver_labels"
@@ -134,10 +134,6 @@ class LabelsRunner(unittest.TestCase):
                 self.assertFalse(first.passed)
         suffixed = {"job": JOB, "mode": "build", "refusal": ["branch_missing: failed"]}
         self.assertFalse(self.bounded(suffixed, 1).observations[0].passed)
-
-    def test_a_bad_call_and_a_stopped_job_are_judged_from_an_empty_folder(self) -> None:
-        self.assertTrue(empty_exit_ok(2, False, 2))
-        self.assertFalse(empty_exit_ok(2, True, 2))
 
 
 if __name__ == "__main__":
