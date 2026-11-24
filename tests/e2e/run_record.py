@@ -21,12 +21,25 @@ BLOCKED_PREFIX = "blocked: "
 VERDICT_FILES = ("record.json", "retention.json", "record.json.part", "retention.json.part")
 
 
+def proven_absent(path: Path) -> bool:
+    """True only when ``path`` is shown not to be there: its look-up says that the name or a part of its path does not exist. A look-up that fails for any other
+    reason (a folder that cannot be searched, an input or output error) proves nothing, so the path is not called gone. A name that is there is not absent."""
+    try:
+        path.lstat()
+    except FileNotFoundError, NotADirectoryError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def remove_verified(folder: Path, names: tuple[str, ...] = VERDICT_FILES) -> list[str]:
-    """Remove the files ``names`` of ``folder`` and give back the names that are still there afterwards: a removal is checked, never assumed."""
+    """Remove the files ``names`` of ``folder`` and give back every name that is not proven absent afterwards (``proven_absent``): a removal is checked,
+    never assumed, and a check that fails counts as a file that may still be there."""
     for name in names:
         with contextlib.suppress(OSError):
             (folder / name).unlink()
-    return [name for name in names if os.path.lexists(folder / name)]
+    return [name for name in names if not proven_absent(folder / name)]
 
 
 @dataclass
@@ -129,7 +142,8 @@ class Record:
         said = (
             f"{self.slug}: the record cannot be written again after a failed print, so there is no record\n"
             if not left
-            else f"{self.slug}: the record cannot be written again after a failed print and cannot be removed ({', '.join(left)}): it may still say {earlier}\n"
+            else f"{self.slug}: the record cannot be written again after a failed print and cannot be removed or checked ({', '.join(left)}): "
+            f"it may still say {earlier}\n"
         )
         with contextlib.suppress(OSError, ValueError, AttributeError):
             sys.stderr.write(said)

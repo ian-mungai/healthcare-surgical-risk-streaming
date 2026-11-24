@@ -19,6 +19,7 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -33,7 +34,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from scripts.sample.candidates import read_candidates
+from scripts.ingestion.notice import Code, Notice
+from scripts.sample.candidates import CANDIDATES_FILE, CandidateError, read_candidates
 from tests.e2e import run_record
 from tests.e2e.run_record import Record
 from tests.fast import run_save
@@ -378,6 +380,36 @@ class FinalFiles(unittest.TestCase):
         self.assertEqual([], list(folder.rglob("log.txt")))
         self.assertIn("so there is no record", self.stderr.getvalue())
 
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_a_run_folder_behind_an_unsearchable_folder_is_not_reported_as_gone(self) -> None:
+        runs = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="run_save_")))
+        folder = runs / "run"
+        folder.mkdir()
+        (folder / "record.json").write_text('{"outcome": "pass"}')
+        runs.chmod(0)
+        self.addCleanup(runs.chmod, 0o755)
+        self.assertEqual(1, run_save.remove_run(folder, trial(), "record.json cannot be written"))
+        self.assertNotIn("so there is no record", self.stderr.getvalue())
+        self.assertIn("cannot be removed or checked", self.stderr.getvalue())
+
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_a_label_that_cannot_be_checked_after_its_removal_fails_removes_the_run_and_says_what_is_true(self) -> None:
+        stopped: list[Path] = []
+
+        def put(path: Path, text: str) -> None:
+            if path.name == "retention.json.part":
+                path.parent.chmod(0)
+                self.addCleanup(path.parent.chmod, 0o755)
+                stopped.append(path.parent)
+                raise OSError("planted failure of the label rewrite")
+            path.write_text(text)
+
+        code, _ = self.save(scan=lambda texts: int(any("end_condition" in text for text in texts)), write=put)
+        self.assertEqual(1, code)
+        self.assertTrue(stopped, "the test needs the label to be written again")
+        self.assertIn("the retention label cannot be made to say fail", self.stderr.getvalue())
+        self.assertNotIn("so there is no record", self.stderr.getvalue())
+
     def test_a_closed_output_and_a_record_that_cannot_be_removed_keep_it_and_the_message_says_so(self) -> None:
         closed = io.StringIO()
         closed.close()
@@ -419,13 +451,13 @@ class Leaks(unittest.TestCase):
         self.assertEqual(0, run_save.leaks(["908 validation"], set()))
 
 
-class CandidateNumbers(unittest.TestCase):
-    """``run_save.candidate_numbers`` reads the candidate list once for a runner and gives its case and patient numbers, or a failing observation."""
+class ReadCandidatesOnce(unittest.TestCase):
+    """``run_save.read_candidates_once`` reads the candidate list once for a runner and gives it, or a failing observation and None."""
 
-    def test_the_numbers_are_the_case_and_patient_numbers_as_text(self) -> None:
+    def test_a_good_read_gives_the_list_and_adds_no_observation(self) -> None:
         record = trial()
-        found = run_save.candidate_numbers(record, lambda: [SimpleNamespace(case=1, patient=2), SimpleNamespace(case=3, patient=2)])
-        self.assertEqual({"1", "2", "3"}, found)
+        items = [SimpleNamespace(case=1, patient=2), SimpleNamespace(case=3, patient=2)]
+        self.assertEqual(items, run_save.read_candidates_once(record, lambda: items))
         self.assertEqual(1, len(record.observations), "a good read adds no observation")
 
     def test_a_read_is_made_once(self) -> None:
@@ -435,21 +467,28 @@ class CandidateNumbers(unittest.TestCase):
             calls.append(1)
             return []
 
-        run_save.candidate_numbers(trial(), read)
+        run_save.read_candidates_once(trial(), read)
         self.assertEqual([1], calls)
 
     def test_a_failed_read_gives_none_and_one_failing_observation_that_names_the_error_class_only(self) -> None:
-        for error in (RuntimeError("path /secret/place"), ValueError("line 4"), OSError("disk")):
+        errors = (
+            RuntimeError("path /secret/place"),
+            ValueError("line 4"),
+            OSError("disk"),
+            CandidateError(Notice(Code.CANDIDATE_HEADER)),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "secret reason"),
+        )
+        for error in errors:
             with self.subTest(type(error).__name__):
                 record = trial()
 
                 def failing(error: Exception = error) -> list[Any]:
                     raise error
 
-                self.assertIsNone(run_save.candidate_numbers(record, failing))
+                self.assertIsNone(run_save.read_candidates_once(record, failing))
                 failed = [item for item in record.observations if not item.passed]
                 self.assertEqual(["the fixed-sample candidate list is read"], [item.case for item in failed])
-                self.assertEqual(type(error).__name__ in failed[0].observed, True)
+                self.assertIn(type(error).__name__, failed[0].observed)
                 self.assertNotIn("secret", failed[0].observed)
 
     def test_an_error_that_is_not_an_i_o_or_value_error_is_not_hidden(self) -> None:
@@ -457,7 +496,12 @@ class CandidateNumbers(unittest.TestCase):
             raise KeyboardInterrupt
 
         with self.assertRaises(KeyboardInterrupt):
-            run_save.candidate_numbers(trial(), failing)
+            run_save.read_candidates_once(trial(), failing)
+
+    def test_the_numbers_are_the_case_and_patient_numbers_as_text(self) -> None:
+        found = run_save.numbers_of([SimpleNamespace(case=1, patient=2), SimpleNamespace(case=3, patient=2)])
+        self.assertEqual({"1", "2", "3"}, found)
+        self.assertEqual(set(), run_save.numbers_of([]))
 
 
 class SilverRunners(unittest.TestCase):
@@ -477,22 +521,37 @@ class SilverRunners(unittest.TestCase):
     }
 
     def main(
-        self, name: str, write: Callable[[Path, str], None] | None, reads: Callable[[Path], Any] | None = None, ran: list[str] | None = None
+        self,
+        name: str,
+        write: Callable[[Path, str], None] | None,
+        reads: Callable[[Path], Any] | None = None,
+        ran: list[str] | None = None,
+        *,
+        dry: bool = False,
     ) -> tuple[int, Path]:
+        """Run ``main`` of a runner with its container run stood in. ``ran`` gets the name when the run starts, ``self.given`` the arguments of the run, and
+        ``self.planned`` the arguments of each dry plan; with ``dry`` the runner's own dry plan runs."""
         module = runner(name)
         folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="silver_main_")))
+        self.given: list[tuple[Any, ...]] = []
+        self.planned: list[tuple[Any, ...]] = []
 
-        def run_local(record: Record, *_: Any, **__: Any) -> None:
+        def run_local(record: Record, *arguments: Any, **__: Any) -> None:
+            self.given.append(arguments)
             if ran is not None:
                 ran.append(name)
             record.expect("a passing step", "control", "it holds", "it held", True)
+
+        def planned(*arguments: Any) -> list[str]:
+            self.planned.append(arguments)
+            return []
 
         patches: list[Any] = [
             mock.patch.object(module, "ROOT", folder),
             mock.patch.object(module, "recorded_state", lambda _: ("revision", "0" * 64)),
             mock.patch.object(module, "run_local", run_local),
             mock.patch.object(module, "stand_in_defined", lambda _: True, create=True),
-            mock.patch.object(module, "planned_reference_names", lambda: [], create=True),
+            *([] if dry else [mock.patch.object(module, "planned_reference_names", planned, create=True)]),
             *(mock.patch.object(module, key, value, create=True) for key, value in self.READS.get(name, {}).items()),
             *([mock.patch.object(module, "read_candidates", reads)] if reads is not None else []),
         ]
@@ -530,18 +589,83 @@ class SilverRunners(unittest.TestCase):
                 self.assertTrue(any("def main" in text for text in seen), "the copy of the script is scanned")
 
     def test_a_candidate_list_that_cannot_be_read_gives_a_failing_record_and_no_raised_error_and_no_run(self) -> None:
-        missing = Path("/nonexistent/candidates.tsv")
+        malformed = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="silver_header_"))) / "candidates.tsv"
+        malformed.write_text("not\tthe\theader\n1\t2\n")
+        for label, path in (("missing", Path("/nonexistent/candidates.tsv")), ("malformed header", malformed)):
+            for name in ("silver_cases", "silver_signals", "silver_patient_split"):
+                with self.subTest(label, runner=name):
+                    ran: list[str] = []
+
+                    def unreadable(_: Path, path: Path = path) -> list[Any]:
+                        return read_candidates(path)
+
+                    code, folder = self.main(name, None, unreadable, ran)
+                    stored = self.stored(folder)
+                    self.assertEqual(1, code)
+                    self.assertEqual("fail", stored["outcome"])
+                    self.assertEqual([], ran, "a run that cannot scan for identifiers is not started")
+                    self.assertEqual([], self.planned, "no dry plan is made from a list that was not read")
+                    failed = [item for item in stored["observations"] if not item["passed"]]
+                    self.assertEqual(["the fixed-sample candidate list is read"], [item["case"] for item in failed])
+                    self.assertNotIn(str(path), json.dumps(stored), "the record names the error class, never a path")
+                    self.assertIn("CandidateError" if label == "malformed header" else "Error", failed[0]["observed"])
+
+    def test_a_malformed_header_with_the_real_dry_plan_gives_a_failing_record_and_no_error(self) -> None:
+        malformed = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="silver_header_"))) / "candidates.tsv"
+        malformed.write_text("not\tthe\theader\n")
+        code, folder = self.main("silver_cases", None, lambda _: read_candidates(malformed), dry=True)
+        stored = self.stored(folder)
+        self.assertEqual(1, code)
+        self.assertEqual("fail", stored["outcome"])
+        self.assertEqual(["the fixed-sample candidate list is read"], [item["case"] for item in stored["observations"] if not item["passed"]])
+
+    def test_each_runner_calls_the_reader_once_on_a_full_dry_path_and_hands_the_list_on(self) -> None:
         for name in ("silver_cases", "silver_signals", "silver_patient_split"):
             with self.subTest(name):
-                ran: list[str] = []
-                code, folder = self.main(name, None, lambda _: read_candidates(missing), ran)
-                stored = self.stored(folder)
-                self.assertNotEqual(0, code)
-                self.assertEqual("fail", stored["outcome"])
-                self.assertEqual([], ran, "a run that cannot scan for identifiers is not started")
-                failed = [item for item in stored["observations"] if not item["passed"]]
-                self.assertEqual(["the fixed-sample candidate list is read"], [item["case"] for item in failed])
-                self.assertNotIn(str(missing), json.dumps(stored), "the record names the error class, never a path")
+                reads: list[Path] = []
+                tracked = read_candidates(CANDIDATES_FILE)
+
+                def reader(path: Path, reads: list[Path] = reads, tracked: list[Any] = tracked) -> list[Any]:
+                    reads.append(path)
+                    return tracked
+
+                code, _ = self.main(name, None, reader, dry=True)
+                self.assertEqual(0, code)
+                self.assertEqual([CANDIDATES_FILE], reads, f"{name} reads the list once")
+                (given,) = self.given
+                self.assertTrue(any(isinstance(item, list) and item == tracked for item in given), "the run gets the list that main read")
+
+    def test_the_dry_plan_gets_the_list_that_main_read(self) -> None:
+        tracked = read_candidates(CANDIDATES_FILE)
+        self.main("silver_cases", None, lambda _: tracked)
+        (arguments,) = self.planned
+        self.assertTrue(any(isinstance(item, list) and item == tracked for item in arguments))
+
+    def test_the_candidate_list_is_read_by_one_call_in_main_and_by_no_other_function(self) -> None:
+        for name in ("silver_cases", "silver_signals", "silver_patient_split"):
+            with self.subTest(name):
+                tree = ast.parse(Path(runner(name).__file__ or "").read_text())
+                found: list[str] = []
+                for function in (node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    for call in ast.walk(function):
+                        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "read_candidates":
+                            found.append(function.name)
+                self.assertEqual(["main"], found)
+
+    def test_a_run_object_takes_its_candidates_and_never_reads_the_list(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="silver_run_")))
+        (folder / "clinical.csv").write_text("caseid\n1\n")
+        candidates = [SimpleNamespace(case=11, patient=22, slot="a_development")]
+        for name, last in (("silver_cases", (Path("clinical"), Path("lab"))), ("silver_patient_split", folder / "clinical.csv")):
+            with self.subTest(name):
+                module = runner(name)
+                with (
+                    mock.patch.object(module, "read_candidates", side_effect=AssertionError("the list is read again")),
+                    mock.patch.object(module, "expected_from_csv", lambda _: ({}, {}), create=True),
+                ):
+                    run = module.Run(SimpleNamespace(), SimpleNamespace(), trial(), last, candidates)
+                self.assertIs(candidates, run.candidates)
+                self.assertEqual({"11", "22"}, run.numbers)
 
     def test_the_candidate_list_is_read_once_by_main_and_the_identifiers_are_the_ones_that_the_scan_gets(self) -> None:
         for name in ("silver_cases", "silver_signals", "silver_patient_split"):

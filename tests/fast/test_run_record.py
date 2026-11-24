@@ -373,6 +373,17 @@ class VerifiedVerdictTest(unittest.TestCase):
         self.assertIn("cannot be removed", message)
         self.assertIn("pass", message)
 
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_a_record_behind_an_unsearchable_folder_is_not_reported_as_gone(self) -> None:
+        record, folder = self.written()
+        folder.chmod(0)
+        self.addCleanup(folder.chmod, 0o755)
+        self.assertEqual(1, record.report(folder))
+        message = self.errors.getvalue()
+        self.assertNotIn("so there is no record", message)
+        self.assertIn("cannot be removed or checked", message)
+        self.assertIn("pass", message)
+
     def test_a_removal_that_fails_is_reported_as_a_removal_that_failed(self) -> None:
         record, folder = self.written()
         with mock.patch.object(Path, "unlink", side_effect=OSError("planted unlink failure")):
@@ -471,3 +482,50 @@ class VerifiedVerdictTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProvenAbsent(unittest.TestCase):
+    """``proven_absent`` is True only when the path is shown not to be there: a check that fails is not a removal that worked."""
+
+    def setUp(self) -> None:
+        self.folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="proven_absent_")))
+
+    def test_a_missing_name_is_proven_absent(self) -> None:
+        self.assertIs(True, run_record.proven_absent(self.folder / "record.json"))
+
+    def test_a_name_under_a_file_is_proven_absent(self) -> None:
+        (self.folder / "file").write_text("x")
+        self.assertIs(True, run_record.proven_absent(self.folder / "file" / "record.json"))
+
+    def test_a_file_a_folder_and_a_broken_link_are_not_absent(self) -> None:
+        (self.folder / "record.json").write_text("{}")
+        (self.folder / "sub").mkdir()
+        (self.folder / "link").symlink_to(self.folder / "nowhere")
+        for name in ("record.json", "sub", "link"):
+            with self.subTest(name):
+                self.assertIs(False, run_record.proven_absent(self.folder / name))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_a_name_behind_an_unsearchable_folder_is_not_proven_absent(self) -> None:
+        (self.folder / "record.json").write_text("{}")
+        self.folder.chmod(0)
+        self.addCleanup(self.folder.chmod, 0o755)
+        self.assertIs(False, run_record.proven_absent(self.folder / "record.json"))
+        self.assertIs(False, run_record.proven_absent(self.folder / "other.json"))
+
+    def test_any_other_error_is_not_proven_absent(self) -> None:
+        for error in (PermissionError("denied"), OSError("i/o"), TimeoutError("slow")):
+            with self.subTest(type(error).__name__), mock.patch.object(Path, "lstat", side_effect=error):
+                self.assertIs(False, run_record.proven_absent(self.folder / "record.json"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_remove_verified_lists_every_name_when_the_folder_cannot_be_searched(self) -> None:
+        (self.folder / "record.json").write_text('{"outcome": "pass"}')
+        self.folder.chmod(0)
+        self.addCleanup(self.folder.chmod, 0o755)
+        self.assertEqual(list(run_record.VERDICT_FILES), run_record.remove_verified(self.folder))
+
+    def test_remove_verified_gives_nothing_when_every_name_is_gone(self) -> None:
+        (self.folder / "record.json").write_text("{}")
+        self.assertEqual([], run_record.remove_verified(self.folder))
+        self.assertFalse((self.folder / "record.json").exists())

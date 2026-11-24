@@ -26,6 +26,7 @@ import dataclasses
 import importlib
 import importlib.util
 import json
+import os
 import re
 import sys
 import tempfile
@@ -632,6 +633,30 @@ class RunnerSource(unittest.TestCase):
                     if isinstance(node, ast.Try)
                 ]
                 self.assertIn(True, removing)
+
+    def test_a_removal_is_judged_by_proven_absent_and_never_by_exists(self) -> None:
+        for name, source in self.sources().items():
+            with self.subTest(runner=name):
+                calls = [
+                    node.func.attr
+                    for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("exists", "lexists")
+                ]
+                self.assertEqual([], calls, "a look-up that fails would say that the folder is gone")
+                self.assertIn("proven_absent", source)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_a_scratch_folder_behind_an_unsearchable_parent_is_not_reported_as_gone(self) -> None:
+        module = runner("silver_cases")
+        with tempfile.TemporaryDirectory() as parent:
+            scratch = Path(parent) / "scratch"
+            scratch.mkdir()
+            os.chmod(parent, 0)
+            try:
+                with mock.patch.object(module.shutil, "rmtree"):
+                    self.assertFalse(module.scrub_tree(scratch))
+            finally:
+                os.chmod(parent, 0o700)
 
 
 class Planted(unittest.TestCase):

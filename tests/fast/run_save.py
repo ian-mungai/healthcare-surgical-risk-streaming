@@ -7,9 +7,10 @@ number beside a set name runs on what the folder holds, and on the record and it
 retention label follows and is read back too; and ``record.json`` is written last, from the final verdict. A failed write or read of an attachment, or of the
 label, therefore gives a failing record. The label and the record are then written from the final verdict by one guarded path, which the reporter also uses
 when a print fails: no file of the folder says pass beside a record that says fail. When ``record.json`` itself cannot be written, there is no record: the
-folder is removed, the reason goes to the error output and the exit code is 1. Each removal is checked: a folder or a file that cannot be removed is said to
-stay, and the earlier label and record are removed before a rewrite, so that a stop in the middle leaves no earlier pass. The runners read the fixed-sample
-candidate list once, through ``candidate_numbers``: a list that cannot be read is a failing observation, and the run does not start.
+folder is removed, the reason goes to the error output and the exit code is 1. Each removal is checked (``proven_absent``): a folder or a file that cannot
+be removed or checked is said to stay, and the earlier label and record are removed before a rewrite, so that a stop in the middle leaves no earlier pass.
+The runners read the fixed-sample candidate list once, through ``read_candidates_once``, first in ``main``, and pass the list on: a list that cannot be
+read is a failing observation, and the run does not start.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from tests.e2e.run_record import FAILED_END, PASSED_END, ROOT, RUN_PAYLOAD_CLASS, Record, remove_verified
+from tests.e2e.run_record import FAILED_END, PASSED_END, ROOT, RUN_PAYLOAD_CLASS, Record, proven_absent, remove_verified
 from tests.fast.sealed_record import sealed_observed
 
 SET_WORD = re.compile(r"\b(training|validation|test)\b")
@@ -53,12 +54,13 @@ def leaks(texts: Iterable[str], numbers: set[str]) -> int:
     return hits
 
 
-def candidate_numbers(record: Record, read: Callable[[], Iterable[Any]]) -> set[str] | None:
-    """The fixed-sample case and patient numbers of the candidate list, read once for the whole run (``read`` gives its candidates). A list that cannot be read
-    is a failing observation of the record, never an error that stops the runner before it saves: the result is then None, and the run is not started, because
-    its saved texts cannot be scanned for these numbers. Only the class name of the error is recorded."""
+def read_candidates_once(record: Record, read: Callable[[], Iterable[Any]]) -> list[Any] | None:
+    """The fixed-sample candidates, read once for the whole run (``read`` gives them). The runner calls this first, before any step that needs the list, and
+    passes the list on. A list that cannot be read (an input or output error, or any ``ValueError`` such as a malformed header) is a failing observation of the
+    record, never an error that stops the runner before it saves: the result is then None, and the run is not started, because its saved texts cannot be
+    scanned for the numbers of the list. Only the class name of the error is recorded."""
     try:
-        candidates = list(read())
+        return list(read())
     except (RuntimeError, ValueError, OSError) as error:
         record.expect(
             "the fixed-sample candidate list is read",
@@ -68,7 +70,12 @@ def candidate_numbers(record: Record, read: Callable[[], Iterable[Any]]) -> set[
             False,
         )
         return None
-    return {str(item.case) for item in candidates} | {str(item.patient) for item in candidates}
+
+
+def numbers_of(candidates: Iterable[Any]) -> set[str]:
+    """The case and patient numbers of the candidates, as text."""
+    items = list(candidates)
+    return {str(item.case) for item in items} | {str(item.patient) for item in items}
 
 
 def read_back(path: Path, text: str) -> str:
@@ -116,10 +123,13 @@ def commit(record: Record, folder: Path, put: Callable[[Path, str], None], *, la
 
 
 def remove_run(folder: Path, record: Record, reason: str) -> int:
-    """Remove the run folder, check that it is gone and say what is true: that there is no record, or that the folder stays and may still say pass."""
+    """Remove the run folder, check that it is proven gone (``proven_absent``) and say what is true: that there is no record, or that the folder cannot be
+    removed or checked and may still say pass."""
     shutil.rmtree(folder, ignore_errors=True)
-    if folder.exists():
-        sys.stderr.write(f"{record.slug}: {reason}, and the run folder cannot be removed: its files may still say pass; outcome would be {record.outcome}\n")
+    if not proven_absent(folder):
+        sys.stderr.write(
+            f"{record.slug}: {reason}, and the run folder cannot be removed or checked: its files may still say pass; outcome would be {record.outcome}\n"
+        )
     else:
         sys.stderr.write(f"{record.slug}: {reason}, so there is no record; outcome would be {record.outcome}\n")
     return 1
@@ -213,7 +223,7 @@ def save_run(
             except OSError:
                 with contextlib.suppress(OSError):
                     (folder / LABEL).unlink()
-                if (folder / LABEL).exists():
+                if not proven_absent(folder / LABEL):
                     return remove_run(folder, record, "the retention label cannot be made to say fail")
         try:
             commit(record, folder, put, label_file=False)
