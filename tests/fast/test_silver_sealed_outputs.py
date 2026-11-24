@@ -13,6 +13,8 @@ Failure modes covered here:
 - The keys that the end-to-end runners allow in a result (``tests/fast/silver_accept.py``) differ from the keys that the job writes, so a runner would fail a
   valid result or pass an extra key.
 - A split-rule problem (``two_sets: 1 patient``) reaches a caller with its count.
+- The result that a job builds (its envelope and its facts) is not the document that the runners' schema accepts: a type, a table name or the list of check
+  names differs between the job and ``tests/fast/silver_accept.py``, so a valid result fails or an invalid one passes.
 """
 
 from __future__ import annotations
@@ -25,19 +27,22 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from spark.jobs import silver_hypotension as hypotension_job
+from spark.jobs import silver_signals as signals_job
 from spark.jobs.patient_split import Lake
 from spark.jobs.silver_hypotension import HypotensionLake
 from spark.jobs.silver_signals import SOURCES, SignalsLake
 from spark.silver import hypotension_run as hypo_run
 from spark.silver import run as signals_run
 from spark.silver.checks import BronzeFacts, NumericFacts, SilverSignalsError, WaveformFacts
+from spark.silver.cli import JOB as SIGNALS_JOB_NAME
 from spark.silver.hypotension_checks import EventFacts, InputFacts, SeriesFacts
 from spark.silver.run import BRANCH_MOVED, Fingerprint
-from spark.silver.tables import ART_MBP_1S, SILVER_TABLES
+from spark.silver.tables import ART_MBP_1S, HYPOTENSION_TABLES, NAMESPACE, SILVER_TABLES
 from spark.split_table import COLUMNS, PatientSplitError, schema_problems
 from tests.fast import test_silver_hypotension_run as hypo
 from tests.fast import test_silver_signals_run as signals
-from tests.fast.silver_accept import HYPOTENSION_JOB, RESULT_KEYS, SIGNALS_JOB, TABLE_KEYS
+from tests.fast.silver_accept import CHECKS, HYPOTENSION_JOB, RESULT_KEYS, SIGNALS_JOB, TABLE_KEYS, sealed
 
 MESSAGE = re.compile(r"^[a-z_]+: failed$|^" + re.escape(BRANCH_MOVED) + "$")
 VOLATILE = ("snapshots", "source_snapshots", "checked_hash", "write_hash", "branch_hash")
@@ -413,6 +418,31 @@ class AllowedKeys(unittest.TestCase):
         self.assertEqual(envelope | set(facts), RESULT_KEYS[HYPOTENSION_JOB])
         for name in ("snapshots", "source_snapshots", "passed"):
             self.assertEqual(set(TABLE_KEYS[HYPOTENSION_JOB][name]), set(facts[name]), name)
+
+    def document(self, job: str, mode: str, facts: dict[str, Any], tables: Any) -> dict[str, Any]:
+        """The result of ``execute`` as the job builds it: its envelope and the facts of the outcome."""
+        return {
+            "mode": mode,
+            "branch": "b",
+            "base_hash": "a" * 64 if mode == "build" else None,
+            "job": job,
+            "tables": [f"{NAMESPACE}.{table}" for table in tables],
+            **facts,
+        }
+
+    def test_the_result_that_each_job_builds_is_sealed_for_the_runners(self) -> None:
+        signals_facts = signals_run.run_build(signals.Fake().operations(), signals.HEAD).facts()
+        hypo_facts = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
+        self.assertTrue(sealed(self.document(SIGNALS_JOB_NAME, "build", signals_facts, SILVER_TABLES), SIGNALS_JOB))
+        self.assertTrue(sealed(self.document(hypotension_job.JOB, "build", hypo_facts, HYPOTENSION_TABLES), HYPOTENSION_JOB))
+        self.assertTrue(sealed(self.document(SIGNALS_JOB_NAME, "verify", self.verified_signals().facts(), SILVER_TABLES), SIGNALS_JOB))
+
+    def test_the_check_names_of_the_runners_are_those_of_the_job_modules(self) -> None:
+        self.assertEqual(list(signals_job.CHECK_NAMES), signals_run.run_build(signals.Fake().operations(), signals.HEAD).facts()["checks_run"])
+        self.assertEqual(list(hypotension_job.CHECK_NAMES), hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()["checks_run"])
+        self.assertEqual(signals_job.CHECK_NAMES, CHECKS[SIGNALS_JOB])
+        self.assertEqual(hypotension_job.CHECK_NAMES, CHECKS[HYPOTENSION_JOB])
+        self.assertNotEqual(signals_job.CHECK_NAMES, hypotension_job.CHECK_NAMES)
 
     def test_a_verify_result_has_the_same_keys_as_a_build_result(self) -> None:
         self.assertEqual(set(signals_run.run_build(signals.Fake().operations(), signals.HEAD).facts()), set(self.verified_signals().facts()))

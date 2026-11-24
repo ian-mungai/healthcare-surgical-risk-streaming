@@ -5,7 +5,8 @@ writes its own lines to them). The path is absolute, its folder is there, and ne
 reserves ``<path>.part`` (an exclusive create) before any work, so a path that cannot hold it (a name of 255 bytes) is a bad call, ``usage``, and nothing runs.
 It writes the whole document to the reserved file, flushes it and renames it to ``<path>``, so that a reader sees no file or the whole file. A watchdog calls
 ``release_reserved`` so that the job it stops leaves no part file. The pattern is that of ``spark/reconcile/cli.py``. ``run_sealed`` is the whole ending of a
-job whose failures are problems of the form ``code: failed`` (the patient split job and the Silver cases job): every line that it prints for a refusal is a
+job whose failures are problems of the form ``code: failed`` (the patient split job and the Silver cases job; the Silver signals and hypotension jobs use the
+same reserve, write and release in ``spark/silver/cli.py``): every line that it prints for a refusal is a
 fixed code and the flag, never a count. This module imports no Spark.
 """
 
@@ -24,7 +25,6 @@ from spark.settings import SettingsError
 
 RESULT_PATH_LIMIT = 4096
 FILE_MODE = 0o644
-RESULT_PREFIX = "RESULT "  # the line of the Silver signal and hypotension jobs (``spark/silver/cli.py``); a sealed job prints no result line
 FLAG = "failed"
 NOT_FOUND = 404
 REFERENCE_NOT_FOUND = "REFERENCE_NOT_FOUND"
@@ -87,7 +87,8 @@ def release_reserved() -> None:
 
 
 def write_reserved(descriptor: int, path: str, document: dict[str, Any]) -> None:
-    """Write the whole document to the reserved part file and rename it to ``path``. A failure removes the part file."""
+    """Write the whole document to the reserved part file and rename it to ``path``. A failure removes the part file. A file that appeared at ``path`` after
+    the reservation is never replaced: that is a ``FileExistsError``."""
     part = path + ".part"
     try:
         text = json.dumps(document, sort_keys=True) + "\n"
@@ -96,6 +97,8 @@ def write_reserved(descriptor: int, path: str, document: dict[str, Any]) -> None
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+        if os.path.lexists(path):
+            raise FileExistsError
         os.rename(part, path)
     except BaseException:
         release_reserved()

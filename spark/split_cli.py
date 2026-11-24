@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieError
-from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, add_result_option, release_reserved, run_sealed
+from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, add_result_option, release_reserved, run_sealed
 from spark.settings import SettingsError, catalog_options
 
 JOB = "patient_split"
 # The names that the other jobs' command lines take from here (``spark/silver/cli.py``): they are defined in ``spark/result_file.py``.
-__all__ = ["INTERNAL_EXIT_CODE", "NOT_FOUND", "REFERENCE_NOT_FOUND", "RESULT_PREFIX"]
+__all__ = ["INTERNAL_EXIT_CODE", "NOT_FOUND", "REFERENCE_NOT_FOUND"]
 DEADLINE_EXIT_CODE = 124
 DEFAULT_DEADLINE_SECONDS = 900.0
 MAX_DEADLINE_SECONDS = 86_400.0

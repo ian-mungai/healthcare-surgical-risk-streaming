@@ -6,6 +6,7 @@ Failure modes covered here:
   command line, and nothing else reaches the caller.
 - A path that is not absolute, a path with a NUL, a folder that is missing, a file or a part file that exists, or a second ``--result`` is taken, so that a
   file is replaced or a caller reads another one.
+- A file that appears at the path while the job runs is replaced by the rename, so a result that a caller already holds is overwritten.
 - A reader sees half a file: the document is written whole to ``<path>.part`` and renamed into place, and a failure leaves no part file.
 - A path that passes the preflight but cannot hold its part file (a name of 255 bytes: ``<name>.part`` is too long) fails only after the job ran. The part
   file is reserved (created exclusively) before any work, and a reservation that fails is a bad call: ``usage``, exit 2, and nothing runs.
@@ -161,6 +162,15 @@ class Writing(unittest.TestCase):
         release_reserved()
         release_reserved()
         self.assertEqual(["other.part"], os.listdir(self.folder))
+
+    def test_a_file_that_appeared_after_the_reservation_is_never_written_over(self) -> None:
+        descriptor = reserve(self.path)
+        self.assertIsNotNone(descriptor)
+        Path(self.path).write_text("other")
+        with self.assertRaises(FileExistsError):
+            write_reserved(cast("int", descriptor), self.path, DOCUMENT)
+        self.assertEqual("other", Path(self.path).read_text())
+        self.assertEqual(["result.json"], os.listdir(self.folder))
 
     def test_a_document_that_is_not_json_leaves_no_part_file(self) -> None:
         with self.assertRaises(TypeError):

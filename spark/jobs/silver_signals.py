@@ -1,7 +1,10 @@
 """The Silver signal tables: ``silver.numeric_observations`` and ``silver.waveform_seconds``, cleaned at their own grain, each value marked valid or invalid.
 
-``python -m spark.jobs.silver_signals build --branch <name> [--base <name>]``
-``python -m spark.jobs.silver_signals verify --branch <name>``
+``python -m spark.jobs.silver_signals build --branch <name> --result <path> [--base <name>]``
+``python -m spark.jobs.silver_signals verify --branch <name> --result <path>``
+
+The result is one JSON file at ``--result`` (an absolute path that does not exist; it is written whole and renamed, see ``spark/silver/cli.py``), also a
+refusal, whose file holds the refusal codes. Standard output stays empty and standard error is for an operator: a caller reads the exit code and the file.
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it.
 It reads ``bronze.numeric_observations``, ``bronze.waveform_seconds`` and ``bronze.tracks`` at that hash and writes the two Silver tables on the
@@ -28,6 +31,7 @@ from spark.bronze import tables as bronze
 from spark.jobs.patient_split import WRITE_CATALOG, Lake
 from spark.session import build_session
 from spark.silver import frames
+from spark.silver.checks import CHECK_NAMES as CHECK_NAMES
 from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
 from spark.silver.run import BRANCH_MOVED, NUMERIC, WAVEFORM, InputRead, Operations, TableRead, run_build, run_verify
