@@ -2,8 +2,13 @@
 # airbyte_release_deadline_seconds. The release is installed or upgraded only when it is not deployed or when the chart or a values file changed since
 # the last success, so a second run starts no migration and changes nothing. A failure shows each pod's phase and why it waits, and never a log or a value.
 # A run that was stopped inside Helm leaves the release with an operation pending, and Helm refuses to install over it. Before the decision, a pending upgrade
-# or rollback is rolled back to the last deployed revision and a pending first install is uninstalled (Helm keeps the volume claims of stateful sets, and
-# Airbyte's database is on the stack's PostgreSQL, which neither command touches). Every other state goes on to the decision as it is.
+# or rollback is rolled back to the last deployed revision and a pending first install, or an uninstall that did not finish, is uninstalled (Helm keeps the volume
+# claims of stateful sets, and Airbyte's database is on the stack's PostgreSQL, which neither command touches). Every other state goes on as it is.
+# The chart's pre-upgrade hook writes the ConfigMap with AIRBYTE_URL before the upgrade runs, and a rollback does not undo it. So the file with the recorded inputs
+# is removed before any recovery command and before any install or upgrade starts, and written only after the pinned install succeeded. A release that a stopped
+# run touched then has no record, and the next run runs the full upgrade from its own inputs. A run that recovered removed the record too, so it always installs. A Helm command that fails
+# stops the run with fixed text naming the status and the step, and never prints Helm's output. A status read decides only when it succeeded or Helm said
+# "release: not found" (the release is absent); any other error stops the run.
 - name: Read the checksum of each values file
   ansible.builtin.stat:
     path: "{{ airbyte_directory }}/{{ item }}"
@@ -37,7 +42,20 @@
 
 - name: Note the release's state
   ansible.builtin.set_fact:
-    airbyte_release_state: "{{ (airbyte_release_status.stdout | from_json).info.status if airbyte_release_status.rc == 0 else 'not installed' }}"
+    airbyte_release_state: >-
+      {{ (airbyte_release_status.stdout | from_json).info.status if airbyte_release_status.rc == 0
+         else ('not installed' if 'release: not found' in airbyte_release_status.stderr else 'unreadable') }}
+
+- name: Stop when the release's status cannot be read
+  when: airbyte_release_state == 'unreadable'
+  ansible.builtin.fail:
+    msg: >-
+      Helm could not read the status of the Airbyte release {{ airbyte_release }} in namespace {{ airbyte_namespace }} (exit status {{ airbyte_release_status.rc }}),
+      so no step ran. Run helm status by hand to see why.
+
+- name: Note whether the release needs a recovery before the install
+  ansible.builtin.set_fact:
+    airbyte_release_recovery: "{{ airbyte_release_state in ['pending-upgrade', 'pending-rollback', 'pending-install', 'uninstalling'] }}"
 
 - name: Read the release's history
   when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
@@ -47,8 +65,16 @@
     KUBECONFIG: "{{ airbyte_kubeconfig }}"
   register: airbyte_release_history
   changed_when: false
+  failed_when: false
   check_mode: false
   timeout: 60
+
+- name: Stop when the release's history cannot be read
+  when: airbyte_release_history is not skipped and airbyte_release_history.rc != 0
+  ansible.builtin.fail:
+    msg: >-
+      Helm could not read the history of the Airbyte release {{ airbyte_release }} (status {{ airbyte_release_state }}, exit status {{ airbyte_release_history.rc }}),
+      so it was not rolled back. Run helm history by hand to see why.
 
 - name: Pick the last revision that was deployed
   when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
@@ -59,6 +85,12 @@
   when: airbyte_release_state in ['pending-upgrade', 'pending-rollback'] and airbyte_release_good_revision | int == 0
   ansible.builtin.fail:
     msg: The Airbyte release is {{ airbyte_release_state }} and has no deployed revision to roll back to.
+
+- name: Forget the recorded inputs before the recovery
+  when: airbyte_release_recovery | bool
+  ansible.builtin.file:
+    path: "{{ airbyte_directory }}/release_inputs.sha256"
+    state: absent
 
 - name: Roll the release back to its last deployed revision
   when: airbyte_release_state in ['pending-upgrade', 'pending-rollback']
@@ -75,11 +107,20 @@
       - "{{ airbyte_release_deadline_seconds }}s"
   environment:
     KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  register: airbyte_release_rollback
   changed_when: true
+  failed_when: false
   timeout: "{{ airbyte_release_deadline_seconds | int + 120 }}"
 
-- name: Uninstall the release that never finished its first install
-  when: airbyte_release_state == 'pending-install'
+- name: Stop when the rollback failed
+  when: airbyte_release_rollback is not skipped and airbyte_release_rollback.rc != 0
+  ansible.builtin.fail:
+    msg: >-
+      Helm could not roll back the Airbyte release {{ airbyte_release }} to revision {{ airbyte_release_good_revision }} (status {{ airbyte_release_state }},
+      exit status {{ airbyte_release_rollback.rc }}). Run helm rollback by hand to see why.
+
+- name: Uninstall the release that never finished its first install or its uninstall
+  when: airbyte_release_state in ['pending-install', 'uninstalling']
   ansible.builtin.command:
     argv:
       - helm
@@ -92,10 +133,20 @@
       - "{{ airbyte_release_deadline_seconds }}s"
   environment:
     KUBECONFIG: "{{ airbyte_kubeconfig }}"
+  register: airbyte_release_uninstall
   changed_when: true
+  failed_when: false
   timeout: "{{ airbyte_release_deadline_seconds | int + 120 }}"
 
+- name: Stop when the uninstall failed
+  when: airbyte_release_uninstall is not skipped and airbyte_release_uninstall.rc != 0
+  ansible.builtin.fail:
+    msg: >-
+      Helm could not uninstall the Airbyte release {{ airbyte_release }} (status {{ airbyte_release_state }}, exit status {{ airbyte_release_uninstall.rc }}).
+      Run helm uninstall by hand to see why.
+
 - name: Read the release's status again
+  when: airbyte_release_recovery | bool
   ansible.builtin.command:
     argv: [helm, status, "{{ airbyte_release }}", --namespace, "{{ airbyte_namespace }}", --output, json]
   environment:
@@ -106,16 +157,34 @@
   check_mode: false
   timeout: 60
 
+- name: Note the release's state after the recovery, or the first reading when none ran
+  ansible.builtin.set_fact:
+    airbyte_release_state_now: >-
+      {{ airbyte_release_state if not (airbyte_release_recovery | bool)
+         else ((airbyte_release_status_now.stdout | from_json).info.status if airbyte_release_status_now.rc == 0
+               else ('not installed' if 'release: not found' in airbyte_release_status_now.stderr else 'unreadable')) }}
+
+- name: Stop when the release's status cannot be read after the recovery
+  when: airbyte_release_state_now == 'unreadable'
+  ansible.builtin.fail:
+    msg: >-
+      Helm could not read the status of the Airbyte release {{ airbyte_release }} after the recovery (status before it: {{ airbyte_release_state }},
+      exit status {{ airbyte_release_status_now.rc }}), so the install did not start. Run helm status by hand to see why.
+
 - name: Decide whether the release must be installed or upgraded
   ansible.builtin.set_fact:
     airbyte_release_needed: >-
-      {{ airbyte_release_status_now.rc != 0
-         or (airbyte_release_status_now.stdout | from_json).info.status != 'deployed'
+      {{ airbyte_release_state_now != 'deployed'
          or (airbyte_release_recorded.content | default('') | b64decode | trim) != airbyte_release_inputs }}
 
 - name: Install or upgrade the release and wait for it
   when: airbyte_release_needed | bool
   block:
+    - name: Forget the recorded inputs before the install starts
+      ansible.builtin.file:
+        path: "{{ airbyte_directory }}/release_inputs.sha256"
+        state: absent
+
     - name: Install or upgrade the release from the pinned chart archive
       ansible.builtin.command:
         argv:
@@ -137,8 +206,17 @@
           - "{{ airbyte_release_deadline_seconds }}s"
       environment:
         KUBECONFIG: "{{ airbyte_kubeconfig }}"
+      register: airbyte_release_install
       changed_when: true
+      failed_when: false
       timeout: "{{ airbyte_release_deadline_seconds | int + 120 }}"
+
+    - name: Stop when the install or upgrade failed
+      when: airbyte_release_install.rc != 0
+      ansible.builtin.fail:
+        msg: >-
+          Helm could not install or upgrade the Airbyte release {{ airbyte_release }} (status {{ airbyte_release_state_now }}, exit status {{ airbyte_release_install.rc }}).
+          Run helm upgrade by hand to see why.
 
     - name: Record the inputs of this successful release
       ansible.builtin.copy:
