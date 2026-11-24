@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from tests.e2e import run_record
@@ -146,7 +147,7 @@ class ClosedOutputTest(unittest.TestCase):
 
 
 class BrokenPipeTest(unittest.TestCase):
-    """A write to a pipe whose reader is gone only fails when the buffer is flushed, so the record must flush before it says pass."""
+    """A write to a pipe whose reader is gone only fails when the buffer is flushed, so a flush that fails after the write rewrites the record to say fail."""
 
     def test_a_pipe_with_no_reader_gives_a_record_that_says_fail_and_exit_status_1(self) -> None:
         scratch = tempfile.TemporaryDirectory(prefix="run_record_")
@@ -166,6 +167,37 @@ class BrokenPipeTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("fail", written["outcome"])
         self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+
+class ReportAloneTest(unittest.TestCase):
+    """A runner that writes its record and then calls ``report`` itself (Silver cases, Silver labels) must also save a failed print as a failed record."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory(prefix="run_record_")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        closed = io.StringIO()
+        closed.close()
+        for patcher in (mock.patch.object(run_record, "ROOT", self.root), mock.patch.object(sys, "stdout", closed)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def written(self, blocked: str) -> tuple[int, dict[str, Any], dict[str, Any]]:
+        record = run_record.Record(feature="a planted feature", slug="slug", rerun="rerun")
+        record.expect("case", "step", "expected", "observed", True)
+        record.settle(blocked)
+        folder = record.write(["a line"])
+        code = record.report(folder)
+        return code, json.loads((folder / "record.json").read_text()), json.loads((folder / "retention.json").read_text())
+
+    def test_a_failed_print_after_write_gives_a_record_that_says_fail(self) -> None:
+        code, written, label = self.written("")
+        self.assertEqual((1, "fail", FAILED), (code, written["outcome"], label["end_condition"]))
+        self.assertEqual(["output"], [item["step"] for item in written["observations"] if not item["passed"]])
+
+    def test_a_failed_print_keeps_the_blocked_reason(self) -> None:
+        code, written, _ = self.written("interrupted")
+        self.assertEqual((1, "blocked: interrupted"), (code, written["outcome"]))
 
 
 if __name__ == "__main__":
