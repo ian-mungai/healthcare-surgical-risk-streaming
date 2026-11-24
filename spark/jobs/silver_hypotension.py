@@ -1,7 +1,10 @@
 """The Silver pressure series and hypotension events: ``silver.art_mbp_1s`` and ``silver.hypotension_events``.
 
-``python -m spark.jobs.silver_hypotension build --branch <name> [--base <name>]``
-``python -m spark.jobs.silver_hypotension verify --branch <name>``
+``python -m spark.jobs.silver_hypotension build --branch <name> --result <path> [--base <name>]``
+``python -m spark.jobs.silver_hypotension verify --branch <name> --result <path>``
+
+The result is one JSON file at ``--result``, as the Silver signals job's is (an absolute path that does not exist; also a refusal, whose file holds the
+refusal codes). Standard output stays empty and standard error is for an operator: a caller reads the exit code and the file.
 
 ``build`` creates the branch from ``main`` (or from ``--base``, which must hold ``silver.waveform_seconds``), refuses a branch that exists and takes the base
 hash from the answer that created it. It reads ``silver.waveform_seconds``, ``bronze.clinical_cases`` and ``silver.patient_split`` at that hash and writes the
@@ -31,6 +34,7 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from spark.silver.frames import fingerprint as fingerprint_of
 from spark.silver.frames import functions
+from spark.silver.hypotension_checks import CHECK_NAMES as CHECK_NAMES
 from spark.silver.hypotension_checks import InputFacts, split_rule_problems
 from spark.silver.hypotension_run import EVENTS, SERIES, Digest, InputRead, Operations, TableRead, run_build, run_verify
 from spark.silver.run import BRANCH_MOVED, Fingerprint

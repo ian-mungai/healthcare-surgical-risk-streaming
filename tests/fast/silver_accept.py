@@ -1,22 +1,39 @@
-"""The pass or fail rules that the Silver end-to-end runs share, as plain functions on a job's output. Nothing here imports Spark or Docker.
+"""The pass or fail rules that the Silver end-to-end runs share, as plain functions on a job's result file. Nothing here imports Spark or Docker.
 
 The runners ``tests/e2e/silver_signals.py`` and ``tests/e2e/silver_hypotension.py`` stay untracked, so each rule that decides from a job's output lives here,
-where ``tests/fast/test_silver_acceptance.py`` tests it. The rules read hashes and snapshot IDs and never ``outcome``: a result that says whether a table was
-written changes when only a held-out row changes, so no result holds it.
+where ``tests/fast/test_silver_acceptance.py`` tests it. A runner asks each job for one result file (``--result``) and reads that file only, never a line of
+the job's standard output or standard error. The file is accepted when all of these hold:
+
+- it holds one JSON object and nothing else, with no key twice and no ``NaN`` (``read_result``);
+- its schema is closed: the exact keys and the exact types at every level, every pass flag a Boolean, every snapshot ID a whole number, and ``checks_run``
+  the job's own list of check names, imported from the job's module and never copied (``sealed``);
+- its hashes and snapshot IDs are the catalog state that the runner captured from Nessie, before the call (the checked hash, the base hash and the snapshot
+  IDs of the sources) and after it (the branch hash and the snapshot IDs of the tables) (``Catalog``, ``catalog_matches``).
+
+A refusal is judged by the exit code and by the refusal document in the same file (``refused``), and never by the text of standard error. The rules read
+hashes and snapshot IDs and never ``outcome``: a result that says whether a table was written changes when only a held-out row changes, so no result holds it.
 """
 
 from __future__ import annotations
 
 import builtins
+import json
 import symtable
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from spark.jobs.silver_hypotension import CHECK_NAMES as HYPOTENSION_CHECKS
+from spark.jobs.silver_signals import CHECK_NAMES as SIGNALS_CHECKS
+from spark.silver.tables import NAMESPACE
 
 SIGNALS_JOB, HYPOTENSION_JOB = "silver_signals", "silver_hypotension"
 TABLES = ("numeric_observations", "waveform_seconds")
+MODES = ("build", "verify")
 ENVELOPE_KEYS = frozenset({"mode", "branch", "base_hash", "job", "tables"})
 FACT_KEYS = frozenset({"checked_hash", "write_hash", "branch_hash", "source_snapshots", "snapshots", "passed", "checks_run"})
-# The exact keys of the result line of each job, read at the command-line boundary: any other key, also a harmless one, fails the control.
+# The exact keys of the result of each job: any other key, also a harmless one, fails the control.
 RESULT_KEYS = {SIGNALS_JOB: ENVELOPE_KEYS | FACT_KEYS, HYPOTENSION_JOB: ENVELOPE_KEYS | FACT_KEYS | {"development_events_digest"}}
 # The exact keys of the three maps in the result of each job: the tables that it writes, the sources that it reads and the tables with a pass flag.
 TABLE_KEYS = {
@@ -31,6 +48,27 @@ TABLE_KEYS = {
         "passed": ("art_mbp_1s", "hypotension_events"),
     },
 }
+# The names of the checks that each job runs, taken from the module of the job.
+CHECKS = {SIGNALS_JOB: SIGNALS_CHECKS, HYPOTENSION_JOB: HYPOTENSION_CHECKS}
+# The tables that each job names in its result, in order.
+TABLE_LISTS = {job: [f"{NAMESPACE}.{table}" for table in keys["snapshots"]] for job, keys in TABLE_KEYS.items()}
+REFUSAL_KEYS = frozenset({"job", "mode", "refusal"})
+
+
+@dataclass(frozen=True, slots=True)
+class Catalog:
+    """What the runner read from Nessie around one call.
+
+    ``checked`` is the hash that the job must have checked: the head of the base before a build, the head of the branch before a verify. ``base`` is the head
+    of the base before a build and ``None`` for a verify. ``head`` is the head of the branch after the call. ``sources`` holds the snapshot ID of each source
+    table at ``checked`` and ``snapshots`` the snapshot ID of each table that the job writes, on the branch at ``head``.
+    """
+
+    checked: str
+    base: str | None
+    head: str
+    sources: Mapping[str, int | None]
+    snapshots: Mapping[str, int | None]
 
 
 def refusal_matches(found: Sequence[str], wanted: Sequence[str]) -> bool:
@@ -42,52 +80,138 @@ def named(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-def sealed(result: Mapping[str, Any], job: str) -> bool:
-    """Whether the result has exactly the keys that the job writes, at the top and in each map of tables, so that a field that the job does not write
-    (``outcome`` or any other) fails the control."""
+def whole(value: Any) -> bool:
+    """Whether the value is a whole number and not a flag (a Boolean is an ``int`` in Python)."""
+    return type(value) is int
+
+
+def flag(value: Any) -> bool:
+    return type(value) is bool
+
+
+def no_repeat(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("a key twice")
+    return dict(pairs)
+
+
+def no_constant(name: str) -> Any:
+    raise ValueError(name)
+
+
+def read_result(path: Path) -> dict[str, Any] | None:
+    """The document in the result file, or ``None``. The file must exist and hold exactly one JSON object, with no key twice and no ``NaN`` or infinity: two
+    documents, a line of other text, a list or a file that is not there is no result."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=no_repeat, parse_constant=no_constant)
+    except OSError, ValueError, RecursionError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def maps_ok(result: Mapping[str, Any], job: str) -> bool:
+    """The three maps of tables have the exact keys of the job, a whole number for each snapshot ID and a Boolean for each pass flag."""
+    for name, keys in TABLE_KEYS[job].items():
+        held = result[name]
+        if not isinstance(held, Mapping) or set(held) != set(keys):
+            return False
+        if not all(flag(value) if name == "passed" else whole(value) for value in held.values()):
+            return False
+    return True
+
+
+def sealed(result: Any, job: str) -> bool:
+    """Whether the result is of the closed schema that the job writes: the exact keys and the exact types at every level, a Boolean for each pass flag, the
+    job's own table names and its own list of check names. A field that the job does not write (``outcome`` or any other), a flag of ``1`` or a check name
+    that the job does not run fails the control."""
     wanted = RESULT_KEYS.get(job)
-    if wanted is None or set(result) != wanted:
+    if wanted is None or not isinstance(result, Mapping) or set(result) != wanted:
         return False
-    return all(isinstance(result[name], Mapping) and set(result[name]) == set(keys) for name, keys in TABLE_KEYS[job].items())
-
-
-def wrote(result: Mapping[str, Any], job: str) -> bool:
-    """Whether the result is of a write: it is sealed, names the checked hash and a write hash, which is the hash of the branch and is not the checked one."""
-    checked, written, branch = result.get("checked_hash"), result.get("write_hash"), result.get("branch_hash")
-    return sealed(result, job) and named(checked) and named(written) and written == branch and written != checked
-
-
-def kept(result: Mapping[str, Any], job: str) -> bool:
-    """Whether the result is of a call that wrote nothing: it is sealed, names the checked hash, holds ``write_hash`` with no value and has the branch there."""
-    checked = result.get("checked_hash")
-    return sealed(result, job) and named(checked) and result["write_hash"] is None and result.get("branch_hash") == checked
-
-
-def catalog_matches(result: Mapping[str, Any], head: str, snapshots: Mapping[str, int | None]) -> bool:
-    """Whether the hashes and the snapshot IDs that the result reports are those that Nessie holds: ``head`` is the hash of the branch that the catalog gives
-    and ``snapshots`` the snapshot ID that the catalog gives for each table. The branch hash is the head, the write hash is the head or has no value, and
-    every reported snapshot ID is a whole number that equals the catalog's, for the same tables."""
-    reported = result.get("snapshots")
-    if not isinstance(reported, Mapping) or not reported or not named(head) or result.get("branch_hash") != head:
-        return False
-    if result.get("write_hash") not in (None, head):
-        return False
-    return set(reported) == set(snapshots) and all(
-        isinstance(value, int) and not isinstance(value, bool) and snapshots[name] == value for name, value in reported.items()
+    build = result["mode"] == "build"
+    return (
+        result["mode"] in MODES
+        and named(result["branch"])
+        and result["job"] == job
+        and (named(result["base_hash"]) if build else result["base_hash"] is None)
+        and type(result["tables"]) is list
+        and result["tables"] == TABLE_LISTS[job]
+        and named(result["checked_hash"])
+        and named(result["branch_hash"])
+        and (result["write_hash"] is None or named(result["write_hash"]))
+        and type(result["checks_run"]) is list
+        and result["checks_run"] == list(CHECKS[job])
+        and maps_ok(result, job)
+        and (whole(result["development_events_digest"]) if job == HYPOTENSION_JOB else True)
     )
 
 
-def moved_null_ok(result: Mapping[str, Any], before: Mapping[str, Any]) -> bool:
-    """Whether a rebuild after a null moved inside one second is accepted: it wrote, it names both snapshot IDs, the waveform snapshot ID is another than
-    ``before`` holds and both pass flags are true."""
-    snapshots, flags = result.get("snapshots"), result.get("passed")
-    if not isinstance(snapshots, Mapping) or not isinstance(flags, Mapping):
+def refused(document: Any, job: str, mode: str, wanted: Sequence[str]) -> bool:
+    """Whether the document is the refusal of this job in this mode with exactly the wanted codes, each complete, in order: the keys are ``job``, ``mode``
+    and ``refusal``, and no other."""
+    return (
+        isinstance(document, Mapping)
+        and set(document) == REFUSAL_KEYS
+        and document["job"] == job
+        and mode in MODES
+        and document["mode"] == mode
+        and type(document["refusal"]) is list
+        and all(isinstance(line, str) for line in document["refusal"])
+        and refusal_matches(document["refusal"], wanted)
+    )
+
+
+def snapshots_match(reported: Any, held: Mapping[str, int | None]) -> bool:
+    """Whether the reported map has the catalog's tables and, for each, the same whole snapshot ID. A table with no ID in the catalog never matches."""
+    return (
+        isinstance(reported, Mapping)
+        and set(reported) == set(held)
+        and bool(held)
+        and all(whole(value) and held[name] == value for name, value in reported.items())
+    )
+
+
+def catalog_matches(result: Any, catalog: Catalog) -> bool:
+    """Whether every hash and every snapshot ID that the result reports is the one that the catalog held: the checked hash and the base hash before the call,
+    the branch hash after it (and the write hash, which is the branch hash or has no value), and the snapshot IDs of the sources and of the tables."""
+    if not isinstance(result, Mapping) or not all(key in result for key in ("checked_hash", "base_hash", "branch_hash", "write_hash")):
         return False
-    now = [snapshots.get(table) for table in TABLES]
-    if not all(isinstance(snapshot, int) and not isinstance(snapshot, bool) for snapshot in now):
-        return False
+    return (
+        named(catalog.checked)
+        and named(catalog.head)
+        and result["checked_hash"] == catalog.checked
+        and result["base_hash"] == catalog.base
+        and (catalog.base is None or named(catalog.base))
+        and result["branch_hash"] == catalog.head
+        and result["write_hash"] in (None, catalog.head)
+        and snapshots_match(result.get("source_snapshots"), catalog.sources)
+        and snapshots_match(result.get("snapshots"), catalog.snapshots)
+    )
+
+
+def wrote(result: Any, job: str, catalog: Catalog) -> bool:
+    """Whether the result is of a write: it is sealed, the catalog holds what it reports, and its write hash is the branch hash and not the checked hash."""
+    return (
+        sealed(result, job)
+        and catalog_matches(result, catalog)
+        and named(result["write_hash"])
+        and result["write_hash"] == result["branch_hash"]
+        and result["write_hash"] != result["checked_hash"]
+    )
+
+
+def kept(result: Any, job: str, catalog: Catalog) -> bool:
+    """Whether the result is of a call that wrote nothing: it is sealed, the catalog holds what it reports, ``write_hash`` has no value and the branch is at the
+    checked hash."""
+    return sealed(result, job) and catalog_matches(result, catalog) and result["write_hash"] is None and result["branch_hash"] == result["checked_hash"]
+
+
+def moved_null_ok(result: Any, catalog: Catalog, before: Mapping[str, Any]) -> bool:
+    """Whether a rebuild after a null moved inside one second is accepted: it wrote, the catalog holds its hashes and snapshot IDs, the waveform snapshot ID is
+    another than ``before`` holds and both pass flags are true."""
     old = before.get("waveform_seconds")
-    return wrote(result, SIGNALS_JOB) and isinstance(old, int) and now[1] != old and all(flags.get(table) is True for table in TABLES)
+    if not wrote(result, SIGNALS_JOB, catalog) or not whole(old):
+        return False
+    return result["snapshots"]["waveform_seconds"] != old and all(result["passed"][table] is True for table in TABLES)
 
 
 def undefined_names(source: str) -> list[str]:
