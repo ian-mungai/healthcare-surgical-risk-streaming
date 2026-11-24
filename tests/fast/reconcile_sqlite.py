@@ -6,6 +6,10 @@ predicate, ``RLIKE`` and ``TRY_CAST`` become a regular-expression function and a
 ``explode`` forms (the ledger of a reading and the copies of a laboratory row) become a join to ``json_each`` and to a table of numbers. A construct that is
 not one of these is not translated and raises ``ValueError``, so a query that gains one fails loudly here and the translation is extended on purpose.
 
+The query is cut once into quoted literals and other text. Every substitution and the join translation read the other text only: a literal is held aside
+and put back unchanged. Only the quoting that the job's queries use is accepted (single-quoted literals, back-quoted plain names, and the backslash pair of the
+typing-rule pattern); a double quote, a comment, a second statement, a bracket name, an escape, a doubled quote or a quote that does not close raises.
+
 ``World`` holds two cohorts. Case 1 of patient 10 is in the training set, case 2 of patient 20 is in the test set. Each table has the rows of a clean,
 reconciled build for both. A test plants a defect in a cohort and reads what the query counts.
 """
@@ -54,12 +58,62 @@ STEPS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], str]], ...] = (
 ANY_SCOPE_JOIN = re.compile(r"\b(SEMI|ANTI)\s+JOIN\b")
 EXACT_SCOPE_JOIN = re.compile(r"\bLEFT (SEMI|ANTI) JOIN dev ON ")
 ENDS_PREDICATE = re.compile(r"(WHERE|GROUP|ORDER|HAVING|LIMIT|UNION|JOIN|LEFT|RIGHT|FULL|INNER|CROSS|ON)\b")
-QUOTED = re.compile(r"'[^']*'|`[^`]*`")
+NAME = re.compile(r"`\w+`")
+HELD = "\x00"
+HELD_LITERAL = re.compile(HELD + r"(\d+)" + HELD)
+REFUSED_OUTSIDE = ('"', "[", "]", "\\", ";", "--", "/*", "*/")
+TYPING_PAIR = "\\\\z"
 
 
 def masked(text: str) -> str:
-    """The text with the inside of every quoted literal and name blanked, so that a bracket or a keyword in a literal is not read as SQL."""
-    return QUOTED.sub(lambda m: m[0][0] + "_" * (len(m[0]) - 2) + m[0][-1], text)
+    """The text with the inside of every back-quoted name blanked, so that a keyword that is also a name is not read as SQL."""
+    return NAME.sub(lambda m: m[0][0] + "_" * (len(m[0]) - 2) + m[0][-1], text)
+
+
+def hold_literals(query: str) -> tuple[str, list[str]]:
+    """The query with each single-quoted literal replaced by a marker that holds its place, and the literals in order.
+
+    Anything the adapter does not handle raises: a literal that does not close, a doubled quote, a backslash that is not the typing-rule pair, a back-quoted
+    name that is not a plain word, and outside a literal a double quote, a bracket name, a backslash, a comment or a second statement. A control character in
+    the query raises as well, so that no text can imitate a held literal.
+    """
+    if any(ord(char) < 32 for char in query):
+        raise ValueError("a query holds a control character, which the adapter uses to hold a literal")
+    text, index = "", 0
+    held: list[str] = []
+    while index < len(query):
+        character = query[index]
+        if character == "'":
+            end = query.find("'", index + 1)
+            if end < 0:
+                raise ValueError(f"a literal does not close: {query[index:][:40]!r}")
+            if query.startswith("''", end) and end > index + 1:
+                raise ValueError(f"a doubled quote in a literal is not translated: {query[index : end + 2][:40]!r}")
+            literal = query[index : end + 1]
+            if "\\" in literal.replace(TYPING_PAIR, ""):
+                raise ValueError(f"a backslash escape in a literal is not translated: {literal[:40]!r}")
+            text += f"{HELD}{len(held)}{HELD}"
+            held.append(literal)
+            index = end + 1
+        elif character == "`":
+            name = NAME.match(query, index)
+            if name is None:
+                raise ValueError(f"a back-quoted name that is not one plain word is not translated: {query[index:][:40]!r}")
+            if query.startswith("`", name.end()):
+                raise ValueError(f"a doubled back quote in a name is not translated: {query[index:][:40]!r}")
+            text += name[0]
+            index = name.end()
+        else:
+            text += character
+            index += 1
+    for refused in REFUSED_OUTSIDE:
+        if refused in text:
+            raise ValueError(f"quoting or syntax that the adapter does not handle: {refused!r}")
+    return text, held
+
+
+def restore_literals(text: str, held: list[str]) -> str:
+    return HELD_LITERAL.sub(lambda m: held[int(m[1])], text)
 
 
 def has_where_at_level(prefix: str) -> bool:
@@ -114,10 +168,11 @@ def scope_joins(query: str) -> str:
 
 
 def translate(query: str) -> str:
-    query = scope_joins(query)
+    text, held = hold_literals(query)
+    text = scope_joins(text)
     for pattern, replace in STEPS:
-        query = pattern.sub(replace, query)
-    return query
+        text = pattern.sub(replace, text)
+    return restore_literals(text, held)
 
 
 def table_name(table: str) -> str:

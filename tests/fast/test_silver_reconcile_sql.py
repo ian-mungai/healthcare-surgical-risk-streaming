@@ -466,6 +466,14 @@ class Adapter(unittest.TestCase):
         anti = lake.translate("(SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = ')' AND x.`b` <> 'WHERE' AND x.`c` = dev.`case_id`)")
         self.assertEqual("(SELECT x.* FROM t x WHERE NOT EXISTS (SELECT 1 FROM dev WHERE x.`a` = ')' AND x.`b` <> 'WHERE' AND x.`c` = dev.`case_id`))", anti)
 
+    def test_a_name_that_is_also_a_keyword_is_not_sql(self) -> None:
+        anti = lake.translate("(SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`WHERE` = dev.`case_id` AND x.`ON` = 1 AND x.`LEFT` = 2) SELECT 1")
+        self.assertEqual(
+            "(SELECT x.* FROM t x WHERE NOT EXISTS (SELECT 1 FROM dev WHERE x.`WHERE` = dev.`case_id` AND x.`ON` = 1 AND x.`LEFT` = 2)) SELECT 1", anti
+        )
+        semi = lake.translate("(SELECT `WHERE`, x.* FROM t x LEFT SEMI JOIN dev ON x.`a` = dev.`case_id`)")
+        self.assertEqual("(SELECT `WHERE`, x.* FROM t x WHERE EXISTS (SELECT 1 FROM dev WHERE x.`a` = dev.`case_id`))", semi)
+
     def test_a_scope_join_with_no_predicate_is_refused(self) -> None:
         for text in ("(SELECT x.* FROM t x LEFT ANTI JOIN dev ON )", "SELECT x.* FROM t x LEFT SEMI JOIN dev ON "):
             with self.subTest(text=text), self.assertRaises(ValueError):
@@ -476,6 +484,63 @@ class Adapter(unittest.TestCase):
         queries += [join_query(join.name) for join in JOINS] + [join_held_out_query(join.name) for join in JOINS]
         for query in queries:
             self.assertNotRegex(lake.translate(query), r"SEMI|ANTI")
+
+    def test_a_literal_is_never_rewritten(self) -> None:
+        literals = (
+            "'^<=>'",
+            "'^ IS '",
+            "'RLIKE'",
+            "'lake.bronze.x'",
+            "'TRY_CAST(a AS BIGINT)'",
+            "'LEFT ANTI JOIN dev ON'",
+            "'explode(`duplicate_source_occurrences`)'",
+        )
+        for literal in literals:
+            with self.subTest(literal=literal):
+                self.assertEqual(f"SELECT {literal} AS `x`", lake.translate(f"SELECT {literal} AS `x`"))
+        text = "SELECT 1 AS n WHERE '^<=>' <> '^ IS ' OR 1 = 1"
+        self.assertEqual(text, lake.translate(text))
+
+    def test_two_different_literals_stay_different_and_a_comparison_of_them_is_read_as_written(self) -> None:
+        query = "SELECT CASE WHEN '^<=>' <> '^ IS ' THEN 1 ELSE 0 END AS n"
+        self.assertEqual(1, lake.flag(lake.clean_world(), query))
+        self.assertEqual(0, lake.flag(lake.clean_world(), "SELECT CASE WHEN 'a RLIKE b' <> 'a RLIKE b' THEN 1 ELSE 0 END AS n"))
+        self.assertEqual(1, lake.flag(lake.clean_world(), "SELECT CASE WHEN 'lake.bronze.x' <> 'bronze_x' THEN 1 ELSE 0 END AS n"))
+
+    def test_a_form_of_quoting_that_the_adapter_does_not_handle_is_refused(self) -> None:
+        forms = (
+            'SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = dev.`case_id` OR x."(" = 1',
+            'SELECT "a" FROM t',
+            "SELECT 'a\\' FROM t",
+            "SELECT 'a\\'' FROM t",
+            "SELECT 'it''s' FROM t",
+            "SELECT 'open FROM t",
+            "SELECT `open FROM t",
+            "SELECT `a b` FROM t",
+            "SELECT `a``b` FROM t",
+            "SELECT [a] FROM t",
+            "SELECT 1 -- note",
+            "SELECT 1 /* note */",
+            "SELECT 1 /* never closed",
+            "SELECT 1 */",
+            "SELECT 1 \\ 2",
+            "SELECT 1; SELECT 2",
+            "SELECT 'a\x00b' FROM t",
+            "SELECT \x01 FROM t",
+        )
+        self.assertEqual(18, len(forms))
+        for text in forms:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                lake.translate(text)
+
+    def test_the_one_backslash_form_of_the_jobs_own_literals_is_kept(self) -> None:
+        text = "SELECT CASE WHEN `c` RLIKE '^-?[0-9]+\\\\z' THEN 1 END AS `n` FROM t"
+        self.assertEqual("SELECT CASE WHEN `c` REGEXP '^-?[0-9]+\\\\z' THEN 1 END AS `n` FROM t", lake.translate(text))
+
+    def test_a_double_quoted_bracket_cannot_move_an_outer_or_into_the_subquery(self) -> None:
+        text = 'SELECT * FROM (SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = dev.`case_id` AND x."(" = 1) OR TRUE) y'
+        with self.assertRaises(ValueError):
+            lake.translate(text)
 
     def test_a_held_out_scope_widened_by_or_true_changes_what_the_cohort_tests_read(self) -> None:
         """The mutation widens only the anti join: every row is then in no held-out scope and a defect of a held-out row is not seen."""
