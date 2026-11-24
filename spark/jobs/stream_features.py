@@ -4,7 +4,8 @@
 its own Nessie branch, which it creates from ``main`` when it is missing, and keeps its offsets and state in ``STREAM_CHECKPOINT_DIR``. With
 ``STREAM_MAX_SECONDS`` set it stops cleanly when that time has passed (a deadline for a test or a batch run) and prints one line that starts with
 ``RESULT ``. With it unset the job is the always-on service and runs until it is stopped. A stop signal stops the query between batches. A failed
-query ends the process with exit status 1.
+query ends the process with exit status 1, a setting that cannot be used with 2 and a checkpoint of another state format with 3
+(``spark/streaming/checkpoint.py``).
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
 from spark.catalog import required_environment
 from spark.session import build_session
 from spark.settings import SettingsError
+from spark.streaming.checkpoint import EXIT_CODE as CHECKPOINT_EXIT_CODE
+from spark.streaming.checkpoint import CheckpointFormatError, check_checkpoint
 from spark.streaming.clinical import ClinicalFileError, load_clinical
 from spark.streaming.lake_sinks import LakeSinks
 from spark.streaming.query import SESSION_OPTIONS, run_query, start_query
@@ -43,6 +46,7 @@ def ensure_branch(client: NessieClient, branch: str) -> None:
 def main() -> int:
     try:
         settings = from_environment(os.environ)
+        check_checkpoint(settings.checkpoint_dir)
         load_clinical(settings.clinical_file)
         client = NessieClient(required_environment("NESSIE_URI"), NESSIE_TIMEOUT_SECONDS)
         client.config()
@@ -54,6 +58,9 @@ def main() -> int:
     except (StreamSettingsError, SettingsError, ClinicalFileError) as error:
         sys.stderr.write(f"{JOB}: {error}\n")
         return 2
+    except CheckpointFormatError as error:
+        sys.stderr.write(f"{JOB}: {error}\n")
+        return CHECKPOINT_EXIT_CODE
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
         return 1
