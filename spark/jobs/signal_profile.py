@@ -5,8 +5,10 @@
 
 ``build`` creates the branch from ``main`` (or from ``--base``), refuses a branch that exists and takes the base hash from the answer that created it.
 It reads ``silver.numeric_observations``, ``silver.waveform_seconds``, ``silver.patient_split``, ``bronze.clinical_cases`` and
-``raw_records.track_list`` at that hash and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). It never writes to
-the base: the merge is the caller's step after its checks.
+``raw_records.track_list`` at that hash and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). Before it measures the
+unscored share, it writes the one-row table ``silver.warning_grid_rule`` (the warning grid rule and the snapshot ID of the patient split that it read,
+``spark/profile/grid_rule.py``) and refuses a stored rule or split snapshot that differs. It never writes to the split or to the base: the merge is the
+caller's step after its checks.
 ``verify`` runs the checks on the tables that a branch holds and writes nothing. The order, the freeze of a rerun that changes nothing, the writes and the
 read-back are in ``spark/profile/run.py``. The command line, its codes and its exit codes are in ``spark/profile/cli.py``. The settings come from the
 environment, as the Silver signals job's do.
@@ -32,8 +34,9 @@ from spark.profile import frames
 from spark.profile.checks import InputFacts, SignalProfileError
 from spark.profile.cli import JOB, run
 from spark.profile.counts import count_rows
-from spark.profile.run import BRANCH_MOVED, COUNTS, PROFILE, SOURCE_NAMES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
-from spark.profile.tables import PROFILE_TABLES
+from spark.profile.grid_rule import GridRule, RuleRead
+from spark.profile.run import BRANCH_MOVED, COUNTS, PROFILE, RULE, SOURCE_NAMES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
+from spark.profile.tables import GRID_RULE, PROFILE_TABLES
 from spark.session import build_session
 from spark.silver import frames as silver_frames
 from spark.silver.tables import NAMESPACE, NUMERIC, WAVEFORM
@@ -184,8 +187,23 @@ class ProfileLake(Lake):
             return
         writer.tableProperty("format-version", "2").create()
 
+    def read_rule_table(self, at: str) -> RuleRead | None:
+        """The warning grid rule table at ``at``, or ``None`` when the hash holds none."""
+        name = f"{self.catalog(at)}.{NAMESPACE}.{RULE}"
+        if not self.session.catalog.tableExists(name):
+            return None
+        frame = self.session.table(name)
+        problems = schema_problems(self.fields_of(frame), GRID_RULE.columns, f"{RULE} table")
+        if problems:
+            raise SignalProfileError(*problems)
+        return frames.rule_read(frame, self.snapshot_id(name))
+
+    def write_rule_table(self, rule: GridRule) -> None:
+        """Create the warning grid rule table with its one row, as one commit. A table that exists is never written: the build refuses it before this step."""
+        frames.rule_frame(self.session, rule).writeTo(f"{WRITE_CATALOG}.{NAMESPACE}.{RULE}").tableProperty("format-version", "2").create()
+
     def write_hash_of(self, checked: str, table: str) -> str | None:
-        return self.write_commit(checked, (PROFILE_TABLES[table].table_key,))
+        return self.write_commit(checked, ((GRID_RULE if table == RULE else PROFILE_TABLES[table]).table_key,))
 
     def release(self) -> None:
         for frame in self.planned.values():
@@ -194,7 +212,16 @@ class ProfileLake(Lake):
 
     def operations(self) -> Operations:
         return Operations(
-            self.head, self.read_input, self.plan, self.read_profile_table, self.write_profile_table, self.write_hash_of, self.prepare, self.release
+            self.head,
+            self.read_input,
+            self.plan,
+            self.read_profile_table,
+            self.write_profile_table,
+            self.write_hash_of,
+            self.prepare,
+            self.release,
+            self.read_rule_table,
+            self.write_rule_table,
         )
 
 
@@ -224,7 +251,7 @@ def execute(arguments: Any) -> dict[str, Any]:
             "base_hash": base if building else None,
             "pinned_release": arguments.pinned_release,
             "job": JOB,
-            "tables": [f"{NAMESPACE}.{table}" for table in PROFILE_TABLES],
+            "tables": [f"{NAMESPACE}.{table}" for table in (RULE, *PROFILE_TABLES)],
             **outcome.facts(),
         }
     finally:

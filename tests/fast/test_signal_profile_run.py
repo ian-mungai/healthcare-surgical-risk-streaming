@@ -11,6 +11,9 @@ Failure modes covered here:
 - The input changes between the first read and the read-back and nothing says so.
 - A count that does not match makes the job fail, or is not named in the result; a sealed count's value or any row is in the result.
 - The frames that the job planned are not released, also after a failure.
+- The warning grid rule is written after the unscored share is measured, or not at all, or it is written again on a rerun that changes nothing.
+- A rerun whose rule or split snapshot differs from the stored row writes anything, instead of refusing before the plan.
+- The rule table is read back wrongly (no row, two rows, another value), or the patient split is written.
 """
 
 from __future__ import annotations
@@ -22,15 +25,18 @@ from typing import Any
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
 from spark.profile.checks import CountsFacts, InputFacts, ProfileFacts, SignalProfileError, UnscoredFacts
 from spark.profile.counts import PRESPECIFIED
-from spark.profile.run import COUNTS, PROFILE, TABLES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
+from spark.profile.grid_rule import GridRule, RuleRead, planned_rule
+from spark.profile.run import COUNTS, PROFILE, RULE, TABLES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
 from spark.profile.unscored import CUTOFF_STEP_SECONDS
 from spark.silver.run import Fingerprint
 
 HEAD = "a" * 64
 PREPARED = "b" * 64
-HASHES = {PROFILE: "c" * 64, UNSCORED: "d" * 64, COUNTS: "e" * 64}
+HASHES = {RULE: "1" * 64, PROFILE: "c" * 64, UNSCORED: "d" * 64, COUNTS: "e" * 64}
 FACTS = InputFacts(numeric_rows=500, waveform_rows=300, tracks=12, arterial_cases=3)
-INPUT = InputRead(FACTS, (11, 12, 13, 14, 15), ())
+SPLIT_SNAPSHOT = 13
+INPUT = InputRead(FACTS, (11, 12, SPLIT_SNAPSHOT, 14, 15), ())
+RULE_ROW = planned_rule(SPLIT_SNAPSHOT)
 FINGERPRINTS = {PROFILE: Fingerprint(12, 5), UNSCORED: Fingerprint(1, 6), COUNTS: Fingerprint(len(PRESPECIFIED), 7)}
 PROFILE_FACTS = ProfileFacts(12, 0, 0, 0, 0, 500, 300, 12)
 UNSCORED_FACTS = UnscoredFacts(
@@ -71,6 +77,15 @@ class Fake:
         self.hashes: dict[str, str | None] = dict(HASHES)
         self.planned = dict(FINGERPRINTS)
         self.moved_after: int | None = None
+        self.held_rule: RuleRead | None = None
+        self.rule_back: RuleRead | None = RuleRead(1, RULE_ROW, 104, True)
+        self.rules_written: list[GridRule] = []
+
+    def settled(self) -> Fake:
+        """A branch that holds every table already, the rule table too."""
+        self.held = dict(self.read_back)
+        self.held_rule = self.rule_back
+        return self
 
     def head(self) -> str:
         self.calls.append("head")
@@ -90,6 +105,14 @@ class Fake:
         self.calls.append(f"read_table {at[:1]} {table} facts={with_facts}")
         return self.held[table] if at == HEAD else self.read_back[table]
 
+    def read_rule(self, at: str) -> RuleRead | None:
+        self.calls.append(f"read_rule {at[:1]}")
+        return self.held_rule if at == HEAD else self.rule_back
+
+    def write_rule(self, rule: GridRule) -> None:
+        self.calls.append(f"write_rule {RULE}")
+        self.rules_written.append(rule)
+
     def write(self, table: str, exists: bool) -> None:
         self.calls.append(f"write {table} exists={exists}")
 
@@ -108,7 +131,9 @@ class Fake:
         self.calls.append("release")
 
     def operations(self) -> Operations:
-        return Operations(self.head, self.read_input, self.plan, self.read_table, self.write, self.write_hash, self.prepare, self.release)
+        return Operations(
+            self.head, self.read_input, self.plan, self.read_table, self.write, self.write_hash, self.prepare, self.release, self.read_rule, self.write_rule
+        )
 
 
 class Build(unittest.TestCase):
@@ -118,14 +143,18 @@ class Build(unittest.TestCase):
         self.assertEqual(
             [
                 "read_input a",
+                "read_rule a",
+                "head",
+                "prepare a",
+                "write_rule warning_grid_rule",
+                "write_hash b warning_grid_rule",
                 "plan a",
                 "read_table a signal_profile facts=False",
                 "read_table a unscored_share facts=False",
                 "read_table a source_counts facts=False",
                 "head",
-                "prepare a",
                 "write signal_profile exists=False",
-                "write_hash b signal_profile",
+                "write_hash 1 signal_profile",
                 "write unscored_share exists=False",
                 "write_hash c unscored_share",
                 "write source_counts exists=False",
@@ -134,6 +163,7 @@ class Build(unittest.TestCase):
                 "read_table e signal_profile facts=True",
                 "read_table e unscored_share facts=True",
                 "read_table e source_counts facts=True",
+                "read_rule e",
                 "head",
                 "release",
             ],
@@ -150,6 +180,7 @@ class Build(unittest.TestCase):
                 "write_hash": HASHES[COUNTS],
                 "branch_hash": HASHES[COUNTS],
                 "source_snapshots": {"numeric_observations": 11, "waveform_seconds": 12, "patient_split": 13, "clinical_cases": 14, "track_list": 15},
+                "grid_rule": {"version": RULE_ROW.rule_version, "snapshot": 104, "split_snapshot": SPLIT_SNAPSHOT, "written": True},
                 "snapshots": {PROFILE: 101, UNSCORED: 102, COUNTS: 103},
                 "rows": {PROFILE: 12, UNSCORED: 1, COUNTS: len(PRESPECIFIED)},
                 "development": {"numeric_rows": 500, "waveform_rows": 300, "tracks": 12, "arterial_cases": 3},
@@ -179,8 +210,7 @@ class Build(unittest.TestCase):
         self.assertEqual(["read_input a", "release"], fake.calls)
 
     def test_a_rebuild_that_changes_nothing_writes_nothing_and_still_reads_back_and_checks(self) -> None:
-        fake = Fake()
-        fake.held = dict(fake.read_back)
+        fake = Fake().settled()
         outcome = run_build(fake.operations(), HEAD, pinned=False)
         self.assertEqual("unchanged", outcome.outcome)
         self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
@@ -188,8 +218,7 @@ class Build(unittest.TestCase):
         self.assertEqual((HEAD, None, HEAD), (outcome.checked_hash, outcome.write_hash, outcome.facts()["branch_hash"]))
 
     def test_a_rebuild_that_changes_one_table_rewrites_that_table_only_and_in_place(self) -> None:
-        fake = Fake()
-        fake.held = dict(fake.read_back)
+        fake = Fake().settled()
         fake.held[UNSCORED] = TableRead(Fingerprint(1, 99), 90)
         run_build(fake.operations(), HEAD, pinned=False)
         self.assertEqual(["write unscored_share exists=True"], [call for call in fake.calls if call.startswith("write ")])
@@ -264,7 +293,7 @@ class Build(unittest.TestCase):
 
     def test_a_branch_that_moved_during_the_read_back_is_named(self) -> None:
         fake = Fake()
-        fake.moved_after = 1
+        fake.moved_after = 2
         with self.assertRaises(SignalProfileError) as caught:
             run_build(fake.operations(), HEAD, pinned=False)
         self.assertEqual(["branch_moved"], codes(caught.exception))
@@ -280,9 +309,122 @@ class Build(unittest.TestCase):
         self.assertEqual("release", fake.calls[-1])
 
 
+class WarningGridRule(unittest.TestCase):
+    def test_the_rule_is_written_before_the_unscored_share_is_planned_and_measured_and_before_every_table(self) -> None:
+        fake = Fake()
+        run_build(fake.operations(), HEAD, pinned=False)
+        rule_at = fake.calls.index(f"write_rule {RULE}")
+        self.assertLess(rule_at, fake.calls.index("plan a"))
+        self.assertLess(fake.calls.index(f"write_hash b {RULE}"), fake.calls.index("plan a"))
+        self.assertTrue(all(rule_at < index for index, call in enumerate(fake.calls) if call.startswith("write ") and RULE not in call))
+
+    def test_the_row_written_is_the_constants_and_the_snapshot_of_the_split_that_was_read(self) -> None:
+        fake = Fake()
+        fake.input = InputRead(FACTS, (11, 12, 777, 14, 15), ())
+        fake.rule_back = RuleRead(1, planned_rule(777), 104, True)
+        run_build(fake.operations(), HEAD, pinned=False)
+        self.assertEqual([planned_rule(777)], fake.rules_written)
+
+    def test_the_rule_is_read_back_at_the_last_write_and_must_be_the_planned_row(self) -> None:
+        for back, expected in (
+            (None, ["table_missing"]),
+            (RuleRead(2, RULE_ROW, 104, True), ["grid_rule_rows"]),
+            (RuleRead(0, None, 104, True), ["grid_rule_rows"]),
+            (RuleRead(1, planned_rule(SPLIT_SNAPSHOT + 1), 104, True), ["grid_rule_changed"]),
+            (RuleRead(1, RULE_ROW, 104, False), ["grid_rule_changed"]),
+        ):
+            with self.subTest(back=back):
+                fake = Fake()
+                fake.rule_back = back
+                with self.assertRaises(SignalProfileError) as caught:
+                    run_build(fake.operations(), HEAD, pinned=False)
+                self.assertEqual(expected, codes(caught.exception))
+
+    def test_a_rerun_with_the_same_rule_and_split_writes_no_rule_and_changes_nothing(self) -> None:
+        fake = Fake().settled()
+        outcome = run_build(fake.operations(), HEAD, pinned=False)
+        self.assertEqual(("unchanged", None), (outcome.outcome, outcome.write_hash))
+        self.assertEqual([], fake.rules_written)
+        self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
+
+    def test_a_rule_that_is_stored_does_not_stop_the_tables_from_being_written(self) -> None:
+        fake = Fake()
+        fake.held_rule = fake.rule_back
+        run_build(fake.operations(), HEAD, pinned=False)
+        self.assertEqual([], fake.rules_written)
+        self.assertEqual(["prepare a", "write signal_profile exists=False"], [call for call in fake.calls if call.startswith(("prepare", "write "))][:2])
+
+    def test_a_changed_rule_or_split_refuses_before_the_plan_and_writes_nothing(self) -> None:
+        changed = dataclasses.replace(RULE_ROW, last_cutoff_margin_seconds=RULE_ROW.last_cutoff_margin_seconds + 60)
+        for held in (
+            RuleRead(1, changed, 104, True),
+            RuleRead(1, dataclasses.replace(RULE_ROW, rule_version="older"), 104, True),
+            RuleRead(1, planned_rule(SPLIT_SNAPSHOT + 1), 104, True),
+            RuleRead(1, planned_rule(SPLIT_SNAPSHOT), 104, False),
+        ):
+            with self.subTest(held=held):
+                fake = Fake().settled()
+                fake.held_rule = held
+                with self.assertRaises(SignalProfileError) as caught:
+                    run_build(fake.operations(), HEAD, pinned=False)
+                self.assertEqual(["grid_rule_changed"], codes(caught.exception))
+                self.assertEqual(["read_input a", "read_rule a", "release"], fake.calls)
+                self.assertEqual([], fake.rules_written)
+
+    def test_a_stored_table_with_no_row_or_two_rows_refuses_and_is_never_written_over(self) -> None:
+        for held in (RuleRead(0, None, 104, True), RuleRead(2, RULE_ROW, 104, True)):
+            with self.subTest(rows=held.rows):
+                fake = Fake()
+                fake.held_rule = held
+                with self.assertRaises(SignalProfileError) as caught:
+                    run_build(fake.operations(), HEAD, pinned=False)
+                self.assertEqual(["grid_rule_rows"], codes(caught.exception))
+                self.assertEqual(["read_input a", "read_rule a", "release"], fake.calls)
+
+    def test_a_rule_write_that_is_not_the_one_commit_on_the_checked_hash_stops_before_the_plan(self) -> None:
+        fake = Fake()
+        fake.hashes[RULE] = None
+        with self.assertRaises(SignalProfileError) as caught:
+            run_build(fake.operations(), HEAD, pinned=False)
+        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertNotIn("plan a", fake.calls)
+        self.assertEqual("release", fake.calls[-1])
+
+    def test_a_branch_that_moved_before_the_rule_write_gets_no_write(self) -> None:
+        fake = Fake()
+        fake.moved_after = 0
+        with self.assertRaises(SignalProfileError) as caught:
+            run_build(fake.operations(), HEAD, pinned=False)
+        self.assertEqual(["branch_moved"], codes(caught.exception))
+        self.assertEqual([], fake.rules_written)
+
+    def test_the_patient_split_is_never_written_and_only_the_four_tables_are(self) -> None:
+        fake = Fake()
+        run_build(fake.operations(), HEAD, pinned=False)
+        written = {call.split()[1] for call in fake.calls if call.startswith(("write ", "write_rule ")) and not call.startswith("write_hash")}
+        hashed = {call.split()[2] for call in fake.calls if call.startswith("write_hash")}
+        self.assertEqual({RULE, PROFILE, UNSCORED, COUNTS}, written)
+        self.assertEqual({RULE, PROFILE, UNSCORED, COUNTS}, hashed)
+        self.assertFalse([call for call in fake.calls if "patient_split" in call])
+
+    def test_a_verify_checks_the_stored_rule_and_writes_nothing(self) -> None:
+        for held, expected in (
+            (None, ["table_missing"]),
+            (RuleRead(1, planned_rule(SPLIT_SNAPSHOT + 1), 104, True), ["grid_rule_changed"]),
+            (RuleRead(2, RULE_ROW, 104, True), ["grid_rule_rows"]),
+        ):
+            with self.subTest(held=held):
+                fake = Fake().settled()
+                fake.held_rule = held
+                with self.assertRaises(SignalProfileError) as caught:
+                    run_verify(fake.operations(), HEAD, pinned=False)
+                self.assertEqual(expected, codes(caught.exception))
+                self.assertFalse([call for call in fake.calls if call.startswith(("write", "prepare"))])
+
+
 class Verify(unittest.TestCase):
     def verify(self, fake: Fake, pinned: bool = False) -> Any:
-        fake.held = dict(fake.read_back)
+        fake.settled()
         return run_verify(fake.operations(), HEAD, pinned=pinned)
 
     def test_a_good_branch_is_verified_and_nothing_is_written(self) -> None:
@@ -291,6 +433,7 @@ class Verify(unittest.TestCase):
         self.assertEqual(
             [
                 "read_input a",
+                "read_rule a",
                 "plan a",
                 "read_table a signal_profile facts=True",
                 "read_table a unscored_share facts=True",

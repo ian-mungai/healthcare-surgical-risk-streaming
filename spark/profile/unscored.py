@@ -8,6 +8,8 @@ share of those samples that the limits leave unscored, on development data.
 arterial waveform: ``T - 900 >= first`` and ``T - 1 <= last``, where ``first`` and ``last`` are the first and the last second that the table holds for the
 case, valid or not. A cutoff with less history is not a candidate (the stated result "no warning available" under "too little history" is a different
 outcome, not an unscored sample). The grid does not look at the operation's start or end.
+Its step is ``GRID_STEP_SECONDS`` of the warning grid rule (``spark.profile.grid_rule``); the rule's origin, first cutoff and last cutoff are not applied
+here, because this grid reads no operation start or end.
 
 **Windows.** The windows are the newest complete seconds at the cutoff (``features.registry.complete_seconds``): the seconds ``T - 20`` to ``T - 1`` for the
 waveform and ``T - 900`` to ``T - 1`` for the series. A second that the table does not hold counts as invalid.
@@ -25,8 +27,9 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
+from spark.profile.grid_rule import GRID_STEP_SECONDS
 
-CUTOFF_STEP_SECONDS = 60
+CUTOFF_STEP_SECONDS = GRID_STEP_SECONDS
 
 
 @dataclass(frozen=True, slots=True)

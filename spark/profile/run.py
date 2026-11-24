@@ -3,15 +3,19 @@
 The job ``spark/jobs/signal_profile.py`` passes its Spark steps to ``run_build`` and ``run_verify``, so that the order runs in the fast tests on stand-in steps.
 It is the order of the Silver signal job (``spark/silver/run.py``) over three tables.
 
-A build resolves the branch to one hash. It reads the inputs at that hash and refuses an input that cannot be profiled (a split that fails its rule check, no
-development case, no development signal) before it plans or writes anything. It plans the three tables (each as a frame and a fingerprint) and compares each
-with the table that the branch holds. A table whose fingerprint is the planned one is left as it is, so a rerun that changes nothing writes no snapshot. It
-writes only while the branch still has the checked hash, creates the namespace as a commit of its own when the branch has none, writes each changed table as one
-commit and reads the inputs and the three tables at the hash of the last write. The read-back must be the planned tables, with every check passing. The job
-ends only when the branch still has that hash.
+A build resolves the branch to one hash. It reads the inputs at that hash and refuses an input that cannot be profiled (a split that fails its rule check,
+no development case, no development signal) before it plans or writes anything. It then reads the warning grid rule table (``spark.profile.grid_rule``): a
+stored row that is not the planned one (the constants and the snapshot ID of the split that was read) refuses with ``grid_rule_changed``, and a table that
+does not hold one row refuses with ``grid_rule_rows``, both before the plan and with no write. A branch without the table gets it as the first write, as
+one commit, before the plan: the plan is where the unscored share is measured. A stored row that is the planned one is left as it is, so a rerun writes no
+second rule. It plans the three tables (each as a frame and a fingerprint) and compares each with the table that the branch holds. A table whose
+fingerprint is the planned one is left as it is, so a rerun that changes nothing writes no snapshot. It writes only while the branch still has the checked
+hash, creates the namespace as a commit of its own when the branch has none, writes each changed table as one commit and reads the inputs and the three
+tables at the hash of the last write. The read-back must be the planned tables, with every check passing. The job ends only when the branch still has that
+hash.
 
-A verify builds the same plan and requires the stored tables to be equal to it. A prespecified count that the reproduced count does not equal is a
-finding, not a failure: its name is in the result (``source_counts.mismatched``).
+A verify builds the same plan and requires the stored tables to be equal to it and the stored rule to be the planned row. A prespecified count that the
+reproduced count does not equal is a finding, not a failure: its name is in the result (``source_counts.mismatched``).
 """
 
 from __future__ import annotations
@@ -31,7 +35,9 @@ from spark.profile.checks import (
     profile_problems,
     unscored_problems,
 )
+from spark.profile.grid_rule import GridRule, RuleRead, planned_rule, rule_problems
 from spark.profile.tables import COUNTS as COUNTS_TABLE
+from spark.profile.tables import GRID_RULE as GRID_RULE_TABLE
 from spark.profile.tables import PROFILE as PROFILE_TABLE
 from spark.profile.tables import UNSCORED as UNSCORED_TABLE
 from spark.silver.run import Fingerprint
@@ -40,6 +46,7 @@ from spark.split_table import unit
 PROFILE = PROFILE_TABLE.name
 UNSCORED = UNSCORED_TABLE.name
 COUNTS = COUNTS_TABLE.name
+RULE = GRID_RULE_TABLE.name
 TABLES = (PROFILE, UNSCORED, COUNTS)
 SOURCE_NAMES = ("numeric_observations", "waveform_seconds", "patient_split", "clinical_cases", "track_list")
 BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
@@ -78,7 +85,8 @@ class Operations:
     holds no such table, and the counts of its checks only when asked. ``write`` writes the planned frame of a table to the branch, over the rows of the table
     that exists or as a new table. ``write_hash`` is given the hash that the write was made on and gives the hash of the write, or ``None`` when the branch
     head is not the one commit of the write directly on it. ``prepare`` creates the namespace when the branch has none, as a commit of its own, and gives the
-    hash that the first write is made on. ``release`` frees the planned frames.
+    hash that the first write is made on. ``release`` frees the planned frames. ``read_rule`` gives the rule table at a hash, or ``None`` for a hash that holds
+    no such table. ``write_rule`` creates it with the one row that it is given and the time of the write.
     """
 
     head: Callable[[], str]
@@ -89,6 +97,8 @@ class Operations:
     write_hash: Callable[[str, str], str | None]
     prepare: Callable[[str], str]
     release: Callable[[], None]
+    read_rule: Callable[[str], RuleRead | None]
+    write_rule: Callable[[GridRule], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +111,8 @@ class Outcome:
     tables: dict[str, TableRead]
     fingerprints: dict[str, Fingerprint]
     pinned: bool
+    rule: RuleRead
+    rule_written: bool
 
     def facts(self) -> dict[str, Any]:
         """What the result line may hold: hashes, snapshot IDs, counts of development data, the names of the source counts that do not match and the checks
@@ -113,6 +125,12 @@ class Outcome:
             "write_hash": self.write_hash,
             "branch_hash": self.branch_hash,
             "source_snapshots": dict(zip(SOURCE_NAMES, self.source.snapshots, strict=True)),
+            "grid_rule": {
+                "version": self.rule.rule.rule_version if self.rule.rule else None,
+                "snapshot": self.rule.snapshot_id,
+                "split_snapshot": self.rule.rule.split_snapshot_id if self.rule.rule else None,
+                "written": self.rule_written,
+            },
             "snapshots": {table: read.snapshot_id for table, read in self.tables.items()},
             "rows": {table: read.fingerprint.rows for table, read in self.tables.items()},
             "development": {
@@ -159,19 +177,47 @@ def differs(read: TableRead | None, planned: Fingerprint) -> bool:
     return read is None or read.fingerprint != planned
 
 
+def wanted_rule(source: InputRead) -> GridRule:
+    """The rule row of the constants and the snapshot ID of the patient split that the inputs were read with."""
+    snapshot = source.snapshots[SOURCE_NAMES.index("patient_split")]
+    if snapshot is None:
+        raise SignalProfileError(f"source_no_snapshot: {unit(1, 'table')}")
+    return planned_rule(snapshot)
+
+
+def stored_rule_problems(read: RuleRead | None, wanted: GridRule) -> list[str]:
+    """The problems of the rule table that a branch holds: it is not there, or it is not the planned row."""
+    return [f"table_missing: {unit(1, 'table')}"] if read is None else rule_problems(read, wanted)
+
+
 def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     source = ops.read_input(head)
     problems = input_problems(source)
     if problems:
         raise SignalProfileError(*problems)
-    planned = ops.plan(head)
-    held = read_tables(ops, head, False)
-    changed = [table for table in TABLES if differs(held[table], planned[table])]
-    at, written = head, None
-    if changed:
+    wanted = wanted_rule(source)
+    stored = ops.read_rule(head)
+    problems = [] if stored is None else rule_problems(stored, wanted)
+    if problems:
+        raise SignalProfileError(*problems)
+    current, written, prepared = head, None, False
+    if stored is None:
         if ops.head() != head:
             raise SignalProfileError(BRANCH_MOVED)
         on = ops.prepare(head)
+        ops.write_rule(wanted)
+        written = ops.write_hash(on, RULE)
+        if written is None:
+            raise SignalProfileError(BRANCH_MOVED)
+        current, prepared = written, True
+    planned = ops.plan(head)
+    held = read_tables(ops, head, False)
+    changed = [table for table in TABLES if differs(held[table], planned[table])]
+    at = current
+    if changed:
+        if ops.head() != current:
+            raise SignalProfileError(BRANCH_MOVED)
+        on = current if prepared else ops.prepare(head)
         for table in changed:
             ops.write(table, held[table] is not None)
             written = ops.write_hash(on, table)
@@ -183,16 +229,17 @@ def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     if later != source:
         raise SignalProfileError(f"source_changed: {unit(1, 'read')} of the inputs differs")
     reads = read_tables(ops, at, True)
-    problems = table_problems(source, reads, pinned=pinned)
+    rule = ops.read_rule(at)
+    problems = table_problems(source, reads, pinned=pinned) + stored_rule_problems(rule, wanted)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
         problems.append(f"readback_differs: {unit(differing, 'table')}")
-    if problems:
+    if problems or rule is None:
         raise SignalProfileError(*problems)
     if ops.head() != at:
         raise SignalProfileError(BRANCH_MOVED)
     tables = {table: read for table, read in reads.items() if read is not None}
-    return Outcome("written" if changed else "unchanged", head, written, at, source, tables, planned, pinned)
+    return Outcome("written" if written else "unchanged", head, written, at, source, tables, planned, pinned, rule, stored is None)
 
 
 def run_build(ops: Operations, head: str, *, pinned: bool) -> Outcome:
@@ -212,6 +259,9 @@ def run_verify(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     try:
         source = ops.read_input(head)
         problems = input_problems(source)
+        rule = ops.read_rule(head)
+        if not problems:
+            problems = stored_rule_problems(rule, wanted_rule(source))
         planned = ops.plan(head) if not problems else {}
         reads = read_tables(ops, head, True)
         problems += table_problems(source, reads, pinned=pinned)
@@ -219,11 +269,11 @@ def run_verify(ops: Operations, head: str, *, pinned: bool) -> Outcome:
             stale = len([table for table in TABLES if differs(reads[table], planned[table])])
             if stale:
                 problems.append(f"plan_differs: {unit(stale, 'table')}")
-        if problems:
+        if problems or rule is None:
             raise SignalProfileError(*problems)
         if ops.head() != head:
             raise SignalProfileError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome("verified", head, None, head, source, tables, {table: read.fingerprint for table, read in tables.items()}, pinned)
+        return Outcome("verified", head, None, head, source, tables, {table: read.fingerprint for table, read in tables.items()}, pinned, rule, False)
     finally:
         ops.release()

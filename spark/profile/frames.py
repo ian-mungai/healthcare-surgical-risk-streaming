@@ -11,6 +11,8 @@ The development cases are the cases of the patients in the training and validati
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import astuple, fields
+from datetime import UTC, datetime
 from functools import reduce
 from operator import add
 from typing import Any
@@ -19,12 +21,14 @@ from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_
 from features.signal_validity import ARTERIAL_WAVEFORM, INVALID_CAUSES
 from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, UnscoredFacts
 from spark.profile.counts import ARTERIAL_TRACK, BY_NAME, FULL_COHORT, NONINVASIVE_TRACK, PRESPECIFIED, SECONDS_PER_HOUR
-from spark.profile.tables import CAUSE_COLUMNS, COUNTS, DEVELOPMENT_SCOPE, KINDS, NUMERIC_KIND, PROFILE, UNSCORED, WAVEFORM_KIND
+from spark.profile.grid_rule import GridRule, RuleRead
+from spark.profile.tables import CAUSE_COLUMNS, COUNTS, DEVELOPMENT_SCOPE, GRID_RULE, KINDS, NUMERIC_KIND, PROFILE, UNSCORED, WAVEFORM_KIND
 from spark.profile.unscored import CUTOFF_STEP_SECONDS, count_unscored
 from spark.silver.frames import count_where, functions, typed, types
 
 DEVELOPMENT_SETS = ("training", "validation")
 TRACK_KEY = ("kind", "track")
+GRID_RULE_FIELDS = tuple(field.name for field in fields(GridRule))
 
 
 def unscored_row(valid_seconds: list[int] | None, first: int | None, last: int | None) -> tuple[int, int, int, int]:
@@ -97,6 +101,20 @@ def counts_frame(session: Any, rows: Sequence[Mapping[str, Any]]) -> Any:
     names = [name for name, _ in COUNTS.columns]
     ddl = ", ".join(f"{name} {kind}" for name, kind in COUNTS.columns)
     return session.createDataFrame([tuple(row[name] for name in names) for row in rows], ddl)
+
+
+def rule_frame(session: Any, rule: GridRule) -> Any:
+    """``silver.warning_grid_rule``: the one row of the rule and the time of the write (UTC)."""
+    ddl = ", ".join(f"{name} {kind}" for name, kind in GRID_RULE.columns)
+    return session.createDataFrame([(*astuple(rule), datetime.now(UTC))], ddl)
+
+
+def rule_read(frame: Any, snapshot_id: int | None) -> RuleRead:
+    """The rule table as the checks read it: row count, first row, snapshot ID and whether every row has a time of write. It is tiny, so it is read whole."""
+    held = frame.collect()
+    first = held[0] if held else None
+    rule = None if first is None else GridRule(*(first[name] for name in GRID_RULE_FIELDS))
+    return RuleRead(len(held), rule, snapshot_id, all(row["written_at"] is not None for row in held))
 
 
 def fixed_counts(clinical: Any, track_list: Any) -> dict[str, float | None]:

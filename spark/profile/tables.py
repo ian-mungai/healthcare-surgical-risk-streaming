@@ -1,8 +1,12 @@
 """The signal profile tables: their names, columns and keys, as data. Nothing here imports Spark.
 
-The namespace ``silver`` of the catalog ``lake`` holds, besides the patient split and the two signal tables, three tables that this module defines. All of
+The namespace ``silver`` of the catalog ``lake`` holds, besides the patient split and the two signal tables, four tables that this module defines. Three of
 them are measures of development patients (the training and validation sets of ``silver.patient_split``) and no row of any of them is a function of a test
-patient, with the one exception that the sealed source counts say.
+patient, with the one exception that the sealed source counts say. The fourth, ``warning_grid_rule``, holds no case, patient or count.
+
+- ``warning_grid_rule``: one row, the rule that sets the one-minute warning grid of a case (``spark.profile.grid_rule``): its version and text, each of its
+  constants as a column, the snapshot ID of the frozen patient split that the job read and the time of the write. The job writes it before it measures the
+  unscored share and never changes it: a rerun whose rule or split snapshot differs refuses.
 
 - ``signal_profile``: one row for each track of the development cases, by kind (``numeric`` or ``waveform``). ``rows`` are the readings or the seconds
   that Silver holds for the track, ``valid_rows`` those marked valid and each ``cause_*`` column those marked invalid with that cause, so that the valid
@@ -70,5 +74,19 @@ COUNTS = SilverTable(
         ("denominator", "string"),
     ),
     ("name",),
+)
+GRID_RULE = SilverTable(
+    "warning_grid_rule",
+    (
+        ("rule_version", "string"),
+        ("rule_text", "string"),
+        ("grid_origin", "string"),
+        ("grid_step_seconds", "int"),
+        ("first_cutoff_offset_seconds", "int"),
+        ("last_cutoff_margin_seconds", "int"),
+        ("split_snapshot_id", "bigint"),
+        ("written_at", "timestamp"),
+    ),
+    ("rule_version",),
 )
 PROFILE_TABLES = {table.name: table for table in (PROFILE, UNSCORED, COUNTS)}

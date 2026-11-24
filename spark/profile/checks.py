@@ -65,6 +65,8 @@ JOB_CODES = frozenset(
         "empty_table",
         "shares",
         "pinned_counts",
+        "grid_rule_rows",
+        "grid_rule_changed",
     }
 )
 CODES = frozenset(CHECK_NAMES) | JOB_CODES
