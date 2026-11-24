@@ -1135,6 +1135,19 @@ class SocketDeadlineTest(unittest.TestCase):
         self.assertLess(elapsed, 0.25 + self.MARGIN)
         self.assertIn("did not answer within", message)
 
+    def test_the_token_request_names_the_client_in_the_fields_airbyte_reads(self) -> None:
+        """Airbyte 2.5.0 answers 400 to ``clientId`` and ``clientSecret`` and gives a token for ``client_id`` and ``client_secret`` (seen live on the host,
+        Nov 24 2026)."""
+        sent: list[Any] = []
+
+        def request(api: Any, method: str, path: str, body: Any = None) -> dict[str, str]:
+            sent.append((method, path, body))
+            return {"access_token": "abc.def.ghi"}
+
+        with mock.patch.object(MODULE_UNDER_TEST.HttpApi, "request", request):
+            MODULE_UNDER_TEST.access_token("http://127.0.0.1:1/api/public/v1", "id", "secret", 1)
+        self.assertEqual([("POST", "/applications/token", {"client_id": "id", "client_secret": "secret"})], sent)
+
     def test_a_token_reply_with_a_character_a_header_cannot_hold_is_a_redacted_refusal(self) -> None:
         for token in (f"{HIDDEN_THREE}\n", f"{HIDDEN_THREE} x", f"{HIDDEN_THREE}\r\nX: y"):
             with self.subTest(token=repr(token)):

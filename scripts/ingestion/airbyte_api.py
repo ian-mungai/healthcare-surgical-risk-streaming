@@ -174,7 +174,7 @@ class HttpAirbyteApi:
     ) -> None:
         self.host, self.port = check_api_origin(base_url)
         self.timeout_seconds = timeout_seconds
-        self.credentials = {"clientId": client_id, "clientSecret": client_secret}
+        self.credentials = {"client_id": client_id, "client_secret": client_secret}
         self.aws = {"access_key_id": aws_access_key_id, "secret_access_key": aws_secret_access_key}
         self.token: str | None = None
         self.workspace: str | None = None

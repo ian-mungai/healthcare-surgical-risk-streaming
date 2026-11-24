@@ -331,7 +331,7 @@ class TokenTest(unittest.TestCase):
         ensure_everything(api)
         self.assertEqual(1, stand_in.tokens)
         self.assertEqual("POST applications/token", stand_in.log[0])
-        self.assertEqual({"clientId": "client", "clientSecret": "client_value"}, stand_in.bodies[0][1])
+        self.assertEqual({"client_id": "client", "client_secret": "client_value"}, stand_in.bodies[0][1])
 
     def test_an_expired_token_is_renewed_once_and_the_call_is_repeated_once(self) -> None:
         api, stand_in = prepared()

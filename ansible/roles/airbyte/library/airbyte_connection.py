@@ -602,7 +602,7 @@ def client_credentials(run: Runner, kubectl: list[str], namespace: str, budget: 
 
 def access_token(base_url: str, client_id: str, client_secret: str, timeout_seconds: float, budget: Budget | None = None) -> str:
     reply = HttpApi(base_url, None, timeout_seconds=timeout_seconds, budget=budget).request(
-        "POST", "/applications/token", {"clientId": client_id, "clientSecret": client_secret}
+        "POST", "/applications/token", {"client_id": client_id, "client_secret": client_secret}
     )
     token = reply.get("access_token")
     if not isinstance(token, str) or not token:
