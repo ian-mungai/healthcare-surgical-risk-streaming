@@ -13,7 +13,7 @@ are in ``spark/silver/cli.py``. The settings come from the environment, as the p
 
 No rule of the tables is estimated from data, so no patient set is read, and no outcome is read. The test set is sealed and Bronze holds the held-out cases'
 signals, so a count or a digest over the rows changes with a held-out row: the result holds hashes, snapshot IDs, the checks that ran and one pass flag for
-each table, and no count, digest, case, track, time or value. A refusal is a code and a flag, except a count of tables.
+each table, and no count, digest, case, track, time or value. A refusal is a code and a flag, never a count.
 """
 
 from __future__ import annotations

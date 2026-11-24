@@ -58,7 +58,7 @@ CODES = frozenset(CHECK_NAMES) | JOB_CODES
 
 
 class SilverSignalsError(ValueError):
-    """The tables cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a flag, or a count of tables."""
+    """The tables cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a flag."""
 
     def __init__(self, *problems: str) -> None:
         super().__init__("; ".join(problems))

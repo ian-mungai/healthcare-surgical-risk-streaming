@@ -98,7 +98,7 @@ class Outcome:
     snapshot_ids: dict[str, int | None]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line holds: the checks that ran, one pass flag for each table, the snapshot IDs, the measure and the cutoffs and the counts of
+        """What the result file holds: the checks that ran, one pass flag for each table, the snapshot IDs, the measure and the cutoffs and the counts of
         development patients.
 
         The laboratory counts and the measure are for development patients only. A failed check raises, so each flag is true in every result.

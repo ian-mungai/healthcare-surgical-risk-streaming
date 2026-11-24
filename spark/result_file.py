@@ -65,10 +65,11 @@ RESERVED: list[str] = []
 def reserve(path: str) -> int | None:
     """Reserve the result: create ``<path>.part`` exclusively and return its descriptor, or ``None`` when the result cannot be written there.
 
-    ``None`` is every case that makes the call a bad one: the folder is missing, the path or its part file exists (also a dangling link or a folder), the part
-    file's name is too long (a name of 255 bytes passes ``result_path``, but ``<name>.part`` does not) or the folder cannot be written. Nothing is replaced."""
+    ``None`` is every case that makes the call a bad one: the path or its part file exists (also a dangling link or a folder), the part file's name is too
+    long (a name of 255 bytes passes ``result_path``, but ``<name>.part`` does not), the folder is missing or the folder cannot be written. Nothing is
+    replaced."""
     part = path + ".part"
-    if not os.path.isdir(os.path.dirname(path)) or os.path.lexists(path):
+    if os.path.lexists(path):
         return None
     try:
         descriptor = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)

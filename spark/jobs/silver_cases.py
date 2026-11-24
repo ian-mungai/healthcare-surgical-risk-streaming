@@ -14,7 +14,7 @@ the median (``spark/silver_cases.py``). Both are saved as tables. Once a branch 
 Every input check and that freeze come before the first write; the checks of the written tables come after the last. A table that already holds the
 rows is not written again. The merge of the branch is the caller's step. ``verify`` runs the checks on a branch and writes nothing.
 
-The test set is sealed, and the clinical table holds the outcome columns: a message is a code and a flag (``key_null: failed``) with a count of tables at most,
+The test set is sealed, and the clinical table holds the outcome columns: a message is a code and a flag (``key_null: failed``) and never a count,
 and the result holds hashes, snapshot IDs, the checks that ran, one pass flag for each of the four tables and measures of the development patients (the
 cutoffs), never a case, a patient, a count over all cases or a field that says whether a table was written.
 The result is one file at ``--result`` (an absolute path that must not exist, ``spark/result_file.py``). A refusal writes the file too, with one diagnostic for

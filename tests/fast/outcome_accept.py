@@ -377,3 +377,39 @@ def no_removed_fields(result: Mapping[str, Any]) -> bool:
     """Whether the result holds none of the fields that a held-out outcome could change: no outcome, no written flag, no count and no digest at any depth, and
     no count of all cases at the top (``cases`` is also the name of a table in the pass flags)."""
     return not keys_of(result) & set(REMOVED_FIELDS) and not set(result) & set(REMOVED_TOP_LEVEL)
+
+
+# --- The untracked runners
+
+STREAMS = r"(?:out|err|output|stdout|stderr)"
+RUNNER_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("stream_length", re.compile(rf"\blen\((?:os\.fsencode\()?\s*{STREAMS}\b")),
+    ("stream_tail", re.compile(rf"\b{STREAMS}\[-\d+:\]")),
+    (
+        "count_in_result",
+        re.compile(
+            r"\.get\(['\"](?:rows|columns|patients|csv_rows|copies|missing|extra|copies_differ|sampled_cases|sampled_found|cells_wrong|lab_columns"
+            r"|fixed_sample_cases_checked|development_cases|development_lab_rows|development_lab_copies|lab_development_rows|lab_development_collapsed)['\"]\)(?!\s*[=!]=)"
+        ),
+    ),
+    ("count_printed", re.compile(r"print\(.*\"[a-z_]+\": [^,}=]*(?:\.count\(\)|\blen\()[^,}=]*(?=[,}])")),
+    ("data_identifier", re.compile(r"\b(?:differing_group|zero_cell|lab_key)\b")),
+    ("count_in_text", re.compile(r"\bf(?:\"[^\"]*|'[^']*)\{[^{}=<>]*\blen\([^{}=<>]*\}")),
+)
+
+
+def runner_leaks(source: str) -> list[tuple[str, int]]:
+    """The rule and the 1-based line of each line of a runner that records what the sealed outputs forbid, one rule for each line (the first that matches).
+
+    The rules: the length of a stream (``stream_length``), a tail of one (``stream_tail``), a count that a result or a stand-in answers (``count_in_result``,
+    ``count_printed``), an identifier that was chosen by looking at data (``data_identifier``) and a length in an f-string (``count_in_text``). A comparison
+    is not a leak (``==``, ``!=`` or an order in a line, or a count that is only compared): only whether it matched may be recorded. A comment is not read."""
+    found: list[tuple[str, int]] = []
+    for number, line in enumerate(source.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for name, pattern in RUNNER_RULES:
+            if pattern.search(line):
+                found.append((name, number))
+                break
+    return found

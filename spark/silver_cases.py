@@ -6,7 +6,7 @@ Silver does the standard steps only: it enforces types, keeps a missing value mi
 builds no join that Gold does not need. A value keeps the unit that the publisher gave it, and a time is in seconds from the start of its case.
 
 The test set is sealed: nothing here names a case or a patient. The clinical table holds the outcome columns, so no count over the cases leaves the job: every
-failure is a code and a flag (``key_null: failed``), with a count of tables the one count left. The operation lengths that set the cutoffs come from
+failure is a code and a flag (``key_null: failed``), never a count. The operation lengths that set the cutoffs come from
 development patients only.
 """
 

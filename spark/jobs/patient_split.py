@@ -24,7 +24,7 @@ refuses a new patient. ``--fixed-sample`` takes the complete tracked candidate f
 set that its slot expects. The result names the checks that ran.
 
 The test set is sealed: a message or the result holds codes with a flag (``two_sets: failed``), hashes and snapshot IDs, and never a patient, a case, a set
-beside one or a count (the clinical table that the patients come from holds the outcome columns). A count of tables is the one count left.
+beside one or a count (the clinical table that the patients come from holds the outcome columns).
 The command line prints fixed codes only (``usage``, ``branch_missing``, ``catalog_error``, ``settings``) and the codes of a failed check.
 The result is one file at ``--result`` (an absolute path that must not exist, ``spark/result_file.py``). A refusal writes the file too, with one diagnostic for
 each code and no count, and a bad call writes none.

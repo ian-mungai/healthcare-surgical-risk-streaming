@@ -10,7 +10,7 @@ The test set is sealed. The series holds the held-out cases' seconds and the eve
 changes with a held-out row and no count of events is ever made. The fingerprint of the series, the counts of the checks and the causes stay inside the job.
 The result holds the hashes, the snapshot IDs, one pass flag for each table, the checks that ran and a digest of the event table (``Digest``, which has no row
 count), which is a measure of the development cases only because the events are made for them only. The checks about events are flags, and every refusal is a
-code and a flag, except a count of tables.
+code and a flag, never a count.
 """
 
 from __future__ import annotations

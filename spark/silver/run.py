@@ -12,7 +12,7 @@ The job ends only when the branch still has that hash.
 
 The test set is sealed and the signals of the held-out cases are in these tables, so a count or a digest over the rows changes with a held-out row. The
 fingerprints, the counts of the checks and the causes stay inside the job. The result holds the hashes, the snapshot IDs, the checks that ran and one pass flag
-for each table, and every refusal is a code and a flag, except a count of tables.
+for each table, and every refusal is a code and a flag, never a count.
 """
 
 from __future__ import annotations

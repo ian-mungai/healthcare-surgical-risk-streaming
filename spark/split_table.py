@@ -153,7 +153,7 @@ class Outcome:
     write_hash: str | None
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: the hash that was checked, the hash of the write, the snapshot IDs, the rule version, the checks that ran, the number
+        """What the result file may hold: the hash that was checked, the hash of the write, the snapshot IDs, the rule version, the checks that ran, the number
         of cases of the tracked fixed sample and one pass flag for the table.
 
         It holds no count of patients, cases or sets, and no field that says whether the table was written: a patient that joins or leaves would change them.
@@ -368,7 +368,7 @@ def source_cases(rows: Iterable[tuple[str | None, str | None]]) -> tuple[dict[in
 
 
 def check_names(*, pinned: bool, sample: Sequence[SampleCase] | None) -> list[str]:
-    """The checks that ``checks`` runs for these options, for the result line."""
+    """The checks that ``checks`` runs for these options, for the result file."""
     names = ["two_sets", "rule_match", "rule_version", "source_snapshot", "source_patients"]
     return names + (["shares", "pinned_counts"] if pinned else []) + (["fixed_sample"] if sample is not None else [])
 

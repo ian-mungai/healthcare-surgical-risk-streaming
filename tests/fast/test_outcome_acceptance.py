@@ -18,6 +18,8 @@ Failure modes covered here:
 - The comparison of the snapshot IDs with Nessie is driven by what the document holds, so that a key that the job added is looked up and a key that it dropped
   is never missed.
 - A job that the watchdog stopped leaves its part file, and a reader refuses the result folder for it.
+- A runner records the length of a stream, a tail of one, a count in a log line or an observation, a count that a stand-in prints, or an identifier that it
+  chose by looking at data (``runner_leaks``).
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from tests.fast.outcome_accept import (
     moved,
     no_removed_fields,
     read_result_file,
+    runner_leaks,
     same_source,
     sealed_table,
     snapshot_ids_are,
@@ -357,6 +360,12 @@ class Hashes(unittest.TestCase):
         self.assertTrue(kept_at_base(quiet))
         self.assertFalse(kept_at_base(moved_branch))
 
+    def test_text_that_is_not_a_hash_is_neither_a_write_nor_a_kept_branch(self) -> None:
+        for text in ("a", "h0", "A" * 64, "g" * 64, "a" * 63):
+            self.assertFalse(wrote({"base_hash": text, "branch_hash": HASH_B}), text)
+            self.assertFalse(wrote({"base_hash": HASH_A, "branch_hash": text}), text)
+            self.assertFalse(kept_at_base({"base_hash": text, "branch_hash": text}), text)
+
     def test_a_hash_that_is_missing_or_not_a_string_is_neither(self) -> None:
         for result in ({}, {"base_hash": None, "branch_hash": None}, {"base_hash": "", "branch_hash": ""}, {"base_hash": 1, "branch_hash": 1}):
             self.assertFalse(wrote(result), result)
@@ -382,6 +391,57 @@ class Flags(unittest.TestCase):
         for key in ("outcome", "written", "cases", "patients", "counts"):
             self.assertFalse(no_removed_fields({key: 1}), key)
         self.assertFalse(no_removed_fields({"measure": [{"rows": 1}]}))
+
+
+class RunnerLeaks(unittest.TestCase):
+    """``runner_leaks`` finds, by rule name and line, each way that an end-to-end runner can record a count, a length or a data-chosen identifier."""
+
+    BAD = {
+        "stream_length": 'streams = f"standard output {len(os.fsencode(out))} bytes"',
+        "stream_length ": "total = len(err)",
+        "stream_tail": 'log.append(f"{out[-3000:]}")',
+        "stream_tail ": "tail = err[-200:] if code else ''",
+        "count_in_text": 'observed = f"rows {len(rows)} of {total}"',
+        "count_in_text ": 'observed = f"counts {counts}, left {len(left)}"',
+        "count_in_result": "observed = f\"rows {result.get('rows')}, columns {result.get('columns')}\"",
+        "count_in_result ": "observed = f\"checked {result.get('fixed_sample_cases_checked')}\"",
+        "count_printed": 'print("RESULT " + json.dumps({"rows": loaded.count(), "columns": len(loaded.columns)}))',
+        "data_identifier": 'observed = f"group of the swap {source.differing_group}"',
+        "data_identifier ": 'observed = f"cell {source.zero_cell}, key {source.lab_key}"',
+    }
+    CLEAN = (
+        "observed = f\"exit {code} after {seconds:.0f} seconds, rows as expected {result.get('rows_as_expected')}\"",
+        'print("RESULT " + json.dumps({"rows_as_expected": loaded.count() == spec["rows"], "columns_as_expected": len(loaded.columns) == spec["columns"]}))',
+        'self.log.append(f"== spark {args}: exit {code} after {seconds:.0f} seconds, result file read")',
+        "held = len(items) == 3",
+        'self.stack.write_spec({"rows": len(self.expected_cases), "patients": len(self.expected_sets)})',
+        "observed = f\"every case checked {result.get('fixed_sample_cases_checked') == len(self.candidates)}, all deleted {deleted == len(set(made))}\"",
+        'observed = f"flags {dict.fromkeys(flags, True)}"',
+    )
+
+    def test_each_bad_line_is_found_by_its_rule_and_its_line_number(self) -> None:
+        for name, line in self.BAD.items():
+            with self.subTest(name):
+                self.assertEqual([(name.strip(), 2)], runner_leaks(f"x = 1\n{line}\ny = 2\n"))
+
+    def test_a_clean_line_is_not_found(self) -> None:
+        for line in self.CLEAN:
+            with self.subTest(line=line[:50]):
+                self.assertEqual([], runner_leaks(f"{line}\n"))
+
+    def test_a_comment_and_a_docstring_line_are_not_a_leak_but_code_after_them_is(self) -> None:
+        self.assertEqual([], runner_leaks("# the log holds len(os.fsencode(out)) once\n"))
+        self.assertEqual([(("stream_length"), 2)], runner_leaks("# a comment\nn = len(out)\n"))
+
+    def test_the_runners_of_this_machine_leak_nothing(self) -> None:
+        folder = Path(__file__).resolve().parents[1] / "e2e"
+        runners = [folder / name for name in ("bronze_clinical_lab.py", "bronze_clinical_lab_container.py", "silver_patient_split.py", "silver_cases.py")]
+        present = [path for path in runners if path.is_file()]
+        if not present:
+            self.skipTest("the untracked runners are not on this machine")
+        for path in present:
+            with self.subTest(runner=path.name):
+                self.assertEqual([], runner_leaks(path.read_text()))
 
 
 def split_run(mode: str = "build") -> tuple[int, dict[str, Any]]:
