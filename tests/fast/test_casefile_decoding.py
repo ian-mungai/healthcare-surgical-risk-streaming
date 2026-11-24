@@ -17,7 +17,8 @@ Failure modes covered here:
 from __future__ import annotations
 
 import ast
-import subprocess
+import importlib
+import re
 import sys
 import unittest
 from array import array
@@ -34,6 +35,7 @@ from casefile.decoding import (
     to_microseconds,
 )
 from features.sampling import ANONYMISED_START
+from scripts.process import run_command
 from tests.fast.fake_vitaldb import FakeSamples
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -166,6 +168,22 @@ class OneDefinition(unittest.TestCase):
             with self.subTest(path):
                 self.assertEqual(set(), defined & banned)
 
+    def test_the_bronze_maps_between_a_kind_of_track_and_its_type_code_name_the_shared_codes_and_hold_no_number(self) -> None:
+        """``spark/bronze/plan.py`` and ``spark/bronze/rows.py`` map a kind of track to its library type and back. Each map is built from the shared codes."""
+        for path, name in (("spark/bronze/plan.py", "TYPE_OF_KIND"), ("spark/bronze/rows.py", "KIND_OF_TYPE")):
+            tree = ast.parse((ROOT / path).read_text())
+            maps = [node.value for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)]
+            with self.subTest(path):
+                self.assertEqual(1, len(maps), f"{path} defines {name} once")
+                numbers = [node.value for node in ast.walk(maps[0]) if isinstance(node, ast.Constant) and isinstance(node.value, int)]
+                self.assertEqual([], numbers, f"{name} in {path} holds the type code as a number and not the shared constant")
+                self.assertEqual({"WAVEFORM", "NUMERIC", "STRING"}, {node.id for node in ast.walk(maps[0]) if isinstance(node, ast.Name)})
+
+    def test_the_bronze_maps_hold_the_values_of_the_shared_codes(self) -> None:
+        plan, rows = importlib.import_module("spark.bronze.plan"), importlib.import_module("spark.bronze.rows")
+        self.assertEqual({"numeric": NUMERIC, "string": STRING, "waveform": WAVEFORM}, plan.TYPE_OF_KIND)
+        self.assertEqual({NUMERIC: "numeric", STRING: "string", WAVEFORM: "waveform"}, rows.KIND_OF_TYPE)
+
 
 def imports_of(path: Path) -> set[str]:
     """Every module that a file imports, at any depth of the file (an import inside a function counts)."""
@@ -204,10 +222,17 @@ class Boundaries(unittest.TestCase):
         dependency of the Bronze job any more (a bounded child process, so that the fast tests' own stand-in does not hide a dependency)."""
         code = (
             "import sys; sys.path.insert(0, sys.argv[1]); import spark.bronze.library, spark.bronze.readers, casefile.decoding; "
-            "sys.exit(7 if {'vitaldb', 'boto3'} & set(sys.modules) else 0)"
+            "sys.exit(7 if {'vitaldb', 'boto3'} & set(sys.modules) else 8 if not sys.dont_write_bytecode else 0)"
         )
-        done = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT)], capture_output=True, text=True, timeout=120, check=False)  # noqa: S603
+        done = run_command(sys.executable, ["-I", "-B", "-c", code, str(ROOT)], timeout=120)
         self.assertEqual((0, ""), (done.returncode, done.stderr), done.stderr)
+
+    def test_no_docstring_of_the_shared_stores_or_of_the_bronze_inputs_calls_a_store_the_replays(self) -> None:
+        owned = re.compile(r"object store (is|of) the replay|The replay reads a version|the replay's\s+own", re.IGNORECASE)
+        for path in ("casefile/s3_store.py", "casefile/folder_store.py", "spark/bronze/inputs.py"):
+            text = ast.get_docstring(ast.parse((ROOT / path).read_text())) or ""
+            with self.subTest(path):
+                self.assertIsNone(owned.search(text.replace("\n", " ")), f"{path} still calls a shared store the replay's own")
 
 
 if __name__ == "__main__":

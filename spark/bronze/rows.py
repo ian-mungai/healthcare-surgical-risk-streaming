@@ -14,10 +14,11 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from casefile.decoding import NUMERIC, STRING, WAVEFORM
 from features.sampling import SamplingError, packet_pieces
 from replay.events.stream import discriminators
 
-KIND_OF_TYPE = {1: "waveform", 2: "numeric", 5: "string"}
+KIND_OF_TYPE = {WAVEFORM: "waveform", NUMERIC: "numeric", STRING: "string"}
 SAMPLE_TYPES = {1: "float32", 2: "float64", 3: "int8", 4: "uint8", 5: "int16", 6: "uint16", 7: "int32", 8: "uint32"}
 
 

@@ -14,10 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from casefile.decoding import NUMERIC, STRING, WAVEFORM
+
 GROUPED = "grouped"
 PER_TRACK = "per_track"
 MODES = (GROUPED, PER_TRACK)
-TYPE_OF_KIND = {"numeric": 2, "string": 5, "waveform": 1}
+TYPE_OF_KIND = {"numeric": NUMERIC, "string": STRING, "waveform": WAVEFORM}
 
 
 class PlanError(ValueError):
