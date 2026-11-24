@@ -34,8 +34,10 @@ def exists(folder: Path) -> bool:
 
 def refuse_unreadable_ancestors(folder: Path) -> None:
     """Raise ``PermissionError`` unless every existing ancestor of ``folder`` allows read and search: a missing folder is empty only under a chain that could
-    have shown it, and an ancestor that can be searched but not read hides what its folder holds."""
-    for ancestor in folder.parents:
+    have shown it, and an ancestor that can be searched but not read hides what its folder holds. Both chains are checked, the one as written and the one of the
+    real path, so a link that skips an unreadable folder gives no other answer than the real path does."""
+    real = Path(os.path.realpath(folder))
+    for ancestor in dict.fromkeys((*folder.parents, *real.parents)):
         if not os.access(ancestor, os.R_OK | os.X_OK):
             raise PermissionError(f"{ancestor.name or ancestor} cannot be read and searched")
 

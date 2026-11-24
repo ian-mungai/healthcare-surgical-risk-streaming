@@ -126,6 +126,40 @@ class ListFolderTests(unittest.TestCase):
             with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
                 list_folder(higher / "middle" / "absent", recursive=recursive)
 
+    def test_a_missing_folder_reached_through_a_link_is_an_error_when_an_ancestor_of_the_real_path_cannot_be_read(self) -> None:
+        """Join round 2b, finding 2: the ancestors were checked as written, so a link that skips an unreadable folder made the real path look empty."""
+        hidden = self.root / "hidden"
+        (hidden / "inner").mkdir(parents=True)
+        (self.root / "alias").symlink_to(hidden / "inner")
+        hidden.chmod(0o100)
+        self.addCleanup(hidden.chmod, 0o700)
+        if os.access(hidden, os.R_OK):
+            self.skipTest("this account reads every folder")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive, route="real path"), self.assertRaises(PermissionError):
+                list_folder(hidden / "inner" / "absent", recursive=recursive)
+            with self.subTest(recursive=recursive, route="alias"), self.assertRaises(PermissionError):
+                list_folder(self.root / "alias" / "absent", recursive=recursive)
+
+    def test_a_missing_folder_reached_through_a_link_is_an_error_when_an_ancestor_as_written_cannot_be_read(self) -> None:
+        (self.root / "real" / "inner").mkdir(parents=True)
+        locked = self.root / "locked"
+        locked.mkdir()
+        (locked / "alias").symlink_to(self.root / "real" / "inner")
+        locked.chmod(0o100)
+        self.addCleanup(locked.chmod, 0o700)
+        if os.access(locked, os.R_OK):
+            self.skipTest("this account reads every folder")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
+                list_folder(locked / "alias" / "absent", recursive=recursive)
+
+    def test_a_missing_folder_reached_through_a_link_under_readable_ancestors_on_both_routes_stays_empty(self) -> None:
+        (self.root / "real" / "inner").mkdir(parents=True)
+        (self.root / "alias").symlink_to(self.root / "real" / "inner")
+        for recursive in (False, True):
+            self.assertEqual([], list_folder(self.root / "alias" / "absent", recursive=recursive))
+
     def test_a_missing_folder_under_a_parent_that_can_be_read_but_not_searched_is_an_error_in_both_modes(self) -> None:
         parent = self.root / "readable"
         parent.mkdir()
