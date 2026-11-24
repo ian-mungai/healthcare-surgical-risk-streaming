@@ -23,9 +23,3 @@ temporal:
       value: {{ airbyte_temporal_visibility_database | to_json }}
     - name: SKIP_DB_CREATE
       value: "true"
-    # The shared PostgreSQL server has no TLS; the chart turns Temporal's TLS on for any external database. These entries come after the chart's own, so
-    # they win.
-    - name: SQL_TLS_ENABLED
-      value: "false"
-    - name: POSTGRES_TLS_ENABLED
-      value: "false"

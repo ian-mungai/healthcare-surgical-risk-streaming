@@ -6,7 +6,8 @@ global:
   auth:
     enabled: true
   database:
-    type: external
+    # The chart's default type, not "external": chart 2.5.0 turns Temporal's database TLS on for an external database, and the shared PostgreSQL
+    # server on the k3s bridge has no TLS. The host values give the bridge address, and postgresql.enabled: false keeps the chart's own database out.
     secretName: airbyte-database
     userSecretKey: database-user
     passwordSecretKey: database-password

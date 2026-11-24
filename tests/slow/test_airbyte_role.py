@@ -687,31 +687,25 @@ class PlacementTest(unittest.TestCase):
             run_tasks(["place_files.yml"], values(folder))
             host = mapping(load_yaml((folder / "airbyte" / "host.values.yaml").read_text()))
         environment = {item["name"]: item["value"] for item in host["temporal"]["extraEnv"]}
-        self.assertEqual(
-            {
-                "DBNAME": "airbyte_temporal",
-                "VISIBILITY_DBNAME": "airbyte_temporal_visibility",
-                "SKIP_DB_CREATE": "true",
-                "SQL_TLS_ENABLED": "false",
-                "POSTGRES_TLS_ENABLED": "false",
-            },
-            environment,
-        )
+        self.assertEqual({"DBNAME": "airbyte_temporal", "VISIBILITY_DBNAME": "airbyte_temporal_visibility", "SKIP_DB_CREATE": "true"}, environment)
 
-    def test_temporal_reaches_the_shared_database_without_tls_and_extra_env_comes_last(self) -> None:
-        """The shared PostgreSQL server on the k3s bridge has no TLS. Chart 2.5.0 turns Temporal's TLS on for every external database
-        (``SQL_TLS_ENABLED`` and ``POSTGRES_TLS_ENABLED`` from its config map), so the schema setup fails with "SSL is not enabled on the server". The chart
-        appends ``temporal.extraEnv`` after its own entries in the setup and the server containers, and Kubernetes takes the last entry of a name."""
+    def test_temporal_reaches_the_shared_database_without_tls(self) -> None:
+        """The shared PostgreSQL server on the k3s bridge has no TLS. Chart 2.5.0 renders Temporal's TLS flags (``SQL_TLS_ENABLED``,
+        ``POSTGRES_TLS_ENABLED`` and their host-verification flags) as true exactly when ``global.database.type`` is ``external``, and the schema setup then
+        fails with "SSL is not enabled on the server". The chart's default type renders them false while the role's host values still point every JDBC URL
+        at the bridge, and ``postgresql.enabled: false`` keeps the chart's own database out. Overriding the flags in ``temporal.extraEnv`` instead repeats
+        their names in the Deployment, which Helm's upgrade patch refuses ($setElementOrder), so no TLS name may appear there."""
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            run_tasks(["place_files.yml"], values(folder))
-            host = mapping(load_yaml((folder / "airbyte" / "host.values.yaml").read_text()))
-        names = [item["name"] for item in host["temporal"]["extraEnv"]]
-        environment = {item["name"]: item["value"] for item in host["temporal"]["extraEnv"]}
-        for name in ("SQL_TLS_ENABLED", "POSTGRES_TLS_ENABLED"):
-            with self.subTest(name):
-                self.assertEqual("false", environment.get(name))
-                self.assertEqual(1, names.count(name))
+            code, output = run_tasks(["place_files.yml"], values(folder))
+            self.assertEqual(0, code, output)
+            merged: dict[str, Any] = {}
+            for name in ("values.yaml", "limits.values.yaml", "host.values.yaml"):
+                merged = merge_values(merged, mapping(load_yaml((folder / "airbyte" / name).read_text())))
+        self.assertNotEqual("external", merged["global"]["database"].get("type"))
+        self.assertIs(False, merged["postgresql"]["enabled"])
+        names = [item["name"] for item in merged["temporal"]["extraEnv"]]
+        self.assertEqual([], [name for name in names if "TLS" in name])
 
     def test_the_public_url_is_set_only_when_given(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
