@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import fcntl
 import hashlib
 import inspect
@@ -272,10 +273,9 @@ def result_line(plan: rules.Plan, *, passed: bool = True, change: Callable[[dict
 class Runner:
     """The stand-in for the Spark job. It prints what it is told to, after recording the staged files and the plan that it found."""
 
-    def __init__(self, line: Callable[[rules.Plan], str] | None = None, exit_code: int | None = None, error_text: str = "") -> None:
+    def __init__(self, line: Callable[[rules.Plan], str] | None = None, exit_code: int | None = None) -> None:
         self.line = line
         self.exit_code = exit_code
-        self.error_text = error_text
         self.calls = 0
         self.seen_files: dict[str, str] = {}
         self.plan: dict[str, Any] = {}
@@ -288,8 +288,9 @@ class Runner:
         text = (self.line or result_line)(rules.parse_plan(plan_text))
         code = self.exit_code
         if code is None:
-            code = 0 if text.startswith("RESULT ") and rules.parse_result(text.removeprefix("RESULT "), rules.parse_plan(plan_text)).passed else 1
-        return run.RunnerReply(code, text, self.error_text)
+            first = text.split("\n", 1)[0]
+            code = 0 if first.startswith("RESULT ") and rules.parse_result(first.removeprefix("RESULT "), rules.parse_plan(plan_text)).passed else 1
+        return run.RunnerReply(code, text)
 
 
 class Case:
@@ -1477,7 +1478,7 @@ class FailureOutputTest(unittest.TestCase):
 
     def test_a_job_that_prints_no_result_gives_a_fixed_message_and_keeps_a_fixed_code_and_none_of_its_output(self) -> None:
         case = Case(self)
-        runner = Runner(lambda plan: f"stdout {MARKER} {COUNT_MARKER}\n", exit_code=1, error_text=f"Malformed record [{MARKER}] rows={COUNT_MARKER}")
+        runner = Runner(lambda plan: f"stdout {MARKER} {COUNT_MARKER}\nMalformed record [{MARKER}] rows={COUNT_MARKER}\n", exit_code=1)
         with self.assertRaises(run.TableChecksError) as raised:
             case.go(runner)
         self.assertNotIn(MARKER, str(raised.exception))
@@ -1490,9 +1491,11 @@ class FailureOutputTest(unittest.TestCase):
     def test_a_result_that_is_refused_keeps_a_fixed_code_and_none_of_the_output(self) -> None:
         case = Case(self)
         bad = Runner(
-            lambda plan: result_line(plan, change=lambda document: document["tables"][0]["checks"][0].update(detail=f"value {MARKER}")),
+            lambda plan: (
+                result_line(plan, change=lambda document: document["tables"][0]["checks"][0].update(detail=f"value {MARKER}"))
+                + f"stderr {MARKER} row_count;source={COUNT_MARKER};table={COUNT_MARKER}\n"
+            ),
             exit_code=0,
-            error_text=f"stderr {MARKER} row_count;source={COUNT_MARKER};table={COUNT_MARKER}",
         )
         with self.assertRaises(run.TableChecksError) as raised:
             case.go(bad)
@@ -1502,9 +1505,11 @@ class FailureOutputTest(unittest.TestCase):
     def test_a_result_with_a_sealed_count_is_refused_and_the_count_reaches_no_file(self) -> None:
         case = Case(self)
         counted = Runner(
-            lambda plan: result_line(plan, change=lambda document: document["tables"][0].update(rows_source=int(COUNT_MARKER), rows_table=int(COUNT_MARKER))),
+            lambda plan: (
+                result_line(plan, change=lambda document: document["tables"][0].update(rows_source=int(COUNT_MARKER), rows_table=int(COUNT_MARKER)))
+                + f"rows {COUNT_MARKER}\n"
+            ),
             exit_code=0,
-            error_text=f"rows {COUNT_MARKER}",
         )
         with self.assertRaises(run.TableChecksError):
             case.go(counted)
@@ -1518,18 +1523,18 @@ class FailureOutputTest(unittest.TestCase):
             with self.subTest(exit_code=exit_code):
                 case = Case(self)
                 with self.assertRaises(run.TableChecksError):
-                    case.go(Runner(exit_code=exit_code, error_text=f"stderr {MARKER}"))
+                    case.go(Runner(lambda plan: result_line(plan) + f"stderr {MARKER}\n", exit_code=exit_code))
                 self.assertEqual(kept_output("exit_code_disagrees", exit_code, 1), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
 
     def test_a_failed_check_keeps_a_fixed_code_and_none_of_the_output(self) -> None:
         case = Case(self)
-        outcome = case.go(Runner(lambda plan: result_line(plan, passed=False) + f"log {MARKER} {COUNT_MARKER}\n", exit_code=1, error_text=f"warning {MARKER}"))
+        outcome = case.go(Runner(lambda plan: result_line(plan, passed=False) + f"log {MARKER} {COUNT_MARKER}\nwarning {MARKER}\n", exit_code=1))
         self.assertFalse(outcome.passed)
         self.assertEqual(kept_output("checks_failed", 1, 1), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
 
     def test_a_passing_run_keeps_no_output_file(self) -> None:
         case = Case(self)
-        case.go(Runner(error_text=f"warning {MARKER}"))
+        case.go(Runner(lambda plan: result_line(plan) + f"warning {MARKER}\n"))
         self.assertFalse((case.run_folder / run.JOB_OUTPUT_FILE).exists())
 
     def test_the_kept_output_is_replaced_by_the_next_refusal_and_never_appended_to(self) -> None:
@@ -1542,8 +1547,171 @@ class FailureOutputTest(unittest.TestCase):
 
     def test_no_marker_reaches_the_saved_result_of_a_failed_run(self) -> None:
         case = Case(self)
-        case.go(Runner(lambda plan: result_line(plan, passed=False), error_text=f"warning {MARKER}"))
+        case.go(Runner(lambda plan: result_line(plan, passed=False) + f"warning {MARKER}\n"))
         self.assertNotIn(MARKER, (case.run_folder / run.RESULT_FILE).read_text())
+
+
+class LegacyJobOutputTest(unittest.TestCase):
+    """A ``job_output.txt`` that the previous controller wrote (the job's stdout and stderr, and a count) is removed under the load lock before any retry
+    can return, whatever that retry ends as. A file of the current fixed form is left as it is."""
+
+    def legacy(self) -> dict[str, bytes]:
+        form = kept_output("no_result", 1, 0)
+        return {
+            "the output of the job": f"exit code: 1\n--- stdout ---\nrows {COUNT_MARKER}\n--- stderr ---\nMalformed record [{MARKER}]\n".encode(),
+            "a count as the number of lines": kept_output("no_result", 1, int(COUNT_MARKER)).encode(),
+            "a count as the exit code": kept_output("no_result", int(COUNT_MARKER), 0).encode(),
+            "a code that is not in the table": b"refusal: values_of_a_patient\nexit code: 1\nresult lines: 0\n",
+            "a line after the form": (form + f"stderr {MARKER}\n").encode(),
+            "text before the form": (f"{MARKER}\n" + form).encode(),
+            "the form without its last newline": form.rstrip("\n").encode(),
+            "the form with a word after a number": (form.rstrip("\n") + f" {MARKER}\n").encode(),
+            "an empty file": b"",
+            "bytes that are not text": b"\xff\xfe" + MARKER.encode(),
+            "a large file": b"x" * 100_000,
+        }
+
+    def plant(self, case: Case, content: bytes) -> Path:
+        case.run_folder.mkdir(parents=True, exist_ok=True)
+        path = case.run_folder / run.JOB_OUTPUT_FILE
+        path.write_bytes(content)
+        return path
+
+    def open_outcome(self, case: Case, runner: Runner) -> None:
+        case.nessie.defer_next_merge = True
+        with self.assertRaisesRegex(run.MergeOutcomeOpen, "merge_outcome_open"):
+            case.go(runner)
+
+    def test_a_refused_run_then_a_success_leaves_no_legacy_file(self) -> None:
+        for label, content in self.legacy().items():
+            with self.subTest(label):
+                case = Case(self)
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner(lambda plan: "", exit_code=1))
+                path = self.plant(case, content)
+                outcome = case.go(Runner())
+                self.assertTrue(outcome.merged)
+                self.assertFalse(path.exists())
+
+    def test_a_retry_after_the_merge_removes_the_legacy_file_and_runs_nothing(self) -> None:
+        for label, content in self.legacy().items():
+            with self.subTest(label):
+                case = Case(self)
+                runner = Runner()
+                case.go(runner)
+                path = self.plant(case, content)
+                again = case.go(runner)
+                self.assertEqual((1, True), (runner.calls, again.merged))
+                self.assertFalse(path.exists())
+                self.assertEqual(1, len(case.nessie.merge_requests))
+
+    def test_a_receipt_rebuilt_from_the_log_removes_the_legacy_file(self) -> None:
+        for label, content in self.legacy().items():
+            with self.subTest(label):
+                case = Case(self)
+                runner = Runner()
+                self.open_outcome(case, runner)
+                path = self.plant(case, content)
+                case.nessie.apply_pending()
+                self.assertTrue(case.go(runner).merged)
+                self.assertFalse(path.exists())
+
+    def test_a_retry_that_ends_open_removes_the_legacy_file_before_it_raises(self) -> None:
+        for label, content in self.legacy().items():
+            with self.subTest(label):
+                case = Case(self)
+                runner = Runner()
+                self.open_outcome(case, runner)
+                path = self.plant(case, content)
+                with self.assertRaises(run.MergeOutcomeOpen):
+                    case.go(runner)
+                self.assertFalse(path.exists())
+
+    def test_a_retry_that_refuses_the_folder_as_another_loads_removes_the_legacy_file_first(self) -> None:
+        case, content = Case(self), self.legacy()["the output of the job"]
+        case.go(Runner())
+        receipt = case.saved()
+        receipt["load"]["branch"] = "another_branch"
+        (case.run_folder / run.RESULT_FILE).write_text(json.dumps(receipt))
+        path = self.plant(case, content)
+        with self.assertRaisesRegex(run.TableChecksError, "another load"):
+            case.go(Runner())
+        self.assertFalse(path.exists())
+
+    def test_a_retry_that_cannot_take_the_lock_leaves_the_file_for_the_run_that_holds_it(self) -> None:
+        case = Case(self)
+        path = self.plant(case, self.legacy()["the output of the job"])
+        case.state.mkdir(parents=True)
+        with run.lock_path(case.reference.sha256, case.state).open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(run.TableChecksError, "another run of this load"):
+                case.go(Runner())
+        self.assertTrue(path.exists())
+
+    def test_a_file_of_the_current_form_stays_byte_for_byte_on_every_retry(self) -> None:
+        for code, exit_code, lines in (("no_result", 1, 0), ("result_refused", 0, 1), ("exit_code_disagrees", -9, 1), ("checks_failed", 1, 1)):
+            with self.subTest(code):
+                case, runner = Case(self), Runner()
+                case.go(runner)
+                path = self.plant(case, kept_output(code, exit_code, lines).encode())
+                case.go(runner)
+                self.assertEqual(kept_output(code, exit_code, lines).encode(), path.read_bytes())
+
+    def test_a_link_in_place_of_the_file_is_removed_and_the_file_it_points_to_is_not_touched_or_written_through(self) -> None:
+        for label, content in (("a file of another form", f"rows {COUNT_MARKER}\n"), ("a file of the fixed form", kept_output("no_result", 1, 0))):
+            with self.subTest(label):
+                case = Case(self)
+                outside = case.root / "outside.txt"
+                outside.write_text(content)
+                case.run_folder.mkdir(parents=True, exist_ok=True)
+                link = case.run_folder / run.JOB_OUTPUT_FILE
+                link.symlink_to(outside)
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner(lambda plan: "", exit_code=3))
+                self.assertEqual(content, outside.read_text())
+                self.assertFalse(link.is_symlink())
+                self.assertEqual(kept_output("no_result", 3, 0), link.read_text())
+
+    def test_a_refusal_after_a_legacy_file_keeps_the_fixed_form_only(self) -> None:
+        for label, content in self.legacy().items():
+            with self.subTest(label):
+                case = Case(self)
+                self.plant(case, content)
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner(lambda plan: "", exit_code=1))
+                self.assertEqual(kept_output("no_result", 1, 0), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    def test_a_folder_in_place_of_the_file_stops_the_run_with_a_fixed_message_before_anything_runs(self) -> None:
+        case, runner = Case(self), Runner()
+        (case.run_folder / run.JOB_OUTPUT_FILE).mkdir()
+        with self.assertRaisesRegex(run.TableChecksError, run.JOB_OUTPUT_FILE):
+            case.go(runner)
+        self.assertEqual(0, runner.calls)
+        self.assertTrue(case.main_untouched())
+        self.assertTrue((case.run_folder / run.JOB_OUTPUT_FILE).is_dir())
+
+    def test_every_file_that_the_controller_writes_is_kept_and_a_number_out_of_bounds_is_refused_and_writes_nothing(self) -> None:
+        for exit_code, lines in ((0, 0), (-255, 9999), (255, 1), (-9, 2), (124, 0)):
+            for code in run.REFUSAL_CODES:
+                with self.subTest(code=code, exit_code=exit_code, lines=lines):
+                    case = Case(self)
+                    run.keep_output(case.run_folder, code, exit_code, lines)
+                    path = case.run_folder / run.JOB_OUTPUT_FILE
+                    before = path.read_bytes()
+                    self.assertEqual(kept_output(code, exit_code, lines).encode(), before)
+                    self.assertTrue(case.go(Runner()).merged)
+                    self.assertEqual(before, path.read_bytes())
+        for exit_code, lines in ((256, 0), (-256, 0), (0, 10_000), (0, -1), (int(COUNT_MARKER), 0), (0, int(COUNT_MARKER))):
+            with self.subTest(exit_code=exit_code, lines=lines):
+                case = Case(self)
+                with self.assertRaises(run.TableChecksError):
+                    run.keep_output(case.run_folder, "no_result", exit_code, lines)
+                self.assertFalse((case.run_folder / run.JOB_OUTPUT_FILE).exists())
+
+    def test_a_folder_that_does_not_exist_yet_is_not_an_error(self) -> None:
+        case = Case(self)
+        case.run_folder.rmdir()
+        self.assertTrue(case.go(Runner()).merged)
 
 
 class RerunTest(unittest.TestCase):
@@ -1620,8 +1788,13 @@ class ComposeRunnerTest(unittest.TestCase):
     def test_a_job_that_passes_its_deadline_is_a_reply_with_the_timeout_code_and_no_output_of_the_command(self) -> None:
         with mock.patch.object(run, "run_command", side_effect=TimeoutExpired("docker", 77)):
             reply = self.runner()(Path("/opt/dagster/staging/run_one"))
-        self.assertEqual(124, reply.exit_code)
-        self.assertIn("77 seconds", reply.stderr)
+        self.assertEqual(run.RunnerReply(124, ""), reply)
+
+    def test_a_reply_holds_the_exit_code_and_the_standard_output_and_nothing_else(self) -> None:
+        self.assertEqual(["exit_code", "stdout"], [field.name for field in dataclasses.fields(run.RunnerReply)])
+        with mock.patch.object(run, "run_command", return_value=CompletedProcess([], 0, "RESULT {}\n", "stderr text")):
+            reply = self.runner()(Path("/opt/dagster/staging/run_one"))
+        self.assertEqual(run.RunnerReply(0, "RESULT {}\n"), reply)
 
     def test_a_staging_folder_outside_the_volume_is_refused_before_anything_starts(self) -> None:
         with mock.patch.object(run, "run_command") as started, self.assertRaises(run.TableChecksError):
