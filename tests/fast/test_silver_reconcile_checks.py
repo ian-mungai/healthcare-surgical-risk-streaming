@@ -23,6 +23,7 @@ from features.signal_validity import INVALID_CAUSES
 from spark.reconcile.checks import (
     CHECK_NAMES,
     CODES,
+    JOIN_TABLE,
     JOINS,
     RECONCILIATIONS,
     SOURCE_TABLES,
@@ -87,6 +88,7 @@ class Keys(unittest.TestCase):
     def test_each_defect_is_named_with_the_table_and_a_count_of_keys(self) -> None:
         for field, code in (
             ("bronze_repeats", "bronze_key_repeated"),
+            ("silver_repeats", "silver_key_repeated"),
             ("unaccounted", "key_unaccounted"),
             ("claimed_twice", "key_claimed_twice"),
             ("silver_unbacked", "key_unbacked"),
@@ -120,9 +122,9 @@ class Keys(unittest.TestCase):
         self.assertEqual(["cases_bronze_empty: 0 keys"], key_problems("cases", empty))
 
     def test_every_cause_is_named_in_one_run(self) -> None:
-        facts = dataclasses.replace(clean("cases"), bronze_repeats=1, unaccounted=2, claimed_twice=3, silver_unbacked=4)
+        facts = dataclasses.replace(clean("cases"), bronze_repeats=1, silver_repeats=5, unaccounted=2, claimed_twice=3, silver_unbacked=4)
         self.assertEqual(
-            ["cases_bronze_key_repeated", "cases_key_unaccounted", "cases_key_claimed_twice", "cases_key_unbacked"],
+            ["cases_bronze_key_repeated", "cases_silver_key_repeated", "cases_key_unaccounted", "cases_key_claimed_twice", "cases_key_unbacked"],
             [problem.split(":")[0] for problem in key_problems("cases", facts)],
         )
 
@@ -141,6 +143,15 @@ class Joins(unittest.TestCase):
 
     def test_a_join_over_no_row_is_named(self) -> None:
         self.assertEqual(["case_split_join_empty: 0 rows"], join_problems("case_split", JoinFacts(rows=0, unmatched=0, fanned=0)))
+
+
+class JoinOwners(unittest.TestCase):
+    def test_each_join_belongs_to_the_table_whose_held_out_flag_takes_its_failures(self) -> None:
+        self.assertEqual(
+            {"numeric_track": "numeric_observations", "waveform_track": "waveform_seconds", "lab_case": "lab_results", "case_split": "cases"}, JOIN_TABLE
+        )
+        self.assertEqual({join.name for join in JOINS}, set(JOIN_TABLE))
+        self.assertTrue(set(JOIN_TABLE.values()) <= set(BY_NAME))
 
 
 class HeldOut(unittest.TestCase):

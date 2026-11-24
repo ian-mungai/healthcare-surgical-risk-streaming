@@ -50,9 +50,11 @@ class Reconciliation:
 
 @dataclass(frozen=True, slots=True)
 class Join:
-    """A join that the Silver build makes. Every row of the first table must have exactly one partner in the second."""
+    """A join that the Silver build makes. Every row of the first table must have exactly one partner in the second. ``table`` is the reconciled table whose
+    held-out flag takes the failures of the join for patients outside the development sets."""
 
     name: str
+    table: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +62,8 @@ class KeyFacts:
     """What the comparison of one table's Bronze keys with its Silver keys shows, for development patients. Every count is of keys.
 
     ``bronze_keys`` is the Bronze rows. ``matched`` is the keys that Bronze holds and exactly one Silver key accounts for, and ``dispositions`` counts them by
-    what they became (``unrecorded`` is a key whose Silver row has no disposition from the closed list).
+    what they became (``unrecorded`` is a key whose Silver row has no disposition from the closed list). ``silver_repeats`` is the declared keys of the
+    Silver table that two rows have.
     """
 
     bronze_keys: int
@@ -70,6 +73,7 @@ class KeyFacts:
     claimed_twice: int
     silver_unbacked: int
     dispositions: dict[str, int]
+    silver_repeats: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,8 +92,14 @@ RECONCILIATIONS = (
     Reconciliation("lab_results", (KEPT, COLLAPSED_COPY)),
 )
 BY_NAME = {reconciliation.name: reconciliation for reconciliation in RECONCILIATIONS}
-JOINS = (Join("numeric_track"), Join("waveform_track"), Join("lab_case"), Join("case_split"))
+JOINS = (
+    Join("numeric_track", silver.NUMERIC.name),
+    Join("waveform_track", silver.WAVEFORM.name),
+    Join("lab_case", "lab_results"),
+    Join("case_split", "cases"),
+)
 JOIN_NAMES = frozenset(join.name for join in JOINS)
+JOIN_TABLE = {join.name: join.table for join in JOINS}
 
 SOURCE_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     **{f"bronze.{table.name}": table.columns for table in (bronze.NUMERIC, bronze.WAVEFORM, bronze.TRACKS)},
@@ -102,6 +112,7 @@ SOURCE_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
 KEY_CHECKS = (
     ("bronze_empty", "key"),
     ("bronze_key_repeated", "key"),
+    ("silver_key_repeated", "key"),
     ("key_unaccounted", "key"),
     ("key_claimed_twice", "key"),
     ("key_unbacked", "key"),
@@ -133,6 +144,7 @@ def key_problems(name: str, facts: KeyFacts) -> list[str]:
     unrecorded = facts.dispositions.get(UNRECORDED, 0)
     counts = {
         "bronze_key_repeated": facts.bronze_repeats,
+        "silver_key_repeated": facts.silver_repeats,
         "key_unaccounted": facts.unaccounted,
         "key_claimed_twice": facts.claimed_twice,
         "key_unbacked": facts.silver_unbacked,

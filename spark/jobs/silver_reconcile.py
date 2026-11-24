@@ -23,10 +23,10 @@ from collections.abc import Sequence
 from typing import Any
 
 from spark.jobs.silver_cases import Lake
-from spark.reconcile.checks import SOURCE_TABLES, JoinFacts, KeyFacts, schema_problems
+from spark.reconcile.checks import JOINS, SOURCE_TABLES, JoinFacts, KeyFacts, schema_problems
 from spark.reconcile.cli import JOB, run
 from spark.reconcile.run import Operations, run_verify
-from spark.reconcile.sql import decode_join_facts, decode_key_facts, held_out_query, join_query, key_facts_query
+from spark.reconcile.sql import decode_join_facts, decode_key_facts, held_out_query, join_held_out_query, join_query, key_facts_query
 from spark.session import build_session
 from spark.settings import CATALOG
 from spark.split_cli import open_client, read_settings, start_deadline
@@ -45,7 +45,8 @@ class ReconcileLake(Lake):
         return decode_key_facts(self.session.sql(key_facts_query(name)).collect()[0].asDict())
 
     def held_out_problem(self, name: str) -> bool:
-        return bool(self.count(held_out_query(name)))
+        queries = [held_out_query(name), *(join_held_out_query(join.name) for join in JOINS if join.table == name)]
+        return any(self.count(query) for query in queries)
 
     def join_facts(self, name: str) -> JoinFacts:
         return decode_join_facts(self.session.sql(join_query(name)).collect()[0].asDict())

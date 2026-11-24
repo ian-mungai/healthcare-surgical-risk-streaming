@@ -128,6 +128,41 @@ class Reads(unittest.TestCase):
         self.assertEqual([f"source_missing: {len(SOURCE_TABLES)} tables"], lake.source_problems())
 
 
+class Flags(unittest.TestCase):
+    """The flag of a table is set by a held-out defect of its keys or of the join that its Silver build makes, and a join never gives a held-out count."""
+
+    def lake(self, ones: list[str]) -> ReconcileLake:
+        class Result:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+            def collect(self) -> list[dict[str, int]]:
+                return [{"n": self.value}]
+
+        class Session:
+            def sql(self, query: str) -> Result:
+                return Result(1 if any(marker in query for marker in ones) else 0)
+
+        return ReconcileLake(Session(), object(), "branch", "a" * 64)  # type: ignore[arg-type]
+
+    def test_a_held_out_join_failure_sets_the_flag_of_its_table_only(self) -> None:
+        owners = {
+            "numeric_observations": "silver.numeric_observations x LEFT ANTI JOIN dev",
+            "waveform_seconds": "silver.waveform_seconds x LEFT ANTI JOIN dev",
+            "lab_results": "silver.lab_results x LEFT ANTI JOIN dev",
+            "cases": "silver.cases x LEFT ANTI JOIN dev",
+        }
+        for name, marker in owners.items():
+            lake = self.lake([marker])
+            with self.subTest(name=name):
+                self.assertEqual({other: other == name for other in owners}, {other: lake.held_out_problem(other) for other in owners})
+
+    def test_a_held_out_key_defect_sets_the_flag_without_a_join_failure(self) -> None:
+        lake = self.lake(["bf AS"])
+        self.assertTrue(all(lake.held_out_problem(name) for name in ("numeric_observations", "cases")))
+        self.assertFalse(self.lake([]).held_out_problem("cases"))
+
+
 class Execute(unittest.TestCase):
     """``execute`` with the Spark session, the Nessie client and the settings replaced by stand-ins that record how they are used."""
 
