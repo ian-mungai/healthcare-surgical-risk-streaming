@@ -18,7 +18,7 @@ from typing import Any
 from features.hypotension import EVENT_SECONDS, SECOND_US, SeriesPoint, events_of
 from features.pressure_series import SERIES_TRACK, ExactMean, SecondFacts, second_facts, series_second
 from features.signal_validity import INVALID_CAUSES, Verdict
-from spark.bronze.quality import row_count_is
+from spark.bronze.quality import row_count_at_least, row_count_is
 from spark.bronze.tables import LINEAGE_COLUMNS
 from spark.silver.frames import DIGEST_TYPE, count_where, functions, typed, types, window
 from spark.silver.hypotension_checks import DEVELOPMENT_SETS, EventFacts, InputFacts, SeriesFacts
@@ -228,7 +228,8 @@ def input_facts(waveform: Any, clinical: Any, split: Any) -> InputFacts:
     without = operations(clinical).join(split.select("subjectid"), "subjectid", "left_anti")
     rows, null_keys = int(seconds["rows"]), int(seconds["null_keys"] or 0)
     # A second with no verdict has no cause to name, so it is counted as a second without a key: the input cannot be used.
-    return InputFacts(rows, null_keys + int(seconds["no_verdict"] or 0), rows - null_keys - int(seconds["distinct"]), 0, exists(without), ())
+    empty = int(not row_count_at_least(art, 1))
+    return InputFacts(empty, null_keys + int(seconds["no_verdict"] or 0), rows - null_keys - int(seconds["distinct"]), 0, exists(without), ())
 
 
 def series_facts(stored: Any, waveform: Any) -> SeriesFacts:

@@ -35,7 +35,7 @@ from spark.silver.hypotension_checks import (
 )
 from spark.split_table import RULE_VERSION, SET_NAMES, SplitRow
 
-INPUT = InputFacts(art_seconds=5000, null_keys=0, duplicate_seconds=0, ambiguous_owner=0, cases_without_split=0, split_problems=())
+INPUT = InputFacts(input_empty=0, null_keys=0, duplicate_seconds=0, ambiguous_owner=0, cases_without_split=0, split_problems=())
 SERIES = SeriesFacts(
     duplicate_keys=0,
     null_verdict=0,
@@ -54,7 +54,7 @@ class Input(unittest.TestCase):
         self.assertEqual([], input_problems(INPUT))
 
     def test_an_input_with_no_arterial_second_is_empty(self) -> None:
-        self.assertEqual(["input_empty: failed"], input_problems(dataclasses.replace(INPUT, art_seconds=0)))
+        self.assertEqual(["input_empty: failed"], input_problems(dataclasses.replace(INPUT, input_empty=1)))
 
     def test_each_defect_is_named_once_as_a_flag_whatever_its_count(self) -> None:
         for null_keys, duplicate_seconds in ((2, 1), (200, 70)):
@@ -163,7 +163,7 @@ class Events(unittest.TestCase):
 
 class Names(unittest.TestCase):
     def test_every_problem_is_a_code_and_a_flag_and_every_code_is_a_check_name(self) -> None:
-        bad_input = dataclasses.replace(INPUT, art_seconds=7, null_keys=1, duplicate_seconds=1)
+        bad_input = dataclasses.replace(INPUT, input_empty=0, null_keys=1, duplicate_seconds=1)
         bad_series = SeriesFacts(1, 1, 1, 1, 1, 1, 1, row_count_differs=1)
         bad_events = EventFacts(1, 1, 1, 1, 1)
         problems = (

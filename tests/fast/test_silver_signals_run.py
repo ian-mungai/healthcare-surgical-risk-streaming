@@ -24,7 +24,7 @@ HEAD = "a" * 64
 PREPARED = "b" * 64
 FIRST_WRITE = "c" * 64
 SECOND_WRITE = "d" * 64
-BRONZE = BronzeFacts(1000, 300, 0, 0, 0, 0, 0, 0, 0)
+BRONZE = BronzeFacts(0, 0, 0, 0, 0, 0, 0, 0)
 INPUT = InputRead(BRONZE, (11, 12, 13))
 FINGERPRINTS = {NUMERIC: Fingerprint(990, 5), WAVEFORM: Fingerprint(300, 9)}
 NUMERIC_FACTS = NumericFacts(0, 0, 0, 0, 0, 0, 0)
@@ -223,7 +223,7 @@ class Build(unittest.TestCase):
         self.assertEqual(failed("numeric_verdict_differs", "waveform_not_every_second"), messages(caught.exception))
 
     def test_bronze_that_changed_between_the_reads_is_named(self) -> None:
-        for later in (InputRead(BRONZE, (11, 12, 14)), InputRead(dataclasses.replace(BRONZE, numeric_rows=1001), (11, 12, 13))):
+        for later in (InputRead(BRONZE, (11, 12, 14)), InputRead(dataclasses.replace(BRONZE, numeric_null_keys=1), (11, 12, 13))):
             with self.subTest(later=later):
                 fake = Fake()
                 fake.later_input = later

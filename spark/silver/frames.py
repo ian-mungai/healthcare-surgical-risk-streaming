@@ -24,7 +24,7 @@ from features.signal_validity import (
     second_extent,
     waveform_verdict,
 )
-from spark.bronze.quality import row_count_is
+from spark.bronze.quality import row_count_at_least, row_count_is
 from spark.silver.checks import BronzeFacts, NumericFacts, WaveformFacts
 from spark.silver.run import Fingerprint
 from spark.silver.tables import NUMERIC, WAVEFORM
@@ -299,8 +299,7 @@ def bronze_facts(numeric: Any, waveform: Any, tracks: Any) -> BronzeFacts:
     twice = waveform.groupBy(*WAVEFORM_KEY).agg(f.count(f.lit(1)).alias("n")).agg(f.sum(f.col("n") - f.lit(1)).alias("extra")).first()["extra"]
     doubled = tracks.groupBy(*TRACK_KEY).agg(f.count(f.lit(1)).alias("n")).filter(f.col("n") > 1).count()
     return BronzeFacts(
-        numeric.count(),
-        waveform.count(),
+        int(not (row_count_at_least(numeric, 1) or row_count_at_least(waveform, 1))),
         null_rows(numeric, (*NUMERIC_KEY, "source_occurrence")),
         gaps,
         numeric.join(present("numeric"), list(TRACK_KEY), "left_anti").count(),

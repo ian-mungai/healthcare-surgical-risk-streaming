@@ -52,12 +52,13 @@ CODES = frozenset(CHECK_NAMES) | JOB_CODES
 class InputFacts:
     """What a read of the input at one hash shows: the arterial seconds of ``silver.waveform_seconds``, the clinical table and the patient split.
 
-    ``ambiguous_owner`` and ``cases_without_split`` are flags (0 or 1). ``split_problems`` are the problems of the split table by itself
+    ``input_empty``, ``ambiguous_owner`` and ``cases_without_split`` are flags (0 or 1): ``input_empty`` says that no arterial second has a row, as Great
+    Expectations' row-count expectation judges it. ``split_problems`` are the problems of the split table by itself
     (``split_rule_problems``); when it is not empty the other facts were not read, because a set is not trusted yet. The counts are tested inside the job and
     never leave it.
     """
 
-    art_seconds: int
+    input_empty: int
     null_keys: int
     duplicate_seconds: int
     ambiguous_owner: int
@@ -110,7 +111,7 @@ def input_problems(facts: InputFacts) -> list[str]:
         return [code_only(problem) for problem in facts.split_problems]
     if facts.cases_without_split:
         return [f"case_without_split: {FLAG}"]
-    if facts.art_seconds == 0:
+    if facts.input_empty:
         return [f"input_empty: {FLAG}"]
     return flagged([("waveform_null_key", facts.null_keys), ("waveform_duplicate_second", facts.duplicate_seconds)])
 

@@ -23,7 +23,7 @@ from spark.silver.hypotension_run import EVENTS, SERIES, Digest, InputRead, Oper
 from spark.silver.run import BRANCH_MOVED, Fingerprint
 
 HEAD, PREPARED, FIRST_WRITE, SECOND_WRITE = "a" * 64, "b" * 64, "c" * 64, "d" * 64
-INPUT = InputRead(InputFacts(5000, 0, 0, 0, 0, ()), (21, 22, 23))
+INPUT = InputRead(InputFacts(0, 0, 0, 0, 0, ()), (21, 22, 23))
 FINGERPRINTS: dict[str, Fingerprint | Digest] = {SERIES: Fingerprint(5000, 5), EVENTS: Digest(9)}
 SERIES_FACTS = SeriesFacts(0, 0, 0, 0, 0, 0, 0)
 EVENT_FACTS = EventFacts(0, 0, 0, 0, 0)
@@ -133,9 +133,9 @@ class Build(unittest.TestCase):
 
     def test_a_split_that_fails_its_rule_or_a_case_with_two_owners_writes_nothing_and_stops_before_any_plan(self) -> None:
         for facts, wanted in (
-            (InputFacts(5000, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
-            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
-            (InputFacts(5000, 0, 0, 0, 1, ()), failed("case_without_split")),
+            (InputFacts(0, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
+            (InputFacts(0, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
+            (InputFacts(0, 0, 0, 0, 1, ()), failed("case_without_split")),
         ):
             with self.subTest(wanted=wanted):
                 fake = Fake()
@@ -147,7 +147,7 @@ class Build(unittest.TestCase):
 
     def test_an_input_defect_writes_nothing_and_releases(self) -> None:
         fake = Fake()
-        fake.input = InputRead(InputFacts(0, 0, 0, 0, 0, ()), (21, 22, 23))
+        fake.input = InputRead(InputFacts(1, 0, 0, 0, 0, ()), (21, 22, 23))
         with self.assertRaises(SilverSignalsError) as caught:
             run_build(fake.operations(), HEAD)
         self.assertEqual(failed("input_empty"), messages(caught.exception))
@@ -227,7 +227,7 @@ class Build(unittest.TestCase):
         self.assertEqual(failed("event_short"), messages(caught.exception))
 
     def test_an_input_that_changed_between_the_reads_is_named(self) -> None:
-        for later in (InputRead(INPUT.facts, (21, 22, 24)), InputRead(dataclasses.replace(INPUT.facts, art_seconds=5001), (21, 22, 23))):
+        for later in (InputRead(INPUT.facts, (21, 22, 24)), InputRead(dataclasses.replace(INPUT.facts, null_keys=1), (21, 22, 23))):
             with self.subTest(later=later):
                 fake = Fake()
                 fake.later_input = later
@@ -329,8 +329,8 @@ class Verify(unittest.TestCase):
 
     def test_a_split_that_fails_its_rule_stops_a_verify_before_any_table_is_read(self) -> None:
         for facts, wanted in (
-            (InputFacts(5000, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
-            (InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
+            (InputFacts(0, 0, 0, 1, 0, ()), failed("ambiguous_case_owner")),
+            (InputFacts(0, 0, 0, 0, 0, ("two_sets: 1 patient",)), failed("two_sets")),
         ):
             with self.subTest(wanted=wanted):
                 fake = Fake()

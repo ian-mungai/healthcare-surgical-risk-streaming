@@ -67,10 +67,10 @@ class SilverSignalsError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class BronzeFacts:
-    """What a read of the Bronze signal tables at one hash shows. A count is of rows, or of keys where it says so."""
+    """What a read of the Bronze signal tables at one hash shows. A count is of keys or rows where it says so. ``input_empty`` is a flag (0 or 1): neither
+    signal table has a row, as Great Expectations' row-count expectation judges it. No count of rows is kept."""
 
-    numeric_rows: int
-    waveform_rows: int
+    input_empty: int
     numeric_null_keys: int
     numeric_occurrence_gaps: int
     numeric_without_track: int
@@ -122,7 +122,7 @@ def flagged(pairs: list[tuple[str, int]]) -> list[str]:
 
 
 def bronze_problems(facts: BronzeFacts) -> list[str]:
-    if facts.numeric_rows == 0 and facts.waveform_rows == 0:
+    if facts.input_empty:
         return [f"input_empty: {FLAG}"]
     return flagged(
         [

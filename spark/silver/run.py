@@ -116,7 +116,7 @@ def checked(table: str, read: TableRead | None) -> bool:
     return read is not None and (read.numeric if table == NUMERIC else read.waveform) is not None
 
 
-def own_problems(source: InputRead, table: str, read: TableRead) -> list[str]:
+def own_problems(table: str, read: TableRead) -> list[str]:
     if table == NUMERIC and read.numeric is not None:
         return numeric_problems(read.numeric)
     if read.waveform is not None:
@@ -124,7 +124,7 @@ def own_problems(source: InputRead, table: str, read: TableRead) -> list[str]:
     return []
 
 
-def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> list[str]:
+def table_problems(reads: dict[str, TableRead | None]) -> list[str]:
     """The tables that are not there, or else the problems of both tables against the counts of the Bronze input."""
     missing = sum(1 for read in reads.values() if read is None)
     if missing:
@@ -135,18 +135,16 @@ def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> lis
     for table in TABLES:
         read = reads[table]
         if read is not None:
-            problems += own_problems(source, table, read)
+            problems += own_problems(table, read)
     return problems
 
 
-def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned: dict[str, Fingerprint] | None) -> dict[str, bool]:
+def passed_flags(reads: dict[str, TableRead | None], planned: dict[str, Fingerprint] | None) -> dict[str, bool]:
     """One flag for each table: the table is there, every check of it passes and, in a build, it is the planned table."""
     flags = {}
     for table in TABLES:
         read = reads[table]
-        flags[table] = (
-            read is not None and checked(table, read) and not own_problems(source, table, read) and (planned is None or not differs(read, planned[table]))
-        )
+        flags[table] = read is not None and checked(table, read) and not own_problems(table, read) and (planned is None or not differs(read, planned[table]))
     return flags
 
 
@@ -183,7 +181,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
     if later != source:
         raise SilverSignalsError(f"source_changed: {FLAG}")
     reads = read_tables(ops, at, True)
-    problems = table_problems(source, reads)
+    problems = table_problems(reads)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
         problems.append(f"readback_differs: {unit(differing, 'table')}")
@@ -197,7 +195,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
         at,
         source,
         {table: read for table, read in reads.items() if read is not None},
-        passed_flags(source, reads, planned),
+        passed_flags(reads, planned),
     )
 
 
@@ -214,12 +212,12 @@ def run_verify(ops: Operations, head: str) -> Outcome:
     try:
         source = ops.read_input(head)
         reads = read_tables(ops, head, True)
-        problems = bronze_problems(source.facts) + table_problems(source, reads)
+        problems = bronze_problems(source.facts) + table_problems(reads)
         if problems:
             raise SilverSignalsError(*problems)
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome(head, None, head, source, tables, passed_flags(source, reads, None))
+        return Outcome(head, None, head, source, tables, passed_flags(reads, None))
     finally:
         ops.release()

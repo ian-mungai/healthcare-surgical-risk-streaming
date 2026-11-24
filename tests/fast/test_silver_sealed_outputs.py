@@ -82,7 +82,7 @@ def refusal(call: Any) -> list[str]:
 class SignalsResult(unittest.TestCase):
     def other_world(self, fake: signals.Fake) -> signals.Fake:
         """The same job on an input with more rows, another fingerprint and another snapshot: a held-out row has changed."""
-        fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=1007, waveform_rows=305), (21, 22, 23))
+        fake.input = signals_run.InputRead(signals.BRONZE, (21, 22, 23))
         fake.planned = {signals_run.NUMERIC: Fingerprint(997, 55), signals_run.WAVEFORM: Fingerprint(305, 66)}
         fake.read_back = {
             signals_run.NUMERIC: signals_run.TableRead(fake.planned[signals_run.NUMERIC], 201, numeric=signals.NUMERIC_FACTS),
@@ -133,21 +133,21 @@ class SignalsFlags(unittest.TestCase):
 
     def test_a_table_that_fails_a_check_is_false_and_the_other_stays_true(self) -> None:
         bad = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, verdict_differs=3))
-        got = signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: bad}), None)
+        got = signals_run.passed_flags(self.reads(**{signals_run.NUMERIC: bad}), None)
         self.assertEqual({signals_run.NUMERIC: False, signals_run.WAVEFORM: True}, got)
 
     def test_a_table_that_is_missing_or_read_without_its_checks_is_false(self) -> None:
         bare = signals_run.TableRead(signals.FINGERPRINTS[signals_run.WAVEFORM], 102)
-        got = signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: None, signals_run.WAVEFORM: bare}), None)
+        got = signals_run.passed_flags(self.reads(**{signals_run.NUMERIC: None, signals_run.WAVEFORM: bare}), None)
         self.assertEqual({signals_run.NUMERIC: False, signals_run.WAVEFORM: False}, got)
 
     def test_a_build_needs_the_table_to_be_the_planned_one(self) -> None:
         planned = {**signals.FINGERPRINTS, signals_run.WAVEFORM: Fingerprint(300, 10)}
-        self.assertEqual({signals_run.NUMERIC: True, signals_run.WAVEFORM: False}, signals_run.passed_flags(signals.INPUT, self.reads(), planned))
+        self.assertEqual({signals_run.NUMERIC: True, signals_run.WAVEFORM: False}, signals_run.passed_flags(self.reads(), planned))
 
     def test_a_count_that_does_not_add_up_to_bronze_is_false(self) -> None:
         short = signals_run.TableRead(signals.FINGERPRINTS[signals_run.NUMERIC], 101, numeric=dataclasses.replace(signals.NUMERIC_FACTS, row_count_differs=1))
-        self.assertFalse(signals_run.passed_flags(signals.INPUT, self.reads(**{signals_run.NUMERIC: short}), None)[signals_run.NUMERIC])
+        self.assertFalse(signals_run.passed_flags(self.reads(**{signals_run.NUMERIC: short}), None)[signals_run.NUMERIC])
 
 
 class SignalsMessages(unittest.TestCase):
@@ -158,7 +158,7 @@ class SignalsMessages(unittest.TestCase):
         """Every refusal that the job can make, each with a defect of the given size."""
         found: list[str] = []
         fake = signals.Fake()
-        fake.input = signals_run.InputRead(BronzeFacts(10 * size, 3 * size, size, size, size, size, size, size, size), (11, 12, 13))
+        fake.input = signals_run.InputRead(BronzeFacts(0, size, size, size, size, size, size, size), (11, 12, 13))
         found += self.build(fake)
         found += refusal(lambda: signals_run.run_build(self.empty_input().operations(), signals.HEAD))
         fake = signals.Fake()
@@ -174,7 +174,7 @@ class SignalsMessages(unittest.TestCase):
         )
         found += self.build(fake)
         fake = signals.Fake()
-        fake.later_input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=1000 + size), (11, 12, 13))
+        fake.later_input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_null_keys=size), (11, 12, 13))
         found += self.build(fake)
         fake = signals.Fake()
         fake.read_back[signals_run.WAVEFORM] = signals_run.TableRead(Fingerprint(300 + size, 10), 102, waveform=signals.WAVEFORM_FACTS)
@@ -189,7 +189,7 @@ class SignalsMessages(unittest.TestCase):
 
     def empty_input(self) -> signals.Fake:
         fake = signals.Fake()
-        fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, numeric_rows=0, waveform_rows=0), (11, 12, 13))
+        fake.input = signals_run.InputRead(dataclasses.replace(signals.BRONZE, input_empty=1), (11, 12, 13))
         return fake
 
     def test_every_message_is_a_code_and_a_flag_or_a_count_of_tables(self) -> None:
@@ -212,7 +212,7 @@ class SignalsMessages(unittest.TestCase):
 
     def test_a_verify_refuses_in_the_same_form(self) -> None:
         fake = signals.Fake()
-        fake.input = signals_run.InputRead(BronzeFacts(10, 3, 5, 5, 5, 5, 5, 5, 5), (11, 12, 13))
+        fake.input = signals_run.InputRead(BronzeFacts(0, 5, 5, 5, 5, 5, 5, 5), (11, 12, 13))
         fake.held = dict(fake.read_back)
         for message in refusal(lambda: signals_run.run_verify(fake.operations(), signals.HEAD)):
             self.assertRegex(message, MESSAGE)
@@ -222,7 +222,7 @@ class HypotensionResult(unittest.TestCase):
     def other_world(self, fake: hypo.Fake) -> hypo.Fake:
         """A held-out row has changed: the series has more seconds and another fingerprint, the snapshots differ, and the events of the development cases are
         the same."""
-        fake.input = hypo_run.InputRead(InputFacts(5007, 0, 0, 0, 0, ()), (31, 32, 33))
+        fake.input = hypo_run.InputRead(InputFacts(0, 0, 0, 0, 0, ()), (31, 32, 33))
         fake.planned = {hypo_run.SERIES: Fingerprint(5007, 55), hypo_run.EVENTS: hypo_run.Digest(9)}
         fake.read_back = {
             hypo_run.SERIES: hypo_run.TableRead(fake.planned[hypo_run.SERIES], 301, series=hypo.SERIES_FACTS),
@@ -267,17 +267,17 @@ class HypotensionFlags(unittest.TestCase):
     def test_a_table_that_fails_a_check_is_false_and_the_other_stays_true(self) -> None:
         bad_series = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.SERIES], 101, series=dataclasses.replace(hypo.SERIES_FACTS, differs=2))
         bad_events = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.EVENTS], 102, events=dataclasses.replace(hypo.EVENT_FACTS, held_out_events=1))
-        self.assertEqual({hypo_run.SERIES: False, hypo_run.EVENTS: True}, hypo_run.passed_flags(hypo.INPUT, self.reads(**{hypo_run.SERIES: bad_series}), None))
-        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(hypo.INPUT, self.reads(**{hypo_run.EVENTS: bad_events}), None))
+        self.assertEqual({hypo_run.SERIES: False, hypo_run.EVENTS: True}, hypo_run.passed_flags(self.reads(**{hypo_run.SERIES: bad_series}), None))
+        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(self.reads(**{hypo_run.EVENTS: bad_events}), None))
 
     def test_a_table_that_is_missing_or_read_without_its_checks_is_false(self) -> None:
         bare = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.EVENTS], 102)
-        got = hypo_run.passed_flags(hypo.INPUT, self.reads(**{hypo_run.SERIES: None, hypo_run.EVENTS: bare}), None)
+        got = hypo_run.passed_flags(self.reads(**{hypo_run.SERIES: None, hypo_run.EVENTS: bare}), None)
         self.assertEqual({hypo_run.SERIES: False, hypo_run.EVENTS: False}, got)
 
     def test_a_build_needs_the_table_to_be_the_planned_one(self) -> None:
         planned = {**hypo.FINGERPRINTS, hypo_run.EVENTS: hypo_run.Digest(10)}
-        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(hypo.INPUT, self.reads(), planned))
+        self.assertEqual({hypo_run.SERIES: True, hypo_run.EVENTS: False}, hypo_run.passed_flags(self.reads(), planned))
 
 
 class HypotensionMessages(unittest.TestCase):
@@ -287,12 +287,12 @@ class HypotensionMessages(unittest.TestCase):
     def messages(self, size: int) -> list[str]:
         found: list[str] = []
         for facts in (
-            InputFacts(5000 + size, size, size, 0, 0, ()),
-            InputFacts(0, 0, 0, 0, 0, ()),
-            InputFacts(5000, 0, 0, 1, 0, ()),
-            InputFacts(5000, 0, 0, 0, size, ()),
+            InputFacts(0, size, size, 0, 0, ()),
+            InputFacts(1, 0, 0, 0, 0, ()),
+            InputFacts(0, 0, 0, 1, 0, ()),
+            InputFacts(0, 0, 0, 0, size, ()),
             InputFacts(
-                5000, 0, 0, 0, 0, (f"two_sets: {size} patients", f"pinned_counts: counts a {size} are not exactly a {size + 1}", f"empty_table: {size} rows")
+                0, 0, 0, 0, 0, (f"two_sets: {size} patients", f"pinned_counts: counts a {size} are not exactly a {size + 1}", f"empty_table: {size} rows")
             ),
         ):
             fake = hypo.Fake()
@@ -307,7 +307,7 @@ class HypotensionMessages(unittest.TestCase):
         fake.read_back[hypo_run.EVENTS] = hypo_run.TableRead(hypo.FINGERPRINTS[hypo_run.EVENTS], 102, events=EventFacts(size, size, size, size, size))
         found += self.build(fake)
         fake = hypo.Fake()
-        fake.later_input = hypo_run.InputRead(InputFacts(5000 + size, 0, 0, 0, 0, ()), (21, 22, 23))
+        fake.later_input = hypo_run.InputRead(InputFacts(0, size, 0, 0, 0, ()), (21, 22, 23))
         found += self.build(fake)
         fake = hypo.Fake()
         fake.read_back[hypo_run.EVENTS] = hypo_run.TableRead(hypo_run.Digest(10 + size), 102, events=hypo.EVENT_FACTS)
@@ -337,7 +337,7 @@ class HypotensionMessages(unittest.TestCase):
 
     def test_a_split_problem_reaches_the_caller_as_its_code_only(self) -> None:
         fake = hypo.Fake()
-        fake.input = hypo_run.InputRead(InputFacts(5000, 0, 0, 0, 0, ("two_sets: 1 patient", "unknown_set: 2 rows")), (21, 22, 23))
+        fake.input = hypo_run.InputRead(InputFacts(0, 0, 0, 0, 0, ("two_sets: 1 patient", "unknown_set: 2 rows")), (21, 22, 23))
         self.assertEqual(["two_sets: failed", "unknown_set: failed"], self.build(fake))
 
 

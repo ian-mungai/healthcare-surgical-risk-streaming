@@ -95,7 +95,7 @@ class Outcome:
         }
 
 
-def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> list[str]:
+def table_problems(reads: dict[str, TableRead | None]) -> list[str]:
     """The tables that are not there, or else the problems of both tables."""
     missing = sum(1 for read in reads.values() if read is None)
     if missing:
@@ -106,7 +106,7 @@ def table_problems(source: InputRead, reads: dict[str, TableRead | None]) -> lis
     return series_problems(series.series) + event_problems(events.events)
 
 
-def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned: dict[str, Fingerprint | Digest] | None) -> dict[str, bool]:
+def passed_flags(reads: dict[str, TableRead | None], planned: dict[str, Fingerprint | Digest] | None) -> dict[str, bool]:
     """One flag for each table: the table is there, every check of it passes and, in a build, it is the planned table."""
     series, events = reads[SERIES], reads[EVENTS]
     held = {
@@ -127,7 +127,7 @@ def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRe
     return {table: ops.read_table(at, table, with_facts) for table in TABLES}
 
 
-def read_checked(ops: Operations, at: str, source: InputRead) -> dict[str, TableRead | None]:
+def read_checked(ops: Operations, at: str) -> dict[str, TableRead | None]:
     """Both tables with the counts of their checks. The events are recomputed from the stored series, so the series is read and checked first: a series that
     fails its checks is reported with its own codes and the event table is not read. A series that is not there is named by ``table_problems`` beside the event
     table if that is missing too: the event table is then only looked for, without its facts."""
@@ -167,8 +167,8 @@ def build_inner(ops: Operations, head: str) -> Outcome:
         at = on
     if ops.read_input(at) != source:
         raise SilverSignalsError(f"source_changed: {FLAG}")
-    reads = read_checked(ops, at, source)
-    problems = table_problems(source, reads)
+    reads = read_checked(ops, at)
+    problems = table_problems(reads)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
         problems.append(f"readback_differs: {unit(differing, 'table')}")
@@ -183,7 +183,7 @@ def build_inner(ops: Operations, head: str) -> Outcome:
         source,
         {table: read for table, read in reads.items() if read is not None},
         events_digest(reads[EVENTS]),
-        passed_flags(source, reads, planned),
+        passed_flags(reads, planned),
     )
 
 
@@ -203,13 +203,13 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         problems = input_problems(source.facts)
         if problems:
             raise SilverSignalsError(*problems)
-        reads = read_checked(ops, head, source)
-        problems = table_problems(source, reads)
+        reads = read_checked(ops, head)
+        problems = table_problems(reads)
         if problems:
             raise SilverSignalsError(*problems)
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome(head, None, head, source, tables, events_digest(reads[EVENTS]), passed_flags(source, reads, None))
+        return Outcome(head, None, head, source, tables, events_digest(reads[EVENTS]), passed_flags(reads, None))
     finally:
         ops.release()
