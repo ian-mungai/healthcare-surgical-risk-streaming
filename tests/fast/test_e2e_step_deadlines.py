@@ -309,6 +309,32 @@ class TeardownRunnerTest(RunnerCase):
                     fixture.remove_unused_bucket()
                 self.assertEqual(reported_gone, fixture.settled)
 
+    def unused_bucket_fixture(self, **binding: Any) -> Any:
+        path = self.root / "runs" / "binding_teardown_local_abcd.json"
+        path.write_text(json.dumps({"bucket": "example-bucket-test-1", "run_id": "r", "state_keys": ["state", "state.tflock"], **binding}))
+        self.aws.call.side_effect = lambda *arguments, **options: (
+            {"Versions": [{"Key": "state.tflock", "VersionId": "1"}]} if arguments[1] == "list-object-versions" else {}
+        )
+        fixture = self.module.Fixture("local", "local", run_record.Record(feature="f", slug="s", rerun="r"), [], dict(CONFIGURATION))
+        self.addCleanup(shutil.rmtree, fixture.scratch, ignore_errors=True)
+        return fixture
+
+    def test_a_binding_that_says_this_run_created_no_bucket_removes_no_object_and_no_bucket_and_settles_the_fixture(self) -> None:
+        fixture = self.unused_bucket_fixture(bucket_creation="none")
+        fixture.remove_unused_bucket()
+        self.assertTrue(fixture.settled)
+        self.assertEqual([], [call for call in self.aws.call.mock_calls if "delete" in str(call)])
+
+    def test_the_removal_of_an_unused_bucket_reads_the_binding_once(self) -> None:
+        fixture = self.unused_bucket_fixture(bucket_creation="created")
+        with (
+            mock.patch.object(self.module, "GONE_DEADLINE_SECONDS", 0.2),
+            mock.patch.object(self.module.time, "sleep", lambda seconds: None),
+            mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as reads,
+        ):
+            fixture.remove_unused_bucket()
+        self.assertEqual(1, reads.call_count)
+
     def test_a_timeout_of_the_live_run_s_own_case_saves_a_failure_record_and_removes_no_binding(self) -> None:
         live = self.root / "runs" / "run_binding.json"
         live.write_text("{}")

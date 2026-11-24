@@ -31,6 +31,7 @@ class StopRun(Exception):
 
 CREATE_STEP = "scripts.infra.state_bootstrap create"
 CREATE_ATTEMPTED = "attempted"
+CREATE_NONE = "none"
 MARGIN_SECONDS = 10 * AWS_TIMEOUT_SECONDS
 # The S3 requests of the teardown's data and state cleanup, each of which can take ``AWS_TIMEOUT_SECONDS`` (a drift check in the fast tests counts them again
 # in ``scripts/infra/teardown.py``): the requests that do not depend on the bucket's contents (the listings, the lock, the owner checks, the bucket's
@@ -88,21 +89,21 @@ def timed_command(step: str, program: str, args: Sequence[str], **options: Any) 
 
 
 def read_binding(path: Path) -> dict[str, Any] | None:
-    """The run binding that a runner's command wrote at ``path``: None when there is no file, and an empty dict when the file cannot be read as a JSON object,
-    so a corrupt binding is still told apart from an absent one."""
-    if not path.is_file():
-        return None
+    """The run binding that a runner's command wrote at ``path``: None only when there is no file, and an empty dict when something is there that cannot be
+    read as a JSON object (a corrupt file, a failed read, a folder), so such a binding is never taken for an absent one."""
     try:
         loaded = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
     except OSError, ValueError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
 
-def named_bucket(path: Path) -> str | None:
-    """The bucket that the binding at ``path`` names. None when there is no file: the commands write the binding before they create anything, so a finished
-    command that left no file created no bucket. An empty string when the file exists and names none that can be read: what it names is not known."""
-    binding = read_binding(path)
+def named_bucket(binding: dict[str, Any] | None) -> str | None:
+    """The bucket that a binding, read once with ``read_binding``, names. None when there is no binding: the commands write the binding before they create
+    anything, so a finished command that left no file created no bucket. An empty string when there is a binding that names none that can be read: what it
+    names is not known."""
     if binding is None:
         return None
     bucket = binding.get("bucket")
@@ -114,30 +115,36 @@ def settle_binding(
 ) -> tuple[str, bool]:
     """What a runner records as its cleanup when it closes, and whether its recovery binding at ``binding_path`` can be removed.
 
-    The binding goes only when every resource that it names is confirmed gone: nothing was started, a finished create step left no binding (the commands write
-    the binding before they create anything), or ``remove`` (the runner's removal of the bucket named by the binding, returning its text and whether S3
-    reported the bucket gone) confirmed it. Every other path keeps the binding and says that resources may remain: a create step that timed out, because a
-    child of it may still be creating the bucket, so no removal is tried; a binding whose ``bucket_creation`` is ``attempted``, because the create call was
-    sent and its outcome is not known (it may have timed out and still land), so a later answer that S3 has no such bucket proves nothing and no removal is
-    tried; a binding that cannot be read or names a bucket that is no short-lived test bucket of this project; a removal that could not confirm. No path
-    claims that no bucket was created unless it confirmed that.
+    The binding is read once, so the bucket and how it was created come from one answer: a second read that fails must never hide what the first one showed.
+    The binding goes only when every resource that it names is confirmed gone or was never this run's: nothing was started, a finished create step left no
+    binding (the commands write the binding before they create anything), the binding says that this run created nothing (``bucket_creation`` is ``none``:
+    the create step refused a bucket that already existed, so no bucket and no object is removed, because none is this run's), or ``remove`` (the runner's
+    removal of the bucket named by the binding, returning its text and whether S3 reported the bucket gone) confirmed it. Every other path keeps the binding
+    and says that resources may remain: a create step that timed out, because a child of it may still be creating the bucket, so no removal is tried; a
+    binding whose ``bucket_creation`` is ``attempted``, because the create call was sent and its outcome is not known (it may have timed out and still
+    land), so a later answer that S3 has no such bucket proves nothing and no removal is tried; a binding that cannot be read for any reason or names a
+    bucket that is no short-lived test bucket of this project; a removal that could not confirm. No path claims that no bucket was created unless it
+    confirmed that.
     """
     if not started:
         return "no bucket was created", True
     name = binding_path.name
-    named = named_bucket(binding_path)
+    binding = read_binding(binding_path)
+    named = named_bucket(binding)
     if timed_out is not None and timed_out.step == CREATE_STEP:
         where = f"the binding {name} is kept" if named is not None else "no binding was written"
         return f"the create step timed out and a child of it may still run, so no removal was tried: the test bucket may remain ({where})", False
-    if named is None:
+    if binding is None or named is None:
         return "no bucket was created: the create step finished and wrote no binding", True
-    if (read_binding(binding_path) or {}).get("bucket_creation") == CREATE_ATTEMPTED:
+    if binding.get("bucket_creation") == CREATE_ATTEMPTED:
         return (
             f"the bucket create was attempted and its outcome is not known, so no removal was tried: the test bucket may remain (the binding {name} is kept)",
             False,
         )
     if not named.startswith(f"{project_bucket}-test-"):
         return f"the binding {name} names no short-lived test bucket that can be read: nothing was removed and resources may remain; binding kept", False
+    if binding.get("bucket_creation") == CREATE_NONE:
+        return "no bucket was created by this run: the create step refused a bucket that already existed, so no bucket and no object was removed", True
     text, gone = remove(named)
     return (text, True) if gone else (f"{text}; resources may remain; the binding {name} is kept", False)
 

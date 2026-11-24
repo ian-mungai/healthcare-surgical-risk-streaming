@@ -12,6 +12,10 @@ Failure modes covered here:
 - A bucket create that was attempted and whose own AWS call timed out exits non-zero while the bucket may still land: the runner finds it missing (S3 answers
   404 right then) and removes the binding that is the only name of the bucket.
 - The teardown fixtures' summary says that each fixture removed its own resources while a fixture kept its binding because resources remain.
+- The cleanup reads the binding twice: an I/O error on the second read, after the first read showed that the create was attempted, hides that and lets the
+  runner delete the binding that is the only name of the bucket. The cleanup reads the binding once.
+- A create that refused an existing bucket of the same name (``bucket_creation`` is ``none``) created nothing, yet the runner sent delete requests for the
+  prior fixture's object and bucket. ``none`` means that this run created nothing: no bucket and no object is removed.
 
 The helper is in the tracked ``tests/e2e/run_record.py`` and runs everywhere. The runners of the cloud checks stay untracked; their tests run only where a
 runner is on disk, with the cloud replaced by stand-ins, and are skipped elsewhere.
@@ -31,7 +35,7 @@ from unittest import mock
 from scripts.aws_cli import AwsError
 from scripts.process import TimeoutExpired
 from tests.e2e import run_record
-from tests.e2e.run_record import CREATE_STEP, StepTimedOut, named_bucket, settle_binding, timed_command
+from tests.e2e.run_record import CREATE_STEP, StepTimedOut, named_bucket, read_binding, settle_binding, timed_command
 from tests.fast import test_e2e_step_deadlines as base
 
 CONFIGURATION = base.CONFIGURATION
@@ -58,26 +62,45 @@ def verified_binding() -> dict[str, Any]:
     }
 
 
-class NamedBucketTest(unittest.TestCase):
+class ReadBindingTest(unittest.TestCase):
     def setUp(self) -> None:
-        scratch = tempfile.TemporaryDirectory(prefix="named_")
+        scratch = tempfile.TemporaryDirectory(prefix="read_")
         self.addCleanup(scratch.cleanup)
         self.path = Path(scratch.name) / "binding.json"
 
-    def test_no_file_names_no_bucket_and_that_is_not_the_same_as_a_file_that_names_none(self) -> None:
-        self.assertIsNone(named_bucket(self.path))
-        self.path.write_text("{}")
-        self.assertEqual("", named_bucket(self.path))
-
-    def test_a_file_that_cannot_be_read_names_no_bucket_but_is_still_a_file(self) -> None:
-        for text in ("{not json", "[]", '{"bucket": 7}'):
+    def test_no_file_is_none_and_a_file_that_cannot_be_read_as_a_json_object_is_an_empty_dict(self) -> None:
+        self.assertIsNone(read_binding(self.path))
+        for text in ("{not json", "[]", "7", ""):
             with self.subTest(text=text):
                 self.path.write_text(text)
-                self.assertEqual("", named_bucket(self.path))
+                self.assertEqual({}, read_binding(self.path))
 
-    def test_a_file_names_its_bucket(self) -> None:
+    def test_a_file_that_is_there_but_fails_to_read_is_never_taken_for_an_absent_one(self) -> None:
         self.path.write_text(json.dumps({"bucket": TEST_BUCKET}))
-        self.assertEqual(TEST_BUCKET, named_bucket(self.path))
+        for error in (PermissionError("denied"), OSError("I/O error")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(Path, "read_text", side_effect=error):
+                self.assertEqual({}, read_binding(self.path))
+        self.path.unlink()
+        self.path.mkdir()
+        self.assertEqual({}, read_binding(self.path), "a directory where the binding should be is an unreadable binding")
+
+    def test_a_file_is_read_once(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET}))
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as reads:
+            self.assertEqual({"bucket": TEST_BUCKET}, read_binding(self.path))
+        self.assertEqual(1, reads.call_count)
+
+
+class NamedBucketTest(unittest.TestCase):
+    def test_no_binding_names_no_bucket_and_that_is_not_the_same_as_a_binding_that_names_none(self) -> None:
+        self.assertIsNone(named_bucket(None))
+        self.assertEqual("", named_bucket({}))
+
+    def test_a_binding_that_cannot_be_read_or_names_no_string_names_no_bucket_but_is_still_a_binding(self) -> None:
+        self.assertEqual("", named_bucket({"bucket": 7}))
+
+    def test_a_binding_names_its_bucket(self) -> None:
+        self.assertEqual(TEST_BUCKET, named_bucket({"bucket": TEST_BUCKET}))
 
 
 class SettleBindingTest(unittest.TestCase):
@@ -142,13 +165,74 @@ class SettleBindingTest(unittest.TestCase):
                 self.assertNotIn(NONE_CREATED, line)
         self.remove.assert_not_called()
 
-    def test_a_binding_whose_bucket_create_finished_or_never_ran_goes_through_the_removal(self) -> None:
-        for creation in ("created", "none"):
-            with self.subTest(creation=creation):
-                self.remove.reset_mock()
-                self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": creation}))
-                self.assertEqual(("the bucket was deleted", True), self.settle())
-                self.remove.assert_called_once_with(TEST_BUCKET)
+    def test_a_binding_whose_bucket_create_finished_goes_through_the_removal(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "created"}))
+        self.assertEqual(("the bucket was deleted", True), self.settle())
+        self.remove.assert_called_once_with(TEST_BUCKET)
+
+    def test_a_binding_whose_create_refused_an_existing_bucket_removes_no_bucket_and_no_object_and_goes(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "none"}))
+        for timed_out in (None, self.step_timeout("scripts.ingestion.cli publish")):
+            with self.subTest(timed_out=timed_out):
+                line, settled = self.settle(timed_out=timed_out)
+                self.assertTrue(settled)
+                self.assertTrue(line.startswith(NONE_CREATED), line)
+                self.assertNotIn(MAY_REMAIN, line)
+        self.remove.assert_not_called()
+
+    def test_a_create_that_timed_out_keeps_even_a_binding_that_says_none_because_a_child_may_still_run(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "none"}))
+        line, settled = self.settle(timed_out=self.step_timeout(CREATE_STEP))
+        self.assertFalse(settled)
+        self.assertIn(MAY_REMAIN, line)
+        self.remove.assert_not_called()
+
+    def test_a_binding_that_says_none_and_names_no_test_bucket_is_still_kept(self) -> None:
+        self.path.write_text(json.dumps({"bucket": PROJECT_BUCKET, "bucket_creation": "none"}))
+        line, settled = self.settle()
+        self.assertFalse(settled)
+        self.assertIn(MAY_REMAIN, line)
+        self.remove.assert_not_called()
+
+    def test_the_binding_is_read_once_so_one_answer_gives_the_bucket_and_how_it_was_created(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "created"}))
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as reads:
+            self.settle()
+        self.assertEqual(1, reads.call_count)
+
+    def test_a_binding_that_shows_the_create_was_attempted_is_kept_although_every_later_read_of_it_fails(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "attempted"}))
+        real = Path.read_text
+        reads: list[Path] = []
+
+        def read_text(path: Path, *arguments: Any, **options: Any) -> str:
+            reads.append(path)
+            if len(reads) > 1:
+                raise OSError("I/O error")
+            return real(path, *arguments, **options)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            line, settled = self.settle()
+        self.assertFalse(settled)
+        self.assertIn("attempted", line)
+        self.assertIn(MAY_REMAIN, line)
+        self.remove.assert_not_called()
+
+    def test_a_binding_whose_read_fails_for_any_reason_is_kept_with_the_bucket_that_may_remain_and_nothing_is_removed(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "created"}))
+        for error in (OSError("I/O error"), PermissionError("denied"), UnicodeDecodeError("utf-8", b"", 0, 1, "bad")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(Path, "read_text", side_effect=error):
+                line, settled = self.settle()
+                self.assertFalse(settled)
+                self.assertIn(MAY_REMAIN, line)
+                self.assertNotIn(NONE_CREATED, line)
+                self.assertIn(self.path.name, line)
+        self.path.unlink()
+        self.path.mkdir()
+        line, settled = self.settle()
+        self.assertFalse(settled)
+        self.assertIn(MAY_REMAIN, line)
+        self.remove.assert_not_called()
 
     def test_the_binding_of_a_test_bucket_goes_only_when_the_removal_confirmed_the_bucket_gone(self) -> None:
         self.path.write_text(json.dumps({"bucket": TEST_BUCKET}))
@@ -252,7 +336,8 @@ class EnvironmentRemovalTest(RemovalCase):
 class BindingCase(base.RunnerCase):
     """A runner run whose create step answers as the case says. ``create`` is one of ``timeout`` (the binding names the bucket and the step timed out),
     ``inner_timeout`` (the step itself finished with exit 1 after its own create-bucket call timed out, so the binding says the create was attempted),
-    ``verified`` (the binding is whole and the step succeeded), ``project`` (the binding names the project's bucket), ``none`` (no binding is written and the
+    ``refused`` (the step refused a bucket of the same name that already exists: exit 1 and a binding that says this run created none), ``verified`` (the
+    binding is whole and the step succeeded), ``project`` (the binding names the project's bucket), ``none`` (no binding is written and the
     step failed), ``unreadable`` (the binding is not JSON and the step failed). Every other command times out."""
 
     create = "verified"
@@ -269,6 +354,9 @@ class BindingCase(base.RunnerCase):
             elif self.create == "inner_timeout":
                 path.write_text(json.dumps(verified_binding() | {"status": "planned", "bucket_creation": "attempted"}))
                 return done(1, "the create-bucket call timed out")
+            elif self.create == "refused":
+                path.write_text(json.dumps(verified_binding() | {"status": "planned", "bucket_creation": "none"}))
+                return done(1, "the bucket already exists and this run did not create it")
             elif self.create == "project":
                 path.write_text(json.dumps(verified_binding() | {"bucket": PROJECT_BUCKET}))
             elif self.create == "keyless":
@@ -312,6 +400,41 @@ class BindingCase(base.RunnerCase):
         self.create = "inner_timeout"
         return self.patched_run()
 
+    def prior_object_key(self) -> str:
+        """A key under which the runner's own removal would delete an object that it finds in the bucket."""
+        return "landing/prior_fixture/object"
+
+    def assert_attempted_create_kept_when_a_late_read_fails(self) -> None:
+        """The runner reads the binding once after its create step. Every read after the second fails, so a cleanup that reads the binding twice loses the
+        word ``attempted`` and, as S3 then answers that the bucket does not exist, removes the binding."""
+        self.aws.call.side_effect = lambda *arguments, **options: None
+        real = Path.read_text
+        reads: list[Path] = []
+
+        def read_text(path: Path, *arguments: Any, **options: Any) -> str:
+            if path.name.startswith("binding_"):
+                reads.append(path)
+                if len(reads) > 2:
+                    raise OSError("I/O error")
+            return real(path, *arguments, **options)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertEqual(1, self.run_attempt())
+        self.assert_kept_with_resources_that_may_remain()
+        self.assertIn("attempted", self.cleanup_text())
+        self.assertEqual([], [call for call in self.aws.call.mock_calls if "delete" in str(call)])
+
+    def assert_refused_create_removes_nothing(self) -> None:
+        """The bucket named by the binding exists and holds an object of the prior fixture, which this run's own removal would delete."""
+        listing = {"Versions": [{"Key": self.prior_object_key(), "VersionId": "1"}]}
+        self.aws.call.side_effect = lambda *arguments, **options: listing if arguments[1] == "list-object-versions" else {}
+        self.create = "refused"
+        self.assertEqual(1, self.patched_run())
+        self.assertEqual([], [call for call in self.aws.call.mock_calls if "delete" in str(call)], "no object and no bucket is removed")
+        self.assertEqual([], self.bindings(), "the run created nothing, so its binding goes")
+        self.assertTrue(self.cleanup_text().startswith(NONE_CREATED), self.cleanup_text())
+        self.assertNotIn(MAY_REMAIN, self.cleanup_text())
+
     def assert_nothing_created(self) -> None:
         self.assertEqual([], self.bindings())
         self.assertTrue(self.cleanup_text().startswith(NONE_CREATED), self.cleanup_text())
@@ -335,6 +458,12 @@ class CleanupBindingCase(BindingCase):
 
     def test_a_create_whose_own_call_timed_out_keeps_the_binding_although_s3_then_reports_no_such_bucket(self) -> None:
         self.assert_attempted_create_kept()
+
+    def test_a_create_whose_own_call_timed_out_keeps_the_binding_although_s3_then_reports_no_such_bucket_and_a_later_read_of_the_binding_fails(self) -> None:
+        self.assert_attempted_create_kept_when_a_late_read_fails()
+
+    def test_a_create_that_refused_a_bucket_that_already_existed_removes_no_object_and_no_bucket_and_drops_its_binding(self) -> None:
+        self.assert_refused_create_removes_nothing()
 
     def test_a_binding_that_names_the_project_s_bucket_is_kept_and_nothing_is_removed(self) -> None:
         code, cleanup = self.run_with("project")
@@ -436,6 +565,15 @@ class EnvironmentBindingTest(BindingCase):
 
     def test_a_create_whose_own_call_timed_out_keeps_the_binding_although_s3_then_reports_no_such_bucket(self) -> None:
         self.assert_attempted_create_kept()
+
+    def test_a_create_whose_own_call_timed_out_keeps_the_binding_although_s3_then_reports_no_such_bucket_and_a_later_read_of_the_binding_fails(self) -> None:
+        self.assert_attempted_create_kept_when_a_late_read_fails()
+
+    def prior_object_key(self) -> str:
+        return str(verified_binding()["state_keys"][0])
+
+    def test_a_create_that_refused_a_bucket_that_already_existed_removes_no_object_and_no_bucket_and_drops_its_binding(self) -> None:
+        self.assert_refused_create_removes_nothing()
 
     def test_a_binding_that_names_the_project_s_bucket_is_kept_and_nothing_is_removed(self) -> None:
         code, cleanup = self.run_with("project")
