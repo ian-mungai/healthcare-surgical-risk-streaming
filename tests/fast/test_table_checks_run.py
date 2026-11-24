@@ -41,6 +41,12 @@ PIN = rules.TrackPin(7, "a" * 64)
 BRANCH = "load_run_one"
 ROOT = Path(__file__).resolve().parents[2]
 MARKER = "MARKER_9d2"
+COUNT_MARKER = "4719238"
+
+
+def kept_output(code: str, exit_code: int, lines: int) -> str:
+    """The whole of ``job_output.txt``: a fixed refusal code and the exit code and the number of result lines, which the controller itself validated."""
+    return f"refusal: {code}\nexit code: {exit_code}\nresult lines: {lines}\n"
 
 
 def setUpModule() -> None:
@@ -49,6 +55,57 @@ def setUpModule() -> None:
 
 def fake_hash(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def legacy_changes() -> dict[str, Callable[[dict[str, Any]], None]]:
+    """The ways that a saved receipt's ``checked`` is not a result of the current form of this load: a sealed count, an earlier form, another load."""
+    counted = int(COUNT_MARKER)
+
+    def row_counts(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["tables"][0].update(rows_source=counted, rows_table=counted)
+
+    def counted_code(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["tables"][1]["checks"][3]["detail"] = f"row_count;source={counted};table={counted}"
+
+    def rows_differ(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["tables"][1]["checks"][4]["detail"] = f"rows_differ;only_file={counted};only_table=0"
+
+    def counted_flag(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["tables"][0]["checks"][3]["detail"] = f"table_compared;equal={counted}"
+
+    def format_four(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["format"] = "table_checks_4"
+        row_counts(receipt)
+        counted_code(receipt)
+
+    def no_verdict(receipt: dict[str, Any]) -> None:
+        del receipt["checked"]["passed"]
+        row_counts(receipt)
+
+    def another_branch_hash(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["branch_hash"] = "c" * 64
+
+    def another_branch(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["branch"] = "another_branch"
+
+    def another_snapshot(receipt: dict[str, Any]) -> None:
+        receipt["checked"]["tables"][2]["snapshot_id"] += 1
+
+    def not_a_document(receipt: dict[str, Any]) -> None:
+        receipt["checked"] = {"run_id": receipt["checked"]["run_id"], "passed": True, "rows": counted}
+
+    return {
+        "row counts of a sealed table": row_counts,
+        "a counted code": counted_code,
+        "the rows_differ code": rows_differ,
+        "a counted flag": counted_flag,
+        "the earlier format": format_four,
+        "no verdict": no_verdict,
+        "not a result": not_a_document,
+        "another branch hash": another_branch_hash,
+        "another branch": another_branch,
+        "another snapshot": another_snapshot,
+    }
 
 
 class FakeNessie(NessieClient):
@@ -901,6 +958,83 @@ class MergeOutcomeTest(unittest.TestCase):
         self.assertTrue(outcome.merged)
         self.assertIsNone(outcome.document["checked"])
 
+    def write_receipt(self, case: Case, receipt: dict[str, Any]) -> None:
+        (case.run_folder / run.RESULT_FILE).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+
+    def test_a_completed_receipt_with_a_saved_result_of_the_current_form_is_returned_as_it_is(self) -> None:
+        case, runner = Case(self), Runner()
+        case.go(runner)
+        before = case.saved()
+        again = case.go(runner)
+        self.assertEqual(1, runner.calls)
+        self.assertEqual(before["checked"], again.document["checked"])
+        self.assertEqual(before, case.saved())
+
+    def test_a_completed_receipt_with_a_saved_result_of_an_earlier_form_is_returned_without_that_result(self) -> None:
+        for label, change in legacy_changes().items():
+            with self.subTest(label):
+                case, runner = Case(self), Runner()
+                case.go(runner)
+                receipt = case.saved()
+                change(receipt)
+                self.write_receipt(case, receipt)
+                again = case.go(runner)
+                self.assertEqual((1, True, True), (runner.calls, again.passed, again.merged))
+                self.assertIsNone(again.document["checked"])
+                self.assertIn("removed", " ".join(again.document["notes"]))
+                self.assertEqual(again.document, case.saved())
+                for text in (json.dumps(again.document), (case.run_folder / run.RESULT_FILE).read_text()):
+                    self.assertNotIn(COUNT_MARKER, text)
+                self.assertEqual(1, len(case.nessie.merge_requests))
+
+    def test_a_completed_receipt_that_was_scrubbed_is_returned_again_the_same_way(self) -> None:
+        case, runner = Case(self), Runner()
+        case.go(runner)
+        receipt = case.saved()
+        legacy_changes()["the earlier format"](receipt)
+        self.write_receipt(case, receipt)
+        first = case.go(runner)
+        second = case.go(runner)
+        self.assertEqual(first.document, second.document)
+        self.assertEqual(1, " ".join(second.document["notes"]).count("removed"))
+
+    def test_a_receipt_rebuilt_after_an_interrupted_merge_keeps_a_saved_result_of_the_current_form(self) -> None:
+        case, runner = Case(self), Runner()
+        self.open_outcome(case, runner)
+        before = case.saved()["checked"]
+        case.nessie.apply_pending()
+        outcome = case.go(runner)
+        self.assertEqual(before, outcome.document["checked"])
+        self.assertNotIn("rebuilt from the log", " ".join(outcome.document["notes"]))
+
+    def test_a_receipt_rebuilt_after_an_interrupted_merge_holds_no_saved_result_of_an_earlier_form(self) -> None:
+        for label, change in legacy_changes().items():
+            with self.subTest(label):
+                case, runner = Case(self), Runner()
+                self.open_outcome(case, runner)
+                receipt = case.saved()
+                change(receipt)
+                self.assertEqual(case.pending()["run_id"], receipt["checked"].get("run_id"))
+                self.write_receipt(case, receipt)
+                case.nessie.apply_pending()
+                outcome = case.go(runner)
+                self.assertTrue(outcome.merged)
+                self.assertIsNone(outcome.document["checked"])
+                self.assertIn("rebuilt from the log", " ".join(outcome.document["notes"]))
+                for text in (json.dumps(outcome.document), (case.run_folder / run.RESULT_FILE).read_text()):
+                    self.assertNotIn(COUNT_MARKER, text)
+                self.assertEqual(1, runner.calls)
+                self.assertFalse(case.pending_path.exists())
+
+    def test_a_saved_result_with_another_run_id_than_the_pending_record_is_not_kept_even_in_the_current_form(self) -> None:
+        case, runner = Case(self), Runner()
+        self.open_outcome(case, runner)
+        receipt = case.saved()
+        receipt["checked"]["run_id"] = "b" * 32
+        self.write_receipt(case, receipt)
+        case.nessie.apply_pending()
+        self.assertIsNone(case.go(runner).document["checked"])
+
 
 class OtherLoadTest(unittest.TestCase):
     """A receipt is rebuilt from the log only when the merge commit names this run's checked branch and source hash."""
@@ -1113,7 +1247,7 @@ class SingleResultTest(unittest.TestCase):
                 with self.assertRaisesRegex(run.TableChecksError, "more than one"):
                     case.go(Runner(two, exit_code=0))
                 self.assertTrue(case.main_untouched())
-                self.assertIn("RESULT", (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+                self.assertEqual(kept_output("several_results", 0, 2), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
 
     @staticmethod
     def with_detail(detail: str) -> Callable[[rules.Plan], str]:
@@ -1338,27 +1472,73 @@ class FailedCheckTest(unittest.TestCase):
 
 
 class FailureOutputTest(unittest.TestCase):
-    """The tables hold per-patient rows: no value of the data reaches a result, a message or an exception. The job's raw output goes to a private file."""
+    """The tables hold per-patient rows and the clinical tables seal their counts: nothing of the job's output reaches a result, a message, an exception or a
+    file. A refused or failed run keeps a fixed refusal code and the numbers that the controller validated itself, and never the job's text."""
 
-    def test_a_job_that_prints_no_result_gives_a_fixed_message_and_its_output_goes_to_a_file_in_the_run_folder(self) -> None:
+    def test_a_job_that_prints_no_result_gives_a_fixed_message_and_keeps_a_fixed_code_and_none_of_its_output(self) -> None:
         case = Case(self)
-        runner = Runner(lambda plan: f"stdout {MARKER}\n", exit_code=1, error_text=f"Malformed record [{MARKER}]")
+        runner = Runner(lambda plan: f"stdout {MARKER} {COUNT_MARKER}\n", exit_code=1, error_text=f"Malformed record [{MARKER}] rows={COUNT_MARKER}")
         with self.assertRaises(run.TableChecksError) as raised:
             case.go(runner)
         self.assertNotIn(MARKER, str(raised.exception))
         self.assertRegex(str(raised.exception), "exit code 1")
         kept = case.run_folder / run.JOB_OUTPUT_FILE
-        self.assertIn(MARKER, kept.read_text())
+        self.assertEqual(kept_output("no_result", 1, 0), kept.read_text())
         self.assertEqual(0o600, kept.stat().st_mode & 0o777)
         self.assertTrue(case.main_untouched())
 
-    def test_a_result_that_is_refused_keeps_the_raw_output_in_the_file_too(self) -> None:
+    def test_a_result_that_is_refused_keeps_a_fixed_code_and_none_of_the_output(self) -> None:
         case = Case(self)
-        bad = Runner(lambda plan: result_line(plan, change=lambda document: document["tables"][0]["checks"][0].update(detail=f"value {MARKER}")), exit_code=0)
+        bad = Runner(
+            lambda plan: result_line(plan, change=lambda document: document["tables"][0]["checks"][0].update(detail=f"value {MARKER}")),
+            exit_code=0,
+            error_text=f"stderr {MARKER} row_count;source={COUNT_MARKER};table={COUNT_MARKER}",
+        )
         with self.assertRaises(run.TableChecksError) as raised:
             case.go(bad)
         self.assertNotIn(MARKER, str(raised.exception))
-        self.assertIn(MARKER, (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+        self.assertEqual(kept_output("result_refused", 0, 1), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    def test_a_result_with_a_sealed_count_is_refused_and_the_count_reaches_no_file(self) -> None:
+        case = Case(self)
+        counted = Runner(
+            lambda plan: result_line(plan, change=lambda document: document["tables"][0].update(rows_source=int(COUNT_MARKER), rows_table=int(COUNT_MARKER))),
+            exit_code=0,
+            error_text=f"rows {COUNT_MARKER}",
+        )
+        with self.assertRaises(run.TableChecksError):
+            case.go(counted)
+        for path in case.run_folder.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(COUNT_MARKER, path.read_text(), path)
+        self.assertEqual(kept_output("result_refused", 0, 1), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    def test_an_exit_code_that_disagrees_with_the_result_keeps_a_fixed_code(self) -> None:
+        for exit_code in (1, 2, -9):
+            with self.subTest(exit_code=exit_code):
+                case = Case(self)
+                with self.assertRaises(run.TableChecksError):
+                    case.go(Runner(exit_code=exit_code, error_text=f"stderr {MARKER}"))
+                self.assertEqual(kept_output("exit_code_disagrees", exit_code, 1), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    def test_a_failed_check_keeps_a_fixed_code_and_none_of_the_output(self) -> None:
+        case = Case(self)
+        outcome = case.go(Runner(lambda plan: result_line(plan, passed=False) + f"log {MARKER} {COUNT_MARKER}\n", exit_code=1, error_text=f"warning {MARKER}"))
+        self.assertFalse(outcome.passed)
+        self.assertEqual(kept_output("checks_failed", 1, 1), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
+
+    def test_a_passing_run_keeps_no_output_file(self) -> None:
+        case = Case(self)
+        case.go(Runner(error_text=f"warning {MARKER}"))
+        self.assertFalse((case.run_folder / run.JOB_OUTPUT_FILE).exists())
+
+    def test_the_kept_output_is_replaced_by_the_next_refusal_and_never_appended_to(self) -> None:
+        case = Case(self)
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner(lambda plan: "", exit_code=3))
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner(lambda plan: "", exit_code=4))
+        self.assertEqual(kept_output("no_result", 4, 0), (case.run_folder / run.JOB_OUTPUT_FILE).read_text())
 
     def test_no_marker_reaches_the_saved_result_of_a_failed_run(self) -> None:
         case = Case(self)
