@@ -29,6 +29,10 @@ SESSION_SECONDS = 3600
 REQUEST_TIMEOUT_SECONDS = 20
 EXPIRATION_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 CREDENTIAL_FIELDS = ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")
+# The form of a credential value that goes into a header or a credential file: the characters of a bearer token (RFC 6750, b64token) and nothing else. A
+# control character such as a line break makes the HTTP library's header error carry the value's text. The expiration is a time of its own form.
+VALUE_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+EXPIRATION_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 
 class CredentialError(RuntimeError):
@@ -53,15 +57,25 @@ def signing_key(secret: str, date: str, region: str, service: str) -> bytes:
     return key
 
 
+def header_value(credentials: dict[str, str], field: str) -> str:
+    """The credential ``field`` of the host role when it is text of the closed header-safe form, or ``CredentialError`` that never holds the value."""
+    value = credentials.get(field)
+    if not isinstance(value, str) or VALUE_FORM.fullmatch(value) is None:
+        raise CredentialError(f"the host role's {field} is not a valid credential value")
+    return value
+
+
 def signed_headers(credentials: dict[str, str], region: str, body: str, now: datetime) -> dict[str, str]:
     """The headers of a Signature Version 4 POST to the regional STS endpoint."""
+    token = header_value(credentials, "Token")
+    access_key = header_value(credentials, "AccessKeyId")
     host = f"sts.{region}.amazonaws.com"
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=utf-8",
         "host": host,
         "x-amz-date": stamp,
-        "x-amz-security-token": credentials["Token"],
+        "x-amz-security-token": token,
     }
     names = ";".join(headers)
     canonical = "\n".join(["POST", "/", "", *[f"{name}:{value}" for name, value in headers.items()], "", names, hashlib.sha256(body.encode()).hexdigest()])
@@ -72,8 +86,8 @@ def signed_headers(credentials: dict[str, str], region: str, body: str, now: dat
         "Content-Type": headers["content-type"],
         "Host": host,
         "X-Amz-Date": stamp,
-        "X-Amz-Security-Token": credentials["Token"],
-        "Authorization": f"AWS4-HMAC-SHA256 Credential={credentials['AccessKeyId']}/{scope}, SignedHeaders={names}, Signature={signature}",
+        "X-Amz-Security-Token": token,
+        "Authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={names}, Signature={signature}",
     }
 
 
@@ -82,7 +96,13 @@ def credential_document(body: str) -> dict[str, Any]:
     found = {field: re.search(rf"<{field}>([^<]+)</{field}>", body) for field in CREDENTIAL_FIELDS}
     if any(match is None for match in found.values()):
         raise CredentialError("the STS response holds no credentials")
-    return {"Version": 1} | {field: match.group(1) for field, match in found.items() if match is not None}
+    document: dict[str, Any] = {"Version": 1}
+    for field, match in found.items():
+        form = EXPIRATION_FORM if field == "Expiration" else VALUE_FORM
+        if match is None or form.fullmatch(match.group(1)) is None:
+            raise CredentialError(f"the STS response's {field} is not a valid credential value")
+        document[field] = match.group(1)
+    return document
 
 
 def metadata(method: str, path: str, headers: dict[str, str]) -> str:
@@ -99,7 +119,10 @@ def metadata(method: str, path: str, headers: dict[str, str]) -> str:
 
 
 def host_credentials() -> dict[str, str]:
-    token = {"X-aws-ec2-metadata-token": metadata("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"})}
+    session = metadata("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+    if VALUE_FORM.fullmatch(session) is None:
+        raise CredentialError("instance metadata answered a session token that is not a valid token")
+    token = {"X-aws-ec2-metadata-token": session}
     role = metadata("GET", "/latest/meta-data/iam/security-credentials/", token).strip()
     credentials: dict[str, str] = json.loads(metadata("GET", f"/latest/meta-data/iam/security-credentials/{role}", token))
     return credentials

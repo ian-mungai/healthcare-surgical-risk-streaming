@@ -58,6 +58,9 @@ DEFAULT_TOKEN_FILE = Path("/run/secrets/k3s_token")
 DEFAULT_CA_FILE = Path("/run/secrets/k3s_ca")
 TLS_NAME = "kubernetes"
 NAME = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+# The form of a bearer token (RFC 6750, b64token), as bytes so that no decoding step can fail with the file's content. A service account token is a JSON Web
+# Token, which fits. A control character such as a line break makes the HTTP library's header error carry the token's text.
+TOKEN_FORM = re.compile(rb"[A-Za-z0-9\-._~+/]+=*")
 API_ADDRESS = re.compile(r"https://[A-Za-z0-9._-]+(:[0-9]{1,5})?")
 REQUEST_SECONDS = 30
 POLL_SECONDS = 3
@@ -120,12 +123,14 @@ class HttpsTransport:
 
     def authorization(self) -> str:
         try:
-            token = self.config.token_file.read_text().strip()
+            token = self.config.token_file.read_bytes().strip()
         except OSError as error:
             raise GroupError(f"cannot read the token file {self.config.token_file.name}: {type(error).__name__}") from error
         if not token:
             raise GroupError(f"the token file {self.config.token_file.name} is empty")
-        return f"Bearer {token}"
+        if TOKEN_FORM.fullmatch(token) is None:
+            raise GroupError(f"the token file {self.config.token_file.name} does not hold a valid token")
+        return f"Bearer {token.decode('ascii')}"
 
     def context(self) -> ssl.SSLContext:
         try:

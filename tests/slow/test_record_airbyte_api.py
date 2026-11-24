@@ -26,6 +26,7 @@ from scripts.ingestion import airbyte_api
 from scripts.ingestion import record_definitions as definitions
 from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, JOB_STATUSES, TERMINAL_STATUSES, AirbyteError, HttpAirbyteApi, check_api_origin, main
 from scripts.ingestion.record_definitions import DESTINATION, SOURCE_FILE, SOURCE_S3, TRACK_LIST, Environment
+from tests.fast.header_secret_support import everything_said_about, unsafe_values
 
 RUN = "run_20261122_ab12cd34"
 ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://nessie.example:19120/api/v2")
@@ -347,6 +348,28 @@ class TokenTest(unittest.TestCase):
         stand_in.failures["GET jobs"] = (401, b"{}")
         with self.assertRaises(AirbyteError):
             api.running_jobs("connection1")
+
+    def test_a_token_a_header_cannot_hold_is_refused_before_it_is_used_with_the_fixed_message_and_no_error_holds_it(self) -> None:
+        for name, token in unsafe_values(MARKER).items():
+            with self.subTest(character=name):
+                api, stand_in = prepared()
+                stand_in.mutations["POST applications/token"] = lambda answer, token=token: answer.__setitem__("access_token", token)
+                with self.assertRaises(AirbyteError) as raised:
+                    api.running_jobs("connection1")
+                self.assertEqual("POST applications/token gave a token that is not a valid token", str(raised.exception))
+                self.assertNotIn(MARKER, everything_said_about(raised.exception))
+                self.assertEqual(["POST applications/token"], stand_in.log)
+                self.assertIsNone(api.token)
+
+    def test_a_token_of_the_header_safe_form_is_sent_as_it_is(self) -> None:
+        api, stand_in = prepared()
+        stand_in.mutations["POST applications/token"] = lambda answer: answer.__setitem__("access_token", "token1")
+        api.running_jobs("connection1")
+        self.assertEqual("token1", api.token)
+        for token in ("eyJhbGciOiJSUzI1NiJ9.e30.c2ln-_x~y+z/w==", "a"):
+            stand_in.mutations["POST applications/token"] = lambda answer, token=token: answer.__setitem__("access_token", token)
+            api.renew_token(1.0)
+            self.assertEqual(token, api.token)
 
 
 class FindConnectionsTest(unittest.TestCase):
