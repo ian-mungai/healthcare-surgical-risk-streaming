@@ -14,7 +14,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from scripts.stack.nessie import NessieError
+from scripts.stack.nessie import CONFLICT_TEXT, NessieConflict, NessieError
 from spark.bronze.publication import PublicationError
 from spark.bronze.quality import QualityError
 from spark.bronze_clinical_lab_run import finish
@@ -53,6 +53,14 @@ class DecodeMessageTest(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 code, _, err = run_main(bronze_decode, DECODE, raises=error)
                 self.assertEqual((1, f"bronze_decode: {type(error).__name__}\n"), (code, err))
+
+    def test_a_nessie_conflict_shows_a_fixed_line_and_no_word_of_nessies_error_code(self) -> None:
+        """Join round 1, finding 4: the error code is a value of Nessie's reply and is not checked, so no job prints it."""
+        conflict = NessieConflict(f"POST /trees was refused: {MARKER}", status=409, error_code=f"{MARKER}_code")
+        for module, argv in ((bronze_decode, DECODE), (bronze_clinical_lab, CLINICAL)):
+            with self.subTest(job=module.JOB):
+                code, out, err = run_main(module, argv, raises=conflict)
+                self.assertEqual((1, "", f"{module.JOB}: {CONFLICT_TEXT}\n"), (code, out, err))
 
     def test_a_missing_package_is_a_fixed_line_that_names_no_package(self) -> None:
         code, _, err = run_main(bronze_decode, DECODE, raises=ImportError(MARKER, name=MARKER))

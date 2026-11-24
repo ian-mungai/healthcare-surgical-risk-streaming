@@ -55,18 +55,20 @@ COPY features/kidney_label.py /opt/jobs/features/kidney_label.py
 COPY features/registry.py /opt/jobs/features/registry.py
 COPY features/model.py /opt/jobs/features/model.py
 COPY features/stats.py /opt/jobs/features/stats.py
-# The Bronze decoder imports the replay's decoder and stores and the ingestion gate, and the gate reads the tracked release pin through ROOT.
+# The Bronze decoder imports the replay's decoder, stores and run record (for the names of its state files) and the ingestion gate, and the gate reads the tracked release pin through ROOT.
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py
 COPY replay/events/errors.py /opt/jobs/replay/events/errors.py
 COPY replay/events/identity.py /opt/jobs/replay/events/identity.py
 COPY replay/events/recording.py /opt/jobs/replay/events/recording.py
+COPY replay/events/run.py /opt/jobs/replay/events/run.py
 COPY replay/events/schedule.py /opt/jobs/replay/events/schedule.py
 COPY replay/events/stream.py /opt/jobs/replay/events/stream.py
 COPY replay/events/waveform.py /opt/jobs/replay/events/waveform.py
 COPY replay/service/__init__.py /opt/jobs/replay/service/__init__.py
 COPY replay/service/decode.py /opt/jobs/replay/service/decode.py
 COPY replay/service/folder_store.py /opt/jobs/replay/service/folder_store.py
+COPY replay/service/run_record.py /opt/jobs/replay/service/run_record.py
 COPY replay/service/s3_store.py /opt/jobs/replay/service/s3_store.py
 COPY scripts/process.py /opt/jobs/scripts/process.py
 COPY scripts/project_config.py /opt/jobs/scripts/project_config.py

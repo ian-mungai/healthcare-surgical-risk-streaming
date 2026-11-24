@@ -16,7 +16,7 @@ from unittest import mock
 
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, describe_error, render
 from scripts.process import run_command
-from scripts.stack.nessie import NessieError
+from scripts.stack.nessie import CONFLICT_TEXT, NessieConflict, NessieError
 from spark.jobs import catalog_proof
 from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS
 
@@ -126,6 +126,19 @@ class DescribeErrorTests(unittest.TestCase):
             code = catalog_proof.main(["--branch", "argument_marker", "--rows", "1"])
         self.assertEqual(1, code)
         self.assertEqual(f"{catalog_proof.JOB}: cannot work with Nessie: NessieError\n", err.getvalue())
+
+    def test_the_catalog_proof_job_shows_a_fixed_line_for_a_conflict_and_no_word_of_the_error_code(self) -> None:
+        conflict = NessieConflict("POST /trees was refused: reply_marker", status=409, error_code="code_marker")
+        with (
+            mock.patch.dict(os.environ, {"NESSIE_URI": "http://nessie.invalid:19120/api/v2"}),
+            mock.patch.object(catalog_proof, "start_deadline"),
+            mock.patch.object(catalog_proof, "NessieClient") as client,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            client.return_value.config.side_effect = conflict
+            code = catalog_proof.main(["--branch", "argument_marker", "--rows", "1"])
+        self.assertEqual(1, code)
+        self.assertEqual(f"{catalog_proof.JOB}: {CONFLICT_TEXT}\n", err.getvalue())
 
     def test_the_scan_finds_each_form_that_it_is_written_for(self) -> None:
         shown = "import sys\n\n\ndef main():\n    try:\n        pass\n    except ValueError as error:\n        sys.stderr.write(f'{error}')\n"

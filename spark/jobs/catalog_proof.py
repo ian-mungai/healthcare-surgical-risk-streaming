@@ -22,7 +22,7 @@ from typing import Any
 
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
+from scripts.stack.nessie import CONFLICT_TEXT, NessieClient, NessieConflict, NessieError
 from spark.catalog import required_environment
 from spark.session import build_session, start_deadline
 from spark.settings import BYTES_PER_MIB, SettingsError, read_memory_limit_mib
@@ -89,8 +89,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "uid": os.getuid(),
             **written,
         }
-    except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
+    except NessieConflict:
+        sys.stderr.write(f"{JOB}: {CONFLICT_TEXT}\n")
         return 1
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")

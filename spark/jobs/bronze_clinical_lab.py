@@ -41,7 +41,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from scripts.ingestion.notice import describe_error
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
+from scripts.stack.nessie import CONFLICT_TEXT, NessieClient, NessieConflict, NessieError
 from spark.bronze.publication import NessiePublisher, PublicationError
 from spark.bronze.quality import column_checks
 from spark.bronze_clinical_lab import BronzeRulesError
@@ -100,8 +100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PublicationError as error:
         sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 1
-    except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
+    except NessieConflict:
+        sys.stderr.write(f"{JOB}: {CONFLICT_TEXT}\n")
         return 1
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")

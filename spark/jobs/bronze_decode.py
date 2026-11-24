@@ -54,12 +54,12 @@ from typing import Any
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError, ManifestRef
-from scripts.ingestion.notice import describe_error
+from scripts.ingestion.notice import Code, Notice, Subject, describe_error
 from scripts.ingestion.store import StoreError
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
+from scripts.stack.nessie import CONFLICT_TEXT, NessieClient, NessieConflict, NessieError
 from spark.bronze.checks import Verdict
 from spark.bronze.commands import branch_report, command_problem, exit_code, failed_text
-from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
+from spark.bronze.inputs import InputError, StoreSpec, parse_cases, verify_inputs
 from spark.bronze.passes import MaxParameter, SumByName, partition_problems, partition_rows
 from spark.bronze.plan import GROUPED, MODES
 from spark.bronze.publication import NessiePublisher, PublicationError
@@ -142,16 +142,20 @@ def table_facts(session: Any, table: TableSpec) -> dict[str, Any]:
 
 def decode(arguments: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
-    reference = ManifestRef.from_json(arguments.manifest_reference.read_text())
+    try:
+        reference = ManifestRef.from_json(arguments.manifest_reference.read_text())
+    except OSError, UnicodeDecodeError:
+        raise ManifestError(Notice(Code.CANNOT_READ, subject=Subject.REFERENCE)) from None
+    wanted = parse_cases(arguments.cases)
     spec = (
         StoreSpec("folder", reference.bucket, arguments.landed_folder, "", arguments.read_log)
         if arguments.landed_folder
         else StoreSpec("s3", reference.bucket, "", required_environment("AWS_REGION"))
     )
-    if spec.log_to_create is not None:
-        create_read_log(spec.log_to_create)
+    log = spec.log_to_create
+    if log is not None:
+        create_read_log(log)
     store = open_store(spec)
-    wanted = [int(text) for text in arguments.cases.split(",") if text] or None
     inputs = verify_inputs(store, reference, wanted)
     caseends = caseend_times(store, inputs)
     client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
@@ -256,8 +260,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (PublicationError, QualityError) as error:
         sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 1
-    except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch (status {error.status}, code {error.error_code})\n")
+    except NessieConflict:
+        sys.stderr.write(f"{JOB}: {CONFLICT_TEXT}\n")
         return 1
     except NessieError as error:
         sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")

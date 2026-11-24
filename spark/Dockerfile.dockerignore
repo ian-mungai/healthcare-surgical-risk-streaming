@@ -21,12 +21,14 @@
 !replay/events/errors.py
 !replay/events/identity.py
 !replay/events/recording.py
+!replay/events/run.py
 !replay/events/schedule.py
 !replay/events/stream.py
 !replay/events/waveform.py
 !replay/service/__init__.py
 !replay/service/decode.py
 !replay/service/folder_store.py
+!replay/service/run_record.py
 !replay/service/s3_store.py
 !scripts/process.py
 !scripts/project_config.py

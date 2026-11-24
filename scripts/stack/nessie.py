@@ -34,6 +34,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 NAMESPACE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 HASH = re.compile(r"[0-9a-f]{64}")
 CONFLICT_STATUS = 409
+CONFLICT_TEXT = "Nessie refused the branch: the reference or its content changed (a conflict)"
 BODY_LIMIT_BYTES = 1_000_000
 
 

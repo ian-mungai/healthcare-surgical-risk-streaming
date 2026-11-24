@@ -17,18 +17,34 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from replay.service.folder_store import refused
+from replay.service.run_record import is_state_folder_name
 from scripts.ingestion.check import CheckedFile
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef, read_manifest
+from scripts.ingestion.notice import ClosedError, Code, Notice
 from scripts.ingestion.store import ObjectStore, ObjectVersion, StoreError
 
 CASE_KEY = re.compile(r".*/vital_files/(\d{4,})\.vital")
+CASE_NUMBER = re.compile(r"[0-9]{1,9}")
 CLINICAL_SUFFIX = "/clinical_data.csv"
 CLINICAL_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 class InputError(RuntimeError):
     """A manifest, a version or a file that the job needs is not what the manifest says."""
+
+
+class CasesError(ClosedError, InputError):
+    """The ``--cases`` list is not case numbers separated by commas. Its text is the fixed usage notice, so it shows no part of the list."""
+
+
+def parse_cases(text: str) -> list[int] | None:
+    """The case numbers of a ``--cases`` list (digits only, an empty item is skipped), or ``None`` for every case file of the manifest."""
+    items = [item for item in text.split(",") if item]
+    if not all(CASE_NUMBER.fullmatch(item) for item in items):
+        raise CasesError(Notice(Code.USAGE))
+    return [int(item) for item in items] or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,8 +59,14 @@ class StoreSpec:
 
     @property
     def log_to_create(self) -> Path | None:
-        """The read log that the driver makes before any read: only a folder store that carries a log path has one."""
-        return Path(self.read_log) if self.kind == "folder" and self.read_log else None
+        """The read log that the driver makes before any read: only a folder store that carries a log path has one. A log whose last name is a file that the
+        replay writes in its state folder (``is_state_folder_name``, any letter case) is refused with ``CANNOT_WRITE`` here, before anything is created."""
+        if self.kind != "folder" or not self.read_log:
+            return None
+        path = Path(self.read_log)
+        if is_state_folder_name(path.name):
+            raise refused()
+        return path
 
 
 @dataclass(frozen=True, slots=True)
