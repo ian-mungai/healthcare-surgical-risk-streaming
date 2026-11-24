@@ -1627,7 +1627,7 @@ class LegacyJobOutputTest(unittest.TestCase):
                     case.go(runner)
                 self.assertFalse(path.exists())
 
-    def test_a_retry_that_refuses_the_folder_as_another_loads_removes_the_legacy_file_first(self) -> None:
+    def test_a_retry_that_refuses_the_folder_as_another_loads_leaves_every_file_of_that_folder(self) -> None:
         case, content = Case(self), self.legacy()["the output of the job"]
         case.go(Runner())
         receipt = case.saved()
@@ -1636,7 +1636,17 @@ class LegacyJobOutputTest(unittest.TestCase):
         path = self.plant(case, content)
         with self.assertRaisesRegex(run.TableChecksError, "another load"):
             case.go(Runner())
-        self.assertFalse(path.exists())
+        self.assertEqual(content, path.read_bytes())
+
+    def test_a_file_of_the_form_with_a_number_the_controller_never_writes_is_removed(self) -> None:
+        form = "refusal: no_result\nexit code: {}\nresult lines: {}\n"
+        for exit_code, lines in (("256", "0"), ("-256", "0"), ("999", "0"), ("001", "0"), ("01", "0"), ("-0", "0"), ("-00", "0"), ("1", "01"), ("1", "0001")):
+            with self.subTest(exit_code=exit_code, lines=lines):
+                case, runner = Case(self), Runner()
+                case.go(runner)
+                path = self.plant(case, form.format(exit_code, lines).encode())
+                case.go(runner)
+                self.assertFalse(path.exists())
 
     def test_a_retry_that_cannot_take_the_lock_leaves_the_file_for_the_run_that_holds_it(self) -> None:
         case = Case(self)

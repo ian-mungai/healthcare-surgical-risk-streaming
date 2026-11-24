@@ -80,7 +80,7 @@ REFUSAL_CODES = ("no_result", "several_results", "result_refused", "exit_code_di
 MAX_EXIT_CODE = 255
 MAX_RESULT_LINES = 9999
 KEPT_OUTPUT_FORM = re.compile(
-    rb"refusal: (?:" + b"|".join(code.encode() for code in REFUSAL_CODES) + rb")\nexit code: -?[0-9]{1,3}\nresult lines: [0-9]{1,4}\n"
+    rb"refusal: (" + b"|".join(code.encode() for code in REFUSAL_CODES) + rb")\nexit code: (-?[0-9]{1,3})\nresult lines: ([0-9]{1,4})\n"
 )
 # The longest file of the form is 64 bytes, so a file that is not of the form is never read past this many bytes.
 KEPT_OUTPUT_LIMIT = 80
@@ -420,7 +420,22 @@ def keep_output(run_folder: Path, code: str, exit_code: int, result_lines: int) 
     run_folder.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(run_folder / JOB_OUTPUT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w") as handle:
-        handle.write(f"refusal: {code}\nexit code: {exit_code}\nresult lines: {result_lines}\n")
+        handle.write(output_text(code, exit_code, result_lines))
+
+
+def output_text(code: str, exit_code: int, result_lines: int) -> str:
+    """The text of ``JOB_OUTPUT_FILE`` that ``keep_output`` writes for these values."""
+    return f"refusal: {code}\nexit code: {exit_code}\nresult lines: {result_lines}\n"
+
+
+def written_by_keep_output(content: bytes) -> bool:
+    """True only for the exact bytes that ``keep_output`` writes for some values within its bounds: no leading zero, no ``-0``, no number out of bounds."""
+    found = KEPT_OUTPUT_FORM.fullmatch(content)
+    if found is None:
+        return False
+    code, exit_code, result_lines = found.group(1).decode(), int(found.group(2)), int(found.group(3))
+    within = -MAX_EXIT_CODE <= exit_code <= MAX_EXIT_CODE and 0 <= result_lines <= MAX_RESULT_LINES
+    return within and output_text(code, exit_code, result_lines).encode() == content
 
 
 def drop_unfixed_output(run_folder: Path) -> None:
@@ -438,7 +453,7 @@ def drop_unfixed_output(run_folder: Path) -> None:
         raise TableChecksError(f"{JOB_OUTPUT_FILE} in the run folder is a folder, so this run did nothing; remove it and run again")
     if stat.S_ISREG(status.st_mode):
         with path.open("rb") as handle:
-            if KEPT_OUTPUT_FORM.fullmatch(handle.read(KEPT_OUTPUT_LIMIT)) is not None:
+            if written_by_keep_output(handle.read(KEPT_OUTPUT_LIMIT)):
                 return
     path.unlink(missing_ok=True)
 
@@ -844,11 +859,12 @@ def run_locked(
 
     A receipt that says merged ends the run (and removes a pending record left over). If the history holds this load's merge commit, the receipt is written
     from it and nothing is sent. If a pending record of this load exists and the history does not hold the commit, the run ends as ``merge_outcome_open``,
-    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``. A job output file of
-    another form than the fixed one is removed first, so no way out of this function leaves one.
+    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``. Once the receipt is
+    known to be this load's (or absent), a job output file of another form than the fixed one is removed, so no other way out of this function leaves one. A
+    folder refused as another load's is left exactly as it is.
     """
-    drop_unfixed_output(run_folder)
     held = saved_result(run_folder, record)
+    drop_unfixed_output(run_folder)
     if held is not None and held["merged"] is True:
         clear_pending(state_directory, record)
         return Outcome(True, True, without_old_checks(run_folder, record, track_pin, held))
