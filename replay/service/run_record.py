@@ -47,10 +47,6 @@ class RunRecord:
     idle_checkpoint_seconds: float = 5.0
 
     @property
-    def state_path(self) -> Path:
-        return Path(self.state_dir) / "state.json"
-
-    @property
     def schedule_path(self) -> Path:
         return Path(self.state_dir) / "schedule.json"
 

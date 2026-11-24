@@ -83,10 +83,10 @@ class Clock:
         return self.now
 
 
-def serve_until_idle(inbox: Path, health: Path, run_request: Callable[[Path, Callable[[], None]], Outcome]) -> int:
+def serve_until_idle(inbox: Path, state: Path, run_request: Callable[[Path, Callable[[], None]], Outcome]) -> int:
     """Serve the inbox until it is empty and the loop would sleep: the stop comes from the idle wait, never from a request."""
     stop = [False]
-    return serve(inbox, health, run_request, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
+    return serve(inbox, state, run_request, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
 
 
 class Loop:
@@ -127,7 +127,7 @@ class Loop:
     def serve(self) -> int:
         return serve(
             self.inbox,
-            self.health,
+            self.root,
             self.run_request,
             lambda: self.stop,
             self.clock,
@@ -501,7 +501,7 @@ class CrashLoopTest(unittest.TestCase):
         def sleep(seconds: float) -> None:
             self.stop = True
 
-        return serve(self.inbox, self.root / "health.json", run_request, lambda: self.stop, Clock(), sleep, 1.0)
+        return serve(self.inbox, self.root, run_request, lambda: self.stop, Clock(), sleep, 1.0)
 
     def crash_on_a(self, path: Path, beat: Callable[[], None]) -> Outcome:
         self.ran.append(path.name)
@@ -710,7 +710,7 @@ class SubmitTest(unittest.TestCase):
             ran.append(path.name)
             return Outcome("finished", 0)
 
-        serve_until_idle(self.inbox, Path(folder.name) / "health.json", run_request)
+        serve_until_idle(self.inbox, Path(folder.name), run_request)
         self.assertEqual([f"{self.name}.json"], ran)
         self.assertTrue((self.inbox / "done" / f"{self.name}.json").is_file())
         self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
@@ -993,7 +993,7 @@ class SubmitTest(unittest.TestCase):
                 self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
                 self.assertEqual(REFERENCE, (self.inbox / "reserved" / f"{self.name}.reference").read_text())
                 self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
-                serve_until_idle(self.inbox, self.inbox.parent / "health.json", lambda path, beat: Outcome("finished", 0))
+                serve_until_idle(self.inbox, self.inbox.parent, lambda path, beat: Outcome("finished", 0))
                 self.assertTrue((self.inbox / folder / f"{self.name}.json").is_file())
                 self.assertFalse((self.inbox / f"{self.name}.json").exists())
 
@@ -1008,7 +1008,7 @@ class SubmitTest(unittest.TestCase):
             ran.append(path.name)
             return Outcome("failed", 3, "the gate refused again")
 
-        serve_until_idle(self.inbox, self.inbox.parent / "health.json", gate_again)
+        serve_until_idle(self.inbox, self.inbox.parent, gate_again)
         self.assertEqual([], ran)
         self.assertTrue((self.inbox / "failed" / f"{self.name}.json").is_file())
         self.assertFalse((self.inbox / f"{self.name}.json").exists())

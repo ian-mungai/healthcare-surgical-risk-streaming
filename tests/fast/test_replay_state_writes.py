@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -33,11 +36,12 @@ NAME = str(RECORD["run_id"])
 
 class HeartbeatTests(Fixture):
     def test_the_heartbeat_replaces_the_health_file_in_its_own_folder_and_nowhere_else(self) -> None:
-        health = Health(self.root / "health.json", Clock())
+        health = Health(self.root, Clock())
         with mock.patch.object(serve_module, "replace_owned_file", wraps=replace_owned_file) as helper:
             health.beat("waiting", force=True)
         helper.assert_called_once()
         self.assertEqual(self.root, helper.call_args.kwargs["state_root"])
+        self.assertEqual(self.root / "health.json", helper.call_args.args[0])
         self.assertEqual("waiting", json.loads((self.root / "health.json").read_text())["status"])
 
     def test_a_link_or_a_folder_in_place_of_the_health_file_is_refused_and_what_the_link_names_stays(self) -> None:
@@ -46,13 +50,13 @@ class HeartbeatTests(Fixture):
         link = self.root / "health.json"
         link.symlink_to(target)
         with self.assertRaises(ClosedInputError) as caught:
-            Health(link, Clock()).beat("waiting", force=True)
+            Health(self.root, Clock()).beat("waiting", force=True)
         self.assertEqual(REFUSED, str(caught.exception))
         self.assertEqual(ORIGINAL, target.read_text())
         link.unlink()
         link.mkdir()
         with self.assertRaises(ClosedInputError):
-            Health(link, Clock()).beat("waiting", force=True)
+            Health(self.root, Clock()).beat("waiting", force=True)
         self.assertEqual([], list(link.iterdir()))
 
     def test_the_start_count_and_the_saved_position_go_through_the_same_helper(self) -> None:
@@ -69,14 +73,15 @@ class HeartbeatTests(Fixture):
 
         (inbox / "a.reference").write_text(REFERENCE)
         with self.assertRaises(ClosedInputError):
-            serve(inbox, self.root / "health.json", run, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
+            serve(inbox, self.root, run, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
         self.assertFalse((self.root / "elsewhere").exists())
 
     def test_the_saved_position_is_replaced_in_its_folder_and_a_link_is_refused(self) -> None:
-        saved = StateFile(self.root / "state.json")
+        saved = StateFile(self.root)
         with mock.patch("replay.service.state_file.replace_owned_file", wraps=replace_owned_file) as helper:
             saved.save(mock.Mock(to_json=lambda: "{}"))
         self.assertEqual(self.root, helper.call_args.kwargs["state_root"])
+        self.assertEqual(self.root / "state.json", saved.path)
         saved.path.unlink()
         saved.path.symlink_to(self.root / "elsewhere")
         with self.assertRaises(ClosedInputError):
@@ -95,6 +100,62 @@ class HeartbeatTests(Fixture):
         with self.assertRaises(FileExistsError):
             late.freeze(frozen)
         self.assertFalse((self.root / "elsewhere").exists())
+
+
+class StateFolderCommandTests(ReplayHarness):
+    """``serve`` and ``health`` take the state folder, never a file path: the health file is the fixed name ``health.json`` inside it."""
+
+    def serve_until_stopped(self, argv: list[str]) -> tuple[int, str]:
+        """Run the service command line and stop it with SIGTERM from a helper thread that repeats until the command returns, with a deadline."""
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        finished = threading.Event()
+
+        def stopper() -> None:
+            deadline = 30.0
+            while not finished.wait(0.2) and (deadline := deadline - 0.2) > 0:
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        thread = threading.Thread(target=stopper)
+        thread.start()
+        try:
+            return self.run_replay(argv)
+        finally:
+            finished.set()
+            thread.join()
+            signal.signal(signal.SIGTERM, previous)
+
+    def test_serve_with_a_state_folder_writes_health_json_in_it_and_leaves_an_unrelated_file_alone(self) -> None:
+        state = self.root / "state"
+        unrelated = self.made("unrelated.json")
+        code, _ = self.serve_until_stopped(["serve", "--state", str(state), "--inbox", str(state / "inbox")])
+        self.assertEqual(0, code)
+        self.assertEqual("stopped", json.loads((state / "health.json").read_text())["status"])
+        self.assertEqual(ORIGINAL, unrelated.read_text())
+        self.assertEqual(["unrelated.json"], sorted(path.name for path in self.root.iterdir() if path.is_file()))
+
+    def test_the_old_health_argument_is_refused_by_both_commands_and_the_file_it_names_stays(self) -> None:
+        existing = self.made("existing.json")
+        for command in ("serve", "health"):
+            with self.subTest(command=command), self.assertRaises(SystemExit) as caught:
+                self.run_replay([command, "--health", str(existing)])
+            self.assertEqual(2, caught.exception.code)
+        self.assertEqual(ORIGINAL, existing.read_text())
+
+    def test_a_state_argument_that_names_a_file_is_refused_with_fixed_text_and_the_file_stays(self) -> None:
+        existing = self.made("existing.json")
+        code, error = self.run_replay(["serve", "--state", str(existing), "--inbox", str(self.root / "inbox")])
+        self.assertEqual(2, code)
+        self.assertIn(REFUSED + "\n", error)
+        self.assertEqual(ORIGINAL, existing.read_text())
+
+    def test_health_reads_the_fixed_file_name_in_the_state_folder(self) -> None:
+        state = self.root / "state"
+        state.mkdir()
+        code, _ = self.run_replay(["health", "--state", str(state)])
+        self.assertEqual(1, code)
+        (state / "health.json").write_text(json.dumps({"status": "waiting", "updated": time.time()}))
+        code, _ = self.run_replay(["health", "--state", str(state)])
+        self.assertEqual(0, code)
 
 
 class QueueWriteTests(Fixture):
@@ -173,7 +234,7 @@ class ErrorTextTests(Fixture):
         (inbox / "a.reference").write_text(REFERENCE)
         stop = [False]
         health = self.root / "health.json"
-        serve(inbox, health, run, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)  # type: ignore[arg-type]
+        serve(inbox, self.root, run, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)  # type: ignore[arg-type]
         stored: dict[str, object] = json.loads((inbox / "results" / "a.json").read_text())
         return stored | {"health": json.loads(health.read_text())}
 
@@ -197,7 +258,7 @@ class ErrorTextTests(Fixture):
         (inbox / "a.reference").write_text(REFERENCE)
         stop = [False]
         health = self.root / "health.json"
-        serve(inbox, health, lambda path, beat: Outcome("finished", 0), lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
+        serve(inbox, self.root, lambda path, beat: Outcome("finished", 0), lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
         stored = json.loads((inbox / "results" / "a.json").read_text())
         self.assertEqual("RunRecordError", stored["error"])
         self.assertNotIn("marker_four", json.dumps(stored) + health.read_text())

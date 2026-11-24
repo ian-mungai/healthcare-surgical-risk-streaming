@@ -52,7 +52,7 @@ from replay.service.run_record import RunRecord, RunRecordError, parse_run_recor
 from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.folder import list_files
 from scripts.ingestion.manifest import ManifestError, ManifestRef
-from scripts.ingestion.notice import Code, describe_error
+from scripts.ingestion.notice import Code, Notice, describe_error
 from scripts.ingestion.output_file import replace_owned_file, write_new_file
 
 BEAT_SECONDS = 5.0
@@ -71,6 +71,7 @@ MAX_ATTEMPTS = 3
 LOCK_SECONDS = 30.0
 LOCK_POLL_SECONDS = 0.01
 FILE_MODE = 0o640
+HEALTH_NAME = "health.json"
 
 
 class SubmitError(ValueError):
@@ -89,8 +90,9 @@ class Outcome:
 class Health:
     """The health file: the status, the request that runs, the last result and the wall time of the last progress, written at most every few seconds."""
 
-    def __init__(self, path: Path, clock: Callable[[], float]) -> None:
-        self.path = path
+    def __init__(self, state: Path, clock: Callable[[], float]) -> None:
+        self.state = state
+        self.path = state / HEALTH_NAME
         self.clock = clock
         self.written = float("-inf")
         self.last: dict[str, Any] | None = None
@@ -99,7 +101,7 @@ class Health:
         now = self.clock()
         if force or now - self.written >= BEAT_SECONDS:
             text = json.dumps({"status": status, "updated": now, "request": request, "last": self.last}, sort_keys=True) + "\n"
-            replace_owned_file(self.path, text, state_root=self.path.parent, mode=FILE_MODE)
+            replace_owned_file(self.path, text, state_root=self.state, mode=FILE_MODE)
             self.written = now
 
 
@@ -252,7 +254,7 @@ def unusable(request: Path) -> Outcome | None:
 
 def serve(
     inbox: Path,
-    health_path: Path,
+    state: Path,
     run_request: Callable[[Path, Callable[[], None]], Outcome],
     stopped: Callable[[], bool],
     clock: Callable[[], float],
@@ -263,8 +265,11 @@ def serve(
     """Serve the inbox until ``stopped`` says so. ``run_request`` runs one record and calls the beat it is given as the run makes progress. A record that is
     not a valid run record never reaches it."""
     inbox.mkdir(parents=True, exist_ok=True)
-    health_path.parent.mkdir(parents=True, exist_ok=True)
-    health = Health(health_path, clock)
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ClosedInputError(Notice(Code.OWNED_REFUSED)) from None
+    health = Health(state, clock)
     health.beat("waiting", force=True)
     while not stopped():
         request = next_request(inbox)

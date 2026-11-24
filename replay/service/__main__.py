@@ -39,7 +39,7 @@ from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, p
 from replay.service.output_guard import refuse_inside_store
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
+from replay.service.serve import HEALTH_NAME, Outcome, healthy, queued_record, serve, submit_command
 from replay.service.state_file import ScheduleFile, StateFile
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
@@ -52,7 +52,7 @@ from scripts.ingestion.store import StoreError
 
 READ_DEADLINE_SECONDS = 600.0
 INBOX = Path("/opt/replay/state/inbox")
-HEALTH_FILE = Path("/opt/replay/state/health.json")
+STATE_FOLDER = Path("/opt/replay/state")
 POLL_SECONDS = 1.0
 STOPPED_CODE = 2
 HEALTH_MAX_AGE_SECONDS = 600.0
@@ -148,7 +148,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
         return flag.is_set()
 
     settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000))
-    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(record.state_path), SystemClock(flag, poll), stop_requested)
+    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(Path(record.state_dir)), SystemClock(flag, poll), stop_requested)
     log("replay_start", run_id=record.run_id, speed=record.speed, schedule_sha256=frozen.schedule.sha256)
     result = replayer.run()
     log("replay_end", sent=result.sent, finished=result.finished)
@@ -186,7 +186,7 @@ def command_observe(record: RunRecord, arguments: argparse.Namespace) -> int:
 
 def command_compare(record: RunRecord, arguments: argparse.Namespace) -> int:
     manifest = Manifest.from_json(Path(arguments.manifest).read_text())
-    state = StateFile(record.state_path).load()
+    state = StateFile(Path(record.state_dir)).load()
     report = compare(manifest, observed_from(Path(arguments.observed).read_text(), state), window_only=arguments.window_only)
     sys.stdout.write(report_document(manifest, report, window_only=arguments.window_only))
     return 0 if report.ok else 1
@@ -224,7 +224,7 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
 def command_serve(arguments: argparse.Namespace) -> int:
     flag = StopFlag()
     log("serve_start", inbox=str(arguments.inbox))
-    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS, log)
+    return serve(arguments.inbox, arguments.state, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS, log)
 
 
 def command_submit(arguments: argparse.Namespace) -> int:
@@ -232,7 +232,7 @@ def command_submit(arguments: argparse.Namespace) -> int:
 
 
 def command_health(arguments: argparse.Namespace) -> int:
-    return 0 if healthy(arguments.health, time.time(), arguments.max_age) else 1
+    return 0 if healthy(arguments.state / HEALTH_NAME, time.time(), arguments.max_age) else 1
 
 
 COMMANDS = {
@@ -276,11 +276,11 @@ def main(argv: list[str] | None = None) -> int:
         command = commands.add_parser(name)
         command.add_argument("--inbox", type=Path, default=INBOX)
         if name == "serve":
-            command.add_argument("--health", type=Path, default=HEALTH_FILE)
+            command.add_argument("--state", type=Path, default=STATE_FOLDER, help="the state folder: the health file is health.json inside it")
         else:
             command.add_argument("--manifest-reference", type=Path, required=True, help="the file that holds the manifest reference of the run")
     health = commands.add_parser("health")
-    health.add_argument("--health", type=Path, default=HEALTH_FILE)
+    health.add_argument("--state", type=Path, default=STATE_FOLDER, help="the state folder: the health file is health.json inside it")
     health.add_argument("--max-age", type=float, default=HEALTH_MAX_AGE_SECONDS, help="the age in seconds above which the health file is stale")
     for name in COMMANDS:
         command = commands.add_parser(name)
@@ -295,9 +295,9 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--window-only", action="store_true")
     arguments = parser.parse_args(argv)
     service_commands = {"serve": command_serve, "submit": command_submit, "health": command_health}
-    if arguments.command in service_commands:
-        return service_commands[arguments.command](arguments)
     try:
+        if arguments.command in service_commands:
+            return service_commands[arguments.command](arguments)
         if getattr(arguments, "out", None) is not None:
             check_new_output(arguments.out)
         record = parse_run_record(read_run_record(arguments.run_record))
