@@ -11,6 +11,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -27,7 +28,7 @@ from scripts.stack.groups_k3s import (
     object_name,
 )
 from scripts.stack.limits import parse_limits
-from tests.fast.header_secret_support import everything_said_about, unsafe_values
+from tests.fast.header_secret_support import raised_text, unsafe_values
 
 NAMESPACE = "airbyte_ns"
 PLANTED_VALUE = "value-that-must-never-appear"
@@ -295,18 +296,17 @@ class TokenTest(unittest.TestCase):
         values["a break inside"] = f"{PLANTED_VALUE}\n{PLANTED_VALUE}".encode()
         for name, content in values.items():
             with self.subTest(character=name), tempfile.TemporaryDirectory() as folder:
-                with self.assertRaises(GroupError) as raised:
-                    self.write_token(folder, content).authorization()
-                self.assertEqual("the token file token does not hold a valid token", str(raised.exception))
-                self.assertNotIn(PLANTED_VALUE, everything_said_about(raised.exception))
+                error, text = raised_text(self.write_token(folder, content).authorization, GroupError, "authorization")
+                self.assertEqual("the token file token does not hold a valid token", str(error))
+                self.assertNotIn(PLANTED_VALUE, text)
 
     def test_a_refused_token_stops_the_request_before_any_connection_is_made(self) -> None:
         for name, value in unsafe_values(PLANTED_VALUE).items():
             with self.subTest(character=name), tempfile.TemporaryDirectory() as folder, mock.patch.object(groups_k3s, "PinnedConnection") as connection:
-                with self.assertRaises(GroupError) as raised:
-                    self.write_token(folder, value.encode()).request("GET", "/api/v1/namespaces")
-                self.assertEqual("the token file token does not hold a valid token", str(raised.exception))
-                self.assertNotIn(PLANTED_VALUE, everything_said_about(raised.exception))
+                transport = self.write_token(folder, value.encode())
+                error, text = raised_text(partial(transport.request, "GET", "/api/v1/namespaces"), GroupError, "authorization")
+                self.assertEqual("the token file token does not hold a valid token", str(error))
+                self.assertNotIn(PLANTED_VALUE, text)
                 connection.assert_not_called()
 
 

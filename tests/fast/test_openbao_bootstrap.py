@@ -15,13 +15,14 @@ import stat
 import sys
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest import mock
 
 from tests.fast.ansible_paths import shared_module
-from tests.fast.header_secret_support import everything_said_about, unsafe_values
+from tests.fast.header_secret_support import raised_text, unsafe_values
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "ansible" / "roles" / "openbao" / "library" / "openbao_bootstrap.py"
@@ -303,10 +304,9 @@ class TokenHeaderTest(unittest.TestCase):
     def test_a_token_a_header_cannot_hold_is_refused_before_any_request_with_the_fixed_message_and_no_error_holds_it(self) -> None:
         for name, token in unsafe_values(PLANTED_MARKER).items():
             with self.subTest(character=name):
-                with self.assertRaises(bootstrap.BootstrapError) as raised:
-                    self.api.call("GET", "sys/health", token)
-                self.assertEqual(REFUSAL, str(raised.exception))
-                self.assertNotIn(PLANTED_MARKER, everything_said_about(raised.exception))
+                error, text = raised_text(partial(self.api.call, "GET", "sys/health", token), bootstrap.BootstrapError, "call")
+                self.assertEqual(REFUSAL, str(error))
+                self.assertNotIn(PLANTED_MARKER, text)
         self.assertEqual([], FakeConnection.requests)
 
     def test_a_login_reply_with_such_a_token_is_refused_at_its_first_use_and_no_error_holds_it(self) -> None:
@@ -315,11 +315,20 @@ class TokenHeaderTest(unittest.TestCase):
                 FakeConnection.answer = (200, json.dumps({"auth": {"client_token": token}}).encode())
                 issued = self.api.login("admin", "an-admin-secret-id")
                 FakeConnection.requests = []
-                with self.assertRaises(bootstrap.BootstrapError) as raised:
-                    self.api.must("GET", "sys/policies/acl/service_a", issued)
-                self.assertEqual(REFUSAL, str(raised.exception))
-                self.assertNotIn(PLANTED_MARKER, everything_said_about(raised.exception))
+                error, text = raised_text(partial(self.api.must, "GET", "sys/policies/acl/service_a", issued), bootstrap.BootstrapError, "call")
+                self.assertEqual(REFUSAL, str(error))
+                self.assertNotIn(PLANTED_MARKER, text)
                 self.assertEqual([], FakeConnection.requests)
+
+    def test_a_login_reply_whose_token_is_not_text_is_refused_and_no_token_is_issued(self) -> None:
+        """``True`` would go into the header as ``True``: a token must be a string, and an empty one is none."""
+        for what, token in {"true": True, "number": 5, "list": ["x"], "object": {"a": "b"}, "empty": "", "null": None}.items():
+            with self.subTest(token=what):
+                FakeConnection.answer = (200, json.dumps({"auth": {"client_token": token}}).encode())
+                error, _ = raised_text(lambda: self.api.login("admin", "an-admin-secret-id"), bootstrap.BootstrapError, "login")
+                self.assertIn("the login of role admin", str(error))
+        FakeConnection.answer = (200, json.dumps({"auth": {"client_token": "hvs.CAESIJ-_x~y+z/w=="}}).encode())
+        self.assertEqual("hvs.CAESIJ-_x~y+z/w==", self.api.login("admin", "an-admin-secret-id"))
 
 
 if __name__ == "__main__":
