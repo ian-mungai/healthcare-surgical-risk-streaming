@@ -10,6 +10,11 @@ global:
     secretName: airbyte-database
     userSecretKey: database-user
     passwordSecretKey: database-password
+    # The chart's replica is the same database read with the same account. Unset, these keys default to CONFIG_DATABASE_REPLICA_USER and
+    # CONFIG_DATABASE_REPLICA_PASSWORD, which the secret does not hold, and the bootloader cannot start.
+    replica:
+      userSecretKey: database-user
+      passwordSecretKey: database-password
   storage:
     type: minio
     secretName: airbyte-storage
