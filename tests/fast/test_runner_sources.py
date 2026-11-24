@@ -2,8 +2,9 @@
 
 Failure modes covered here:
 
-- A source path names a directory (or a link to one, or any link) and the whole directory is bound into the container before the pin is checked. ``mount_for``
-  must refuse any source that is not a regular file by metadata alone (``os.lstat`` and ``stat.S_ISREG``, no read).
+- A source setting names a directory (or a link to one) and the whole directory is bound into the container before the pin is checked. ``resolve_source``
+  follows links to one real path and must refuse a result that is not a regular file or that lies inside the repository, by metadata alone (``os.lstat``,
+  ``stat.S_ISREG`` and file identity, no read).
 - A source path is built a second time: a string or ``Path`` that names either file outside its one definition, a second ``os.environ`` or ``getenv`` lookup of
   either name, or a read or a hash inside ``mount_for``.
 - The clinical default does not follow ``LANDED_CACHE``, so setting it alone leaves the file where it was.

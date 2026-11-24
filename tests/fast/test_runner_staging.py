@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,7 +39,38 @@ def pinned_mounts(mode):
 """
 
 
-def load_function(source: str, name: str, prelude: str = "") -> Any:
+COMPOSE_TEMPLATE = """
+def check_compose_source(folder, sources):
+    if folder.is_symlink():
+        raise RuntimeError("the compose folder is a link")
+    for path in sorted(folder.rglob("*")):
+        if path.is_dir() and not path.is_symlink():
+            continue
+        for source in sources:
+            try:
+                same = os.path.samefile(path, source)
+            except OSError:
+                continue
+            if same:
+                raise RuntimeError("a file of the compose folder is a selected input")
+"""
+
+
+RESOLVE_TEMPLATE = """
+def resolve_pinned_mounts():
+    RESOLVED_MOUNTS["load_clinical"] = [mount_for(CLINICAL_FILE, CLINICAL_TARGET)]
+    RESOLVED_MOUNTS["load_track_list"] = [mount_for(TRACK_LIST_FILE, TRACK_LIST_TARGET)]
+    RESOLVED_SOURCES[:] = [mount["source"].replace("$$", "$") for mounts in RESOLVED_MOUNTS.values() for mount in mounts]
+    return RESOLVED_MOUNTS
+"""
+RESOLVE_PRELUDE = (
+    "CLINICAL_FILE, TRACK_LIST_FILE = '/a/clinical-$X.csv', '/b/trks.csv'\nCLINICAL_TARGET, TRACK_LIST_TARGET = '/t1', '/t2'\n"
+    "RESOLVED_MOUNTS = {}\nRESOLVED_SOURCES = []\n"
+    "def mount_for(path, target):\n    return {'source': path.replace('$', '$$'), 'target': target}\n\n"
+)
+
+
+def load_function(source: str, name: str, prelude: str = "", *, module_vars: bool = False) -> Any:
     tree = ast.parse(source)
     wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
     if len(wanted) != 1:
@@ -52,7 +84,7 @@ def load_function(source: str, name: str, prelude: str = "") -> Any:
             raise RuntimeError("cannot load")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-    return getattr(module, name)
+    return vars(module) if module_vars else getattr(module, name)
 
 
 def link_wrong(source: str) -> list[str]:
@@ -91,6 +123,67 @@ def link_wrong(source: str) -> list[str]:
     return wrong
 
 
+def compose_wrong(source: str) -> list[str]:
+    """Run ``check_compose_source`` over compose folders and name each case it gets wrong."""
+    wrong: list[str] = []
+    check = load_function(source, "check_compose_source", "import os\n")
+    with tempfile.TemporaryDirectory() as parent_name:
+        parent = Path(parent_name).resolve()
+        inputs = parent / "inputs"
+        inputs.mkdir()
+        clinical, track_list = inputs / "clinical.csv", inputs / "trks.csv"
+        clinical.write_text("same")
+        track_list.write_text("other")
+        sources = [str(clinical), str(track_list)]
+        cases: dict[str, tuple[bool, str]] = {
+            "a folder of ordinary files": (False, "plain"),
+            "a file with the same content as an input": (False, "same_content"),
+            "a hard link to the clinical file": (True, "hard"),
+            "a hard link to the track list": (True, "hard_second"),
+            "a hard link in a subfolder": (True, "hard_deep"),
+            "a link to the clinical file": (True, "link_file"),
+            "a dangling link": (False, "dangling"),
+            "a compose folder that is a link to the input folder": (True, "folder_link"),
+            "a compose folder that is a link to a harmless folder": (True, "folder_link_harmless"),
+        }
+        for label, (refused, kind) in cases.items():
+            folder = parent / "cases" / kind
+            if kind == "folder_link":
+                folder.parent.mkdir(parents=True, exist_ok=True)
+                folder.symlink_to(inputs)
+            elif kind == "folder_link_harmless":
+                harmless = parent / "harmless"
+                harmless.mkdir()
+                (harmless / "a.yml").write_text("x")
+                folder.parent.mkdir(parents=True, exist_ok=True)
+                folder.symlink_to(harmless)
+            else:
+                (folder / "sub").mkdir(parents=True)
+                (folder / "compose.yml").write_text("x")
+                if kind == "same_content":
+                    (folder / "copy.csv").write_text("same")
+                elif kind == "hard":
+                    os.link(clinical, folder / "hard.csv")
+                elif kind == "hard_second":
+                    os.link(track_list, folder / "hard.csv")
+                elif kind == "hard_deep":
+                    os.link(clinical, folder / "sub" / "deep.csv")
+                elif kind == "link_file":
+                    (folder / "link.csv").symlink_to(clinical)
+                elif kind == "dangling":
+                    (folder / "dangling.csv").symlink_to(parent / "none.csv")
+            try:
+                check(folder, sources)
+                if refused:
+                    wrong.append(f"accepted {label}")
+            except RuntimeError as error:
+                if not refused:
+                    wrong.append(f"refused {label}")
+                elif parent_name in str(error) or str(parent) in str(error):
+                    wrong.append(f"the refusal of {label} names the path")
+    return wrong
+
+
 def call_lines(function: ast.FunctionDef, name: str) -> list[int]:
     return [
         part.lineno
@@ -118,6 +211,9 @@ def order_problems(source: str) -> list[str]:
         problems.append("run_prepared does not copy the Compose tree exactly once")
     elif not any(keyword.arg == "symlinks" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in copies[0].keywords):
         problems.append("the Compose tree is copied without keeping its links")
+    sources = call_lines(prepared, "check_compose_source")
+    if len(sources) != 1 or not copies or not (sources[0] < copies[0].lineno):
+        problems.append("the compose folder is not checked against the selected inputs before it is copied")
     checks = call_lines(prepared, "check_tree_links")
     stacks = call_lines(prepared, "Stack")
     if len(checks) != 1 or not copies or not stacks or not (copies[0].lineno < checks[0] < min(stacks)):
@@ -135,6 +231,7 @@ def run_local(record, log, cache):
 
 
 def run_prepared(record, log, cache, scratch):
+    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)
     shutil.copytree(ROOT / "compose", scratch, symlinks=True, dirs_exist_ok=True)
     check_tree_links(scratch)
     stack = Stack(scratch)
@@ -161,6 +258,58 @@ class Links(unittest.TestCase):
         ):
             with self.subTest(change=new[:40]):
                 self.assertTrue(link_wrong(TEMPLATE.replace(old, new)), "the weaker check got every case right")
+
+
+class ComposeSource(unittest.TestCase):
+    def sources(self) -> list[tuple[str, str]]:
+        found = [("template", COMPOSE_TEMPLATE)]
+        if RUNNER.is_file():
+            found.append(("runner", RUNNER.read_text()))
+        return found
+
+    def test_a_compose_folder_that_is_a_link_or_holds_a_file_that_is_an_input_is_refused(self) -> None:
+        for label, source in self.sources():
+            with self.subTest(source=label):
+                self.assertEqual([], compose_wrong(source))
+
+    def test_each_weaker_check_gets_a_case_wrong(self) -> None:
+        for old, new in (
+            ('    if folder.is_symlink():\n        raise RuntimeError("the compose folder is a link")\n', ""),
+            ("os.path.samefile(path, source)", "path.name == Path(source).name"),
+            ("os.path.samefile(path, source)", "path.is_symlink() and os.path.samefile(path, source)"),
+            ("for source in sources:", "for source in sources[:1]:"),
+            ("folder.rglob(", "folder.glob("),
+            ("if path.is_dir() and not path.is_symlink():", "if path.is_dir():\n            continue\n        if path.is_symlink():"),
+        ):
+            with self.subTest(change=new[:40]):
+                self.assertTrue(compose_wrong(COMPOSE_TEMPLATE.replace(old, new)), "the weaker check got every case right")
+
+
+class SelectedInputs(unittest.TestCase):
+    def wrong(self, source: str) -> list[str]:
+        namespace = load_function(source, "resolve_pinned_mounts", RESOLVE_PRELUDE, module_vars=True)
+        wrong = []
+        mounts = namespace["resolve_pinned_mounts"]()
+        if sorted(mounts) != ["load_clinical", "load_track_list"]:
+            wrong.append("a load has no mount")
+        if namespace["RESOLVED_SOURCES"] != ["/a/clinical-$X.csv", "/b/trks.csv"]:
+            wrong.append("the selected inputs are not the real paths with their dollars undoubled")
+        return wrong
+
+    def test_both_selected_inputs_are_known_to_the_compose_check_by_their_real_paths(self) -> None:
+        for label, source in (("template", RESOLVE_TEMPLATE), *([("runner", RUNNER.read_text())] if RUNNER.is_file() else [])):
+            with self.subTest(source=label):
+                self.assertEqual([], self.wrong(source))
+
+    def test_each_weaker_version_gets_a_case_wrong(self) -> None:
+        for old, new in (
+            ('    RESOLVED_SOURCES[:] = [mount["source"].replace("$$", "$") for mounts in RESOLVED_MOUNTS.values() for mount in mounts]\n', ""),
+            ('RESOLVED_SOURCES[:] = [mount["source"].replace("$$", "$")', 'RESOLVED_SOURCES[:] = [mount["source"]'),
+            ("for mounts in RESOLVED_MOUNTS.values() for mount in mounts]", "for mounts in [RESOLVED_MOUNTS['load_clinical']] for mount in mounts]"),
+            ("RESOLVED_SOURCES[:] =", "x ="),
+        ):
+            with self.subTest(change=new[:40]):
+                self.assertTrue(self.wrong(RESOLVE_TEMPLATE.replace(old, new)))
 
 
 class Pinned(unittest.TestCase):
@@ -209,6 +358,13 @@ class Order(unittest.TestCase):
             ("symlinks=True, ", ""),
             ("symlinks=True, ", "symlinks=False, "),
             ("    check_tree_links(scratch)\n", ""),
+            ('    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n', ""),
+            (
+                '    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n'
+                '    shutil.copytree(ROOT / "compose", scratch, symlinks=True, dirs_exist_ok=True)\n',
+                '    shutil.copytree(ROOT / "compose", scratch, symlinks=True, dirs_exist_ok=True)\n'
+                '    check_compose_source(ROOT / "compose", RESOLVED_SOURCES)\n',
+            ),
             ("    check_tree_links(scratch)\n    stack = Stack(scratch)\n", "    stack = Stack(scratch)\n    check_tree_links(scratch)\n"),
             ("    stack = Stack(scratch)\n", "    stack = Stack(scratch)\n    resolve_source(CLINICAL_FILE)\n"),
         ):
