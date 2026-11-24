@@ -13,24 +13,31 @@ existed), a delayed submit that meets an archival (waits for it, then queues not
 86,400 or whose speed is not a finite number from 0.01 to 1,000 (refused at submit, and failed with its reason when planted in the queue), a restart
 after a result was written but before the record was archived (the result stays, the record is archived, nothing runs again), a replay that raises an
 arithmetic or value error (that request fails at once), a request that stops the service three starts in a row whatever the error (fails on the fourth
-start and the next request runs), a stop by signal (not counted) and a submission that is not valid UTF-8 (refused with its reason).
+start and the next request runs), a record whose state folder is the inbox, inside it or around it, or whose read log is inside it, or with a path that is not
+a path (refused at submit and failed with a fixed code before the run writes anything or the start is counted, links, ``..``, relative paths and two
+spellings of one folder resolved), a health file or a service folder that is the inbox or lands in it (the start stops), a stop by signal
+(not counted) and a submission that is not valid UTF-8 (refused with its reason).
 """
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from replay.service import serve as serve_module
+from replay.service.run_record import RunRecord, parse_run_record
 from replay.service.serve import (
     Outcome,
     SubmitError,
@@ -47,9 +54,11 @@ from replay.service.serve import (
     submit,
     submit_command,
 )
+from replay.service.state_file import atomic_write
 from scripts.ingestion.gate import GateRefused, Problem
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.notice import Cause, Code, Notice
+from tests.fast.fake_vitaldb import installed
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
 OTHER_REFERENCE = ManifestRef("bucket", "manifests/replay/" + "c" * 64 + ".json", "version_2", "d" * 64).to_json()
@@ -161,6 +170,87 @@ def nested(depth: int) -> str:
     return "[" * depth + "]" * depth
 
 
+STATE_DIR_CODE = "state_dir_overlaps_inbox"
+
+
+def linked(inbox: Path) -> str:
+    link = inbox.parent / "link_to_inbox"
+    link.symlink_to(inbox, target_is_directory=True)
+    return str(link)
+
+
+OVERLAPPING_STATE_DIRS: dict[str, Callable[[Path], str]] = {
+    "the inbox": str,
+    "the inbox with a trailing slash": lambda inbox: f"{inbox}/",
+    "the inbox with a dot": lambda inbox: f"{inbox}/.",
+    "the inbox through a parent": lambda inbox: str(inbox.parent / "elsewhere" / ".." / inbox.name),
+    "a link to the inbox": linked,
+    "a folder of the inbox": lambda inbox: str(inbox / "done"),
+    "a folder inside the inbox that does not exist": lambda inbox: str(inbox / "runs" / "replay_0a1b2c3d"),
+    "the folder that holds the inbox": lambda inbox: str(inbox.parent),
+    "a folder above the inbox": lambda inbox: str(inbox.parent.parent),
+}
+SEPARATE_STATE_DIRS: dict[str, Callable[[Path], str]] = {
+    "a sibling folder": lambda inbox: str(inbox.parent / "state" / "replay_0a1b2c3d"),
+    "a sibling whose name begins with the inbox's": lambda inbox: f"{inbox}_state",
+    "a folder far from the inbox": lambda inbox: "/opt/replay/state/replay_0a1b2c3d",
+    "a name too long for the file system": lambda inbox: "/" + "x" * 5000,
+}
+
+READ_LOG_CODE = "read_log_in_inbox"
+INVALID_PATH_CODE = "invalid_path"
+SERVICE_FOLDER_CODE = "service_folder_is_inbox"
+SERVICE_FOLDERS = ("results", "done", "failed", "reserved", "locks")
+MALFORMED_PATHS = {"a NUL": "bad\u0000dir", "a lone surrogate": "bad\ud800dir"}
+
+
+def with_read_log(path: str, **changes: Any) -> dict[str, Any]:
+    return {**RECORD, "object_store": {"kind": "folder", "root": "/landed", "read_log": path}, **changes}
+
+
+def linked_request(inbox: Path) -> str:
+    link = inbox.parent / "link_to_request"
+    link.symlink_to(inbox / "b.json")
+    return str(link)
+
+
+def linked_inbox_file(inbox: Path) -> str:
+    return f"{linked(inbox)}/reads.log"
+
+
+READ_LOGS_IN_THE_INBOX: dict[str, Callable[[Path], str]] = {
+    "a request of the inbox": lambda inbox: str(inbox / "b.json"),
+    "a new file in the inbox": lambda inbox: str(inbox / "reads.log"),
+    "a file in a folder of the inbox": lambda inbox: str(inbox / "done" / "reads.log"),
+    "a file through a parent": lambda inbox: str(inbox.parent / "elsewhere" / ".." / inbox.name / "reads.log"),
+    "a file through a link to the inbox": linked_inbox_file,
+    "a link to a request": linked_request,
+    "a path relative to the folder that holds the inbox": lambda inbox: f"{inbox.name}/b.json",
+}
+READ_LOGS_OUTSIDE_THE_INBOX: dict[str, Callable[[Path], str]] = {
+    "a file beside the inbox": lambda inbox: str(inbox.parent / "reads.log"),
+    "a file in a sibling whose name begins with the inbox's": lambda inbox: f"{inbox}_state/reads.log",
+    "a path relative to the folder that holds the inbox": lambda inbox: "state/reads.log",
+}
+
+
+@contextlib.contextmanager
+def working_in(folder: Path) -> Iterator[None]:
+    """Run with ``folder`` as the working folder, as a second process that started elsewhere would."""
+    before = os.getcwd()
+    os.chdir(folder)
+    try:
+        yield
+    finally:
+        os.chdir(before)
+
+
+def case_insensitive_volume() -> bool:
+    with tempfile.TemporaryDirectory(prefix="replay_case_probe_") as folder:
+        (Path(folder) / "Probe").mkdir()
+        return (Path(folder) / "probe").is_dir()
+
+
 class ServeTest(unittest.TestCase):
     def loop(self, outcomes: dict[str, Outcome], sleeps_before_stop: int = 3) -> Loop:
         loop = Loop(outcomes, sleeps_before_stop)
@@ -250,6 +340,194 @@ class ServeTest(unittest.TestCase):
                 self.assertEqual(("failed", 2), (result["outcome"], result["exit_code"]))
                 self.assertTrue(result["error"].startswith("RunRecordError: "), result["error"])
                 self.assertTrue((loop.inbox / "done" / "b.json").is_file())
+
+    def test_a_record_whose_state_folder_is_the_inbox_or_shares_a_place_with_it_fails_with_a_fixed_code_before_anything_is_written_and_serving_continues(
+        self,
+    ) -> None:
+        for label, state_dir_of in OVERLAPPING_STATE_DIRS.items():
+            with self.subTest(label):
+                other = self.loop({"a.json": Outcome("finished", 0), "b.json": Outcome("finished", 0)})
+                other.put("a.json", json.dumps({**RECORD, "state_dir": state_dir_of(other.inbox)}))
+                other.put("b.json", json.dumps(RECORD))
+                before = sorted(path.name for path in other.inbox.iterdir())
+                self.assertEqual(0, other.serve())
+                self.assertEqual(["b.json"], other.ran, "the request that overlaps the inbox must not run")
+                self.assertFalse((other.inbox / "state.json").exists())
+                self.assertFalse((other.inbox / "schedule.json").exists())
+                self.assertTrue((other.inbox / "failed" / "a.json").is_file())
+                result = json.loads((other.inbox / "results" / "a.json").read_text())
+                self.assertEqual(("failed", 2), (result["outcome"], result["exit_code"]))
+                self.assertTrue(result["error"].startswith(f"{STATE_DIR_CODE}: "), result["error"])
+                self.assertNotIn(str(other.inbox), result["error"], "the text is fixed: it names no path")
+                self.assertTrue((other.inbox / "done" / "b.json").is_file())
+                self.assertEqual(["a.json", "a.reference", "b.json", "b.reference"], before)
+
+    def test_a_run_that_checkpoints_into_its_state_folder_never_has_its_checkpoint_archived_as_a_request(self) -> None:
+        """The defect as it happened: the stand-in run writes its checkpoint where the record says, and the loop must not see it as a request."""
+        loop = self.loop({})
+        written: list[Path] = []
+
+        def run_request(path: Path, beat: Callable[[], None]) -> Outcome:
+            loop.ran.append(path.name)
+            checkpoint = Path(json.loads(path.read_text())["state_dir"]) / "state.json"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("{}")
+            written.append(checkpoint)
+            return Outcome("finished", 0)
+
+        loop.run_request = run_request  # type: ignore[method-assign]
+        loop.put("a.json", json.dumps({**RECORD, "state_dir": str(loop.inbox)}))
+        loop.serve()
+        self.assertEqual([], written)
+        self.assertFalse((loop.inbox / "state.json").exists())
+        self.assertFalse((loop.inbox / "failed" / "state.json").exists())
+
+    def test_a_record_whose_state_folder_shares_no_place_with_the_inbox_runs(self) -> None:
+        for label, state_dir_of in SEPARATE_STATE_DIRS.items():
+            with self.subTest(label):
+                loop = self.loop({"a.json": Outcome("finished", 0)})
+                loop.put("a.json", json.dumps({**RECORD, "state_dir": state_dir_of(loop.inbox)}))
+                loop.serve()
+                self.assertEqual(["a.json"], loop.ran)
+                self.assertTrue((loop.inbox / "done" / "a.json").is_file())
+
+    def refused_request(self, record: dict[str, Any], code: str) -> Loop:
+        """Serve a request with this record next to a good one: it fails with the fixed ``code`` before anything is written, and the good one runs."""
+        loop = self.loop({"a.json": Outcome("finished", 0), "b.json": Outcome("finished", 0)})
+        loop.put("a.json", json.dumps(record))
+        loop.put("b.json", json.dumps(RECORD))
+        self.assertEqual(0, loop.serve())
+        self.assertEqual(["b.json"], loop.ran, "the refused request must not run")
+        self.assertTrue((loop.inbox / "failed" / "a.json").is_file())
+        result = json.loads((loop.inbox / "results" / "a.json").read_text())
+        self.assertEqual(("failed", 2), (result["outcome"], result["exit_code"]))
+        self.assertTrue(result["error"].startswith(f"{code}: "), result["error"])
+        self.assertNotIn(str(loop.inbox), result["error"], "the text is fixed: it names no path")
+        self.assertTrue((loop.inbox / "done" / "b.json").is_file())
+        return loop
+
+    def test_a_record_whose_read_log_is_a_file_of_the_inbox_fails_with_a_fixed_code_and_never_appends_to_another_request(self) -> None:
+        for label, read_log_of in READ_LOGS_IN_THE_INBOX.items():
+            with self.subTest(label):
+                loop = self.loop({"a.json": Outcome("finished", 0), "b.json": Outcome("finished", 0)})
+                loop.put("a.json", json.dumps(with_read_log(read_log_of(loop.inbox))))
+                loop.put("b.json", json.dumps(RECORD))
+                self.assertEqual(0, loop.serve())
+                self.assertEqual(["b.json"], loop.ran)
+                result = json.loads((loop.inbox / "results" / "a.json").read_text())
+                self.assertTrue(result["error"].startswith(f"{READ_LOG_CODE}: "), result["error"])
+                self.assertNotIn(str(loop.inbox), result["error"])
+                self.assertFalse((loop.inbox / "reads.log").exists())
+
+    def test_a_record_whose_read_log_is_outside_the_inbox_runs(self) -> None:
+        for label, read_log_of in READ_LOGS_OUTSIDE_THE_INBOX.items():
+            with self.subTest(label):
+                loop = self.loop({"a.json": Outcome("finished", 0)})
+                loop.put("a.json", json.dumps(with_read_log(read_log_of(loop.inbox))))
+                loop.serve()
+                self.assertEqual(["a.json"], loop.ran)
+
+    def test_a_record_with_a_malformed_state_folder_or_read_log_fails_with_a_fixed_code_and_serving_continues(self) -> None:
+        for label, text in MALFORMED_PATHS.items():
+            for field, record in {"state_dir": {**RECORD, "state_dir": text}, "read_log": with_read_log(text)}.items():
+                with self.subTest(label, field=field):
+                    self.refused_request(record, INVALID_PATH_CODE)
+
+    def test_a_relative_state_folder_or_read_log_is_taken_from_the_folder_that_holds_the_inbox_whatever_the_working_folder_is(self) -> None:
+        elsewhere = tempfile.TemporaryDirectory(prefix="replay_elsewhere_")
+        self.addCleanup(elsewhere.cleanup)
+        with working_in(Path(elsewhere.name)):
+            for relative in ("inbox", "inbox/runs/replay_0a1b2c3d", "."):
+                with self.subTest(relative):
+                    self.refused_request({**RECORD, "state_dir": relative}, STATE_DIR_CODE)
+
+    def test_a_queued_record_gives_the_run_its_relative_paths_from_the_folder_that_holds_the_inbox(self) -> None:
+        elsewhere = tempfile.TemporaryDirectory(prefix="replay_elsewhere_")
+        self.addCleanup(elsewhere.cleanup)
+        loop = self.loop({})
+        loop.put("a.json", json.dumps(with_read_log("state/reads.log", state_dir="state/replay_0a1b2c3d")))
+        with working_in(Path(elsewhere.name)):
+            record = queued_record(loop.inbox / "a.json")
+        base = loop.inbox.resolve().parent
+        self.assertEqual(str(base / "state" / "replay_0a1b2c3d"), record.state_dir)
+        self.assertEqual(str(base / "state" / "reads.log"), record.object_store.read_log)
+        self.assertEqual(str(base / "state" / "replay_0a1b2c3d" / "state.json"), str(record.state_path))
+
+    def aliased(self, loop: Loop) -> Path:
+        """A link to the loop's inbox, in a folder other than the one that holds the inbox."""
+        folder = loop.root / "aliases"
+        folder.mkdir()
+        link = folder / "alias"
+        link.symlink_to(loop.inbox, target_is_directory=True)
+        return link
+
+    def test_the_inbox_spelled_through_a_link_gives_a_relative_path_the_same_base_as_its_real_path(self) -> None:
+        loop = self.loop({})
+        link = self.aliased(loop)
+        loop.put("a.json", json.dumps(with_read_log("state/reads.log", state_dir="state/replay_0a1b2c3d")))
+        through_link, through_real = queued_record(link / "a.json"), queued_record(loop.inbox / "a.json")
+        self.assertEqual(str(loop.root.resolve() / "state" / "replay_0a1b2c3d"), through_real.state_dir)
+        self.assertEqual(through_real.state_dir, through_link.state_dir)
+        self.assertEqual(through_real.object_store.read_log, through_link.object_store.read_log)
+        self.assertEqual(str(loop.root.resolve() / "state" / "reads.log"), through_link.object_store.read_log)
+
+    def test_a_state_folder_that_is_in_the_inbox_by_the_real_base_is_refused_when_the_service_names_the_inbox_by_a_link(self) -> None:
+        loop = self.loop({"a.json": Outcome("finished", 0), "b.json": Outcome("finished", 0)})
+        link = self.aliased(loop)
+        loop.put("a.json", json.dumps({**RECORD, "state_dir": "inbox/runs/replay_0a1b2c3d"}))
+        loop.put("b.json", json.dumps(RECORD))
+        loop.inbox = link
+        self.assertEqual(0, loop.serve())
+        self.assertEqual(["b.json"], loop.ran, "the request whose state folder is in the inbox must not run")
+        result = json.loads((link / "results" / "a.json").read_text())
+        self.assertTrue(result["error"].startswith(f"{STATE_DIR_CODE}: "), result["error"])
+
+    def test_a_refused_record_is_refused_before_its_start_count_is_written_and_before_the_retry_cap(self) -> None:
+        refused: dict[str, Callable[[Path], dict[str, Any]]] = {
+            "a state folder that is the inbox": lambda inbox: {**RECORD, "state_dir": str(inbox)},
+            "a read log in the inbox": lambda inbox: with_read_log(str(inbox / "reads.log")),
+            "a malformed state folder": lambda inbox: {**RECORD, "state_dir": "bad\u0000dir"},
+        }
+        for label, record_of in refused.items():
+            with self.subTest(label, case="no count is written"):
+                loop = self.loop({})
+                loop.put("a.json", json.dumps(record_of(loop.inbox)))
+                written: list[str] = []
+
+                def recording(path: Path, data: str | bytes, written: list[str] = written) -> None:
+                    written.append(path.name)
+                    atomic_write(path, data)
+
+                with mock.patch("replay.service.serve.atomic_write", recording):
+                    loop.serve()
+                self.assertEqual([], [name for name in written if name.endswith(".attempts")], written)
+            with self.subTest(label, case="the retry cap does not hide the reason"):
+                loop = self.loop({})
+                loop.put("a.json", json.dumps(record_of(loop.inbox)))
+                (loop.inbox / "a.attempts").write_text(f"{serve_module.MAX_ATTEMPTS}\n")
+                loop.serve()
+                error = json.loads((loop.inbox / "results" / "a.json").read_text())["error"]
+                self.assertFalse(error.startswith("the service stopped"), error)
+                self.assertFalse((loop.inbox / "a.attempts").exists())
+
+    @unittest.skipUnless(case_insensitive_volume(), "the volume tells the inbox's name in another case apart")
+    def test_a_state_folder_or_read_log_that_spells_the_inbox_in_another_case_is_the_same_folder_on_a_case_insensitive_volume(self) -> None:
+        for field in ("state_dir", "read_log"):
+            with self.subTest(field):
+                folder = tempfile.TemporaryDirectory(prefix="replay_case_")
+                self.addCleanup(folder.cleanup)
+                inbox = Path(folder.name) / "inbox"
+                inbox.mkdir()
+                loop = self.loop({"a.json": Outcome("finished", 0)})
+                loop.inbox = inbox
+                loop.health = Path(folder.name) / "health.json"
+                shouted = str(inbox.parent / "INBOX")
+                record = {**RECORD, "state_dir": shouted} if field == "state_dir" else with_read_log(f"{shouted}/reads.log")
+                loop.put("a.json", json.dumps(record))
+                loop.serve()
+                self.assertEqual([], loop.ran)
+                code = STATE_DIR_CODE if field == "state_dir" else READ_LOG_CODE
+                self.assertTrue(json.loads((inbox / "results" / "a.json").read_text())["error"].startswith(f"{code}: "))
 
     def test_a_queued_record_without_its_reference_fails_and_the_reference_beside_a_record_replaces_the_one_in_it(self) -> None:
         loop = self.loop({"b.json": Outcome("finished", 0)})
@@ -425,6 +703,153 @@ class ServeTest(unittest.TestCase):
         self.assertEqual([], loop.ran)
 
 
+class ServeStartTest(unittest.TestCase):
+    """The loop's start-up check of its own files: the health file is a ``.json`` file too, so inside the inbox the loop would take it for a request."""
+
+    def start(self, health_of: Callable[[Path], Path], before: Callable[[Path], None] = lambda inbox: None) -> tuple[int, list[str], list[str], list[str]]:
+        folder = tempfile.TemporaryDirectory(prefix="replay_start_")
+        self.addCleanup(folder.cleanup)
+        inbox = Path(folder.name) / "inbox"
+        inbox.mkdir()
+        (inbox / "link").symlink_to(inbox, target_is_directory=True)
+        before(inbox)
+        self.inbox = inbox
+        logged: list[str] = []
+        ran: list[str] = []
+
+        def run_request(path: Path, beat: Callable[[], None]) -> Outcome:
+            ran.append(path.name)
+            return Outcome("finished", 0)
+
+        stop = [False]
+        code = serve(
+            inbox,
+            health_of(inbox),
+            run_request,
+            lambda: stop[0],
+            Clock(),
+            lambda seconds: stop.__setitem__(0, True),
+            1.0,
+            lambda event, **fields: logged.append(json.dumps({"event": event, **fields})),
+        )
+        files = sorted(str(path.relative_to(folder.name)) for path in Path(folder.name).rglob("*") if path.is_file())
+        return code, files, logged, ran
+
+    def test_a_health_file_inside_the_inbox_stops_the_start_with_exit_2_and_a_fixed_code_and_nothing_is_written(self) -> None:
+        for label, health_of in {
+            "in the inbox": lambda inbox: inbox / "health.json",
+            "in a folder of the inbox": lambda inbox: inbox / "done" / "health.json",
+            "through a link": lambda inbox: inbox / "link" / "health.json",
+            "through a parent": lambda inbox: inbox.parent / "elsewhere" / ".." / "inbox" / "health.json",
+        }.items():
+            with self.subTest(label):
+                code, files, logged, ran = self.start(health_of)
+                self.assertEqual(2, code)
+                self.assertEqual([], files)
+                self.assertEqual([], ran)
+                self.assertEqual(1, len(logged), logged)
+                self.assertTrue(logged[0].startswith('{"event": "serve_refused", "message": "health_file_in_inbox: '), logged[0])
+                self.assertNotIn("replay_start_", logged[0], "the text is fixed: it names no path")
+
+    def test_a_health_file_that_is_a_link_in_the_inbox_is_refused_because_its_write_would_replace_the_link_inside_the_inbox(self) -> None:
+        def link_out(target: str) -> Callable[[Path], Path]:
+            def make(inbox: Path) -> Path:
+                (inbox.parent / "outside").mkdir(exist_ok=True)
+                link = inbox / "health.json"
+                link.symlink_to(target if target.startswith("..") else inbox.parent / target)
+                return link
+
+            return make
+
+        for label, health_of in {
+            "a link to a file outside": link_out("outside/health.json"),
+            "a relative link to a file outside": link_out("../outside/health.json"),
+        }.items():
+            with self.subTest(label):
+                code, files, logged, ran = self.start(health_of)
+                self.assertEqual((2, [], []), (code, files, ran))
+                self.assertTrue(logged[0].startswith('{"event": "serve_refused", "message": "health_file_in_inbox: '), logged)
+                self.assertTrue((self.inbox / "health.json").is_symlink(), "the link must still be the link")
+
+    def test_a_health_file_that_is_a_link_outside_the_inbox_to_a_file_in_it_is_refused(self) -> None:
+        def link_in(inbox: Path) -> Path:
+            link = inbox.parent / "health.json"
+            link.symlink_to(inbox / "health.json")
+            return link
+
+        code, files, logged, _ = self.start(link_in)
+        self.assertEqual((2, []), (code, files))
+        self.assertIn("health_file_in_inbox", logged[0])
+
+    def test_a_service_folder_that_is_the_inbox_stops_the_start_with_exit_2_and_a_fixed_code_before_anything_is_written(self) -> None:
+        for name in SERVICE_FOLDERS:
+            for label, target in {
+                "a link to the inbox": lambda inbox: inbox,
+                "a relative link": lambda inbox: Path("."),
+                "a link through a link": lambda inbox: inbox / "link",
+            }.items():
+                with self.subTest(folder=name, link=label):
+
+                    def plant(inbox: Path, name: str = name, target: Callable[[Path], Path] = target) -> None:
+                        (inbox / name).symlink_to(target(inbox), target_is_directory=True)
+
+                    code, files, logged, ran = self.start(lambda inbox: inbox.parent / "health.json", plant)
+                    self.assertEqual((2, [], []), (code, files, ran))
+                    self.assertEqual(1, len(logged), logged)
+                    self.assertTrue(logged[0].startswith(f'{{"event": "serve_refused", "message": "{SERVICE_FOLDER_CODE}: '), logged[0])
+                    self.assertNotIn("replay_start_", logged[0], "the text is fixed: it names no path")
+                    self.assertEqual(sorted(["link", name]), sorted(path.name for path in self.inbox.iterdir()))
+
+    @unittest.skipUnless(case_insensitive_volume(), "the volume tells the inbox's name in another case apart")
+    def test_a_service_folder_that_links_to_the_inbox_by_another_spelling_stops_the_start_on_a_case_insensitive_volume(self) -> None:
+        def plant(inbox: Path) -> None:
+            (inbox / "done").symlink_to(inbox.parent / "INBOX", target_is_directory=True)
+
+        code, files, logged, _ = self.start(lambda inbox: inbox.parent / "health.json", plant)
+        self.assertEqual((2, []), (code, files))
+        self.assertIn(SERVICE_FOLDER_CODE, logged[0])
+
+    def test_a_service_folder_that_is_a_link_to_another_folder_starts_the_service(self) -> None:
+        for name in SERVICE_FOLDERS:
+            with self.subTest(name):
+
+                def plant(inbox: Path, name: str = name) -> None:
+                    (inbox.parent / "elsewhere").mkdir()
+                    (inbox / name).symlink_to(inbox.parent / "elsewhere", target_is_directory=True)
+
+                code, _, logged, _ = self.start(lambda inbox: inbox.parent / "health.json", plant)
+                self.assertEqual((0, []), (code, logged))
+
+    def test_a_health_file_with_a_malformed_path_stops_the_start_with_exit_2_and_the_fixed_code_invalid_path(self) -> None:
+        for label, text in MALFORMED_PATHS.items():
+            with self.subTest(label):
+
+                def health_of(inbox: Path, text: str = text) -> Path:
+                    return inbox.parent / text
+
+                code, files, logged, _ = self.start(health_of)
+                self.assertEqual((2, []), (code, files))
+                self.assertTrue(logged[0].startswith(f'{{"event": "serve_refused", "message": "{INVALID_PATH_CODE}: '), logged)
+
+    def test_a_health_file_inside_an_inbox_that_does_not_exist_yet_leaves_the_inbox_uncreated(self) -> None:
+        folder = tempfile.TemporaryDirectory(prefix="replay_start_")
+        self.addCleanup(folder.cleanup)
+        inbox = Path(folder.name) / "inbox"
+        code = serve(inbox, inbox / "health.json", lambda path, beat: Outcome("finished", 0), lambda: True, Clock(), lambda seconds: None, 1.0)
+        self.assertEqual(2, code)
+        self.assertEqual([], list(Path(folder.name).iterdir()))
+
+    def test_a_health_file_beside_the_inbox_starts_the_service(self) -> None:
+        for label, health_of in {
+            "beside the inbox": lambda inbox: inbox.parent / "health.json",
+            "in a folder whose name begins with the inbox's": lambda inbox: inbox.parent / "inbox_state" / "health.json",
+        }.items():
+            with self.subTest(label):
+                code, files, logged, _ = self.start(health_of)
+                self.assertEqual((0, []), (code, logged))
+                self.assertEqual(1, sum(name.endswith("health.json") for name in files), files)
+
+
 class ResultSizeTest(unittest.TestCase):
     """The writer and the reader of a result file share one limit, so every result the service writes is a result it reads back."""
 
@@ -572,6 +997,49 @@ class CrashLoopTest(unittest.TestCase):
         self.assertTrue((self.inbox / "failed" / "a.reference").is_file())
         self.assertTrue((self.inbox / "done" / "b.json").is_file())
         self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+
+    def fail_checking_a(self) -> Any:
+        """Make the check of the request ``a.json`` raise an error that nothing handles, as a defect in the check would."""
+        original = serve_module.queued_record
+
+        def queued(request: Path) -> RunRecord:
+            if request.name == "a.json":
+                raise KeyError("an error that nothing handles")
+            return original(request)
+
+        return mock.patch.object(serve_module, "queued_record", queued)
+
+    def test_an_unexpected_error_while_a_request_is_checked_counts_as_a_start_so_three_in_a_row_fail_it_on_the_fourth_and_the_next_request_runs(self) -> None:
+        self.put("a")
+        self.put("b")
+        with self.fail_checking_a():
+            for count in (1, 2, 3):
+                with self.assertRaises(KeyError):
+                    self.start(lambda path, beat: Outcome("finished", 0))
+                self.assertEqual(str(count), (self.inbox / "a.attempts").read_text().strip())
+            self.assertEqual(0, self.start(self.crash_on_a))
+        self.assertEqual(["b.json"], self.ran)
+        result = json.loads((self.inbox / "results" / "a.json").read_text())
+        self.assertEqual(("failed", "the service stopped during this request 3 times"), (result["outcome"], result["error"]))
+        self.assertTrue((self.inbox / "failed" / "a.json").is_file())
+        self.assertTrue((self.inbox / "done" / "b.json").is_file())
+        self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+
+    def test_an_ordinary_refusal_is_not_counted_however_often_it_is_met(self) -> None:
+        (self.inbox / "a.json").write_text("not json")
+        (self.inbox / "a.reference").write_text(REFERENCE)
+        written: list[str] = []
+
+        def recording(path: Path, data: str | bytes) -> None:
+            written.append(path.name)
+            atomic_write(path, data)
+
+        with mock.patch.object(serve_module, "atomic_write", recording):
+            self.assertEqual(0, self.start(self.crash_on_a))
+        self.assertEqual([], [name for name in written if name.endswith(".attempts")], written)
+        self.assertEqual([], self.ran)
+        self.assertEqual([], sorted(path.name for path in self.inbox.glob("*.attempts")))
+        self.assertTrue((self.inbox / "failed" / "a.json").is_file())
 
     def test_two_stops_then_a_finish_is_not_a_failure_and_the_count_goes_with_the_archived_request(self) -> None:
         self.put("a")
@@ -797,6 +1265,95 @@ class SubmitTest(unittest.TestCase):
             with self.subTest(text=text[:30], reference=reference[:10]), self.assertRaises(SubmitError):
                 submit(self.inbox, text, reference)
         self.assertFalse(self.inbox.exists() and any(self.inbox.iterdir()))
+
+    def test_a_record_whose_state_folder_shares_a_place_with_the_inbox_is_refused_with_a_fixed_code_and_nothing_is_written(self) -> None:
+        for label, state_dir_of in OVERLAPPING_STATE_DIRS.items():
+            with self.subTest(label):
+                folder = tempfile.TemporaryDirectory(prefix="replay_submit_")
+                self.addCleanup(folder.cleanup)
+                inbox = Path(folder.name) / "inbox"
+                inbox.mkdir()
+                with self.assertRaisesRegex(SubmitError, f"^{STATE_DIR_CODE}: ") as caught:
+                    submit(inbox, json.dumps({**RECORD, "state_dir": state_dir_of(inbox)}), REFERENCE)
+                self.assertNotIn(str(inbox), str(caught.exception))
+                self.assertEqual([], sorted(str(path.relative_to(inbox)) for path in inbox.rglob("*")))
+
+    def test_a_record_whose_state_folder_shares_no_place_with_the_inbox_is_submitted(self) -> None:
+        for label, state_dir_of in SEPARATE_STATE_DIRS.items():
+            with self.subTest(label):
+                folder = tempfile.TemporaryDirectory(prefix="replay_submit_")
+                self.addCleanup(folder.cleanup)
+                inbox = Path(folder.name) / "inbox"
+                self.assertEqual("submitted", submit(inbox, json.dumps({**RECORD, "state_dir": state_dir_of(inbox)}), REFERENCE))
+
+    def refused(self, record: dict[str, Any], code: str) -> None:
+        """The submission is refused with the fixed ``code`` and nothing is written in the inbox."""
+        with self.assertRaisesRegex(SubmitError, f"^{code}: ") as caught:
+            submit(self.inbox, json.dumps(record), REFERENCE)
+        self.assertNotIn(str(self.inbox), str(caught.exception))
+        self.assertEqual([], sorted(str(path.relative_to(self.inbox)) for path in self.inbox.rglob("*")) if self.inbox.exists() else [])
+
+    def test_a_record_whose_read_log_is_in_the_inbox_is_refused_with_a_fixed_code_and_nothing_is_written(self) -> None:
+        for label, read_log_of in READ_LOGS_IN_THE_INBOX.items():
+            with self.subTest(label):
+                self.setUp()
+                self.inbox.mkdir()
+                self.refused(with_read_log(read_log_of(self.inbox)), READ_LOG_CODE)
+
+    def test_a_record_whose_read_log_is_outside_the_inbox_is_submitted(self) -> None:
+        for label, read_log_of in READ_LOGS_OUTSIDE_THE_INBOX.items():
+            with self.subTest(label):
+                self.setUp()
+                self.assertEqual("submitted", submit(self.inbox, json.dumps(with_read_log(read_log_of(self.inbox))), REFERENCE))
+
+    def test_a_malformed_state_folder_or_read_log_is_refused_with_the_fixed_code_invalid_path_and_the_command_exits_2(self) -> None:
+        for label, text in MALFORMED_PATHS.items():
+            for field, record in {"state_dir": {**RECORD, "state_dir": text}, "read_log": with_read_log(text)}.items():
+                with self.subTest(label, field=field):
+                    self.setUp()
+                    self.refused(record, INVALID_PATH_CODE)
+                    self.assertEqual(2, self.command(json.dumps(record).encode(), REFERENCE.encode()))
+                    self.assertFalse(self.inbox.exists() and any(self.inbox.iterdir()))
+
+    def test_a_relative_state_folder_or_read_log_is_taken_from_the_folder_that_holds_the_inbox_whatever_the_working_folder_is(self) -> None:
+        elsewhere = tempfile.TemporaryDirectory(prefix="replay_elsewhere_")
+        self.addCleanup(elsewhere.cleanup)
+        with working_in(Path(elsewhere.name)):
+            for relative in ("inbox", "inbox/runs/replay_0a1b2c3d", "."):
+                with self.subTest(relative):
+                    self.refused({**RECORD, "state_dir": relative}, STATE_DIR_CODE)
+            self.refused(with_read_log("inbox/reads.log"), READ_LOG_CODE)
+            self.assertEqual("submitted", submit(self.inbox, json.dumps({**RECORD, "state_dir": "state/replay_0a1b2c3d"}), REFERENCE))
+
+    def test_a_relative_state_folder_is_taken_from_the_folder_that_holds_the_real_inbox_when_the_inbox_is_given_as_a_link(self) -> None:
+        self.inbox.mkdir()
+        (self.inbox.parent / "aliases").mkdir()
+        link = self.inbox.parent / "aliases" / "alias"
+        link.symlink_to(self.inbox, target_is_directory=True)
+        with self.assertRaisesRegex(SubmitError, f"^{STATE_DIR_CODE}: "):
+            submit(link, json.dumps({**RECORD, "state_dir": "inbox/runs/replay_0a1b2c3d"}), REFERENCE)
+        self.assertEqual([], self.files())
+        self.assertEqual("submitted", submit(link, json.dumps({**RECORD, "state_dir": "state/replay_0a1b2c3d"}), REFERENCE))
+
+    def test_a_service_folder_that_is_the_inbox_refuses_the_submission_with_a_fixed_code_and_writes_nothing(self) -> None:
+        for name in SERVICE_FOLDERS:
+            with self.subTest(name):
+                self.setUp()
+                self.inbox.mkdir()
+                (self.inbox / name).symlink_to(self.inbox, target_is_directory=True)
+                self.refused_with_links(RECORD, SERVICE_FOLDER_CODE, name)
+
+    def refused_with_links(self, record: dict[str, Any], code: str, link: str) -> None:
+        with self.assertRaisesRegex(SubmitError, f"^{code}: "):
+            submit(self.inbox, json.dumps(record), REFERENCE)
+        self.assertEqual([link], sorted(path.name for path in self.inbox.iterdir()))
+
+    @unittest.skipUnless(case_insensitive_volume(), "the volume tells the inbox's name in another case apart")
+    def test_a_state_folder_or_read_log_that_spells_the_inbox_in_another_case_is_refused_on_a_case_insensitive_volume(self) -> None:
+        self.inbox.mkdir()
+        shouted = str(self.inbox.parent / "INBOX")
+        self.refused({**RECORD, "state_dir": shouted}, STATE_DIR_CODE)
+        self.refused(with_read_log(f"{shouted}/reads.log"), READ_LOG_CODE)
 
     def plant(self, folder: str, text: str = "", reference: str | None = REFERENCE) -> None:
         """A record that is held under this run ID without a reservation, as one was before reservations existed."""
@@ -1096,6 +1653,105 @@ class SubmitTest(unittest.TestCase):
         with self.assertRaises(SubmitError) as caught:
             read_submission(missing, io.BytesIO(b"{}"))
         self.assertIn("reference", str(caught.exception))
+
+
+def program() -> Any:
+    """The program module with stand-ins for the libraries that only the replay image holds (the publisher's, and Avro), which are dropped again from the
+    modules that Python has loaded, so no other test sees them. The tests here call the program's own ``main`` and commands' wiring, never those libraries."""
+    with installed(), mock.patch.dict(sys.modules, {"fastavro": mock.MagicMock()}):
+        return importlib.import_module("replay.service.__main__")
+
+
+class ArchivedRecordTest(unittest.TestCase):
+    """A command that reads a record the service archived takes its relative paths from the folder that holds the resolved inbox, as the run did."""
+
+    def setUp(self) -> None:
+        self.cli = program()
+        folder = tempfile.TemporaryDirectory(prefix="replay_archived_")
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        self.inbox = self.root / "real" / "inbox"
+        (self.inbox / "done").mkdir(parents=True)
+        self.archived = self.inbox / "done" / "a.json"
+        self.archived.write_text(json.dumps(with_read_log("state/reads.log", state_dir="state/replay_0a1b2c3d")))
+        (self.root / "aliases").mkdir()
+        self.link = self.root / "aliases" / "alias"
+        self.link.symlink_to(self.inbox, target_is_directory=True)
+
+    def arguments(self, name: str, *inbox: Path) -> list[str]:
+        extra = {
+            "manifest": ["--out", str(self.root / "manifest.json")],
+            "observe": ["--out", str(self.root / "observed.json")],
+            "compare": ["--manifest", str(self.root / "manifest.json"), "--observed", str(self.root / "observed.json")],
+        }
+        return [name, "--run-record", str(self.archived), *[item for place in inbox for item in ("--inbox", str(place))], *extra.get(name, [])]
+
+    def test_every_command_that_takes_a_run_record_takes_the_inbox_and_resolves_the_relative_paths_from_the_folder_that_holds_it(self) -> None:
+        expected_state = str(self.root / "real" / "state" / "replay_0a1b2c3d")
+        for name in self.cli.COMMANDS:
+            for spelled in (self.inbox, self.link):
+                with self.subTest(command=name, inbox=spelled.name):
+                    seen: list[RunRecord] = []
+
+                    def capture(record: RunRecord, arguments: Any, seen: list[RunRecord] = seen) -> int:
+                        seen.append(record)
+                        return 0
+
+                    with mock.patch.dict(self.cli.COMMANDS, {name: capture}):
+                        self.assertEqual(0, self.cli.main(self.arguments(name, spelled)))
+                    self.assertEqual(expected_state, seen[0].state_dir)
+                    self.assertEqual(str(self.root / "real" / "state" / "reads.log"), seen[0].object_store.read_log)
+
+    def test_a_record_whose_paths_the_service_refuses_runs_no_command_and_writes_nothing(self) -> None:
+        cases = {
+            "read_log in the inbox": (with_read_log("inbox/next.json", state_dir="state/replay_0a1b2c3d"), "read_log_in_inbox"),
+            "state_dir the inbox": (with_read_log("state/reads.log", state_dir="inbox"), "state_dir_overlaps_inbox"),
+            "state_dir inside the inbox": (with_read_log("state/reads.log", state_dir="inbox/runs/replay_0a1b2c3d"), "state_dir_overlaps_inbox"),
+        }
+        queued = self.inbox / "next.json"
+        queued.write_text('{"queued": true}')
+        for label, (document, code) in cases.items():
+            self.archived.write_text(json.dumps(document))
+            for name in self.cli.COMMANDS:
+                for spelled in (self.inbox, self.link):
+                    with self.subTest(case=label, command=name, inbox=spelled.name):
+                        calls: list[str] = []
+
+                        def capture(record: RunRecord, arguments: Any, calls: list[str] = calls) -> int:
+                            calls.append("called")
+                            return 0
+
+                        stderr = io.StringIO()
+                        with mock.patch.dict(self.cli.COMMANDS, {name: capture}), contextlib.redirect_stderr(stderr):
+                            self.assertEqual(2, self.cli.main(self.arguments(name, spelled)))
+                        self.assertEqual([], calls)
+                        self.assertIn(code, stderr.getvalue())
+                        self.assertEqual('{"queued": true}', queued.read_text())
+
+    def test_without_the_inbox_the_record_is_read_as_it_is(self) -> None:
+        seen: list[RunRecord] = []
+
+        def capture(record: RunRecord, arguments: Any) -> int:
+            seen.append(record)
+            return 0
+
+        with mock.patch.dict(self.cli.COMMANDS, {"run": capture}):
+            self.assertEqual(0, self.cli.main(self.arguments("run")))
+        self.assertEqual(parse_run_record(self.archived.read_text()), seen[0])
+
+    def test_manifest_looks_for_the_frozen_schedule_where_the_run_froze_it(self) -> None:
+        looked: list[str] = []
+
+        class Nothing:
+            def __init__(self, path: Path) -> None:
+                looked.append(str(path))
+
+            def load(self) -> None:
+                return None
+
+        with mock.patch.object(self.cli, "ScheduleFile", Nothing), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, self.cli.main(self.arguments("manifest", self.link)))
+        self.assertEqual([str(self.root / "real" / "state" / "replay_0a1b2c3d" / "schedule.json")], looked)
 
 
 if __name__ == "__main__":

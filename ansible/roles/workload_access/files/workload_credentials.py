@@ -27,23 +27,37 @@ METADATA_HOST = "169.254.169.254"
 RENEW_BEFORE = timedelta(minutes=30)
 SESSION_SECONDS = 3600
 REQUEST_TIMEOUT_SECONDS = 20
-EXPIRATION_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 CREDENTIAL_FIELDS = ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")
+# The form of a credential value that goes into a header or a credential file: the characters of a bearer token (RFC 6750, b64token) and nothing else. A
+# control character such as a line break makes the HTTP library's header error carry the value's text. The expiration is a time of its own form: the time of
+# AWS Query (ISO 8601 in UTC) with optional fractions of a second.
+VALUE_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+EXPIRATION_FORM = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z")
 
 
 class CredentialError(RuntimeError):
     """Instance metadata or STS did not return usable credentials."""
 
 
+def parse_expiration(text: str) -> datetime | None:
+    """The time of an expiration in the form of AWS Query, with or without fractions of a second, or ``None`` when it is no such time or no date."""
+    match = EXPIRATION_FORM.fullmatch(text)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second = (int(part) for part in match.groups()[:6])
+    microsecond = int((match.group(7) or "").ljust(6, "0")[:6])
+    try:
+        return datetime(year, month, day, hour, minute, second, microsecond, tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def needs_renewal(document: dict[str, Any] | None, now: datetime) -> bool:
     """Whether the stored credentials are missing, malformed or within the renewal window."""
     if not document or any(not document.get(field) for field in CREDENTIAL_FIELDS):
         return True
-    try:
-        expiration = datetime.strptime(str(document["Expiration"]), EXPIRATION_FORMAT).replace(tzinfo=UTC)
-    except ValueError:
-        return True
-    return expiration - now < RENEW_BEFORE
+    expiration = parse_expiration(str(document["Expiration"]))
+    return expiration is None or expiration - now < RENEW_BEFORE
 
 
 def signing_key(secret: str, date: str, region: str, service: str) -> bytes:
@@ -53,15 +67,25 @@ def signing_key(secret: str, date: str, region: str, service: str) -> bytes:
     return key
 
 
+def header_value(credentials: dict[str, str], field: str) -> str:
+    """The credential ``field`` of the host role when it is text of the closed header-safe form, or ``CredentialError`` that never holds the value."""
+    value = credentials.get(field)
+    if not isinstance(value, str) or VALUE_FORM.fullmatch(value) is None:
+        raise CredentialError(f"the host role's {field} is not a valid credential value")
+    return value
+
+
 def signed_headers(credentials: dict[str, str], region: str, body: str, now: datetime) -> dict[str, str]:
     """The headers of a Signature Version 4 POST to the regional STS endpoint."""
+    token = header_value(credentials, "Token")
+    access_key = header_value(credentials, "AccessKeyId")
     host = f"sts.{region}.amazonaws.com"
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=utf-8",
         "host": host,
         "x-amz-date": stamp,
-        "x-amz-security-token": credentials["Token"],
+        "x-amz-security-token": token,
     }
     names = ";".join(headers)
     canonical = "\n".join(["POST", "/", "", *[f"{name}:{value}" for name, value in headers.items()], "", names, hashlib.sha256(body.encode()).hexdigest()])
@@ -72,8 +96,8 @@ def signed_headers(credentials: dict[str, str], region: str, body: str, now: dat
         "Content-Type": headers["content-type"],
         "Host": host,
         "X-Amz-Date": stamp,
-        "X-Amz-Security-Token": credentials["Token"],
-        "Authorization": f"AWS4-HMAC-SHA256 Credential={credentials['AccessKeyId']}/{scope}, SignedHeaders={names}, Signature={signature}",
+        "X-Amz-Security-Token": token,
+        "Authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={names}, Signature={signature}",
     }
 
 
@@ -82,7 +106,37 @@ def credential_document(body: str) -> dict[str, Any]:
     found = {field: re.search(rf"<{field}>([^<]+)</{field}>", body) for field in CREDENTIAL_FIELDS}
     if any(match is None for match in found.values()):
         raise CredentialError("the STS response holds no credentials")
-    return {"Version": 1} | {field: match.group(1) for field, match in found.items() if match is not None}
+    document: dict[str, Any] = {"Version": 1}
+    for field, match in found.items():
+        if match is None:
+            raise CredentialError(f"the STS response's {field} is not a valid credential value")
+        text = match.group(1)
+        if (parse_expiration(text) is None) if field == "Expiration" else (VALUE_FORM.fullmatch(text) is None):
+            raise CredentialError(f"the STS response's {field} is not a valid credential value")
+        document[field] = text
+    return document
+
+
+def decoded(body: bytes, source: str) -> str:
+    """The text of an answer of ``source``, or ``CredentialError`` that holds no part of the answer: the decoding error holds its bytes, so it is left first."""
+    try:
+        return body.decode()
+    except UnicodeDecodeError:
+        text = None
+    if text is None:
+        raise CredentialError(f"{source} answered text that is not UTF-8")
+    return text
+
+
+def role_document(text: str) -> dict[str, str]:
+    """The role's credentials from instance metadata, or ``CredentialError`` that holds no part of the document: the JSON error holds the document."""
+    try:
+        document = json.loads(text)
+    except ValueError:
+        document = None
+    if not isinstance(document, dict):
+        raise CredentialError("instance metadata answered a role document that is not a JSON object")
+    return document
 
 
 def metadata(method: str, path: str, headers: dict[str, str]) -> str:
@@ -90,19 +144,21 @@ def metadata(method: str, path: str, headers: dict[str, str]) -> str:
     try:
         connection.request(method, path, headers=headers)
         response = connection.getresponse()
-        text = response.read().decode()
+        body = response.read()
     finally:
         connection.close()
     if response.status != http.client.OK:
         raise CredentialError(f"instance metadata answered {response.status} for {path}")
-    return text
+    return decoded(body, "instance metadata")
 
 
 def host_credentials() -> dict[str, str]:
-    token = {"X-aws-ec2-metadata-token": metadata("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"})}
+    session = metadata("PUT", "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+    if VALUE_FORM.fullmatch(session) is None:
+        raise CredentialError("instance metadata answered a session token that is not a valid token")
+    token = {"X-aws-ec2-metadata-token": session}
     role = metadata("GET", "/latest/meta-data/iam/security-credentials/", token).strip()
-    credentials: dict[str, str] = json.loads(metadata("GET", f"/latest/meta-data/iam/security-credentials/{role}", token))
-    return credentials
+    return role_document(metadata("GET", f"/latest/meta-data/iam/security-credentials/{role}", token))
 
 
 def assume_role(credentials: dict[str, str], region: str, role_arn: str, session_name: str, now: datetime) -> dict[str, Any]:
@@ -112,9 +168,10 @@ def assume_role(credentials: dict[str, str], region: str, role_arn: str, session
     try:
         connection.request("POST", "/", body=body, headers=signed_headers(credentials, region, body, now))
         response = connection.getresponse()
-        text = response.read().decode()
+        body_bytes = response.read()
     finally:
         connection.close()
+    text = decoded(body_bytes, "STS")
     if response.status != http.client.OK:
         code = re.search(r"<Code>([^<]+)</Code>", text)
         raise CredentialError(f"STS refused the role for {session_name}: {code.group(1) if code else response.status}")
@@ -126,10 +183,19 @@ def write_credentials(name: str, group_id: int, document: dict[str, Any]) -> Non
     folder.mkdir(mode=0o750, parents=True, exist_ok=True)
     os.chown(folder, 0, group_id)
     partial = folder / "credentials.json.partial"
-    partial.write_text(json.dumps(document))
-    os.chown(partial, 0, group_id)
-    os.chmod(partial, 0o640)
-    partial.replace(folder / "credentials.json")
+    # A file or link that an earlier run left is removed (a link itself, never what it points to). The new file is created exclusively with its final mode and
+    # given to the group through its descriptor: the credentials never go to a file that this run did not create or that other users can read.
+    partial.unlink(missing_ok=True)
+    descriptor = os.open(partial, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o640)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            os.fchown(handle.fileno(), 0, group_id)
+            os.fchmod(handle.fileno(), 0o640)
+            handle.write(json.dumps(document))
+        partial.replace(folder / "credentials.json")
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def stored(name: str) -> dict[str, Any] | None:

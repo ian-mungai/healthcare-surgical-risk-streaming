@@ -32,7 +32,6 @@ import sys
 import tarfile
 import tempfile
 import threading
-import traceback
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +45,7 @@ from scripts.process import CompletedProcess, run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.secret_inputs import Marker, listed_names, make_marker, scan_text, scan_tree
+from tests.fast.traceback_support import raised_text
 from tests.slow.ansible_support import ROLES, SHARED_MODULE_UTILS, environment, shared_module
 
 PLAYBOOK_SECONDS = 180
@@ -631,9 +631,7 @@ class DiagnosticSinks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / ".env"
             path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
-            with self.assertRaises(ConfigurationError) as caught:
-                load_configuration(path)
-        shown = "".join(traceback.format_exception(caught.exception))
+            _, shown = raised_text(lambda: load_configuration(path), ConfigurationError, "load_configuration")
         self.assertIn("TAILSCALE_CLIENT_ID", shown, "control: the refusal names the setting")
         self.assertEqual([], scan_text(shown, [marker]))
 

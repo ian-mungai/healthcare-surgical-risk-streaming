@@ -6,8 +6,9 @@ The folder holds ``plan.json`` (written by the orchestrator, see ``spark/table_c
 ``lab_data.csv``. The job opens the catalog on the plan's branch **as of the plan's hash**, so it reads the tables exactly as the load step left them, and
 it writes nothing: the merge is the orchestrator's step after every check passed. For each table it checks the column list, the row count, the key multiset
 and the row payload against the staged file, and for the track list the pinned row count and digest. Rows are compared as multisets by Spark
-(``exceptAll``), so no table or file is collected into the driver. The digest of the track list is built from the sorted rows streamed through the driver
-one at a time.
+(``exceptAll``), so no table or file is collected into the driver. The result of the clinical and the laboratory table holds one flag for each comparison and no
+count, because both tables can reflect an outcome (see ``spark/table_checks.py``). The digest of the track list is built from the sorted rows streamed through
+the driver one at a time.
 
 Exit code 0: every check passed. 1: a check failed (the result line says which). 2: the plan or the settings cannot be used. Settings come from the
 environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse and ``JOB_DEADLINE_SECONDS``.
@@ -105,17 +106,18 @@ def ticked(names: Sequence[str]) -> list[str]:
 
 
 def multiset_check(result: TableResult, name: str, source: Any, table: Any) -> None:
-    """Count the rows that each frame alone holds, as multisets. The check passes if both counts are zero (the rule of its code). No row is shown."""
-    result.add(name, rules.detail("rows_differ", only_file=source.exceptAll(table).count(), only_table=table.exceptAll(source).count()))
+    """Compare the two frames as multisets. The counts of the rows that each frame alone holds stay in this function: the result holds one flag, 1 when both
+    counts are zero. No row and no count is shown."""
+    result.add(name, rules.detail("table_compared", equal=int(source.exceptAll(table).count() == 0 and table.exceptAll(source).count() == 0)))
 
 
 def compare_rows(result: TableResult, spec: TableSpec, columns: Sequence[str], source: Any, table: Any) -> None:
     """The three comparisons of a file table, in the order of its required checks: the row count, the key multiset and the row payload.
 
-    The frames need ``select``, ``exceptAll`` and ``count`` only. The key is the spec's key columns, or the whole row when the table has none.
+    The frames need ``select``, ``exceptAll`` and ``count`` only. The key is the spec's key columns, or the whole row when the table has none. The tables of
+    the files are the sealed ones: each comparison reports one flag and the row counts are never kept in the result.
     """
-    result.rows_source, result.rows_table = source.count(), table.count()
-    result.add("row count", rules.detail("row_count", source=result.rows_source, table=result.rows_table))
+    result.add("row count", rules.detail("table_compared", equal=int(source.count() == table.count())))
     keys = ticked(spec.key if spec.key else columns)
     multiset_check(result, "key multiset", source.select(*keys), table.select(*keys))
     multiset_check(result, "row payload", source, table)
@@ -129,7 +131,10 @@ def snapshot_of(session: Any, name: str) -> int | None:
 
 
 def check_table(session: Any, staging: Path, plan: Plan, entry: PlanTable) -> TableResult:
-    """Run the required checks of one table in order and stop at the first that fails. Every detail is a code and counts."""
+    """Run the required checks of one table in order and stop at the first that fails.
+
+    Every detail is a code with its numbers: counts for the track list, and for a sealed table one flag for each comparison.
+    """
     from pyspark.errors import AnalysisException
     from pyspark.sql import functions as F  # noqa: N812
 

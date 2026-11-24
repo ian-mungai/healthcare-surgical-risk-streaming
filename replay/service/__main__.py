@@ -12,7 +12,11 @@
               refused (exit 2), as is a record or reference that is not valid UTF-8 text.
 ``health``    exit 0 when the service waits or runs and its health file is fresh: the container's health check.
 
-Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. A run that ``serve``
+Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them, and may take
+``--inbox``: the inbox that a record from ``done/`` or ``failed/`` came from, so its relative ``state_dir`` and ``read_log`` are taken from the folder that
+holds the resolved inbox, where the service ran it. A record whose paths the service refuses (a state folder that shares a place with the inbox, a read
+log inside it) is refused with ``--inbox`` too, before the command starts, so no command writes into the inbox. Without ``--inbox`` the record is read
+as it is. A run that ``serve``
 takes reads its manifest reference from beside its record in the inbox, not from the record's ``manifest_reference`` field. Exit codes: 0 done,
 1 the check failed or the service is not healthy, 3 the gate refused an object version, 2 anything else that stopped the command.
 """
@@ -38,7 +42,7 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
+from replay.service.serve import Outcome, anchor_record, healthy, path_refusal, queued_record, serve, submit_command
 from replay.service.state_file import ScheduleFile, StateFile, atomic_write
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
@@ -273,6 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     for name in COMMANDS:
         command = commands.add_parser(name)
         command.add_argument("--run-record", type=Path, required=True)
+        command.add_argument(
+            "--inbox", type=Path, help="the inbox the record came from: its relative paths are taken from the folder that holds the resolved inbox"
+        )
         if name == "manifest":
             command.add_argument("--out", type=Path, required=True)
         if name == "observe":
@@ -287,6 +294,11 @@ def main(argv: list[str] | None = None) -> int:
         return service_commands[arguments.command](arguments)
     try:
         record = parse_run_record(arguments.run_record.read_text())
+        if arguments.inbox is not None:
+            if (refusal := path_refusal(record, arguments.inbox)) is not None:
+                log("refused", reason=refusal)
+                return STOPPED_CODE
+            record = anchor_record(record, arguments.inbox)
         return COMMANDS[arguments.command](record, arguments)
     except GateRefused as refused:
         problems = [{"position": problem.position, "requested": problem.requested, "cause": problem.cause} for problem in refused.problems]

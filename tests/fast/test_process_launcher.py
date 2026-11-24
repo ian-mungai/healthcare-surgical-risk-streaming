@@ -24,7 +24,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import traceback
 import unittest
 import warnings
 from collections.abc import Iterator
@@ -34,6 +33,7 @@ from unittest import mock
 
 from scripts import process
 from scripts.process import run_command
+from tests.fast.traceback_support import raised_text
 
 BUCKET = "example-private-bucket"
 ROLE = "private_role_name"
@@ -127,15 +127,14 @@ class LauncherTest(unittest.TestCase):
             self.run_program("echo done")
         self.kill_leftovers()
 
-    def run_with_private_arguments(self) -> BaseException:
+    def run_with_private_arguments(self) -> tuple[BaseException, str]:
         arguments = ["-c", START_SCRIPT.format(tail="wait"), "sh", str(self.pids), BUCKET, ROLE]
-        with self.assertRaises(process.ProcessGroupSurvived) as caught:
-            run_command("sh", arguments, timeout=1)
-        self.kill_leftovers()
-        return caught.exception
+        try:
+            return raised_text(lambda: run_command("sh", arguments, timeout=1), process.ProcessGroupSurvived, "stop_group", "run_command")
+        finally:
+            self.kill_leftovers()
 
-    def assert_chain_holds_no_private_argument(self, error: BaseException) -> None:
-        text = "".join(traceback.format_exception(error))
+    def assert_chain_holds_no_private_argument(self, error: BaseException, text: str) -> None:
         chain: list[BaseException] = []
         link: BaseException | None = error
         while link is not None and link not in chain:
@@ -159,14 +158,14 @@ class LauncherTest(unittest.TestCase):
                 real_killpg(pgid, signum)
 
         with mock.patch.object(os, "killpg", side_effect=kill_but_report_alive), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
-            error = self.run_with_private_arguments()
+            error, text = self.run_with_private_arguments()
         self.assertIsInstance(error.__context__, process.TimeoutExpired)
-        self.assert_chain_holds_no_private_argument(error)
+        self.assert_chain_holds_no_private_argument(error, text)
 
     def test_a_program_that_is_not_reaped_after_a_deadline_shows_no_argument_of_the_timed_out_command(self) -> None:
         with mock.patch.object(os, "killpg", side_effect=ProcessLookupError), mock.patch.object(process, "KILL_WAIT_SECONDS", 0.2):
-            error = self.run_with_private_arguments()
-        self.assert_chain_holds_no_private_argument(error)
+            error, text = self.run_with_private_arguments()
+        self.assert_chain_holds_no_private_argument(error, text)
 
     def test_an_interrupt_while_a_deadline_is_handled_shows_no_argument_of_the_timed_out_command(self) -> None:
         def interrupted(started: subprocess.Popen[str], *arguments: object, **options: object) -> None:
@@ -175,10 +174,11 @@ class LauncherTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 raise KeyboardInterrupt from None
 
-        with mock.patch.object(subprocess.Popen, "communicate", autospec=True, side_effect=interrupted), self.assertRaises(KeyboardInterrupt) as caught:
-            run_command("sh", ["-c", "sleep 300", "sh", BUCKET, ROLE], timeout=1)
-        text = "".join(traceback.format_exception(caught.exception))
-        context = caught.exception.__context__
+        with mock.patch.object(subprocess.Popen, "communicate", autospec=True, side_effect=interrupted):
+            caught, text = raised_text(
+                lambda: run_command("sh", ["-c", "sleep 300", "sh", BUCKET, ROLE], timeout=1), KeyboardInterrupt, "run_command", "interrupted"
+            )
+        context = caught.__context__
         for private in (BUCKET, ROLE):
             self.assertNotIn(private, f"{text} {context!s} {context!r}")
         self.assertIsInstance(context, subprocess.TimeoutExpired)

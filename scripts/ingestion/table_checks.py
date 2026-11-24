@@ -32,6 +32,12 @@ a reviewer saw 90 seconds against a budget of 70. This is an accepted limit; the
 A run in which a check fails merges nothing and leaves the load branch for inspection. A run in which the merge request fails or times out may still have
 merged, and ends as ``merge_outcome_open`` or ``merge_not_found``: the history of main is then the only record of whether it did. A rerun after a merge runs
 nothing and merges nothing more. A rerun after a failed check checks again and replaces the result. Messages name no data value.
+
+The job's own output is never kept: a refused or failed run keeps only a fixed refusal code and numbers in ``job_output.txt``, and the reply of the job holds
+its exit code and its standard output only. A ``job_output.txt`` of any other form (one that an earlier controller wrote from the job's output) is removed under
+the lock once the run folder holds this load's receipt or none, before the run goes on, whatever it ends as; a folder refused as another load's is left
+untouched. A saved receipt's checks that are not a result of the current form (an earlier format, or a count of a
+clinical table) are removed when the receipt is returned or rebuilt, and the receipt says so.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import time
 import uuid
@@ -68,6 +75,20 @@ RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
 JOB_OUTPUT_FILE = "job_output.txt"
+# The only refusals that ``JOB_OUTPUT_FILE`` can name. The job's own text is never kept: it can hold counts and values of a held-out patient's rows.
+REFUSAL_CODES = ("no_result", "several_results", "result_refused", "exit_code_disagrees", "checks_failed")
+# The bounds of the two numbers of ``JOB_OUTPUT_FILE``: an exit code of a process, and the number of result lines. A larger number is never kept.
+MAX_EXIT_CODE = 255
+MAX_RESULT_LINES = 9999
+KEPT_OUTPUT_FORM = re.compile(
+    rb"refusal: (" + b"|".join(code.encode() for code in REFUSAL_CODES) + rb")\nexit code: (-?[0-9]{1,3})\nresult lines: ([0-9]{1,4})\n"
+)
+# The longest file of the form is 64 bytes, so a file that is not of the form is never read past this many bytes.
+KEPT_OUTPUT_LIMIT = 80
+SAVED_CHECKS_REMOVED_NOTE = (
+    "the saved checks of this receipt were removed: they were not a result of the current form, which holds no count of a clinical table"
+)
+REBUILT_NOTE = "the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch"
 # One fixed directory for the lock and the pending merge record of every load: a folder of ``dagster_data``, the named volume that the code location already
 # mounts at ``/opt/dagster/data``, so a pending record survives a restart of the code location. (``/run/dagster`` is a tmpfs and does not.)
 STATE_DIRECTORY = Path("/opt/dagster/data/table_checks")
@@ -154,11 +175,10 @@ class LoadRecord:
 
 @dataclass(frozen=True, slots=True)
 class RunnerReply:
-    """What the Spark job's process ended with."""
+    """What the Spark job's process ended with: its exit code and its standard output. Its standard error is never read."""
 
     exit_code: int
     stdout: str
-    stderr: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +216,8 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
         try:
             result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
         except TimeoutExpired:
-            return RunnerReply(124, "", f"the table checks job did not finish within {deadline_seconds:g} seconds and was stopped")
-        return RunnerReply(result.returncode, result.stdout, result.stderr)
+            return RunnerReply(124, "")
+        return RunnerReply(result.returncode, result.stdout)
 
     return start
 
@@ -388,39 +408,84 @@ def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, em
     }
 
 
-def keep_output(run_folder: Path, reply: RunnerReply) -> None:
-    """Keep the raw output of the job in a private file of the run folder. It can hold values of the data, so it is never put into a message."""
+def keep_output(run_folder: Path, code: str, exit_code: int, result_lines: int) -> None:
+    """Keep a fixed refusal code, the job's exit code and the number of result lines in a private file of the run folder.
+
+    The job's standard output and error are never kept: they can hold a count or a value of a held-out patient's rows, and the clinical tables seal both
+    (the owner's decision D). The two numbers are read by this controller and not copied from the job's text.
+    """
+    if code not in REFUSAL_CODES or type(exit_code) is not int or type(result_lines) is not int:
+        raise TableChecksError("the job output file takes a code of the table of refusals and two whole numbers")
+    if not -MAX_EXIT_CODE <= exit_code <= MAX_EXIT_CODE or not 0 <= result_lines <= MAX_RESULT_LINES:
+        raise TableChecksError("the job output file takes an exit code and a number of result lines that are within their bounds")
     run_folder.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(run_folder / JOB_OUTPUT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w") as handle:
-        handle.write(f"exit code {reply.exit_code}\n--- standard output ---\n{reply.stdout}\n--- standard error ---\n{reply.stderr}\n")
+        handle.write(output_text(code, exit_code, result_lines))
+
+
+def output_text(code: str, exit_code: int, result_lines: int) -> str:
+    """The text of ``JOB_OUTPUT_FILE`` that ``keep_output`` writes for these values."""
+    return f"refusal: {code}\nexit code: {exit_code}\nresult lines: {result_lines}\n"
+
+
+def written_by_keep_output(content: bytes) -> bool:
+    """True only for the exact bytes that ``keep_output`` writes for some values within its bounds: no leading zero, no ``-0``, no number out of bounds."""
+    found = KEPT_OUTPUT_FORM.fullmatch(content)
+    if found is None:
+        return False
+    code, exit_code, result_lines = found.group(1).decode(), int(found.group(2)), int(found.group(3))
+    within = -MAX_EXIT_CODE <= exit_code <= MAX_EXIT_CODE and 0 <= result_lines <= MAX_RESULT_LINES
+    return within and output_text(code, exit_code, result_lines).encode() == content
+
+
+def drop_unfixed_output(run_folder: Path) -> None:
+    """Remove a ``job_output.txt`` that is not of the fixed form that ``keep_output`` writes, whoever wrote it: an earlier controller kept the job's own output.
+
+    Call it under the load's lock. A file of the form stays as it is. Any other file, a link or any other kind of file but a folder is removed (a link is
+    removed and never followed). A folder of that name stops the run: it is not removed.
+    """
+    path = run_folder / JOB_OUTPUT_FILE
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(status.st_mode):
+        raise TableChecksError(f"{JOB_OUTPUT_FILE} in the run folder is a folder, so this run did nothing; remove it and run again")
+    if stat.S_ISREG(status.st_mode):
+        with path.open("rb") as handle:
+            if written_by_keep_output(handle.read(KEPT_OUTPUT_LIMIT)):
+                return
+    path.unlink(missing_ok=True)
 
 
 def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple[rules.JobResult, dict[str, Any]]:
     """The job's one result held to the plan it was run for, with pass or fail derived from its checks, and an exit code that agrees with it.
 
     The output must hold exactly one ``RESULT`` line. The document kept is the validated one (``JobResult.document``), never the job's own text. Every message
-    here is fixed text and numbers; the raw output of the job goes to ``JOB_OUTPUT_FILE`` of the run folder, also when the result is refused.
+    here is fixed text and numbers. A refused or failed run keeps ``JOB_OUTPUT_FILE`` in the run folder: a fixed refusal code and numbers, never the output.
     """
     lines = [line for line in reply.stdout.splitlines() if line.startswith(RESULT_PREFIX)]
     if len(lines) != 1:
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "no_result" if not lines else "several_results", reply.exit_code, len(lines))
         what = "printed no result" if not lines else "printed more than one result"
-        raise TableChecksError(f"the table checks job ended with exit code {reply.exit_code} and {what}; its output is in {JOB_OUTPUT_FILE} of the run folder")
+        raise TableChecksError(
+            f"the table checks job ended with exit code {reply.exit_code} and {what}; its refusal code is in {JOB_OUTPUT_FILE} of the run folder"
+        )
     try:
         result = rules.parse_result(lines[0].removeprefix(RESULT_PREFIX), plan)
     except rules.RulesError:
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "result_refused", reply.exit_code, len(lines))
         raise TableChecksError(
-            f"the table checks job's result is not a result for this plan; the job's output is in {JOB_OUTPUT_FILE} of the run folder"
+            f"the table checks job's result is not a result for this plan; its refusal code is in {JOB_OUTPUT_FILE} of the run folder"
         ) from None
     if reply.exit_code != (0 if result.passed else 1):
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "exit_code_disagrees", reply.exit_code, len(lines))
         raise TableChecksError(
-            f"the table checks job ended with exit code {reply.exit_code}, which does not agree with its result; its output is in {JOB_OUTPUT_FILE}"
+            f"the table checks job ended with exit code {reply.exit_code}, which does not agree with its result; its refusal code is in {JOB_OUTPUT_FILE}"
         )
     if not result.passed:
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "checks_failed", reply.exit_code, len(lines))
     return result, result.document()
 
 
@@ -733,10 +798,49 @@ def record_merge(run_folder: Path, state_directory: Path, record: LoadRecord, do
     return Outcome(True, True, document)
 
 
-def attempt_evidence(held: dict[str, Any] | None, pending: Pending | None) -> bool:
-    """Whether the saved receipt holds passed checks of the attempt that the pending record names: only then do they stand for the merge that was found."""
-    checked = held.get("checked") if held is not None and held["passed"] is True else None
-    return isinstance(checked, dict) and pending is not None and checked.get("run_id") == pending.run_id
+def usable_checks(record: LoadRecord, track_pin: rules.TrackPin, held: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The ``checked`` of a saved receipt when it is a result of the current form for this load, read again by the rules that read the job's result, else None.
+
+    A result of the earlier format, one with a count of a sealed table or any other form that ``parse_saved_result`` refuses gives None, so it is never
+    returned again or written into a new receipt. The run ID and the empty form are the saved result's own: the attempt is matched to its pending record apart.
+    """
+    checked = held.get("checked") if held is not None else None
+    if type(checked) is not dict:
+        return None
+    run_id, empty_form = checked.get("run_id"), checked.get("empty_form")
+    if type(run_id) is not str or rules.RUN_ID.fullmatch(run_id) is None or empty_form not in rules.EMPTY_FORMS:
+        return None
+    tables = tuple(
+        rules.PlanTable(
+            spec.name,
+            record.tables[spec.name],
+            rows=track_pin.rows if spec.source == "pin" else 0,
+            rows_sha256=track_pin.sha256 if spec.source == "pin" else "",
+        )
+        for spec in rules.TABLES
+    )
+    try:
+        return rules.parse_saved_result(checked, rules.Plan(run_id, record.branch, record.branch_hash, empty_form, tables)).document()
+    except rules.RulesError:
+        return None
+
+
+def attempt_evidence(record: LoadRecord, track_pin: rules.TrackPin, held: dict[str, Any] | None, pending: Pending | None) -> bool:
+    """Whether the saved receipt holds passed checks of the current form and of the attempt that the pending record names: only then do they stand for the
+    merge that was found."""
+    checked = usable_checks(record, track_pin, held) if held is not None and held["passed"] is True else None
+    return checked is not None and pending is not None and checked["run_id"] == pending.run_id
+
+
+def without_old_checks(run_folder: Path, record: LoadRecord, track_pin: rules.TrackPin, held: dict[str, Any]) -> dict[str, Any]:
+    """A completed receipt as it is returned: its saved checks stay when they are of the current form. Any other ``checked`` is removed, with a note, from the
+    returned receipt and from the file, so a count of a sealed table of an earlier run is neither returned nor kept."""
+    if held.get("checked") is None or usable_checks(record, track_pin, held) is not None:
+        return held
+    notes = held.get("notes")
+    document = {**held, "checked": None, "notes": [*(notes if isinstance(notes, list) else []), SAVED_CHECKS_REMOVED_NOTE]}
+    write_result(run_folder, document)
+    return document
 
 
 def run_locked(
@@ -756,21 +860,24 @@ def run_locked(
 
     A receipt that says merged ends the run (and removes a pending record left over). If the history holds this load's merge commit, the receipt is written
     from it and nothing is sent. If a pending record of this load exists and the history does not hold the commit, the run ends as ``merge_outcome_open``,
-    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``.
+    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``. Once the receipt is
+    known to be this load's (or absent), a job output file of another form than the fixed one is removed, so no other way out of this function leaves one. A
+    folder refused as another load's is left exactly as it is.
     """
     held = saved_result(run_folder, record)
+    drop_unfixed_output(run_folder)
     if held is not None and held["merged"] is True:
         clear_pending(state_directory, record)
-        return Outcome(True, True, held)
+        return Outcome(True, True, without_old_checks(run_folder, record, track_pin, held))
     default = default_branch(nessie)
     pending = read_pending(state_directory, record)
     found = merged_commit(nessie, record, main_head(nessie, default), deadline_for(nessie, timing))
     if found is not None:
         confirm_main(nessie, record, default, found.hash)
-        evidence = held if attempt_evidence(held, pending) else None
+        evidence = held if attempt_evidence(record, track_pin, held, pending) else None
         document = evidence if evidence is not None else receipt(record, empty_form, None, passed=True)
         if evidence is None:
-            document["notes"].append("the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch")
+            document["notes"].append(REBUILT_NOTE)
         return record_merge(run_folder, state_directory, record, document, default, found)
     if pending is not None:
         raise MergeOutcomeOpen(open_message(record, state_directory))

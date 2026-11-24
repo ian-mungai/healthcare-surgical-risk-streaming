@@ -65,23 +65,18 @@ def outcome(result: rules.TableResult) -> dict[str, bool]:
 
 
 class CompareRowsTest(unittest.TestCase):
-    def test_every_comparison_reports_its_counts_whether_it_passed_or_not(self) -> None:
-        result = compare("clinical_data")
-        self.assertEqual(
-            ["row_count;source=4;table=4", "rows_differ;only_file=0;only_table=0", "rows_differ;only_file=0;only_table=0"],
-            [check.detail for check in result.checks],
-        )
-        failed = compare("clinical_data", ROWS[:3])
-        self.assertEqual(
-            ["row_count;source=4;table=3", "rows_differ;only_file=1;only_table=0", "rows_differ;only_file=1;only_table=0"],
-            [check.detail for check in failed.checks],
-        )
+    def test_every_comparison_reports_one_fixed_code_and_no_count_whether_it_passed_or_not(self) -> None:
+        for name in ("clinical_data", "lab_data"):
+            result = compare(name)
+            self.assertEqual(["table_compared;equal=1"] * 3, [check.detail for check in result.checks])
+            failed = compare(name, ROWS[:3])
+            self.assertEqual(["table_compared;equal=0"] * 3, [check.detail for check in failed.checks])
 
     def test_control_equal_rows_pass_every_comparison_in_the_required_order(self) -> None:
         result = compare("clinical_data")
         self.assertEqual({"row count": True, "key multiset": True, "row payload": True}, outcome(result))
         self.assertEqual(["row count", "key multiset", "row payload"], [check.name for check in result.checks])
-        self.assertEqual((4, 4), (result.rows_source, result.rows_table))
+        self.assertEqual((None, None), (result.rows_source, result.rows_table))
 
     def test_the_comparisons_are_the_tail_of_the_tables_required_checks(self) -> None:
         for name in ("clinical_data", "lab_data"):
@@ -101,6 +96,10 @@ class CompareRowsTest(unittest.TestCase):
 
     def test_an_extra_row_fails_the_row_count(self) -> None:
         self.assertFalse(outcome(compare("clinical_data", [*ROWS, ("4", "10", "50")]))["row count"])
+
+    def test_a_row_that_only_the_table_holds_fails_the_key_and_the_payload_comparison_too(self) -> None:
+        for name in ("clinical_data", "lab_data"):
+            self.assertEqual({"row count": False, "key multiset": False, "row payload": False}, outcome(compare(name, [*ROWS, ("4", "10", "50")])))
 
     def test_a_trimmed_or_cased_value_is_a_different_value(self) -> None:
         rows = [("1", "07", "60"), ("2", "8", ""), ("3", "09", "71"), ("3", "09", "71")]
@@ -127,7 +126,7 @@ class CompareRowsTest(unittest.TestCase):
         rows = [("1", "07", "60"), ("2", "08", ""), (MARKER, "09", "71"), ("3", "09", MARKER)]
         result = compare("clinical_data", rows)
         self.assertFalse(result.passed)
-        self.assertNotIn(MARKER, json.dumps(result.document()))
+        self.assertNotIn(MARKER, json.dumps([{"name": check.name, "passed": check.passed, "detail": check.detail} for check in result.checks]))
         for check in result.checks:
             rules.parse_detail(check.detail)
 
@@ -167,14 +166,15 @@ class MainTest(unittest.TestCase):
 
     @staticmethod
     def passing(session: Any, staging: Path, plan: rules.Plan, entry: rules.PlanTable) -> rules.TableResult:
-        rows = entry.rows if entry.rows else 5
+        sealed = rules.SPEC_BY_NAME[entry.name].sealed
+        rows = None if sealed else entry.rows
         result = rules.TableResult(entry.name, entry.snapshot_id, rows_table=rows, rows_source=rows, columns_source=3, columns_table=3)
         details = {
             "columns": rules.detail("columns_differ", missing=0, extra=0, repeated=0, order=0, not_string=0),
             "rows digest": rules.detail("digest_compared", equal=1),
-            "row count": rules.detail("row_count", source=rows, table=rows),
-            "key multiset": rules.detail("rows_differ", only_file=0, only_table=0),
-            "row payload": rules.detail("rows_differ", only_file=0, only_table=0),
+            "row count": rules.detail("table_compared", equal=1) if sealed else rules.detail("row_count", source=entry.rows, table=entry.rows),
+            "key multiset": rules.detail("table_compared", equal=1),
+            "row payload": rules.detail("table_compared", equal=1),
         }
         for name in rules.REQUIRED_CHECKS[entry.name]:
             result.add(name, details.get(name, "ok"))
@@ -194,8 +194,10 @@ class MainTest(unittest.TestCase):
 
     def test_a_failed_check_ends_with_exit_code_1_and_a_result_that_names_the_check(self) -> None:
         def failing(session: Any, staging: Path, plan: rules.Plan, entry: rules.PlanTable) -> rules.TableResult:
+            if entry.name != "lab_data":
+                return self.passing(session, staging, plan, entry)
             result = rules.TableResult(entry.name, entry.snapshot_id)
-            result.add(rules.REQUIRED_CHECKS[entry.name][0], "bytes_differ" if entry.name == "lab_data" else "ok")
+            result.add(rules.REQUIRED_CHECKS[entry.name][0], "bytes_differ")
             return result
 
         code, out, _, _ = self.run_main(self.staging(), failing)

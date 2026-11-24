@@ -11,9 +11,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
+from scripts.stack import groups_k3s
 from scripts.stack.groups import GroupError
 from scripts.stack.groups_k3s import (
     ONE_OFF,
@@ -25,6 +28,7 @@ from scripts.stack.groups_k3s import (
     object_name,
 )
 from scripts.stack.limits import parse_limits
+from tests.fast.header_secret_support import raised_text, unsafe_values
 
 NAMESPACE = "airbyte_ns"
 PLANTED_VALUE = "value-that-must-never-appear"
@@ -275,6 +279,35 @@ class TokenTest(unittest.TestCase):
             with self.assertRaises(GroupError) as missing:
                 HttpsTransport(KubernetesConfig(config.api, NAMESPACE, "airbyte", Path(folder) / "none", config.ca_file)).authorization()
             self.assertIn("none", str(missing.exception))
+
+    def write_token(self, folder: str, content: bytes) -> HttpsTransport:
+        token_file = Path(folder) / "token"
+        token_file.write_bytes(content)
+        return HttpsTransport(KubernetesConfig("https://k3s_api:6443", NAMESPACE, "airbyte", token_file, Path(folder) / "ca.crt"))
+
+    def test_a_token_that_is_a_header_safe_token_is_used_as_it_is(self) -> None:
+        for token in ("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJrOHMifQ.c2ln-_x~y+z/w", "abc==", "a"):
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as folder:
+                self.assertEqual(f"Bearer {token}", self.write_token(folder, f"{token}\r\n".encode()).authorization())
+
+    def test_a_token_a_header_cannot_hold_is_refused_with_the_fixed_message_and_no_error_holds_it(self) -> None:
+        values = {name: value.encode() for name, value in unsafe_values(PLANTED_VALUE).items()}
+        values["invalid UTF-8"] = PLANTED_VALUE.encode() + b"\xff\xfe"
+        values["a break inside"] = f"{PLANTED_VALUE}\n{PLANTED_VALUE}".encode()
+        for name, content in values.items():
+            with self.subTest(character=name), tempfile.TemporaryDirectory() as folder:
+                error, text = raised_text(self.write_token(folder, content).authorization, GroupError, "authorization")
+                self.assertEqual("the token file token does not hold a valid token", str(error))
+                self.assertNotIn(PLANTED_VALUE, text)
+
+    def test_a_refused_token_stops_the_request_before_any_connection_is_made(self) -> None:
+        for name, value in unsafe_values(PLANTED_VALUE).items():
+            with self.subTest(character=name), tempfile.TemporaryDirectory() as folder, mock.patch.object(groups_k3s, "PinnedConnection") as connection:
+                transport = self.write_token(folder, value.encode())
+                error, text = raised_text(partial(transport.request, "GET", "/api/v1/namespaces"), GroupError, "authorization")
+                self.assertEqual("the token file token does not hold a valid token", str(error))
+                self.assertNotIn(PLANTED_VALUE, text)
+                connection.assert_not_called()
 
 
 if __name__ == "__main__":

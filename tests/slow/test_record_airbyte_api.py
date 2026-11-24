@@ -1,6 +1,6 @@
 """The Airbyte calls of the record connections, against a stand-in of Airbyte's public API.
 
-The stand-in holds only what this reading of the API needs: the token call, the workspace, the custom definitions, the sources, destinations and connections
+The stand-in holds only what this reading of the API needs: the token call, the workspace, the built-in definitions, the sources, destinations and connections
 with their lists, creates and updates, and the job calls. It is the test's statement of that reading, which is the one the raw connection's module makes of the
 same API, and the real API is proven on the host: a case here shows that the code does what it means to do, not that Airbyte answers as the stand-in does.
 
@@ -44,10 +44,17 @@ ENDLESS_LIMIT = 5000
 class StandIn:
     """Airbyte's public API in memory. ``log`` lists each call as its method and path; ``bodies`` keeps each request body."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, builtin: bool = True) -> None:
         self.log: list[str] = []
         self.bodies: list[tuple[str, dict[str, Any]]] = []
         self.definitions: dict[str, dict[str, dict[str, Any]]] = {"source": {}, "destination": {}}
+        if builtin:
+            for kind, identifier, connector in (
+                ("source", "source_definition1", SOURCE_S3),
+                ("source", "source_definition2", SOURCE_FILE),
+                ("destination", "destination_definition1", DESTINATION),
+            ):
+                self.add_definition(kind, identifier, connector.repository, connector.tag)
         self.sources: dict[str, dict[str, Any]] = {}
         self.destinations: dict[str, dict[str, Any]] = {}
         self.connections: dict[str, dict[str, Any]] = {}
@@ -63,6 +70,16 @@ class StandIn:
         self.requested: list[tuple[str, int, list[str]]] = []
         self.budgets: list[float] = []
         self.mutations: dict[str, Any] = {}
+
+    def add_definition(self, kind: str, identifier: str, repository: str, tag: str, name: str = "Built-in") -> None:
+        """A definition that Airbyte holds already, as its built-in ones: the client never writes one."""
+        self.definitions[kind][identifier] = {
+            "id": identifier,
+            "name": name,
+            "dockerRepository": repository,
+            "dockerImageTag": tag,
+            "platform_added": "a default",
+        }
 
     def ident(self, prefix: str) -> str:
         self.counters[prefix] = self.counters.get(prefix, 0) + 1
@@ -99,7 +116,7 @@ class StandIn:
         if parts == ["workspaces"] and method == "GET":
             return {"data": self.workspaces}
         if parts[0] == "workspaces" and len(parts) >= 4 and parts[2] == "definitions":
-            return self.definition(method, parts[3].removesuffix("s"), parts[4:], body)
+            return self.definition(method, parts[3].removesuffix("s"), query)
         if parts[0] in ("sources", "destinations"):
             return self.actor(method, parts[0].removesuffix("s"), parts[1:], body, query)
         if parts[0] == "connections":
@@ -108,16 +125,12 @@ class StandIn:
             return self.job(method, parts[1:], query, body)
         return None
 
-    def definition(self, method: str, kind: str, rest: list[str], body: dict[str, Any]) -> Any:
+    def definition(self, method: str, kind: str, query: dict[str, list[str]]) -> Any:
         store = self.definitions[kind]
         if method == "GET":
-            return {"data": list(store.values())}
-        if method == "POST":
-            entry = {**body, "id": self.ident(f"{kind}_definition")}
-            store[entry["id"]] = entry
-            return entry
-        store[rest[0]].update(body)
-        return store[rest[0]]
+            offset, limit = int(query.get("offset", ["0"])[0]), int(query.get("limit", ["100"])[0])
+            return {"data": list(store.values())[offset : offset + limit], "next": f"{ORIGIN}{PREFIX}/more" if offset + limit < len(store) else None}
+        raise AssertionError(f"{method} of a {kind} definition: the client writes no definition")
 
     def actor(self, method: str, kind: str, rest: list[str], body: dict[str, Any], query: dict[str, list[str]]) -> Any:
         store = self.sources if kind == "source" else self.destinations
@@ -186,6 +199,8 @@ def prepared() -> tuple[Api, StandIn]:
 
 
 def ensure_everything(api: Api, run: str = RUN) -> dict[str, str]:
+    """The writes of a load in its order: the load checks the three definitions before its first copy and so before any of these writes."""
+    api.check_definitions()
     api.ensure_destination(definitions.destination_configuration(ENVIRONMENT, definitions.branch_name(run)))
     ids = {}
     for table in definitions.TABLES:
@@ -199,13 +214,18 @@ def writes(stand_in: StandIn) -> list[str]:
 
 
 class EnsureTest(unittest.TestCase):
-    def test_the_first_call_creates_each_definition_the_destination_each_source_and_each_connection(self) -> None:
+    def test_the_first_call_creates_the_destination_each_source_and_each_connection_on_the_built_in_definitions_and_no_definition(self) -> None:
         api, stand_in = prepared()
         ids = ensure_everything(api)
         self.assertEqual(["clinical_data", "lab_data", "track_list"], sorted(ids))
         self.assertEqual((3, 1, 3), (len(stand_in.sources), len(stand_in.destinations), len(stand_in.connections)))
-        images = {f"{entry['dockerRepository']}:{entry['dockerImageTag']}" for kind in stand_in.definitions.values() for entry in kind.values()}
-        self.assertEqual({SOURCE_S3.image, SOURCE_FILE.image, DESTINATION.image}, images)
+        self.assertEqual([], [label for label in stand_in.log if "definitions" in label and not label.startswith("GET ")])
+        self.assertEqual((2, 1), (len(stand_in.definitions["source"]), len(stand_in.definitions["destination"])), "no definition was added")
+        self.assertEqual(
+            {"clinical_data": "source_definition1", "lab_data": "source_definition1", "track_list": "source_definition2"},
+            {table: stand_in.sources[f"source{index}"]["definitionId"] for index, table in enumerate(("clinical_data", "lab_data", "track_list"), start=1)},
+        )
+        self.assertEqual({"destination_definition1"}, {entry["definitionId"] for entry in stand_in.destinations.values()})
 
     def test_a_second_call_makes_no_write_although_airbyte_added_fields_to_its_answers(self) -> None:
         api, stand_in = prepared()
@@ -247,17 +267,99 @@ class EnsureTest(unittest.TestCase):
         self.assertEqual([f"PATCH connections/{ids['clinical_data']}"], writes(stand_in))
         self.assertEqual("full_refresh_overwrite", stand_in.connections[ids["clinical_data"]]["configurations"]["streams"][0]["syncMode"])
 
-    def test_a_definition_at_another_version_is_moved_to_the_pinned_one(self) -> None:
+    def test_a_definition_at_another_version_is_refused_before_any_write_and_the_message_names_no_value(self) -> None:
+        for kind, identifier, connector in (
+            ("source", "source_definition1", SOURCE_S3),
+            ("source", "source_definition2", SOURCE_FILE),
+            ("destination", "destination_definition1", DESTINATION),
+        ):
+            for tag in ("0.0.1", "latest", "", f"{connector.tag}.1"):
+                with self.subTest(kind=kind, image=connector.repository, tag=tag):
+                    api, stand_in = prepared()
+                    stand_in.definitions[kind][identifier]["dockerImageTag"] = tag
+                    with self.assertRaises(AirbyteError) as raised:
+                        ensure_everything(api)
+                    self.assertEqual([], writes(stand_in), "a refusal comes before the first write of any kind")
+                    message = str(raised.exception)
+                    self.assertIn(f"{kind} definition", message)
+                    for value in (connector.repository, connector.tag, tag, identifier):
+                        if value:
+                            self.assertNotIn(value, message)
+
+    def test_the_check_of_the_definitions_makes_only_reads_and_checks_all_three_before_it_answers(self) -> None:
+        api, stand_in = prepared()
+        api.check_definitions()
+        self.assertEqual([], [label for label in stand_in.log if not label.startswith("GET ") and label != "POST applications/token"])
+        for kind in ("sources", "destinations"):
+            self.assertTrue(any(label.startswith(f"GET workspaces/workspace1/definitions/{kind}") for label in stand_in.log), kind)
+        for kind, identifier, connector in (
+            ("source", "source_definition1", SOURCE_S3),
+            ("source", "source_definition2", SOURCE_FILE),
+            ("destination", "destination_definition1", DESTINATION),
+        ):
+            with self.subTest(kind=kind, image=connector.repository):
+                api, stand_in = prepared()
+                stand_in.definitions[kind][identifier]["dockerImageTag"] = "0.0.1"
+                with self.assertRaises(AirbyteError):
+                    api.check_definitions()
+                self.assertEqual([], writes(stand_in))
+
+    def test_no_definition_or_two_definitions_of_a_pinned_image_are_refused_whatever_their_names_and_tags(self) -> None:
+        for kind, identifier, connector in (
+            ("source", "source_definition1", SOURCE_S3),
+            ("source", "source_definition2", SOURCE_FILE),
+            ("destination", "destination_definition1", DESTINATION),
+        ):
+            with self.subTest(kind=kind, image=connector.repository, case="none"):
+                api, stand_in = prepared()
+                del stand_in.definitions[kind][identifier]
+                with self.assertRaises(AirbyteError) as raised:
+                    ensure_everything(api)
+                self.assertNotIn(connector.repository, str(raised.exception))
+                self.assertEqual([], writes(stand_in), "a refusal comes before the first write of any kind")
+            for second_tag, name in ((connector.tag, "Built-in"), (connector.tag, "vitaldb S3 source (pinned)"), ("0.0.1", "older")):
+                with self.subTest(kind=kind, image=connector.repository, case=f"two: {second_tag} {name}"):
+                    api, stand_in = prepared()
+                    stand_in.add_definition(kind, "definition_extra", connector.repository, second_tag, name)
+                    with self.assertRaises(AirbyteError) as raised:
+                        ensure_everything(api)
+                    self.assertNotIn(connector.repository, str(raised.exception))
+                    self.assertEqual([], writes(stand_in), "a refusal comes before the first write of any kind")
+
+    def test_only_the_exact_image_matches_so_a_similar_image_is_neither_taken_nor_counted(self) -> None:
+        api, stand_in = prepared()
+        for index, repository in enumerate(
+            (
+                "airbyte/source-s3-data-lake",
+                "airbyte/source-s3-v3",
+                "other/airbyte/source-s3",
+                "airbyte/source-s3 ",
+                "AIRBYTE/SOURCE-S3",
+                "airbyte/source-file-secure",
+            )
+        ):
+            stand_in.add_definition("source", f"similar{index}", repository, SOURCE_S3.tag)
+        stand_in.add_definition("destination", "similar_destination", "airbyte/destination-s3", DESTINATION.tag)
+        ids = ensure_everything(api)
+        self.assertEqual(3, len(ids))
+        self.assertEqual({"destination_definition1"}, {entry["definitionId"] for entry in stand_in.destinations.values()})
+
+    def test_the_definition_is_found_on_a_later_page_of_the_listing(self) -> None:
+        api, stand_in = prepared()
+        built_in = dict(stand_in.definitions["source"])
+        stand_in.definitions["source"].clear()
+        for index in range(250):
+            stand_in.add_definition("source", f"other{index}", f"other/source-{index}", "1.0.0")
+        stand_in.definitions["source"].update(built_in)
+        ids = ensure_everything(api)
+        self.assertEqual(3, len(ids))
+
+    def test_a_run_and_a_second_run_never_write_a_definition(self) -> None:
         api, stand_in = prepared()
         ensure_everything(api)
-        for kind in stand_in.definitions.values():
-            for entry in kind.values():
-                entry["dockerImageTag"] = "0.0.1"
-        stand_in.log.clear()
-        ensure_everything(api)
-        self.assertEqual(3, len([label for label in writes(stand_in) if label.startswith("PUT")]))
-        tags = {entry["dockerImageTag"] for kind in stand_in.definitions.values() for entry in kind.values()}
-        self.assertEqual({SOURCE_S3.tag, SOURCE_FILE.tag, DESTINATION.tag}, tags)
+        ensure_everything(api, "run_next")
+        self.assertEqual([], [label for label in stand_in.log if "definitions" in label and not label.startswith("GET ")])
+        self.assertTrue(any(label.startswith("GET workspaces/workspace1/definitions/sources") for label in stand_in.log))
 
     def test_the_connections_hold_no_schedule_and_the_destination_branch_is_the_load_branch(self) -> None:
         api, stand_in = prepared()
@@ -676,8 +778,6 @@ FIELD_CASES = (
     ("destination definition id", f"GET {DEFINITIONS}/destinations", first, "id", built, read_everything),
     ("destination definition repository", f"GET {DEFINITIONS}/destinations", first, "dockerRepository", built, read_everything),
     ("destination definition tag", f"GET {DEFINITIONS}/destinations", first, "dockerImageTag", built, read_everything),
-    ("created source definition", f"POST {DEFINITIONS}/sources", whole_answer, "id", nothing, read_everything),
-    ("created destination definition", f"POST {DEFINITIONS}/destinations", whole_answer, "id", nothing, read_everything),
     ("source id", "GET sources", first, "sourceId", built, read_everything),
     ("source definition of a source", "GET sources", first, "definitionId", built, read_everything),
     ("source configuration", "GET sources", first, "configuration", built, read_everything),

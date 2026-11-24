@@ -1,15 +1,17 @@
 """The calls of the record connections to Airbyte's public API, with the standard library.
 
-``HttpAirbyteApi`` makes the custom definitions, the destination, the sources and the connections match what ``record_definitions`` says, and runs, watches and
-cancels a sync. It speaks the public API under ``/api/public/v1`` of Airbyte's server, with the access token that the instance's client credentials give: the
-same reading of the API that the raw connection's module makes (``ansible/roles/airbyte/library/airbyte_connection.py``). The paths and bodies are proven on the
-host, not here.
+``HttpAirbyteApi`` makes the destination, the sources and the connections match what ``record_definitions`` says, and runs, watches and cancels a sync. It
+writes no connector definition: Airbyte 2.5.0 refuses a custom definition for an image that a built-in definition uses (it answers 409). Each definition is
+the one that Airbyte holds for the pinned image (exactly one listed ``dockerRepository`` match), and its ``dockerImageTag`` must equal the pinned tag; none,
+several or another tag is refused with a fixed message that names no value, and the operator upgrades Airbyte or changes the pin. It speaks the public API
+under ``/api/public/v1`` of Airbyte's server, with the access token that the instance's client credentials give: the same reading of the API that the raw
+connection's module makes (``ansible/roles/airbyte/library/airbyte_connection.py``). The paths and bodies are proven on the host, not here.
 
-Idempotent: each ``ensure_*`` lists what exists and creates only what is missing, and updates only what lacks a value of the document, so a second call with the
-same arguments makes no create and no update. Airbyte adds fields of its own to an answer, so only the document's values are compared. A connection is created
-without a stream list of its own: Airbyte reads the source's schema when it creates the connection, so each source must read a file that exists. Every later run
-changes only the source's read prefix and the destination's branch. An object that belongs to another definition or joins other objects, and a name that two
-objects hold, are refused and changed nowhere: deleting a connection would delete its sync state.
+Idempotent: each ``ensure_*`` lists what exists and creates only what is missing (never a definition), and updates only what lacks a value of the document, so a
+second call with the same arguments makes no create and no update. Airbyte adds fields of its own to an answer, so only the document's values are compared. A
+connection is created without a stream list of its own: Airbyte reads the source's schema when it creates the connection, so each source must read a file
+that exists. Every later run changes only the source's read prefix and the destination's branch. An object that belongs to another definition or joins other
+objects, and a name that two objects hold, are refused and changed nowhere: deleting a connection would delete its sync state.
 
 Every answer that the load reads is read through a closed shape: a field that is missing, of another type or outside its closed set refuses the call with an
 error that names the call and the field, never the text of the answer. A job is read through the documented shape of ``JobResponse`` (``jobId`` whole number,
@@ -74,12 +76,6 @@ SYNC = "sync"
 # The addresses that the deploy can write: the bridge address that k3s gives the node is a private address, and the code location reaches it through the host.
 PRIVATE_NETWORKS = tuple(ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
 ORIGIN = re.compile(r"http://([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})")
-DEFINITION_FIELDS = ("name", "dockerRepository", "dockerImageTag")
-DEFINITION_NAMES = {
-    definitions.SOURCE_S3.repository: "vitaldb S3 source (pinned)",
-    definitions.SOURCE_FILE.repository: "vitaldb File source (pinned)",
-    definitions.DESTINATION.repository: "vitaldb S3 Data Lake destination (pinned)",
-}
 
 
 class AirbyteError(RuntimeError):
@@ -332,20 +328,28 @@ class HttpAirbyteApi:
         return self.workspace
 
     def definition_id(self, kind: str, connector: Connector) -> str:
-        """The id of this tool's own definition of the connector at the pinned version: created when missing, moved to the version when it differs."""
-        name = DEFINITION_NAMES[connector.repository]
+        """The id of the definition that Airbyte holds for the pinned image, when its tag is the pinned one. No definition is created or updated.
+
+        The definition is taken by its ``dockerRepository``, not by a name, because a custom definition cannot be made for a built-in image. None or several of
+        the image, and another tag, are refused with a message that names no image, tag, ID or count.
+        """
         path = f"/workspaces/{quote(self.workspace_id(), safe='')}/definitions/{kind}s"
-        current = named(self.listing(path), name, f"{kind} definition")
-        if current is None:
-            created = self.call("POST", path, {"name": name, "dockerRepository": connector.repository, "dockerImageTag": connector.tag})
-            return text(created, "id", f"POST {path.rsplit('/', 1)[-1]}")
         what = f"GET {kind} definitions"
-        if text(current, "dockerRepository", what) != connector.repository:
-            raise AirbyteError(f"the {kind} definition of this tool runs another image than the pinned one")
-        identity = text(current, "id", what)
-        if text(current, "dockerImageTag", what) != connector.tag:
-            self.call("PUT", f"{path}/{quote(identity, safe='')}", {"name": name, "dockerImageTag": connector.tag})
-        return identity
+        matches = [entry for entry in self.listing(path) if text(entry, "dockerRepository", what) == connector.repository]
+        if len(matches) != 1:
+            raise AirbyteError(f"Airbyte does not hold exactly one {kind} definition of a pinned image; this tool takes the one that Airbyte provides")
+        if text(matches[0], "dockerImageTag", what) != connector.tag:
+            raise AirbyteError(f"the {kind} definition of a pinned image is at another version than the pin; upgrade Airbyte or change the pin")
+        return text(matches[0], "id", what)
+
+    def check_definitions(self) -> None:
+        """Check the three definitions of the load before any write: each of its pinned images has exactly one definition, and its tag is the pin.
+
+        The load calls this before its first copy, so a connector that Airbyte holds at another version stops the run with no input copied and no source,
+        destination or connection created or patched. Only reads are made. The refusal is the one of ``definition_id``.
+        """
+        for kind, connector in (("source", definitions.SOURCE_S3), ("source", definitions.SOURCE_FILE), ("destination", definitions.DESTINATION)):
+            self.definition_id(kind, connector)
 
     def actors(self, kind: str) -> list[dict[str, Any]]:
         return self.listing(f"/{kind}s?workspaceIds={quote(self.workspace_id(), safe='')}")
