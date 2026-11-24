@@ -17,6 +17,7 @@ RUN useradd --uid 10003 --user-group --no-create-home --shell /usr/sbin/nologin 
 COPY replay/requirements.txt /opt/replay/requirements.txt
 RUN pip install --require-hashes --only-binary :all: --no-deps --requirement /opt/replay/requirements.txt
 
+COPY features/__init__.py features/sampling.py /opt/replay/app/features/
 COPY replay /opt/replay/app/replay
 COPY scripts/__init__.py scripts/process.py scripts/project_config.py /opt/replay/app/scripts/
 COPY scripts/ingestion /opt/replay/app/scripts/ingestion

@@ -74,3 +74,16 @@ class SampleFormat(unittest.TestCase):
         path = self.case(6, [65535, 100, 65535])
         decoded = decoder.decode_case(path, TIMES).waveforms[0]
         self.assertEqual([65535.0, 100.0, 65535.0], [float(sample) for sample in decoded.records[0].samples])
+
+
+class PacketStart(unittest.TestCase):
+    def test_a_packet_start_reaches_the_event_model_as_the_float_the_file_holds_with_no_rounding(self) -> None:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        start = START + 940.0 - 2.0**-21
+        path = Path(folder.name) / "case.vital"
+        packets = (waveform_record(1, 2, [9, 9, 9, 9], dt=START), waveform_record(1, 2, [1, 2, 3, 4], dt=start))
+        path.write_bytes(gzip.compress(vital(track_packet(1, name="WAVE", kind=1, fmt=2, rate=4.0), *packets)))
+        decoded = decoder.decode_case(path, CaseTimes(7, 0, 940_000_000, 941_000_000)).waveforms[0]
+        self.assertEqual([START, start], [record.start_s for record in decoded.records])
+        self.assertNotEqual(START + round((start - START) * 1_000_000) / 1_000_000, decoded.records[1].start_s)

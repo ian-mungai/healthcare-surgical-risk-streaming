@@ -78,6 +78,7 @@ COPY features/eligibility.py /opt/jobs/features/eligibility.py
 COPY features/leakage.py /opt/jobs/features/leakage.py
 COPY features/numeric.py /opt/jobs/features/numeric.py
 COPY features/row.py /opt/jobs/features/row.py
+COPY features/sampling.py /opt/jobs/features/sampling.py
 COPY features/series_input.py /opt/jobs/features/series_input.py
 COPY features/validate.py /opt/jobs/features/validate.py
 COPY features/waveform.py /opt/jobs/features/waveform.py

@@ -21,6 +21,7 @@ from features.model import ClinicalValue, FeatureRow, Reading, WaveformSecond, W
 from features.pressure_series import SecondFacts, second_facts
 from features.registry import ARTERIAL_SERIES, NUMERIC_TRACKS, WAVEFORM_TRACKS
 from features.row import build_row
+from features.sampling import ANONYMISED_START
 from features.series_input import series_readings
 from features.signal_validity import (
     FLAT_WINDOW_SECONDS,
@@ -38,15 +39,18 @@ from replay.events.manifest import reference_seconds
 from replay.events.recording import CaseRecording, CaseTimes, NumericTrack, StringTrack, WaveformRecord, WaveformTrack
 from replay.events.schedule import ScheduledOccurrence
 from replay.events.stream import occurrence_events, outgoing
+from spark.bronze.rows import Lineage, waveform_rows
 from spark.streaming.model import Context, Event, FeatureRecord, Policy, Record
 from spark.streaming.occurrence import process
 from spark.streaming.signals import ARTERIAL_WAVEFORM
 from spark.streaming.state import OccurrenceState
 from spark.streaming.wire import event_from_record
+from tests.fast.replay_support import encoded
 
 SECOND = 1_000_000
 RUN = "stream_0a1b2c3d"
 ORIGIN_US = 5_000 * SECOND
+EARLY_US_FLOAT = 2.0**-21
 HEART_RATE = "Solar8000/HR"
 ARTERIAL_MEAN = "Solar8000/ART_MBP"
 NO_CLINICAL: Callable[[int], Mapping[str, ClinicalValue]] = lambda case_id: {}  # noqa: E731
@@ -81,13 +85,16 @@ def synthetic_recording(
     arterial_gain: float = 1.0,
     arterial_offset: float = 0.0,
     marker_s: tuple[int, int] | None = None,
+    packet_s: int | None = None,
+    early_from_s: int | None = None,
 ) -> CaseRecording:
     """A case with registry tracks: two numeric tracks (one with a duplicate reading and one with a not-a-number reading), an unregistered numeric track, a
     string track, an arterial waveform with one invalid second, and a second waveform with a gain and an offset. ``flat_s`` (the first second and the one after
     the last) makes those arterial seconds a small wave that is flat over 20 seconds, ``jump_s`` starts that second with a sample far from the one before it and
     ``gap_s`` leaves that arterial second out of the recording. The arterial track has the sample format, gain and offset given: its raw samples are the
     physical ones for a float format and ``(physical - offset) / gain`` rounded for an integer format, and ``marker_s`` (second, position) writes the format's
-    gap marker into that sample."""
+    gap marker into that sample. ``packet_s`` cuts the arterial track into packets of that many seconds, and ``early_from_s`` writes each packet that starts at
+    that second or later half a microsecond (``2 ** -21`` seconds, the step of the float) before its whole second, as the published files hold some packets."""
     heart = [(second * SECOND, hr_base + (second % 7)) for second in range(1, caseend_s, hr_step_s)]
     heart.append((41 * SECOND, hr_base + 30.0))
     heart.extend((time, value) for time, value in extra_hr)
@@ -106,12 +113,14 @@ def synthetic_recording(
             return GAP_MARKERS.get(arterial_format, math.nan)
         return physical if arterial_format in FLOAT_FORMATS else float(round((physical - arterial_offset) / arterial_gain))
 
+    runs = [(arterial_start_s, caseend_s)] if gap_s is None else [(arterial_start_s, gap_s), (gap_s + 1, caseend_s)]
+    blocks = [(low, min(low + (packet_s or caseend_s), end)) for first, end in runs for low in range(first, end, packet_s or caseend_s)]
     arterial_records = [
         WaveformRecord(
-            start * SECOND,
+            encoded(start * SECOND) - (EARLY_US_FLOAT if early_from_s is not None and start >= early_from_s else 0.0),
             array("d", [raw_of(second, position, value) for second in range(start, end) for position, value in enumerate(arterial_seconds[second])]),
         )
-        for start, end in (((arterial_start_s, caseend_s),) if gap_s is None else ((arterial_start_s, gap_s), (gap_s + 1, caseend_s)))
+        for start, end in blocks
         if end > start
     ]
     pleth_samples = [float((second * rate + position) % 50) for second in range(caseend_s) for position in range(rate)]
@@ -125,7 +134,7 @@ def synthetic_recording(
         strings=(StringTrack("Test/EVENT", ((50 * SECOND, "note"),)),),
         waveforms=(
             WaveformTrack(ARTERIAL_WAVEFORM, "mmHg", arterial_rate or float(rate), arterial_gain, arterial_offset, arterial_format, tuple(arterial_records)),
-            WaveformTrack("SNUADC/PLETH", "%", float(rate), 0.5, 1.0, 5, (WaveformRecord(0, array("d", pleth_samples)),)),
+            WaveformTrack("SNUADC/PLETH", "%", float(rate), 0.5, 1.0, 5, (WaveformRecord(encoded(0), array("d", pleth_samples)),)),
         ),
     )
 
@@ -214,7 +223,19 @@ def oracle_physical(raw: Sequence[float], sample_format: int, gain: float, offse
     return physical_samples(raw, sample_format, gain, offset)
 
 
-def oracle_window(recording: CaseRecording, cutoff_us: int, clinical: Mapping[str, ClinicalValue] | None = None) -> WindowInput:
+def bronze_seconds(track: WaveformTrack) -> dict[int, tuple[int, list[float]]]:
+    """Each second of a waveform track as Bronze's own rows hold it: ``(offset of the first sample, raw samples)``, from the packets' encoded starts."""
+    records = [(record.start_s, record.samples) for record in track.records]
+    rows = waveform_rows(0, track.name, track.sample_rate, records, ANONYMISED_START, Lineage("v0001", "ab" * 32))
+    return {row[2]: (row[3], list(row[4])) for row in rows}
+
+
+def oracle_window(
+    recording: CaseRecording,
+    cutoff_us: int,
+    clinical: Mapping[str, ClinicalValue] | None = None,
+    seconds_of: Callable[[WaveformTrack], dict[int, tuple[int, list[float]]]] = reference_seconds,
+) -> WindowInput:
     """The window of a cutoff from the whole recording, as Silver's batch path makes it: the first reading of a track and time judged by ``numeric_verdict``,
     every waveform second judged by ``waveform_verdict`` with the extent of the 19 seconds before it, and the series made of the arterial seconds' facts."""
     numeric: dict[str, list[Reading]] = {}
@@ -229,7 +250,7 @@ def oracle_window(recording: CaseRecording, cutoff_us: int, clinical: Mapping[st
     for wave in recording.waveforms:
         if wave.name not in WAVEFORM_TRACKS:
             continue
-        held = {second: (offset, oracle_physical(raw, wave.sample_format, wave.gain, wave.offset)) for second, (offset, raw) in reference_seconds(wave).items()}
+        held = {second: (offset, oracle_physical(raw, wave.sample_format, wave.gain, wave.offset)) for second, (offset, raw) in seconds_of(wave).items()}
         seconds = []
         for second, (offset, samples) in sorted(held.items()):
             before = held.get(second - 1)
@@ -248,17 +269,29 @@ def oracle_window(recording: CaseRecording, cutoff_us: int, clinical: Mapping[st
     return WindowInput(cutoff_us, numeric, waveforms, dict(clinical or {}))
 
 
-def oracle_row(recording: CaseRecording, cutoff_us: int, clinical: Mapping[str, ClinicalValue] | None = None) -> FeatureRow:
-    return build_row(oracle_window(recording, cutoff_us, clinical))
+def oracle_row(
+    recording: CaseRecording,
+    cutoff_us: int,
+    clinical: Mapping[str, ClinicalValue] | None = None,
+    seconds_of: Callable[[WaveformTrack], dict[int, tuple[int, list[float]]]] = reference_seconds,
+) -> FeatureRow:
+    return build_row(oracle_window(recording, cutoff_us, clinical, seconds_of))
 
 
-def oracle_values(recording: CaseRecording, cutoff_us: int, clinical: Mapping[str, ClinicalValue] | None = None) -> dict[str, object]:
-    document = json.loads(json.dumps(row_document("oracle", oracle_row(recording, cutoff_us, clinical)), allow_nan=False))
+def oracle_values(
+    recording: CaseRecording,
+    cutoff_us: int,
+    clinical: Mapping[str, ClinicalValue] | None = None,
+    seconds_of: Callable[[WaveformTrack], dict[int, tuple[int, list[float]]]] = reference_seconds,
+) -> dict[str, object]:
+    document = json.loads(json.dumps(row_document("oracle", oracle_row(recording, cutoff_us, clinical, seconds_of)), allow_nan=False))
     values: dict[str, object] = document["features"]
     return values
 
 
-def oracle_eligibility(recording: CaseRecording, cutoff_us: int) -> tuple[bool, tuple[str, ...]]:
-    window = oracle_window(recording, cutoff_us)
+def oracle_eligibility(
+    recording: CaseRecording, cutoff_us: int, seconds_of: Callable[[WaveformTrack], dict[int, tuple[int, list[float]]]] = reference_seconds
+) -> tuple[bool, tuple[str, ...]]:
+    window = oracle_window(recording, cutoff_us, None, seconds_of)
     result = warning_eligibility(cutoff_us, window.numeric.get(ARTERIAL_SERIES, ()), window.waveforms[ARTERIAL_WAVEFORM])
     return result.eligible, result.reasons

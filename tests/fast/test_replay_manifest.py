@@ -26,13 +26,14 @@ from array import array
 from collections.abc import Iterable
 from dataclasses import replace
 
+from features.sampling import ANONYMISED_START
 from replay.events.manifest import Manifest, ManifestError, Observed, build_manifest, compare, reference_seconds
 from replay.events.payload import payload_digest
 from replay.events.recording import WaveformRecord, WaveformTrack
 from replay.events.schedule import FrozenSchedule, admitted_occurrences
 from replay.events.stream import occurrence_events, outgoing
 from replay.events.waveform import second_samples, second_spans
-from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule
+from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule, encoded
 
 
 def replayed(frozen: FrozenSchedule) -> Observed:
@@ -145,11 +146,34 @@ class WaveformCrossCheck(unittest.TestCase):
             start = draw(f"{rate}:start", -5_000_000, 5_000_000)
             for number in range(12):
                 count = draw(f"{rate}:{number}:count", 1, 900)
-                records.append(WaveformRecord(start, array("d", (float(index) for index in range(count)))))
+                records.append(WaveformRecord(encoded(start), array("d", (float(index) for index in range(count)))))
                 start += draw(f"{rate}:{number}:step", -300_000, 1_800_000)
             track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, 2, tuple(records))
             replay_side = {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)}
             self.assertEqual(reference_seconds(track), replay_side, f"rate {rate}")
+
+
+class BoundaryPackets(unittest.TestCase):
+    """The manifest's derivation reads the exact packet start, as the replay's second function does, so a packet half a microsecond before a
+    boundary has its first sample in the second before it in both."""
+
+    def test_the_manifest_and_the_replay_place_a_packet_half_a_microsecond_before_940_seconds_in_the_second_before_it(self) -> None:
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (WaveformRecord(ANONYMISED_START + 940.0 - 2.0**-21, array("d", [1.0, 2.0, 3.0, 4.0])),))
+        expected = {939: (999_999, [1.0]), 940: (249_999, [2.0, 3.0, 4.0])}
+        self.assertEqual(expected, reference_seconds(track))
+        self.assertEqual(expected, {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)})
+
+    def test_control_a_packet_on_the_boundary_is_one_whole_second_in_both(self) -> None:
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (WaveformRecord(ANONYMISED_START + 940.0, array("d", [1.0, 2.0, 3.0, 4.0])),))
+        self.assertEqual({940: (0, [1.0, 2.0, 3.0, 4.0])}, reference_seconds(track))
+
+    def test_the_two_derivations_agree_on_packets_at_the_floats_around_a_boundary(self) -> None:
+        for rate in (4.0, 62.5, 500.0, 0.3):
+            for step in (-3, -2, -1, 0, 1, 2):
+                start = ANONYMISED_START + 940.0 + step * 2.0**-21
+                track = WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, 2, (WaveformRecord(start, array("d", (float(index) for index in range(70)))),))
+                replay_side = {span.second: (span.start_offset_us, list(second_samples(track, span))) for span in second_spans(track)}
+                self.assertEqual(reference_seconds(track), replay_side, (rate, step))
 
 
 class Comparison(unittest.TestCase):

@@ -40,6 +40,7 @@ from tests.fast.stream_support import (
     ORIGIN_US,
     RUN,
     SECOND,
+    bronze_seconds,
     by_replay_time,
     events_for,
     features_of,
@@ -306,6 +307,36 @@ class SignalParity(unittest.TestCase):
         changed = replace(recording, numeric=(recording.numeric[0], replace(recording.numeric[1], readings=tuple(wide)), recording.numeric[2]))
         self.agree(changed, (60 * SECOND, 120 * SECOND))
         self.assertNotEqual(oracle_values(recording, 60 * SECOND), oracle_values(changed, 60 * SECOND))
+
+
+class PacketBoundary(unittest.TestCase):
+    """A packet that starts half a microsecond before a whole second (the float just below it) puts its first sample in the second before it. The stream
+    reads the seconds that the replay cut from the exact packet start, so it judges each second as the batch path does from the same packets."""
+
+    def agree(self, recording: CaseRecording, cutoffs: Sequence[int]) -> dict[int, FeatureRecord]:
+        records, _ = run_stream(events_for(recording))
+        found = features_of(records)
+        for cutoff in cutoffs:
+            with self.subTest(cutoff=cutoff):
+                self.assertEqual(oracle_values(recording, cutoff, None, bronze_seconds), values_of(found[cutoff]))
+                self.assertEqual(oracle_eligibility(recording, cutoff, bronze_seconds), (found[cutoff].warning_eligible, found[cutoff].eligibility_reasons))
+        return found
+
+    def test_the_stream_reports_the_batch_valid_readings_and_eligibility_at_960_seconds_for_packets_half_a_microsecond_before_each_second(self) -> None:
+        recording = synthetic_recording(caseend_s=1_000, opend_s=990, opstart_s=30, rate=4, packet_s=1, early_from_s=939)
+        found = self.agree(recording, (960 * SECOND,))
+        batch = oracle_values(recording, 960 * SECOND, None, bronze_seconds)
+        values = values_of(found[960 * SECOND])
+        self.assertEqual(batch, values)
+        self.assertFalse(found[960 * SECOND].warning_eligible)
+        control = synthetic_recording(caseend_s=1_000, opend_s=990, opstart_s=30, rate=4, packet_s=1)
+        valid = values_of(features_of(run_stream(events_for(control))[0])[960 * SECOND])
+        self.assertNotEqual(valid, values, "the packets that start early change the valid readings and the eligibility")
+        self.assertTrue(features_of(run_stream(events_for(control))[0])[960 * SECOND].warning_eligible)
+
+    def test_control_packets_that_start_exactly_on_each_second_give_the_batch_rows_and_the_stream_rows_alike(self) -> None:
+        recording = synthetic_recording(caseend_s=1_000, opend_s=990, opstart_s=30, rate=4, packet_s=1)
+        self.agree(recording, (120 * SECOND, 960 * SECOND))
 
 
 class BatchIndependence(unittest.TestCase):

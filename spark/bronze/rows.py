@@ -5,7 +5,7 @@ generator, so a track's rows are made as Spark takes them and a track is never h
 
 The position of a reading among the readings that share its time is the event model's own definition (``replay.events.stream.discriminators``), so a Bronze row
 and the replay's event for the same reading have the same discriminator. The second of a waveform sample is placed from the encoded values with no rounding
-(``spark/bronze/sampling.py``).
+(``features/sampling.py``).
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from features.sampling import SamplingError, packet_pieces
 from replay.events.stream import discriminators
-from spark.bronze.sampling import SamplingError, packet_pieces
 
 KIND_OF_TYPE = {1: "waveform", 2: "numeric", 5: "string"}
 SAMPLE_TYPES = {1: "float32", 2: "float64", 3: "int8", 4: "uint8", 5: "int16", 6: "uint16", 7: "int32", 8: "uint32"}
@@ -139,7 +139,7 @@ def waveform_rows(
     """One row for each second of a waveform track that holds a sample: ``(case, track, second, offset of its first sample, its samples)``.
 
     ``records`` are the packets of the track in the order of the file, each the file's own start time (float seconds since the epoch) and its samples. A
-    sample's second is placed from the exact values (``spark/bronze/sampling.py``). A second takes its samples in the order of the records, and its offset
+    sample's second is placed from the exact values (``features/sampling.py``). A second takes its samples in the order of the records, and its offset
     from the first packet that has a sample in it.
     """
     chunks: dict[int, list[tuple[int, int, int]]] = {}

@@ -18,19 +18,22 @@ import unittest
 from array import array
 from collections.abc import Callable
 
+from features.sampling import ANONYMISED_START
 from features.signal_validity import FLOAT_FORMATS, GAP_MARKERS
 from replay.events.identity import Occurrence
 from replay.events.recording import WAVEFORM_FORMATS, CaseRecording, CaseTimes, NumericTrack, RecordingError, StringTrack, WaveformRecord, WaveformTrack
 from replay.events.schedule import ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import earliest_due_offset_us, occurrence_events, outgoing
 from replay.events.waveform import second_samples, second_spans
-from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule
+from tests.fast.replay_support import RUN_ID, SECOND, boundary_recordings, boundary_schedule, encoded
 
 WAVE_KEYS = {"event_id", "run_id", "room", "occurrence_id", "case_id", "track", "case_time_us", "discriminator", "replay_time_us"}
 
 
 def waveform(rate: float, *records: tuple[int, list[float]], sample_format: int = 2) -> WaveformTrack:
-    return WaveformTrack("Test/W", "mV", rate, 1.0, 0.0, sample_format, tuple(WaveformRecord(start, array("d", samples)) for start, samples in records))
+    return WaveformTrack(
+        "Test/W", "mV", rate, 1.0, 0.0, sample_format, tuple(WaveformRecord(encoded(start), array("d", samples)) for start, samples in records)
+    )
 
 
 def seconds_of(track: WaveformTrack) -> list[tuple[int, int, list[float]]]:
@@ -41,13 +44,22 @@ class WaveformSeconds(unittest.TestCase):
     def test_each_sample_belongs_to_the_second_in_which_its_own_time_falls(self) -> None:
         track = boundary_recordings()[9001].waveforms[0]
         self.assertEqual(
-            [(0, 250_000, [10, 11, 12]), (1, 0, [13, 14, 15]), (3, 250_000, [20, 21, 22]), (4, 0, [23]), (6, 900_000, [30]), (7, 150_000, [31, 32])],
+            [(0, 250_000, [10, 11, 12]), (1, 0, [13, 14, 15]), (3, 250_000, [20, 21, 22]), (4, 0, [23]), (6, 906_250, [30]), (7, 156_250, [31, 32])],
             seconds_of(track),
         )
 
     def test_a_sample_exactly_on_a_second_boundary_opens_the_next_second(self) -> None:
         track = waveform(4.0, (0, [1, 2, 3, 4, 5]))
         self.assertEqual([(0, 0, [1, 2, 3, 4]), (1, 0, [5])], seconds_of(track))
+
+    def test_a_packet_that_starts_half_a_microsecond_before_a_boundary_keeps_its_first_sample_in_the_second_before_it(self) -> None:
+        packet = WaveformRecord(ANONYMISED_START + 940.0 - 2.0**-21, array("d", [1.0, 2.0, 3.0, 4.0]))
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (packet,))
+        self.assertEqual([(939, 999_999, [1.0]), (940, 249_999, [2.0, 3.0, 4.0])], seconds_of(track))
+
+    def test_control_a_packet_that_starts_exactly_on_the_boundary_is_one_whole_second(self) -> None:
+        track = WaveformTrack("Test/W", "mV", 4.0, 1.0, 0.0, 2, (WaveformRecord(ANONYMISED_START + 940.0, array("d", [1.0, 2.0, 3.0, 4.0])),))
+        self.assertEqual([(940, 0, [1.0, 2.0, 3.0, 4.0])], seconds_of(track))
 
     def test_a_second_with_no_sample_has_no_message(self) -> None:
         self.assertEqual([0, 1, 3, 4, 6, 7], [item[0] for item in seconds_of(boundary_recordings()[9001].waveforms[0])])
@@ -250,7 +262,7 @@ class OutgoingEvents(unittest.TestCase):
                 "gain": 0.5,
                 "offset": -1.0,
                 "sample_format": 5,
-                "start_offset_us": 150_000,
+                "start_offset_us": 156_250,
                 "samples": [31.0, 32.0],
             },
             payload,

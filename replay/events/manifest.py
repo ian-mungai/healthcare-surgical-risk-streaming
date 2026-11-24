@@ -1,7 +1,7 @@
 """The manifest of expected events, and its comparison with what Kafka and the replay's admissions hold.
 
 The manifest is derived from the decoded case files and the frozen schedule only. It never reads what the replay sent or admitted. It has its own code for the
-waveform seconds (sample by sample, with exact integer arithmetic) and for the payloads, so a mistake in the replay's code is not a mistake in the manifest.
+waveform seconds (sample by sample, from the exact encoded values) and for the payloads, so a mistake in the replay's code is not a mistake in the manifest.
 It lists every event of every admitted occurrence with its ID, its due replay time, whether it is due inside the half-open window and the digest of its
 decoded payload. A string event and a marker keep their payload too, so their text and their kind can be read in a report.
 
@@ -13,16 +13,19 @@ due inside the window.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
+from features.sampling import ANONYMISED_START
 from replay.events.errors import EventModelError
 from replay.events.identity import Marker, marker_event_id, source_event_id
 from replay.events.payload import payload_digest
 from replay.events.recording import CaseRecording, WaveformTrack
 from replay.events.schedule import FrozenSchedule, ScheduledOccurrence, admitted_occurrences
-from replay.events.waveform import MICROSECONDS, rate_ratio
+from replay.events.waveform import MICROSECONDS
 
 MANIFEST_FORMAT = "replay_manifest_2"
 REPORT_LINES_PER_KIND = 20
@@ -103,15 +106,23 @@ class Manifest:
 
 
 def reference_seconds(track: WaveformTrack) -> dict[int, tuple[int, list[float]]]:
-    """Each second of a waveform as ``(offset of its first sample, its raw samples)``, derived sample by sample with exact integer arithmetic."""
-    numerator, denominator = rate_ratio(track.sample_rate)
+    """Each second of a waveform as ``(offset of its first sample, its raw samples)``, derived sample by sample from the exact encoded values.
+
+    The time of a sample is the packet's encoded start, minus the anonymised start, plus its index over the rate, with every term an exact fraction and nothing
+    rounded before the floor. It shares no step with ``features.sampling.packet_pieces``, which cuts whole packets.
+    """
+    if not math.isfinite(track.sample_rate) or track.sample_rate <= 0:
+        raise ManifestError("a waveform's sample rate must be a positive finite number")
+    rate, origin = Fraction(track.sample_rate), Fraction(ANONYMISED_START)
     seconds: dict[int, tuple[int, list[float]]] = {}
     for record in track.records:
+        if not math.isfinite(record.start_s):
+            raise ManifestError("a waveform packet's start must be a finite number")
         for index, raw in enumerate(record.samples):
-            scaled = record.start_us * numerator + index * denominator * MICROSECONDS
-            second = scaled // (numerator * MICROSECONDS)
+            instant = Fraction(record.start_s) - origin + Fraction(index) / rate
+            second = math.floor(instant)
             if second not in seconds:
-                seconds[second] = (scaled // numerator - second * MICROSECONDS, [])
+                seconds[second] = (math.floor((instant - second) * MICROSECONDS), [])
             seconds[second][1].append(float(raw))
     return seconds
 

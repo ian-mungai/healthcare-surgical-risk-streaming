@@ -19,6 +19,7 @@
 !features/leakage.py
 !features/numeric.py
 !features/row.py
+!features/sampling.py
 !features/series_input.py
 !features/validate.py
 !features/waveform.py
