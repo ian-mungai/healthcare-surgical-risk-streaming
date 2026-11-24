@@ -474,6 +474,32 @@ class PushHookTest(TemporaryRepository):
         self.assertEqual(run.returncode, 9, run.stderr)
         self.assertEqual((self.repo / "owner_input").read_text(), "line\n")
 
+    def test_a_hooks_folder_that_is_a_link_to_a_folder_keeps_the_owners_hook_and_writes_the_gate_in_the_real_folder(self) -> None:
+        """Join round 2b, finding 1: the owner's hook moved aside and the write into the linked folder was then refused."""
+        real = self.repo.parent / "shared_hooks"
+        real.mkdir()
+        (real / push_hook.HOOK_NAME).write_text("#!/bin/sh\nexit 7\n")
+        (real / push_hook.HOOK_NAME).chmod(0o755)
+        link = self.repo / ".git" / "hooks"
+        shutil.rmtree(link)
+        link.symlink_to(real)
+        self.assertTrue(push_hook.install(self.repo))
+        self.assertTrue(link.is_symlink())
+        self.assertEqual("#!/bin/sh\nexit 7\n", (real / push_hook.KEPT_NAME).read_text())
+        self.assertEqual(push_hook.HOOK_TEXT, (real / push_hook.HOOK_NAME).read_text())
+        self.assertTrue(push_hook.installed(self.repo))
+        self.assertFalse(push_hook.install(self.repo))
+
+    def test_a_hooks_folder_that_leads_to_no_folder_is_refused_and_nothing_is_created_or_moved(self) -> None:
+        link = self.repo / ".git" / "hooks"
+        shutil.rmtree(link)
+        gone = self.repo.parent / "gone_hooks"
+        link.symlink_to(gone)
+        with self.assertRaises(OSError):
+            push_hook.install(self.repo)
+        self.assertFalse(os.path.lexists(gone))
+        self.assertEqual(str(gone), os.readlink(link))
+
     def hooks_state(self) -> dict[str, tuple[str, str | bytes]]:
         """Every entry of the hooks folder with its kind and content, a link by its target, so that a change of any name shows."""
         state: dict[str, tuple[str, str | bytes]] = {}

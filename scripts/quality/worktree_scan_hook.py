@@ -35,8 +35,16 @@ class KeptHookError(RuntimeError):
 
 
 def hooks_folder(root: Path) -> Path:
-    """The hooks folder that Git reports for the repository."""
-    return root / git("rev-parse", "--git-path", "hooks", cwd=root).strip()
+    """The hooks folder that Git reports for the repository, with every link followed when it leads to a folder.
+
+    The owned-file write refuses a state folder that is a link, so the folder is resolved here, before the owner's hook is moved or anything is written. A link
+    that leads to nothing, to a file or in a loop is returned as Git reports it: the installer then refuses at its first step, before anything moves.
+    """
+    reported = root / git("rev-parse", "--git-path", "hooks", cwd=root).strip()
+    try:
+        return Path(os.path.realpath(reported, strict=True))
+    except OSError:
+        return reported
 
 
 @dataclass(frozen=True)
@@ -81,7 +89,7 @@ def install(root: Path, hook: LegacyHook = SCANNER) -> bool:
         return False
     folder = hooks_folder(root)
     path = folder / hook.name
-    folder.mkdir(parents=True, exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)  # a link that leads to no folder raises here, before the owner's hook moves
     if os.path.lexists(path) and not is_scanner(path, hook):
         kept = path.with_name(hook.kept_name)
         if os.path.lexists(kept):
