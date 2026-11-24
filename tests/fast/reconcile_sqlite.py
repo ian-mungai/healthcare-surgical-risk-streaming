@@ -1,14 +1,13 @@
 """Run the reconciliation's own Spark SQL on tiny tables in SQLite, so that a test can look at what a query returns and not only at its text.
 
-The translation is small and exact: three-part table names become one name, ``<=>`` becomes ``IS``, a semi join and an anti join with the development
-cases become a join and a left join with a ``WHERE``, ``RLIKE`` and ``TRY_CAST`` become a regular-expression function and a cast (the pattern of the typing
-rule guards the cast), and the two ``explode`` forms (the ledger of a reading and the copies of a laboratory row) become a join to ``json_each`` and to a
-table of numbers. A construct that is not one of these is not translated, so a query that gains one fails loudly here and the translation is extended on
-purpose.
+The translation is small and exact: three-part table names become one name, ``<=>`` becomes ``IS``, ``LEFT SEMI JOIN dev ON <predicate>`` becomes
+``WHERE EXISTS (SELECT 1 FROM dev WHERE <predicate>)`` and ``LEFT ANTI JOIN dev ON <predicate>`` becomes ``WHERE NOT EXISTS (...)``, each with the whole
+predicate, ``RLIKE`` and ``TRY_CAST`` become a regular-expression function and a cast (the pattern of the typing rule guards the cast), and the two
+``explode`` forms (the ledger of a reading and the copies of a laboratory row) become a join to ``json_each`` and to a table of numbers. A construct that is
+not one of these is not translated and raises ``ValueError``, so a query that gains one fails loudly here and the translation is extended on purpose.
 
 ``World`` holds two cohorts. Case 1 of patient 10 is in the training set, case 2 of patient 20 is in the test set. Each table has the rows of a clean,
 reconciled build for both. A test plants a defect in a cohort and reads what the query counts.
-build for both. A test plants a defect in a cohort and reads what the query counts.
 """
 
 from __future__ import annotations
@@ -42,14 +41,6 @@ STEPS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], str]], ...] = (
     (re.compile(r"TRY_CAST\((.+?) AS BIGINT\)"), lambda m: f"CAST({m[1]} AS INTEGER)"),
     (re.compile(r"TRY_CAST\((.+?) AS DOUBLE\)"), lambda m: f"CAST({m[1]} AS REAL)"),
     (
-        re.compile(r"LEFT SEMI JOIN dev ON (\S+ = dev\.`case_id`)"),
-        lambda m: " ".join(("JOIN (SELECT DISTINCT `case_id` FROM dev) dev ON", m[1])),
-    ),
-    (
-        re.compile(r"LEFT ANTI JOIN dev ON (\S+ = dev\.`case_id`)"),
-        lambda m: " ".join(("LEFT JOIN (SELECT DISTINCT `case_id` FROM dev) dev ON", m[1], "WHERE dev.`case_id` IS NULL")),
-    ),
-    (
         re.compile(r"explode\(`duplicate_source_occurrences`\) AS `duplicate` FROM (\w+)"),
         lambda m: f"je.value AS `duplicate` FROM {m[1]}, json_each({m[1]}.`duplicate_source_occurrences`) AS je",
     ),
@@ -60,7 +51,70 @@ STEPS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], str]], ...] = (
 )
 
 
+ANY_SCOPE_JOIN = re.compile(r"\b(SEMI|ANTI)\s+JOIN\b")
+EXACT_SCOPE_JOIN = re.compile(r"\bLEFT (SEMI|ANTI) JOIN dev ON ")
+ENDS_PREDICATE = re.compile(r"(WHERE|GROUP|ORDER|HAVING|LIMIT|UNION|JOIN|LEFT|RIGHT|FULL|INNER|CROSS|ON)\b")
+QUOTED = re.compile(r"'[^']*'|`[^`]*`")
+
+
+def masked(text: str) -> str:
+    """The text with the inside of every quoted literal and name blanked, so that a bracket or a keyword in a literal is not read as SQL."""
+    return QUOTED.sub(lambda m: m[0][0] + "_" * (len(m[0]) - 2) + m[0][-1], text)
+
+
+def has_where_at_level(prefix: str) -> bool:
+    """Whether the innermost open select of ``prefix`` already has a ``WHERE``."""
+    levels = [False]
+    for token in re.finditer(r"\(|\)|\bWHERE\b", masked(prefix)):
+        if token[0] == "(":
+            levels.append(False)
+        elif token[0] == ")":
+            levels.pop()
+        else:
+            levels[-1] = True
+    return levels[-1]
+
+
+def predicate_end(text: str, start: int) -> int:
+    """The index where the predicate that begins at ``start`` ends: the bracket that closes the select that holds it, or the end of the text."""
+    hidden, depth = masked(text), 0
+    for index in range(start, len(hidden)):
+        if hidden[index] == "(":
+            depth += 1
+        elif hidden[index] == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+        elif depth == 0 and (index == 0 or not hidden[index - 1].isalnum()) and ENDS_PREDICATE.match(hidden, index):
+            raise ValueError(f"a scope join is followed by more than its predicate: {text[index : index + 20]!r}")
+    if depth:
+        raise ValueError("a scope join predicate has an open bracket that is not closed")
+    return len(hidden)
+
+
+def scope_joins(query: str) -> str:
+    """Each ``LEFT SEMI|ANTI JOIN dev ON <predicate>`` as ``WHERE [NOT] EXISTS (SELECT 1 FROM dev WHERE <the whole predicate>)``; any other form raises."""
+    while True:
+        hidden = masked(query)
+        found, exact = ANY_SCOPE_JOIN.search(hidden), EXACT_SCOPE_JOIN.search(hidden)
+        if found is None:
+            return query
+        if exact is None:
+            raise ValueError(
+                f"a semi join or an anti join that is not 'LEFT SEMI|ANTI JOIN dev ON <predicate>' is not translated: {query[found.start() :][:60]!r}"
+            )
+        if has_where_at_level(query[: exact.start()]):
+            raise ValueError("a scope join follows a WHERE of its own select")
+        end = predicate_end(query, exact.end())
+        predicate = query[exact.end() : end]
+        if not predicate.strip():
+            raise ValueError("a scope join has no predicate")
+        negation = "NOT " if exact[1] == "ANTI" else ""
+        query = "".join((query[: exact.start()], "WHERE ", negation, "EXISTS (SELECT 1 FROM dev WHERE ", predicate, ")", query[end:]))
+
+
 def translate(query: str) -> str:
+    query = scope_joins(query)
     for pattern, replace in STEPS:
         query = pattern.sub(replace, query)
     return query

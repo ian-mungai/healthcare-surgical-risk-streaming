@@ -1,9 +1,9 @@
-"""The Spark SQL text of the reconciliation: which keys each side holds, how a Silver row is expanded to the Bronze keys that it accounts for, which rows count
-as development and what each query returns.
+"""The Spark SQL of the reconciliation: the text of each query (which keys each side holds, how a Silver row is expanded to the Bronze keys that it accounts
+for, which rows count as development) and what each query returns on tiny tables.
 
-No Spark runs here, so these tests hold the text to the rules: a comparison that leaves out one direction, a null-safe key that is not null-safe, a held-out
-query that returns a count, a development filter that lets the test set in, a ledger that is not expanded or a value written into a query would each change the
-reconciliation without a failure. The queries run in the acceptance run.
+The text tests hold a query to its rules: a comparison that leaves out one direction, a null-safe key that is not null-safe, a held-out query that returns a
+count, a development filter that lets the test set in, a ledger that is not expanded or a value written into a query. The result tests run each query in SQLite
+through ``tests.fast.reconcile_sqlite`` on a world of two cohorts and read the counts and the flags. Spark runs the queries in the acceptance run.
 """
 
 from __future__ import annotations
@@ -418,6 +418,78 @@ class Cohorts(unittest.TestCase):
         self.assertEqual(
             {"numeric_track": 2, "waveform_track": 2, "lab_case": 2, "case_split": 1}, {join.name: joined(world, join.name).rows for join in JOINS}
         )
+
+
+class Adapter(unittest.TestCase):
+    """The SQLite adapter must read a scope join as Spark does: the whole predicate of a ``LEFT SEMI JOIN`` is an ``EXISTS`` and the whole predicate of a
+    ``LEFT ANTI JOIN`` is a ``NOT EXISTS``. A scope that is widened in one direction only is a defect of the query that the cohort tests must see."""
+
+    def test_a_semi_join_is_exists_and_an_anti_join_is_not_exists_of_the_whole_predicate(self) -> None:
+        semi = lake.translate("WITH ks AS (SELECT k.* FROM k LEFT SEMI JOIN dev ON k.`scope_case` = dev.`case_id`)")
+        anti = lake.translate("WITH ks AS (SELECT k.* FROM k LEFT ANTI JOIN dev ON k.`scope_case` = dev.`case_id`)")
+        self.assertEqual("WITH ks AS (SELECT k.* FROM k WHERE EXISTS (SELECT 1 FROM dev WHERE k.`scope_case` = dev.`case_id`))", semi)
+        self.assertEqual("WITH ks AS (SELECT k.* FROM k WHERE NOT EXISTS (SELECT 1 FROM dev WHERE k.`scope_case` = dev.`case_id`))", anti)
+
+    def test_a_predicate_with_more_than_one_term_is_kept_whole(self) -> None:
+        anti = lake.translate("SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = dev.`case_id` OR TRUE")
+        self.assertEqual("SELECT x.* FROM t x WHERE NOT EXISTS (SELECT 1 FROM dev WHERE x.`a` = dev.`case_id` OR TRUE)", anti)
+
+    def test_a_join_form_that_is_not_translated_exactly_is_refused(self) -> None:
+        forms = (
+            "SELECT x.* FROM t x LEFT ANTI JOIN other ON x.`a` = other.`b`",
+            "SELECT x.* FROM t x LEFT SEMI JOIN dev d ON x.`a` = d.`case_id`",
+            "SELECT x.* FROM t x LEFT ANTI JOIN dev",
+            "SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = dev.`case_id` WHERE x.`b` = 1",
+            "SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = dev.`case_id` GROUP BY x.`a`",
+            "SELECT x.* FROM t x WHERE x.`b` = 1 LEFT ANTI JOIN dev ON x.`a` = dev.`case_id`",
+            "SELECT x.* FROM t x RIGHT ANTI JOIN dev ON x.`a` = dev.`case_id`",
+            "SELECT x.* FROM t x ANTI JOIN dev ON x.`a` = dev.`case_id`",
+            "SELECT x.* FROM t x LEFT ANTI JOIN dev ON (x.`a` = dev.`case_id`",
+        )
+        self.assertEqual(9, len(forms))
+        for text in forms:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                lake.translate(text)
+
+    def test_a_join_form_that_is_not_translated_exactly_is_refused_also_before_a_form_that_is(self) -> None:
+        text = "SELECT x.* FROM t x LEFT ANTI JOIN other ON x.`a` = other.`b` LEFT ANTI JOIN dev ON x.`a` = dev.`case_id`"
+        with self.assertRaises(ValueError):
+            lake.translate(text)
+
+    def test_a_predicate_with_brackets_is_kept_whole_to_the_bracket_that_ends_the_select(self) -> None:
+        anti = lake.translate("(SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = dev.`case_id` AND (x.`b` IN (1, 2) OR x.`c` IS NULL)) SELECT 1")
+        self.assertEqual(
+            "(SELECT x.* FROM t x WHERE NOT EXISTS (SELECT 1 FROM dev WHERE x.`a` = dev.`case_id` AND (x.`b` IN (1, 2) OR x.`c` IS NULL))) SELECT 1", anti
+        )
+
+    def test_a_bracket_or_a_keyword_in_a_literal_is_not_sql(self) -> None:
+        anti = lake.translate("(SELECT x.* FROM t x LEFT ANTI JOIN dev ON x.`a` = ')' AND x.`b` <> 'WHERE' AND x.`c` = dev.`case_id`)")
+        self.assertEqual("(SELECT x.* FROM t x WHERE NOT EXISTS (SELECT 1 FROM dev WHERE x.`a` = ')' AND x.`b` <> 'WHERE' AND x.`c` = dev.`case_id`))", anti)
+
+    def test_a_scope_join_with_no_predicate_is_refused(self) -> None:
+        for text in ("(SELECT x.* FROM t x LEFT ANTI JOIN dev ON )", "SELECT x.* FROM t x LEFT SEMI JOIN dev ON "):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                lake.translate(text)
+
+    def test_no_query_of_the_job_keeps_a_semi_or_anti_join_after_translation(self) -> None:
+        queries = [key_facts_query(name) for name in BY_NAME] + [held_out_query(name) for name in BY_NAME]
+        queries += [join_query(join.name) for join in JOINS] + [join_held_out_query(join.name) for join in JOINS]
+        for query in queries:
+            self.assertNotRegex(lake.translate(query), r"SEMI|ANTI")
+
+    def test_a_held_out_scope_widened_by_or_true_changes_what_the_cohort_tests_read(self) -> None:
+        """The mutation widens only the anti join: every row is then in no held-out scope and a defect of a held-out row is not seen."""
+
+        def widened(query: str) -> str:
+            return re.sub(r"(LEFT ANTI JOIN dev ON [^)]+)", r"\1 OR TRUE", query)
+
+        world = lake.delete(lake.clean_world(), "silver.cases", caseid=HELD)
+        self.assertEqual(1, lake.flag(world, held_out_query("cases")))
+        self.assertNotEqual(widened(held_out_query("cases")), held_out_query("cases"))
+        self.assertEqual(0, lake.flag(world, widened(held_out_query("cases"))))
+        world = lake.delete(lake.clean_world(), "bronze.tracks", case_id=HELD, track="A")
+        self.assertEqual(1, lake.flag(world, join_held_out_query("numeric_track")))
+        self.assertEqual(0, lake.flag(world, widened(join_held_out_query("numeric_track"))))
 
 
 class SilverKeys(unittest.TestCase):
