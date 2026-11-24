@@ -11,12 +11,15 @@ the job's standard output or standard error. The file is accepted when all of th
 - its hashes and snapshot IDs are the catalog state that the runner captured from Nessie, before the call (the checked hash, the base hash and the snapshot
   IDs of the sources) and after it (the branch hash and the snapshot IDs of the tables) (``Catalog``, ``catalog_matches``).
 
-A refusal is judged by the exit code and by the refusal document in the same file (``refused``), and never by the text of standard error. The rules read
-hashes and snapshot IDs and never ``outcome``: a result that says whether a table was written changes when only a held-out row changes, so no result holds it.
+A call is judged once, by one accept function for its kind (``accept_write``, ``accept_keep``, ``accept_refusal``, ``accept_usage``). Each takes the exit
+code, the outcome that the call expected and the parsed file, and returns an ``Accepted``: the accepted document, or one fixed reason and an empty result. The
+exit code is judged first. A refusal is judged by the exit code and by the refusal document in the same file, and never by the text of standard error. The
+rules read hashes and snapshot IDs and never ``outcome``: a result that says whether a table was written changes when only a held-out row changes, so no
+result holds it.
 
-A runner records the fields of a file only after the file passed its rule (``evidence``, ``refusal_evidence``). A file that failed gives one fixed phrase
-from ``REASONS`` and ``REFUSAL_REASONS``: the rule that failed, never a value of the file. A call that exits with a usage error passes only when its result
-folder held nothing, checked before any parse (``result_present``, ``usage_refused``).
+A runner reads a field of a result, prints it and caches it only through an ``Accepted`` that passed for the outcome that its call expected. A call that failed
+gives one fixed phrase from ``REASONS``, ``REFUSAL_REASONS`` or ``USAGE_REASONS``: the rule that failed, never a value of the file. A call that exits with a
+usage error passes only when its result folder held nothing, checked before any parse (``result_present``, ``accept_usage``).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ import builtins
 import json
 import symtable
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -67,10 +70,14 @@ NOT_CLOSED = "the schema is not the job's closed schema"
 OFF_CATALOG = "a hash or a snapshot differs from the catalog"
 NOT_A_WRITE = "the result is not a write"
 NOT_A_KEEP = "the result is not a call that wrote nothing"
-REASONS = (NO_FILE, NO_CATALOG, OTHER_BRANCH, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP)
+WRONG_EXIT = "the exit code is not the expected one"
+NOT_EMPTY = "the result folder held something"
+REASONS = (WRONG_EXIT, NO_FILE, NO_CATALOG, OTHER_BRANCH, NOT_CLOSED, OFF_CATALOG, NOT_A_WRITE, NOT_A_KEEP)
 REFUSAL_NOT_CLOSED = "the refusal document is not the closed refusal schema"
 REFUSAL_OTHER_CODES = "the refusal codes are not the wanted ones"
-REFUSAL_REASONS = (NO_FILE, REFUSAL_NOT_CLOSED, REFUSAL_OTHER_CODES)
+REFUSAL_REASONS = (WRONG_EXIT, NO_FILE, REFUSAL_NOT_CLOSED, REFUSAL_OTHER_CODES)
+USAGE_REASONS = (WRONG_EXIT, NOT_EMPTY)
+EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,21 +172,6 @@ def sealed(result: Any, job: str) -> bool:
     )
 
 
-def refused(document: Any, job: str, mode: str, wanted: Sequence[str]) -> bool:
-    """Whether the document is the refusal of this job in this mode with exactly the wanted codes, each complete, in order: the keys are ``job``, ``mode``
-    and ``refusal``, and no other."""
-    return (
-        isinstance(document, Mapping)
-        and set(document) == REFUSAL_KEYS
-        and document["job"] == job
-        and mode in MODES
-        and document["mode"] == mode
-        and type(document["refusal"]) is list
-        and all(isinstance(line, str) for line in document["refusal"])
-        and refusal_matches(document["refusal"], wanted)
-    )
-
-
 def refusal_rejection(document: Any, job: str, mode: str, wanted: Sequence[str]) -> str | None:
     """The fixed phrase of the rule that a refusal document fails, or ``None`` when ``refused`` passes it. A phrase is one of ``REFUSAL_REASONS``: it holds
     no code or other value of the document."""
@@ -196,13 +188,6 @@ def refusal_rejection(document: Any, job: str, mode: str, wanted: Sequence[str])
     if not closed:
         return REFUSAL_NOT_CLOSED
     return None if refusal_matches(document["refusal"], wanted) else REFUSAL_OTHER_CODES
-
-
-def refusal_evidence(document: Any, job: str, mode: str, wanted: Sequence[str]) -> str:
-    """The codes of a refusal for the record, written only when the document is the wanted refusal (so the codes are the wanted ones). A document that failed
-    gives its fixed phrase and no value of the file."""
-    reason = refusal_rejection(document, job, mode, wanted)
-    return f"refusal rejected: {reason}" if reason is not None else f"refusal {document['refusal']}"
 
 
 def snapshots_match(reported: Any, held: Mapping[str, int | None]) -> bool:
@@ -258,25 +243,71 @@ def rejection(document: Any, job: str, catalog: Catalog | None, outcome: str) ->
     return None if document["write_hash"] is None and document["branch_hash"] == document["checked_hash"] else NOT_A_KEEP
 
 
-def wrote(result: Any, job: str, catalog: Catalog) -> bool:
-    """Whether the result is of a write: it names the requested branch, it is sealed, the catalog holds what it reports, and its write hash is the branch hash
-    and not the checked hash."""
-    return rejection(result, job, catalog, AS_WRITE) is None
+@dataclass(frozen=True, slots=True)
+class Accepted:
+    """The verdict of one accept function on one call: ``reason`` is ``None`` and ``document`` is the accepted document, or ``reason`` is one fixed phrase and
+    there is no document. A rejected call keeps no value of its file, so no field, hash, snapshot ID or code text of it can be read, printed or cached.
+    ``kind`` is ``result``, ``refusal`` or ``usage``."""
+
+    kind: str
+    reason: str | None
+    document: Mapping[str, Any] | None = field(default=None, repr=False)
+
+    @property
+    def ok(self) -> bool:
+        return self.reason is None
+
+    @property
+    def result(self) -> Mapping[str, Any]:
+        """The accepted document, and an empty mapping for a call that was not accepted."""
+        return self.document if self.document is not None else {}
+
+    def facts(self, *names: str) -> str:
+        """The record line of the call. An accepted result gives its named fields and an accepted refusal its codes. A call that was not accepted gives its
+        fixed phrase and no value of the file."""
+        if self.kind == "usage":
+            return f"usage exit {EXIT_USAGE} with an empty result folder" if self.ok else f"usage rejected: {self.reason}"
+        if not self.ok:
+            return f"{self.kind} rejected: {self.reason}"
+        if self.kind == "refusal":
+            return f"refusal {self.result['refusal']}"
+        return ", ".join(f"{name.replace('_', ' ')} {self.result[name]}" for name in names)
 
 
-def kept(result: Any, job: str, catalog: Catalog) -> bool:
-    """Whether the result is of a call that wrote nothing: it names the requested branch, it is sealed, the catalog holds what it reports, ``write_hash`` has no
-    value and the branch is at the checked hash."""
-    return rejection(result, job, catalog, AS_KEEP) is None
-
-
-def evidence(document: Any, job: str, catalog: Catalog | None, outcome: str, names: Sequence[str]) -> str:
-    """The named fields of a result for the record, written only when the result passed its rule. A result that failed gives its fixed phrase and no value of
-    the file: not a field, a count of the file or a refusal code."""
+def accept_result(code: int, document: Any, job: str, catalog: Catalog | None, outcome: str) -> Accepted:
+    """The call as the ``outcome`` (``AS_WRITE`` or ``AS_KEEP``) that it expected: it exited 0 and its file passes ``rejection`` for that outcome."""
+    if code != EXIT_OK:
+        return Accepted("result", WRONG_EXIT)
     reason = rejection(document, job, catalog, outcome)
-    if reason is not None:
-        return f"result rejected: {reason}"
-    return ", ".join(f"{name.replace('_', ' ')} {document[name]}" for name in names)
+    return Accepted("result", reason) if reason is not None else Accepted("result", None, document)
+
+
+def accept_write(code: int, document: Any, job: str, catalog: Catalog | None) -> Accepted:
+    """The call as a write: exit 0, the requested branch, the closed schema, the hashes and snapshot IDs of the catalog, and a write hash that is the branch
+    hash and not the checked hash."""
+    return accept_result(code, document, job, catalog, AS_WRITE)
+
+
+def accept_keep(code: int, document: Any, job: str, catalog: Catalog | None) -> Accepted:
+    """The call as one that wrote nothing: exit 0, the same rules, no write hash and the branch at the checked hash."""
+    return accept_result(code, document, job, catalog, AS_KEEP)
+
+
+def accept_refusal(code: int, document: Any, job: str, mode: str, wanted: Sequence[str], expected: int = EXIT_REFUSED) -> Accepted:
+    """The call as the wanted refusal: it exited with the ``expected`` code and its file is the refusal document of this job in this mode with exactly the
+    wanted codes, each complete, in order. The text of standard error is never read."""
+    if code != expected:
+        return Accepted("refusal", WRONG_EXIT)
+    reason = refusal_rejection(document, job, mode, wanted)
+    return Accepted("refusal", reason) if reason is not None else Accepted("refusal", None, document)
+
+
+def accept_usage(code: int, present: bool) -> Accepted:
+    """The call as a usage refusal: it exited 2 and its result folder held nothing, read before any parse. A usage exit with a file there, of any content
+    (``[]`` too), fails."""
+    if code != EXIT_USAGE:
+        return Accepted("usage", WRONG_EXIT)
+    return Accepted("usage", NOT_EMPTY) if present else Accepted("usage", None)
 
 
 def result_present(folder: Path) -> bool:
@@ -288,17 +319,11 @@ def result_present(folder: Path) -> bool:
         return True
 
 
-def usage_refused(code: int, present: bool) -> bool:
-    """Whether a call that was given a bad argument passed: it exits 2 and its result folder was empty. A usage exit with a file there, of any content (``[]``
-    too), fails."""
-    return code == 2 and not present
-
-
-def moved_null_ok(result: Any, catalog: Catalog, before: Mapping[str, Any]) -> bool:
-    """Whether a rebuild after a null moved inside one second is accepted: it wrote, the catalog holds its hashes and snapshot IDs, the waveform snapshot ID is
+def moved_null_ok(accepted: Accepted, before: Mapping[str, Any]) -> bool:
+    """Whether a rebuild after a null moved inside one second is accepted: the call was accepted as a write (``accept_write``), the waveform snapshot ID is
     another than ``before`` holds and both pass flags are true."""
-    old = before.get("waveform_seconds")
-    if not wrote(result, SIGNALS_JOB, catalog) or not whole(old):
+    result, old = accepted.result, before.get("waveform_seconds")
+    if not accepted.ok or accepted.kind != "result" or not whole(old):
         return False
     return result["snapshots"]["waveform_seconds"] != old and all(result["passed"][table] is True for table in TABLES)
 
