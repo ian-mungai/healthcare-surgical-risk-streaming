@@ -348,6 +348,23 @@ class OutputSchemaTest(unittest.TestCase):
         engine = Lake(Session({}, {}, []), None, "b")  # type: ignore[arg-type]
         self.assertEqual(2, engine.output_schema_tables_wrong())
 
+    def test_a_cases_table_of_the_schema_before_the_double_is_legacy_and_nothing_else_is(self) -> None:
+        lab = [(c.name, c.type) for c in LAB_COLUMNS]
+        legacy = [(c.name, "bigint" if c.name == "icu_days" else c.type) for c in CASE_COLUMNS]
+        current = [(c.name, c.type) for c in CASE_COLUMNS]
+        self.assertTrue(self.tables(legacy, lab).cases_schema_legacy())
+        self.assertFalse(self.tables(current, lab).cases_schema_legacy())
+        self.assertFalse(self.tables([(name, "string" if name == "height" else kind) for name, kind in legacy], lab).cases_schema_legacy())
+        self.assertFalse(self.tables([*legacy, ("extra", "string")], lab).cases_schema_legacy())
+        self.assertFalse(self.tables(legacy[:-1], lab).cases_schema_legacy())
+        self.assertFalse(self.tables([(name, "string" if name == "icu_days" else kind) for name, kind in current], lab).cases_schema_legacy())
+        self.assertFalse(Lake(Session({}, {}, []), None, "b").cases_schema_legacy())  # type: ignore[arg-type]
+
+    def test_a_legacy_cases_table_is_still_counted_as_a_wrong_table(self) -> None:
+        lab = [(c.name, c.type) for c in LAB_COLUMNS]
+        legacy = [(c.name, "bigint" if c.name == "icu_days" else c.type) for c in CASE_COLUMNS]
+        self.assertEqual(1, self.tables(legacy, lab).output_schema_tables_wrong())
+
 
 if __name__ == "__main__":
     unittest.main()

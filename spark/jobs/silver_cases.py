@@ -17,6 +17,12 @@ on the private branch the old table is dropped and the new one is made as a new 
 catalog), and the checks of the written tables (every published value kept, the column types) run before any merge, which is the caller's step. ``verify``
 runs the checks on a branch and writes nothing.
 
+A ``silver.cases`` table of the legacy schema (``icu_days`` as a whole number, before the double) is never repaired in place and ``verify`` refuses it with the
+fixed code ``cases_schema_legacy: failed``. Its rebuild needs this order, and the caller owns each step: (1) tag the base hash that holds the legacy table, so
+that its old schema and snapshot stay readable through the tag after the merge; (2) ``build`` on a new branch from that base, which drops the legacy table on
+that branch and makes the new one; (3) ``verify`` the new branch; (4) merge it into the base. A ``build`` on a branch that exists is refused, so a rebuild
+always needs a new branch name.
+
 The test set is sealed: the result and the messages hold codes, counts, table names and the cutoffs, and never a case or a patient.
 Settings come from the environment: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, ``AWS_REGION`` for an s3 warehouse, ``NESSIE_TIMEOUT_SECONDS`` and
 ``JOB_DEADLINE_SECONDS``.
@@ -104,6 +110,7 @@ CUTOFF_COLUMNS = (
 NEVER_FEATURE_VALUE = ",".join(NEVER_FEATURE_COLUMNS)
 READ_TABLES = (*SOURCE_SCHEMAS, CASES_TABLE, LAB_TABLE, MEASURE_TABLE, CUTOFFS_TABLE)
 NOT_FOUND = 404
+LEGACY_ICU_DAYS = "bigint"
 
 
 class Lake:
@@ -259,6 +266,10 @@ class Lake:
             ]
             changed |= self.write_values(CUTOFFS_SOURCE, CUTOFF_COLUMNS, rows)
         return changed
+
+    def cases_schema_legacy(self) -> bool:
+        """Whether ``silver.cases`` is exactly the schema before the double: the columns of the rules with ``icu_days`` as a whole number."""
+        return self.columns(CASES_SOURCE) == [(column.name, LEGACY_ICU_DAYS if column.name == "icu_days" else column.type) for column in CASE_COLUMNS]
 
     def output_schema_tables_wrong(self) -> int:
         """How many of the two written tables have other columns or types than the rules give, or are not there."""
