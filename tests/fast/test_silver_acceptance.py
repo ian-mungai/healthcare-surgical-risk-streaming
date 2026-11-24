@@ -777,6 +777,11 @@ class AcceptedCalls(unittest.TestCase):
         self.assertFalse(moved_null_ok(accept_refusal(1, refusal(), SIGNALS_JOB, "build", ["waveform_duplicate_second: failed"]), BEFORE))
         self.assertFalse(moved_null_ok(accept_usage(2, False), BEFORE))
 
+    def test_a_moved_null_needs_a_write_of_the_signals_job(self) -> None:
+        """Recheck 6: an accepted keep whose snapshot differs from an older one, and an accepted write of the hypotension job, are not a moved null."""
+        self.assertFalse(moved_null_ok(accept_keep(0, unwritten(), SIGNALS_JOB, KEPT), {**BEFORE, "waveform_seconds": 13}))
+        self.assertFalse(moved_null_ok(accept_write(0, hypotension(), HYPOTENSION_JOB, HYPO_WROTE), BEFORE))
+
     def test_the_accept_functions_of_the_other_job_and_a_wrong_catalog_reject(self) -> None:
         self.assertTrue(accept_write(0, hypotension(), HYPOTENSION_JOB, HYPO_WROTE).ok)
         self.assertFalse(accept_write(0, hypotension(), SIGNALS_JOB, HYPO_WROTE).ok)

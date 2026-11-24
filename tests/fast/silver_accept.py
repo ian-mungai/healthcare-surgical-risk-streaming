@@ -173,8 +173,8 @@ def sealed(result: Any, job: str) -> bool:
 
 
 def refusal_rejection(document: Any, job: str, mode: str, wanted: Sequence[str]) -> str | None:
-    """The fixed phrase of the rule that a refusal document fails, or ``None`` when ``refused`` passes it. A phrase is one of ``REFUSAL_REASONS``: it holds
-    no code or other value of the document."""
+    """The fixed phrase of the rule that a refusal document fails, or ``None`` when it passes as a refusal (``accept_refusal``). A phrase is one of
+    ``REFUSAL_REASONS``: it holds no code or other value of the document."""
     if not isinstance(document, Mapping):
         return NO_FILE
     closed = (
@@ -247,11 +247,13 @@ def rejection(document: Any, job: str, catalog: Catalog | None, outcome: str) ->
 class Accepted:
     """The verdict of one accept function on one call: ``reason`` is ``None`` and ``document`` is the accepted document, or ``reason`` is one fixed phrase and
     there is no document. A rejected call keeps no value of its file, so no field, hash, snapshot ID or code text of it can be read, printed or cached.
-    ``kind`` is ``result``, ``refusal`` or ``usage``."""
+    ``kind`` is ``result``, ``refusal`` or ``usage``; a result also names the ``job`` and the ``outcome`` (``AS_WRITE`` or ``AS_KEEP``) it was judged as."""
 
     kind: str
     reason: str | None
     document: Mapping[str, Any] | None = field(default=None, repr=False)
+    job: str | None = None
+    outcome: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -277,9 +279,9 @@ class Accepted:
 def accept_result(code: int, document: Any, job: str, catalog: Catalog | None, outcome: str) -> Accepted:
     """The call as the ``outcome`` (``AS_WRITE`` or ``AS_KEEP``) that it expected: it exited 0 and its file passes ``rejection`` for that outcome."""
     if code != EXIT_OK:
-        return Accepted("result", WRONG_EXIT)
+        return Accepted("result", WRONG_EXIT, job=job, outcome=outcome)
     reason = rejection(document, job, catalog, outcome)
-    return Accepted("result", reason) if reason is not None else Accepted("result", None, document)
+    return Accepted("result", reason, job=job, outcome=outcome) if reason is not None else Accepted("result", None, document, job, outcome)
 
 
 def accept_write(code: int, document: Any, job: str, catalog: Catalog | None) -> Accepted:
@@ -320,10 +322,10 @@ def result_present(folder: Path) -> bool:
 
 
 def moved_null_ok(accepted: Accepted, before: Mapping[str, Any]) -> bool:
-    """Whether a rebuild after a null moved inside one second is accepted: the call was accepted as a write (``accept_write``), the waveform snapshot ID is
-    another than ``before`` holds and both pass flags are true."""
+    """Whether a rebuild after a null moved inside one second is accepted: the call was accepted as a write of the signals job (``accept_write``), the
+    waveform snapshot ID is another than ``before`` holds and both pass flags are true."""
     result, old = accepted.result, before.get("waveform_seconds")
-    if not accepted.ok or accepted.kind != "result" or not whole(old):
+    if not accepted.ok or accepted.outcome != AS_WRITE or accepted.job != SIGNALS_JOB or not whole(old):
         return False
     return result["snapshots"]["waveform_seconds"] != old and all(result["passed"][table] is True for table in TABLES)
 
