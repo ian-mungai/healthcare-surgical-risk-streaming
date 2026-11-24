@@ -211,13 +211,20 @@ def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
 
 
 def inside_state(record: RunRecord, state: Path) -> RunRecord:
-    """The record with its state folder resolved, which must be ``state`` or a folder directly inside it: a run that the service takes keeps its saved
-    position nowhere else. The folder that is checked is the one the run is given, so a link or a ``..`` part cannot lead the run out of it."""
+    """The record with its state folder resolved, which must be ``state`` or a folder directly inside it, and its folder store's read log, when it
+    has one, resolved too, which must be a file directly inside that folder: a run that the service takes keeps its saved position and appends its reads
+    nowhere else. What is checked is what the run is given, so a link or a ``..`` part cannot lead the run out of it."""
     folder = Path(record.state_dir).resolve()
     root = state.resolve()
     if folder != root and folder.parent != root:
         raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
-    return replace(record, state_dir=str(folder))
+    store = record.object_store
+    if store.read_log is None:
+        return replace(record, state_dir=str(folder))
+    read_log = Path(store.read_log).resolve()
+    if read_log.parent != folder:
+        raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
+    return replace(record, state_dir=str(folder), object_store=replace(store, read_log=str(read_log)))
 
 
 def run_request(path: Path, beat: Callable[[], None], flag: StopFlag, state: Path) -> Outcome:

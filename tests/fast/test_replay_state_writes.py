@@ -184,10 +184,12 @@ class QueuedStateFolderTests(ReplayHarness):
 
         return mock.patch.object(program, "replay_record", replay)
 
-    def queue(self, state_dir: Path | str) -> dict[str, Any]:
-        """Queue one run that names ``state_dir``, serve until the service is stopped and return the run's result."""
+    def queue(self, state_dir: Path | str, read_log: Path | None = None) -> dict[str, Any]:
+        """Queue one run that names ``state_dir`` (and, when given, the ``read_log`` of its folder store), serve until the service is stopped and return the
+        run's result."""
         self.inbox.mkdir(exist_ok=True)
-        (self.inbox / "a.json").write_text(json.dumps({**RECORD, "state_dir": str(state_dir)}))
+        store = dict(RECORD["object_store"]) | ({"read_log": str(read_log)} if read_log is not None else {})  # type: ignore[call-overload]
+        (self.inbox / "a.json").write_text(json.dumps({**RECORD, "state_dir": str(state_dir), "object_store": store}))
         (self.inbox / "a.reference").write_text(REFERENCE)
         code, _ = serve_until_stopped(self, ["serve", "--state", str(self.state), "--inbox", str(self.inbox)])
         self.assertEqual(0, code)
@@ -255,6 +257,24 @@ class QueuedStateFolderTests(ReplayHarness):
                 self.assertEqual(("finished", 0, ""), (result["outcome"], result["exit_code"], result["error"]))
                 self.assertEqual([named.resolve()], self.saved)
                 self.assertEqual("saved by the run", (named / "state.json").read_text())
+
+    def test_a_read_log_outside_the_run_folder_is_refused_and_the_file_it_names_is_unchanged(self) -> None:
+        for label in ("outside the state folder", "in the state folder above the run"):
+            with self.subTest(read_log=label):
+                self.setUp()
+                named = self.state / "replay_0a1b2c3d"
+                log = self.root / "other" / "reads.log" if label == "outside the state folder" else self.state / "reads.log"
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text(ORIGINAL)
+                result = self.queue(named, read_log=log)
+                self.assertEqual(RUN_REFUSED, result["error"])
+                self.assertEqual(ORIGINAL, log.read_text())
+                self.assertEqual([], self.saved)
+
+    def test_a_read_log_directly_inside_the_run_folder_still_works(self) -> None:
+        named = self.state / "replay_0a1b2c3d"
+        result = self.queue(named, read_log=named / "reads.log")
+        self.assertEqual(("finished", 0, ""), (result["outcome"], result["exit_code"], result["error"]))
 
     def test_the_standalone_run_command_keeps_its_folder_whatever_it_is(self) -> None:
         self.replay_files("run")
