@@ -9,6 +9,9 @@ Failure modes covered here:
 - The teardown fixture removes its bucket and its binding after a failure during or after the apply, which may have written a role or a state that only
   the binding and the state name.
 - The refusal test of a wrong state location alters the genuine binding, and a timeout keeps the altered copy.
+- A bucket create that was attempted and whose own AWS call timed out exits non-zero while the bucket may still land: the runner finds it missing (S3 answers
+  404 right then) and removes the binding that is the only name of the bucket.
+- The teardown fixtures' summary says that each fixture removed its own resources while a fixture kept its binding because resources remain.
 
 The helper is in the tracked ``tests/e2e/run_record.py`` and runs everywhere. The runners of the cloud checks stay untracked; their tests run only where a
 runner is on disk, with the cloud replaced by stand-ins, and are skipped elsewhere.
@@ -127,6 +130,26 @@ class SettleBindingTest(unittest.TestCase):
         self.assertIn(self.path.name, line)
         self.remove.assert_not_called()
 
+    def test_a_binding_whose_bucket_create_was_attempted_is_kept_and_nothing_is_removed_whichever_step_ended_the_run(self) -> None:
+        self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": "attempted"}))
+        for timed_out in (None, self.step_timeout("scripts.ingestion.cli publish")):
+            with self.subTest(timed_out=timed_out):
+                line, settled = self.settle(timed_out=timed_out)
+                self.assertFalse(settled)
+                self.assertIn(MAY_REMAIN, line)
+                self.assertIn("attempted", line)
+                self.assertIn(self.path.name, line)
+                self.assertNotIn(NONE_CREATED, line)
+        self.remove.assert_not_called()
+
+    def test_a_binding_whose_bucket_create_finished_or_never_ran_goes_through_the_removal(self) -> None:
+        for creation in ("created", "none"):
+            with self.subTest(creation=creation):
+                self.remove.reset_mock()
+                self.path.write_text(json.dumps({"bucket": TEST_BUCKET, "bucket_creation": creation}))
+                self.assertEqual(("the bucket was deleted", True), self.settle())
+                self.remove.assert_called_once_with(TEST_BUCKET)
+
     def test_the_binding_of_a_test_bucket_goes_only_when_the_removal_confirmed_the_bucket_gone(self) -> None:
         self.path.write_text(json.dumps({"bucket": TEST_BUCKET}))
         self.assertEqual(("the bucket was deleted", True), self.settle())
@@ -228,6 +251,7 @@ class EnvironmentRemovalTest(RemovalCase):
 
 class BindingCase(base.RunnerCase):
     """A runner run whose create step answers as the case says. ``create`` is one of ``timeout`` (the binding names the bucket and the step timed out),
+    ``inner_timeout`` (the step itself finished with exit 1 after its own create-bucket call timed out, so the binding says the create was attempted),
     ``verified`` (the binding is whole and the step succeeded), ``project`` (the binding names the project's bucket), ``none`` (no binding is written and the
     step failed), ``unreadable`` (the binding is not JSON and the step failed). Every other command times out."""
 
@@ -242,6 +266,9 @@ class BindingCase(base.RunnerCase):
                 raise TimeoutExpired(program, options["timeout"])
             if self.create == "verified":
                 path.write_text(json.dumps(verified_binding()))
+            elif self.create == "inner_timeout":
+                path.write_text(json.dumps(verified_binding() | {"status": "planned", "bucket_creation": "attempted"}))
+                return done(1, "the create-bucket call timed out")
             elif self.create == "project":
                 path.write_text(json.dumps(verified_binding() | {"bucket": PROJECT_BUCKET}))
             elif self.create == "keyless":
@@ -256,6 +283,10 @@ class BindingCase(base.RunnerCase):
             return done()
         raise TimeoutExpired(program, options["timeout"])
 
+    def patched_run(self) -> int:
+        """Run the runner's ``main`` with the stand-ins that its cases need."""
+        return self.run_main()
+
     def bindings(self) -> list[Path]:
         return sorted((self.root / "runs").glob(self.binding_glob))
 
@@ -268,6 +299,18 @@ class BindingCase(base.RunnerCase):
         self.assertIn(MAY_REMAIN, self.cleanup_text())
         self.assertNotIn(NONE_CREATED, self.cleanup_text())
         self.assertIn(self.bindings()[0].name, self.cleanup_text())
+
+    def assert_attempted_create_kept(self) -> None:
+        """The run's own create call timed out, and S3 then answers that the bucket does not exist: the real removal would call that gone."""
+        self.aws.call.side_effect = lambda *arguments, **options: None
+        self.assertEqual(1, self.run_attempt())
+        self.assert_kept_with_resources_that_may_remain()
+        self.assertIn("attempted", self.cleanup_text())
+        self.assertEqual([], [call for call in self.aws.call.mock_calls if "delete" in str(call)])
+
+    def run_attempt(self) -> int:
+        self.create = "inner_timeout"
+        return self.patched_run()
 
     def assert_nothing_created(self) -> None:
         self.assertEqual([], self.bindings())
@@ -283,15 +326,15 @@ class CleanupBindingCase(BindingCase):
         with mock.patch.object(self.module, "remove_test_bucket", cleanup):
             return self.patched_run(), cleanup
 
-    def patched_run(self) -> int:
-        return self.run_main()
-
     def test_a_create_that_timed_out_keeps_its_binding_says_the_bucket_may_remain_and_removes_nothing_while_a_child_may_still_run(self) -> None:
         code, cleanup = self.run_with("timeout")
         self.assertEqual(1, code)
         self.assert_kept_with_resources_that_may_remain()
         cleanup.assert_not_called()
         self.assertEqual([], [call for call in self.aws.call.mock_calls if "delete" in str(call)])
+
+    def test_a_create_whose_own_call_timed_out_keeps_the_binding_although_s3_then_reports_no_such_bucket(self) -> None:
+        self.assert_attempted_create_kept()
 
     def test_a_binding_that_names_the_project_s_bucket_is_kept_and_nothing_is_removed(self) -> None:
         code, cleanup = self.run_with("project")
@@ -386,6 +429,13 @@ class EnvironmentBindingTest(BindingCase):
         self.assertEqual(1, code)
         self.assert_kept_with_resources_that_may_remain()
         cleanup.assert_not_called()
+
+    def patched_run(self) -> int:
+        with mock.patch.object(self.module, "expected_creates", lambda environment: []):
+            return self.run_main()
+
+    def test_a_create_whose_own_call_timed_out_keeps_the_binding_although_s3_then_reports_no_such_bucket(self) -> None:
+        self.assert_attempted_create_kept()
 
     def test_a_binding_that_names_the_project_s_bucket_is_kept_and_nothing_is_removed(self) -> None:
         code, cleanup = self.run_with("project")
@@ -544,6 +594,61 @@ class TeardownBindingTest(base.RunnerCase):
         cleanup.assert_not_called()
         self.assertTrue(fixture.binding_path.is_file())
         self.assertIn(MAY_REMAIN, record.observations[-1].observed)
+
+    def run_fixtures(self, *names: str, settled: tuple[str, ...] = ()) -> str:
+        """Run the named fixtures with a build that fails and a passing control that settles only the fixtures in ``settled``. Each fixture's binding is
+        written first, as its create step does. Return the cleanup text of the saved record."""
+
+        def passing(fixture: Any) -> None:
+            fixture.settled = fixture.name in settled
+
+        def build(fixture: Any) -> None:
+            fixture.binding_path.write_text(json.dumps(verified_binding()))
+
+        with (
+            mock.patch.object(self.module.Fixture, "build", build),
+            mock.patch.object(self.module, "receipt_cases", lambda fixture: None),
+            mock.patch.object(self.module, "inventory_cases", lambda fixture: None),
+            mock.patch.object(self.module, "state_cases", lambda fixture: None),
+            mock.patch.object(self.module, "lock_case", lambda fixture: None),
+            mock.patch.object(self.module.Fixture, "passing_control", passing),
+        ):
+            self.run_main(*names)
+        return self.cleanup_of_the_record()
+
+    def cleanup_of_the_record(self) -> str:
+        text: str = self.saved()["cleanup"]
+        return text
+
+    def test_the_summary_says_a_fixture_removed_its_resources_only_when_it_settled_and_names_the_binding_of_each_that_did_not(self) -> None:
+        text = self.run_fixtures("local", "s3", settled=("local",))
+        self.assertIn("binding_teardown_s3_abcd.json", text)
+        self.assertNotIn("binding_teardown_local_abcd.json", text)
+        self.assertIn(MAY_REMAIN, text)
+        self.assertNotIn("each fixture that reached its passing control removed its own resources", text)
+        self.assertTrue((self.root / "runs" / "binding_teardown_s3_abcd.json").is_file())
+        self.assertFalse((self.root / "runs" / "binding_teardown_local_abcd.json").is_file())
+
+    def test_the_summary_of_fixtures_that_all_settled_says_so_and_names_no_binding_that_remains(self) -> None:
+        text = self.run_fixtures("local", "s3", settled=("local", "s3"))
+        self.assertNotIn(MAY_REMAIN, text)
+        self.assertNotIn(".json", text)
+        self.assertIn("local", text)
+        self.assertIn("s3", text)
+
+    def test_the_summary_of_a_fixture_that_wrote_no_binding_says_so_and_does_not_claim_a_removal(self) -> None:
+        with mock.patch.object(self.module.Fixture, "build", mock.Mock(side_effect=RuntimeError("the create failed"))):
+            self.run_main("local")
+        text = self.cleanup_of_the_record()
+        self.assertIn("no binding was written", text)
+        self.assertNotIn("removed", text)
+
+    def test_the_summary_of_the_live_run_names_its_binding_and_says_nothing_was_removed(self) -> None:
+        (self.root / "runs" / "run_binding.json").write_text("{}")
+        self.run_main("live")
+        text = self.cleanup_of_the_record()
+        self.assertIn("run_binding.json", text)
+        self.assertNotIn("each fixture", text)
 
     def aws_for_unused_bucket(self, *, gone: bool) -> None:
         heads: Any = iter([{}, *([None] if gone else [])])

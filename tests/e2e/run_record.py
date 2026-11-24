@@ -30,6 +30,7 @@ class StopRun(Exception):
 
 
 CREATE_STEP = "scripts.infra.state_bootstrap create"
+CREATE_ATTEMPTED = "attempted"
 MARGIN_SECONDS = 10 * AWS_TIMEOUT_SECONDS
 # The S3 requests of the teardown's data and state cleanup, each of which can take ``AWS_TIMEOUT_SECONDS`` (a drift check in the fast tests counts them again
 # in ``scripts/infra/teardown.py``): the requests that do not depend on the bucket's contents (the listings, the lock, the owner checks, the bucket's
@@ -57,9 +58,10 @@ STEP_SECONDS: dict[tuple[str, str], int] = {
 
 
 class StepTimedOut(Exception):
-    """A step's outer deadline passed. It is not a ``RuntimeError``, so no runner's cleanup that catches a failed step removes anything: a child of the step
-    can still run, and what it is changing is not known. The runner records the failed step, keeps the binding of its bucket and closes the record. ``step``
-    names the step that timed out."""
+    """A step's outer deadline passed. It is not a ``RuntimeError``, so a handler that catches a failed step never takes it for one: a child of the step can
+    still run, and what it is changing is not known. The runner records the failed step and closes the record. Whether the binding of its bucket is kept
+    depends on the step: the create step's timeout keeps it with no removal tried (``settle_binding``), and each runner that stops its cleanup on any timeout
+    says so itself. ``step`` names the step that timed out."""
 
     step: str = ""
 
@@ -115,8 +117,10 @@ def settle_binding(
     The binding goes only when every resource that it names is confirmed gone: nothing was started, a finished create step left no binding (the commands write
     the binding before they create anything), or ``remove`` (the runner's removal of the bucket named by the binding, returning its text and whether S3
     reported the bucket gone) confirmed it. Every other path keeps the binding and says that resources may remain: a create step that timed out, because a
-    child of it may still be creating the bucket, so no removal is tried; a binding that cannot be read or names a bucket that is no short-lived test bucket
-    of this project; a removal that could not confirm. No path claims that no bucket was created unless it confirmed that.
+    child of it may still be creating the bucket, so no removal is tried; a binding whose ``bucket_creation`` is ``attempted``, because the create call was
+    sent and its outcome is not known (it may have timed out and still land), so a later answer that S3 has no such bucket proves nothing and no removal is
+    tried; a binding that cannot be read or names a bucket that is no short-lived test bucket of this project; a removal that could not confirm. No path
+    claims that no bucket was created unless it confirmed that.
     """
     if not started:
         return "no bucket was created", True
@@ -127,6 +131,11 @@ def settle_binding(
         return f"the create step timed out and a child of it may still run, so no removal was tried: the test bucket may remain ({where})", False
     if named is None:
         return "no bucket was created: the create step finished and wrote no binding", True
+    if (read_binding(binding_path) or {}).get("bucket_creation") == CREATE_ATTEMPTED:
+        return (
+            f"the bucket create was attempted and its outcome is not known, so no removal was tried: the test bucket may remain (the binding {name} is kept)",
+            False,
+        )
     if not named.startswith(f"{project_bucket}-test-"):
         return f"the binding {name} names no short-lived test bucket that can be read: nothing was removed and resources may remain; binding kept", False
     text, gone = remove(named)
