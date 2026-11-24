@@ -177,6 +177,33 @@ class Writing(unittest.TestCase):
             self.written({"x": object()})
         self.assertEqual([], os.listdir(self.folder))
 
+    def test_every_error_path_closes_the_descriptor_of_the_part_file(self) -> None:
+        def refuse(source: str, target: str) -> None:
+            raise OSError("disk full")
+
+        plants: dict[str, tuple[Any, dict[Any, Any]]] = {
+            "a document that is not json": (contextlib.nullcontext(), {"x": object()}),
+            "a document with keys that are not text": (contextlib.nullcontext(), {"x": float("nan"), (1, 2): 3}),
+            "a rename that fails": (mock.patch("os.rename", refuse), DOCUMENT),
+            "a file that appeared": (mock.patch("os.path.lexists", return_value=True), DOCUMENT),
+        }
+        for name, (patch, document) in plants.items():
+            with self.subTest(name):
+                descriptor = reserve(self.path)
+                self.assertIsNotNone(descriptor)
+                with patch, contextlib.suppress(Exception):
+                    write_reserved(cast("int", descriptor), self.path, document)
+                with self.assertRaises(OSError):
+                    os.fstat(cast("int", descriptor))
+                release_reserved()
+
+    def test_a_descriptor_that_the_write_took_is_closed_once_after_a_good_write(self) -> None:
+        descriptor = reserve(self.path)
+        self.assertIsNotNone(descriptor)
+        write_reserved(cast("int", descriptor), self.path, DOCUMENT)
+        with self.assertRaises(OSError):
+            os.fstat(cast("int", descriptor))
+
 
 JOB = "toy_job"
 MARKER = "MARKER_4417"

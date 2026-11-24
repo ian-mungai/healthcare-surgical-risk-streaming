@@ -40,7 +40,7 @@ class SealedError(ValueError):
 
 
 def result_path(text: str) -> str:
-    """An absolute path of a sane length with no NUL. Its folder and the absence of the file are checked by ``usable``."""
+    """An absolute path of a sane length with no NUL. Its folder and the absence of the file are checked by ``reserve``."""
     if not text.startswith("/") or "\x00" in text or len(text) > RESULT_PATH_LIMIT or text.endswith("/"):
         raise argparse.ArgumentTypeError("usage")
     return text
@@ -87,12 +87,13 @@ def release_reserved() -> None:
 
 
 def write_reserved(descriptor: int, path: str, document: dict[str, Any]) -> None:
-    """Write the whole document to the reserved part file and rename it to ``path``. A failure removes the part file. A file that appeared at ``path`` after
-    the reservation is never replaced: that is a ``FileExistsError``."""
+    """Write the whole document to the reserved part file and rename it to ``path``. The descriptor belongs to the file object from the first line, so every
+    error path closes it. A failure removes the part file. A file that appeared at ``path`` after the reservation is never replaced: that is a
+    ``FileExistsError``."""
     part = path + ".part"
     try:
-        text = json.dumps(document, sort_keys=True) + "\n"
         with os.fdopen(descriptor, "w") as handle:
+            text = json.dumps(document, sort_keys=True) + "\n"
             os.fchmod(handle.fileno(), FILE_MODE)
             handle.write(text)
             handle.flush()
