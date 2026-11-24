@@ -13,8 +13,9 @@ settings come from the environment, as the other Silver jobs' do.
 
 The test set is sealed. No rule is estimated from data. A label table has a row for every case, but the patient split is read after the check of who owns each
 case, only to find the development cases (training and validation) for the measure, and it is trusted after its own rule check, which comes first. The labels
-are outcomes, so the result holds the number of cases, the fingerprints, the snapshot IDs and the development measure, and every check about a label is a flag.
-It never names a count of a label, a case, a patient, a set, a time or a value.
+are outcomes, and a digest of a label table changes with a held-out row, so the result holds the snapshot IDs, one pass flag for each table and the development
+measure, and every check about a label is a flag. It never names a count, a digest, a label, a case, a patient, a set, a time or a value; a refusal is a
+code and a flag. The measure is planned, written and read back with every check passing before any intensive care label is planned.
 """
 
 from __future__ import annotations
@@ -32,9 +33,8 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import run
 from spark.silver.frames import fingerprint as fingerprint_of
 from spark.silver.frames import functions
-from spark.silver.hypotension_frames import ownership_flag
 from spark.silver.label_checks import ICU, KIDNEY, MEASURE, TABLES, InputFacts, TableFacts, split_rule_problems
-from spark.silver.label_run import InputRead, Operations, Plan, TableRead, run_build, run_verify
+from spark.silver.label_run import InputRead, MeasurePlan, Operations, TableRead, run_build, run_verify
 from spark.silver.run import BRANCH_MOVED, Fingerprint
 from spark.silver.tables import LABEL_TABLES, NAMESPACE
 from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS
@@ -46,7 +46,7 @@ JOB = "silver_labels"
 CASES_TABLE = f"{NAMESPACE}.cases"
 LAB_TABLE = f"{NAMESPACE}.lab_results"
 SPLIT_TABLE = f"{NAMESPACE}.patient_split"
-CASE_FIELDS = ("caseid", "subjectid", "anestart", "opend", "icu_days")
+CASE_FIELDS = ("caseid", "subjectid", "anestart", "opend", "icu_days")  # every published column of the cases that the label frames read
 CASE_TYPES = {column.name: column.type for column in CASE_COLUMNS}
 CASES_NEEDED = tuple((name, CASE_TYPES[name]) for name in CASE_FIELDS)
 LAB_NEEDED = tuple((column.name, column.type) for column in LAB_COLUMNS)
@@ -112,27 +112,31 @@ class LabelsLake(Lake):
         if any(snapshot is None for snapshot in snapshots):
             raise SilverSignalsError(f"source_no_snapshot: {unit(sum(1 for snapshot in snapshots if snapshot is None), 'table')}")
         held = (snapshots[0], snapshots[1], snapshots[2])
-        if ownership_flag(cases):
+        if frames.ownership_flag(cases):
             return InputRead(InputFacts(0, 1, 0, (), 0), held)
         problems = self.split_problems(split)
         if problems:
             return InputRead(InputFacts(0, 0, 0, tuple(problems), 0), held)
         return InputRead(frames.input_facts(cases, split), held)
 
-    def plan(self, at: str) -> Plan:
-        """Build the three frames at ``at``, keep them on disk for the write and give their fingerprints and the measure. The measure comes from the
-        development patients' values only."""
-        disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
+    def persist(self, table: str, frame: Any) -> Fingerprint:
+        """Keep a planned frame on disk for the write and give its fingerprint, which stays inside the run (a digest changes with a held-out row)."""
+        self.planned[table] = frame.persist(importlib.import_module("pyspark").StorageLevel.DISK_ONLY)
+        return fingerprint_of(self.planned[table])
+
+    def plan_measure(self, at: str) -> MeasurePlan:
+        """Plan the measure of ``icu_days`` alone, from the development patients' values only. No label is planned or evaluated here."""
         cases, _ = self.cases(at)
-        lab, _ = self.lab(at)
         split, _ = self.split(at)
         rows = frames.measure_rows(cases, split)
-        self.planned = {
-            MEASURE: frames.measure_frame(self.session, rows).persist(disk),
-            ICU: frames.icu_frame(cases).persist(disk),
-            KIDNEY: frames.kidney_frame(cases, lab).persist(disk),
-        }
-        return Plan({table: fingerprint_of(frame) for table, frame in self.planned.items()}, tuple(rows))
+        return MeasurePlan(self.persist(MEASURE, frames.measure_frame(self.session, rows)), tuple(rows))
+
+    def plan_labels(self, at: str) -> dict[str, Fingerprint]:
+        """Plan the intensive care labels and the kidney injury labels at ``at``, the hash of the write of the measure that was read back with every check
+        passing."""
+        cases, _ = self.cases(at)
+        lab, _ = self.lab(at)
+        return {ICU: self.persist(ICU, frames.icu_frame(cases)), KIDNEY: self.persist(KIDNEY, frames.kidney_frame(cases, lab))}
 
     def read_label_table(self, at: str, table: str, with_facts: bool) -> TableRead | None:
         name = f"{self.catalog(at)}.{NAMESPACE}.{table}"
@@ -179,7 +183,17 @@ class LabelsLake(Lake):
         return self.write_commit(checked, (LABEL_TABLES[table].table_key,))
 
     def operations(self) -> Operations:
-        return Operations(self.head, self.read_input, self.plan, self.read_label_table, self.write_label_table, self.write_hash_of, self.prepare, self.release)
+        return Operations(
+            self.head,
+            self.read_input,
+            self.plan_measure,
+            self.plan_labels,
+            self.read_label_table,
+            self.write_label_table,
+            self.write_hash_of,
+            self.prepare,
+            self.release,
+        )
 
 
 def execute(arguments: Any) -> dict[str, Any]:

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from features.icu_label import is_valid
 from spark.silver_cases import PERCENTILES, SilverCasesError, unit
 
+UNITS = ("cases", "days")
+
 
 @dataclass(frozen=True, slots=True)
 class IcuMeasureRow:

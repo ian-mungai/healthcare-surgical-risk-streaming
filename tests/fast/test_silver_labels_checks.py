@@ -17,8 +17,13 @@ import dataclasses
 import re
 import unittest
 
+from features.icu_label import REASONS as ICU_REASONS
+from features.kidney_label import REASONS as KIDNEY_REASONS
+from features.label_values import LABEL_VALUES
+from spark.bronze.checks import ALLOWED_EXPECTATIONS
 from spark.silver.label_checks import (
     CHECK_NAMES,
+    COLUMN_FLAGS,
     ICU,
     KIDNEY,
     MEASURE,
@@ -26,12 +31,14 @@ from spark.silver.label_checks import (
     TABLE_CHECKS,
     InputFacts,
     TableFacts,
+    column_plan,
     input_problems,
     table_problems,
 )
 
 INPUT = InputFacts(cases=6388, ambiguous_owner=0, cases_without_split=0, split_problems=(), development_cases=5000)
 MESSAGE = re.compile(r"[a-z_]+: (\d+ [a-z]+s?|failed)")
+FLAG_MESSAGE = re.compile(r"[a-z_]+: failed")
 
 
 def good(table: str, rows: int = 6388) -> TableFacts:
@@ -67,9 +74,11 @@ class Tables(unittest.TestCase):
             with self.subTest(table=table):
                 self.assertEqual([], table_problems(INPUT.cases, table, good(table)))
 
-    def test_a_label_table_holds_every_case_and_names_how_many_are_missing_or_added(self) -> None:
-        self.assertEqual(["icu_not_every_case: 3 cases"], table_problems(INPUT.cases, ICU, good(ICU, INPUT.cases - 3)))
-        self.assertEqual(["kidney_not_every_case: 1 case"], table_problems(INPUT.cases, KIDNEY, good(KIDNEY, INPUT.cases + 1)))
+    def test_a_label_table_holds_every_case_and_is_one_flag_whatever_the_difference(self) -> None:
+        for missing in (-1, 1, 3, 2000, INPUT.cases):
+            with self.subTest(missing=missing):
+                self.assertEqual(["icu_not_every_case: failed"], table_problems(INPUT.cases, ICU, good(ICU, INPUT.cases - missing)))
+                self.assertEqual(["kidney_not_every_case: failed"], table_problems(INPUT.cases, KIDNEY, good(KIDNEY, INPUT.cases - missing)))
         self.assertEqual({ICU: "icu_not_every_case", KIDNEY: "kidney_not_every_case"}, ROW_CHECKS)
 
     def test_the_measure_has_no_row_count_check(self) -> None:
@@ -91,12 +100,83 @@ class Tables(unittest.TestCase):
                     with self.assertRaises(KeyError):
                         table_problems(INPUT.cases, table, TableFacts(INPUT.cases, flags))
 
-    def test_no_message_about_a_label_holds_a_digit_except_the_count_of_cases(self) -> None:
+    def test_no_message_about_a_label_holds_a_digit(self) -> None:
         for table in (ICU, KIDNEY):
-            facts = TableFacts(INPUT.cases, {name: 77 for name in TABLE_CHECKS[table]})
+            facts = TableFacts(INPUT.cases - 77, {name: 77 for name in TABLE_CHECKS[table]})
             problems = table_problems(INPUT.cases, table, facts)
-            self.assertEqual(len(TABLE_CHECKS[table]), len(problems))
+            self.assertEqual(len(TABLE_CHECKS[table]) + 1, len(problems))
             self.assertFalse([problem for problem in problems if any(char.isdigit() for char in problem)])
+            for problem in problems:
+                self.assertRegex(problem, FLAG_MESSAGE)
+
+
+def pairs(table: str) -> set[tuple[str, str]]:
+    return {
+        (check.expectation, check.kwargs.get("column") or ",".join(check.kwargs["column_list"])) for checks in column_plan(table).values() for check in checks
+    }
+
+
+class GreatExpectations(unittest.TestCase):
+    """The column checks of the label tables are data that Great Expectations runs: a key never null or twice, a label column never null, a label and a
+    reason in their domains."""
+
+    def test_the_label_tables_check_their_key_their_nulls_and_their_domains(self) -> None:
+        for table, reasons in ((ICU, ICU_REASONS), (KIDNEY, KIDNEY_REASONS)):
+            with self.subTest(table=table):
+                self.assertEqual(
+                    {
+                        ("ExpectColumnValuesToNotBeNull", "case_id"),
+                        ("ExpectCompoundColumnsToBeUnique", "case_id"),
+                        ("ExpectColumnValuesToNotBeNull", "label"),
+                        ("ExpectColumnValuesToNotBeNull", "eligible"),
+                        ("ExpectColumnValuesToNotBeNull", "eligibility_reason"),
+                        ("ExpectColumnValuesToBeInSet", "label"),
+                        ("ExpectColumnValuesToBeInSet", "eligibility_reason"),
+                    },
+                    pairs(table),
+                )
+                sets = {
+                    check.kwargs["column"]: check.kwargs["value_set"]
+                    for checks in column_plan(table).values()
+                    for check in checks
+                    if "value_set" in check.kwargs
+                }
+                self.assertEqual({"label": list(LABEL_VALUES), "eligibility_reason": list(reasons)}, sets)
+
+    def test_the_measure_checks_its_key_its_nulls_and_its_units(self) -> None:
+        self.assertEqual(
+            {
+                ("ExpectColumnValuesToNotBeNull", "statistic"),
+                ("ExpectColumnValuesToNotBeNull", "unit"),
+                ("ExpectColumnValuesToNotBeNull", "value"),
+                ("ExpectCompoundColumnsToBeUnique", "statistic"),
+                ("ExpectColumnValuesToBeInSet", "unit"),
+            },
+            pairs(MEASURE),
+        )
+
+    def test_the_measure_units_are_the_two_that_the_measure_writes(self) -> None:
+        sets = [check.kwargs["value_set"] for check in column_plan(MEASURE)["icu_measure_columns"] if "value_set" in check.kwargs]
+        self.assertEqual([["cases", "days"]], sets)
+
+    def test_each_check_belongs_to_a_flag_of_its_table_and_every_expectation_is_one_that_the_bronze_checks_allow(self) -> None:
+        for table in (MEASURE, ICU, KIDNEY):
+            plan = column_plan(table)
+            self.assertEqual(set(COLUMN_FLAGS[table]), set(plan))
+            self.assertLessEqual(set(plan), set(TABLE_CHECKS[table]))
+            names = [(check.table, check.name) for checks in plan.values() for check in checks]
+            self.assertEqual(len(names), len(set(names)))
+            for checks in plan.values():
+                self.assertTrue(checks)
+                for check in checks:
+                    self.assertIn(check.expectation, ALLOWED_EXPECTATIONS)
+                    self.assertEqual(table, check.table)
+
+    def test_the_key_flag_holds_the_key_checks_and_the_value_flag_the_others(self) -> None:
+        plan = column_plan(ICU)
+        self.assertEqual({"ExpectColumnValuesToNotBeNull", "ExpectCompoundColumnsToBeUnique"}, {check.expectation for check in plan["icu_duplicate_key"]})
+        self.assertEqual({"case_id"}, {c.kwargs.get("column") or c.kwargs["column_list"][0] for c in plan["icu_duplicate_key"]})
+        self.assertNotIn("case_id", {check.kwargs.get("column") for check in plan["icu_label_value"]})
 
 
 class Names(unittest.TestCase):
@@ -107,6 +187,7 @@ class Names(unittest.TestCase):
         problems += input_problems(dataclasses.replace(INPUT, development_cases=0))
         for table in (MEASURE, ICU, KIDNEY):
             problems += table_problems(INPUT.cases, table, TableFacts(1, {name: 1 for name in TABLE_CHECKS[table]}))
+        self.assertTrue(all(FLAG_MESSAGE.fullmatch(problem) for problem in problems if problem.split(":")[0] not in {"input_empty", "development_empty"}))
         names = {problem.split(":")[0] for problem in problems}
         self.assertEqual(set(CHECK_NAMES), names)
         for problem in problems:

@@ -33,8 +33,9 @@ order, the first before the others:
   Key: case.
 - ``kidney_injury_labels``: one row for each case. It records the baseline (value, time and its number among the results of that case, time and test: with the
   case and the test ``cr`` they name the row of ``silver.lab_results``), the baseline, 48-hour and 7-day windows, how many results fell in each follow-up
-  window, the two measurements of the absolute rise and the result of the relative rise, the latest time that the rule read, the label and its eligibility
-  reason (``features.kidney_label``). Times are seconds from the start of the case. Key: case.
+  window, the two measurements of the absolute rise and the result of the relative rise, the highest follow-up result of the first 48 hours and of the 7 days
+  (each with its value, time and number, so that a negative can be reproduced), the latest time that the rule read, the label and its eligibility reason
+  (``features.kidney_label``). Times are seconds from the start of the case. Key: case.
 
 The labels are outcomes and the test set is sealed: a label table is complete (every case has a row), but no check, log or result shows a label value of a
 held-out patient. The undated baseline (``preop_cr``) and the sensitivity analyses are not built here.
@@ -164,6 +165,12 @@ KIDNEY_INJURY_LABELS = SilverTable(
         ("relative_value", "double"),
         ("relative_time_s", "bigint"),
         ("relative_occurrence", "int"),
+        ("early_highest_value", "double"),
+        ("early_highest_time_s", "bigint"),
+        ("early_highest_occurrence", "int"),
+        ("followup_highest_value", "double"),
+        ("followup_highest_time_s", "bigint"),
+        ("followup_highest_occurrence", "int"),
         ("latest_time_s", "bigint"),
         ("label", "string"),
         ("eligible", "boolean"),

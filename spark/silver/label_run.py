@@ -6,11 +6,12 @@ written, each table is compared by its fingerprint with the table that the branc
 write is made only while the branch still has the checked hash, each changed table is one commit whose hash comes from the branch's log, and the input and all
 tables are read again at the hash of the last write. The read-back must be the planned tables, with every check passing.
 
-The measure of ``icu_days`` is written first, as a commit of its own, and the intensive care labels and the kidney injury labels after it: the values of the
-field are measured and recorded before the label is built. A write that fails stops the build before the next one.
+The measure of ``icu_days`` comes first, as a commit of its own: it is planned, written and read back with every check passing before any intensive care label
+is planned (evaluated), and the intensive care labels and the kidney injury labels come after it. A write that fails stops the build before the next one.
 
-The labels are outcomes and the test set is sealed: the result holds the number of cases (an input), the fingerprints (a row count and a digest), the snapshot
-IDs, the checks that ran and the measure of ``icu_days`` of the development patients. Every check about a label is a flag.
+The labels are outcomes and the test set is sealed, and a digest of a label table changes with a held-out row. The fingerprints (a row count and a digest) are
+used inside the run to compare a table with its plan and are never part of the result: the result holds the hashes, the snapshot IDs, one pass flag for each
+table, the checks that ran and the measure of ``icu_days`` of the development patients. A refusal is a code and a flag, never a count.
 """
 
 from __future__ import annotations
@@ -20,27 +21,29 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from spark.silver.checks import SilverSignalsError
-from spark.silver.label_checks import CHECK_NAMES, TABLES, InputFacts, TableFacts, input_problems, table_problems
+from spark.silver.hypotension_checks import FLAG
+from spark.silver.label_checks import CHECK_NAMES, ICU, KIDNEY, MEASURE, TABLES, InputFacts, TableFacts, input_problems, table_problems
 from spark.silver.label_measure import IcuMeasureRow
 from spark.silver.run import BRANCH_MOVED, Fingerprint
-from spark.split_table import unit
+
+LABEL_TABLES = (ICU, KIDNEY)
 
 
 @dataclass(frozen=True, slots=True)
 class InputRead:
-    """What a read of the input at one hash gives: the counts and flags of the checks and the snapshot IDs of the three tables it reads (the cases, the
-    laboratory results and the patient split)."""
+    """What a read of the input at one hash gives: the facts of the checks and the snapshot IDs of the three tables it reads (the cases, the laboratory
+    results and the patient split)."""
 
     facts: InputFacts
     snapshots: tuple[int | None, int | None, int | None]
 
 
 @dataclass(frozen=True, slots=True)
-class Plan:
-    """The fingerprints of the planned tables and the measure of ``icu_days`` of the development patients."""
+class MeasurePlan:
+    """The fingerprint of the planned measure of ``icu_days`` and its rows, from the development patients' values only."""
 
-    fingerprints: dict[str, Fingerprint]
-    measure: tuple[IcuMeasureRow, ...]
+    fingerprint: Fingerprint
+    rows: tuple[IcuMeasureRow, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,17 +57,20 @@ class TableRead:
 
 @dataclass(frozen=True, slots=True)
 class Operations:
-    """The Spark steps: every read is at the hash that is given and ``plan`` keeps the frames for ``write``.
+    """The Spark steps: every read is at the hash that is given.
 
-    ``read_table`` gives ``None`` for a hash that holds no such table. ``write`` writes the planned frame of a table to the branch, over the rows of the table
-    that exists or as a new table. ``write_hash`` is given the hash that the write was made on and gives the hash of the write, or ``None`` when the branch head
-    is not the one commit of the write directly on it. ``prepare`` creates the namespace when the branch has none, as a commit of its own, and gives the hash
-    that the first write is made on. ``release`` frees the planned frames.
+    ``plan_measure`` plans the measure only. ``plan_labels`` plans the intensive care labels and the kidney injury labels at the hash that is given and gives
+    their fingerprints: it is called only after the measure was written and read back. Both keep the planned frames for ``write``. ``read_table`` gives ``None``
+    for a hash that holds no such table. ``write`` writes the planned frame of a table to the branch, over the rows of the table that exists or as a new table.
+    ``write_hash`` is given the hash that the write was made on and gives the hash of the write, or ``None`` when the branch head is not the one commit of the
+    write directly on it. ``prepare`` creates the namespace when the branch has none, as a commit of its own, and gives the hash that the first write is made
+    on. ``release`` frees the planned frames.
     """
 
     head: Callable[[], str]
     read_input: Callable[[str], InputRead]
-    plan: Callable[[str], Plan]
+    plan_measure: Callable[[str], MeasurePlan]
+    plan_labels: Callable[[str], dict[str, Fingerprint]]
     read_table: Callable[[str, str, bool], TableRead | None]
     write: Callable[[str, bool], None]
     write_hash: Callable[[str, str], str | None]
@@ -80,11 +86,12 @@ class Outcome:
     branch_hash: str
     source: InputRead
     tables: dict[str, TableRead]
-    plan: Plan
+    measure: tuple[IcuMeasureRow, ...]
+    passed: dict[str, bool]
 
     def facts(self) -> dict[str, Any]:
-        """What the result line may hold: hashes, snapshot IDs, the fingerprints, the checks that ran and the measure of ``icu_days`` of the development
-        patients. It holds no count of a label."""
+        """What the result line may hold: hashes, snapshot IDs, one pass flag for each table, the checks that ran and the measure of ``icu_days`` of the
+        development patients. It holds no count, no digest and no value of a label."""
         return {
             "outcome": self.outcome,
             "checked_hash": self.checked_hash,
@@ -92,9 +99,8 @@ class Outcome:
             "branch_hash": self.branch_hash,
             "source_snapshots": dict(zip(("cases", "lab_results", "patient_split"), self.source.snapshots, strict=True)),
             "snapshots": {table: read.snapshot_id for table, read in self.tables.items()},
-            "rows": {table: read.fingerprint.rows for table, read in self.tables.items()},
-            "fingerprints": {table: [read.fingerprint.rows, read.fingerprint.digest] for table, read in self.tables.items()},
-            "icu_measure": [asdict(row) for row in self.plan.measure],
+            "passed": dict(self.passed),
+            "icu_measure": [asdict(row) for row in self.measure],
             "checks_run": list(CHECK_NAMES),
         }
 
@@ -105,11 +111,10 @@ def read_tables(ops: Operations, at: str, with_facts: bool) -> dict[str, TableRe
 
 def read_problems(source: InputRead, reads: dict[str, TableRead | None]) -> list[str]:
     """The tables that are not there, or else the problems of each table."""
-    missing = sum(1 for read in reads.values() if read is None or read.facts is None)
-    if missing:
-        return [f"table_missing: {unit(missing, 'table')}"]
+    if any(read is None or read.facts is None for read in reads.values()):
+        return [f"table_missing: {FLAG}"]
     problems: list[str] = []
-    for table in TABLES:
+    for table in reads:
         read = reads[table]
         if read is not None and read.facts is not None:
             problems += table_problems(source.facts.cases, table, read.facts)
@@ -121,40 +126,74 @@ def differs(read: TableRead | None, planned: Fingerprint) -> bool:
     return read is None or read.fingerprint != planned
 
 
+@dataclass(slots=True)
+class Chain:
+    """The commits of one build: the hash that the next write is made on and the hash of the last write."""
+
+    head: str
+    on: str
+    written: str | None = None
+    prepared: bool = False
+
+    def write(self, ops: Operations, table: str, exists: bool) -> None:
+        if not self.prepared:
+            if ops.head() != self.head:
+                raise SilverSignalsError(BRANCH_MOVED)
+            self.on, self.prepared = ops.prepare(self.head), True
+        ops.write(table, exists)
+        self.written = ops.write_hash(self.on, table)
+        if self.written is None:
+            raise SilverSignalsError(BRANCH_MOVED)
+        self.on = self.written
+
+
+def passed_flags(source: InputRead, reads: dict[str, TableRead | None], planned: dict[str, Fingerprint] | None) -> dict[str, bool]:
+    """One flag for each table: the table is there, every check of it passes and, in a build, it is the planned table."""
+    flags = {}
+    for table in TABLES:
+        read = reads.get(table)
+        ok = read is not None and read.facts is not None and not table_problems(source.facts.cases, table, read.facts)
+        flags[table] = bool(ok) and (planned is None or not differs(read, planned[table]))
+    return flags
+
+
 def build_inner(ops: Operations, head: str) -> Outcome:
     source = ops.read_input(head)
     problems = input_problems(source.facts)
     if problems:
         raise SilverSignalsError(*problems)
-    planned = ops.plan(head)
-    held = read_tables(ops, head, False)
-    changed = [table for table in TABLES if differs(held[table], planned.fingerprints[table])]
-    at, written = head, None
-    if changed:
-        if ops.head() != head:
-            raise SilverSignalsError(BRANCH_MOVED)
-        on = ops.prepare(head)
-        for table in changed:
-            ops.write(table, held[table] is not None)
-            written = ops.write_hash(on, table)
-            if written is None:
-                raise SilverSignalsError(BRANCH_MOVED)
-            on = written
-        at = on
+    measure = ops.plan_measure(head)
+    chain = Chain(head, head)
+    held_measure = ops.read_table(head, MEASURE, False)
+    if differs(held_measure, measure.fingerprint):
+        chain.write(ops, MEASURE, held_measure is not None)
+    first = ops.read_table(chain.on, MEASURE, True)
+    problems = read_problems(source, {MEASURE: first})
+    if not problems and differs(first, measure.fingerprint):
+        problems = [f"readback_differs: {FLAG}"]
+    if problems:
+        raise SilverSignalsError(*problems)
+    labels = ops.plan_labels(chain.on)
+    planned = {MEASURE: measure.fingerprint, **labels}
+    held = {table: ops.read_table(chain.on, table, False) for table in LABEL_TABLES}
+    for table in LABEL_TABLES:
+        if differs(held[table], labels[table]):
+            chain.write(ops, table, held[table] is not None)
+    at = chain.on
     if ops.read_input(at) != source:
-        raise SilverSignalsError(f"source_changed: {unit(1, 'read')} of the input differs")
+        raise SilverSignalsError(f"source_changed: {FLAG}")
     reads = read_tables(ops, at, True)
     problems = read_problems(source, reads)
-    differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned.fingerprints[table])])
+    differing = any(reads[table] is not None and differs(reads[table], planned[table]) for table in TABLES)
     if differing and not problems:
-        problems.append(f"readback_differs: {unit(differing, 'table')}")
+        problems.append(f"readback_differs: {FLAG}")
     if problems:
         raise SilverSignalsError(*problems)
     if ops.head() != at:
         raise SilverSignalsError(BRANCH_MOVED)
-    return Outcome(
-        "written" if changed else "unchanged", head, written, at, source, {table: read for table, read in reads.items() if read is not None}, planned
-    )
+    written = chain.written
+    flags = passed_flags(source, reads, planned)
+    return Outcome("written" if written else "unchanged", head, written, at, source, {t: r for t, r in reads.items() if r is not None}, measure.rows, flags)
 
 
 def run_build(ops: Operations, head: str) -> Outcome:
@@ -180,6 +219,6 @@ def run_verify(ops: Operations, head: str) -> Outcome:
         if ops.head() != head:
             raise SilverSignalsError(BRANCH_MOVED)
         tables = {table: read for table, read in reads.items() if read is not None}
-        return Outcome("verified", head, None, head, source, tables, Plan({table: read.fingerprint for table, read in tables.items()}, ()))
+        return Outcome("verified", head, None, head, source, tables, (), passed_flags(source, reads, None))
     finally:
         ops.release()

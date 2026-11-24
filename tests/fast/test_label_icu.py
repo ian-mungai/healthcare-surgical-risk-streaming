@@ -6,15 +6,52 @@ Every case here is hand-built and kept apart from published data. Failure modes 
 - A missing value is a no stay (zero) instead of unknown, or a negative or non-finite value is a stay or a no stay instead of unknown.
 - The measure counts a missing or invalid value as a recorded one, or leaves out a form of the value that the label must read (whole days or fractions).
 - The measure is not the same for the same values in another order, or it reads a value of a patient who is not in the development sets.
+- A boundary rule is an unnamed comparison, so its status (decided by the plan, a lead assumption in the owner's unattended run) is not recorded, or a
+  constant is dead: flipping it does not change the result at its boundary.
 """
 
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
-from features.icu_label import INVALID, MISSING, RECORDED, icu_label
+from features import icu_label as rule
+from features.icu_label import (
+    BOUNDARY_STATUS,
+    FRACTIONS_ARE_VALID,
+    INVALID,
+    INVALID_BELOW,
+    LEAD_ASSUMPTION,
+    MISSING,
+    PLAN,
+    RECORDED,
+    STAY_ABOVE,
+    icu_label,
+)
 from features.label_values import NEGATIVE, POSITIVE, UNKNOWN
-from spark.silver.label_measure import IcuMeasureRow, icu_measure_rows
+from spark.silver.label_measure import UNITS, IcuMeasureRow, icu_measure_rows
+
+
+class BoundaryRules(unittest.TestCase):
+    def test_each_boundary_rule_has_its_value_and_its_status(self) -> None:
+        self.assertEqual({"STAY_ABOVE": PLAN, "INVALID_BELOW": LEAD_ASSUMPTION, "FRACTIONS_ARE_VALID": LEAD_ASSUMPTION}, BOUNDARY_STATUS)
+        self.assertEqual((0.0, 0.0, True), (STAY_ABOVE, INVALID_BELOW, FRACTIONS_ARE_VALID))
+
+    def test_a_flipped_constant_changes_the_result_at_its_boundary(self) -> None:
+        for name, flipped, value, held, changed in (
+            ("STAY_ABOVE", 0.5, 0.25, POSITIVE, NEGATIVE),
+            ("INVALID_BELOW", -2.0, -1.0, UNKNOWN, NEGATIVE),
+            ("INVALID_BELOW", 0.5, 0.0, NEGATIVE, UNKNOWN),
+            ("FRACTIONS_ARE_VALID", False, 0.5, POSITIVE, UNKNOWN),
+        ):
+            with self.subTest(constant=name, value=value):
+                self.assertEqual(held, icu_label(value).label)
+                with mock.patch.object(rule, name, flipped):
+                    self.assertEqual(changed, icu_label(value).label)
+
+    def test_a_fraction_of_half_a_day_is_a_stay(self) -> None:
+        outcome = icu_label(0.5)
+        self.assertEqual((POSITIVE, True, RECORDED, 0.5), (outcome.label, outcome.eligible, outcome.reason, outcome.icu_days))
 
 
 class Label(unittest.TestCase):
@@ -74,7 +111,7 @@ class MeasureTable(unittest.TestCase):
         rows = icu_measure_rows([0.0, 1.0])
         names = [row.statistic for row in rows]
         self.assertEqual(len(names), len(set(names)))
-        self.assertTrue(all(isinstance(row, IcuMeasureRow) and row.unit in {"cases", "days"} for row in rows))
+        self.assertTrue(all(isinstance(row, IcuMeasureRow) and row.unit in UNITS for row in rows))
 
     def test_no_recorded_value_has_no_least_or_greatest(self) -> None:
         counts = measured([None, -1.0])

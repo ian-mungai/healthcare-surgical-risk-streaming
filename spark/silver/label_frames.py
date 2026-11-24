@@ -5,20 +5,21 @@ Python only to call the label rules: ``features.kidney_label`` decides every kid
 batch and any later path cannot differ. The two row functions below are thin adapters that flatten a rule's answer into the columns of its table.
 
 The labels are outcomes and the test set is sealed. A label table has a row for every case, but the values read from it are flags (``exists``), never a count:
-the facts of a label table hold its rows (the cases, an input) and one number for each check that is only tested for being positive. The measure of
+the facts of a label table hold its rows (compared with the cases inside the run, never printed) and one number for each check that is only tested for being
+positive. The column checks (a key null or twice, a null in a column, a value outside its domain) are Great Expectations checks (``quality_flags``); the exact
+comparison with the rebuilt table and the rules that join several columns are Spark. The measure of
 ``icu_days`` is made from the development patients' values only: a case joins to the patient split by its patient, and only a set of ``DEVELOPMENT_SETS``
 counts. The split is used only after its own rule check (the job runs it first).
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import reduce
 from operator import and_
 from typing import Any
 
-from features.icu_label import REASONS as ICU_REASONS
-from features.icu_label import icu_label
+from features.icu_label import FRACTIONS_ARE_VALID, INVALID_BELOW, STAY_ABOVE, icu_label
 from features.kidney_label import (
     ABSOLUTE_HOURS,
     BASELINE_DAYS,
@@ -33,12 +34,13 @@ from features.kidney_label import (
     Result,
     kidney_label,
 )
-from features.kidney_label import REASONS as KIDNEY_REASONS
-from features.label_values import LABEL_VALUES, NEGATIVE, POSITIVE, UNKNOWN
+from features.label_values import NEGATIVE, POSITIVE, UNKNOWN
+from spark.bronze.checks import Check, CheckResult, verdict
+from spark.bronze.quality import column_checks
 from spark.silver.frames import functions, typed, types
 from spark.silver.hypotension_checks import DEVELOPMENT_SETS
-from spark.silver.hypotension_frames import development_cases, exists
-from spark.silver.label_checks import InputFacts, TableFacts
+from spark.silver.hypotension_frames import exists
+from spark.silver.label_checks import COLUMN_FLAGS, ICU, KIDNEY, MEASURE, InputFacts, TableFacts, column_plan
 from spark.silver.label_measure import IcuMeasureRow, icu_measure_rows
 from spark.silver.tables import ICU_DAYS_MEASURE, ICU_LABELS, KIDNEY_INJURY_LABELS
 
@@ -75,6 +77,8 @@ def kidney_values(label: KidneyLabel) -> tuple[Any, ...]:
         *parts(label.later),
         label.relative_rise,
         *parts(label.relative_result),
+        *parts(label.early_highest),
+        *parts(label.followup_highest),
         label.latest_time_s,
         label.label,
         label.eligible,
@@ -127,13 +131,32 @@ def icu_frame(cases: Any) -> Any:
     return typed(judged.select("case_id", f.col("_i.*")), ICU_LABELS.columns)
 
 
+def development_sets(split: Any) -> Any:
+    """The patients of the development sets. The patient split must have passed its rule check before this is used."""
+    f = functions()
+    return split.select("subjectid", f.col("set").alias("_set")).filter(f.col("_set").isin(*DEVELOPMENT_SETS)).select("subjectid")
+
+
 def development_values(cases: Any, split: Any) -> list[float | None]:
     """The ``icu_days`` of the cases of the development patients only, one for each case. The patient split must have passed its rule check before this is
     used. The held-out patients' values are never selected."""
     f = functions()
-    sets = split.select("subjectid", f.col("set").alias("_set")).filter(f.col("_set").isin(*DEVELOPMENT_SETS)).select("subjectid")
-    rows = cases.select("subjectid", f.col("icu_days").cast("double").alias("_value")).join(sets, "subjectid", "inner").select("_value").collect()
+    rows = (
+        cases.select("subjectid", f.col("icu_days").cast("double").alias("_value"))
+        .join(development_sets(split), "subjectid", "inner")
+        .select("_value")
+        .collect()
+    )
     return [None if row["_value"] is None else float(row["_value"]) for row in rows]
+
+
+def ownership_flag(cases: Any) -> int:
+    """One flag, 0 or 1: whether a case row has a case number or a patient that is null, or a case number that another row has. It reads the two key columns
+    only, before any join of a case to its patient (``silver.cases`` is typed, so no value is converted here)."""
+    f = functions()
+    unusable = cases.filter(f.col("caseid").isNull() | f.col("subjectid").isNull())
+    repeated = cases.filter(f.col("caseid").isNotNull()).groupBy("caseid").agg(f.count(f.lit(1)).alias("n")).filter(f.col("n") > 1)
+    return int(exists(unusable) or exists(repeated))
 
 
 def measure_rows(cases: Any, split: Any) -> list[IcuMeasureRow]:
@@ -150,7 +173,8 @@ def measure_frame(session: Any, rows: Sequence[IcuMeasureRow]) -> Any:
 def input_facts(cases: Any, split: Any) -> InputFacts:
     """The facts of the input once the split is trusted. ``cases_without_split`` is a flag: whether any case has a patient that the split lacks."""
     without = cases.join(split.select("subjectid"), "subjectid", "left_anti")
-    return InputFacts(int(cases.count()), 0, exists(without), (), int(development_cases(cases, split).count()))
+    development = cases.filter(functions().col("caseid").isNotNull()).join(development_sets(split), "subjectid", "inner")
+    return InputFacts(int(cases.count()), 0, exists(without), (), int(development.count()))
 
 
 def differing(stored: Any, planned: Any, columns: tuple[tuple[str, str], ...]) -> int:
@@ -159,9 +183,14 @@ def differing(stored: Any, planned: Any, columns: tuple[tuple[str, str], ...]) -
     return int(exists(left.exceptAll(right)) or exists(right.exceptAll(left)))
 
 
-def twice(stored: Any, key: str) -> int:
-    f = functions()
-    return exists(stored.groupBy(key).agg(f.count(f.lit(1)).alias("n")).filter(f.col("n") > 1))
+def quality_flags(frame: Any, table: str, run: Callable[[Any, Sequence[Check]], list[CheckResult]] = column_checks) -> dict[str, int]:
+    """The column checks of a table (``column_plan``) run in Great Expectations on the stored ``frame``: one flag, 0 or 1, for each group of checks, that is 1
+    when any check of the group failed. The count that the library found never leaves this function. A check that the runner leaves out counts as failed, and a
+    result for a check that the plan does not hold is an error (``verdict``)."""
+    plan = column_plan(table)
+    checks = [check for flag in COLUMN_FLAGS[table] for check in plan[flag]]
+    failed = {failure.name for failure in verdict(checks, run(frame, checks)).failed}
+    return {flag: int(any(check.name in failed for check in plan[flag])) for flag in COLUMN_FLAGS[table]}
 
 
 def implies(present: Any, condition: Any) -> Any:
@@ -170,23 +199,23 @@ def implies(present: Any, condition: Any) -> Any:
     return f.when(present, f.coalesce(condition, f.lit(False))).otherwise(f.lit(True))
 
 
-def measure_facts(stored: Any, session: Any, cases: Any, split: Any) -> TableFacts:
-    return TableFacts(
-        int(stored.count()), {"icu_measure_differs": differing(stored, measure_frame(session, measure_rows(cases, split)), ICU_DAYS_MEASURE.columns)}
-    )
+def measure_facts(stored: Any, session: Any, cases: Any, split: Any, run: Callable[..., list[CheckResult]] = column_checks) -> TableFacts:
+    flags = {
+        **quality_flags(stored, MEASURE, run),
+        "icu_measure_differs": differing(stored, measure_frame(session, measure_rows(cases, split)), ICU_DAYS_MEASURE.columns),
+    }
+    return TableFacts(int(stored.count()), flags)
 
 
-def icu_facts(stored: Any, cases: Any) -> TableFacts:
+def icu_facts(stored: Any, cases: Any, run: Callable[..., list[CheckResult]] = column_checks) -> TableFacts:
     f = functions()
     label, reason, eligible, value = f.col("label"), f.col("eligibility_reason"), f.col("eligible"), f.col("icu_days")
     finite = value.between(-LIMIT, LIMIT)
-    wanted = f.when(value.isNull(), f.lit(UNKNOWN)).when(~finite | (value < 0), f.lit(UNKNOWN)).when(value > 0, f.lit(POSITIVE)).otherwise(f.lit(NEGATIVE))
-    why = f.when(value.isNull(), f.lit("missing")).when(~finite | (value < 0), f.lit("invalid")).otherwise(f.lit("recorded"))
+    invalid = ~finite | (value < f.lit(INVALID_BELOW)) | (f.lit(not FRACTIONS_ARE_VALID) & (value != f.floor(value)))
+    wanted = f.when(value.isNull(), f.lit(UNKNOWN)).when(invalid, f.lit(UNKNOWN)).when(value > f.lit(STAY_ABOVE), f.lit(POSITIVE)).otherwise(f.lit(NEGATIVE))
+    why = f.when(value.isNull(), f.lit("missing")).when(invalid, f.lit("invalid")).otherwise(f.lit("recorded"))
     flags = {
-        "icu_duplicate_key": twice(stored, "case_id"),
-        "icu_label_value": exists(
-            stored.filter(label.isNull() | ~label.isin(*LABEL_VALUES) | reason.isNull() | ~reason.isin(*ICU_REASONS) | eligible.isNull())
-        ),
+        **quality_flags(stored, ICU, run),
         "icu_eligibility": exists(stored.filter(~eligible.eqNullSafe(label != f.lit(UNKNOWN)))),
         "icu_value_rule": exists(stored.filter(~(label.eqNullSafe(wanted) & reason.eqNullSafe(why)))),
         "icu_differs": differing(stored, icu_frame(cases), ICU_LABELS.columns),
@@ -212,6 +241,14 @@ def kidney_times_ok() -> Any:
         ),
         implies(c("relative_time_s").isNotNull(), (c("relative_time_s") > c("followup_start_s")) & (c("relative_time_s") <= c("relative_window_end_s"))),
         implies(c("latest_time_s").isNotNull(), c("latest_time_s") <= c("relative_window_end_s")),
+        implies(
+            c("early_highest_time_s").isNotNull(),
+            (c("early_highest_time_s") > c("followup_start_s")) & (c("early_highest_time_s") <= c("absolute_window_end_s")),
+        ),
+        implies(
+            c("followup_highest_time_s").isNotNull(),
+            (c("followup_highest_time_s") > c("followup_start_s")) & (c("followup_highest_time_s") <= c("relative_window_end_s")),
+        ),
     ]
     return reduce(and_, checks)
 
@@ -242,17 +279,22 @@ def kidney_rule_bad() -> Any:
     )
     absolute_ok = implies(absolute.eqNullSafe(f.lit(True)), c("later_value") - c("earlier_value") >= f.lit(ABSOLUTE_RISE - TOLERANCE))
     relative_ok = implies(relative.eqNullSafe(f.lit(True)), c("relative_value") >= f.lit(RELATIVE_RATIO) * c("baseline_value") - f.lit(TOLERANCE))
-    return ~f.coalesce(reason_ok & label_ok & absolute_ok & relative_ok, f.lit(False))
+    highest_ok = (
+        (c("early_highest_time_s").isNotNull() == (c("early_results") > 0))
+        & (c("followup_highest_time_s").isNotNull() == (results > 0))
+        & implies(c("early_highest_value").isNotNull(), c("followup_highest_value") >= c("early_highest_value"))
+    )
+    reaches = c("followup_highest_value") >= f.lit(RELATIVE_RATIO) * c("baseline_value") - f.lit(TOLERANCE)
+    stays_under = c("followup_highest_value") < f.lit(RELATIVE_RATIO) * c("baseline_value") + f.lit(TOLERANCE)
+    recorded_ok = implies(c("eligible").eqNullSafe(f.lit(True)), f.when(relative.eqNullSafe(f.lit(True)), reaches).otherwise(stays_under))
+    return ~f.coalesce(reason_ok & label_ok & absolute_ok & relative_ok & highest_ok & recorded_ok, f.lit(False))
 
 
-def kidney_facts(stored: Any, cases: Any, lab: Any) -> TableFacts:
+def kidney_facts(stored: Any, cases: Any, lab: Any, run: Callable[..., list[CheckResult]] = column_checks) -> TableFacts:
     f = functions()
     label, reason, eligible = f.col("label"), f.col("eligibility_reason"), f.col("eligible")
     flags = {
-        "kidney_duplicate_key": twice(stored, "case_id"),
-        "kidney_label_value": exists(
-            stored.filter(label.isNull() | ~label.isin(*LABEL_VALUES) | reason.isNull() | ~reason.isin(*KIDNEY_REASONS) | eligible.isNull())
-        ),
+        **quality_flags(stored, KIDNEY, run),
         "kidney_eligibility": exists(stored.filter(~(eligible.eqNullSafe(label != f.lit(UNKNOWN)) & eligible.eqNullSafe(reason == f.lit(ELIGIBLE))))),
         "kidney_times": exists(stored.filter(~kidney_times_ok())),
         "kidney_rule": exists(stored.filter(kidney_rule_bad())),

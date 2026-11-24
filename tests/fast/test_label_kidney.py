@@ -11,21 +11,39 @@ Every case here is hand-built and kept apart from published data. Failure modes 
 - The absolute rule pairs measurements more than 48 hours apart, or pairs a result with itself or a result at the same time, or reads the baseline only.
 - A follow-up on day one only or on day five only is not enough or too much to decide, or a negative is called for a case that is not eligible.
 - A label row does not carry the baseline with its time and source, the windows, the measurements and the times that the rule read.
+- A negative keeps no measurement that it used: with one baseline, follow-up values of 1.1 and of 1.2 give the same label, so a later check cannot
+  reproduce it. The row records the highest follow-up result of the first 48 hours and of the 7 days, each with its value, time and number.
+- A boundary rule is an unnamed comparison inside the code, so its status (decided by the plan, a lead assumption, pending the owner) is not recorded and a
+  changed answer of the owner is not one line. Each is a named constant, flipping it changes the result, and the pending one changes one line only.
 """
 
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
+from unittest import mock
 
+from features import kidney_label as rule
 from features.kidney_label import (
     ABSOLUTE_HOURS,
     ABSOLUTE_RISE_MG_DL,
+    ABSOLUTE_WINDOW_END_INCLUSIVE,
     BASELINE_DAYS,
+    BASELINE_MAX_AGE_INCLUSIVE,
+    BASELINE_STRICTLY_BEFORE_ANESTART,
+    BASELINE_TIE_TAKES_LOWER,
+    BOUNDARY_STATUS,
     ELIGIBLE,
     FOLLOWUP_DAYS,
+    FOLLOWUP_END_INCLUSIVE,
+    FOLLOWUP_INCLUDES_OPEND,
+    LEAD_ASSUMPTION,
+    MEASUREMENT_MINIMUM_EXCLUSIVE,
     NEITHER,
     NO_BASELINE,
     NO_FOLLOWUP,
+    PENDING_OWNER,
+    PLAN,
     RELATIVE_RATIO,
     Result,
     kidney_label,
@@ -64,6 +82,65 @@ class Constants(unittest.TestCase):
         self.assertEqual(7, FOLLOWUP_DAYS)
         self.assertEqual("0.3", str(ABSOLUTE_RISE_MG_DL))
         self.assertEqual("1.5", str(RELATIVE_RATIO))
+
+
+class BoundaryRules(unittest.TestCase):
+    """Each boundary rule is a named constant with its status. Flipping a constant must change the result at its boundary, so none is dead."""
+
+    def test_each_boundary_rule_has_its_value_and_its_status(self) -> None:
+        self.assertEqual(
+            {
+                "FOLLOWUP_INCLUDES_OPEND": PLAN,
+                "FOLLOWUP_END_INCLUSIVE": PLAN,
+                "ABSOLUTE_WINDOW_END_INCLUSIVE": PLAN,
+                "BASELINE_STRICTLY_BEFORE_ANESTART": PLAN,
+                "BASELINE_MAX_AGE_INCLUSIVE": PLAN,
+                "MEASUREMENT_MINIMUM_EXCLUSIVE": LEAD_ASSUMPTION,
+                "BASELINE_TIE_TAKES_LOWER": PENDING_OWNER,
+            },
+            BOUNDARY_STATUS,
+        )
+        self.assertEqual(
+            (False, True, True, True, True, Decimal(0), True),
+            (
+                FOLLOWUP_INCLUDES_OPEND,
+                FOLLOWUP_END_INCLUSIVE,
+                ABSOLUTE_WINDOW_END_INCLUSIVE,
+                BASELINE_STRICTLY_BEFORE_ANESTART,
+                BASELINE_MAX_AGE_INCLUSIVE,
+                MEASUREMENT_MINIMUM_EXCLUSIVE,
+                BASELINE_TIE_TAKES_LOWER,
+            ),
+        )
+        self.assertEqual(["BASELINE_TIE_TAKES_LOWER"], [name for name, status in BOUNDARY_STATUS.items() if status == PENDING_OWNER])
+
+    def test_a_flipped_constant_changes_the_result_at_its_boundary(self) -> None:
+        cases = (
+            ("FOLLOWUP_INCLUDES_OPEND", True, (before(HOUR, 1.0), after(0, 3.0)), (UNKNOWN, NO_FOLLOWUP), (POSITIVE, ELIGIBLE)),
+            ("FOLLOWUP_END_INCLUSIVE", False, (before(HOUR, 1.0), after(7 * DAY, 1.5)), (POSITIVE, ELIGIBLE), (UNKNOWN, NO_FOLLOWUP)),
+            (
+                "ABSOLUTE_WINDOW_END_INCLUSIVE",
+                False,
+                (before(HOUR, 1.0), result(OPEND, 1.0), after(48 * HOUR, 1.3)),
+                (POSITIVE, ELIGIBLE),
+                (NEGATIVE, ELIGIBLE),
+            ),
+            ("BASELINE_STRICTLY_BEFORE_ANESTART", False, (result(ANESTART, 1.0), after(HOUR, 1.0)), (UNKNOWN, NO_BASELINE), (NEGATIVE, ELIGIBLE)),
+            ("BASELINE_MAX_AGE_INCLUSIVE", False, (before(30 * DAY, 1.0), after(HOUR, 1.0)), (NEGATIVE, ELIGIBLE), (UNKNOWN, NO_BASELINE)),
+            ("MEASUREMENT_MINIMUM_EXCLUSIVE", Decimal(-1), (before(HOUR, 0.0), after(HOUR, 1.0)), (UNKNOWN, NO_BASELINE), (POSITIVE, ELIGIBLE)),
+        )
+        for name, flipped, results, held, changed in cases:
+            with self.subTest(constant=name):
+                self.assertEqual(held, label_of(*results))
+                with mock.patch.object(rule, name, flipped):
+                    self.assertEqual(changed, label_of(*results))
+
+    def test_the_pending_rule_changes_with_one_constant_and_only_the_baseline_moves(self) -> None:
+        results = (result(ANESTART - HOUR, 1.4, 2), result(ANESTART - HOUR, 1.0, 1), after(HOUR, 1.0))
+        self.assertEqual(result(ANESTART - HOUR, 1.0, 1), kidney_label(ANESTART, OPEND, list(results)).baseline)
+        with mock.patch.object(rule, "BASELINE_TIE_TAKES_LOWER", False):
+            outcome = kidney_label(ANESTART, OPEND, list(results))
+        self.assertEqual(result(ANESTART - HOUR, 1.4, 2), outcome.baseline)
 
 
 class Positives(unittest.TestCase):
@@ -164,9 +241,11 @@ class Baseline(unittest.TestCase):
             (UNKNOWN, NO_BASELINE, None, None, None), (outcome.label, outcome.reason, outcome.baseline, outcome.absolute_rise, outcome.relative_rise)
         )
 
-    def test_two_results_at_the_last_time_give_the_first_by_occurrence(self) -> None:
-        outcome = kidney_label(ANESTART, OPEND, [result(ANESTART - HOUR, 1.4, 2), result(ANESTART - HOUR, 1.0, 1), after(HOUR, 1.0)])
-        self.assertEqual(result(ANESTART - HOUR, 1.0, 1), outcome.baseline)
+    def test_two_results_at_the_last_time_give_the_lower_value(self) -> None:
+        for numbers in ((2, 1), (1, 2)):
+            with self.subTest(numbers=numbers):
+                outcome = kidney_label(ANESTART, OPEND, [result(ANESTART - HOUR, 1.4, numbers[0]), result(ANESTART - HOUR, 1.0, numbers[1]), after(HOUR, 1.0)])
+                self.assertEqual(result(ANESTART - HOUR, 1.0, numbers[1]), outcome.baseline)
 
     def test_a_result_with_no_value_or_a_value_that_is_not_positive_is_not_a_measurement(self) -> None:
         self.assertEqual((UNKNOWN, NO_BASELINE), label_of(before(HOUR, 0.0), after(HOUR, 1.0)))
@@ -211,6 +290,45 @@ class Eligibility(unittest.TestCase):
     def test_the_order_of_the_results_does_not_matter(self) -> None:
         results = [before(HOUR, 1.0), before(3 * DAY, 0.8), after(HOUR, 1.1), after(40 * HOUR, 1.3), after(5 * DAY, 1.6)]
         self.assertEqual(kidney_label(ANESTART, OPEND, results), kidney_label(ANESTART, OPEND, results[::-1]))
+
+
+class Measurements(unittest.TestCase):
+    """What a label row keeps of the follow-up: the highest result of the first 48 hours and of the 7 days, so that a negative can be reproduced."""
+
+    def test_a_negative_records_the_highest_result_of_each_window(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(HOUR, 1.1), after(30 * HOUR, 1.15), after(4 * DAY, 1.2)])
+        self.assertEqual((NEGATIVE, ELIGIBLE), (outcome.label, outcome.reason))
+        self.assertEqual((after(30 * HOUR, 1.15), after(4 * DAY, 1.2)), (outcome.early_highest, outcome.followup_highest))
+
+    def test_one_baseline_with_follow_up_of_1_1_and_of_1_2_are_not_the_same_row(self) -> None:
+        low = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(DAY, 1.1)])
+        high = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(DAY, 1.2)])
+        self.assertEqual((NEGATIVE, NEGATIVE), (low.label, high.label))
+        self.assertNotEqual(low, high)
+
+    def test_the_48_hour_edge_is_in_the_early_window_and_the_next_second_is_not(self) -> None:
+        edge = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(48 * HOUR, 1.1), after(48 * HOUR + 1, 1.2)])
+        self.assertEqual((after(48 * HOUR, 1.1), after(48 * HOUR + 1, 1.2)), (edge.early_highest, edge.followup_highest))
+        late = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(48 * HOUR + 1, 1.2)])
+        self.assertEqual((None, after(48 * HOUR + 1, 1.2)), (late.early_highest, late.followup_highest))
+
+    def test_equal_highest_values_give_the_earliest_then_the_lowest_number(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(2 * HOUR, 1.1), result(OPEND + HOUR, 1.1, 2), result(OPEND + HOUR, 1.1, 1)])
+        self.assertEqual(result(OPEND + HOUR, 1.1, 1), outcome.early_highest)
+
+    def test_a_result_after_day_7_or_at_opend_is_never_the_highest(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0), after(0, 9.0), after(HOUR, 1.1), after(7 * DAY + 1, 9.0)])
+        self.assertEqual((after(HOUR, 1.1), after(HOUR, 1.1)), (outcome.early_highest, outcome.followup_highest))
+
+    def test_an_unknown_label_records_its_follow_up_when_it_has_one(self) -> None:
+        no_baseline = kidney_label(ANESTART, OPEND, [after(HOUR, 1.1), after(3 * DAY, 1.2)])
+        self.assertEqual((UNKNOWN, after(HOUR, 1.1), after(3 * DAY, 1.2)), (no_baseline.label, no_baseline.early_highest, no_baseline.followup_highest))
+        no_followup = kidney_label(ANESTART, OPEND, [before(HOUR, 1.0)])
+        self.assertEqual((None, None), (no_followup.early_highest, no_followup.followup_highest))
+
+    def test_the_baseline_is_recorded_with_its_value_and_time_for_a_negative(self) -> None:
+        outcome = kidney_label(ANESTART, OPEND, [result(ANESTART - 2 * HOUR, 0.9, 3), after(DAY, 1.0)])
+        self.assertEqual((NEGATIVE, result(ANESTART - 2 * HOUR, 0.9, 3)), (outcome.label, outcome.baseline))
 
 
 class Times(unittest.TestCase):
