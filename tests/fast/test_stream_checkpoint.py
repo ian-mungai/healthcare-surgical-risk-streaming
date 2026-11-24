@@ -89,13 +89,22 @@ class CheckpointFolder(unittest.TestCase):
         marker.write_text("")
         self.refused()
 
-    def test_a_path_that_is_not_a_local_folder_is_refused_because_its_format_cannot_be_read(self) -> None:
+    def test_a_path_with_any_scheme_is_refused_before_a_marker_is_checked_or_made_and_leaves_nothing_behind(self) -> None:
+        """``file:/x`` has no ``//``: it passed as a relative folder named ``file:``, got a marker there, and Spark then used ``/x`` with none."""
         here = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, here)
-        with self.assertRaises(CheckpointFormatError):
-            check_checkpoint("s3a://bucket/checkpoint")
-        self.assertEqual([], list(self.root.iterdir()), "a refused path leaves nothing behind")
+        elsewhere = self.root / "elsewhere" / "ck"
+        for text in (f"file:{elsewhere}", f"file://{elsewhere}", f"file:///{elsewhere}", "file:relative/ck", "s3a://bucket/checkpoint", "hdfs:/a/b", "S3A:/x"):
+            with self.subTest(path=text), self.assertRaises(CheckpointFormatError) as caught:
+                check_checkpoint(text)
+            self.assertEqual(REFUSAL_CODE, caught.exception.code)
+            self.assertEqual([], list(self.root.iterdir()), "a refused path leaves nothing behind")
+
+    def test_control_a_local_path_whose_name_has_a_colon_after_a_slash_is_a_folder_and_passes(self) -> None:
+        folder = self.root / "a:b" / "ck"
+        check_checkpoint(folder)
+        self.assertEqual(STATE_FORMAT, (folder / STATE_FORMAT_FILE).read_text().strip())
 
     def test_the_refusal_carries_the_fixed_code(self) -> None:
         (self.checkpoint / "state").mkdir(parents=True)
@@ -138,6 +147,20 @@ class JobStart(unittest.TestCase):
         self.assertIn(REFUSAL_CODE, errors)
         nessie.assert_not_called()
         session.assert_not_called()
+
+    def test_a_checkpoint_given_as_a_file_uri_ends_the_job_with_the_fixed_exit_code_and_makes_no_marker_in_either_folder(self) -> None:
+        here = Path.cwd()
+        os.chdir(self.checkpoint.parent)
+        self.addCleanup(os.chdir, here)
+        target = self.checkpoint.parent / "target"
+        for text in (f"file:{target}", f"file://{target}", f"file:///{target}"):
+            with self.subTest(path=text), mock.patch.dict(os.environ, {"STREAM_CHECKPOINT_DIR": text}):
+                code, errors, nessie, session = self.run_main()
+                self.assertEqual(EXIT_CODE, code)
+                self.assertIn(REFUSAL_CODE, errors)
+                nessie.assert_not_called()
+                session.assert_not_called()
+                self.assertEqual([], list(self.checkpoint.parent.iterdir()))
 
     def test_control_a_new_folder_passes_the_check_and_the_job_goes_on_to_nessie(self) -> None:
         code, _, nessie, _ = self.run_main()

@@ -6,12 +6,14 @@ writes a marker file with the format into a new checkpoint folder, and refuses a
 earlier jobs wrote) or with another format. The refusal has a fixed code in its text and a fixed exit code. The job makes it before it calls Nessie, the
 registry or Spark.
 
-The folder is a local path (a volume). A path with a scheme cannot be read here, so it is refused too.
+The folder is a local path (a volume). A path that starts with a URI scheme (``s3a://``, ``file:/``, ``file:///``) cannot be read here, and Spark would read
+it as another place than the folder this check marks, so it is refused too, before any marker is checked or made.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from spark.streaming.state import STATE_FORMAT
@@ -20,6 +22,7 @@ STATE_FORMAT_FILE = "state_format"
 TEMPORARY_FILE = f".{STATE_FORMAT_FILE}.tmp"
 REFUSAL_CODE = "checkpoint_state_format_refused"
 EXIT_CODE = 3
+URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:")
 
 
 class CheckpointFormatError(RuntimeError):
@@ -44,7 +47,7 @@ def write_marker(folder: Path, expected: str) -> None:
 def check_checkpoint(checkpoint: str | Path, expected: str = STATE_FORMAT) -> None:
     """Mark a new checkpoint folder with ``expected`` and pass, pass a folder marked with ``expected``, and refuse any other folder."""
     text = str(checkpoint)
-    if "://" in text:
+    if URI_SCHEME.match(text):
         raise CheckpointFormatError(f"the checkpoint {text} is not a local folder, so its state format cannot be read before the query starts")
     folder = Path(checkpoint)
     marker = folder / STATE_FORMAT_FILE
