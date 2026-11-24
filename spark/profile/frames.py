@@ -208,29 +208,32 @@ def whole_number(row: Mapping[str, Any], name: str) -> int:
     return int(value)
 
 
+UNSCORED_WHOLE_NUMBERS = (
+    "cutoffs",
+    "waveform",
+    "numeric",
+    "either",
+    "cases",
+    "no_grid",
+    "cutoff_step",
+    "cutoff_offset",
+    "last_margin",
+    "waveform_window",
+    "waveform_limit",
+    "numeric_window",
+    "numeric_limit",
+)
+
+
 def unscored_facts(frame: Any) -> UnscoredFacts:
+    """The facts of ``unscored_share``: the row count and the first row's values. Every whole-number column of every stored row is checked before the first row
+    is chosen, so a row that is not in form gives the one refusal whatever the order of the rows."""
     rows = frame.collect()
     if not rows:
         return UnscoredFacts(0, 0, 0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    one = rows[0]
-    share = one["unscored_share"]
-    return UnscoredFacts(
-        len(rows),
-        whole_number(one, "cutoffs"),
-        whole_number(one, "waveform"),
-        whole_number(one, "numeric"),
-        whole_number(one, "either"),
-        None if share is None else float(share),
-        whole_number(one, "cases"),
-        whole_number(one, "no_grid"),
-        whole_number(one, "cutoff_step"),
-        whole_number(one, "cutoff_offset"),
-        whole_number(one, "last_margin"),
-        whole_number(one, "waveform_window"),
-        whole_number(one, "waveform_limit"),
-        whole_number(one, "numeric_window"),
-        whole_number(one, "numeric_limit"),
-    )
+    held = [{name: whole_number(row, name) for name in UNSCORED_WHOLE_NUMBERS} for row in rows]
+    share = rows[0]["unscored_share"]
+    return UnscoredFacts(rows=len(rows), share=None if share is None else float(share), **held[0])
 
 
 def counts_facts(frame: Any) -> CountsFacts:

@@ -88,6 +88,25 @@ class AStoredUnscoredRowWithANull(unittest.TestCase):
                 frames.unscored_facts(Rows([unscored_row(**{name: None})]))
             self.assertEqual([CODE], caught.exception.problems)
 
+    def test_a_null_in_a_later_row_is_the_fixed_refusal_whatever_the_row_order(self) -> None:
+        for name in WHOLE_NUMBER_COLUMNS:
+            for rows in ([unscored_row(), unscored_row(**{name: None})], [unscored_row(**{name: None}), unscored_row()]):
+                with self.subTest(column=name, null_first=rows[0][name] is None), self.assertRaises(SignalProfileError) as caught:
+                    frames.unscored_facts(Rows(rows))
+                self.assertEqual([CODE], caught.exception.problems)
+
+    def test_a_null_in_the_last_of_three_rows_is_the_fixed_refusal(self) -> None:
+        with self.assertRaises(SignalProfileError) as caught:
+            frames.unscored_facts(Rows([unscored_row(), unscored_row(), unscored_row(cutoff_step=None)]))
+        self.assertEqual([CODE], caught.exception.problems)
+
+    def test_rows_in_form_keep_the_first_row_and_the_count(self) -> None:
+        facts = frames.unscored_facts(Rows([unscored_row(cutoffs=7), unscored_row(cutoffs=9, unscored_share=None)]))
+        self.assertEqual((2, 7, 0.5), (facts.rows, facts.cutoffs, facts.share))
+
+    def test_a_later_row_with_no_share_is_not_refused(self) -> None:
+        self.assertEqual(2, frames.unscored_facts(Rows([unscored_row(), unscored_row(unscored_share=None)])).rows)
+
     def test_the_refusal_holds_no_value_and_no_column_name(self) -> None:
         with self.assertRaises(SignalProfileError) as caught:
             frames.unscored_facts(Rows([unscored_row(cutoff_step=None, cutoff_offset=MARKER)]))
@@ -114,35 +133,20 @@ class AStoredUnscoredRowWithANull(unittest.TestCase):
         self.assertEqual((1, f"signal_profile: {CODE}\n"), (code, err.getvalue()))
 
 
-class Column:
-    """An expression over one row: the few operators that ``wanted_results`` uses."""
-
-    def __init__(self, fn: Callable[[dict[str, Any]], Any]) -> None:
-        self.fn = fn
-
-    def __eq__(self, other: object) -> Column:  # type: ignore[override]
-        return Column(lambda row: self.fn(row) == (other.fn(row) if isinstance(other, Column) else other))
-
-    def __and__(self, other: Column) -> Column:
-        return Column(lambda row: bool(self.fn(row)) and bool(other.fn(row)))
-
-    def isNull(self) -> Column:  # noqa: N802
-        return Column(lambda row: self.fn(row) is None)
-
-    def isNotNull(self) -> Column:  # noqa: N802
-        return Column(lambda row: self.fn(row) is not None)
-
-    __hash__ = None  # type: ignore[assignment]
+def column(fn: Callable[[dict[str, Any]], Any]) -> Any:
+    """A Spark column of a stand-in session: a mock that holds ``fn``, its value for one row, with the few operators that ``wanted_results`` uses."""
+    held = mock.MagicMock()
+    held.fn = fn
+    held.configure_mock(
+        __eq__=lambda _, other: column(lambda row: fn(row) == other.fn(row)),
+        __and__=lambda _, other: column(lambda row: bool(fn(row)) and bool(other.fn(row))),
+        isNull=lambda: column(lambda row: fn(row) is None),
+        isNotNull=lambda: column(lambda row: fn(row) is not None),
+    )
+    return held
 
 
-class Functions:
-    @staticmethod
-    def col(name: str) -> Column:
-        return Column(lambda row: row[name])
-
-    @staticmethod
-    def lit(value: Any) -> Column:
-        return Column(lambda row: value)
+FUNCTIONS = mock.MagicMock(col=lambda name: column(lambda row: row[name]), lit=lambda value: column(lambda row: value))
 
 
 class Lab:
@@ -151,7 +155,7 @@ class Lab:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
 
-    def filter(self, condition: Column) -> Lab:
+    def filter(self, condition: Any) -> Lab:
         return Lab([row for row in self.rows if condition.fn(row)])
 
     def limit(self, count: int) -> Lab:
@@ -166,7 +170,7 @@ def lab_row(**changes: Any) -> dict[str, Any]:
 
 
 def unusable(*rows: dict[str, Any]) -> int:
-    with mock.patch.object(label_frames, "functions", return_value=Functions()):
+    with mock.patch.object(label_frames, "functions", return_value=FUNCTIONS):
         return int(label_frames.unusable_results(Lab(list(rows))))
 
 
