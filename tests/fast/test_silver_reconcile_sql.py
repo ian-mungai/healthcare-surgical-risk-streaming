@@ -514,6 +514,10 @@ class Adapter(unittest.TestCase):
             "SELECT 'a\\' FROM t",
             "SELECT 'a\\'' FROM t",
             "SELECT 'it''s' FROM t",
+            "SELECT '''' FROM t",
+            "SELECT ''''",
+            "SELECT '''' '' FROM t",
+            "SELECT ''''''",
             "SELECT 'open FROM t",
             "SELECT `open FROM t",
             "SELECT `a b` FROM t",
@@ -528,8 +532,16 @@ class Adapter(unittest.TestCase):
             "SELECT 'a\x00b' FROM t",
             "SELECT \x01 FROM t",
         )
-        self.assertEqual(18, len(forms))
+        self.assertEqual(22, len(forms))
         for text in forms:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                lake.translate(text)
+
+    def test_an_empty_literal_is_kept_and_an_adjacent_pair_of_quotes_is_not_two_empty_literals(self) -> None:
+        for text in ("SELECT '' AS `x` FROM t", "SELECT '', '' FROM t", "SELECT '' '' FROM t", "SELECT ''"):
+            with self.subTest(text=text):
+                self.assertEqual(text, lake.translate(text))
+        for text in ("SELECT '''' FROM t", "SELECT ''''", "SELECT '''' '' FROM t"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 lake.translate(text)
 

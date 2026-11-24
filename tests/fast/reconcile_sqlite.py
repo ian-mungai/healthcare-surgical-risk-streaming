@@ -8,7 +8,8 @@ not one of these is not translated and raises ``ValueError``, so a query that ga
 
 The query is cut once into quoted literals and other text. Every substitution and the join translation read the other text only: a literal is held aside
 and put back unchanged. Only the quoting that the job's queries use is accepted (single-quoted literals, back-quoted plain names, and the backslash pair of the
-typing-rule pattern); a double quote, a comment, a second statement, a bracket name, an escape, a doubled quote or a quote that does not close raises.
+typing-rule pattern); a double quote, a comment, a second statement, a bracket name, an escape, a doubled quote, an adjacent pair of quotes or a quote that
+does not close raises. An empty literal (two quotes with a space or a comma after them) is kept.
 
 ``World`` holds two cohorts. Case 1 of patient 10 is in the training set, case 2 of patient 20 is in the test set. Each table has the rows of a clean,
 reconciled build for both. A test plants a defect in a cohort and reads what the query counts.
@@ -87,7 +88,7 @@ def hold_literals(query: str) -> tuple[str, list[str]]:
             end = query.find("'", index + 1)
             if end < 0:
                 raise ValueError(f"a literal does not close: {query[index:][:40]!r}")
-            if query.startswith("''", end) and end > index + 1:
+            if query.startswith("'", end + 1):
                 raise ValueError(f"a doubled quote in a literal is not translated: {query[index : end + 2][:40]!r}")
             literal = query[index : end + 1]
             if "\\" in literal.replace(TYPING_PAIR, ""):
