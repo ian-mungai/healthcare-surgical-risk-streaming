@@ -9,7 +9,7 @@
 #    the quick test modules that cover them) and the dependency scan when a lock file changes (scripts/quality/push_gate.py). About 40 seconds for one commit
 #    (measured 39 s on Nov 23 2026, 37 s of it the quick tests of 12 changed files); 2 minutes at most.
 #    One hook is shared by every worktree: it records the gate version that `make setup` installed it for (GATE_VERSION in scripts/quality/push_gate.py) and refuses a
-#    push from a worktree whose gate is missing or older, naming the fix: `make setup` or a rebase.
+#    push from a worktree whose gate is missing or older, naming the fix: `make setup` or a rebase. A gate file that sed cannot read stops the push as a sed failure.
 # 3. Hosted CI (.github/workflows/ci.yml): every check in full on each push of a work branch, each pull request, the squash-merge commit on main, every Monday and
 #    on demand.
 # Terraform providers are pinned by hash in infra/.terraform.lock.hcl and are not vulnerability-scanned: Trivy 0.76.2 detects no package in a Terraform lock file.
