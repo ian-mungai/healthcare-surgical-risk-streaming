@@ -489,21 +489,21 @@ class CatalogErrorTest(unittest.TestCase):
         self.catalog = NessieCatalog(Client(self.server))
 
     def test_each_failing_call_of_the_load_s_path_is_a_catalog_error_with_the_chain_suppressed_and_no_word_of_the_answer(self) -> None:
-        operations: dict[str, tuple[str, Callable[[], object], str]] = {
-            "head": ("/trees/load_run1", lambda: self.catalog.head("load_run1"), "head"),
-            "reference": ("/trees/load_run1", lambda: self.catalog.reference("load_run1"), "read_reference"),
-            "create_branch": ("/trees", lambda: self.catalog.create_branch("load_run2", MAIN), "create_branch"),
-            "delete_branch": (f"/trees/load_run1@{'3' * 64}", lambda: self.catalog.delete_branch("load_run1", "3" * 64), "delete_branch"),
-            "history": ("/trees/main/history", lambda: self.catalog.has_recorded_manifest("a" * 64), "history"),
-            "history of a branch": ("/trees/load_run1/history", lambda: self.catalog.descends_from("load_run1", "9" * 64), "history"),
-            "entries": ("/trees/main/entries", lambda: self.catalog.snapshot_ids("main"), "table_keys"),
-            "contents": ("/trees/main/contents/raw_records.clinical_data", lambda: self.catalog.snapshot_ids("main"), "snapshot_ids"),
+        operations: dict[str, tuple[str, Callable[[], object], tuple[str, ...]]] = {
+            "head": ("/trees/load_run1", lambda: self.catalog.head("load_run1"), ("head", "read_reference")),
+            "reference": ("/trees/load_run1", lambda: self.catalog.reference("load_run1"), ("reference", "read_reference")),
+            "create_branch": ("/trees", lambda: self.catalog.create_branch("load_run2", MAIN), ("create_branch",)),
+            "delete_branch": (f"/trees/load_run1@{'3' * 64}", lambda: self.catalog.delete_branch("load_run1", "3" * 64), ("delete_branch",)),
+            "history": ("/trees/main/history", lambda: self.catalog.has_recorded_manifest("a" * 64), ("has_recorded_manifest", "history")),
+            "history of a branch": ("/trees/load_run1/history", lambda: self.catalog.descends_from("load_run1", "9" * 64), ("descends_from", "history")),
+            "entries": ("/trees/main/entries", lambda: self.catalog.snapshot_ids("main"), ("snapshot_ids", "table_keys")),
+            "contents": ("/trees/main/contents/raw_records.clinical_data", lambda: self.catalog.snapshot_ids("main"), ("snapshot_ids",)),
         }
-        for name, (path, call, raising_function) in operations.items():
+        for name, (path, call, raising_functions) in operations.items():
             for status in (500, 403) if name == "delete_branch" else (500, 400, 403):
                 with self.subTest(f"{name} {status}"):
                     self.server.fail = (path, status)
-                    error, text = raised_text(call, CatalogError, raising_function)
+                    error, text = raised_text(call, CatalogError, *raising_functions)
                     self.assertTrue(str(error).startswith("catalog_error: "), str(error))
                     self.assertNotIn(self.MARKER, str(error))
                     self.assertIsNone(error.__cause__)
