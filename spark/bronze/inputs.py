@@ -41,6 +41,11 @@ class StoreSpec:
     region: str = ""
     read_log: str = ""
 
+    @property
+    def log_to_create(self) -> Path | None:
+        """The read log that the driver makes before any read: only a folder store that carries a log path has one."""
+        return Path(self.read_log) if self.kind == "folder" and self.read_log else None
+
 
 @dataclass(frozen=True, slots=True)
 class CaseFile:

@@ -52,6 +52,9 @@ class RunRecord:
 
 
 SCHEDULE_NAME = "schedule.json"
+STATE_NAME = "state.json"
+HEALTH_NAME = "health.json"
+STATE_FOLDER_NAMES = frozenset(name.casefold() for name in (SCHEDULE_NAME, STATE_NAME, HEALTH_NAME))
 REQUIRED: dict[str, type | tuple[type, ...]] = {
     "run_id": str,
     "rooms": int,

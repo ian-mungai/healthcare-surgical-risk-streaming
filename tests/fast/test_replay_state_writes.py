@@ -312,7 +312,7 @@ class QueuedStateFolderTests(ReplayHarness):
         self.assertEqual(("finished", 0, ""), (result["outcome"], result["exit_code"], result["error"]))
 
     def test_a_read_log_that_exists_in_any_form_is_refused_by_the_run_that_opens_its_store_and_every_byte_is_unchanged(self) -> None:
-        kinds = ("the replay's state file", "the frozen schedule", "a file with text", "an empty file", "a hard link", "a link", "a folder", "a named pipe")
+        kinds = ("a file with text", "an empty file", "a hard link", "a link", "a folder", "a named pipe")
         for kind in kinds:
             for folder_label in ("a per-run folder", "the state folder itself"):
                 with self.subTest(read_log=kind, folder=folder_label):
@@ -321,8 +321,8 @@ class QueuedStateFolderTests(ReplayHarness):
                     named.mkdir(exist_ok=True)
                     other = named / "other.txt"
                     other.write_text(ORIGINAL)
-                    log = named / {"the replay's state file": "state.json", "the frozen schedule": "schedule.json"}.get(kind, "reads.log")
-                    if kind in ("the replay's state file", "the frozen schedule", "a file with text"):
+                    log = named / "reads.log"
+                    if kind == "a file with text":
                         log.write_text(ORIGINAL)
                     elif kind == "an empty file":
                         log.write_bytes(b"")
@@ -342,6 +342,43 @@ class QueuedStateFolderTests(ReplayHarness):
                     self.assertEqual(held, log.read_bytes() if stat.S_ISREG(mode) else None)
                     self.assertEqual(ORIGINAL, other.read_text())
                     self.assertEqual([], [entry.name for entry in named.iterdir() if entry.name not in {"other.txt", log.name, "inbox", "health.json"}])
+
+    def test_a_read_log_named_like_a_file_the_replay_writes_is_refused_before_the_run_starts_whether_the_file_exists_or_not(self) -> None:
+        names = ("state.json", "schedule.json", "health.json", "STATE.JSON", "Schedule.Json", "HEALTH.json")
+        for name in names:
+            for folder_label in ("a per-run folder", "the state folder itself"):
+                for exists in (False, True):
+                    with self.subTest(read_log=name, folder=folder_label, exists=exists):
+                        self.setUp()
+                        named = self.state / "replay_0a1b2c3d" if folder_label == "a per-run folder" else self.state
+                        named.mkdir(exist_ok=True)
+                        log = named / name
+                        if exists:
+                            log.write_text(ORIGINAL)
+                        before = sorted((entry.name, entry.read_bytes()) for entry in named.iterdir() if entry.is_file())
+                        result = self.queue(named, read_log=log, opens_store=True)
+                        self.assertEqual(("failed", 2, RUN_REFUSED), (result["outcome"], result["exit_code"], result["error"]))
+                        self.assertEqual([], self.saved)
+                        after = sorted((entry.name, entry.read_bytes()) for entry in named.iterdir() if entry.is_file())
+                        own = named == self.state
+                        self.assertEqual(
+                            [item for item in before if not (own and item[0].casefold() == "health.json")],
+                            [item for item in after if not (own and item[0].casefold() == "health.json")],
+                        )
+
+    def test_a_read_log_that_is_a_link_to_a_vacant_name_is_refused_and_the_name_stays_vacant(self) -> None:
+        for target in ("state.json", "schedule.json", "reads_target.log"):
+            for folder_label in ("a per-run folder", "the state folder itself"):
+                with self.subTest(target=target, folder=folder_label):
+                    self.setUp()
+                    named = self.state / "replay_0a1b2c3d" if folder_label == "a per-run folder" else self.state
+                    named.mkdir(exist_ok=True)
+                    log = named / "reads.log"
+                    log.symlink_to(named / target)
+                    result = self.queue(named, read_log=log, opens_store=True)
+                    self.assertEqual(("failed", 2, CANNOT_WRITE), (result["outcome"], result["exit_code"], result["error"]))
+                    self.assertTrue(log.is_symlink())
+                    self.assertFalse((named / target).exists())
 
     def test_a_queued_run_whose_state_folder_is_the_inbox_and_whose_read_log_is_its_own_queued_record_leaves_every_byte_unchanged(self) -> None:
         self.inbox.mkdir()

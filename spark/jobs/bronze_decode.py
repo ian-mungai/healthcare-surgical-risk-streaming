@@ -123,8 +123,8 @@ def decode(arguments: argparse.Namespace) -> dict[str, Any]:
         if arguments.landed_folder
         else StoreSpec("s3", reference.bucket, "", required_environment("AWS_REGION"))
     )
-    if arguments.read_log:
-        create_read_log(Path(arguments.read_log))
+    if spec.log_to_create is not None:
+        create_read_log(spec.log_to_create)
     store = open_store(spec)
     wanted = [int(text) for text in arguments.cases.split(",") if text] or None
     inputs = verify_inputs(store, reference, wanted)

@@ -11,12 +11,12 @@ from pathlib import Path
 
 from replay.events.run import RunState
 from replay.events.schedule import FrozenSchedule
+from replay.service.run_record import STATE_NAME
 from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.notice import Code
 from scripts.ingestion.output_file import replace_owned_file, write_new_file
 
 FILE_MODE = 0o640
-STATE_NAME = "state.json"
 
 
 class StateFile:

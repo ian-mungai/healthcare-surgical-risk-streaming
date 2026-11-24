@@ -48,7 +48,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
-from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
+from replay.service.run_record import HEALTH_NAME, RunRecord, RunRecordError, parse_run_record
 from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.folder import list_files
 from scripts.ingestion.manifest import ManifestError, ManifestRef
@@ -71,7 +71,6 @@ MAX_ATTEMPTS = 3
 LOCK_SECONDS = 30.0
 LOCK_POLL_SECONDS = 0.01
 FILE_MODE = 0o640
-HEALTH_NAME = "health.json"
 
 
 class SubmitError(ValueError):

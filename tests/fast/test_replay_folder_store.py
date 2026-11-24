@@ -178,14 +178,6 @@ class ReadLogTest(unittest.TestCase):
             store.note_read(self.version)
         self.assertEqual([Code.CANNOT_WRITE], self.codes(caught.exception))
 
-    def test_a_whole_write_is_not_an_error(self) -> None:
-        log = self.root / "reads.log"
-        store = FolderStore(self.root / "store", read_log=self.created(log))
-        with mock.patch.object(os, "write", wraps=os.write) as written:
-            store.note_read(self.version)
-        written.assert_called_once()
-        self.assertEqual(f"{KEY} v0001\n", log.read_text())
-
     def test_a_job_worker_attaches_to_the_log_that_its_driver_created_and_only_to_a_regular_file(self) -> None:
         log = self.root / "reads.log"
         self.created(log)

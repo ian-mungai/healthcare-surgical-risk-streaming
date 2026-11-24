@@ -44,8 +44,8 @@ from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_in
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
 from replay.service.output_guard import refuse_inside_store
 from replay.service.registry import RegistryClient, RegistryError
-from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import HEALTH_NAME, Outcome, healthy, queued_record, serve, submit_command
+from replay.service.run_record import HEALTH_NAME, STATE_FOLDER_NAMES, RunRecord, RunRecordError, parse_run_record
+from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
 from replay.service.state_file import ScheduleFile, StateFile
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
@@ -215,8 +215,10 @@ def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
 
 def inside_state(record: RunRecord, state: Path) -> RunRecord:
     """The record with its state folder resolved, which must be ``state`` or a folder directly inside it, and its folder store's read log, when it
-    has a non-empty one, resolved too. The log must be directly inside that folder, so a run that the service takes keeps its saved position and appends its
-    reads nowhere else. What is checked is what the run is given, so a link or a ``..`` part cannot lead the run out of it. Whether the path may be used is
+    has a non-empty one, set directly inside that folder. Only the log's folder is resolved, never its last part, so a link in that place is left for the
+    exclusive create to refuse and cannot lead the log to another name. A name that the replay writes in its state folder (``STATE_FOLDER_NAMES``, compared
+    without letter case) is refused, so a queued run keeps its saved position, its schedule and the health file. What is checked is what the run is given,
+    so a link or a ``..`` part cannot lead the run out of the folder. Whether the path may be used is
     decided when the run opens its folder store: the read log is always a new file, so a path that exists in any form is refused there. An empty read log
     means no log, as in the standalone run."""
     folder = Path(record.state_dir).resolve()
@@ -226,9 +228,10 @@ def inside_state(record: RunRecord, state: Path) -> RunRecord:
     store = record.object_store
     if not store.read_log:
         return replace(record, state_dir=str(folder))
-    read_log = Path(store.read_log).resolve()
-    if read_log.parent != folder:
+    named = Path(store.read_log)
+    if named.parent.resolve() != folder or named.name in {"", ".."} or named.name.casefold() in STATE_FOLDER_NAMES:
         raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
+    read_log = folder / named.name
     return replace(record, state_dir=str(folder), object_store=replace(store, read_log=str(read_log)))
 
 
