@@ -95,5 +95,5 @@ def run_verify(ops: Operations, head: str) -> Outcome:
     if ops.head() != head:
         problems.append(BRANCH_MOVED)
     if problems:
-        raise ReconcileError(*problems)
+        raise ReconcileError(*problems, held_out_clean={name: not flagged for name, flagged in flags.items()})
     return Outcome("verified", head, keys, joins, snapshots)

@@ -9,6 +9,8 @@ Failure modes covered here:
 - The watchdog that stops a job that runs too long names another job or holds a duration.
 - The job is told to read a table at the head of the branch instead of the hash that it resolved, so a branch that moves changes what it reads.
 - A module that the job imports, directly or through another, is left out of the image or of the build context.
+- The result reaches the caller through the free text of the job's two streams, so that a line of them can carry a value or be read as a result. It is one
+  file at a path on the command line, written whole and then renamed into place, with a closed schema, and it never overwrites a file.
 """
 
 from __future__ import annotations
@@ -16,9 +18,14 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import sys
+import tempfile
 import unittest
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scripts.stack.nessie import NessieError
 from spark.jobs.silver_reconcile import ReconcileLake
@@ -35,12 +42,15 @@ from tests.fast.test_spark_bronze_image import DOCKERFILE, IGNORE_FILE, image_pr
 MARKER = "MARKER_5521"
 
 
-def invoke(argv: list[str], execute: Any = None) -> tuple[int, str, str]:
+def invoke(argv: list[str], execute: Any = None, folder: str | None = None) -> tuple[int, str, str]:
+    """Run the command line. A ``verify`` call with no ``--result`` gets one in ``folder`` (a fresh folder of the caller), so that it is judged for its own
+    arguments."""
     out, err = io.StringIO(), io.StringIO()
     code = 0
+    call = [*argv, "--result", f"{folder}/result.json"] if folder is not None and "verify" in argv and "--result" not in argv else argv
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
-            code = run(argv, execute or (lambda arguments: {"mode": arguments.mode, "branch": arguments.branch}))
+            code = run(call, execute or (lambda arguments: {"mode": arguments.mode, "branch": arguments.branch}))
         except SystemExit as stop:
             code = int(stop.code or 0)
     return code, out.getvalue(), err.getvalue()
@@ -54,10 +64,16 @@ def raising(error: Exception) -> Any:
 
 
 class CommandLine(unittest.TestCase):
+    def setUp(self) -> None:
+        self.folder = self.enterContext(tempfile.TemporaryDirectory(prefix="reconcile_cli_"))
+
+    def call(self, argv: list[str], execute: Any = None) -> tuple[int, str, str]:
+        return invoke(argv, execute, self.folder)
+
     def test_a_good_call_prints_one_result_line_and_nothing_else(self) -> None:
-        code, out, err = invoke(["verify", "--branch", "b"])
+        code, out, err = self.call(["verify", "--branch", "b"])
         self.assertEqual((0, ""), (code, err))
-        self.assertEqual({"mode": "verify", "branch": "b"}, json.loads(out.removeprefix("RESULT ")))
+        self.assertEqual({"mode": "verify", "branch": "b", "diagnostics": []}, json.loads(out.removeprefix("RESULT ")))
 
     def test_a_bad_call_prints_the_code_usage_and_does_not_echo_the_argument(self) -> None:
         for argv in (
@@ -71,11 +87,14 @@ class CommandLine(unittest.TestCase):
             ["verify", "--branch", "b", "--pinned-release"],
         ):
             with self.subTest(argv=argv):
-                code, out, err = invoke(argv)
+                code, out, err = self.call(argv)
                 self.assertEqual((2, "", "silver_reconcile: usage\n"), (code, out, err))
+        self.assertEqual([], os.listdir(self.folder))
 
     def test_a_failed_check_prints_each_problem_as_a_code_and_a_count_and_exits_1(self) -> None:
-        code, out, err = invoke(["verify", "--branch", "b"], raising(ReconcileError("cases_key_unaccounted: 3 keys", "lab_results_held_out: a held-out key")))
+        code, out, err = self.call(
+            ["verify", "--branch", "b"], raising(ReconcileError("cases_key_unaccounted: 3 keys", "lab_results_held_out: a held-out key"))
+        )
         self.assertEqual((1, ""), (code, out))
         self.assertEqual("silver_reconcile: cases_key_unaccounted: 3 keys\nsilver_reconcile: lab_results_held_out: a held-out key\n", err)
 
@@ -84,14 +103,184 @@ class CommandLine(unittest.TestCase):
         other = NessieError(f"{MARKER} refused", status=409, error_code="REFERENCE_CONFLICT")
         for error, expected in ((missing, "branch_missing"), (other, "catalog_error"), (NessieError(MARKER, status=404, error_code="OTHER"), "catalog_error")):
             with self.subTest(expected=expected):
-                code, out, err = invoke(["verify", "--branch", "b"], raising(error))
+                if os.path.lexists(f"{self.folder}/result.json"):
+                    os.remove(f"{self.folder}/result.json")
+                code, out, err = self.call(["verify", "--branch", "b"], raising(error))
                 self.assertEqual((1, "", f"silver_reconcile: {expected}\n"), (code, out, err))
 
     def test_a_setting_that_cannot_be_used_and_any_other_error_are_codes(self) -> None:
-        code, out, err = invoke(["verify", "--branch", "b"], raising(SettingsError(MARKER)))
+        code, out, err = self.call(["verify", "--branch", "b"], raising(SettingsError(MARKER)))
         self.assertEqual((2, "", "silver_reconcile: settings\n"), (code, out, err))
-        code, out, err = invoke(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
+        os.remove(f"{self.folder}/result.json")
+        code, out, err = self.call(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
         self.assertEqual((70, "", "silver_reconcile: internal_error\n"), (code, out, err))
+
+
+def read_file(folder: str) -> Any:
+    return json.loads(Path(f"{folder}/result.json").read_text())
+
+
+class ResultFile(unittest.TestCase):
+    """The result is one file at ``--result``: the closed schema, written whole and renamed into place, for every ending that the job maps to a code."""
+
+    def setUp(self) -> None:
+        self.folder = self.enterContext(tempfile.TemporaryDirectory(prefix="reconcile_result_"))
+        self.path = f"{self.folder}/result.json"
+
+    def call(self, execute: Any = None, argv: list[str] | None = None) -> tuple[int, str, str]:
+        return invoke(argv or ["verify", "--branch", "b", "--result", self.path], execute)
+
+    def test_a_clean_run_writes_exactly_its_result_and_an_empty_list_of_diagnostics(self) -> None:
+        facts = {"outcome": "verified", "branch_hash": "a" * 64, "reconciled": {}}
+        code, out, _ = self.call(lambda arguments: {"mode": arguments.mode, "branch": arguments.branch, **facts})
+        self.assertEqual(0, code)
+        self.assertEqual({"mode": "verify", "branch": "b", **facts, "diagnostics": []}, read_file(self.folder))
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+        self.assertTrue(out.startswith("RESULT "))
+
+    def test_the_file_is_the_same_whatever_the_streams_hold(self) -> None:
+        def noisy(arguments: Namespace) -> dict[str, Any]:
+            sys.stdout.write("WARN a line that no reader may rely on\n")
+            sys.stderr.write(f"WARNING: Using incubator modules: jdk.incubator.vector {MARKER}\n")
+            return {"mode": arguments.mode, "branch": arguments.branch}
+
+        code, _, _ = self.call(noisy)
+        self.assertEqual(0, code)
+        self.assertEqual({"mode": "verify", "branch": "b", "diagnostics": []}, read_file(self.folder))
+
+    def test_a_failed_check_writes_each_problem_as_a_code_and_a_count_or_no_count_and_the_flag_of_each_table(self) -> None:
+        flags = {"numeric_observations": True, "waveform_seconds": True, "cases": True, "lab_results": False}
+        error = ReconcileError("cases_key_unaccounted: 3 keys", "case_split_join_empty: 0 rows", "lab_results_held_out: a held-out key", held_out_clean=flags)
+        code, out, _ = self.call(raising(error))
+        self.assertEqual((1, ""), (code, out))
+        self.assertEqual(
+            {
+                "mode": "verify",
+                "branch": "b",
+                "job": JOB,
+                "outcome": "failed",
+                "diagnostics": [
+                    {"code": "cases_key_unaccounted", "count": 3},
+                    {"code": "case_split_join_empty", "count": 0},
+                    {"code": "lab_results_held_out", "count": None},
+                ],
+                "held_out_clean": flags,
+            },
+            read_file(self.folder),
+        )
+
+    def test_a_refusal_and_a_failure_before_the_flags_hold_no_count_and_no_flag(self) -> None:
+        code, _, _ = self.call(raising(ReconcileError(SPLIT_REFUSAL, OWNER_REFUSAL)))
+        self.assertEqual(1, code)
+        document = read_file(self.folder)
+        self.assertEqual(
+            [{"code": "split_rule_broken", "count": None}, {"code": "ambiguous_case_owner", "count": None}],
+            document["diagnostics"],
+        )
+        self.assertIsNone(document["held_out_clean"])
+
+    def test_every_other_ending_is_one_code_in_the_file_and_the_text_of_the_error_is_not(self) -> None:
+        missing = NessieError(f"{MARKER} not found", status=404, error_code="REFERENCE_NOT_FOUND")
+        other = NessieError(f"{MARKER} refused", status=409, error_code="REFERENCE_CONFLICT")
+        endings = (
+            (missing, 1, "branch_missing"),
+            (other, 1, "catalog_error"),
+            (SettingsError(MARKER), 2, "settings"),
+            (RuntimeError(MARKER), 70, "internal_error"),
+        )
+        for error, status, expected in endings:
+            with self.subTest(expected=expected):
+                code, _, _ = self.call(raising(error))
+                self.assertEqual(status, code)
+                document = read_file(self.folder)
+                self.assertEqual([{"code": expected, "count": None}], document["diagnostics"])
+                self.assertEqual({"mode", "branch", "job", "outcome", "diagnostics", "held_out_clean"}, set(document))
+                self.assertEqual(("failed", None), (document["outcome"], document["held_out_clean"]))
+                self.assertNotIn(MARKER, Path(self.path).read_text())
+                os.remove(self.path)
+
+    def test_a_file_that_is_there_is_never_replaced_and_the_job_does_not_run(self) -> None:
+        Path(self.path).write_text("old")
+        ran: list[str] = []
+
+        def execute(arguments: Namespace) -> dict[str, Any]:
+            ran.append("run")
+            return {}
+
+        code, out, err = self.call(execute)
+        self.assertEqual((2, "", "silver_reconcile: usage\n"), (code, out, err))
+        self.assertEqual(([], "old"), (ran, Path(self.path).read_text()))
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+
+    def test_a_path_that_cannot_hold_a_result_is_usage_and_is_not_echoed(self) -> None:
+        Path(f"{self.folder}/{MARKER}_directory").mkdir()
+        Path(f"{self.folder}/{MARKER}_file").write_text("x")
+        Path(f"{self.path}.part").write_text("x")
+        paths = (
+            "",
+            "result.json",
+            f"./{MARKER}.json",
+            f"{self.folder}/{MARKER}_missing/result.json",
+            f"{self.folder}/{MARKER}_file/result.json",
+            f"{self.folder}/{MARKER}_directory",
+            f"{self.folder}/{MARKER}_dangling",
+            self.path,
+            f"{self.folder}/result\x00.json",
+        )
+        os.symlink(f"{self.folder}/{MARKER}_nowhere", f"{self.folder}/{MARKER}_dangling")
+        for path in paths:
+            with self.subTest(path=path):
+                code, out, err = invoke(["verify", "--branch", "b", "--result", path], lambda arguments: {})
+                self.assertEqual((2, "", "silver_reconcile: usage\n"), (code, out, err))
+        self.assertEqual({"result.json.part", f"{MARKER}_directory", f"{MARKER}_file", f"{MARKER}_dangling"}, set(os.listdir(self.folder)))
+
+    def test_the_result_option_is_given_once_and_is_required(self) -> None:
+        for argv in (
+            ["verify", "--branch", "b"],
+            ["verify", "--branch", "b", "--result"],
+            ["verify", "--branch", "b", "--result", self.path, "--result", self.path + "2"],
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = invoke(argv, lambda arguments: {})
+                self.assertEqual((2, "", "silver_reconcile: usage\n"), (code, out, err))
+        self.assertEqual([], os.listdir(self.folder))
+
+    def test_the_file_is_not_there_while_the_job_runs_and_appears_whole_in_one_rename(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def during(arguments: Namespace) -> dict[str, Any]:
+            seen["during"] = os.listdir(self.folder)
+            return {"mode": arguments.mode, "branch": arguments.branch}
+
+        real = os.rename
+
+        def rename(source: str, target: str) -> None:
+            seen["target_before"] = os.path.lexists(target)
+            seen["whole"] = json.loads(Path(source).read_text())
+            seen["names"] = (os.path.basename(source), os.path.basename(target))
+            real(source, target)
+
+        with mock.patch("os.rename", rename):
+            code, _, _ = self.call(during)
+        self.assertEqual(0, code)
+        self.assertEqual([], seen["during"])
+        self.assertIs(False, seen["target_before"])
+        self.assertEqual({"mode": "verify", "branch": "b", "diagnostics": []}, seen["whole"])
+        self.assertEqual(("result.json.part", "result.json"), seen["names"])
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+
+    def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_part_left_and_no_result_line(self) -> None:
+        def refuse(source: str, target: str) -> None:
+            raise OSError(f"{MARKER} disk full")
+
+        with mock.patch("os.rename", refuse):
+            code, out, err = self.call()
+        self.assertEqual((70, "", "silver_reconcile: internal_error\n"), (code, out, err))
+        self.assertEqual([], os.listdir(self.folder))
+
+    def test_the_file_is_readable_by_another_user_and_is_not_executable(self) -> None:
+        self.call()
+        self.assertEqual(0o644, os.stat(self.path).st_mode & 0o777)
 
 
 class Watchdog(unittest.TestCase):

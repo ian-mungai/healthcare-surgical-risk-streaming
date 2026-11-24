@@ -1,6 +1,6 @@
 """The reconciliation of the Silver tables with Bronze, by stable key, on the hash of a Nessie branch.
 
-``python -m spark.jobs.silver_reconcile verify --branch <name>``
+``python -m spark.jobs.silver_reconcile verify --branch <name> --result <path>``
 
 The job resolves the branch to one hash, opens its Spark session pinned to that hash and reads Bronze and Silver there, so a branch that moves changes
 nothing that it reads. It writes nothing and creates no table. For each of ``silver.numeric_observations``, ``silver.waveform_seconds``,
@@ -13,6 +13,9 @@ environment, as the patient split's do: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, 
 
 Before any count it checks the patient split table by the split job's own rules and the owner of each Bronze case by the Silver cases job's own query, and a
 failure of either refuses the whole run with one fixed code (``split_rule_broken``, ``ambiguous_case_owner``) and no count.
+
+The result is one JSON file at ``<path>`` (it must not exist, and it is written whole and renamed into place), with outcome ``verified`` or ``failed``; the
+job's standard output and standard error are for the operator and no caller reads them (``spark/reconcile/cli.py``).
 
 The test set is sealed. The counts and dispositions are those of development patients; for every other patient the result holds one flag for each table. The
 result holds hashes, snapshot IDs, counts of keys and the checks that ran, and no case, track, time or value.

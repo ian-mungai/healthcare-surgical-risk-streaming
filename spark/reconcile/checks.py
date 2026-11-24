@@ -38,11 +38,13 @@ OWNER_REFUSAL = OWNERSHIP_PROBLEM
 
 
 class ReconcileError(ValueError):
-    """The reconciliation cannot run or a check failed. ``problems`` holds one message for each cause, each a code and a count."""
+    """The reconciliation cannot run or a check failed. ``problems`` holds one message for each cause, each a code and a count. ``held_out_clean`` holds one
+    flag for each table (``True`` when no held-out key of it is wrong) once every flag was judged, and ``None`` when the run failed before that."""
 
-    def __init__(self, *problems: str) -> None:
+    def __init__(self, *problems: str, held_out_clean: Mapping[str, bool] | None = None) -> None:
         super().__init__("; ".join(problems))
         self.problems = list(problems)
+        self.held_out_clean = None if held_out_clean is None else dict(held_out_clean)
 
 
 @dataclass(frozen=True, slots=True)

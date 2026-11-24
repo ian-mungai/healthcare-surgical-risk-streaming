@@ -177,6 +177,31 @@ class Verify(unittest.TestCase):
             run_verify(fake.operations(), HEAD)
         self.assertEqual([BRANCH_MOVED.split(":")[0]], codes(caught.exception))
 
+    def test_a_failure_after_every_flag_was_judged_carries_one_clean_flag_for_each_table(self) -> None:
+        fake = Fake()
+        fake.flags["cases"] = True
+        fake.keys["lab_results"] = dataclasses.replace(clean("lab_results"), unaccounted=1)
+        with self.assertRaises(ReconcileError) as caught:
+            run_verify(fake.operations(), HEAD)
+        self.assertEqual({name: name != "cases" for name in NAMES}, caught.exception.held_out_clean)
+        self.assertEqual(NAMES, list(caught.exception.held_out_clean or {}))
+        moved = Fake()
+        moved.moved_after = 0
+        with self.assertRaises(ReconcileError) as caught:
+            run_verify(moved.operations(), HEAD)
+        self.assertEqual(dict.fromkeys(NAMES, True), caught.exception.held_out_clean)
+
+    def test_a_failure_before_the_flags_are_judged_carries_no_flag(self) -> None:
+        for field, value in (("schema", ["source_schema: 1 table"]), ("refused", [SPLIT_REFUSAL]), ("refused", [OWNER_REFUSAL])):
+            fake = Fake()
+            setattr(fake, field, value)
+            with self.subTest(field=field, value=value), self.assertRaises(ReconcileError) as caught:
+                run_verify(fake.operations(), HEAD)
+            self.assertIsNone(caught.exception.held_out_clean)
+
+    def test_an_error_made_by_hand_has_no_flag(self) -> None:
+        self.assertIsNone(ReconcileError("cases_key_unaccounted: 1 key").held_out_clean)
+
     def test_a_defect_and_a_moved_branch_are_both_named(self) -> None:
         fake = Fake()
         fake.moved_after = 0
