@@ -1,35 +1,20 @@
 """The replay's files on its named volume: the frozen schedule and the saved state.
 
-A file is written to a temporary name of its own in the same folder (so two writers never share one), flushed to disk, renamed over the target and the
-folder is flushed, so a stop at any instant leaves
-either the whole old file or the whole new file. The frozen schedule is created once and never overwritten.
+The saved state is replaced through ``replace_owned_file`` in the folder of the run, so a stop at any instant leaves either the whole old file or the whole new
+file, and a link or a folder in its place is refused. The frozen schedule is created through ``write_new_file`` once and never overwritten.
 """
 
 from __future__ import annotations
 
-import os
-import secrets
 from pathlib import Path
 
 from replay.events.run import RunState
 from replay.events.schedule import FrozenSchedule
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.notice import Code
+from scripts.ingestion.output_file import replace_owned_file, write_new_file
 
-
-def atomic_write(path: Path, data: str | bytes) -> None:
-    """Write ``data`` whole or not at all. Text is written as UTF-8 and bytes exactly as given."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.{secrets.token_hex(4)}.writing")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(data.encode() if isinstance(data, str) else data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    folder = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(folder)
-    finally:
-        os.close(folder)
+FILE_MODE = 0o640
 
 
 class StateFile:
@@ -42,7 +27,8 @@ class StateFile:
         return RunState.from_json(self.path.read_text()) if self.path.is_file() else None
 
     def save(self, state: RunState) -> None:
-        atomic_write(self.path, state.to_json())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        replace_owned_file(self.path, state.to_json(), state_root=self.path.parent, mode=FILE_MODE)
 
 
 class ScheduleFile:
@@ -56,6 +42,10 @@ class ScheduleFile:
 
     def freeze(self, frozen: FrozenSchedule) -> None:
         """Write the schedule. A schedule that already exists is never replaced: the caller compares it with the new one first."""
-        if self.path.exists():
-            raise FileExistsError(f"{self.path.name} is already frozen")
-        atomic_write(self.path, frozen.to_json())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            write_new_file(self.path, frozen.to_json(), mode=FILE_MODE)
+        except ClosedInputError as error:
+            if any(notice.code is Code.OUTPUT_EXISTS for notice in error.notices):
+                raise FileExistsError("the schedule is already frozen") from None
+            raise

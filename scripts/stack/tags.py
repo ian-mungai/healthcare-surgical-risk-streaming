@@ -34,7 +34,7 @@ from typing import Any
 from urllib.parse import quote
 
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import describe_error
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.stack.nessie import BODY_LIMIT_BYTES, HASH, NessieClient, NessieConflict, NessieError, Reference
 
 RUN_TAG_PREFIX = "run-"
@@ -57,8 +57,9 @@ class NotOnTrunk(NessieError):
     """The hash is not in the history of the trunk, or the trunk is not a branch. No tag is made or accepted."""
 
 
-class RecordNotPublished(NessieError):
-    """The tag was made and the run folder's record could not be published. The tag is left in place."""
+class RecordNotPublished(NessieError, FixedTextError):
+    """The tag was made and the run folder's record could not be published. The tag is left in place. Its text is constant advice (``not_published_advice``)
+    that holds no tag, hash, path or exception text."""
 
 
 class TagConflict(NessieError):
@@ -352,16 +353,21 @@ def tag_and_record(client: NessieClient, run_id: str, merged_hash: str, folder: 
     except Exception as error:
         if stage == "before":
             raise
-        if made:
-            left = f"the tag {prepared.tag} was made at {merged_hash} and is left in place"
-        elif stage == "posting":
-            left = f"the tag {prepared.tag} may have been made at {merged_hash} and is left in place if it was"
-        else:
-            left = f"the tag {prepared.tag} was already in place at {merged_hash}"
-        raise RecordNotPublished(f"the record could not be published ({error}); {left}") from error
+        raise RecordNotPublished(not_published_advice(stage, made=made)) from error
     finally:
         with contextlib.suppress(OSError):
             Path(staging).unlink(missing_ok=True)
+
+
+def not_published_advice(stage: str, *, made: bool) -> str:
+    """The constant advice of ``RecordNotPublished``: what the operator must know about the tag when the record could not be published."""
+    if made:
+        left = "the run's tag was made and is left in place"
+    elif stage == "posting":
+        left = "the run's tag may have been made and is left in place if it was"
+    else:
+        left = "the run's tag was already in place"
+    return f"RecordNotPublished: the record could not be published; {left}"
 
 
 def version_record(result: TagResult) -> dict[str, Any]:

@@ -236,8 +236,8 @@ class KeyAdviceError(ConfigurationError, FixedTextError):
 
 def refuse_while_history_records(admin: Aws) -> None:
     """Stop before the key call when the AWS command line would record its answer, secret key included, in its history database."""
-    advice = f"turn it off with: aws configure set cli_history disabled --profile {admin.profile}"
-    unreadable = KeyAdviceError(f"the cli_history setting of the profile {admin.profile} could not be read, so key stops before it creates a key; {advice}")
+    advice = "turn it off with: aws configure set cli_history disabled --profile <ADMIN_PROFILE>"
+    unreadable = KeyAdviceError(f"the cli_history setting of the administrator profile could not be read, so key stops before it creates a key; {advice}")
     try:
         result = run_command("aws", ["configure", "get", "cli_history", "--profile", admin.profile], timeout=CONFIG_READ_SECONDS)
     except TimeoutExpired:
@@ -249,7 +249,7 @@ def refuse_while_history_records(admin: Aws) -> None:
         raise unreadable
     if value == "enabled":
         raise KeyAdviceError(
-            f"cli_history is enabled for the profile {admin.profile}: the AWS command line would record the new secret key; {advice}, then run key again"
+            f"cli_history is enabled for the administrator profile: the AWS command line would record the new secret key; {advice}, then run key again"
         )
 
 

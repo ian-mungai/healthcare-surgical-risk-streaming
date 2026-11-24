@@ -126,7 +126,6 @@ class Subject(StrEnum):
     RUN_RECORD = "the run record"
     OUTPUT = "an output file"
     ROUTES_FILE = "the routes file"
-    STAGING_PEAK = "the staging peak record"
     SAMPLE_PIN = "the Platform sample pin"
 
 
@@ -162,6 +161,8 @@ class Code(StrEnum):
     CANNOT_WRITE = "cannot write {subject}"
     OUTPUT_EXISTS = "an output path is already held, as a file, a link, a folder or a name that differs only in case; name a new file for the output"
     OUTPUT_FOLDER = "the folder of an output path does not exist, or the output could not be created there; this command makes no folder"
+    OUTPUT_IN_STORE = "an output path lies inside the object store folder of the run; name a path outside it"
+    OWNED_REFUSED = "a state file lies outside its state folder, or the entry in its place is a link, a folder or another kind of entry; nothing was written"
     CONFIGURATION_INVALID = "the configuration in .env is missing or holds a value that is not valid; .env.example lists every key"
     AWS_FAILED = "an AWS call failed; its full error text is kept in an owner-only file under runs/raw_errors"
     AWS_FAILED_NOT_KEPT = "an AWS call failed; its full error text could not be kept"

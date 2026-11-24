@@ -14,7 +14,13 @@ Every command reads the manifest and the list of object versions. None reads a p
 
 ``.venv/bin/python -m scripts.ingestion.copy_probe job --job job.json --log job.log``
 
-``.venv/bin/python -m scripts.ingestion.copy_probe sample --reference reference.json --output tests/fixtures/vitaldb/platform_sample.json``
+``mkdir -p runs/sample``, then:
+
+``.venv/bin/python -m scripts.ingestion.copy_probe sample --reference reference.json --output runs/sample/platform_sample_new.json``
+
+``sample`` never replaces a path, so it writes to a fresh path. A change of the tracked pin ``tests/fixtures/vitaldb/platform_sample.json`` is made by hand:
+review ``diff tests/fixtures/vitaldb/platform_sample.json runs/sample/platform_sample_new.json``, copy the new file over the tracked one yourself and commit
+it.
 
 ``selection`` prints the selection file for ``connection render --selection`` and for ``cli check`` and ``cli publish``. ``job`` reads the job's record as
 Airbyte's public API gives it for ``GET /jobs/{jobId}`` and the job's log as text. ``--bucket`` is the one of ``cli``. Every line a command writes is a

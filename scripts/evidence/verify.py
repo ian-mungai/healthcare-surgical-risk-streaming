@@ -22,6 +22,7 @@ from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding
 from scripts.infra.terraform_wrapper import WrapperError, load_run
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -77,7 +78,8 @@ def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -
     shutil.rmtree(readback, ignore_errors=True)
     partial.replace(readback)
     record = {"run_id": run.run_id, "commit": run.commit, "manifest_sha256": manifest_sha256(manifest), "files": len(manifest["files"])}
-    receipt.write_text(json.dumps(record | {"verified_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}, indent=2) + "\n")
+    text = json.dumps(record | {"verified_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}, indent=2) + "\n"
+    replace_owned_file(receipt, text, state_root=receipt.parent, mode=0o644)
     if not sign(receipt):
         receipt.unlink()
         receipt.with_name("receipt.json.sig").unlink(missing_ok=True)

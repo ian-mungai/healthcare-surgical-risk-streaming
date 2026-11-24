@@ -28,6 +28,7 @@ from typing import Any
 from scripts.aws_cli import Aws, AwsError
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -56,7 +57,7 @@ class RunBinding:
 
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2) + "\n")
+        replace_owned_file(path, json.dumps(asdict(self), indent=2) + "\n", state_root=path.parent, mode=0o644)
 
 
 def state_keys(environment: str) -> list[str]:

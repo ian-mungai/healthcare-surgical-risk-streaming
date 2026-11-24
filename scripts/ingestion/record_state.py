@@ -12,12 +12,12 @@ the recorded hash (the triple of kind, name and creation hash; the file holds th
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.ingestion.record_definitions import READ_PREFIX, check_run
 
 STATE_FORMAT = "load_state_1"
@@ -79,15 +79,10 @@ class RunState:
 
     def save(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=self.directory)
         try:
-            with os.fdopen(descriptor, "w") as handle:
-                handle.write(json.dumps(self.document(), indent=2, sort_keys=True) + "\n")
-            os.chmod(temporary, 0o644)
-            os.replace(temporary, self.path)
-        except BaseException:
-            Path(temporary).unlink(missing_ok=True)
-            raise
+            replace_owned_file(self.path, json.dumps(self.document(), indent=2, sort_keys=True) + "\n", state_root=self.directory, mode=0o644)
+        except ClosedInputError:
+            raise OSError("the state file could not be written") from None
 
     def versions(self, key: str) -> frozenset[str]:
         return frozenset(self.copies.get(key, set()))

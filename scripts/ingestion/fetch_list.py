@@ -1,17 +1,16 @@
 """Fetch the publisher's checksum list as verification metadata: pinned by its release path, size and SHA-256, and kept apart from the payloads.
 
-The list is read without credentials from the pinned key of the publisher's bucket into a temporary file beside the target. It takes the target's place only
-after its size and SHA-256 equal the tracked pin's, so an unverified byte is never at the target. A target that already holds the pinned list is left alone and
-nothing is read. The check reads the list from this file and verifies it again against the same pin. The file is a local verification record and never lands in
-the project's bucket among the payloads: the manifest of a passed check records the list's key and SHA-256.
+The list is read without credentials from the pinned key of the publisher's bucket into a private temporary folder. It is created at the target through
+``write_new_file`` only after its size and SHA-256 equal the tracked pin's, so an unverified byte is never at the target and no existing path is replaced. A
+target that already holds the pinned list is left alone and nothing is read; a target that holds anything else is refused before anything is read. The check
+reads the list from this file and verifies it again against the same pin. The file is a local verification record and never lands in the project's bucket
+among the payloads: the manifest of a passed check records the list's key and SHA-256.
 
 ``.venv/bin/python -m scripts.ingestion.fetch_list --output runs/ingestion/SHA256SUMS.txt``
 """
 
 from __future__ import annotations
 
-import contextlib
-import os
 import sys
 import tempfile
 from collections.abc import Callable
@@ -20,6 +19,7 @@ from pathlib import Path
 
 from scripts.ingestion.closed import ClosedInputError, QuietParser, parse_json
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.sample.candidates import RELEASE_FILE, release_problems
 from scripts.sample.publisher import PublisherError, download_key, file_sha256, read_pinned
 
@@ -50,20 +50,17 @@ def holds_pinned_list(target: Path, pin: ListPin) -> bool:
 
 
 def fetch_checksum_list(target: Path, pin: ListPin, download: Callable[[str, Path], None] = download_key) -> bool:
-    """Put the pinned list at ``target`` and return True, or return False when it is already there. Raise ``PublisherError`` and keep nothing otherwise."""
+    """Create the pinned list at ``target`` and return True, or return False when it is already there. Raise ``PublisherError`` or ``ClosedInputError`` and keep
+    nothing otherwise."""
     if holds_pinned_list(target, pin):
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=".SHA256SUMS_", dir=target.parent)
-    os.close(descriptor)
-    partial = Path(name)
-    try:
+    check_new_output(target)
+    with tempfile.TemporaryDirectory(prefix="checksum_list_") as scratch:
+        partial = Path(scratch) / "SHA256SUMS.txt"
         download(pin.key, partial)
         read_pinned(Subject.READING_LIST, partial, pin.size_bytes, pin.sha256)
-        partial.replace(target)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            partial.unlink()
+        write_new_file(target, partial.read_bytes())
     return True
 
 

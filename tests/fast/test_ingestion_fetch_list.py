@@ -1,7 +1,7 @@
 """The publisher's checksum list is fetched as verification metadata: pinned by its release path, size and SHA-256, and kept apart from the payloads.
 
 The tracked pin fixes the list's key, size and SHA-256, and a synthetic list stands in for the published one in these cases. A fetched file is verified before
-it takes its place, so no unverified byte is ever at the target, and a second fetch of a verified file reads nothing.
+it takes its place (it is created and never replaces a path), so no unverified byte is ever at the target, and a second fetch of a verified file reads nothing.
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ import io
 import json
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
 from scripts.ingestion import fetch_list
+from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.fetch_list import ListPin, fetch_checksum_list, tracked_list_pin
-from scripts.ingestion.notice import Code, Notice, Subject
+from scripts.ingestion.notice import Code, Notice, Subject, render
 from scripts.sample.publisher import PublisherError
 
 PIN = json.loads(Path("tests/fixtures/vitaldb/release.json").read_text())
@@ -83,18 +85,48 @@ class FetchTest(unittest.TestCase):
         self.assertEqual([], again.keys)
         self.assertEqual(LIST_BYTES, self.target.read_bytes())
 
-    def test_a_changed_file_at_the_target_is_replaced_by_the_verified_list(self) -> None:
+    def test_a_changed_file_at_the_target_is_refused_before_anything_is_read_and_stays(self) -> None:
         self.target.parent.mkdir(parents=True)
         self.target.write_bytes(b"edited")
-        self.assertTrue(fetch_checksum_list(self.target, SYNTHETIC, Download()))
-        self.assertEqual(LIST_BYTES, self.target.read_bytes())
+        download = Download()
+        with self.assertRaises(ClosedInputError) as raised:
+            fetch_checksum_list(self.target, SYNTHETIC, download)
+        self.assertEqual(render(Notice(Code.OUTPUT_EXISTS)), str(raised.exception))
+        self.assertEqual([], download.keys)
+        self.assertEqual(b"edited", self.target.read_bytes())
+        self.assertEqual([], self.leftovers())
 
-    def test_a_changed_file_stays_when_the_new_read_does_not_verify_so_the_check_refuses_it(self) -> None:
+    def test_a_link_or_a_folder_at_the_target_is_refused_and_left_as_it_was(self) -> None:
         self.target.parent.mkdir(parents=True)
-        self.target.write_bytes(b"edited")
+        elsewhere = self.folder / "elsewhere"
+        plants: list[Callable[[], object]] = [lambda: self.target.symlink_to(elsewhere), lambda: self.target.mkdir()]
+        for plant in plants:
+            plant()
+            with self.assertRaises(ClosedInputError):
+                fetch_checksum_list(self.target, SYNTHETIC, Download())
+            self.assertFalse(elsewhere.exists())
+            self.assertTrue(self.target.is_symlink() or self.target.is_dir())
+            if self.target.is_symlink():
+                self.target.unlink()
+            else:
+                self.target.rmdir()
+
+    def test_the_list_is_written_through_the_helper_and_not_over_a_path_that_appears_after_the_read(self) -> None:
+        late = Download()
+
+        def appears(key: str, target: Path) -> None:
+            late(key, target)
+            self.target.write_bytes(b"late")
+
+        self.target.parent.mkdir(parents=True)
+        with self.assertRaises(ClosedInputError):
+            fetch_checksum_list(self.target, SYNTHETIC, appears)
+        self.assertEqual(b"late", self.target.read_bytes())
+
+    def test_a_read_that_does_not_verify_leaves_no_file_and_no_temporary_folder_beside_the_target(self) -> None:
         with self.assertRaises(PublisherError):
             fetch_checksum_list(self.target, SYNTHETIC, Download(b"1" * len(LIST_BYTES)))
-        self.assertEqual(b"edited", self.target.read_bytes())
+        self.assertEqual([], self.leftovers())
 
     def test_the_tracked_pin_gives_the_key_size_and_digest_of_the_release_pin(self) -> None:
         pin = tracked_list_pin()

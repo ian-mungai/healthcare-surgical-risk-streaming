@@ -46,7 +46,6 @@ import json
 import math
 import os
 import re
-import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -58,6 +57,7 @@ from urllib.parse import quote
 from scripts.ingestion.folder import list_files
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
@@ -341,18 +341,17 @@ def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Pa
             version = versions.get((entry.key, entry.version_id))
             if version is None:
                 raise TableChecksError(f"the manifest's version of the file for {name} is no longer listed")
-            digest, size = hashlib.sha256(), 0
-            fd, partial = tempfile.mkstemp(dir=staging, prefix=f".{name}.")
-            with os.fdopen(fd, "wb") as handle:
-                for block in store.iter_version(version):
-                    digest.update(block)
-                    handle.write(block)
-                    size += len(block)
-            if digest.hexdigest() != entry.sha256 or size != entry.size:
-                Path(partial).unlink()
+            digest, blocks = hashlib.sha256(), []
+            for block in store.iter_version(version):
+                digest.update(block)
+                blocks.append(block)
+            data = b"".join(blocks)
+            if digest.hexdigest() != entry.sha256 or len(data) != entry.size:
                 raise TableChecksError(f"the bytes read for {name} are not the verified file of the manifest")
-            secure(Path(partial), STAGING_FILE_MODE, gid)
-            os.replace(partial, staging / f"{name}.csv")
+            path = staging / f"{name}.csv"
+            replace_owned_file(path, data, state_root=staging, mode=STAGING_FILE_MODE)
+            secure(path, STAGING_FILE_MODE, gid)
+            size = len(data)
             staged.append(Staged(name, f"{name}.csv", entry.sha256, size))
     except BaseException:
         remove_staged(staging)
@@ -363,7 +362,7 @@ def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Pa
 def write_plan(staging: Path, document: Mapping[str, Any], gid: int) -> None:
     """Write the plan into the staging folder with the same mode and group as the staged files."""
     path = staging / PLAN_FILE
-    path.write_text(json.dumps(document, indent=1) + "\n")
+    replace_owned_file(path, json.dumps(document, indent=1) + "\n", state_root=staging, mode=STAGING_FILE_MODE)
     secure(path, STAGING_FILE_MODE, gid)
 
 
@@ -401,9 +400,8 @@ def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, em
 def keep_output(run_folder: Path, reply: RunnerReply) -> None:
     """Keep the raw output of the job in a private file of the run folder. It can hold values of the data, so it is never put into a message."""
     run_folder.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(run_folder / JOB_OUTPUT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(f"exit code {reply.exit_code}\n--- standard output ---\n{reply.stdout}\n--- standard error ---\n{reply.stderr}\n")
+    text = f"exit code {reply.exit_code}\n--- standard output ---\n{reply.stdout}\n--- standard error ---\n{reply.stderr}\n"
+    replace_owned_file(run_folder / JOB_OUTPUT_FILE, text, state_root=run_folder, mode=0o600)
 
 
 def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple[rules.JobResult, dict[str, Any]]:
@@ -558,14 +556,7 @@ def write_pending(state_directory: Path, record: LoadRecord, started: float, run
         "started": started,
         "run_id": run_id,
     }
-    fd, partial = tempfile.mkstemp(dir=state_directory, prefix=".pending.")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        os.replace(partial, pending_path(record.manifest.sha256, state_directory))
-    except BaseException:
-        Path(partial).unlink(missing_ok=True)
-        raise
+    replace_owned_file(pending_path(record.manifest.sha256, state_directory), json.dumps(document, indent=2, sort_keys=True) + "\n", state_root=state_directory)
 
 
 def open_message(record: LoadRecord, state_directory: Path) -> str:
@@ -589,15 +580,7 @@ def write_result(run_folder: Path, document: Mapping[str, Any]) -> None:
             was_merged = False
         if was_merged:
             raise TableChecksError("the receipt of this load says merged, and a receipt that says merged is never replaced by one that says it is not")
-    fd, partial = tempfile.mkstemp(dir=run_folder, prefix=".table_checks.")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        os.chmod(partial, 0o644)
-        os.replace(partial, run_folder / RESULT_FILE)
-    except BaseException:
-        Path(partial).unlink(missing_ok=True)
-        raise
+    replace_owned_file(run_folder / RESULT_FILE, json.dumps(document, indent=2, sort_keys=True) + "\n", state_root=run_folder, mode=0o644)
 
 
 def saved_result(run_folder: Path, record: LoadRecord) -> dict[str, Any] | None:
@@ -716,12 +699,14 @@ def require_base(head: str, record: LoadRecord) -> None:
 def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing, run_id: str) -> MergeCommit:
     """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it. A request is never sent twice.
 
-    The request carries the recorded hash, the one Spark read, so what is merged is what was checked, and the head of the default branch that the log was
-    searched from as its expected target hash. Nessie 0.110.1 can also accept an older expected hash after a compatible commit on the target, so that hash is a
-    guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record, with the run ID of the checks, is written before
-    the request. The request is sent once: after a failure of it, whatever the failure, the history is searched until one deadline has passed, and a merge
-    not found by then ends as ``merge_outcome_open`` with the pending record kept. After a success answer the merge commit must be in the history
-    (``merge_not_found`` otherwise). The caller builds the receipt from the commit and its parent, never from what was sent or answered.
+    The request carries the recorded hash, the one Spark read, so what is merged is what was checked, and the checked base hash of the load (the head that
+    ``require_base`` just confirmed) as its expected target hash: ``NessieClient.merge`` puts it in the request path ``/trees/<target>@<hash>/history/merge``
+    (``scripts/stack/nessie.py``, ``merge``), so a target that moved is refused on the server. Nessie 0.110.1 can also accept an older expected hash after a
+    compatible commit on the target, so that hash is a guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record,
+    with the run ID of the checks, is written before the request. The request is sent once: after a failure of it, whatever the failure, the history is searched
+    until one deadline has passed, and a merge not found by then ends as ``merge_outcome_open`` with the pending record kept. After a success answer the merge
+    commit must be in the history (``merge_not_found`` otherwise). The caller builds the receipt from the commit and its parent, never from what was sent or
+    answered.
 
     A second request for the same source is a no-op in Nessie 0.110.1: it answers that nothing was applied, which ``NessieClient.merge`` raises as an error.
     The design does not rely on it, because a request that timed out can still be applied later: only the history says what happened.
@@ -747,7 +732,7 @@ def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path
     )
     write_pending(state_directory, record, timing.wall(), run_id)
     try:
-        nessie.merge(record.branch, default, head, message, source_hash=record.branch_hash)
+        nessie.merge(record.branch, default, record.base_hash, message, source_hash=record.branch_hash)
     except NessieError:
         found = wait_for_merge(nessie, record, default, timing)
         if found is None:
@@ -871,8 +856,7 @@ def run_locked(
         remove_staged(staging)
     result, checked = read_result(reply, plan, run_folder)
     document = receipt(record, empty_form, checked, passed=result.passed)
-    if result.passed:
-        require_base(main_head(nessie, default), record)
+    require_base(main_head(nessie, default), record)
     write_result(run_folder, document)
     if not result.passed:
         return Outcome(False, False, document)

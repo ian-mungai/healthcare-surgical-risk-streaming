@@ -184,7 +184,44 @@ def shutil_rmtree(path: Path) -> None:
     shutil.rmtree(path)
 
 
-class CommandTests(Fixture):
+class ReplayHarness(Fixture):
+    def replay_files(self, command: str) -> None:
+        """Write a run record that names the folder store of this test and the files that a replay run keeps."""
+        (self.root / "state").mkdir(exist_ok=True)
+        document = {
+            "run_id": f"r_{command}",
+            "rooms": 1,
+            "speed": 1,
+            "stagger_seconds": 0,
+            "turnover_seconds": 0,
+            "window_seconds": 60,
+            "manifest_reference": str(self.root / "reference.json"),
+            "object_store": {"kind": "folder", "root": str(self.root / "store")},
+            "kafka_bootstrap": "kafka:9092",
+            "registry_url": "http://registry:8081",
+            "state_dir": str(self.root / "state"),
+        }
+        (self.root / "run.json").write_text(json.dumps(document))
+
+    def run_replay(self, argv: list[str]) -> tuple[int, str]:
+        """Run the replay program with the packages that only its image holds replaced by stand-ins, so its own command line and guard run."""
+        stubs: dict[str, object] = {}
+        while True:
+            with mock.patch.dict(sys.modules, stubs):
+                for name in [name for name in sys.modules if name.startswith("replay.service")]:
+                    del sys.modules[name]
+                try:
+                    program = importlib.import_module("replay.service.__main__")
+                except ModuleNotFoundError as error:
+                    if error.name is None or error.name in stubs:
+                        raise
+                    stubs[error.name] = mock.MagicMock()
+                    continue
+                with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(b""))):
+                    return self.run_main(program.main, argv)
+
+
+class CommandTests(ReplayHarness):
     def test_every_command_refuses_an_output_that_something_holds_in_any_form(self) -> None:
         inputs = {name: self.made(f"in_{name}") for name in ("selection", "checksum_list", "pairings", "result", "reference", "samples", "release")}
         commands: dict[str, Callable[[Path], tuple[int, str]]] = {
@@ -269,41 +306,6 @@ class CommandTests(Fixture):
                     self.assertIn(EXISTS, err)
                     self.assertEqual(ORIGINAL, stored.read_text())
         self.assertEqual(["link_to_v0001", "v0001"], sorted(path.name for path in store.iterdir()))
-
-    def replay_files(self, command: str) -> None:
-        """Write a run record that names the folder store of this test and the files that a replay run keeps."""
-        (self.root / "state").mkdir(exist_ok=True)
-        document = {
-            "run_id": f"r_{command}",
-            "rooms": 1,
-            "speed": 1,
-            "stagger_seconds": 0,
-            "turnover_seconds": 0,
-            "window_seconds": 60,
-            "manifest_reference": str(self.root / "reference.json"),
-            "object_store": {"kind": "folder", "root": str(self.root / "store")},
-            "kafka_bootstrap": "kafka:9092",
-            "registry_url": "http://registry:8081",
-            "state_dir": str(self.root / "state"),
-        }
-        (self.root / "run.json").write_text(json.dumps(document))
-
-    def run_replay(self, argv: list[str]) -> tuple[int, str]:
-        """Run the replay program with the packages that only its image holds replaced by stand-ins, so its own command line and guard run."""
-        stubs: dict[str, object] = {}
-        while True:
-            with mock.patch.dict(sys.modules, stubs):
-                for name in [name for name in sys.modules if name.startswith("replay.service")]:
-                    del sys.modules[name]
-                try:
-                    program = importlib.import_module("replay.service.__main__")
-                except ModuleNotFoundError as error:
-                    if error.name is None or error.name in stubs:
-                        raise
-                    stubs[error.name] = mock.MagicMock()
-                    continue
-                with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(b""))):
-                    return self.run_main(program.main, argv)
 
     def test_a_replay_command_that_cannot_read_its_run_record_names_the_argument_and_not_the_path(self) -> None:
         missing = self.root / "secret_folder_marker" / "run.json"

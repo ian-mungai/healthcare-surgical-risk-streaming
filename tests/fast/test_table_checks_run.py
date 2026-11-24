@@ -26,6 +26,7 @@ from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from scripts.ingestion import table_checks as run
+from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.process import CompletedProcess, TimeoutExpired
@@ -509,6 +510,128 @@ class OutputBindingTest(unittest.TestCase):
         case = Case(self)
         self.assertTrue(case.go(Runner()).merged)
         self.assertEqual([(BRANCH, case.branch_hash, "main")], case.nessie.merges)
+
+
+class BaseCheckBeforeSavingTest(unittest.TestCase):
+    """The base of the load is checked right before any result is saved, a failed one too, and the merge names the checked base as the target's hash."""
+
+    def test_a_failed_check_saves_nothing_when_the_default_branch_moved_while_the_job_ran(self) -> None:
+        case, runner = Case(self), Runner(lambda plan: result_line(plan, passed=False))
+
+        def move() -> None:
+            case.nessie.add_main_commit("another tool", {})
+
+        runner.during = move
+        with self.assertRaisesRegex(run.StaleBaseError, "recorded base"):
+            case.go(runner)
+        self.assertEqual(1, runner.calls)
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+        self.assertEqual([], case.nessie.merges)
+
+    def test_a_failed_check_is_saved_when_the_base_is_unchanged(self) -> None:
+        case = Case(self)
+        outcome = case.go(Runner(lambda plan: result_line(plan, passed=False)))
+        self.assertFalse(outcome.passed)
+        self.assertEqual((False, False), (case.saved()["passed"], case.saved()["merged"]))
+
+    def test_a_job_output_that_cannot_be_read_as_a_result_keeps_its_file_and_saves_no_result(self) -> None:
+        case = Case(self)
+        with self.assertRaises(run.TableChecksError):
+            case.go(Runner(lambda plan: "nothing useful\n", exit_code=1))
+        self.assertFalse((case.run_folder / run.RESULT_FILE).exists())
+
+    def test_the_merge_request_names_the_checked_base_hash_as_the_expected_hash_of_the_target(self) -> None:
+        case = Case(self)
+        case.nessie.add_main_commit("another tool", {})
+        moved = case.nessie.heads["main"]
+        with mock.patch.object(run, "require_base"), self.assertRaises(run.MergeOutcomeOpen):
+            case.go(Runner())
+        self.assertEqual([case.record.base_hash], [request["expected"] for request in case.nessie.merge_requests])
+        self.assertNotEqual(moved, case.record.base_hash)
+        self.assertEqual([], case.nessie.merges)
+        self.assertEqual(moved, case.nessie.heads["main"], "the server refused the merge, so main is as the other tool left it")
+
+    def test_a_target_that_moved_after_the_check_is_refused_by_the_server_and_nothing_is_merged(self) -> None:
+        case = Case(self)
+        seen: list[int] = []
+
+        def move_after_the_search() -> None:
+            seen.append(1)
+            if len(seen) == 2:
+                case.nessie.defer_main_commit = "another tool writes to main"
+
+        case.nessie.on_history_read = move_after_the_search
+        with self.assertRaises(run.MergeOutcomeOpen):
+            case.go(Runner())
+        self.assertEqual([case.record.base_hash], [request["expected"] for request in case.nessie.merge_requests])
+        self.assertEqual([], case.nessie.merges)
+
+
+class OwnedWriteTest(unittest.TestCase):
+    """The result, the pending record, the job output, the staged files and the plan are replaced through ``replace_owned_file``: a link or a folder in their
+    place is refused and never followed."""
+
+    def planted(self, path: Path, kind: str, elsewhere: Path) -> None:
+        if kind == "link":
+            elsewhere.write_text("kept\n")
+            path.symlink_to(elsewhere)
+        elif kind == "dangling link":
+            path.symlink_to(elsewhere)
+        else:
+            path.mkdir()
+
+    def test_a_link_or_a_folder_in_place_of_the_result_is_refused_and_not_followed(self) -> None:
+        for kind in ("link", "dangling link", "folder"):
+            with self.subTest(kind=kind):
+                case = Case(self)
+                elsewhere = case.root / "elsewhere"
+                self.planted(case.run_folder / run.RESULT_FILE, kind, elsewhere)
+                with self.assertRaises((ClosedInputError, run.TableChecksError)):
+                    run.write_result(case.run_folder, {"passed": True, "merged": False})
+                self.assertEqual("kept\n" if kind == "link" else None, elsewhere.read_text() if elsewhere.exists() else None)
+
+    def test_a_link_or_a_folder_in_place_of_the_pending_record_is_refused_and_not_followed(self) -> None:
+        for kind in ("link", "dangling link", "folder"):
+            with self.subTest(kind=kind):
+                case = Case(self)
+                case.state.mkdir()
+                elsewhere = case.root / "elsewhere"
+                self.planted(case.pending_path, kind, elsewhere)
+                with self.assertRaises((ClosedInputError, run.TableChecksError)):
+                    run.write_pending(case.state, case.record, 1.0, "a" * 32)
+                self.assertEqual("kept\n" if kind == "link" else None, elsewhere.read_text() if elsewhere.exists() else None)
+
+    def test_a_link_in_place_of_the_job_output_file_is_refused_and_not_followed(self) -> None:
+        case = Case(self)
+        elsewhere = case.root / "elsewhere"
+        elsewhere.write_text("kept\n")
+        (case.run_folder / run.JOB_OUTPUT_FILE).symlink_to(elsewhere)
+        with self.assertRaises(ClosedInputError):
+            run.keep_output(case.run_folder, run.RunnerReply(1, "out", "err"))
+        self.assertEqual("kept\n", elsewhere.read_text())
+
+    def test_a_link_in_place_of_a_staged_file_or_the_plan_is_refused_and_not_followed(self) -> None:
+        case = Case(self)
+        case.staging.mkdir()
+        elsewhere = case.root / "elsewhere"
+        elsewhere.write_text("kept\n")
+        (case.staging / "clinical_data.csv").symlink_to(elsewhere)
+        (case.staging / run.PLAN_FILE).symlink_to(elsewhere)
+        with self.assertRaises((ClosedInputError, run.TableChecksError)):
+            run.stage_verified_files(case.landed.store, case.reference, case.staging, os.getgid())
+        with self.assertRaises(ClosedInputError):
+            run.write_plan(case.staging, {"format": "x"}, os.getgid())
+        self.assertEqual("kept\n", elsewhere.read_text())
+
+    def test_the_result_is_replaced_whole_in_the_run_folder_and_a_merged_receipt_is_not_replaced_by_an_unmerged_one(self) -> None:
+        case = Case(self)
+        run.write_result(case.run_folder, {"passed": True, "merged": False})
+        run.write_result(case.run_folder, {"passed": True, "merged": True})
+        with self.assertRaises(run.TableChecksError):
+            run.write_result(case.run_folder, {"passed": True, "merged": False})
+        self.assertEqual(True, case.saved()["merged"])
+        self.assertEqual([run.RESULT_FILE], [path.name for path in case.run_folder.iterdir()])
+        self.assertEqual(0o644, stat.S_IMODE((case.run_folder / run.RESULT_FILE).stat().st_mode))
 
 
 class MergeRecordTest(unittest.TestCase):

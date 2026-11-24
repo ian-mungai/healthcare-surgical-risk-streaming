@@ -705,7 +705,6 @@ class AfterTagTest(unittest.TestCase):
             code, _, err = self.run_it(nessie)
         self.assertEqual(1, code)
         self.assertIn("RecordNotPublished", err)
-        self.assertIn("RecordNotPublished", err)
         self.assertEqual(("TAG", HASH_ONE), nessie.references[f"run-{RUN_ID}"])
 
     def test_a_deadline_during_the_create_call_says_that_the_tag_may_have_been_made_and_is_left_in_place_if_so(self) -> None:

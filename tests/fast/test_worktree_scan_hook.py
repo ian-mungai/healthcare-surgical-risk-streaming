@@ -17,6 +17,7 @@ import os
 import stat
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from scripts.quality import worktree_scan_hook
@@ -67,15 +68,37 @@ class WorktreeScanHookTest(TemporaryRepository):
         self.assertTrue((self.hook().parent / "pre-commit.legacy.previous").is_symlink())
         self.assertTrue(worktree_scan_hook.installed(self.repo))
 
-    def stop_half_way(self, path: Path, data: str, *arguments: object, **keywords: object) -> int:
-        with open(path, "w") as handle:
-            handle.write(data[:25])
-        raise OSError("the write stopped")
+    def stop_half_way(self) -> Any:
+        """Patch ``os.fdopen`` so the handle of the helper's temporary file takes the first 25 characters and then stops."""
+        real = os.fdopen
+
+        class HalfWay:
+            def __init__(self, descriptor: int, mode: str) -> None:
+                self.handle = real(descriptor, mode)
+
+            def __enter__(self) -> HalfWay:
+                return self
+
+            def __exit__(self, *details: object) -> None:
+                self.handle.close()
+
+            def fileno(self) -> int:
+                return self.handle.fileno()
+
+            def write(self, data: bytes) -> int:
+                self.handle.write(data[:25])
+                self.handle.flush()
+                raise OSError("the write stopped")
+
+            def flush(self) -> None:
+                self.handle.flush()
+
+        return mock.patch("scripts.ingestion.output_file.os.fdopen", HalfWay)
 
     def test_a_write_that_stops_half_way_never_reaches_the_hook_path_and_the_next_setup_succeeds(self) -> None:
         self.hook().parent.mkdir(parents=True, exist_ok=True)
         self.hook().write_text("#!/bin/sh\nexit 0\n")
-        with mock.patch.object(Path, "write_text", autospec=True, side_effect=self.stop_half_way), self.assertRaises(OSError):
+        with self.stop_half_way(), self.assertRaises(OSError):
             worktree_scan_hook.install(self.repo)
         self.assertFalse(self.hook().exists())
         self.assertEqual("#!/bin/sh\nexit 0\n", (self.hook().parent / "pre-commit.legacy.previous").read_text())
@@ -87,7 +110,7 @@ class WorktreeScanHookTest(TemporaryRepository):
         earlier = worktree_scan_hook.EARLIER_HOOK_TEXTS[0]
         self.hook().parent.mkdir(parents=True, exist_ok=True)
         self.hook().write_text(earlier)
-        with mock.patch.object(Path, "write_text", autospec=True, side_effect=self.stop_half_way), self.assertRaises(OSError):
+        with self.stop_half_way(), self.assertRaises(OSError):
             worktree_scan_hook.install(self.repo)
         self.assertEqual(earlier, self.hook().read_text())
         self.assertTrue(worktree_scan_hook.install(self.repo))

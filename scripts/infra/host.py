@@ -35,6 +35,7 @@ from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
@@ -177,7 +178,7 @@ def record_tailscale_device(run_id: str, host_name: str, device_id: str) -> Path
     """Write the host's current Tailscale device to the run folder, over any earlier record: a host that left the network and rejoined has a new device."""
     target = ROOT / "runs" / run_id / DEVICE_FILE
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n")
+    replace_owned_file(target, json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n", state_root=target.parent, mode=0o644)
     return target
 
 
@@ -249,7 +250,7 @@ def keep_host_keys_of(run_id: str, instance: str) -> None:
         return
     (folder / "known_hosts").unlink(missing_ok=True)
     folder.mkdir(parents=True, exist_ok=True)
-    owner.write_text(f"{instance}\n")
+    replace_owned_file(owner, f"{instance}\n", state_root=folder, mode=0o644)
 
 
 def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str | None:

@@ -104,6 +104,45 @@ class ListFolderTests(unittest.TestCase):
             with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
                 list_folder(ancestor / "runs", "*", recursive=recursive)
 
+    def test_a_missing_folder_under_a_parent_that_can_be_searched_but_not_read_is_an_error_in_both_modes(self) -> None:
+        parent = self.root / "parent"
+        parent.mkdir()
+        parent.chmod(0o100)
+        self.addCleanup(parent.chmod, 0o700)
+        if os.access(parent, os.R_OK):
+            self.skipTest("this account reads every folder")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
+                list_folder(parent / "absent", recursive=recursive)
+
+    def test_a_missing_folder_under_a_higher_ancestor_that_can_be_searched_but_not_read_is_an_error_in_both_modes(self) -> None:
+        higher = self.root / "higher"
+        (higher / "middle").mkdir(parents=True)
+        higher.chmod(0o100)
+        self.addCleanup(higher.chmod, 0o700)
+        if os.access(higher, os.R_OK):
+            self.skipTest("this account reads every folder")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(PermissionError):
+                list_folder(higher / "middle" / "absent", recursive=recursive)
+
+    def test_a_missing_folder_under_a_parent_that_can_be_read_but_not_searched_is_an_error_in_both_modes(self) -> None:
+        parent = self.root / "readable"
+        parent.mkdir()
+        parent.chmod(0o400)
+        self.addCleanup(parent.chmod, 0o700)
+        if os.access(parent, os.X_OK):
+            self.skipTest("this account searches every folder")
+        for recursive in (False, True):
+            with self.subTest(recursive=recursive), self.assertRaises(OSError):
+                list_folder(parent / "absent", recursive=recursive)
+
+    def test_the_files_listing_and_a_missing_folder_under_a_readable_chain_stay_empty(self) -> None:
+        (self.root / "chain" / "inner").mkdir(parents=True)
+        for recursive in (False, True):
+            self.assertEqual([], list_folder(self.root / "chain" / "inner" / "absent", recursive=recursive))
+            self.assertEqual([], list_files(self.root / "chain" / "inner" / "absent", recursive=recursive))
+
     def test_only_a_missing_final_component_holds_nothing_in_both_modes(self) -> None:
         for recursive in (False, True):
             with self.subTest(recursive=recursive):

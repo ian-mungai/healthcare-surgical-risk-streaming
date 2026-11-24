@@ -19,6 +19,7 @@ from unittest import mock
 
 from orchestration.surgical_risk.run_folder import SECRET_KEY
 from scripts.ingestion.airbyte_api import AirbyteError
+from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.record_copy import CopyChanged, CopyError
@@ -270,6 +271,11 @@ class FaultInTheLoadTest(unittest.TestCase):
         self.assertEqual([], setup.records())
 
 
+def folder_state(folder: Path) -> dict[str, tuple[bytes, int, int]]:
+    """Each file of the folder as its bytes, its change time and its inode, so a write, a replacement or a touch shows."""
+    return {path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in sorted(folder.iterdir())}
+
+
 def make_legacy(setup: Setup) -> LoadResult:
     """Rewrite the two files of a finished load as version 1 left them: the full record and the five-field file, both in the format ``load_record_1``."""
     result = setup.load()
@@ -289,13 +295,15 @@ class LegacyRecordTest(unittest.TestCase):
         result = make_legacy(setup)
         self.assertEqual(result, LoadResult.from_json((setup.folder / f"{RUN}.json").read_text()))
 
-    def test_a_second_call_of_a_run_that_version_1_finished_loads_nothing_and_makes_the_table_checks_file_again(self) -> None:
+    def test_a_second_call_of_a_run_that_version_1_finished_loads_nothing_and_leaves_both_files_as_they_were(self) -> None:
         setup = Setup(self)
         result = make_legacy(setup)
         airbyte_calls = list(setup.airbyte.calls)
+        before = folder_state(setup.folder)
         self.assertEqual(result, setup.load())
         self.assertEqual(airbyte_calls, setup.airbyte.calls)
-        text = (setup.folder / f"{RUN}.load_record.json").read_text()
+        self.assertEqual(before, folder_state(setup.folder), "no file was written, replaced or touched")
+        text = current_load_record_text(setup.folder / f"{RUN}.load_record.json")
         self.assertEqual(LOAD_RECORD_FIELDS, set(json.loads(text)))
         self.assertEqual(BASE_HASH, parse_load_record(text).base_hash)
 
@@ -304,14 +312,67 @@ class LegacyRecordTest(unittest.TestCase):
         result = make_legacy(setup)
         self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256))
 
-    def test_the_table_checks_file_of_version_1_is_made_again_from_the_full_record_when_the_job_reads_it(self) -> None:
+    def test_the_table_checks_file_of_version_1_is_converted_in_memory_and_nothing_is_written(self) -> None:
         setup = Setup(self)
-        make_legacy(setup)
+        result = make_legacy(setup)
+        other = setup.folder / "run_other.load_record.json"
+        other.write_text("another run's file\n")
         path = setup.folder / f"{RUN}.load_record.json"
+        before = folder_state(setup.folder)
         text = current_load_record_text(path)
+        self.assertEqual(result.load_record_json(), text)
         self.assertEqual(BASE_HASH, parse_load_record(text).base_hash)
-        self.assertEqual(text, path.read_text())
+        self.assertEqual(before, folder_state(setup.folder), "no file of the folder was written, replaced, touched or added")
         self.assertEqual(text, current_load_record_text(path))
+
+    def test_the_table_checks_file_of_version_1_is_read_from_a_folder_that_cannot_be_written(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        setup.folder.chmod(0o500)
+        self.addCleanup(setup.folder.chmod, 0o700)
+        if os.access(setup.folder, os.W_OK):
+            self.skipTest("this process can write to a folder without write permission")
+        self.assertEqual(result.load_record_json(), current_load_record_text(setup.folder / f"{RUN}.load_record.json"))
+
+    def test_a_file_of_version_1_that_disagrees_with_the_full_record_in_any_of_its_five_fields_is_refused(self) -> None:
+        changes: dict[str, Any] = {
+            "branch": "load_other",
+            "branch_hash": "f" * 64,
+            "manifest": {"bucket": "other", "key": "k", "version_id": "v", "sha256": "0" * 64},
+            "tables": {"clinical_data": 99, "lab_data": 2, "track_list": 3},
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                setup = Setup(self)
+                make_legacy(setup)
+                path = setup.folder / f"{RUN}.load_record.json"
+                document = json.loads(path.read_text())
+                document[field] = value
+                path.write_text(json.dumps(document))
+                before = folder_state(setup.folder)
+                with self.assertRaises(LoadError):
+                    current_load_record_text(path)
+                self.assertEqual(before, folder_state(setup.folder))
+
+    def test_a_file_of_version_1_with_a_missing_or_extra_field_is_refused(self) -> None:
+        edits: list[Callable[[dict[str, Any]], object]] = [lambda document: document.pop("tables"), lambda document: document.update(extra=1)]
+        for edit in edits:
+            setup = Setup(self)
+            make_legacy(setup)
+            path = setup.folder / f"{RUN}.load_record.json"
+            document = json.loads(path.read_text())
+            edit(document)
+            path.write_text(json.dumps(document))
+            with self.assertRaises(LoadError):
+                current_load_record_text(path)
+
+    def test_the_file_of_the_current_format_is_returned_as_it_is_and_judged_by_the_table_checks_parser(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        path = setup.folder / f"{RUN}.load_record.json"
+        self.assertEqual(result.load_record_json(), current_load_record_text(path))
+        path.write_text("not json")
+        self.assertEqual("not json", current_load_record_text(path))
 
     def test_a_file_of_version_1_with_no_full_record_beside_it_is_refused(self) -> None:
         setup = Setup(self)
@@ -319,6 +380,66 @@ class LegacyRecordTest(unittest.TestCase):
         (setup.folder / f"{RUN}.json").unlink()
         with self.assertRaises(LoadError):
             current_load_record_text(setup.folder / f"{RUN}.load_record.json")
+
+
+class SidecarWriteTest(unittest.TestCase):
+    """The file for the table checks belongs to its run: a try that stopped before the run record leaves one that the retry replaces whole, a link or a
+    folder in its place is refused, and the run record is created and never replaced."""
+
+    def test_a_file_that_a_stopped_try_left_is_replaced_whole_by_the_retry(self) -> None:
+        setup = Setup(self)
+        setup.load()
+        (setup.folder / f"{RUN}.json").unlink()
+        (setup.folder / f"{RUN}.load_record.json").write_text("left by a stopped try\n")
+        again = setup.load()
+        self.assertEqual(again.load_record_json(), (setup.folder / f"{RUN}.load_record.json").read_text())
+        self.assertEqual(sorted(RECORD_FILES), sorted(path.name for path in setup.folder.iterdir()))
+
+    def test_a_link_or_a_folder_in_place_of_the_file_is_refused_and_not_followed(self) -> None:
+        for label in ("a link", "a dangling link", "a folder"):
+            with self.subTest(case=label):
+                setup = Setup(self)
+                setup.load()
+                (setup.folder / f"{RUN}.json").unlink()
+                sidecar = setup.folder / f"{RUN}.load_record.json"
+                sidecar.unlink()
+                elsewhere = setup.folder.parent / f"elsewhere_{label.replace(' ', '_')}"
+                if label == "a link":
+                    elsewhere.write_text("kept\n")
+                    sidecar.symlink_to(elsewhere)
+                elif label == "a dangling link":
+                    sidecar.symlink_to(elsewhere)
+                else:
+                    sidecar.mkdir()
+                with self.assertRaises(LoadError):
+                    setup.load()
+                self.assertEqual("kept\n" if label == "a link" else None, elsewhere.read_text() if elsewhere.exists() else None)
+                self.addCleanup(elsewhere.unlink, missing_ok=True)
+
+    def test_the_second_call_of_a_finished_run_makes_a_missing_file_and_refuses_one_that_disagrees(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        sidecar = setup.folder / f"{RUN}.load_record.json"
+        sidecar.unlink()
+        self.assertEqual(result, setup.load())
+        self.assertEqual(result.load_record_json(), sidecar.read_text())
+        before = folder_state(setup.folder)
+        self.assertEqual(result, setup.load())
+        self.assertEqual(before, folder_state(setup.folder), "a file that agrees is left alone")
+        sidecar.write_text("other\n")
+        with self.assertRaises(LoadError):
+            setup.load()
+        self.assertEqual("other\n", sidecar.read_text())
+
+    def test_the_run_record_is_created_through_the_helper_and_a_held_one_is_never_replaced(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        (setup.folder / f"{RUN}.load_record.json").unlink()
+        run_record = setup.folder / f"{RUN}.json"
+        before = run_record.read_bytes(), run_record.stat().st_ino
+        with self.assertRaises(LoadError):
+            write_record(setup.folder, result)
+        self.assertEqual(before, (run_record.read_bytes(), run_record.stat().st_ino))
 
 
 class SecondCallTest(unittest.TestCase):
@@ -467,7 +588,7 @@ class LoadRecordShapeTest(unittest.TestCase):
 
     def test_the_run_record_is_written_last_so_a_stop_between_the_two_files_is_an_unfinished_load_that_a_retry_completes(self) -> None:
         setup = Setup(self)
-        with mock.patch("scripts.ingestion.record_load.os.link", side_effect=OSError("stopped")), self.assertRaises(OSError):
+        with mock.patch("scripts.ingestion.output_file.os.link", side_effect=OSError("stopped")), self.assertRaises(ClosedInputError):
             setup.load()
         self.assertEqual([f"{RUN}.load_record.json"], setup.records())
         result = setup.load()

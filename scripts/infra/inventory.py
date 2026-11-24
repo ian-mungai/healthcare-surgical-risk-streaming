@@ -21,6 +21,7 @@ from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run, state_json
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
 
@@ -44,7 +45,7 @@ def write_inventory(binding: Path) -> Path:
         "authorized_retained": retained,
     }
     target = folder / "inventory.json"
-    target.write_text(json.dumps(inventory, indent=2) + "\n")
+    replace_owned_file(target, json.dumps(inventory, indent=2) + "\n", state_root=folder, mode=0o644)
     return target
 
 

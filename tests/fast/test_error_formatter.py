@@ -69,7 +69,7 @@ def exception_uses(source: str) -> list[int]:
     return sorted(lines)
 
 
-MARKED = {"infra.iam.scripts.manage_policies.KeyAdviceError"}
+MARKED = {"infra.iam.scripts.manage_policies.KeyAdviceError", "scripts.stack.tags.RecordNotPublished"}
 
 
 def marked_classes() -> set[str]:
@@ -88,6 +88,21 @@ class DescribeErrorTests(unittest.TestCase):
 
         self.assertEqual("fixed advice", describe_error(policies.KeyAdviceError("fixed advice")))
         self.assertEqual(MARKED, marked_classes())
+
+    def test_the_tag_advice_after_the_create_call_is_constant_and_names_no_tag_hash_or_exception_text(self) -> None:
+        from scripts.stack import tags
+
+        seen = set()
+        for stage, made in (("after", False), ("posting", False), ("posting", True), ("after", True)):
+            advice = tags.not_published_advice(stage, made=made)
+            seen.add(advice)
+            self.assertTrue(advice.startswith("RecordNotPublished: "), advice)
+            self.assertNotIn("run-", advice)
+            self.assertEqual(advice, describe_error(tags.RecordNotPublished(advice)))
+        self.assertEqual(3, len(seen), "three situations: made, may have been made, already in place")
+        error = tags.RecordNotPublished(tags.not_published_advice("after", made=True))
+        self.assertIsInstance(error, NessieError)
+        self.assertEqual(tags.not_published_advice("after", made=True), describe_error(error))
 
     def test_a_closed_error_shows_its_fixed_notices(self) -> None:
         error = ClosedError(Notice(Code.CANNOT_READ, subject=Subject.RESULT))

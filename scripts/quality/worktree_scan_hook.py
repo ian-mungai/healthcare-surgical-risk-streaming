@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import os
 import stat
-import tempfile
 from pathlib import Path
 
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.quality.repo_checks import git
 
 HOOK_NAME = "pre-commit.legacy"
@@ -63,13 +64,8 @@ def install(root: Path) -> bool:
                 f"move one away as the owner, then run setup again; nothing was overwritten"
             )
         os.rename(path, kept)
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f"{HOOK_NAME}.")
-    os.close(descriptor)
-    pending = Path(name)
     try:
-        pending.write_text(HOOK_TEXT)
-        pending.chmod(HOOK_MODE)
-        os.replace(pending, path)
-    finally:
-        pending.unlink(missing_ok=True)
+        replace_owned_file(path, HOOK_TEXT, state_root=path.parent, mode=HOOK_MODE)
+    except ClosedInputError:
+        raise OSError("the hook could not be written") from None
     return True

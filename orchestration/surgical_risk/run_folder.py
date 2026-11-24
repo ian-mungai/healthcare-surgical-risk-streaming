@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.ingestion.folder import list_folder
+from scripts.ingestion.output_file import write_new_file
 
 REDACTED = "[redacted]"
 LEFT_RUNNING_TAG = "surgical_risk/left_running"
@@ -242,9 +243,8 @@ def write_record(runs: Path, record: Mapping[str, Any]) -> Path:
     text = json.dumps(record, indent=2) + "\n"
     staging = Path(tempfile.mkdtemp(prefix=".writing_", dir=runs))
     try:
-        (staging / "record.json").write_text(text)
+        write_new_file(staging / "record.json", text, mode=0o644)
         staging.chmod(0o755)
-        (staging / "record.json").chmod(0o644)
         final = runs / folder_name(record)
         os.rename(staging, final)
     except BaseException:

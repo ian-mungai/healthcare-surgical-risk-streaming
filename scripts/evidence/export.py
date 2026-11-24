@@ -17,6 +17,7 @@ from scripts.infra.state_bootstrap import DEFAULT_BINDING
 from scripts.infra.terraform_wrapper import WrapperError, load_run
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.project_config import ROOT
 
 
@@ -37,7 +38,7 @@ def main() -> int:
     if problems:
         sys.stderr.write("".join(f"{problem}\n" for problem in problems) + "nothing was exported\n")
         return 1
-    (export / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    replace_owned_file(export / "manifest.json", json.dumps(manifest, indent=2) + "\n", state_root=export, mode=0o644)
     with tarfile.open(export / "evidence.tar.gz", "w:gz") as archive:
         for item in manifest["files"]:
             archive.add(folder / item["path"], arcname=item["path"])

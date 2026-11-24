@@ -42,9 +42,7 @@ that the load read>``, 64 lower case hex digits, as the load's record names it (
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -52,9 +50,12 @@ from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
 from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, TERMINAL_STATUSES, AirbyteError
+from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.folder import list_files
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
+from scripts.ingestion.notice import Code
+from scripts.ingestion.output_file import replace_owned_file, write_new_file
 from scripts.ingestion.record_copy import (
     Copied,
     CopyError,
@@ -295,25 +296,45 @@ def read_record(record_dir: Path, run_id: str) -> LoadResult | None:
 
 
 def write_load_record(record_dir: Path, result: LoadResult) -> Path:
-    """Write the file for the table checks whole under its final name. It is replaced by the same content when a retry writes it again."""
+    """Write the file for the table checks whole under its final name. It belongs to its run, so a retry after a stop replaces it through
+    ``replace_owned_file``; a link, a folder or any other entry in its place is refused."""
     final = record_dir / LOAD_RECORD_FILE.format(run_id=result.run_id)
-    descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=record_dir)
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(result.load_record_json())
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, final)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+        replace_owned_file(final, result.load_record_json(), state_root=record_dir, mode=0o644)
+    except ClosedInputError:
+        raise LoadError("the file for the table checks cannot be written: its place is not a regular file of this folder") from None
     return final
 
 
-def current_load_record_text(path: Path) -> str:
-    """The text of the file for the table checks at ``path``, made again from the full run record beside it when version 1 wrote it.
+def keep_load_record(record_dir: Path, result: LoadResult) -> Path:
+    """The file for the table checks of a finished run: made when it is missing, left alone when it agrees with the record, refused when it does not.
+    A file of version 1 agrees when its five fields match the record, and it is not rewritten."""
+    final = record_dir / LOAD_RECORD_FILE.format(run_id=result.run_id)
+    if not final.is_symlink() and not final.exists():
+        return write_load_record(record_dir, result)
+    if not final.is_file() or final.is_symlink() or current_load_record_text(final) != result.load_record_json():
+        raise LoadError("the file for the table checks does not agree with the record of this finished run")
+    return final
 
-    Version 1 wrote five fields and no base head. Its full run record saved the base head, so the file is regenerated from that record in the current
-    format. A file of the current format is returned as it is, and the table checks' parser judges it.
+
+def legacy_fields_agree(document: dict[str, Any], full: LoadResult) -> bool:
+    """Whether a file of version 1 holds exactly its five fields and each equals the field of the full run record."""
+    expected = {
+        "format": LEGACY_LOAD_RECORD_FORMAT,
+        "branch": full.branch,
+        "branch_hash": full.head_hash,
+        "manifest": asdict(full.manifest),
+        "tables": dict(full.snapshots),
+    }
+    return document == expected
+
+
+def current_load_record_text(path: Path) -> str:
+    """The text of the file for the table checks at ``path`` in the current format. It only reads: nothing is written, replaced or touched.
+
+    Version 1 wrote five fields and no base head. Its full run record, beside it, saved the base head. The five fields are checked against that record, a
+    mismatch is refused, and the current text is made in memory from the record. A file of the current format is returned as it is, and the table checks'
+    parser judges it.
     """
     text = path.read_text()
     try:
@@ -328,7 +349,8 @@ def current_load_record_text(path: Path) -> str:
     full = read_record(path.parent, run_id)
     if full is None:
         raise LoadError("the load record is of version 1 and the full record that it is made again from is missing")
-    write_load_record(path.parent, full)
+    if not legacy_fields_agree(document, full):
+        raise LoadError("the load record is of version 1 and does not agree with the full record beside it")
     return full.load_record_json()
 
 
@@ -340,16 +362,12 @@ def write_record(record_dir: Path, result: LoadResult) -> Path:
     record_dir.mkdir(parents=True, exist_ok=True)
     write_load_record(record_dir, result)
     final = record_path(record_dir, result.run_id)
-    descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=record_dir)
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(result.to_json())
-        os.chmod(temporary, 0o644)
-        os.link(temporary, final)
-    except FileExistsError:
-        raise LoadError("the record of this run exists and is not replaced") from None
-    finally:
-        os.unlink(temporary)
+        write_new_file(final, result.to_json(), mode=0o644)
+    except ClosedInputError as error:
+        if any(notice.code is Code.OUTPUT_EXISTS for notice in error.notices):
+            raise LoadError("the record of this run exists and is not replaced") from None
+        raise
     return final
 
 
@@ -539,7 +557,7 @@ def load_records(
     finished = read_record(record_dir, run_id)
     if finished is not None:
         result = confirm_finished(finished, reference, catalog)
-        write_load_record(record_dir, result)
+        keep_load_record(record_dir, result)
         remove_all(store, run_id, state)
         return result
     if catalog.has_recorded_manifest(reference.sha256):

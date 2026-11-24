@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import glob
 import re
-import shutil
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.ingestion.folder import list_files, list_folder
 from scripts.ingestion.notice import Code, Notice
+from scripts.ingestion.output_file import write_new_file
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
 VERSION_FILE = re.compile(r"v(\d{4})(\.deleted)?")
@@ -95,7 +95,7 @@ class FolderStore:
         folder = self.root / key
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"v{number:04d}"
-        path.write_bytes(data)
+        write_new_file(path, data, mode=0o644)
         return self.version_of(key, number, False, path, latest=True)
 
     def land_file(self, key: str, source: Path) -> ObjectVersion:
@@ -104,5 +104,5 @@ class FolderStore:
         folder = self.root / key
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"v{number:04d}"
-        shutil.copyfile(source, path)
+        write_new_file(path, source.read_bytes(), mode=0o644)
         return self.version_of(key, number, False, path, latest=True)

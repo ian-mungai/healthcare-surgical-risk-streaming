@@ -2,8 +2,8 @@
 
 ``pathlib``'s ``glob``, ``rglob`` and ``iterdir`` return nothing for a folder that is not readable, and ``Path.is_file`` says no for a file that it cannot
 examine. A reader of a run, inbox or input folder then takes a folder or a file that it cannot see for an empty one. The rule here is one for both modes:
-only a missing final component of the path holds nothing, and every other failure, at the folder or at any folder above or below it, raises
-``OSError``. That includes a link to nothing and a file in place of the folder.
+only a missing final component of the path holds nothing, and only under ancestors that all allow read and search; every other failure, at the folder or
+at any folder above or below it, raises ``OSError``. That includes a link to nothing and a file in place of the folder.
 """
 
 from __future__ import annotations
@@ -27,8 +27,17 @@ def exists(folder: Path) -> bool:
     try:
         os.lstat(folder)
     except FileNotFoundError:
+        refuse_unreadable_ancestors(folder)
         return False
     return True
+
+
+def refuse_unreadable_ancestors(folder: Path) -> None:
+    """Raise ``PermissionError`` unless every existing ancestor of ``folder`` allows read and search: a missing folder is empty only under a chain that could
+    have shown it, and an ancestor that can be searched but not read hides what its folder holds."""
+    for ancestor in folder.parents:
+        if not os.access(ancestor, os.R_OK | os.X_OK):
+            raise PermissionError(f"{ancestor.name or ancestor} cannot be read and searched")
 
 
 def list_folder(folder: Path, pattern: str = "*", *, recursive: bool = False) -> list[Path]:

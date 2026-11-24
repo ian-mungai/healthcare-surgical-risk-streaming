@@ -36,6 +36,7 @@ from replay.events.stream import earliest_due_offset_us
 from replay.service.check import observed_document, observed_from, report_document
 from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_inputs
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
+from replay.service.output_guard import refuse_inside_store
 from replay.service.registry import RegistryClient, RegistryError
 from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
 from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
@@ -213,9 +214,9 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
         code = replay_record(queued_record(path), flag, beat)
         outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.is_set() else "failed", code)
     except GateRefused as refused:
-        outcome = Outcome("failed", 3, str(refused))
+        outcome = Outcome("failed", 3, describe_error(refused))
     except STOPPING_ERRORS as error:
-        outcome = Outcome("failed", 2, f"{type(error).__name__}: {error}")
+        outcome = Outcome("failed", 2, describe_error(error))
     log("request_end", request=path.stem, outcome=outcome.kind, exit_code=outcome.exit_code, error=outcome.error)
     return outcome
 
@@ -300,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(arguments, "out", None) is not None:
             check_new_output(arguments.out)
         record = parse_run_record(read_run_record(arguments.run_record))
+        if getattr(arguments, "out", None) is not None and record.object_store.kind == "folder" and record.object_store.root is not None:
+            refuse_inside_store(Path(record.object_store.root), arguments.out)
         return COMMANDS[arguments.command](record, arguments)
     except ClosedError as error:
         sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))

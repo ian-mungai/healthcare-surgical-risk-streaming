@@ -20,6 +20,7 @@ from pathlib import Path
 
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
 
@@ -151,8 +152,7 @@ def settle(tool: Tool, *, check: bool) -> bool:
         sys.stderr.write(f"{label}: the installed binary is missing or differs from the pinned archive\n")
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(binary)
-    target.chmod(BINARY_MODE)
+    replace_owned_file(target, binary, state_root=target.parent, mode=BINARY_MODE)
     sys.stdout.write(f"{label}: installed from the verified archive\n")
     return True
 

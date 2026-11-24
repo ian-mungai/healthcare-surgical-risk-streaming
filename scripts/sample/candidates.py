@@ -5,12 +5,16 @@ The candidates are plain data in ``tests/fixtures/vitaldb/candidates.tsv`` (one 
 a case that a later step may use, once it has verified the copy, as part of the fixed sample. The choice follows the rules in ``SLOTS`` and uses neither
 an outcome nor a hand-picked number. Training and validation are development data. Run from the repository root:
 
-    .venv/bin/python -m scripts.sample.candidates build --output tests/fixtures/vitaldb/candidates.tsv
+    mkdir -p runs/sample
+    .venv/bin/python -m scripts.sample.candidates build --output runs/sample/candidates_new.tsv
+    diff tests/fixtures/vitaldb/candidates.tsv runs/sample/candidates_new.tsv
     .venv/bin/python -m scripts.sample.candidates check
 
-``build`` writes the candidate file only after the pinned checksum list, the clinical table and the track list match their pins. ``check`` also compares
-the tracked file with a rebuild and with the checksum list. Each run reads into a new temporary folder and removes it. Every line either command writes
-is a ``Notice``: a candidate is named by its line in the candidate file or its place in the rebuild, never by its case number, key or size.
+``build`` never replaces a path, so it writes to a fresh path. A change of the tracked file is made by hand after the diff above is reviewed: copy the new
+file over ``tests/fixtures/vitaldb/candidates.tsv`` yourself and commit it. ``build`` writes the candidate file only after the pinned checksum list, the
+clinical table and the track list match their pins. ``check`` also compares the tracked file with a rebuild and with the checksum list. Each run reads into
+a new temporary folder and removes it. Every line either command writes is a ``Notice``: a candidate is named by its line in the candidate file or its place
+in the rebuild, never by its case number, key or size.
 
 VitalDB credit: Lee, H., & Jung, C. (2022). VitalDB, a high-fidelity multi-parameter vital signs database in surgical patients (version 1.0.0). PhysioNet.
 https://doi.org/10.13026/czw8-9p62. Source: https://physionet.org/content/vitaldb/1.0.0/. Licence: https://creativecommons.org/licenses/by/4.0/.

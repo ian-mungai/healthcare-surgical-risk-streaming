@@ -248,7 +248,7 @@ class ServeTest(unittest.TestCase):
                 self.assertFalse((loop.inbox / "a.json").exists())
                 result = json.loads((loop.inbox / "results" / "a.json").read_text())
                 self.assertEqual(("failed", 2), (result["outcome"], result["exit_code"]))
-                self.assertTrue(result["error"].startswith("RunRecordError: "), result["error"])
+                self.assertEqual("RunRecordError", result["error"])
                 self.assertTrue((loop.inbox / "done" / "b.json").is_file())
 
     def test_a_queued_record_without_its_reference_fails_and_the_reference_beside_a_record_replaces_the_one_in_it(self) -> None:
@@ -257,7 +257,7 @@ class ServeTest(unittest.TestCase):
         loop.put("b.json", json.dumps(RECORD))
         loop.serve()
         self.assertEqual(["b.json"], loop.ran)
-        self.assertIn("manifest reference", json.loads((loop.inbox / "results" / "a.json").read_text())["error"])
+        self.assertEqual("RunRecordError", json.loads((loop.inbox / "results" / "a.json").read_text())["error"])
         record = queued_record(loop.inbox / "done" / "b.json")
         self.assertEqual(str(loop.inbox / "done" / "b.reference"), record.manifest_reference)
         self.assertNotEqual(RECORD["manifest_reference"], record.manifest_reference)
@@ -607,7 +607,7 @@ class CrashLoopTest(unittest.TestCase):
                 self.assertEqual(0, self.start(run))
                 self.assertEqual(["a.json", "b.json"], self.ran)
                 result = json.loads((self.inbox / "results" / "a.json").read_text())
-                self.assertEqual(("failed", 2, f"{type(error).__name__}: {error}"), (result["outcome"], result["exit_code"], result["error"]))
+                self.assertEqual(("failed", 2, type(error).__name__), (result["outcome"], result["exit_code"], result["error"]))
                 self.assertTrue((self.inbox / "failed" / "a.json").is_file())
                 self.assertTrue((self.inbox / "done" / "b.json").is_file())
 

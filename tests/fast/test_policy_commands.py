@@ -264,7 +264,8 @@ class KeyTest(unittest.TestCase):
         code, output, backup = self.run_key(account)
         self.assertEqual(1, code)
         self.assertIn("cli_history", output)
-        self.assertIn("aws configure set cli_history disabled --profile admin_profile", output)
+        self.assertIn("aws configure set cli_history disabled --profile <ADMIN_PROFILE>", output)
+        self.assertNotIn("admin_profile", output, "the advice is constant and holds no value of --admin-profile")
         self.assertEqual(0, self.creations(account))
         self.assertFalse(backup.exists())
         self.assertNotIn(SECRET, output)
@@ -289,6 +290,8 @@ class KeyTest(unittest.TestCase):
         code, output, backup = self.run_key(account)
         self.assertEqual(1, code)
         self.assertIn("cli_history", output)
+        self.assertIn("--profile <ADMIN_PROFILE>", output)
+        self.assertNotIn("admin_profile", output, "no message of the key command holds a value of --admin-profile")
         self.assertEqual(0, self.creations(account))
         self.assertFalse(backup.exists())
 
