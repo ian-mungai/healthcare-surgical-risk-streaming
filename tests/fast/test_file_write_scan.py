@@ -12,7 +12,9 @@ that no longer matches a call fails the test too, so the list never keeps a site
 pattern and check that the scan finds it.
 
 The scan cannot see what a value holds, so it counts a value that it cannot read as a write: a mode or ``os.open`` flags that are a variable, a call or an
-unpacked list (only ``O_*`` constants joined with ``|`` are read-only), and a ``getattr`` of a non-literal name on a module that writes. It follows a name that
+unpacked list (only ``os`` constants joined with ``|`` are read-only, and a name that is not imported from ``os`` is not one), a call of ``open`` or ``os.open``
+with ``*arguments`` or ``**keywords``, a ``rename`` or ``replace`` with the ``target`` by keyword or unpacked, and a ``getattr`` of a non-literal name on a
+module that writes. An archive's ``extract`` and ``extractall`` write. It follows a name that
 stands for a function or module of another file (``import os as o``, ``from os import replace as swap``, ``move = os.rename``), so the plain forms and
 the renamed ones are one call. The call text in a list entry is the text as it is written in the file.
 
@@ -38,7 +40,7 @@ HELPERS = frozenset({"write_new_file", "publish_reserved", "replace_owned_file"}
 OPEN_MODE = re.compile(r"^[rwxabt+]+(:[A-Za-z0-9*]+)?$")
 WRITE_LETTERS = frozenset("wax+")
 WRITE_FLAGS = frozenset({"O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC", "O_EXCL"})
-WRITE_METHODS = frozenset({"write_text", "write_bytes", "touch", "symlink_to", "hardlink_to"})
+WRITE_METHODS = frozenset({"write_text", "write_bytes", "touch", "symlink_to", "hardlink_to", "extractall", "extract"})
 OS_MOVES = frozenset({"replace", "rename", "renames", "link", "symlink", "truncate", "mkfifo", "mknod"})
 SHUTIL_WRITES = frozenset({"copy", "copy2", "copyfile", "copyfileobj", "copytree", "copymode", "copystat", "move", "make_archive", "unpack_archive"})
 DUMPS = frozenset({"json", "pickle", "marshal", "yaml", "tomli_w", "plistlib"})
@@ -73,6 +75,10 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
     ("scripts/evidence/export.py", "main", "tarfile.open"): (
         1,
         "The evidence archive is streamed into the export folder that the command made; it is too large to hold in memory for the helper",
+    ),
+    ("scripts/evidence/verify.py", "verify_export", "archive.extractall"): (
+        1,
+        "Extracts the evidence archive into a partial folder that this command made empty a line before, with the data filter that refuses a member outside it",
     ),
     ("scripts/evidence/verify.py", "verify_export", "partial.replace"): (
         1,
@@ -270,6 +276,17 @@ def aliases(tree: ast.AST) -> dict[str, str]:
     return found
 
 
+def imported_constants(tree: ast.AST) -> dict[str, str]:
+    """Each name that a ``from os import O_RDONLY`` brings in, with the module and name it stands for. A name that is bound by an assignment is not here: it
+    can be bound again to a value that writes, and the scan cannot tell which binding a call sees."""
+    return {
+        item.asname or item.name: f"{node.module}.{item.name}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module in {"os", "posix"} and not node.level
+        for item in node.names
+    }
+
+
 def resolve(node: ast.expr, names: dict[str, str]) -> str:
     """The text of ``node`` with the first name of a plain chain replaced by what it stands for, until it stands for nothing else."""
     text = dotted(node)
@@ -283,9 +300,16 @@ def resolve(node: ast.expr, names: dict[str, str]) -> str:
     return text
 
 
+def unpacked(call: ast.Call) -> bool:
+    """Whether the call passes ``*arguments`` or ``**keywords``: the scan cannot see which mode, flags or target they hold."""
+    return any(isinstance(item, ast.Starred) for item in call.args) or any(item.arg is None for item in call.keywords)
+
+
 def mode_writes(call: ast.Call, positions: tuple[int, ...], strict: tuple[int, ...] = ()) -> bool:
     """Whether the mode argument of an ``open``-like call may write: a string with ``w``, ``a``, ``x`` or ``+``, or (at a ``strict`` position or by keyword)
-    a mode that is not a string literal."""
+    a mode that is not a string literal, or an unpacked argument or keyword that may hold the mode."""
+    if unpacked(call):
+        return True
     candidates = [(item.value, True) for item in call.keywords if item.arg == "mode"]
     candidates += [(call.args[position], position in strict) for position in positions if position < len(call.args)]
     for value, must_be_literal in candidates:
@@ -297,27 +321,36 @@ def mode_writes(call: ast.Call, positions: tuple[int, ...], strict: tuple[int, .
     return False
 
 
-def read_only_flags(expression: ast.expr) -> bool:
-    """Whether the flags are only ``O_*`` constants (or 0) joined with ``|``, such as ``os.O_RDONLY | os.O_NOFOLLOW``, and none of them writes."""
+def read_only_flags(expression: ast.expr, constants: dict[str, str] | None = None, names: dict[str, str] | None = None) -> bool:
+    """Whether the flags are only constants of ``os`` (or 0) joined with ``|``, such as ``os.O_RDONLY | os.O_NOFOLLOW``, and none of them writes.
+
+    A constant is ``os.O_*`` (``os`` may be an alias in ``names``) or a name that ``from os import`` brought in (``constants``, see ``imported_constants``). A
+    name that is bound in another way, and an ``O_*`` attribute of any other object, may hold a write flag and is not read only."""
+    constants, names = constants or {}, names or {}
     if isinstance(expression, ast.BinOp):
-        return isinstance(expression.op, ast.BitOr) and read_only_flags(expression.left) and read_only_flags(expression.right)
+        return (
+            isinstance(expression.op, ast.BitOr) and read_only_flags(expression.left, constants, names) and read_only_flags(expression.right, constants, names)
+        )
     if isinstance(expression, ast.Attribute):
-        return isinstance(expression.value, ast.Name) and expression.attr.startswith("O_") and expression.attr not in WRITE_FLAGS
+        return resolve(expression.value, names) in {"os", "posix"} and expression.attr.startswith("O_") and expression.attr not in WRITE_FLAGS
     if isinstance(expression, ast.Name):
-        return expression.id.startswith("O_") and expression.id not in WRITE_FLAGS
+        module, _, flag = constants.get(expression.id, "").rpartition(".")
+        return module in {"os", "posix"} and flag.startswith("O_") and flag not in WRITE_FLAGS
     return isinstance(expression, ast.Constant) and expression.value == 0 and type(expression.value) is int
 
 
-def flags_write(call: ast.Call) -> bool:
-    """Whether the flags of an ``os.open`` call may write: a write flag, or anything that is not a plain join of ``O_*`` constants (a variable, a call or an
-    unpacked list), because the scan cannot see what it holds. A call without flags writes nothing."""
+def flags_write(call: ast.Call, constants: dict[str, str] | None = None, names: dict[str, str] | None = None) -> bool:
+    """Whether the flags of an ``os.open`` call may write: a write flag, or anything that is not a plain join of ``os`` constants (a variable, a call or an
+    unpacked list or mapping), because the scan cannot see what it holds. A call without flags writes nothing."""
+    if unpacked(call):
+        return True
     flags = [call.args[1]] if len(call.args) > 1 else [item.value for item in call.keywords if item.arg == "flags"]
-    return any(not read_only_flags(item) for item in flags)
+    return any(not read_only_flags(item, constants, names) for item in flags)
 
 
-def writes_a_file(call: ast.Call, names: dict[str, str] | None = None) -> bool:
+def writes_a_file(call: ast.Call, names: dict[str, str] | None = None, constants: dict[str, str] | None = None) -> bool:
     """Whether ``call`` writes, moves or links a file. ``names`` are the aliases of the file (see ``aliases``), so ``o.replace`` after ``import os as o`` is
-    ``os.replace`` and ``replace`` after ``from os import replace`` is too."""
+    ``os.replace`` and ``replace`` after ``from os import replace`` is too. ``constants`` are the names that ``from os import`` brought in."""
     names = names or {}
     function = call.func
     if isinstance(function, ast.Call) and dotted(function.func) == "getattr" and len(function.args) >= 2:
@@ -336,7 +369,7 @@ def writes_a_file(call: ast.Call, names: dict[str, str] | None = None) -> bool:
     if owner in {"os", "posix"} and name in OS_MOVES:
         return True
     if owner == "os" and name == "open":
-        return flags_write(call)
+        return flags_write(call, constants, names)
     if (owner == "os" and name == "fdopen") or (owner == "io" and name == "open"):
         return mode_writes(call, (1,), (1,))
     if owner == "shutil" and name in SHUTIL_WRITES:
@@ -347,8 +380,8 @@ def writes_a_file(call: ast.Call, names: dict[str, str] | None = None) -> bool:
         return True
     if not owner and name == "open":
         return mode_writes(call, (1,), (1,))
-    if owner and name in {"replace", "rename"} and len(call.args) == 1 and not call.keywords:
-        return True
+    if owner and name in {"replace", "rename"}:
+        return unpacked(call) or any(item.arg == "target" for item in call.keywords) or (len(call.args) == 1 and not call.keywords)
     if owner and name == "open":
         return mode_writes(call, (0, 1), (1,) if owner in ARCHIVES else (0,))
     return False
@@ -374,8 +407,11 @@ def write_calls(source: str) -> list[tuple[int, str, str]]:
     tree = ast.parse(source)
     scopes = enclosing(tree)
     names = aliases(tree)
+    constants = imported_constants(tree)
     found = [
-        (node.lineno, scopes.get(node, ""), ast.unparse(node.func)) for node in ast.walk(tree) if isinstance(node, ast.Call) and writes_a_file(node, names)
+        (node.lineno, scopes.get(node, ""), ast.unparse(node.func))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and writes_a_file(node, names, constants)
     ]
     return sorted(found)
 
@@ -518,6 +554,32 @@ PLANTS = {
     "the module itself by assignment": "import os\n\nsystem = os\n\n\ndef f(a, b):\n    system.replace(a, b)\n",
     "getattr with a name": "import os\n\n\ndef f(a, b):\n    getattr(os, 'replace')(a, b)\n",
     "getattr with a name that is computed": "import os\n\n\ndef f(a, b, name):\n    getattr(os, name)(a, b)\n",
+    "Path.rename with the target by keyword": "def f(path, other):\n    path.rename(target=other)\n",
+    "Path.replace with the target by keyword": "def f(path, other):\n    path.replace(target=other)\n",
+    "Path.replace with unpacked arguments": "def f(path, rest):\n    path.replace(*rest)\n",
+    "Path.rename with unpacked keywords": "def f(path, rest):\n    path.rename(**rest)\n",
+    "open with unpacked arguments": "def f(rest):\n    open(*rest)\n",
+    "open with unpacked keywords": "def f(path, rest):\n    open(path, **rest)\n",
+    "open with a mode behind an unpacked argument": "def f(path, rest):\n    open(*rest, 'rb')\n",
+    "Path.open with unpacked arguments": "def f(path, rest):\n    path.open(*rest)\n",
+    "Path.open with unpacked keywords": "def f(path, rest):\n    path.open(**rest)\n",
+    "io.open with unpacked arguments": "import io\n\n\ndef f(rest):\n    io.open(*rest)\n",
+    "gzip.open with unpacked keywords": "import gzip\n\n\ndef f(path, rest):\n    gzip.open(path, **rest)\n",
+    "os.fdopen with unpacked arguments": "import os\n\n\ndef f(rest):\n    os.fdopen(*rest)\n",
+    "os.open with unpacked arguments": "import os\n\n\ndef f(rest):\n    os.open(*rest)\n",
+    "os.open with unpacked keywords": "import os\n\n\ndef f(path, rest):\n    os.open(path, **rest)\n",
+    "os.open with write flags bound to a name": ("import os\n\nflags = os.O_WRONLY | os.O_CREAT\n\n\ndef f(path):\n    os.open(path, flags)\n"),
+    "os.open with write flags bound to a name that starts with O_": (
+        "import os\n\nO_NEW = os.O_WRONLY | os.O_CREAT\n\n\ndef f(path):\n    os.open(path, O_NEW)\n"
+    ),
+    "os.open with a write flag imported under another name": "from os import O_WRONLY as O_SAFE, open as raw\n\n\ndef f(path):\n    raw(path, O_SAFE)\n",
+    "os.open with a write flag bound to a name": "import os\n\nflags = os.O_RDWR\n\n\ndef f(path):\n    os.open(path, flags)\n",
+    "os.open with a flag of another object": "import os\n\n\ndef f(path, config):\n    os.open(path, config.O_RDONLY)\n",
+    "os.open with a flag that is rebound after it was read only": (
+        "import os\n\nO_MODE = os.O_RDONLY\nO_MODE = os.O_WRONLY | os.O_CREAT\n\n\ndef f(path):\n    os.open(path, O_MODE)\n"
+    ),
+    "TarFile.extractall": "def f(archive, folder):\n    archive.extractall(folder)\n",
+    "ZipFile.extract": "def f(archive, folder):\n    archive.extract('a', folder)\n",
 }
 READS = {
     "open for reading": "def f(path):\n    open(path)\n    open(path, 'rb')\n    path.open('r')\n    path.open(newline='')\n",
@@ -539,6 +601,11 @@ READS = {
     "a name that only looks like an import alias": "def f(replace, rename, link):\n    return replace, rename, link\n",
     "getattr of a computed name on an object that is no writing module": "def f(obj, name):\n    return getattr(obj, name)()\n",
     "a local name that is also a method of text": "from os import path as p\n\n\ndef f(text):\n    return p.exists(text), text.replace('a', 'b')\n",
+    "text replace with a count by keyword": "def f(text):\n    return text.replace('a', 'b', count=1)\n",
+    "open for reading with a mode by keyword": "def f(path):\n    return open(path, mode='rb'), path.open(mode='r')\n",
+    "os.open for reading with the flags of an import": (
+        "from os import O_NOFOLLOW, O_RDONLY, open as raw\n\n\ndef f(path):\n    raw(path, O_RDONLY | O_NOFOLLOW)\n"
+    ),
 }
 
 
@@ -573,11 +640,23 @@ class ScanFindsEachPatternTests(unittest.TestCase):
         self.assertEqual("loop", resolve(ast.parse("loop", mode="eval").body, names))
         self.assertIn(resolve(ast.parse("swap", mode="eval").body, {"swap": "other", "other": "swap"}), ("swap", "other"))
 
-    def test_only_o_constants_are_read_only_flags(self) -> None:
-        read_only = ("os.O_RDONLY", "os.O_RDONLY | os.O_NONBLOCK", "O_RDONLY", "0", "os.O_RDONLY | 0")
-        may_write = ("flags", "os.O_WRONLY", "O_CREAT", "os.O_RDONLY | extra", "f(x)", "1", "os.O_RDONLY & os.O_NONBLOCK", "os.name", "*rest")
-        self.assertEqual([], [text for text in read_only if not read_only_flags(ast.parse(text, mode="eval").body)])
-        self.assertEqual([], [text for text in may_write if text != "*rest" and read_only_flags(ast.parse(text, mode="eval").body)])
+    def test_only_constants_of_os_are_read_only_flags(self) -> None:
+        constants = {"O_RDONLY": "os.O_RDONLY", "O_CREAT": "os.O_CREAT", "O_NOFOLLOW": "posix.O_NOFOLLOW"}
+        read_only = ("os.O_RDONLY", "os.O_RDONLY | os.O_NONBLOCK", "O_RDONLY", "0", "os.O_RDONLY | 0", "o.O_RDONLY", "O_RDONLY | O_NOFOLLOW")
+        may_write = (
+            "flags",
+            "os.O_WRONLY",
+            "O_CREAT",
+            "os.O_RDONLY | extra",
+            "f(x)",
+            "1",
+            "os.O_RDONLY & os.O_NONBLOCK",
+            "os.name",
+            "config.O_RDONLY",
+            "O_OTHER",
+        )
+        self.assertEqual([], [text for text in read_only if not read_only_flags(ast.parse(text, mode="eval").body, constants, {"o": "os"})])
+        self.assertEqual([], [text for text in may_write if read_only_flags(ast.parse(text, mode="eval").body, constants, {"o": "os"})])
 
     def test_a_write_inside_a_helper_is_not_reported_and_the_same_call_elsewhere_in_the_helper_file_is(self) -> None:
         source = "def write_new_file(path):\n    path.write_bytes(b'x')\n\n\ndef other(path):\n    path.write_bytes(b'x')\n"
