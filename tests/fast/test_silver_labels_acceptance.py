@@ -234,7 +234,7 @@ class Refusals(unittest.TestCase):
 
     def test_the_wanted_codes_in_order_with_exit_1_pass(self) -> None:
         self.assertTrue(refusal_ok(1, self.refusal(), "verify", ["kidney_rule: failed", "kidney_differs: failed"]))
-        self.assertTrue(refusal_ok(1, self.refusal(refusal=["branch_missing: failed"], mode="build"), "build", ["branch_missing: failed"]))
+        self.assertTrue(refusal_ok(1, self.refusal(refusal=["branch_missing"], mode="build"), "build", ["branch_missing"]))
 
     def test_each_part_is_needed(self) -> None:
         wanted = ["kidney_rule: failed", "kidney_differs: failed"]
@@ -255,9 +255,9 @@ class Refusals(unittest.TestCase):
                 self.assertFalse(refusal_ok(code, document, "verify", wanted))
 
     def test_a_refusal_with_another_expected_exit_code_passes_only_for_that_code(self) -> None:
-        document = self.refusal(refusal=["settings: failed"])
-        self.assertTrue(refusal_ok(2, document, "verify", ["settings: failed"], expected=2))
-        self.assertFalse(refusal_ok(1, document, "verify", ["settings: failed"], expected=2))
+        document = self.refusal(refusal=["settings"])
+        self.assertTrue(refusal_ok(2, document, "verify", ["settings"], expected=2))
+        self.assertFalse(refusal_ok(1, document, "verify", ["settings"], expected=2))
 
 
 class EmptyExits(unittest.TestCase):

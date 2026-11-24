@@ -10,6 +10,14 @@ Failure modes covered here (owner decision D, fix round 2):
   fixture row changes, and the runner records it.
 - The profile stand-in prints the rows of the full release's clinical table and track list and the patients of its split (the host compares them with the
   pinned numbers), and a stand-in program of either runner prints a total in a load step instead of a flag.
+
+Failure modes covered here (fix round 3, owner decision D):
+
+- The profile runner expects the printed outcome ``written`` after the plant that rewrites only ``source_counts``. The build says ``unchanged`` (the rewrite of
+  that table alone never changes the printed outcome), so the case fails on a correct build. The runner expects ``unchanged`` and reads the rewrite from the
+  snapshot ID of ``source_counts`` in Nessie, which must be a whole number on the base and another one on the built branch.
+- The runner records a pass when the comparison read printed ``as_planted: true`` and then exited 1: the read needs exit 0 and the true flag.
+- The profile dump prints and logs the row totals of the numeric and waveform tables, which a held-out change moves.
 """
 
 from __future__ import annotations
@@ -85,17 +93,26 @@ class Rule(unittest.TestCase):
 
 
 class ProfileMismatch(unittest.TestCase):
-    def run_of(self, stand: Any) -> tuple[Any, Record, list[str]]:
+    COUNTS = "silver.source_counts"
+
+    def run_of(self, stand: Any, outcome: Any = "unchanged", snapshots: tuple[Any, Any] = (31, 32), build_code: int = 0) -> tuple[Any, Record, list[str]]:
+        """The mismatch case on stand-ins: the build prints ``outcome``, and Nessie holds ``snapshots`` (the base, the built branch) for ``source_counts``."""
         module = runner("signal_profile")
         record = Record(feature="test", slug="test", rerun="none")
         run = module.Run.__new__(module.Run)
         modes: list[str] = []
         run.record, run.trunk = record, "trunk"
         run.stack = SimpleNamespace(
-            profile=lambda mode, branch, base=None, pinned=False: (0, {"outcome": "written", "source_counts": {"pinned": True, "passed": True}}, "", 0.0)
+            profile=lambda mode, branch, base=None, pinned=False: (
+                build_code,
+                {"outcome": outcome, "source_counts": {"pinned": True, "passed": True}},
+                "",
+                0.0,
+            )
         )
         run.fork = lambda base, label: f"{label}_branch"
         run.name = lambda base: f"{base}_built"
+        run.table_snapshot = lambda branch, table: snapshots[1] if branch.endswith("_built") and table == self.COUNTS else snapshots[0]
 
         def asked(mode: str, branch: str, **values: Any) -> tuple[int, dict[str, Any], str, float]:
             modes.append(mode)
@@ -113,11 +130,14 @@ class ProfileMismatch(unittest.TestCase):
         return 0, {"counts": rows, "as_planted": True, "tampered": "track_list"}, "", 0.0
 
     @staticmethod
-    def answering(answer: Any) -> Any:
+    def answering(answer: Any, code: int = 0, plant_code: int = 0) -> Any:
         def stand(mode: str, values: dict[str, Any]) -> tuple[int, dict[str, Any], str, float]:
-            return 0, {"as_planted": answer}, "", 0.0
+            return (plant_code if mode == "tamper" else code), {"as_planted": answer}, "", 0.0
 
         return stand
+
+    def passed(self, record: Record) -> bool:
+        return bool(record.observations) and all(item.passed for item in record.observations)
 
     def test_the_mismatch_case_asks_for_one_flag_and_records_no_name_of_a_count(self) -> None:
         _, record, modes = self.run_of(self.leaky)
@@ -125,14 +145,47 @@ class ProfileMismatch(unittest.TestCase):
         self.assertEqual(["tamper", "counts_flag"], modes)
         for name in NAMES:
             self.assertNotIn(name, texts(record))
-        self.assertTrue(all(item.passed for item in record.observations), texts(record))
+        self.assertTrue(self.passed(record), texts(record))
 
     def test_the_mismatch_case_fails_when_the_flag_is_false_or_not_a_flag(self) -> None:
         answers: list[Any] = [False, None, 1, "True", [], {}]
         for answer in answers:
             with self.subTest(answer=answer):
                 _, record, _ = self.run_of(self.answering(answer))
-                self.assertFalse(all(item.passed for item in record.observations))
+                self.assertFalse(self.passed(record))
+
+    def test_the_mismatch_case_fails_when_the_flag_read_exits_non_zero_after_printing_the_true_flag(self) -> None:
+        for code in (1, 2, 70, 124):
+            with self.subTest(code=code):
+                _, record, _ = self.run_of(self.answering(True, code=code))
+                self.assertFalse(self.passed(record))
+        _, record, _ = self.run_of(self.answering(True))
+        self.assertTrue(self.passed(record), texts(record))
+
+    def test_the_mismatch_case_fails_when_the_plant_exits_non_zero(self) -> None:
+        _, record, _ = self.run_of(self.answering(True, plant_code=1))
+        self.assertFalse(self.passed(record))
+
+    def test_the_build_that_rewrites_only_the_source_counts_says_unchanged(self) -> None:
+        _, record, _ = self.run_of(self.answering(True), outcome="unchanged")
+        self.assertTrue(self.passed(record), texts(record))
+        for outcome in ("written", "verified", None, True):
+            with self.subTest(outcome=outcome):
+                _, record, _ = self.run_of(self.answering(True), outcome=outcome)
+                self.assertFalse(self.passed(record))
+
+    def test_the_rewrite_is_read_from_the_snapshot_id_of_the_source_counts_in_nessie(self) -> None:
+        for snapshots in ((31, 31), (31, None), (None, 32), (None, None), ("31", "32"), (True, 2)):
+            with self.subTest(snapshots=snapshots):
+                _, record, _ = self.run_of(self.answering(True), snapshots=snapshots)
+                self.assertFalse(self.passed(record))
+        _, record, _ = self.run_of(self.answering(True), snapshots=(31, 4_000_000_000))
+        self.assertTrue(self.passed(record), texts(record))
+
+    def test_the_mismatch_case_fails_when_the_build_exits_non_zero(self) -> None:
+        _, record, modes = self.run_of(self.answering(True), build_code=1)
+        self.assertFalse(self.passed(record))
+        self.assertNotIn("counts_flag", modes)
 
     def test_the_stand_in_compares_the_names_inside_the_container(self) -> None:
         module = runner("signal_profile")
@@ -154,6 +207,50 @@ class ProfileMismatch(unittest.TestCase):
         row = values["counts"].elt  # type: ignore[attr-defined]
         self.assertEqual({"name", "value", "expected"}, {key.value for key in row.keys})
         self.assertIn("count_flags", values)
+
+    def test_the_dump_prints_no_total_of_a_waveform_or_numeric_table_that_a_held_out_change_moves(self) -> None:
+        source = runner("signal_profile").STAND_IN
+        dump = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "dump")
+        result = next(
+            node.value
+            for node in ast.walk(dump)
+            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "result" and isinstance(node.value, ast.Dict)
+        )
+        self.assertNotIn("silver_rows", {getattr(key, "value", "") for key in result.keys})
+        self.assertEqual([], whole_table_counts(dump, ("SNUM", "SWAV")))
+
+
+def whole_table_counts(function: ast.FunctionDef, tables: tuple[str, ...]) -> list[str]:
+    """The tables of ``tables`` that ``function`` counts with no ``filter`` between ``session.table(<name>)`` and ``.count()``: a total of every case."""
+    found: list[str] = []
+    for call in (node for node in ast.walk(function) if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "count"):
+        chain: ast.expr = call.func.value  # type: ignore[attr-defined]
+        filtered, table = False, None
+        while True:
+            if isinstance(chain, ast.Call) and isinstance(chain.func, ast.Attribute):
+                if chain.func.attr == "table" and chain.args and isinstance(chain.args[0], ast.Name) and chain.args[0].id in tables:
+                    table = chain.args[0].id
+                filtered = filtered or chain.func.attr == "filter"
+                chain = chain.func.value
+            elif isinstance(chain, ast.Attribute):
+                chain = chain.value
+            else:
+                break
+        if table is not None and not filtered:
+            found.append(table)
+    return sorted(found)
+
+
+class WholeTableCounts(unittest.TestCase):
+    def found(self, body: str) -> list[str]:
+        function = next(node for node in ast.parse(f"def dump(session, spec):\n    {body}\n").body if isinstance(node, ast.FunctionDef))
+        return whole_table_counts(function, ("SNUM", "SWAV"))
+
+    def test_a_count_of_a_whole_table_is_found_and_a_count_of_chosen_cases_is_not(self) -> None:
+        self.assertEqual(["SNUM"], self.found("n = session.table(SNUM).count()"))
+        self.assertEqual(["SNUM", "SWAV"], self.found('n = {"a": session.table(SNUM).count(), "b": session.table(SWAV).count()}'))
+        self.assertEqual([], self.found('n = session.table(SNUM).filter(F.col("case_id").isin(ids)).count()'))
+        self.assertEqual([], self.found("n = session.table(CNT).count()"))
 
 
 class ProfileLoads(unittest.TestCase):

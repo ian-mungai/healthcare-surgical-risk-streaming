@@ -438,10 +438,10 @@ class LabelsCalls(unittest.TestCase):
         check_command(self, commands[0], folders)
 
     def test_a_refusal_is_judged_from_the_file_and_never_from_a_stream(self) -> None:
-        document = {"job": "silver_labels", "mode": "build", "refusal": ["branch_missing: failed"]}
+        document = {"job": "silver_labels", "mode": "build", "refusal": ["branch_missing"]}
         stack, _, _ = self.stack(document, 1, out="silver_labels: other: failed\n", err="silver_labels: other: failed\n")
         call = stack.silver("build", BRANCH, base="no_such_base")
-        self.assertTrue(refusal_ok(call.code, call.document, "build", ["branch_missing: failed"]))
+        self.assertTrue(refusal_ok(call.code, call.document, "build", ["branch_missing"]))
         self.assertFalse(refusal_ok(call.code, call.document, "build", ["other: failed"]))
 
     def test_each_call_has_a_fresh_folder_and_no_file_of_an_earlier_call_is_read(self) -> None:
