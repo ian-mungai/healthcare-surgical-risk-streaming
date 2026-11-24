@@ -8,14 +8,14 @@ branch is the caller's step.
 The test set is sealed, and the clinical table that the tables come from holds the outcome columns. A message holds a code and a flag (``key_null: failed``)
 and a count of tables at most. The result holds the hashes, the snapshot IDs, the checks that ran, one pass flag for each table and measures of the development
 patients (the cutoffs and their counts), and never a case, a patient, an argument, a count over all cases or a field that says whether a table was written:
-a held-out outcome changes both, and the branch hash against the base hash shows a write. The command line prints fixed codes only: ``usage``,
+a held-out outcome changes both, and the branch hash against the base hash shows a write. The result is one file at ``--result``
+(``spark/result_file.py``), with one diagnostic for each code of a failed check and no count; the command line prints fixed codes only: ``usage``,
 ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import threading
@@ -23,8 +23,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
-from scripts.stack.nessie import NessieError
-from spark.settings import SettingsError
+from spark.result_file import add_result_option, run_sealed
 from spark.silver_cases import (
     FLAG,
     CutoffRow,
@@ -38,10 +37,10 @@ from spark.silver_cases import (
     same_rows,
     unit,
 )
-from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, reference_name
+from spark.split_cli import reference_name
 
 JOB = "silver_cases"
-TABLES = ("cases", "lab", "rules")
+TABLES = ("cases", "lab", "operation_length_measure", "score_cutoffs")
 CHECKS_SAMPLE = [
     "key_not_null",
     "key_unique",
@@ -105,7 +104,7 @@ class Outcome:
         The laboratory counts and the measure are for development patients only. A failed check raises, so each flag is true in every result.
         """
         return {
-            "checks_run": CHECKS_BUILD if self.pinned else CHECKS_SAMPLE,
+            "checks_run": list(CHECKS_BUILD if self.pinned else CHECKS_SAMPLE),
             "passed": {name: True for name in TABLES},
             "development_lab_rows": self.output["lab_rows"],
             "development_lab_copies": self.output["lab_copies"],
@@ -212,33 +211,25 @@ def parser() -> argparse.ArgumentParser:
         mode.add_argument("--pinned-release", action="store_true", help="the full release: require its exact row counts")
         if name == "build":
             mode.add_argument("--base", default="main", type=reference_name, help="the branch to create the private branch from")
+        add_result_option(mode)
     return command
 
 
-def report(message: str) -> None:
-    sys.stderr.write(f"{JOB}: {message}\n")
+def result_document(arguments: argparse.Namespace, base: str | None, head: str, outcome: Outcome) -> dict[str, Any]:
+    """The result of a clean call: the mode and the branch that the caller asked for, the base hash and the branch hash, and the facts of the outcome."""
+    return {
+        "mode": arguments.mode,
+        "branch": arguments.branch,
+        "base_hash": base,
+        "branch_hash": head,
+        "pinned_release": arguments.pinned_release,
+        **outcome.facts(),
+    }
 
 
 def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict[str, Any]]) -> int:
-    """Parse the call, run ``execute`` and print its result line.
+    """Parse the call, run ``execute`` and write its result to the file at ``--result`` (``spark/result_file.py``).
 
     Exit 0 on success, 1 on a failed check or a failed upstream, 2 on a bad call or setting, 70 on anything else.
     """
-    arguments = parser().parse_args(argv)
-    try:
-        result = execute(arguments)
-    except SilverCasesError as error:
-        for problem in error.problems:
-            report(problem)
-        return 1
-    except NessieError as error:
-        report("branch_missing" if error.status == NOT_FOUND and error.error_code == REFERENCE_NOT_FOUND else "catalog_error")
-        return 1
-    except SettingsError:
-        report("settings")
-        return 2
-    except Exception:
-        report("internal_error")
-        return INTERNAL_EXIT_CODE
-    sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
-    return 0
+    return run_sealed(parser(), argv, execute, JOB)

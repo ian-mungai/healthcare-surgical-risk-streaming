@@ -16,8 +16,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 from scripts.stack.nessie import NessieError
@@ -25,6 +28,7 @@ from spark.settings import SettingsError
 from spark.silver_cases import CutoffRow, MeasureRow, SilverCasesError, cutoff_rows, measure_rows
 from spark.silver_cases_run import (
     CHECKS_BUILD,
+    result_document,
     run,
     run_build,
     run_verify,
@@ -181,7 +185,7 @@ class BuildOrderTest(unittest.TestCase):
 
     def test_the_result_names_the_pass_flags_the_development_counts_the_cutoffs_and_every_check_that_ran(self) -> None:
         facts = build(FakeOps())
-        self.assertEqual({"cases": True, "lab": True, "rules": True}, facts["passed"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, facts["passed"])
         self.assertEqual(CHECKS_BUILD, facts["checks_run"])
         self.assertEqual(690000, facts["development_lab_rows"])
         self.assertEqual(700000, facts["development_lab_copies"])
@@ -275,7 +279,7 @@ class InputFailureTest(unittest.TestCase):
             input=clean_input_facts(bronze_case_rows=13),
             output=clean_output_facts(case_rows=13, bronze_case_rows=13, lab_rows=90, lab_copies=100, bronze_lab_rows=100),
         )
-        self.assertEqual({"cases": True, "lab": True, "rules": True}, build(sample, pinned=False)["passed"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, build(sample, pinned=False)["passed"])
 
 
 class FreezeTest(unittest.TestCase):
@@ -349,7 +353,9 @@ class OutputFailureTest(unittest.TestCase):
 
     def test_cutoffs_read_back_in_another_order_are_the_same_cutoffs(self) -> None:
         reordered = (measure_rows(LENGTHS)[::-1], cutoff_rows(LENGTHS)[::-1])
-        self.assertEqual({"cases": True, "lab": True, "rules": True}, build(FakeOps(after_write_rules=reordered))["passed"])
+        self.assertEqual(
+            {"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, build(FakeOps(after_write_rules=reordered))["passed"]
+        )
 
     def test_cutoffs_read_back_with_a_repeated_row_fail_even_when_every_row_is_one_that_was_written(self) -> None:
         rows = cutoff_rows(LENGTHS)
@@ -365,7 +371,7 @@ class VerifyTest(unittest.TestCase):
     def test_verify_writes_nothing_and_runs_the_input_and_output_checks_and_the_rules_comparison(self) -> None:
         ops = FakeOps(held=(measure_rows(LENGTHS), cutoff_rows(LENGTHS)))
         facts = run_verify(ops, pinned=True).facts()
-        self.assertEqual({"cases": True, "lab": True, "rules": True}, facts["passed"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, facts["passed"])
         self.assertFalse({"write_cases", "write_lab", "write_rules"} & set(ops.calls))
         self.assertEqual(
             ["split_problems", "ownership_problems", "input_facts", "development_lengths", "output_schema", "existing_rules", "output_facts", "snapshot_ids"],
@@ -386,11 +392,13 @@ class VerifyTest(unittest.TestCase):
 
 
 def invoke(argv: list[str], execute: Any = None) -> tuple[int, str, str]:
+    """Run the command line. A ``build`` or ``verify`` call with no ``--result`` gets one in a fresh folder, so that it is judged for its own arguments."""
     out, err = io.StringIO(), io.StringIO()
     code = 0
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with tempfile.TemporaryDirectory(prefix="cases_cli_") as folder, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        call = [*argv, "--result", f"{folder}/result.json"] if ({"build", "verify"} & set(argv)) and "--result" not in argv else argv
         try:
-            code = run(argv, execute or (lambda arguments: {"mode": arguments.mode}))
+            code = run(call, execute or (lambda arguments: {"mode": arguments.mode}))
         except SystemExit as stop:
             code = int(stop.code or 0)
     return code, out.getvalue(), err.getvalue()
@@ -415,7 +423,7 @@ class CommandLineTest(unittest.TestCase):
     def test_a_good_call_prints_one_result_line_and_exits_0(self) -> None:
         code, out, err = invoke(["build", "--branch", "b", "--pinned-release"])
         self.assertEqual((0, ""), (code, err))
-        self.assertEqual({"mode": "build"}, json.loads(out.removeprefix("RESULT ")))
+        self.assertEqual({"mode": "build", "diagnostics": []}, json.loads(out.removeprefix("RESULT ")))
 
     def test_the_arguments_are_a_mode_a_branch_a_base_for_build_and_the_pinned_flag(self) -> None:
         seen: list[Namespace] = []
@@ -434,6 +442,41 @@ class CommandLineTest(unittest.TestCase):
         code, out, err = invoke(["build", "--branch", "b"], raising(SilverCasesError("key_duplicate: 2 keys", "unparsed: 1 value in 1 column (height)")))
         self.assertEqual((1, ""), (code, out))
         self.assertEqual("silver_cases: key_duplicate: 2 keys\nsilver_cases: unparsed: 1 value in 1 column (height)\n", err)
+
+    def test_the_result_is_one_file_and_a_failed_check_writes_its_codes_and_no_count(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cases_file_") as folder:
+            path = f"{folder}/result.json"
+            argv = ["build", "--branch", "b", "--result", path]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(1, run(argv, raising(SilverCasesError("key_duplicate: failed", "source_table: 2 tables"))))
+            self.assertEqual(
+                {"mode": "build", "branch": "b", "job": "silver_cases", "diagnostics": [{"code": "key_duplicate"}, {"code": "source_table"}]},
+                json.loads(Path(path).read_text()),
+            )
+            self.assertEqual(["result.json"], os.listdir(folder))
+
+    def test_a_result_file_that_is_there_is_never_replaced_and_the_job_does_not_run(self) -> None:
+        seen: list[Namespace] = []
+        with tempfile.TemporaryDirectory(prefix="cases_file_") as folder:
+            path = Path(f"{folder}/result.json")
+            path.write_text("old")
+            self.assertEqual((2, "", "silver_cases: usage\n"), invoke(["verify", "--branch", "b", "--result", str(path)], recording(seen)))
+            self.assertEqual(([], "old"), (seen, path.read_text()))
+
+    def test_the_result_option_is_required(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            run(["build", "--branch", "b"], recording([]))
+        self.assertEqual("silver_cases: usage\n", err.getvalue())
+
+    def test_the_result_document_of_a_run_holds_the_asked_mode_and_branch_the_hashes_and_the_facts_and_no_other_field(self) -> None:
+        arguments = Namespace(mode="build", branch="b", pinned_release=True)
+        document = result_document(arguments, "a" * 64, "c" * 64, run_build(FakeOps(), pinned=True))
+        self.assertEqual(
+            {"mode", "branch", "base_hash", "branch_hash", "pinned_release", "checks_run", "passed", "development_lab_rows", "development_lab_copies"}
+            | {"development_cases", "snapshot_ids", "measure", "cutoffs"},
+            set(document),
+        )
+        self.assertEqual(("build", "b", True), (document["mode"], document["branch"], document["pinned_release"]))
 
     def test_nessie_is_a_fixed_code_whatever_its_message_holds(self) -> None:
         code, _, err = invoke(["build", "--branch", "b"], raising(NessieError(f"cannot work with {MARKER}", status=409)))

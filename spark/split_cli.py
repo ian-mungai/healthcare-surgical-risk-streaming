@@ -12,7 +12,6 @@ input never leaves a branch behind that blocks the retry.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import re
@@ -24,14 +23,12 @@ from pathlib import Path
 from typing import Any
 
 from scripts.stack.nessie import NessieClient, NessieError
+from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, RESULT_PREFIX, add_result_option, run_sealed
 from spark.settings import SettingsError, catalog_options
-from spark.split_table import PatientSplitError
 
 JOB = "patient_split"
-RESULT_PREFIX = "RESULT "
-NOT_FOUND = 404
-REFERENCE_NOT_FOUND = "REFERENCE_NOT_FOUND"
-INTERNAL_EXIT_CODE = 70
+# The names that the other jobs' command lines take from here (``spark/silver/cli.py``): they are defined in ``spark/result_file.py``.
+__all__ = ["INTERNAL_EXIT_CODE", "NOT_FOUND", "REFERENCE_NOT_FOUND", "RESULT_PREFIX"]
 DEADLINE_EXIT_CODE = 124
 DEFAULT_DEADLINE_SECONDS = 900.0
 MAX_DEADLINE_SECONDS = 86_400.0
@@ -67,6 +64,7 @@ def parser() -> argparse.ArgumentParser:
         mode.add_argument("--fixed-sample", type=Path, help="the complete tracked candidate file of the fixed sample, to check each case's set")
         if name == "build":
             mode.add_argument("--base", default="main", type=reference_name, help="the branch to create the private branch from")
+        add_result_option(mode)
     return command
 
 
@@ -133,30 +131,9 @@ def open_client(uri: str, timeout_seconds: float) -> NessieClient:
         raise SettingsError("the Nessie address cannot be parsed") from None
 
 
-def report(message: str) -> None:
-    sys.stderr.write(f"{JOB}: {message}\n")
-
-
 def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict[str, Any]]) -> int:
-    """Parse the call, run ``execute`` and print its result line.
+    """Parse the call, run ``execute`` and write its result to the file at ``--result`` (``spark/result_file.py``).
 
     Exit 0 on success, 1 on a failed check or a failed upstream, 2 on a bad call or setting, 70 on anything else.
     """
-    arguments = parser().parse_args(argv)
-    try:
-        result = execute(arguments)
-    except PatientSplitError as error:
-        for problem in error.problems:
-            report(problem)
-        return 1
-    except NessieError as error:
-        report("branch_missing" if error.status == NOT_FOUND and error.error_code == REFERENCE_NOT_FOUND else "catalog_error")
-        return 1
-    except SettingsError:
-        report("settings")
-        return 2
-    except Exception:
-        report("internal_error")
-        return INTERNAL_EXIT_CODE
-    sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
-    return 0
+    return run_sealed(parser(), argv, execute, JOB)

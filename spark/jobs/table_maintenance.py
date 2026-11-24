@@ -19,12 +19,15 @@ Each run:
 5. lists the tags again and reads every table at every tag again, and exits 1 when a tag vanished or moved or any read differs from the one before.
    A tag made during the run is reported in ``tags_added`` and is read too, and is not a failure: a compaction adds a commit and removes nothing.
 
-The job prints one line that starts with ``RESULT `` and holds the plan, the rewrites and the reads before and after. A table that holds an outcome or a
-label (every table except the Bronze signal tables and the catalog proof table) is sealed in the result: its read holds the tag, the table and the snapshot
-ID, and its rewrite holds one flag, because a row count, a checksum or a file count of it changes when a held-out outcome does. The job still reads, compares
-and refuses on those counts inside, and a refusal about a sealed table names no value. It reads ``NESSIE_URI``,
-``WAREHOUSE_LOCATION`` and ``AWS_REGION`` from the environment, like the catalog proof, and ends at ``--deadline-seconds``. With ``--rewrite-all``
-every data file is rewritten, which a small table needs, because Iceberg's size rules leave a few small files as they are.
+The job prints one line that starts with ``RESULT `` and holds the plan, the checks that ran (``checks_run``), the rewrites and the reads before and after.
+A table that holds an outcome or a label (every table except the Bronze signal tables and the catalog proof table) is sealed in the result: its read holds
+the tag, the table and the snapshot ID, and its rewrite holds one flag (``compacted`` after a rewrite, ``dry_run`` on a dry run, which rewrites nothing),
+because a row count, a checksum or a file count of it changes when a held-out outcome does. The job still reads, compares and refuses on those counts
+inside. Every refusal is one fixed code on standard error and nothing of the error's text, a table, a tag or Spark: ``usage``, ``settings``,
+``catalog_error``, ``internal_error`` or the code of the refusal (``unsafe_table``, ``branches_in_flight``, ``tag_changed`` and the others in
+``spark/maintenance.py``). It reads ``NESSIE_URI``, ``WAREHOUSE_LOCATION`` and ``AWS_REGION`` from the environment, like the catalog proof, and ends at
+``--deadline-seconds``. With ``--rewrite-all`` every data file is rewritten, which a small table needs, because Iceberg's size rules leave a few small files
+as they are.
 """
 
 from __future__ import annotations
@@ -37,13 +40,24 @@ from typing import Any
 from scripts.stack.nessie import NessieError
 from scripts.stack.tags import TableSnapshot, TagClient, default_branch, list_references, list_tags, table_snapshots
 from spark.catalog import add_catalog, required_environment
-from spark.maintenance import RetentionError, compare_reads, compare_tags, in_flight_branches, parse, public_reads, sealed_report, table_identifier
+from spark.maintenance import (
+    CHECKS_RUN,
+    JOB,
+    RetentionError,
+    compare_reads,
+    compare_tags,
+    in_flight_branches,
+    parse,
+    public_reads,
+    sealed_report,
+    table_identifier,
+)
 from spark.preconditions import PROPERTY_KEYS, precondition_problems
 from spark.session import build_session, start_deadline
 from spark.settings import CATALOG, SettingsError
 
-JOB = "table_maintenance"
 RESULT_PREFIX = "RESULT "
+INTERNAL_EXIT_CODE = 70
 
 
 def iceberg_table(session: Any, name: str) -> Any:
@@ -64,7 +78,8 @@ def read_tagged(session: Any, tagged: dict[str, tuple[TableSnapshot, ...]], pins
                 if item.snapshot_id is None:
                     if current is not None:
                         raise RetentionError(
-                            f"the tag {tag} holds {item.table} with no snapshot in Nessie, and the catalog reads it at snapshot {int(current.snapshotId())}"
+                            f"the tag {tag} holds {item.table} with no snapshot in Nessie, and the catalog reads it at snapshot {int(current.snapshotId())}",
+                            code="tag_snapshot_mismatch",
                         )
                     reads.append({"tag": tag, "table": item.table, "snapshot_id": None, "rows": 0, "checksum": None})
                     continue
@@ -73,9 +88,9 @@ def read_tagged(session: Any, tagged: dict[str, tuple[TableSnapshot, ...]], pins
             except RetentionError:
                 raise
             except Exception as error:
-                raise RetentionError(f"the tag {tag} no longer reads {item.table}: {type(error).__name__}: {str(error).splitlines()[0][:300]}") from error
+                raise RetentionError(f"the tag {tag} no longer reads {item.table}", code="tag_unreadable") from error
             if snapshot != item.snapshot_id:
-                raise RetentionError(f"the tag {tag} reads {item.table} at snapshot {snapshot}, not at {item.snapshot_id}")
+                raise RetentionError(f"the tag {tag} reads {item.table} at snapshot {snapshot}, not at {item.snapshot_id}", code="tag_snapshot_mismatch")
             checksum = None if row["checksum"] is None else int(row["checksum"])
             reads.append({"tag": tag, "table": item.table, "snapshot_id": snapshot, "rows": int(row["rows"]), "checksum": checksum})
     return reads
@@ -100,7 +115,7 @@ def refuse_unsafe_tables(session: Any, tables: Sequence[str]) -> None:
         properties = iceberg_table(session, f"{CATALOG}.{table}").properties()
         problems += precondition_problems(table, {key: properties.get(key) for key in PROPERTY_KEYS})
     if problems:
-        raise RetentionError("; ".join(problems))
+        raise RetentionError("; ".join(problems), code="unsafe_table")
 
 
 def compact(session: Any, table: str, rewrite_all: bool, dry_run: bool) -> dict[str, Any]:
@@ -121,17 +136,22 @@ def maintain(arguments: Any) -> dict[str, Any]:
     client = TagClient(required_environment("NESSIE_URI"), arguments.deadline_seconds)
     trunk = default_branch(client)
     if arguments.trunk is not None and arguments.trunk != trunk:
-        raise RetentionError(f"{arguments.trunk} is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted")
+        raise RetentionError(
+            f"{arguments.trunk} is not Nessie's default branch {trunk}: the tables of the default branch are the ones that are compacted",
+            code="trunk_not_default",
+        )
     branches = list_references(client, "BRANCH")
     if trunk not in branches:
-        raise RetentionError(f"the default branch {trunk} does not exist")
+        raise RetentionError(f"the default branch {trunk} does not exist", code="trunk_missing")
     waiting = in_flight_branches(branches, trunk)
     if waiting:
-        raise RetentionError(f"the branches {', '.join(waiting)} exist, so a run may be writing: maintenance waits until they are merged or deleted")
+        raise RetentionError(
+            f"the branches {', '.join(waiting)} exist, so a run may be writing: maintenance waits until they are merged or deleted", code="branches_in_flight"
+        )
     on_trunk = [item.table for item in table_snapshots(client, trunk)]
     missing = sorted(set(arguments.tables) - set(on_trunk))
     if missing:
-        raise RetentionError(f"the tables {', '.join(missing)} are not on {trunk}")
+        raise RetentionError(f"the tables {', '.join(missing)} are not on {trunk}", code="tables_not_on_trunk")
     tables = [table_identifier(table) for table in (arguments.tables or on_trunk)]
     tags_before = list_tags(client)
     tagged_before = {tag: table_snapshots(client, tag) for tag in sorted(tags_before)}
@@ -151,13 +171,14 @@ def maintain(arguments: Any) -> dict[str, Any]:
     changed, added = compare_tags(tags_before, tags_after)
     differences = changed + compare_reads(before, after)
     if differences:
-        raise RetentionError("a tag does not read as it did: " + "; ".join(differences))
+        raise RetentionError("a tag does not read as it did: " + "; ".join(differences), code="tag_changed")
     return {
         "trunk": trunk,
         "dry_run": arguments.dry_run,
         "tags": sorted(tags_before),
         "tags_added": added,
-        "tables": {table: sealed_report(table, report) for table, report in compacted.items()},
+        "checks_run": list(CHECKS_RUN),
+        "tables": {table: sealed_report(table, report, dry_run=arguments.dry_run) for table, report in compacted.items()},
         "tagged_reads_before": public_reads(before),
         "tagged_reads_after": public_reads(after),
     }
@@ -169,16 +190,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_deadline(arguments.deadline_seconds, JOB)
         result = maintain(arguments)
     except RetentionError as error:
-        sys.stderr.write(f"{JOB}: refused: {error}\n")
-        return 1
-    except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
-        return 1
-    except SettingsError as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
-        return 2
+        return refuse(error.code, 1)
+    except NessieError:
+        return refuse("catalog_error", 1)
+    except SettingsError:
+        return refuse("settings", 2)
+    except Exception:
+        return refuse("internal_error", INTERNAL_EXIT_CODE)
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0
+
+
+def refuse(code: str, status: int) -> int:
+    """End with one fixed code on standard error and no text of the error."""
+    sys.stderr.write(f"{JOB}: {code}\n")
+    return status
 
 
 if __name__ == "__main__":

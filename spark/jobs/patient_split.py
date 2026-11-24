@@ -159,6 +159,19 @@ class Lake:
         frame.writeTo(table).tableProperty("format-version", "2").create()
 
 
+def result_document(arguments: argparse.Namespace, base: str | None, facts: dict[str, Any]) -> dict[str, Any]:
+    """The result of a clean call: the mode and the branch that the caller asked for, the base hash of a build, the two tables and the facts of the outcome."""
+    return {
+        "mode": arguments.mode,
+        "branch": arguments.branch,
+        "base_hash": base,
+        "pinned_release": arguments.pinned_release,
+        "table": TARGET_NAME,
+        "source_table": SOURCE_NAME,
+        **facts,
+    }
+
+
 def execute(arguments: argparse.Namespace) -> dict[str, Any]:
     """Run one call. Every local step comes first: the settings, the Nessie client, the candidate file, the deadline and the Spark session. Then the first call
     to Nessie, which creates the branch (build) or finds it (verify), resolves its hash once and checks or builds the table at that hash."""
@@ -175,15 +188,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         base = client.create_branch(arguments.branch, arguments.base).hash if building else client.reference(arguments.branch).hash
         operations = Operations(lake.head, lake.read_source, lake.read_table, lake.write, lake.write_hash, lake.prepare)
         outcome = (run_build if building else run_verify)(operations, base, pinned=arguments.pinned_release, sample=sample)
-        return {
-            "mode": arguments.mode,
-            "branch": arguments.branch,
-            "base_hash": base if building else None,
-            "pinned_release": arguments.pinned_release,
-            "table": TARGET_NAME,
-            "source_table": SOURCE_NAME,
-            **outcome.facts(),
-        }
+        return result_document(arguments, base if building else None, outcome.facts())
     finally:
         if session is not None:
             session.stop()

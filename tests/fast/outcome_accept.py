@@ -1,20 +1,51 @@
 """The pass or fail rules that the end-to-end runs of the Bronze clinical, patient split and Silver cases jobs share, as plain functions on a job's output.
 
-Nothing here imports Spark or Docker. The runners ``tests/e2e/bronze_clinical_lab.py``, ``tests/e2e/silver_patient_split.py`` and ``tests/e2e/silver_cases.py``
-stay untracked, so each rule that decides from a job's output lives here, where ``tests/fast/test_outcome_acceptance.py`` tests it. The clinical table holds
-the outcome columns, so a result holds no count, digest or field that says whether a table was written. A write is read from the base hash and the branch
-hash, an equality with the loaded table from the checks that compare them, and a rebuild after the source moved from the snapshot IDs.
+Nothing here imports Spark or Docker. The runners ``tests/e2e/bronze_clinical_lab.py``, ``tests/e2e/silver_patient_split.py`` and
+``tests/e2e/silver_cases.py`` stay untracked, so each rule that decides from a job's output lives here, where ``tests/fast/test_outcome_acceptance.py``
+tests it.
+
+A runner reads one file with a closed schema and never a line of a job's streams. ``read_result_file`` reads the file, and ``bronze_problem``,
+``split_problem`` and ``cases_problem`` judge it: exactly the fields that the job writes at every level, Boolean flags, whole-number snapshot IDs, the job,
+the command or mode and the branch that the runner asked for, and the exit status. The clinical and laboratory tables hold the outcome columns and the
+creatinine results, so a result holds no count, digest or field that says whether a table was written. A write is read from the base hash and the branch
+hash, an equality with the loaded table from the checks that compare them, and a rebuild after the source moved from the snapshot IDs, which the runner also
+compares with Nessie's own (``snapshots_are``).
 """
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import stat
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
-SEALED_KEYS = ("rows", "source_rows", "keys_digest", "rows_digest")
+from spark.bronze_clinical_lab_cli import CHECKS_FAILED, EXIT_CODES
+from spark.bronze_clinical_lab_run import CHECK_NAMES, CHECKS_PASSED
+
+RESULT_NAME = "result.json"
+RESULT_LIMIT_BYTES = 1_000_000
+BRONZE_JOB = "bronze_clinical_lab"
+BRONZE_COMMANDS = ("write", "verify")
+BRONZE_TABLES = {
+    "clinical_cases": ("clinical", "raw_records.clinical_data", "bronze.clinical_cases"),
+    "lab_results": ("lab", "raw_records.lab_data", "bronze.lab_results"),
+}
 EQUALITY_CHECKS = ("row count", "no value changed", "key unique", "key not null")
 REMOVED_FIELDS = ("outcome", "written", "patients", "counts", "rows", "source_rows", "keys_digest", "rows_digest", "digest", "checksum")
 REMOVED_TOP_LEVEL = ("cases",)
+CODE = re.compile(r"[a-z][a-z_]*")
+HASH = re.compile(r"[0-9a-f]{64}")
+# The exit status of a refusal of the patient split and the Silver cases jobs: a setting is 2, an unmapped error is 70 and any other code is 1.
+SEALED_EXIT = {"settings": 2, "internal_error": 70}
+
+Spec = Any
+
+
+def is_hash(value: Any) -> bool:
+    return isinstance(value, str) and HASH.fullmatch(value) is not None
 
 
 def named(value: Any) -> bool:
@@ -25,27 +56,175 @@ def snapshot(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def fits(value: Any, spec: Spec) -> bool:
+    """Whether ``value`` has exactly the form of ``spec``.
+
+    A dict spec is closed: the value is a dict with exactly its keys, each of the form of its spec. A list spec of one item holds any number of items of that
+    form. A tuple spec is a list of alternatives. A frozenset is a list of allowed text values. ``str``, ``int`` and ``bool`` are exact types (a bool is not a
+    number, a float is not a whole number), ``None`` is none, a text is that text, and a function is a rule."""
+    if isinstance(spec, dict):
+        return isinstance(value, dict) and set(value) == set(spec) and all(fits(value[key], item) for key, item in spec.items())
+    if isinstance(spec, list):
+        return isinstance(value, list) and all(fits(item, spec[0]) for item in value)
+    if isinstance(spec, tuple):
+        return any(fits(value, item) for item in spec)
+    if isinstance(spec, frozenset):
+        return isinstance(value, str) and value in spec
+    if spec is None:
+        return value is None
+    if isinstance(spec, str):
+        return isinstance(value, str) and value == spec
+    if spec in (str, int, bool):
+        return type(value) is spec
+    return bool(spec(value))
+
+
+def pairs_without_repeat(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    names = [name for name, _ in pairs]
+    if len(set(names)) != len(names):
+        raise ValueError("a key is repeated")
+    return dict(pairs)
+
+
+def read_result_file(folder: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """The one result file that a job left in its fresh result folder, and why it is refused as a fixed text that holds nothing of it, or ``None``.
+
+    A folder with no file is no result and no problem (a bad call and a job that the watchdog stopped write none); the caller decides whether one was due. A
+    folder that holds anything else than ``result.json`` is refused, as is a file that is not a plain file of at most ``RESULT_LIMIT_BYTES``, is not text, is
+    not one JSON document with no key written twice, or is not an object."""
+    names = sorted(os.listdir(folder))
+    if not names:
+        return None, None
+    if names != [RESULT_NAME]:
+        return None, "the result folder holds a file other than the result"
+    path = folder / RESULT_NAME
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > RESULT_LIMIT_BYTES:
+            return None, "the result is not a plain file of a size that is allowed"
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read(RESULT_LIMIT_BYTES + 1).decode("utf-8"), object_pairs_hook=pairs_without_repeat)
+    except OSError, ValueError, RecursionError:
+        return None, "the result file is not one whole JSON document"
+    if not isinstance(document, dict):
+        return None, "the result is not one document"
+    return document, None
+
+
+def diagnostics_are(document: Mapping[str, Any], wanted: Sequence[str]) -> bool:
+    items = document.get("diagnostics")
+    return isinstance(items, list) and all(fits(item, {"code": str}) for item in items) and [item["code"] for item in items] == list(wanted)
+
+
+def codes_are(document: Mapping[str, Any], wanted: Sequence[str]) -> bool:
+    """Whether the codes of the diagnostics of a result are exactly the wanted ones, in order, each one a code and nothing else."""
+    return diagnostics_are(document, wanted)
+
+
+# --- Bronze clinical and laboratory
+
+TABLE_SPEC: Spec = {
+    "source_table": str,
+    "bronze_table": str,
+    "source_snapshot_id": (int, None),
+    "bronze_snapshot_id": (int, None),
+    "passed": bool,
+    "checks": [{"name": frozenset(CHECK_NAMES), "passed": bool}],
+}
+RUN_SPEC: Spec = {
+    "job": BRONZE_JOB,
+    "command": str,
+    "branch": str,
+    "branch_hash": is_hash,
+    "default_branch": named,
+    "source_hash": is_hash,
+    "passed": bool,
+    "tables": {"clinical_cases": TABLE_SPEC, "lab_results": TABLE_SPEC},
+    "diagnostics": [{"code": str}],
+}
+REFUSAL_SPEC: Spec = {"job": BRONZE_JOB, "command": str, "branch": str, "passed": bool, "diagnostics": [{"code": frozenset(EXIT_CODES)}]}
+
+
 def sealed_table(table: Mapping[str, Any]) -> bool:
-    """Whether a table of a Bronze result holds no count, no digest and no check detail: each check is its name and its flag only."""
-    checks = table.get("checks")
-    if any(key in table for key in SEALED_KEYS) or not isinstance(checks, list) or not checks:
-        return False
-    return all(isinstance(check, Mapping) and set(check) == {"name", "passed"} for check in checks)
+    """Whether a table of a Bronze result has exactly the fields that the job writes: the snapshot IDs, the flag and checks of a name and a flag, and no
+    count, no digest, no metadata path and no check detail."""
+    return fits(dict(table), TABLE_SPEC) and bool(table["checks"])
 
 
 def passed_checks(table: Mapping[str, Any]) -> set[str]:
     return {check["name"] for check in table.get("checks") or [] if isinstance(check, Mapping) and check.get("passed") is True}
 
 
+def table_problem(name: str, table: Mapping[str, Any]) -> str | None:
+    kind, source_table, bronze_table = BRONZE_TABLES[name]
+    names = [check["name"] for check in table["checks"]]
+    if table["source_table"] != source_table or table["bronze_table"] != bronze_table:
+        return "a table of the result is not the one that the job checks"
+    if len(set(names)) != len(names) or not names:
+        return "a check of a table is repeated or the table has none"
+    if table["passed"] != all(check["passed"] for check in table["checks"]):
+        return "the flag of a table does not agree with its checks"
+    if table["passed"] and names != list(CHECKS_PASSED[kind]):
+        return "a passed table does not hold exactly the checks of its kind"
+    return None
+
+
+def bronze_problem(document: Any, command: str, branch: str, exit_code: int) -> str | None:
+    """Why a Bronze result file is not the closed schema of the job's result for this command and branch, as a fixed text that holds no value of it, or
+    ``None``.
+
+    There are two forms, both closed. A run (it holds ``tables``) holds the hashes, both tables and one diagnostic list that is empty when every table
+    passed (exit 0) and is ``checks_failed`` when one did not (exit 1). A refusal holds the job, the command, the branch, ``passed`` false and one code
+    of the closed list, with that code's exit status. The command and the branch are exactly the ones that the runner asked for."""
+    if not isinstance(document, dict):
+        return "the result is not one document"
+    if command not in BRONZE_COMMANDS or document.get("command") != command or document.get("branch") != branch:
+        return "a fixed value at the top of the result is not the expected one"
+    if "tables" not in document:
+        if not fits(document, REFUSAL_SPEC) or document["passed"] is not False:
+            return "a refusal is not the closed schema"
+        code = document["diagnostics"][0]["code"] if len(document["diagnostics"]) == 1 else None
+        if code is None or EXIT_CODES[code] != exit_code:
+            return "a refusal does not hold exactly one code that agrees with the exit status"
+        return None
+    if not fits(document, RUN_SPEC):
+        return "the result is not the closed schema"
+    for name, table in document["tables"].items():
+        problem = table_problem(name, table)
+        if problem is not None:
+            return problem
+    every = all(table["passed"] for table in document["tables"].values())
+    if document["passed"] != every:
+        return "the flag of the result does not agree with its tables"
+    wanted = [] if every else [CHECKS_FAILED]
+    if [item["code"] for item in document["diagnostics"]] != wanted or exit_code != (0 if every else 1):
+        return "the diagnostics of the result do not agree with its flags and the exit status"
+    return None
+
+
 def equals_loaded(table: Mapping[str, Any]) -> bool:
-    """Whether a sealed table equals the loaded table: it passed, both snapshot IDs are named and the checks of the row count, the values, the key and its
-    null check passed. The value check compares both tables as multisets, in both directions."""
+    """Whether a table equals the loaded table: it is sealed, it passed, both snapshot IDs are named and the checks of the row count, the values, the key
+    and its null check passed. The value check compares both tables as multisets, in both directions. It holds for the clinical and the laboratory
+    table."""
     return (
         sealed_table(table)
-        and table.get("passed") is True
+        and table["passed"] is True
+        and snapshot(table["source_snapshot_id"])
+        and snapshot(table["bronze_snapshot_id"])
+        and set(EQUALITY_CHECKS) <= passed_checks(table)
+    )
+
+
+def snapshots_are(table: Mapping[str, Any], source: int | None, bronze: int | None) -> bool:
+    """Whether the snapshot IDs that a table reports are the ones that Nessie holds for the loaded table at the source hash and for the Bronze table on the
+    branch. A missing ID (None) or a Boolean is never equal."""
+    return (
+        snapshot(source)
+        and snapshot(bronze)
+        and table.get("source_snapshot_id") == source
+        and table.get("bronze_snapshot_id") == bronze
         and snapshot(table.get("source_snapshot_id"))
         and snapshot(table.get("bronze_snapshot_id"))
-        and set(EQUALITY_CHECKS) <= passed_checks(table)
     )
 
 
@@ -64,6 +243,94 @@ def moved(before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
     )
 
 
+# --- Patient split and Silver cases
+
+
+def snapshot_map(value: Any) -> bool:
+    return isinstance(value, dict) and all(isinstance(key, str) and fits(item, (int, None)) for key, item in value.items())
+
+
+SPLIT_JOB, CASES_JOB = "patient_split", "silver_cases"
+MODES = frozenset({"build", "verify"})
+SPLIT_SPEC: Spec = {
+    "mode": MODES,
+    "branch": str,
+    "base_hash": (named, None),
+    "pinned_release": bool,
+    "table": "silver.patient_split",
+    "source_table": "bronze.clinical_cases",
+    "checked_hash": named,
+    "write_hash": (named, None),
+    "branch_hash": named,
+    "snapshot_id": (int, None),
+    "source_snapshot_id": (int, None),
+    "rule_version": named,
+    "passed": {"patient_split": bool},
+    "checks_run": [str],
+    "fixed_sample_cases_checked": (int, None),
+    "diagnostics": [],
+}
+CASES_TABLES = ("cases", "lab", "operation_length_measure", "score_cutoffs")
+CASES_SPEC: Spec = {
+    "mode": MODES,
+    "branch": str,
+    "base_hash": (named, None),
+    "branch_hash": named,
+    "pinned_release": bool,
+    "checks_run": [str],
+    "passed": dict.fromkeys(CASES_TABLES, bool),
+    "development_lab_rows": int,
+    "development_lab_copies": int,
+    "development_cases": int,
+    "snapshot_ids": snapshot_map,
+    "measure": [{"statistic": str, "unit": str, "value": int}],
+    "cutoffs": [
+        {
+            "cutoff": str,
+            "anchor": str,
+            "elapsed_seconds": (int, None),
+            "basis": str,
+            "rule_version": str,
+            "development_cases": int,
+            "median_length_seconds": int,
+        }
+    ],
+    "diagnostics": [],
+}
+SEALED_REFUSAL_SPEC: Spec = {"mode": MODES, "branch": str, "job": str, "diagnostics": [{"code": CODE.fullmatch}]}
+
+
+def sealed_problem(document: Any, spec: Spec, job: str, mode: str, branch: str, exit_code: int) -> str | None:
+    """Why a result file of the patient split or the Silver cases job is not the closed schema of the job's result, as a fixed text, or ``None``.
+
+    A clean result holds the facts of the job and no diagnostic (exit 0), and every pass flag is true. A refusal holds the mode, the branch, the job and one
+    diagnostic for each code, each exactly a code and no count, with exit 70 for ``internal_error``, 2 for ``settings`` and 1 for the others. The mode and the
+    branch are exactly the ones that the runner asked for."""
+    if not isinstance(document, dict):
+        return "the result is not one document"
+    if document.get("mode") != mode or document.get("branch") != branch:
+        return "a fixed value at the top of the result is not the expected one"
+    if document.get("diagnostics"):
+        if not fits(document, SEALED_REFUSAL_SPEC) or document["job"] != job:
+            return "a refusal is not the closed schema"
+        wanted = {SEALED_EXIT.get(item["code"], 1) for item in document["diagnostics"]}
+        return None if wanted == {exit_code} else "the codes of a refusal do not agree with the exit status"
+    if not fits(document, spec):
+        return "the result is not the closed schema"
+    if exit_code != 0:
+        return "a clean result does not agree with the exit status"
+    flags = document["passed"]
+    return None if all(value is True for value in flags.values()) else "a pass flag of a clean result is not true"
+
+
+def split_problem(document: Any, mode: str, branch: str, exit_code: int) -> str | None:
+    return sealed_problem(document, SPLIT_SPEC, SPLIT_JOB, mode, branch, exit_code)
+
+
+def cases_problem(document: Any, mode: str, branch: str, exit_code: int) -> str | None:
+    return sealed_problem(document, CASES_SPEC, CASES_JOB, mode, branch, exit_code)
+
+
 def wrote(result: Mapping[str, Any]) -> bool:
     """Whether a build moved its branch off the base: it names both hashes and they differ."""
     base, branch = result.get("base_hash"), result.get("branch_hash")
@@ -77,7 +344,7 @@ def kept_at_base(result: Mapping[str, Any]) -> bool:
 
 
 def all_passed(result: Mapping[str, Any], tables: Sequence[str]) -> bool:
-    """Whether the result has one pass flag for each of ``tables``, each true, and no other."""
+    """Whether the result has one pass flag for each of ``tables``, each the Boolean true, and no other."""
     flags = result.get("passed")
     return isinstance(flags, Mapping) and set(flags) == set(tables) and all(flags[table] is True for table in tables)
 
@@ -94,10 +361,3 @@ def no_removed_fields(result: Mapping[str, Any]) -> bool:
     """Whether the result holds none of the fields that a held-out outcome could change: no outcome, no written flag, no count and no digest at any depth, and
     no count of all cases at the top (``cases`` is also the name of a table in the pass flags)."""
     return not keys_of(result) & set(REMOVED_FIELDS) and not set(result) & set(REMOVED_TOP_LEVEL)
-
-
-def refusal_is_flags(found: Sequence[str], wanted: Sequence[str]) -> bool:
-    """Whether the lines that a job wrote are exactly the wanted ones, in order. A wanted code is the line ``code: failed``; a wanted line that holds a colon is
-    taken as it is (a count of tables)."""
-    expected = [item if ": " in item else f"{item}: failed" for item in wanted]
-    return list(found) == expected

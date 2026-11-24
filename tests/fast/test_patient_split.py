@@ -1143,11 +1143,13 @@ class EntryPointTest(unittest.TestCase):
 
 
 def call_main(main: Callable[[list[str]], int], argv: list[str]) -> tuple[int, str, str]:
+    """Run ``main``. A ``build`` or ``verify`` call with no ``--result`` gets one in a fresh folder, so that it is judged for its own arguments."""
     out, err = io.StringIO(), io.StringIO()
     code = 0
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with tempfile.TemporaryDirectory(prefix="split_main_") as folder, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        call = [*argv, "--result", f"{folder}/result.json"] if ({"build", "verify"} & set(argv)) and "--result" not in argv else argv
         try:
-            code = main(argv)
+            code = main(call)
         except SystemExit as stop:
             code = int(stop.code or 0)
     return code, out.getvalue(), err.getvalue()

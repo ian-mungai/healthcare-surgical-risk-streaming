@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 
+from spark.result_file import SealedError
 from spark.split_table import COLUMNS as SPLIT_COLUMNS
 from spark.split_table import SplitRow, table_problems
 
@@ -132,12 +133,8 @@ SOURCE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
 }
 
 
-class SilverCasesError(ValueError):
+class SilverCasesError(SealedError):
     """A rule was broken or a check failed. ``problems`` holds one message for each cause, each a code and a flag, or a count of tables."""
-
-    def __init__(self, *problems: str) -> None:
-        super().__init__("; ".join(problems))
-        self.problems = list(problems)
 
 
 def unit(count: int, noun: str) -> str:

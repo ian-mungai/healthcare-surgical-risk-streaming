@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.sample.split import BUCKETS, HEX_DIGITS, SEED, TRAIN_BUCKETS, VALIDATION_BUCKETS, Part, patient_part
+from spark.result_file import SealedError
 from spark.settings import CATALOG, catalog_options
 
 SET_NAMES: Mapping[Part, str] = {"train": "training", "validation": "validation", "test": "test"}
@@ -89,12 +90,8 @@ CODES = frozenset(
 CODES_OF_THE_JOB = frozenset({"source_no_snapshot", "source_empty", "source_table"})
 
 
-class PatientSplitError(ValueError):
+class PatientSplitError(SealedError):
     """The split cannot be built or a check failed. ``problems`` holds one message for each cause, each a code and a flag, or a count of tables."""
-
-    def __init__(self, *problems: str) -> None:
-        super().__init__("; ".join(problems))
-        self.problems = list(problems)
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +167,7 @@ class Outcome:
             "source_snapshot_id": self.source.snapshot_id,
             "rule_version": RULE_VERSION,
             "passed": {"patient_split": True},
-            "checks_run": self.checks_run,
+            "checks_run": list(self.checks_run),
             "fixed_sample_cases_checked": self.sample_cases,
         }
 

@@ -9,7 +9,7 @@ Failure modes covered here:
 
 - A result of the Silver cases job holds ``outcome`` or ``written`` (a held-out row changes whether a table was written) or the count of all cases.
 - A result of the patient split holds ``outcome``, the count of patients or cases or the count of each set.
-- A result of the Bronze clinical table holds its row counts, its digests or a check detail that holds a count.
+- A result of a Bronze table, clinical or laboratory, holds its row counts, its digests, its metadata path or a check detail that holds a count.
 - The table maintenance result holds the row count or the checksum of a tagged table that can hold an outcome, or a refusal that names them.
 - A refusal holds a count of rows, cases, patients, keys, values or columns after its code.
 - A changed held-out row changes the result in more than the hashes and the snapshot IDs.
@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import io
+import json
 import re
 import unittest
+from argparse import Namespace
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +31,7 @@ from unittest import mock
 
 from scripts.stack.tags import TableSnapshot
 from spark import maintenance, silver_cases, split_table
-from spark.bronze_clinical_lab_run import finish
+from spark.bronze_clinical_lab_cli import ending
 from spark.jobs import table_maintenance as maintenance_job
 from spark.jobs.patient_split import Lake as SplitLake
 from spark.silver_cases import OWNERSHIP_PROBLEM, SilverCasesError, check_lengths, cutoff_rows, frozen_problems, input_problems, measure_rows, output_problems
@@ -69,9 +71,9 @@ class CasesResult(unittest.TestCase):
         self.assertEqual([], [path for path in numbers(facts) if path[0] not in self.ALLOWED_NUMBERS], facts)
 
     def test_each_table_has_one_pass_flag(self) -> None:
-        self.assertEqual({"cases": True, "lab": True, "rules": True}, self.facts()["passed"])
+        self.assertEqual({"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True}, self.facts()["passed"])
         self.assertEqual(
-            {"cases": True, "lab": True, "rules": True},
+            {"cases": True, "lab": True, "operation_length_measure": True, "score_cutoffs": True},
             run_verify(cases.FakeOps(held=(measure_rows(cases.LENGTHS), cutoff_rows(cases.LENGTHS))), pinned=True).facts()["passed"],
         )
 
@@ -192,42 +194,56 @@ class SplitRefusals(unittest.TestCase):
         self.assertEqual(["schema: failed"], split_table.schema_problems([("x", "string")], split_table.COLUMNS))
 
 
-def clinical(result: dict[str, Any]) -> dict[str, Any]:
-    table: dict[str, Any] = result["tables"]["clinical_cases"]
+def table_of(result: dict[str, Any], name: str) -> dict[str, Any]:
+    table: dict[str, Any] = result["tables"][name]
     return table
 
 
-class BronzeClinicalResult(unittest.TestCase):
+class BronzeResult(unittest.TestCase):
+    """Both Bronze tables are sealed: the laboratory table holds the creatinine results that the kidney outcome is built from."""
+
+    TABLES = ("clinical_cases", "lab_results")
+    FIELDS = {"source_table", "bronze_table", "source_snapshot_id", "bronze_snapshot_id", "passed", "checks"}
+
     def result(self, harness: bronze.Harness | None = None, command: str = "write") -> dict[str, Any]:
         return (harness or bronze.Harness()).run(command)
 
-    def test_the_clinical_table_holds_no_count_no_digest_and_no_check_detail(self) -> None:
-        table = clinical(self.result())
-        self.assertEqual(set(), set(table) & BANNED_KEYS, table)
-        self.assertTrue(table["passed"])
-        for check in table["checks"]:
-            self.assertEqual({"name", "passed"}, set(check), check)
+    @staticmethod
+    def returning(result: dict[str, Any]) -> Callable[[Namespace], dict[str, Any]]:
+        return lambda arguments: result
 
-    def test_the_clinical_table_keeps_its_snapshot_ids_and_the_laboratory_table_keeps_its_counts_and_digests(self) -> None:
+    def test_each_table_holds_the_snapshot_ids_a_flag_and_checks_of_a_name_and_a_flag_and_nothing_else(self) -> None:
         result = self.result()
-        self.assertEqual(9, clinical(result)["bronze_snapshot_id"])
-        lab = result["tables"]["lab_results"]
-        self.assertEqual(6, lab["rows"])
-        self.assertEqual("lab-keys", lab["keys_digest"])
+        for name in self.TABLES:
+            table = table_of(result, name)
+            self.assertEqual(self.FIELDS, set(table), name)
+            self.assertTrue(table["passed"])
+            for check in table["checks"]:
+                self.assertEqual({"name", "passed"}, set(check), check)
 
-    def test_the_clinical_digests_are_not_even_computed(self) -> None:
+    def test_no_table_holds_a_count_a_digest_a_metadata_path_or_a_detail_at_any_depth(self) -> None:
+        found = keys_of(self.result())
+        self.assertEqual(set(), found & (BANNED_KEYS | {"source_metadata_location", "detail", "keys_digest", "rows_digest"}), found)
+
+    def test_both_tables_keep_their_snapshot_ids(self) -> None:
+        result = self.result()
+        for name in self.TABLES:
+            self.assertEqual((7, 9), (table_of(result, name)["source_snapshot_id"], table_of(result, name)["bronze_snapshot_id"]), name)
+
+    def test_no_digest_is_computed_for_either_table(self) -> None:
         harness = bronze.Harness()
         self.result(harness)
-        self.assertNotIn("digests:clinical", harness.calls)
-        self.assertIn("digests:lab", harness.calls)
+        self.assertEqual([], [call for call in harness.calls if call.startswith("digests")])
 
-    def test_a_clinical_table_with_other_row_counts_gives_the_same_result(self) -> None:
+    def test_other_row_counts_give_the_same_result(self) -> None:
         other = bronze.Harness()
         other.spark.source_count_value = other.spark.bronze_count_value = 9
-        self.assertEqual(clinical(self.result()), clinical(self.result(other)))
+        first, second = self.result(), self.result(other)
+        for name in self.TABLES:
+            self.assertEqual(table_of(first, name), table_of(second, name), name)
 
-    def test_a_failed_clinical_check_is_a_name_and_a_flag_and_its_message_holds_no_digit(self) -> None:
-        for plant in ("difference", "duplicates", "nulls", "rows"):
+    def test_a_failed_check_is_a_name_and_a_flag_and_its_message_holds_no_value_for_either_table(self) -> None:
+        for plant in ("difference", "duplicates", "nulls", "rows", "gaps"):
             harness = bronze.Harness()
             if plant == "difference":
                 harness.spark.difference_counts = (3, 4)
@@ -235,32 +251,32 @@ class BronzeClinicalResult(unittest.TestCase):
                 harness.spark.duplicates = 7
             elif plant == "nulls":
                 harness.spark.null_counts = (5, 6)
+            elif plant == "gaps":
+                harness.spark.gaps = 8
             else:
                 harness.spark.bronze_count_value = 8
             result = self.result(harness, "verify")
             self.assertFalse(result["passed"], plant)
-            err, out = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stderr(err):
-                finish(result, "bronze_run", out, err)
-            clinical_failures = [part for part in err.getvalue().split("; ") if "clinical_cases" in part]
-            self.assertTrue(clinical_failures, plant)
-            for part in clinical_failures:
-                self.assertNotRegex(part.split("clinical_cases")[1], r"[0-9]", f"{plant}: {part}")
+            _, _, lines = ending(Namespace(command="verify", branch="bronze_run"), self.returning(result))
+            self.assertTrue(lines, plant)
+            self.assertNotRegex("".join(lines).replace("occurrence numbers from 1 without a gap", ""), r"[0-9]", plant)
+            for table in result["tables"].values():
+                for check in table["checks"]:
+                    self.assertEqual({"name", "passed"}, set(check), plant)
 
-    def test_the_laboratory_table_keeps_its_check_details(self) -> None:
+    def test_a_laboratory_check_that_fails_is_in_the_result_by_its_name(self) -> None:
         harness = bronze.Harness()
         harness.spark.gaps = 2
-        lab = self.result(harness, "verify")["tables"]["lab_results"]
-        self.assertTrue(all("detail" in check for check in lab["checks"]))
+        self.assertEqual({"occurrence numbers from 1 without a gap"}, harness.failed(harness.run("verify")))
 
     def test_the_verdict_of_a_publish_reads_names_and_flags_only(self) -> None:
         from spark.bronze_clinical_lab_publish import verdict_of
 
-        harness = bronze.Harness()
-        harness.spark.difference_counts = (1, 0)
-        self.assertEqual(
-            [("clinical_cases", "no value changed", "equality")], [(f.table, f.name, f.guard) for f in verdict_of(self.result(harness, "verify")).failed][:1]
-        )
+        for plant, name in (("clinical_cases", "no value changed"), ("lab_results", "no value changed")):
+            harness = bronze.Harness()
+            harness.spark.difference_counts = (1, 0)
+            failed = verdict_of(self.result(harness, "verify")).failed
+            self.assertIn((plant, name, "equality"), [(f.table, f.name, f.guard) for f in failed])
 
 
 class MaintenanceResult(unittest.TestCase):
@@ -306,17 +322,18 @@ class MaintenanceResult(unittest.TestCase):
         after = [{"tag": "t", "table": "bronze.tracks", "snapshot_id": 1, "rows": 11, "checksum": 5}]
         self.assertIn("11", maintenance.compare_reads(before, after)[0])
 
-    def test_the_compaction_report_of_a_sealed_table_holds_no_count(self) -> None:
-        self.assertEqual({"compacted": True}, maintenance.sealed_report(self.SEALED_TABLE, {"rewrite_data_files": {"rewritten_data_files_count": 3}}))
+    def test_the_compaction_report_of_a_sealed_table_is_one_flag_and_a_dry_run_is_never_called_compacted(self) -> None:
         report = {"rewrite_data_files": {"rewritten_data_files_count": 3}}
-        self.assertEqual(report, maintenance.sealed_report("bronze.tracks", report))
-        self.assertEqual({"compacted": True}, maintenance.sealed_report(self.SEALED_TABLE, {"would_rewrite": {"data_files": 4, "bytes": 9}}))
+        self.assertEqual({"compacted": True}, maintenance.sealed_report(self.SEALED_TABLE, report, dry_run=False))
+        self.assertEqual({"dry_run": True}, maintenance.sealed_report(self.SEALED_TABLE, {"would_rewrite": {"data_files": 4, "bytes": 9}}, dry_run=True))
+        self.assertEqual(report, maintenance.sealed_report("bronze.tracks", report, dry_run=False))
+        self.assertEqual({"would_rewrite": {"data_files": 4}}, maintenance.sealed_report("bronze.tracks", {"would_rewrite": {"data_files": 4}}, dry_run=True))
 
 
 class MaintainResult(unittest.TestCase):
     """The result that ``maintain`` returns, with the reads of the tags replaced: a sealed table holds no row count and no checksum anywhere in it."""
 
-    def result(self, tables: tuple[str, ...]) -> dict[str, Any]:
+    def result(self, tables: tuple[str, ...], argv: list[str] | None = None) -> dict[str, Any]:
         reads = [{"tag": "run-a", "table": table, "snapshot_id": 7, "rows": 1234, "checksum": 5678} for table in tables]
         snapshots = tuple(TableSnapshot(table, 7, "file:/w/m.json") for table in tables)
         patches = (
@@ -328,7 +345,7 @@ class MaintainResult(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for patched in patches:
                 stack.enter_context(patched)
-            return maintenance_tests.Rewrites(dict.fromkeys(tables, maintenance_tests.SAFE)).run([], maintenance_tests.stand_in(tables))
+            return maintenance_tests.Rewrites(dict.fromkeys(tables, maintenance_tests.SAFE)).run(argv or [], maintenance_tests.stand_in(tables))
 
     def test_a_sealed_table_holds_no_row_count_and_no_checksum_in_the_result(self) -> None:
         result = self.result(("silver.cases", "silver.patient_split"))
@@ -336,6 +353,17 @@ class MaintainResult(unittest.TestCase):
         self.assertFalse(found & {"rows", "checksum", "rewrite_data_files"}, result)
         self.assertEqual([7, 7], [item["snapshot_id"] for item in result["tagged_reads_before"]])
         self.assertEqual(result["tagged_reads_before"], result["tagged_reads_after"])
+
+    def test_the_result_names_the_checks_that_ran_and_a_dry_run_is_not_a_compaction(self) -> None:
+        result = self.result(("silver.cases",))
+        self.assertEqual(list(maintenance.CHECKS_RUN), result["checks_run"])
+        self.assertEqual({"compacted": True}, result["tables"]["silver.cases"])
+
+    def test_a_dry_run_of_a_sealed_table_holds_dry_run_and_no_compacted_flag(self) -> None:
+        result = self.result(("silver.cases", "bronze.tracks"), ["--dry-run"])
+        self.assertEqual({"dry_run": True}, result["tables"]["silver.cases"])
+        self.assertTrue(result["dry_run"])
+        self.assertNotIn("compacted", json.dumps(result["tables"]["silver.cases"]))
 
     def test_an_open_table_keeps_them_in_the_result(self) -> None:
         result = self.result(("bronze.tracks",))

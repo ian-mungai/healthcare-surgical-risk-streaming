@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import unittest
+from argparse import Namespace
 from collections import Counter
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -23,7 +24,8 @@ from spark.bronze_clinical_lab import (
     TableContent,
     assign_occurrences,
 )
-from spark.bronze_clinical_lab_run import RESULT_PREFIX, finish, parser, run_job
+from spark.bronze_clinical_lab_cli import ending
+from spark.bronze_clinical_lab_run import JOB, NotABranch, SourceNotInHistory, parser, run_job
 from spark.settings import SettingsError
 
 HASH = "a" * 64
@@ -179,10 +181,6 @@ class FakeSpark:
             raise AssertionError("no row may be numbered or sorted when a key is null")
         return [] if self.collect_nothing else self.collected()
 
-    def digests(self, kind: str, columns: list[str]) -> tuple[str, str]:
-        self.calls.append(f"digests:{kind}")
-        return f"{kind}-keys", f"{kind}-rows"
-
     def close(self) -> None:
         self.calls.append("close")
 
@@ -221,7 +219,7 @@ def verify_calls(kind: str, reference: str = BRANCH) -> list[str]:
     ]
     if kind == "lab":
         calls += ["occurrence_gaps", "repeated_row_count", f"repeated_rows:{REPEATED_ROWS_LIMIT}"]
-    return calls if kind == "clinical" else [*calls, f"digests:{kind}"]  # the digests of the clinical table, which holds the outcome, never leave the job
+    return calls  # no digest of either table is computed: neither table's rows can leave the job in any form
 
 
 def start_calls(command: str) -> list[str]:
@@ -348,8 +346,9 @@ class DefaultBranchTest(unittest.TestCase):
         for command in ("write", "verify"):
             harness = Harness()
             harness.nessie.history = {TRUNK: set(), "load-unmerged": {HASH}}
-            with self.subTest(command), self.assertRaisesRegex(NessieError, "not in the history of trunk"):
+            with self.subTest(command), self.assertRaisesRegex(NessieError, "not in the history of trunk") as raised:
                 harness.run(command)
+            self.assertIsInstance(raised.exception, SourceNotInHistory)
             self.assertEqual(["default_branch", f"history_contains:{TRUNK}:aaaa"], harness.calls)
 
     def test_the_command_line_has_no_base_argument_so_no_other_branch_can_be_named(self) -> None:
@@ -367,24 +366,27 @@ class DefaultBranchTest(unittest.TestCase):
     def test_a_loaded_table_that_is_not_there_at_the_hash_is_refused_before_any_branch_is_created(self) -> None:
         harness = Harness()
         del harness.nessie.contents[(f"{TRUNK}@{HASH}", SOURCES[1])]
-        with self.assertRaisesRegex(BronzeRulesError, "raw_records.lab_data"):
+        with self.assertRaisesRegex(BronzeRulesError, "raw_records.lab_data") as raised:
             harness.run("write")
+        self.assertEqual("source_table_missing", raised.exception.code)
         self.assertFalse([call for call in harness.calls if call.startswith(("create_branch", "open:"))])
 
     def test_verify_refuses_a_name_that_is_not_a_branch(self) -> None:
         harness = Harness()
         harness.nessie.branches = set()
-        with self.assertRaisesRegex(NessieError, "not a branch"):
+        with self.assertRaisesRegex(NessieError, "not a branch") as raised:
             harness.run("verify")
+        self.assertIsInstance(raised.exception, NotABranch)
 
 
 class SourceLineageTest(unittest.TestCase):
-    def test_the_report_holds_the_metadata_location_and_the_snapshot_of_each_loaded_table_at_the_hash(self) -> None:
+    def test_the_report_holds_the_snapshot_of_each_loaded_table_at_the_hash_and_no_metadata_location(self) -> None:
         result = Harness().run("write")
-        clinical = result["tables"]["clinical_cases"]
-        self.assertEqual(content(SOURCES[0]).metadata_location, clinical["source_metadata_location"])
-        self.assertEqual(7, clinical["source_snapshot_id"])
-        self.assertEqual(9, clinical["bronze_snapshot_id"])
+        for name in ("clinical_cases", "lab_results"):
+            table = result["tables"][name]
+            self.assertEqual((7, 9), (table["source_snapshot_id"], table["bronze_snapshot_id"]), name)
+            self.assertNotIn("source_metadata_location", table, name)
+            self.assertNotIn("file:", json.dumps(table), name)
 
     def test_a_loaded_table_with_another_metadata_location_but_the_same_snapshot_fails_source_changed(self) -> None:
         harness = Harness()
@@ -431,10 +433,10 @@ class TableCheckTest(unittest.TestCase):
 class NullKeyTest(unittest.TestCase):
     PLANTED_CASE = "X-PLANTED-CASE"
 
-    def verified(self, harness: Harness) -> tuple[dict[str, Any], int, str, str]:
+    def verified(self, harness: Harness) -> tuple[dict[str, Any], int, str]:
         result = harness.run("verify")
-        out, err = io.StringIO(), io.StringIO()
-        return result, finish(result, BRANCH, out, err), out.getvalue(), err.getvalue()
+        code, _, lines = ending(Namespace(command="verify", branch=BRANCH), lambda arguments: result)
+        return result, code, "".join(f"{JOB}: {line}\n" for line in lines)
 
     def test_a_null_key_in_bronze_or_in_the_loaded_table_fails_the_key_check_first_and_nothing_is_numbered_or_sorted(self) -> None:
         for nulls in ((0, 1), (2, 0), (1, 1)):
@@ -442,10 +444,9 @@ class NullKeyTest(unittest.TestCase):
             harness.spark.null_counts = nulls
             harness.spark.numbering_forbidden = True
             with self.subTest(nulls):
-                result, code, out, _ = self.verified(harness)
+                result, code, _ = self.verified(harness)
                 self.assertEqual(1, code)
                 self.assertEqual({"key not null"}, harness.failed(result))
-                self.assertTrue(out.startswith(RESULT_PREFIX))
                 for later in ("occurrence_gaps", "repeated_row_count", "repeated_rows", "source_count", "difference", "digests", "key_duplicates"):
                     self.assertFalse([call for call in harness.calls if call.startswith(later)], later)
 
@@ -460,20 +461,19 @@ class NullKeyTest(unittest.TestCase):
         harness.spark.null_counts = (0, 1)
         harness.spark.numbering = lambda rows: [(*row[:4], None) for row in rows]
         harness.spark.numbering_forbidden = True
-        result, code, out, err = self.verified(harness)
+        result, code, err = self.verified(harness)
         self.assertEqual((1, False), (code, result["passed"]))
-        self.assertIn("1 in bronze", err)
-        self.assertEqual(1, out.count("\n"))
+        self.assertEqual(f"{JOB}: checks_failed\n{JOB}: clinical_cases: key not null: failed\n{JOB}: lab_results: key not null: failed\n", err)
 
     def test_a_null_case_and_a_text_case_in_one_group_give_a_result_and_no_row_value_in_any_output(self) -> None:
         harness = Harness()
         harness.spark.null_counts = (0, 1)
         harness.spark.extra_repeated = [(None, "5", "k", "4.0", 1), (self.PLANTED_CASE, "5", "k", "4.1", 2)]
         harness.spark.numbering_forbidden = True
-        result, code, out, err = self.verified(harness)
+        result, code, err = self.verified(harness)
         self.assertEqual(1, code)
         self.assertFalse(result["passed"])
-        self.assertNotIn(self.PLANTED_CASE, out + err + json.dumps(result))
+        self.assertNotIn(self.PLANTED_CASE, err + json.dumps(result))
 
     def test_a_null_result_is_a_missing_value_and_not_a_null_key(self) -> None:
         harness = Harness()
@@ -503,12 +503,14 @@ class OccurrenceRuleTest(unittest.TestCase):
         harness.spark.numbering = lambda rows: [(*row[:4], row[4] + (1 if index == 0 else 0)) for index, row in enumerate(correct_numbers(rows))]
         self.assertEqual({"occurrence rule"}, harness.failed(harness.run("verify")))
 
-    def test_more_repeated_rows_than_the_limit_are_refused_with_the_limit_in_the_message(self) -> None:
+    def test_more_repeated_rows_than_the_limit_are_refused_with_a_code_and_no_count_in_the_message(self) -> None:
         self.assertEqual(100_000, REPEATED_ROWS_LIMIT)
         harness = Harness()
-        harness.spark.extra_repeated = [("9", "9", "k", "1", 1)] * (REPEATED_ROWS_LIMIT + 1)
-        with self.assertRaisesRegex(BronzeRulesError, str(REPEATED_ROWS_LIMIT)):
+        harness.spark.extra_repeated = [("9", "9", "k", "1", 1)] * (REPEATED_ROWS_LIMIT + 7)
+        with self.assertRaises(BronzeRulesError) as raised:
             harness.run("verify")
+        self.assertEqual("repeated_rows_over_limit", raised.exception.code)
+        self.assertNotIn(str(REPEATED_ROWS_LIMIT + 7 + 6), str(raised.exception))
 
     def test_no_row_collected_where_the_counts_say_repeated_groups_exist_fails_the_check(self) -> None:
         harness = Harness()

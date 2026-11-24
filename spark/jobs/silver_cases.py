@@ -51,7 +51,7 @@ from spark.silver_cases import (
     split_rule_problems,
     unit,
 )
-from spark.silver_cases_run import JOB, run, run_build, run_verify, start_deadline
+from spark.silver_cases_run import JOB, result_document, run, run_build, run_verify, start_deadline
 from spark.silver_cases_sql import (
     BRONZE_CASES_SOURCE,
     BRONZE_LAB_SOURCE,
@@ -322,14 +322,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, Any]:
         head = client.reference(arguments.branch).hash
         if pinned is not None and head != pinned:
             raise SilverCasesError(BRANCH_MOVED)
-        return {
-            "mode": arguments.mode,
-            "branch": arguments.branch,
-            "base_hash": base,
-            "branch_hash": head,
-            "pinned_release": arguments.pinned_release,
-            **outcome.facts(),
-        }
+        return result_document(arguments, base, head, outcome)
     finally:
         if session is not None:
             session.stop()

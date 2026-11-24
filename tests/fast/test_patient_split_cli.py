@@ -15,13 +15,16 @@ import io
 import json
 import math
 import os
+import tempfile
 import threading
 import unittest
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from scripts.stack.nessie import NessieConflict, NessieError
+from spark.jobs.patient_split import result_document
 from spark.settings import SettingsError
 from spark.split_cli import number_setting, open_client, run, start_deadline
 from spark.split_table import PatientSplitError
@@ -30,11 +33,13 @@ MARKER = "MARKER_8731"
 
 
 def invoke(argv: list[str], execute: Any = None) -> tuple[int, str, str]:
+    """Run the command line. A ``build`` or ``verify`` call with no ``--result`` gets one in a fresh folder, so that it is judged for its own arguments."""
     out, err = io.StringIO(), io.StringIO()
     code = 0
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    with tempfile.TemporaryDirectory(prefix="split_cli_") as folder, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        call = [*argv, "--result", f"{folder}/result.json"] if ({"build", "verify"} & set(argv)) and "--result" not in argv else argv
         try:
-            code = run(argv, execute or (lambda arguments: {"mode": arguments.mode}))
+            code = run(call, execute or (lambda arguments: {"mode": arguments.mode}))
         except SystemExit as stop:
             code = int(stop.code or 0)
     return code, out.getvalue(), err.getvalue()
@@ -57,7 +62,7 @@ class CommandLineTest(unittest.TestCase):
             ),
             (code, err),
         )
-        self.assertEqual({"mode": "build"}, json.loads(out.removeprefix("RESULT ")))
+        self.assertEqual({"mode": "build", "diagnostics": []}, json.loads(out.removeprefix("RESULT ")))
 
     def test_a_marker_in_any_bad_argument_reaches_no_output(self) -> None:
         for argv in (
@@ -108,6 +113,50 @@ class CommandLineTest(unittest.TestCase):
     def test_a_failed_check_prints_its_codes_one_to_a_line(self) -> None:
         code, out, err = invoke(["build", "--branch", "b"], raising(PatientSplitError("two_sets: failed", "rule_mismatch: failed")))
         self.assertEqual((1, "", "patient_split: two_sets: failed\npatient_split: rule_mismatch: failed\n"), (code, out, err))
+
+
+class ResultFileTest(unittest.TestCase):
+    """The result is one file at ``--result``; a failed check writes its codes and no count, and the job's streams are for the operator."""
+
+    def setUp(self) -> None:
+        self.folder = self.enterContext(tempfile.TemporaryDirectory(prefix="split_file_"))
+        self.path = f"{self.folder}/result.json"
+        self.argv = ["build", "--branch", "b", "--result", self.path]
+
+    def test_a_failed_check_writes_each_code_and_no_count(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(1, run(self.argv, raising(PatientSplitError("two_sets: failed", "source_table: 2 tables"))))
+        self.assertEqual(
+            {"mode": "build", "branch": "b", "job": "patient_split", "diagnostics": [{"code": "two_sets"}, {"code": "source_table"}]},
+            json.loads(Path(self.path).read_text()),
+        )
+
+    def test_the_result_option_is_required_and_a_file_that_is_there_is_never_replaced(self) -> None:
+        self.assertEqual((2, "", "patient_split: usage\n"), invoke(["build", "--branch", "b", "--result"]))
+        Path(self.path).write_text("old")
+        seen: list[str] = []
+
+        def execute(arguments: Namespace) -> dict[str, Any]:
+            seen.append("run")
+            return {}
+
+        self.assertEqual((2, "", "patient_split: usage\n"), invoke(self.argv, execute))
+        self.assertEqual(([], "old"), (seen, Path(self.path).read_text()))
+
+    def test_the_result_document_names_the_asked_mode_and_branch_and_adds_the_facts(self) -> None:
+        arguments = Namespace(mode="verify", branch="b", pinned_release=False)
+        self.assertEqual(
+            {
+                "mode": "verify",
+                "branch": "b",
+                "base_hash": "h0",
+                "pinned_release": False,
+                "table": "silver.patient_split",
+                "source_table": "bronze.clinical_cases",
+                "x": 1,
+            },
+            result_document(arguments, "h0", {"x": 1}),
+        )
 
 
 class DeadlineTest(unittest.TestCase):

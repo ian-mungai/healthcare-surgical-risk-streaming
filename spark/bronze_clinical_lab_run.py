@@ -7,11 +7,11 @@ Spark, so the whole sequence runs on fakes in the fast tests.
 from __future__ import annotations
 
 import argparse
-import json
 import re
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TextIO
+from typing import Any, Protocol
 from urllib.parse import quote
 
 from scripts.stack.nessie import NessieClient, NessieError, Reference
@@ -19,7 +19,6 @@ from spark.bronze_clinical_lab import (
     BRONZE_NAMESPACE,
     OCCURRENCE_COLUMN,
     REPEATED_ROWS_LIMIT,
-    SEALED_KINDS,
     SOURCE_NAMESPACE,
     TABLES,
     BronzeRulesError,
@@ -27,11 +26,36 @@ from spark.bronze_clinical_lab import (
     occurrence_differences,
     payload_columns,
 )
+from spark.result_file import add_result_option
 from spark.settings import SettingsError
 
 JOB = "bronze_clinical_lab"
-RESULT_PREFIX = "RESULT "
 HASH = re.compile(r"[0-9a-f]{64}")
+# Every check that a table report can hold, and the checks of a table that passed, in order. The runner of the job reads its result file against these lists.
+CHECK_NAMES = (
+    "source_changed",
+    "bronze table exists",
+    "columns",
+    "key not null",
+    "row count",
+    "no value changed",
+    "key unique",
+    "occurrence numbers from 1 without a gap",
+    "occurrence rule",
+)
+CHECKS_PASSED = {
+    "clinical": ("source_changed", "columns", "key not null", "row count", "no value changed", "key unique"),
+    "lab": (
+        "source_changed",
+        "columns",
+        "key not null",
+        "row count",
+        "no value changed",
+        "key unique",
+        "occurrence numbers from 1 without a gap",
+        "occurrence rule",
+    ),
+}
 HISTORY_PAGE_SIZE = 500
 HISTORY_PAGE_LIMIT = 200
 Row = tuple[str | None, str | None, str | None, str | None, int]
@@ -80,69 +104,59 @@ class SparkOps(Protocol):
 
     def repeated_rows(self, limit: int) -> list[Row]: ...
 
-    def digests(self, kind: str, columns: list[str]) -> tuple[str, str]: ...
-
     def close(self) -> None: ...
+
+
+class SourceNotInHistory(NessieError):
+    """The source hash is not in the history of Nessie's default branch."""
+
+
+class NotABranch(NessieError):
+    """The name is not a branch."""
 
 
 @dataclass(slots=True)
 class TableReport:
+    """One table's checks. Both tables are sealed: the clinical table holds the outcome columns and the laboratory table holds the creatinine results that the
+    kidney outcome is built from, so a row count, a digest, a metadata path or a check detail of either changes with a held-out patient. The report holds the
+    snapshot IDs, the names of the checks with a flag each and one pass flag."""
+
     kind: str
     source_table: str
     bronze_table: str
-    rows: int = 0
-    source_rows: int = 0
-    source_metadata_location: str | None = None
     source_snapshot_id: int | None = None
     bronze_snapshot_id: int | None = None
-    keys_digest: str = ""
-    rows_digest: str = ""
     checks: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
         return bool(self.checks) and all(check["passed"] for check in self.checks)
 
-    @property
-    def sealed(self) -> bool:
-        return self.kind in SEALED_KINDS
-
-    def add(self, name: str, passed: bool, detail: str) -> bool:
-        """Record one check. A sealed table's check holds its name and its flag only: its detail holds counts of rows, which a held-out outcome can change."""
-        self.checks.append({"name": name, "passed": passed} if self.sealed else {"name": name, "passed": passed, "detail": detail})
+    def add(self, name: str, passed: bool) -> bool:
+        self.checks.append({"name": name, "passed": passed})
         return passed
 
     def document(self) -> dict[str, Any]:
-        """What the result holds for this table: the snapshot IDs, the pass flag and the checks. A sealed table holds no row count and no digest."""
-        if self.sealed:
-            return {
-                "source_table": f"{SOURCE_NAMESPACE}.{self.source_table}",
-                "bronze_table": f"{BRONZE_NAMESPACE}.{self.bronze_table}",
-                "source_metadata_location": self.source_metadata_location,
-                "source_snapshot_id": self.source_snapshot_id,
-                "bronze_snapshot_id": self.bronze_snapshot_id,
-                "passed": self.passed,
-                "checks": self.checks,
-            }
         return {
             "source_table": f"{SOURCE_NAMESPACE}.{self.source_table}",
             "bronze_table": f"{BRONZE_NAMESPACE}.{self.bronze_table}",
-            "rows": self.rows,
-            "source_rows": self.source_rows,
-            "source_metadata_location": self.source_metadata_location,
             "source_snapshot_id": self.source_snapshot_id,
             "bronze_snapshot_id": self.bronze_snapshot_id,
-            "keys_digest": self.keys_digest,
-            "rows_digest": self.rows_digest,
             "passed": self.passed,
             "checks": self.checks,
         }
 
 
+class QuietParser(argparse.ArgumentParser):
+    """An argument parser whose only error output is the code ``usage``."""
+
+    def error(self, message: str) -> Any:
+        sys.stderr.write(f"{JOB}: usage\n")
+        raise SystemExit(2)
+
+
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog=f"python -m spark.jobs.{JOB}", description="Copy the loaded clinical and laboratory tables into Bronze on a private branch."
-    )
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Copy the loaded clinical and laboratory tables into Bronze on a private branch.")
     commands = command.add_subparsers(dest="command", required=True)
     for name, text in (
         ("write", "create the branch from the source hash, write both Bronze tables and verify them"),
@@ -152,65 +166,51 @@ def parser() -> argparse.ArgumentParser:
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--branch", required=True, help="the private branch that holds (write: will hold) the Bronze tables")
         sub.add_argument("--source-hash", required=True, help="the hash of Nessie's default branch at which the table checks merged the loaded tables")
+        add_result_option(sub)
     return command
 
 
 def verify_table(nessie: NessieOps, spark: SparkOps, branch: str, pinned: str, kind: str, columns: list[str]) -> TableReport:
-    """Run the checks of one table on ``branch`` against the loaded table at ``pinned`` and return its report. Nothing is written."""
-    source_table, bronze_table, key = TABLES[kind]
+    """Run the checks of one table on ``branch`` against the loaded table at ``pinned`` and return its report. Nothing is written.
+
+    The counts that a check reads stay inside this function: the report holds a name and a flag for each check.
+    """
+    source_table, bronze_table, _ = TABLES[kind]
     report = TableReport(kind, source_table, bronze_table)
     source_key, bronze_key = f"{SOURCE_NAMESPACE}.{source_table}", f"{BRONZE_NAMESPACE}.{bronze_table}"
     on_branch, at_hash = nessie.content(branch, source_key), nessie.content(pinned, source_key)
-    report.source_metadata_location = at_hash.metadata_location if at_hash else None
     report.source_snapshot_id = at_hash.snapshot_id if at_hash else None
-    report.add(
-        "source_changed",
-        at_hash is not None and on_branch == at_hash,
-        f"the loaded table on the branch is {on_branch}, at the source hash it is {at_hash}",
-    )
+    report.add("source_changed", at_hash is not None and on_branch == at_hash)
     bronze_content = nessie.content(branch, bronze_key)
     report.bronze_snapshot_id = bronze_content.snapshot_id if bronze_content else None
     if bronze_content is None:
-        report.add("bronze table exists", False, f"{bronze_key} is not on the branch")
+        report.add("bronze table exists", False)
         return report
     wanted = [*columns, OCCURRENCE_COLUMN] if kind == "lab" else columns
     wanted_types = {name: "string" for name in columns} | ({OCCURRENCE_COLUMN: "int"} if kind == "lab" else {})
     found = spark.bronze_columns(kind, columns) or []
-    report.add("columns", [name for name, _ in found] == wanted and dict(found) == wanted_types, f"expected {len(wanted)} columns, found {len(found)}")
+    report.add("columns", [name for name, _ in found] == wanted and dict(found) == wanted_types)
     if [name for name, _ in found] != wanted:
         return report
     loaded_nulls, bronze_nulls = spark.null_keys(kind, columns)
-    report.add(
-        "key not null",
-        loaded_nulls == 0 and bronze_nulls == 0,
-        f"{loaded_nulls} null value(s) in the key columns of the loaded table and {bronze_nulls} in bronze (key columns {', '.join(key)})",
-    )
+    report.add("key not null", loaded_nulls == 0 and bronze_nulls == 0)
     if loaded_nulls or bronze_nulls:
         return report
-    report.source_rows, report.rows = spark.source_count(kind, columns), spark.bronze_count(kind)
-    report.add("row count", report.rows == report.source_rows, f"loaded {report.source_rows}, bronze {report.rows}")
+    source_rows = spark.source_count(kind, columns)
+    report.add("row count", spark.bronze_count(kind) == source_rows)
     missing, extra = spark.difference(kind, columns)
-    report.add(
-        "no value changed", missing == 0 and extra == 0, f"rows of the loaded table not in bronze {missing}, rows of bronze not in the loaded table {extra}"
-    )
-    duplicates = spark.key_duplicates(kind)
-    report.add("key unique", duplicates == 0, f"{duplicates} row(s) of bronze share their key with another row")
+    report.add("no value changed", missing == 0 and extra == 0)
+    report.add("key unique", spark.key_duplicates(kind) == 0)
     if kind == "lab":
-        gaps = spark.occurrence_gaps()
-        report.add("occurrence numbers from 1 without a gap", gaps == 0, f"{gaps} group(s) of case, time and test name with a gap or a start above 1")
+        report.add("occurrence numbers from 1 without a gap", spark.occurrence_gaps() == 0)
         in_groups = spark.repeated_row_count()
         if in_groups > REPEATED_ROWS_LIMIT:
-            raise BronzeRulesError(f"the repeated laboratory groups hold {in_groups} rows, more than {REPEATED_ROWS_LIMIT}: the check refuses to collect them")
+            raise BronzeRulesError(
+                f"the repeated laboratory groups hold more than {REPEATED_ROWS_LIMIT} rows: the check refuses to collect them", code="repeated_rows_over_limit"
+            )
         repeated = spark.repeated_rows(REPEATED_ROWS_LIMIT)
         differences = occurrence_differences(repeated) if len(repeated) == in_groups else None
-        report.add(
-            "occurrence rule",
-            differences == 0,
-            f"{len(repeated)} rows collected of {in_groups} rows in repeated groups, "
-            f"{'not compared' if differences is None else f'{differences} differ from the Python numbering'}",
-        )
-    if not report.sealed:
-        report.keys_digest, report.rows_digest = spark.digests(kind, columns)
+        report.add("occurrence rule", differences == 0)
     return report
 
 
@@ -225,24 +225,6 @@ def result_document(command: str, branch: str, branch_hash: str, default_branch:
         "passed": len(reports) == len(TABLES) and all(report.passed for report in reports),
         "tables": {report.bronze_table: report.document() for report in reports},
     }
-
-
-def finish(result: dict[str, Any], branch: str, stdout: TextIO, stderr: TextIO) -> int:
-    """Print the ``RESULT`` line and return the exit code: 0 when every check passed, else 1 with the failed checks on ``stderr``.
-
-    A check of a sealed table is a name only. A check of the other table is its name and its detail, which holds counts.
-    """
-    stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
-    if result["passed"]:
-        return 0
-    failed = [
-        f"{table['bronze_table']}: {check['name']}" + (f" ({check['detail']})" if "detail" in check else "")
-        for table in result["tables"].values()
-        for check in table["checks"]
-        if not check["passed"]
-    ]
-    stderr.write(f"{JOB}: the table checks failed on branch {branch}: {'; '.join(failed)}\n")
-    return 1
 
 
 def run_job(
@@ -264,15 +246,17 @@ def run_job(
         raise SettingsError("the source hash must be 64 lowercase hexadecimal digits")
     default_branch = nessie.default_branch()
     if not nessie.history_contains(default_branch, source_hash):
-        raise NessieError(f"the hash {source_hash} is not in the history of {default_branch}")
+        raise SourceNotInHistory(f"the hash {source_hash} is not in the history of {default_branch}")
     pinned = f"{default_branch}@{source_hash}"
     if command == "write":
         for kind, (source_table, _, _) in TABLES.items():
             if nessie.content(pinned, f"{SOURCE_NAMESPACE}.{source_table}") is None:
-                raise BronzeRulesError(f"the loaded {kind} table {SOURCE_NAMESPACE}.{source_table} is not in {default_branch} at the source hash")
+                raise BronzeRulesError(
+                    f"the loaded {kind} table {SOURCE_NAMESPACE}.{source_table} is not in {default_branch} at the source hash", code="source_table_missing"
+                )
         nessie.create_branch(branch, default_branch, source_hash)
     elif not nessie.is_branch(branch):
-        raise NessieError(f"{branch} is not a branch")
+        raise NotABranch(f"{branch} is not a branch")
     if command == "verify" and branch_hash is None:
         branch_hash = nessie.head(branch)
     reference = branch if branch_hash is None else f"{branch}@{branch_hash}"
