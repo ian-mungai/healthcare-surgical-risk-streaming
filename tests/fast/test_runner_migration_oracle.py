@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import ast
 import importlib
+import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tests" / "e2e" / "signal_profile.py"
@@ -149,6 +152,81 @@ class MigrationWiring(unittest.TestCase):
         self.assertIn("rebuilt_by_drop_then_create", ast.unparse(assign.value))
 
 
+class FakeNessie:
+    """Every branch is at the planted head, and the history of any branch is the migration: a put and then a delete of the table's key on the planted head."""
+
+    def __init__(self) -> None:
+        self.created: list[tuple[str, str]] = []
+
+    def create_branch(self, branch: str, base: str) -> None:
+        self.created.append((branch, base))
+
+    def reference(self, branch: str) -> SimpleNamespace:
+        return SimpleNamespace(hash=PLANTED)
+
+    def request(self, method: str, path: str, query: dict[str, str] | None = None) -> dict[str, Any]:
+        return log_of(entry("2", operation("PUT")), entry("1", operation("DELETE")), entry(PLANTED))
+
+
+class FakeStack:
+    """The first pinned build answers with ``build``; any other build is refused with one schema line; a verify passes."""
+
+    def __init__(self, build: dict[str, Any]) -> None:
+        self.build = build
+
+    def stand_in(self, mode: str, branch: str) -> tuple[int, dict[str, Any], str, float]:
+        return 0, {}, "", 0.0
+
+    def profile(self, mode: str, branch: str, base: str | None = None, pinned: bool = False) -> tuple[int, dict[str, Any], str, float]:
+        if mode == "verify":
+            return 0, {"outcome": "verified"}, "", 0.0
+        if pinned:
+            return 0, self.build, "", 1.0
+        return 1, {}, "signal_profile: table_schema: 1 table", 0.0
+
+
+class FakeRecord:
+    def __init__(self) -> None:
+        self.observations: list[tuple[str, bool]] = []
+
+    def expect(self, case: str, step: str, expected: str, observed: str, passed: bool) -> bool:
+        self.observations.append((case, passed))
+        return passed
+
+
+@unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
+class MigrationCaseRun(unittest.TestCase):
+    """``schema_cases`` is run with a stub stack, Nessie and record, so the verdict of the migration case is read from what it records."""
+
+    def setUp(self) -> None:
+        self.module = importlib.import_module("tests.e2e.signal_profile")
+
+    def verdict(self, build: dict[str, Any]) -> bool:
+        record = FakeRecord()
+        run = self.module.Run(FakeStack(build), FakeNessie(), record, {}, {})
+        with mock.patch.object(self.module.Run, "spec"):
+            run.schema_cases()
+        case, passed = record.observations[0]
+        self.assertEqual("planted: the unscored share as the 12-column predecessor wrote it", case)
+        return passed
+
+    def built(self, **extra: Any) -> dict[str, Any]:
+        return {"outcome": "written", "rebuilt": ["unscored_share"], "grid_rule": {"written": False}, **extra}
+
+    def test_a_build_on_the_planted_head_that_rebuilt_only_the_table_is_recorded_as_passed(self) -> None:
+        self.assertTrue(self.verdict(self.built(base_hash=PLANTED)))
+
+    def test_a_build_response_without_a_base_hash_is_recorded_as_failed(self) -> None:
+        self.assertFalse(self.verdict(self.built()))
+
+    def test_a_build_response_with_an_empty_or_null_base_hash_is_recorded_as_failed(self) -> None:
+        self.assertFalse(self.verdict(self.built(base_hash="")))
+        self.assertFalse(self.verdict(self.built(base_hash=None)))
+
+    def test_a_build_response_with_another_base_hash_is_recorded_as_failed(self) -> None:
+        self.assertFalse(self.verdict(self.built(base_hash=MOVED)))
+
+
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
 class OracleCaseNumber(unittest.TestCase):
     def setUp(self) -> None:
@@ -156,9 +234,9 @@ class OracleCaseNumber(unittest.TestCase):
         tree = ast.parse(self.module.STAND_IN)
         self.dump = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "dump")
         helper = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "grid_by_case")
-        space: dict[str, Any] = {}
-        exec(compile(ast.Module(body=[helper], type_ignores=[]), "stand_in", "exec"), space)  # noqa: S102
-        self.grid_by_case = space["grid_by_case"]
+        module_code = compile(ast.Module(body=[helper], type_ignores=[]), "stand_in", "exec")
+        body = next(item for item in module_code.co_consts if isinstance(item, types.CodeType) and item.co_name == "grid_by_case")
+        self.grid_by_case = types.FunctionType(body, {})
 
     def test_the_same_case_written_with_leading_zeros_is_one_case_with_its_pairs_together(self) -> None:
         rows = [("99", "1000", "5000"), ("099", "1000", "5000"), ("0099", "1000", None)]
