@@ -12,9 +12,9 @@ asks for no name. The library never says that it stopped at an error: ``load_vit
 why ``case_problem`` judges a file before any row is made (``spark/bronze/structure.py``) and why every pass checks the library's answer.
 
 A numeric or text reading's case time is the record time minus the anonymised start, in whole microseconds, as the replay's decoder
-(``replay/service/decode.py``) makes it, so a row and the replay's event for the same reading have the same key. A waveform sample's second is placed
-from the exact encoded values and not from a rounded start (``features/sampling.py``). The numeric tracks of the four-byte integer formats (codes
-7 and 8) are read by the packet walk with fixed-width little-endian formats, because the library unpacks eight bytes from each four-byte value.
+(``replay/service/decode.py``, with ``casefile/decoding.py``) makes it, so a row and the replay's event for the same reading have the same key. A waveform
+sample's second is placed from the exact encoded values and not from a rounded start (``features/sampling.py``). The numeric tracks of the four-byte integer
+formats (codes 7 and 8) are read by the packet walk with fixed-width little-endian formats, because the library unpacks eight bytes from each four-byte value.
 """
 
 from __future__ import annotations
@@ -25,11 +25,11 @@ from collections.abc import Collection, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
+from casefile.decoding import END_TOLERANCE_SECONDS, NUMERIC, samples_of, to_microseconds
+from features.sampling import ANONYMISED_START
 from spark.bronze.plan import GROUPED, track_passes
 from spark.bronze.rows import Lineage, StructureError, numeric_rows, string_rows, track_info, track_row, waveform_rows
 from spark.bronze.structure import (
-    END_TOLERANCE_SECONDS,
-    NUMERIC,
     OWN_FORMATS,
     Walk,
     recording_problem,
@@ -38,12 +38,6 @@ from spark.bronze.structure import (
     walk_file,
 )
 
-# The replay's decoder module imports the publisher's library when it is imported, so it is imported by name here, as the library is: the tools environment has
-# neither, and the fast tests put a stand-in for the library in place first. ``ANONYMISED_START``, ``samples_of`` and ``to_microseconds`` are the replay's own.
-decode = importlib.import_module("replay.service.decode")
-ANONYMISED_START: float = decode.ANONYMISED_START
-samples_of: Any = decode.samples_of
-to_microseconds: Any = decode.to_microseconds
 READS = {"header": 0, "load": 0, "walk": 0}
 
 

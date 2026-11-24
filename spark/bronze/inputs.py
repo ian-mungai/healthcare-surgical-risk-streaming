@@ -6,7 +6,7 @@ manifest binds into a scratch file and compares its SHA-256 with the manifest's 
 read by mistake.
 
 The object store is the replay's: the project's bucket read with boto3 on the host, or a folder of object versions in a local run
-(``replay/service/folder_store.py``).
+(``casefile/folder_store.py``).
 """
 
 from __future__ import annotations

@@ -80,12 +80,12 @@ compose_stack_built_images:
       stack_fixtures: tests/fixtures/vitaldb
   - tag: surgical-risk-spark:4.1.4
     name: spark
-    sources: [spark, scripts, replay, features, tests/fixtures/vitaldb]
+    sources: [spark, scripts, replay, casefile, features, tests/fixtures/vitaldb]
     context: "."
     dockerfile: spark/Dockerfile
   - tag: surgical-risk-replay:1.7.2
     name: replay
-    sources: [replay, scripts, features, tests]
+    sources: [replay, casefile, scripts, features, tests]
     context: "."
     dockerfile: replay/Dockerfile
 # The namespace of the first commit that the deploy gives Nessie's main branch.

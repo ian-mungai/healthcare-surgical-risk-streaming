@@ -55,6 +55,11 @@ def copied_pairs(dockerfile: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def covers(line: str, path: str) -> bool:
+    """Whether a ``COPY`` line copies ``path``: it names the file, or a folder that holds it."""
+    return any(path == source or path.startswith(source + "/") for source, _ in copied_pairs(line))
+
+
 def image_problems(dockerfile: str, rules: list[str], needed: set[str]) -> list[str]:
     """Each needed file that no ``COPY`` line puts at its own path below ``/opt/jobs``, or that the build's ignore file leaves out."""
     found = []
@@ -116,7 +121,9 @@ class Image(unittest.TestCase):
     def test_every_module_that_the_decoder_imports_and_the_pin_are_in_the_image(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         for path in (
-            "replay/service/decode.py",
+            "casefile/decoding.py",
+            "casefile/folder_store.py",
+            "casefile/s3_store.py",
             "replay/events/waveform.py",
             "scripts/ingestion/gate.py",
             "scripts/sample/candidates.py",
@@ -133,11 +140,11 @@ class Image(unittest.TestCase):
     def test_a_module_or_the_pin_left_out_is_named(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)
         text, rules = DOCKERFILE.read_text(), ignore_rules(IGNORE_FILE.read_text())
-        for path in ("replay/service/decode.py", "replay/events/stream.py", "scripts/process.py", "tests/fixtures/vitaldb/release.json"):
+        for path in ("casefile/decoding.py", "replay/events/stream.py", "scripts/process.py", "tests/fixtures/vitaldb/release.json"):
             with self.subTest(ignored=path):
                 self.assertIn(f"{path}: the build's ignore file leaves it out", image_problems(text, [*rules, path], needed))
             with self.subTest(not_copied=path):
-                without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
+                without = "\n".join(line for line in text.splitlines() if not covers(line, path))
                 self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, rules, needed))
 
     def test_the_image_holds_every_file_of_the_feature_package_so_its_version_is_the_hosts(self) -> None:
@@ -150,6 +157,16 @@ class Image(unittest.TestCase):
             with self.subTest(left_out=path):
                 without = "\n".join(line for line in text.splitlines() if f" {path} " not in line + " ")
                 self.assertIn(f"{path}: no COPY line puts it at {JOBS}/{path}", image_problems(without, ignore_rules(IGNORE_FILE.read_text()), every))
+
+    def test_the_image_copies_none_of_the_replay_services_decoder_or_stores_which_the_shared_package_holds(self) -> None:
+        """The Bronze job and the replay each copy the shared ``casefile`` package, and neither copies the other's files for it: the replay's decoder module
+        imports the publisher's library, which the replay image holds for the replay alone."""
+        copied = [source for source, _ in copied_pairs(DOCKERFILE.read_text())]
+        for path in ("replay/service/decode.py", "replay/service/folder_store.py", "replay/service/s3_store.py"):
+            with self.subTest(path=path):
+                self.assertNotIn(path, copied)
+                self.assertNotIn(path, ignore_rules(IGNORE_FILE.read_text()))
+                self.assertNotIn("!" + path, ignore_rules(IGNORE_FILE.read_text()))
 
     def test_the_image_copies_no_replay_module_that_no_job_imports(self) -> None:
         needed = imported_files(bronze_sources() + stream_sources()) | set(READ_FILES)

@@ -1,7 +1,6 @@
-"""The parts of the Bronze job that need a library of the Spark image: the object store of the replay and the replay's reading of the clinical table.
+"""The parts of the Bronze job that open the object store and read the clinical table, with the shared package (``casefile``) that the replay uses too.
 
-The fast tests do not import this module: the stores need boto3 on the host and the clinical table's reader sits in the replay's decoder module,
-which imports the publisher's library.
+The S3 store needs boto3 on the host, so it is imported only when a job names a bucket.
 """
 
 from __future__ import annotations
@@ -9,8 +8,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from replay.service.decode import clinical_times
-from replay.service.folder_store import FolderStore
+from casefile.decoding import clinical_times
+from casefile.folder_store import FolderStore
 from scripts.ingestion.store import ObjectStore
 from spark.bronze.inputs import CLINICAL_LIMIT_BYTES, CaseFile, InputError, StoreSpec, VerifiedInputs
 
@@ -19,7 +18,7 @@ def open_store(spec: StoreSpec) -> ObjectStore:
     if spec.kind == "folder" and spec.root:
         return FolderStore(Path(spec.root), spec.bucket, Path(spec.read_log) if spec.read_log else None)
     if spec.kind == "s3" and spec.region:
-        from replay.service.s3_store import S3ReadStore  # boto3 is needed only on the host
+        from casefile.s3_store import S3ReadStore  # boto3 is needed only on the host
 
         return S3ReadStore(spec.bucket, spec.region)
     raise InputError("the object store is a folder with its root or an s3 bucket with its region")

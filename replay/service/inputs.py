@@ -12,10 +12,11 @@ import re
 import tempfile
 from pathlib import Path
 
+from casefile.decoding import clinical_times
+from casefile.folder_store import FolderStore
 from replay.events.recording import CaseRecording, CaseTimes
 from replay.events.schedule import Plan
-from replay.service.decode import clinical_times, decode_case
-from replay.service.folder_store import FolderStore
+from replay.service.decode import decode_case
 from replay.service.run_record import RunRecord
 from scripts.ingestion.check import CheckedFile
 from scripts.ingestion.gate import verify_before_read
@@ -35,7 +36,7 @@ def open_store(record: RunRecord, reference: ManifestRef) -> ObjectStore:
     if record.object_store.kind == "folder" and record.object_store.root is not None:
         read_log = Path(record.object_store.read_log) if record.object_store.read_log else None
         return FolderStore(Path(record.object_store.root), reference.bucket, read_log)
-    from replay.service.s3_store import S3ReadStore  # the folder store needs no boto3, and the host's store is only loaded on the host
+    from casefile.s3_store import S3ReadStore  # the folder store needs no boto3, and the host's store is only loaded on the host
 
     return S3ReadStore(reference.bucket, record.object_store.region or "")
 

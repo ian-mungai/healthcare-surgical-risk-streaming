@@ -86,7 +86,9 @@ COPY features/sampling.py /opt/jobs/features/sampling.py
 COPY features/series_input.py /opt/jobs/features/series_input.py
 COPY features/validate.py /opt/jobs/features/validate.py
 COPY features/waveform.py /opt/jobs/features/waveform.py
-# The Bronze decoder and the streaming job import the replay's decoder, stores, event model and wire codec and the ingestion gate, and the gate reads the tracked release pin through ROOT.
+# The Bronze decoder imports the shared case-file package (the decoding helpers and the read-only stores that the replay uses too), and the streaming job imports the replay's event model and
+# wire codec. Both import the ingestion gate, and the gate reads the tracked release pin through ROOT.
+COPY casefile /opt/jobs/casefile
 COPY replay/__init__.py /opt/jobs/replay/__init__.py
 COPY replay/events/__init__.py /opt/jobs/replay/events/__init__.py
 COPY replay/events/errors.py /opt/jobs/replay/events/errors.py
@@ -100,11 +102,8 @@ COPY replay/events/schedule.py /opt/jobs/replay/events/schedule.py
 COPY replay/events/stream.py /opt/jobs/replay/events/stream.py
 COPY replay/events/waveform.py /opt/jobs/replay/events/waveform.py
 COPY replay/service/__init__.py /opt/jobs/replay/service/__init__.py
-COPY replay/service/decode.py /opt/jobs/replay/service/decode.py
-COPY replay/service/folder_store.py /opt/jobs/replay/service/folder_store.py
 COPY replay/service/registry.py /opt/jobs/replay/service/registry.py
 COPY replay/service/wire_codec.py /opt/jobs/replay/service/wire_codec.py
-COPY replay/service/s3_store.py /opt/jobs/replay/service/s3_store.py
 COPY scripts/process.py /opt/jobs/scripts/process.py
 COPY scripts/project_config.py /opt/jobs/scripts/project_config.py
 COPY scripts/ingestion /opt/jobs/scripts/ingestion
