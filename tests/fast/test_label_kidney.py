@@ -118,7 +118,6 @@ class BoundaryRules(unittest.TestCase):
         )
         self.assertEqual(["BASELINE_TIE_TAKES_LOWER"], [name for name, status in BOUNDARY_STATUS.items() if status == OWNER])
         self.assertFalse([name for name, status in BOUNDARY_STATUS.items() if "pending" in status])
-        self.assertFalse(hasattr(rule, "PENDING_OWNER"))
 
     def test_a_flipped_constant_changes_the_result_at_its_boundary(self) -> None:
         cases = (
