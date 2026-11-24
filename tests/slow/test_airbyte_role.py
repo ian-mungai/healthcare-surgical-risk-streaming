@@ -364,7 +364,7 @@ class GroupAccessCheckTest(unittest.TestCase):
 
     def test_every_resource_outside_the_core_group_names_its_group(self) -> None:
         """Without its group, kubectl resolves a resource through discovery; when discovery fails it falls back to the core group, warns on stderr and answers
-        no, so a denial would pass for the wrong group (review 1 of the fix, Nov 23 2026)."""
+        no, so a denial would pass for the wrong group."""
         core = {"pods", "secrets", "services", "configmaps", "serviceaccounts", "persistentvolumeclaims", "events", "endpoints"}
         for item in self.check()["loop"]:
             with self.subTest(item=item):
@@ -373,9 +373,8 @@ class GroupAccessCheckTest(unittest.TestCase):
     def test_any_output_on_stderr_fails_the_check(self) -> None:
         condition = self.check()["failed_when"]
         conditions = condition if isinstance(condition, list) else [condition]
-        joined = " ".join(conditions)
-        self.assertIn("airbyte_group_access_checks.stdout | trim != item.answer", joined)
-        self.assertIn("or airbyte_group_access_checks.stderr | trim | length > 0", joined)
+        expected = "airbyte_group_access_checks.stdout | trim != item.answer or airbyte_group_access_checks.stderr | trim | length > 0"
+        self.assertEqual([expected], [" ".join(text.split()) for text in conditions], "one condition, exactly this one: a second clause could pass a warned no")
 
 
 def policies(text: str) -> list[dict[str, Any]]:
