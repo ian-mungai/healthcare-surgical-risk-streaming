@@ -52,7 +52,7 @@ jobs:
           case "${status}" in
             0) range="${BASE}..${HEAD}" ;;
             1)
-              echo "The base commit '${BASE}' is not in this checkout, so only the head commit is checked."
+              echo "The base commit '${BASE}' is not in this checkout, so every commit reachable from the head commit is checked."
               range="${HEAD}"
               ;;
             *)

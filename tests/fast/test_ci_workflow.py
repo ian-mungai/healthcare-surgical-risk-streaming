@@ -71,7 +71,7 @@ COMMIT_RANGE_SCRIPT = "\n".join(
         'case "${status}" in',
         '  0) range="${BASE}..${HEAD}" ;;',
         "  1)",
-        "    echo \"The base commit '${BASE}' is not in this checkout, so only the head commit is checked.\"",
+        "    echo \"The base commit '${BASE}' is not in this checkout, so every commit reachable from the head commit is checked.\"",
         '    range="${HEAD}"',
         "    ;;",
         "  *)",
@@ -1788,8 +1788,8 @@ COMMIT_RANGE_STEP = "Check the commit messages of the pushed range"
 class CommitRangeStepTest(TemporaryRepository):
     """The commit-range step of the hooks job, run as GitHub runs it, in a repository of two commits with a stand-in for the checker.
 
-    A base commit that is absent from the checkout is a known case, so the step checks the head commit alone and says so. Any other failure of Git is not
-    that case: it must show Git's message and stop the step, not narrow the range without a word (the old ``2>/dev/null`` hid it).
+    A base commit that is absent from the checkout is a known case, so the step checks every commit reachable from the head commit, and says so. Any other
+    failure of Git is not that case: it must show Git's message and stop the step, not narrow the range without a word (the old ``2>/dev/null`` hid it).
     """
 
     def setUp(self) -> None:
@@ -1818,13 +1818,13 @@ class CommitRangeStepTest(TemporaryRepository):
         code, output, errors, calls = self.run_step(self.base)
         self.assertEqual((0, "", "", [f"-m scripts.quality.repo_checks commit-range {self.base}..{self.head}"]), (code, output, errors, calls))
 
-    def test_a_base_that_is_not_in_the_checkout_checks_the_head_alone_and_names_the_base(self) -> None:
+    def test_a_base_that_is_not_in_the_checkout_checks_the_history_of_the_head_and_names_the_base(self) -> None:
         for label, base in {"empty": "", "all zeros": "0" * 40, "unknown": "deadbeef" * 5}.items():
             with self.subTest(base=label):
                 self.calls.unlink(missing_ok=True)
                 code, output, errors, calls = self.run_step(base)
                 self.assertEqual((0, [f"-m scripts.quality.repo_checks commit-range {self.head}"], ""), (code, calls, errors), output)
-                self.assertIn(f"The base commit '{base}' is not in this checkout, so only the head commit is checked.", output)
+                self.assertIn(f"The base commit '{base}' is not in this checkout, so every commit reachable from the head commit is checked.", output)
 
     def test_a_git_failure_other_than_a_missing_base_shows_its_message_and_stops_the_step(self) -> None:
         tools = self.repo.parent / "tools"
