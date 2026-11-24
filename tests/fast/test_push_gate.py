@@ -382,6 +382,8 @@ class PushHookTest(TemporaryRepository):
         self.assertIn("push gate stopped by sed", run.stderr)
         self.assertIn("Permission denied", run.stderr, "the error of sed itself is shown")
         self.assertIn(f"sed failed while it read the gate version from {push_hook.GATE_FILE} (its own error is above)", run.stderr, "the fixed message")
+        self.assertIn("correct the error shown above, then push again", run.stderr, "the advice fits every sed failure, a missing sed included")
+        self.assertNotIn("make the file readable", run.stderr)
         self.assertNotIn("stopped by gate version", run.stderr)
         self.assertFalse((self.repo / "gate_input").exists(), "the gate did not run")
 

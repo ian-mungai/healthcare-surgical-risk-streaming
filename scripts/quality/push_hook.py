@@ -41,7 +41,7 @@ _VERSION_CHECK = (
     f"if [ -e {GATE_FILE} ]; then\n"
     f"  version=\"$(sed -n 's/^GATE_VERSION = \\([0-9][0-9]*\\)$/\\1/p' {GATE_FILE})\" || {{\n"
     f'    echo "push gate stopped by sed: sed failed while it read the gate version from {GATE_FILE} (its own error is above), '
-    'so the version is unknown: make the file readable, then push again" >&2\n'
+    'so the version is unknown: correct the error shown above, then push again" >&2\n'
     "    exit 1\n"
     "  }\n"
     "fi\n"
