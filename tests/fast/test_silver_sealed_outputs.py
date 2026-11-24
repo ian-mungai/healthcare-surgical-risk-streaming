@@ -10,14 +10,18 @@ Failure modes covered here:
 - A refusal or a problem message carries a count of rows, cases, seconds, readings, keys or patients, or the size of a defect changes its text.
 - A result holds the field ``outcome``, which says whether a table was written, so it changes when only a held-out row changes.
 - A refusal of a table's columns carries a count of columns.
+- The keys that the end-to-end runners allow in a result (``tests/fast/silver_accept.py``) differ from the keys that the job writes, so a runner would fail a
+  valid result or pass an extra key.
 - A split-rule problem (``two_sets: 1 patient``) reaches a caller with its count.
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -33,6 +37,7 @@ from spark.silver.tables import ART_MBP_1S, SILVER_TABLES
 from spark.split_table import COLUMNS, PatientSplitError, schema_problems
 from tests.fast import test_silver_hypotension_run as hypo
 from tests.fast import test_silver_signals_run as signals
+from tests.fast.silver_accept import HYPOTENSION_JOB, RESULT_KEYS, SIGNALS_JOB, TABLE_KEYS
 
 TABLE_COUNT_CODES = ("table_missing", "readback_differs", "source_no_snapshot", "source_table")
 MESSAGE = re.compile(r"^[a-z_]+: failed$|^(" + "|".join(TABLE_COUNT_CODES) + r"): [0-9]+ tables?$|^" + re.escape(BRANCH_MOVED) + "$")
@@ -388,6 +393,38 @@ class SchemaRefusals(unittest.TestCase):
         lake = Lake(WrongColumnsSession(), None, "b", SETTINGS)  # type: ignore[arg-type]
         self.assertEqual(["schema: failed"], self.refused(lambda: lake.read_source(AT), PatientSplitError))
         self.assertEqual(["schema: failed"], self.refused(lambda: lake.read_table(AT), PatientSplitError))
+
+
+def literal_keys_of_execute(path: str) -> set[str]:
+    """The string keys of the dictionary that the job's ``execute`` returns, read from its source, and ``*`` where it spreads the facts of the outcome."""
+    tree = ast.parse((Path(__file__).resolve().parents[2] / path).read_text())
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "execute")
+    result = next(node.value for node in ast.walk(function) if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict))
+    return {str(key.value) if isinstance(key, ast.Constant) else "*" for key in result.keys}
+
+
+class AllowedKeys(unittest.TestCase):
+    def test_the_signals_runners_keys_are_the_keys_of_the_job(self) -> None:
+        facts = signals_run.run_build(signals.Fake().operations(), signals.HEAD).facts()
+        envelope = literal_keys_of_execute("spark/jobs/silver_signals.py") - {"*"}
+        self.assertEqual(envelope | set(facts), RESULT_KEYS[SIGNALS_JOB])
+        for name in ("snapshots", "source_snapshots", "passed"):
+            self.assertEqual(set(TABLE_KEYS[SIGNALS_JOB][name]), set(facts[name]), name)
+
+    def test_the_hypotension_runners_keys_are_the_keys_of_the_job(self) -> None:
+        facts = hypo_run.run_build(hypo.Fake().operations(), hypo.HEAD).facts()
+        envelope = literal_keys_of_execute("spark/jobs/silver_hypotension.py") - {"*"}
+        self.assertEqual(envelope | set(facts), RESULT_KEYS[HYPOTENSION_JOB])
+        for name in ("snapshots", "source_snapshots", "passed"):
+            self.assertEqual(set(TABLE_KEYS[HYPOTENSION_JOB][name]), set(facts[name]), name)
+
+    def test_a_verify_result_has_the_same_keys_as_a_build_result(self) -> None:
+        self.assertEqual(set(signals_run.run_build(signals.Fake().operations(), signals.HEAD).facts()), set(self.verified_signals().facts()))
+
+    def verified_signals(self) -> Any:
+        fake = signals.Fake()
+        fake.held = dict(fake.read_back)
+        return signals_run.run_verify(fake.operations(), signals.HEAD)
 
 
 if __name__ == "__main__":
