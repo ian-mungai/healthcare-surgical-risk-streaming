@@ -61,6 +61,11 @@ class MeasureTable(unittest.TestCase):
         self.assertEqual((0.0, 19.0), (counts["min"], counts["max"]))
         self.assertEqual(9.0, counts["p50"])
 
+    def test_the_percentiles_are_by_nearest_rank_which_rounds_up(self) -> None:
+        values: list[float | None] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 7.0, None, -1.0]
+        counts = measured(values)
+        self.assertEqual((0.0, 0.0, 0.0, 1.0, 2.0, 7.0, 7.0), tuple(counts[f"p{percent}"] for percent in (5, 10, 25, 50, 75, 90, 95)))
+
     def test_the_order_does_not_matter(self) -> None:
         values: list[float | None] = [3.0, None, 0.0, 1.5, -2.0, 0.0]
         self.assertEqual(icu_measure_rows(values), icu_measure_rows(values[::-1]))
