@@ -687,7 +687,31 @@ class PlacementTest(unittest.TestCase):
             run_tasks(["place_files.yml"], values(folder))
             host = mapping(load_yaml((folder / "airbyte" / "host.values.yaml").read_text()))
         environment = {item["name"]: item["value"] for item in host["temporal"]["extraEnv"]}
-        self.assertEqual({"DBNAME": "airbyte_temporal", "VISIBILITY_DBNAME": "airbyte_temporal_visibility", "SKIP_DB_CREATE": "true"}, environment)
+        self.assertEqual(
+            {
+                "DBNAME": "airbyte_temporal",
+                "VISIBILITY_DBNAME": "airbyte_temporal_visibility",
+                "SKIP_DB_CREATE": "true",
+                "SQL_TLS_ENABLED": "false",
+                "POSTGRES_TLS_ENABLED": "false",
+            },
+            environment,
+        )
+
+    def test_temporal_reaches_the_shared_database_without_tls_and_extra_env_comes_last(self) -> None:
+        """The shared PostgreSQL server on the k3s bridge has no TLS. Chart 2.5.0 turns Temporal's TLS on for every external database
+        (``SQL_TLS_ENABLED`` and ``POSTGRES_TLS_ENABLED`` from its config map), so the schema setup fails with "SSL is not enabled on the server". The chart
+        appends ``temporal.extraEnv`` after its own entries in the setup and the server containers, and Kubernetes takes the last entry of a name."""
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            run_tasks(["place_files.yml"], values(folder))
+            host = mapping(load_yaml((folder / "airbyte" / "host.values.yaml").read_text()))
+        names = [item["name"] for item in host["temporal"]["extraEnv"]]
+        environment = {item["name"]: item["value"] for item in host["temporal"]["extraEnv"]}
+        for name in ("SQL_TLS_ENABLED", "POSTGRES_TLS_ENABLED"):
+            with self.subTest(name):
+                self.assertEqual("false", environment.get(name))
+                self.assertEqual(1, names.count(name))
 
     def test_the_public_url_is_set_only_when_given(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
