@@ -1,7 +1,9 @@
 """End-to-end check of the commit guards through real ``git commit`` calls.
 
 Run from the repository root: ``.venv/bin/python -m tests.e2e.commit_guards``. ``--shard INDEX/COUNT`` runs one share
-of the cases, for parallel jobs. The run copies every file Git does not ignore into a temporary repository, installs
+of the cases, for parallel jobs. ``--parallel N`` runs the shards ``1/N`` to ``N/N`` at the same time in one process, each in its own temporary
+repository, within the free cores and memory, and writes one record that lists every observation. ``--compare FIRST SECOND`` compares the records of two
+runs of the same code. The run copies every file Git does not ignore into a temporary repository, installs
 the hooks there and makes a baseline commit. Each case then makes a passing control commit and a planted-fault commit.
 The control must advance HEAD. The fault must be refused by its named guard alone, with every message that guard is expected
 to print, and leave HEAD unchanged. The planted fast test is proven by its full test name, its assertion message and a
@@ -14,15 +16,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import re
 import shutil
 import sys
 import tempfile
+import threading
+from collections import Counter
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
+from subprocess import CalledProcessError, TimeoutExpired
+from typing import Any
 
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
@@ -32,6 +40,11 @@ from tests.e2e.run_record import Observation, Record
 ROOT = Path(__file__).resolve().parents[2]
 RERUN = ".venv/bin/python -m tests.e2e.commit_guards"
 COMMAND_TIMEOUT_SECONDS = 300
+# An estimate, not a measurement, of the memory that one worker's commits use. It caps the workers by free memory.
+WORKER_MIB = 2048
+MEMINFO = Path("/proc/meminfo")
+BASELINE = "baseline"
+COVERAGE = "shards"
 LINKED_FOLDERS = (".venv", ".tools")
 FAILED_HOOK = re.compile(r"\.Failed\n- hook id: (\S+)")
 GOOD_MESSAGE = "docs: add a planted note"
@@ -234,6 +247,41 @@ def tool_version(program: str, *args: str) -> str:
     return run_command(str(ROOT / program), [*args, "--version"], cwd=ROOT, timeout=COMMAND_TIMEOUT_SECONDS, check=True).stdout.strip()
 
 
+def meminfo_available_mib(text: str) -> int | None:
+    """The ``MemAvailable`` line of a Linux ``/proc/meminfo`` in mebibytes, or None when it has none."""
+    found = re.search(r"^MemAvailable:\s+(\d+) kB$", text, re.MULTILINE)
+    return int(found.group(1)) // 1024 if found else None
+
+
+def vm_stat_available_mib(text: str) -> int | None:
+    """The free, inactive and speculative pages of macOS ``vm_stat`` in mebibytes, or None when one of the three or the page size is missing."""
+    size = re.search(r"page size of (\d+) bytes", text)
+    pages = dict(re.findall(r"^Pages (free|inactive|speculative):\s+(\d+)\.$", text, re.MULTILINE))
+    if size is None or len(pages) != 3:
+        return None
+    return sum(int(count) for count in pages.values()) * int(size.group(1)) // 1024 // 1024
+
+
+def available_memory_mib() -> int | None:
+    """The memory that a new process can use, in mebibytes, from Linux or macOS. None when this computer gives no figure."""
+    try:
+        if MEMINFO.is_file():
+            return meminfo_available_mib(MEMINFO.read_text())
+        if platform.system() == "Darwin":
+            return vm_stat_available_mib(run_command("vm_stat", [], timeout=COMMAND_TIMEOUT_SECONDS, check=True).stdout)
+    except OSError, CalledProcessError, TimeoutExpired:
+        return None
+    return None
+
+
+def plan_workers(requested: int, case_count: int, cores: int, available_mib: int | None) -> int:
+    """The workers to start: the request, capped by the cases, by the cores less one for the computer's other work and by the free memory. At least one."""
+    limits = [requested, case_count, cores - 1]
+    if available_mib is not None:
+        limits.append(available_mib // WORKER_MIB)
+    return max(1, min(limits))
+
+
 class Fixture:
     """A temporary repository holding a copy of the source tree, with the hooks installed."""
 
@@ -343,7 +391,8 @@ def describe_run(record: Record) -> None:
     record.revision, record.tree_sha256 = recorded_state(ROOT)
 
 
-def run_cases(fixture: Fixture, record: Record, log: list[str], shard: tuple[int, int]) -> None:
+def run_cases(fixture: Fixture, record: Record, log: list[str], shard: tuple[int, int], stop: threading.Event | None = None) -> None:
+    """Run the cases of one shard in the fixture. A set ``stop`` starts no further case."""
     index, count = shard
     fixture.must("git", "init", "--quiet", "--initial-branch", "main")
     fixture.must(".venv/bin/pre-commit", "install")
@@ -351,43 +400,187 @@ def run_cases(fixture: Fixture, record: Record, log: list[str], shard: tuple[int
     fixture.must("git", "add", "--all")
     code, output = fixture.run("git", "commit", "-m", "chore: add the source tree")
     log.append(f"== baseline\n{output}")
-    record.observations.append(Observation("baseline", "control", "exit 0", f"exit {code}", code == 0))
+    record.observations.append(Observation(BASELINE, "control", "exit 0", f"exit {code}", code == 0))
     if code == 0:
         for number, case in enumerate(planted_cases()):
+            if stop is not None and stop.is_set():
+                break
             if number % count == index - 1:
                 record.observations.extend(run_case(fixture, case, log))
 
 
-def remove_fixture(fixture: Fixture | None, record: Record) -> None:
-    if fixture is None:
+def remove_fixtures(fixtures: list[Fixture], record: Record) -> None:
+    """Remove every temporary repository. A removal that fails or is interrupted does not leave the others behind."""
+    if not fixtures:
         record.cleanup = "no temporary repository was made"
         return
     try:
-        fixture.remove()
+        with ExitStack() as stack:
+            for fixture in fixtures:
+                stack.callback(fixture.remove)
     except OSError as error:
         record.cleanup = f"removal failed: {type(error).__name__}"
         record.expect("cleanup", "remove", "temporary repository removed", record.cleanup, False)
     else:
-        record.cleanup = "temporary repository removed"
+        record.cleanup = "temporary repository removed" if len(fixtures) == 1 else f"{len(fixtures)} temporary repositories removed"
+
+
+@dataclass
+class Worker:
+    """One shard of a parallel run, with its own observations and log, so no two workers write the same list."""
+
+    index: int
+    count: int
+    record: Record
+    log: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return f"shard {self.index} of {self.count}"
+
+
+def work(worker: Worker, paths: list[str], fixtures: list[Fixture], stop: threading.Event) -> None:
+    """The body of a worker's thread: its fixture, filled and run for its shard. A failure is the worker's own failed observation."""
+    try:
+        fixture = Fixture(worker.record)
+        fixtures.append(fixture)
+        fixture.populate(paths)
+        run_cases(fixture, worker.record, worker.log, (worker.index, worker.count), stop)
+    except Exception as error:
+        worker.log.append(f"{type(error).__name__}: {error}")
+        worker.record.expect(worker.label, "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
+
+
+def join_all(threads: list[threading.Thread]) -> None:
+    for thread in threads:
+        if thread.ident is not None:
+            thread.join()
+
+
+def covered(observations: list[Observation]) -> Observation:
+    """Every case once, control and fault, in the merged observations of the workers."""
+    seen = Counter((item.case, item.step) for item in observations)
+    wanted = [(case.name, step) for case in planted_cases() for step in ("control", "fault")]
+    missing = [f"{case} ({step})" for case, step in wanted if seen[(case, step)] == 0]
+    repeated = [f"{case} ({step})" for case, step in wanted if seen[(case, step)] > 1]
+    observed = f"missing: {missing}, repeated: {repeated}" if missing or repeated else "every case observed once"
+    return Observation(COVERAGE, "coverage", "every case observed once, control and fault", observed, not missing and not repeated)
+
+
+def merge_workers(record: Record, log: list[str], team: list[Worker]) -> None:
+    """Put the workers' baselines, then their case observations in the order of the case list, then their commands and logs into the one record."""
+    order = {case.name: number for number, case in enumerate(planted_cases())}
+    every = [item for worker in team for item in worker.record.observations]
+    record.observations.extend(item for item in every if item.case == BASELINE)
+    record.observations.extend(sorted((item for item in every if item.case != BASELINE), key=lambda item: order.get(item.case, len(order))))
+    for worker in team:
+        record.commands.extend(worker.record.commands)
+        log.extend(worker.log)
+
+
+def run_parallel(paths: list[str], record: Record, log: list[str], fixtures: list[Fixture], workers: int) -> None:
+    """Run the shards ``1/workers`` to ``workers/workers`` at the same time and merge them into ``record``.
+
+    An interrupt stops the workers before any repository is removed: no case starts after it, and each running commit ends first.
+    """
+    team = [Worker(index, workers, Record(feature=record.feature, slug=record.slug, rerun=record.rerun)) for index in range(1, workers + 1)]
+    stop = threading.Event()
+    threads = [threading.Thread(target=work, args=(worker, paths, fixtures, stop), name=f"guard_shard_{worker.index}") for worker in team]
+    try:
+        for thread in threads:
+            thread.start()
+        join_all(threads)
+    finally:
+        stop.set()
+        join_all(threads)
+        merge_workers(record, log, team)
+    record.observations.append(covered([item for item in record.observations if item.case != BASELINE]))
+
+
+def compare_records(first: dict[str, Any], second: dict[str, Any]) -> list[str]:
+    """What differs between two run records of the same code: the code's revision and tree, and each case's expected text, observed text and result.
+
+    Each worker of a parallel run has its own baseline, and only a parallel run has the coverage observation, so those are not compared.
+    """
+    problems = [f"{key} differs: {first.get(key)!r} and {second.get(key)!r}" for key in ("revision", "tree_sha256") if first.get(key) != second.get(key)]
+
+    def keyed(loaded: dict[str, Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        found: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in loaded["observations"]:
+            if item["case"] not in (BASELINE, COVERAGE):
+                found.setdefault((item["case"], item["step"]), []).append(item)
+        return found
+
+    one, two = keyed(first), keyed(second)
+    for case, step in sorted(set(one) | set(two)):
+        left, right = one.get((case, step), []), two.get((case, step), [])
+        if len(left) != len(right):
+            problems.append(f"{case} ({step}): {len(left)} observations in the first record, {len(right)} in the second")
+            continue
+        problems += [
+            f"{case} ({step}): {name} differs: {a[name]!r} and {b[name]!r}"
+            for a, b in zip(left, right, strict=True)
+            for name in ("expected", "observed", "passed")
+            if a[name] != b[name]
+        ]
+    return problems
+
+
+def compare_command(first: str, second: str) -> int:
+    """Print what differs between the records in two run folders and return 1, or print that they agree and return 0."""
+    try:
+        records = [json.loads((Path(folder) / "record.json").read_text()) for folder in (first, second)]
+    except (OSError, ValueError) as error:
+        sys.stdout.write(f"cannot read a record: {type(error).__name__}\n")
+        return 1
+    problems = compare_records(*records)
+    sys.stdout.write("\n".join(problems) + "\n" if problems else "the records agree on the code and on every case\n")
+    return 1 if problems else 0
+
+
+def parse_workers(text: str) -> int:
+    if not re.fullmatch(r"\d+", text) or int(text) < 1:
+        raise argparse.ArgumentTypeError("use a whole number of workers, 1 or more, for example 4")
+    return int(text)
+
+
+def worker_plan(requested: int, cores: int, available_mib: int | None, workers: int) -> str:
+    memory = "not readable" if available_mib is None else f"{available_mib} MiB"
+    return f"parallel run: {workers} of {requested} requested workers ({cores} cores, available memory {memory}, {WORKER_MIB} MiB estimated for each worker)"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the planted-fault cases, write the run record and return 0 only when every assertion held."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--shard", type=parse_shard, default=(1, 1), metavar="INDEX/COUNT", help="run one share of the cases")
-    index, count = parser.parse_args(argv).shard
-    record = Record(feature="commit guards, local commit path", slug="commit_guards", rerun=RERUN, mode="full" if count == 1 else f"shard {index} of {count}")
+    choice = parser.add_mutually_exclusive_group()
+    choice.add_argument("--shard", type=parse_shard, default=None, metavar="INDEX/COUNT", help="run one share of the cases")
+    choice.add_argument("--parallel", type=parse_workers, default=None, metavar="N", help="run N shards at the same time and write one record")
+    choice.add_argument("--compare", nargs=2, default=None, metavar=("FIRST", "SECOND"), help="compare the records in two run folders")
+    args = parser.parse_args(argv)
+    if args.compare:
+        return compare_command(*args.compare)
+    index, count = args.shard or (1, 1)
+    cores = os.cpu_count() or 1
+    available = available_memory_mib() if args.parallel and args.parallel > 1 else None
+    workers = plan_workers(args.parallel, len(planted_cases()), cores, available) if args.parallel and args.parallel > 1 else 1
+    mode = "full" if count == 1 and workers == 1 else f"shard {index} of {count}" if count > 1 else f"parallel {workers}"
+    record = Record(feature="commit guards, local commit path", slug="commit_guards", rerun=RERUN, mode=mode)
     record.limits = ["local commit path only: the hosted CI path has its own run", "the planted token and account reference are fake values built at run time"]
+    if args.parallel and args.parallel > 1:
+        record.limits.append(worker_plan(args.parallel, cores, available, workers))
     log: list[str] = []
-    fixture: Fixture | None = None
+    fixtures: list[Fixture] = []
     blocked = ""
     try:
         paths = source_files()
         before = tree_digest(paths)
         describe_run(record)
-        fixture = Fixture(record)
-        fixture.populate(paths)
-        run_cases(fixture, record, log, (index, count))
+        if workers > 1:
+            run_parallel(paths, record, log, fixtures, workers)
+        else:
+            fixtures.append(Fixture(record))
+            fixtures[0].populate(paths)
+            run_cases(fixtures[0], record, log, (index, count))
         unchanged = tree_digest(source_files()) == before
         record.observations.append(Observation("source tree", "snapshot", "unchanged during the run", f"unchanged: {unchanged}", unchanged))
     except KeyboardInterrupt:
@@ -397,7 +590,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.append(f"{type(error).__name__}: {error}")
         record.expect("run", "protected execution", "every step completes", f"{type(error).__name__}; see log.txt", False)
     finally:
-        code = record.close_after(lambda: remove_fixture(fixture, record), log, blocked=blocked)
+        code = record.close_after(lambda: remove_fixtures(fixtures, record), log, blocked=blocked)
     return code
 
 

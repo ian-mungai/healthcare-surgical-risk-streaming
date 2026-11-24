@@ -219,7 +219,7 @@ class ProtectedRunTest(unittest.TestCase):
             mock.patch.object(commit_guards, "tool_version", return_value="tool 1"),
             mock.patch.object(commit_guards, "Fixture"),
             mock.patch.object(commit_guards, "run_cases"),
-            mock.patch.object(commit_guards, "remove_fixture"),
+            mock.patch.object(commit_guards, "remove_fixtures"),
             mock.patch.object(commit_guards, "source_files", side_effect=listed),
         ):
             return commit_guards.main()
