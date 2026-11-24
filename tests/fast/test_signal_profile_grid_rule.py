@@ -13,13 +13,10 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import contextlib
+import ast
 import dataclasses
-import importlib.util
-import sys
 import unittest
 from pathlib import Path
-from types import ModuleType
 from unittest import mock
 
 from spark.profile import grid_rule, unscored
@@ -58,24 +55,22 @@ class TheConstants(unittest.TestCase):
         self.assertIn("Status: decided", text)
         self.assertIn("Nov 23 2026", text)
 
-    def load_with(self, **changes: int) -> ModuleType:
-        """A copy of the unscored module that is loaded while the grid rule's constants have other values."""
-        spec = importlib.util.spec_from_file_location("unscored_with_other_constants", unscored.__file__)
-        if spec is None or spec.loader is None:
-            self.fail("the unscored module has no file to load")
-        copy = importlib.util.module_from_spec(spec)
-        with contextlib.ExitStack() as patches:
-            for name, value in changes.items():
-                patches.enter_context(mock.patch.object(grid_rule, name, value))
-            patches.enter_context(mock.patch.dict(sys.modules, {spec.name: copy}))
-            spec.loader.exec_module(copy)
-        return copy
+    def test_the_grid_of_the_unscored_share_is_the_one_of_the_row_that_it_is_given(self) -> None:
+        self.assertEqual([0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720], list(unscored.grid_cutoffs(0, 1020, BASE)))
+        other = dataclasses.replace(BASE, grid_step_seconds=120, first_cutoff_offset_seconds=30, last_cutoff_margin_seconds=600)
+        self.assertEqual([30, 150, 270, 390], list(unscored.grid_cutoffs(0, 1000, other)))
+        self.assertEqual([0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720], list(unscored.grid_cutoffs(0, 1020, BASE)))
 
-    def test_the_grid_of_the_unscored_share_reads_the_constants_of_the_saved_row(self) -> None:
-        self.assertEqual([0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720], list(unscored.grid_cutoffs(0, 1020)))
-        copy = self.load_with(GRID_STEP_SECONDS=120, FIRST_CUTOFF_OFFSET_SECONDS=30, LAST_CUTOFF_MARGIN_SECONDS=600)
-        self.assertEqual([30, 150, 270, 390], list(copy.grid_cutoffs(0, 1000)))
-        self.assertEqual([0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720], list(unscored.grid_cutoffs(0, 1020)))
+    def test_the_measure_holds_no_copy_of_the_constants_of_the_rule(self) -> None:
+        # The planner is given the saved row; a module that reads the constants again could measure another grid than the one that the table says.
+        for module in ("frames", "unscored"):
+            tree = ast.parse((Path(grid_rule.__file__).parent / f"{module}.py").read_text(encoding="utf-8"))
+            used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+                alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) for alias in node.names
+            }
+            for name in ("GRID_STEP_SECONDS", "FIRST_CUTOFF_OFFSET_SECONDS", "LAST_CUTOFF_MARGIN_SECONDS", "GRID_ORIGIN"):
+                with self.subTest(module=module, constant=name):
+                    self.assertNotIn(name, used)
 
     def test_the_stored_unscored_row_is_held_to_the_same_constants(self) -> None:
         columns = {name for name, _ in UNSCORED.columns}

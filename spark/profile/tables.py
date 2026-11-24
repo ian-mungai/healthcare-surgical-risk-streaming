@@ -8,6 +8,9 @@ patient, with the one exception that the sealed source counts say. The fourth, `
   constants as a column, the snapshot ID of the frozen patient split that the job read and the time of the write. The job writes it before it measures the
   unscored share and never changes it: a rerun whose rule or split snapshot differs refuses.
 
+- Schema states (``schema_state``): before the job's first commit each output table is ``absent``, ``current`` (the columns of its card), ``predecessor``
+  (only the unscored share's 12 columns from before the warning grid: the job rebuilds it on its own branch) or ``other`` (the job refuses: ``table_schema``).
+
 - ``signal_profile``: one row for each track of the development cases, by kind (``numeric`` or ``waveform``). ``rows`` are the readings or the seconds
   that Silver holds for the track, ``valid_rows`` those marked valid and each ``cause_*`` column those marked invalid with that cause, so that the valid
   rows and the cause columns add up to the rows. ``valid_share`` is ``valid_rows / rows``. ``cases`` is the number of development cases that hold the track.
@@ -22,6 +25,8 @@ patient, with the one exception that the sealed source counts say. The fourth, `
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 from features.signal_validity import INVALID_CAUSES
 from spark.silver.tables import SilverTable
@@ -96,3 +101,36 @@ GRID_RULE = SilverTable(
     ("rule_version",),
 )
 PROFILE_TABLES = {table.name: table for table in (PROFILE, UNSCORED, COUNTS)}
+
+ABSENT = "absent"
+CURRENT = "current"
+PREDECESSOR = "predecessor"
+OTHER = "other"
+PREDECESSOR_COLUMNS = {
+    UNSCORED.name: (
+        ("scope", "string"),
+        ("cases", "bigint"),
+        ("cutoffs", "bigint"),
+        ("waveform", "bigint"),
+        ("numeric", "bigint"),
+        ("either", "bigint"),
+        ("unscored_share", "double"),
+        ("cutoff_step", "int"),
+        ("waveform_window", "int"),
+        ("waveform_limit", "int"),
+        ("numeric_window", "int"),
+        ("numeric_limit", "int"),
+    )
+}
+
+
+def schema_state(table: SilverTable, fields: Sequence[tuple[str, str]] | None) -> str:
+    """The state of a stored table's columns (``None`` for a table that is not there): ``absent``, ``current`` (the card's columns, in order), ``predecessor``
+    (the columns that the table had before the warning grid, for the one table that has such a card) or ``other``."""
+    if fields is None:
+        return ABSENT
+    held = list(fields)
+    if held == list(table.columns):
+        return CURRENT
+    predecessor = PREDECESSOR_COLUMNS.get(table.name)
+    return PREDECESSOR if predecessor is not None and held == list(predecessor) else OTHER

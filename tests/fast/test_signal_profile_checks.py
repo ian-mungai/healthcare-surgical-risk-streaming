@@ -296,6 +296,9 @@ class Codes(unittest.TestCase):
             "input_empty",
             "source_table",
             "source_no_snapshot",
+            "table_schema",
+            "grid_rule_changed",
+            "grid_rule_rows",
         ):
             with self.subTest(code=code):
                 self.assertIn(code, CODES)

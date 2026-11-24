@@ -4,18 +4,23 @@ The job ``spark/jobs/signal_profile.py`` passes its Spark steps to ``run_build``
 It is the order of the Silver signal job (``spark/silver/run.py``) over three tables.
 
 A build resolves the branch to one hash. It reads the inputs at that hash and refuses an input that cannot be profiled (a split that fails its rule check,
-no development case, no development signal) before it plans or writes anything. It then reads the warning grid rule table (``spark.profile.grid_rule``): a
-stored row that is not the planned one (the constants and the snapshot ID of the split that was read) refuses with ``grid_rule_changed``, and a table that
-does not hold one row refuses with ``grid_rule_rows``, both before the plan and with no write. A branch without the table gets it as the first write, as
-one commit, before the plan: the plan is where the unscored share is measured. A stored row that is the planned one is left as it is, so a rerun writes no
-second rule. It plans the three tables (each as a frame and a fingerprint) and compares each with the table that the branch holds. A table whose
-fingerprint is the planned one is left as it is, so a rerun that changes nothing writes no snapshot. It writes only while the branch still has the checked
-hash, creates the namespace as a commit of its own when the branch has none, writes each changed table as one commit and reads the inputs and the three
-tables at the hash of the last write. The read-back must be the planned tables, with every check passing. The job ends only when the branch still has that
-hash.
+no development case, no development signal) before it plans or writes anything. It then classifies the schema of every output table, the rule table
+included (``schemas``), before its first commit: a table whose columns are not its card's and are not the one predecessor schema refuses with ``table_schema``
+and nothing is written. The predecessor 12-column ``unscored_share`` is rebuilt on the job's branch by a drop and a create, each one commit (never a replace or
+an overwrite of other columns). It then reads the warning grid rule table (``spark.profile.grid_rule``): a stored row that is not the planned one (the
+constants and the snapshot ID of the split that was read) refuses with ``grid_rule_changed``, and a table that does not hold one row refuses with
+``grid_rule_rows``, both before the plan and with no write. A branch without the table gets it as the first write, as one commit, before the plan, and the row
+is read back at that commit and checked equal to the planned one before the plan (a stand-in that saves another value refuses there, before any profile
+table). The plan is built on that saved row: the cutoffs and the rule columns of the unscored share are its values, not the module's constants. A stored row
+that is the planned one is left as it is, so a rerun writes no second rule. It plans the three tables (each as a frame and a fingerprint) and compares each
+with the table that the branch holds. A table whose fingerprint is the planned one is left as it is, so a rerun that changes nothing writes no snapshot. It
+writes only while the branch still has the checked hash, creates the namespace as a commit of its own when the branch has none, writes each changed table as
+one commit (a rebuilt table as the drop and then the create) and reads the inputs and the three tables at the hash of the last write. The read-back must be
+the planned tables, with every check passing. The job ends only when the branch still has that hash.
 
-A verify builds the same plan and requires the stored tables to be equal to it and the stored rule to be the planned row. A prespecified count that the
-reproduced count does not equal is a finding, not a failure: its name is in the result (``source_counts.mismatched``).
+A verify classifies the schemas first (any table that is not its card's, the predecessor included, is ``table_schema``), then builds the same plan on the stored
+rule row and requires the stored tables to be equal to it and the stored rule to be the planned row. A prespecified count that the reproduced count does not
+equal is a finding, not a failure: its name is in the result (``source_counts.mismatched``).
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from spark.profile.checks import (
 from spark.profile.grid_rule import GridRule, RuleRead, planned_rule, rule_problems
 from spark.profile.tables import COUNTS as COUNTS_TABLE
 from spark.profile.tables import GRID_RULE as GRID_RULE_TABLE
+from spark.profile.tables import OTHER, PREDECESSOR
 from spark.profile.tables import PROFILE as PROFILE_TABLE
 from spark.profile.tables import UNSCORED as UNSCORED_TABLE
 from spark.silver.run import Fingerprint
@@ -48,6 +54,8 @@ UNSCORED = UNSCORED_TABLE.name
 COUNTS = COUNTS_TABLE.name
 RULE = GRID_RULE_TABLE.name
 TABLES = (PROFILE, UNSCORED, COUNTS)
+OUTPUTS = (*TABLES, RULE)
+SCHEMA_CODE = "table_schema"
 SOURCE_NAMES = ("numeric_observations", "waveform_seconds", "patient_split", "clinical_cases", "track_list")
 BRANCH_MOVED = "branch_moved: the branch head is not the one that was checked"
 
@@ -79,19 +87,21 @@ class TableRead:
 
 @dataclass(frozen=True, slots=True)
 class Operations:
-    """The Spark steps. ``head`` is the hash of the branch now and every read is at the hash that is given.
-
-    ``plan`` builds the three frames at that hash, keeps them for ``write`` and gives their fingerprints. ``read_table`` gives ``None`` for a hash that
-    holds no such table, and the counts of its checks only when asked. ``write`` writes the planned frame of a table to the branch, over the rows of the table
-    that exists or as a new table. ``write_hash`` is given the hash that the write was made on and gives the hash of the write, or ``None`` when the branch
-    head is not the one commit of the write directly on it. ``prepare`` creates the namespace when the branch has none, as a commit of its own, and gives the
-    hash that the first write is made on. ``release`` frees the planned frames. ``read_rule`` gives the rule table at a hash, or ``None`` for a hash that holds
-    no such table. ``write_rule`` creates it with the one row that it is given and the time of the write.
-    """
+    """The Spark steps. ``head`` is the hash of the branch now and every read is at the hash that is given. ``schemas`` gives the state of each output
+    table's columns at a hash (``spark.profile.tables.schema_state``), the rule table included. ``plan`` builds the three frames at that hash on the
+    saved rule row that it is given, keeps them for ``write`` and gives their fingerprints. ``read_table`` gives ``None`` for a hash that holds no
+    such table, and the counts of its checks only when asked. ``write`` writes the planned frame of a table to the branch, over the rows of the table
+    that exists or as a new table. ``write_hash`` is given the hash that the write was made on and gives the hash of the write, or ``None`` when the
+    branch head is not the one commit of the write directly on it. ``prepare`` creates the namespace when the branch has none, as a commit of its own,
+    and gives the hash that the first write is made on. ``release`` frees the planned frames. ``read_rule`` gives the rule table at a hash, or
+    ``None`` for a hash that holds no such table. ``write_rule`` creates it with the one row that it is given and the time of the write. ``drop``
+    drops a table of the job's branch and ``drop_hash`` is given the hash that the drop was made on and gives the hash of the drop, or ``None`` when
+    the branch head is not the one commit of the drop directly on it."""
 
     head: Callable[[], str]
     read_input: Callable[[str], InputRead]
-    plan: Callable[[str], dict[str, Fingerprint]]
+    schemas: Callable[[str], dict[str, str]]
+    plan: Callable[[str, GridRule], dict[str, Fingerprint]]
     read_table: Callable[[str, str, bool], TableRead | None]
     write: Callable[[str, bool], None]
     write_hash: Callable[[str, str], str | None]
@@ -99,6 +109,8 @@ class Operations:
     release: Callable[[], None]
     read_rule: Callable[[str], RuleRead | None]
     write_rule: Callable[[GridRule], None]
+    drop: Callable[[str], None]
+    drop_hash: Callable[[str, str], str | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +125,7 @@ class Outcome:
     pinned: bool
     rule: RuleRead
     rule_written: bool
+    rebuilt: tuple[str, ...] = ()
 
     def facts(self) -> dict[str, Any]:
         """What the result line may hold: hashes, snapshot IDs, counts of development data, the names of the source counts that do not match and the checks
@@ -149,6 +162,7 @@ class Outcome:
             if unscored
             else {},
             "source_counts": {"pinned": self.pinned, "mismatched": list(self.tables[COUNTS].mismatched)},
+            "rebuilt": list(self.rebuilt),
             "fingerprints": {table: [value.rows, value.digest] for table, value in self.fingerprints.items()},
             "checks_run": list(CHECK_NAMES),
         }
@@ -196,9 +210,27 @@ def stored_rule_problems(read: RuleRead | None, wanted: GridRule) -> list[str]:
     return [f"table_missing: {unit(1, 'table')}"] if read is None else rule_problems(read, wanted)
 
 
+def checked_rule(read: RuleRead | None, wanted: GridRule) -> GridRule:
+    """The rule row of a stored table, after it is checked equal to the planned row. The plan is built on this row."""
+    problems = stored_rule_problems(read, wanted)
+    if problems or read is None or read.rule is None:
+        raise SignalProfileError(*(problems or [f"table_missing: {unit(1, 'table')}"]))
+    return read.rule
+
+
+def unfit_schemas(states: dict[str, str], *, rebuildable: bool) -> list[str]:
+    """The refusal for the output tables whose columns are not the card's: another schema, and the predecessor schema too unless a build can rebuild it."""
+    unfit = [table for table in OUTPUTS if states[table] == OTHER or (states[table] == PREDECESSOR and not (rebuildable and table == UNSCORED))]
+    return [f"{SCHEMA_CODE}: {unit(len(unfit), 'table')}"] if unfit else []
+
+
 def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     source = ops.read_input(head)
     problems = input_problems(source)
+    if problems:
+        raise SignalProfileError(*problems)
+    states = ops.schemas(head)
+    problems = unfit_schemas(states, rebuildable=True)
     if problems:
         raise SignalProfileError(*problems)
     wanted = wanted_rule(source)
@@ -207,6 +239,7 @@ def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     if problems:
         raise SignalProfileError(*problems)
     current, written, prepared = head, None, False
+    saved = stored
     if stored is None:
         if ops.head() != head:
             raise SignalProfileError(BRANCH_MOVED)
@@ -216,8 +249,10 @@ def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
         if written is None:
             raise SignalProfileError(BRANCH_MOVED)
         current, prepared = written, True
-    planned = ops.plan(head)
-    held = read_tables(ops, head, False)
+        saved = ops.read_rule(written)
+    rule = checked_rule(saved, wanted)
+    planned = ops.plan(head, rule)
+    held = {table: None if states[table] == PREDECESSOR else ops.read_table(head, table, False) for table in TABLES}
     changed = [table for table in TABLES if differs(held[table], planned[table])]
     at = current
     if changed:
@@ -225,7 +260,15 @@ def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
             raise SignalProfileError(BRANCH_MOVED)
         on = current if prepared else ops.prepare(head)
         for table in changed:
-            ops.write(table, held[table] is not None)
+            if states[table] == PREDECESSOR:
+                ops.drop(table)
+                dropped = ops.drop_hash(on, table)
+                if dropped is None:
+                    raise SignalProfileError(BRANCH_MOVED)
+                on = dropped
+                ops.write(table, False)
+            else:
+                ops.write(table, held[table] is not None)
             written = ops.write_hash(on, table)
             if written is None:
                 raise SignalProfileError(BRANCH_MOVED)
@@ -235,17 +278,18 @@ def build_inner(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     if later != source:
         raise SignalProfileError(f"source_changed: {unit(1, 'read')} of the inputs differs")
     reads = read_tables(ops, at, True)
-    rule = ops.read_rule(at)
-    problems = table_problems(source, reads, pinned=pinned) + stored_rule_problems(rule, wanted)
+    back = ops.read_rule(at)
+    problems = table_problems(source, reads, pinned=pinned) + stored_rule_problems(back, wanted)
     differing = len([table for table in TABLES if reads[table] is not None and differs(reads[table], planned[table])])
     if differing and not problems:
         problems.append(f"readback_differs: {unit(differing, 'table')}")
-    if problems or rule is None:
+    if problems or back is None:
         raise SignalProfileError(*problems)
     if ops.head() != at:
         raise SignalProfileError(BRANCH_MOVED)
     tables = {table: read for table, read in reads.items() if read is not None}
-    return Outcome("written" if written else "unchanged", head, written, at, source, tables, planned, pinned, rule, stored is None)
+    rebuilt = tuple(table for table in changed if states[table] == PREDECESSOR)
+    return Outcome("written" if written else "unchanged", head, written, at, source, tables, planned, pinned, back, stored is None, rebuilt)
 
 
 def run_build(ops: Operations, head: str, *, pinned: bool) -> Outcome:
@@ -265,10 +309,13 @@ def run_verify(ops: Operations, head: str, *, pinned: bool) -> Outcome:
     try:
         source = ops.read_input(head)
         problems = input_problems(source)
+        problems += unfit_schemas(ops.schemas(head), rebuildable=False)
+        if problems and any(problem.startswith(f"{SCHEMA_CODE}:") for problem in problems):
+            raise SignalProfileError(*problems)
         rule = ops.read_rule(head)
         if not problems:
             problems = stored_rule_problems(rule, wanted_rule(source))
-        planned = ops.plan(head) if not problems else {}
+        planned = ops.plan(head, rule.rule) if not problems and rule is not None and rule.rule is not None else {}
         reads = read_tables(ops, head, True)
         problems += table_problems(source, reads, pinned=pinned)
         if planned and not problems:

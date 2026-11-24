@@ -21,9 +21,9 @@ from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_
 from features.signal_validity import ARTERIAL_WAVEFORM, INVALID_CAUSES
 from spark.profile.checks import FLOAT_TOLERANCE, CountsFacts, InputFacts, ProfileFacts, UnscoredFacts
 from spark.profile.counts import ARTERIAL_TRACK, BY_NAME, FULL_COHORT, NONINVASIVE_TRACK, PRESPECIFIED, SECONDS_PER_HOUR
-from spark.profile.grid_rule import FIRST_CUTOFF_OFFSET_SECONDS, GRID_ORIGIN, GRID_STEP_SECONDS, LAST_CUTOFF_MARGIN_SECONDS, RULE_END, GridRule, RuleRead
+from spark.profile.grid_rule import RULE_END, GridRule, RuleRead
 from spark.profile.tables import CAUSE_COLUMNS, COUNTS, DEVELOPMENT_SCOPE, GRID_RULE, KINDS, NUMERIC_KIND, PROFILE, UNSCORED, WAVEFORM_KIND
-from spark.profile.unscored import count_unscored
+from spark.profile.unscored import count_unscored, grid_pair
 from spark.silver.frames import count_where, functions, typed, types
 
 DEVELOPMENT_SETS = ("training", "validation")
@@ -34,10 +34,14 @@ GRID_RULE_FIELDS = tuple(field.name for field in fields(GridRule))
 UNSCORED_COUNTS = ("cutoffs", "waveform", "numeric", "either", "no_grid")
 
 
-def unscored_row(valid_seconds: list[int] | None, opstart: float | None, opend: float | None) -> tuple[int, int, int, int, int]:
+def unscored_row(
+    valid_seconds: list[int] | None, pairs: Sequence[Sequence[float | None]] | None, step: int, first_offset: int, last_margin: int
+) -> tuple[int, int, int, int, int]:
     """The cutoffs of the warning grid of one case, those that fail the waveform limit, the numeric limit and either, and 1 for a case with no grid
-    (``count_unscored``). The times are as the clinical table gives them: a number of seconds or nothing."""
-    counted = count_unscored(valid_seconds or [], opstart, opend)
+    (``count_unscored``). ``pairs`` are the distinct (``opstart``, ``opend``) of the case's clinical rows, as numbers of seconds or nothing (``grid_pair``). The
+    step, the first cutoff offset and the last cutoff margin are the values of the saved rule row."""
+    opstart, opend = grid_pair(pairs or [])
+    counted = count_unscored(valid_seconds or [], opstart, opend, GridRule("", "", "", step, first_offset, last_margin, 0))
     return (counted.cutoffs, counted.waveform, counted.numeric, counted.either, counted.no_grid)
 
 
@@ -54,17 +58,17 @@ def development_cases(clinical: Any, split: Any) -> Any:
     return clinical.join(f.broadcast(patients), "subjectid").select(f.col("caseid").cast("bigint").alias("case_id")).distinct()
 
 
-def development_grid(clinical: Any, split: Any) -> Any:
-    """One row for each case of a patient in the training or validation set: ``case_id`` and the origin and end of its warning grid as numbers of seconds
-    (``opstart`` and ``opend`` by the rule's names). A time that is missing or is not a number is null, and so is the time of a case that the table holds twice
-    with different times: the case has no grid."""
+def development_grid(clinical: Any, split: Any, rule: GridRule) -> Any:
+    """One row for each case of a patient in the training or validation set: ``case_id`` and ``pairs``, the distinct (origin, end) of the case's clinical
+    rows as numbers of seconds. The origin column is the one that the saved rule names and the end column is the rule's end. A time that is missing or
+    is not a number is null and stays in its pair: a set of structs keeps a pair with a null, which a minimum and a maximum would not.
+    ``unscored_row`` gives a case a grid only when it holds one pair with no null."""
     f = functions()
     patients = split.filter(f.col("set").isin(*DEVELOPMENT_SETS)).select("subjectid")
     held = clinical.join(f.broadcast(patients), "subjectid").select(
-        f.col("caseid").cast("bigint").alias("case_id"), *[f.col(name).try_cast("double").alias(name) for name in (GRID_ORIGIN, RULE_END)]
+        f.col("caseid").cast("bigint").alias("case_id"), *[f.col(name).try_cast("double").alias(name) for name in (rule.grid_origin, RULE_END)]
     )
-    lone = [f.when(f.min(name) == f.max(name), f.min(name)).alias(name) for name in (GRID_ORIGIN, RULE_END)]
-    return held.groupBy("case_id").agg(*lone)
+    return held.groupBy("case_id").agg(f.collect_set(f.struct(*[f.col(name) for name in (rule.grid_origin, RULE_END)])).alias("pairs"))
 
 
 def kind_profile(frame: Any, kind: str, development: Any) -> Any:
@@ -85,30 +89,31 @@ def profile_frame(numeric: Any, waveform: Any, development: Any) -> Any:
     return typed(both.withColumn("valid_share", f.try_divide(f.col("valid_rows").cast("double"), f.col("rows").cast("double"))), PROFILE.columns)
 
 
-def unscored_frame(waveform: Any, grid: Any) -> Any:
+def unscored_frame(waveform: Any, grid: Any, rule: GridRule) -> Any:
     """``silver.unscored_share``: one row, from the arterial waveform seconds of the development cases and their warning grids (``development_grid``), counted
-    once for each case."""
+    once for each case, on the saved rule row ``rule``."""
     f = functions()
     seconds = waveform.filter(f.col("track") == f.lit(ARTERIAL_WAVEFORM)).join(f.broadcast(grid.select("case_id")), "case_id")
     per_case = seconds.groupBy("case_id").agg(f.collect_list(f.when(f.col("valid"), f.col("case_second"))).alias("valid_seconds"))
     cases = per_case.join(f.broadcast(grid), "case_id")
-    counted = cases.withColumn("_u", unscored_udf()(f.col("valid_seconds"), f.col(GRID_ORIGIN), f.col(RULE_END)))
+    step, first_offset, last_margin = (f.lit(value) for value in (rule.grid_step_seconds, rule.first_cutoff_offset_seconds, rule.last_cutoff_margin_seconds))
+    counted = cases.withColumn("_u", unscored_udf()(f.col("valid_seconds"), f.col("pairs"), step, first_offset, last_margin))
     total = counted.agg(
         f.count(f.lit(1)).alias("cases"),
         *[f.coalesce(f.sum(f.col(f"_u.{name}")), f.lit(0)).alias(name) for name in UNSCORED_COUNTS],
     )
-    rule = {
+    columns = {
         "scope": f.lit(DEVELOPMENT_SCOPE),
         "unscored_share": f.try_divide(f.col("either").cast("double"), f.col("cutoffs").cast("double")),
-        "cutoff_step": f.lit(GRID_STEP_SECONDS),
-        "cutoff_offset": f.lit(FIRST_CUTOFF_OFFSET_SECONDS),
-        "last_margin": f.lit(LAST_CUTOFF_MARGIN_SECONDS),
+        "cutoff_step": step,
+        "cutoff_offset": first_offset,
+        "last_margin": last_margin,
         "waveform_window": f.lit(WAVEFORM_WINDOW_SECONDS),
         "waveform_limit": f.lit(MAX_INVALID_WAVEFORM_SECONDS),
         "numeric_window": f.lit(NUMERIC_WINDOW_SECONDS),
         "numeric_limit": f.lit(MAX_INVALID_NUMERIC_PERCENT),
     }
-    return typed(total.withColumns(rule), UNSCORED.columns)
+    return typed(total.withColumns(columns), UNSCORED.columns)
 
 
 def counts_frame(session: Any, rows: Sequence[Mapping[str, Any]]) -> Any:

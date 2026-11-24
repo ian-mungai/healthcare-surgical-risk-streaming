@@ -4,13 +4,18 @@ Analysis decision 5 limits a sample: its 20-second waveform window tolerates no 
 tolerates at most 10% invalid seconds (``features.registry``, ``features.eligibility``). Decision 3 takes one sample each minute. The profile measures the
 share of the samples of the warning grid that the limits leave unscored, on development data.
 
-**Grid.** The grid is the warning grid rule that the job saves in ``silver.warning_grid_rule`` (``spark.profile.grid_rule``), read from its constants and
-copied nowhere: the cutoffs start at ``opstart`` plus the first cutoff offset, step ``GRID_STEP_SECONDS`` and end at the latest grid time at or before
-``opend`` minus ``LAST_CUTOFF_MARGIN_SECONDS``. The grid is of the operation and not of the recorded span of the waveform: a cutoff whose windows reach before
-the first or after the last recorded second is a cutoff, and its absent seconds are invalid (it is unscored, which is what the plan's "too little history"
-means for a sample). A case with no ``opstart`` or no ``opend``, or an ``opend`` that is not after ``opstart``, or a time that is not a whole second (Silver's
-seconds are whole), has no eligible monitored time (analysis plan, "Eligible monitored time": the time between ``opstart`` and ``opend``). It has no grid and
-no cutoff, and it is counted in ``no_grid`` and in the cases. An operation too short for one cutoff has no cutoff and is not counted in ``no_grid``.
+**Grid.** The grid is the warning grid rule that the job saves in ``silver.warning_grid_rule`` (``spark.profile.grid_rule``). The measure is given the saved
+row (``GridRule``, read back from the table and checked equal to the planned one) and reads no constant of its own: the cutoffs start at ``opstart`` plus the
+row's first cutoff offset, step by the row's step and end at the latest grid time at or before ``opend`` minus the row's last cutoff margin. The grid is of
+the operation and not of the recorded span of the waveform: a cutoff whose windows reach before the first or after the last recorded second is a cutoff, and
+its absent seconds are invalid (it is unscored, which is what the plan's "too little history" means for a sample). A case with no ``opstart`` or no ``opend``,
+or an ``opend`` that is not after ``opstart``, or a time that is not a whole second (Silver's seconds are whole), has no eligible monitored time (analysis
+plan, "Eligible monitored time": the time between ``opstart`` and ``opend``). It has no grid and no cutoff, and it is counted in ``no_grid`` and in the cases.
+An operation too short for one cutoff has no cutoff and is not counted in ``no_grid``.
+
+**Clinical rows.** A case that ``bronze.clinical_cases`` holds in more than one row has a grid only when its rows hold one distinct pair of (``opstart``,
+``opend``) and neither time of that pair is missing (``grid_pair``). Two different pairs, also two pairs that each miss a time ((1000, none) and (none, 1300)),
+give no grid: a minimum and a maximum would ignore the missing times and join the two rows into a pair that no row holds.
 
 **Windows.** The windows are the newest complete seconds at the cutoff (``features.registry.complete_seconds``): the seconds ``T - 20`` to ``T - 1`` for the
 waveform and ``T - 900`` to ``T - 1`` for the series. A second that the table does not hold counts as invalid.
@@ -24,12 +29,12 @@ The count is the same as ``features.eligibility.warning_eligibility`` at each cu
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from math import isfinite
 
 from features.registry import MAX_INVALID_NUMERIC_PERCENT, MAX_INVALID_WAVEFORM_SECONDS, NUMERIC_WINDOW_SECONDS, WAVEFORM_WINDOW_SECONDS
-from spark.profile.grid_rule import FIRST_CUTOFF_OFFSET_SECONDS, GRID_STEP_SECONDS, LAST_CUTOFF_MARGIN_SECONDS
+from spark.profile.grid_rule import GridRule
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +58,16 @@ def whole_second(value: float | None) -> int | None:
     return int(value)
 
 
-def grid_cutoffs(opstart: int, opend: int) -> range:
-    """The cutoffs of a case: from ``opstart`` plus the first offset, in steps, through the latest at or before ``opend`` minus the margin."""
-    return range(opstart + FIRST_CUTOFF_OFFSET_SECONDS, opend - LAST_CUTOFF_MARGIN_SECONDS + 1, GRID_STEP_SECONDS)
+def grid_pair(pairs: Iterable[Sequence[float | None]]) -> tuple[float | None, float | None]:
+    """The (``opstart``, ``opend``) of a case from the distinct pairs that its clinical rows hold, missing times kept: the one pair, or no time at all when the
+    case has no pair or more than one. A lone pair keeps a missing time as missing, so ``count_unscored`` gives that case no grid."""
+    distinct = {(pair[0], pair[1]) for pair in pairs}
+    return next(iter(distinct)) if len(distinct) == 1 else (None, None)
+
+
+def grid_cutoffs(opstart: int, opend: int, rule: GridRule) -> range:
+    """The cutoffs of a case on the saved rule: from ``opstart`` plus the first offset, in steps, through the latest at or before ``opend`` minus the margin."""
+    return range(opstart + rule.first_cutoff_offset_seconds, opend - rule.last_cutoff_margin_seconds + 1, rule.grid_step_seconds)
 
 
 def within(held: list[int], low: int, high: int) -> int:
@@ -63,8 +75,8 @@ def within(held: list[int], low: int, high: int) -> int:
     return bisect_right(held, high) - bisect_left(held, low)
 
 
-def count_unscored(valid_seconds: Iterable[int], opstart: float | None, opend: float | None) -> Unscored:
-    """Count the cutoffs of a case and those that break a limit, from its valid seconds. A case with no grid gives ``NO_GRID``."""
+def count_unscored(valid_seconds: Iterable[int], opstart: float | None, opend: float | None, rule: GridRule) -> Unscored:
+    """Count the cutoffs of a case on the saved rule and those that break a limit, from its valid seconds. A case with no grid gives ``NO_GRID``."""
     start, end = whole_second(opstart), whole_second(opend)
     if start is None or end is None or end <= start:
         return NO_GRID
@@ -72,7 +84,7 @@ def count_unscored(valid_seconds: Iterable[int], opstart: float | None, opend: f
     held = set(valid)
     readings = [second for second in valid if second - 1 in held]
     cutoffs = waveform = numeric = either = 0
-    for cutoff in grid_cutoffs(start, end):
+    for cutoff in grid_cutoffs(start, end, rule):
         cutoffs += 1
         short_waveform = WAVEFORM_WINDOW_SECONDS - within(valid, cutoff - WAVEFORM_WINDOW_SECONDS, cutoff - 1) > MAX_INVALID_WAVEFORM_SECONDS
         invalid = NUMERIC_WINDOW_SECONDS - within(readings, cutoff - NUMERIC_WINDOW_SECONDS, cutoff - 1)

@@ -41,6 +41,7 @@ CHECK_NAMES = (
 JOB_CODES = frozenset(
     {
         "schema",
+        "table_schema",
         "table_missing",
         "readback_differs",
         "plan_differs",

@@ -7,8 +7,10 @@
 It reads ``silver.numeric_observations``, ``silver.waveform_seconds``, ``silver.patient_split``, ``bronze.clinical_cases`` and
 ``raw_records.track_list`` at that hash and writes the three tables on the branch (the tables are in ``spark/profile/tables.py``). Before it measures the
 unscored share, it writes the one-row table ``silver.warning_grid_rule`` (the warning grid rule and the snapshot ID of the patient split that it read,
-``spark/profile/grid_rule.py``) and refuses a stored rule or split snapshot that differs. It never writes to the split or to the base: the merge is the
-caller's step after its checks.
+``spark/profile/grid_rule.py``) and refuses a stored rule or split snapshot that differs. It reads that row back and plans the unscored share on the saved
+row, not on the constants. Before its first commit it classifies the schema of every output table: the predecessor 12-column ``unscored_share`` is rebuilt on
+the job's own branch by a drop and a create (never a replace), and any other schema refuses with ``table_schema`` before anything is written. It never writes
+to the split or to the base: the merge is the caller's step after its checks.
 ``verify`` runs the checks on the tables that a branch holds and writes nothing. The order, the freeze of a rerun that changes nothing, the writes and the
 read-back are in ``spark/profile/run.py``. The command line, its codes and its exit codes are in ``spark/profile/cli.py``. The settings come from the
 environment, as the Silver signals job's do.
@@ -28,16 +30,18 @@ import importlib
 import sys
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import quote
 
 from scripts.stack.nessie import NessieClient
 from spark.jobs.patient_split import SOURCE_NAME, TARGET_NAME, WRITE_CATALOG, Lake
 from spark.profile import frames
 from spark.profile.checks import InputFacts, SignalProfileError
 from spark.profile.cli import JOB, run
+from spark.profile.commits import drop_commit
 from spark.profile.counts import count_rows
 from spark.profile.grid_rule import GRID_ORIGIN, RULE_END, GridRule, RuleRead
 from spark.profile.run import BRANCH_MOVED, COUNTS, PROFILE, RULE, SOURCE_NAMES, UNSCORED, InputRead, Operations, TableRead, run_build, run_verify
-from spark.profile.tables import GRID_RULE, PROFILE_TABLES
+from spark.profile.tables import GRID_RULE, PROFILE_TABLES, schema_state
 from spark.session import build_session
 from spark.silver import frames as silver_frames
 from spark.silver.tables import NAMESPACE, NUMERIC, WAVEFORM
@@ -65,6 +69,7 @@ INPUTS = {
     "clinical_cases": (SOURCE_NAME, CLINICAL_COLUMNS, True),
     "track_list": ("raw_records.track_list", TRACK_LIST_COLUMNS, True),
 }
+OUTPUT_TABLES = {**PROFILE_TABLES, RULE: GRID_RULE}
 
 
 class ProfileLake(Lake):
@@ -134,8 +139,17 @@ class ProfileLake(Lake):
         facts = frames.input_facts(held["numeric_observations"][0], held["waveform_seconds"][0], self.development_ids)
         return InputRead(facts, snapshots, ())
 
-    def plan(self, at: str) -> dict[str, Any]:
-        """Build the three frames at ``at``, keep the two that need a pass over Silver on disk for the write and give their fingerprints."""
+    def schemas(self, at: str) -> dict[str, str]:
+        """The state of the columns of each output table (the rule table too) at ``at``: absent, the card's, the predecessor's or another. It reads no row."""
+        states = {}
+        for name, table in OUTPUT_TABLES.items():
+            qualified = f"{self.catalog(at)}.{NAMESPACE}.{name}"
+            held = self.session.table(qualified) if self.session.catalog.tableExists(qualified) else None
+            states[name] = schema_state(table, None if held is None else self.fields_of(held))
+        return states
+
+    def plan(self, at: str, rule: GridRule) -> dict[str, Any]:
+        """Build the three frames at ``at`` on the saved rule row ``rule``, keep the two that need a pass over Silver on disk and give their fingerprints."""
         disk = importlib.import_module("pyspark").StorageLevel.DISK_ONLY
         held = self.inputs(at)
         numeric, waveform = held["numeric_observations"][0], held["waveform_seconds"][0]
@@ -153,7 +167,7 @@ class ProfileLake(Lake):
             values |= frames.fixed_counts(clinical, track_list)
         self.planned = {
             PROFILE: frames.profile_frame(numeric, waveform, development).persist(disk),
-            UNSCORED: frames.unscored_frame(waveform, frames.development_grid(clinical, split)).persist(disk),
+            UNSCORED: frames.unscored_frame(waveform, frames.development_grid(clinical, split, rule), rule).persist(disk),
             COUNTS: frames.counts_frame(self.session, count_rows(values, compared=self.pinned_release)),
         }
         return {table: silver_frames.fingerprint(frame) for table, frame in self.planned.items()}
@@ -203,6 +217,16 @@ class ProfileLake(Lake):
         """Create the warning grid rule table with its one row, as one commit. A table that exists is never written: the build refuses it before this step."""
         frames.rule_frame(self.session, rule).writeTo(f"{WRITE_CATALOG}.{NAMESPACE}.{RULE}").tableProperty("format-version", "2").create()
 
+    def drop_table(self, table: str) -> None:
+        """Drop a table of the job's own branch (the predecessor ``unscored_share``). The base keeps its table until the caller merges, after the checks. The
+        new table is created as a new one by ``write_profile_table``: a replace of a table that exists stalls in Spark with the Nessie catalog."""
+        self.session.sql(f"DROP TABLE {WRITE_CATALOG}.{NAMESPACE}.{OUTPUT_TABLES[table].name}")
+
+    def drop_hash_of(self, checked: str, table: str) -> str | None:
+        """The hash of the drop, from the branch's log: the head, one commit directly on ``checked`` that deletes only the key of ``table``."""
+        log = self.client.request("GET", f"/trees/{quote(self.branch, safe='')}/history", query={"fetch": "ALL", "max-records": "2"}) or {}
+        return drop_commit(log.get("logEntries", []), checked, OUTPUT_TABLES[table].table_key)
+
     def write_hash_of(self, checked: str, table: str) -> str | None:
         return self.write_commit(checked, ((GRID_RULE if table == RULE else PROFILE_TABLES[table]).table_key,))
 
@@ -215,6 +239,7 @@ class ProfileLake(Lake):
         return Operations(
             self.head,
             self.read_input,
+            self.schemas,
             self.plan,
             self.read_profile_table,
             self.write_profile_table,
@@ -223,6 +248,8 @@ class ProfileLake(Lake):
             self.release,
             self.read_rule_table,
             self.write_rule_table,
+            self.drop_table,
+            self.drop_hash_of,
         )
 
 
