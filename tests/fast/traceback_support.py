@@ -8,14 +8,33 @@ from collections.abc import Callable
 HEADER = "Traceback (most recent call last)"
 
 
+def frame_names(error: BaseException) -> set[str]:
+    """The function of each frame of the error and the errors shown with it, never read from the text, which a note can fill."""
+    names: set[str] = set()
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        names.update(frame.name for frame in traceback.extract_tb(current.__traceback__))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif not current.__suppress_context__:
+            pending.append(current.__context__)
+    return names
+
+
 def traceback_text(error: BaseException, *frames: str) -> str:
-    """What a terminal shows for the error. Fails when the error has no traceback or when a named function is not in it."""
-    text = "".join(traceback.format_exception(error))
-    if HEADER not in text:
+    """What a terminal shows for the error. Fails when the error has no traceback of its own or when a named function is in no frame of its shown chain."""
+    if not traceback.extract_tb(error.__traceback__):
         raise AssertionError(f"the error has no traceback, so a check of its text reads the message and the chain only: {type(error).__name__}")
+    text = "".join(traceback.format_exception(error))
+    names = frame_names(error)
     for frame in frames:
-        if f", in {frame}\n" not in text:
-            raise AssertionError(f"the traceback has no frame in {frame}: {text}")
+        if frame not in names:
+            raise AssertionError(f"the traceback has no frame in {frame}: {sorted(names)}")
     return text
 
 
