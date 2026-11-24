@@ -57,7 +57,9 @@ from spark.silver_cases import (
     CutoffRow,
     MeasureRow,
     SilverCasesError,
+    cutoff_table_rows,
     flag,
+    measure_table_rows,
     same_rows,
     source_schema_problems,
     split_rule_problems,
@@ -235,21 +237,10 @@ class Lake:
     def existing_rules(self) -> tuple[list[MeasureRow] | None, list[CutoffRow] | None]:
         measure = self.read_rows(MEASURE_SOURCE, MEASURE_COLUMNS)
         cutoffs = self.read_rows(CUTOFFS_SOURCE, CUTOFF_COLUMNS)
-        measure_rows = None if measure is None else [MeasureRow(row["statistic"], row["unit"], int(row["value"])) for row in measure]
-        cutoff_rows = None
-        if cutoffs is not None:
-            cutoff_rows = [
-                CutoffRow(
-                    row["cutoff"],
-                    row["anchor"],
-                    None if row["elapsed_seconds"] is None else int(row["elapsed_seconds"]),
-                    row["basis"],
-                    row["rule_version"],
-                    int(row["development_cases"]),
-                    int(row["median_length_seconds"]),
-                )
-                for row in cutoffs
-            ]
+        measure_rows, broken_measure = (None, 0) if measure is None else measure_table_rows(measure)
+        cutoff_rows, broken_cutoffs = (None, 0) if cutoffs is None else cutoff_table_rows(cutoffs)
+        if broken_measure or broken_cutoffs:
+            raise SilverCasesError(flag("inherited_row"))
         return measure_rows, cutoff_rows
 
     def write_values(self, source: str, columns: Sequence[tuple[str, str]], rows: Sequence[Sequence[object]]) -> bool:
