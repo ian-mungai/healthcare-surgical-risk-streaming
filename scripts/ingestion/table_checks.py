@@ -35,7 +35,8 @@ nothing and merges nothing more. A rerun after a failed check checks again and r
 
 The job's own output is never kept: a refused or failed run keeps only a fixed refusal code and numbers in ``job_output.txt``, and the reply of the job holds
 its exit code and its standard output only. A ``job_output.txt`` of any other form (one that an earlier controller wrote from the job's output) is removed under
-the lock before any run goes on, whatever it ends as. A saved receipt's checks that are not a result of the current form (an earlier format, or a count of a
+the lock once the run folder holds this load's receipt or none, before the run goes on, whatever it ends as; a folder refused as another load's is left
+untouched. A saved receipt's checks that are not a result of the current form (an earlier format, or a count of a
 clinical table) are removed when the receipt is returned or rebuilt, and the receipt says so.
 """
 

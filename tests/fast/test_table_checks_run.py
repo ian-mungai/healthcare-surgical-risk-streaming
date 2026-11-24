@@ -1553,7 +1553,8 @@ class FailureOutputTest(unittest.TestCase):
 
 class LegacyJobOutputTest(unittest.TestCase):
     """A ``job_output.txt`` that the previous controller wrote (the job's stdout and stderr, and a count) is removed under the load lock before any retry
-    can return, whatever that retry ends as. A file of the current fixed form is left as it is."""
+    can return, whatever that retry ends as, once the folder holds this load's receipt or none; a folder refused as another load's is left untouched. A file
+    of the exact text the controller writes is left as it is."""
 
     def legacy(self) -> dict[str, bytes]:
         form = kept_output("no_result", 1, 0)
