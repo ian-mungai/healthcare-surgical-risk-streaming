@@ -57,6 +57,7 @@ JOB_CODES = frozenset(
         "source_extra",
         "source_snapshot",
         "bad_subjectid",
+        "table_row",
         "two_sets",
         "repeated_patient",
         "unknown_set",
