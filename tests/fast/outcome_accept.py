@@ -382,33 +382,58 @@ def no_removed_fields(result: Mapping[str, Any]) -> bool:
 # --- The untracked runners
 
 STREAMS = r"(?:out|err|output|stdout|stderr)"
+# The keys of a result or a stand-in's answer that hold a count, a list of rows or causes, a digest or a length: a runner may compare them and never print them.
+COUNT_KEYS = (
+    "rows|columns|patients|csv_rows|copies|missing|extra|copies_differ|sampled_cases|sampled_found|cells_wrong|lab_columns|fixed_sample_cases_checked"
+    "|development_cases|development_lab_rows|development_lab_copies|lab_development_rows|lab_development_collapsed|development_events_digest"
+    "|bronze_numeric|bronze_duplicates|bronze_waveform|silver_numeric|silver_waveform|numeric_causes|waveform_causes|arterial_seconds|series_rows"
+    "|series_absent|series_mismatch|clinical_rows|split_rows|waveform_rows|duplicate_keys|seconds|expected_events|stored_events|probes|plant_events"
+    "|planted|tracks_added|expected_rows|absent|verdict_mismatch|sample_mismatch|field_mismatch|ledger_mismatch|value_mismatch"
+    "|arterial_track_of_the_plant_case|numeric|waveform"
+)
+SPEC_CALL = "write_spec("
+# A key that names itself as computed from development cases alone may hold a count (the Silver cases job writes ``development_cases``).
+DEVELOPMENT_KEY = re.compile(r"[\"'](?:lab_)?development_[a-z_]+[\"']:")
+COMPARED = r"[^()=<>!]*(?:\([^()]*\)[^()=<>!]*)*"
 RUNNER_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("stream_length", re.compile(rf"\blen\((?:os\.fsencode\()?\s*{STREAMS}\b")),
     ("stream_tail", re.compile(rf"\b{STREAMS}\[-\d+:\]")),
-    (
-        "count_in_result",
-        re.compile(
-            r"\.get\(['\"](?:rows|columns|patients|csv_rows|copies|missing|extra|copies_differ|sampled_cases|sampled_found|cells_wrong|lab_columns"
-            r"|fixed_sample_cases_checked|development_cases|development_lab_rows|development_lab_copies|lab_development_rows|lab_development_collapsed)['\"]\)(?!\s*[=!]=)"
-        ),
-    ),
+    ("stream_logged", re.compile(rf"\{{{STREAMS}\}}")),
+    ("digest_saved", re.compile(r"(?:facts|environment)[^#\n]*digest|digest[^#\n]*\b(?:facts|environment)\b", re.IGNORECASE)),
+    ("count_in_result", re.compile(rf"\.get\(['\"](?:{COUNT_KEYS})['\"]\)(?!\s*[=!]=)")),
     ("count_printed", re.compile(r"print\(.*\"[a-z_]+\": [^,}=]*(?:\.count\(\)|\blen\()[^,}=]*(?=[,}])")),
+    (
+        "count_emitted",
+        re.compile(rf"[\"'][a-z_]+[\"']:\s*(?:[^,}}=]*(?:\.count\(\)(?!\s*[=!<>])|\blen\((?!{COMPARED}\)\s*[=!<>]))|[^,}}=]*\b(?:int|sum)\({COMPARED}\))"),
+    ),
     ("data_identifier", re.compile(r"\b(?:differing_group|zero_cell|lab_key)\b")),
     ("count_in_text", re.compile(r"\bf(?:\"[^\"]*|'[^']*)\{[^{}=<>]*\blen\([^{}=<>]*\}")),
+    ("refusal_count", re.compile(r"[\"'][a-z]+(?:_[a-z]+)*: \d")),
 )
 
 
 def runner_leaks(source: str) -> list[tuple[str, int]]:
     """The rule and the 1-based line of each line of a runner that records what the sealed outputs forbid, one rule for each line (the first that matches).
 
-    The rules: the length of a stream (``stream_length``), a tail of one (``stream_tail``), a count that a result or a stand-in answers (``count_in_result``,
-    ``count_printed``), an identifier that was chosen by looking at data (``data_identifier``) and a length in an f-string (``count_in_text``). A comparison
-    is not a leak (``==``, ``!=`` or an order in a line, or a count that is only compared): only whether it matched may be recorded. A comment is not read."""
+    The rules: the length of a stream (``stream_length``), a tail of one (``stream_tail``), a stream put into a text (``stream_logged``), a digest in a saved
+    fact (``digest_saved``), a count that a result or a stand-in answers (``count_in_result``, ``count_printed``) or emits (``count_emitted``), an identifier
+    that was chosen by looking at data (``data_identifier``), a length in an f-string (``count_in_text``) and a refusal code with a count after it
+    (``refusal_count``). A comparison
+    is not a leak (``==``, ``!=`` or an order in a line, or a count that is only compared): only whether it matched may be recorded. A comment is not read. A
+    ``write_spec(`` call holds the values that go into the scratch folder, not into a result, so ``count_emitted`` skips it, and so a key that begins
+    ``development_`` (``DEVELOPMENT_KEY``)."""
     found: list[tuple[str, int]] = []
+    depth = 0
     for number, line in enumerate(source.splitlines(), 1):
         if line.lstrip().startswith("#"):
             continue
+        start = line.find(SPEC_CALL) if depth == 0 else 0
+        inside_spec = depth > 0 or start >= 0
+        if inside_spec:
+            depth = max(depth + line[max(start, 0) :].count("(") - line[max(start, 0) :].count(")"), 0)
         for name, pattern in RUNNER_RULES:
+            if name == "count_emitted" and (inside_spec or DEVELOPMENT_KEY.search(line)):
+                continue
             if pattern.search(line):
                 found.append((name, number))
                 break

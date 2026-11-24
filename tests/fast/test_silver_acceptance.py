@@ -151,7 +151,7 @@ class Refusals(unittest.TestCase):
     def test_a_refusal_matches_only_its_complete_lines_in_order(self) -> None:
         self.assertTrue(refusal_matches(["rule_mismatch: failed"], ["rule_mismatch: failed"]))
         self.assertTrue(refusal_matches(["event_short: failed", "event_times: failed"], ["event_short: failed", "event_times: failed"]))
-        self.assertTrue(refusal_matches(["source_table: 0 tables"], ["source_table: 0 tables"]))
+        self.assertTrue(refusal_matches(["source_table: failed"], ["source_table: failed"]))
 
     def test_a_line_with_the_wanted_code_and_other_text_does_not_match(self) -> None:
         self.assertFalse(refusal_matches(["rule_mismatch: 37 patients"], ["rule_mismatch: failed"]))

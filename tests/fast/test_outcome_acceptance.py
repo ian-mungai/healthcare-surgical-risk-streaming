@@ -18,8 +18,9 @@ Failure modes covered here:
 - The comparison of the snapshot IDs with Nessie is driven by what the document holds, so that a key that the job added is looked up and a key that it dropped
   is never missed.
 - A job that the watchdog stopped leaves its part file, and a reader refuses the result folder for it.
-- A runner records the length of a stream, a tail of one, a count in a log line or an observation, a count that a stand-in prints, or an identifier that it
-  chose by looking at data (``runner_leaks``).
+- A runner records the length of a stream, a tail of one, a stream in a log line, a count in a log line or an observation, a count that a stand-in prints
+  or emits, a digest that is saved, a refusal expectation with a count in it, or an identifier that it chose by looking at data (``runner_leaks``). The
+  Silver signals and hypotension runners are linted like the other four.
 """
 
 from __future__ import annotations
@@ -74,6 +75,48 @@ HASH_A, HASH_B = "a" * 64, "b" * 64
 HASHES = {"h0": HASH_A, "h1": HASH_B, "hn": "c" * 64, "h2": "d" * 64}
 HASH_FIELDS = ("base_hash", "checked_hash", "write_hash", "branch_hash")
 BRANCH = bronze.BRANCH
+# Every key that a result or a stand-in of the runners has answered with a count, a list of rows or causes, or a digest.
+# Written out here, not read from the rule.
+WRITTEN_COUNT_KEYS = (
+    "rows",
+    "columns",
+    "patients",
+    "fixed_sample_cases_checked",
+    "development_cases",
+    "development_events_digest",
+    "bronze_numeric",
+    "bronze_duplicates",
+    "bronze_waveform",
+    "silver_numeric",
+    "silver_waveform",
+    "numeric_causes",
+    "waveform_causes",
+    "arterial_seconds",
+    "series_rows",
+    "series_absent",
+    "series_mismatch",
+    "clinical_rows",
+    "split_rows",
+    "waveform_rows",
+    "duplicate_keys",
+    "seconds",
+    "expected_events",
+    "stored_events",
+    "probes",
+    "plant_events",
+    "arterial_track_of_the_plant_case",
+    "expected_rows",
+    "numeric",
+    "waveform",
+)
+RUNNERS = (
+    "bronze_clinical_lab.py",
+    "bronze_clinical_lab_container.py",
+    "silver_patient_split.py",
+    "silver_cases.py",
+    "silver_signals.py",
+    "silver_hypotension.py",
+)
 
 
 def bronze_run(command: str = "verify", **plant: Any) -> tuple[int, dict[str, Any]]:
@@ -396,19 +439,33 @@ class Flags(unittest.TestCase):
 class RunnerLeaks(unittest.TestCase):
     """``runner_leaks`` finds, by rule name and line, each way that an end-to-end runner can record a count, a length or a data-chosen identifier."""
 
-    BAD = {
-        "stream_length": 'streams = f"standard output {len(os.fsencode(out))} bytes"',
-        "stream_length ": "total = len(err)",
-        "stream_tail": 'log.append(f"{out[-3000:]}")',
-        "stream_tail ": "tail = err[-200:] if code else ''",
-        "count_in_text": 'observed = f"rows {len(rows)} of {total}"',
-        "count_in_text ": 'observed = f"counts {counts}, left {len(left)}"',
-        "count_in_result": "observed = f\"rows {result.get('rows')}, columns {result.get('columns')}\"",
-        "count_in_result ": "observed = f\"checked {result.get('fixed_sample_cases_checked')}\"",
-        "count_printed": 'print("RESULT " + json.dumps({"rows": loaded.count(), "columns": len(loaded.columns)}))',
-        "data_identifier": 'observed = f"group of the swap {source.differing_group}"',
-        "data_identifier ": 'observed = f"cell {source.zero_cell}, key {source.lab_key}"',
-    }
+    BAD = (
+        ("stream_length", 'streams = f"standard output {len(os.fsencode(out))} bytes"'),
+        ("stream_length", "total = len(err)"),
+        ("stream_tail", 'log.append(f"{out[-3000:]}")'),
+        ("stream_tail", "tail = err[-200:] if code else ''"),
+        ("count_in_text", 'observed = f"rows {len(rows)} of {total}"'),
+        ("count_in_text", 'observed = f"counts {counts}, left {len(left)}"'),
+        ("count_in_result", "observed = f\"rows {result.get('rows')}, columns {result.get('columns')}\""),
+        ("count_in_result", "observed = f\"checked {result.get('fixed_sample_cases_checked')}\""),
+        ("count_printed", 'print("RESULT " + json.dumps({"rows": loaded.count(), "columns": len(loaded.columns)}))'),
+        ("data_identifier", 'observed = f"group of the swap {source.differing_group}"'),
+        ("data_identifier", 'observed = f"cell {source.zero_cell}, key {source.lab_key}"'),
+        ("stream_logged", 'self.log.append(f"== docker {" ".join(arguments[:3])}: exit {code}\\n{out}{err}")'),
+        ("stream_logged", 'log.append(f"build said {output}")'),
+        ("count_emitted", '        "silver_numeric": session.table(SNUM).count(),'),
+        ("count_emitted", '    emit({"planted": len(rows), "tracks_added": added})'),
+        ("count_emitted", '        "numeric": {key: int(value or 0) for key, value in numeric.items()},'),
+        ("count_in_result", "observed = f\"rows {result.get('silver_numeric')}, bronze {result.get('bronze_numeric')}\""),
+        ("count_in_result", "observed = f\"arterial seconds {result.get('arterial_seconds')}, absent {result.get('series_absent')}\""),
+        ("count_in_result", "observed = f\"rows {result.get('clinical_rows')}, causes {result.get('numeric_causes')}\""),
+        ("count_in_result", "observed = f\"events {result.get('expected_events')} vs {result.get('stored_events')}, probes {result.get('probes')}\""),
+        ("digest_saved", 'self.facts.update(control_branch=branch, events_digest=result["development_events_digest"])'),
+        ("digest_saved", 'self.facts["digest"] = result.get("development_events_digest")'),
+        ("digest_saved", "record.environment.update(events_digest=str(digest))"),
+        ("refusal_count", '            ["source_table: 0 tables"],'),
+        ("refusal_count", 'wanted = ["two_sets: 2 patients", "key_null: failed"]'),
+    )
     CLEAN = (
         "observed = f\"exit {code} after {seconds:.0f} seconds, rows as expected {result.get('rows_as_expected')}\"",
         'print("RESULT " + json.dumps({"rows_as_expected": loaded.count() == spec["rows"], "columns_as_expected": len(loaded.columns) == spec["columns"]}))',
@@ -417,12 +474,26 @@ class RunnerLeaks(unittest.TestCase):
         'self.stack.write_spec({"rows": len(self.expected_cases), "patients": len(self.expected_sets)})',
         "observed = f\"every case checked {result.get('fixed_sample_cases_checked') == len(self.candidates)}, all deleted {deleted == len(set(made))}\"",
         'observed = f"flags {dict.fromkeys(flags, True)}"',
+        "self.log.append(f\"== docker {' '.join(arguments[:3])}: exit {code} after {seconds:.0f} seconds\")",
+        '        "numeric_equal": numeric.get("absent") == numeric.get("verdict_mismatch") == 0,',
+        '    emit({"planted": True, "all_read": len(held) == len(expected)})',
+        '            ["source_table: failed"],',
+        "observed = f\"events digest equal {accepted.ok and result.get('development_events_digest') == self.events_digest}\"",
+        'self.events_digest = result["development_events_digest"]',
+        "observed = f\"snapshots {snapshots} vs {result.get('snapshots')}, sources {sources}\"",
+        'observed = f"no container left {not left}, all deleted {deleted == len(set(run.made)) + len(run.tags)}"',
     )
 
     def test_each_bad_line_is_found_by_its_rule_and_its_line_number(self) -> None:
-        for name, line in self.BAD.items():
-            with self.subTest(name):
-                self.assertEqual([(name.strip(), 2)], runner_leaks(f"x = 1\n{line}\ny = 2\n"))
+        for name, line in self.BAD:
+            with self.subTest(name, line=line[:50]):
+                self.assertEqual([(name, 2)], runner_leaks(f"x = 1\n{line}\ny = 2\n"))
+
+    def test_every_key_of_the_count_list_is_found_when_it_is_printed_and_not_when_it_is_compared(self) -> None:
+        for key in WRITTEN_COUNT_KEYS:
+            with self.subTest(key):
+                self.assertEqual([("count_in_result", 1)], runner_leaks(f"observed = f\"{{result.get('{key}')}}\"\n"))
+                self.assertEqual([], runner_leaks(f"flag = result.get('{key}') == expected\n"))
 
     def test_a_clean_line_is_not_found(self) -> None:
         for line in self.CLEAN:
@@ -433,9 +504,15 @@ class RunnerLeaks(unittest.TestCase):
         self.assertEqual([], runner_leaks("# the log holds len(os.fsencode(out)) once\n"))
         self.assertEqual([(("stream_length"), 2)], runner_leaks("# a comment\nn = len(out)\n"))
 
+    def test_every_runner_file_of_this_machine_is_in_the_list_that_is_linted(self) -> None:
+        folder = Path(__file__).resolve().parents[1] / "e2e"
+        helpers = {"__init__.py", "commit_guards.py", "deadline.py", "run_record.py"}
+        present = {path.name for path in folder.glob("*.py")} - helpers
+        self.assertEqual(set(), present - set(RUNNERS), "a runner that no lint reads")
+
     def test_the_runners_of_this_machine_leak_nothing(self) -> None:
         folder = Path(__file__).resolve().parents[1] / "e2e"
-        runners = [folder / name for name in ("bronze_clinical_lab.py", "bronze_clinical_lab_container.py", "silver_patient_split.py", "silver_cases.py")]
+        runners = [folder / name for name in RUNNERS]
         present = [path for path in runners if path.is_file()]
         if not present:
             self.skipTest("the untracked runners are not on this machine")
