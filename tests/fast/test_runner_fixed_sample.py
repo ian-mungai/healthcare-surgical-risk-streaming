@@ -23,7 +23,7 @@ import unittest
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess, TimeoutExpired
 from typing import Any
 from unittest import mock
 
@@ -52,6 +52,7 @@ class World:
     unlisted: set[int] = field(default_factory=set)
     resized: set[int] = field(default_factory=set)
     raises: Exception | None = None
+    command_raises: Exception | None = None
     check_exit: int = 0
     tracked: list[Candidate] = field(default_factory=lambda: read_candidates(CANDIDATES_FILE))
     commands: list[list[str]] = field(default_factory=list)
@@ -59,6 +60,8 @@ class World:
     def run_command(self, program: str, arguments: Sequence[str], **_: Any) -> CompletedProcess[str]:
         words = list(arguments)
         self.commands.append([program, *words])
+        if self.command_raises is not None:
+            raise self.command_raises
         text = f"{SENTINEL} case {self.tracked[0].case} {self.tracked[0].sha256}"
         if "build" in words:
             if "--release" in words:
@@ -210,6 +213,20 @@ class FixedSampleRecords(unittest.TestCase):
                 self.assertEqual(1, saved.code)
                 self.assertEqual(f"blocked: {type(error).__name__}", saved.record["outcome"])
                 self.assertNotIn(PLANTED_ERROR_CASE, saved.text)
+
+    def test_a_child_command_that_times_out_or_fails_with_output_blocks_the_run_and_names_only_the_class_of_the_error(self) -> None:
+        for label, world in (
+            ("a download that times out", World(raises=TimeoutExpired("aws", 600))),
+            ("a download that fails with output", World(raises=CalledProcessError(2, ["aws", PLANTED_ERROR_CASE], SENTINEL, SENTINEL))),
+            ("a candidate command that times out", World(command_raises=TimeoutExpired("python", 600))),
+            ("a candidate command that fails with output", World(command_raises=CalledProcessError(2, ["python", PLANTED_ERROR_CASE], SENTINEL, SENTINEL))),
+        ):
+            with self.subTest(label):
+                saved = self.saved(world)
+                self.assertEqual(1, saved.code)
+                self.assertIn(saved.record["outcome"], ("blocked: TimeoutExpired", "blocked: CalledProcessError"))
+                self.assertNotIn(PLANTED_ERROR_CASE, saved.text)
+                self.assertNotIn(SENTINEL, saved.text)
 
 
 if __name__ == "__main__":
