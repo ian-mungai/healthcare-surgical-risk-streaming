@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import re
 import unittest
+from pathlib import Path
+from typing import Any
 
-CLASS = r"[A-Za-z0-9_.<>]+"
-FRAME = r"[A-Za-z0-9_.<>-]+:\d+:[A-Za-z0-9_.<>]+"
-BODY = re.compile(rf"^internal_error class=(?P<classes>{CLASS}(?: <- {CLASS}){{0,4}}) frames=(?P<frames>{FRAME}(?: \| {FRAME}){{0,39}})?$")
+from spark import internal_diagnostic
+from spark.internal_diagnostic import is_diagnostic
+
+OWN_FILE = str(Path(internal_diagnostic.__file__).parent / "fake_job.py")  # a file of a package of the project that does not exist
 
 
 def split_lines(err: str, job: str) -> tuple[list[str], list[str]]:
@@ -19,12 +21,31 @@ def split_lines(err: str, job: str) -> tuple[list[str], list[str]]:
 
 
 def assert_internal(case: unittest.TestCase, err: str, job: str, code_line: str | None, classes: tuple[str, ...], marker: str) -> list[str]:
-    """Standard error is the code line (when given) and exactly one diagnostic line of the right shape that names ``classes`` first, with no ``marker``. Gives
-    the frames."""
+    """Standard error is the code line (when given) and exactly one diagnostic line of the one shape of the producer (``is_diagnostic``) that names ``classes``
+    first, with no ``marker``. Gives the frames."""
     rest, found = split_lines(err, job)
     case.assertEqual([] if code_line is None else [code_line], rest)
     case.assertEqual(1, len(found), err)
-    match = BODY.match(found[0]) or case.fail(found[0])
-    case.assertEqual(list(classes), match["classes"].split(" <- ")[: len(classes)])
+    case.assertTrue(is_diagnostic(found[0]), found[0])
+    head, _, tail = found[0].partition(" frames=")
+    case.assertEqual(list(classes), head.partition("class=")[2].split(" <- ")[: len(classes)])
     case.assertNotIn(marker, err)
-    return (match["frames"] or "").split(" | ")
+    return [frame for frame in tail.split(" | ") if frame]
+
+
+class RaisingLoader:
+    """A source loader that raises when the source of a file is asked for (``linecache`` asks it for every frame that ``traceback`` prints)."""
+
+    def get_source(self, name: str) -> str:
+        raise RuntimeError("the loader failed")
+
+
+def error_with_raising_loader() -> KeyError:
+    """An error that was raised in a frame of a project file whose module has a source loader that raises."""
+    scope: dict[str, Any] = {"__name__": "fake_job", "__loader__": RaisingLoader()}
+    exec(compile("def entry():\n    raise KeyError\n", OWN_FILE, "exec"), scope)  # noqa: S102 (a stand-in for a module of the project)
+    try:
+        scope["entry"]()
+    except KeyError as error:
+        return error
+    raise AssertionError("no error")

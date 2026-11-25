@@ -8,7 +8,9 @@ holds and writes nothing. The merge or the publication of the branch is the call
 The test set is sealed. A message or the result holds codes, dimension names and counts, and never a case, a patient, a key or an argument. The lab test
 dimension reads the laboratory table, which holds the results of held-out patients: its counts and its write stay inside the job, the result holds one pass
 flag for it, and its failures print as ``<code>: failed``. The command line
-prints fixed codes only: ``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check.
+prints fixed codes only: ``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check. The one other
+line is the diagnostic of an ``internal_error``, directly after its code: the class labels of a fixed list and the frames of the project's own code
+(``spark/internal_diagnostic.py``), and no text of an error.
 """
 
 from __future__ import annotations

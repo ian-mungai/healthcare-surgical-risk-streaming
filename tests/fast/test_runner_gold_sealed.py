@@ -45,6 +45,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.process import TimeoutExpired
+from spark.internal_diagnostic import internal_error_line
 from spark.settings import SettingsError
 from tests.e2e.run_record import Record
 
@@ -344,16 +345,44 @@ class Refusals(unittest.TestCase):
         self.assertEqual((70, "gold_dimensions: internal_error\n"), (code, err))
         self.assertEqual(0, stack.unknown_lines)
 
+    def counted(self, code: int, *lines: str) -> int:
+        """The unknown lines of one run of the Gold command that ended with exit code ``code`` and wrote ``lines`` (each with the prefix of the job)."""
+        stack = self.stack([(code, "", "".join(f"gold_dimensions: {line}\n" for line in lines))])
+        stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
+        return int(stack.unknown_lines)
+
     def test_a_line_that_is_shaped_like_the_diagnostic_line_but_holds_text_is_counted_as_unknown(self) -> None:
         for text in (
             "internal_error class=builtins.RuntimeError frames=a.py:1:f message",
             "internal_error class=builtins.RuntimeError: boom frames=",
-            "internal_error class=a frames=/x/a.py:1:f",
+            "internal_error class=a frames=",
+            "internal_error class=builtins.RuntimeError frames=/x/a.py:1:f",
+            "internal_error class=" + "C" * 121 + " frames=",
+            "internal_error class=builtins.NotAClass frames=",
+            "internal_error class=builtins.RuntimeError frames=a-b.py:1:f",
+            "internal_error class=builtins.RuntimeError frames=other | other",
         ):
-            with self.subTest(text=text):
-                stack = self.stack([(70, "", f"gold_dimensions: {text}\n")])
-                stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
-                self.assertEqual(1, stack.unknown_lines)
+            with self.subTest(text=text[:60]):
+                self.assertEqual(1, self.counted(70, "internal_error", text))
+
+    def test_a_diagnostic_line_is_unknown_on_any_exit_code_but_70(self) -> None:
+        diagnostic = "internal_error class=builtins.KeyError frames=a.py:1:f"
+        for code, first in ((1, "branch_missing"), (1, "internal_error"), (2, "internal_error"), (0, "internal_error")):
+            with self.subTest(code=code, first=first):
+                self.assertEqual(1, self.counted(code, first, diagnostic))
+        self.assertEqual(0, self.counted(70, "internal_error", diagnostic))
+
+    def test_two_diagnostic_lines_on_one_internal_error_are_one_unknown_and_so_is_one_that_follows_another_code(self) -> None:
+        diagnostic = "internal_error class=builtins.KeyError frames=a.py:1:f"
+        self.assertEqual(1, self.counted(70, "internal_error", diagnostic, diagnostic))
+        self.assertEqual(1, self.counted(70, "settings", diagnostic))
+        self.assertEqual(1, self.counted(70, diagnostic))
+
+    def test_every_line_that_the_producer_prints_for_an_error_is_known_even_with_a_hyphen_in_a_name(self) -> None:
+        for name, module in (("A-b", "m-n"), ("C" * 500, "m"), ("has space", "")):
+            with self.subTest(name=name[:10]):
+                error = type(name, (Exception,), {"__module__": module})("MARKER_4417")
+                self.assertEqual(0, self.counted(70, "internal_error", internal_error_line(error)))
 
     def test_a_sealed_job_still_returns_no_error_text(self) -> None:
         stack = self.stack([])
