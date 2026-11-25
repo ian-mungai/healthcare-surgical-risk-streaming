@@ -705,6 +705,7 @@ class HostUpTest(unittest.TestCase):
                 "compose_stack_platform_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
+                "airbyte_connection_scope": "fixed_sample",
             },
             calls["run_ansible"].call_args_list[0].args[2],
         )
@@ -1033,9 +1034,14 @@ class DeployVariablesTest(unittest.TestCase):
                 "compose_stack_platform_commit": "b" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
+                "airbyte_connection_scope": "fixed_sample",
             },
             host.deploy_variables(CONFIGURATION, "b" * 40),
         )
+
+    def test_the_dev_host_copies_the_fixed_sample_and_only_the_prod_host_copies_the_full_release(self) -> None:
+        self.assertEqual("fixed_sample", host.deploy_variables(CONFIGURATION | {"ENVIRONMENT": "dev"}, "b" * 40)["airbyte_connection_scope"])
+        self.assertEqual("full_release", host.deploy_variables(CONFIGURATION | {"ENVIRONMENT": "prod"}, "b" * 40)["airbyte_connection_scope"])
 
     def test_a_bucket_name_that_s3_refuses_stops_the_deploy_before_ansible_runs(self) -> None:
         with self.assertRaises(WarehouseError):
