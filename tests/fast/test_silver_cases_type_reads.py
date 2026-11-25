@@ -1,7 +1,7 @@
 """The Silver cases runner's independent read compares each table's types with the types of that table.
 
-The runner is untracked, so each test skips when it is not on this machine. Spark is a stand-in: the stand-in program's own ``types_equal`` runs as written,
-and the two dumps are read as source.
+The runner is untracked, so each test skips when it is not on this machine. Spark is a stand-in: the stand-in program's own ``types_equal`` runs as written
+(through the loader of ``tests/fast/test_runner_flag_compare.py``), and the two dumps are read as source.
 
 Failure modes covered here:
 
@@ -21,6 +21,7 @@ from typing import Any
 
 from spark.silver_cases import CASE_COLUMNS, LAB_COLUMNS
 from tests.e2e.run_record import Record
+from tests.fast.test_runner_flag_compare import stand_in_namespace
 from tests.fast.test_runner_gold_sealed import runner
 
 
@@ -51,10 +52,7 @@ class TypesEqual(unittest.TestCase):
     """The helper of the stand-in program that compares a frame's types with the wanted ones."""
 
     def helper(self) -> Any:
-        source = runner("silver_cases").STAND_IN
-        names: dict[str, Any] = {}
-        exec(compile(ast.Module(body=[function_of(source, "types_equal")], type_ignores=[]), "<stand-in>", "exec"), names)  # noqa: S102
-        return names["types_equal"]
+        return stand_in_namespace(runner("silver_cases").STAND_IN, ("types_equal",))["types_equal"]
 
     def test_the_same_types_in_the_same_order_are_equal(self) -> None:
         self.assertIs(True, self.helper()(frame_of(["bigint", "string"]), ["bigint", "string"]))
