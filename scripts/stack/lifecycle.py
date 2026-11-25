@@ -22,7 +22,6 @@ It exits 0 when no rule reaches the warehouse, and 1 naming each problem, or whe
 
 from __future__ import annotations
 
-import argparse
 import os
 import re
 import sys
@@ -32,6 +31,9 @@ from pathlib import Path
 from typing import Any
 
 from scripts.aws_cli import RAW_ERRORS, Aws, AwsError
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.folder import raise_error
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WAREHOUSE_PREFIX
 
@@ -87,7 +89,7 @@ def declared_problems(infra: str | Path) -> list[str]:
     """
     root = Path(infra)
     found = []
-    for directory, names, files in os.walk(root, followlinks=False):
+    for directory, names, files in os.walk(root, followlinks=False, onerror=raise_error):
         names.sort()
         for file_name in sorted(files):
             if not file_name.endswith(DECLARATION_ENDINGS):
@@ -161,7 +163,7 @@ def read_live(aws: Aws, bucket: str) -> dict[str, Any] | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Check the declared rules and the live bucket's rules. Exit 0 when none reaches the warehouse prefix, 1 when one does or the bucket cannot be read."""
-    parser = argparse.ArgumentParser(prog="scripts.stack.lifecycle", description="Check that no S3 lifecycle rule expires the live table paths.")
+    parser = QuietParser(prog="scripts.stack.lifecycle", description="Check that no S3 lifecycle rule expires the live table paths.")
     parser.add_subparsers(dest="command", required=True).add_parser("check")
     parser.parse_args(argv)
     try:
@@ -171,7 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         bucket_problems = [] if live is None else expiring_rule_problems(live, PROTECTED_PREFIX)
         found = declared_problems(INFRA_FOLDER) + [f"bucket: {problem}" for problem in bucket_problems]
     except (ConfigurationError, AwsError, ValueError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     if found:
         sys.stderr.write("".join(f"{problem}\n" for problem in found))

@@ -3,9 +3,15 @@ output "host_instance_id" {
   value       = one(module.host[*].instance_id)
 }
 
-output "host_public_ip" {
-  description = "Public address of the host, which admits no inbound connection."
-  value       = one(module.host[*].public_ip)
+output "host_image_id" {
+  description = "AMI recorded for the Terraform-managed EC2 instance. Null when Terraform manages no host. Sensitive because an instance made from the former SSM lookup keeps that lookup's sensitive mark in state."
+  value       = one(module.host[*].image_id)
+  sensitive   = true
+
+  precondition {
+    condition     = !var.provision_host || local.ubuntu_ami != ""
+    error_message = "infra/ubuntu_build.json pins no AMI for the region ${var.aws_region}: add the AMI of the pinned serial for that region, or run in a pinned region."
+  }
 }
 
 output "host_role_arn" {

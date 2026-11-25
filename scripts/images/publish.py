@@ -1,13 +1,23 @@
-"""Build each project image on this computer from the tracked files of HEAD, push it to the private Docker Hub repository and pin the digest it was given.
+"""Build each project image on this computer from the tracked files of HEAD, push it to the private Docker Hub repository and pin its pushed digest.
 
 The images come from ``compose_stack_built_images`` in the group variables. Each image's folder is staged from ``git archive`` of HEAD, so an untracked
 file and a Git-ignored file (the handoff, the project standard, ``.env``) cannot enter an image. The pin file is left out of every folder, because a pin of an
-image must not change the hash of the image that holds the Compose folder. The tag holds the hash of the folder, so the same files give the same tag, and a tag
-that the repository already holds is never built or pushed again, and a pin that the pin file already holds must equal the digest that the repository gives
-its tag. The repository is read with ``docker manifest inspect``, the CLI's own registry client, which no builder's registry mirror answers for. A push
-follows only when that command prints its own not-found line for the tag. The pin file is written once, after every image has resolved.
-The command relies on the ``docker login`` that this computer already has.
-It reads, prints and writes no token, and every message is fixed text: no output of Docker or Git is ever shown.
+image must not change the hash of the image that holds the Compose folder. The tag holds the hash of the folder, so the same files give the same tag.
+
+The pin file is the authority and the registry is never read. An image whose tag the pin file already holds is neither built nor pushed, and its pin stays as
+it is. An image whose tag the pin file lacks is built, pushed and pinned. The digest is the one that ``docker push`` reports for the exact tag, in its line
+``<tag>: digest: sha256:<64 hex digits> size: <number>`` on standard output. The push asks for the one linux/amd64 manifest (``--platform``), which the build
+loaded (``buildx build --platform linux/amd64 --load``), so the pinned digest is the manifest that the host pulls by digest. Any output without exactly one
+such line for the tag is refused. The pin file is written once, after every image has resolved, so a failure leaves every pin as it was.
+
+Accepted behavior: a push that succeeded but whose pin was not saved is pushed again on the next run and may overwrite that unpinned tag. Nothing pins it, so
+no host pulls it.
+
+Accepted limit (owner, Nov 25 2026): two publishes at the same time can replace the digest of a pinned tag, because each reads the pin file before the other has
+written it. The command takes no lock. Trigger to revisit: more than one person or process publishes. Today only the owner publishes, by hand.
+
+The command relies on the ``docker login`` that this computer already has. It reads, prints and writes no token, and every message is fixed text: no output
+of Docker or Git is ever shown.
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.images import pins
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ENV_FILE, ConfigurationError, load_configuration
 
@@ -32,16 +43,16 @@ PLATFORM = "linux/amd64"
 GIT_SECONDS = 120
 BUILD_SECONDS = 1800
 PUSH_SECONDS = 1800
-INSPECT_SECONDS = 120
-DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-LOGIN_WORDS = ("denied", "unauthorized", "authentication required", "requested access")
 STARTED_TEXT = "could not be started: it is not installed, not on the path or not executable"
-LOGIN_TEXT = "the push was refused: run docker login on this computer, then run the command again"
 NOT_PLAIN = "a source holds a symbolic link or another file that is not a plain file"
 
 
-class PublishError(Exception):
-    """A fixed-text failure. The text holds no output of Docker or Git."""
+class PublishError(FixedTextError):
+    """A fixed-text failure. The text holds no output of Docker or Git. ``exit_status`` is the exit status of the Docker command that failed, if any."""
+
+    def __init__(self, message: str, exit_status: int | None = None) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
 
 
 @dataclass(frozen=True)
@@ -147,84 +158,42 @@ def build_image(settings: Settings, image: dict[str, Any], folder: Path, tag: st
         raise PublishError(f"{image['name']}: the build failed")
 
 
-def push_image(settings: Settings, name: str, tag: str) -> None:
-    code, out, error = docker(settings, ["push", tag], PUSH_SECONDS, "docker push")
-    if code != 0:
-        raise PublishError(LOGIN_TEXT if refused_login(out + error) else f"{name}: the push failed")
-
-
-def refused_login(output: str) -> bool:
-    return any(word in output.lower() for word in LOGIN_WORDS)
-
-
-def platform_digest(name: str, answer: str) -> str:
-    """The digest of the one linux/amd64 image in the answer of ``docker manifest inspect --verbose``: its ``Descriptor.digest``, or that of the one linux/amd64
-    entry when the answer is a list. Another shape, platform or count is refused."""
-    refused = PublishError(f"{name}: the repository's answer is not one image for {PLATFORM}")
-    try:
-        document: Any = json.loads(answer)
-    except ValueError:
-        raise refused from None
-    entries: list[Any] = document if isinstance(document, list) else [document]
-    found: list[str] = []
-    for entry in entries:
-        descriptor: Any = entry.get("Descriptor") if isinstance(entry, dict) else None
-        platform: Any = descriptor.get("platform") if isinstance(descriptor, dict) else None
-        digest: Any = descriptor.get("digest") if isinstance(descriptor, dict) else None
-        if isinstance(platform, dict) and isinstance(digest, str) and f"{platform.get('os')}/{platform.get('architecture')}" == PLATFORM:
-            found.append(digest)
+def pushed_digest(name: str, tag: str, output: str) -> str:
+    """The digest in the one line of ``docker push`` output that has the form ``<tag>: digest: sha256:<64 hex digits> size: <number>`` for this tag.
+    The tag in the line is the part after the repository. No such line, or more than one, is refused."""
+    label = re.escape(tag.rpartition(":")[2])
+    found = [match.group(1) for line in re.split(r"\r?\n", output) if (match := re.fullmatch(rf"{label}: digest: (sha256:[0-9a-f]{{64}}) size: [0-9]+", line))]
     if len(found) != 1:
-        raise refused
+        raise PublishError(f"{name}: the push output holds no digest line of the form <tag>: digest: sha256:<64 hex digits> size: <number> for the pushed tag")
     return found[0]
 
 
-def remote_digest(settings: Settings, name: str, tag: str) -> str | None:
-    """The digest that the repository holds for the tag, or None only when the CLI's own registry client prints its whole not-found line for this tag
-    (``no such manifest: docker.io/<tag>``, from ``docker manifest inspect``; Buildx reads through a builder's registry mirror and is not used).
-
-    Any other failure of the read (the network, a timeout, another text, a missing login) is a refusal, so a push never follows a read that failed."""
-    code, out, error = docker(settings, ["manifest", "inspect", "--verbose", tag], INSPECT_SECONDS, "docker inspect")
-    if code == 0:
-        return platform_digest(name, out)
-    if error.rstrip() == f"no such manifest: docker.io/{tag}":
-        return None
-    raise PublishError(LOGIN_TEXT if refused_login(out + error) else f"{name}: the repository could not be read")
-
-
-def pin_image(found: dict[str, dict[str, str]], name: str, tag: str, digest: str, repository: str) -> dict[str, dict[str, str]]:
-    """The pins with this image's entry set. A tag that is already pinned with another digest is refused: a pushed tag never changes."""
-    if not DIGEST.fullmatch(digest):
-        raise PublishError(f"{name}: the repository returned a digest that is not sha256 and 64 hex digits")
-    current = found.get(name)
-    if current is not None and current["tag"] == tag and current["digest"] != f"{repository}@{digest}":
-        raise PublishError(f"{name}: the tag already has a different digest in the pin file")
-    return {**found, name: {"tag": tag, "digest": f"{repository}@{digest}"}}
+def push_image(settings: Settings, name: str, tag: str) -> str:
+    """Push the tag as its one linux/amd64 manifest and return the digest that the push reported for it. A failed push ends with the CLI's own exit status."""
+    code, out, _ = docker(settings, ["push", "--platform", PLATFORM, tag], PUSH_SECONDS, "docker push")
+    if code != 0:
+        raise PublishError(
+            f"{name}: the push failed with the exit status {code} of docker: check docker login on this computer, then run the command again", code
+        )
+    return pushed_digest(name, tag, out)
 
 
 def publish_image(settings: Settings, image: dict[str, Any], found: dict[str, dict[str, str]], scratch: Path) -> tuple[dict[str, dict[str, str]], str]:
+    """The pins with this image resolved, and the message. A tag that the pin file holds keeps its pin and runs no Docker command."""
     name = image["name"]
     folder = scratch / name
     folder.mkdir()
     tag = image_tag(settings, image, stage(settings, image, folder))
-    pinned = found.get(name, {}).get("tag") == tag
-    digest = remote_digest(settings, name, tag)
-    if pinned:
-        if digest is None:
-            raise PublishError(f"{name}: the repository does not hold the pinned tag: remove its entry from the pin file and run the command again")
-        return pin_image(found, name, tag, digest, settings.repository), f"{name}: already pinned"
-    if digest is not None:
-        return pin_image(found, name, tag, digest, settings.repository), f"{name}: pinned from the repository"
+    if found.get(name, {}).get("tag") == tag:
+        return found, f"{name}: already pinned"
     build_image(settings, image, folder, tag)
-    push_image(settings, name, tag)
-    digest = remote_digest(settings, name, tag)
-    if digest is None:
-        raise PublishError(f"{name}: the repository does not hold the tag after the push")
-    return pin_image(found, name, tag, digest, settings.repository), f"{name}: pushed and pinned"
+    digest = push_image(settings, name, tag)
+    return {**found, name: {"tag": tag, "digest": f"{settings.repository}@{digest}"}}, f"{name}: pushed and pinned"
 
 
 def publish(settings: Settings) -> list[str]:
-    """Publish every image of the list in order and write the pin file once, after the last image. A failure before then changes no pin: the next run finds the
-    tags that were pushed in the repository and pins them from there."""
+    """Publish every image of the list in order and write the pin file once, after the last image. A failure before then changes no pin: the next run pushes
+    again every tag that the pin file still lacks."""
     require_clean(settings)
     try:
         found = pins.load(settings.pin_file)
@@ -254,8 +223,9 @@ def main(argv: Sequence[str] | None = None, settings: Settings | None = None) ->
         for message in publish(settings or default_settings()):
             sys.stdout.write(message + "\n")
     except PublishError as error:
-        sys.stderr.write(f"publish: {error}\n")
-        return 1
+        sys.stderr.write(f"publish: {describe_error(error)}\n")
+        status = error.exit_status
+        return status if status is not None and 0 < status < 256 else 1
     return 0
 
 

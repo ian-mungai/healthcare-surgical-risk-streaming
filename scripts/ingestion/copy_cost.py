@@ -38,7 +38,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
@@ -49,7 +48,8 @@ from typing import Any
 
 from scripts.ingestion.check import CheckResult
 from scripts.ingestion.closed import QuietParser
-from scripts.ingestion.notice import ClosedError, Code, Notice, render
+from scripts.ingestion.notice import ClosedError, Code, Notice, describe_error, render
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
 COST_FORMAT = "copy_cost_1"
@@ -149,15 +149,8 @@ def estimate(result: CheckResult, *, region: str, extra_objects: int, since: dat
 
 
 def write_record(path: Path, document: Mapping[str, Any]) -> None:
-    """Create the output for its owner only. An existing path, also a link, is refused and left as it was."""
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raise CostError("the output path exists") from None
-    except OSError:
-        raise CostError("the output path cannot be created") from None
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(json.dumps(document, indent=1) + "\n")
+    """Create the output for its owner only. A path that is held, in any form, is refused and left as it was."""
+    write_new_file(path, json.dumps(document, indent=1) + "\n", mode=0o600)
 
 
 def whole_number(text: str) -> int:
@@ -190,8 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     command.add_argument("--output", type=Path, required=True, help="a new file for the record")
     arguments = command.parse_args(argv)
     try:
+        check_new_output(arguments.output)
         try:
-            text = arguments.result.read_text()
+            text = arguments.result.read_text(encoding="utf-8")
         except OSError, UnicodeDecodeError:
             raise CostError("the check result cannot be read") from None
         document = estimate(
@@ -202,7 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
         return 1
     except CostError as error:
-        sys.stderr.write(f"copy cost: {error}\n")
+        sys.stderr.write(f"copy cost: {describe_error(error)}\n")
         return 1
     sys.stdout.write(
         f"copy cost: {document['copy']['payload_objects']} payload objects written of {document['copy']['verified_objects']} verified, "

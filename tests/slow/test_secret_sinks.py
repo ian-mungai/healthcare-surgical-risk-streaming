@@ -674,7 +674,7 @@ class EvidenceSinks(unittest.TestCase):
                 (folder / relative).parent.mkdir(parents=True, exist_ok=True)
                 (folder / relative).write_text(text)
             binding = root / "binding.json"
-            RunBinding(run_id, "c0ffee", "s3", "us-west-2", "example-project", "default", ["a", "b"], "verified").write(binding)
+            RunBinding(run_id, "c0ffee", "s3", "us-west-2", "example-project", "default", ["a", "b"], "verified").write(binding, state_root=root)
             with (
                 mock.patch.object(export, "ROOT", root),
                 mock.patch.object(export, "build_manifest", wraps=build_manifest) as built,

@@ -8,7 +8,6 @@ manifest's hash. The key's path comes from ``EVIDENCE_VERIFIER_KEY`` in ``.env``
 
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
 import sys
@@ -21,6 +20,9 @@ from scripts.evidence.manifest import archive_problems, manifest_problems, manif
 from scripts.evidence.receipt import NAMESPACE, SIGNATURE_TIMEOUT_SECONDS
 from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding
 from scripts.infra.terraform_wrapper import WrapperError, load_run
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 
@@ -76,7 +78,8 @@ def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -
     shutil.rmtree(readback, ignore_errors=True)
     partial.replace(readback)
     record = {"run_id": run.run_id, "commit": run.commit, "manifest_sha256": manifest_sha256(manifest), "files": len(manifest["files"])}
-    receipt.write_text(json.dumps(record | {"verified_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}, indent=2) + "\n")
+    text = json.dumps(record | {"verified_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}, indent=2) + "\n"
+    replace_owned_file(receipt, text, state_root=export, mode=0o644)
     if not sign(receipt):
         receipt.unlink()
         receipt.with_name("receipt.json.sig").unlink(missing_ok=True)
@@ -86,19 +89,19 @@ def verify_export(folder: Path, run: RunBinding, sign: Callable[[Path], bool]) -
 
 def main() -> int:
     """Check the readback, sign the receipt and return a non-zero code when the readback is incomplete or the signing fails."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--binding", type=Path, default=DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     try:
         run = load_run(parser.parse_args().binding)
     except WrapperError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     folder = ROOT / "runs" / run.run_id
     invalidate_receipt(folder)
     try:
         key = load_configuration().get("EVIDENCE_VERIFIER_KEY", "")
     except ConfigurationError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     missing = export_problem(folder)
     if missing:

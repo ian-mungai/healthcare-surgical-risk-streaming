@@ -1,6 +1,7 @@
 """The pin file: each project image, by the tag that was pushed and the digest that the repository gave it.
 
-``compose/image_pins.yml`` is the one source of the digests. The publish command writes it. ``render`` turns it into the ``IMAGE_<NAME>`` settings that
+``compose/image_pins.yml`` is the one source of the digests and the authority on what was pushed: the publish command pushes only a tag that
+this file lacks, takes the digest from the push, never reads the registry and writes this file. ``render`` turns it into the ``IMAGE_<NAME>`` settings that
 the host's Compose reads, and stops when an image has no pin. The list of images is ``compose_stack_built_images`` in the group variables,
 which nothing else copies.
 """
@@ -17,6 +18,7 @@ from typing import Any
 
 import yaml
 
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.project_config import IMAGE_REPOSITORY_PATTERN
 from scripts.stack.yaml_text import YamlError, load_yaml
 
@@ -30,7 +32,7 @@ HEADER = (
 )
 
 
-class PinError(ValueError):
+class PinError(FixedTextError, ValueError):
     """A fixed-text failure of the pin file or of the render. The text holds no value that was read from outside."""
 
 
@@ -121,7 +123,7 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         sys.stdout.write(render_environment(load(path), [image["name"] for image in load_images()]))
     except PinError as error:
-        sys.stderr.write(f"image pins: {error}\n")
+        sys.stderr.write(f"image pins: {describe_error(error)}\n")
         return 1
     return 0
 

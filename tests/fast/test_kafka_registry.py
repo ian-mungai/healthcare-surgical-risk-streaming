@@ -161,7 +161,15 @@ def overrides_output(topic: str, overrides: dict[str, str]) -> str:
 class FakeBroker:
     """The two Kafka tools of the broker's image, with a canned answer for each: the topics' description and each topic's explicit overrides."""
 
-    def __init__(self, describe: str, overrides: dict[str, str], raw: dict[str, str] | None = None, alter_exit: int = 0) -> None:
+    def __init__(
+        self,
+        describe: str,
+        overrides: dict[str, str],
+        raw: dict[str, str] | None = None,
+        alter_exit: int = 0,
+        alter_error: str = "the broker refused the change",
+    ) -> None:
+        self.alter_error = alter_error
         self.describe = describe
         self.overrides = overrides
         self.raw = raw or {}
@@ -173,7 +181,7 @@ class FakeBroker:
         if command[5].endswith("kafka-topics.sh"):
             return (0, self.describe, "") if "--describe" in command else (0, "", "")
         if "--alter" in command:
-            return self.alter_exit, "", "the broker refused the change" if self.alter_exit else ""
+            return self.alter_exit, "", self.alter_error if self.alter_exit else ""
         name = command[command.index("--entity-name") + 1]
         if name in self.raw:
             return 0, self.raw[name], ""
@@ -437,6 +445,72 @@ class StepTest(unittest.TestCase):
         self.assertIsNone(module.result)
         self.assertIn("unexpected shape", module.failure["msg"])
         self.assertEqual([], self.alters(broker))
+
+
+class BrokerFailureTest(unittest.TestCase):
+    """A failed Kafka tool call shows the service, the tool, the exit code and one fixed reason word. The tool's text can hold a path, an address or a token."""
+
+    LEAKED = "/srv/example.invalid/kafka/leaked.properties token=eyJleaked-kafka-token-5"
+    TEXTS = {
+        "refused": f"org.apache.kafka.common.errors.TopicAuthorizationException: Not authorized to access topics: {LEAKED}",
+        "unreachable": f"Error while executing topic command : Timed out waiting for a node assignment. {LEAKED}",
+        "not found": f'service "kafka" is not running {LEAKED}',
+        "failed": f"Exception in thread main: {LEAKED}: bad value",
+    }
+
+    def failure(self, tool: str, error: str, code: int = 1) -> str:
+        broker = topics_module.Broker(lambda command: (code, "the answer", error), ["docker", "compose"])
+        with self.assertRaises(topics_module.TopicError) as caught:
+            broker.tool(tool, ["--describe"])
+        return str(caught.exception)
+
+    def test_each_failed_call_shows_the_tool_the_code_and_one_fixed_reason_and_none_of_the_tools_text(self) -> None:
+        for reason, text in self.TEXTS.items():
+            for tool in ("kafka-topics", "kafka-configs"):
+                with self.subTest(reason=reason, tool=tool):
+                    message = self.failure(tool, text, code=3)
+                    self.assertEqual(f"service kafka: {tool} exited with 3 (reason: {reason})", message)
+                    self.assertNotIn("leaked", message)
+                    self.assertNotIn("eyJleaked", message)
+
+    def test_a_topic_that_the_broker_does_not_have_and_a_refused_connection_are_each_named_by_their_word(self) -> None:
+        self.assertIn("(reason: not found)", self.failure("kafka-configs", "The topic 'x' doesn't exist and doesn't have dynamic config."))
+        self.assertIn("(reason: unreachable)", self.failure("kafka-topics", "java.net.ConnectException: Connection refused"))
+        self.assertIn("(reason: refused)", self.failure("kafka-topics", "SaslAuthenticationException: Authentication failed"))
+
+    def test_the_old_sentence_of_the_broker_that_only_said_it_refused_is_a_plain_failure_and_an_empty_text_too(self) -> None:
+        self.assertIn("(reason: failed)", self.failure("kafka-configs", "the broker refused the change"))
+        self.assertEqual("service kafka: kafka-topics exited with 1 (reason: failed)", self.failure("kafka-topics", ""))
+
+    def test_the_failed_step_carries_the_fixed_message_to_the_task_result(self) -> None:
+        without = {name: value for name, value in WANTED_OVERRIDES.items() if name != "flush.messages"}
+        broker = FakeBroker(DESCRIBE, without, alter_exit=1, alter_error=self.TEXTS["refused"])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "topics.txt"
+            path.write_text("replay_events 10 36 2048 128 delete\n")
+            module = FakeModule(broker, str(path))
+            with mock.patch.object(topics_module, "AnsibleModule", lambda **_: module):
+                topics_module.main()
+        self.assertEqual({"msg": "service kafka: kafka-configs exited with 1 (reason: refused)"}, module.failure)
+
+    def test_a_text_with_the_signs_of_two_reasons_gets_the_first_of_refused_then_unreachable_then_not_found(self) -> None:
+        refused, unreachable, missing = "Not authorized", "Connection refused", "doesn't exist"
+        self.assertIn("(reason: refused)", self.failure("kafka-topics", f"{missing} {unreachable} {refused}"))
+        self.assertIn("(reason: unreachable)", self.failure("kafka-topics", f"{missing} {unreachable}"))
+        self.assertIn("(reason: not found)", self.failure("kafka-topics", missing))
+
+    SIGNS = {
+        "refused": ("AuthorizationException", "AuthenticationException", "Authentication failed", "Not authorized"),
+        "unreachable": ("Timed out waiting for a node assignment", "Connection refused", "Connection to node", "Cannot connect to the Docker daemon"),
+        "not found": ("doesn't exist", "UnknownTopicOrPartition", "is not running", "no such service", "executable file not found"),
+    }
+
+    def test_every_sign_of_each_reason_is_named_by_its_word_and_the_list_holds_no_other_sign(self) -> None:
+        for reason, signs in self.SIGNS.items():
+            for sign in signs:
+                with self.subTest(reason=reason, sign=sign):
+                    self.assertIn(f"(reason: {reason})", self.failure("kafka-topics", f"kafka: {sign}"))
+        self.assertEqual(self.SIGNS, {word: tuple(signs) for word, signs in topics_module.REASONS})
 
 
 class ListenerTest(unittest.TestCase):

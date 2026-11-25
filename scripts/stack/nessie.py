@@ -17,7 +17,6 @@ hash, and says ``initialised``. It says ``unchanged`` only when the namespace is
 
 from __future__ import annotations
 
-import argparse
 import http.client
 import json
 import os
@@ -28,11 +27,16 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+
 DEFAULT_TIMEOUT_SECONDS = 30.0
 NAMESPACE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 HASH = re.compile(r"[0-9a-f]{64}")
 CONFLICT_STATUS = 409
+CONFLICT_TEXT = "Nessie refused the branch: the reference or its content changed (a conflict)"
 BODY_LIMIT_BYTES = 1_000_000
+ADDRESS_TEXT = "the Nessie address must be a plain http URL with a host and a port from 0 to 65535 if it has one, such as http://127.0.0.1:19120/api/v2"
 
 
 class PlainText(str):
@@ -82,11 +86,15 @@ class NessieClient:
     """Calls to one Nessie server. ``base_url`` ends in ``/api/v2``. Every call ends within ``timeout_seconds``."""
 
     def __init__(self, base_url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
-        parts = urlsplit(base_url)
+        try:
+            parts = urlsplit(base_url)
+            port = parts.port
+        except ValueError:
+            raise NessieError(ADDRESS_TEXT) from None
         if parts.scheme != "http" or not parts.hostname or parts.query or parts.fragment:
-            raise NessieError("the Nessie address must be a plain http URL with a host, such as http://127.0.0.1:19120/api/v2")
+            raise NessieError(ADDRESS_TEXT)
         self.host = parts.hostname
-        self.port = parts.port or 80
+        self.port = port or 80
         self.prefix = parts.path.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
@@ -265,7 +273,7 @@ class NessieClient:
 
 def main(argv: list[str] | None = None) -> int:
     """Give the default branch the project namespace when its head lacks it. Exit 0 when it holds it, 1 when Nessie fails or refuses, 2 for bad input."""
-    parser = argparse.ArgumentParser(prog="scripts.stack.nessie", description="Give Nessie's default branch its first commit, a namespace, once.")
+    parser = QuietParser(prog="scripts.stack.nessie", description="Give Nessie's default branch its first commit, a namespace, once.")
     commands = parser.add_subparsers(dest="command", required=True)
     initialise = commands.add_parser("initialise")
     initialise.add_argument("--namespace", required=True, help="the namespace of the first commit: lower-case letters, digits and underscores")
@@ -281,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         done = NessieClient(uri).initialise(arguments.branch, arguments.namespace)
     except NessieError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     if done.committed:
         sys.stdout.write(f"initialised: {done.branch} holds the namespace {arguments.namespace}, committed now\n")

@@ -17,11 +17,16 @@ from typing import Any
 
 from ansible.module_utils.basic import AnsibleModule
 
-ERROR_CHARACTERS = 300
+# One fixed word for the text that docker prints on standard error. The text can hold a socket path, a registry address or a token, so none of it is shown.
+REASONS = (
+    ("refused", ("permission denied", "unauthorized", "access denied")),
+    ("unreachable", ("Cannot connect to the Docker daemon", "error during connect", "connection refused", "no such host", "i/o timeout")),
+    ("not found", ("No such container", "No such object", "no such service", "is not running", "executable file not found")),
+)
 
 
 class StaleError(RuntimeError):
-    """The output of Docker is not what the module reads. The message holds no file content."""
+    """The output of Docker is not what the module reads. The message holds no file content and no text of docker."""
 
 
 def service_files(config: Any) -> dict[str, list[Path]]:
@@ -91,11 +96,16 @@ def stale_services(files: dict[str, list[Path]], started: dict[str, float], modi
     return found
 
 
+def reason(error: str) -> str:
+    """The one word of ``REASONS`` whose text docker's standard error holds, or ``failed``."""
+    return next((word for word, texts in REASONS if any(text in error for text in texts)), "failed")
+
+
 def run(module: AnsibleModule, arguments: list[str]) -> str:
     code, output, error = module.run_command(arguments, check_rc=False)
     if code != 0:
         step = next((word for word in arguments if word in ("config", "ps", "inspect")), "command")
-        raise StaleError(f"docker {step} exited with {code}: {error.strip()[:ERROR_CHARACTERS]}")
+        raise StaleError(f"docker {step} exited with {code} (reason: {reason(error)})")
     return str(output)
 
 

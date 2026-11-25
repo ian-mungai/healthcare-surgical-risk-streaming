@@ -11,6 +11,7 @@ from functools import cache
 from pathlib import Path
 
 from replay.events.identity import DELIMITER, component
+from scripts.ingestion.folder import list_files
 
 FEATURES_FOLDER = Path(__file__).resolve().parents[2] / "features"
 VERSION_PREFIX = "features_"
@@ -20,7 +21,7 @@ VERSION_DIGITS = 12
 @cache
 def feature_version() -> str:
     digest = hashlib.sha256()
-    for path in sorted(FEATURES_FOLDER.glob("*.py")):
+    for path in list_files(FEATURES_FOLDER, "*.py"):
         digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
     return f"{VERSION_PREFIX}{digest.hexdigest()[:VERSION_DIGITS]}"
 

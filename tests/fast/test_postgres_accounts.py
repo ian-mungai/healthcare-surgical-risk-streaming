@@ -328,29 +328,64 @@ class StateTest(unittest.TestCase):
         self.assertEqual(1, accounts.STATE_QUERY.count(":'databases'"))
 
 
-class ServerErrorTest(unittest.TestCase):
-    """A failed ``psql`` run never shows the server's error text when the statements carry a password verifier: the text can repeat a part of the statement."""
+class ServerFailureTest(unittest.TestCase):
+    """A failed psql call shows the service, the exit code and one fixed reason word. psql repeats the failed statement; the server's text can hold a name."""
 
-    FRAGMENT = "b6XFM3jOXIKRGszgsSSbt0ahRBPMegngJx/ydQrhm40=:bSQil7LYTkLF1VD90t0B4"
+    LEAKED = "/srv/example.invalid/pg/leaked.conf token=eyJleaked-pg-token-9"
+    TEXTS = {
+        "refused": f'psql: error: connection to server failed: FATAL:  password authentication failed for user "{LEAKED}"',
+        "unreachable": f"psql: error: connection to server on socket {LEAKED} failed: could not connect to server",
+        "not found": f'ERROR:  role "{LEAKED}" does not exist',
+        "failed": f"ERROR:  syntax error at or near {LEAKED}\nLINE 1: CREATE ROLE x PASSWORD 'SCRAM-SHA-256$4096:aaaa$bbbb:cccc'",
+    }
 
-    def failing(self, sql: str) -> str:
-        def run(args: list[str], data: str) -> tuple[int, str, str]:
-            return 1, "", f"ERROR: role \"x\" does not exist\nLINE 1: ...PASSWORD '...{self.FRAGMENT}'\n"
-
-        server = accounts.Server(run, ["docker", "compose"])
+    def failure(self, error: str, code: int = 1) -> str:
+        server = accounts.Server(lambda command, data: (code, "the answer", error), ["docker", "compose"])
         with self.assertRaises(accounts.AccountError) as caught:
-            server.psql(sql, TOOLS)
+            server.psql("SELECT 1;", {"nessie": ["nessie"]})
         return str(caught.exception)
 
-    def test_a_statement_that_carries_a_verifier_is_reported_by_the_exit_status_only_even_when_the_text_shows_a_cut_piece_of_it(self) -> None:
-        text = self.failing(f"CREATE ROLE \"nessie\" PASSWORD '{SERVER_VERIFIER}';\n")
-        self.assertIn("psql exited with 1", text)
-        self.assertNotIn(self.FRAGMENT, text)
-        self.assertNotIn("does not exist", text)
+    def test_each_failed_call_shows_the_service_the_code_and_one_fixed_reason_and_none_of_psqls_text(self) -> None:
+        for reason, text in self.TEXTS.items():
+            with self.subTest(reason=reason):
+                message = self.failure(text, code=2)
+                self.assertEqual(f"service postgres: psql exited with 2 (reason: {reason})", message)
+                for leaked in ("leaked", "eyJleaked", "SCRAM", "CREATE ROLE", "<verifier>"):
+                    self.assertNotIn(leaked, message)
 
-    def test_a_statement_without_a_password_keeps_the_server_text_for_the_owner_to_read(self) -> None:
-        text = self.failing('CREATE DATABASE "nessie" OWNER "nessie";\n')
-        self.assertIn('role "x" does not exist', text)
+    def test_a_server_that_is_not_started_or_a_service_that_does_not_run_gets_the_word_that_names_it(self) -> None:
+        self.assertIn("(reason: unreachable)", self.failure("FATAL:  the database system is starting up"))
+        self.assertIn("(reason: not found)", self.failure('service "postgres" is not running'))
+        self.assertIn("(reason: refused)", self.failure("ERROR:  permission denied for database postgres"))
+
+    def test_an_empty_text_is_a_plain_failure(self) -> None:
+        self.assertEqual("service postgres: psql exited with 1 (reason: failed)", self.failure(""))
+
+    def test_a_text_with_the_signs_of_two_reasons_gets_the_first_of_refused_then_unreachable_then_not_found(self) -> None:
+        refused, unreachable, missing = "password authentication failed", "could not connect to server", "does not exist"
+        self.assertIn("(reason: refused)", self.failure(f"{missing} {unreachable} {refused}"))
+        self.assertIn("(reason: unreachable)", self.failure(f"{missing} {unreachable}"))
+        self.assertIn("(reason: not found)", self.failure(missing))
+
+    SIGNS = {
+        "refused": ("authentication failed", "permission denied", "must be superuser", "no pg_hba.conf entry"),
+        "unreachable": (
+            "could not connect to server",
+            "Connection refused",
+            "is starting up",
+            "is shutting down",
+            "closed the connection unexpectedly",
+            "Is the server running",
+        ),
+        "not found": ("does not exist", "is not running", "no such service", "executable file not found"),
+    }
+
+    def test_every_sign_of_each_reason_is_named_by_its_word_and_the_list_holds_no_other_sign(self) -> None:
+        for reason, signs in self.SIGNS.items():
+            for sign in signs:
+                with self.subTest(reason=reason, sign=sign):
+                    self.assertIn(f"(reason: {reason})", self.failure(f"psql: {sign}"))
+        self.assertEqual(self.SIGNS, {word: tuple(signs) for word, signs in accounts.REASONS})
 
 
 if __name__ == "__main__":

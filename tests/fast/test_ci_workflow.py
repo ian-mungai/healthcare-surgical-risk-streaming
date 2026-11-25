@@ -43,7 +43,7 @@ from typing import Any
 import yaml
 
 from scripts.process import run_command
-from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS
+from tests.fast.git_fixture import ROOT, TIMEOUT_SECONDS, TemporaryRepository
 
 WORKFLOW_TEXT = (ROOT / ".github/workflows/ci.yml").read_text()
 RUNNER = "ubuntu-24.04"
@@ -66,11 +66,20 @@ SHARD_COMMAND = f'make test-guards SHARD="${{SHARD}}/{SHARDS}"'
 DEADLINE_COMMAND = "make test-deadline"
 COMMIT_RANGE_SCRIPT = "\n".join(
     [
-        'if git cat-file -e "${BASE}^{commit}" 2>/dev/null; then',
-        '  .venv/bin/python -m scripts.quality.repo_checks commit-range "${BASE}..${HEAD}"',
-        "else",
-        '  .venv/bin/python -m scripts.quality.repo_checks commit-range "${HEAD}"',
-        "fi",
+        "status=0",
+        'git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null || status=$?',
+        'case "${status}" in',
+        '  0) range="${BASE}..${HEAD}" ;;',
+        "  1)",
+        "    echo \"The base commit '${BASE}' is not in this checkout, so every commit reachable from the head commit is checked.\"",
+        '    range="${HEAD}"',
+        "    ;;",
+        "  *)",
+        "    echo \"git failed with status ${status} while it looked for the base commit '${BASE}'\" >&2",
+        '    exit "${status}"',
+        "    ;;",
+        "esac",
+        '.venv/bin/python -m scripts.quality.repo_checks commit-range "${range}"',
         "",
     ]
 )
@@ -1771,6 +1780,61 @@ class RulesetTest(unittest.TestCase):
     def test_the_required_check_is_the_name_that_the_workflow_gives(self) -> None:
         jobs = load_workflow(WORKFLOW_TEXT)["jobs"]
         self.assertEqual(jobs["required"]["name"], self.rules["required_status_checks"]["required_status_checks"][0]["context"])
+
+
+COMMIT_RANGE_STEP = "Check the commit messages of the pushed range"
+
+
+class CommitRangeStepTest(TemporaryRepository):
+    """The commit-range step of the hooks job, run as GitHub runs it, in a repository of two commits with a stand-in for the checker.
+
+    A base commit that is absent from the checkout is a known case, so the step checks every commit reachable from the head commit, and says so. Any other
+    failure of Git is not that case: it must show Git's message and stop the step, not narrow the range without a word (the old ``2>/dev/null`` hid it).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.git("commit", "--quiet", "--allow-empty", "--message", "first")
+        self.base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("commit", "--quiet", "--allow-empty", "--message", "second")
+        self.head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.calls = self.repo / "calls.txt"
+        checker = self.repo / ".venv/bin/python"
+        checker.parent.mkdir(parents=True)
+        checker.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{self.calls}"\n')
+        checker.chmod(0o755)
+        steps = yaml.safe_load(WORKFLOW_TEXT)["jobs"]["hooks"]["steps"]
+        self.script = self.repo.parent / "step.sh"
+        self.script.write_text(next(step["run"] for step in steps if step.get("name") == COMMIT_RANGE_STEP))
+
+    def run_step(self, base: str, path: str | None = None) -> tuple[int, str, str, list[str]]:
+        env = {**self.env, "BASE": base, "HEAD": self.head}
+        if path is not None:
+            env["PATH"] = path
+        run = run_command("bash", [*GITHUB_BASH, str(self.script)], env=env, cwd=self.repo, timeout=TIMEOUT_SECONDS)
+        return run.returncode, run.stdout, run.stderr, self.calls.read_text().splitlines() if self.calls.exists() else []
+
+    def test_control_a_base_in_the_checkout_checks_the_range_and_says_nothing(self) -> None:
+        code, output, errors, calls = self.run_step(self.base)
+        self.assertEqual((0, "", "", [f"-m scripts.quality.repo_checks commit-range {self.base}..{self.head}"]), (code, output, errors, calls))
+
+    def test_a_base_that_is_not_in_the_checkout_checks_the_history_of_the_head_and_names_the_base(self) -> None:
+        for label, base in {"empty": "", "all zeros": "0" * 40, "unknown": "deadbeef" * 5}.items():
+            with self.subTest(base=label):
+                self.calls.unlink(missing_ok=True)
+                code, output, errors, calls = self.run_step(base)
+                self.assertEqual((0, [f"-m scripts.quality.repo_checks commit-range {self.head}"], ""), (code, calls, errors), output)
+                self.assertIn(f"The base commit '{base}' is not in this checkout, so every commit reachable from the head commit is checked.", output)
+
+    def test_a_git_failure_other_than_a_missing_base_shows_its_message_and_stops_the_step(self) -> None:
+        tools = self.repo.parent / "tools"
+        tools.mkdir()
+        (tools / "git").write_text('#!/bin/sh\necho "fatal: object database is corrupt" >&2\nexit 128\n')
+        (tools / "git").chmod(0o755)
+        code, output, errors, calls = self.run_step(self.base, f"{tools}:{os.environ['PATH']}")
+        self.assertEqual((128, [], ""), (code, calls, output), errors)
+        self.assertIn("fatal: object database is corrupt", errors)
+        self.assertIn("git failed with status 128 while it looked for the base commit", errors)
 
 
 if __name__ == "__main__":

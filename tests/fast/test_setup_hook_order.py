@@ -185,7 +185,7 @@ class OlderHookChainTest(TemporaryRepository):
         run_command(sys.executable, ["-m", "pre_commit", "install"], cwd=self.repo, env=self.env, timeout=TIMEOUT_SECONDS, check=True)
         with mock.patch.object(install_tools, "ROOT", self.repo), contextlib.redirect_stderr(error):
             self.assertFalse(install_tools.settle_hook(check=False))
-        self.assertIn("pre-commit.legacy.previous", error.getvalue())
+        self.assertIn("KeptHookError", error.getvalue())
         self.assertEqual("#!/bin/sh\necho kept first\n", (self.hooks / "pre-commit.legacy.previous").read_text())
         self.assertEqual(MARKING_HOOK, (self.hooks / "pre-commit.legacy").read_text())
         with mock.patch.object(install_tools, "ROOT", self.repo), contextlib.redirect_stderr(io.StringIO()):

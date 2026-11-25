@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest import mock
 
 from spark.jobs import stream_features
-from spark.streaming.checkpoint import EXIT_CODE, REFUSAL_CODE, STATE_FORMAT_FILE, TEMPORARY_FILE, CheckpointFormatError, check_checkpoint
+from spark.streaming.checkpoint import EXIT_CODE, REFUSAL_CODE, STATE_FORMAT_FILE, CheckpointFormatError, check_checkpoint
 from spark.streaming.state import STATE_FORMAT
 
 
@@ -52,7 +52,7 @@ class CheckpointFolder(unittest.TestCase):
 
     def test_a_folder_that_holds_only_the_temporary_file_of_an_interrupted_marker_write_is_marked(self) -> None:
         self.checkpoint.mkdir()
-        (self.checkpoint / TEMPORARY_FILE).write_text("partial")
+        (self.checkpoint / ".0a1b2c3d.part").write_text("partial")
         check_checkpoint(self.checkpoint)
         self.assertEqual(STATE_FORMAT, (self.checkpoint / STATE_FORMAT_FILE).read_text().strip())
 
@@ -64,13 +64,13 @@ class CheckpointFolder(unittest.TestCase):
         check_checkpoint(self.checkpoint)
         self.assertEqual(before, sorted(path.name for path in self.checkpoint.iterdir()))
 
-    def test_a_checkpoint_marked_with_an_older_format_is_refused_and_names_both_formats(self) -> None:
+    def test_a_checkpoint_marked_with_an_older_format_is_refused_and_names_only_the_format_that_the_job_reads(self) -> None:
         for older in ("stream_state_1", "stream_state_2"):
             with self.subTest(older=older):
                 self.checkpoint.mkdir(exist_ok=True)
                 (self.checkpoint / STATE_FORMAT_FILE).write_text(older + "\n")
                 message = str(self.refused())
-                self.assertIn(older, message)
+                self.assertNotIn(older, message)
                 self.assertIn(STATE_FORMAT, message)
 
     def test_a_checkpoint_with_content_and_no_marker_is_refused_as_one_of_an_older_job(self) -> None:

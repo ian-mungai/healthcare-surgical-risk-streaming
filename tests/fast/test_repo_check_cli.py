@@ -112,5 +112,17 @@ class GeneratedWithTrailerTest(TemporaryRepository):
                 self.assertEqual(0, result.returncode, result.stderr)
 
 
+class SingleRevisionRangeTest(TemporaryRepository):
+    """A revision with no base names the whole history behind it, which is what CI's fallback for a missing base commit checks and now says."""
+
+    def test_one_revision_checks_every_commit_reachable_from_it_and_not_only_itself(self) -> None:
+        self.git("commit", "--quiet", "--allow-empty", "-m", "oops: an old subject that is not conventional")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "docs: add a note")
+        result = self.check("commit-range", "HEAD")
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertIn("not a Conventional Commit", result.stderr)
+        self.assertEqual(0, self.check("commit-range", "HEAD~1..HEAD").returncode)
+
+
 if __name__ == "__main__":
     unittest.main()

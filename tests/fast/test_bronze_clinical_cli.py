@@ -180,10 +180,14 @@ class Endings(unittest.TestCase):
         self.assertEqual(([["result.json.part"]], ["result.json"]), (seen, os.listdir(self.folder)))
 
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_result_line(self) -> None:
-        def refuse(source: str, target: str) -> None:
-            raise OSError(f"{MARKER} disk full")
+        link = os.link
 
-        with mock.patch("os.rename", refuse):
+        def refuse(source: str, target: str) -> None:
+            if not str(target).endswith(".part"):
+                raise OSError(f"{MARKER} disk full")
+            link(source, target)
+
+        with mock.patch("os.link", refuse):
             code, out, err = invoke(self.argv, lambda arguments: self.verified())
         self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
         self.assertEqual([], os.listdir(self.folder))

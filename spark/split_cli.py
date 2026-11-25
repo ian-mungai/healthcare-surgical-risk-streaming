@@ -12,7 +12,6 @@ input never leaves a branch behind that blocks the retry.
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
 import sys
@@ -22,29 +21,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.stack.nessie import NessieClient, NessieError
 from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, add_result_option, release_reserved, run_sealed
-from spark.settings import SettingsError, catalog_options
+from spark.settings import (
+    DEFAULT_NESSIE_TIMEOUT_SECONDS,
+    MAX_DEADLINE_SECONDS,
+    MAX_NESSIE_TIMEOUT_SECONDS,
+    SettingsError,
+    catalog_options,
+    number_setting,
+)
 
 JOB = "patient_split"
 # The names that the other jobs' command lines take from here (``spark/silver/cli.py``): they are defined in ``spark/result_file.py``.
 __all__ = ["INTERNAL_EXIT_CODE", "NOT_FOUND", "REFERENCE_NOT_FOUND"]
 DEADLINE_EXIT_CODE = 124
 DEFAULT_DEADLINE_SECONDS = 900.0
-MAX_DEADLINE_SECONDS = 86_400.0
-DEFAULT_NESSIE_TIMEOUT_SECONDS = 30.0
-MAX_NESSIE_TIMEOUT_SECONDS = 600.0
 # Every environment variable that the job reads, here and in spark/session.py. A test holds this list to the source.
 SETTING_NAMES = ("JOB_DEADLINE_SECONDS", "NESSIE_TIMEOUT_SECONDS", "NESSIE_URI", "WAREHOUSE_LOCATION", "AWS_REGION")
 REFERENCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-
-
-class QuietParser(argparse.ArgumentParser):
-    """An argument parser whose only error output is the code ``usage``."""
-
-    def error(self, message: str) -> Any:
-        sys.stderr.write(f"{JOB}: usage\n")
-        raise SystemExit(2)
 
 
 def reference_name(text: str) -> str:
@@ -66,20 +62,6 @@ def parser() -> argparse.ArgumentParser:
             mode.add_argument("--base", default="main", type=reference_name, help="the branch to create the private branch from")
         add_result_option(mode)
     return command
-
-
-def number_setting(name: str, default: float, maximum: float) -> float:
-    """The number above 0 and up to ``maximum`` in the variable ``name``, or ``default`` when it is not set. Any other value is a ``SettingsError``."""
-    text = os.environ.get(name)
-    if text is None:
-        return default
-    try:
-        value = float(text)
-    except ValueError:
-        raise SettingsError(f"{name} is not a number") from None
-    if not math.isfinite(value) or not 0 < value <= maximum:
-        raise SettingsError(f"{name} is not a number from 0 to {maximum:g}")
-    return value
 
 
 def required_setting(name: str) -> str:

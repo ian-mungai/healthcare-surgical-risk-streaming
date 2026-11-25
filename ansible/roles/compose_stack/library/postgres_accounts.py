@@ -13,7 +13,8 @@ A line of the tool list is a bare tool name, which owns one database named for t
 lists. A database belongs to one tool: a name listed twice or owned by another tool is refused.
 
 The module computes each password's SCRAM-SHA-256 verifier itself and sends only the verifier to the server, so no password reaches a command
-line, a statement or a log. It uses only the standard library and runs on the host's Python.
+line, a statement or a log. A failed psql call shows its exit code and one fixed word (refused, unreachable, not found or failed), never psql's text.
+It uses only the standard library and runs on the host's Python.
 """
 
 from __future__ import annotations
@@ -47,7 +48,23 @@ MAXIMUM_ITERATIONS = 1_000_000
 SALT_BYTES = 16
 ATTRIBUTES = "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
 VERIFIER = re.compile(r"SCRAM-SHA-256\$(\d+):([A-Za-z0-9+/=]+)\$([A-Za-z0-9+/=]+):([A-Za-z0-9+/=]+)")
-ERROR_CHARACTERS = 400
+# One fixed word for the text that psql prints on standard error. psql repeats the failed statement and the server names roles, databases and paths, so none of
+# the text is shown.
+REASONS = (
+    ("refused", ("authentication failed", "permission denied", "must be superuser", "no pg_hba.conf entry")),
+    (
+        "unreachable",
+        (
+            "could not connect to server",
+            "Connection refused",
+            "is starting up",
+            "is shutting down",
+            "closed the connection unexpectedly",
+            "Is the server running",
+        ),
+    ),
+    ("not found", ("does not exist", "is not running", "no such service", "executable file not found")),
+)
 
 
 class AccountError(RuntimeError):
@@ -197,6 +214,11 @@ class Server:
         self.run = run
         self.compose_command = compose_command
 
+    @staticmethod
+    def reason(error: str) -> str:
+        """The one word of ``REASONS`` whose text psql's standard error holds, or ``failed``."""
+        return next((word for word, texts in REASONS if any(text in error for text in texts)), "failed")
+
     def psql(self, sql: str, tools: dict[str, list[str]]) -> str:
         options = (
             f'-X -q -A -t -F "|" -v ON_ERROR_STOP=1 -v tools={tool_variable(tools)} -v databases={database_variable(tools)} -U {ADMINISTRATOR} -d postgres'
@@ -204,9 +226,7 @@ class Server:
         script = PSQL_SCRIPT.replace("@PASSWORD_FILE@", ADMINISTRATOR_FILE_IN_CONTAINER).replace("@ACCOUNT@", ADMINISTRATOR).replace("@OPTIONS@", options)
         code, output, error = self.run([*self.compose_command, "exec", "-T", SERVICE, "sh", "-c", script], sql)
         if code != 0:
-            if "PASSWORD" in sql:
-                raise AccountError(f"service {SERVICE}: psql exited with {code}; its error text is not shown because the statements carry password verifiers")
-            raise AccountError(f"service {SERVICE}: psql exited with {code}: {error.strip()[:ERROR_CHARACTERS]}")
+            raise AccountError(f"service {SERVICE}: psql exited with {code} (reason: {self.reason(error)})")
         return output
 
 

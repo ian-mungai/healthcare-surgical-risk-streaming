@@ -17,12 +17,6 @@ mock_provider "aws" {
     }
   }
 
-  mock_data "aws_ssm_parameter" {
-    defaults = {
-      value = "ami-0123456789abcdef0"
-    }
-  }
-
   mock_data "aws_ec2_instance_type" {
     defaults = {
       memory_size = 32768
@@ -67,6 +61,7 @@ run "host_matches_the_design" {
 
   variables {
     name          = "example_project_host_dev"
+    ami           = jsondecode(file("ubuntu_build.json")).amis["us-west-2"]
     boundary_name = "example_project_role_boundary"
     instance_type = "m6a.2xlarge"
     disk_gib      = 200
@@ -86,8 +81,8 @@ run "host_matches_the_design" {
   }
 
   assert {
-    condition     = aws_instance.host.instance_type == "m6a.2xlarge" && aws_instance.host.ami == "ami-0123456789abcdef0"
-    error_message = "The host is an m6a.2xlarge from the Ubuntu image parameter."
+    condition     = aws_instance.host.instance_type == "m6a.2xlarge" && aws_instance.host.ami == jsondecode(file("ubuntu_build.json")).amis["us-west-2"]
+    error_message = "The host is an m6a.2xlarge from the AMI that the pinned Ubuntu build names for its region."
   }
 
   assert {
@@ -178,6 +173,39 @@ run "host_matches_the_design" {
   }
 }
 
+run "host_image_is_the_pinned_build_of_the_run_region" {
+  command = plan
+
+  assert {
+    condition     = output.host_image_id == jsondecode(file("ubuntu_build.json")).amis["us-west-2"]
+    error_message = "The environment gives the host the AMI that infra/ubuntu_build.json names for the run's region, with no lookup in the AWS parameter store."
+  }
+}
+
+run "region_missing_from_the_pin_refuses_the_host" {
+  command = plan
+
+  variables {
+    aws_region = "eu-west-1"
+  }
+
+  expect_failures = [output.host_image_id]
+}
+
+run "region_missing_from_the_pin_is_harmless_without_a_host" {
+  command = plan
+
+  variables {
+    aws_region     = "eu-west-1"
+    provision_host = false
+  }
+
+  assert {
+    condition     = output.host_image_id == null
+    error_message = "A host that already exists needs no image, so a region outside the pin plans without one."
+  }
+}
+
 run "host_joins_tailscale_without_a_stored_key" {
   command = plan
 
@@ -187,6 +215,7 @@ run "host_joins_tailscale_without_a_stored_key" {
 
   variables {
     name          = "example_project_host_dev"
+    ami           = jsondecode(file("ubuntu_build.json")).amis["us-west-2"]
     boundary_name = "example_project_role_boundary"
     instance_type = "m6a.2xlarge"
     disk_gib      = 200
@@ -247,6 +276,38 @@ run "host_joins_tailscale_without_a_stored_key" {
     condition     = strcontains(local.user_data, "After=network-online.target tailscaled.service") && !strcontains(local.user_data, "Before=")
     error_message = "The join unit orders itself after the network only, so it never slows a reboot or the services that start with it."
   }
+}
+
+run "the_permanent_deploy_role_keeps_its_name" {
+  command = plan
+
+  assert {
+    condition     = local.deploy_role_name == "example_project_deploy_dev"
+    error_message = "Without a test run ID the deploy role is the permanent role of the environment."
+  }
+}
+
+run "a_test_run_names_its_own_deploy_role_apart_from_the_permanent_one" {
+  command = plan
+
+  variables {
+    test_run_id = "01010000abcdef"
+  }
+
+  assert {
+    condition     = local.deploy_role_name == "example_project_deploy_t01010000abcdef" && local.deploy_role_name != "example_project_deploy_dev"
+    error_message = "A short-lived test run gets a deploy role named from its run ID, so an apply never meets the permanent role."
+  }
+}
+
+run "a_test_run_id_that_is_not_lower_case_hex_is_refused" {
+  command = plan
+
+  variables {
+    test_run_id = "../x"
+  }
+
+  expect_failures = [var.test_run_id]
 }
 
 run "deploy_role_trusts_only_the_protected_workflow" {
@@ -780,6 +841,7 @@ run "host_may_assume_only_workload_roles" {
 
   variables {
     name                  = "example_project_host_dev"
+    ami                   = jsondecode(file("ubuntu_build.json")).amis["us-west-2"]
     boundary_name         = "example_project_role_boundary"
     instance_type         = "m6a.2xlarge"
     disk_gib              = 200

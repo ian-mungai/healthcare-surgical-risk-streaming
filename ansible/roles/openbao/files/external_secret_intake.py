@@ -29,6 +29,7 @@ import re
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import NoReturn
 from urllib.parse import urlsplit
 
 
@@ -199,8 +200,15 @@ def run(name: str, value: str | None, directory: Path, list_path: Path, address:
     return "written"
 
 
+class QuietParser(argparse.ArgumentParser):
+    """An argument parser whose usage error names no word of the command line, so a mistyped value is never repeated on standard error."""
+
+    def error(self, message: str) -> NoReturn:
+        self.exit(2, f"{self.prog}: the command line is not valid\n")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Write one external secret from standard input into OpenBao when its path is empty.")
+    parser = QuietParser(description="Write one external secret from standard input into OpenBao when its path is empty.")
     parser.add_argument("--directory", default=DEFAULT_DIRECTORY, help="the secrets folder")
     parser.add_argument("--list", default=DEFAULT_LIST, help="the list of external secrets")
     parser.add_argument("--address", default=DEFAULT_ADDRESS, help="the address of OpenBao")

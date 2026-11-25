@@ -13,19 +13,16 @@ Failure modes covered here:
 
 from __future__ import annotations
 
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.infra.terraform_wrapper import pinned_terraform
-from scripts.process import CompletedProcess, run_command
+from scripts.process import CompletedProcess
 from scripts.project_config import ROOT
 from tests.fast.secret_inputs import Marker, make_marker, scan_text
+from tests.slow.terraform_support import Terraform
 
-INIT_SECONDS = 300
 TEST_SECONDS = 300
-PROVIDERS = ROOT / ".tools" / "terraform" / "static" / "providers"
 PLAN_TESTS = ROOT / "infra" / "tests" / "plan.tftest.hcl"
 VARIABLES = """
 variables {
@@ -49,40 +46,13 @@ run "probe" {
 """
 
 
-class Terraform:
-    """The pinned Terraform on a copy of ``infra/`` with no cloud access: an unreadable profile, empty credential files and a data folder of its own."""
-
-    def __init__(self, scratch: Path) -> None:
-        self.scratch = scratch
-        self.config = scratch / "infra"
-        shutil.copytree(ROOT / "infra", self.config, ignore=shutil.ignore_patterns(".terraform", "probe_tests"))
-        (scratch / "empty").write_text("")
-        self.env = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(scratch),
-            "TF_DATA_DIR": str(scratch / "data"),
-            "TF_IN_AUTOMATION": "1",
-            "AWS_PROFILE": "no_such_profile",
-            "AWS_CONFIG_FILE": str(scratch / "empty"),
-            "AWS_SHARED_CREDENTIALS_FILE": str(scratch / "empty"),
-        }
-
-    def run(self, *arguments: str, seconds: int) -> CompletedProcess[str]:
-        return run_command(str(pinned_terraform()), [f"-chdir={self.config}", *arguments], cwd=self.scratch, env=self.env, timeout=seconds)
-
-    def init(self) -> None:
-        plugin = [f"-plugin-dir={PROVIDERS}"] if PROVIDERS.is_dir() else []
-        result = self.run("init", "-backend=false", "-input=false", "-no-color", *plugin, seconds=INIT_SECONDS)
-        if result.returncode != 0:
-            raise AssertionError("terraform init failed:\n" + (result.stdout + result.stderr)[-2000:])
-
-    def probe(self, client_id: str) -> CompletedProcess[str]:
-        """``terraform test`` with the mock provider of the project's own plan tests, and the client ID on the command line as the wrapper gives it."""
-        folder = self.config / "probe_tests"
-        folder.mkdir()
-        mock_provider = PLAN_TESTS.read_text().split("\nvariables {", 1)[0]
-        (folder / "probe.tftest.hcl").write_text(mock_provider + VARIABLES)
-        return self.run("test", "-no-color", "-test-directory=probe_tests", f"-var=tailscale_client_id={client_id}", seconds=TEST_SECONDS)
+def probe(terraform: Terraform, client_id: str) -> CompletedProcess[str]:
+    """``terraform test`` with the mock provider of the project's own plan tests, and the client ID on the command line as the wrapper gives it."""
+    folder = terraform.config / "probe_tests"
+    folder.mkdir()
+    mock_provider = PLAN_TESTS.read_text().split("\nvariables {", 1)[0]
+    (folder / "probe.tftest.hcl").write_text(mock_provider + VARIABLES)
+    return terraform.run("test", "-no-color", "-test-directory=probe_tests", f"-var=tailscale_client_id={client_id}", seconds=TEST_SECONDS)
 
 
 class DiagnosticTest(unittest.TestCase):
@@ -94,14 +64,14 @@ class DiagnosticTest(unittest.TestCase):
 
     def test_an_auth_key_given_as_the_client_id_is_refused_by_the_rule_and_its_value_is_never_printed(self) -> None:
         marker = Marker("auth key", "tskey-auth-" + make_marker("plain").value)
-        result = self.terraform.probe(marker.value)
+        result = probe(self.terraform, marker.value)
         output = result.stdout + result.stderr
         self.assertNotEqual(0, result.returncode, output)
         self.assertIn("Give the federated identity's client ID, never an auth key.", output, "control: the validation rule refused the value")
         self.assertEqual([], scan_text(output, [marker]), output)
 
     def test_a_client_id_that_the_rule_accepts_passes_the_plan(self) -> None:
-        result = self.terraform.probe("example-client-id")
+        result = probe(self.terraform, "example-client-id")
         output = result.stdout + result.stderr
         self.assertEqual(0, result.returncode, output)
         self.assertIn("1 passed", output)

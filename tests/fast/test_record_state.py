@@ -60,7 +60,7 @@ class StateTest(unittest.TestCase):
         state = RunState(self.folder, RUN)
         state.add(KEY, "v1")
         before = self.path().read_text()
-        with mock.patch("scripts.ingestion.record_state.os.replace", side_effect=OSError("stopped")), self.assertRaises(OSError):
+        with mock.patch("scripts.ingestion.output_file.os.replace", side_effect=OSError("stopped")), self.assertRaises(OSError):
             state.add(KEY, "v2")
         self.assertEqual(before, self.path().read_text())
         self.assertEqual([self.path().name], sorted(path.name for path in self.folder.iterdir()), "no temporary file is left")

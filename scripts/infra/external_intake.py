@@ -114,7 +114,9 @@ def helper() -> ModuleType:
 def declared_secrets(path: Path = LIST_FILE) -> list[Any]:
     try:
         return list(helper().parse_external(path.read_text()))
-    except (OSError, ValueError) as error:
+    except OSError:
+        raise IntakeError("the list of external secrets cannot be read") from None
+    except ValueError as error:
         raise IntakeError(f"the list of external secrets cannot be used: {error}") from None
 
 

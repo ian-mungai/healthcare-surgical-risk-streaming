@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.output_file import write_new_file
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT
 
@@ -23,9 +25,10 @@ def keep_raw_error(name: str, text: str) -> Path:
     RAW_ERRORS.mkdir(mode=0o700, parents=True, exist_ok=True)
     RAW_ERRORS.chmod(0o700)
     target = RAW_ERRORS / f"{time.time_ns()}_{name}.txt"
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(text)
+    try:
+        write_new_file(target, text)
+    except ClosedInputError:
+        raise OSError("the raw error text could not be kept") from None
     return target
 
 

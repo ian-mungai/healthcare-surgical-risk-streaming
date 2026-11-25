@@ -17,6 +17,7 @@ from unittest import mock
 from scripts.ingestion import record_run
 from scripts.ingestion.record_run import SECRET_FILES, SettingsError, main, settings_from_environment
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
+from tests.fast.locale_support import non_utf_8_locale
 from tests.fast.record_support import RELEASE_FILES, FakeAirbyte, FakeCatalog, landed_records
 from tests.fast.test_record_catalog import Client, Server
 
@@ -99,17 +100,49 @@ class SettingsTest(EnvironmentCase):
                     for hidden in (str(self.folder), CLIENT_ID, CLIENT_VALUE, KEY_ID, KEY_VALUE):
                         self.assertNotIn(hidden, str(raised.exception))
 
+    def test_a_file_of_invalid_utf_8_is_named_by_its_setting_like_a_missing_one_and_shows_no_path(self) -> None:
+        """Join round 2, class of finding 2: ``UnicodeDecodeError`` is not an ``OSError``, so a file of invalid UTF-8 ended in a traceback."""
+        for name in (
+            "AIRBYTE_CLIENT_ID_FILE",
+            "AIRBYTE_CLIENT_SECRET_FILE",
+            "AIRBYTE_AWS_ACCESS_KEY_ID_FILE",
+            "AIRBYTE_AWS_SECRET_ACCESS_KEY_FILE",
+            "AIRBYTE_API_URL_FILE",
+            "AIRBYTE_NESSIE_URL_FILE",
+        ):
+            path = Path(self.environment[name])
+            original = path.read_bytes()
+            # Under Latin-1 ``0xff`` is a letter and ``0x85`` after an address is white space that ``strip`` removes: only the encoding refuses them.
+            invalid = original.rstrip(b"\n") + b"\x85\n" if name.endswith("_URL_FILE") else b"\xff\xfe\n"
+            for locale_name, locale in (("UTF-8", contextlib.nullcontext()), ("ISO8859-1", non_utf_8_locale())):
+                with self.subTest(name=name, locale=locale_name), locale:
+                    path.write_bytes(invalid)
+                    try:
+                        with self.assertRaises(SettingsError) as raised:
+                            settings_from_environment(self.environment)
+                    finally:
+                        path.write_bytes(original)
+                    self.assertEqual(f"the file named by {name} cannot be read", str(raised.exception))
+
     def test_a_deadline_that_is_not_a_positive_number_is_refused(self) -> None:
         for value in ("0", "-5", "soon", "nan", "inf"):
             with self.subTest(value), self.assertRaises(SettingsError) as raised:
                 settings_from_environment({**self.environment, "RECORD_SYNC_DEADLINE_SECONDS": value})
             self.assertIn("RECORD_SYNC_DEADLINE_SECONDS", str(raised.exception))
 
+    def test_a_catalog_address_that_urlsplit_refuses_is_a_settings_error_that_names_the_variable_and_shows_no_value(self) -> None:
+        for text in ("http://[marker_value_x9:19120/api/v2", "http://nes\u2100marker_value_x9:19120/api/v2"):
+            with self.subTest(text), self.assertRaises(SettingsError) as raised:
+                settings_from_environment({**self.environment, "NESSIE_URI": text})
+            self.assertIn("NESSIE_URI", str(raised.exception))
+            self.assertNotIn("marker_value_x9", str(raised.exception))
+            self.assertIsNone(raised.exception.__cause__)
+
     def test_the_airbyte_address_and_the_catalog_address_must_be_plain_http_urls(self) -> None:
         with self.assertRaises(SettingsError) as raised:
             settings_from_environment({**self.environment, "NESSIE_URI": "https://elsewhere.example"})
         self.assertIn("NESSIE_URI", str(raised.exception))
-        for text in ("https://10.42.0.1:19120/api/v2", "10.42.0.1:19120", "", "http://"):
+        for text in ("https://10.42.0.1:19120/api/v2", "10.42.0.1:19120", "", "http://", "http://[10.42.0.1:19120/api/v2", "http://nes\u2100sie:19120/api/v2"):
             with self.subTest(text):
                 (self.folder / "nessie_url").write_text(text + "\n")
                 with self.assertRaises(SettingsError) as raised:
@@ -223,13 +256,13 @@ class CommandOutputTest(EnvironmentCase):
             with self.subTest(status):
                 code, output, errors = self.run_command(self.failing("/trees/main/history", status))
                 self.assertEqual(1, code)
-                self.assertIn("catalog_error", errors)
+                self.assertIn("CatalogError", errors)
                 self.assertNotIn(MARKER, errors + output)
 
     def test_a_failing_reference_call_of_the_branch_check_prints_the_fixed_code_and_no_word_of_the_answer(self) -> None:
         code, output, errors = self.run_command(self.failing("/trees/load_run_20261122_ab12cd34"))
         self.assertEqual(1, code)
-        self.assertIn("catalog_error", errors)
+        self.assertIn("CatalogError", errors)
         self.assertNotIn(MARKER, errors + output)
         self.assertNotIn("Traceback", errors)
 

@@ -19,6 +19,8 @@ from dagster import (
     op,
 )
 
+from scripts.ingestion.folder import list_folder
+
 from .retention import PRUNE_JOB, RUN_RETENTION_DAYS, SECONDS_PER_DAY, EndedRun, prune, removal_message
 from .run_records import ENDED, RUNS_DIR, write_run_folder
 
@@ -40,7 +42,7 @@ class DagsterRunStore:
 
     def ensure_folder(self, run_id: str) -> None:
         run = self.instance.get_run_by_id(run_id)
-        if run is not None and not any(RUNS_DIR.glob(f"*_{run_id}")):
+        if run is not None and not list_folder(RUNS_DIR, f"*_{run_id}"):
             write_run_folder(self.instance, run)
 
     def delete_compute_logs(self, run_id: str) -> None:

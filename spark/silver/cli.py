@@ -1,10 +1,10 @@
 """The command line of the Silver jobs (signals, pressure series): it writes its result as one file and prints fixed codes, and no error holds an argument, a
 name or upstream text.
 
-Every call takes ``--result <path>``, an absolute path that does not exist. The job reserves ``<path>.part`` (an exclusive create) before ``execute`` runs, so a
+Every call takes ``--result <path>``, an absolute path that does not exist. The job reserves ``<path>.part`` (a new file) before ``execute`` runs, so a
 path that cannot hold its result (a folder that is not there, a part file that is there, a name of 255 bytes) is a bad call, ``usage``, and nothing runs. The
-result is the one JSON document that the job writes to the reserved file and then renames to the path, so a reader sees no file or the whole file, and a
-file that is there is never written over (``spark/result_file.py``, which the watchdog uses to remove the part file of a job that it stops). A failed call
+result is the one JSON document that the job writes to a private file in the folder and then links to the path, so a reader sees no file or the whole file, and
+a file that is there is never written over (``spark/result_file.py``, which the watchdog uses to remove the part file of a job that it stops). A failed call
 writes a refusal document there instead (``{"job", "mode", "refusal"}``, the refusal being the codes of its problems).
 Standard output stays empty, and standard error holds the codes for an operator: a caller reads the exit code and the file, never the streams.
 

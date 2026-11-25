@@ -44,7 +44,8 @@ from scripts.infra.host import (
     workload_variables,
 )
 from scripts.infra.state_bootstrap import RunBinding
-from scripts.process import CompletedProcess, TimeoutExpired
+from scripts.ingestion.notice import Code, Notice, render
+from scripts.process import CompletedProcess, TimeoutExpired, run_command
 from scripts.project_config import ROOT
 from scripts.stack.warehouse import WarehouseError
 
@@ -180,7 +181,8 @@ STATUS_TOOL = (
 )
 SSH_TOOL = (
     '#!/bin/sh\nif [ ! -e "$FAKE_SSH_LOG" ]; then for a in "$@"; do case "$a" in UserKnownHostsFile=*) f="${a#UserKnownHostsFile=}"\n'
-    '{ cat "$f" 2>/dev/null || echo "no saved keys"; cat "${f}_instance" 2>/dev/null || echo "no recorded instance"; } > "$FAKE_FIRST_SSH_SAW" ;;\n'
+    '{ if [ -e "$f" ]; then cat "$f"; else echo "no saved keys"; fi\n'
+    '  if [ -e "${f}_instance" ]; then cat "${f}_instance"; else echo "no recorded instance"; fi; } > "$FAKE_FIRST_SSH_SAW" ;;\n'
     "esac; done; fi\n"
     'printf \'%s\\n\' "$@" >> "$FAKE_SSH_LOG"\nprintf \'%s\\n\' "$FAKE_INSTANCE"\n'
     'case "$*" in *"tailscale logout"*) exit "${FAKE_LOGOUT_EXIT:-0}" ;; esac\nexit "${FAKE_SSH_EXIT:-0}"\n'
@@ -188,6 +190,47 @@ SSH_TOOL = (
 CONNECTED = {"BackendState": "Running"}
 INSTANCE = "i-0123456789abcdef0"
 OTHER_INSTANCE = "i-0fedcba9876543210"
+
+
+class FakeSshRecordTest(unittest.TestCase):
+    """What the stand-in ``ssh`` records that its first call saw. A saved file that cannot be read must not be recorded as an absent one."""
+
+    def first_call(self, folder: Path, make: Callable[[Path], None]) -> tuple[str, str, int]:
+        (folder / "ssh").write_text(SSH_TOOL)
+        known_hosts = folder / "known_hosts"
+        make(known_hosts)
+        env = {"PATH": os.environ["PATH"], "FAKE_SSH_LOG": str(folder / "ssh.log"), "FAKE_FIRST_SSH_SAW": str(folder / "saw"), "FAKE_INSTANCE": INSTANCE}
+        result = run_command("sh", [str(folder / "ssh"), "-o", f"UserKnownHostsFile={known_hosts}"], env=env, timeout=30)
+        saw = folder / "saw"
+        return (saw.read_text() if saw.exists() else ""), result.stderr, result.returncode
+
+    def test_control_absent_files_are_recorded_as_absent_without_a_message(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            saw, errors, code = self.first_call(Path(scratch), lambda known_hosts: None)
+        self.assertEqual(("no saved keys\nno recorded instance\n", "", 0), (saw, errors, code))
+
+    def test_control_saved_files_are_recorded_with_their_text(self) -> None:
+        def make(known_hosts: Path) -> None:
+            known_hosts.write_text(SAVED_KEY)
+            Path(f"{known_hosts}_instance").write_text(f"{INSTANCE}\n")
+
+        with tempfile.TemporaryDirectory() as scratch:
+            saw, errors, _ = self.first_call(Path(scratch), make)
+        self.assertEqual((SAVED_KEY + f"{INSTANCE}\n", ""), (saw, errors))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any file")
+    def test_a_saved_file_that_cannot_be_read_shows_the_error_and_is_not_recorded_as_absent(self) -> None:
+        def make(known_hosts: Path) -> None:
+            known_hosts.write_text(SAVED_KEY)
+            known_hosts.chmod(0)
+            Path(f"{known_hosts}_instance").write_text(f"{INSTANCE}\n")
+            Path(f"{known_hosts}_instance").chmod(0)
+
+        with tempfile.TemporaryDirectory() as scratch:
+            saw, errors, _ = self.first_call(Path(scratch), make)
+        self.assertNotIn("no saved keys", saw)
+        self.assertNotIn("no recorded instance", saw)
+        self.assertEqual(2, errors.count("Permission denied"), errors)
 
 
 @dataclass(frozen=True)
@@ -513,7 +556,7 @@ CONFIGURATION = {
 def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     path = folder / "run_binding.json"
     RunBinding("20260101t0000-abcdef", "0" * 40, backend, "us-west-2", "example-project", "default", ["terraform.tfstate"], "verified", provision_host).write(
-        path
+        path, state_root=folder
     )
     return path
 
@@ -530,6 +573,7 @@ class StopAndStartWithRefusedLimitsTest(unittest.TestCase):
         for folder in ("modules", "environments"):
             (self.root / "infra" / folder).mkdir(parents=True)
         (self.root / "infra" / ".terraform.lock.hcl").write_text("")
+        (self.root / "infra" / "ubuntu_build.json").write_text("{}")
         self.binding = binding_file(self.root, backend="s3", provision_host=True)
         record = self.root / ".tools" / "terraform" / "20260101t0000-abcdef" / "config" / ".terraform" / "terraform.tfstate"
         record.parent.mkdir(parents=True)
@@ -1179,7 +1223,7 @@ class AnsibleRunTest(unittest.TestCase):
 
     def test_a_failed_setup_names_only_the_failure_and_the_file_that_keeps_the_output(self) -> None:
         printed, message, raw = self.run_it(exit_code=2)
-        self.assertEqual("the Ansible host setup failed; its full output is in runs/run-one/raw/ansible_output.txt", message)
+        self.assertEqual("the Ansible host setup failed; its full output is in the run's raw folder as ansible_output.txt", message)
         self.assertIn(f"fatal: [platform]: FAILED! {PRIVATE_TEXT}", raw)
         self.assertIn(f"stderr line: {PRIVATE_TEXT}", raw)
         self.assertNotIn("example-private-bucket", printed)
@@ -1197,7 +1241,7 @@ class AnsibleRunTest(unittest.TestCase):
     def test_output_with_no_recap_prints_nothing_and_still_names_the_file(self) -> None:
         printed, message, _ = self.run_it(exit_code=2, recap="")
         self.assertEqual("", printed)
-        self.assertEqual("the Ansible host setup failed; its full output is in runs/run-one/raw/ansible_output.txt", message)
+        self.assertEqual("the Ansible host setup failed; its full output is in the run's raw folder as ansible_output.txt", message)
 
     def test_a_recap_line_that_is_not_the_counts_of_the_platform_host_is_not_printed(self) -> None:
         printed, _, _ = self.run_it(exit_code=2, recap=f"platform : {PRIVATE_TEXT}")
@@ -1214,7 +1258,7 @@ class AnsibleRunTest(unittest.TestCase):
 
     def test_a_successful_setup_names_the_file_that_keeps_the_output(self) -> None:
         printed, _, _ = self.run_it(exit_code=0)
-        self.assertIn("the Ansible host setup passed; its full output is in runs/run-one/raw/ansible_output.txt", printed)
+        self.assertIn("the Ansible host setup passed; its full output is in the run's raw folder as ansible_output.txt", printed)
 
 
 class TailscaleStatusFailureTest(unittest.TestCase):
@@ -1278,7 +1322,7 @@ class HostCheckArgumentsTest(unittest.TestCase):
     def test_a_check_without_an_instance_id_is_refused(self) -> None:
         code, errors = self.run_main("check", "--host-name", "platform-dev")
         self.assertEqual(2, code)
-        self.assertIn("--instance-id", errors)
+        self.assertIn(render(Notice(Code.USAGE)), errors)
 
     def test_an_empty_or_malformed_instance_id_is_refused_without_naming_it(self) -> None:
         for value in ("", " ", "i-xyz", "i-123", "i-0123456789abcdef012", "platform-dev", "i-0123456789abcdef0 extra"):
@@ -1291,7 +1335,14 @@ class HostCheckArgumentsTest(unittest.TestCase):
     def test_a_check_without_a_host_name_is_refused(self) -> None:
         code, errors = self.run_main("check", "--instance-id", INSTANCE)
         self.assertEqual(2, code)
-        self.assertIn("--host-name", errors)
+        self.assertIn(render(Notice(Code.USAGE)), errors)
+
+    def test_a_host_name_that_is_not_the_name_of_an_environments_host_is_refused_without_naming_it(self) -> None:
+        for value in ("planted_name", "platform", "platform-staging", "platform-dev extra", "other-dev"):
+            with self.subTest(value=value):
+                code, errors = self.run_main("check", "--host-name", value, "--instance-id", INSTANCE)
+                self.assertEqual(2, code)
+                self.assertNotIn(value, errors)
 
 
 class DeployWorkflowTest(unittest.TestCase):

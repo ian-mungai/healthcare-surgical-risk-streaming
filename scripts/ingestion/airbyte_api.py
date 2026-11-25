@@ -42,7 +42,6 @@ the deploy runs it, so that the client, the settings and the deploy share one de
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import http.client
 import ipaddress
@@ -57,6 +56,8 @@ from typing import Any
 from urllib.parse import quote
 
 from scripts.ingestion import record_definitions as definitions
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.ingestion.record_definitions import Connector, Table
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -458,7 +459,7 @@ class HttpAirbyteApi:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="scripts.ingestion.airbyte_api", description="Check an address that may receive the Airbyte credentials.")
+    parser = QuietParser(prog="scripts.ingestion.airbyte_api", description="Check an address that may receive the Airbyte credentials.")
     commands = parser.add_subparsers(dest="command", required=True)
     checker = commands.add_parser("check")
     checker.add_argument("--address", required=True)
@@ -466,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         check_api_origin(arguments.address)
     except AirbyteError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     return 0
 

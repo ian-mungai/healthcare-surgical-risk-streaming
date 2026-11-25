@@ -26,7 +26,6 @@ secret files at ``/run/secrets/airbyte_<name>``. The Airbyte role (``record_clie
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import re
@@ -38,8 +37,9 @@ from urllib.parse import urlsplit
 
 from scripts.aws_cli import Aws
 from scripts.ingestion.airbyte_api import AirbyteError, HttpAirbyteApi, check_api_origin
+from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.manifest import ManifestRef
-from scripts.ingestion.notice import ClosedError
+from scripts.ingestion.notice import ClosedError, describe_error
 from scripts.ingestion.record_catalog import NessieCatalog
 from scripts.ingestion.record_copy import CopyError, S3CopyStore
 from scripts.ingestion.record_definitions import DefinitionError, Environment, check_environment
@@ -91,8 +91,8 @@ def seconds(environment: Mapping[str, str], name: str, default: float) -> float:
 def secret_file(environment: Mapping[str, str], name: str) -> str:
     path = Path(setting(environment, name))
     try:
-        value = path.read_text().strip()
-    except OSError:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError, UnicodeDecodeError:
         raise SettingsError(f"the file named by {name} cannot be read") from None
     if not value:
         raise SettingsError(f"the file named by {name} is empty")
@@ -100,7 +100,10 @@ def secret_file(environment: Mapping[str, str], name: str) -> str:
 
 
 def plain_http(name: str, value: str) -> str:
-    parts = urlsplit(value)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise SettingsError(f"the setting {name} must be a plain http URL with a host") from None
     if parts.scheme != "http" or not parts.hostname:
         raise SettingsError(f"the setting {name} must be a plain http URL with a host")
     return value
@@ -109,8 +112,8 @@ def plain_http(name: str, value: str) -> str:
 def api_address(environment: Mapping[str, str]) -> str:
     """The Airbyte address from the file that the deploy wrote, and nowhere else. ``SettingsError`` unless it is ``http://<private IPv4>:<port>``."""
     try:
-        text = Path(setting(environment, "AIRBYTE_API_URL_FILE")).read_text().strip()
-    except OSError:
+        text = Path(setting(environment, "AIRBYTE_API_URL_FILE")).read_text(encoding="utf-8").strip()
+    except OSError, UnicodeDecodeError:
         raise SettingsError("the file named by AIRBYTE_API_URL_FILE cannot be read") from None
     try:
         check_api_origin(text)
@@ -122,8 +125,8 @@ def api_address(environment: Mapping[str, str]) -> str:
 def nessie_address(environment: Mapping[str, str]) -> str:
     """The Nessie address as Airbyte's pods reach it, from the file that the deploy wrote beside the credentials. It carries no credential."""
     try:
-        text = Path(setting(environment, "AIRBYTE_NESSIE_URL_FILE")).read_text().strip()
-    except OSError:
+        text = Path(setting(environment, "AIRBYTE_NESSIE_URL_FILE")).read_text(encoding="utf-8").strip()
+    except OSError, UnicodeDecodeError:
         raise SettingsError("the file named by AIRBYTE_NESSIE_URL_FILE cannot be read") from None
     try:
         return plain_http("AIRBYTE_NESSIE_URL_FILE", text)
@@ -187,17 +190,17 @@ def run_load(settings: RecordSettings, run_id: str, reference: ManifestRef) -> L
 
 
 def main(argv: list[str] | None = None, environment: Mapping[str, str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="scripts.ingestion.record_run", description="Run a record load by hand.")
+    parser = QuietParser(prog="scripts.ingestion.record_run", description="Run a record load by hand.")
     commands = parser.add_subparsers(dest="command", required=True)
     loader = commands.add_parser("load")
     loader.add_argument("--run-id", required=True)
     loader.add_argument("--reference", type=Path, required=True, help="the manifest reference file of the passed check")
     arguments = parser.parse_args(argv)
     try:
-        reference = ManifestRef.from_json(arguments.reference.read_text())
+        reference = ManifestRef.from_json(arguments.reference.read_text(encoding="utf-8"))
         result = run_load(settings_from_environment(os.environ if environment is None else environment), arguments.run_id, reference)
     except (SettingsError, LoadError, CopyError, AirbyteError, NessieError, DefinitionError, ClosedError) as error:
-        sys.stderr.write(f"{type(error).__name__}: {error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     except (OSError, ValueError) as error:
         sys.stderr.write(f"{type(error).__name__}\n")

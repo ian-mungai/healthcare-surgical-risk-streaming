@@ -54,10 +54,11 @@ from replay.service.serve import (
     submit,
     submit_command,
 )
-from replay.service.state_file import atomic_write
+from replay.service.state_file import StateFile
 from scripts.ingestion.gate import GateRefused, Problem
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.notice import Cause, Code, Notice
+from scripts.ingestion.output_file import replace_owned_file
 from tests.fast.fake_vitaldb import installed
 
 REFERENCE = ManifestRef("bucket", "manifests/replay/" + "a" * 64 + ".json", "version_1", "b" * 64).to_json()
@@ -92,10 +93,10 @@ class Clock:
         return self.now
 
 
-def serve_until_idle(inbox: Path, health: Path, run_request: Callable[[Path, Callable[[], None]], Outcome]) -> int:
+def serve_until_idle(inbox: Path, state: Path, run_request: Callable[[Path, Callable[[], None]], Outcome]) -> int:
     """Serve the inbox until it is empty and the loop would sleep: the stop comes from the idle wait, never from a request."""
     stop = [False]
-    return serve(inbox, health, run_request, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
+    return serve(inbox, state, run_request, lambda: stop[0], Clock(), lambda seconds: stop.__setitem__(0, True), 1.0)
 
 
 class Loop:
@@ -136,7 +137,7 @@ class Loop:
     def serve(self) -> int:
         return serve(
             self.inbox,
-            self.health,
+            self.root,
             self.run_request,
             lambda: self.stop,
             self.clock,
@@ -338,7 +339,7 @@ class ServeTest(unittest.TestCase):
                 self.assertFalse((loop.inbox / "a.json").exists())
                 result = json.loads((loop.inbox / "results" / "a.json").read_text())
                 self.assertEqual(("failed", 2), (result["outcome"], result["exit_code"]))
-                self.assertTrue(result["error"].startswith("RunRecordError: "), result["error"])
+                self.assertEqual("RunRecordError", result["error"])
                 self.assertTrue((loop.inbox / "done" / "b.json").is_file())
 
     def test_a_record_whose_state_folder_is_the_inbox_or_shares_a_place_with_it_fails_with_a_fixed_code_before_anything_is_written_and_serving_continues(
@@ -451,7 +452,7 @@ class ServeTest(unittest.TestCase):
         base = loop.inbox.resolve().parent
         self.assertEqual(str(base / "state" / "replay_0a1b2c3d"), record.state_dir)
         self.assertEqual(str(base / "state" / "reads.log"), record.object_store.read_log)
-        self.assertEqual(str(base / "state" / "replay_0a1b2c3d" / "state.json"), str(record.state_path))
+        self.assertEqual(base / "state" / "replay_0a1b2c3d" / "state.json", StateFile(Path(record.state_dir)).path)
 
     def aliased(self, loop: Loop) -> Path:
         """A link to the loop's inbox, in a folder other than the one that holds the inbox."""
@@ -494,11 +495,11 @@ class ServeTest(unittest.TestCase):
                 loop.put("a.json", json.dumps(record_of(loop.inbox)))
                 written: list[str] = []
 
-                def recording(path: Path, data: str | bytes, written: list[str] = written) -> None:
+                def recording(path: Path, data: str | bytes, written: list[str] = written, **options: Any) -> None:
                     written.append(path.name)
-                    atomic_write(path, data)
+                    replace_owned_file(path, data, **options)
 
-                with mock.patch("replay.service.serve.atomic_write", recording):
+                with mock.patch("replay.service.serve.replace_owned_file", recording):
                     loop.serve()
                 self.assertEqual([], [name for name in written if name.endswith(".attempts")], written)
             with self.subTest(label, case="the retry cap does not hide the reason"):
@@ -535,7 +536,7 @@ class ServeTest(unittest.TestCase):
         loop.put("b.json", json.dumps(RECORD))
         loop.serve()
         self.assertEqual(["b.json"], loop.ran)
-        self.assertIn("manifest reference", json.loads((loop.inbox / "results" / "a.json").read_text())["error"])
+        self.assertEqual("RunRecordError", json.loads((loop.inbox / "results" / "a.json").read_text())["error"])
         record = queued_record(loop.inbox / "done" / "b.json")
         self.assertEqual(str(loop.inbox / "done" / "b.reference"), record.manifest_reference)
         self.assertNotEqual(RECORD["manifest_reference"], record.manifest_reference)
@@ -724,7 +725,7 @@ class ServeStartTest(unittest.TestCase):
         stop = [False]
         code = serve(
             inbox,
-            health_of(inbox),
+            health_of(inbox).parent,  # the service takes its state folder; the health file is health.json in it
             run_request,
             lambda: stop[0],
             Clock(),
@@ -751,7 +752,7 @@ class ServeStartTest(unittest.TestCase):
                 self.assertTrue(logged[0].startswith('{"event": "serve_refused", "message": "health_file_in_inbox: '), logged[0])
                 self.assertNotIn("replay_start_", logged[0], "the text is fixed: it names no path")
 
-    def test_a_health_file_that_is_a_link_in_the_inbox_is_refused_because_its_write_would_replace_the_link_inside_the_inbox(self) -> None:
+    def test_a_health_file_that_is_a_link_in_the_inbox_is_refused_and_the_link_stays(self) -> None:
         def link_out(target: str) -> Callable[[Path], Path]:
             def make(inbox: Path) -> Path:
                 (inbox.parent / "outside").mkdir(exist_ok=True)
@@ -825,7 +826,7 @@ class ServeStartTest(unittest.TestCase):
             with self.subTest(label):
 
                 def health_of(inbox: Path, text: str = text) -> Path:
-                    return inbox.parent / text
+                    return inbox.parent / text / "health.json"  # the state folder that holds the health file has the malformed name
 
                 code, files, logged, _ = self.start(health_of)
                 self.assertEqual((2, []), (code, files))
@@ -835,7 +836,7 @@ class ServeStartTest(unittest.TestCase):
         folder = tempfile.TemporaryDirectory(prefix="replay_start_")
         self.addCleanup(folder.cleanup)
         inbox = Path(folder.name) / "inbox"
-        code = serve(inbox, inbox / "health.json", lambda path, beat: Outcome("finished", 0), lambda: True, Clock(), lambda seconds: None, 1.0)
+        code = serve(inbox, inbox, lambda path, beat: Outcome("finished", 0), lambda: True, Clock(), lambda seconds: None, 1.0)
         self.assertEqual(2, code)
         self.assertEqual([], list(Path(folder.name).iterdir()))
 
@@ -926,7 +927,7 @@ class CrashLoopTest(unittest.TestCase):
         def sleep(seconds: float) -> None:
             self.stop = True
 
-        return serve(self.inbox, self.root / "health.json", run_request, lambda: self.stop, Clock(), sleep, 1.0)
+        return serve(self.inbox, self.root, run_request, lambda: self.stop, Clock(), sleep, 1.0)
 
     def crash_on_a(self, path: Path, beat: Callable[[], None]) -> Outcome:
         self.ran.append(path.name)
@@ -1030,11 +1031,11 @@ class CrashLoopTest(unittest.TestCase):
         (self.inbox / "a.reference").write_text(REFERENCE)
         written: list[str] = []
 
-        def recording(path: Path, data: str | bytes) -> None:
+        def recording(path: Path, data: str | bytes, **options: Any) -> None:
             written.append(path.name)
-            atomic_write(path, data)
+            replace_owned_file(path, data, **options)
 
-        with mock.patch.object(serve_module, "atomic_write", recording):
+        with mock.patch.object(serve_module, "replace_owned_file", recording):
             self.assertEqual(0, self.start(self.crash_on_a))
         self.assertEqual([], [name for name in written if name.endswith(".attempts")], written)
         self.assertEqual([], self.ran)
@@ -1075,7 +1076,7 @@ class CrashLoopTest(unittest.TestCase):
                 self.assertEqual(0, self.start(run))
                 self.assertEqual(["a.json", "b.json"], self.ran)
                 result = json.loads((self.inbox / "results" / "a.json").read_text())
-                self.assertEqual(("failed", 2, f"{type(error).__name__}: {error}"), (result["outcome"], result["exit_code"], result["error"]))
+                self.assertEqual(("failed", 2, type(error).__name__), (result["outcome"], result["exit_code"], result["error"]))
                 self.assertTrue((self.inbox / "failed" / "a.json").is_file())
                 self.assertTrue((self.inbox / "done" / "b.json").is_file())
 
@@ -1178,7 +1179,7 @@ class SubmitTest(unittest.TestCase):
             ran.append(path.name)
             return Outcome("finished", 0)
 
-        serve_until_idle(self.inbox, Path(folder.name) / "health.json", run_request)
+        serve_until_idle(self.inbox, Path(folder.name), run_request)
         self.assertEqual([f"{self.name}.json"], ran)
         self.assertTrue((self.inbox / "done" / f"{self.name}.json").is_file())
         self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
@@ -1550,7 +1551,7 @@ class SubmitTest(unittest.TestCase):
                 self.assertEqual(text, (self.inbox / "reserved" / self.name).read_text())
                 self.assertEqual(REFERENCE, (self.inbox / "reserved" / f"{self.name}.reference").read_text())
                 self.assertEqual("already submitted", submit(self.inbox, text, REFERENCE))
-                serve_until_idle(self.inbox, self.inbox.parent / "health.json", lambda path, beat: Outcome("finished", 0))
+                serve_until_idle(self.inbox, self.inbox.parent, lambda path, beat: Outcome("finished", 0))
                 self.assertTrue((self.inbox / folder / f"{self.name}.json").is_file())
                 self.assertFalse((self.inbox / f"{self.name}.json").exists())
 
@@ -1565,7 +1566,7 @@ class SubmitTest(unittest.TestCase):
             ran.append(path.name)
             return Outcome("failed", 3, "the gate refused again")
 
-        serve_until_idle(self.inbox, self.inbox.parent / "health.json", gate_again)
+        serve_until_idle(self.inbox, self.inbox.parent, gate_again)
         self.assertEqual([], ran)
         self.assertTrue((self.inbox / "failed" / f"{self.name}.json").is_file())
         self.assertFalse((self.inbox / f"{self.name}.json").exists())

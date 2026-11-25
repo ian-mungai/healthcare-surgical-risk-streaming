@@ -33,6 +33,7 @@ from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.sample import candidates, publisher
 from scripts.sample.candidates import CANDIDATES_FILE, RELEASE_FILE, CandidateError, read_candidates, release_problems
 from scripts.sample.publisher import PublisherError
+from tests.fast.locale_support import non_utf_8_locale
 
 TRACK_HEADER = "caseid,tname,tid\n"
 CLINICAL_HEADER = "﻿caseid,subjectid,casestart,caseend,age\n"
@@ -518,7 +519,7 @@ class QuietMessages(unittest.TestCase):
             self.assertIn("cannot read the candidate file", errors.getvalue())
             self.assertNotIn(self.MARKER, errors.getvalue())
 
-    def test_a_build_whose_output_cannot_be_written_is_reported_by_its_role(self) -> None:
+    def test_a_build_whose_output_has_no_folder_is_refused_before_the_release_is_read(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             blocked = Path(folder) / self.MARKER
             blocked.write_text("a file where a folder must be")
@@ -529,7 +530,7 @@ class QuietMessages(unittest.TestCase):
                 contextlib.redirect_stderr(errors),
             ):
                 self.assertEqual(1, candidates.main())
-        self.assertIn("cannot write the candidate file", errors.getvalue())
+        self.assertIn("folder of an output path does not exist", errors.getvalue())
         self.assertNotIn(self.MARKER, errors.getvalue())
 
     def test_a_pin_whose_table_key_is_no_text_is_reported_and_not_raised(self) -> None:
@@ -634,6 +635,23 @@ class RebuildChecks(unittest.TestCase):
                 self.assertRaisesRegex(error, cause),
             ):
                 candidates.read_inputs(release, Path(folder))
+
+    def test_a_candidate_file_and_a_checksum_list_with_a_byte_that_is_not_utf_8_are_refused_by_role_where_a_latin_1_locale_would_read_them(self) -> None:
+        """Join round 4, finding 3: a read that names no encoding decoded ``0xff`` as ``ÿ`` under ``en_US.ISO8859-1`` and answered with another notice."""
+        release = json.loads(RELEASE_FILE.read_text())
+        with tempfile.TemporaryDirectory() as folder, non_utf_8_locale():
+            path = Path(folder) / "candidates.tsv"
+            path.write_bytes(b"\xff\n")
+            with self.assertRaises(PublisherError) as candidate_file:
+                read_candidates(path)
+            self.assertEqual("cannot read the candidate file", str(candidate_file.exception))
+            with (
+                mock.patch.object(candidates, "download_key", side_effect=lambda key, target: target.write_bytes(b"\xff\n")),
+                mock.patch.object(candidates, "read_pinned"),
+                self.assertRaises(PublisherError) as checksum_list,
+            ):
+                candidates.read_inputs(release, Path(folder))
+            self.assertEqual("cannot read the checksum list", str(checksum_list.exception))
 
 
 class ClosedPinFields(unittest.TestCase):
