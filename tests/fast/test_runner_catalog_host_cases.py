@@ -13,7 +13,13 @@ Failure modes covered here:
   also exist after the write without the case noticing.
 - The host mode reads "the table on main" and the later write's row count from a constant: it substitutes the rows it wrote, or 25, and passes on a main
   that moved.
-- A private trunk whose seed commit fails is not in the list of references to delete, and stays in Nessie.
+- A private trunk whose seed commit fails is not in the list of references to delete, and stays in Nessie. The trunk is made outside the ``try`` whose
+  ``finally`` runs the cleanup, so a seed that answers 503 leaves it behind.
+- The refusal of a workload is read as AccessDenied from any text that holds the word, so another code (``InvalidRequest``) or another operation passes.
+- The job gets no deadline of 3 seconds, or the workload checks mount the folder of the other workload, or the probe key that is listed is not the one that
+  was written, and the case still passes.
+- An SSH warning on the standard error of a call is read as part of an answer (the key count, the identity).
+- The message of the job that cannot work with Nessie is any text with those words, and not the job's own line.
 """
 
 from __future__ import annotations
@@ -108,12 +114,20 @@ class Stack:
     def spark_containers(self) -> list[str]:
         return self.left
 
-    def docker(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+    def docker_split(self, *arguments: str, timeout: float = 0) -> tuple[int, str, str]:
         self.docker_calls.append(arguments)
         if self.aws is None:
             raise AssertionError("no docker answers")
-        answer: tuple[int, str] = self.aws(arguments)
+        answer: tuple[int, str, str] = self.aws(arguments)
         return answer
+
+    def docker(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+        code, out, err = self.docker_split(*arguments, timeout=timeout)
+        return code, out + err
+
+    def docker_out(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+        code, out, _ = self.docker_split(*arguments, timeout=timeout)
+        return code, out
 
     def container(self, service: str) -> str:
         return ""
@@ -190,7 +204,9 @@ class DeadlineLine(unittest.TestCase):
     def answers(self, module: ModuleType, late: tuple[int, str, str, float]) -> Stack:
         def jobs(arguments: list[str], environment: dict[str, str] | None) -> tuple[int, str, str, float]:
             if environment and "NESSIE_URI" in environment:
-                return 1, "", "catalog_proof: cannot work with Nessie\n", 6.0
+                return 1, "", f"WARNING: noise\n{spark_name(module)}: cannot work with Nessie: connection refused\n", 6.0
+            if (environment or {}).get("JOB_DEADLINE_SECONDS") != "3":
+                return 0, "RESULT {}\n", "", 30.0
             return late
 
         return Stack(jobs)
@@ -216,6 +232,34 @@ class DeadlineLine(unittest.TestCase):
         noise = "WARNING: Using incubator modules\nSet by the cluster manager (via SPARK_LOCAL_DIRS)\n"
         run = self.run_case(module, (124, "", f"{noise}{spark_name(module)}: timeout\n", 4.0))
         self.assertEqual(failed(run), [])
+
+    def test_the_late_job_is_given_a_deadline_of_three_seconds_and_nothing_else(self) -> None:
+        module = runner()
+        stack = self.answers(module, (124, "", f"{spark_name(module)}: timeout\n", 4.0))
+        proof = proof_of(module, stack)
+        proof.bounded_failures()
+        late = [environment for _, environment in stack.job_calls if environment and "JOB_DEADLINE_SECONDS" in environment]
+        self.assertEqual(late, [{"JOB_DEADLINE_SECONDS": "3"}])
+        self.assertEqual(failed(proof.record), [])
+
+    def test_the_message_of_the_job_that_cannot_work_with_nessie_is_its_own_line(self) -> None:
+        module = runner()
+        for message in (
+            "at org.apache.spark: cannot work with Nessie: trace\n",
+            "table_checks: cannot work with Nessie: x\n",
+            f"{spark_name(module)}: could not reach the catalog; cannot work with Nessie\n",
+            f"{spark_name(module)}: cannot work with Nessie\n",
+        ):
+            with self.subTest(message=message):
+
+                def jobs(arguments: list[str], environment: dict[str, str] | None, message: str = message) -> tuple[int, str, str, float]:
+                    if environment and "NESSIE_URI" in environment:
+                        return 1, "", message, 6.0
+                    return 124, "", f"{spark_name(module)}: timeout\n", 4.0
+
+                proof = proof_of(module, Stack(jobs))
+                proof.bounded_failures()
+                self.assertEqual(failed(proof.record), ["no route to Nessie"])
 
     def test_the_old_message_with_a_duration_does_not_pass(self) -> None:
         module = runner()
@@ -247,16 +291,31 @@ class DeadlineLine(unittest.TestCase):
         self.assertNotIn("did not finish within", (E2E / "catalog_proof.py").read_text())
 
 
+DENIED_LIST = "An error occurred (AccessDenied) when calling the ListObjectsV2 operation: User is not authorized to perform: s3:ListBucket\n"
+DENIED_PUT = "An error occurred (AccessDenied) when calling the PutObject operation: User is not authorized to perform: s3:PutObject\n"
+PARAMETER = "aws: [ERROR]: An error occurred (ParamValidation): Error parsing parameter '--body': Blob values must be a path to a file.\n"
+
+
 class AwsOfTheHost:
-    """The AWS CLI image as the host ran it: ``--body /dev/null`` is refused with exit 252, and a write from the Trino role is refused with AccessDenied."""
+    """The AWS CLI image as the host ran it: ``--body /dev/null`` is refused with exit 252, and a write from the Trino role is refused with AccessDenied.
 
-    def __init__(self, *, accept_write: bool = False, probe_listed: bool = False, spark_write_denied: bool = True) -> None:
+    Each answer is ``(exit code, stdout, stderr)``: the CLI writes its errors to stderr, and ssh adds ``warning`` to the stderr of every call. ``leftover``
+    puts an object at the probe key of the run before the write. ``calls`` holds what each call asked for, with the workload whose folder it mounted.
+    """
+
+    def __init__(
+        self, *, accept_write: bool = False, leftover: str = "", state_error: str = DENIED_LIST, write_error: str = DENIED_PUT, warning: str = ""
+    ) -> None:
         self.accept_write = accept_write
-        self.probe_listed = probe_listed
-        self.written = False
-        self.spark_write_denied = spark_write_denied
+        self.bucket = {leftover} if leftover else set()
+        self.state_error = state_error
+        self.write_error = write_error
+        self.warning = warning
+        self.calls: list[tuple[str, str]] = []
+        self.put_key = ""
+        self.listed_keys: list[str] = []
 
-    def __call__(self, arguments: tuple[str, ...]) -> tuple[int, str]:
+    def __call__(self, arguments: tuple[str, ...]) -> tuple[int, str, str]:
         words = list(arguments)
         text = " ".join(words)
         workload = re.search(r"/run/workload_access/(spark|trino):", text)
@@ -267,45 +326,56 @@ class AwsOfTheHost:
         if "--entrypoint" in words:
             if "sh" not in words or after[:1] != ["-c"]:
                 raise AssertionError(text)
-            return self.shell(script, workload.group(1))
-        return self.cli(after, workload.group(1))
+            code, out, err = self.shell(script, workload.group(1))
+        else:
+            code, out, err = self.cli(after, workload.group(1))
+        return code, out, err + self.warning
 
-    def shell(self, script: str, workload: str) -> tuple[int, str]:
-        put = re.search(r"aws s3api put-object .*--body (\S+)", script)
+    def shell(self, script: str, workload: str) -> tuple[int, str, str]:
+        put = re.search(r"aws s3api put-object .*--bucket (\S+) --key (\S+) --body (\S+)", script)
         if put is None:
-            return 0, ""
-        if put.group(1) == "/dev/null" or "printf" not in script or f"> {put.group(1)}" not in script:
-            return 252, "aws: [ERROR]: An error occurred (ParamValidation): Error parsing parameter '--body': Blob values must be a path to a file.\n"
+            return 0, "", ""
+        self.calls.append((workload, "put"))
+        self.put_key = put.group(2)
+        if put.group(3) == "/dev/null" or "printf" not in script or f"> {put.group(3)}" not in script:
+            return 252, "", PARAMETER
         if self.accept_write:
-            self.written = True
-            return 0, '{"ETag": "x"}\n'
-        return 254, "An error occurred (AccessDenied) when calling the PutObject operation: User is not authorized to perform: s3:PutObject\n"
+            self.bucket.add(self.put_key)
+            return 0, '{"ETag": "x"}\n', ""
+        return 254, "", self.write_error
 
-    def cli(self, after: list[str], workload: str) -> tuple[int, str]:
+    def cli(self, after: list[str], workload: str) -> tuple[int, str, str]:
         if after[:2] == ["sts", "get-caller-identity"]:
-            return 0, f"arn:aws:sts::1:assumed-role/workload_{workload}/x\n"
+            self.calls.append((workload, "identity"))
+            return 0, f"arn:aws:sts::1:assumed-role/workload_{workload}/x\n", ""
         if after[:2] == ["s3api", "put-object"]:
-            return 252, "aws: [ERROR]: An error occurred (ParamValidation): Error parsing parameter '--body': Blob values must be a path to a file.\n"
+            return 252, "", PARAMETER
         if after[:2] == ["s3api", "list-objects-v2"]:
             prefix = after[after.index("--prefix") + 1]
             if prefix.startswith("state/"):
-                return 254, "An error occurred (AccessDenied) when calling the ListObjectsV2 operation\n"
-            if "probe" in prefix and "--query" in after:
-                return 0, ("1\n" if self.written or self.probe_listed else "0\n")
-            return 0, '{"KeyCount": 1}\n'
+                self.calls.append((workload, "state list"))
+                return 254, "", self.state_error
+            if "--query" in after:
+                self.calls.append((workload, "probe list"))
+                self.listed_keys.append(prefix)
+                return 0, ("1\n" if prefix in self.bucket else "0\n"), ""
+            self.calls.append((workload, "warehouse list"))
+            return 0, '{"KeyCount": 1}\n', ""
         raise AssertionError(after)
 
 
 class TrinoWorkloadWrite(unittest.TestCase):
-    def run_case(self, aws: AwsOfTheHost) -> tuple[Record, Stack]:
+    def run_case(self, aws: AwsOfTheHost, *, leftover: bool = False) -> tuple[Record, Stack]:
         module = runner()
         stack = Stack(aws=aws)
         proof = proof_of(module, stack)
+        if leftover:
+            aws.bucket.add(f"warehouse/catalog_proof_trino_write_probe_{proof.suffix}")
         module.workload_cases(proof, BUCKET)
         return proof.record, stack
 
     def test_the_cli_would_refuse_the_old_body_before_sending(self) -> None:
-        self.assertEqual(AwsOfTheHost().shell("aws s3api put-object --body /dev/null", "trino")[0], 252)
+        self.assertEqual(AwsOfTheHost().shell("aws s3api put-object --bucket b --key k --body /dev/null", "trino")[0], 252)
 
     def test_the_write_is_made_from_a_regular_file_inside_the_container_and_refused_by_the_bucket(self) -> None:
         run, stack = self.run_case(AwsOfTheHost())
@@ -317,20 +387,73 @@ class TrinoWorkloadWrite(unittest.TestCase):
         self.assertIn("write exit 254", observed)
         self.assertIn("refusal is AccessDenied: True", observed)
 
-    def test_the_probe_key_is_listed_by_its_own_prefix_and_found_absent(self) -> None:
-        run, stack = self.run_case(AwsOfTheHost())
-        listed = [call for call in stack.docker_calls if "list-objects-v2" in " ".join(call) and "catalog_proof_trino_write_probe_" in " ".join(call)]
-        self.assertEqual(len(listed), 1)
+    def test_the_probe_key_that_is_listed_is_the_key_that_was_written(self) -> None:
+        aws = AwsOfTheHost()
+        run, _ = self.run_case(aws)
+        self.assertTrue(aws.put_key.startswith("warehouse/catalog_proof_trino_write_probe_"))
+        self.assertEqual(aws.listed_keys, [aws.put_key])
         self.assertIn("probe key absent: True", observation(run, "the Trino workload's own access").observed)
+
+    def test_each_call_mounts_the_folder_of_its_own_workload(self) -> None:
+        aws = AwsOfTheHost()
+        self.run_case(aws)
+        self.assertEqual(
+            aws.calls,
+            [
+                ("spark", "identity"),
+                ("spark", "warehouse list"),
+                ("spark", "state list"),
+                ("trino", "warehouse list"),
+                ("trino", "put"),
+                ("trino", "probe list"),
+            ],
+        )
 
     def test_the_case_fails_when_the_write_is_accepted(self) -> None:
         run, _ = self.run_case(AwsOfTheHost(accept_write=True))
         self.assertEqual(failed(run), ["the Trino workload's own access"])
 
     def test_the_case_fails_when_the_probe_key_exists_after_a_refusal(self) -> None:
-        run, _ = self.run_case(AwsOfTheHost(probe_listed=True))
+        run, _ = self.run_case(AwsOfTheHost(), leftover=True)
         self.assertEqual(failed(run), ["the Trino workload's own access"])
         self.assertIn("probe key absent: False", observation(run, "the Trino workload's own access").observed)
+
+    def test_a_warning_of_ssh_on_the_error_output_changes_no_answer(self) -> None:
+        run, _ = self.run_case(AwsOfTheHost(warning="Warning: Permanently added '100.64.0.9' (ED25519) to the list of known hosts.\n"))
+        self.assertEqual(failed(run), [])
+        self.assertIn("probe key absent: True", observation(run, "the Trino workload's own access").observed)
+
+    def test_a_refusal_with_another_code_does_not_pass_for_the_state_prefix(self) -> None:
+        for text in (
+            "An error occurred (InvalidRequest) when calling the ListObjectsV2 operation: AccessDenied was the cause\n",
+            "An error occurred (AccessDenied) when calling the GetObject operation: Access Denied\n",
+            "An error occurred (AccessDeniedException) when calling the ListObjectsV2 operation: x\n",
+            "AccessDenied\n",
+        ):
+            with self.subTest(text=text):
+                run, _ = self.run_case(AwsOfTheHost(state_error=text))
+                self.assertEqual(failed(run), ["the Spark workload's own access"])
+
+    def test_a_refusal_with_another_code_does_not_pass_for_the_trino_write(self) -> None:
+        for text in (
+            "An error occurred (InvalidRequest) when calling the PutObject operation: AccessDenied was the cause\n",
+            "An error occurred (AccessDenied) when calling the DeleteObject operation: Access Denied\n",
+            "An error occurred (AccessDeniedException) when calling the PutObject operation: x\n",
+            "AccessDenied\n",
+        ):
+            with self.subTest(text=text):
+                run, _ = self.run_case(AwsOfTheHost(write_error=text))
+                self.assertEqual(failed(run), ["the Trino workload's own access"])
+                self.assertIn("refusal is AccessDenied: False", observation(run, "the Trino workload's own access").observed)
+
+    def test_the_refusal_on_the_standard_output_does_not_pass(self) -> None:
+        class OnStdout(AwsOfTheHost):
+            def cli(self, after: list[str], workload: str) -> tuple[int, str, str]:
+                code, out, err = super().cli(after, workload)
+                return code, out + err, ""
+
+        run, _ = self.run_case(OnStdout())
+        self.assertEqual(failed(run), ["the Spark workload's own access"])
 
     def test_the_observation_holds_exit_codes_and_flags_only(self) -> None:
         run, _ = self.run_case(AwsOfTheHost())
@@ -440,15 +563,69 @@ class FailingSeed(unittest.TestCase):
         self.assertEqual(made, ["proof_trunk_x"])
         self.assertIn("proof_trunk_x", client.references)
 
-    def test_the_cleanup_removes_a_trunk_whose_seed_failed(self) -> None:
+    def test_the_host_mode_removes_a_trunk_whose_seed_answers_503_and_leaves_main_as_it_was(self) -> None:
         module = runner()
         client = self.Refusing()
-        proof = proof_of(module, Stack(), HostTrino(), client)
-        with self.assertRaises(NessieError):
-            module.start_private_trunk(client, proof.trunk, proof.made)
-        note = module.finish(proof, proof.record)
-        self.assertNotIn("proof_trunk_x", client.references)
-        self.assertIn("deleted: 1", note)
+        main_before = client.reference("main").hash
+        run, log = record(), list[str]()
+
+        class HostStack(Stack):
+            def health(self, service: str) -> str:
+                return "healthy"
+
+            def docker(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+                return 0, ""
+
+            def compose_out(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+                return 0, "the warehouse is at s3://wh/"
+
+        with (
+            mock.patch.multiple(
+                module,
+                Remote=lambda: SimpleNamespace(remove_file=lambda path: None),
+                Stack=lambda target, rec, lg: HostStack(),
+                load_configuration=lambda: {"S3_BUCKET": BUCKET},
+                configured_warehouse_location=lambda: "s3://wh/",
+                ExecNessie=lambda stack: client,
+                ExecTrino=lambda stack: HostTrino(),
+            ),
+            self.assertRaises(NessieError),
+        ):
+            module.run_host(run, log)
+        self.assertEqual([name for name in client.references if name.startswith("proof_trunk_")], [])
+        self.assertEqual(client.reference("main").hash, main_before)
+        self.assertIn("deleted: 1", run.cleanup)
+        self.assertIn("no commit was added to main", run.cleanup)
+
+    def test_the_location_of_the_warehouse_is_read_from_the_standard_output_of_the_configuration(self) -> None:
+        module = runner()
+        client = HostNessie()
+        run = record()
+
+        class HostStack(Stack):
+            def health(self, service: str) -> str:
+                return "healthy"
+
+            def docker(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+                return 0, ""
+
+            def compose_out(self, *arguments: str, timeout: float = 0) -> tuple[int, str]:
+                return 0, "{}"
+
+            def compose_run(self, *arguments: str, stdin: str | None = None, timeout: float = 0) -> tuple[int, str]:
+                return 0, "warning: the location s3://wh/ is not set"
+
+        with mock.patch.multiple(
+            module,
+            Remote=lambda: SimpleNamespace(remove_file=lambda path: None),
+            Stack=lambda target, rec, lg: HostStack(),
+            load_configuration=lambda: {"S3_BUCKET": BUCKET},
+            configured_warehouse_location=lambda: "s3://wh/",
+            ExecNessie=lambda stack: client,
+            ExecTrino=lambda stack: HostTrino(),
+        ):
+            module.run_host(run, [])
+        self.assertEqual(failed(run), ["deployed stack"])
 
     def test_the_trunk_that_seeds_well_is_listed_once(self) -> None:
         module = runner()

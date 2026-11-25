@@ -184,8 +184,8 @@ class NessieStatAnswers(unittest.TestCase):
 
     def stack(self, module: ModuleType, process: tuple[int, str], stat: tuple[int, str]) -> tuple[object, Record]:
         record = Record(feature="x", slug="x", rerun="x")
-        target = SimpleNamespace(secrets_directory="/opt/platform/secrets", run=lambda args, **_: stat)
-        stack = SimpleNamespace(record=record, target=target, compose_run=lambda *args, **_: process)
+        target = SimpleNamespace(secrets_directory="/opt/platform/secrets", read=lambda args, **_: stat)
+        stack = SimpleNamespace(record=record, target=target, compose_out=lambda *args, **_: process)
         return stack, record
 
     def cases(self, process: tuple[int, str], stat: tuple[int, str]) -> dict[str, tuple[bool, str]]:
