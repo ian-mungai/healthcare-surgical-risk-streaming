@@ -9,7 +9,8 @@ A heavy job carries the tag ``HEAVY_TAG_KEY``. The instance setting ``concurrenc
 be in progress, so a second heavy job stays queued until the first ends. A job below the figure has no tag and is never held.
 
 Each job that runs a service group is declared in ``JOB_GROUPS`` with its group, and takes its tags from ``job_tags``. A fast test holds every group named
-there to the limits file. The record load is the first.
+there to the limits file. The record load is the first. The table checks job runs one Spark container, so it is declared with ``batch_bronze`` and takes the
+Spark tag.
 
 The limits file and the figure are read when the code location starts. After either changes, restart the code location so that the tags follow it.
 """
@@ -35,7 +36,7 @@ SPARK_TAG_KEY = "surgical_risk/spark"
 SPARK_TAG_VALUE = "true"
 LIMITS_FILE = Path(os.environ.get("LIMITS_FILE", "/opt/dagster/limits.yml"))
 # Each job that runs a service group, by job name, with the group of the limits file that it runs.
-JOB_GROUPS: Mapping[str, str] = MappingProxyType({"record_load_job": "ingestion"})
+JOB_GROUPS: Mapping[str, str] = MappingProxyType({"record_load_job": "ingestion", "table_checks_job": "batch_bronze"})
 
 
 class ConcurrencyError(ValueError):

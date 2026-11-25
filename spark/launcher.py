@@ -3,8 +3,8 @@
 ``python -m spark.launcher <job> [job arguments]`` is the entry point of the services ``spark_bronze``, ``spark_silver``, ``spark_gold`` and
 ``spark_maintenance``. Each service sets ``SPARK_WORKLOAD`` to its workload, which is the AWS identity that its credentials hold. The launcher asks
 ``scripts.stack.job_workloads.refusal_of`` whether ``spark.jobs.<job>`` belongs to that workload. It refuses before the job's module is imported, so Spark has
-not started and no job runs under the identity of another layer. With no job, as when ``make group-up GROUP=batch_<workload>`` starts the service, it prints
-its usage and exits 2: nothing runs, so a start of the service never rewrites a table. A refusal is one fixed code on standard error, with no argument.
+not started and no job runs under the identity of another layer. With no job, as when a container of an older version of the service starts again, it
+prints its usage and exits 2: nothing runs, so a start of the service never rewrites a table. A refusal is one fixed code on standard error, with no argument.
 """
 
 from __future__ import annotations

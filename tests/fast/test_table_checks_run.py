@@ -30,6 +30,7 @@ from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
 from scripts.process import CompletedProcess, TimeoutExpired
+from scripts.stack import spark_slot as slot
 from scripts.stack.groups import Settings
 from scripts.stack.nessie import NessieClient, NessieError
 from spark import table_checks as rules
@@ -2056,11 +2057,17 @@ class ComposeRunnerTest(unittest.TestCase):
     """The command that starts the job through the stack's Compose files: the Bronze service and its profile, no dependency started, the staging
     volume read-only."""
 
+    def setUp(self) -> None:
+        """No Docker daemon is needed: the view of the running services is a stand-in and the one lock file is a file of the test."""
+        self.enterContext(mock.patch.object(slot, "LOCK_FILE", Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot_"))) / "slot.lock"))
+
     def settings(self) -> Settings:
         return Settings(compose_directory=ROOT / "compose", project="stack_example", host_env=Path("/opt/stack/compose/host.env"))
 
     def runner(self) -> run.Runner:
-        return run.compose_runner(self.settings(), volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77)
+        return run.compose_runner(
+            self.settings(), volume="stack_example_table_check_staging", directory="/opt/dagster/staging", deadline_seconds=77, running=lambda: []
+        )
 
     def test_control_the_command_names_the_job_the_volume_and_the_folder_of_this_run(self) -> None:
         with mock.patch.object(run, "run_command", return_value=CompletedProcess([], 0, "RESULT {}\n", "")) as started:

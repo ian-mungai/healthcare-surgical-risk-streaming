@@ -73,7 +73,7 @@ from scripts.stack.groups import Settings, compose_arguments, rendered_environme
 from scripts.stack.job_workloads import job_command, profile_of_job
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
-from scripts.stack.spark_slot import SlotBusy, spark_slot
+from scripts.stack.spark_slot import SlotError, spark_slot
 from scripts.stack.tags import paged
 from spark import table_checks as rules
 
@@ -212,7 +212,6 @@ def compose_runner(
     directory: str,
     deadline_seconds: float,
     running: Callable[[], Collection[str]] | None = None,
-    slot_lock: Path | None = None,
 ) -> Runner:
     """A runner that starts the job as a one-off of the Bronze service that ``scripts/stack/job_workloads.py`` names, in that service's own profile and with no
     service it depends on started. The job reads the loaded tables with the Bronze credentials, which cannot write them.
@@ -223,8 +222,8 @@ def compose_runner(
     that passes its deadline is stopped by the launcher and its reply carries the exit code 124.
 
     The job holds the one Spark slot (``scripts/stack/spark_slot.py``) for the whole of ``docker compose run``, so it does not start while a job of any Spark
-    service runs and no other Spark job starts before its container has exited. ``running`` reads the running services and ``slot_lock`` names the lock file;
-    both default to the stack's own.
+    service runs and no other Spark job starts before its container has exited. ``running`` reads the running services and defaults to the stack's own. The lock
+    is the one file of the slot (``spark_slot.LOCK_FILE``), which the manual one-off of ``scripts/stack/spark_run.py`` takes too.
     """
     root = Path(directory)
     read_running = running or (lambda: running_services(settings, load_limits(settings.limits_file)))
@@ -240,9 +239,9 @@ def compose_runner(
         )
         environment = rendered_environment(load_limits(settings.limits_file))
         try:
-            with spark_slot(read_running, lock_file=slot_lock):
+            with spark_slot(read_running):
                 result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
-        except SlotBusy as error:
+        except SlotError as error:
             raise TableChecksError(f"the table checks do not start: {error}") from None
         except TimeoutExpired:
             return RunnerReply(124, "")

@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from scripts.stack.job_workloads import JOB_WORKLOADS, SERVICE_WORKLOADS
+from scripts.stack.job_workloads import JOB_WORKLOADS, SERVICE_WORKLOADS, SPARK_SERVICES
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNERS = sorted((ROOT / "tests" / "e2e").glob("*.py")) + sorted((ROOT / "tests" / "e2e").glob("*/*.py"))
@@ -40,6 +40,17 @@ def stale_names(text: str) -> list[str]:
         if PATHS.search(line):
             continue
         found += [f"{what}: line {number}" for what, pattern in STALE.items() if pattern.search(line)]
+    return found
+
+
+def repeated_filters(text: str) -> list[str]:
+    """Each line of ``text`` that lists Spark containers with a repeated filter key: the old list ``SPARK_FILTERS``, or two values of the service label."""
+    found = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if "SPARK_FILTERS" in line:
+            found.append(f"SPARK_FILTERS: line {number}")
+        if len(re.findall(r"label=com\.docker\.compose\.service=", line)) > 1:
+            found.append(f"the service label twice in one request: line {number}")
     return found
 
 
@@ -88,11 +99,65 @@ class LaunchHelperTest(unittest.TestCase):
                 self.assertEqual([ROOT / "a" / workload], self.launch.access_folders(ROOT / "a", [job]))
                 self.assertEqual([f"{workload.upper()}_ACCESS_DIR={ROOT / 'a' / workload}"], self.launch.access_settings(ROOT / "a", [job]))
 
-    def test_the_filters_list_every_spark_service(self) -> None:
-        self.assertEqual(
-            ["spark_bronze", "spark_silver", "spark_gold", "spark_maintenance"],
-            [item.rsplit("=", 1)[1] for item in self.launch.SPARK_FILTERS if item.startswith("label=")],
-        )
+    LABEL = "com.docker.compose"
+
+    def docker_ps(self, containers: list[tuple[str, str, dict[str, str]]], arguments: list[str]) -> str:
+        """The output of ``docker ps`` over ``containers`` (ID, state, labels), with the label filters of Docker 29.9.3: the filters of one key are ANDed
+        (``daemon/internal/filters/parse.go``, ``GetBoolOrDefault`` and ``Match`` over a list of values), so two values for one label key match no container."""
+        self.assertEqual("ps", arguments[0])
+        wanted = [arguments[position + 1].removeprefix("label=").split("=", 1) for position, word in enumerate(arguments) if word == "--filter"]
+        every = "--all" in arguments
+        lines = []
+        for identifier, state, labels in containers:
+            if (every or state == "running") and all(labels.get(key) == value for key, value in wanted):
+                lines.append(f"{identifier} {labels.get(self.LABEL + '.service', '')}")
+        return "\n".join(lines) + "\n" if lines else ""
+
+    def stack(self, live: str) -> list[tuple[str, str, dict[str, str]]]:
+        project = {f"{self.LABEL}.project": "stack_example"}
+        return [
+            ("c_nessie", "running", project | {f"{self.LABEL}.service": "nessie"}),
+            ("c_live", "running", project | {f"{self.LABEL}.service": live}),
+            ("c_old", "exited", project | {f"{self.LABEL}.service": "spark_gold"}),
+            ("c_other", "running", {f"{self.LABEL}.project": "another", f"{self.LABEL}.service": live}),
+        ]
+
+    def test_one_live_container_of_each_spark_service_is_listed_with_the_filters_of_docker_29_9_3(self) -> None:
+        """One live Silver container gave an empty list, so the stall check and the cleanup saw no Spark container: four values of one key are ANDed."""
+        for service in SPARK_SERVICES:
+            with self.subTest(service=service):
+                listed = self.docker_ps(self.stack(service), self.launch.ps_arguments("stack_example", all_states=False))
+                self.assertEqual(["c_live"], self.launch.spark_ids(listed))
+
+    def test_the_cleanup_listing_keeps_a_stopped_spark_container_and_the_live_listing_does_not(self) -> None:
+        containers = self.stack("spark_silver")
+        self.assertEqual(["c_live"], self.launch.spark_ids(self.docker_ps(containers, self.launch.ps_arguments("stack_example", all_states=False))))
+        self.assertEqual(["c_live", "c_old"], self.launch.spark_ids(self.docker_ps(containers, self.launch.ps_arguments("stack_example", all_states=True))))
+
+    def test_the_listing_asks_once_by_project_with_no_service_filter_and_selects_the_spark_services_in_python(self) -> None:
+        arguments = self.launch.ps_arguments("stack_example", all_states=True)
+        filters = [arguments[position + 1] for position, word in enumerate(arguments) if word == "--filter"]
+        self.assertEqual(["label=com.docker.compose.project=stack_example"], filters)
+        self.assertEqual(["c_a", "c_b"], self.launch.spark_ids("c_a spark_bronze\nc_n nessie\nc_b spark_maintenance\n\nc_x\nc_y spark_bronze_extra\n"))
+        self.assertEqual([], self.launch.spark_ids(""))
+
+    def test_the_old_helper_list_is_gone(self) -> None:
+        self.assertFalse(hasattr(self.launch, "SPARK_FILTERS"))
+
+
+@unittest.skipUnless(RUNNERS, "the untracked runners are not here")
+class RunnerListingScanTest(unittest.TestCase):
+    """A runner lists its Spark containers through the helper. A list of several values for one label filter key is ANDed by Docker, so it lists nothing."""
+
+    def test_no_runner_uses_the_filters_that_listed_nothing(self) -> None:
+        found = {path.relative_to(ROOT).as_posix(): repeated_filters(path.read_text()) for path in RUNNERS}
+        self.assertEqual({}, {name: hits for name, hits in found.items() if hits})
+
+    def test_the_scan_names_a_planted_repeat_and_a_planted_use_of_the_old_list(self) -> None:
+        self.assertEqual(["SPARK_FILTERS: line 1"], repeated_filters("*SPARK_FILTERS,"))
+        planted = '"--filter", "label=com.docker.compose.service=spark_silver", "--filter", "label=com.docker.compose.service=spark_gold",'
+        self.assertEqual(["the service label twice in one request: line 1"], repeated_filters(planted))
+        self.assertEqual([], repeated_filters('"--filter", "label=com.docker.compose.project=p", "--filter", f"label=com.docker.compose.service={service}",'))
 
 
 if __name__ == "__main__":

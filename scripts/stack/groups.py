@@ -10,6 +10,9 @@ services and leaves every other service running. Both are safe to repeat: a grou
 again. A message holds the service's name and a closed list of fields of its state (state, health, exit code, out-of-memory flag, restarts), never a
 container's own text, so no secret can reach it.
 
+``up`` refuses a Spark group (``batch_<workload>``) before Compose starts a container: the service starts no job by itself, and a stopped container of an older
+version would restart its old job under ``--no-recreate``. A Spark job starts with ``scripts/stack/spark_run.py``, which holds the one Spark slot.
+
 ``.venv/bin/python -m scripts.stack.groups up|down <group>`` runs from the repository or inside the Dagster image. The compose folder is
 ``--compose-directory``, ``STACK_COMPOSE_DIRECTORY`` or the repository's ``compose`` folder. Exit status: 0 done, 1 refused or failed, 75 the group waits
 and the wait ended, 2 wrong usage. ``STACK_TEST_AVAILABLE_MIB`` and ``--available-mib`` are test inputs that replace the reading of the host's available
@@ -19,12 +22,11 @@ memory, as ``scripts.stack.admission`` documents for its own test inputs.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import re
 import sys
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -36,9 +38,12 @@ from scripts.project_config import ROOT
 from scripts.stack.admission import EXIT_WAIT, SUPPORTING_GROUP, AdmissionError, Decision, check_group, describe
 from scripts.stack.job_workloads import SPARK_GROUPS
 from scripts.stack.limits import SERVICE_NAME, Limits, LimitsError, load_limits, render_environment
-from scripts.stack.spark_slot import SlotBusy, spark_slot
 from scripts.stack.yaml_text import YamlError, load_yaml
 
+SPARK_REFUSAL = (
+    "group-up never starts a Spark group, because its service starts no job and a stopped container of an older version would restart its old job. "
+    "Start a job with python -m scripts.stack.spark_run <job> in the code location container"
+)
 ALWAYS_ON_GROUPS = frozenset({SUPPORTING_GROUP})
 COMPOSE_DIRECTORY_VARIABLE = "STACK_COMPOSE_DIRECTORY"
 PROJECT_VARIABLE = "COMPOSE_PROJECT_NAME"
@@ -66,6 +71,10 @@ Log = Callable[[str], None]
 
 class GroupError(RuntimeError):
     """A group cannot be started or stopped. The message names the group or the service and holds no text of a container."""
+
+
+class SparkGroupRefused(GroupError):
+    """``group-up`` was asked to start a Spark group, which it never does."""
 
 
 class GroupWaits(GroupError):
@@ -239,13 +248,18 @@ def docker(arguments: Sequence[str], *, timeout: float, label: str, env: Mapping
 
 
 def parse_inspect(text: str) -> dict[str, ServiceState]:
-    """The states in the output of ``docker inspect`` with ``INSPECT_FORMAT``. A line of another size is dropped and a value outside its list is ``unknown``."""
+    """The states in the output of ``docker inspect`` with ``INSPECT_FORMAT``. A line of another size is dropped and a value outside its list is ``unknown``.
+
+    Several containers can carry one service name (the one-offs of ``docker compose run`` and the stopped containers of earlier runs). A container that is alive
+    is never replaced by a stopped one, so a live job holds its service whatever order Docker lists them in."""
     found: dict[str, ServiceState] = {}
     for line in text.splitlines():
         parts = line.split("|")
         if len(parts) != 6 or not SERVICE_NAME.fullmatch(parts[0]):
             continue
         service, state, health, exit_code, oom, restarts = parts
+        if service in found and found[service].state in ALIVE_STATES and state not in ALIVE_STATES:
+            continue
         found[service] = ServiceState(
             service,
             state if state in STATES else "unknown",
@@ -364,17 +378,11 @@ def admit(settings: Settings, limits: Limits, group: Group, wait_seconds: float,
         time.sleep(ADMISSION_POLL_SECONDS)
 
 
-@contextlib.contextmanager
-def claim_spark_slot(settings: Settings, limits: Limits, group: Group, wait_seconds: float) -> Iterator[None]:
-    """The one Spark slot for the start of a Spark group, held until the group is started, and nothing for any other group. A taken slot is ``GroupWaits``."""
-    if group.name not in SPARK_GROUPS:
-        yield
-        return
-    try:
-        with spark_slot(lambda: running_services(settings, limits), wait_seconds=wait_seconds):
-            yield
-    except SlotBusy as error:
-        raise GroupWaits(f"group {group.name}: {error}") from error
+def refuse_spark_group(group: Group) -> None:
+    """Refuse a Spark group before Compose starts a container. A stopped container of an older version keeps its old entry point under ``up --no-recreate``
+    and would start its old job, and the service starts no job by itself. A job starts with ``scripts/stack/spark_run.py``, which takes the slot."""
+    if group.name in SPARK_GROUPS:
+        raise SparkGroupRefused(f"the group {group.name} is a Spark group: {SPARK_REFUSAL}")
 
 
 def start_group(
@@ -383,14 +391,14 @@ def start_group(
     """Admit and start a group, and return the services that this call started. A group that is up is not started again."""
     limits = load_limits(settings.limits_file)
     group = find_group(limits, group_name)
+    refuse_spark_group(group)
     require_control(settings, group)
     before = running_services(settings, limits)
-    with claim_spark_slot(settings, limits, group, wait_seconds):
-        decision = admit(settings, limits, group, wait_seconds, log)
-        log(f"admission: {describe(decision)}")
-        start_compose(settings, limits, group, deadline_seconds, log)
-        if group.k3s and settings.k3s is not None:
-            settings.k3s.start(group.k3s, deadline_seconds)
+    decision = admit(settings, limits, group, wait_seconds, log)
+    log(f"admission: {describe(decision)}")
+    start_compose(settings, limits, group, deadline_seconds, log)
+    if group.k3s and settings.k3s is not None:
+        settings.k3s.start(group.k3s, deadline_seconds)
     return StartResult(group.name, tuple(sorted(running_services(settings, limits) - before)), decision)
 
 
@@ -443,6 +451,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except GroupWaits as error:
         sys.stderr.write(f"groups: waits: {describe_error(error)}\n")
         return EXIT_WAIT
+    except SparkGroupRefused:
+        sys.stderr.write(f"groups: refused: {SPARK_REFUSAL}\n")
+        return 1
     except (GroupError, AdmissionError, LimitsError) as error:
         sys.stderr.write(f"groups: refused: {describe_error(error)}\n")
         return 1

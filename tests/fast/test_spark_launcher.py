@@ -2,8 +2,8 @@
 
 Each of the four Spark services has the same entry point, ``python -m spark.launcher``, and the environment variable ``SPARK_WORKLOAD`` that names its workload.
 The launcher refuses a job that ``scripts/stack/job_workloads.py`` does not map to that workload, before Spark starts, so a job cannot run under the identity
-of another layer by a typed service name. With no job it prints its usage and exits 2: ``make group-up GROUP=batch_maintenance`` starts the service and no
-rewrite. The checks run the real launcher in a child process, with no Spark in it, so a refusal that came too late would fail on the missing Spark.
+of another layer by a typed service name. With no job it prints its usage and exits 2, so a service that starts with no job
+starts no rewrite. The checks run the real launcher in a child process, with no Spark in it, so a refusal that came too late would fail on the missing Spark.
 """
 
 from __future__ import annotations

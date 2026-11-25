@@ -123,7 +123,7 @@ class JobTableTest(unittest.TestCase):
                 self.assertNotRegex(text, r"spark\.jobs\.[a-z_]+[\"'`]", path.name)
                 if "job_command(" in text:
                     launchers.append(path.relative_to(ROOT).as_posix())
-        self.assertEqual(["scripts/ingestion/table_checks.py"], launchers)
+        self.assertEqual(["scripts/ingestion/table_checks.py", "scripts/stack/spark_run.py"], launchers)
 
 
 class GrantTest(unittest.TestCase):

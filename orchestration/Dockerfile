@@ -30,7 +30,7 @@ COPY --from=amazon/aws-cli:2.42.1@sha256:b0102d2269f87d8531d931c1a59e248101ace58
 RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 
 COPY --from=stack_scripts __init__.py aws_cli.py process.py project_config.py /opt/dagster/app/scripts/
-COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/job_workloads.py stack/limits.py stack/nessie.py stack/spark_slot.py stack/tags.py stack/yaml_text.py \
+COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py stack/groups_k3s.py stack/job_workloads.py stack/limits.py stack/nessie.py stack/spark_run.py stack/spark_slot.py stack/tags.py stack/yaml_text.py \
     /opt/dagster/app/scripts/stack/
 # The table checks and the record load: the ingestion package (gate, manifest, table checks, copy, Airbyte client, catalog and load),
 # the pinned publisher files they read, the rules of the Spark job that the controller also holds the result to, and the tracked release pin that the manifest
