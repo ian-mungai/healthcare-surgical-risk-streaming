@@ -207,6 +207,8 @@ runner_checkout_python_archive: "{{ runner_checkout_python_download_directory }}
 runner_checkout_python_home: "{{ runner_checkout_python_directory }}/{{ runner_checkout_python_version }}"
 runner_checkout_python: "{{ runner_checkout_python_home }}/bin/python{{ runner_checkout_python_version.split('.')[:2] | join('.') }}"
 # The files, relative to the folder, that the environment's packages come from: every one is installed with --require-hashes, so every requirement in it must carry a hash.
+# The host process of the runners imports only PyYAML and ansible-core, both in the root lock (tests/fast/test_runner_requirements.py reads every import); the locks of spark/,
+# replay/ and orchestration/ are for the containers' code and are not installed here.
 runner_checkout_requirements:
   - requirements.txt
 runner_checkout_folder: "{{ runner_checkout_directory }}/{{ runner_checkout_commit }}"
