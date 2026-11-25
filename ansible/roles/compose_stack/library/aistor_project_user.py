@@ -12,13 +12,19 @@ variable, which is the only way ``mc`` takes a sign-in without writing it to a c
 never a module argument, never in Ansible's or the host shell's environment and never in a host command line; it exists for the length of one ``mc`` call,
 in that call's environment inside the container.
 
-The project user's password is read from the root-only file on the host and travels to the container on standard input. It is an ``mc`` argument for the one
-``mc admin user add`` call (the command takes no other form: ``mc admin user add ALIAS ACCESSKEY SECRETKEY``), so it is visible in the container's process list
-for that call only. No secret is printed, logged or part of a message: a failed call is reported by its fixed name and exit status.
+The project user's password reaches ``mc`` on standard input and never as an argument: the pinned client (``mc.RELEASE.2026-09-19T15-24-59Z``, SHA-256
+``83938eded435e7c28c397ece1dc590b2a79626dd9354aae2107060fec559ae2b``, in the image ``RELEASE.2026-09-19T17-05-25Z``, whose layer holds the help text of the
+form) takes ``mc admin user add ALIAS ACCESSKEY`` and then reads the secret key from standard input when that is not a terminal (``fetchUserKeys`` in
+``cmd/admin-user-add.go``: two arguments and no terminal read one line). ``docker compose exec -T`` gives no terminal. So the password is in no process list.
+No secret is printed, logged or part of a message: a failed call is reported by its fixed name and exit status.
 
-The policy reaches the project's one bucket and the objects in it, and no admin action. The user holds that policy and no other: a policy that someone
-attached later is detached. The module changes nothing when everything matches, and a check run reports the actions without making any call that writes.
-It uses only the standard library and runs on the host's Python.
+The policy holds exactly the S3 calls that the pinned Terraform provider (aminueza/minio v3.46.2) makes for the two resources of ``infra/storage`` and
+nothing else; each action has its source file and line in ``tests/fast/test_aistor_project_user.py`` (``PROVIDER_CALLS``). It publishes no policy (the bucket's
+``acl = "private"`` only removes one), writes no object and deletes no version. The user holds that policy, no other policy and no group: a policy or a group
+that someone added is removed before a disabled user is enabled, and a failed removal leaves the user disabled. A user or a policy is made only when the server
+answers in its own code that it does not exist (``XMinioAdminNoSuchUser`` or ``XMinioAdminNoSuchPolicy`` with a failed exit status); any other answer fails.
+The module changes nothing when everything matches, and a check run reports the actions without making any call that writes. It uses only the standard library
+and runs on the host's Python.
 """
 
 from __future__ import annotations
@@ -40,38 +46,30 @@ BUILT_IN_POLICIES = {"consoleAdmin", "readwrite", "readonly", "writeonly", "diag
 ROOT_PAIR_FILES = ("/run/secrets/aistor_root_user", "/run/secrets/aistor_root_password")
 # The one place that gives the root pair to a process: the environment of one ``mc`` call, read inside the container from its own mounted files.
 ROOT_SIGN_IN = f'MC_HOST_{ALIAS}="http://$(cat {ROOT_PAIR_FILES[0]}):$(cat {ROOT_PAIR_FILES[1]})@127.0.0.1:9000"'
+GROUP_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+NO_SUCH_USER = "XMinioAdminNoSuchUser"
+NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
 SCRIPTS = {
-    "read": f'{ROOT_SIGN_IN} exec mc --no-color "$@"',
-    "user_add": f'IFS= read -r secret_value && {ROOT_SIGN_IN} exec mc --no-color admin user add {ALIAS} "$1" "$secret_value"',
+    "read": f'{ROOT_SIGN_IN} exec mc --no-color --json "$@" 2>&1',
+    "user_add": f'{ROOT_SIGN_IN} exec mc --no-color admin user add {ALIAS} "$1"',
     "policy_create": (
         f'file=$(mktemp) && cat > "$file" && {ROOT_SIGN_IN} mc --no-color admin policy create {ALIAS} "$1" "$file"; status=$?; rm -f "$file"; exit $status'
     ),
 }
+# Every S3 call of the pinned provider for the two resources (bucket and versioning), with private ACL and no forced destroy, on the project's one bucket and on
+# no object. The source of each action (file and line of aminueza/terraform-provider-minio v3.46.2) is the table PROVIDER_CALLS of the unit test, which a test
+# holds equal to this list: a new action needs a new row, a new resource needs a new test.
 BUCKET_ACTIONS = [
     "s3:CreateBucket",
     "s3:DeleteBucket",
     "s3:ListBucket",
     "s3:ListBucketVersions",
-    "s3:ListBucketMultipartUploads",
     "s3:GetBucketLocation",
     "s3:GetBucketVersioning",
     "s3:PutBucketVersioning",
     "s3:GetBucketPolicy",
-    "s3:PutBucketPolicy",
     "s3:DeleteBucketPolicy",
     "s3:GetBucketTagging",
-    "s3:PutBucketTagging",
-]
-OBJECT_ACTIONS = [
-    "s3:GetObject",
-    "s3:PutObject",
-    "s3:DeleteObject",
-    "s3:GetObjectVersion",
-    "s3:DeleteObjectVersion",
-    "s3:GetObjectTagging",
-    "s3:PutObjectTagging",
-    "s3:AbortMultipartUpload",
-    "s3:ListMultipartUploadParts",
 ]
 
 
@@ -98,15 +96,12 @@ Runner = Callable[[Call], Result]
 
 
 def policy_document(bucket: str) -> dict[str, Any]:
-    """The project's policy: bucket actions on the bucket, object actions on its objects, and nothing else."""
+    """The project's policy: the provider's bucket actions on the one bucket, and nothing on its objects."""
     if BUCKET_NAME.fullmatch(bucket) is None:
         raise BootstrapError("the bucket name is not a bucket name: 3 to 63 lower case letters, digits and hyphens")
     return {
         "Version": "2012-10-17",
-        "Statement": [
-            {"Effect": "Allow", "Action": list(BUCKET_ACTIONS), "Resource": [f"arn:aws:s3:::{bucket}"]},
-            {"Effect": "Allow", "Action": list(OBJECT_ACTIONS), "Resource": [f"arn:aws:s3:::{bucket}/*"]},
-        ],
+        "Statement": [{"Effect": "Allow", "Action": list(BUCKET_ACTIONS), "Resource": [f"arn:aws:s3:::{bucket}"]}],
     }
 
 
@@ -128,13 +123,41 @@ def command_line(compose: list[str], service: str, call: Call) -> list[str]:
     return [*compose, "exec", "-T", service, "sh", "-c", SCRIPTS[call.kind], "mc", *call.arguments]
 
 
-def parse_user_info(text: str) -> tuple[str, list[str]]:
-    """The status and the policies of a user from the text of ``mc admin user info``."""
-    status = re.search(r"^\s*Status:\s*(\S*)", text, re.MULTILINE)
-    held = re.search(r"^\s*PolicyName:[ \t]*(.*)$", text, re.MULTILINE)
-    if status is None or held is None:
+def answer_of(text: str) -> dict[str, Any]:
+    """The JSON object of one ``mc --json`` answer, or an error that holds no part of the text."""
+    try:
+        document = json.loads(text)
+    except ValueError:
+        raise BootstrapError("the answer of the server is not the documented JSON form") from None
+    if not isinstance(document, dict):
+        raise BootstrapError("the answer of the server is not the documented JSON form")
+    return document
+
+
+def parse_user_info(text: str, user: str | None = None) -> tuple[str, list[str], list[str]]:
+    """The status, the policies and the groups of a user from the JSON of ``mc --json admin user info``. Any other form is refused and nothing is made."""
+    document = answer_of(text)
+    status, name, held, groups = document.get("userStatus"), document.get("accessKey"), document.get("policyName", ""), document.get("memberOf", [])
+    if document.get("status") != "success" or not isinstance(status, str) or not status or not isinstance(name, str) or not name:
         raise BootstrapError("the answer for the user is not user information")
-    return status.group(1), [name.strip() for name in held.group(1).split(",") if name.strip()]
+    if (user is not None and name != user) or not isinstance(held, str) or not isinstance(groups, list):
+        raise BootstrapError("the answer for the user is not user information")
+    names = [item.get("name") if isinstance(item, dict) else None for item in groups]
+    if not all(isinstance(group, str) and GROUP_NAME.fullmatch(group) for group in names):
+        raise BootstrapError("the answer for the user holds a group name of another form")
+    return status, [policy.strip() for policy in held.split(",") if policy.strip()], [str(group) for group in names]
+
+
+def is_absent(result: Result, code: str) -> bool:
+    """Whether the answer is the server's own statement that the thing does not exist: a failed call whose JSON error holds exactly this code."""
+    if result.status == 0:
+        return False
+    try:
+        found = answer_of(result.output)
+    except BootstrapError:
+        return False
+    cause = ((found.get("error") or {}).get("cause") or {}).get("error") or {}
+    return found.get("status") == "error" and isinstance(cause, dict) and cause.get("Code") == code
 
 
 def read(runner: Runner, *words: str) -> Result:
@@ -147,14 +170,19 @@ def write(runner: Runner, call: Call, what: str) -> None:
         raise BootstrapError(f"the call to {what} failed with exit status {result.status}")
 
 
-def current_policy_matches(runner: Runner, policy: str, document: dict[str, Any]) -> bool:
+def policy_state(runner: Runner, policy: str, document: dict[str, Any]) -> bool:
+    """Whether the policy exists and matches. A policy that does not exist, by the server's own code, is False; any other failed or unreadable answer fails."""
     result = read(runner, "admin", "policy", "info", ALIAS, policy)
+    if is_absent(result, NO_SUCH_POLICY):
+        return False
     if result.status != 0:
-        return False
-    try:
-        return normalised(json.loads(result.output)) == normalised(document)
-    except ValueError:
-        return False
+        raise BootstrapError(f"the call to read the policy failed with exit status {result.status}")
+    found = answer_of(result.output)
+    info = found.get("policyInfo")
+    stored = info.get("Policy") if isinstance(info, dict) else None
+    if found.get("status") != "success" or not isinstance(stored, dict):
+        raise BootstrapError("the answer for the policy is not policy information")
+    return normalised(stored) == normalised(document)
 
 
 def reconcile(runner: Runner, user: str, policy: str, bucket: str, password: str, *, check_only: bool) -> list[str]:
@@ -167,31 +195,38 @@ def reconcile(runner: Runner, user: str, policy: str, bucket: str, password: str
         raise BootstrapError("the project user's password file does not hold a password of the expected form")
     document = policy_document(bucket)
     actions: list[str] = []
-    if not current_policy_matches(runner, policy, document):
+    if not policy_state(runner, policy, document):
         actions.append("create the policy")
         if not check_only:
             write(runner, Call("policy_create", (policy,), json.dumps(document)), "create the policy")
     answer = read(runner, "admin", "user", "info", ALIAS, user)
-    if answer.status != 0:
+    if is_absent(answer, NO_SUCH_USER):
         actions.append("create the user")
         if not check_only:
             write(runner, Call("user_add", (user,), password + "\n"), "create the user")
-        status, held = "enabled", list[str]()
+        status, held, groups = "enabled", list[str](), list[str]()
+    elif answer.status != 0:
+        raise BootstrapError(f"the call to read the user failed with exit status {answer.status}")
     else:
-        status, held = parse_user_info(answer.output)
-        if status != "enabled":
-            actions.append("enable the user")
-            if not check_only:
-                write(runner, Call("read", ("admin", "user", "enable", ALIAS, user)), "enable the user")
-    if policy not in held:
-        actions.append("attach the policy to the user")
-        if not check_only:
-            write(runner, Call("read", ("admin", "policy", "attach", ALIAS, policy, "--user", user)), "attach the policy")
+        status, held, groups = parse_user_info(answer.output, user)
+    # Access that is not the project's goes first, the project's policy next and the enabling last: a user that is disabled is never enabled with extra access.
     for other in held:
         if other != policy:
             actions.append(f"detach the policy {other} from the user")
             if not check_only:
                 write(runner, Call("read", ("admin", "policy", "detach", ALIAS, other, "--user", user)), "detach a policy")
+    for group in groups:
+        actions.append(f"remove the user from the group {group}")
+        if not check_only:
+            write(runner, Call("read", ("admin", "group", "remove", ALIAS, group, user)), "remove the user from a group")
+    if policy not in held:
+        actions.append("attach the policy to the user")
+        if not check_only:
+            write(runner, Call("read", ("admin", "policy", "attach", ALIAS, policy, "--user", user)), "attach the policy")
+    if status != "enabled":
+        actions.append("enable the user")
+        if not check_only:
+            write(runner, Call("read", ("admin", "user", "enable", ALIAS, user)), "enable the user")
     return actions
 
 
