@@ -152,6 +152,99 @@ class PlanTest(unittest.TestCase):
         self.assertEqual([], planned(list(self.services), list(self.tools), state))
 
 
+class ProjectUserTest(unittest.TestCase):
+    """The AIStor project user's sign-in is kept at the service's own path, so the service's own role (and no other) reads it."""
+
+    client = None
+
+    def setUp(self) -> None:
+        self.client = bootstrap.Client("aistor", "project_user", "a-project-value-0123456789abcdef")
+
+    def plan_with(self, state: Any, services: list[str] | None = None) -> list[str]:
+        names = services or ["nessie", "aistor"]
+        actions = bootstrap.plan(names, [], state, lambda name: "", TTL, MAX_TTL, client=self.client)
+        return [action.description for action in actions]
+
+    def matching_state(self) -> Any:
+        state = good_state(["nessie", "aistor"], [])
+        state.client = {"user": "project_user", "password": "a-project-value-0123456789abcdef"}
+        return state
+
+    def test_a_server_that_holds_the_sign_in_needs_no_action(self) -> None:
+        self.assertEqual([], self.plan_with(self.matching_state()))
+
+    def test_a_missing_sign_in_is_written_after_the_services_own_actions(self) -> None:
+        state = good_state(["nessie"], [])
+        self.assertEqual(
+            ["write policy service_aistor", "write role aistor", "issue a secret ID for aistor", "write the AIStor project user's sign-in of aistor"],
+            self.plan_with(state),
+        )
+
+    def test_a_stored_user_or_value_that_differs_is_written_back(self) -> None:
+        for key, value in (("user", "someone_else"), ("password", "an-older-value-0123456789abcdef")):
+            state = self.matching_state()
+            state.client[key] = value
+            with self.subTest(field=key):
+                self.assertEqual(["write the AIStor project user's sign-in of aistor"], self.plan_with(state))
+
+    def test_no_client_means_no_sign_in_action_even_when_none_is_stored(self) -> None:
+        state = good_state(["nessie", "aistor"], [])
+        self.assertEqual([], [action.description for action in bootstrap.plan(["nessie", "aistor"], [], state, lambda name: "", TTL, MAX_TTL)])
+
+    def test_the_sign_in_is_stored_at_the_services_own_path_with_the_user_and_the_value_and_nothing_else(self) -> None:
+        sent: list[tuple[str, str, dict[str, Any]]] = []
+
+        class Recorder:
+            def must(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
+                sent.append((method, path, body or {}))
+                return {}
+
+        action = bootstrap.Action("client", "aistor", "write the AIStor project user's sign-in of aistor")
+        with tempfile.TemporaryDirectory() as scratch:
+            bootstrap.apply(Recorder(), "token", action, Path(scratch), MY_OWNER, TTL, MAX_TTL, client=self.client)
+        self.assertEqual(
+            [("POST", "secret/data/services/aistor/aistor", {"data": {"user": "project_user", "password": "a-project-value-0123456789abcdef"}})], sent
+        )
+
+    def test_the_stored_sign_in_is_read_from_the_same_path(self) -> None:
+        asked: list[str] = []
+
+        class Reader:
+            def call(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+                asked.append(path)
+                if path == "secret/data/services/aistor/aistor":
+                    return 200, {"data": {"data": {"user": "project_user", "password": "a-project-value-0123456789abcdef"}}}
+                return 404, {}
+
+        with tempfile.TemporaryDirectory() as scratch:
+            state = bootstrap.read_state(Reader(), "token", ["aistor"], [], Path(scratch), client=self.client)
+        self.assertEqual({"user": "project_user", "password": "a-project-value-0123456789abcdef"}, state.client)
+        self.assertIn("secret/data/services/aistor/aistor", asked)
+
+    def test_the_client_must_be_a_listed_service_so_its_sign_in_is_never_stored_where_no_policy_reads_it(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "services.txt").write_text("nessie\n")
+            (folder / "tools.txt").write_text("nessie\n")
+            params = {
+                "secrets_directory": str(folder),
+                "services_file": str(folder / "services.txt"),
+                "tools_file": str(folder / "tools.txt"),
+                "root_owner": "0:0",
+                "file_owner": "100:1000",
+                "address": "http://127.0.0.1:8200",
+                "client_service": "aistor",
+                "client_user": "project_user",
+                "client_password_file": str(folder / "none"),
+            }
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "no entry in the service list"):
+                bootstrap.reconcile(params, check_only=True)
+
+    def test_a_policy_never_reaches_the_path_of_another_service_so_the_project_sign_in_stays_the_services_own(self) -> None:
+        self.assertNotIn("aistor", bootstrap.policy_text("nessie"))
+        self.assertIn("secret/data/services/aistor/*", bootstrap.policy_text("aistor"))
+
+
 def secret_file(directory: Path, name: str, owner: tuple[int, int] = MY_OWNER, mode: int = 0o400) -> Path:
     path = directory / "openbao" / f"{name}.secret_id"
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-# Run after the stack is healthy. Reads openbao_services_file, openbao_tools_file, openbao_address, openbao_user, secret_files_root_owner and the token lifetimes.
+# Run after the stack is healthy. Reads openbao_services_file, openbao_tools_file, openbao_address, openbao_user, secret_files_root_owner, the token lifetimes and the three openbao_client_* variables (the AIStor project user's sign-in).
 # Prints no secret.
 - name: Make OpenBao match the service list
   openbao_bootstrap:
@@ -6,6 +6,9 @@
     secrets_directory: "{{ openbao_secrets_directory }}"
     services_file: "{{ openbao_services_file }}"
     tools_file: "{{ openbao_tools_file }}"
+    client_service: "{{ openbao_client_service }}"
+    client_user: "{{ openbao_client_user }}"
+    client_password_file: "{{ openbao_client_password_file }}"
     address: "{{ openbao_address }}"
     file_owner: "{{ openbao_user }}"
     root_owner: "{{ secret_files_root_owner }}"

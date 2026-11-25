@@ -6,9 +6,10 @@ and is given that owner and mode when it has others.
 
 ``step: reconcile`` logs in as the ``bootstrap`` AppRole and makes the running server match the service list: for each service one policy that reads
 only its own path, one AppRole named for the service with a renewable token, one secret ID in a file that only the service reads (mode 0400, owned by
-the numeric user on its list line, or by root when the line has none) and, for a service that is also a PostgreSQL tool, its PostgreSQL password at its own
-path. A server that already matches needs no change and the step reports none. It reports every secret file with its owner, for the role's check. A
-service that left the list keeps its role and is reported as unlisted, never removed.
+the numeric user on its list line, or by root when the line has none), for a service that is also a PostgreSQL tool its PostgreSQL password at its own
+path and, for the one service named ``client_service``, the sign-in of the AIStor project user (its name and the password in a root-only file) at
+``secret/services/<service>/aistor``, which only that service's own role reads. A server that already matches needs no change and the step reports none. It
+reports every secret file with its owner, for the role's check. A service that left the list keeps its role and is reported as unlisted, never removed.
 
 It uses only the standard library and runs on the host's Python. No secret is a module argument, a command line, a log line or a message.
 """
@@ -21,7 +22,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -88,6 +89,19 @@ class State:
     roles: dict[str, dict[str, Any]]
     secret_id_valid: dict[str, bool]
     passwords: dict[str, str | None]
+    client: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class Client:
+    """The AIStor project user whose sign-in one service's path keeps. Neither value is in the text form of the object."""
+
+    service: str
+    user: str = field(repr=False)
+    password: str = field(repr=False)
+
+    def path(self) -> str:
+        return f"secret/data/services/{self.service}/aistor"
 
 
 @dataclass(frozen=True)
@@ -97,7 +111,15 @@ class Action:
     description: str
 
 
-def plan(services: list[str], tools: list[str], state: State, password_of: Callable[[str], str], token_ttl: int, token_max_ttl: int) -> list[Action]:
+def plan(
+    services: list[str],
+    tools: list[str],
+    state: State,
+    password_of: Callable[[str], str],
+    token_ttl: int,
+    token_max_ttl: int,
+    client: Client | None = None,
+) -> list[Action]:
     """The changes that make the server match the list, and none when it already does."""
     actions: list[Action] = []
     for service in services:
@@ -111,6 +133,8 @@ def plan(services: list[str], tools: list[str], state: State, password_of: Calla
             actions.append(Action("secret_id", service, f"issue a secret ID for {service}"))
         if service in tools and state.passwords.get(service) != password_of(service):
             actions.append(Action("password", service, f"write the PostgreSQL password of {service}"))
+        if client is not None and service == client.service and state.client != {"user": client.user, "password": client.password}:
+            actions.append(Action("client", service, f"write the AIStor project user's sign-in of {service}"))
     return actions
 
 
@@ -204,7 +228,7 @@ class Api:
         return str(token)
 
 
-def read_state(api: Api, token: str, services: list[str], tools: list[str], secrets_directory: Path) -> State:
+def read_state(api: Api, token: str, services: list[str], tools: list[str], secrets_directory: Path, client: Client | None = None) -> State:
     state = State(policies={}, roles={}, secret_id_valid={}, passwords={})
     for service in services:
         status, document = api.call("GET", f"sys/policies/acl/{policy_name(service)}", token)
@@ -230,10 +254,19 @@ def read_state(api: Api, token: str, services: list[str], tools: list[str], secr
                 state.passwords[service] = str(((document.get("data") or {}).get("data") or {}).get("password") or "")
             elif status != 404:
                 raise BootstrapError(f"GET secret/data/services/{service}/postgres: HTTP {status}")
+    if client is not None:
+        status, document = api.call("GET", client.path(), token)
+        if status == 200:
+            stored = (document.get("data") or {}).get("data") or {}
+            state.client = {"user": str(stored.get("user") or ""), "password": str(stored.get("password") or "")}
+        elif status != 404:
+            raise BootstrapError(f"GET {client.path()}: HTTP {status}")
     return state
 
 
-def apply(api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int], token_ttl: int, token_max_ttl: int) -> None:
+def apply(
+    api: Api, token: str, action: Action, secrets_directory: Path, owner: tuple[int, int], token_ttl: int, token_max_ttl: int, client: Client | None = None
+) -> None:
     service = action.service
     if action.kind == "policy":
         api.must("PUT", f"sys/policies/acl/{policy_name(service)}", token, {"policy": policy_text(service)})
@@ -244,6 +277,8 @@ def apply(api: Api, token: str, action: Action, secrets_directory: Path, owner: 
         if not issued:
             raise BootstrapError(f"OpenBao returned no secret ID for {service}")
         write_private_file(secret_file(secrets_directory, f"{service}.secret_id"), issued, replace=True, owner=owner)
+    elif action.kind == "client" and client is not None:
+        api.must("POST", client.path(), token, {"data": {"user": client.user, "password": client.password}})
     else:
         password = PasswordStore.in_secrets(secrets_directory).read(service)
         api.must("POST", f"secret/data/services/{service}/postgres", token, {"data": {"password": password}})
@@ -285,19 +320,24 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
     tools = parse_names(Path(params["tools_file"]).read_text(), "tool")
     if missing := [tool for tool in tools if tool not in services]:
         raise BootstrapError(f"PostgreSQL tool {missing[0]!r} has no entry in the service list, so its password would never reach OpenBao")
+    client = None
+    if params.get("client_service"):
+        if params["client_service"] not in services:
+            raise BootstrapError(f"AIStor client {params['client_service']!r} has no entry in the service list, so no policy would read its sign-in")
+        client = Client(params["client_service"], params["client_user"], read_file(Path(params["client_password_file"]), "AIStor project password file"))
     api = Api(params["address"])
     api.wait_ready(int(params["ready_deadline_seconds"]))
     token = api.login(ADMIN_ROLE, read_file(secret_file(secrets_directory, ADMIN_ID_FILE), "admin secret ID file"))
     ttl, max_ttl = int(params["token_ttl_seconds"]), int(params["token_max_ttl_seconds"])
-    state = read_state(api, token, services, tools, secrets_directory)
-    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl)
+    state = read_state(api, token, services, tools, secrets_directory, client)
+    actions = plan(services, tools, state, PasswordStore.in_secrets(secrets_directory).read, ttl, max_ttl, client)
     actions += access_actions(entries, secrets_directory, [action.service for action in actions if action.kind == "secret_id"], root_owner)
     if not check_only:
         for action in actions:
             if action.kind == "access":
                 set_access(secret_file(secrets_directory, f"{action.service}.secret_id"), owners[action.service])
             else:
-                apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl)
+                apply(api, token, action, secrets_directory, owners[action.service], ttl, max_ttl, client)
     files = [
         {"path": str(path), "owner": f"{owner[0]}:{owner[1]}"} for path, owner in secret_files(secrets_directory, entries, admin_owner, root_owner).items()
     ]
@@ -319,6 +359,9 @@ def main() -> None:
             "root_owner": {"type": "str", "default": "0:0"},
             "services_file": {"type": "path"},
             "tools_file": {"type": "path"},
+            "client_service": {"type": "str"},
+            "client_user": {"type": "str"},
+            "client_password_file": {"type": "path"},
             "address": {"type": "str"},
             "ready_deadline_seconds": {"type": "int", "default": 120},
             "token_ttl_seconds": {"type": "int", "default": 3600},
@@ -336,6 +379,8 @@ def main() -> None:
             module.exit_json(changed=created, created=[ADMIN_ID_FILE] if created else [], secret_files=files)
         if not all(params[key] for key in ("services_file", "tools_file", "address")):
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
+        if bool(params["client_service"]) != bool(params["client_user"]) or bool(params["client_service"]) != bool(params["client_password_file"]):
+            raise BootstrapError("client_service, client_user and client_password_file are given together or not at all")
         module.exit_json(**reconcile(params, check_only=module.check_mode))
     except (BootstrapError, SecretFileError) as error:
         module.fail_json(msg=str(error))
