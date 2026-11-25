@@ -728,6 +728,137 @@ class HostRunnerCase(unittest.TestCase):
         self.assertEqual(module.CLEANUP_ROUNDS, len(seen))
         self.assertFalse(confirmed)
 
+    def timed_out(self, module: ModuleType, listings: list[Any], removals: Any = None, known: set[str] | None = None) -> tuple[Calls, Any]:
+        """Run ``remove_timed_out`` with the listings of the Spark containers in this order (a list of IDs, or an exception for a listing that times out; the
+        last one repeats) and give the calls and the error that it raised (None when it confirmed that none is left)."""
+        position = {"at": 0}
+
+        def answer(args: list[str]) -> Any:
+            if args[:1] == ["ps"] and "--filter" in args:
+                reply = listings[min(position["at"], len(listings) - 1)]
+                position["at"] += 1
+                return reply if isinstance(reply, BaseException) else "".join(f"{item}\n" for item in reply)
+            return ""
+
+        calls = Calls(answer, lambda args: removals(args) if removals and args[:1] == ["rm"] else 0)
+        error = None
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module):
+            stack = self.stack(module, folder)
+            stack.known_containers = set(known or ())
+            try:
+                stack.remove_timed_out()
+            except RuntimeError as caught:
+                error = caught
+        return calls, error
+
+    def removed_ids(self, calls: Calls) -> list[list[str]]:
+        return [args[2:] for _, args, _ in calls.items if args[:2] == ["rm", "-f"]]
+
+    def test_a_container_that_a_live_listing_returns_after_an_earlier_listing_timed_out_is_removed_and_the_removal_is_confirmed(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls, error = self.timed_out(module, [TimeoutExpired("docker", 1), ["c1"], []])
+        self.assertIsNone(error)
+        self.assertEqual([["c1"]], self.removed_ids(calls))
+
+    def test_a_container_that_a_live_listing_returns_is_removed_whatever_listing_it_comes_after(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        for before in ([OSError("docker")], [TimeoutExpired("docker", 1), TimeoutExpired("docker", 1)]):
+            with self.subTest(failed=len(before)):
+                calls, error = self.timed_out(module, [*before, ["c1", "c2"], []])
+                self.assertIsNone(error)
+                self.assertEqual([["c1", "c2"]], self.removed_ids(calls))
+
+    def test_a_container_that_is_listed_and_whose_removal_fails_is_removed_again_when_the_listings_fail_afterwards_and_the_run_fails(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls, error = self.timed_out(module, [["c1"], TimeoutExpired("docker", 1)], removals=lambda _: 1)
+        self.assertIsNotNone(error)
+        removed = self.removed_ids(calls)
+        self.assertGreater(len(removed), 1)
+        self.assertTrue(all(ids == ["c1"] for ids in removed))
+
+    def test_when_every_listing_fails_the_containers_that_an_earlier_listing_returned_are_still_removed_and_the_run_fails(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls, error = self.timed_out(module, [TimeoutExpired("docker", 1)], known={"c9", "c7"})
+        self.assertIsNotNone(error)
+        self.assertEqual(["c7", "c9"], self.removed_ids(calls)[0])
+        self.assertLessEqual(len(self.removed_ids(calls)), module.CLEANUP_ROUNDS)
+
+    def test_a_removal_that_works_with_no_listing_afterwards_is_not_a_confirmation(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls, error = self.timed_out(module, [["c1"], TimeoutExpired("docker", 1)])
+        self.assertIsNotNone(error)
+        self.assertEqual(["c1"], self.removed_ids(calls)[0])
+
+    def test_a_listing_that_fails_with_no_container_known_removes_nothing_and_fails_the_run(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls, error = self.timed_out(module, [TimeoutExpired("docker", 1)])
+        self.assertIsNotNone(error)
+        self.assertEqual([], self.removed_ids(calls))
+
+    def test_containers_that_keep_coming_back_after_a_timeout_are_each_removed_and_the_steps_stay_bounded_and_the_run_fails(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        counter = iter(range(100))
+
+        def fresh() -> list[str]:
+            return [f"c{next(counter)}"]
+
+        calls, error = self.timed_out(module, [fresh() for _ in range(20)])
+        self.assertIsNotNone(error)
+        self.assertEqual(module.CLEANUP_ROUNDS, len(self.removed_ids(calls)))
+        self.assertLessEqual(sum(1 for line in calls.words() if line.startswith("ps ")), module.CLEANUP_ROUNDS + 1)
+
+    def test_an_empty_listing_after_a_timeout_confirms_with_no_removal(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls, error = self.timed_out(module, [[]])
+        self.assertIsNone(error)
+        self.assertEqual([], self.removed_ids(calls))
+
+    def test_a_job_that_times_out_removes_a_container_that_only_a_later_listing_returns_and_fails_with_the_step_and_not_with_a_container_left(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        listings = iter([TimeoutExpired("docker", 1), "c1\n", ""])
+
+        def answer(args: list[str]) -> Any:
+            if "--entrypoint" in args:
+                return TimeoutExpired("docker", 1)
+            return next(listings) if args[:1] == ["ps"] and "--filter" in args else ""
+
+        calls = Calls(answer)
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module), self.assertRaises(RuntimeError) as caught:
+            self.stack(module, folder).job(["-m", "spark.jobs.x", "build"])
+        self.assertIn("did not finish within", str(caught.exception))
+        self.assertEqual([["c1"]], self.removed_ids(calls))
+
+    def test_known_containers_are_removed_when_the_listings_of_the_project_keep_failing(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls = Calls(lambda args: TimeoutExpired("docker", 1) if args[:2] == ["ps", "-aq"] else "")
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module):
+            stack = self.stack(module, folder)
+            stack.known_containers = {"c1"}
+            confirmed = module.remove_project(stack, [])
+        self.assertFalse(confirmed)
+        self.assertIn("rm -f --volumes c1", calls.words())
+        self.assertFalse(any(line.startswith(("volume rm", "network rm")) for line in calls.words()))
+
+    def test_a_container_that_a_listing_of_the_run_returned_is_kept_for_the_removal(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        calls = Calls(lambda args: "c1\nc2\n" if args[:1] == ["ps"] and "--filter" in args else "")
+        with tempfile.TemporaryDirectory(prefix="host_runner_") as folder, calls.patches(module):
+            stack = self.stack(module, folder)
+            self.assertEqual(["c1", "c2"], stack.spark_containers())
+            self.assertEqual({"c1", "c2"}, stack.known_containers)
+            self.assertEqual(["c1", "c2"], stack.spark_containers(cleaning=True))
+
+    def test_the_record_says_that_nessie_and_its_references_are_gone_only_when_the_removal_of_the_project_is_confirmed(self) -> None:
+        module = self.module(**{self.flag: "1"})
+        claim = "every reference in it went with"
+        for confirmed in (True, False):
+            with self.subTest(confirmed=confirmed):
+                record, _, lines = self.cleaned(module, created=False, remove=lambda *_, confirmed=confirmed: confirmed)
+                self.assertEqual(confirmed, any(claim in line for line in lines))
+                self.assertEqual(confirmed, self.passed(record, "compose project removed"))
+                if not confirmed:
+                    self.assertTrue(any("may still hold" in line for line in lines))
+
     def cleaned(
         self, module: ModuleType, *, created: bool, answer: Any = None, code: Any = None, remove: Any = None, scratch_gone: bool = True
     ) -> tuple[Any, Calls, list[str]]:
@@ -981,6 +1112,21 @@ class HostRunnerCase(unittest.TestCase):
         self.assertIn("SPARK_IMAGE_ID", header)
         self.assertIn("/opt/jobs", header)
         self.assertIn("Boolean", header)
+
+    def test_the_two_accepted_limits_of_the_host_mode_are_in_the_header_and_in_the_limits_of_the_host_record(self) -> None:
+        text = (E2E / f"{self.NAME}.py").read_text()
+        header = " ".join(text[: text.index("from __future__")].split())
+        limits = (
+            "a call to Nessie can finish up to about one socket timeout after the run deadline",
+            "a very slow read of an environment file can let Spark start with a memory cap that was computed before the read",
+        )
+        host_branch = text[text.index("record.limits = [") :]
+        for limit in limits:
+            with self.subTest(limit=limit):
+                self.assertIn(limit, header)
+                self.assertEqual(1, host_branch.count(f'record.limits.append("{limit}")'))
+                self.assertLess(host_branch.index("if HOST:"), host_branch.index(limit))
+                self.assertLess(host_branch.index(limit), host_branch.index("else:"))
 
     def test_a_tag_that_could_not_be_made_from_the_verified_id_is_not_counted_as_created_by_a_success(self) -> None:
         module = self.module(**{self.flag: "1"})
