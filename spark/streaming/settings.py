@@ -8,8 +8,11 @@ test can stop the job after its first sink commit. It is off unless set.
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 
 from replay.events.formats import FEATURE_READY_TOPIC, INPUT_TOPIC
 from spark.streaming.model import MINUTE, SECOND
@@ -18,6 +21,8 @@ DEFAULT_LATE_LIMIT_SECONDS = 30.0
 DEFAULT_TRIGGER_SECONDS = 2.0
 DEFAULT_MAX_OFFSETS = 50_000
 DEFAULT_BRANCH = "stream"
+MAXIMUM_SECONDS = 31_536_000.0
+MAXIMUM_OFFSETS = 2_147_483_647.0
 
 
 class StreamSettingsError(ValueError):
@@ -48,7 +53,9 @@ def required(env: Mapping[str, str], name: str) -> str:
     return value
 
 
-def number(env: Mapping[str, str], name: str, default: float, *, minimum: float, allow_zero: bool = False) -> float:
+def number(env: Mapping[str, str], name: str, default: float, *, minimum: float, allow_zero: bool = False, maximum: float = MAXIMUM_SECONDS) -> float:
+    """The number in ``name``, or ``default`` when it is not set: finite, at least ``minimum`` (more than zero unless ``allow_zero``) and at most ``maximum``
+    (a year in seconds unless given). Any other value is a ``StreamSettingsError`` that names the variable and not the value."""
     text = env.get(name, "")
     if not text:
         return default
@@ -56,18 +63,42 @@ def number(env: Mapping[str, str], name: str, default: float, *, minimum: float,
         value = float(text)
     except ValueError:
         raise StreamSettingsError(f"{name} is not a number") from None
-    if value < minimum or (value == 0 and not allow_zero):
+    if not math.isfinite(value) or value < minimum or (value == 0 and not allow_zero):
         raise StreamSettingsError(f"{name} must be {'zero or more' if allow_zero else 'more than zero'}")
+    if value > maximum:
+        raise StreamSettingsError(f"{name} must be at most {maximum:g}")
     return value
+
+
+PLAIN_DECIMAL = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+WHOLE_NUMBER = re.compile(r"[0-9]+")
+
+
+def offset_count(env: Mapping[str, str], name: str, default: int) -> int:
+    """The number of offsets per trigger: a whole number from 1 to ``MAXIMUM_OFFSETS``. The text is read exactly as a decimal, so a fraction that a float
+    would round to a whole number (``1.0000000000000001``) is refused, and no fraction is ever cut to a whole number. Only plain ASCII digits with an optional
+    fraction are read: no sign, exponent, underscore or space, which ``Decimal`` would accept (``1e_9``, ``1_000``, `` 5``)."""
+    text = env.get(name, "")
+    if not text:
+        return default
+    if PLAIN_DECIMAL.fullmatch(text) is None:
+        raise StreamSettingsError(f"{name} must be a whole number from 1")
+    value = Decimal(text)
+    if not (value == value.to_integral_value() and 1 <= value <= MAXIMUM_OFFSETS):
+        raise StreamSettingsError(f"{name} must be a whole number from 1")
+    return int(value)
 
 
 def from_environment(env: Mapping[str, str]) -> StreamSettings:
     test_exit: int | None = None
     if env.get("STREAM_TEST_EXIT_AFTER_SINK", ""):
         text = env["STREAM_TEST_EXIT_AFTER_SINK"]
-        if not text.isdigit() or int(text) < 1:
+        if WHOLE_NUMBER.fullmatch(text) is None or int(text) < 1:
             raise StreamSettingsError("STREAM_TEST_EXIT_AFTER_SINK must be a whole number from 1")
         test_exit = int(text)
+    cutoff_step_us = round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND)
+    if cutoff_step_us < 1:
+        raise StreamSettingsError("STREAM_CUTOFF_STEP_SECONDS must be at least one microsecond")
     return StreamSettings(
         bootstrap=required(env, "KAFKA_BOOTSTRAP"),
         registry_url=required(env, "REGISTRY_URL"),
@@ -76,9 +107,9 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
         output_topic=env.get("STREAM_OUTPUT_TOPIC", "") or FEATURE_READY_TOPIC,
         branch=env.get("STREAM_BRANCH", "") or DEFAULT_BRANCH,
         late_limit_us=round(number(env, "STREAM_LATE_LIMIT_SECONDS", DEFAULT_LATE_LIMIT_SECONDS, minimum=0, allow_zero=True) * SECOND),
-        cutoff_step_us=round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND),
+        cutoff_step_us=cutoff_step_us,
         trigger_seconds=number(env, "STREAM_TRIGGER_SECONDS", DEFAULT_TRIGGER_SECONDS, minimum=0),
-        max_offsets_per_trigger=int(number(env, "STREAM_MAX_OFFSETS_PER_TRIGGER", DEFAULT_MAX_OFFSETS, minimum=0)),
+        max_offsets_per_trigger=offset_count(env, "STREAM_MAX_OFFSETS_PER_TRIGGER", DEFAULT_MAX_OFFSETS),
         max_seconds=number(env, "STREAM_MAX_SECONDS", 0.0, minimum=0, allow_zero=True),
         clinical_file=env.get("STREAM_CLINICAL_FILE", ""),
         test_exit_after_sink=test_exit,

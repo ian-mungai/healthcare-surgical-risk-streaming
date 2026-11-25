@@ -32,6 +32,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.folder import raise_error
 from scripts.process import TimeoutExpired, run_command
 from scripts.quality import repo_checks
 
@@ -188,7 +189,7 @@ def python_files(changed: list[str]) -> list[str]:
 
 def mypy_folders(root: Path) -> tuple[str, ...]:
     """The folders and files that the project's MyPy configuration checks."""
-    configuration = tomllib.loads((root / "pyproject.toml").read_text()) if (root / "pyproject.toml").is_file() else {}
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8")) if (root / "pyproject.toml").is_file() else {}
     return tuple(configuration.get("tool", {}).get("mypy", {}).get("files", ()))
 
 
@@ -207,7 +208,7 @@ def module_name(file: str) -> str:
 def repository_python_files(root: Path) -> dict[str, str]:
     """Each dotted module name of the repository's Python files with its file. Tool folders, run folders and the worktrees inside the repository are skipped."""
     names: dict[str, str] = {}
-    for folder, subfolders, files in os.walk(root):
+    for folder, subfolders, files in os.walk(root, onerror=raise_error):
         subfolders[:] = sorted(name for name in subfolders if name not in SKIPPED_FOLDERS and not name.startswith(".worktrees"))
         for file in sorted(files):
             if file.endswith(".py"):
@@ -242,7 +243,7 @@ def import_graph(root: Path) -> dict[str, set[str]]:
     direct: dict[str, set[str]] = {}
     for name, file in files.items():
         try:
-            direct[name] = imported_modules((root / file).read_text(), name, files)
+            direct[name] = imported_modules((root / file).read_text(encoding="utf-8"), name, files)
         except SyntaxError, UnicodeDecodeError:
             direct[name] = set()
     graph: dict[str, set[str]] = {}
@@ -271,7 +272,7 @@ def select_tests(root: Path, changed: list[str]) -> list[str]:
     """The quick test modules (dotted names) that cover the changed files: a changed test module, a module that imports a changed file through any depth
     of imports and a module whose text names a changed path, file name or module."""
     graph = import_graph(root)
-    texts = {name: (root / f"{name.replace('.', '/')}.py").read_text() for name in graph}
+    texts = {name: (root / f"{name.replace('.', '/')}.py").read_text(encoding="utf-8") for name in graph}
     selected = set()
     for name, reached in graph.items():
         own = f"{name.replace('.', '/')}.py"
@@ -427,5 +428,20 @@ def main(stdin: str, *, by_hook: bool = False) -> int:
     return 0
 
 
+UNREADABLE = (
+    "push gate stopped by the file system: a file or folder of the repository could not be read, so the checks that apply are unknown: "
+    "fix its access, then push again"
+)
+
+
+def command(stdin: str, *, by_hook: bool = False) -> int:
+    """Run the gate for the command line and turn a file system error into one fixed line: the error text names the path of an unreadable folder."""
+    try:
+        return main(stdin, by_hook=by_hook)
+    except OSError:
+        sys.stderr.write(f"{UNREADABLE}\n")
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else main("" if sys.stdin.isatty() else sys.stdin.read(), by_hook=len(sys.argv) > 1))
+    sys.exit(scan_all_dependencies() if sys.argv[1:] == ["--all-locks"] else command("" if sys.stdin.isatty() else sys.stdin.read(), by_hook=len(sys.argv) > 1))

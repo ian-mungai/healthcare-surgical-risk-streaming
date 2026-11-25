@@ -249,6 +249,38 @@ run "host_joins_tailscale_without_a_stored_key" {
   }
 }
 
+run "the_permanent_deploy_role_keeps_its_name" {
+  command = plan
+
+  assert {
+    condition     = local.deploy_role_name == "example_project_deploy_dev"
+    error_message = "Without a test run ID the deploy role is the permanent role of the environment."
+  }
+}
+
+run "a_test_run_names_its_own_deploy_role_apart_from_the_permanent_one" {
+  command = plan
+
+  variables {
+    test_run_id = "01010000abcdef"
+  }
+
+  assert {
+    condition     = local.deploy_role_name == "example_project_deploy_t01010000abcdef" && local.deploy_role_name != "example_project_deploy_dev"
+    error_message = "A short-lived test run gets a deploy role named from its run ID, so an apply never meets the permanent role."
+  }
+}
+
+run "a_test_run_id_that_is_not_lower_case_hex_is_refused" {
+  command = plan
+
+  variables {
+    test_run_id = "../x"
+  }
+
+  expect_failures = [var.test_run_id]
+}
+
 run "deploy_role_trusts_only_the_protected_workflow" {
   command = plan
 

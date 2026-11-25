@@ -123,7 +123,9 @@ class Subject(StrEnum):
     JOB_RECORD = "the job record"
     JOB_LOG = "the job log"
     STAGING_SAMPLES = "the staging samples"
-    STAGING_PEAK = "the staging peak record"
+    RUN_RECORD = "the run record"
+    OUTPUT = "an output file"
+    ROUTES_FILE = "the routes file"
     SAMPLE_PIN = "the Platform sample pin"
 
 
@@ -157,6 +159,11 @@ class Code(StrEnum):
     USAGE = "the command line is not valid; run it with --help for its commands and options"
     CANNOT_READ = "cannot read {subject}"
     CANNOT_WRITE = "cannot write {subject}"
+    OUTPUT_EXISTS = "an output path is already held, as a file, a link, a folder or a name that differs only in case; name a new file for the output"
+    OUTPUT_FOLDER = "the folder of an output path does not exist, or the output could not be created there; this command makes no folder"
+    OUTPUT_IN_STORE = "an output path lies inside the object store folder of the run; name a path outside it"
+    OWNED_REFUSED = "a state file lies outside its state folder, or the entry in its place is a link, a folder or another kind of entry; nothing was written"
+    RUN_STATE_FOLDER = "the run's state folder is not the service's state folder or a folder directly inside it; the run was refused and nothing was written"
     CONFIGURATION_INVALID = "the configuration in .env is missing or holds a value that is not valid; .env.example lists every key"
     AWS_FAILED = "an AWS call failed; its full error text is kept in an owner-only file under runs/raw_errors"
     AWS_FAILED_NOT_KEPT = "an AWS call failed; its full error text could not be kept"
@@ -393,3 +400,19 @@ class ClosedError(Exception):
 
     def __str__(self) -> str:
         return "; ".join(render(notice) for notice in self.notices)
+
+
+class FixedTextError(Exception):
+    """An exception whose whole text is fixed advice that its raising module builds from constants and the configured project names, never from a value of
+    the command line, a path, an input or a reply. ``describe_error`` shows its text. A class is marked only where the text is operator advice that a command
+    must show (a retry that could create a second access key is one). ``tests/fast/test_error_formatter.py`` lists every marked class, so a new one shows
+    in review."""
+
+
+def describe_error(error: BaseException) -> str:
+    """The one text that a command shows for a caught exception: the fixed notices of a ``ClosedError``, the fixed advice of a ``FixedTextError`` and, for any
+    other exception, the name of its type.
+
+    The text of any other exception can hold a path, a value of an input or a reply of a service, so it is never shown.
+    """
+    return str(error) if isinstance(error, (ClosedError, FixedTextError)) else type(error).__name__

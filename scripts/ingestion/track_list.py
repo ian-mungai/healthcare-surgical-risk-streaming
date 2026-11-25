@@ -10,7 +10,6 @@ header is not a row. A field with a tab or a line break is refused, because the 
 
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import json
@@ -19,6 +18,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.sample.candidates import RELEASE_FILE, release_problems
 from scripts.sample.publisher import TRACK_LIST_COLUMNS
 
@@ -61,7 +62,7 @@ def rows_digest(rows: Iterable[Sequence[str]]) -> tuple[int, str]:
 def pinned_track_list() -> PinnedTrackList:
     """The pinned address, row count and digest of the tracked release pin. Raise ``TrackListPinError`` when the pin is not valid."""
     try:
-        release = json.loads(RELEASE_FILE.read_text())
+        release = json.loads(RELEASE_FILE.read_text(encoding="utf-8"))
     except OSError, ValueError:
         raise TrackListPinError("the tracked release pin cannot be read") from None
     if release_problems(release):
@@ -98,7 +99,7 @@ def file_problems(path: Path, pin: PinnedTrackList) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog=PROGRAM, description="Check a track list file against the pinned row count and digest.")
+    parser = QuietParser(prog=PROGRAM, description="Check a track list file against the pinned row count and digest.")
     commands = parser.add_subparsers(dest="command", required=True)
     checker = commands.add_parser("check")
     checker.add_argument("--file", type=Path, required=True)
@@ -106,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         problems = file_problems(arguments.file, pinned_track_list())
     except TrackListPinError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     for problem in problems:
         sys.stderr.write(f"{problem}\n")

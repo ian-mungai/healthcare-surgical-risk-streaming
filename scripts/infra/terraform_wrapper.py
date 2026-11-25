@@ -19,7 +19,6 @@ A change of a root output counts as a change of the plan. ``plan --destroy`` sav
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -32,7 +31,9 @@ from pathlib import Path
 from typing import Any
 
 from scripts.infra.created import created_entries, merge_created
-from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem
+from scripts.infra.state_bootstrap import DEFAULT_BINDING, RunBinding, bucket_problem, run_suffix
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import ROOT, ConfigurationError, load_configuration
 from scripts.stack.heavy_inputs import heavy_inputs_text
@@ -102,7 +103,10 @@ def backend_override(run: RunBinding) -> str | None:
 
 def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, str]:
     """The Terraform variables that come from the run and not from the environment's variable file."""
-    return {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    values = {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    if run.bucket_mode == "short_lived":
+        values["test_run_id"] = run_suffix(run.run_id)
+    return values
 
 
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:
@@ -407,7 +411,7 @@ def record_created(run: RunBinding, applied_plan: dict[str, Any]) -> None:
 
 def main() -> int:
     """Save a plan or apply the reviewed plan and return a non-zero code on a refusal or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["plan", "apply"])
     parser.add_argument("--destroy", action="store_true", help="plan: save a destroy plan")
     parser.add_argument("--confirm", default="", help="apply: the confirmation code that plan printed")
@@ -421,7 +425,7 @@ def main() -> int:
             return 0
         return apply_plan(run, arguments.confirm, configuration)
     except (ConfigurationError, WrapperError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

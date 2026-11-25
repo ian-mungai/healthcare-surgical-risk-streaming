@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from scripts.infra.state_bootstrap import RunBinding
+from scripts.ingestion.output_file import write_new_file
 from scripts.process import run_command
 from scripts.project_config import ROOT
 
@@ -33,8 +34,8 @@ def signature_is_valid(receipt: bytes | None, signature: bytes | None, signers: 
     with tempfile.TemporaryDirectory(prefix="receipt_") as scratch:
         signature_file = Path(scratch) / "receipt.sig"
         signers_file = Path(scratch) / "allowed_signers"
-        signature_file.write_bytes(signature)
-        signers_file.write_text(signers)
+        write_new_file(signature_file, signature)
+        write_new_file(signers_file, signers)
         arguments = ["-Y", "verify", "-f", str(signers_file), "-I", SIGNER, "-n", NAMESPACE, "-s", str(signature_file)]
         return run_command("ssh-keygen", arguments, input_text=receipt.decode(errors="replace"), timeout=SIGNATURE_TIMEOUT_SECONDS).returncode == 0
 

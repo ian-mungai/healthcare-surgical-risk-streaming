@@ -17,7 +17,6 @@ Every wait has a deadline and fails with a message that names what did not happe
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -34,6 +33,9 @@ from scripts.infra import state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
 from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
@@ -161,8 +163,8 @@ def tailscale_status(timeout: float) -> dict[str, Any]:
     program = "tailscale" if shutil.which("tailscale") else TAILSCALE_APP
     try:
         result = run_command(program, ["status", "--json"], timeout=min(timeout, SSH_ATTEMPT_SECONDS))
-    except FileNotFoundError as error:
-        raise HostError(f"the Tailscale client is not installed on this computer: {error}") from None
+    except FileNotFoundError:
+        raise HostError("the Tailscale client is not installed on this computer") from None
     except TimeoutExpired:
         raise NoPeerError(timeout_text("tailscale status", min(timeout, SSH_ATTEMPT_SECONDS))) from None
     if result.returncode != 0:
@@ -182,9 +184,10 @@ def tailscale_device_id(host_name: str) -> str:
 
 def record_tailscale_device(run_id: str, host_name: str, device_id: str) -> Path:
     """Write the host's current Tailscale device to the run folder, over any earlier record: a host that left the network and rejoined has a new device."""
-    target = ROOT / "runs" / run_id / DEVICE_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n")
+    folder = ROOT / "runs" / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / DEVICE_FILE
+    replace_owned_file(target, json.dumps({"host_name": host_name, "device_id": device_id}, indent=2) + "\n", state_root=folder, mode=0o644)
     return target
 
 
@@ -256,7 +259,7 @@ def keep_host_keys_of(run_id: str, instance: str) -> None:
         return
     (folder / "known_hosts").unlink(missing_ok=True)
     folder.mkdir(parents=True, exist_ok=True)
-    owner.write_text(f"{instance}\n")
+    replace_owned_file(owner, f"{instance}\n", state_root=folder, mode=0o644)
 
 
 def ssh_output(run_id: str, address: str, command: str, timeout: float) -> str | None:
@@ -555,7 +558,7 @@ def host_check(host_name: str, instance: str) -> int:
 
 def main() -> int:
     """Run one host command and return a non-zero code on a refusal, an expired deadline or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["up", "stop", "start", "check"])
     parser.add_argument("--host-name", default="", help="check: the host's Tailscale name, for example platform-dev")
     parser.add_argument("--instance-id", default="", help="check: the EC2 instance ID that the host must answer with")
@@ -575,7 +578,7 @@ def main() -> int:
             return host_up(aws, configuration, arguments.binding, arguments.confirm)
         return (host_stop if arguments.command == "stop" else host_start)(aws, configuration, arguments.binding)
     except (ConfigurationError, WrapperError, HostError, AwsError, WarehouseError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

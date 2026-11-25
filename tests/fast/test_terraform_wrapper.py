@@ -23,7 +23,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.infra import teardown, terraform_wrapper
-from scripts.infra.state_bootstrap import RunBinding
+from scripts.infra.state_bootstrap import RunBinding, bucket_problem
 from scripts.infra.terraform_wrapper import (
     HEAVY_INPUT_NAMES,
     WrapperError,
@@ -95,6 +95,13 @@ class PlanBindingTest(unittest.TestCase):
             {"data_bucket_name": "example-project", "aws_profile": "example_project_dev", "provision_host": "true"},
             run_variables(RUN, {"AWS_PROFILE": "example_project_dev"}),
         )
+
+    def test_a_short_lived_test_run_is_given_its_own_run_suffix_for_its_deploy_role_and_a_permanent_run_is_not(self) -> None:
+        test_run = RunBinding(**{**RUN.__dict__, "bucket_mode": "short_lived"})
+        values = run_variables(test_run, {"AWS_PROFILE": "example_project_dev"})
+        self.assertEqual("01010000abcdef", values["test_run_id"])
+        self.assertNotIn("test_run_id", run_variables(RUN, {"AWS_PROFILE": "example_project_dev"}))
+        self.assertNotIn("test_run_id", run_variables(LOCAL, {"AWS_PROFILE": "example_project_dev"}))
 
     def test_plan_saved_for_the_s3_backend_is_refused_under_the_local_backend(self) -> None:
         self.assertEqual(
@@ -374,6 +381,42 @@ class StaleInputsTest(unittest.TestCase):
         (self.root / "compose" / "limits.yml").write_text(LIMITS.replace("memory_limit_mib: 4096", "memory_limit_mib: 1"))
         self.assertIsNone(stale_inputs_problem(plan_with(HEAVY_INPUTS | {"spark_limit_mib": 1})))
         self.assertIsNotNone(stale_inputs_problem(plan_with(HEAVY_INPUTS | {"spark_limit_mib": True})))
+
+
+class OtherStateLocationTest(unittest.TestCase):
+    """The apply refusal for a plan saved for another state location, offline and with the wrapper's own checks of the binding. A binding that differs in its
+    workspace is a valid binding (its bucket and keys are the run's), so the apply reaches the location check; a binding that differs in its bucket is refused
+    earlier, by the bucket check, and never reaches it. The live test of the saved plan uses the first form."""
+
+    CONFIGURATION = {"S3_BUCKET": "example-project", "ENVIRONMENT": "dev", "AWS_PROFILE": "example_project_dev"}
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(terraform_wrapper, "ROOT", self.root))
+        folder = self.root / "runs" / RUN.run_id / "plans"
+        folder.mkdir(parents=True)
+        (folder / "apply.tfplan").write_bytes(PLAN)
+        (folder / "apply_binding.json").write_text(json.dumps(plan_binding(RUN, PLAN, "apply")))
+        self.terraform = self.enterContext(mock.patch.object(terraform_wrapper, "terraform", side_effect=AssertionError("Terraform must not run")))
+
+    def test_a_binding_with_another_workspace_passes_the_bucket_check_and_the_apply_is_refused_for_the_state_location_alone(self) -> None:
+        moved = RunBinding(**{**RUN.__dict__, "workspace": "other_workspace"})
+        self.assertIsNone(bucket_problem(moved, self.CONFIGURATION))
+        with self.assertRaises(WrapperError) as caught:
+            apply_plan(moved, CODE, self.CONFIGURATION)
+        self.assertEqual("refused before any change: the plan was saved for a different state location than this run's", str(caught.exception))
+        self.terraform.assert_not_called()
+
+    def test_a_binding_with_another_bucket_is_refused_by_the_bucket_check_and_never_reaches_the_location_check(self) -> None:
+        moved = RunBinding(**{**RUN.__dict__, "bucket": RUN.bucket + "x"})
+        with self.assertRaises(WrapperError) as caught:
+            apply_plan(moved, CODE, self.CONFIGURATION)
+        self.assertNotIn("different state location", str(caught.exception))
+        self.assertIn("the binding's permanent bucket is not the bucket named by S3_BUCKET", str(caught.exception))
+        self.terraform.assert_not_called()
+
+    def test_the_run_of_the_plan_with_the_right_workspace_is_not_refused_for_its_location(self) -> None:
+        self.assertEqual([], binding_problems(RUN, plan_binding(RUN, PLAN, "apply"), PLAN, CODE, "apply"))
 
 
 class ConfirmedPlanTest(unittest.TestCase):

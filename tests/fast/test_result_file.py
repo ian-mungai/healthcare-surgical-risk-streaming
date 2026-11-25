@@ -6,11 +6,16 @@ Failure modes covered here:
   command line, and nothing else reaches the caller.
 - A path that is not absolute, a path with a NUL, a folder that is missing, a file or a part file that exists, or a second ``--result`` is taken, so that a
   file is replaced or a caller reads another one.
-- A file that appears at the path while the job runs is replaced by the rename, so a result that a caller already holds is overwritten.
-- A reader sees half a file: the document is written whole to ``<path>.part`` and renamed into place, and a failure leaves no part file.
+- A file that appears at the path while the job runs is replaced, so a result that a caller already holds is overwritten. The document is put in place with
+  ``publish_reserved`` (a hard link, which fails when the path exists), so nothing is replaced even by a late writer.
+- A reader sees half a file: the document is written whole into the reserved part file and linked into place. A write or link that fails leaves no result
+  file, and no part file when the part name can be removed. A part name that cannot be removed leaves the part file after a failed link as well as both
+  names after the link (the result is whole). A removal that fails once and works at the end of the call leaves no part file, and the call still ends as
+  ``internal_error``, exit 70.
 - A path that passes the preflight but cannot hold its part file (a name of 255 bytes: ``<name>.part`` is too long) fails only after the job ran. The part
   file is reserved (created exclusively) before any work, and a reservation that fails is a bad call: ``usage``, exit 2, and nothing runs.
-- A job that the watchdog stops leaves its reserved part file for a reader to take for a result.
+- A job that the watchdog stops leaves its reserved part file, or a second staging file that holds the whole result, for a reader to take for a result. The
+  reserved part file is the only staging file (``test_result_watchdog.py`` stops a real process right before the link).
 - The file is not readable by the caller or is executable.
 - An ending that the job maps to a code writes no file, or a failure writes the text of its error, a count or an argument into the file or a stream.
 """
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
@@ -27,9 +33,11 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from unittest import mock
 
+from scripts.ingestion.closed import ClosedInputError, QuietParser
+from scripts.ingestion.output_file import write_new_file
 from scripts.stack.nessie import NessieError
 from spark import result_file
 from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, release_reserved, reserve, result_path, run_sealed, write_reserved
@@ -40,7 +48,8 @@ DOCUMENT = {"job": "j", "passed": True, "diagnostics": []}
 
 class Parsing(unittest.TestCase):
     def parser(self) -> argparse.ArgumentParser:
-        command = argparse.ArgumentParser(exit_on_error=False)
+        command = QuietParser()
+        command.error = lambda message: (_ for _ in ()).throw(argparse.ArgumentError(None, message))  # type: ignore[method-assign]
         add_result_option(command)
         return command
 
@@ -58,7 +67,7 @@ class Parsing(unittest.TestCase):
         class Error(Exception):
             pass
 
-        command = argparse.ArgumentParser()
+        command = QuietParser()
         command.error = lambda message: (_ for _ in ()).throw(Error(message))  # type: ignore[method-assign]
         command.add_argument("--result", type=result_path, action=Once, required=True)
         with self.assertRaises(Error):
@@ -75,13 +84,11 @@ class Writing(unittest.TestCase):
         release_reserved()
 
     def written(self, document: dict[str, Any] = DOCUMENT) -> None:
-        descriptor = reserve(self.path)
-        self.assertIsNotNone(descriptor)
-        write_reserved(cast("int", descriptor), self.path, document)
+        self.assertIsNotNone(reserve(self.path))
+        write_reserved(self.path, document)
 
     def test_a_path_is_reserved_only_when_its_folder_is_there_and_neither_it_nor_its_part_file_is(self) -> None:
-        descriptor = reserve(self.path)
-        self.assertIsNotNone(descriptor)
+        self.assertEqual(f"{self.path}.part", reserve(self.path))
         self.assertEqual(["result.json.part"], os.listdir(self.folder))
         self.assertIsNone(reserve(self.path))
         release_reserved()
@@ -115,45 +122,51 @@ class Writing(unittest.TestCase):
         self.assertEqual(0o644, FILE_MODE)
         self.assertEqual(["result.json"], os.listdir(self.folder))
 
-    def test_the_file_appears_whole_in_one_rename_from_the_part_file(self) -> None:
+    def test_the_file_appears_whole_in_one_link_from_the_reserved_part_file_and_never_over_another(self) -> None:
         seen: dict[str, object] = {}
-        real = os.rename
+        real = os.link
+        self.assertIsNotNone(reserve(self.path))
 
-        def rename(source: str, target: str) -> None:
+        def link(source: str, target: str) -> None:
             seen["target_before"] = os.path.lexists(target)
             seen["whole"] = json.loads(Path(source).read_text())
             seen["names"] = (os.path.basename(source), os.path.basename(target))
+            seen["folder"] = os.listdir(self.folder)
             real(source, target)
 
-        with mock.patch("os.rename", rename):
-            self.written()
+        with mock.patch("os.link", link):
+            write_reserved(self.path, DOCUMENT)
         self.assertEqual((False, DOCUMENT, ("result.json.part", "result.json")), (seen["target_before"], seen["whole"], seen["names"]))
+        self.assertEqual(["result.json.part"], seen["folder"])
+        self.assertEqual(["result.json"], os.listdir(self.folder))
 
-    def test_the_document_is_flushed_to_disk_before_the_rename(self) -> None:
+    def test_the_document_is_flushed_to_disk_before_the_file_is_put_in_place(self) -> None:
         order: list[str] = []
-        real_fsync, real_rename = os.fsync, os.rename
+        real_fsync, real_link = os.fsync, os.link
+        self.assertIsNotNone(reserve(self.path))
 
         def fsync(descriptor: int) -> None:
             order.append("fsync")
             real_fsync(descriptor)
 
-        def rename(source: str, target: str) -> None:
-            order.append("rename")
-            real_rename(source, target)
+        def link(source: str, target: str) -> None:
+            order.append("link")
+            real_link(source, target)
 
         with (
             mock.patch("os.fsync", fsync),
-            mock.patch("os.rename", rename),
+            mock.patch("os.link", link),
         ):
-            self.written()
-        self.assertEqual(["fsync", "rename"], order)
+            write_reserved(self.path, DOCUMENT)
+        self.assertEqual(["fsync", "link"], order)
 
     def test_a_failed_write_leaves_neither_a_file_nor_a_part_file(self) -> None:
         def refuse(source: str, target: str) -> None:
             raise OSError("disk full")
 
-        with mock.patch("os.rename", refuse), self.assertRaises(OSError):
-            self.written()
+        self.assertIsNotNone(reserve(self.path))
+        with mock.patch("os.link", refuse), self.assertRaises(ClosedInputError):
+            write_reserved(self.path, DOCUMENT)
         self.assertEqual([], os.listdir(self.folder))
 
     def test_the_watchdog_release_removes_the_reserved_part_file_and_nothing_else(self) -> None:
@@ -164,11 +177,10 @@ class Writing(unittest.TestCase):
         self.assertEqual(["other.part"], os.listdir(self.folder))
 
     def test_a_file_that_appeared_after_the_reservation_is_never_written_over(self) -> None:
-        descriptor = reserve(self.path)
-        self.assertIsNotNone(descriptor)
+        self.assertIsNotNone(reserve(self.path))
         Path(self.path).write_text("other")
-        with self.assertRaises(FileExistsError):
-            write_reserved(cast("int", descriptor), self.path, DOCUMENT)
+        with self.assertRaises(ClosedInputError):
+            write_reserved(self.path, DOCUMENT)
         self.assertEqual("other", Path(self.path).read_text())
         self.assertEqual(["result.json"], os.listdir(self.folder))
 
@@ -177,32 +189,22 @@ class Writing(unittest.TestCase):
             self.written({"x": object()})
         self.assertEqual([], os.listdir(self.folder))
 
-    def test_every_error_path_closes_the_descriptor_of_the_part_file(self) -> None:
+    def test_a_failed_write_leaves_no_result_file_and_no_part_file_when_the_part_name_can_be_removed(self) -> None:
         def refuse(source: str, target: str) -> None:
             raise OSError("disk full")
 
         plants: dict[str, tuple[Any, dict[Any, Any]]] = {
             "a document that is not json": (contextlib.nullcontext(), {"x": object()}),
             "a document with keys that are not text": (contextlib.nullcontext(), {"x": float("nan"), (1, 2): 3}),
-            "a rename that fails": (mock.patch("os.rename", refuse), DOCUMENT),
-            "a file that appeared": (mock.patch("os.path.lexists", return_value=True), DOCUMENT),
+            "a link that fails": (mock.patch("os.link", refuse), DOCUMENT),
         }
         for name, (patch, document) in plants.items():
             with self.subTest(name):
-                descriptor = reserve(self.path)
-                self.assertIsNotNone(descriptor)
+                self.assertIsNotNone(reserve(self.path))
                 with patch, contextlib.suppress(Exception):
-                    write_reserved(cast("int", descriptor), self.path, document)
-                with self.assertRaises(OSError):
-                    os.fstat(cast("int", descriptor))
+                    write_reserved(self.path, document)
+                self.assertEqual([], os.listdir(self.folder))
                 release_reserved()
-
-    def test_a_descriptor_that_the_write_took_is_closed_once_after_a_good_write(self) -> None:
-        descriptor = reserve(self.path)
-        self.assertIsNotNone(descriptor)
-        write_reserved(cast("int", descriptor), self.path, DOCUMENT)
-        with self.assertRaises(OSError):
-            os.fstat(cast("int", descriptor))
 
 
 JOB = "toy_job"
@@ -349,13 +351,75 @@ class Sealed(unittest.TestCase):
         self.assertEqual([], os.listdir(self.folder))
 
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_result_line(self) -> None:
-        def refuse(source: str, target: str) -> None:
-            raise OSError(f"{MARKER} disk full")
+        link = os.link
 
-        with mock.patch("os.rename", refuse):
+        def refuse(source: str, target: str) -> None:
+            if not str(target).endswith(".part"):
+                raise OSError(f"{MARKER} disk full")
+            link(source, target)
+
+        with mock.patch("os.link", refuse):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
         self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
         self.assertIs(result_file.INTERNAL_EXIT_CODE, 70)
+        self.assertEqual([], os.listdir(self.folder))
+
+    def test_a_part_name_that_cannot_be_removed_after_the_link_is_internal_error_and_exit_70_not_a_clean_end(self) -> None:
+        real = os.unlink
+
+        def unlink(target: object, *arguments: Any, **keywords: Any) -> None:
+            if str(target) == f"{self.path}.part":
+                raise OSError(errno.EIO, f"{MARKER} input output error")
+            real(target, *arguments, **keywords)  # type: ignore[arg-type]
+
+        with mock.patch("os.unlink", unlink):
+            code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
+        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual(["result.json", "result.json.part"], sorted(os.listdir(self.folder)))
+
+    def test_a_link_that_fails_and_a_part_name_that_cannot_be_removed_leave_the_part_file_in_both_writers(self) -> None:
+        real_unlink = os.unlink
+
+        def refuse_link(source: object, target: object) -> None:
+            raise OSError(errno.ENOSPC, "disk full")
+
+        def refuse_unlink(target: object, *arguments: Any, **keywords: Any) -> None:
+            if str(target).endswith(".part"):
+                raise OSError(errno.EIO, "input output error")
+            real_unlink(target, *arguments, **keywords)  # type: ignore[arg-type]
+
+        self.assertIsNotNone(reserve(self.path))
+        with mock.patch("os.link", refuse_link), mock.patch("os.unlink", refuse_unlink), self.assertRaises(ClosedInputError):
+            write_reserved(self.path, DOCUMENT)
+        self.assertEqual(["result.json.part"], os.listdir(self.folder))
+        os.unlink(f"{self.path}.part")
+        with mock.patch("os.link", refuse_link), mock.patch("os.unlink", refuse_unlink), self.assertRaises(ClosedInputError):
+            write_new_file(Path(self.path), "{}\n", mode=FILE_MODE)
+        left = os.listdir(self.folder)
+        self.assertEqual(1, len(left))
+        self.assertTrue(left[0].endswith(".part") and left[0] != "result.json.part")
+
+    def test_a_part_name_that_fails_to_be_removed_once_is_removed_at_the_end_and_the_call_still_ends_as_exit_70(self) -> None:
+        real_unlink = os.unlink
+        refused: list[str] = []
+
+        def unlink_once(target: object, *arguments: Any, **keywords: Any) -> None:
+            if str(target) == f"{self.path}.part" and not refused:
+                refused.append(str(target))
+                raise OSError(errno.EIO, "input output error")
+            real_unlink(target, *arguments, **keywords)  # type: ignore[arg-type]
+
+        real_link = os.link
+
+        def refuse_link(source: Any, target: Any) -> None:
+            if str(target) == self.path:
+                raise OSError(errno.ENOSPC, "disk full")
+            real_link(source, target)
+
+        with mock.patch("os.link", refuse_link), mock.patch("os.unlink", unlink_once):
+            code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
+        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual(1, len(refused))
         self.assertEqual([], os.listdir(self.folder))
 
     def test_a_sealed_error_keeps_its_problems_in_order(self) -> None:

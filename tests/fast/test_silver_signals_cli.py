@@ -7,7 +7,7 @@ Failure modes covered here:
 - The call takes no ``--result`` path, a relative one, or one that exists, and the job runs and writes over it or beside it.
 - The result file is seen half written, holds a document that is not the result, is written over a file that is there, or leaves a temporary file behind.
 - A refusal, a failed upstream, a bad setting or an internal error leaves no result file, or one whose codes are not the codes printed on standard error.
-- A result that cannot be written (a value that is not JSON, a rename that fails) ends the job with exit 0 and no file.
+- A result that cannot be written (a value that is not JSON, a link that fails, a part file that stays after the link) ends the job with exit 0.
 - A path that cannot hold its part file (a folder that is not there, a name of 255 bytes) is found only after the job ran, and the job's work is lost. The
   part file is reserved before ``execute``, and a failed reservation is a bad call: ``usage``, exit 2, and nothing runs.
 - A job that the watchdog stops, or a file that appears while the job runs, leaves a part file or is written over.
@@ -104,20 +104,23 @@ class CommandLine(InFolder):
         self.assertTrue(text.endswith("\n"))
         self.assertEqual(0o644, stat.S_IMODE(self.path.stat().st_mode))
 
-    def test_the_file_is_written_whole_to_another_name_and_then_renamed(self) -> None:
+    def test_the_file_is_written_whole_to_the_reserved_part_file_in_the_same_folder_and_then_linked_into_place(self) -> None:
         seen: list[tuple[str, str, Any, bool]] = []
-        rename = os.rename
+        link = os.link
 
         def spy(source: str, target: str) -> None:
-            seen.append((str(source), str(target), json.loads(Path(source).read_text()), self.path.exists()))
-            rename(source, target)
+            if str(target) == str(self.path):
+                seen.append((str(source), str(target), json.loads(Path(source).read_text()), self.path.exists()))
+            link(source, target)
 
-        with mock.patch("os.rename", spy):
+        with mock.patch("os.link", spy):
             code, out, err = self.call(["build", "--branch", "b"])
         self.assertEqual((0, "", ""), (code, out, err))
         self.assertEqual(1, len(seen))
         source, target, whole, existed = seen[0]
         self.assertEqual(str(self.path), target)
+        self.assertNotEqual(str(self.path), source)
+        self.assertEqual(self.folder, Path(source).parent)
         self.assertEqual(str(self.path) + ".part", source)
         self.assertEqual({"mode": "build", "branch": "b"}, whole)
         self.assertFalse(existed)
@@ -224,14 +227,18 @@ class CommandLine(InFolder):
                 self.path.unlink()
 
     def test_a_file_that_cannot_be_written_after_the_run_is_an_internal_error_with_no_file_and_no_part_file(self) -> None:
+        link = os.link
+
         def refuse(source: str, target: str) -> None:
-            raise OSError(f"{MARKER} disk full")
+            if not str(target).endswith(".part"):
+                raise OSError(f"{MARKER} disk full")
+            link(source, target)
 
         for name, execute in (
             ("a result", None),
             ("a refusal", raising(SilverSignalsError("numeric_verdict_differs: failed"))),
         ):
-            with self.subTest(name), mock.patch("os.rename", refuse):
+            with self.subTest(name), mock.patch("os.link", refuse):
                 code, out, err = self.call(["build", "--branch", "b"], execute)
                 self.assertEqual((70, "", "silver_signals: internal_error: failed\n"), (code, out, err))
                 self.assertEqual([], self.left())

@@ -14,7 +14,7 @@ environment, as the patient split's do: ``NESSIE_URI``, ``WAREHOUSE_LOCATION``, 
 Before any count it checks the patient split table by the split job's own rules and the owner of each Bronze case by the Silver cases job's own query, and a
 failure of either refuses the whole run with one fixed code (``split_rule_broken``, ``ambiguous_case_owner``) and no count.
 
-The result is one JSON file at ``<path>`` (it must not exist, and it is written whole and renamed into place), with outcome ``verified`` or ``failed``; the
+The result is one JSON file at ``<path>`` (it must not exist, and it is written whole into a part file and linked), with outcome ``verified`` or ``failed``; the
 job's standard output and standard error are for the operator and no caller reads them (``spark/reconcile/cli.py``).
 
 The test set is sealed. The counts and dispositions are those of development patients; for every other patient the result holds one flag for each table. The

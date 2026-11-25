@@ -56,7 +56,7 @@ import functools
 import json
 import os
 import re
-import secrets
+import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
@@ -64,9 +64,12 @@ from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
 from replay.service import places
-from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.state_file import atomic_write
+from replay.service.run_record import HEALTH_NAME, RunRecord, RunRecordError, parse_run_record
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.manifest import ManifestError, ManifestRef
+from scripts.ingestion.notice import Code, Notice, describe_error
+from scripts.ingestion.output_file import replace_owned_file, write_new_file
 
 BEAT_SECONDS = 5.0
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
@@ -119,8 +122,9 @@ class Outcome:
 class Health:
     """The health file: the status, the request that runs, the last result and the wall time of the last progress, written at most every few seconds."""
 
-    def __init__(self, path: Path, clock: Callable[[], float]) -> None:
-        self.path = path
+    def __init__(self, state: Path, clock: Callable[[], float]) -> None:
+        self.state = state
+        self.path = state / HEALTH_NAME
         self.clock = clock
         self.written = float("-inf")
         self.last: dict[str, Any] | None = None
@@ -128,7 +132,8 @@ class Health:
     def beat(self, status: str, request: str = "", *, force: bool = False) -> None:
         now = self.clock()
         if force or now - self.written >= BEAT_SECONDS:
-            atomic_write(self.path, json.dumps({"status": status, "updated": now, "request": request, "last": self.last}, sort_keys=True) + "\n")
+            text = json.dumps({"status": status, "updated": now, "request": request, "last": self.last}, sort_keys=True) + "\n"
+            replace_owned_file(self.path, text, state_root=self.state, mode=FILE_MODE)
             self.written = now
 
 
@@ -145,7 +150,7 @@ def healthy(path: Path, now: float, max_age_seconds: float) -> bool:
 
 
 def next_request(inbox: Path) -> Path | None:
-    requests = sorted(path for path in inbox.glob("*.json") if path.is_file())
+    requests = list_files(inbox, "*.json")
     return requests[0] if requests else None
 
 
@@ -251,9 +256,11 @@ def result_text(request: Path, outcome: Outcome) -> str:
 
 
 def keep(inbox: Path, request: Path, outcome: Outcome) -> dict[str, Any]:
-    """Write the request's result, then move the request to ``done/`` or ``failed/``. A stop between the two leaves the result, and the restart only moves."""
+    """Write the request's result, then move the request to ``done/`` or ``failed/``. A stop between the two leaves the result, and the restart only moves.
+    The result is a new file: a path that is held in any form stops the service with a fixed error, never replaces it."""
     text = result_text(request, outcome)
-    atomic_write(inbox / RESULTS / request.name, text)
+    (inbox / RESULTS).mkdir(parents=True, exist_ok=True)
+    write_new_file(inbox / RESULTS / request.name, text, mode=FILE_MODE)
     archive(inbox, request, outcome.kind)
     result: dict[str, Any] = json.loads(text)
     return result
@@ -263,7 +270,7 @@ def anchor_record(record: RunRecord, inbox: Path) -> RunRecord:
     """The run record with its relative ``state_dir`` and ``read_log`` taken from the folder that holds the resolved inbox: the one base of ``submit``, of the
     check, of the run and of the commands that read an archived record."""
     store = record.object_store
-    if store.read_log is not None:
+    if store.read_log:  # an empty read log means no log, so it is left empty
         store = replace(store, read_log=str(places.anchored(store.read_log, inbox)))
     return replace(record, state_dir=str(places.anchored(record.state_dir, inbox)), object_store=store)
 
@@ -285,7 +292,7 @@ def path_refusal(record: RunRecord, inbox: Path) -> str | None:
     try:
         if places.shares_place(places.anchored(record.state_dir, inbox), inbox):
             return STATE_DIR_MESSAGE
-        if record.object_store.read_log is not None and places.inside(places.anchored(record.object_store.read_log, inbox), inbox):
+        if record.object_store.read_log and places.inside(places.anchored(record.object_store.read_log, inbox), inbox):
             return READ_LOG_MESSAGE
     except places.PathError:
         return INVALID_PATH_MESSAGE
@@ -316,14 +323,14 @@ def unusable(request: Path) -> Outcome | None:
     try:
         record = queued_record(request)
     except (OSError, ValueError) as error:
-        return Outcome("failed", 2, f"{type(error).__name__}: {error}")
+        return Outcome("failed", 2, describe_error(error))
     refusal = path_refusal(record, request.parent)
     return None if refusal is None else Outcome("failed", 2, refusal)
 
 
 def serve(
     inbox: Path,
-    health_path: Path,
+    state: Path,
     run_request: Callable[[Path, Callable[[], None]], Outcome],
     stopped: Callable[[], bool],
     clock: Callable[[], float],
@@ -334,11 +341,18 @@ def serve(
     """Serve the inbox until ``stopped`` says so. ``run_request`` runs one record and calls the beat it is given as the run makes progress. A record that is
     not a valid run record never reaches it. A health file inside the inbox stops the start with 2 before anything is written: it is a ``.json`` file, so the
     loop would take it for a request."""
-    if (refusal := start_refusal(inbox, health_path)) is not None:
+    if (refusal := start_refusal(inbox, state / HEALTH_NAME)) is not None:
         log("serve_refused", message=refusal)
         return 2
     inbox.mkdir(parents=True, exist_ok=True)
-    health = Health(health_path, clock)
+    # The inbox is taken by its real path from here on, as the start check above compared it, so a service that names its inbox by a link writes its
+    # start counts and results through the owned-file helpers, which refuse a folder that is a link.
+    inbox = Path(os.path.realpath(inbox, strict=True))
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ClosedInputError(Notice(Code.OWNED_REFUSED)) from None
+    health = Health(state, clock)
     health.beat("waiting", force=True)
     while not stopped():
         request = next_request(inbox)
@@ -355,7 +369,7 @@ def serve(
             # A defect in the check, not a refusal of the record: it counts as a start, so a service that restarts on it stops after MAX_ATTEMPTS starts.
             started = started_count(request)
             if started < MAX_ATTEMPTS:
-                atomic_write(attempts_of(request), f"{started + 1}\n")
+                replace_owned_file(attempts_of(request), f"{started + 1}\n", state_root=inbox, mode=FILE_MODE)
                 log("request_check_failed", request=request.stem, error=type(error).__name__)
                 raise
             refused = Outcome("failed", 2, f"the service stopped during this request {MAX_ATTEMPTS} times")
@@ -368,16 +382,16 @@ def serve(
             health.last = keep(inbox, request, Outcome("failed", 2, f"the service stopped during this request {MAX_ATTEMPTS} times"))
             health.beat("waiting", force=True)
             continue
-        atomic_write(attempts_of(request), f"{started + 1}\n")
+        replace_owned_file(attempts_of(request), f"{started + 1}\n", state_root=inbox, mode=FILE_MODE)
         health.beat("running", request.stem, force=True)
         try:
             outcome = run_request(request, functools.partial(health.beat, "running", request.stem))
         except (ArithmeticError, ValueError) as error:
-            outcome = Outcome("failed", 2, f"{type(error).__name__}: {error}")
+            outcome = Outcome("failed", 2, describe_error(error))
         if outcome.kind == "stopped" or stopped():
             if outcome.kind != "stopped":
                 log("request_left_queued", request=request.stem, outcome=outcome.kind, error=outcome.error)
-            atomic_write(attempts_of(request), f"{started}\n")
+            replace_owned_file(attempts_of(request), f"{started}\n", state_root=inbox, mode=FILE_MODE)
             break
         health.last = keep(inbox, request, outcome)
         health.beat("waiting", force=True)
@@ -386,34 +400,48 @@ def serve(
 
 
 def claim(path: Path, data: bytes) -> bool:
-    """Create ``path`` with exactly ``data`` when it does not exist and say so. The bytes are complete when the file appears, and no second claim succeeds."""
+    """Create ``path`` with exactly ``data`` when it does not exist and say so. The bytes are complete when the file appears, and no second claim succeeds.
+    A path that is held in any form (a link too) is not claimed."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.claiming")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, FILE_MODE)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
+        write_new_file(path, data, mode=FILE_MODE)
+    except ClosedInputError as error:
+        if any(notice.code is Code.OUTPUT_EXISTS for notice in error.notices):
             return False
-        return True
-    finally:
-        temporary.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def queue_file(path: Path, data: bytes) -> None:
+    """Put one file of the queue entry in the inbox. A regular file that holds the very same bytes (a stop left it) stays; any other path that is held, a link
+    too, is refused and never replaced."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        write_new_file(path, data, mode=FILE_MODE)
+        return
+    if regular_bytes(path) != data:
+        raise SubmitError("the queue already holds another file under this run ID")
 
 
 def reserve(inbox: Path, name: str, data: bytes, what: str, run_id: str) -> None:
     """Reserve ``reserved/<name>`` with ``data``. Bytes that equal the reservation already held pass; other bytes are refused."""
     path = inbox / RESERVED / name
-    if not claim(path, data) and path.read_bytes() != data:
+    if not claim(path, data) and regular_bytes(path) != data:
         raise SubmitError(f"the run ID {run_id} already holds another {what}; use a new run ID")
 
 
 def record_held(inbox: Path, name: str) -> Path | None:
     """The file of the record ``name`` in the inbox, ``done/`` or ``failed/``, else None."""
     return next((path for path in (inbox / name, inbox / "done" / name, inbox / "failed" / name) if path.is_file()), None)
+
+
+def regular_bytes(path: Path) -> bytes | None:
+    """The bytes of a regular file, or None for a path that is missing, unreadable or a link, a folder or another kind of entry."""
+    try:
+        return path.read_bytes() if stat.S_ISREG(os.lstat(path).st_mode) else None
+    except OSError:
+        return None
 
 
 def bytes_of(path: Path) -> bytes | None:
@@ -479,8 +507,9 @@ def submit(inbox: Path, record_data: bytes | str, reference_data: bytes | str) -
         reserve(inbox, record.run_id + REFERENCE_SUFFIX, reference_bytes, "manifest reference", record.run_id)
         if record_held(inbox, name) is not None:
             return "already submitted"
-        atomic_write(reference_of(inbox / name), reference_bytes)
-        atomic_write(inbox / name, record_bytes)
+        inbox.mkdir(parents=True, exist_ok=True)
+        queue_file(reference_of(inbox / name), reference_bytes)
+        queue_file(inbox / name, record_bytes)
     return "submitted"
 
 
@@ -489,7 +518,7 @@ def submit_command(inbox: Path, reference_file: Path, stream: BinaryIO, out: Tex
     try:
         record, reference = read_submission(reference_file, stream)
         out.write(submit(inbox, record, reference) + "\n")
-    except SubmitError as error:
-        log("submit_refused", message=str(error))
+    except (SubmitError, ClosedInputError) as error:
+        log("submit_refused", message=describe_error(error))
         return 2
     return 0

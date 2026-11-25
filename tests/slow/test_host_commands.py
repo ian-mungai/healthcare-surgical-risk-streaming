@@ -43,6 +43,7 @@ from scripts.infra.host import (
     workload_variables,
 )
 from scripts.infra.state_bootstrap import RunBinding
+from scripts.ingestion.notice import Code, Notice, render
 from scripts.process import CompletedProcess, TimeoutExpired, run_command
 from scripts.project_config import ROOT
 from scripts.stack.warehouse import WarehouseError
@@ -553,7 +554,7 @@ CONFIGURATION = {
 def binding_file(folder: Path, *, backend: str, provision_host: bool) -> Path:
     path = folder / "run_binding.json"
     RunBinding("20260101t0000-abcdef", "0" * 40, backend, "us-west-2", "example-project", "default", ["terraform.tfstate"], "verified", provision_host).write(
-        path
+        path, state_root=folder
     )
     return path
 
@@ -1188,7 +1189,7 @@ class HostCheckArgumentsTest(unittest.TestCase):
     def test_a_check_without_an_instance_id_is_refused(self) -> None:
         code, errors = self.run_main("check", "--host-name", "platform-dev")
         self.assertEqual(2, code)
-        self.assertIn("--instance-id", errors)
+        self.assertIn(render(Notice(Code.USAGE)), errors)
 
     def test_an_empty_or_malformed_instance_id_is_refused_without_naming_it(self) -> None:
         for value in ("", " ", "i-xyz", "i-123", "i-0123456789abcdef012", "platform-dev", "i-0123456789abcdef0 extra"):
@@ -1201,7 +1202,7 @@ class HostCheckArgumentsTest(unittest.TestCase):
     def test_a_check_without_a_host_name_is_refused(self) -> None:
         code, errors = self.run_main("check", "--instance-id", INSTANCE)
         self.assertEqual(2, code)
-        self.assertIn("--host-name", errors)
+        self.assertIn(render(Notice(Code.USAGE)), errors)
 
 
 class DeployWorkflowTest(unittest.TestCase):

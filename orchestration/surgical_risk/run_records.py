@@ -24,6 +24,8 @@ from dagster import (
     sensor,
 )
 
+from scripts.ingestion.folder import list_folder
+
 from .retention import PRUNE_JOB, parse_removal
 from .run_folder import LEFT_RUNNING_TAG, CheckFacts, RunFacts, StepFacts, build_record, left_running_tag_value, write_record
 
@@ -103,7 +105,7 @@ def run_folders(context: SensorEvaluationContext) -> SkipReason:
     after = float(context.cursor) if context.cursor else 0.0
     since = datetime.fromtimestamp(max(after - OVERLAP_SECONDS, 0.0), UTC)
     records = context.instance.get_run_records(RunsFilter(statuses=ENDED, updated_after=since), limit=BATCH_LIMIT, order_by="update_timestamp", ascending=True)
-    existing = {path.name.rsplit("_", 1)[-1] for path in RUNS_DIR.glob("*_*")} if RUNS_DIR.is_dir() else set()
+    existing = {path.name.rsplit("_", 1)[-1] for path in list_folder(RUNS_DIR, "*_*")}
     written = 0
     for entry in records:
         if entry.dagster_run.run_id not in existing:

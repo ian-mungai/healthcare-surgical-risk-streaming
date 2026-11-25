@@ -92,9 +92,9 @@ def read_result_file(folder: Path) -> tuple[dict[str, Any] | None, str | None]:
     """The one result file that a job left in its fresh result folder, and why it is refused as a fixed text that holds nothing of it, or ``None``.
 
     A folder with no file is no result and no problem (a bad call and a job that the watchdog stopped write none); the caller decides whether one was due. A
-    folder that holds only the part file is the same: a job that was killed after it reserved its result and before it renamed it. A
-    folder that holds anything else than ``result.json`` is refused, as is a file that is not a plain file of at most ``RESULT_LIMIT_BYTES``, is not text, is
-    not one JSON document with no key written twice, or is not an object."""
+    folder that holds only the part file is the same: a job that was killed after it reserved its result and before it linked it. A folder that holds anything
+    else than ``result.json`` is refused (the result with its part file too: a cleanup that failed after the link), as is a file that is not a plain file of at
+    most ``RESULT_LIMIT_BYTES``, is not text, is not one JSON document with no key written twice, or is not an object."""
     names = sorted(os.listdir(folder))
     if not names or names == [PART_NAME]:
         return None, None

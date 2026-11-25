@@ -74,7 +74,7 @@ def shares_place(path: str | Path, folder: str | Path) -> bool:
 
 
 def written_into(path: str | Path, folder: str | Path) -> bool:
-    """Whether a write of ``path`` by ``atomic_write`` lands in ``folder`` or below it, or lands in the place that ``path`` links to.
+    """Whether a write of ``path`` by ``replace_owned_file`` lands in ``folder`` or below it, or lands in the place that ``path`` links to.
 
     The write makes a temporary file beside ``path`` and renames it over ``path``, so a link in ``path`` is replaced by the file and the place that counts is
     the resolved folder that holds ``path``, not where the link points.

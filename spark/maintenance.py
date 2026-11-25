@@ -46,7 +46,7 @@ def finite_seconds(text: str) -> float:
     try:
         seconds = float(text)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"the deadline {text!r} is not a number of seconds") from None
+        raise argparse.ArgumentTypeError("the deadline must be a number of seconds") from None
     if not math.isfinite(seconds) or not 0 < seconds <= MAX_DEADLINE_SECONDS:
         raise argparse.ArgumentTypeError(f"the deadline must be a finite number of seconds above 0 and at most {MAX_DEADLINE_SECONDS:g}")
     return seconds
@@ -63,7 +63,7 @@ def table_argument(text: str) -> str:
     try:
         return table_identifier(text)
     except RetentionError as error:
-        raise argparse.ArgumentTypeError(f"{text!r}: {error}") from None
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 class QuietParser(argparse.ArgumentParser):

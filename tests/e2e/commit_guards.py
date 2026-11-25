@@ -42,6 +42,7 @@ from subprocess import CalledProcessError, TimeoutExpired
 from types import FrameType
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 from scripts.quality import worktree_scan_hook
 from scripts.quality.repo_checks import git, visible_files
@@ -714,7 +715,7 @@ def worker_plan(requested: int, cores: int, available_mib: int | None, workers: 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the planted-fault cases, write the run record and return 0 only when every assertion held."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--shard", type=parse_shard, default=None, metavar="INDEX/COUNT", help="run one share of the cases")
     choice.add_argument("--parallel", type=parse_workers, default=None, metavar="N", help="run N shards at the same time and write one record")

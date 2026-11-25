@@ -120,6 +120,12 @@ class PagesTest(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(SystemExit):
                 headroom.read_jobs(text)
 
+    def test_a_text_that_is_not_json_is_refused_with_fixed_text_that_holds_no_word_of_the_decoder(self) -> None:
+        for text in ("not json", '{"jobs": [1,]}', '{"a": "marker_value_x9" "b"}'):
+            with self.subTest(text=text), self.assertRaises(SystemExit) as stopped:
+                headroom.read_jobs(text)
+            self.assertEqual("the jobs API answer is not JSON", stopped.exception.code)
+
     def test_the_command_asks_for_the_latest_attempt_of_this_run_only(self) -> None:
         arguments = headroom.api_arguments("owner/repository", "4242")
         self.assertEqual(arguments[:2], ["api", "--paginate"])

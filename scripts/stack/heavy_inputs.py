@@ -14,6 +14,7 @@ import json
 import sys
 from collections.abc import Sequence
 
+from scripts.ingestion.notice import describe_error
 from scripts.stack.groups import ALWAYS_ON_GROUPS
 from scripts.stack.limits import LIMITS_FILE, Limits, LimitsError, load_limits
 
@@ -45,7 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         text = heavy_inputs_text(load_limits(LIMITS_FILE))
     except LimitsError as error:
-        sys.stderr.write(f"limits: {error}\n")
+        sys.stderr.write(f"limits: {describe_error(error)}\n")
         return 1
     sys.stdout.write(text)
     return 0

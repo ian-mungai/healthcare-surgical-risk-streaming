@@ -51,22 +51,25 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError, ManifestRef
-from scripts.stack.nessie import NessieClient, NessieConflict, NessieError
+from scripts.ingestion.notice import Code, Notice, Subject, describe_error
+from scripts.ingestion.store import StoreError
+from scripts.stack.nessie import CONFLICT_TEXT, NessieClient, NessieConflict, NessieError
 from spark.bronze.checks import Verdict
 from spark.bronze.commands import branch_report, command_problem, exit_code, failed_text
-from spark.bronze.inputs import InputError, StoreSpec, verify_inputs
+from spark.bronze.inputs import InputError, StoreSpec, parse_cases, verify_inputs
 from spark.bronze.passes import MaxParameter, SumByName, partition_problems, partition_rows
 from spark.bronze.plan import GROUPED, MODES
 from spark.bronze.publication import NessiePublisher, PublicationError
 from spark.bronze.quality import QualityError, run_checks
-from spark.bronze.readers import caseend_times, open_store
+from spark.bronze.readers import caseend_times, create_read_log, open_store
 from spark.bronze.rows import StructureError
 from spark.bronze.tables import KIND_TABLE, NAMESPACE, TABLES, TableSpec
 from spark.catalog import required_environment
 from spark.session import build_session, start_deadline
-from spark.settings import BYTES_PER_MIB, SettingsError, read_memory_limit_mib
+from spark.settings import BYTES_PER_MIB, MAX_DEADLINE_SECONDS, MAX_NESSIE_TIMEOUT_SECONDS, SettingsError, number_setting, read_memory_limit_mib
 
 JOB = "bronze_decode"
 RESULT_PREFIX = "RESULT "
@@ -79,9 +82,7 @@ COMMANDS = ("write", "verify", "publish")
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(
-        prog=f"python -m spark.jobs.{JOB}", description="Decode the verified case files into the Bronze tables on a private Nessie branch."
-    )
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Decode the verified case files into the Bronze tables on a private Nessie branch.")
     command.add_argument("command", nargs="?", choices=COMMANDS, default="write", help="write (the default), verify the checks of a branch or publish a branch")
     command.add_argument("--branch", required=True, help="the private branch (write: to create from the base and write to)")
     command.add_argument("--base", default="main", help="write: the branch to create the private branch from. publish: the branch to assign")
@@ -96,7 +97,11 @@ def parser() -> argparse.ArgumentParser:
     )
     command.add_argument("--parallelism", type=int, default=1, help="how many cases are decoded at once")
     command.add_argument("--landed-folder", default="", help="a folder of object versions that stands in for the bucket, for a local run")
-    command.add_argument("--read-log", default="", help="with --landed-folder: a file that gets the key and version of every object read")
+    command.add_argument(
+        "--read-log",
+        default="",
+        help="with --landed-folder: a new file (a path that exists in any form is refused) that gets the key and version of every object read",
+    )
     return command
 
 
@@ -137,17 +142,23 @@ def table_facts(session: Any, table: TableSpec) -> dict[str, Any]:
 
 def decode(arguments: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
-    reference = ManifestRef.from_json(arguments.manifest_reference.read_text())
+    try:
+        reference = ManifestRef.from_json(arguments.manifest_reference.read_text())
+    except OSError, UnicodeDecodeError:
+        raise ManifestError(Notice(Code.CANNOT_READ, subject=Subject.REFERENCE)) from None
+    wanted = parse_cases(arguments.cases)
     spec = (
         StoreSpec("folder", reference.bucket, arguments.landed_folder, "", arguments.read_log)
         if arguments.landed_folder
         else StoreSpec("s3", reference.bucket, "", required_environment("AWS_REGION"))
     )
+    log = spec.log_to_create
+    if log is not None:
+        create_read_log(log)
     store = open_store(spec)
-    wanted = [int(text) for text in arguments.cases.split(",") if text] or None
     inputs = verify_inputs(store, reference, wanted)
     caseends = caseend_times(store, inputs)
-    client = NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
+    client = nessie_client()
     client.config()
     session = build_session(JOB, arguments.base)
     try:
@@ -209,7 +220,9 @@ def branch_checker(branch: str) -> Callable[[str], Verdict]:
 
 
 def nessie_client() -> NessieClient:
-    return NessieClient(required_environment("NESSIE_URI"), float(os.environ.get("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS)))
+    return NessieClient(
+        required_environment("NESSIE_URI"), number_setting("NESSIE_TIMEOUT_SECONDS", DEFAULT_NESSIE_TIMEOUT_SECONDS, MAX_NESSIE_TIMEOUT_SECONDS)
+    )
 
 
 def run_command(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -235,36 +248,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"{JOB}: --parallelism must be at least 1\n")
         return 2
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
+        start_deadline(number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS), JOB)
         result = run_command(arguments)
     except GateRefused as error:
-        sys.stderr.write(f"{JOB}: the gate refused the inputs before any payload was read: {error}\n")
+        sys.stderr.write(f"{JOB}: the gate refused the inputs before any payload was read: {describe_error(error)}\n")
         return 1
     except ManifestError as error:
-        sys.stderr.write(f"{JOB}: the manifest cannot be trusted: {error}\n")
+        sys.stderr.write(f"{JOB}: the manifest cannot be trusted: {describe_error(error)}\n")
         return 1
-    except (InputError, StructureError) as error:
-        sys.stderr.write(f"{JOB}: refused: {error}\n")
+    except (InputError, StructureError, StoreError) as error:
+        sys.stderr.write(f"{JOB}: refused: {describe_error(error)}\n")
         return 1
     except (PublicationError, QualityError) as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 1
-    except NessieConflict as error:
-        sys.stderr.write(f"{JOB}: Nessie refused the branch {arguments.branch}: {error}\n")
+    except NessieConflict:
+        sys.stderr.write(f"{JOB}: {CONFLICT_TEXT}\n")
         return 1
     except NessieError as error:
-        sys.stderr.write(f"{JOB}: cannot work with Nessie: {error}\n")
+        sys.stderr.write(f"{JOB}: cannot work with Nessie: {describe_error(error)}\n")
         return 1
-    except ImportError as error:
-        sys.stderr.write(f"{JOB}: the image does not hold a package that the checks need ({error.name})\n")
+    except ImportError:
+        sys.stderr.write(f"{JOB}: the image does not hold a package that the checks need\n")
         return 2
     except SettingsError as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     code = exit_code(result)
     if code:
-        sys.stderr.write(f"{JOB}: the checks stopped the job on branch {arguments.branch}, and {arguments.base} is unchanged: {failed_text(result)}\n")
+        sys.stderr.write(f"{JOB}: the checks stopped the job and the base is unchanged: {failed_text(result)}\n")
     return code
 
 

@@ -35,8 +35,8 @@ def load_clinical(path: str) -> ClinicalLookup:
         return lambda case_id: {}
     try:
         document: Any = load(Path(path).read_text())
-    except (OSError, ValueError, FeatureInputError) as error:
-        raise ClinicalFileError(f"the clinical file cannot be read: {error}") from None
+    except OSError, ValueError, FeatureInputError:
+        raise ClinicalFileError("the clinical file cannot be read") from None
     if not isinstance(document, dict) or set(document) != {"cases"} or not isinstance(document["cases"], dict):
         raise ClinicalFileError("the clinical file must be an object with the one key cases")
     cases: dict[int, dict[str, ClinicalValue]] = {}

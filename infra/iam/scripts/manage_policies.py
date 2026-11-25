@@ -37,6 +37,8 @@ from typing import Any
 
 from infra.iam.scripts.render_policy import BOUNDARY_DIRECTORY, PolicyRenderError, load_documents, scope_problems
 from scripts.aws_cli import AWS_TIMEOUT_SECONDS, Aws, AwsError
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ConfigurationError, load_configuration
 
@@ -228,22 +230,26 @@ def profile_is_the_user(project: Aws, user_arn: str, *, timeout: float = AWS_TIM
     return bool(identity.get("Arn") == user_arn and identity.get("Account") == user_arn.split(":")[4])
 
 
+class KeyAdviceError(ConfigurationError, FixedTextError):
+    """The key command stops, and its text tells the owner what to do before a retry. Built from constants and the configured user and profile names only."""
+
+
 def refuse_while_history_records(admin: Aws) -> None:
     """Stop before the key call when the AWS command line would record its answer, secret key included, in its history database."""
-    advice = f"turn it off with: aws configure set cli_history disabled --profile {admin.profile}"
-    unreadable = ConfigurationError(f"the cli_history setting of the profile {admin.profile} could not be read, so key stops before it creates a key; {advice}")
+    advice = "turn it off with: aws configure set cli_history disabled --profile <ADMIN_PROFILE>"
+    unreadable = KeyAdviceError(f"the cli_history setting of the administrator profile could not be read, so key stops before it creates a key; {advice}")
     try:
         result = run_command("aws", ["configure", "get", "cli_history", "--profile", admin.profile], timeout=CONFIG_READ_SECONDS)
     except TimeoutExpired:
-        raise ConfigurationError(f"{timeout_text('aws configure get', CONFIG_READ_SECONDS)}, so key stops before it creates a key; run key again") from None
+        raise KeyAdviceError(f"{timeout_text('aws configure get', CONFIG_READ_SECONDS)}, so key stops before it creates a key; run key again") from None
     except OSError:
         raise unreadable from None
     value = result.stdout.strip()
     if result.returncode not in (0, 1):
         raise unreadable
     if value == "enabled":
-        raise ConfigurationError(
-            f"cli_history is enabled for the profile {admin.profile}: the AWS command line would record the new secret key; {advice}, then run key again"
+        raise KeyAdviceError(
+            f"cli_history is enabled for the administrator profile: the AWS command line would record the new secret key; {advice}, then run key again"
         )
 
 
@@ -255,7 +261,7 @@ def write_new_key(admin: Aws, user: str, backup: Path) -> None:
         handle = os.fdopen(descriptor, "w")
     except OSError:
         backup.unlink()
-        raise ConfigurationError(f"the backup file {backup.name} could not be opened, so no key was created: run key again") from None
+        raise KeyAdviceError(f"the backup file {backup.name} could not be opened, so no key was created: run key again") from None
     try:
         with handle:
             try:
@@ -265,7 +271,7 @@ def write_new_key(admin: Aws, user: str, backup: Path) -> None:
                 stored = True
             except AwsError as error:
                 if not REFUSED_BY_IAM.search(str(error)):
-                    raise ConfigurationError(UNCERTAIN_CREATE.format(user=user)) from error
+                    raise KeyAdviceError(UNCERTAIN_CREATE.format(user=user)) from error
                 backup.unlink()
                 raise
             except ValueError, LookupError, TypeError, OSError:
@@ -273,7 +279,7 @@ def write_new_key(admin: Aws, user: str, backup: Path) -> None:
     except OSError:
         stored = False
     if not stored:
-        raise ConfigurationError(UNSTORED_KEY.format(user=user))
+        raise KeyAdviceError(UNSTORED_KEY.format(user=user))
 
 
 def wait_until_the_profile_works(project: Aws, user_arn: str) -> None:
@@ -283,17 +289,17 @@ def wait_until_the_profile_works(project: Aws, user_arn: str) -> None:
         if profile_is_the_user(project, user_arn, timeout=remaining) and time.monotonic() <= deadline:
             return
         time.sleep(max(0.0, min(KEY_POLL_SECONDS, deadline - time.monotonic())))
-    raise ConfigurationError(f"the new key did not start to work within {KEY_READY_SECONDS:g} seconds; run key again to check it")
+    raise KeyAdviceError(f"the new key did not start to work within {KEY_READY_SECONDS:g} seconds; run key again to check it")
 
 
 def create_key(admin: Aws, configuration: dict[str, str], names: Names) -> int:
     """Give the project user its one access key, a private backup file and a working profile. A second run changes nothing."""
     user = names.user
     if configuration["AWS_PROFILE"] != user:
-        raise ConfigurationError(f"AWS_PROFILE must equal the project user's name, {user}, for the key to be imported as that profile")
+        raise KeyAdviceError(f"AWS_PROFILE must equal the project user's name, {user}, for the key to be imported as that profile")
     found = admin.call("iam", "get-user", "--user-name", user, missing=("NoSuchEntity",))
     if found is None:
-        raise ConfigurationError(f"the user {user} does not exist: run apply first")
+        raise KeyAdviceError(f"the user {user} does not exist: run apply first")
     user_arn = found["User"]["Arn"]
     project = Aws(user, configuration["AWS_REGION"])
     backup = KEY_FOLDER / f"{user}_accessKeys.csv"
@@ -301,9 +307,9 @@ def create_key(admin: Aws, configuration: dict[str, str], names: Names) -> int:
         if profile_is_the_user(project, user_arn):
             sys.stdout.write(f"no change: {user} has its access key and the profile {user} works\n")
             return 0
-        raise ConfigurationError(f"{user} already has an access key and the project profile does not work: this tool never deletes a key; review it")
+        raise KeyAdviceError(f"{user} already has an access key and the project profile does not work: this tool never deletes a key; review it")
     if backup.exists():
-        raise ConfigurationError(f"the backup file already exists and is never overwritten: {backup.name} in {KEY_FOLDER.name}; move it away as the owner")
+        raise KeyAdviceError(f"the backup file already exists and is never overwritten: {backup.name} in {KEY_FOLDER.name}; move it away as the owner")
     refuse_while_history_records(admin)
     KEY_FOLDER.mkdir(mode=0o700, exist_ok=True)
     write_new_key(admin, user, backup)
@@ -365,7 +371,7 @@ def run(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     """Run plan, apply, key or export and return a non-zero code on a refusal, a difference or a failure."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["plan", "apply", "key", "export"])
     parser.add_argument("--admin-profile", required=True, help="the owner's administrator AWS profile; never the project profile")
     parser.add_argument("--confirm", default="", help="apply: the confirmation code that plan printed")
@@ -376,7 +382,7 @@ def guarded(arguments: argparse.Namespace) -> int:
     try:
         return run(arguments)
     except (ConfigurationError, PolicyRenderError, AwsError) as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
 
 

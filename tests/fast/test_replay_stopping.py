@@ -105,7 +105,8 @@ class StoppedWaitLoopTest(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.inbox = Path(folder.name) / "inbox"
         self.inbox.mkdir()
-        self.health = Path(folder.name) / "health.json"
+        self.state = Path(folder.name)
+        self.health = self.state / "health.json"
         (self.inbox / "a.json").write_text(json.dumps(RECORD))
         (self.inbox / "a.reference").write_text(REFERENCE)
         self.sink, self.store = MemorySink(), MemoryStore()
@@ -132,7 +133,7 @@ class StoppedWaitLoopTest(unittest.TestCase):
                 timer.start()
         started = time.monotonic()
         sleep = flag.wait if stop_after is not None else lambda seconds: flag.request()
-        serve(self.inbox, self.health, run_request, flag.is_set, Clock(), sleep, 60.0)
+        serve(self.inbox, self.state, run_request, flag.is_set, Clock(), sleep, 60.0)
         return time.monotonic() - started, len(results)
 
     def attempts(self) -> str:
@@ -173,7 +174,7 @@ class StoppedWaitLoopTest(unittest.TestCase):
         for count in (1, 2, 3):
             stop[0] = False
             with self.assertRaises(Crash):
-                serve(self.inbox, self.health, crashing, lambda: stop[0], Clock(), lambda seconds: None, 1.0)
+                serve(self.inbox, self.state, crashing, lambda: stop[0], Clock(), lambda seconds: None, 1.0)
             self.assertEqual(str(count), self.attempts())
         ran: list[str] = []
         calls = iter([False, True])
@@ -182,7 +183,7 @@ class StoppedWaitLoopTest(unittest.TestCase):
             ran.append(path.name)
             return Outcome("finished", 0)
 
-        serve(self.inbox, self.health, never_run, lambda: next(calls), Clock(), lambda seconds: None, 1.0)
+        serve(self.inbox, self.state, never_run, lambda: next(calls), Clock(), lambda seconds: None, 1.0)
         self.assertEqual([], ran)
         result = json.loads((self.inbox / "results" / "a.json").read_text())
         self.assertEqual(("failed", "the service stopped during this request 3 times"), (result["outcome"], result["error"]))

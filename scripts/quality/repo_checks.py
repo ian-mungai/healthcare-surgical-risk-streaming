@@ -6,7 +6,6 @@ its file and line, the rule and the fix. The privacy scan reports the type of a 
 
 from __future__ import annotations
 
-import argparse
 import fnmatch
 import os
 import re
@@ -15,6 +14,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.ingestion.closed import QuietParser
 from scripts.process import run_command
 
 GIT_TIMEOUT_SECONDS = 60
@@ -133,7 +133,7 @@ def message_findings(location: str, message: str, *, comments: bool = False, rev
 
 
 def commit_message(path: str) -> list[Finding]:
-    return message_findings(path, Path(path).read_text(), comments=True, reveal_subject=True)
+    return message_findings(path, Path(path).read_text(encoding="utf-8"), comments=True, reveal_subject=True)
 
 
 SHORT_SHA = 12
@@ -170,7 +170,7 @@ def read_allowlist(committed: list[tuple[str, bytes]] | None = None) -> tuple[li
     findings: list[Finding] = []
     kinds = [*PRIVACY_PATTERNS, "env-value"]
     if committed is None:
-        source = Path(ALLOWLIST).read_text() if Path(ALLOWLIST).exists() else None
+        source = Path(ALLOWLIST).read_text(encoding="utf-8") if Path(ALLOWLIST).exists() else None
     else:
         source = next((data.decode("utf-8", "replace") for path, data in committed if path == ALLOWLIST), None)
     if source is None:
@@ -194,7 +194,7 @@ def env_values() -> list[str]:
     if not Path(".env").is_file():
         return []
     values = []
-    for line in Path(".env").read_text().splitlines():
+    for line in Path(".env").read_text(encoding="utf-8").splitlines():
         key, _, value = line.partition("=")
         value = value.strip().strip("\"'")
         if ENV_VALUE_KEYS.search(key.strip().upper()) and len(value) >= ENV_VALUE_MINIMUM and not line.lstrip().startswith("#"):
@@ -274,7 +274,7 @@ def privacy_scan(commit: str | None = None) -> tuple[list[Finding], list[str]]:
 
 def main() -> int:
     """Run the named check and return 1 when it has findings."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("check", choices=["credential-files", "data-files", "commit-msg", "commit-range", "privacy-scan"])
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--all", action="store_true", help="privacy-scan: every file Git does not ignore")

@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.ingestion.notice import Code, Notice, render
 from scripts.stack.admission import (
     COMPOSE_PROJECT,
     EXIT_ADMITTED,
@@ -242,19 +243,20 @@ class CommandTest(unittest.TestCase):
     def test_an_unknown_group_exits_with_the_refusal_status_and_not_the_wait_status(self) -> None:
         code, out, err = self.command("batch", 100000)
         self.assertEqual((EXIT_REFUSED, ""), (code, out))
-        self.assertIn("unknown group", err)
+        self.assertIn("AdmissionError", err)
 
     def test_a_limits_file_that_fails_its_checks_exits_with_the_refusal_status_and_the_loaders_message(self) -> None:
         self.limits_path.write_text(GOOD.replace("memory_limit_mib: 4096", "memory_limit_mib: 0"))
         code, out, err = self.command("heavy", 100000)
         self.assertEqual((EXIT_REFUSED, ""), (code, out))
-        self.assertIn("heavy_one", err)
-        self.assertIn("memory_limit_mib", err)
+        self.assertIn("LimitsError", err)
+        self.assertNotIn("heavy_one", err)
 
     def test_a_missing_limits_file_exits_with_the_refusal_status(self) -> None:
         code, _, err = run("heavy", "--limits", str(Path(self.folder.name) / "none.yml"), "--available-mib", "1", "--running", "")
         self.assertEqual(EXIT_REFUSED, code)
-        self.assertIn("none.yml", err)
+        self.assertIn("LimitsError", err)
+        self.assertNotIn("none.yml", err)
 
     def test_the_running_names_are_a_comma_list_and_the_empty_text_is_none(self) -> None:
         code, out, _ = self.command("heavy", 4096 + HEAVY_NEED, "postgres,chart_registry")
@@ -267,8 +269,8 @@ class CommandTest(unittest.TestCase):
             with self.subTest(text=text):
                 code, out, err = run("heavy", "--available-mib", text, "--running", "")
                 self.assertEqual((2, ""), (code, out))
-                self.assertIn("--available-mib", err)
-                self.assertIn("is not a whole number", err)
+                self.assertIn(render(Notice(Code.USAGE)), err)
+                self.assertNotIn(text or "\0", err)
 
 
 if __name__ == "__main__":

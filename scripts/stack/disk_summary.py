@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from collections import Counter
@@ -26,7 +25,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.closed import ClosedInputError, QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import write_new_file
 from scripts.stack.capacity_sampler import SCHEMA, SamplerError, parse_staging
 
 SUMMARY_FORMAT = "disk_measurements_1"
@@ -173,15 +174,11 @@ def summarize(phases: Mapping[str, Path], limits: Mapping[str, int]) -> dict[str
 
 
 def write_record(path: Path, document: Mapping[str, Any]) -> None:
-    """Create the output for its owner only. An existing path, also a link, is refused and left as it was."""
+    """Create the output for its owner only. A path that is held, in any form, is refused and left as it was."""
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        raise SummaryError("the output path exists") from None
-    except OSError:
-        raise SummaryError("the output path cannot be created") from None
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(json.dumps(document, indent=1) + "\n")
+        write_new_file(path, json.dumps(document, indent=1) + "\n", mode=0o600)
+    except ClosedInputError:
+        raise SummaryError("the output path is held or its folder does not exist") from None
 
 
 def phase_argument(text: str) -> tuple[str, Path]:
@@ -223,7 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         document = summarize(dict(arguments.phase), dict(arguments.limit))
         write_record(arguments.output, document)
     except SummaryError as error:
-        sys.stderr.write(f"disk summary: {error}\n")
+        sys.stderr.write(f"disk summary: {describe_error(error)}\n")
         return 1
     for name, summary in document["phases"].items():
         sys.stdout.write("\n".join(describe(name, summary)) + "\n")

@@ -9,36 +9,112 @@ credentials and the role that reach the bucket, and the latency of a real networ
 
 from __future__ import annotations
 
+import glob
+import os
 import re
-import shutil
+import stat
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts.ingestion.notice import Code, Notice
+from scripts.ingestion.folder import list_files, list_folder
+from scripts.ingestion.notice import Code, Notice, Subject
+from scripts.ingestion.output_file import write_new_file
 from scripts.ingestion.store import BLOCK_BYTES, ObjectVersion, StoreError
 
 VERSION_FILE = re.compile(r"v(\d{4})(\.deleted)?")
 
 
+# The files that the replay writes in a run's state folder. A read log (the folder store's record of what it read, written by the replay and the Bronze
+# decoder) is never given one of these names, so it cannot take the place of a saved position, a schedule or the health file.
+SCHEDULE_NAME = "schedule.json"
+STATE_NAME = "state.json"
+HEALTH_NAME = "health.json"
+STATE_FOLDER_NAMES = frozenset(name.casefold() for name in (SCHEDULE_NAME, STATE_NAME, HEALTH_NAME))
+
+
+def is_state_folder_name(name: str) -> bool:
+    """Whether ``name`` cannot be a read log's last part: it is empty, it is ``..`` or it is a file that the replay writes in its state folder, compared
+    without letter case."""
+    return name in {"", ".."} or name.casefold() in STATE_FOLDER_NAMES
+
+
+def refused() -> StoreError:
+    return StoreError(Notice(Code.CANNOT_WRITE, subject=Subject.OUTPUT))
+
+
+class ReadLog:
+    """The read log of a test run: a file that gets the key and version ID of every read, so a test can show which versions were read.
+
+    The log is always a new file. ``create`` opens it once, when the run opens its folder store, with ``O_CREAT | O_EXCL | O_NOFOLLOW``: a path that exists in
+    any form (a file, an empty file, a link, a dangling link, a folder, a named pipe, a hard link) is refused with ``CANNOT_WRITE`` before any read and what it
+    names stays as it was. Every read then appends one whole line to that open file; a write that stores fewer bytes than the line is ``CANNOT_WRITE`` too.
+    ``attach`` is for a job worker (a Spark partition) that gets the path of the log that its driver created: it opens that file again for appending, without
+    following a link or waiting for a reader, and refuses everything that is not a regular file.
+    """
+
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor: int | None = descriptor
+
+    @classmethod
+    def create(cls, path: Path) -> ReadLog:
+        try:
+            return cls(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o644))
+        except OSError:
+            raise refused() from None
+
+    @classmethod
+    def attach(cls, path: Path) -> ReadLog:
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            raise refused() from None
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise refused()
+        return cls(descriptor)
+
+    def append(self, line: str) -> None:
+        data = line.encode()
+        if self.descriptor is None:
+            raise refused()
+        try:
+            written = os.write(self.descriptor, data)
+        except OSError:
+            raise refused() from None
+        if written != len(data):
+            raise refused()
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class FolderStore:
-    def __init__(self, root: Path, bucket: str = "local-landed-copy", read_log: Path | None = None) -> None:
+    def __init__(self, root: Path, bucket: str = "local-landed-copy", read_log: ReadLog | None = None) -> None:
         self.root = root
         self.bucket = bucket
         self.read_log = read_log
 
     def note_read(self, version: ObjectVersion) -> None:
-        """Append the key and version ID of a read to the read log, so a test can show which versions were read."""
+        """Append the key and version ID of a read to the read log, when the store has one."""
         if self.read_log is not None:
-            with self.read_log.open("a") as handle:
-                handle.write(f"{version.key} {version.version_id}\n")
+            self.read_log.append(f"{version.key} {version.version_id}\n")
 
     def entries(self, key: str) -> list[tuple[int, bool, Path]]:
-        folder = self.root / key
+        folder = self.root
+        for part in key.split("/"):
+            if not list_folder(folder, glob.escape(part)):
+                return []
+            folder = folder / part
         found = []
-        for path in folder.iterdir() if folder.is_dir() else ():
+        for path in list_files(folder):
             match = VERSION_FILE.fullmatch(path.name)
-            if match and path.is_file():
+            if match:
                 found.append((int(match.group(1)), match.group(2) is not None, path))
         return sorted(found)
 
@@ -48,7 +124,7 @@ class FolderStore:
 
     def list_versions(self, prefix: str) -> list[ObjectVersion]:
         found: list[ObjectVersion] = []
-        keys = {str(path.parent.relative_to(self.root)) for pattern in ("v????", "v????.deleted") for path in self.root.rglob(pattern) if path.is_file()}
+        keys = {str(path.parent.relative_to(self.root)) for pattern in ("v????", "v????.deleted") for path in list_files(self.root, pattern, recursive=True)}
         for key in sorted(key for key in keys if key.startswith(prefix)):
             entries = self.entries(key)
             found += [self.version_of(key, number, marker, path, latest=index == len(entries) - 1) for index, (number, marker, path) in enumerate(entries)]
@@ -89,7 +165,7 @@ class FolderStore:
         folder = self.root / key
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"v{number:04d}"
-        path.write_bytes(data)
+        write_new_file(path, data, mode=0o644)
         return self.version_of(key, number, False, path, latest=True)
 
     def land_file(self, key: str, source: Path) -> ObjectVersion:
@@ -98,5 +174,5 @@ class FolderStore:
         folder = self.root / key
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"v{number:04d}"
-        shutil.copyfile(source, path)
+        write_new_file(path, source.read_bytes(), mode=0o644)
         return self.version_of(key, number, False, path, latest=True)

@@ -21,15 +21,16 @@ import functools
 import hashlib
 import json
 import operator
-import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
 from spark import table_checks as rules
 from spark.session import build_session, start_deadline
-from spark.settings import SettingsError
+from spark.settings import MAX_DEADLINE_SECONDS, SettingsError, number_setting
 from spark.table_checks import Plan, PlanTable, RulesError, TableResult, TableSpec
 
 JOB = "table_checks"
@@ -40,7 +41,7 @@ HASH_BLOCK_BYTES = 1024 * 1024
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(prog=f"python -m spark.jobs.{JOB}", description="Check each loaded table against its verified source.")
+    command = QuietParser(prog=f"python -m spark.jobs.{JOB}", description="Check each loaded table against its verified source.")
     command.add_argument("--staging", required=True, help="the folder that holds plan.json and the staged verified files")
     return command
 
@@ -179,14 +180,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     staging = Path(arguments.staging)
     try:
-        start_deadline(float(os.environ.get("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS)), JOB)
+        start_deadline(number_setting("JOB_DEADLINE_SECONDS", DEFAULT_JOB_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS), JOB)
         plan = rules.parse_plan((staging / PLAN_FILE).read_text())
         session = build_session(JOB, plan.branch, plan.branch_hash)
     except OSError as error:
         sys.stderr.write(f"{JOB}: the plan cannot be read ({type(error).__name__})\n")
         return 2
     except (RulesError, SettingsError) as error:
-        sys.stderr.write(f"{JOB}: {error}\n")
+        sys.stderr.write(f"{JOB}: {describe_error(error)}\n")
         return 2
     try:
         results = [check_table(session, staging, plan, entry) for entry in plan.tables]
