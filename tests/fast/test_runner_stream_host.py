@@ -472,14 +472,19 @@ class Images(HostRunnerCase):
     """The host runs the pinned images that its Compose renders from ``compose/image_pins.yml``. It builds nothing, so a local tag is not there."""
 
     PIN = "compose/image_pins.yml"
+    INVENTORY = "ansible/group_vars/all.yml"
 
     def checkout(self, text: str | None = None, *, listed: bool = True, digest: str | None = None) -> tuple[Path, Any]:
-        """A checkout folder with a pin file (the real one unless ``text`` is given) and a manifest that lists it unless ``listed`` is false."""
+        """A checkout folder with the image inventory and a pin file (the real one unless ``text`` is given), and a manifest that lists both, or without the pin
+        file when ``listed`` is false."""
         root = self.scratch / "checkout"
         (root / "compose").mkdir(parents=True, exist_ok=True)
         body = (COMPOSE / "image_pins.yml").read_text() if text is None else text
         (root / self.PIN).write_text(body)
-        files = {"compose/services/kafka.yml": "1" * 64}
+        inventory = (ROOT / self.INVENTORY).read_text()
+        (root / self.INVENTORY).parent.mkdir(parents=True, exist_ok=True)
+        (root / self.INVENTORY).write_text(inventory)
+        files = {"compose/services/kafka.yml": "1" * 64, self.INVENTORY: hashlib.sha256(inventory.encode()).hexdigest()}
         if listed:
             files[self.PIN] = digest or hashlib.sha256(body.encode()).hexdigest()
         return root, self.module.SourceManifest("0" * 40, files)
@@ -543,6 +548,36 @@ class Images(HostRunnerCase):
             replay, spark = self.module.deployed_images(manifest, root)
         self.assertEqual([True], swapped)
         self.assertEqual((pinned["replay"]["digest"], pinned["spark"]["digest"]), (replay, spark))
+
+    def test_an_image_inventory_that_was_altered_after_the_manifest_refuses_the_run(self) -> None:
+        root, manifest = self.checkout()
+        (root / self.INVENTORY).write_text((root / self.INVENTORY).read_text() + "# edited on the host\n")
+        with self.assertRaisesRegex(self.module.Blocked, f"{self.INVENTORY} differs from the source manifest"):
+            self.module.deployed_images(manifest, root)
+
+    def test_an_image_inventory_that_the_manifest_does_not_list_refuses_the_run(self) -> None:
+        root, manifest = self.checkout()
+        del manifest.files[self.INVENTORY]
+        with self.assertRaisesRegex(self.module.Blocked, f"no entry for {self.INVENTORY}"):
+            self.module.deployed_images(manifest, root)
+
+    def test_the_images_are_read_by_the_host_runners_shared_reader_against_the_runs_own_manifest(self) -> None:
+        root, manifest = self.checkout()
+        (root / "runner_manifest.json").write_text("not the manifest that the run read")
+        asked: list[tuple[object, Path]] = []
+        shared = import_runner("host_checkout").pinned_references
+
+        def reader(files: object, given: Path) -> dict[str, str]:
+            asked.append((files, given))
+            found: dict[str, str] = shared(files, given)
+            return found
+
+        with mock.patch.object(self.module, "pinned_references", reader):
+            self.module.deployed_images(manifest, root)
+        self.assertEqual([(manifest.files, root)], asked)
+
+    def test_the_shared_reader_is_a_runner_file_that_the_run_checks_against_its_manifest(self) -> None:
+        self.assertIn("tests/e2e/host_checkout.py", self.module.runner_files(ROOT))
 
     def test_a_pin_file_that_the_manifest_does_not_list_refuses_the_run(self) -> None:
         root, manifest = self.checkout(listed=False)

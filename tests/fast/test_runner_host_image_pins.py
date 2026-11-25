@@ -11,6 +11,8 @@ Failure modes covered here:
 - A runner that builds its own Spark image replaces a line of ``spark.yml`` that no longer exists, so the replacement does nothing and Compose stops with
   "render the image pins first".
 - A pin file with no pin for an image, or one that is not the fixed shape, gives a reference anyway.
+- A host mode that launches the Spark job through the host's Compose passes its setup because the pinned digest is cached, while the deployed settings render
+  another cached image for the job.
 """
 
 from __future__ import annotations
@@ -455,21 +457,30 @@ class BronzeHostMode(unittest.TestCase):
         self.assertNotIn("decode.REPLAY_IMAGE", source)
         self.assertNotIn("proof.IMAGE", source)
 
-    def test_the_stage_of_the_deployed_stack_looks_for_the_pinned_images(self) -> None:
-        source = inspect.getsource(self.module.stage_stack)
-        self.assertIn("committed_reference(name)", source)
-        self.assertIn('("spark", "replay")', source)
-
     def test_the_replay_container_starts_the_pinned_replay_image(self) -> None:
         source = inspect.getsource(self.module.HostStack.replay)
         self.assertIn('committed_reference("replay")', source)
         self.assertNotIn("REPLAY_IMAGE", source)
 
-    def stage(self, reference: Any) -> tuple[list[str], list[tuple[str, bool]]]:
-        """Run the stage of the deployed stack on stand-ins that stop it at its first expectation, with ``reference`` standing in for the pin file reader.
-        Returns the images that it asked the host about and the observations that it recorded."""
+    SPARK = "example.invalid/x@sha256:" + "a" * 64
+    REPLAY = "example.invalid/x@sha256:" + "b" * 64
+    OTHER = "example.invalid/x@sha256:" + "c" * 64
+
+    def references(self, name: str) -> str:
+        return {"spark": self.SPARK, "replay": self.REPLAY}[name]
+
+    def stage(self, reference: Any, rendered: str | None = SPARK, config_exit: int = 0) -> tuple[list[str], list[tuple[str, bool]]]:
+        """Run the stage of the deployed stack on stand-ins that stop it at its first expectation, with ``reference`` standing in for the pin file reader and
+        ``rendered`` for the Spark image that the host's Compose renders for the job. Every image that the host is asked about is cached, and the warehouse
+        location and the region are set, so only the images can fail the setup. Returns the images that it asked about and the observations."""
         inspected: list[str] = []
         shown: list[tuple[str, bool]] = []
+        document: dict[str, Any] = {
+            "services": {
+                "spark": {"environment": {"WAREHOUSE_LOCATION": "s3://example/"}} | ({} if rendered is None else {"image": rendered}),
+                "trino": {"environment": {"WAREHOUSE_LOCATION": "s3://example/"}},
+            }
+        }
 
         def docker(*arguments: str) -> tuple[int, str]:
             inspected.append(arguments[-1])
@@ -479,19 +490,48 @@ class BronzeHostMode(unittest.TestCase):
             shown.append((observed, passed))
             return False
 
-        stack = SimpleNamespace(health=lambda _: "healthy", docker=docker, compose_out=lambda *_: (0, ""), target=SimpleNamespace(run=lambda *_: (0, "")))
+        stack = SimpleNamespace(
+            health=lambda _: "healthy",
+            docker=docker,
+            compose_out=lambda *_: (config_exit, json.dumps(document)),
+            target=SimpleNamespace(run=lambda *_: (0, "AWS_REGION=example-region\n")),
+        )
         run = SimpleNamespace(stack=stack, record=SimpleNamespace(expect=expect))
         with (
             mock.patch.object(self.module, "committed_reference", reference),
+            mock.patch.object(self.module.proof, "committed_reference", reference),
             mock.patch.object(self.module, "configured_warehouse_location", lambda: "s3://example/"),
         ):
             self.assertFalse(self.module.stage_stack(run))
         return inspected, shown
 
     def test_the_stage_asks_the_host_about_the_pinned_references_of_the_commit(self) -> None:
-        spark, replay = "example.invalid/x@sha256:" + "a" * 64, "example.invalid/x@sha256:" + "b" * 64
-        inspected, _ = self.stage(lambda name: {"spark": spark, "replay": replay}[name])
-        self.assertEqual([spark, replay], inspected)
+        inspected, shown = self.stage(self.references)
+        self.assertEqual([self.SPARK, self.REPLAY], inspected)
+        self.assertEqual([True], [passed for _, passed in shown])
+
+    def test_a_host_that_renders_another_image_for_the_job_fails_the_setup_though_both_digests_are_cached(self) -> None:
+        inspected, shown = self.stage(self.references, rendered=self.OTHER)
+        self.assertEqual([self.SPARK, self.REPLAY], inspected)
+        self.assertEqual([False], [passed for _, passed in shown])
+
+    def test_a_host_whose_rendered_settings_cannot_be_read_or_name_no_image_for_the_job_fails_the_setup(self) -> None:
+        for rendered, exit_code in ((self.SPARK, 1), (None, 0), ("", 0)):
+            with self.subTest(rendered=rendered, exit_code=exit_code):
+                _, shown = self.stage(self.references, rendered=rendered, config_exit=exit_code)
+                self.assertEqual([False], [passed for _, passed in shown])
+
+    def test_the_stage_judges_the_rendered_image_with_the_catalog_proofs_check_and_holds_no_copy_of_it(self) -> None:
+        asked: list[object] = []
+
+        def state(stack: object) -> tuple[bool, bool]:
+            asked.append(stack)
+            return True, False
+
+        with mock.patch.object(self.module.proof, "spark_image_state", state):
+            _, shown = self.stage(self.references)
+        self.assertEqual((1, [False]), (len(asked), [passed for _, passed in shown]))
+        self.assertNotIn('["services"]["spark"]["image"]', (E2E / "bronze_host.py").read_text())
 
     def test_a_commit_with_no_readable_pin_counts_as_images_that_are_not_on_the_host_and_asks_the_host_about_none(self) -> None:
         def unreadable(name: str) -> str:

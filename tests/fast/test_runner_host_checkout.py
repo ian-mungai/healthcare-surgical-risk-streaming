@@ -33,6 +33,7 @@ E2E = ROOT / "tests" / "e2e"
 HELPER = E2E / "host_checkout.py"
 ENTRY_POINTS = ("gold_dimensions", "silver_signals", "silver_hypotension")
 PIN = "compose/image_pins.yml"
+INVENTORY = "ansible/group_vars/all.yml"
 
 
 @unittest.skipUnless(HELPER.is_file(), "the temporary runners are not in this checkout")
@@ -43,11 +44,19 @@ class HostCheckout(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
         (self.root / "compose").mkdir()
+        (self.root / "ansible" / "group_vars").mkdir(parents=True)
+        self.inventory = (ROOT / INVENTORY).read_text()
+        (self.root / INVENTORY).write_text(self.inventory)
         self.write_pin_file((ROOT / PIN).read_text())
 
     def write_pin_file(self, text: str) -> None:
         (self.root / PIN).write_text(text)
-        self.write_manifest({PIN: hashlib.sha256(text.encode()).hexdigest(), "compose/services/kafka.yml": "1" * 64})
+        self.write_manifest(self.listed(text) | {"compose/services/kafka.yml": "1" * 64})
+
+    def listed(self, pin_text: str, inventory: str | None = None) -> dict[str, str]:
+        """The manifest entries of the pin file and of the image inventory of the checkout, with the digests of the given texts."""
+        texts = {PIN: pin_text, INVENTORY: self.inventory if inventory is None else inventory}
+        return {name: hashlib.sha256(text.encode()).hexdigest() for name, text in texts.items()}
 
     def write_manifest(self, files: dict[str, str], commit: str = "a" * 40) -> None:
         (self.root / "runner_manifest.json").write_text(json.dumps({"commit": commit, "files": files}))
@@ -128,6 +137,69 @@ class HostCheckout(unittest.TestCase):
             reference = self.module.pinned_reference("spark", self.root)
         self.assertEqual([True], swapped)
         self.assertEqual(pinned["spark"]["digest"], reference)
+
+    def test_an_image_inventory_that_was_altered_after_the_manifest_refuses_though_it_names_the_same_images(self) -> None:
+        (self.root / INVENTORY).write_text(self.inventory + "# edited on the host\n")
+        with self.assertRaisesRegex(self.module.HostCheckoutError, f"{INVENTORY} differs from the source manifest"):
+            self.module.pinned_reference("spark", self.root)
+
+    def test_an_image_inventory_that_the_manifest_does_not_list_or_that_is_gone_or_is_a_link_refuses(self) -> None:
+        pin_text = (ROOT / PIN).read_text()
+        self.write_manifest({PIN: self.listed(pin_text)[PIN]})
+        with self.assertRaisesRegex(self.module.HostCheckoutError, f"no entry for {INVENTORY}"):
+            self.module.pinned_reference("spark", self.root)
+        self.write_manifest(self.listed(pin_text))
+        (self.root / INVENTORY).unlink()
+        with self.assertRaisesRegex(self.module.HostCheckoutError, INVENTORY):
+            self.module.pinned_reference("spark", self.root)
+        elsewhere = self.root / "elsewhere.yml"
+        elsewhere.write_text(self.inventory)
+        (self.root / INVENTORY).symlink_to(elsewhere)
+        with self.assertRaisesRegex(self.module.HostCheckoutError, INVENTORY):
+            self.module.pinned_reference("spark", self.root)
+
+    def test_the_images_are_the_ones_that_the_inventory_of_that_checkout_names_and_not_of_the_runners_own_tree(self) -> None:
+        shorter = "compose_stack_built_images:\n  - name: spark\n"
+        (self.root / INVENTORY).write_text(shorter)
+        self.write_manifest(self.listed((ROOT / PIN).read_text(), shorter))
+        with self.assertRaises(self.module.HostCheckoutError):
+            self.module.pinned_reference("spark", self.root)
+
+    def test_an_inventory_of_another_shape_refuses(self) -> None:
+        for text in ("[]\n", "compose_stack_built_images: 3\n", "other: []\n", "{unclosed\n"):
+            with self.subTest(text=text):
+                (self.root / INVENTORY).write_text(text)
+                self.write_manifest(self.listed((ROOT / PIN).read_text(), text))
+                with self.assertRaises(self.module.HostCheckoutError):
+                    self.module.pinned_reference("spark", self.root)
+
+    def test_the_images_come_from_the_inventory_bytes_that_were_hashed(self) -> None:
+        original = Path.read_bytes
+        swapped: list[bool] = []
+
+        def swap_after_the_read(path: Path) -> bytes:
+            data = original(path)
+            if path.name == "all.yml" and not swapped:
+                swapped.append(True)
+                path.write_text("compose_stack_built_images: []\n")
+            return data
+
+        with mock.patch.object(Path, "read_bytes", swap_after_the_read):
+            reference = self.module.pinned_reference("spark", self.root)
+        self.assertEqual([True], swapped)
+        self.assertEqual(pins.load()["spark"]["digest"], reference)
+
+    def test_the_pin_file_and_the_inventory_are_judged_by_one_reading_of_the_manifest(self) -> None:
+        read = self.module.read_source_manifest
+        readings: list[Path] = []
+
+        def counted(root: Path) -> object:
+            readings.append(root)
+            return read(root)
+
+        with mock.patch.object(self.module, "read_source_manifest", counted):
+            self.module.pinned_reference("spark", self.root)
+        self.assertEqual([self.root], readings)
 
     def test_a_refusal_names_the_file_and_never_a_value_of_it(self) -> None:
         self.write_pin_file("images:\n  spark:\n    tag: private_tag_value\n    digest: private_digest_value\n")
