@@ -4,7 +4,8 @@ The images come from ``compose_stack_built_images`` in the group variables. Each
 file and a Git-ignored file (the handoff, the project standard, ``.env``) cannot enter an image. The pin file is left out of every folder, because a pin of an
 image must not change the hash of the image that holds the Compose folder. The tag holds the hash of the folder, so the same files give the same tag, and a tag
 that the repository already holds is never built or pushed again, and a pin that the pin file already holds must equal the digest that the repository gives
-its tag. A push follows only when the repository's own answer says that the tag is absent. The pin file is written once, after every image has resolved.
+its tag. The repository is read with ``docker manifest inspect``, the CLI's own registry client, which no builder's registry mirror answers for. A push
+follows only when that command prints its own not-found line for the tag. The pin file is written once, after every image has resolved.
 The command relies on the ``docker login`` that this computer already has.
 It reads, prints and writes no token, and every message is fixed text: no output of Docker or Git is ever shown.
 """
@@ -130,38 +131,64 @@ def build_arguments(image: dict[str, Any], folder: Path, tag: str) -> list[str]:
     return [*arguments, str(folder if context == "." else folder / context)]
 
 
-def docker(settings: Settings, arguments: Sequence[str], seconds: int, label: str) -> tuple[int, str]:
+def docker(settings: Settings, arguments: Sequence[str], seconds: int, label: str) -> tuple[int, str, str]:
     try:
         done = run_command(settings.docker, arguments, timeout=seconds)
     except TimeoutExpired as error:
         raise PublishError(timeout_text(label, seconds)) from error
     except OSError as error:
         raise PublishError(f"docker {STARTED_TEXT}") from error
-    return done.returncode, (done.stdout + done.stderr).lower()
+    return done.returncode, done.stdout, done.stderr
 
 
 def build_image(settings: Settings, image: dict[str, Any], folder: Path, tag: str) -> None:
-    code, _ = docker(settings, build_arguments(image, folder, tag), BUILD_SECONDS, "docker build")
+    code, _, _ = docker(settings, build_arguments(image, folder, tag), BUILD_SECONDS, "docker build")
     if code != 0:
         raise PublishError(f"{image['name']}: the build failed")
 
 
 def push_image(settings: Settings, name: str, tag: str) -> None:
-    code, output = docker(settings, ["push", tag], PUSH_SECONDS, "docker push")
+    code, out, error = docker(settings, ["push", tag], PUSH_SECONDS, "docker push")
     if code != 0:
-        raise PublishError(LOGIN_TEXT if any(word in output for word in LOGIN_WORDS) else f"{name}: the push failed")
+        raise PublishError(LOGIN_TEXT if refused_login(out + error) else f"{name}: the push failed")
+
+
+def refused_login(output: str) -> bool:
+    return any(word in output.lower() for word in LOGIN_WORDS)
+
+
+def platform_digest(name: str, answer: str) -> str:
+    """The digest of the one linux/amd64 image in the answer of ``docker manifest inspect --verbose``: its ``Descriptor.digest``, or that of the one linux/amd64
+    entry when the answer is a list. Another shape, platform or count is refused."""
+    refused = PublishError(f"{name}: the repository's answer is not one image for {PLATFORM}")
+    try:
+        document: Any = json.loads(answer)
+    except ValueError:
+        raise refused from None
+    entries: list[Any] = document if isinstance(document, list) else [document]
+    found: list[str] = []
+    for entry in entries:
+        descriptor: Any = entry.get("Descriptor") if isinstance(entry, dict) else None
+        platform: Any = descriptor.get("platform") if isinstance(descriptor, dict) else None
+        digest: Any = descriptor.get("digest") if isinstance(descriptor, dict) else None
+        if isinstance(platform, dict) and isinstance(digest, str) and f"{platform.get('os')}/{platform.get('architecture')}" == PLATFORM:
+            found.append(digest)
+    if len(found) != 1:
+        raise refused
+    return found[0]
 
 
 def remote_digest(settings: Settings, name: str, tag: str) -> str | None:
-    """The digest that the repository holds for the tag, or None only when its own answer says that this tag is absent (``ERROR: <tag>: not found``).
+    """The digest that the repository holds for the tag, or None only when the CLI's own registry client prints its whole not-found line for this tag
+    (``no such manifest: docker.io/<tag>``, from ``docker manifest inspect``; Buildx reads through a builder's registry mirror and is not used).
 
-    Any other failure of the read (the network, a timeout, another not-found text, a missing login) is a refusal, so a push never follows a read that failed."""
-    code, output = docker(settings, ["buildx", "imagetools", "inspect", "--format", "{{.Manifest.Digest}}", tag], INSPECT_SECONDS, "docker inspect")
+    Any other failure of the read (the network, a timeout, another text, a missing login) is a refusal, so a push never follows a read that failed."""
+    code, out, error = docker(settings, ["manifest", "inspect", "--verbose", tag], INSPECT_SECONDS, "docker inspect")
     if code == 0:
-        return output.strip()
-    if re.fullmatch(rf"error: (?:docker\.io/)?{re.escape(tag.lower())}: not found", output.strip()):
+        return platform_digest(name, out)
+    if error.rstrip() == f"no such manifest: docker.io/{tag}" and not out.strip():
         return None
-    raise PublishError(LOGIN_TEXT if any(word in output for word in LOGIN_WORDS) else f"{name}: the repository could not be read")
+    raise PublishError(LOGIN_TEXT if refused_login(out + error) else f"{name}: the repository could not be read")
 
 
 def pin_image(found: dict[str, dict[str, str]], name: str, tag: str, digest: str, repository: str) -> dict[str, dict[str, str]]:

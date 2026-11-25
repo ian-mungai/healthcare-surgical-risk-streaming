@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -54,16 +55,39 @@ if args[:1] == ["push"]:
     state[args[1]] = override.read_text().strip() if override.exists() else "sha256:" + hashlib.sha256(args[1].encode()).hexdigest()
     remote.write_text(json.dumps(state))
     sys.exit(0)
-if args[:3] == ["buildx", "imagetools", "inspect"]:
+if args[:3] == ["manifest", "inspect", "--verbose"]:
     tag = args[-1]
     if tag in state:
-        print(state[tag])
+        shape = here / "shape"
+        digest = state[tag]
+        def entry(arch, dig, os_name="linux"):
+            platform = {{"architecture": arch, "os": os_name}}
+            return {{"Ref": "docker.io/" + tag, "Descriptor": {{"mediaType": "m", "digest": dig, "size": 1, "platform": platform}}}}
+        kind = shape.read_text().strip() if shape.exists() else "single"
+        if kind == "single":
+            document = entry("amd64", digest)
+        elif kind == "list":
+            document = [entry("arm64", "sha256:" + "a" * 64), entry("amd64", digest), entry("unknown", "sha256:" + "b" * 64, "unknown")]
+        elif kind == "list_without_amd64":
+            document = [entry("arm64", digest)]
+        elif kind == "list_twice":
+            document = [entry("amd64", digest), entry("amd64", "sha256:" + "c" * 64)]
+        elif kind == "other_platform":
+            document = entry("arm64", digest)
+        elif kind == "not_json":
+            print("not json")
+            sys.exit(0)
+        elif kind == "no_descriptor":
+            document = {{"Ref": "x"}}
+        else:
+            document = {{"Descriptor": {{"digest": digest, "platform": {{"architecture": "amd64"}}}}}}
+        print(json.dumps(document, indent="\\t"))
         sys.exit(0)
     broken = here / "inspect_fails"
     if broken.exists():
         sys.stderr.write(broken.read_text().replace("TAG", tag) or "ERROR: {CANARY_TEXT} the registry is unreachable\\n")
         sys.exit(1)
-    sys.stderr.write("ERROR: docker.io/" + tag + ": not found\\n")
+    sys.stderr.write("no such manifest: docker.io/" + tag + "\\n")
     sys.exit(1)
 sys.exit(3)
 """
@@ -256,7 +280,8 @@ class PushTest(Case):
         found = pins.load(self.pin_file)
         for name in ("app", "tool"):
             self.assertEqual(f"{REPOSITORY}@{digest_of(found[name]['tag'])}", found[name]["digest"])
-        self.assertTrue(any(line.startswith("buildx imagetools inspect --format {{.Manifest.Digest}} ") for line in self.calls()))
+        self.assertTrue(any(line.startswith("manifest inspect --verbose ") for line in self.calls()))
+        self.assertFalse(any("imagetools" in line for line in self.calls()), "the builder's registry mirror must not answer")
 
     def test_a_second_run_with_the_pins_in_place_reads_each_digest_but_builds_pushes_and_writes_nothing(self) -> None:
         self.run_publish()
@@ -267,7 +292,7 @@ class PushTest(Case):
         written.assert_not_called()
         added = self.calls()[before:]
         self.assertEqual(2, len(added))
-        self.assertTrue(all(line.startswith("buildx imagetools inspect ") for line in added), added)
+        self.assertTrue(all(line.startswith("manifest inspect --verbose ") for line in added), added)
         self.assertEqual(text, self.pin_file.read_text())
 
     def test_a_pin_that_was_edited_by_hand_to_another_digest_with_the_same_tag_is_refused_and_no_pin_changes(self) -> None:
@@ -281,7 +306,7 @@ class PushTest(Case):
             self.run_publish()
         self.assertEqual("tool: the tag already has a different digest in the pin file", str(raised.exception))
         self.assertEqual(text, self.pin_file.read_text())
-        self.assertEqual([], [line for line in self.calls()[len(before) :] if not line.startswith("buildx imagetools inspect ")])
+        self.assertEqual([], [line for line in self.calls()[len(before) :] if not line.startswith("manifest inspect --verbose ")])
 
     def test_a_pinned_tag_that_the_repository_no_longer_holds_is_refused_and_not_pushed_again(self) -> None:
         self.run_publish()
@@ -367,16 +392,33 @@ class InspectFailureTest(Case):
     def test_an_unreachable_registry_or_a_timeout_or_any_other_failure_of_the_read_is_not_read_as_an_absent_tag(self) -> None:
         for text in (
             "",
-            f"ERROR: {CANARY_TEXT} Get https://registry-1.docker.io/v2/: dial tcp: i/o timeout\n",
-            f"ERROR: {CANARY_TEXT} 500 Internal Server Error\n",
-            f"docker: 'buildx' is not a docker command: {CANARY_TEXT} not found\n",
-            f"ERROR: {CANARY_TEXT} command not found\n",
-            f"ERROR: {CANARY_TEXT} repository not found\n",
-            f"ERROR: {CANARY_TEXT} manifest unknown\n",
-            f"ERROR: {CANARY_TEXT} name unknown\n",
-            "ERROR: docker.io/example/other_images:app-1.2-000000000000: not found\n",
-            "ERROR: docker.io/TAG: not found, and the registry also said: x\n",
-            "WARNING: slow\nERROR: docker.io/TAG: not found\n",
+            f"{CANARY_TEXT} Get https://registry-1.docker.io/v2/: dial tcp: i/o timeout\n",
+            f"{CANARY_TEXT} 500 Internal Server Error\n",
+            f"docker: 'manifest' is not a docker command: {CANARY_TEXT} not found\n",
+            f"{CANARY_TEXT} command not found\n",
+            f"{CANARY_TEXT} repository not found\n",
+            f"{CANARY_TEXT} manifest unknown\n",
+            f"{CANARY_TEXT} name unknown\n",
+            "no such manifest: docker.io/example/other_images:app-1.2-000000000000\n",
+            "no such manifest: docker.io/TAG, and the registry also said: x\n",
+            "WARNING: slow\nno such manifest: docker.io/TAG\n",
+            "no such manifest: docker.io/TAG\nno such manifest: docker.io/TAG\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual("app: the repository could not be read", self.refuse(text))
+
+    def test_the_answers_of_a_builder_or_a_registry_mirror_are_not_read_as_an_absent_tag_only_the_cli_s_own_line_with_its_whole_text_is(self) -> None:
+        for text in (
+            "ERROR: docker.io/TAG: not found\n",
+            "error: TAG: not found\n",
+            "ERROR: docker.io/TAG: Not Found\n",
+            "unexpected status from HEAD request to https://mirror.example.invalid/v2/manifests/TAG: 404 Not Found\n",
+            "No such manifest: docker.io/TAG\n",
+            "no such manifest: TAG\n",
+            "no such manifest: docker.io/TAG:extra\n",
+            "no such manifest:docker.io/TAG\n",
+            "  no such manifest: docker.io/TAG\n",
+            "404 page not found\n",
         ):
             with self.subTest(text=text):
                 self.assertEqual("app: the repository could not be read", self.refuse(text))
@@ -384,16 +426,61 @@ class InspectFailureTest(Case):
     def test_a_refused_login_in_the_read_gives_the_login_text(self) -> None:
         self.assertEqual(
             "the push was refused: run docker login on this computer, then run the command again",
-            self.refuse(f"ERROR: {CANARY_TEXT} requested access to the resource is denied\n"),
+            self.refuse(f"{CANARY_TEXT} requested access to the resource is denied\n"),
         )
 
-    def test_the_registrys_own_not_found_answer_for_the_exact_tag_lets_the_push_follow_with_or_without_the_docker_io_prefix(self) -> None:
-        for answer in ("ERROR: docker.io/TAG: not found\n", "ERROR: TAG: not found\r\n", "error: docker.io/TAG: Not Found\n\n"):
+    def test_the_cli_s_own_not_found_line_for_the_exact_tag_lets_the_push_follow_with_any_line_ending_and_trailing_blank_lines(self) -> None:
+        for answer in (
+            "no such manifest: docker.io/TAG\n",
+            "no such manifest: docker.io/TAG\r\n",
+            "no such manifest: docker.io/TAG\n\n",
+            "no such manifest: docker.io/TAG",
+        ):
             with self.subTest(answer=answer):
                 self.setUp()
                 (self.bin / "inspect_fails").write_text(answer)
                 self.assertEqual(["app: pushed and pinned"], self.run_publish(images=IMAGES[:1]))
                 self.assertEqual(1, len(self.pushes()))
+
+    def test_the_read_runs_the_clis_own_manifest_command_and_never_the_builder(self) -> None:
+        self.run_publish(images=IMAGES[:1])
+        reads = [line for line in self.calls() if line.startswith("manifest ")]
+        self.assertEqual(2, len(reads), "one read before the push and one after")
+        self.assertTrue(all(re.fullmatch(r"manifest inspect --verbose example/project_images:app-1\.2-[0-9a-f]{12}", line) for line in reads), reads)
+        self.assertEqual([], [line for line in self.calls() if line.startswith("buildx") and not line.startswith("buildx build")])
+
+
+class DigestReadTest(Case):
+    """The digest is the one Descriptor.digest of the answer, or of its linux/amd64 entry when the answer is a list."""
+
+    def pinned(self, shape: str) -> str:
+        (self.bin / "shape").write_text(shape)
+        self.run_publish(images=IMAGES[:1])
+        return pins.load(self.pin_file)["app"]["digest"]
+
+    def test_a_single_image_answer_gives_its_descriptor_digest(self) -> None:
+        digest = self.pinned("single")
+        tag = pins.load(self.pin_file)["app"]["tag"]
+        self.assertEqual(f"{REPOSITORY}@{digest_of(tag)}", digest)
+
+    def test_a_list_answer_gives_the_digest_of_its_linux_amd64_entry_and_not_another_platform(self) -> None:
+        digest = self.pinned("list")
+        tag = pins.load(self.pin_file)["app"]["tag"]
+        self.assertEqual(f"{REPOSITORY}@{digest_of(tag)}", digest)
+
+    def test_an_answer_that_is_not_exactly_one_linux_amd64_image_is_refused_and_no_pin_is_written(self) -> None:
+        for shape in ("list_without_amd64", "list_twice", "other_platform", "not_json", "no_descriptor", "no_platform"):
+            with self.subTest(shape=shape):
+                self.setUp()
+                (self.bin / "shape").write_text(shape)
+                self.run_publish_failing_after_push()
+
+    def run_publish_failing_after_push(self) -> None:
+        """The first read finds the tag absent, the push stores it, and the second read gets the bad shape: no pin is written."""
+        with self.assertRaises(PublishError) as raised:
+            self.run_publish(images=IMAGES[:1])
+        self.assertEqual("app: the repository's answer is not one image for linux/amd64", str(raised.exception))
+        self.assertEqual("images: {}\n", self.pin_file.read_text())
 
 
 class MissingToolTest(Case):
