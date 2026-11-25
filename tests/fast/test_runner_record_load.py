@@ -8,6 +8,8 @@ Failure modes covered here:
 - A removal that fails is not a failed record.
 - The load branch holds a raw table, or main does, and the record still passes (the branch was not compared with its exact value).
 - A branch of another owner is moved, and the record passes because the assertion only checks that a branch of that name exists.
+- A tag of the branch's name at the recorded hash passes the check that the branch was kept (the kind of the reference was not compared).
+- A raw table whose content holds no snapshot is on the load branch or on main, and the absence check passes (it read snapshot IDs and not catalog keys).
 
 The runner is untracked, so the tests run only where it is on disk. A stand-in ``docker`` program on the path answers the commands; nothing starts.
 """
@@ -159,18 +161,35 @@ class RunnerSites(unittest.TestCase):
 
 
 class FakeCatalog:
-    def __init__(self, branches: dict[str, dict[str, int] | None], heads: dict[str, str] | None = None) -> None:
+    """``branches`` maps a name to its snapshot IDs (None: no such reference). ``kinds`` and ``heads`` set the kind and hash of a reference. ``keys`` sets the
+    raw table keys of a branch, which by default are one per snapshot ID; a key with no snapshot is a table whose content holds no ``snapshotId``."""
+
+    def __init__(
+        self,
+        branches: dict[str, dict[str, int] | None],
+        heads: dict[str, str] | None = None,
+        kinds: dict[str, str] | None = None,
+        keys: dict[str, list[str]] | None = None,
+    ) -> None:
         self.branches = branches
         self.heads = heads or {}
+        self.kinds = kinds or {}
+        self.keys = keys or {}
 
     def reference(self, name: str) -> SimpleNamespace | None:
-        return SimpleNamespace(hash=self.heads.get(name, "h" * 64)) if self.branches.get(name) is not None else None
+        found = self.branches.get(name)
+        return None if found is None else SimpleNamespace(kind=self.kinds.get(name, "BRANCH"), hash=self.heads.get(name, "h" * 64))
 
     def snapshot_ids(self, name: str) -> dict[str, int]:
         found = self.branches.get(name)
         if found is None:
             raise KeyError(name)
         return found
+
+    def table_keys(self, name: str) -> list[str]:
+        if name in self.keys:
+            return self.keys[name]
+        return sorted(f"raw_records.{table}" for table in self.snapshot_ids(name))
 
 
 @unittest.skipUnless(RUNNER.is_file(), "the temporary acceptance runner is not in this checkout")
@@ -185,7 +204,7 @@ class RecordAssertions(unittest.TestCase):
         record = self.record()
         self.module.expect_no_raw_table(record, "case", FakeCatalog({"load_x": {}, "main": {}}), "load_x")
         self.assertEqual([True, True], [item.passed for item in record.observations])
-        self.assertEqual(["{}", "{}"], [item.observed for item in record.observations])
+        self.assertEqual(["[]", "[]"], [item.observed for item in record.observations])
 
     def test_an_absent_branch_holds_no_table(self) -> None:
         record = self.record()
@@ -196,7 +215,19 @@ class RecordAssertions(unittest.TestCase):
         record = self.record()
         self.module.expect_no_raw_table(record, "case", FakeCatalog({"load_x": {"clinical_data": 7001}, "main": {}}), "load_x")
         self.assertEqual([False, True], [item.passed for item in record.observations])
-        self.assertIn("7001", record.observations[0].observed)
+        self.assertIn("raw_records.clinical_data", record.observations[0].observed)
+
+    def test_a_raw_table_key_with_no_snapshot_on_the_load_branch_fails(self) -> None:
+        record = self.record()
+        catalog = FakeCatalog({"load_x": {}, "main": {}}, keys={"load_x": ["raw_records.clinical_data"]})
+        self.module.expect_no_raw_table(record, "case", catalog, "load_x")
+        self.assertEqual([False, True], [item.passed for item in record.observations])
+
+    def test_a_raw_table_key_with_no_snapshot_on_main_fails(self) -> None:
+        record = self.record()
+        catalog = FakeCatalog({"load_x": {}, "main": {}}, keys={"main": ["raw_records.lab_data"]})
+        self.module.expect_no_raw_table(record, "case", catalog, "load_x")
+        self.assertEqual([True, False], [item.passed for item in record.observations])
 
     def test_a_table_on_main_fails(self) -> None:
         record = self.record()
@@ -208,16 +239,38 @@ class RecordAssertions(unittest.TestCase):
         self.module.expect_branch_head(record, "case", FakeCatalog({"other": {}}, {"other": "a" * 64}), "other", "a" * 64)
         self.assertTrue(record.observations[0].passed)
 
+    def test_a_tag_at_the_recorded_hash_fails(self) -> None:
+        record = self.record()
+        self.module.expect_branch_head(record, "case", FakeCatalog({"other": {}}, {"other": "a" * 64}, {"other": "TAG"}), "other", "a" * 64)
+        self.assertFalse(record.observations[0].passed)
+        self.assertIn("TAG", record.observations[0].observed)
+        self.assertIn("BRANCH", record.observations[0].expected)
+
     def test_a_branch_at_another_head_fails(self) -> None:
         record = self.record()
         self.module.expect_branch_head(record, "case", FakeCatalog({"other": {}}, {"other": "b" * 64}), "other", "a" * 64)
         self.assertFalse(record.observations[0].passed)
-        self.assertEqual(("a" * 64, "b" * 64), (record.observations[0].expected, record.observations[0].observed))
+        self.assertIn("a" * 64, record.observations[0].expected)
+        self.assertIn("b" * 64, record.observations[0].observed)
 
     def test_a_missing_branch_fails(self) -> None:
         record = self.record()
         self.module.expect_branch_head(record, "case", FakeCatalog({}), "other", "a" * 64)
         self.assertFalse(record.observations[0].passed)
+
+    def test_the_catalog_check_of_main_reads_keys_and_not_snapshot_ids(self) -> None:
+        tree = ast.parse(RUNNER.read_text())
+        run_cases = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run_cases")
+        main_checks = [
+            node
+            for node in ast.walk(run_cases)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "snapshot_ids"
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "main"
+        ]
+        self.assertEqual([], main_checks)
 
     def test_exact_compares_the_two_values_it_shows(self) -> None:
         record = self.record()
