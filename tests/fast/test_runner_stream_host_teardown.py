@@ -272,6 +272,30 @@ class UnresolvedTags(TeardownCase):
             self.assertEqual(1, self.tear_down(broker, self.branch()))
         self.assertEqual({self.VOLUME}, broker.volumes)
 
+    def test_a_tag_that_is_both_recorded_and_unconfirmed_is_never_deleted(self) -> None:
+        name = f"stream_features_{SUFFIX}"
+        self.inventory(references=[{"name": name, "type": "TAG", "hash": HASH_A}], unconfirmed=[self.TAG])
+        broker = Broker(set(), volumes=(self.VOLUME,))
+        nessie = FakeNessie({name: Reference("TAG", name, HASH_A)})
+        self.assertEqual(1, self.tear_down(broker, nessie))
+        self.assertEqual([], nessie.deleted)
+        self.assertIn(name, nessie.references)
+        self.assertEqual({self.VOLUME}, broker.volumes)
+        text = self.output.getvalue()
+        self.assertIn("INCOMPLETE", text)
+        self.assertIn(f"never deleted: ['{self.TAG}']", text)
+        self.assertNotIn("every resource is gone", text)
+
+    def test_the_other_references_of_that_inventory_are_still_deleted(self) -> None:
+        name = f"stream_features_{SUFFIX}"
+        branch = f"stream_control_{SUFFIX}"
+        entries = [{"name": branch, "type": "BRANCH", "hash": HASH_A}, {"name": name, "type": "TAG", "hash": HASH_A}]
+        self.inventory(references=entries, unconfirmed=[self.TAG])
+        nessie = FakeNessie({branch: Reference("BRANCH", branch, HASH_A), name: Reference("TAG", name, HASH_A)})
+        self.assertEqual(1, self.tear_down(Broker(set(), volumes=(self.VOLUME,)), nessie))
+        self.assertEqual([(branch, HASH_A, "BRANCH")], nessie.deleted)
+        self.assertEqual({name}, set(nessie.references))
+
     def test_a_topic_alone_does_not_keep_the_volume(self) -> None:
         self.inventory(unconfirmed=[f"topic replay_events_p8h_{SUFFIX}_late"])
         broker = Broker(set(), volumes=(self.VOLUME,))

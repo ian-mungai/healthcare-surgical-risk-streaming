@@ -233,6 +233,38 @@ class Sampling(RoomsCase):
         with mock.patch.object(self.host, "run_command", lambda program, args, **options: done(1)), self.assertRaises(RuntimeError):
             sampler.usage()
 
+    def sampled(self, checkpoint: CompletedProcess[str]) -> Any:
+        """One round of the ten-room sampler over the real stack reads: ten broker end offsets and the given answer of the checkpoint command."""
+        stack = object.__new__(self.host.HostStack)
+        stack.input_topic = "replay_events"
+        stack.docker = lambda *arguments, timeout=60: checkpoint
+        stack.end_offsets = lambda timeout=60: {partition: 7 for partition in range(10)}
+        sampler = self.host.rooms_sampler(stack, "job", "rooms10", {"stream": "b" * 64})
+
+        def usage() -> dict[str, tuple[float, float]]:
+            sampler.stop.set()
+            return {"stream": (1.0, 1.0)}
+
+        sampler.usage = usage
+        sampler.loop()
+        return sampler
+
+    def test_a_checkpoint_read_that_fails_is_a_failed_reading_and_never_a_zero_commit(self) -> None:
+        sampler = self.sampled(done(1, "", "ls: no such file"))
+        self.assertEqual(1, sampler.failures)
+        self.assertEqual([], sampler.samples)
+
+    def test_a_job_that_has_not_committed_yet_is_a_reading_with_the_whole_end_offset_behind(self) -> None:
+        sampler = self.sampled(done(0, "NONE\n"))
+        self.assertEqual(0, sampler.failures)
+        self.assertEqual([{partition: 7 for partition in range(10)}], [sample.lag for sample in sampler.samples])
+
+    def test_a_committed_batch_is_a_reading_of_the_lag_behind_it(self) -> None:
+        offsets = {"replay_events": {str(partition): 5 for partition in range(10)}}
+        sampler = self.sampled(done(0, json.dumps(offsets) + "\n"))
+        self.assertEqual(0, sampler.failures)
+        self.assertEqual([{partition: 2 for partition in range(10)}], [sample.lag for sample in sampler.samples])
+
     def test_a_line_names_its_container_by_id(self) -> None:
         line = json.dumps({"ID": "abc123abc123", "Name": "n", "CPUPerc": "1.5%", "MemUsage": "100MiB / 1GiB"})
         self.assertEqual(("abc123abc123", 1.5, 100.0), self.host.parse_stats_id_line(line))
