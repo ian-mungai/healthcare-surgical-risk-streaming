@@ -53,6 +53,10 @@ class Settings(unittest.TestCase):
             ("STREAM_MAX_OFFSETS_PER_TRIGGER", "0"),
             ("STREAM_TEST_EXIT_AFTER_SINK", "0"),
             ("STREAM_TEST_EXIT_AFTER_SINK", "x"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "\u00b2"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "\u0661"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", "1_0"),
+            ("STREAM_TEST_EXIT_AFTER_SINK", " 7"),
         ):
             with self.subTest(name=name, value=value), self.assertRaisesRegex(StreamSettingsError, name):
                 from_environment({**BASE, name: value})
@@ -70,7 +74,7 @@ class Settings(unittest.TestCase):
             with self.subTest(text=text), self.assertRaisesRegex(StreamSettingsError, "STREAM_MAX_OFFSETS_PER_TRIGGER") as caught:
                 from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text})
             self.assertNotIn(text, str(caught.exception))
-        for text, wanted in (("1", 1), ("7", 7), ("1e3", 1000), ("2.0", 2), ("50000", 50_000)):
+        for text, wanted in (("1", 1), ("7", 7), ("2.0", 2), ("50000", 50_000)):
             with self.subTest(text=text):
                 self.assertEqual(wanted, from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text}).max_offsets_per_trigger)
         self.assertEqual(50_000, from_environment(BASE).max_offsets_per_trigger)
@@ -93,11 +97,22 @@ class Settings(unittest.TestCase):
             "Infinity",
             "1e999999999999999999999",
             "\u0661\u0662",
+            "1e_9",
+            "1e3",
+            "1E+3",
+            "1_000",
+            " 5",
+            "5 ",
+            "5\n",
+            "+5",
+            "5.",
+            ".5",
+            "1e0",
         ):
             with self.subTest(value=text), self.assertRaisesRegex(StreamSettingsError, "STREAM_MAX_OFFSETS_PER_TRIGGER") as caught:
                 from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text})
             self.assertNotIn(text, str(caught.exception))
-        for text, expected in (("1.0000000000", 1), ("1e3", 1_000), ("1E+3", 1_000), ("00050000", 50_000), ("2147483647.0", 2_147_483_647), ("5.00", 5)):
+        for text, expected in (("1.0000000000", 1), ("5", 5), ("5.0", 5), ("00050000", 50_000), ("2147483647.0", 2_147_483_647), ("5.00", 5)):
             with self.subTest(value=text):
                 self.assertEqual(expected, from_environment({**BASE, "STREAM_MAX_OFFSETS_PER_TRIGGER": text}).max_offsets_per_trigger)
 

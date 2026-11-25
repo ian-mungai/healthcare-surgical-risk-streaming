@@ -9,9 +9,10 @@ test can stop the job after its first sink commit. It is off unless set.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from replay.events.formats import FEATURE_READY_TOPIC, INPUT_TOPIC
 from spark.streaming.model import MINUTE, SECOND
@@ -69,17 +70,21 @@ def number(env: Mapping[str, str], name: str, default: float, *, minimum: float,
     return value
 
 
+PLAIN_DECIMAL = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+WHOLE_NUMBER = re.compile(r"[0-9]+")
+
+
 def offset_count(env: Mapping[str, str], name: str, default: int) -> int:
     """The number of offsets per trigger: a whole number from 1 to ``MAXIMUM_OFFSETS``. The text is read exactly as a decimal, so a fraction that a float
-    would round to a whole number (``1.0000000000000001``) is refused, and no fraction is ever cut to a whole number."""
+    would round to a whole number (``1.0000000000000001``) is refused, and no fraction is ever cut to a whole number. Only plain ASCII digits with an optional
+    fraction are read: no sign, exponent, underscore or space, which ``Decimal`` would accept (``1e_9``, ``1_000``, `` 5``)."""
     text = env.get(name, "")
     if not text:
         return default
-    try:
-        value = Decimal(text)
-    except InvalidOperation:
-        raise StreamSettingsError(f"{name} is not a number") from None
-    if not (text.isascii() and value.is_finite() and value == value.to_integral_value() and 1 <= value <= MAXIMUM_OFFSETS):
+    if PLAIN_DECIMAL.fullmatch(text) is None:
+        raise StreamSettingsError(f"{name} must be a whole number from 1")
+    value = Decimal(text)
+    if not (value == value.to_integral_value() and 1 <= value <= MAXIMUM_OFFSETS):
         raise StreamSettingsError(f"{name} must be a whole number from 1")
     return int(value)
 
@@ -88,7 +93,7 @@ def from_environment(env: Mapping[str, str]) -> StreamSettings:
     test_exit: int | None = None
     if env.get("STREAM_TEST_EXIT_AFTER_SINK", ""):
         text = env["STREAM_TEST_EXIT_AFTER_SINK"]
-        if not text.isdigit() or int(text) < 1:
+        if WHOLE_NUMBER.fullmatch(text) is None or int(text) < 1:
             raise StreamSettingsError("STREAM_TEST_EXIT_AFTER_SINK must be a whole number from 1")
         test_exit = int(text)
     cutoff_step_us = round(number(env, "STREAM_CUTOFF_STEP_SECONDS", MINUTE / SECOND, minimum=0) * SECOND)
