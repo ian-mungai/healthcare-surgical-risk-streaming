@@ -4,8 +4,9 @@ output "host_instance_id" {
 }
 
 output "host_image_id" {
-  description = "AMI of the host: the pinned Canonical Ubuntu 24.04 build for the run's region. Null for a host that already exists."
+  description = "AMI of the host: the pinned Canonical Ubuntu 24.04 build for the run's region. Null for a host that already exists. Marked sensitive because the AWS provider marks the instance's attributes so (live plan, Nov 24 2026); the image check reads the plan's own JSON, never this output."
   value       = one(module.host[*].image_id)
+  sensitive   = true
 
   precondition {
     condition     = !var.provision_host || local.ubuntu_ami != ""
