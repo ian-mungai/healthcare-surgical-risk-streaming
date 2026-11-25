@@ -19,8 +19,9 @@ from spark.internal_diagnostic import CLASS_LIMIT, FRAME_LIMIT, UNAVAILABLE_LINE
 from tests.fast.test_internal_diagnostic import ENTRY, FOREIGN, INNER, MARKER, ROOT, TRACKED, caught, from_file, nested, outer
 
 OTHER_FILE = "spark/profile/checks.py"
-NAMED = f"{TRACKED}:63:{ENTRY}"
-NAMED_TWO = f"{TRACKED}:9:{INNER}"
+ENTRY_PLAIN = TRACKED + ENTRY  # no separator between the file and the function
+NAMED = f"{TRACKED}:{ENTRY}"
+NAMED_TWO = f"{TRACKED}:{INNER}"
 OWN = f"internal_error class=builtins.KeyError frames=other | {NAMED} | {NAMED_TWO}"
 
 
@@ -31,13 +32,10 @@ class Accepted(unittest.TestCase):
             "internal_error class=builtins.RuntimeError frames=",
             "internal_error class=other frames=other",
             "internal_error class=scripts.stack.nessie.NessieError <- builtins.OSError <- other"
-            f" frames={TRACKED}:1:<module> | {TRACKED}:2:<lambda> | {OTHER_FILE}:3:<listcomp>",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:0:<genexpr> | {TRACKED}:9999999:<dictcomp> | {TRACKED}:7:<setcomp>",
+            f" frames={TRACKED}:<module> | {TRACKED}:<lambda> | {OTHER_FILE}:<listcomp>",
+            f"internal_error class=builtins.KeyError frames={TRACKED}:<genexpr> | {TRACKED}:<dictcomp> | {TRACKED}:<setcomp>",
             UNAVAILABLE_LINE,
-            "internal_error class="
-            + " <- ".join(["builtins.KeyError"] * CLASS_LIMIT)
-            + " frames="
-            + " | ".join(f"{TRACKED}:{n}:{ENTRY}" for n in range(FRAME_LIMIT)),
+            "internal_error class=" + " <- ".join(["builtins.KeyError"] * CLASS_LIMIT) + " frames=" + " | ".join([f"{TRACKED}:{ENTRY}"] * FRAME_LIMIT),
         ):
             with self.subTest(line=line[:80]):
                 self.assertTrue(is_diagnostic(line))
@@ -58,43 +56,32 @@ class Accepted(unittest.TestCase):
 
 class Refused(unittest.TestCase):
     def test_a_line_that_the_producer_cannot_print_is_refused(self) -> None:
-        many_frames = " | ".join(f"{TRACKED}:{n}:{ENTRY}" for n in range(FRAME_LIMIT + 1))
+        many_frames = " | ".join([f"{TRACKED}:{ENTRY}"] * (FRAME_LIMIT + 1))
         many_classes = " <- ".join(["builtins.KeyError"] * (CLASS_LIMIT + 1))
         for line in (
             "internal_error class=" + "C" * 121 + " frames=",  # a class of 121 characters
             "internal_error class=builtins.NotAClass frames=",  # not on the lists
             "internal_error class=tests.fast.x.Secretive frames=",
             f"internal_error class=spark.settings.{MARKER} frames=",
-            f"internal_error class=builtins.KeyError frames=/x/{TRACKED}:1:{ENTRY}",  # a path outside the project
-            f"internal_error class=builtins.KeyError frames={ROOT}/{TRACKED}:1:{ENTRY}",  # a full path
-            f"internal_error class=builtins.KeyError frames=result_file.py:1:{ENTRY}",  # the old form: a base name
-            f"internal_error class=builtins.KeyError frames=spark/{MARKER}.py:1:{ENTRY}",  # a file that the inventory does not hold
-            f"internal_error class=builtins.KeyError frames=spark/result_file-x.py:1:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames=spark/../{TRACKED}:1:{ENTRY}",  # a path that is not in its one form
-            f"internal_error class=builtins.KeyError frames=spark//result_file.py:1:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames=./{TRACKED}:1:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:{MARKER}",  # a function that the file does not define
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:{ENTRY}-g",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:{FOREIGN}",  # a function of another file
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:<string>",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:{ENTRY} text",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:{ENTRY} | ",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:01:{ENTRY}",  # a number with a leading zero
-            f"internal_error class=builtins.KeyError frames={TRACKED}:00:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:0000001:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:+1:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1_0:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:\u0661:{ENTRY}",  # a digit of another script
-            f"internal_error class=builtins.KeyError frames={TRACKED}:10000000:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:12345678:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:x:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:-1:{ENTRY}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}::{ENTRY}",
+            f"internal_error class=builtins.KeyError frames=/x/{TRACKED}:{ENTRY}",  # a path outside the project
+            f"internal_error class=builtins.KeyError frames={ROOT}/{TRACKED}:{ENTRY}",  # a full path
+            f"internal_error class=builtins.KeyError frames=result_file.py:{ENTRY}",  # the old form: a base name
+            f"internal_error class=builtins.KeyError frames=spark/{MARKER}.py:{ENTRY}",  # a file that the inventory does not hold
+            f"internal_error class=builtins.KeyError frames=spark/result_file-x.py:{ENTRY}",
+            f"internal_error class=builtins.KeyError frames=spark/../{TRACKED}:{ENTRY}",  # a path that is not in its one form
+            f"internal_error class=builtins.KeyError frames=spark//result_file.py:{ENTRY}",
+            f"internal_error class=builtins.KeyError frames=./{TRACKED}:{ENTRY}",
+            f"internal_error class=builtins.KeyError frames={TRACKED}:{MARKER}",  # a function that the file does not define
+            f"internal_error class=builtins.KeyError frames={TRACKED}:{ENTRY}-g",
+            f"internal_error class=builtins.KeyError frames={TRACKED}:{FOREIGN}",  # a function of another file
+            f"internal_error class=builtins.KeyError frames={TRACKED}:<string>",
+            f"internal_error class=builtins.KeyError frames={TRACKED}:{ENTRY} text",
+            f"internal_error class=builtins.KeyError frames={TRACKED}:{ENTRY} | ",
             "internal_error class=builtins.KeyError frames=other | other",  # a run of other is one
             f"internal_error class=builtins.KeyError frames={NAMED} | other | other | {NAMED_TWO}",
             f"internal_error class={many_classes} frames=",
             f"internal_error class=builtins.KeyError frames={many_frames}",
-            f"internal_error class=builtins.KeyError frames={TRACKED}:1:" + "f" * 101,
+            f"internal_error class=builtins.KeyError frames={TRACKED}:" + "f" * 101,
             "internal_error class= frames=",
             "internal_error class=builtins.KeyError",
             "internal_error class=builtins.KeyError frames=unavailable",
@@ -110,9 +97,19 @@ class Refused(unittest.TestCase):
             with self.subTest(line=line[:80]):
                 self.assertFalse(is_diagnostic(line))
 
+    def test_a_frame_with_a_line_number_in_any_form_is_refused(self) -> None:
+        # PySpark 4 sets the line of a rebuilt frame from a number in an error message, so a line number may be a value of the data: the line has none.
+        for number in ("0", "1", "63", "9999999", "10000000", "01", "00", "+1", "-1", "1_0", "\u0661", "x", "", "7316254"):
+            for text in (f"{TRACKED}:{number}:{ENTRY}", f"{ENTRY_PLAIN}:{number}", f"{TRACKED}:{ENTRY}:{number}"):
+                with self.subTest(frame=text):
+                    self.assertFalse(is_diagnostic(f"internal_error class=builtins.KeyError frames={text}"))
+                    self.assertFalse(is_diagnostic(f"internal_error class=builtins.KeyError frames=other | {text} | {NAMED}"))
+        old_form = f"internal_error class=builtins.KeyError frames=other | {TRACKED}:2:{ENTRY}"  # a diagnostic of the older format, with its line number
+        self.assertEqual(frozenset(), accepted_diagnostics(["internal_error", old_form], 70))
+
     def test_a_frame_whose_function_is_called_other_is_a_name_only_when_the_file_defines_it(self) -> None:
-        self.assertFalse(is_diagnostic(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:1:other | other"))
-        self.assertFalse(is_diagnostic(f"internal_error class=builtins.KeyError frames={TRACKED}:1:other"))
+        self.assertFalse(is_diagnostic(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:other | other"))
+        self.assertFalse(is_diagnostic(f"internal_error class=builtins.KeyError frames={TRACKED}:other"))
 
 
 class Places(unittest.TestCase):
@@ -155,7 +152,7 @@ class Places(unittest.TestCase):
         self.assertEqual(frozenset({3}), accepted_diagnostics([self.CODE, "message", self.CODE, OWN], 70))
 
     def test_a_line_of_another_form_after_the_code_is_not_one(self) -> None:
-        for text in ("internal_error class=builtins.KeyError frames=/x/a.py:1:f", "internal_error class=" + "C" * 121 + " frames=", "message"):
+        for text in ("internal_error class=builtins.KeyError frames=/x/a.py:f", "internal_error class=" + "C" * 121 + " frames=", "message"):
             with self.subTest(text=text[:40]):
                 self.assertEqual(frozenset(), accepted_diagnostics([self.CODE, text], 70))
 

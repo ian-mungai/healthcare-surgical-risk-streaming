@@ -44,7 +44,7 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
 from spark.split_cli import start_deadline
 from spark.split_table import schema_problems
-from tests.fast.internal_line_support import assert_internal, split_lines
+from tests.fast.internal_line_support import LINE_MARKER, assert_internal, error_with_marked_line, split_lines
 
 MARKER = "MARKER_8731"
 PART = "result.json.part"
@@ -216,6 +216,13 @@ class CommandLine(InFolder):
         assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", ("builtins.RuntimeError",), MARKER)
         self.assertEqual({"job": "silver_signals", "mode": "verify", "refusal": ["internal_error"]}, self.document())
         self.assertNotIn(MARKER, self.path.read_text())
+
+    def test_a_line_number_on_a_tracked_frame_is_not_in_standard_error_or_the_result_file(self) -> None:
+        code, out, err = self.call(["verify", "--branch", "b"], raising(error_with_marked_line()))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", ("builtins.KeyError",), LINE_MARKER)
+        self.assertEqual({"job": "silver_signals", "mode": "verify", "refusal": ["internal_error"]}, self.document())
+        self.assertNotIn(LINE_MARKER, self.path.read_text())
 
     def test_a_result_that_is_not_json_is_an_internal_error_with_the_refusal_document(self) -> None:
         for name, execute in (

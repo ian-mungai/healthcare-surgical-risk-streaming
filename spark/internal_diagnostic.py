@@ -13,12 +13,15 @@ and nothing that it holds: ``internal_error class=<a> <- <b> frames=<f1> | <f2>`
   owns, because they run its ``__class__``, ``__instancecheck__`` and ``__subclasscheck__``.
 - ``frames`` is the traceback of the first error, the last ``FRAME_LIMIT`` of them, the innermost last. The walk follows ``tb_next`` and reads the code
   object of each frame directly: no source line is read (``traceback`` and ``linecache`` are not used, so a source loader never runs). A frame is
-  ``path:line:function`` (the path from the root of the project, as in ``spark/result_file.py``) only when its file name, with ``..`` resolved as text, is
+  ``path:function`` (the path from the root of the project, as in ``spark/result_file.py``) only when its file name, with ``..`` resolved as text, is
   exactly the root of the project and a path of the fixed inventory of tracked code (``spark/internal_inventory.py``, which
   ``scripts/quality/internal_inventory.py`` generates and a fast test checks against ``git ls-files`` and the AST of each file) and its function is a name
-  that the inventory holds for that file (or one of ``FIXED_NAMES``). The line is a whole number from 0 to ``LINE_LIMIT``, printed with no leading zero.
-  Every other frame is the word ``other``, and a run of them is one: a name that data can build (a generated file name, a function compiled at run time) is
-  never in the inventory.
+  that the inventory holds for that file (or one of ``FIXED_NAMES``). Every other frame is the word ``other``, and a run of them is one: a name that data can
+  build (a generated file name, a function compiled at run time) is never in the inventory.
+- A frame has **no line number**, in the producer or in the grammar. PySpark 4.1 rebuilds a traceback from the message of a Java error and sets the line of
+  each frame (``co_firstlineno``, ``co_lines``) from a number in that message, so a value of the data could print as the line number beside the name of a
+  tracked file and function. The line number is never read (``tb_lineno`` is not used), and a frame that has one is not a frame of the grammar. So a reader
+  refuses a diagnostic of the older format (``path:line:function``): the runners and the image must carry the same version of this module as the job.
 - Any failure of the formatter gives the fixed line ``internal_error class=unavailable frames=unavailable``. The function never raises, so it cannot change
   the exit code of a job or skip its result write.
 
@@ -43,7 +46,6 @@ from spark.internal_inventory import INVENTORY
 CLASS_LIMIT = 5
 FRAME_LIMIT = 40
 WALK_LIMIT = 100_000
-LINE_LIMIT = 9_999_999
 ROOT_LIMIT = 4_096  # a file name longer than this is never a path of the project
 INTERNAL_EXIT_CODE = 70
 OTHER = "other"
@@ -129,17 +131,17 @@ def traceback_of(error: BaseException) -> types.TracebackType | None:
     return found
 
 
-def frame_label(filename: object, line: object, name: object) -> str:
-    """``path:line:function`` of a frame of the inventory, else ``other``. The three values come from a code object and a traceback: the path (``..``
-    resolved as text) must be exactly the root of the project and a path of the inventory, and the function a name that the inventory holds for it."""
-    if type(filename) is not str or type(line) is not int or type(name) is not str or not 0 <= line <= LINE_LIMIT or len(filename) > ROOT_LIMIT:
+def frame_label(filename: object, name: object) -> str:
+    """``path:function`` of a frame of the inventory, else ``other``. The two values come from a code object: the path (``..`` resolved as text) must be
+    exactly the root of the project and a path of the inventory, and the function a name that the inventory holds for it. No line number is taken or printed."""
+    if type(filename) is not str or type(name) is not str or len(filename) > ROOT_LIMIT:
         return OTHER
     path = os.path.normpath(filename)
     if not path.startswith(PREFIX):
         return OTHER
     relative = path[len(PREFIX) :]
     names = FILES.get(relative)
-    return f"{relative}:{line}:{name}" if names is not None and (name in names or name in FIXED_NAMES) else OTHER
+    return f"{relative}:{name}" if names is not None and (name in names or name in FIXED_NAMES) else OTHER
 
 
 def frames_of(error: BaseException) -> list[str]:
@@ -152,7 +154,7 @@ def frames_of(error: BaseException) -> list[str]:
         if walked > WALK_LIMIT:
             raise ValueError("the traceback does not end")
         code = step.tb_frame.f_code
-        label = frame_label(code.co_filename, step.tb_lineno, code.co_name)
+        label = frame_label(code.co_filename, code.co_name)
         if label != OTHER or not labels or labels[-1] != OTHER:
             labels.append(label)
         step = step.tb_next
@@ -172,10 +174,9 @@ def _any_of(names: Sequence[str]) -> str:
 
 
 CLASS_TOKEN = _any_of([*BUILTIN_CLASSES.values(), *PROJECT_CLASSES, *LIBRARY_CLASSES, *(f"{PYSPARK_MODULE}.{name}" for name in PYSPARK_CLASSES), OTHER])
-NUMBER = r"(?:0|[1-9][0-9]{0,6})"  # a whole number up to LINE_LIMIT with no leading zero (a digit of another script is not in [0-9])
-FRAME_BODY = rf"(?P<path>[A-Za-z0-9_/]{{1,{PATH_LIMIT}}}\.py):(?P<line>{NUMBER}):(?P<name>[A-Za-z_<][A-Za-z0-9_>]{{0,{NAME_LIMIT + 1}}})"
+FRAME_BODY = rf"(?P<path>[A-Za-z0-9_/]{{1,{PATH_LIMIT}}}\.py):(?P<name>[A-Za-z_<][A-Za-z0-9_>]{{0,{NAME_LIMIT + 1}}})"
 FRAME = re.compile(FRAME_BODY)
-FRAME_TOKEN = rf"(?:{FRAME_BODY.replace('?P<path>', '').replace('?P<line>', '').replace('?P<name>', '')}|{OTHER})"
+FRAME_TOKEN = rf"(?:{FRAME_BODY.replace('?P<path>', '').replace('?P<name>', '')}|{OTHER})"
 CLASSES = rf"{CLASS_TOKEN}(?: <- {CLASS_TOKEN}){{0,{CLASS_LIMIT - 1}}}"
 FRAMES = rf"{FRAME_TOKEN}(?: \| {FRAME_TOKEN}){{0,{FRAME_LIMIT - 1}}}"
 LINE = re.compile(rf"internal_error class=(?P<classes>{CLASSES}) frames=(?P<frames>{FRAMES})?")

@@ -374,11 +374,12 @@ class Refusals(unittest.TestCase):
                 self.assertEqual(1, self.counted(code, first, diagnostic))
         self.assertEqual(0, self.counted(70, "internal_error", diagnostic))
 
-    def test_a_zero_padded_line_number_a_generated_file_and_a_second_pair_are_unknown(self) -> None:
+    def test_a_line_number_in_any_form_a_generated_file_and_a_second_pair_are_unknown(self) -> None:
         good = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
-        padded = good.replace(":2:", ":02:")
         generated = good.replace("spark/result_file.py", "spark/generated_by_data.py")
-        self.assertEqual(1, self.counted(70, "internal_error", padded))
+        for number in ("2", "02", "7316254", "0"):  # the older format had a line number: the runners refuse it
+            with self.subTest(number=number):
+                self.assertEqual(1, self.counted(70, "internal_error", good.replace(".py:", f".py:{number}:")))
         self.assertEqual(1, self.counted(70, "internal_error", generated))
         self.assertEqual(
             2, self.counted(70, "internal_error", good, "internal_error", good)

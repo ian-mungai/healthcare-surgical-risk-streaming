@@ -36,9 +36,11 @@ from spark import internal_diagnostic as diagnostic
 from spark.internal_classes import PACKAGES
 from spark.internal_diagnostic import CLASS_LIMIT, FRAME_LIMIT, internal_error_line
 from spark.internal_inventory import INVENTORY
-from tests.fast.internal_line_support import RaisingLoader, assert_internal
+from tests.fast.internal_line_support import LINE_MARKER as MARKER_LINE
+from tests.fast.internal_line_support import RaisingLoader, assert_internal, error_with_marked_line
 
 MARKER = "MARKER_4417"
+LINE_MARKER = int(MARKER_LINE)  # a number that a message can carry; it must not be in a line, a file or standard error
 ROOT = Path(diagnostic.__file__).resolve().parent.parent
 TRACKED = "spark/result_file.py"  # a tracked file of the project (its source is not read: the code is compiled from a text under its name)
 ENTRY, INNER = sorted(INVENTORY[TRACKED])[:2]  # two names that the inventory holds for that file
@@ -79,6 +81,16 @@ def caught(raiser: Callable[[], object]) -> BaseException:
     except BaseException as error:
         return error
     raise AssertionError("no error")
+
+
+def last_line(error: BaseException) -> int:
+    """The line number that the innermost frame of the traceback of ``error`` carries."""
+    step = error.__traceback__
+    if step is None:
+        raise AssertionError("no traceback")
+    while step.tb_next is not None:
+        step = step.tb_next
+    return step.tb_lineno
 
 
 def nested(depth: int) -> None:
@@ -122,7 +134,7 @@ class TheLine(unittest.TestCase):
         source = f"def {ENTRY}():\n    {INNER}()\n\n\ndef {INNER}():\n    raise KeyError\n"
         classes, frames = self.check(internal_error_line(from_file(OWN, source)))
         self.assertEqual(["builtins.KeyError"], classes)
-        self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}", f"{TRACKED}:6:{INNER}"], frames)
+        self.assertEqual(["other", f"{TRACKED}:{ENTRY}", f"{TRACKED}:{INNER}"], frames)
 
     def test_every_package_of_the_project_counts_and_nothing_near_it_does(self) -> None:
         for package in PACKAGES:
@@ -130,7 +142,7 @@ class TheLine(unittest.TestCase):
             name = INVENTORY[path][0]
             with self.subTest(package=package):
                 frames = parts(internal_error_line(from_file(str(ROOT / path), f"def {name}():\n    raise KeyError\n", name)))[1]
-                self.assertEqual(["other", f"{path}:2:{name}"], frames)
+                self.assertEqual(["other", f"{path}:{name}"], frames)
         source = f"def {ENTRY}():\n    raise KeyError\n"
         for filename in (
             str(ROOT / "tests" / "fast" / "x.py"),  # the tests are not a package of the job
@@ -168,7 +180,7 @@ class TheLine(unittest.TestCase):
         source = f"def {ENTRY}():\n    raise KeyError\n"
         for filename in (f"{ROOT}/spark/../{TRACKED}", f"{ROOT}/./{TRACKED}", f"{ROOT}//{TRACKED}"):
             with self.subTest(filename=filename):
-                self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}"], self.check(internal_error_line(from_file(filename, source)))[1])
+                self.assertEqual(["other", f"{TRACKED}:{ENTRY}"], self.check(internal_error_line(from_file(filename, source)))[1])
 
     def test_a_function_name_that_the_inventory_does_not_hold_for_that_file_is_other(self) -> None:
         for name in (f"{MARKER}_function", FOREIGN, "has space", "a;b", "x" * 101, "é", "", "<string>", "<genexpr> ", ENTRY + "_"):
@@ -183,30 +195,48 @@ class TheLine(unittest.TestCase):
     def test_the_fixed_names_of_code_without_a_function_are_named_in_a_file_of_the_inventory(self) -> None:
         source = f"def {ENTRY}():\n    return list(1 / n for n in [0])\n"
         frames = self.check(internal_error_line(from_file(OWN, source)))[1]
-        self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}", f"{TRACKED}:2:<genexpr>"], frames)
+        self.assertEqual(["other", f"{TRACKED}:{ENTRY}", f"{TRACKED}:<genexpr>"], frames)
         scope: dict[str, Any] = {}
         exec(compile("run = lambda: 1 / 0\n", OWN, "exec"), scope)  # noqa: S102
-        self.assertEqual(["other", f"{TRACKED}:1:<lambda>"], self.check(internal_error_line(caught(scope["run"])))[1])
+        self.assertEqual(["other", f"{TRACKED}:<lambda>"], self.check(internal_error_line(caught(scope["run"])))[1])
 
-    def test_a_line_number_is_a_whole_number_in_range_printed_in_its_one_form(self) -> None:
-        self.assertEqual(f"{TRACKED}:5:{ENTRY}", diagnostic.frame_label(OWN, 5, ENTRY))
-        self.assertEqual(f"{TRACKED}:0:{ENTRY}", diagnostic.frame_label(OWN, 0, ENTRY))
-        self.assertEqual(f"{TRACKED}:9999999:{ENTRY}", diagnostic.frame_label(OWN, diagnostic.LINE_LIMIT, ENTRY))
-        for line in (-1, diagnostic.LINE_LIMIT + 1, True, 5.0, "5", None):
-            with self.subTest(line=line):
-                self.assertEqual("other", diagnostic.frame_label(OWN, line, ENTRY))
+    def test_a_frame_is_the_path_and_the_function_and_never_a_line_number(self) -> None:
+        self.assertEqual(f"{TRACKED}:{ENTRY}", diagnostic.frame_label(OWN, ENTRY))
         for filename in (OWN.encode(), None, 5):
             with self.subTest(filename=filename):
-                self.assertEqual("other", diagnostic.frame_label(filename, 1, ENTRY))
-        self.assertEqual("other", diagnostic.frame_label(OWN, 1, None))
+                self.assertEqual("other", diagnostic.frame_label(filename, ENTRY))
+        self.assertEqual("other", diagnostic.frame_label(OWN, None))
+        with self.assertRaises(TypeError):
+            diagnostic.frame_label(OWN, 5, ENTRY)  # type: ignore[call-arg]  # a function takes no line number
+
+    def test_a_line_number_that_a_message_sets_on_a_tracked_frame_is_not_in_the_line(self) -> None:
+        # PySpark 4.1 rebuilds a traceback from the message of a Java error and sets the line of each frame (``co_firstlineno``, ``co_lines``) from a number
+        # in it, so a value of the data can be the line number of a frame of a tracked file and function.
+        for number in (LINE_MARKER, 1, 63):
+            with self.subTest(number=number):
+                error = error_with_marked_line(str(number))
+                self.assertEqual(number, last_line(error))  # the innermost frame carries the number
+                line = internal_error_line(error)
+                self.assertEqual((["builtins.KeyError"], ["other", f"{TRACKED}:{ENTRY}"]), self.check(line))
+                self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:{ENTRY}", line)
+                self.assertNotIn(str(number), line.replace(TRACKED, "").replace(ENTRY, ""))
+
+    def test_a_line_number_that_the_first_line_of_the_code_carries_is_not_in_the_line_either(self) -> None:
+        scope: dict[str, Any] = {}
+        exec(compile(f"def {ENTRY}():\n    raise KeyError\n", OWN, "exec"), scope)  # noqa: S102
+        function = types.FunctionType(scope[ENTRY].__code__.replace(co_firstlineno=LINE_MARKER), scope)
+        line = internal_error_line(caught(function))
+        self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:{ENTRY}", line)
+        self.assertNotIn(str(LINE_MARKER + 1), line)
+        self.assertNotIn(str(LINE_MARKER), line)
 
     def test_a_str_that_is_a_subclass_or_is_too_long_is_other(self) -> None:
         class Text(str):
             """A str whose methods could run code."""
 
-        self.assertEqual("other", diagnostic.frame_label(Text(OWN), 1, ENTRY))
-        self.assertEqual("other", diagnostic.frame_label(OWN, 1, Text(ENTRY)))
-        self.assertEqual("other", diagnostic.frame_label(OWN + "/" * 5000, 1, ENTRY))
+        self.assertEqual("other", diagnostic.frame_label(Text(OWN), ENTRY))
+        self.assertEqual("other", diagnostic.frame_label(OWN, Text(ENTRY)))
+        self.assertEqual("other", diagnostic.frame_label(OWN + "/" * 5000, ENTRY))
 
     def test_a_function_that_was_compiled_from_a_text_is_other(self) -> None:
         source = f"def {MARKER}():\n    raise KeyError\n"
@@ -226,13 +256,13 @@ class TheLine(unittest.TestCase):
         scope: dict[str, Any] = {"callback": lambda: (_ for _ in ()).throw(KeyError())}
         exec(compile(source, OWN, "exec"), scope)  # noqa: S102
         _, frames = self.check(internal_error_line(caught(scope[ENTRY])))
-        self.assertEqual(["other", f"{TRACKED}:2:{ENTRY}", "other"], frames)
+        self.assertEqual(["other", f"{TRACKED}:{ENTRY}", "other"], frames)
 
     def test_the_frames_are_cut_at_forty_with_the_innermost_last(self) -> None:
         source = f"def {ENTRY}(depth=200):\n    if depth == 0:\n        raise RuntimeError\n    {ENTRY}(depth - 1)\n"
         _, frames = self.check(internal_error_line(from_file(OWN, source)))
         self.assertEqual(FRAME_LIMIT, len(frames))
-        self.assertEqual(f"{TRACKED}:3:{ENTRY}", frames[-1])
+        self.assertEqual(f"{TRACKED}:{ENTRY}", frames[-1])
         self.assertNotIn("other", frames)
 
     def test_an_error_that_was_never_raised_has_a_class_and_no_frames(self) -> None:
@@ -431,7 +461,7 @@ class TheFallback(unittest.TestCase):
     def test_a_source_loader_that_raises_does_not_stop_the_line(self) -> None:
         source = f"def {ENTRY}():\n    raise KeyError\n"
         line = internal_error_line(from_file(OWN, source, loader=RaisingLoader()))
-        self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:2:{ENTRY}", line)
+        self.assertEqual(f"internal_error class=builtins.KeyError frames=other | {TRACKED}:{ENTRY}", line)
 
     def test_no_source_line_of_any_file_is_read(self) -> None:
         with mock.patch("linecache.getlines", side_effect=AssertionError("a source line was read")) as read, mock.patch("linecache.getline", read):
@@ -448,7 +478,6 @@ class TheFallback(unittest.TestCase):
         class Cycle:
             """A traceback that never ends (the real type cannot be built that way)."""
 
-            tb_lineno = 1
             tb_frame = types.SimpleNamespace(f_code=types.SimpleNamespace(co_filename="x", co_name="f"))
 
             @property
@@ -464,7 +493,7 @@ class TheFallback(unittest.TestCase):
             def f_code(self) -> Any:
                 raise RuntimeError(MARKER)
 
-        walk = types.SimpleNamespace(tb_frame=Frame(), tb_next=None, tb_lineno=1)
+        walk = types.SimpleNamespace(tb_frame=Frame(), tb_next=None)
         with mock.patch.object(diagnostic, "traceback_of", return_value=walk):
             self.assertEqual(diagnostic.UNAVAILABLE_LINE, internal_error_line(caught(outer)))
 

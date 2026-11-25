@@ -14,7 +14,8 @@ ROOT = Path(internal_diagnostic.__file__).resolve().parent.parent
 TRACKED = "spark/result_file.py"  # a tracked file of the project, standing in for a module of a job
 OWN_FILE = str(ROOT / TRACKED)
 ENTRY = sorted(INVENTORY[TRACKED])[0]  # a name that the inventory holds for that file
-ENTRY_FRAME = f"{TRACKED}:2:{ENTRY}"  # the frame of ``def ENTRY(): raise KeyError`` in the second line
+LINE_MARKER = "7316254"  # a number that a message can carry (PySpark 4 sets the line of a rebuilt frame from one); no line, file or standard error holds it
+ENTRY_FRAME = f"{TRACKED}:{ENTRY}"  # the frame of ``def ENTRY(): raise KeyError``: the path and the function, no line number
 
 
 def split_lines(err: str, job: str) -> tuple[list[str], list[str]]:
@@ -51,6 +52,16 @@ def error_with_raising_loader() -> KeyError:
     exec(compile(f"def {ENTRY}():\n    raise KeyError\n", OWN_FILE, "exec"), scope)  # noqa: S102 (a stand-in for a module of the project)
     try:
         scope[ENTRY]()
+    except KeyError as error:
+        return error
+    raise AssertionError("no error")
+
+
+def error_with_marked_line(number: str = LINE_MARKER) -> KeyError:
+    """An error raised in a frame of a tracked file and function whose line number (``tb_lineno``) is ``number``, as PySpark 4 builds from a message."""
+    code = compile("\n" * (int(number) - 1) + "raise KeyError", OWN_FILE, "exec").replace(co_name=ENTRY)
+    try:
+        exec(code, {})  # noqa: S102 (a stand-in for a frame that PySpark rebuilds)
     except KeyError as error:
         return error
     raise AssertionError("no error")
