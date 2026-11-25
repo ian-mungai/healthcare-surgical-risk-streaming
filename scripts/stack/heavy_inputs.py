@@ -3,7 +3,8 @@
 The limits loader is the one reader of ``compose/limits.yml``, so the file is validated once and Terraform reads no YAML of its own. ``main`` prints one JSON
 object with exactly these positive whole numbers, in MiB: ``host_reserve_mib``, ``always_on_limits_mib`` (the sum of the limits of the services of the
 always-on groups, as ``scripts/stack/groups.py`` defines them) and ``spark_limit_mib`` (the largest limit of the Spark job services, because one job runs at
-a time). The Terraform wrapper stages the object as ``heavy_inputs.tfvars.json`` in each run's copy of the configuration.
+a time, which the Spark slot of ``scripts/stack/spark_slot.py`` enforces). The Terraform wrapper stages the object as ``heavy_inputs.tfvars.json`` in each
+run's copy of the configuration.
 
 ``.venv/bin/python -m scripts.stack.heavy_inputs`` prints the JSON.
 """
@@ -16,10 +17,8 @@ from collections.abc import Sequence
 
 from scripts.ingestion.notice import describe_error
 from scripts.stack.groups import ALWAYS_ON_GROUPS
-from scripts.stack.job_workloads import SERVICE_WORKLOADS
+from scripts.stack.job_workloads import SPARK_SERVICES
 from scripts.stack.limits import LIMITS_FILE, Limits, LimitsError, load_limits
-
-SPARK_SERVICES = tuple(f"spark_{workload}" for workload in SERVICE_WORKLOADS)
 
 
 def heavy_inputs_document(limits: Limits) -> dict[str, int]:

@@ -19,11 +19,12 @@ memory, as ``scripts.stack.admission`` documents for its own test inputs.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import sys
 import time
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -33,7 +34,9 @@ from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
 from scripts.project_config import ROOT
 from scripts.stack.admission import EXIT_WAIT, SUPPORTING_GROUP, AdmissionError, Decision, check_group, describe
+from scripts.stack.job_workloads import SPARK_GROUPS
 from scripts.stack.limits import SERVICE_NAME, Limits, LimitsError, load_limits, render_environment
+from scripts.stack.spark_slot import SlotBusy, spark_slot
 from scripts.stack.yaml_text import YamlError, load_yaml
 
 ALWAYS_ON_GROUPS = frozenset({SUPPORTING_GROUP})
@@ -361,6 +364,19 @@ def admit(settings: Settings, limits: Limits, group: Group, wait_seconds: float,
         time.sleep(ADMISSION_POLL_SECONDS)
 
 
+@contextlib.contextmanager
+def claim_spark_slot(settings: Settings, limits: Limits, group: Group, wait_seconds: float) -> Iterator[None]:
+    """The one Spark slot for the start of a Spark group, held until the group is started, and nothing for any other group. A taken slot is ``GroupWaits``."""
+    if group.name not in SPARK_GROUPS:
+        yield
+        return
+    try:
+        with spark_slot(lambda: running_services(settings, limits), wait_seconds=wait_seconds):
+            yield
+    except SlotBusy as error:
+        raise GroupWaits(f"group {group.name}: {error}") from error
+
+
 def start_group(
     settings: Settings, group_name: str, *, wait_seconds: float = 0, deadline_seconds: float = START_DEADLINE_SECONDS, log: Log = no_log
 ) -> StartResult:
@@ -369,11 +385,12 @@ def start_group(
     group = find_group(limits, group_name)
     require_control(settings, group)
     before = running_services(settings, limits)
-    decision = admit(settings, limits, group, wait_seconds, log)
-    log(f"admission: {describe(decision)}")
-    start_compose(settings, limits, group, deadline_seconds, log)
-    if group.k3s and settings.k3s is not None:
-        settings.k3s.start(group.k3s, deadline_seconds)
+    with claim_spark_slot(settings, limits, group, wait_seconds):
+        decision = admit(settings, limits, group, wait_seconds, log)
+        log(f"admission: {describe(decision)}")
+        start_compose(settings, limits, group, deadline_seconds, log)
+        if group.k3s and settings.k3s is not None:
+            settings.k3s.start(group.k3s, deadline_seconds)
     return StartResult(group.name, tuple(sorted(running_services(settings, limits) - before)), decision)
 
 

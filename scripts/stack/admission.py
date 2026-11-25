@@ -5,6 +5,9 @@ memory limit. ``decide`` is a pure decision over stated figures. The group is ad
 
     reserve + limits of the supporting services not running + limits of the group's services not running <= available memory
 
+and, for a Spark group (``batch_<workload>``), when no Spark service runs at all: the memory figure of the host assumes one Spark job, so a Spark group
+waits for the one Spark slot (``scripts/stack/spark_slot.py``) while any Spark job runs, also a job of its own service.
+
 A service that runs is left out of both sums, because its use is already inside the host's available figure. A service that does not run is counted by its
 limit. When every service of the group and of the supporting group runs, nothing starts and the group is admitted. ``describe`` writes one message
 with the four figures in MiB. A group that waits is not a failure of the program: it exits with ``EXIT_WAIT``.
@@ -27,7 +30,9 @@ from pathlib import Path
 from scripts.ingestion.closed import QuietParser
 from scripts.ingestion.notice import describe_error
 from scripts.process import TimeoutExpired, run_command, timeout_text
+from scripts.stack.job_workloads import SPARK_GROUPS
 from scripts.stack.limits import LIMITS_FILE, SERVICE_NAME, Limits, LimitsError, load_limits
+from scripts.stack.spark_slot import spark_holders
 
 EXIT_ADMITTED = 0
 EXIT_REFUSED = 1
@@ -52,6 +57,7 @@ class Decision:
     supporting_mib: int
     group_mib: int
     available_mib: int
+    slot_holders: tuple[str, ...] = ()
 
     @property
     def needed_mib(self) -> int:
@@ -63,7 +69,7 @@ class Decision:
 
     @property
     def admitted(self) -> bool:
-        return self.nothing_to_start or self.needed_mib <= self.available_mib
+        return not self.slot_holders and (self.nothing_to_start or self.needed_mib <= self.available_mib)
 
 
 def not_running_mib(limits: Limits, group: str, running: Collection[str]) -> int:
@@ -78,13 +84,16 @@ def decide(limits: Limits, group: str, running: Collection[str], available_mib: 
     if group not in known:
         raise AdmissionError(f"unknown group {group!r}: the limits file holds the groups {', '.join(known)}")
     supporting_mib = 0 if group == SUPPORTING_GROUP else not_running_mib(limits, SUPPORTING_GROUP, running)
-    return Decision(group, limits.host_reserve_mib, supporting_mib, not_running_mib(limits, group, running), available_mib)
+    holders = spark_holders(running) if group in SPARK_GROUPS else ()
+    return Decision(group, limits.host_reserve_mib, supporting_mib, not_running_mib(limits, group, running), available_mib, holders)
 
 
 def describe(decision: Decision) -> str:
     """The one message of a decision: the four figures with their names, and how far the group is from fitting."""
     verdict = "admitted" if decision.admitted else "waits"
     margin = decision.available_mib - decision.needed_mib
+    if decision.slot_holders:
+        return f"group {decision.group} waits: the one Spark slot is held by {', '.join(decision.slot_holders)}, and one Spark job runs at a time"
     ending = "nothing to start" if decision.nothing_to_start else (f"{margin} MiB spare" if decision.admitted else f"{-margin} MiB short")
     return (
         f"group {decision.group} {verdict}: reserve {decision.reserve_mib} MiB, supporting services {decision.supporting_mib} MiB, "

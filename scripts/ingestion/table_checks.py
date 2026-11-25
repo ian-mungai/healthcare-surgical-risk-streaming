@@ -55,7 +55,7 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -69,10 +69,11 @@ from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
 from scripts.sample.candidates import RELEASE_FILE
-from scripts.stack.groups import Settings, compose_arguments, rendered_environment
+from scripts.stack.groups import Settings, compose_arguments, rendered_environment, running_services
 from scripts.stack.job_workloads import job_command, profile_of_job
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.spark_slot import SlotBusy, spark_slot
 from scripts.stack.tags import paged
 from spark import table_checks as rules
 
@@ -204,7 +205,15 @@ class Outcome:
 Runner = Callable[[Path], RunnerReply]
 
 
-def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_seconds: float) -> Runner:
+def compose_runner(
+    settings: Settings,
+    *,
+    volume: str,
+    directory: str,
+    deadline_seconds: float,
+    running: Callable[[], Collection[str]] | None = None,
+    slot_lock: Path | None = None,
+) -> Runner:
     """A runner that starts the job as a one-off of the Bronze service that ``scripts/stack/job_workloads.py`` names, in that service's own profile and with no
     service it depends on started. The job reads the loaded tables with the Bronze credentials, which cannot write them.
 
@@ -212,8 +221,13 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
     read-only, at ``/staging``. The job runs as ``SPARK_UID`` with ``STAGING_GID`` as its group, the group of the staged files. The environment of the command
     is the one the group commands use: the memory limits that ``scripts.stack.limits`` renders from the limits file, then the process's own variables. A job
     that passes its deadline is stopped by the launcher and its reply carries the exit code 124.
+
+    The job holds the one Spark slot (``scripts/stack/spark_slot.py``) for the whole of ``docker compose run``, so it does not start while a job of any Spark
+    service runs and no other Spark job starts before its container has exited. ``running`` reads the running services and ``slot_lock`` names the lock file;
+    both default to the stack's own.
     """
     root = Path(directory)
+    read_running = running or (lambda: running_services(settings, load_limits(settings.limits_file)))
 
     def start(staging: Path) -> RunnerReply:
         if staging.parent != root:
@@ -226,7 +240,10 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
         )
         environment = rendered_environment(load_limits(settings.limits_file))
         try:
-            result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
+            with spark_slot(read_running, lock_file=slot_lock):
+                result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
+        except SlotBusy as error:
+            raise TableChecksError(f"the table checks do not start: {error}") from None
         except TimeoutExpired:
             return RunnerReply(124, "")
         return RunnerReply(result.returncode, result.stdout)
