@@ -3,8 +3,9 @@
 # file, build the images the project makes itself, create Airbyte's namespace on k3s and write the k3s token and certificate authority that the code
 # location reads as Compose secrets, so a new host deploys in one pass, start PostgreSQL alone and wait for it, make the PostgreSQL accounts match the tool
 # list, prepare the secret store's first start, start the remaining services but the orchestration services and wait for them, make the Kafka
-# topics and the registry's rules match their lists, make the secret store match the service list, and last check the AIStor licence file and start AIStor (the
-# services of compose_stack_storage_services start apart, so a missing licence refuses that step after everything else is deployed). The orchestration services (the code location and what waits for it) start last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
+# topics and the registry's rules match their lists, make the secret store match the service list, and last check the AIStor licence file, start AIStor (the
+# services of compose_stack_storage_services start apart, so a missing licence refuses that step after everything else is deployed) and make the AIStor project
+# user, the one use of its root pair. The orchestration services (the code location and what waits for it) start last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
 # code location mounts files that only they can make, and it gives Nessie's main branch its first commit. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
@@ -24,7 +25,7 @@
 - name: Create the Grafana password file
   ansible.builtin.include_tasks: grafana_password.yml
 
-- name: Create the AIStor root credential files
+- name: Create the AIStor credential files
   ansible.builtin.include_tasks: aistor_credentials.yml
 
 - name: Build the images the project makes itself
@@ -77,3 +78,6 @@
   ansible.builtin.include_tasks: start.yml
   vars:
     compose_stack_start_services: "{{ compose_stack_storage_services }}"
+
+- name: Make the AIStor project user and its policy, the only use of the root pair (a second run makes no call that writes)
+  ansible.builtin.include_tasks: aistor_project_user.yml

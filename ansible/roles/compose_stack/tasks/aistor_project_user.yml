@@ -1,0 +1,14 @@
+# Reads compose_stack_docker, compose_stack_storage_services, compose_stack_aistor_service, compose_stack_aistor_project_user, compose_stack_aistor_project_policy,
+# compose_stack_aistor_project_password_file and aistor_bucket (the launcher gives the bucket). The only use of AIStor's root pair, and a one-time one: the module
+# makes the project's user and policy through mc in the AIStor container, which reads the root files from its own secrets mount, and makes no write call when the
+# user and the policy already match, so a second deploy does not use root. The task is hidden, so neither password reaches a log.
+- name: Make the AIStor project user and its policy, once, with the root pair that the server's container reads
+  aistor_project_user:
+    compose_command: "{{ compose_stack_docker }}"
+    service: "{{ compose_stack_aistor_service }}"
+    user: "{{ compose_stack_aistor_project_user }}"
+    policy: "{{ compose_stack_aistor_project_policy }}"
+    bucket: "{{ aistor_bucket }}"
+    password_file: "{{ compose_stack_aistor_project_password_file }}"
+  timeout: 300
+  no_log: true

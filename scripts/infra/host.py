@@ -369,12 +369,14 @@ def platform_commit() -> str:
 
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
-    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, and the bucket that Airbyte's
-    connection copies into. No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host without Ansible."""
+    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, the bucket that Airbyte's
+    connection copies into and the bucket that the AIStor project user's policy reaches. No variable holds the AWS profile or the key: the launcher reads
+    the key itself and sends it to the host without Ansible."""
     return {
         "compose_stack_platform_commit": commit,
         "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
         "airbyte_landing_bucket": configuration["S3_BUCKET"],
+        "aistor_bucket": configuration["S3_BUCKET"],
     }
 
 

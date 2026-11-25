@@ -169,7 +169,7 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_makes_openbao_match_and_starts_aistor_last(
+    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_matches_openbao_starts_aistor_and_makes_its_project_user_last(
         self,
     ) -> None:
         self.assertEqual(
@@ -193,6 +193,7 @@ class StepOrderTest(unittest.TestCase):
                 "openbao/bootstrap.yml",
                 "aistor_licence.yml",
                 "start.yml {{ compose_stack_storage_services }}",
+                "aistor_project_user.yml",
             ],
             step_order(),
         )
@@ -391,14 +392,14 @@ class GrafanaPasswordTest(unittest.TestCase):
 
 
 class AistorCredentialsTest(unittest.TestCase):
-    """AIStor's root user and root password are two files that root owns (the server runs as root), mode 0400, made once, never printed and never replaced."""
+    """AIStor's root user and password and the project user's password are three files of root, mode 0400, made once, never printed or replaced."""
 
-    FILES = ("root_user", "root_password")
+    FILES = ("root_user", "root_password", "project_password")
 
     def values(self, folder: Path) -> dict[str, object]:
         return variables(folder)
 
-    def test_both_files_are_made_for_root_with_mode_0400_in_a_folder_for_root_and_no_output_holds_a_value(self) -> None:
+    def test_each_file_is_made_for_root_with_mode_0400_in_a_folder_for_root_and_no_output_holds_a_value(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             code, output = run_tasks(["aistor_credentials.yml"], self.values(folder))
@@ -412,7 +413,7 @@ class AistorCredentialsTest(unittest.TestCase):
                 self.assertEqual((0o400, UID, GID), (stat.S_IMODE(statuses[name].st_mode), statuses[name].st_uid, statuses[name].st_gid))
                 self.assertRegex(texts[name], r"^[A-Za-z0-9_-]{40,}$")
                 self.assertNotIn(texts[name], output)
-        self.assertNotEqual(texts["root_user"], texts["root_password"])
+        self.assertEqual(len(self.FILES), len(set(texts.values())), "each file has a value of its own")
         self.assertEqual((0o700, UID, GID), (stat.S_IMODE(folder_status.st_mode), folder_status.st_uid, folder_status.st_gid))
 
     def test_a_second_run_changes_nothing_and_keeps_both_values(self) -> None:
@@ -463,7 +464,7 @@ class AistorCredentialVerifyTest(unittest.TestCase):
             folder = Path(scratch)
             target = folder / "secrets" / "aistor"
             target.mkdir(parents=True, mode=0o700)
-            for name in ("root_user", "root_password"):
+            for name in ("root_user", "root_password", "project_password"):
                 if not create and name == "root_password":
                     continue
                 if link and name == "root_password":

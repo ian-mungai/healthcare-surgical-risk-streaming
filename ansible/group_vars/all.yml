@@ -64,6 +64,14 @@ compose_stack_owner: root
 # is missing or empty. The services that start apart from the rest, after their own step: AIStor starts after the check of its licence file.
 compose_stack_aistor_licence_file: "{{ compose_stack_secrets_directory }}/aistor/licence"
 compose_stack_storage_services: [aistor]
+# The one-time bootstrap (aistor_project_user.yml) is the only use of AIStor's root pair: it makes the project's one user and one policy, and every other client
+# (Terraform, the storage command, its checks) signs in as that user. The user's password is a generated root-only file beside the root files; the OpenBao step
+# copies the user and the password to secret/services/<compose_stack_aistor_service>/aistor, which that service's own role alone reads. The bucket is given by
+# the launcher as aistor_bucket (the S3_BUCKET value of the project profile). The policy name must not be one of AIStor's built-in policies.
+compose_stack_aistor_service: aistor
+compose_stack_aistor_project_user: project_user
+compose_stack_aistor_project_policy: project_bucket
+compose_stack_aistor_project_password_file: "{{ compose_stack_secrets_directory }}/aistor/project_password"
 compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.

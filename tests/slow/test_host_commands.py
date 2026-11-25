@@ -704,6 +704,7 @@ class HostUpTest(unittest.TestCase):
                 "compose_stack_platform_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
+                "aistor_bucket": "example-bucket",
             },
             calls["run_ansible"].call_args_list[0].args[2],
         )
@@ -1032,6 +1033,7 @@ class DeployVariablesTest(unittest.TestCase):
                 "compose_stack_platform_commit": "b" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
+                "aistor_bucket": "example-bucket",
             },
             host.deploy_variables(CONFIGURATION, "b" * 40),
         )
