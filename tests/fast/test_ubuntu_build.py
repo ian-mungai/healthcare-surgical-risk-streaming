@@ -14,10 +14,12 @@ Failure modes covered here:
 - The serial is not eight digits, an AMI is not ``ami-`` and 17 lower-case hex digits, a region name is not a region name, the sum is not 64 lower-case hex
   digits, or the URL is not the image of the pinned serial under ``https://cloud-images.ubuntu.com/releases/noble/``: each refused for its own cause.
 - No region has an AMI: refused, so the host would have no image.
-- A tracked or new text file of any folder other than the pin names an Ubuntu AMI, the pinned serial or a build's release folder: refused, named by file
+- A tracked or new file of any folder other than the pin names an Ubuntu AMI, the pinned serial or a build's release folder: refused, named by file
   and line.
-- Any tracked or new text file of any folder (Terraform, IAM policy, script, YAML, shell) uses the parameter store in any form, or names its public parameter
-  paths: refused, named by file and line. Only this file is left out of that scan, because its patterns and fixtures are the forms.
+- Any tracked or new file of any folder (Terraform, IAM policy, script, YAML, shell; each read as Latin-1 bytes, so no encoding hides a token) uses the
+  parameter store in a closed list of forms (a resource, an IAM action, the AWS command line, a client, a managed policy named for it, a public parameter
+  path): refused, named by file and line. Prose that only says a host starts without the service passes. Only this file is
+  left out of that scan, because its patterns and fixtures are the forms.
 """
 
 from __future__ import annotations
@@ -44,13 +46,21 @@ KEYS = {"serial", "amis", "cloud_image"}
 IMAGE_KEYS = {"url", "sha256"}
 # What names a build outside the pin: an AMI ID, a build's folder or an AMI name with a serial. The pinned serial itself is added at run time.
 BUILD_NAMES = (re.compile(r"\bami-[0-9a-f]{17}\b"), re.compile(r"\brelease-\d{8}\b"), re.compile(r"ubuntu-noble-24\.04-[a-z0-9]+-server-\d{8}"))
-# What uses the parameter store in any form: the name as a word or as a part of an identifier (``aws_ssm_parameter``, ``ssm:GetParameter``, ``aws ssm``,
-# ``client("ssm")``, ``ssm_client``), the managed policies and clients named for it, and the paths of the public parameters. A run of letters or digits on
-# either side (``classmethod``, ``dessmount``) is no use.
-SSM_NAMES = (
-    re.compile(r"(?<![A-Za-z0-9])ssm(?![A-Za-z0-9])", re.IGNORECASE),
-    re.compile(r"AmazonSSM|SSMClient"),
-    re.compile(r"/aws/service/"),
+# What uses the parameter store, by the way it is used and never by the word alone, so prose that says a host starts without it passes: a Terraform
+# resource, an IAM action, the AWS command line, a client of the service, a managed policy named for it and the paths of the public parameters. Each pattern
+# ignores case. This list is closed: a use in another form is added here with its test.
+SSM_NAMES = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"aws_ssm_",
+        r"[\"']ssm:",
+        r"\bssm:[A-Za-z*]",
+        r"aws\s+ssm\s",
+        r"client\(\s*[\"']ssm[\"']",
+        r"/aws/service/",
+        r"AmazonSSM|AmazonEC2RoleforSSM",
+        r"arn:aws:iam::aws:policy/[^\s\"']*ssm",
+    )
 )
 GUARD = "tests/fast/test_ubuntu_build.py"
 
@@ -86,11 +96,11 @@ def pin_problems(pin: Any) -> list[str]:
 
 
 def scanned_files(root: Path, skip: tuple[str, ...] = ()) -> dict[str, str]:
-    """Every file of the repository at ``root`` that Git tracks or that is new and not ignored, as text by name. The pin itself, the files of ``skip`` and
-    any file that is not UTF-8 text are left out."""
+    """Every file of the repository at ``root`` that Git tracks or that is new and not ignored, as text by name. The pin itself and the files of ``skip`` are
+    left out. A file is read as bytes and decoded as Latin-1, which keeps every ASCII token of any text encoding and refuses no file, binary or not."""
     listed = git_in(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", keep_newlines=True).stdout
     names = sorted({name for name in listed.split("\0") if name and name != PIN and name not in skip and (root / name).is_file()})
-    return {name: text for name in names if (text := read_text(root, name)) is not None}
+    return {name: text for name in names if (text := read_latin_1(root, name)) is not None}
 
 
 def pinned_serial(root: Path) -> str:
@@ -105,14 +115,14 @@ def build_patterns(serial: str) -> tuple[re.Pattern[str], ...]:
 
 def hits(files: dict[str, str], patterns: tuple[re.Pattern[str], ...]) -> list[str]:
     return [
-        f"{name}:{number}" for name, text in sorted(files.items()) for number, line in enumerate(text.splitlines(), 1) if any(p.search(line) for p in patterns)
+        f"{name}:{number}" for name, text in sorted(files.items()) for number, line in enumerate(text.split("\n"), 1) if any(p.search(line) for p in patterns)
     ]
 
 
-def read_text(root: Path, name: str) -> str | None:
+def read_latin_1(root: Path, name: str) -> str | None:
     try:
-        return (root / name).read_text()
-    except UnicodeDecodeError, OSError:
+        return (root / name).read_bytes().decode("latin-1")
+    except OSError:
         return None
 
 
@@ -222,23 +232,36 @@ class NoParameterStoreLookupTest(unittest.TestCase):
             "a Terraform data source": 'data "aws_ssm_' + 'parameter" "ubuntu" {',
             "a Terraform resource": 'resource "aws_ssm_' + 'document" "x" {',
             "an IAM action": '"Action": "ssm' + ':GetParameter"',
+            "an IAM action in single quotes": "Action: 'ssm" + ":GetParameter'",
+            "an IAM action with a wildcard in quotes": '"ss' + 'm:*"',
+            "an IAM action prefix in quotes": 'prefix = "ss' + 'm:"',
             "an IAM action in YAML": "- ssm" + ":GetParameters",
+            "an IAM wildcard in YAML": "- ss" + "m:*",
+            "an IAM action in capitals": "- SS" + "M:GetParameter",
             "a managed policy": "arn:aws:iam::aws:policy/AmazonSS" + "MManagedInstanceCore",
+            "the old managed policy of the instance role": 'policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSS' + 'M"',
+            "a managed policy named in a list": "managed_policies: [AmazonEC2RoleforSS" + "M]",
+            "a managed policy named without its ARN": "managed_policies: [AmazonSS" + "MManagedInstanceCore]",
+            "a managed policy of any name that holds the letters": "arn:aws:iam::aws:policy/service-role/Something" + "SSM" + "Core",
             "the AWS CLI service": "aws ss" + "m get-parameter --name x",
-            "the AWS CLI service in an argument list": '["aws", "ss' + 'm", "get-parameter"]',
+            "the AWS CLI service with spaces and capitals": "AWS   SS" + "M get-parameter",
             "a boto3 client": 'boto3.client("ss' + 'm")',
-            "a boto3 client in single quotes": "session.client(service_name='ss" + "m')",
-            "a client name": "ss" + "m_client = make()",
+            "a boto3 client in single quotes": "boto3.client('ss" + "m')",
+            "a boto3 client with spaces": 'boto3.client( "ss' + 'm" )',
             "the parameter path": 'name = "/aws/serv' + 'ice/canonical/ubuntu/server/24.04"',
             "another parameter path": "/aws/serv" + "ice/ami-amazon-linux-latest/x",
-            "a capital name": "SS" + "M_PARAMETER = 1",
         }
         for label, line in forms.items():
             with self.subTest(form=label):
                 self.assertEqual(["f:2"], hits({"f": "first\n" + line + "\n"}, SSM_NAMES))
 
-    def test_words_that_only_contain_the_letters_name_no_use(self) -> None:
-        files = {"a": "a dessmount, a classmethod, a MESSMATE and a bypassmark name no grant\n", "b": "assumed role, assembly, ssh and ssl\n"}
+    def test_prose_and_names_that_only_contain_the_letters_name_no_use(self) -> None:
+        files = {
+            "a": "a dessmount, a classmethod, a MESSMATE and a bypassmark name no grant\n",
+            "b": "assumed role, assembly, ssh and ssl\n",
+            "c": "the host starts without SS" + "M and needs no SS" + "M grant; an SS" + "M-free image\n",
+            "d": "# Systems Manager is not used (ss" + "m_client was removed, SS" + "M_PARAMETER too)\n",
+        }
         self.assertEqual([], hits(files, SSM_NAMES))
 
     def test_no_text_file_of_the_repository_uses_the_parameter_store(self) -> None:
@@ -272,29 +295,48 @@ class PlantedUseIsFoundTest(unittest.TestCase):
         git_in(self.root, "add", "--", PIN, "scripts/infra/launcher.py")
         self.write("scripts/new_script.sh", "aws ssm get-parameter --name /x\n")
 
+    EXPECTED = ("ansible/group_vars/all.yml:3", "scripts/infra/launcher.py:3", "scripts/new_script.sh:1")
+
     def write(self, name: str, text: str) -> None:
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
     def test_a_parameter_store_use_in_a_tracked_script_a_new_script_or_a_yaml_file_is_found_by_file_and_line(self) -> None:
-        self.assertEqual(
-            ["ansible/group_vars/all.yml:3", "scripts/infra/launcher.py:3", "scripts/new_script.sh:1"],
-            hits(scanned_files(self.root), SSM_NAMES),
-        )
+        self.assertEqual(list(self.EXPECTED), hits(scanned_files(self.root), SSM_NAMES))
 
     def test_a_build_name_in_a_yaml_file_is_found_and_the_pin_itself_is_left_out(self) -> None:
         self.assertEqual(
             ["ansible/group_vars/all.yml:1", "ansible/group_vars/all.yml:2"], hits(scanned_files(self.root), build_patterns(pinned_serial(self.root)))
         )
 
-    def test_a_file_of_the_skip_list_is_left_out_and_a_binary_or_ignored_file_is_not_read(self) -> None:
-        (self.root / "blob.bin").write_bytes(b"\xff\xfe aws ssm \x00")
+    def test_a_script_in_latin_1_is_scanned_by_its_ascii_and_a_line_with_utf_8_letters_keeps_its_number(self) -> None:
+        script = b"#!/bin/sh\n# caf\xe9 and the sign \xb0\naws ssm get-parameter --name /x\n"
+        (self.root / "scripts" / "legacy.sh").write_bytes(script)
+        self.write("docs/notes.md", "\u00c5ngstr\u00f6m \u2026 \u00c5\nami-" + "0aaaaaaaaaaaaaaaa\n")
+        files = scanned_files(self.root)
+        self.assertEqual(
+            ["ansible/group_vars/all.yml:3", "scripts/infra/launcher.py:3", "scripts/legacy.sh:3", "scripts/new_script.sh:1"], hits(files, SSM_NAMES)
+        )
+        self.assertEqual(["ansible/group_vars/all.yml:1", "docs/notes.md:2"], hits(files, BUILD_NAMES))
+
+    def test_an_instance_role_policy_attachment_for_the_parameter_store_is_found_in_a_terraform_file(self) -> None:
+        self.write(
+            "infra/modules/host/role.tf",
+            'resource "aws_iam_role_policy_attachment" "x" {\n  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSS' + 'M"\n}\n',
+        )
+        self.assertEqual(sorted(["infra/modules/host/role.tf:2", *self.EXPECTED]), hits(scanned_files(self.root), SSM_NAMES))
+
+    def test_prose_about_the_parameter_store_passes_and_a_binary_file_is_read_too(self) -> None:
+        self.write("docs/design.md", "The host starts without SS" + "M and needs no SS" + "M grant.\n")
+        (self.root / "blob.bin").write_bytes(b"\xff\xfe\x00 aws ss" + b"m get-parameter \x00")
+        self.assertEqual(sorted(["blob.bin:1", *self.EXPECTED]), hits(scanned_files(self.root), SSM_NAMES))
+
+    def test_a_file_of_the_skip_list_and_an_ignored_file_are_left_out(self) -> None:
         self.write(".gitignore", "ignored.txt\n")
         self.write("ignored.txt", "aws ssm get-parameter\n")
         files = scanned_files(self.root, skip=("scripts/new_script.sh",))
         self.assertNotIn("scripts/new_script.sh", files)
-        self.assertNotIn("blob.bin", files)
         self.assertNotIn("ignored.txt", files)
         self.assertNotIn(PIN, files)
         self.assertIn("scripts/infra/launcher.py", files)
