@@ -12,6 +12,7 @@ with a default is accepted. Adding a field with no default or changing a type is
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,13 @@ COMPATIBILITY_RULE = "BACKWARD"
 INPUT_TOPIC = "replay_events"
 FEATURE_READY_TOPIC = "feature_ready"
 REGISTRY_GROUP = "surgical_risk"
+OWN_INPUT_TOPIC = re.compile(rf"{INPUT_TOPIC}_[a-z0-9_]{{1,200}}")
+
+
+def is_input_topic(name: object) -> bool:
+    """Whether ``name`` may carry the replay's input events: the deployed ``replay_events`` or a topic of one run, ``replay_events_`` and lower case letters,
+    digits and underscores. The run record and the Kafka sink share this one check."""
+    return isinstance(name, str) and (name == INPUT_TOPIC or OWN_INPUT_TOPIC.fullmatch(name) is not None)
 
 
 @dataclass(frozen=True, slots=True)

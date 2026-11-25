@@ -21,7 +21,10 @@ OBSERVED_FORMAT = "replay_observed_1"
 
 @dataclass(frozen=True, slots=True)
 class Received:
-    """One message read back from a topic: where it was, the content ID in its first bytes and its decoded payload."""
+    """One message read back from a topic: where it was, the content ID in its first bytes and its decoded payload.
+
+    ``appended_ms`` is the broker's own append time in milliseconds since the epoch, for a message of a topic that stamps it (``LogAppendTime``), and None for a
+    message that carries its producer's time or none."""
 
     topic: str
     partition: int
@@ -29,6 +32,7 @@ class Received:
     content_id: int
     record_name: str
     payload: dict[str, Any]
+    appended_ms: int | None = None
 
 
 def observed_document(received: Iterable[Received], run_id: str) -> str:

@@ -19,6 +19,7 @@ from casefile.folder_store import SCHEDULE_NAME as SCHEDULE_NAME
 from casefile.folder_store import STATE_FOLDER_NAMES as STATE_FOLDER_NAMES
 from casefile.folder_store import STATE_NAME as STATE_NAME
 from casefile.folder_store import is_state_folder_name as is_state_folder_name
+from replay.events.formats import INPUT_TOPIC, is_input_topic
 from replay.events.run import DEFAULT_CHECKPOINT_EVENTS, MAX_SPEED, MIN_SPEED
 
 
@@ -50,6 +51,7 @@ class RunRecord:
     state_dir: str
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVENTS
     idle_checkpoint_seconds: float = 5.0
+    input_topic: str = INPUT_TOPIC
 
     @property
     def schedule_path(self) -> Path:
@@ -69,7 +71,7 @@ REQUIRED: dict[str, type | tuple[type, ...]] = {
     "registry_url": str,
     "state_dir": str,
 }
-OPTIONAL: dict[str, type | tuple[type, ...]] = {"cases": list, "checkpoint_every": int, "idle_checkpoint_seconds": (int, float)}
+OPTIONAL: dict[str, type | tuple[type, ...]] = {"cases": list, "checkpoint_every": int, "idle_checkpoint_seconds": (int, float), "input_topic": str}
 TIMING_FIELDS = ("stagger_seconds", "turnover_seconds", "window_seconds", "idle_checkpoint_seconds")
 MAX_TIMING_SECONDS = 86_400
 
@@ -106,6 +108,9 @@ def parse_run_record(text: str) -> RunRecord:
     store = closed(document["object_store"], {"kind": str}, {"root": str, "region": str, "read_log": str}, "the run record's object_store")
     if store["kind"] not in ("folder", "s3") or (store["kind"] == "folder" and "root" not in store) or (store["kind"] == "s3" and "region" not in store):
         raise RunRecordError("object_store is a folder with a root or an s3 store with a region")
+    topic = document.get("input_topic", INPUT_TOPIC)
+    if not is_input_topic(topic):
+        raise RunRecordError(f"input_topic is {INPUT_TOPIC} or a topic of this run named {INPUT_TOPIC}_<lower case letters, digits and underscores>")
     cases = document.get("cases")
     if cases is not None and (not cases or any(not isinstance(case, int) or isinstance(case, bool) for case in cases)):
         raise RunRecordError("cases is a non-empty list of case numbers")
@@ -124,4 +129,5 @@ def parse_run_record(text: str) -> RunRecord:
         document["state_dir"],
         document.get("checkpoint_every", DEFAULT_CHECKPOINT_EVENTS),
         float(document.get("idle_checkpoint_seconds", 5.0)),
+        topic,
     )

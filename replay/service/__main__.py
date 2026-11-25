@@ -37,7 +37,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from replay.events.formats import COMPATIBILITY_RULE, FORMATS, INPUT_TOPIC, REGISTRY_GROUP, schema_text
+from replay.events.formats import COMPATIBILITY_RULE, FORMATS, REGISTRY_GROUP, schema_text
 from replay.events.identity import partition_of
 from replay.events.manifest import Manifest, build_manifest, compare
 from replay.events.run import Replayer, RunSettings
@@ -125,7 +125,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
     killed and that start counts as an attempt."""
     if flag.is_set():
         return STOPPED_CODE
-    partitions = partition_count(record.kafka_bootstrap, INPUT_TOPIC)
+    partitions = partition_count(record.kafka_bootstrap, record.input_topic)
     partition_of(record.rooms - 1, partitions)
     if flag.is_set():
         return STOPPED_CODE
@@ -141,7 +141,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
     if flag.is_set():
         return STOPPED_CODE
     writer = Writer(RegistryClient(record.registry_url))
-    sink = KafkaSink(record.kafka_bootstrap, writer, partitions)
+    sink = KafkaSink(record.kafka_bootstrap, writer, partitions, input_topic=record.input_topic)
     prefetched = dict(frozen.decoded)
 
     def source(case_id: int) -> Any:
@@ -157,7 +157,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
         beat()
         return flag.is_set()
 
-    settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000))
+    settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000), record.input_topic)
     replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(Path(record.state_dir)), SystemClock(flag, poll), stop_requested)
     log("replay_start", run_id=record.run_id, speed=record.speed, schedule_sha256=frozen.schedule.sha256)
     result = replayer.run()
@@ -188,7 +188,7 @@ def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
 
 def command_observe(record: RunRecord, arguments: argparse.Namespace) -> int:
     reader = Reader(RegistryClient(record.registry_url))
-    received = read_all(record.kafka_bootstrap, reader, [INPUT_TOPIC], READ_DEADLINE_SECONDS)
+    received = read_all(record.kafka_bootstrap, reader, [record.input_topic], READ_DEADLINE_SECONDS)
     write_new_file(Path(arguments.out), observed_document(received, record.run_id), mode=0o640)
     sys.stdout.write(json.dumps({"messages_read": len(received)}) + "\n")
     return 0

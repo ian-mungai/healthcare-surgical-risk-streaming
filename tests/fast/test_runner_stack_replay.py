@@ -47,6 +47,9 @@ class StandInStack:
         self.run_dir = run_dir
         self.calls: list[tuple[str, ...]] = []
 
+    def read_run_file(self, name: str) -> str:
+        return (self.run_dir / name).read_text()
+
     def replay(self, command: str, record_name: str, *extra: str, timeout: float) -> CompletedProcess[str]:
         self.calls.append((command, *extra))
         if command == "observe":
@@ -77,6 +80,18 @@ class ObservationFiles(unittest.TestCase):
         with self.assertRaises(self.module.Blocked):
             self.case.observe("before")
         self.assertEqual(calls, len(self.stack.calls))
+
+    def test_a_later_step_reuses_the_text_that_the_one_read_returned(self) -> None:
+        self.case.observe("before")
+        text = self.case.observe()
+        calls = len(self.stack.calls)
+        self.assertEqual(text, self.case.observation())
+        self.assertNotEqual(text, self.case.observation("before"))
+        self.assertEqual(calls, len(self.stack.calls))
+
+    def test_a_stage_that_was_never_read_has_no_text_to_reuse(self) -> None:
+        with self.assertRaises(self.module.Blocked):
+            self.case.observation()
 
     def test_the_comparison_in_the_image_reads_the_observation_after_the_replay(self) -> None:
         self.case.observe("before")
