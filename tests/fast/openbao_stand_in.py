@@ -70,6 +70,7 @@ class StandIn:
         self.drops: list[list[Any]] = []
         self.tamper: list[str] = []
         self.failures: list[list[Any]] = []
+        self.tamper_digests: list[str] = []
         self.ignore_deletes = False
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -94,6 +95,10 @@ class StandIn:
     def fail_next(self, method: str, prefix: str, status: int, text: str) -> None:
         """Answer the first call that matches with this status and an error list that holds ``text`` (a real server can repeat a rejected value there)."""
         self.failures.append([method, prefix, status, text])
+
+    def tamper_next_digest(self, stored: str) -> None:
+        """Store this text as the digest of the next write instead of the one it was sent (the value is stored as sent)."""
+        self.tamper_digests.append(stored)
 
     def tamper_next_write(self, stored: str) -> None:
         self.tamper.append(stored)
@@ -187,7 +192,7 @@ class StandIn:
                         return self.answer(400, {"errors": ["check-and-set parameter did not match the current version"]})
                     versions.append(outer.tamper.pop(0) if outer.tamper else body["data"][field_of(name)])
                     if "sha256" in body["data"]:
-                        outer.digests.setdefault(name, {})[len(versions) - 1] = body["data"]["sha256"]
+                        outer.digests.setdefault(name, {})[len(versions) - 1] = outer.tamper_digests.pop(0) if outer.tamper_digests else body["data"]["sha256"]
                     return self.answer(200, {"data": {"version": len(versions)}})
                 return self.answer(404)
 

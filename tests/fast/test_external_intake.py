@@ -237,12 +237,15 @@ class HostCodeTest(IntakeCase):
             "not_allowed",
             "no_answer",
             "mismatch",
+            "mismatch_kept",
+            "stored_mismatch",
             "cannot_write",
         ):
             with self.subTest(code=code), self.assertRaises(IntakeError) as caught:
                 external_intake.run_intake(declared(), replying((3, f"{code}\n")), answering(VALUE), external_intake.write_line)
             self.assertIn(NAME, str(caught.exception))
             self.assertNotIn(VALUE, str(caught.exception))
+            self.assertNotEqual(external_intake.MESSAGES["script_unknown"].format(name=NAME), str(caught.exception), "the code has a message of its own")
             for advice in ("reset", "volume", "recreate"):
                 self.assertNotIn(advice, str(caught.exception), "no message tells the owner to destroy the host's OpenBao or its data")
 

@@ -77,7 +77,16 @@ MESSAGES = {
     ),
     "script_no_answer": ("the host's OpenBao did not answer the intake script for external secret {name}; run the command again, which completes the write"),
     "script_mismatch": (
-        "the host's OpenBao stored another text than the one sent for external secret {name}; the stored version was removed, so run the command again"
+        "the host's OpenBao stored another text than the one sent for external secret {name}; a read showed the path empty after the removal, "
+        "so run the command again"
+    ),
+    "script_mismatch_kept": (
+        "the host's OpenBao stored another text than the one sent for external secret {name}, and no read showed that the stored version was removed: "
+        "remove that path's data in the host's OpenBao, then run the command again"
+    ),
+    "script_stored_mismatch": (
+        "the value that the host's OpenBao holds for external secret {name} does not match the SHA-256 stored beside it, so it is not used: "
+        "remove that path's data in the host's OpenBao, then run the command again"
     ),
     "script_cannot_write": "the intake script on the host could not store external secret {name}",
     "written": "external secret {name} is stored in the host's OpenBao",

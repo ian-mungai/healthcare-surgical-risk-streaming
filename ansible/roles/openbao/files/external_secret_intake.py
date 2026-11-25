@@ -8,18 +8,20 @@ Ansible task or module ever holds the value. It prints one code and nothing else
 ``unknown_name``, ``bad_form`` (a value that is not text or fails the check of its name), ``stored_bad_form`` (the stored value fails the check),
 ``no_login`` (the login of the intake role was refused or its secret ID file cannot be read), ``not_allowed`` (the policy of the intake role
 forbids the call: the host playbook writes that policy from the list at every deploy, so run it first), ``no_answer`` (the server did not
-answer), ``mismatch`` (the read-back text did not equal the sent one: the stored version is removed) and ``cannot_write``.
+answer), ``stored_mismatch`` (the stored text does not match the SHA-256 stored beside it, or has none), ``mismatch`` (the read-back text did not equal the sent
+one: the stored version is removed, and a read shows the path empty), ``mismatch_kept`` (the same, but no read showed the path empty) and ``cannot_write``.
 
-The write is one check-and-set call, so it creates the value only while no value is stored, and it is read back and compared by SHA-256 with the sent
-value. A call that never arrived leaves the path empty and the next run writes. A call whose read-back was lost leaves the whole value (the form was
-checked before it was sent, and one call stores all of it), and the next run finds it present. It uses only the standard library and the helpers that
+The write is one check-and-set call that stores the value and its SHA-256 together, so it creates them only while no value is stored. The call is read back
+and compared by SHA-256 with the sent value, and every other read checks the stored text against the SHA-256 beside it: a mismatch is a refusal, never
+``present``. A call that never arrived leaves the path empty and the next run writes. A call whose read-back was lost leaves the whole value with its
+SHA-256 (the form was checked before it was sent, and one call stores all of it), and the next run finds it present. A removal is reported only after a read
+shows the path empty. It uses only the standard library and the helpers that
 the role installs beside it, and runs on the host's Python. The launcher starts it as ``sudo /usr/bin/python3 -I <this file>``; isolated mode drops
 the script's folder from the import path, so the script loads the helpers by their path beside itself."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import http.client
 import importlib.util
 import json
@@ -118,11 +120,11 @@ def login_token(server: Server, directory: Path) -> str:
     return token
 
 
-def stored_value(server: Server, token: str, name: str) -> str | None:
-    """The value that the path holds, or None when it is empty (absent or removed)."""
+def stored_document(server: Server, token: str, name: str) -> tuple[str | None, object]:
+    """The value that the path holds and the SHA-256 stored beside it, or ``(None, None)`` when the path is empty (absent or removed). Nothing is checked."""
     status, document = server.call("GET", f"secret/data/external/{name}", token)
     if status == 404:
-        return None
+        return None, None
     if status == 403:
         raise Refusal("not_allowed")
     data = document.get("data")
@@ -130,7 +132,24 @@ def stored_value(server: Server, token: str, name: str) -> str | None:
     value = inner.get("value") if isinstance(inner, dict) else None
     if status != 200 or not isinstance(value, str):
         raise Refusal("cannot_write")
+    return value, inner.get("sha256")
+
+
+def stored_value(server: Server, token: str, name: str) -> str | None:
+    """The value that the path holds, or None when it is empty. A text that does not match the SHA-256 beside it, or has none, is refused."""
+    value, digest = stored_document(server, token, name)
+    if value is not None and digest != external.value_digest(value):
+        raise Refusal("stored_mismatch")
     return value
+
+
+def removed(server: Server, token: str, name: str) -> bool:
+    """Remove the stored version and return True only when a read afterwards shows the path empty."""
+    try:
+        server.call("DELETE", f"secret/data/external/{name}", token)
+        return stored_document(server, token, name)[0] is None
+    except Refusal:
+        return False
 
 
 def current_version(server: Server, token: str, name: str) -> int:
@@ -166,17 +185,17 @@ def run(name: str, value: str | None, directory: Path, list_path: Path, address:
     if stored is not None:
         return "unchanged"
     version = current_version(server, token, name)
-    status, _ = server.call("POST", f"secret/data/external/{name}", token, {"options": {"cas": version}, "data": {"value": value}})
+    sent = external.value_digest(value)
+    status, _ = server.call("POST", f"secret/data/external/{name}", token, {"options": {"cas": version}, "data": {"value": value, "sha256": sent}})
     if status == 403:
         raise Refusal("not_allowed")
     if status == 400:
         raise Refusal("cannot_write") if stored_value(server, token, name) is None else Refusal("unchanged")
     if status != 200:
         raise Refusal("cannot_write")
-    read_back = stored_value(server, token, name)
-    if read_back is None or hashlib.sha256(read_back.encode()).hexdigest() != hashlib.sha256(value.encode()).hexdigest():
-        server.call("DELETE", f"secret/data/external/{name}", token)
-        raise Refusal("mismatch")
+    read_back, stored_digest = stored_document(server, token, name)
+    if read_back is None or external.value_digest(read_back) != sent or stored_digest != sent:
+        raise Refusal("mismatch" if removed(server, token, name) else "mismatch_kept")
     return "written"
 
 

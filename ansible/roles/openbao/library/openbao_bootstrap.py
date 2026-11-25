@@ -326,30 +326,40 @@ def access_actions(entries: list[Entry], secrets_directory: Path, issued: list[s
     return actions
 
 
-def kv_value(api: Api, token: str, path: str) -> str | None:
-    """The text in the field ``value`` at ``secret/data/<path>``, or None when the path is empty."""
+def kv_document(api: Api, token: str, path: str) -> tuple[str | None, object]:
+    """The text in the field ``value`` at ``secret/data/<path>`` and the SHA-256 beside it, or ``(None, None)`` when the path is empty. Nothing is checked."""
     status, document = api.call("GET", f"secret/data/{path}", token)
     if status == 404:
-        return None
+        return None, None
     if status != 200:
         raise BootstrapError(f"GET secret/data/{path}: HTTP {status}")
-    value = ((document.get("data") or {}).get("data") or {}).get("value")
+    fields = (document.get("data") or {}).get("data") or {}
+    value = fields.get("value")
     if not isinstance(value, str):
         raise BootstrapError(f"the value at secret/data/{path} is not text")
+    return value, fields.get("sha256")
+
+
+def kv_value(api: Api, token: str, path: str) -> str | None:
+    """The text in the field ``value`` at ``secret/data/<path>``, or None when the path is empty. A text with no matching SHA-256 beside it is refused."""
+    value, digest = kv_document(api, token, path)
+    if value is not None and digest != value_digest(value):
+        raise BootstrapError(f"the text at secret/data/{path} does not match the SHA-256 that was stored beside it, so it is not used")
     return value
 
 
 def kv_store(api: Api, token: str, path: str, value: str) -> None:
-    """Store ``value`` at ``secret/data/<path>`` with check-and-set on the current version, read it back and compare it by SHA-256.
+    """Store ``value`` and its SHA-256 at ``secret/data/<path>`` in one write with check-and-set on the current version, read them back and compare.
 
-    A stored text that differs is an error."""
+    A stored text that differs is an error, and every later read refuses it."""
     status, document = api.call("GET", f"secret/metadata/{path}", token)
     if status not in (200, 404):
         raise BootstrapError(f"GET secret/metadata/{path}: HTTP {status}")
     version = int((document.get("data") or {}).get("current_version") or 0) if status == 200 else 0
-    api.must("POST", f"secret/data/{path}", token, {"options": {"cas": version}, "data": {"value": value}})
-    read_back = kv_value(api, token, path)
-    if read_back is None or value_digest(read_back) != value_digest(value):
+    sent = value_digest(value)
+    api.must("POST", f"secret/data/{path}", token, {"options": {"cas": version}, "data": {"value": value, "sha256": sent}})
+    read_back, stored_digest = kv_document(api, token, path)
+    if read_back is None or value_digest(read_back) != sent or stored_digest != sent:
         raise BootstrapError(f"OpenBao stored another text at secret/data/{path} than the one sent")
 
 

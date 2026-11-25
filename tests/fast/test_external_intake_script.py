@@ -6,6 +6,7 @@ The script is run as the role installs it: beside its helper, in the host's inte
 
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -186,6 +187,57 @@ class WriteTest(Case):
         with mock.patch.object(sys, "stdin", mock.Mock(buffer=io.BytesIO(json.dumps({"name": NAME, "value": VALUE}).encode()))), redirect_stdout(out):
             code = self.load().main(arguments)
         self.assertEqual((3, "no_answer\n"), (code, out.getvalue()))
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class DigestTest(Case):
+    """The value and its SHA-256 are stored in one check-and-set write, every read checks them, and a cleanup is reported only after a read confirms it."""
+
+    PATH = f"external/{NAME}"
+
+    def test_the_digest_goes_in_the_same_write_as_the_value(self) -> None:
+        self.assertEqual((0, "written\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+        self.assertEqual(1, self.server.writes())
+        self.assertEqual({0: digest(VALUE)}, self.server.digests[self.PATH])
+
+    def test_a_stored_text_that_does_not_match_its_digest_is_refused_by_a_code_and_is_never_present_or_unchanged(self) -> None:
+        self.server.versions[self.PATH] = [VALUE]
+        self.server.digests[self.PATH] = {0: digest(OTHER)}
+        for document in ({"name": NAME, "value": None}, {"name": NAME, "value": OTHER}):
+            with self.subTest(sent=document["value"] is not None):
+                self.assertEqual((3, "stored_mismatch\n", ""), self.run_script(document))
+        self.assertEqual(0, self.server.writes())
+
+    def test_a_stored_text_with_no_digest_is_refused_the_same_way(self) -> None:
+        self.server.versions[self.PATH] = [VALUE]
+        self.server.bare.add(self.PATH)
+        self.assertEqual((3, "stored_mismatch\n", ""), self.run_script({"name": NAME, "value": None}))
+
+    def test_a_read_back_that_differs_removes_the_version_and_says_so_only_when_a_read_shows_the_path_empty(self) -> None:
+        self.server.tamper_next_write(OTHER)
+        self.assertEqual((3, "mismatch\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+        self.assertIsNone(self.server.stored(self.PATH))
+
+    def test_a_read_back_whose_digest_differs_from_the_sent_one_is_the_same_mismatch_even_when_the_text_is_right(self) -> None:
+        self.server.tamper_next_digest(digest(OTHER))
+        self.assertEqual((3, "mismatch\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+        self.assertIsNone(self.server.stored(self.PATH))
+
+    def test_a_removal_that_the_server_answers_but_does_not_do_is_not_reported_as_done(self) -> None:
+        self.server.tamper_next_write(OTHER)
+        self.server.ignore_deletes = True
+        self.assertEqual((3, "mismatch_kept\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+        self.assertEqual(OTHER, self.server.stored(self.PATH))
+        self.assertEqual((3, "stored_mismatch\n", ""), self.run_script({"name": NAME, "value": None}), "the kept version is never read as present")
+
+    def test_a_removal_whose_call_never_arrived_is_not_reported_as_done(self) -> None:
+        self.server.tamper_next_write(OTHER)
+        self.server.drop_next("DELETE", "/v1/secret/data/")
+        self.assertEqual((3, "mismatch_kept\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+        self.assertEqual(OTHER, self.server.stored(self.PATH))
 
 
 class IsolatedRunTest(Case):

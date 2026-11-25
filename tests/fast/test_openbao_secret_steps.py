@@ -7,6 +7,7 @@ empty, and written from OpenBao to the file that its container reads. The server
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -139,6 +140,19 @@ class FetchTest(StepCase):
                 self.assertNotIn(stored.strip(), str(caught.exception))
             self.assertFalse((self.folder / "token").exists())
 
+    def test_a_stored_text_that_does_not_match_its_digest_or_has_none_is_refused_and_no_file_is_written(self) -> None:
+        for label in ("another digest", "no digest"):
+            self.server.versions[f"external/{NAME}"] = [VALUE]
+            self.server.bare.discard(f"external/{NAME}")
+            if label == "no digest":
+                self.server.bare.add(f"external/{NAME}")
+            else:
+                self.server.digests[f"external/{NAME}"] = {0: "0" * 64}
+            with self.subTest(label), self.assertRaises(bootstrap.BootstrapError) as caught:
+                self.fetch(self.folder / "token")
+            self.assertNotIn(VALUE, str(caught.exception))
+            self.assertFalse((self.folder / "token").exists())
+
     def test_a_check_run_writes_no_file(self) -> None:
         self.server.versions[f"external/{NAME}"] = [VALUE]
         self.assertTrue(self.fetch(self.folder / "token", check_only=True)["changed"])
@@ -221,6 +235,28 @@ class GeneratedTest(StepCase):
             self.generated(target)
         self.assertNotIn("another-text-marker", str(caught.exception))
         self.assertFalse(target.exists())
+
+    def test_the_digest_goes_in_the_same_write_as_the_generated_value(self) -> None:
+        target = self.folder / "admin.password"
+        self.generated(target)
+        stored = self.server.stored(f"services/{GRAFANA_NAME}") or ""
+        self.assertEqual(1, self.server.writes())
+        self.assertEqual({0: hashlib.sha256(stored.encode()).hexdigest()}, self.server.digests[f"services/{GRAFANA_NAME}"])
+
+    def test_a_stored_text_that_does_not_match_its_digest_or_has_none_is_an_error_that_is_never_adopted_and_no_file_is_written(self) -> None:
+        for label in ("another digest", "no digest"):
+            path = f"services/{GRAFANA_NAME}"
+            self.server.versions[path] = ["stored-password-marker"]
+            self.server.bare.discard(path)
+            if label == "no digest":
+                self.server.bare.add(path)
+            else:
+                self.server.digests[path] = {0: "0" * 64}
+            target = self.folder / "admin.password"
+            with self.subTest(label), self.assertRaises(bootstrap.BootstrapError) as caught:
+                self.generated(target)
+            self.assertNotIn("stored-password-marker", str(caught.exception))
+            self.assertFalse(target.exists())
 
     def test_a_server_error_that_repeats_the_generated_value_shows_no_value(self) -> None:
         target = self.folder / "admin.password"
