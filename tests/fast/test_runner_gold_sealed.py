@@ -46,6 +46,7 @@ from unittest import mock
 
 from scripts.process import TimeoutExpired
 from spark import split_table
+from spark.profile.counts import BY_NAME
 from spark.settings import SettingsError
 from tests.e2e.run_record import Record
 from tests.fast.runner_import import import_runner
@@ -1373,7 +1374,7 @@ class ProfileDump(unittest.TestCase):
             if (isinstance(node, ast.FunctionDef) and node.name in ("dump", "profile_sql", "grid_by_case"))
             or (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant | ast.Tuple))
         ]
-        names = namespace(ast.unparse(ast.Module(body=keep, type_ignores=[])), F=FakeFunctions, PINNED_COUNTS=split_table.PINNED_COUNTS)
+        names = namespace(ast.unparse(ast.Module(body=keep, type_ignores=[])), F=FakeFunctions, PINNED_COUNTS=split_table.PINNED_COUNTS, BY_NAME=BY_NAME)
         spec = {
             "dev_cases": self.DEV,
             "causes": self.CAUSES,
@@ -1417,7 +1418,7 @@ class ProfileDump(unittest.TestCase):
         none, and each row holds the expected value. ``edits`` changes one row by name: ``{"name": {"value": 1}}``. The second item is the spec that the
         runner sends: the names, the wanted value of the development counts that are no patient count and the expected value of the counts that are none."""
         counts = self.module.PRESPECIFIED
-        patient_counts = {"patients", "development_patients_training", "development_patients_validation"}
+        patient_counts = {"patients", "development_patients_training", "development_patients_validation", "cases"}
         rows = []
         for count in counts:
             row = {

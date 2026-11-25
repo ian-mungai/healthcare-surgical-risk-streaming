@@ -26,9 +26,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from spark import split_table
+from spark.profile.counts import BY_NAME
 from tests.e2e.run_record import Record
 from tests.fast.sealed_record import FLAG_NAME
-from tests.fast.test_heldout_figures import figure_derivable
+from tests.fast.test_heldout_figures import CASE_FIGURE, FIGURE, figure_derivable, numbers_of
 from tests.fast.test_runner_gold_sealed import runner
 
 BRANCH_HASH, BASE_HASH = "b" * 64, "a" * 64
@@ -347,7 +349,21 @@ class ProfileCases(unittest.TestCase):
         self.assertGreater(len(wanted), 0)
         self.assertNotIn("development_cases", wanted)
 
-    def test_the_independent_read_sends_the_container_no_total_of_patients_and_nothing_that_the_test_count_follows_from(self) -> None:
+    def requests_written(self) -> list[dict[str, Any]]:
+        """The complete request that ``write_spec`` receives for each call of a stand-in: the loads of the three tables, the split and the independent read in
+        both forms (pinned and unpinned), through the runner's own ``stand`` and ``spec``."""
+        written: list[dict[str, Any]] = []
+        self.stack.write_spec = written.append
+        self.stack.stand_in = lambda mode, branch: (0, self.healthy_dump(), "", 0.1)
+        built = {"branch": "p6_prof_profile_x1", "rows": {"signal_profile": 6}, "development": {}, "source_snapshots": {"patient_split": 5}}
+        pinned = {name: float(self.module.BY_NAME[name].expected) for name in ("development_cases", *PATIENT_COUNT_NAMES[1:])}
+        for mode in ("load_clinical", "load_track_list", "write_split"):
+            self.flow.stand(mode, "p6_prof_trunk_x1")
+        for pinned_run in (True, False):
+            self.flow.independent(built, [908], pinned, "", "control", pinned=pinned_run, arterial=False)
+        return written
+
+    def test_the_independent_read_sends_the_container_no_total_of_patients_or_cases_and_nothing_that_a_test_count_follows_from(self) -> None:
         asked: list[dict[str, Any]] = []
         self.stack.write_spec = lambda *_: None
 
@@ -364,8 +380,41 @@ class ProfileCases(unittest.TestCase):
         self.assertEqual(
             ["development_cases"], sorted(sent["want_values"]), "the development patient counts are the rule's pinned counts, read in the container"
         )
-        self.assertTrue(set(PATIENT_COUNT_NAMES).isdisjoint(sent["count_expected"]), "an expected total of patients is sent")
-        self.assertFalse(figure_derivable(sent), "the test count follows from the numbers that the runner sends")
+        self.assertTrue((set(PATIENT_COUNT_NAMES) | {"cases"}).isdisjoint(sent["count_expected"]), "an expected total of patients or of cases is sent")
+
+    def test_no_complete_request_holds_a_total_of_patients_or_cases_or_a_number_that_a_test_set_count_follows_from(self) -> None:
+        written = self.requests_written()
+        self.assertGreaterEqual(len(written), 5, "the loads, the split and the independent reads each wrote a request")
+        module = self.module
+        constants = {
+            "cases": list(module.CASES),
+            "files": self.flow.files,
+            "pins": module.release_pins(),
+            "sha256": self.flow.files[module.PLANT_CASE]["sha256"],
+            "causes": list(module.INVALID_CAUSES),
+            "nan": list(module.NAN_BLOCK),
+            "gap": list(module.GAP_BLOCK),
+        }
+        totals = {sum(split_table.PINNED_COUNTS.values()), int(BY_NAME["patients"].expected), int(BY_NAME["cases"].expected)}
+        for index, request in enumerate(written):
+            with self.subTest(request=index, keys=sorted(request)):
+                self.assertLessEqual(
+                    set(request), set(constants) | {"dev_cases", "names", "sealed", "want_values", "count_expected"}, "a key of the request is new: judge it"
+                )
+                self.assertEqual({key: value for key, value in constants.items() if key in request}, {key: request[key] for key in constants if key in request})
+                self.assertLessEqual(set(request["dev_cases"]), set(module.CASES), "a case that the runner does not hold is named as a development case")
+                counted = {key: value for key, value in request.items() if key not in constants and key != "dev_cases"}
+                self.assertTrue(totals.isdisjoint(numbers_of(request)), "the request holds the total of the patients or of the cases of the cohort")
+                self.assertFalse(figure_derivable(counted, FIGURE), "the test-set patient count follows from the counts of the request")
+                self.assertFalse(figure_derivable(counted, CASE_FIGURE), "the held-out case count follows from the counts of the request")
+
+    def test_the_held_out_counts_would_follow_from_the_old_request(self) -> None:
+        """The control of the test above: the request as it was (the totals in ``expected``, the development counts in ``want_values``) gives both figures."""
+        counts = split_table.PINNED_COUNTS
+        cases = {"expected": {"cases": int(BY_NAME["cases"].expected)}, "want_values": {"development_cases": float(BY_NAME["development_cases"].expected)}}
+        patients = {"expected": {"patients": sum(counts.values())}, "want_values": {"training": counts["training"], "validation": counts["validation"]}}
+        self.assertTrue(figure_derivable(cases, CASE_FIGURE))
+        self.assertTrue(figure_derivable(patients, FIGURE))
 
     def test_the_independent_read_returns_true_when_every_comparison_passes_and_records_flags_only(self) -> None:
         self.assertIs(True, self.independent(self.healthy_dump()))

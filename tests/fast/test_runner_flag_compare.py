@@ -356,9 +356,10 @@ class ProfileLoadSteps(LoadStepCase):
 
     runner_name = "signal_profile"
     FUNCTIONS = ("load_clinical", "load_track_list", "write_split")
-    CLINICAL = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(CLIN).count() == spec["expected"]["cases"], '
-    TRACKS = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(TLIST).count() == spec["expected"]["tracks"], '
-    SPLIT = 'print("RESULT " + json.dumps({"patients_as_pinned": len(rows) == spec["expected"]["patients"], '
+    totals: tuple[int, int] = (0, 0)
+    CLINICAL = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(CLIN).count() == BY_NAME["cases"].expected, '
+    TRACKS = 'print("RESULT " + json.dumps({"rows_as_pinned": session.table(TLIST).count() == BY_NAME["tracks"].expected, '
+    SPLIT = 'print("RESULT " + json.dumps({"patients_as_pinned": len(rows) == sum(PINNED_COUNTS.values()), '
 
     def inputs(self, held: int) -> tuple[Session, dict[str, Any]]:
         cases = [*DEVELOPMENT, *held_cases(held), 424242]
@@ -367,13 +368,17 @@ class ProfileLoadSteps(LoadStepCase):
             for case in cases
         ]
         tracks = [{"caseid": str(case), "tname": f"T{index}", "tid": f"{case:04d}{index}"} for case in cases for index in range(1 + (case >= HELD_BASE) * held)]
-        spec = {"pins": {"clinical": {}, "track_list": {}}, "expected": {"cases": len(clinical), "tracks": len(tracks), "patients": len(clinical)}}
+        spec: dict[str, Any] = {"pins": {"clinical": {}, "track_list": {}}}
+        self.totals = (len(clinical), len(tracks))
         files = {"/pinned/clinical_data.csv": (clinical, CLINICAL_COLUMNS), "/pinned/trks_plain.csv": (tracks, ["caseid", "tname", "tid"])}
         return Session(files=files), spec
 
     def outputs(self, held: int, source: str | None = None) -> dict[str, dict[str, Any]]:
-        names = stand_in_namespace(source or self.source, self.FUNCTIONS)
+        """The three load steps on the stand-in tables. The container reads the totals itself (the rule's pinned counts and the prespecified table): here they
+        are the sizes of the stand-in tables, and the spec holds no total."""
         session, spec = self.inputs(held)
+        counted = {name: SimpleNamespace(expected=total) for name, total in zip(("cases", "tracks"), self.totals, strict=True)}
+        names = stand_in_namespace(source or self.source, self.FUNCTIONS, BY_NAME=counted, PINNED_COUNTS={"all": self.totals[0]})
         found = {name: printed_result(names[name], session, spec) for name in ("load_clinical", "load_track_list")}
         found["write_split"] = printed_result(names["write_split"], session, spec, False)
         again = printed_result(names["write_split"], session, spec, True)
