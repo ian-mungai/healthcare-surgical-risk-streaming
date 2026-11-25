@@ -22,6 +22,8 @@ concurrency:
     tag_concurrency_limits:
       - key: surgical_risk/heavy
         limit: 1
+    # Each run is a process that holds up to two PostgreSQL connections at once, so this number is part of the budget in compose/postgres_connections.yml. The default is 10.
+    max_concurrent_runs: 3
 
 run_launcher:
   module: dagster

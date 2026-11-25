@@ -33,12 +33,17 @@ server:
   enabled: true
   service:
     type: ClusterIP
+  # The pool size of each of the server's two database pools, config and jobs (compose/postgres_connections.yml). The default is 20.
+  configDbMaxPoolSize: "4"
 worker:
   enabled: true
 workloadLauncher:
   enabled: true
 workloadApiServer:
   enabled: true
+  # The chart passes CONFIG_DB_MAX_POOL_SIZE only to the server, and this pod reads the same variable for its pool (default 20).
+  env_vars:
+    CONFIG_DB_MAX_POOL_SIZE: "4"
 manifestServer:
   enabled: true
 cron:
@@ -47,6 +52,13 @@ airbyteBootloader:
   enabled: true
 temporal:
   enabled: true
+  # Temporal's four services each keep a pool for the default store and one for the visibility store (compose/postgres_connections.yml). The defaults are 20 and 10,
+  # so the live host held 65 connections for Temporal alone. The values are strings because they become environment values.
+  env_vars:
+    SQL_MAX_CONNS: "4"
+    SQL_MAX_IDLE_CONNS: "4"
+    SQL_VIS_MAX_CONNS: "2"
+    SQL_VIS_MAX_IDLE_CONNS: "2"
 minio:
   enabled: true
   storage:

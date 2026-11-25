@@ -1,0 +1,140 @@
+# The one source of how many connection slots each client of the shared PostgreSQL server may hold. A fast test (tests/fast/test_postgres_connection_budget.py,
+# scripts/stack/connection_budget.py) fails when the maxima and the margin do not fit under max_connections less superuser_reserved_connections, when a
+# service of limits.yml is neither a client nor listed in not_clients, when an account of postgres_tools.txt has no client, and when a tracked file does not carry the
+# figure that an entry states. The server is started with the two figures below (compose/services/postgres.yml), so none is an image default.
+#
+# Live failure (Nov 25 2026, host-up): the server held 97 idle connections of ordinary accounts (Temporal 65, Apicurio 20, Airbyte's database 10, Nessie 1, Alloy 1), so
+# the Dagster code location got "remaining connection slots are reserved for roles with the SUPERUSER attribute". Each tool's default pool is sized for a server of its
+# own; the entries below replace the defaults with a figure that fits this one.
+#
+# max_connections stays at 100. A backend of PostgreSQL 18 holds about 5 to 10 MiB when idle and more once it has run queries (work_mem and the catalog caches), and
+# the server's memory limit is 1024 MiB in limits.yml, so doubling the slots would risk the server's memory for connections that the tools do not need.
+#
+# For each client: max is the most connections it may hold at once, and equals the total of its settings (value times count) plus its allotment. The allotment is
+# the connections that no tracked setting caps: the tool opens them on use, and the entry gives the figure that the budget reserves for them. A setting with count 0
+# holds no connection (an idle-pool figure that must not exceed its maximum) and is checked only for its value. The margin is for the administrator's own sessions,
+# the provisioning step, the health checks, the one-shot schema setup of Temporal and the brief overlap of an old and a new Airbyte pod during a restart.
+postgres:
+  max_connections: 100
+  superuser_reserved_connections: 3
+  margin: 10
+
+clients:
+  # Temporal has four services in one process (frontend, history, matching, worker) and each keeps its own pool for each of its two stores. The live host held
+  # 3 services x 20 on the default store (SQL_MAX_CONNS default 20) and 5 on the visibility store (SQL_VIS_MAX_CONNS default 10). The chart's dynamic-config keys
+  # history.historyMgrNumConns and frontend.historyMgrNumConns no longer exist in Temporal 1.30.8 (common/dynamicconfig/constants.go), so only the environment caps the pools.
+  temporal:
+    account: airbyte
+    services: [airbyte_temporal, airbyte_temporal_admin]
+    max: 24
+    allotment: 0
+    settings:
+      - {file: ansible/roles/airbyte/files/values.yaml, path: temporal.env_vars.SQL_MAX_CONNS, value: 4, count: 4}
+      - {file: ansible/roles/airbyte/files/values.yaml, path: temporal.env_vars.SQL_MAX_IDLE_CONNS, value: 4, count: 0}
+      - {file: ansible/roles/airbyte/files/values.yaml, path: temporal.env_vars.SQL_VIS_MAX_CONNS, value: 2, count: 4}
+      - {file: ansible/roles/airbyte/files/values.yaml, path: temporal.env_vars.SQL_VIS_MAX_IDLE_CONNS, value: 2, count: 0}
+    source: >-
+      temporalio/temporal v1.30.8 docker/config_template.yaml (maxConns from SQL_MAX_CONNS default 20, maxIdleConns from SQL_MAX_IDLE_CONNS default 20, visibility from
+      SQL_VIS_MAX_CONNS default 10 and SQL_VIS_MAX_IDLE_CONNS default 10); the chart (airbyte 2.5.0, temporal.env_vars) renders each entry as an environment value of the
+      Temporal container; the factor 4 is one pool per service and store (common/persistence/sql/factory.go, one reference-counted connection for each factory)
+
+  # Pods of chart 2.5.0 that read Airbyte's own database: server, workload API server, worker, cron, workload launcher and the bootloader. Their pools (Hikari,
+  # minimum-idle 0 except the workload API server's 5) open on use. Only CONFIG_DB_MAX_POOL_SIZE is a chart setting: server.configDbMaxPoolSize reaches the server,
+  # which has two pools of it (config and jobs), and env_vars gives the same variable to the workload API server's one pool. The pools named local-secrets (20 in the
+  # server, worker, launcher and cron), config-replica and the cron's and bootloader's fixed 5 have no chart setting, so the allotment holds their share.
+  airbyte_pods:
+    account: airbyte
+    services: [airbyte_server, airbyte_workload_api_server, airbyte_worker, airbyte_cron, airbyte_workload_launcher, airbyte_bootloader]
+    max: 24
+    allotment: 12
+    settings:
+      - {file: ansible/roles/airbyte/files/values.yaml, path: server.configDbMaxPoolSize, value: 4, count: 2}
+      - {file: ansible/roles/airbyte/files/values.yaml, path: workloadApiServer.env_vars.CONFIG_DB_MAX_POOL_SIZE, value: 4, count: 1}
+    source: >-
+      airbytehq/airbyte-platform application.yml files (airbyte-server and airbyte-workload-api-server: datasources.config and .jobs maximum-pool-size
+      ${CONFIG_DB_MAX_POOL_SIZE:20}; airbyte-cron and airbyte-bootloader: 5; local-secrets: 20), read on the main branch because the repository has no tag after v2.0.0;
+      chart 2.5.0 templates/config/_server.tpl (server.configDbMaxPoolSize renders CONFIG_DB_MAX_POOL_SIZE)
+
+  # Apicurio 3.3.5 starts with 20 connections (initial-size 20, min-size 20, max-size 100): the 20 idle connections of the live host. Agroal refuses a minimum above the maximum.
+  apicurio:
+    account: apicurio
+    services: [apicurio]
+    max: 4
+    allotment: 0
+    settings:
+      - {file: compose/services/apicurio.yml, path: services.apicurio.environment.APICURIO_DATASOURCE_JDBC_MAX_SIZE, value: 4, count: 1}
+      - {file: compose/services/apicurio.yml, path: services.apicurio.environment.APICURIO_DATASOURCE_JDBC_MIN_SIZE, value: 1, count: 0}
+      - {file: compose/services/apicurio.yml, path: services.apicurio.environment.APICURIO_DATASOURCE_JDBC_INITIAL_SIZE, value: 1, count: 0}
+    source: Apicurio/apicurio-registry 3.3.5 app/src/main/resources/application.properties (apicurio.datasource.jdbc.initial-size, min-size and max-size feed quarkus.datasource.postgresql.jdbc.*)
+
+  # Nessie 0.110.1 keeps Quarkus's Agroal defaults (min-size 0, max-size 20) for its datasource named postgresql.
+  nessie:
+    account: nessie
+    services: [nessie]
+    max: 4
+    allotment: 0
+    settings:
+      - {file: compose/services/nessie.yml, path: services.nessie.environment.QUARKUS_DATASOURCE_POSTGRESQL_JDBC_MAX_SIZE, value: 4, count: 1}
+    source: Quarkus datasource reference (quarkus.datasource."name".jdbc.max-size, default 20); Nessie's application.properties sets no size for the postgresql datasource
+
+  # Alloy's postgres exporter is the Grafana fork of prometheus-community/postgres_exporter v0.19.0. Its legacy server and its collector instance each call
+  # db.SetMaxOpenConns(1) (exporter/server.go and collector/instance.go), one connection each for the one data source.
+  alloy:
+    account: alloy
+    services: [alloy]
+    max: 2
+    allotment: 2
+    source: prometheus-community/postgres_exporter exporter/server.go and collector/instance.go (SetMaxOpenConns(1) in each); grafana/alloy v1.22.0 go.mod pins v0.19.0
+
+  # dagster-postgres 0.29.31 keeps no connection in the daemon, the code location and the run processes (NullPool: one connection for each statement). The web server
+  # (optimize_for_webserver) gives each of its three storages (runs, event log, schedules) a pool of 1 and an overflow that --db-pool-max-overflow sets (default 20).
+  dagster_webserver:
+    account: dagster
+    services: [dagster_webserver]
+    max: 9
+    allotment: 3
+    settings:
+      - {file: compose/services/dagster_webserver.yml, path: services.dagster_webserver.command, flag: --db-pool-max-overflow, value: 2, count: 3}
+    source: dagster-webserver 1.13.31 cli.py (DEFAULT_POOL_MAX_OVERFLOW = 20, option --db-pool-max-overflow); dagster-postgres 0.29.31 run_storage.py, event_log.py and schedule_storage.py (pool_size 1)
+
+  # The daemon runs one thread for each daemon type plus the heartbeat thread, and each statement is its own short connection: the sensor, backfill, scheduler,
+  # run queue, run monitoring, asset, event log consumer and freshness daemons are eight threads, so the allotment is those eight, the heartbeat and one spare.
+  dagster_daemon:
+    account: dagster
+    services: [dagster_daemon]
+    max: 10
+    allotment: 10
+    source: dagster 1.13.31 _core/instance/methods/daemon_methods.py (get_required_daemon_types); dagster-postgres 0.29.31 (NullPool)
+
+  # The code location serves the gRPC API with its own instance (two simultaneous statements at most) and starts each run as a process: a run holds at most two
+  # connections at once (the in-process executor runs the steps in turn, and the event log and the run heartbeat are the two writers). The run queue's
+  # max_concurrent_runs (default 10) is the cap on the processes.
+  dagster_code_location:
+    account: dagster
+    services: [dagster_code_location]
+    max: 8
+    allotment: 2
+    settings:
+      - {file: orchestration/dagster.yaml, path: concurrency.runs.max_concurrent_runs, value: 3, count: 2}
+    source: dagster 1.13.31 _core/instance/config.py (concurrency.runs.max_concurrent_runs) and _core/run_coordinator/queued_run_coordinator.py (default 10)
+
+# Every other service of limits.yml. A service that is listed here and reads a PostgreSQL password or address in its Compose file fails the test.
+not_clients:
+  - postgres
+  - openbao
+  - caddy
+  - prometheus
+  - grafana
+  - loki
+  - spark
+  - trino
+  - kafka
+  - replay
+  - airbyte_manifest_server
+  - airbyte_minio
+  - airbyte_minio_create_bucket
+  - airbyte_job_connector
+  - airbyte_job_check
+  - airbyte_job_discover
+  - airbyte_job_replication
+  - airbyte_job_sidecar

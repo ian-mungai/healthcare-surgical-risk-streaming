@@ -6,7 +6,8 @@ services:
     restart: unless-stopped
     init: true
     user: "10001:10001"
-    command: [dagster-webserver, --host, 0.0.0.0, --port, "3000", --workspace, /opt/dagster/instance/workspace.yaml]
+    # The overflow of each of the three storage pools (compose/postgres_connections.yml). The default is 20, so the web server could hold 63 connections.
+    command: [dagster-webserver, --host, 0.0.0.0, --port, "3000", --workspace, /opt/dagster/instance/workspace.yaml, --db-pool-max-overflow, "2"]
     depends_on:
       postgres:
         condition: service_healthy
