@@ -220,37 +220,92 @@ esac
 """
 # The k3s stand-in logs each call and answers ``kubectl get deployment --output name`` with two deployments (``flag_no_deployments`` lists none).
 # ``flag_fail_restart`` fails the restart and ``flag_fail_rollout`` fails the rollout status of the second deployment, each with text that must never reach
-# the task log. It keeps the running pods in the file ``pods`` (one deployment name per line, the old pod of each): ``get deployment <name>`` answers with the
-# selector of that deployment, as ``flag_scale_missing`` answers with the NotFound error for an absent one and ``flag_fail_scale_read`` fails; ``scale`` takes
-# the deployment's pod off the list at once and logs ``old exits <name>`` (``flag_fail_scale`` fails it); ``get pods --selector`` shows that pod until the
-# poll count of ``flag_pods_linger`` (one poll) has passed, and for ever with ``flag_pods_stay``.
+# the task log. It keeps the running pods in the file ``pods`` (one deployment name per line, the old pod of each) and, for each deployment, the replicas it
+# wants (``spec_<name>``, one when absent), its generation (``gen_<name>``) and the generation the controller has seen (``observed_<name>``). ``get
+# deployment <name>`` answers by its ``--output`` template: the uid, replicas and selector (``flag_scale_missing`` answers with the NotFound error for an
+# absent one, ``flag_fail_scale_read`` fails every read and ``flag_fail_read_<short name>`` fails the read of one deployment with a ServiceUnavailable
+# error), the generation state (``flag_observed_lags`` lets the controller see a scale one read late, ``flag_observed_stuck`` never) or the replicas alone.
+# ``scale`` takes the deployment's pod off the list at once and logs ``old exits <name>`` (``flag_fail_scale`` fails every scale, ``flag_fail_scale_<short
+# name>`` fails the scale to zero of one deployment, ``flag_fail_scale_applied`` after it took effect, ``flag_fail_restore`` fails each scale to more than
+# zero and the file ``after_fail_scale`` is sourced after a failed scale to model another writer). ``get replicaset`` shows the replicas the owned
+# ReplicaSets want: one until the first poll after the scale with ``flag_rs_lingers`` and for ever with ``flag_rs_stays``. ``get pods --selector`` shows the
+# old pod until the poll count of ``flag_pods_linger`` (one poll) has passed, and for ever with ``flag_pods_stay``. With the file ``clock`` the stand-in
+# programs ``date`` and ``sleep`` run on a clock of whole seconds that only ``sleep`` and the answer time of ``get pods`` (the seconds in the file
+# ``delay_pods``, only for the deployment that the file ``delay_pods_only`` names when it exists) move; a request whose ``--request-timeout`` is shorter than
+# its answer time fails after that timeout, as kubectl's client does.
 K3S_STAND_IN = """#!/bin/sh
 echo "$*" >> "$STAND_IN/log"
 leak() { echo "Error: LEAKED-STDERR $1" >&2; echo "LEAKED-STDOUT $1"; exit 1; }
+fail_after_scale() { [ -e "$STAND_IN/after_fail_scale" ] && . "$STAND_IN/after_fail_scale"; leak scale; }
+flag() { [ -e "$STAND_IN/flag_$1" ]; }
+recall() { if [ -e "$STAND_IN/$1" ]; then cat "$STAND_IN/$1"; else echo "$2"; fi; }
+advance() { [ -e "$STAND_IN/clock" ] && echo $(( $(cat "$STAND_IN/clock") + $1 )) > "$STAND_IN/clock"; return 0; }
+limit=""; output=""; replicas=""; prev=""
+for argument in "$@"; do
+  case "$argument" in --request-timeout=*) limit=${argument#*=} ;; --replicas=*) replicas=${argument#*=} ;; esac
+  [ "$prev" = "--request-timeout" ] && limit=$argument
+  [ "$prev" = "--output" ] && output=$argument
+  prev="$argument"
+done
+limit=${limit%s}
 case "$2 $3" in
 "scale deployment")
+  short=${4#airbyte-}
   [ -e "$STAND_IN/flag_fail_scale" ] && leak scale
-  if grep -qx "$4" "$STAND_IN/pods"; then
-    grep -vx "$4" "$STAND_IN/pods" > "$STAND_IN/pods.next"; mv "$STAND_IN/pods.next" "$STAND_IN/pods"; echo "old exits $4" >> "$STAND_IN/pods.log"
+  [ "$replicas" != 0 ] && flag fail_restore && leak restore
+  if [ "$replicas" = 0 ] && flag "fail_scale_$short" && ! flag fail_scale_applied; then fail_after_scale; fi
+  if [ "$(recall "spec_$4" 1)" != "$replicas" ]; then
+    generation=$(recall "gen_$4" 1)
+    if flag observed_lags || flag observed_stuck; then echo "$generation" > "$STAND_IN/observed_$4"; fi
+    echo $(( generation + 1 )) > "$STAND_IN/gen_$4"; echo "$replicas" > "$STAND_IN/spec_$4"
   fi
-  : > "$STAND_IN/scaled_$4" ;;
+  if [ "$replicas" = 0 ]; then
+    if grep -qx "$4" "$STAND_IN/pods"; then
+      grep -vx "$4" "$STAND_IN/pods" > "$STAND_IN/pods.next"; mv "$STAND_IN/pods.next" "$STAND_IN/pods"; echo "old exits $4" >> "$STAND_IN/pods.log"
+    fi
+    : > "$STAND_IN/scaled_$4"
+  fi
+  if [ "$replicas" = 0 ] && flag "fail_scale_$short" && flag fail_scale_applied; then fail_after_scale; fi ;;
 "get pods")
   selector=""; prev=""
   for argument in "$@"; do [ "$prev" = "--selector" ] && selector="$argument"; prev="$argument"; done
   [ -n "$selector" ] || exit 0
   name=${selector#airbyte=}; name=${name%,}
-  [ -e "$STAND_IN/flag_pods_stay" ] && { echo "pod/$name-0"; exit 0; }
-  if [ -e "$STAND_IN/flag_pods_linger" ] && [ -e "$STAND_IN/scaled_$name" ] && [ ! -e "$STAND_IN/polled_$name" ]; then
+  delay=$(recall delay_pods 0)
+  [ "$(recall delay_pods_only "$name")" = "$name" ] || delay=0
+  if [ -n "$limit" ] && [ "$delay" -gt "$limit" ]; then advance "$limit"; echo "Unable to connect to the server: Client.Timeout exceeded" >&2; exit 1; fi
+  advance "$delay"
+  flag pods_stay && { echo "pod/$name-0"; exit 0; }
+  if flag pods_linger && [ -e "$STAND_IN/scaled_$name" ] && [ ! -e "$STAND_IN/polled_$name" ]; then
     : > "$STAND_IN/polled_$name"; echo "pod/$name-0"
   fi ;;
+"get replicaset")
+  selector=""; prev=""
+  for argument in "$@"; do [ "$prev" = "--selector" ] && selector="$argument"; prev="$argument"; done
+  name=${selector#airbyte=}; name=${name%,}
+  case "$output" in *"uid-$name"*) ;; *) leak "replicaset template without the uid of $name" ;; esac
+  if flag rs_stays || [ ! -e "$STAND_IN/scaled_$name" ]; then echo "1 "; exit 0; fi
+  if flag rs_lingers && [ ! -e "$STAND_IN/rs_polled_$name" ]; then : > "$STAND_IN/rs_polled_$name"; echo "1 "; exit 0; fi
+  echo "0 0 " ;;
 "rollout restart") [ -e "$STAND_IN/flag_fail_restart" ] && leak restart ;;
 "get deployment")
   case "$4" in
   --*) [ -e "$STAND_IN/flag_no_deployments" ] || printf 'deployment.apps/airbyte-server\ndeployment.apps/airbyte-workload-launcher\n' ;;
   *)
+    short=${4#airbyte-}
     [ -e "$STAND_IN/flag_fail_scale_read" ] && leak read
     [ -e "$STAND_IN/flag_scale_missing" ] && { echo "Error from server (NotFound): deployments.apps \"$4\" not found" >&2; exit 1; }
-    [ -e "$STAND_IN/flag_empty_selector" ] || echo "airbyte=$4," ;;
+    spec=$(recall "spec_$4" 1)
+    case "$output" in
+    *observedGeneration*)
+      generation=$(recall "gen_$4" 1)
+      echo "$generation $(recall "observed_$4" "$generation") $spec"
+      flag observed_lags && rm -f "$STAND_IN/observed_$4" ;;
+    *metadata.uid*)
+      flag "fail_read_$short" && { echo "Error from server (ServiceUnavailable): the server is currently unable to handle the request" >&2; exit 1; }
+      if flag empty_selector || flag "empty_selector_$short"; then echo "uid-$4 $spec "; else echo "uid-$4 $spec airbyte=$4,"; fi ;;
+    *) echo "$spec" ;;
+    esac ;;
   esac ;;
 "rollout status")
   [ -e "$STAND_IN/flag_fail_rollout" ] && [ "$4" = deployment.apps/airbyte-workload-launcher ] && leak rollout
@@ -258,6 +313,14 @@ case "$2 $3" in
 esac
 exit 0
 """
+# A ``date`` and a ``sleep`` that follow the stand-in's clock when the file ``clock`` exists and are the real programs otherwise.
+CLOCK_SHIM = """#!/bin/sh
+PATH=/usr/bin:/bin
+[ -e "$STAND_IN/clock" ] || exec {program} "$@"
+{body}
+"""
+DATE_SHIM = CLOCK_SHIM.format(program="date", body='[ "$*" = "+%s" ] && cat "$STAND_IN/clock" || exec date "$@"')
+SLEEP_SHIM = CLOCK_SHIM.format(program="sleep", body='echo $(( $(cat "$STAND_IN/clock") + $1 )) > "$STAND_IN/clock"')
 CHART_SHA = "c" * 64
 DEADLINE = 600
 UPGRADE = "upgrade --install"
@@ -280,11 +343,14 @@ RESTART = [
     "kubectl rollout status deployment.apps/airbyte-workload-launcher",
 ]
 # The post-renderer makes each deployment that holds connections Recreate in the manifests of the upgrade itself, so no patch follows the upgrade. A rollback
-# applies the manifests of an older revision, which no post-renderer shaped, so the role first takes the pods of each such deployment away: it reads the
-# deployment's selector and scales it to zero (one pair for each deployment), then polls until no pod has the selector (one poll for each deployment).
+# applies the manifests of an older revision, which no post-renderer shaped, so the role first takes the pods of each such deployment away. It reads every
+# deployment's selector and replicas before it scales any (one read for each deployment), scales each to zero (one call for each), and then, for each
+# deployment, polls until the controller has seen the scale, every owned ReplicaSet wants no replica and no pod has the selector (one deployment read, one
+# ReplicaSet list and one pod list for each poll).
 SCALE_DOWN = [
-    *[line for name in RECREATE_DEPLOYMENTS for line in (f"kubectl get deployment airbyte-{name}", f"kubectl scale deployment airbyte-{name}")],
-    *["kubectl get pods" for _ in RECREATE_DEPLOYMENTS],
+    *[f"kubectl get deployment airbyte-{name}" for name in RECREATE_DEPLOYMENTS],
+    *[f"kubectl scale deployment airbyte-{name}" for name in RECREATE_DEPLOYMENTS],
+    *[line for name in RECREATE_DEPLOYMENTS for line in (f"kubectl get deployment airbyte-{name}", "kubectl get replicaset", "kubectl get pods")],
 ]
 UPGRADE_AND_RESTART = [UPGRADE, *RESTART]
 # The chart's own manifests for the deployments that hold connections and two that the role leaves alone, as ``helm template`` renders them for chart 2.5.0
@@ -363,7 +429,7 @@ class ReleaseSandbox:
         programs = folder / "bin"
         for directory in (self.stand_in, programs):
             directory.mkdir()
-        for name, text in (("helm", HELM_STAND_IN), ("k3s", K3S_STAND_IN)):
+        for name, text in (("helm", HELM_STAND_IN), ("k3s", K3S_STAND_IN), ("date", DATE_SHIM), ("sleep", SLEEP_SHIM)):
             (programs / name).write_text(text)
             (programs / name).chmod(stat.S_IRWXU)
         (self.stand_in / "rollout.py").write_text(ROLLOUT)
@@ -401,13 +467,15 @@ class ReleaseSandbox:
             "ANSIBLE_VERBOSITY": "1",
         }
 
-    def run(self, flags: tuple[str, ...] = (), host_values: str | None = None) -> tuple[int, str, list[str]]:
-        for old in self.stand_in.glob("flag_*"):
-            old.unlink()
-        for name in ("status_seen", "recovered", "log", "pods.log", "pods.next"):
+    def run(self, flags: tuple[str, ...] = (), host_values: str | None = None, seed: dict[str, str] | None = None) -> tuple[int, str, list[str]]:
+        """Run ``release.yml`` once. ``seed`` writes files of the k3s stand-in (the replicas of a deployment, the clock) before the run."""
+        for name in ("status_seen", "recovered", "log", "pods.log", "pods.next", "clock", "delay_pods", "delay_pods_only", "after_fail_scale"):
             (self.stand_in / name).unlink(missing_ok=True)
-        for old in (*self.stand_in.glob("scaled_*"), *self.stand_in.glob("polled_*")):
-            old.unlink()
+        for pattern in ("flag_*", "scaled_*", "polled_*", "rs_polled_*", "spec_*", "gen_*", "observed_*"):
+            for old in self.stand_in.glob(pattern):
+                old.unlink()
+        for name, text in (seed or {}).items():
+            (self.stand_in / name).write_text(text)
         (self.stand_in / "pods").write_text("".join(f"airbyte-{name}\n" for name in STRATEGIES))
         for flag in flags:
             (self.stand_in / f"flag_{flag}").write_text("")
@@ -435,6 +503,11 @@ class ReleaseSandbox:
 
     def record(self) -> Path:
         return self.directory / RECORD
+
+
+def without_timeouts(log: list[str]) -> list[str]:
+    """The calls of a run without the ``--request-timeout`` of each, which the cases that do not look at the time leave out."""
+    return [re.sub(r" --request-timeout[= ]\S+", "", line) for line in log]
 
 
 def commands(log: list[str]) -> list[str]:
@@ -652,18 +725,21 @@ class ReleaseRecoveryTest(unittest.TestCase):
                 code, output, log = box.run(flags=("pods_linger",))
                 events = box.pod_events()
                 self.assertEqual(0, code, output)
+                log = without_timeouts(log)
                 scale = [line for line in log if line.startswith("kubectl scale deployment")]
                 self.assertEqual([f"kubectl scale deployment airbyte-{name} --namespace airbyte --replicas=0" for name in RECREATE_DEPLOYMENTS], scale)
                 reads = [line for line in log if line.startswith("kubectl get deployment airbyte-")]
-                self.assertEqual(len(RECREATE_DEPLOYMENTS), len(reads))
+                self.assertGreaterEqual(len(reads), 2 * len(RECREATE_DEPLOYMENTS), "one read of the selector and one of the state for each deployment")
                 for name in RECREATE_DEPLOYMENTS:
                     self.assertLess(events.index(f"old exits airbyte-{name}"), events.index(f"new starts airbyte-{name}"), events)
                 steps = commands(log)
-                pairs = SCALE_DOWN[: 2 * len(RECREATE_DEPLOYMENTS)]
-                polls = steps[1 + len(pairs) : steps.index("rollback airbyte 1")]
-                self.assertEqual(["history airbyte", *pairs], steps[: 1 + len(pairs)])
-                self.assertEqual({"kubectl get pods"}, set(polls))
-                self.assertGreater(len(polls), len(RECREATE_DEPLOYMENTS), "a pod that lingers is polled again before the rollback")
+                first = SCALE_DOWN[: 2 * len(RECREATE_DEPLOYMENTS)]
+                polls = steps[1 + len(first) : steps.index("rollback airbyte 1")]
+                self.assertEqual(["history airbyte", *first], steps[: 1 + len(first)])
+                self.assertEqual(
+                    {"kubectl get replicaset", "kubectl get pods", *(f"kubectl get deployment airbyte-{name}" for name in RECREATE_DEPLOYMENTS)}, set(polls)
+                )
+                self.assertGreater(polls.count("kubectl get pods"), len(RECREATE_DEPLOYMENTS), "a pod that lingers is polled again before the rollback")
 
     def test_the_rollback_is_not_run_while_a_pod_of_a_deployment_that_holds_connections_is_still_there_and_the_wait_ends_at_its_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -698,6 +774,94 @@ class ReleaseRecoveryTest(unittest.TestCase):
                 self.assertEqual(
                     [], [line for line in log if line.startswith("kubectl get pods")], "an empty selector would match every pod, so no pod is listed with it"
                 )
+
+    def pending_box(self, scratch: str, **changes: object) -> ReleaseSandbox:
+        return ReleaseSandbox(scratch, "pending-upgrade", history("deployed", "pending-upgrade"), "other", changes)
+
+    def assert_stopped_before_the_rollback(self, code: int, output: str, log: list[str], status: int) -> None:
+        self.assertNotEqual(0, code)
+        self.assertIn(f"exit status {status}", output)
+        self.assertIn("could not take the pods", output)
+        self.assertNotIn(LEAK, output)
+        self.assertEqual([], [line for line in commands(log) if line.startswith("rollback") or line == UPGRADE], "no Helm command changes the release")
+
+    def test_the_rollback_waits_until_the_controller_has_seen_the_scale_down_and_every_replicaset_wants_no_replica_although_no_pod_is_left(self) -> None:
+        """``kubectl scale`` returns before the controller has reconciled: a ReplicaSet can still want a replica while no pod exists, and a new pod can
+        start from it (Codex recheck 2, medium finding 1)."""
+        for flag, counted in (("rs_lingers", "kubectl get replicaset"), ("observed_lags", "kubectl get deployment airbyte-")):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as scratch:
+                code, output, log = self.pending_box(scratch).run(flags=(flag,), seed={"clock": "1000"})
+                self.assertEqual(0, code, output)
+                polled = len([line for line in log if line.startswith(counted)])
+                self.assertGreater(polled, len(RECREATE_DEPLOYMENTS) * (2 if flag == "observed_lags" else 1), "the state is read again before the rollback")
+                self.assertLess(
+                    max(index for index, line in enumerate(log) if line.startswith(counted)),
+                    log.index("rollback airbyte 1 --namespace airbyte --wait --timeout 600s"),
+                )
+        for flag in ("rs_stays", "observed_stuck"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as scratch:
+                box = self.pending_box(scratch, airbyte_scale_down_deadline_seconds=5)
+                code, output, log = box.run(flags=(flag,), seed={"clock": "1000"})
+                self.assert_stopped_before_the_rollback(code, output, log, 6)
+
+    def test_every_selector_is_read_and_checked_before_the_first_deployment_is_scaled(self) -> None:
+        """A failed or empty read of a later deployment left an earlier one at zero with the release still pending (Codex recheck 2, medium finding 2)."""
+        for flag, status in (("fail_read_cron", 4), ("empty_selector_worker", 4)):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as scratch:
+                code, output, log = self.pending_box(scratch).run(flags=(flag,))
+                self.assert_stopped_before_the_rollback(code, output, log, status)
+                self.assertEqual([], [line for line in log if line.startswith("kubectl scale")], "nothing is scaled before every deployment was read")
+
+    def test_a_scale_that_fails_after_other_deployments_were_scaled_puts_back_only_the_replicas_it_changed_after_it_read_the_live_state(self) -> None:
+        """Temporal wants two replicas, the cron none and the others one. The scale of the worker (third) fails."""
+        seed = {"spec_airbyte-temporal": "2", "spec_airbyte-cron": "0"}
+        zero = [f"kubectl scale deployment airbyte-{name} --namespace airbyte --replicas=0" for name in ("temporal", "cron", "worker")]
+        put_back = "kubectl scale deployment airbyte-{} --namespace airbyte --replicas={}".format
+        cases: tuple[tuple[str, tuple[str, ...], dict[str, str], list[str]], ...] = (
+            ("the failed scale did not take effect", ("fail_scale_worker",), {}, [*zero, put_back("temporal", 2)]),
+            ("the failed scale took effect", ("fail_scale_worker", "fail_scale_applied"), {}, [*zero, put_back("temporal", 2), put_back("worker", 1)]),
+            ("another writer changed temporal", ("fail_scale_worker",), {"after_fail_scale": 'echo 4 > "$STAND_IN/spec_airbyte-temporal"\n'}, zero),
+        )
+        for name, flags, extra, expected in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as scratch:
+                code, output, log = self.pending_box(scratch).run(flags=flags, seed=seed | extra)
+                self.assert_stopped_before_the_rollback(code, output, log, 3)
+                log = without_timeouts(log)
+                self.assertEqual(expected, [line for line in log if line.startswith("kubectl scale")], "the deployment that was not reached is never touched")
+                for line in [line for line in log if line.startswith("kubectl scale") and "--replicas=0" not in line]:
+                    target = line.split(" --namespace")[0].removeprefix("kubectl scale deployment ")
+                    self.assertIn(
+                        f"kubectl get deployment {target} --namespace airbyte --output",
+                        " ".join(log[: log.index(line)]).replace("--request-timeout", ""),
+                        "the live state is read first",
+                    )
+        with tempfile.TemporaryDirectory() as scratch:
+            code, output, log = self.pending_box(scratch).run(flags=("fail_scale_worker", "fail_restore"), seed=seed)
+            self.assert_stopped_before_the_rollback(code, output, log, 7)
+            self.assertIn("could not be put back", output)
+
+    def test_every_request_is_bounded_by_the_time_that_is_left_and_an_answer_after_the_deadline_is_not_accepted(self) -> None:
+        """A one-second budget accepted an empty pod list that came after two seconds (Codex recheck 2, medium finding 3). The stand-in's clock moves only
+        by ``sleep`` and by the answer time of the pod list, and a request with a shorter timeout fails after it."""
+        with tempfile.TemporaryDirectory() as scratch:
+            box = self.pending_box(scratch, airbyte_scale_down_deadline_seconds=1)
+            code, output, log = box.run(seed={"clock": "1000", "delay_pods": "2"})
+            self.assert_stopped_before_the_rollback(code, output, log, 5)
+        with tempfile.TemporaryDirectory() as scratch:
+            box = self.pending_box(scratch, airbyte_scale_down_deadline_seconds=1)
+            code, output, log = box.run(seed={"clock": "1000", "delay_pods": "1", "delay_pods_only": f"airbyte-{RECREATE_DEPLOYMENTS[-1]}"})
+            self.assert_stopped_before_the_rollback(code, output, log, 6)
+        with tempfile.TemporaryDirectory() as scratch:
+            box = self.pending_box(scratch, airbyte_scale_down_deadline_seconds=40)
+            code, output, log = box.run(flags=("pods_linger",), seed={"clock": "1000", "delay_pods": "3"})
+            self.assertEqual(0, code, output)
+            asked = [line for line in log if re.match(r"kubectl (scale|get pods|get replicaset|get deployment airbyte-)", line)]
+            budgets = [int(match.group(1)) for line in asked if (match := re.search(r"--request-timeout[= ](\d+)s", line))]
+            self.assertEqual(len(asked), len(budgets), "every request of the scale-down names a timeout")
+            self.assertEqual(sorted(budgets, reverse=True), budgets, "the timeout only shrinks")
+            self.assertLessEqual(budgets[0], 40)
+            self.assertLess(budgets[-1], budgets[0], "the timeout is the time that is left, not the whole deadline")
+            self.assertGreaterEqual(budgets[-1], 1)
 
     def test_a_release_that_needs_no_rollback_scales_nothing_down(self) -> None:
         for status, past, recorded in (

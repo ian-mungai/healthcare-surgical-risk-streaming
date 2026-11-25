@@ -1,41 +1,118 @@
 # Reads airbyte_recreate_deployments (each name is the part after the release name), airbyte_release, airbyte_namespace and airbyte_scale_down_deadline_seconds.
 # Helm's rollback has no post-renderer and applies the manifests of an older revision, which may state a rolling update (the chart's template for the workload API
 # server does, and the others default to one). So before a rollback, each of these deployments is scaled to zero and the run waits until no pod has the deployment's
-# own selector, which also counts a pod that is terminating and still holds its connections. A deployment that the release lacks is skipped. A selector that cannot
-# be read, or an empty one that would match every pod of the namespace, stops the run. The wait ends at the deadline. The rollback's own manifests then start the new
-# pods with nothing beside them. Each exit status is a fixed text: 3 scaling, 4 reading a selector, 5 listing pods, 6 a deployment that still had pods at the deadline.
+# own selector, which also counts a pod that is terminating and still holds its connections. A deployment that the release lacks is skipped.
+# Order: first every deployment is read (uid, replicas, selector) and checked, so a failed or empty read stops the run before anything is scaled (an empty selector
+# would match every pod of the namespace). Then each is scaled to zero. A scale that fails puts back the replicas of the deployments the run asked to scale,
+# after it read each one's live replicas: only a deployment that is at zero now is scaled to the count the run recorded, so a count that another writer changed is left
+# alone and a deployment that already wanted no replica is never touched. Then, for each deployment, the wait ends when (1) the Deployment controller has observed the
+# scale (status.observedGeneration >= metadata.generation and spec.replicas is zero), because kubectl scale returns before the controller acts
+# (kubectl pkg/cmd/scale/scale.go), (2) every ReplicaSet owned by the deployment (by uid) wants zero replicas, because a ReplicaSet can still want one while no pod
+# exists, and a rollback would then meet a pod that starts (kubernetes pkg/controller/deployment/util/deployment_util.go, the rolling-update logic scales the
+# ReplicaSets after the Deployment's spec), and (3) no pod has the selector. The whole run has one deadline: each request carries --request-timeout with the seconds
+# that are left, and a poll that ends at or after the deadline is not accepted, even when its answer is empty. The rollback's own manifests then start the new pods
+# with nothing beside them. Each exit status is a fixed text: 3 scaling, 4 reading a deployment, 5 reading the state of a deployment or listing its ReplicaSets or
+# pods, 6 the deadline, 7 scaling failed and the replicas could not be put back.
 - name: Scale each deployment that holds database connections to zero and wait until its pods are gone
   ansible.builtin.shell:
     cmd: |
       set -u
       end=$(( $(date +%s) + DEADLINE ))
-      selectors=""
+      budget=0
+      left() {
+        budget=$(( end - $(date +%s) ))
+        [ "$budget" -gt 0 ] || exit 6
+      }
+      records=""
       for name in $DEPLOYMENTS; do
-        out=$(k3s kubectl get deployment "$RELEASE-$name" --namespace "$NAMESPACE" --output "$SELECTOR_TEMPLATE" 2>&1) || {
+        left
+        out=$(k3s kubectl get deployment "$RELEASE-$name" --namespace "$NAMESPACE" --request-timeout "${budget}s" --output "$READ_TEMPLATE" 2>&1 </dev/null) || {
           case "$out" in
             *NotFound*) continue ;;
             *) exit 4 ;;
           esac
         }
-        selector=${out%,}
-        [ -n "$selector" ] || exit 4
-        k3s kubectl scale deployment "$RELEASE-$name" --namespace "$NAMESPACE" --replicas=0 >/dev/null 2>&1 || exit 3
-        selectors="$selectors $selector"
+        uid=""; replicas=""; selector=""
+        read -r uid replicas selector <<EOF
+      $out
+      EOF
+        case "$replicas" in
+          '' | *[!0-9]*) exit 4 ;;
+        esac
+        selector=${selector%,}
+        [ -n "$uid" ] && [ -n "$selector" ] || exit 4
+        records="$records
+      $name $uid $replicas $selector"
       done
-      for selector in $selectors; do
+      # Each name that the run asks to scale, with the replicas it had. The record is made before the request: a request that failed may have been applied.
+      changed=""
+      put_back() {
+        failed=0
+        while read -r name replicas; do
+          [ -n "$name" ] || continue
+          live=$(k3s kubectl get deployment "$RELEASE-$name" --namespace "$NAMESPACE" --request-timeout "${RESTORE_TIMEOUT}s" --output "$REPLICAS_TEMPLATE" 2>/dev/null </dev/null) || { failed=1; continue; }
+          [ "$live" = 0 ] || continue
+          k3s kubectl scale deployment "$RELEASE-$name" --namespace "$NAMESPACE" --replicas="$replicas" --request-timeout "${RESTORE_TIMEOUT}s" >/dev/null 2>&1 </dev/null || failed=1
+        done <<EOF
+      $changed
+      EOF
+        [ "$failed" = 0 ]
+      }
+      while read -r name uid replicas selector; do
+        [ -n "$name" ] || continue
+        if [ "$replicas" -gt 0 ]; then
+          changed="$changed
+      $name $replicas"
+        fi
+        left
+        k3s kubectl scale deployment "$RELEASE-$name" --namespace "$NAMESPACE" --replicas=0 --request-timeout "${budget}s" >/dev/null 2>&1 </dev/null || {
+          put_back || exit 7
+          exit 3
+        }
+      done <<EOF
+      $records
+      EOF
+      while read -r name uid replicas selector; do
+        [ -n "$name" ] || continue
         while :; do
-          listed=$(k3s kubectl get pods --namespace "$NAMESPACE" --selector "$selector" --output name 2>/dev/null) || exit 5
-          [ -z "$listed" ] && break
+          ready=0
+          left
+          state=$(k3s kubectl get deployment "$RELEASE-$name" --namespace "$NAMESPACE" --request-timeout "${budget}s" --output "$STATE_TEMPLATE" 2>/dev/null </dev/null) || exit 5
+          generation=""; observed=""; wanted=""
+          read -r generation observed wanted <<EOF
+      $state
+      EOF
+          if [ "$wanted" = 0 ] && [ "$observed" -ge "$generation" ] 2>/dev/null; then
+            left
+            replicasets=$(k3s kubectl get replicaset --namespace "$NAMESPACE" --selector "$selector" --request-timeout "${budget}s" --output "$REPLICASET_HEAD$uid$REPLICASET_TAIL" 2>/dev/null </dev/null) || exit 5
+            idle=1
+            for count in $replicasets; do
+              [ "$count" = 0 ] || idle=0
+            done
+            if [ "$idle" = 1 ]; then
+              left
+              listed=$(k3s kubectl get pods --namespace "$NAMESPACE" --selector "$selector" --request-timeout "${budget}s" --output name 2>/dev/null </dev/null) || exit 5
+              [ -n "$listed" ] || ready=1
+            fi
+          fi
           [ "$(date +%s)" -lt "$end" ] || exit 6
+          [ "$ready" = 1 ] && break
           sleep 1
         done
-      done
+      done <<EOF
+      $records
+      EOF
   environment:
     DEPLOYMENTS: "{{ airbyte_recreate_deployments | join(' ') }}"
     RELEASE: "{{ airbyte_release }}"
     NAMESPACE: "{{ airbyte_namespace }}"
     DEADLINE: "{{ airbyte_scale_down_deadline_seconds }}"
-    SELECTOR_TEMPLATE: "{% raw %}go-template={{range $key, $value := .spec.selector.matchLabels}}{{$key}}={{$value}},{{end}}{% endraw %}"
+    RESTORE_TIMEOUT: "10"
+    READ_TEMPLATE: "{% raw %}go-template={{.metadata.uid}} {{.spec.replicas}} {{range $key, $value := .spec.selector.matchLabels}}{{$key}}={{$value}},{{end}}{% endraw %}"
+    STATE_TEMPLATE: "{% raw %}go-template={{.metadata.generation}} {{.status.observedGeneration}} {{.spec.replicas}}{% endraw %}"
+    REPLICAS_TEMPLATE: "{% raw %}go-template={{.spec.replicas}}{% endraw %}"
+    REPLICASET_HEAD: '{% raw %}go-template={{range .items}}{{$set := .}}{{range .metadata.ownerReferences}}{{if eq .uid "{% endraw %}'
+    REPLICASET_TAIL: '{% raw %}"}}{{$set.spec.replicas}} {{end}}{{end}}{{end}}{% endraw %}'
   register: airbyte_release_scale_down
   changed_when: true
   failed_when: false
@@ -47,6 +124,8 @@
   ansible.builtin.fail:
     msg: >-
       k3s could not take the pods of the Airbyte deployments {{ airbyte_recreate_deployments | join(', ') }} away before the rollback of the release {{ airbyte_release }}
-      (exit status {{ airbyte_release_scale_down.rc }}: 3 scaling, 4 reading a selector, 5 listing pods, 6 a deployment still had pods after {{ airbyte_scale_down_deadline_seconds }} seconds),
+      (exit status {{ airbyte_release_scale_down.rc }}: 3 scaling, 4 reading a deployment, 5 reading the state of a deployment or listing its ReplicaSets or pods,
+      6 the scale-down was not finished after {{ airbyte_scale_down_deadline_seconds }} seconds or a deployment still had pods,
+      7 scaling failed and the replicas could not be put back),
       so the release was not rolled back and a rollback to older manifests could have started a new pod beside an old one that holds its database connections.
-      Run kubectl get pods by hand to see which pods stay.
+      Run kubectl get deployments and kubectl get pods by hand to see what stays and the replicas of each deployment.
