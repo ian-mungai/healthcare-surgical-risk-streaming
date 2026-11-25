@@ -10,7 +10,7 @@ from scripts.infra import host
 from scripts.project_config import ROOT
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import ROLES, group_variables
-from tests.fast.test_host_budget import flatten, module_name, playbook_occurrences
+from tests.fast.test_host_budget import flatten, module_name, number, playbook_occurrences
 
 ROLE = ROLES / "runner_checkout"
 WAITING_MODULES = ("command", "shell", "get_url", "unarchive", "uri")
@@ -48,17 +48,68 @@ class HostPlaybookTest(unittest.TestCase):
 class DeadlineTest(unittest.TestCase):
     def test_every_task_that_waits_for_a_command_a_download_or_an_unpack_has_its_own_deadline(self) -> None:
         waiting = [(file, task) for file, task in role_tasks() if module_name(task, WAITING_MODULES) is not None]
-        self.assertGreaterEqual(len(waiting), 6, "the interpreter download and unpack, the archive, the environment, the install and the checks")
+        self.assertGreaterEqual(
+            len(waiting), 12, "the interpreter's download, unpack and checks, the archive, the environment, the install, the removals and the closing"
+        )
         for file, task in waiting:
             with self.subTest(file=file, task=task["name"]):
                 key = str(module_name(task, WAITING_MODULES))
                 inner = task[key] if isinstance(task[key], dict) else {}
                 self.assertTrue("timeout" in task or "timeout" in inner, "a wait with no deadline")
 
+    def test_every_command_runs_under_timeout_with_a_kill_after_so_that_it_is_stopped_where_it_runs_and_the_task_deadline_comes_later(self) -> None:
+        commands = [(file, task) for file, task in role_tasks() if module_name(task, ("command",)) is not None]
+        self.assertGreaterEqual(len(commands), 14)
+        for file, task in commands:
+            with self.subTest(file=file, task=task["name"]):
+                argv = task[str(module_name(task, ("command",)))]["argv"]
+                if isinstance(argv, str):
+                    argv = task["vars"]["install_start"]
+                self.assertEqual("timeout", argv[0], "the command is started by timeout, which stops it and its processes at the place where it runs")
+                kill_after, deadline = number(str(argv[1]).removeprefix("--kill-after=")), number(argv[2])
+                self.assertEqual("--kill-after=", str(argv[1])[:13])
+                self.assertGreater(kill_after, 0)
+                self.assertGreater(
+                    number(task["timeout"]),
+                    deadline + kill_after,
+                    "the task's own deadline must come after timeout has killed the command, or the command could outlive the task",
+                )
+
+    def test_the_removals_and_the_permission_changes_run_under_a_deadline_and_no_file_task_removes_or_changes_a_folder_below_the_checkout(self) -> None:
+        for file, task in role_tasks():
+            with self.subTest(file=file, task=task["name"]):
+                key = module_name(task, ("file",))
+                if key is not None:
+                    arguments = task[key]
+                    self.assertNotEqual("absent", arguments.get("state"), "a deletion with no deadline of its own")
+                    self.assertNotIn("recurse", arguments, "a recursive change with no deadline of its own")
+        started = {
+            str(task[str(module_name(task, ("command",)))]["argv"][3])
+            for _, task in role_tasks()
+            if module_name(task, ("command",)) and isinstance(task[str(module_name(task, ("command",)))]["argv"], list)
+        }
+        self.assertTrue({"rm", "chmod", "chown", "find"} <= started, "the removals, the permission changes and the listing run as commands under a deadline")
+
+    def test_the_recursive_listing_has_a_deadline(self) -> None:
+        listings = [task for _, task in role_tasks() if module_name(task, ("find",)) is not None]
+        self.assertGreaterEqual(len(listings), 1)
+        for task in listings:
+            self.assertIn("timeout", task)
+
     def test_no_task_runs_a_shell_line_or_a_script_whose_deadline_and_arguments_the_budget_cannot_read(self) -> None:
         for file, task in role_tasks():
             with self.subTest(file=file, task=task["name"]):
                 self.assertIsNone(module_name(task, SHELL_MODULES))
+
+    def test_a_failed_build_confirms_that_no_process_still_works_in_the_folder_before_it_removes_anything(self) -> None:
+        text = (ROLE / "tasks" / "archive.yml").read_text()
+        document: Any = load_yaml(text)
+        rescue = document[0]["rescue"]
+        names = [task["name"] for task in rescue]
+        self.assertEqual("Confirm that no process of the failed build still works in the runner folder", names[0])
+        self.assertIn("until", rescue[0])
+        self.assertIn("pgrep", str(rescue[0]))
+        self.assertEqual(["Confirm", "Refuse", "Remove", "Fail"], [name.split()[0] for name in names], "the check comes first and the removal only after it")
 
 
 class PinnedInstallTest(unittest.TestCase):
@@ -95,7 +146,7 @@ class PinnedInstallTest(unittest.TestCase):
 
     def test_the_interpreter_and_the_environment_are_checked_against_the_pinned_version(self) -> None:
         checks = [task for _, task in role_tasks() if "stdout" in str(task.get("ansible.builtin.assert", "")) and "runner_checkout_python_version" in str(task)]
-        self.assertEqual(2, len(checks), "the shared interpreter and the new environment's interpreter")
+        self.assertEqual(3, len(checks), "the unpacked interpreter before it is published, the shared interpreter and the new environment's interpreter")
 
 
 class SourceTest(unittest.TestCase):
@@ -108,9 +159,7 @@ class SourceTest(unittest.TestCase):
         archives = [
             task
             for _, task in role_tasks()
-            if "ansible.builtin.command" in task
-            and task["ansible.builtin.command"]["argv"][0] == "git"
-            and "archive" in task["ansible.builtin.command"]["argv"]
+            if "ansible.builtin.command" in task and "git" in task["ansible.builtin.command"]["argv"] and "archive" in task["ansible.builtin.command"]["argv"]
         ]
         self.assertEqual(1, len(archives))
         self.assertEqual("localhost", archives[0]["delegate_to"])

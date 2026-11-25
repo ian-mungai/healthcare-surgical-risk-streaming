@@ -1,18 +1,30 @@
 # Reads runner_checkout_folder, runner_checkout_python, runner_checkout_requirements, runner_checkout_python_version and the deadlines. The environment is made from
 # the pinned interpreter and filled with every package from the hash-pinned requirements: pip refuses a requirement with no hash, a hash that does not match and a
-# source build, so the folder holds exactly what the lock files name.
+# source build, so the folder holds exactly what the lock files name. Each command runs under timeout with a kill-after.
 - name: Make the environment
   ansible.builtin.command:
-    argv: ["{{ runner_checkout_python }}", -m, venv, "{{ runner_checkout_folder }}/.venv"]
+    argv:
+      - timeout
+      - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+      - "{{ runner_checkout_environment_deadline_seconds }}"
+      - "{{ runner_checkout_python }}"
+      - -m
+      - venv
+      - "{{ runner_checkout_folder }}/.venv"
   changed_when: true
-  timeout: "{{ runner_checkout_environment_deadline_seconds }}"
+  timeout: "{{ runner_checkout_environment_deadline_seconds + runner_checkout_stop_grace_seconds }}"
 
 - name: Read the environment's interpreter version
   ansible.builtin.command:
-    argv: ["{{ runner_checkout_folder }}/.venv/bin/python", --version]
+    argv:
+      - timeout
+      - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+      - "{{ runner_checkout_check_deadline_seconds }}"
+      - "{{ runner_checkout_folder }}/.venv/bin/python"
+      - --version
   register: runner_checkout_environment_interpreter
   changed_when: false
-  timeout: "{{ runner_checkout_check_deadline_seconds }}"
+  timeout: "{{ runner_checkout_check_deadline_seconds + runner_checkout_stop_grace_seconds }}"
 
 - name: Confirm that the environment's interpreter is the pinned version
   ansible.builtin.assert:
@@ -25,7 +37,19 @@
   ansible.builtin.command:
     argv: "{{ install_start + requirement_arguments }}"
   vars:
-    install_start: ["{{ runner_checkout_folder }}/.venv/bin/python", -m, pip, install, --require-hashes, --only-binary, ":all:", --no-input, --disable-pip-version-check]
+    install_start:
+      - timeout
+      - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+      - "{{ runner_checkout_install_deadline_seconds }}"
+      - "{{ runner_checkout_folder }}/.venv/bin/python"
+      - -m
+      - pip
+      - install
+      - --require-hashes
+      - --only-binary
+      - ":all:"
+      - --no-input
+      - --disable-pip-version-check
     requirement_arguments: "{{ runner_checkout_requirements | map('regex_replace', '^', '--requirement=' ~ runner_checkout_folder ~ '/') | list }}"
   changed_when: true
-  timeout: "{{ runner_checkout_install_deadline_seconds }}"
+  timeout: "{{ runner_checkout_install_deadline_seconds + runner_checkout_stop_grace_seconds }}"
