@@ -68,7 +68,8 @@ compose_stack_docker_socket: /var/run/docker.sock
 # The images the project makes itself. The owner's computer builds and pushes them (make images-push, scripts/images/publish.py), which reads this list and nothing else:
 # the tag that holds the version (the repository and the folder's hash complete it), the name of the image (its pin in compose/image_pins.yml), the repository's folders
 # that the image's folder holds, the build context (a source, or "." for the whole folder; the first source when unset), the Dockerfile (in the context when unset) and
-# the named build contexts that the Dockerfile copies from. The host builds nothing: it pulls the pinned digests (pull_images.yml).
+# the named build contexts that the Dockerfile copies from. The pin file is the authority: the command pushes only a tag that the pin file lacks and never reads the registry.
+# The host builds nothing: it pulls the pinned digests (pull_images.yml).
 compose_stack_built_images:
   - tag: surgical-risk-dagster:1.13.31
     name: dagster

@@ -1,6 +1,7 @@
 """The pin file: each project image, by the tag that was pushed and the digest that the repository gave it.
 
-``compose/image_pins.yml`` is the one source of the digests. The publish command writes it. ``render`` turns it into the ``IMAGE_<NAME>`` settings that
+``compose/image_pins.yml`` is the one source of the digests and the authority on what was pushed: the publish command pushes only a tag that
+this file lacks, takes the digest from the push, never reads the registry and writes this file. ``render`` turns it into the ``IMAGE_<NAME>`` settings that
 the host's Compose reads, and stops when an image has no pin. The list of images is ``compose_stack_built_images`` in the group variables,
 which nothing else copies.
 """
