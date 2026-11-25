@@ -9,8 +9,11 @@ Failure modes covered here:
 - The removal after a failed run lists containers by a label that the deployed project also carries.
 - The project name of the batch is not its own (it starts with the deployed project's name), so a cleanup by label reaches the deployed containers.
 - The environment file that the one-off services read holds a variable of the host's own environment (a credential) or leaves out a name that the overlay needs.
-- The image tags, the host ports or the topic settings drift from the deploy's own files (``ansible/group_vars/all.yml``, the Compose service files and
-  ``compose/kafka/topics.txt``), so the batch would test an image or a topic that is not the deployed one.
+- The host ports or the topic settings drift from the deploy's own files (the Compose service files and ``compose/kafka/topics.txt``), so the batch would
+  test a topic that is not the deployed one.
+- The images that the batch launches are not the pinned ones that the host pulls and runs (``compose/image_pins.yml``, rendered by
+  ``scripts/images/pins.py``): a local tag of the deploy's build list (the host builds nothing, so it does not exist there), a pin file that the source
+  manifest does not list or that differs from it, or a pin file with no replay or Spark pin.
 - The overlay publishes a port, names a container, mounts a volume of the platform, restarts a container by itself, depends on a platform service (a start would
   recreate it), uses a literal memory limit or points a service at a host name that is not the platform's.
 - A topic that is not the batch's own (``feature_ready`` itself, ``warnings``, ``risk_scores``) is created or deleted by the batch.
@@ -23,6 +26,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import os
 import re
@@ -33,6 +37,7 @@ from types import ModuleType
 from typing import Any
 from unittest import mock
 
+from scripts.images import pins
 from scripts.process import CompletedProcess
 from scripts.stack.yaml_text import load_yaml
 from tests.e2e.run_record import Record
@@ -448,13 +453,12 @@ class Environment(HostRunnerCase):
             self.fail("a compose service file has no default host port")
         self.assertEqual((int(apicurio[1]), int(nessie[1])), self.module.host_ports({}))
 
-    def test_the_image_tags_are_the_ones_the_deploy_builds_and_the_compose_files_name(self) -> None:
-        replay, spark = self.module.deployed_images()
-        document: Any = load_yaml((ROOT / "ansible" / "group_vars" / "all.yml").read_text())
-        built = {item["name"]: item["tag"] for item in document["compose_stack_built_images"]}
-        self.assertEqual((built["replay"], built["spark"]), (replay, spark))
-        self.assertIn(f"image: {replay}", (COMPOSE / "services" / "replay.yml").read_text())
-        self.assertIn(f"image: {spark}", (COMPOSE / "services" / "spark.yml").read_text())
+    def test_the_compose_files_name_the_rendered_pin_variables_and_no_local_tag(self) -> None:
+        for file, variable in (("replay.yml", "IMAGE_REPLAY"), ("spark.yml", "IMAGE_SPARK")):
+            with self.subTest(file=file):
+                text = (COMPOSE / "services" / file).read_text()
+                self.assertIn(f"image: ${{{variable}:?", text)
+                self.assertNotIn("surgical-risk-", text)
 
     def test_the_deployed_network_is_the_compose_project_name_and_default(self) -> None:
         name = re.search(r"^name: (\S+)", (COMPOSE / "compose.yml").read_text(), re.MULTILINE)
@@ -462,6 +466,93 @@ class Environment(HostRunnerCase):
             self.fail("compose.yml names no project")
         self.assertEqual(f"{name[1]}_default", self.module.PLATFORM_NETWORK)
         self.assertEqual(name[1], self.module.DEPLOYED_PROJECT)
+
+
+class Images(HostRunnerCase):
+    """The host runs the pinned images that its Compose renders from ``compose/image_pins.yml``. It builds nothing, so a local tag is not there."""
+
+    PIN = "compose/image_pins.yml"
+
+    def checkout(self, text: str | None = None, *, listed: bool = True, digest: str | None = None) -> tuple[Path, Any]:
+        """A checkout folder with a pin file (the real one unless ``text`` is given) and a manifest that lists it unless ``listed`` is false."""
+        root = self.scratch / "checkout"
+        (root / "compose").mkdir(parents=True, exist_ok=True)
+        body = (COMPOSE / "image_pins.yml").read_text() if text is None else text
+        (root / self.PIN).write_text(body)
+        files = {"compose/services/kafka.yml": "1" * 64}
+        if listed:
+            files[self.PIN] = digest or hashlib.sha256(body.encode()).hexdigest()
+        return root, self.module.SourceManifest("0" * 40, files)
+
+    def rendered(self) -> dict[str, str]:
+        """The settings that the host's Compose reads, from the repository's own renderer and pin file."""
+        names = [image["name"] for image in pins.load_images()]
+        values: dict[str, str] = self.module.parse_environment_file(pins.render_environment(pins.load(), names))
+        return values
+
+    def test_the_references_equal_the_pin_files_as_the_compose_stack_renders_them(self) -> None:
+        root, manifest = self.checkout()
+        replay, spark = self.module.deployed_images(manifest, root)
+        rendered = self.rendered()
+        self.assertEqual((rendered["IMAGE_REPLAY"], rendered["IMAGE_SPARK"]), (replay, spark))
+        found = pins.load()
+        self.assertEqual((found["replay"]["digest"], found["spark"]["digest"]), (replay, spark))
+
+    def test_a_reference_is_a_digest_of_the_pin_files_repository_and_never_a_local_tag_of_the_deploy_list(self) -> None:
+        root, manifest = self.checkout()
+        local_tags = {image["tag"] for image in pins.load_images()}
+        for reference in self.module.deployed_images(manifest, root):
+            with self.subTest(reference=reference):
+                self.assertRegex(reference, r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+                self.assertNotIn(reference, local_tags)
+                self.assertFalse(reference.startswith("surgical-risk-"))
+
+    def test_the_runners_text_names_no_local_image_tag_and_does_not_read_the_deploy_list_for_what_it_launches(self) -> None:
+        source = RUNNER.read_text()
+        self.assertNotRegex(source, r"surgical-risk-(replay|spark|dagster)")
+        self.assertNotIn("compose_stack_built_images", source)
+        self.assertNotIn("GROUP_VARIABLES", source)
+
+    def test_the_references_that_reach_the_overlays_file_are_the_pinned_ones(self) -> None:
+        root, manifest = self.checkout()
+        replay, spark = self.module.deployed_images(manifest, root)
+        with mock.patch.object(self.module, "run_command", lambda *a, **k: done()):
+            stack = self.module.HostStack(
+                Record(feature="stand-in", slug="stand_in", rerun="none"), [], replay, spark, self.scratch / "l", self.scratch, self.scratch
+            )
+        self.assertEqual((replay, spark), (stack.env["REPLAY_IMAGE"], stack.env["SPARK_IMAGE"]))
+        self.assertEqual(self.rendered()["IMAGE_REPLAY"], stack.env["REPLAY_IMAGE"])
+
+    def test_a_pin_file_that_the_manifest_does_not_list_refuses_the_run(self) -> None:
+        root, manifest = self.checkout(listed=False)
+        with self.assertRaises(self.module.Blocked):
+            self.module.deployed_images(manifest, root)
+
+    def test_a_pin_file_that_differs_from_the_manifest_refuses_the_run(self) -> None:
+        root, manifest = self.checkout(digest="f" * 64)
+        with self.assertRaises(self.module.Blocked):
+            self.module.deployed_images(manifest, root)
+
+    def test_a_missing_pin_file_refuses_the_run(self) -> None:
+        root, manifest = self.checkout()
+        (root / self.PIN).unlink()
+        with self.assertRaises(self.module.Blocked):
+            self.module.deployed_images(manifest, root)
+
+    def test_a_pin_file_without_the_replay_or_spark_pin_refuses_the_run_and_names_no_tag(self) -> None:
+        for name in ("replay", "spark"):
+            with self.subTest(missing=name):
+                found = {key: value for key, value in pins.load().items() if key != name}
+                path = self.scratch / f"pins_{name}.yml"
+                pins.write(path, found)
+                root, manifest = self.checkout(path.read_text())
+                with self.assertRaises(self.module.Blocked):
+                    self.module.deployed_images(manifest, root)
+
+    def test_a_pin_file_that_is_not_the_fixed_shape_refuses_the_run(self) -> None:
+        root, manifest = self.checkout("images:\n  replay:\n    tag: surgical-risk-replay:1.7.2\n    digest: surgical-risk-replay:1.7.2\n")
+        with self.assertRaises(self.module.Blocked):
+            self.module.deployed_images(manifest, root)
 
 
 @unittest.skipUnless(OVERLAY.is_file(), "the temporary overlay is not in this checkout")
