@@ -6,12 +6,14 @@ Each case changes one fact of a good setup and expects the result to follow from
 
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts.stack.groups import (
     ALWAYS_ON_GROUPS,
+    PROJECT_IMAGE_SETTINGS,
     GroupError,
     ServiceState,
     Settings,
@@ -22,7 +24,10 @@ from scripts.stack.groups import (
     groups_of,
     parse_inspect,
     profile_of,
+    rendered_environment,
+    start_compose,
     stop_arguments,
+    stop_compose,
     up_arguments,
     wait_ready,
 )
@@ -133,6 +138,40 @@ class StopTest(unittest.TestCase):
 
     def test_any_other_group_may_be_stopped(self) -> None:
         check_stoppable("batch")
+
+
+PLANTED = {name: "planted/shell_value@sha256:" + "f" * 64 for name in sorted(PROJECT_IMAGE_SETTINGS)}
+
+
+class ProjectImageSettingTest(unittest.TestCase):
+    """The digests of the project images come from the rendered host settings file only: a shell variable of the same name would win in interpolation."""
+
+    def test_the_three_project_image_settings_are_the_ones_that_the_pin_list_names(self) -> None:
+        self.assertEqual({"IMAGE_DAGSTER", "IMAGE_REPLAY", "IMAGE_SPARK"}, PROJECT_IMAGE_SETTINGS)
+
+    def test_a_shell_variable_of_a_project_image_setting_is_not_in_the_environment_of_a_compose_command_and_the_other_variables_stay(self) -> None:
+        with mock.patch.dict(os.environ, PLANTED | {"KEEP_THIS_ONE": "yes", "IMAGE_UNRELATED": "kept"}):
+            found = rendered_environment(load_limits(LIMITS_FILE))
+        self.assertEqual([], [name for name in PLANTED if name in found])
+        self.assertEqual(("yes", "kept"), (found["KEEP_THIS_ONE"], found["IMAGE_UNRELATED"]))
+        self.assertTrue(any(name.startswith("MEM_LIMIT_") for name in found), "the memory limits of the limits file are still there")
+
+    def test_the_start_and_the_stop_of_a_group_send_that_environment_to_docker(self) -> None:
+        limits = parse_limits(GOOD)
+        group = find_group(limits, "batch")
+        states = {name: ServiceState(name, "running", "healthy", 0, False, 0) for name in group.compose}
+        stopped = {name: ServiceState(name, "exited", "none", 0, False, 0) for name in group.compose}
+        with (
+            mock.patch.dict(os.environ, PLANTED),
+            mock.patch("scripts.stack.groups.docker", return_value="") as docker,
+            mock.patch("scripts.stack.groups.read_states", side_effect=[{}, states, stopped]),
+            mock.patch("scripts.stack.groups.wait_ready"),
+        ):
+            start_compose(settings(), limits, group, 5, lambda _text: None)
+            stop_compose(settings(), limits, group, (), lambda _text: None)
+        self.assertEqual(2, docker.call_count)
+        for call in docker.call_args_list:
+            self.assertEqual([], [name for name in PLANTED if name in call.kwargs["env"]])
 
 
 LINE = "{service}|{state}|{health}|{exit_code}|{oom}|{restarts}"

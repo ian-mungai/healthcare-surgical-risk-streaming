@@ -16,6 +16,7 @@ from typing import Any
 
 from scripts.images import pins
 from scripts.infra.host import PROJECT_WORKLOAD_GIDS
+from scripts.stack import groups
 from scripts.stack.limits import load_limits, variable_name
 from scripts.stack.yaml_text import load_yaml
 
@@ -25,6 +26,13 @@ SERVICES = COMPOSE / "services"
 IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest@)[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 PROJECT_IMAGE = re.compile(r"^\$\{(IMAGE_[A-Z0-9_]+):\?render the image pins first\}$")
 PROJECT_VARIABLES = {pins.variable_name(image["name"]) for image in pins.load_images()}
+PROJECT_SERVICE_IMAGES = {
+    "dagster_code_location": "IMAGE_DAGSTER",
+    "dagster_daemon": "IMAGE_DAGSTER",
+    "dagster_webserver": "IMAGE_DAGSTER",
+    "replay": "IMAGE_REPLAY",
+    "spark": "IMAGE_SPARK",
+}
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
 HOST_NETWORK_SERVICES = {"caddy"}
@@ -64,6 +72,10 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
     if image.startswith("${"):
         if project is None or project.group(1) not in PROJECT_VARIABLES:
             problems.append(f"{name}: image must name a project image through the one setting of the pin file (IMAGE_<NAME>), and the list must name the image")
+        elif PROJECT_SERVICE_IMAGES.get(name) != project.group(1):
+            problems.append(
+                f"{name}: image must read its own pin ({PROJECT_SERVICE_IMAGES.get(name, 'none: this service uses no project image')}), not {project.group(1)}"
+            )
     elif not IMAGE.match(image):
         problems.append(f"{name}: image must be pinned by a tag other than latest and by a sha256 digest, or be a project image named through the pin file")
     if "build" in service:
@@ -745,26 +757,36 @@ class ProjectImageTest(unittest.TestCase):
         used = {PROJECT_IMAGE.match(image).group(1) for image in self.project_services().values()}  # type: ignore[union-attr]
         self.assertEqual(PROJECT_VARIABLES, used)
 
-    def test_the_rendered_setting_of_every_project_service_is_the_digest_of_the_pin_file_and_no_service_names_a_tag_of_the_project(self) -> None:
+    def test_each_project_service_reads_its_own_image_and_no_other_service_reads_one(self) -> None:
+        self.assertEqual(PROJECT_SERVICE_IMAGES, {service: PROJECT_IMAGE.match(image).group(1) for service, image in self.project_services().items()})  # type: ignore[union-attr]
+
+    def test_the_settings_that_the_group_commands_keep_out_of_the_shell_are_the_ones_that_the_services_read(self) -> None:
+        self.assertEqual(PROJECT_VARIABLES, set(groups.PROJECT_IMAGE_SETTINGS))
+        self.assertEqual(PROJECT_VARIABLES, set(PROJECT_SERVICE_IMAGES.values()))
+
+    def test_the_rendered_setting_of_every_project_service_is_the_digest_of_that_service_s_own_pin_and_no_service_names_a_tag_of_the_project(self) -> None:
         found = self.complete_pins()
         rendered = dict(line.split("=", 1) for line in pins.render_environment(found, [image["name"] for image in pins.load_images()]).splitlines())
+        self.assertEqual(len(found), len({value["digest"] for value in found.values()}), "each pin has its own digest, so a wrong binding is seen")
         for service, image in self.project_services().items():
             variable = PROJECT_IMAGE.match(image).group(1)  # type: ignore[union-attr]
             with self.subTest(service=service):
-                self.assertRegex(rendered[variable], r"^[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
+                self.assertEqual(found[PROJECT_SERVICE_IMAGES[service].removeprefix("IMAGE_").lower()]["digest"], rendered[variable])
         for path in sorted(SERVICES.glob("*.yml")):
             (service,) = load(path)["services"].values()
             with self.subTest(file=path.name):
                 self.assertNotIn("surgical-risk-", str(service["image"]))
                 self.assertNotIn("build", service)
 
-    def test_a_tracked_pin_file_with_entries_gives_every_project_service_its_digest(self) -> None:
+    def test_a_tracked_pin_file_with_entries_gives_every_project_service_its_own_digest(self) -> None:
         found = pins.load(pins.PIN_FILE)
         if not found:
             self.skipTest("nothing was pushed yet: the pin file is empty")
-        rendered = pins.render_environment(found, [image["name"] for image in pins.load_images()])
-        for image in self.project_services().values():
-            self.assertIn(PROJECT_IMAGE.match(image).group(1) + "=", rendered)  # type: ignore[union-attr]
+        rendered = dict(line.split("=", 1) for line in pins.render_environment(found, [image["name"] for image in pins.load_images()]).splitlines())
+        for service, image in self.project_services().items():
+            with self.subTest(service=service):
+                variable = PROJECT_IMAGE.match(image).group(1)  # type: ignore[union-attr]
+                self.assertEqual(found[PROJECT_SERVICE_IMAGES[service].removeprefix("IMAGE_").lower()]["digest"], rendered[variable])
 
 
 class PlantedDefectTest(unittest.TestCase):
@@ -791,9 +813,14 @@ class PlantedDefectTest(unittest.TestCase):
                 self.assertEqual(1, len(problems))
                 self.assertIn("mem_limit", problems[0])
 
+    def project_defect(self, name: str, mutate: Any) -> list[str]:
+        document = copy.deepcopy(load(SERVICES / f"{name}.yml"))
+        mutate(document, document["services"][name])
+        return service_problems(name, document)
+
     def test_a_project_image_must_come_from_the_pin_file_setting_and_never_from_a_local_tag_a_built_name_or_another_setting(self) -> None:
         good = "${IMAGE_DAGSTER:?render the image pins first}"
-        self.assertEqual([], self.defect(lambda _document, service: service.update(image=good)))
+        self.assertEqual([], self.project_defect("dagster_webserver", lambda _document, service: service.update(image=good)))
         for image in (
             "surgical-risk-dagster:1.13.31",
             "surgical-risk-dagster",
@@ -804,9 +831,25 @@ class PlantedDefectTest(unittest.TestCase):
             "other-dagster:1.13.31",
         ):
             with self.subTest(image=image):
-                problems = self.defect(lambda _document, service, image=image: service.update(image=image))
+                problems = self.project_defect("dagster_webserver", lambda _document, service, image=image: service.update(image=image))
                 self.assertEqual(1, len(problems))
                 self.assertIn("image", problems[0])
+
+    def test_a_service_bound_to_the_pin_of_another_image_is_named_and_so_is_a_service_that_has_no_project_image_but_reads_one(self) -> None:
+        for name, wrong in (
+            ("dagster_webserver", "IMAGE_SPARK"),
+            ("dagster_daemon", "IMAGE_REPLAY"),
+            ("dagster_code_location", "IMAGE_SPARK"),
+            ("replay", "IMAGE_DAGSTER"),
+            ("spark", "IMAGE_DAGSTER"),
+        ):
+            with self.subTest(service=name):
+                problems = self.project_defect(name, lambda _document, service, wrong=wrong: service.update(image=f"${{{wrong}:?render the image pins first}}"))
+                self.assertEqual(1, len(problems))
+                self.assertIn("its own pin", problems[0])
+        problems = self.defect(lambda _document, service: service.update(image="${IMAGE_SPARK:?render the image pins first}"))
+        self.assertEqual(1, len(problems))
+        self.assertIn("uses no project image", problems[0])
 
     def test_a_service_that_builds_an_image_on_the_host_is_named(self) -> None:
         problems = self.defect(lambda _document, service: service.update(build={"context": "../..", "dockerfile": "x/Dockerfile"}))

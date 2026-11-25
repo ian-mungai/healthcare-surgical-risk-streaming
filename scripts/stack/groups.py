@@ -40,6 +40,8 @@ PROJECT_VARIABLE = "COMPOSE_PROJECT_NAME"
 AVAILABLE_VARIABLE = "STACK_TEST_AVAILABLE_MIB"
 COMPOSE_LABEL = "com.docker.compose"
 HOST_SETTINGS_FILE = "host.env"
+# The digest settings of the project's three images (the five services that use them). They come from the rendered host settings file and from nothing else.
+PROJECT_IMAGE_SETTINGS = frozenset({"IMAGE_DAGSTER", "IMAGE_REPLAY", "IMAGE_SPARK"})
 COMPOSE_FILE = "compose.yml"
 LIMITS_FILE_NAME = "limits.yml"
 COMMAND_SECONDS = 60
@@ -215,9 +217,10 @@ def settings_from_environment(
 
 
 def rendered_environment(limits: Limits) -> dict[str, str]:
-    """The environment of a Compose command: the memory limits from the limits file, then the process's own variables, which win."""
+    """The environment of a Compose command: the memory limits from the limits file, then the process's own variables, which win. The digest settings of the
+    project's images are the exception: a shell variable of one of those names would win over the rendered host settings file, so none is passed."""
     limits_text = dict(line.split("=", 1) for line in render_environment(limits).splitlines())
-    return limits_text | dict(os.environ)
+    return limits_text | {name: value for name, value in os.environ.items() if name not in PROJECT_IMAGE_SETTINGS}
 
 
 def docker(arguments: Sequence[str], *, timeout: float, label: str, env: Mapping[str, str] | None = None) -> str:
