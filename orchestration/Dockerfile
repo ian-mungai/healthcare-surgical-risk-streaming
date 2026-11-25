@@ -37,11 +37,14 @@ COPY --from=stack_scripts stack/__init__.py stack/admission.py stack/groups.py s
 # reader and the track list's pin open.
 COPY --from=stack_scripts ingestion/__init__.py ingestion/airbyte_api.py ingestion/check.py ingestion/closed.py ingestion/folder.py ingestion/gate.py ingestion/landing.py \
     ingestion/manifest.py ingestion/notice.py ingestion/output_file.py ingestion/record_catalog.py ingestion/record_copy.py ingestion/record_definitions.py ingestion/record_load.py \
-    ingestion/record_run.py ingestion/record_state.py ingestion/selection.py ingestion/store.py ingestion/table_checks.py ingestion/track_list.py \
+    ingestion/raw_copy.py ingestion/record_run.py ingestion/record_state.py ingestion/selection.py ingestion/store.py ingestion/table_checks.py ingestion/track_list.py \
+    ingestion/connection.py \
     /opt/dagster/app/scripts/ingestion/
 COPY --from=stack_scripts sample/__init__.py sample/candidates.py sample/publisher.py sample/split.py /opt/dagster/app/scripts/sample/
 COPY --from=stack_spark __init__.py table_checks.py /opt/dagster/app/spark/
 COPY --from=stack_fixtures release.json /opt/dagster/app/tests/fixtures/vitaldb/release.json
+# The candidate list that the raw copy's fixed-sample selection reads when it checks the connection's globs.
+COPY --from=stack_fixtures candidates.tsv /opt/dagster/app/tests/fixtures/vitaldb/candidates.tsv
 COPY --from=stack_compose compose.yml limits.yml /opt/dagster/stack/compose/
 COPY --from=stack_compose services /opt/dagster/stack/compose/services
 
