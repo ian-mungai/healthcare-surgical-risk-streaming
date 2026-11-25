@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import io
 import json
 import tempfile
@@ -30,7 +31,7 @@ from spark import split_table
 from spark.profile.counts import BY_NAME
 from tests.e2e.run_record import Record
 from tests.fast.sealed_record import FLAG_NAME
-from tests.fast.test_heldout_figures import CASE_FIGURE, FIGURE, figure_derivable, numbers_of
+from tests.fast.test_heldout_figures import CASE_FIGURE, FIGURE, figure_derivable, figure_pattern, numbers_of
 from tests.fast.test_runner_gold_sealed import runner
 
 BRANCH_HASH, BASE_HASH = "b" * 64, "a" * 64
@@ -396,14 +397,18 @@ class ProfileCases(unittest.TestCase):
             "gap": list(module.GAP_BLOCK),
         }
         totals = {sum(split_table.PINNED_COUNTS.values()), int(BY_NAME["patients"].expected), int(BY_NAME["cases"].expected)}
+        # Every assertion here is a Boolean with a fixed message and the sub-test is named by the index only: a rejected request prints none of its contents.
         for index, request in enumerate(written):
-            with self.subTest(request=index, keys=sorted(request)):
-                self.assertLessEqual(
-                    set(request), set(constants) | {"dev_cases", "names", "sealed", "want_values", "count_expected"}, "a key of the request is new: judge it"
-                )
-                self.assertEqual({key: value for key, value in constants.items() if key in request}, {key: request[key] for key in constants if key in request})
-                self.assertLessEqual(set(request["dev_cases"]), set(module.CASES), "a case that the runner does not hold is named as a development case")
+            with self.subTest(request=index):
                 counted = {key: value for key, value in request.items() if key not in constants and key != "dev_cases"}
+                self.assertTrue(
+                    set(request) <= set(constants) | {"dev_cases", "names", "sealed", "want_values", "count_expected"}, "a key of the request is new: judge it"
+                )
+                self.assertTrue(
+                    {key: value for key, value in constants.items() if key in request} == {key: request[key] for key in constants if key in request},
+                    "a constant of the request is not the runner's constant",
+                )
+                self.assertTrue(set(request["dev_cases"]) <= set(module.CASES), "a case that the runner does not hold is named as a development case")
                 self.assertTrue(totals.isdisjoint(numbers_of(request)), "the request holds the total of the patients or of the cases of the cohort")
                 self.assertFalse(figure_derivable(counted, FIGURE), "the test-set patient count follows from the counts of the request")
                 self.assertFalse(figure_derivable(counted, CASE_FIGURE), "the held-out case count follows from the counts of the request")
@@ -635,6 +640,57 @@ class GoldCases(unittest.TestCase):
         text = json.dumps(asdict(record), default=str)
         self.assertNotIn(str(SECRET), text)
         self.assertIn("stopped by OSError", text)
+
+
+class RequestTestOutputIsSafe(unittest.TestCase):
+    """The request test rejects a request that holds a count, and its output names no count (the reviewer's probe: a count planted under ``pins.clinical`` was
+    printed in the dictionary diff of the failing assertion). Each plant is run through the real test with its own requests."""
+
+    TEST = "test_no_complete_request_holds_a_total_of_patients_or_cases_or_a_number_that_a_test_set_count_follows_from"
+
+    @staticmethod
+    def planted(requests: list[dict[str, Any]], count: int) -> dict[str, list[dict[str, Any]]]:
+        """Each plant is a copy of the requests in which the first request that holds the key carries the count in one place."""
+
+        def with_edit(edit: Any) -> list[dict[str, Any]]:
+            made = copy.deepcopy(requests)
+            edit(next(request for request in made if "pins" in request))
+            return made
+
+        return {
+            "a size under pins.clinical": with_edit(lambda request: request["pins"]["clinical"].update(size=count)),
+            "a new key under pins.clinical": with_edit(lambda request: request["pins"]["clinical"].update(rows=count)),
+            "a text under pins.clinical": with_edit(lambda request: request["pins"]["clinical"].update(sha256=f"{count:,} patients")),
+            "a new key under pins": with_edit(lambda request: request["pins"].update(test={"patients": count})),
+            "a new key of the request": with_edit(lambda request: request.update(held_out=count)),
+            "a new key of the request named by the count": with_edit(lambda request: request.update({f"set_{count}": 1})),
+            "a case that the runner does not hold": with_edit(lambda request: request.update(dev_cases=[count])),
+            "a changed file entry": with_edit(
+                lambda request: request["files"].update({count: {"sha256": "c" * 64}}) if "files" in request else request.update(x=1)
+            ),
+        }
+
+    def run_plant(self, requests: list[dict[str, Any]]) -> tuple[str, bool]:
+        case = ProfileCases(self.TEST)
+        case.setUp()
+        case.requests_written = lambda: requests  # type: ignore[method-assign]
+        stream = io.StringIO()
+        result = unittest.TextTestRunner(stream=stream, verbosity=0).run(case)
+        if result.skipped:
+            self.skipTest("the signal profile runner is not on this machine")
+        return stream.getvalue(), result.wasSuccessful()
+
+    def test_a_request_that_holds_a_count_fails_the_test_and_the_output_names_no_count(self) -> None:
+        case = ProfileCases(self.TEST)
+        case.setUp()
+        requests = case.requests_written()
+        for figure_name, count in (("the test count", FIGURE), ("the held-out case count", CASE_FIGURE)):
+            for label, plant in self.planted(requests, count).items():
+                with self.subTest(figure=figure_name, plant=label):
+                    output, passed = self.run_plant(plant)
+                    self.assertFalse(passed, "the request test passed on a request that holds a count")
+                    for each in (FIGURE, CASE_FIGURE):
+                        self.assertFalse(figure_pattern(each).search(output) is not None, "the output of the request test holds a count")
 
 
 class FlagNames(unittest.TestCase):
