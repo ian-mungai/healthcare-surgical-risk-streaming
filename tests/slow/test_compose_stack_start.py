@@ -65,7 +65,14 @@ case "$verb" in
     if [ ! -f "$store/config.json" ]; then echo "pull denied: not logged in" >&2; exit 1; fi
     cp "$store/config.json" "$here/pull_config.json"
     ls -l "$store/config.json" | cut -c1-10 >> "$here/pull_file_mode.log"
-    if [ -f "$here/ignore_term_pull" ]; then trap '' TERM; echo $$ > "$here/pull.pid"; while :; do sleep 1; done; fi
+    if [ -f "$here/ignore_term_pull" ]; then
+      trap '' TERM
+      echo $$ > "$here/pull.pid"
+      while :; do
+        [ -d "$DOCKER_CONFIG" ] || touch "$here/folder_gone_early"
+        sleep 1
+      done
+    fi
     if [ -f "$here/hang_pull" ]; then exec sleep 30; fi ;;
   up)
     touch "$here/started"
@@ -608,9 +615,11 @@ class PullTest(unittest.TestCase):
             pid = int((stand_in.parent / "pull.pid").read_text())
             self.addCleanup(self.kill_quietly, pid)
             gone = self.is_gone(pid)
+            early = (stand_in.parent / "folder_gone_early").exists()
         self.assertNotEqual(0, code, output)
         self.assertIn("the image pull ran past its deadline of 14 seconds", output)
         self.assertTrue(gone, "the pull survived the task: one TERM is not enough")
+        self.assertFalse(early, "the folder was removed while the pull still ran")
         self.assertEqual([], left)
         self.assertLess(elapsed, 14 + 20, "the task ended well inside Ansible's own timeout plus its start-up")
         self.assertNotIn(self.TOKEN, output)
