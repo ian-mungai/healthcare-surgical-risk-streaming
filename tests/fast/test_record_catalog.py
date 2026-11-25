@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import tempfile
-import traceback
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -20,6 +19,7 @@ from scripts.ingestion.record_catalog import CatalogError, NessieCatalog
 from scripts.ingestion.record_load import BranchExists, BranchMoved, LoadError, RefState, owned_leftover
 from scripts.ingestion.record_state import RunState
 from scripts.stack.nessie import NessieClient
+from tests.fast.traceback_support import raised_text
 
 MAIN = "a" * 64
 
@@ -489,46 +489,42 @@ class CatalogErrorTest(unittest.TestCase):
         self.catalog = NessieCatalog(Client(self.server))
 
     def test_each_failing_call_of_the_load_s_path_is_a_catalog_error_with_the_chain_suppressed_and_no_word_of_the_answer(self) -> None:
-        operations: dict[str, tuple[str, Callable[[], object]]] = {
-            "head": ("/trees/load_run1", lambda: self.catalog.head("load_run1")),
-            "reference": ("/trees/load_run1", lambda: self.catalog.reference("load_run1")),
-            "create_branch": ("/trees", lambda: self.catalog.create_branch("load_run2", MAIN)),
-            "delete_branch": (f"/trees/load_run1@{'3' * 64}", lambda: self.catalog.delete_branch("load_run1", "3" * 64)),
-            "history": ("/trees/main/history", lambda: self.catalog.has_recorded_manifest("a" * 64)),
-            "history of a branch": ("/trees/load_run1/history", lambda: self.catalog.descends_from("load_run1", "9" * 64)),
-            "entries": ("/trees/main/entries", lambda: self.catalog.snapshot_ids("main")),
-            "contents": ("/trees/main/contents/raw_records.clinical_data", lambda: self.catalog.snapshot_ids("main")),
+        operations: dict[str, tuple[str, Callable[[], object], tuple[str, ...]]] = {
+            "head": ("/trees/load_run1", lambda: self.catalog.head("load_run1"), ("head", "read_reference")),
+            "reference": ("/trees/load_run1", lambda: self.catalog.reference("load_run1"), ("reference", "read_reference")),
+            "create_branch": ("/trees", lambda: self.catalog.create_branch("load_run2", MAIN), ("create_branch",)),
+            "delete_branch": (f"/trees/load_run1@{'3' * 64}", lambda: self.catalog.delete_branch("load_run1", "3" * 64), ("delete_branch",)),
+            "history": ("/trees/main/history", lambda: self.catalog.has_recorded_manifest("a" * 64), ("has_recorded_manifest", "history")),
+            "history of a branch": ("/trees/load_run1/history", lambda: self.catalog.descends_from("load_run1", "9" * 64), ("descends_from", "history")),
+            "entries": ("/trees/main/entries", lambda: self.catalog.snapshot_ids("main"), ("snapshot_ids", "table_keys")),
+            "contents": ("/trees/main/contents/raw_records.clinical_data", lambda: self.catalog.snapshot_ids("main"), ("snapshot_ids",)),
         }
-        for name, (path, call) in operations.items():
+        for name, (path, call, raising_functions) in operations.items():
             for status in (500, 403) if name == "delete_branch" else (500, 400, 403):
                 with self.subTest(f"{name} {status}"):
                     self.server.fail = (path, status)
-                    with self.assertRaises(CatalogError) as raised:
-                        call()
-                    self.assertTrue(str(raised.exception).startswith("catalog_error: "), str(raised.exception))
-                    self.assertNotIn(self.MARKER, str(raised.exception))
-                    self.assertIsNone(raised.exception.__cause__)
-                    self.assertTrue(raised.exception.__suppress_context__)
-                    self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
+                    error, text = raised_text(call, CatalogError, *raising_functions)
+                    self.assertTrue(str(error).startswith("catalog_error: "), str(error))
+                    self.assertNotIn(self.MARKER, str(error))
+                    self.assertIsNone(error.__cause__)
+                    self.assertTrue(error.__suppress_context__)
+                    self.assertNotIn(self.MARKER, text)
 
     def test_a_refusal_of_the_typed_delete_as_a_wrong_kind_says_so_in_a_fixed_text_and_holds_no_answer(self) -> None:
         self.server.fail = (f"/trees/load_run1@{'3' * 64}", 400)
-        with self.assertRaises(LoadError) as raised:
-            self.catalog.delete_branch("load_run1", "3" * 64)
-        self.assertNotIsInstance(raised.exception, CatalogError)
-        self.assertIn("not a branch", str(raised.exception))
-        self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
+        error, text = raised_text(lambda: self.catalog.delete_branch("load_run1", "3" * 64), LoadError, "delete_branch")
+        self.assertNotIsInstance(error, CatalogError)
+        self.assertIn("not a branch", str(error))
+        self.assertNotIn(self.MARKER, text)
 
     def test_a_conflict_on_delete_and_on_create_keep_their_own_meaning_and_hold_no_answer_either(self) -> None:
         self.server.fail_body = json.dumps({"errorCode": "REFERENCE_CONFLICT", "message": self.MARKER}).encode()
         self.server.fail = (f"/trees/load_run1@{'3' * 64}", 409)
-        with self.assertRaises(BranchMoved) as raised:
-            self.catalog.delete_branch("load_run1", "3" * 64)
-        self.assertNotIn(self.MARKER, "".join(traceback.format_exception(raised.exception)))
+        _, moved_text = raised_text(lambda: self.catalog.delete_branch("load_run1", "3" * 64), BranchMoved, "delete_branch")
+        self.assertNotIn(self.MARKER, moved_text)
         self.server.fail = ("/trees", 409)
-        with self.assertRaises(BranchExists) as exists:
-            self.catalog.create_branch("load_run2", MAIN)
-        self.assertNotIn(self.MARKER, "".join(traceback.format_exception(exists.exception)))
+        _, exists_text = raised_text(lambda: self.catalog.create_branch("load_run2", MAIN), BranchExists, "create_branch")
+        self.assertNotIn(self.MARKER, exists_text)
 
 
 class RecordedManifestTest(unittest.TestCase):

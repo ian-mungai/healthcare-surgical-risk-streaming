@@ -288,6 +288,15 @@ class FakeAirbyte(Interrupts):
         self.running_error = False
         self.start_error = False
         self.on_status: Callable[[], None] | None = None
+        self.refuse_definitions = False
+        self.on_check_definitions: Callable[[], None] | None = None
+
+    def check_definitions(self) -> None:
+        self.calls.append("check_definitions")
+        if self.on_check_definitions is not None:
+            self.on_check_definitions()
+        if self.refuse_definitions:
+            raise AirbyteError("the source definition of a pinned image is at another version than the pin; upgrade Airbyte or change the pin")
 
     def find_connection_ids(self) -> dict[str, str]:
         self.calls.append("find_connection_ids")

@@ -138,7 +138,7 @@ class InitialiseCommandTest(unittest.TestCase):
                 with serving(state) as uri:
                     code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
                 self.assertEqual(1, code)
-                self.assertIn("configuration", err)
+                self.assertIn("NessieError", err)
                 self.assertNotIn("unchanged", out)
                 self.assertEqual([], state.commits)
 
@@ -194,8 +194,8 @@ class InitialiseCommandTest(unittest.TestCase):
                 with serving(state) as uri:
                     code, out, err = run(["initialise", "--namespace", "surgical_risk", "--branch", given], uri)
                 self.assertEqual(1, code)
-                self.assertIn(default, err)
-                self.assertIn(given, err)
+                self.assertIn("NessieError", err)
+                self.assertNotIn(given, err)
                 self.assertEqual("", out)
                 self.assertEqual([], state.commits)
         with serving(StandIn(default="trunk")) as uri:
@@ -220,7 +220,7 @@ class InitialiseCommandTest(unittest.TestCase):
                 with serving(state) as uri:
                     code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
                 self.assertEqual(1, code)
-                self.assertIn("hash", err)
+                self.assertIn("NessieError", err)
                 self.assertNotIn("unchanged", out)
                 self.assertNotIn("initialised", out)
                 self.assertEqual(commits, len(state.commits))
@@ -231,7 +231,7 @@ class InitialiseCommandTest(unittest.TestCase):
         with serving(state) as uri:
             code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
         self.assertEqual(1, code)
-        self.assertIn("surgical_risk", err)
+        self.assertIn("NessieError", err)
         self.assertNotIn("initialised", out)
 
     def test_a_refusal_exits_1_and_names_the_call_and_nothing_is_committed(self) -> None:
@@ -239,7 +239,7 @@ class InitialiseCommandTest(unittest.TestCase):
         with serving(state) as uri:
             code, out, err = run(["initialise", "--namespace", "surgical_risk"], uri)
         self.assertEqual(1, code)
-        self.assertIn("GET /api/v2/config was refused with status 500", err)
+        self.assertIn("NessieError", err)
         self.assertEqual([], state.commits)
 
     def test_no_address_or_a_bad_namespace_exits_2_before_any_call(self) -> None:

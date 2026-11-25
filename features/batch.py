@@ -13,9 +13,7 @@ Spark wiring comes with the Silver and streaming jobs: they read their windows e
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -24,6 +22,8 @@ from features import document
 from features.leakage import LeakageError, row_problems
 from features.model import FeatureInputError, FeatureRow, WindowInput
 from features.row import build_row
+from scripts.ingestion.notice import ClosedError, describe_error, render
+from scripts.ingestion.output_file import check_new_output, write_new_file
 
 
 def compute_rows(windows: Iterable[WindowInput], include_sensitivity: bool = False) -> list[FeatureRow]:
@@ -54,17 +54,11 @@ def serialise(rows: Iterable[tuple[object, FeatureRow]]) -> str:
 
 
 def run(source: Path, target: Path) -> int:
-    """Read the windows, write the rows. The target is replaced in one step, or not written at all."""
+    """Read the windows, write the rows to a path that is free. The target is written whole, or not at all, and is never replaced."""
     windows = document.parse_file(document.load(source.read_text()))
     rows = compute_rows(window for _, window in windows)
     text = serialise((window_id, row) for (window_id, _), row in zip(windows, rows, strict=True))
-    handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
-    try:
-        with os.fdopen(handle, "w") as stream:
-            stream.write(text)
-        os.replace(temporary, target)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    write_new_file(target, text, mode=0o644)
     return len(rows)
 
 
@@ -74,9 +68,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write("usage: python -m features.batch WINDOWS.json ROWS.json\n")
         return 2
     try:
+        check_new_output(Path(arguments[1]))
         run(Path(arguments[0]), Path(arguments[1]))
-    except (FeatureInputError, LeakageError, OSError, KeyError, TypeError, ValueError) as error:
-        sys.stderr.write(f"features.batch: {error}\n")
+    except ClosedError as error:
+        sys.stderr.write("".join(f"features.batch: {render(notice)}\n" for notice in error.notices))
+        return 2
+    except OSError:
+        sys.stderr.write("features.batch: the windows file cannot be read or the rows file cannot be written\n")
+        return 2
+    except (FeatureInputError, LeakageError, KeyError, TypeError, ValueError) as error:
+        sys.stderr.write(f"features.batch: {describe_error(error)}\n")
         return 2
     return 0
 

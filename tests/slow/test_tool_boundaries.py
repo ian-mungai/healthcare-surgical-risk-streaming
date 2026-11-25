@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import stat
 import tempfile
-import traceback
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -30,6 +29,7 @@ from scripts.infra.state_bootstrap import RunBinding
 from scripts.infra.terraform_wrapper import WrapperError
 from scripts.process import CompletedProcess, TimeoutExpired
 from scripts.project_config import ConfigurationError
+from tests.fast.traceback_support import traceback_text
 
 BUCKET = "example-private-bucket"
 ROLE = "private_role_name"
@@ -46,16 +46,16 @@ def raised(call: Callable[[], Any]) -> Exception:
     raise AssertionError("the call raised nothing")
 
 
-def printed(error: BaseException) -> str:
-    """Everything a terminal shows for the exception: its text and its whole chain."""
-    return "".join(traceback.format_exception(error))
+def printed(error: BaseException, *frames: str) -> str:
+    """What a terminal shows for the exception: traceback, text and chain. Fails for an exception with no traceback or a missing named frame."""
+    return traceback_text(error, *frames)
 
 
 class Boundary(unittest.TestCase):
-    def assert_private_values_absent(self, error: BaseException) -> None:
+    def assert_private_values_absent(self, error: BaseException, *frames: str) -> None:
         for value in (BUCKET, ROLE):
             self.assertNotIn(value, str(error))
-            self.assertNotIn(value, printed(error))
+            self.assertNotIn(value, printed(error, *frames))
             self.assertNotIn(value, repr(error))
         self.assertIsNone(error.__cause__)
         self.assertTrue(error.__suppress_context__ or error.__context__ is None)
@@ -91,7 +91,7 @@ class AwsCallTest(Boundary):
             error = raised(lambda: self.aws.call("iam", "create-access-key"))
         self.assertIsInstance(error, AwsError)
         self.assertEqual("aws iam create-access-key failed: LimitExceeded; its full error text could not be kept", str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "call")
 
     def test_a_failed_write_with_no_error_code_gives_the_exit_status(self) -> None:
         failed = CompletedProcess(["aws"], 130, "", f"no code in this text {BUCKET}")
@@ -107,7 +107,7 @@ class AwsCallTest(Boundary):
     def test_a_timeout_names_the_tool_its_first_two_words_and_the_deadline_only(self) -> None:
         error = self.timed_out()
         self.assertEqual("aws s3api delete-object timed out after 7.5 seconds", str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "call")
         self.assertNotIn(BUCKET, str(error.__dict__))
 
     def test_a_timeout_is_still_a_timeout_expired_and_an_aws_error(self) -> None:
@@ -117,7 +117,7 @@ class AwsCallTest(Boundary):
 
     def test_partial_error_output_of_a_timeout_goes_to_the_owner_only_file_and_not_to_the_message(self) -> None:
         error = self.timed_out(stderr=f"partial text {BUCKET} {ROLE}".encode())
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "call")
         kept = list((self.scratch / "runs" / "raw_errors").iterdir())
         self.assertEqual(1, len(kept))
         self.assertEqual(f"partial text {BUCKET} {ROLE}", kept[0].read_text())
@@ -132,7 +132,7 @@ class AwsCallTest(Boundary):
         with mock.patch.object(aws_cli, "keep_raw_error", side_effect=OSError(ROLE)):
             error = self.timed_out(stderr=b"partial")
         self.assertEqual("aws s3api delete-object timed out after 7.5 seconds; its partial error text could not be kept", str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "call")
 
     def test_the_standard_output_of_a_timeout_is_never_kept_because_a_key_command_prints_its_secret_there(self) -> None:
         self.timed_out(output=b"secret-in-standard-output")
@@ -186,32 +186,28 @@ class TerraformCallTest(Boundary):
 
     def test_a_failed_call_gives_the_exit_status_and_names_the_file_that_keeps_the_output(self) -> None:
         error = self.run_terraform(CompletedProcess(["terraform"], 43, "", f"Error: {ROLE} {BUCKET}"))
-        self.assertEqual(
-            "terraform apply failed with exit status 43; its full output is in runs/20260101t0000-abcdef/raw/terraform_apply_failure.txt", str(error)
-        )
+        self.assertEqual("terraform apply failed with exit status 43; its full output is in the run's raw folder as terraform_apply_failure.txt", str(error))
         self.save.assert_called_once_with(RUN.run_id, "terraform_apply_failure.txt", f"Error: {ROLE} {BUCKET}")
 
     def test_a_failed_write_of_the_private_file_still_gives_the_exit_status(self) -> None:
         error = self.run_terraform(CompletedProcess(["terraform"], 43, "", f"Error: {ROLE}"), saved=OSError(BUCKET))
         self.assertIsInstance(error, WrapperError)
         self.assertEqual("terraform apply failed with exit status 43; its full output could not be kept", str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "terraform")
 
     def test_a_timeout_names_the_command_word_and_the_deadline_and_keeps_the_partial_output_privately(self) -> None:
         timeout = TimeoutExpired(["/opt/terraform", "-chdir=x", "apply", *PRIVATE_ARGUMENTS], 30, output=f"out {BUCKET}".encode(), stderr=f"err {ROLE}")
         error = self.run_terraform(timeout)
         self.assertIsInstance(error, WrapperError)
-        self.assertEqual(
-            "terraform apply timed out after 30 seconds; its partial output is in runs/20260101t0000-abcdef/raw/terraform_apply_failure.txt", str(error)
-        )
-        self.assert_private_values_absent(error)
+        self.assertEqual("terraform apply timed out after 30 seconds; its partial output is in the run's raw folder as terraform_apply_failure.txt", str(error))
+        self.assert_private_values_absent(error, "terraform")
         self.save.assert_called_once_with(RUN.run_id, "terraform_apply_failure.txt", f"out {BUCKET}err {ROLE}")
 
     def test_a_timeout_with_a_failed_write_still_says_so(self) -> None:
         timeout = TimeoutExpired(["terraform", *PRIVATE_ARGUMENTS], 30, output=b"partial")
         error = self.run_terraform(timeout, saved=OSError(ROLE))
         self.assertEqual("terraform apply timed out after 30 seconds; its partial output could not be kept", str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "terraform")
 
     def test_a_timeout_with_no_partial_output_writes_no_file(self) -> None:
         error = self.run_terraform(TimeoutExpired(["terraform", *PRIVATE_ARGUMENTS], 30))
@@ -231,9 +227,9 @@ class HostCallTest(Boundary):
         self.assertIsInstance(error, host.HostError)
         deadline = f"{host.HOST_SETUP_TIMEOUT_SECONDS:g}"
         self.assertEqual(
-            f"ansible-playbook host.yml timed out after {deadline} seconds; its partial output is in runs/{RUN.run_id}/raw/ansible_output.txt", str(error)
+            f"ansible-playbook host.yml timed out after {deadline} seconds; its partial output is in the run's raw folder as ansible_output.txt", str(error)
         )
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "run_ansible")
         save.assert_called_once_with(RUN.run_id, "ansible_output.txt", f"x {BUCKET}")
 
     def test_an_ansible_timeout_with_a_failed_write_still_says_so(self) -> None:
@@ -245,7 +241,7 @@ class HostCallTest(Boundary):
         ):
             error = raised(lambda: host.run_ansible(RUN.run_id, "100.64.0.1", {}))
         self.assertTrue(str(error).endswith("its partial output could not be kept"), str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "run_ansible")
 
     def test_a_tailscale_timeout_is_not_ready_and_shows_no_argument(self) -> None:
         timeout = TimeoutExpired(["/Applications/Tailscale", "status", "--json", *PRIVATE_ARGUMENTS], 20)
@@ -253,7 +249,7 @@ class HostCallTest(Boundary):
             error = raised(lambda: host.tailscale_status(20))
         self.assertIsInstance(error, host.NoPeerError)
         self.assertEqual("tailscale status timed out after 20 seconds", str(error))
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "tailscale_status")
 
     def test_an_ssh_timeout_is_no_answer_and_raises_nothing_that_shows_an_argument(self) -> None:
         timeout = TimeoutExpired(["/usr/bin/ssh", f"user@{BUCKET}", f"echo {ROLE}"], 20)
@@ -267,7 +263,7 @@ class PolicyToolTest(Boundary):
         with mock.patch.object(manage_policies, "run_command", side_effect=timeout):
             error = raised(lambda: manage_policies.refuse_while_history_records(Aws("admin_profile", "us-west-2")))
         self.assertIsInstance(error, ConfigurationError)
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "refuse_while_history_records")
 
     def test_a_timeout_of_the_history_setting_read_names_the_command_and_the_deadline_and_no_profile(self) -> None:
         timeout = TimeoutExpired(["/usr/bin/aws", "configure", "get", "cli_history", "--profile", ROLE], 30)
@@ -276,7 +272,7 @@ class PolicyToolTest(Boundary):
         self.assertIsInstance(error, ConfigurationError)
         self.assertIn("aws configure get timed out after 30 seconds", str(error))
         self.assertNotIn("admin_profile", f"{error!s} {error!r}")
-        self.assert_private_values_absent(error)
+        self.assert_private_values_absent(error, "refuse_while_history_records")
 
     def test_a_timeout_of_the_create_call_keeps_the_reservation_message_and_shows_no_argument(self) -> None:
         timeout = TimeoutExpired(["/usr/bin/aws", "iam", "create-access-key", "--user-name", ROLE], 120)
@@ -286,7 +282,7 @@ class PolicyToolTest(Boundary):
             self.assertTrue(backup.exists())
         self.assertIsInstance(error, ConfigurationError)
         self.assertIn("check the access keys of the_user as the owner before a retry", str(error))
-        self.assertNotIn(ROLE, printed(error))
+        self.assertNotIn(ROLE, printed(error, "write_new_key", "call"))
 
 
 if __name__ == "__main__":

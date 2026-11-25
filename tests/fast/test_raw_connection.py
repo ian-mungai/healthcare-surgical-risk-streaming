@@ -21,6 +21,7 @@ from scripts.ingestion.connection import ConnectionDefinitionError, desired_stat
 from scripts.ingestion.selection import Selection
 from scripts.sample.split import is_development
 from tests.fast.ansible_paths import group_variables
+from tests.fast.locale_support import non_utf_8_locale
 
 PIN = json.loads(Path("tests/fixtures/vitaldb/release.json").read_text())
 PREFIX = PIN["source"]["release_path"]
@@ -137,11 +138,14 @@ class SourceAndDestinationTest(unittest.TestCase):
             self.assertNotIn("secret_fields", document[part], "the module holds the one table of the fields that take the key; the document names none")
         self.assertNotIn("secret_fields", json.dumps(document))
 
-    def test_the_source_definition_is_one_shared_pinned_definition_that_another_connection_can_reuse(self) -> None:
+    def test_the_definition_entries_hold_the_image_and_the_tag_and_no_name_that_could_select_a_definition(self) -> None:
         shared = connection.source_definition(SOURCE_TAG)
-        self.assertEqual({"name": connection.SOURCE_DEFINITION_NAME, "dockerRepository": "airbyte/source-s3", "dockerImageTag": SOURCE_TAG}, shared)
+        self.assertEqual({"dockerRepository": "airbyte/source-s3", "dockerImageTag": SOURCE_TAG}, shared)
         self.assertEqual(shared, state()["source"]["definition"])
-        self.assertEqual("s3_source_pinned", connection.SOURCE_DEFINITION_NAME, "the name is the one that the record connection takes the definition by")
+        self.assertEqual({"dockerRepository": "airbyte/destination-s3", "dockerImageTag": DESTINATION_TAG}, state()["destination"]["definition"])
+        self.assertFalse(hasattr(connection, "SOURCE_DEFINITION_NAME"), "no name selects a definition: Airbyte's built-in one is taken by its image")
+        self.assertFalse(hasattr(connection, "DESTINATION_DEFINITION_NAME"))
+        self.assertNotIn("_pinned", json.dumps(state()))
         with self.assertRaises(ConnectionDefinitionError):
             connection.source_definition("latest")
 
@@ -229,6 +233,18 @@ class RenderTest(unittest.TestCase):
             path.write_text("{}")
             code, output, _ = self.render(*self.common(), "--selection", str(path))
         self.assertEqual((1, ""), (code, output))
+
+    def test_a_selection_file_that_cannot_be_read_as_text_or_is_missing_exits_1_with_the_one_fixed_line_and_no_traceback(self) -> None:
+        """Join round 2, finding 2: a file of invalid UTF-8 raised ``UnicodeDecodeError``, which is not an ``OSError``, and ended in a traceback."""
+        with tempfile.TemporaryDirectory() as scratch:
+            invalid = Path(scratch) / "invalid.json"
+            invalid.write_bytes(b'{"name": "\xff\xfe"}')
+            for label, path in (("invalid UTF-8", invalid), ("missing", Path(scratch) / "missing.json"), ("a folder", Path(scratch))):
+                for command in (self.common(), ["selection"]):
+                    for locale_name, locale in (("UTF-8", contextlib.nullcontext()), ("ISO8859-1", non_utf_8_locale())):
+                        with self.subTest(file=label, command=command[0], locale=locale_name), locale:
+                            code, output, errors = self.render(*command, "--selection", str(path))
+                            self.assertEqual((1, "", "cannot read the selection file\n"), (code, output, errors))
 
 
 class PinTest(unittest.TestCase):

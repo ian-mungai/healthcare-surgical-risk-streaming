@@ -13,6 +13,10 @@ provider "aws" {
 locals {
   data_prefixes = ["landing", "warehouse"]
   read_prefixes = ["manifests"]
+
+  deploy_role_name = var.test_run_id == "" ? "${var.project_name}_deploy_${var.environment}" : "${var.project_name}_deploy_t${var.test_run_id}"
+  ubuntu_build     = jsondecode(file("${path.module}/ubuntu_build.json"))
+  ubuntu_ami       = lookup(local.ubuntu_build.amis, var.aws_region, "")
 }
 
 module "host" {
@@ -20,6 +24,7 @@ module "host" {
   count  = var.provision_host ? 1 : 0
 
   name          = "${var.project_name}_host_${var.environment}"
+  ami           = local.ubuntu_ami
   boundary_name = "${var.project_name}_role_boundary"
   instance_type = var.host_instance_type
   disk_gib      = var.host_disk_gib
@@ -41,7 +46,7 @@ module "host" {
 module "deploy" {
   source = "./modules/deploy"
 
-  name                 = "${var.project_name}_deploy_${var.environment}"
+  name                 = local.deploy_role_name
   boundary_name        = "${var.project_name}_role_boundary"
   github_repository    = var.github_repository
   github_owner_id      = var.github_owner_id

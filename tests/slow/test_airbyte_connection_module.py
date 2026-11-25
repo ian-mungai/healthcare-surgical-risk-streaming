@@ -43,6 +43,8 @@ KEY_VALUE = "key-value-that-must-not-leak-0001"
 OTHER_KEY_ID = "AKIAEXAMPLEKEYID0002"
 OTHER_KEY_VALUE = "key-value-that-must-not-leak-0002"
 KEYS = {"aws_access_key_id": KEY_ID, "aws_secret_access_key": KEY_VALUE}
+SOURCE_DEFINITION_ID = "88888888-8888-8888-8888-888888888881"
+DESTINATION_DEFINITION_ID = "88888888-8888-8888-8888-888888888882"
 MASK = "**********"
 MASKED_FIELDS = {"aws_access_key_id", "aws_secret_access_key", "access_key_id", "secret_access_key"}
 
@@ -59,6 +61,7 @@ def load_module() -> ModuleType:
 
 
 MODULE_UNDER_TEST = load_module()
+NOT_SET = object()
 
 
 def document() -> dict[str, Any]:
@@ -68,7 +71,7 @@ def document() -> dict[str, Any]:
 class FakeAirbyte:
     """Airbyte's public API as far as the module uses it. Every answer carries fields that the document does not hold."""
 
-    def __init__(self, workspaces: int = 1) -> None:
+    def __init__(self, workspaces: int = 1, *, builtin: bool = True) -> None:
         self.workspaces = [WORKSPACE, "22222222-2222-2222-2222-222222222222"][:workspaces]
         self.objects: dict[str, dict[str, dict[str, Any]]] = {
             "source_definitions": {},
@@ -87,6 +90,21 @@ class FakeAirbyte:
         self.bodies: list[tuple[str, str, dict[str, Any]]] = []
         self.keys: dict[str, str] = dict(KEYS)
         self.recorded: dict[str, str] = {}
+        self.limit = 100
+        self.next_of: Any = NOT_SET
+        if builtin:
+            self.add_definition("source", SOURCE_DEFINITION_ID, "airbyte/source-s3", "4.17.1")
+            self.add_definition("destination", DESTINATION_DEFINITION_ID, "airbyte/destination-s3", "1.9.11")
+
+    def add_definition(self, kind: str, identifier: str, repository: str, tag: str, name: str = "S3") -> None:
+        """A definition that Airbyte holds already, as its built-in ones: the module never writes one."""
+        self.objects[f"{kind}_definitions"][identifier] = {
+            "id": identifier,
+            "name": name,
+            "dockerRepository": repository,
+            "dockerImageTag": tag,
+            "documentationUrl": "https://example.invalid",
+        }
 
     def new_id(self) -> str:
         self.counter += 1
@@ -99,6 +117,7 @@ class FakeAirbyte:
         url = urlparse(path)
         parts = url.path.strip("/").split("/")
         offset = int(parse_qs(url.query).get("offset", ["0"])[0])
+        self.limit = int(parse_qs(url.query).get("limit", ["100"])[0])
         if method == "GET":
             return self.read(parts, offset)
         self.writes.append(f"{method} {url.path}")
@@ -137,8 +156,9 @@ class FakeAirbyte:
 
     def listing(self, kind: str, offset: int) -> dict[str, Any]:
         rows = self.damaged(self.KIND_NAMES[kind], [self.masked(copy.deepcopy(row)) for row in self.objects[kind].values()])
-        page = rows[offset : offset + 2]
-        return {"data": page, "next": "more" if offset + 2 < len(rows) else None}
+        page = rows[offset : offset + self.limit]
+        following = "more" if offset + self.limit < len(rows) else None
+        return {"data": page, "next": following if self.next_of is NOT_SET else self.next_of}
 
     def read(self, parts: list[str], offset: int) -> dict[str, Any]:
         if parts == ["workspaces"]:
@@ -150,7 +170,7 @@ class FakeAirbyte:
 
     def write(self, method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
         """Store the write and answer it. A test can plant a fault in the answer of one call: the object is stored, the answer is faulty."""
-        kind = f"{parts[3][:-1]}_definition" if parts[0] == "workspaces" else self.KIND_NAMES[parts[0]]
+        kind = self.KIND_NAMES[parts[0]]
         self.write_log.append((method, kind))
         answer = copy.deepcopy(self.store(method, parts, body))
         if self.write_damage is not None and self.write_damage[:2] == (method, kind):
@@ -162,11 +182,6 @@ class FakeAirbyte:
         return answer
 
     def store(self, method: str, parts: list[str], body: dict[str, Any]) -> dict[str, Any]:
-        if parts[0] == "workspaces":
-            kind, identifier = f"{parts[3][:-1]}_definitions", parts[4] if len(parts) > 4 else None
-            record = self.objects[kind].get(identifier or "", {}) | body | {"id": identifier or self.new_id(), "documentationUrl": "https://example.invalid"}
-            self.objects[kind][record["id"]] = record
-            return record
         kind = parts[0]
         key = {"sources": "sourceId", "destinations": "destinationId", "connections": "connectionId"}[kind]
         identifier = parts[1] if len(parts) > 1 else self.new_id()
@@ -206,24 +221,16 @@ def apply(api: FakeAirbyte, wanted: dict[str, Any] | None = None) -> list[str]:
 
 
 class CreateAndRepeatTest(unittest.TestCase):
-    def test_on_an_empty_airbyte_every_object_is_created_once_definitions_first_and_the_connection_last(self) -> None:
+    def test_on_an_airbyte_with_the_built_in_definitions_each_object_is_created_once_and_no_definition_is_written(self) -> None:
         api = FakeAirbyte()
         changes = apply(api)
-        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], changes)
-        self.assertEqual(
-            [
-                f"POST /workspaces/{WORKSPACE}/definitions/sources",
-                f"POST /workspaces/{WORKSPACE}/definitions/destinations",
-                "POST /sources",
-                "POST /destinations",
-                "POST /connections",
-            ],
-            api.writes,
-        )
+        self.assertEqual(["source", "destination", "connection"], changes)
+        self.assertEqual(["POST /sources", "POST /destinations", "POST /connections"], api.writes)
         connected = api.only("connections")
         self.assertEqual((api.only("sources")["sourceId"], api.only("destinations")["destinationId"]), (connected["sourceId"], connected["destinationId"]))
-        self.assertEqual(api.only("source_definitions")["id"], api.only("sources")["definitionId"])
-        self.assertEqual(api.only("destination_definitions")["id"], api.only("destinations")["definitionId"])
+        self.assertEqual(SOURCE_DEFINITION_ID, api.only("sources")["definitionId"], "the source takes the built-in definition's id")
+        self.assertEqual(DESTINATION_DEFINITION_ID, api.only("destinations")["definitionId"])
+        self.assertEqual((1, 1), (len(api.objects["source_definitions"]), len(api.objects["destination_definitions"])), "no definition was added")
 
     def test_a_second_run_changes_nothing_and_writes_nothing_although_the_platform_adds_fields_of_its_own(self) -> None:
         api = FakeAirbyte()
@@ -243,9 +250,9 @@ class CreateAndRepeatTest(unittest.TestCase):
     def test_many_objects_in_pages_are_all_seen(self) -> None:
         api = FakeAirbyte()
         apply(api)
-        for index in range(5):
-            api.objects["sources"][f"4444444{index}-4444-4444-4444-444444444444"] = {
-                "sourceId": f"4444444{index}-4444-4444-4444-444444444444",
+        for index in range(230):
+            api.objects["sources"][f"{index:08d}-4444-4444-4444-444444444444"] = {
+                "sourceId": f"{index:08d}-4444-4444-4444-444444444444",
                 "name": f"other_{index}",
                 "definitionId": "44444444-4444-4444-4444-444444444444",
                 "workspaceId": WORKSPACE,
@@ -254,6 +261,161 @@ class CreateAndRepeatTest(unittest.TestCase):
         api.writes.clear()
         self.assertEqual([], apply(api))
         self.assertEqual([], api.writes)
+
+
+class PagerTest(unittest.TestCase):
+    """A list call ends at the first reply whose ``next`` is null or empty text. A ``next`` of any other type is refused, as the record pager refuses it."""
+
+    def many_definitions(self) -> FakeAirbyte:
+        api = FakeAirbyte(builtin=False)
+        for index in range(230):
+            api.add_definition("source", f"{index:08d}-5555-5555-5555-555555555555", f"other/source-{index}", "1.0.0", f"other {index}")
+            api.add_definition("destination", f"{index:08d}-4444-4444-4444-444444444444", f"other/destination-{index}", "1.0.0", f"other {index}")
+        api.add_definition("source", SOURCE_DEFINITION_ID, "airbyte/source-s3", "4.17.1")
+        api.add_definition("destination", DESTINATION_DEFINITION_ID, "airbyte/destination-s3", "1.9.11")
+        return api
+
+    def test_a_next_that_is_neither_null_nor_text_is_refused_and_does_not_end_the_list_early(self) -> None:
+        for value in (False, 0, [], {}, 7, ["more"], {"more": 1}, 1.5, True):
+            with self.subTest(next=value):
+                api = self.many_definitions()
+                api.next_of = value
+                with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+                    apply(api)
+                self.assertIn("next", str(raised.exception), "the refusal is the pager's, not a later 'no definition' that page two would have answered")
+                self.assertEqual([], api.writes)
+
+    def test_a_null_next_and_an_empty_next_end_a_list_that_has_one_page(self) -> None:
+        for value in (None, ""):
+            with self.subTest(next=value):
+                api = FakeAirbyte()
+                api.next_of = value
+                self.assertEqual(["source", "destination", "connection"], apply(api))
+
+    def test_a_text_next_on_each_page_but_the_last_reads_every_page(self) -> None:
+        api = self.many_definitions()
+        self.assertEqual(["source", "destination", "connection"], apply(api))
+
+
+class BuiltinDefinitionTest(unittest.TestCase):
+    """The connection runs the pinned connector version by taking the one definition that Airbyte holds for the image, at exactly the pinned tag.
+
+    Airbyte 2.5.0 refuses a custom definition for an image that a built-in definition uses, so the module creates no definition and updates none.
+    """
+
+    KINDS = (("source", "airbyte/source-s3", "4.17.1"), ("destination", "airbyte/destination-s3", "1.9.11"))
+
+    def refused(self, api: FakeAirbyte) -> str:
+        api.writes.clear()
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            apply(api)
+        self.assertEqual([], api.writes, "a refusal is made before any write")
+        return str(raised.exception)
+
+    def test_a_listing_with_the_built_in_definition_at_the_pinned_tag_gives_no_definition_write_and_the_actor_uses_its_id(self) -> None:
+        api = FakeAirbyte()
+        steps = MODULE_UNDER_TEST.plan(api, document(), api.keys, api.recorded)
+        self.assertEqual(["source", "destination", "connection"], [step.label for step in steps])
+        apply(api)
+        self.assertEqual([], [write for write in api.writes if "/definitions/" in write])
+        self.assertEqual(SOURCE_DEFINITION_ID, api.only("sources")["definitionId"])
+
+    def test_a_definition_at_another_tag_is_refused_without_a_write_and_the_refusal_names_no_value(self) -> None:
+        for kind, _, _ in self.KINDS:
+            for tag in ("4.17.2", "4.17.0", "latest", ""):
+                with self.subTest(kind=kind, tag=tag):
+                    api = FakeAirbyte()
+                    api.only(f"{kind}_definitions")["dockerImageTag"] = tag
+                    message = self.refused(api)
+                    self.assertIn(f"{kind} definition", message)
+                    for value in (tag, "4.17.1", "1.9.11", SOURCE_DEFINITION_ID, DESTINATION_DEFINITION_ID, "airbyte/"):
+                        if value:
+                            self.assertNotIn(value, message)
+
+    def test_the_document_asking_for_another_tag_than_the_one_airbyte_holds_is_refused_too(self) -> None:
+        for kind in ("source", "destination"):
+            with self.subTest(kind=kind):
+                wanted = document()
+                wanted[kind]["definition"]["dockerImageTag"] = "9.9.9"
+                api = FakeAirbyte()
+                self.assertIn(f"{kind} definition", self.refused_with(api, wanted))
+
+    def refused_with(self, api: FakeAirbyte, wanted: dict[str, Any]) -> str:
+        with self.assertRaises(MODULE_UNDER_TEST.ApiError) as raised:
+            apply(api, wanted)
+        self.assertEqual([], api.writes)
+        return str(raised.exception)
+
+    def test_no_definition_of_the_image_is_refused_and_nothing_is_created(self) -> None:
+        for kind, _, _ in self.KINDS:
+            with self.subTest(kind=kind):
+                api = FakeAirbyte()
+                api.objects[f"{kind}_definitions"].clear()
+                self.assertIn(f"{kind} definition", self.refused(api))
+                self.assertEqual([], [call for call in api.calls if call.startswith("POST")])
+
+    def test_two_definitions_of_the_image_are_refused_whatever_their_names_and_tags(self) -> None:
+        for kind, repository, tag in self.KINDS:
+            for second_tag, name in ((tag, "S3"), (tag, "s3_source_pinned"), ("0.0.1", "S3 older")):
+                with self.subTest(kind=kind, tag=second_tag, name=name):
+                    api = FakeAirbyte()
+                    api.add_definition(kind, "99999999-9999-9999-9999-999999999999", repository, second_tag, name)
+                    self.assertIn(f"{kind} definition", self.refused(api))
+
+    def test_only_the_exact_image_matches_so_a_similar_image_is_neither_taken_nor_counted(self) -> None:
+        api = FakeAirbyte()
+        for index, repository in enumerate(
+            ("airbyte/source-s3-data-lake", "airbyte/source-s3-v3", "other/airbyte/source-s3", "airbyte/source-s3 ", "AIRBYTE/SOURCE-S3")
+        ):
+            api.add_definition("source", f"7777777{index}-7777-7777-7777-777777777777", repository, "4.17.1")
+        for index, repository in enumerate(("airbyte/destination-s3-data-lake", "airbyte/destination-gcs")):
+            api.add_definition("destination", f"6666666{index}-6666-6666-6666-666666666666", repository, "1.9.11")
+        self.assertEqual(["source", "destination", "connection"], apply(api))
+        self.assertEqual((SOURCE_DEFINITION_ID, DESTINATION_DEFINITION_ID), (api.only("sources")["definitionId"], api.only("destinations")["definitionId"]))
+
+    def test_the_definition_is_found_on_a_later_page_of_the_listing(self) -> None:
+        api = FakeAirbyte(builtin=False)
+        for index in range(230):
+            api.add_definition("source", f"{index:08d}-5555-5555-5555-555555555555", f"other/source-{index}", "1.0.0", f"other {index}")
+            api.add_definition("destination", f"{index:08d}-4444-4444-4444-444444444444", f"other/destination-{index}", "1.0.0", f"other {index}")
+        api.add_definition("source", SOURCE_DEFINITION_ID, "airbyte/source-s3", "4.17.1")
+        api.add_definition("destination", DESTINATION_DEFINITION_ID, "airbyte/destination-s3", "1.9.11")
+        self.assertEqual(["source", "destination", "connection"], apply(api))
+        self.assertEqual(SOURCE_DEFINITION_ID, api.only("sources")["definitionId"])
+
+    def test_no_run_ever_writes_a_definition_whatever_the_state(self) -> None:
+        def drift(api: FakeAirbyte) -> None:
+            api.only("sources")["configuration"]["streams"][0]["globs"].pop()
+            api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
+
+        for name, prepare in {"empty": lambda api: None, "drifted": drift}.items():
+            with self.subTest(name):
+                api = FakeAirbyte()
+                if name == "drifted":
+                    apply(api)
+                prepare(api)
+                api.write_log.clear()
+                apply(api)
+                self.assertEqual([], [kind for _, kind in api.write_log if kind.endswith("_definition")])
+        for method, kind in MODULE_UNDER_TEST.WRITE_CALLS:
+            self.assertFalse(kind.endswith("_definition"), f"{method} {kind}")
+
+    def test_the_role_comment_says_that_definitions_are_found_by_image_and_the_other_objects_by_name(self) -> None:
+        header = "".join((ROLES / "airbyte" / "tasks" / "connection.yml").read_text().partition("\n- name:")[0])
+        self.assertNotIn("finds each object by its name", header)
+        self.assertIn("dockerRepository", header)
+        self.assertIn("by their names", header)
+
+    def test_the_module_holds_no_function_or_verb_that_writes_a_definition(self) -> None:
+        text = MODULE.read_text()
+        self.assertNotIn("plan_definition", text)
+        self.assertNotIn('"PUT"', text, "only a definition was ever updated with PUT")
+
+    def test_an_actor_of_another_definition_than_the_built_in_one_is_refused(self) -> None:
+        api = FakeAirbyte()
+        apply(api)
+        api.only("sources")["definitionId"] = "66666666-6666-6666-6666-666666666666"
+        self.assertIn("another definition", self.refused(api))
 
 
 class DriftTest(unittest.TestCase):
@@ -266,22 +428,6 @@ class DriftTest(unittest.TestCase):
         api.writes.clear()
         self.assertEqual([], apply(api), "the repair must hold")
         return api
-
-    def test_a_changed_source_connector_version_is_repaired_by_updating_the_definition(self) -> None:
-        def damage(api: FakeAirbyte) -> None:
-            api.only("source_definitions")["dockerImageTag"] = "4.17.2"
-
-        api = FakeAirbyte()
-        apply(api)
-        damage(api)
-        api.writes.clear()
-        self.assertEqual(["source definition"], apply(api))
-        self.assertEqual(1, len(api.writes))
-        self.assertTrue(api.writes[0].startswith("PUT /workspaces/"))
-        self.assertEqual("4.17.1", api.only("source_definitions")["dockerImageTag"])
-
-    def test_a_changed_destination_connector_version_is_repaired(self) -> None:
-        self.repaired(lambda api: api.only("destination_definitions").update(dockerImageTag="latest"), ["destination definition"])
 
     def test_a_dropped_selected_file_is_repaired(self) -> None:
         def damage(api: FakeAirbyte) -> None:
@@ -540,6 +686,22 @@ class KeyInjectionTest(unittest.TestCase):
                 wanted[part]["definition"]["dockerRepository"] = image
                 self.refused_before_any_call(wanted)
 
+    def test_a_definition_entry_holds_the_image_and_the_tag_and_nothing_that_could_select_by_name(self) -> None:
+        for part in ("source", "destination"):
+            with self.subTest(part=part, case="a name"):
+                wanted = document()
+                wanted[part]["definition"]["name"] = "s3_custom"
+                self.refused_before_any_call(wanted)
+            for field in ("dockerRepository", "dockerImageTag"):
+                with self.subTest(part=part, case=f"no {field}"):
+                    wanted = document()
+                    del wanted[part]["definition"][field]
+                    self.refused_before_any_call(wanted)
+            with self.subTest(part=part, case="a tag that is not text"):
+                wanted = document()
+                wanted[part]["definition"]["dockerImageTag"] = 4
+                self.refused_before_any_call(wanted)
+
     def test_the_outgoing_configuration_may_differ_from_the_document_at_the_table_paths_only(self) -> None:
         def evil(configuration: dict[str, Any], fields: Any, secrets: Any) -> dict[str, Any]:
             filled = copy.deepcopy(configuration)
@@ -648,7 +810,7 @@ class PlanTest(unittest.TestCase):
         api.only("source_definitions")["dockerImageTag"] = "latest"
         api.only("connections")["sourceId"] = "55555555-5555-5555-5555-555555555555"
         self.refused_without_a_write(api)
-        self.assertEqual("latest", api.only("source_definitions")["dockerImageTag"], "the drifted version is not touched when the run is refused")
+        self.assertEqual("latest", api.only("source_definitions")["dockerImageTag"], "the module never moves a definition to the pin")
 
     def test_a_drifted_source_and_a_destination_of_another_definition_give_no_write_call(self) -> None:
         api = self.build()
@@ -682,17 +844,17 @@ class PlanTest(unittest.TestCase):
 
     def test_planning_reads_everything_and_writes_nothing_and_the_plan_names_each_step_in_order(self) -> None:
         api = self.build()
-        api.only("source_definitions")["dockerImageTag"] = "latest"
+        api.only("sources")["configuration"]["streams"][0]["globs"].pop()
         api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
         steps = MODULE_UNDER_TEST.plan(api, document(), api.keys, api.recorded)
-        self.assertEqual(["source definition", "connection"], [step.label for step in steps])
+        self.assertEqual(["source", "connection"], [step.label for step in steps])
         self.assertEqual([], api.writes)
         self.assertTrue(all(call.startswith("GET ") for call in api.calls))
 
     def test_a_clean_plan_applies_in_order_and_a_second_plan_is_empty(self) -> None:
         api = FakeAirbyte()
         steps = MODULE_UNDER_TEST.plan(api, document(), api.keys, api.recorded)
-        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], [step.label for step in steps])
+        self.assertEqual(["source", "destination", "connection"], [step.label for step in steps])
         self.assertEqual([], api.writes)
 
 
@@ -826,7 +988,6 @@ class AnswerShapeTest(unittest.TestCase):
     def drifted(self) -> FakeAirbyte:
         api = FakeAirbyte()
         apply(api)
-        api.only("source_definitions")["dockerImageTag"] = "latest"
         api.only("sources")["configuration"]["streams"][0]["globs"].pop()
         api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
         api.keys = {"aws_access_key_id": OTHER_KEY_ID, "aws_secret_access_key": OTHER_KEY_VALUE}
@@ -838,8 +999,8 @@ class AnswerShapeTest(unittest.TestCase):
         self.assertEqual(set(self.KINDS), set(shapes))
         for kind, needed in {
             "workspace": {"workspaceId"},
-            "source_definition": {"id", "name", "dockerRepository", "dockerImageTag"},
-            "destination_definition": {"id", "name", "dockerRepository", "dockerImageTag"},
+            "source_definition": {"id", "dockerRepository", "dockerImageTag"},
+            "destination_definition": {"id", "dockerRepository", "dockerImageTag"},
             "source": {"sourceId", "name", "definitionId", "configuration"},
             "destination": {"destinationId", "name", "definitionId", "configuration"},
             "connection": {"connectionId", "name", "sourceId", "destinationId", "status", "schedule", "configurations"},
@@ -929,8 +1090,6 @@ class WriteAnswerTest(unittest.TestCase):
     def updating(self) -> FakeAirbyte:
         api = FakeAirbyte()
         apply(api)
-        api.only("source_definitions")["dockerImageTag"] = "latest"
-        api.only("destination_definitions")["dockerImageTag"] = "latest"
         api.only("sources")["configuration"]["streams"][0]["globs"].pop()
         api.only("destinations")["configuration"]["s3_bucket_path"] = "warehouse"
         api.only("connections")["schedule"] = {"scheduleType": "cron", "cronExpression": "0 0 * * * ?"}
@@ -946,7 +1105,7 @@ class WriteAnswerTest(unittest.TestCase):
     def test_the_list_of_write_calls_is_the_set_the_module_makes_and_each_has_an_id_key(self) -> None:
         made = {call for scenario in (self.creating, self.updating) for call in self.sequence(scenario)}
         self.assertEqual(made, set(MODULE_UNDER_TEST.WRITE_CALLS))
-        self.assertEqual(10, len(MODULE_UNDER_TEST.WRITE_CALLS))
+        self.assertEqual(6, len(MODULE_UNDER_TEST.WRITE_CALLS), "no definition is written, so the calls are the actors' and the connection's")
         for _, kind in MODULE_UNDER_TEST.WRITE_CALLS:
             self.assertIn(MODULE_UNDER_TEST.ID_OF[kind], MODULE_UNDER_TEST.ID_KEYS[kind])
 
@@ -995,8 +1154,8 @@ class WriteAnswerTest(unittest.TestCase):
                         apply(api)
 
     def test_a_clean_run_of_each_scenario_is_unchanged_by_the_check(self) -> None:
-        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], apply(self.creating()))
-        self.assertEqual(["source definition", "destination definition", "source", "destination", "connection"], apply(self.updating()))
+        self.assertEqual(["source", "destination", "connection"], apply(self.creating()))
+        self.assertEqual(["source", "destination", "connection"], apply(self.updating()))
 
 
 class RecordPermissionTest(unittest.TestCase):
@@ -1027,10 +1186,7 @@ class RecordPermissionTest(unittest.TestCase):
 
     def test_a_run_that_writes_the_record_anew_reports_no_extra_change(self) -> None:
         api = FakeAirbyte()
-        self.assertEqual(
-            ["source definition", "destination definition", "source", "destination", "connection"],
-            MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path),
-        )
+        self.assertEqual(["source", "destination", "connection"], MODULE_UNDER_TEST.apply_document(api, document(), KEYS, self.path))
 
 
 class SocketDeadlineTest(unittest.TestCase):

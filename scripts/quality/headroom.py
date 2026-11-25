@@ -85,8 +85,8 @@ def read_jobs(text: str) -> list[dict[str, Any]]:
         position += len(text[position:]) - len(text[position:].lstrip())
         try:
             page, position = decoder.raw_decode(text, position)
-        except json.JSONDecodeError as error:
-            raise SystemExit(f"the jobs API answer is not JSON: {error}") from error
+        except json.JSONDecodeError:
+            raise SystemExit("the jobs API answer is not JSON") from None
         if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
             raise SystemExit("the jobs API answer holds no list of jobs")
         jobs += page["jobs"]
@@ -117,13 +117,13 @@ def main() -> int:
         raise SystemExit(f"the environment lacks {', '.join(missing)}: run this in a hosted job")
     answer = run_command("gh", api_arguments(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]), timeout=API_TIMEOUT_SECONDS, check=True)
     jobs = read_jobs(answer.stdout)
-    limits = expected_limits(yaml.safe_load(WORKFLOW.read_text()))
+    limits = expected_limits(yaml.safe_load(WORKFLOW.read_text(encoding="utf-8")))
     table = summary(limits, jobs)
     sys.stdout.write(table)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
-        with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as handle:
+        with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as handle:
             handle.write(table)
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     own = workflow["jobs"].get(os.environ.get("GITHUB_JOB", ""), {}).get("name")
     found = problems(limits, jobs, own)
     for line in found:

@@ -7,12 +7,21 @@
 ``compare``   compare the observed file and the saved state with the manifest. Exit 0 only when every expected ID is there with its payload.
 ``formats``   register the Avro formats in the registry, which must already hold its global compatibility rule.
 ``serve``     the always-on service: wait for a run record in the inbox, run it as ``run`` does, keep it with its result and return to waiting.
+              A record whose ``state_dir`` is not the ``--state`` folder or a folder directly inside it is refused (exit code 2 in its result), so no
+              queued run writes its saved position elsewhere; ``run`` takes the record's ``state_dir`` as it is. The same refusal covers a folder store
+              read log (when non-empty) that is not directly inside that folder. A read log is always a new file, made once when the run opens its folder store
+              (standalone or queued): a path that exists in any form is refused (exit code 2, ``cannot write an output file``) before any read, and
+              what it names stays as it was.
 ``submit``    read a run record on standard input and put it in the inbox under its run ID, with the manifest reference file that ``--manifest-reference``
               names beside it, both as their exact bytes; the same record and reference again change nothing, other bytes under that run ID are
               refused (exit 2), as is a record or reference that is not valid UTF-8 text.
 ``health``    exit 0 when the service waits or runs and its health file is fresh: the container's health check.
 
-Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them. A run that ``serve``
+Every command but the last three takes the run record (``--run-record``), which holds the settings of the run, the speed among them, and may take
+``--inbox``: the inbox that a record from ``done/`` or ``failed/`` came from, so its relative ``state_dir`` and ``read_log`` are taken from the folder that
+holds the resolved inbox, where the service ran it. A record whose paths the service refuses (a state folder that shares a place with the inbox, a read
+log inside it) is refused with ``--inbox`` too, before the command starts, so no command writes into the inbox. Without ``--inbox`` the record is read
+as it is. A run that ``serve``
 takes reads its manifest reference from beside its record in the inbox, not from the record's ``manifest_reference`` field. Exit codes: 0 done,
 1 the check failed or the service is not healthy, 3 the gate refused an object version, 2 anything else that stopped the command.
 """
@@ -24,6 +33,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -36,19 +46,23 @@ from replay.events.stream import earliest_due_offset_us
 from replay.service.check import observed_document, observed_from, report_document
 from replay.service.inputs import InputError, VerifiedInputs, plan_of, verify_inputs
 from replay.service.kafka_io import DeliveryError, KafkaSink, KafkaStartError, partition_count, read_all
+from replay.service.output_guard import refuse_inside_store
 from replay.service.registry import RegistryClient, RegistryError
-from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.serve import Outcome, healthy, queued_record, serve, submit_command
-from replay.service.state_file import ScheduleFile, StateFile, atomic_write
+from replay.service.run_record import HEALTH_NAME, RunRecord, RunRecordError, is_state_folder_name, parse_run_record
+from replay.service.serve import Outcome, anchor_record, healthy, path_refusal, queued_record, serve, submit_command
+from replay.service.state_file import ScheduleFile, StateFile
 from replay.service.stopping import StopFlag, SystemClock
 from replay.service.wire_codec import FormatMismatch, Reader, Writer
+from scripts.ingestion.closed import ClosedInputError, QuietParser
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestError
+from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, describe_error, render
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.store import StoreError
 
 READ_DEADLINE_SECONDS = 600.0
 INBOX = Path("/opt/replay/state/inbox")
-HEALTH_FILE = Path("/opt/replay/state/health.json")
+STATE_FOLDER = Path("/opt/replay/state")
 POLL_SECONDS = 1.0
 STOPPED_CODE = 2
 HEALTH_MAX_AGE_SECONDS = 600.0
@@ -144,7 +158,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
         return flag.is_set()
 
     settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000))
-    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(record.state_path), SystemClock(flag, poll), stop_requested)
+    replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(Path(record.state_dir)), SystemClock(flag, poll), stop_requested)
     log("replay_start", run_id=record.run_id, speed=record.speed, schedule_sha256=frozen.schedule.sha256)
     result = replayer.run()
     log("replay_end", sent=result.sent, finished=result.finished)
@@ -167,7 +181,7 @@ def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
         raise ScheduleError("the run record's plan differs from the frozen schedule on the volume")
     recordings = {case: inputs.decode(times[case]) for case in sorted({item.occurrence.case_id for item in admitted_occurrences(schedule)})}
     manifest = build_manifest(schedule, recordings)
-    atomic_write(Path(arguments.out), manifest.to_json())
+    write_new_file(Path(arguments.out), manifest.to_json(), mode=0o640)
     sys.stdout.write(json.dumps({"events": len(manifest.events), "occurrences": len(manifest.occurrences), "schedule_sha256": manifest.schedule_sha256}) + "\n")
     return 0
 
@@ -175,14 +189,14 @@ def command_manifest(record: RunRecord, arguments: argparse.Namespace) -> int:
 def command_observe(record: RunRecord, arguments: argparse.Namespace) -> int:
     reader = Reader(RegistryClient(record.registry_url))
     received = read_all(record.kafka_bootstrap, reader, [INPUT_TOPIC], READ_DEADLINE_SECONDS)
-    atomic_write(Path(arguments.out), observed_document(received, record.run_id))
+    write_new_file(Path(arguments.out), observed_document(received, record.run_id), mode=0o640)
     sys.stdout.write(json.dumps({"messages_read": len(received)}) + "\n")
     return 0
 
 
 def command_compare(record: RunRecord, arguments: argparse.Namespace) -> int:
     manifest = Manifest.from_json(Path(arguments.manifest).read_text())
-    state = StateFile(record.state_path).load()
+    state = StateFile(Path(record.state_dir)).load()
     report = compare(manifest, observed_from(Path(arguments.observed).read_text(), state), window_only=arguments.window_only)
     sys.stdout.write(report_document(manifest, report, window_only=arguments.window_only))
     return 0 if report.ok else 1
@@ -203,16 +217,39 @@ def command_formats(record: RunRecord, _: argparse.Namespace) -> int:
     return 0
 
 
-def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome:
-    """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text."""
+def inside_state(record: RunRecord, state: Path) -> RunRecord:
+    """The record with its state folder resolved, which must be ``state`` or a folder directly inside it, and its folder store's read log, when it
+    has a non-empty one, set directly inside that folder. Only the log's folder is resolved, never its last part, so a link in that place is left for the
+    exclusive create to refuse and cannot lead the log to another name. A name that the replay writes in its state folder (``is_state_folder_name``) is
+    refused, so a queued run keeps its saved position, its schedule and the health file. What is checked is what the run is given, so a link or a ``..`` part
+    cannot lead the run out of the folder. Whether the path may be used is decided when the run opens its folder store (``open_store`` checks the name again,
+    for the standalone commands too): the read log is always a new file, so a path that exists in any form is refused there. An empty read log
+    means no log, as in the standalone run."""
+    folder = Path(record.state_dir).resolve()
+    root = state.resolve()
+    if folder != root and folder.parent != root:
+        raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
+    store = record.object_store
+    if not store.read_log:
+        return replace(record, state_dir=str(folder))
+    named = Path(store.read_log)
+    if named.parent.resolve() != folder or is_state_folder_name(named.name):
+        raise ClosedInputError(Notice(Code.RUN_STATE_FOLDER))
+    read_log = folder / named.name
+    return replace(record, state_dir=str(folder), object_store=replace(store, read_log=str(read_log)))
+
+
+def run_request(path: Path, beat: Callable[[], None], flag: StopFlag, state: Path) -> Outcome:
+    """One request of the inbox as an outcome: a stop before the end leaves it to run again, and every error that stops a run fails it with its text. A
+    request whose state folder is not ``state`` or a folder directly inside it fails before anything starts."""
     log("request_start", request=path.stem)
     try:
-        code = replay_record(queued_record(path), flag, beat)
+        code = replay_record(inside_state(queued_record(path), state), flag, beat)
         outcome = Outcome("finished", 0) if code == 0 else Outcome("stopped" if flag.is_set() else "failed", code)
     except GateRefused as refused:
-        outcome = Outcome("failed", 3, str(refused))
+        outcome = Outcome("failed", 3, describe_error(refused))
     except STOPPING_ERRORS as error:
-        outcome = Outcome("failed", 2, f"{type(error).__name__}: {error}")
+        outcome = Outcome("failed", 2, describe_error(error))
     log("request_end", request=path.stem, outcome=outcome.kind, exit_code=outcome.exit_code, error=outcome.error)
     return outcome
 
@@ -220,7 +257,16 @@ def run_request(path: Path, beat: Callable[[], None], flag: StopFlag) -> Outcome
 def command_serve(arguments: argparse.Namespace) -> int:
     flag = StopFlag()
     log("serve_start", inbox=str(arguments.inbox))
-    return serve(arguments.inbox, arguments.health, lambda path, beat: run_request(path, beat, flag), flag.is_set, time.time, flag.wait, POLL_SECONDS, log)
+    return serve(
+        arguments.inbox,
+        arguments.state,
+        lambda path, beat: run_request(path, beat, flag, arguments.state),
+        flag.is_set,
+        time.time,
+        flag.wait,
+        POLL_SECONDS,
+        log,
+    )
 
 
 def command_submit(arguments: argparse.Namespace) -> int:
@@ -228,7 +274,7 @@ def command_submit(arguments: argparse.Namespace) -> int:
 
 
 def command_health(arguments: argparse.Namespace) -> int:
-    return 0 if healthy(arguments.health, time.time(), arguments.max_age) else 1
+    return 0 if healthy(arguments.state / HEALTH_NAME, time.time(), arguments.max_age) else 1
 
 
 COMMANDS = {
@@ -257,22 +303,33 @@ STOPPING_ERRORS = (
 )
 
 
+def read_run_record(path: Path) -> str:
+    """The text of the run record file. A file that cannot be read is named by its role and never by its path."""
+    try:
+        return path.read_text()
+    except OSError, UnicodeDecodeError:
+        raise ClosedInputError(Notice(Code.CANNOT_READ, subject=Subject.RUN_RECORD)) from None
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("serve", "submit"):
         command = commands.add_parser(name)
         command.add_argument("--inbox", type=Path, default=INBOX)
         if name == "serve":
-            command.add_argument("--health", type=Path, default=HEALTH_FILE)
+            command.add_argument("--state", type=Path, default=STATE_FOLDER, help="the state folder: the health file is health.json inside it")
         else:
             command.add_argument("--manifest-reference", type=Path, required=True, help="the file that holds the manifest reference of the run")
     health = commands.add_parser("health")
-    health.add_argument("--health", type=Path, default=HEALTH_FILE)
+    health.add_argument("--state", type=Path, default=STATE_FOLDER, help="the state folder: the health file is health.json inside it")
     health.add_argument("--max-age", type=float, default=HEALTH_MAX_AGE_SECONDS, help="the age in seconds above which the health file is stale")
     for name in COMMANDS:
         command = commands.add_parser(name)
         command.add_argument("--run-record", type=Path, required=True)
+        command.add_argument(
+            "--inbox", type=Path, help="the inbox the record came from: its relative paths are taken from the folder that holds the resolved inbox"
+        )
         if name == "manifest":
             command.add_argument("--out", type=Path, required=True)
         if name == "observe":
@@ -283,17 +340,29 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--window-only", action="store_true")
     arguments = parser.parse_args(argv)
     service_commands = {"serve": command_serve, "submit": command_submit, "health": command_health}
-    if arguments.command in service_commands:
-        return service_commands[arguments.command](arguments)
     try:
-        record = parse_run_record(arguments.run_record.read_text())
+        if arguments.command in service_commands:
+            return service_commands[arguments.command](arguments)
+        if getattr(arguments, "out", None) is not None:
+            check_new_output(arguments.out)
+        record = parse_run_record(read_run_record(arguments.run_record))
+        if arguments.inbox is not None:
+            if (refusal := path_refusal(record, arguments.inbox)) is not None:
+                log("refused", reason=refusal)
+                return STOPPED_CODE
+            record = anchor_record(record, arguments.inbox)
+        if getattr(arguments, "out", None) is not None and record.object_store.kind == "folder" and record.object_store.root is not None:
+            refuse_inside_store(Path(record.object_store.root), arguments.out)
         return COMMANDS[arguments.command](record, arguments)
+    except ClosedError as error:
+        sys.stderr.write("".join(f"{render(notice)}\n" for notice in error.notices))
+        return 2
     except GateRefused as refused:
         problems = [{"position": problem.position, "requested": problem.requested, "cause": problem.cause} for problem in refused.problems]
-        log("gate_refused", reason=str(refused), problems=problems)
+        log("gate_refused", reason=describe_error(refused), problems=problems)
         return 3
     except STOPPING_ERRORS as error:
-        log("stopped", error=type(error).__name__, message=str(error))
+        log("stopped", error=type(error).__name__, message=describe_error(error))
         return 2
 
 

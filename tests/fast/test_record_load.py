@@ -10,7 +10,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import tempfile
 import unittest
 from collections.abc import Callable, Iterator
@@ -20,6 +19,7 @@ from unittest import mock
 
 from orchestration.surgical_risk.run_folder import SECRET_KEY
 from scripts.ingestion.airbyte_api import AirbyteError
+from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef
 from scripts.ingestion.record_copy import CopyChanged, CopyError
@@ -31,15 +31,19 @@ from scripts.ingestion.record_load import (
     LoadError,
     LoadResult,
     SyncDeadline,
+    current_load_record_text,
     earlier_record,
     load_records,
     manifest_line,
+    read_record,
     recorded_manifest,
     result_tags,
     write_record,
 )
 from scripts.ingestion.record_state import RunState, StateError
+from scripts.ingestion.table_checks import TableChecksError, parse_load_record
 from tests.fast.ingestion_support import list_text_for, pin_the_synthetic_list
+from tests.fast.locale_support import non_utf_8_locale
 from tests.fast.record_support import BASE_HASH, RELEASE_FILES, RUN, FakeAirbyte, FakeCatalog, FakeClock, Stopped, landed_records
 
 ENVIRONMENT = Environment("example-bucket", "us-west-2", "warehouse", "http://nessie.example:19120/api/v2")
@@ -132,6 +136,27 @@ class OrderTest(unittest.TestCase):
 
 
 class FaultBeforeTheCopyTest(unittest.TestCase):
+    def test_the_three_definitions_are_checked_before_the_first_copy_and_before_any_other_airbyte_call(self) -> None:
+        setup = Setup(self)
+        seen: list[int] = []
+        setup.airbyte.on_check_definitions = lambda: seen.append(len(setup.store.copies))
+        setup.load()
+        self.assertEqual([0], seen, "no copy had been made when the definitions were checked")
+        self.assertEqual("check_definitions", setup.airbyte.calls[0])
+        self.assertEqual(1, setup.airbyte.calls.count("check_definitions"))
+
+    def test_a_connector_definition_that_does_not_match_its_pin_leaves_the_copies_airbyte_and_the_catalog_untouched(self) -> None:
+        setup = Setup(self)
+        setup.airbyte.refuse_definitions = True
+        written = list(setup.store.writes)
+        with self.assertRaises(AirbyteError):
+            setup.load()
+        self.assertEqual([], setup.store.copies, "no input was copied")
+        self.assertEqual(written, setup.store.writes, "the store was not written")
+        self.assertEqual(["check_definitions"], setup.airbyte.calls, "Airbyte was asked nothing else: no actor was created or patched")
+        self.assertEqual(["has_recorded_manifest", f"reference {BRANCH}"], setup.catalog.calls, "the catalog made no branch")
+        self.assertEqual([], setup.records())
+
     def test_a_manifest_that_does_not_exist_leaves_everything_untouched(self) -> None:
         setup = Setup(self)
         absent = ManifestRef(setup.reference.bucket, f"manifests/probe_set/{'0' * 64}.json", "version9999", "0" * 64)
@@ -158,7 +183,9 @@ class FaultBeforeTheCopyTest(unittest.TestCase):
         setup.store.corrupt.add(setup.landed.keys["clinical_data.csv"])
         with self.assertRaises(CopyError):
             setup.load()
-        self.assertEqual(["find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked which connections exist")
+        self.assertEqual(
+            ["check_definitions", "find_connection_ids"], setup.airbyte.calls, "Airbyte was only asked about its definitions and which connections exist"
+        )
         self.assertEqual(["has_recorded_manifest", f"reference {BRANCH}"], setup.catalog.calls, "the catalog was asked two questions and made no branch")
         self.assertEqual([], setup.records())
 
@@ -269,6 +296,177 @@ class FaultInTheLoadTest(unittest.TestCase):
         self.assertEqual([], setup.records())
 
 
+def folder_state(folder: Path) -> dict[str, tuple[bytes, int, int]]:
+    """Each file of the folder as its bytes, its change time and its inode, so a write, a replacement or a touch shows."""
+    return {path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in sorted(folder.iterdir())}
+
+
+def make_legacy(setup: Setup) -> LoadResult:
+    """Rewrite the two files of a finished load as version 1 left them: the full record and the five-field file, both in the format ``load_record_1``."""
+    result = setup.load()
+    full = json.loads((setup.folder / f"{RUN}.json").read_text())
+    full["format"] = "load_record_1"
+    (setup.folder / f"{RUN}.json").write_text(json.dumps(full))
+    five = {name: full[name] for name in ("format", "branch", "branch_hash", "manifest", "tables")}
+    (setup.folder / f"{RUN}.load_record.json").write_text(json.dumps(five))
+    return result
+
+
+class LegacyRecordTest(unittest.TestCase):
+    """A record that version 1 wrote is read as it is, and the file for the table checks is made again from its saved base head."""
+
+    def test_the_full_record_of_version_1_is_read(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        self.assertEqual(result, LoadResult.from_json((setup.folder / f"{RUN}.json").read_text()))
+
+    def test_a_second_call_of_a_run_that_version_1_finished_loads_nothing_and_leaves_both_files_as_they_were(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        airbyte_calls = list(setup.airbyte.calls)
+        before = folder_state(setup.folder)
+        self.assertEqual(result, setup.load())
+        self.assertEqual(airbyte_calls, setup.airbyte.calls)
+        self.assertEqual(before, folder_state(setup.folder), "no file was written, replaced or touched")
+        text = current_load_record_text(setup.folder / f"{RUN}.load_record.json")
+        self.assertEqual(LOAD_RECORD_FIELDS, set(json.loads(text)))
+        self.assertEqual(BASE_HASH, parse_load_record(text).base_hash)
+
+    def test_the_manifest_lookup_finds_a_record_that_version_1_wrote(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256))
+
+    def test_the_table_checks_file_of_version_1_is_converted_in_memory_and_nothing_is_written(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        other = setup.folder / "run_other.load_record.json"
+        other.write_text("another run's file\n")
+        path = setup.folder / f"{RUN}.load_record.json"
+        before = folder_state(setup.folder)
+        text = current_load_record_text(path)
+        self.assertEqual(result.load_record_json(), text)
+        self.assertEqual(BASE_HASH, parse_load_record(text).base_hash)
+        self.assertEqual(before, folder_state(setup.folder), "no file of the folder was written, replaced, touched or added")
+        self.assertEqual(text, current_load_record_text(path))
+
+    def test_the_table_checks_file_of_version_1_is_read_from_a_folder_that_cannot_be_written(self) -> None:
+        setup = Setup(self)
+        result = make_legacy(setup)
+        setup.folder.chmod(0o500)
+        self.addCleanup(setup.folder.chmod, 0o700)
+        if os.access(setup.folder, os.W_OK):
+            self.skipTest("this process can write to a folder without write permission")
+        self.assertEqual(result.load_record_json(), current_load_record_text(setup.folder / f"{RUN}.load_record.json"))
+
+    def test_a_file_of_version_1_that_disagrees_with_the_full_record_in_any_of_its_five_fields_is_refused(self) -> None:
+        changes: dict[str, Any] = {
+            "branch": "load_other",
+            "branch_hash": "f" * 64,
+            "manifest": {"bucket": "other", "key": "k", "version_id": "v", "sha256": "0" * 64},
+            "tables": {"clinical_data": 99, "lab_data": 2, "track_list": 3},
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                setup = Setup(self)
+                make_legacy(setup)
+                path = setup.folder / f"{RUN}.load_record.json"
+                document = json.loads(path.read_text())
+                document[field] = value
+                path.write_text(json.dumps(document))
+                before = folder_state(setup.folder)
+                with self.assertRaises(LoadError):
+                    current_load_record_text(path)
+                self.assertEqual(before, folder_state(setup.folder))
+
+    def test_a_file_of_version_1_with_a_missing_or_extra_field_is_refused(self) -> None:
+        edits: list[Callable[[dict[str, Any]], object]] = [lambda document: document.pop("tables"), lambda document: document.update(extra=1)]
+        for edit in edits:
+            setup = Setup(self)
+            make_legacy(setup)
+            path = setup.folder / f"{RUN}.load_record.json"
+            document = json.loads(path.read_text())
+            edit(document)
+            path.write_text(json.dumps(document))
+            with self.assertRaises(LoadError):
+                current_load_record_text(path)
+
+    def test_the_file_of_the_current_format_is_returned_as_it_is_and_judged_by_the_table_checks_parser(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        path = setup.folder / f"{RUN}.load_record.json"
+        self.assertEqual(result.load_record_json(), current_load_record_text(path))
+        path.write_text("not json")
+        self.assertEqual("not json", current_load_record_text(path))
+
+    def test_a_file_of_version_1_with_no_full_record_beside_it_is_refused(self) -> None:
+        setup = Setup(self)
+        make_legacy(setup)
+        (setup.folder / f"{RUN}.json").unlink()
+        with self.assertRaises(LoadError):
+            current_load_record_text(setup.folder / f"{RUN}.load_record.json")
+
+
+class SidecarWriteTest(unittest.TestCase):
+    """The file for the table checks belongs to its run: a try that stopped before the run record leaves one that the retry replaces whole, a link or a
+    folder in its place is refused, and the run record is created and never replaced."""
+
+    def test_a_file_that_a_stopped_try_left_is_replaced_whole_by_the_retry(self) -> None:
+        setup = Setup(self)
+        setup.load()
+        (setup.folder / f"{RUN}.json").unlink()
+        (setup.folder / f"{RUN}.load_record.json").write_text("left by a stopped try\n")
+        again = setup.load()
+        self.assertEqual(again.load_record_json(), (setup.folder / f"{RUN}.load_record.json").read_text())
+        self.assertEqual(sorted(RECORD_FILES), sorted(path.name for path in setup.folder.iterdir()))
+
+    def test_a_link_or_a_folder_in_place_of_the_file_is_refused_and_not_followed(self) -> None:
+        for label in ("a link", "a dangling link", "a folder"):
+            with self.subTest(case=label):
+                setup = Setup(self)
+                setup.load()
+                (setup.folder / f"{RUN}.json").unlink()
+                sidecar = setup.folder / f"{RUN}.load_record.json"
+                sidecar.unlink()
+                elsewhere = setup.folder.parent / f"elsewhere_{label.replace(' ', '_')}"
+                if label == "a link":
+                    elsewhere.write_text("kept\n")
+                    sidecar.symlink_to(elsewhere)
+                elif label == "a dangling link":
+                    sidecar.symlink_to(elsewhere)
+                else:
+                    sidecar.mkdir()
+                with self.assertRaises(LoadError):
+                    setup.load()
+                self.assertEqual("kept\n" if label == "a link" else None, elsewhere.read_text() if elsewhere.exists() else None)
+                self.addCleanup(elsewhere.unlink, missing_ok=True)
+
+    def test_the_second_call_of_a_finished_run_makes_a_missing_file_and_refuses_one_that_disagrees(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        sidecar = setup.folder / f"{RUN}.load_record.json"
+        sidecar.unlink()
+        self.assertEqual(result, setup.load())
+        self.assertEqual(result.load_record_json(), sidecar.read_text())
+        before = folder_state(setup.folder)
+        self.assertEqual(result, setup.load())
+        self.assertEqual(before, folder_state(setup.folder), "a file that agrees is left alone")
+        sidecar.write_text("other\n")
+        with self.assertRaises(LoadError):
+            setup.load()
+        self.assertEqual("other\n", sidecar.read_text())
+
+    def test_the_run_record_is_created_through_the_helper_and_a_held_one_is_never_replaced(self) -> None:
+        setup = Setup(self)
+        result = setup.load()
+        (setup.folder / f"{RUN}.load_record.json").unlink()
+        run_record = setup.folder / f"{RUN}.json"
+        before = run_record.read_bytes(), run_record.stat().st_ino
+        with self.assertRaises(LoadError):
+            write_record(setup.folder, result)
+        self.assertEqual(before, (run_record.read_bytes(), run_record.stat().st_ino))
+
+
 class SecondCallTest(unittest.TestCase):
     def test_a_second_call_of_a_finished_run_copies_syncs_and_branches_nothing(self) -> None:
         setup = Setup(self)
@@ -339,7 +537,7 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(TABLES, sorted(document["snapshots"]))
         self.assertTrue(all(isinstance(snapshot, int) for snapshot in document["snapshots"].values()))
         self.assertEqual(["clinical_data", "lab_data"], [copy["table"] for copy in document["copies"]])
-        self.assertEqual({"airbyte/destination-s3-data-lake:0.4.2", "airbyte/source-s3:4.17.1", "airbyte/source-file:0.6.2"}, set(document["connectors"]))
+        self.assertEqual({"airbyte/destination-s3-data-lake:0.4.2", "airbyte/source-s3:4.17.1", "airbyte/source-file:0.6.1"}, set(document["connectors"]))
 
     def test_the_record_holds_no_secret_and_no_object_key_outside_the_read_prefix(self) -> None:
         setup = Setup(self)
@@ -354,36 +552,20 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(RECORD_FILES, sorted(path.name for path in setup.folder.iterdir()))
 
 
-LOAD_RECORD_FIELDS = {"format", "branch", "branch_hash", "manifest", "tables"}
-HASH = re.compile(r"[0-9a-f]{64}")
+LOAD_RECORD_FIELDS = {"format", "branch", "branch_hash", "base_hash", "manifest", "tables"}
 
 
 def table_checks_accept(text: str) -> bool:
-    """The rules of the table checks' parser for a load record, as read in ``parse_load_record`` of ``scripts/ingestion/table_checks.py`` on
-    ``feat/p4-table-checks``: exactly the five fields, each of its type, the format ``load_record_1``, a branch that is not main, 64 lower case hex digits for
-    the hashes and an integer for each of the three tables."""
-    document = json.loads(text)
-    manifest = document.get("manifest")
-    tables = document.get("tables")
-    return (
-        type(document) is dict
-        and set(document) == LOAD_RECORD_FIELDS
-        and document["format"] == "load_record_1"
-        and type(document["branch"]) is str
-        and document["branch"] not in ("", "main")
-        and HASH.fullmatch(str(document["branch_hash"])) is not None
-        and type(manifest) is dict
-        and set(manifest) == {"bucket", "key", "version_id", "sha256"}
-        and all(type(value) is str for value in manifest.values())
-        and HASH.fullmatch(manifest["sha256"]) is not None
-        and type(tables) is dict
-        and sorted(tables) == sorted(TABLES)
-        and all(type(snapshot) is int for snapshot in tables.values())
-    )
+    """Whether the table checks' own parser (``parse_load_record``) accepts the text as a load record."""
+    try:
+        parse_load_record(text)
+    except TableChecksError:
+        return False
+    return True
 
 
 class LoadRecordShapeTest(unittest.TestCase):
-    """The shape that the table checks read: ``load_record_1``."""
+    """The shape that the table checks read: ``load_record_2``."""
 
     EXTRA = {"format", "branch_hash", "manifest", "tables"}
 
@@ -394,7 +576,7 @@ class LoadRecordShapeTest(unittest.TestCase):
         self.assertEqual(
             {"run_id", "manifest_sha256", "branch", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors"} | self.EXTRA, set(document)
         )
-        self.assertEqual("load_record_1", document["format"])
+        self.assertEqual("load_record_2", document["format"])
         self.assertEqual((BRANCH, result.head_hash), (document["branch"], document["branch_hash"]))
         self.assertEqual(
             {"bucket": setup.reference.bucket, "key": setup.reference.key, "version_id": setup.reference.version_id, "sha256": setup.reference.sha256},
@@ -404,14 +586,16 @@ class LoadRecordShapeTest(unittest.TestCase):
         self.assertEqual(TABLES, sorted(document["tables"]))
         self.assertTrue(all(type(snapshot) is int for snapshot in document["tables"].values()))
 
-    def test_a_second_file_holds_exactly_the_five_fields_that_the_table_checks_accept_and_no_others(self) -> None:
+    def test_a_second_file_holds_exactly_the_six_fields_that_the_table_checks_accept_and_no_others(self) -> None:
         setup = Setup(self)
         result = setup.load()
         text = (setup.folder / f"{RUN}.load_record.json").read_text()
         document = json.loads(text)
         self.assertEqual(LOAD_RECORD_FIELDS, set(document))
         self.assertTrue(table_checks_accept(text))
-        self.assertEqual((BRANCH, result.head_hash, result.snapshots), (document["branch"], document["branch_hash"], document["tables"]))
+        self.assertEqual(
+            (BRANCH, result.head_hash, BASE_HASH, result.snapshots), (document["branch"], document["branch_hash"], document["base_hash"], document["tables"])
+        )
         self.assertEqual(setup.reference.sha256, document["manifest"]["sha256"])
 
     def test_the_run_record_alone_is_refused_by_the_table_checks_rules_because_of_its_other_fields_which_is_why_the_second_file_exists(self) -> None:
@@ -427,9 +611,47 @@ class LoadRecordShapeTest(unittest.TestCase):
         self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256))
         self.assertEqual("0" * 64, other.sha256)
 
+    def test_a_record_file_of_invalid_utf_8_is_refused_by_name_when_read_and_is_not_a_record_when_searched(self) -> None:
+        """Join round 2, class of finding 2: ``UnicodeDecodeError`` is not an ``OSError`` or a ``LoadError``, so such a file ended in a traceback."""
+        setup = Setup(self)
+        result = setup.load()
+        (setup.folder / "zzz_not_text.json").write_bytes(b"\xff\xfe")
+        self.assertEqual(result, earlier_record(setup.folder, setup.reference.sha256), "a file that is not text is not a record")
+        unreadable = setup.folder / "zzz_unreadable.json"
+        unreadable.write_text("{}")
+        unreadable.chmod(0)
+        try:
+            with self.assertRaises(PermissionError, msg="a file that cannot be opened is an error and is not skipped as not a record"):
+                earlier_record(setup.folder, setup.reference.sha256)
+        finally:
+            unreadable.chmod(0o644)
+        unreadable.unlink()
+        (setup.folder / f"{RUN}.json").write_bytes(b"\xff\xfe")
+        with self.assertRaises(LoadError) as raised:
+            read_record(setup.folder, RUN)
+        self.assertEqual("the record of this run cannot be read", str(raised.exception))
+
+    def test_a_record_with_a_byte_that_is_not_utf_8_is_refused_and_skipped_under_a_locale_that_would_decode_it(self) -> None:
+        """Join round 3, finding 2: ``read_text()`` used the locale's encoding, so under ``ISO8859-1`` a record with a ``0xff`` byte was accepted."""
+        setup = Setup(self)
+        result = setup.load()
+        record = setup.folder / f"{RUN}.json"
+        document = json.loads(record.read_text(encoding="utf-8"))
+        document["branch"] += "MARK"
+        broken = json.dumps(document).encode().replace(b"MARK", b"\xff")
+        record.write_bytes(broken)
+        (setup.folder / "zzz_other.json").write_bytes(broken)
+        with non_utf_8_locale():
+            self.assertEqual(document["branch"].replace("MARK", "\xff"), LoadResult.from_json(record.read_text()).branch, "the simulation reads the byte")
+            with self.assertRaises(LoadError) as raised:
+                read_record(setup.folder, RUN)
+            self.assertEqual("the record of this run cannot be read", str(raised.exception))
+            self.assertIsNone(earlier_record(setup.folder, setup.reference.sha256), "files that are not UTF-8 text are not records")
+        self.assertIsNotNone(result)
+
     def test_the_run_record_is_written_last_so_a_stop_between_the_two_files_is_an_unfinished_load_that_a_retry_completes(self) -> None:
         setup = Setup(self)
-        with mock.patch("scripts.ingestion.record_load.os.link", side_effect=OSError("stopped")), self.assertRaises(OSError):
+        with mock.patch("scripts.ingestion.output_file.os.link", side_effect=OSError("stopped")), self.assertRaises(ClosedInputError):
             setup.load()
         self.assertEqual([f"{RUN}.load_record.json"], setup.records())
         result = setup.load()

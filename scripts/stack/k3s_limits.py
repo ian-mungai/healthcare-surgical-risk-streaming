@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from scripts.ingestion.notice import describe_error
 from scripts.project_config import ROOT
 from scripts.stack.limits import Limits, LimitsError, load_limits
 from scripts.stack.yaml_text import YamlError, load_yaml
@@ -256,8 +257,11 @@ def main() -> int:
         else:
             sys.stderr.write("usage: python -m scripts.stack.k3s_limits values | limit-range <namespace> | check-chart\n")
             return 2
-    except (LimitsError, YamlError, OSError) as error:
-        sys.stderr.write(f"k3s limits: {error}\n")
+    except (LimitsError, YamlError) as error:
+        sys.stderr.write(f"k3s limits: {describe_error(error)}\n")
+        return 1
+    except OSError:
+        sys.stderr.write("k3s limits: a file cannot be read\n")
         return 1
     return 0
 

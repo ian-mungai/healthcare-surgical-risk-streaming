@@ -14,7 +14,13 @@ Every command reads the manifest and the list of object versions. None reads a p
 
 ``.venv/bin/python -m scripts.ingestion.copy_probe job --job job.json --log job.log``
 
-``.venv/bin/python -m scripts.ingestion.copy_probe sample --reference reference.json --output tests/fixtures/vitaldb/platform_sample.json``
+``mkdir -p runs/sample``, then:
+
+``.venv/bin/python -m scripts.ingestion.copy_probe sample --reference reference.json --output runs/sample/platform_sample_new.json``
+
+``sample`` never replaces a path, so it writes to a fresh path. A change of the tracked pin ``tests/fixtures/vitaldb/platform_sample.json`` is made by hand:
+review ``diff tests/fixtures/vitaldb/platform_sample.json runs/sample/platform_sample_new.json``, copy the new file over the tracked one yourself and commit
+it.
 
 ``selection`` prints the selection file for ``connection render --selection`` and for ``cli check`` and ``cli publish``. ``job`` reads the job's record as
 Airbyte's public API gives it for ``GET /jobs/{jobId}`` and the job's log as text. ``--bucket`` is the one of ``cli``. Every line a command writes is a
@@ -41,6 +47,7 @@ from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.landing import LANDING_PREFIX, METADATA_SUFFIX
 from scripts.ingestion.manifest import ManifestRef, read_manifest
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.ingestion.selection import FULL_RELEASE_TABLES, Selection, SelectionError, pinned_release
 from scripts.ingestion.store import NULL_VERSION_IDS, ObjectStore, ObjectVersion, S3Store
 from scripts.project_config import ConfigurationError, load_configuration
@@ -86,7 +93,7 @@ class Pins:
 def tracked_pins() -> Pins:
     """The pins of the tracked files: the candidate file and the release pin's two tables. Raise ``ProbeRefused`` when the release pin is not valid."""
     try:
-        release = parse_json(RELEASE_FILE.read_text(), Subject.TRACKED_PIN)
+        release = parse_json(RELEASE_FILE.read_text(encoding="utf-8"), Subject.TRACKED_PIN)
     except ClosedInputError, OSError, UnicodeDecodeError:
         raise ProbeRefused(Notice(Code.PIN_UNREADABLE)) from None
     problems = release_problems(release)
@@ -317,7 +324,7 @@ def command_sample(arguments: argparse.Namespace) -> int:
         return refuse(*problems)
     items = sample_cases(entries, pins)
     try:
-        arguments.output.write_text(format_sample(items))
+        write_new_file(arguments.output, format_sample(items))
     except OSError:
         return refuse(Notice(Code.CANNOT_WRITE, subject=Subject.SAMPLE_PIN))
     say(Notice(Code.SAMPLE_WROTE, count=len(items)))
@@ -340,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     sample.add_argument("--output", type=Path, default=SAMPLE_FILE, help="where to write the Platform sample pin")
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "sample":
+            check_new_output(arguments.output)
         return {"selection": command_selection, "landed": command_landed, "job": command_job, "sample": command_sample}[arguments.command](arguments)
     except ClosedError as error:
         return refuse(*error.notices)

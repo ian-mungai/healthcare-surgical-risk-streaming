@@ -12,6 +12,8 @@ import shutil
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from tests.e2e.run_record import proven_absent
+
 
 def run_cleanup(steps: Sequence[Callable[[], object]], scrub: Callable[[], object]) -> None:
     """Run every step, then ``scrub``, whatever a step raises. The first error is raised after the scrub."""
@@ -29,7 +31,7 @@ def run_cleanup(steps: Sequence[Callable[[], object]], scrub: Callable[[], objec
 
 
 def scrub_tree(path: Path) -> bool:
-    """Remove ``path`` and everything under it, also a read-only part, and return whether it is gone."""
+    """Remove ``path`` and everything under it, also a read-only part, and return whether it is proven gone (a look-up that fails is not gone)."""
 
     def retry(function: Callable[[str], object], target: str, _error: BaseException) -> None:
         for item in (os.path.dirname(target), target):
@@ -39,4 +41,4 @@ def scrub_tree(path: Path) -> bool:
             function(target)
 
     shutil.rmtree(path, onexc=retry)
-    return not path.exists()
+    return proven_absent(path)

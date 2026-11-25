@@ -7,14 +7,14 @@ the root owner (``root_owner``) with mode 0400, as every secret file is: an exis
 is applied only when a key it holds differs, and keys that Airbyte added to ``airbyte-auth-secrets`` itself are left alone.
 
 A value goes to the cluster on the standard input of ``kubectl apply --server-side``, so no value is in a command line, a rendered file or a last-applied
-annotation. No result or message holds a value. The module uses only the standard library and runs on the host's Python.
+annotation. No result or message holds a value or any text of kubectl: a failed call shows one fixed word (refused, not found,
+unreachable or failed). The module uses only the standard library and runs on the host's Python.
 """
 
 from __future__ import annotations
 
 import base64
 import json
-import re
 import secrets
 from collections.abc import Callable
 from pathlib import Path
@@ -27,7 +27,6 @@ DATABASE_FILE = "postgres/airbyte.password"
 PASSWORD_BYTES = 32
 KEY_ID_BYTES = 10
 FIELD_MANAGER = "platform_airbyte"
-ERROR_CHARACTERS = 400
 GENERATED: dict[str, Callable[[], str]] = {
     "admin.password": lambda: secrets.token_urlsafe(PASSWORD_BYTES),
     "storage_access_key_id": lambda: secrets.token_hex(KEY_ID_BYTES),
@@ -101,12 +100,17 @@ def wanted_secrets(files: SecretFiles, database_user: str) -> dict[str, dict[str
     }
 
 
-def hide(text: str, values: list[str]) -> str:
-    """The text with every secret value, plain or base64, replaced, and cut to a short length."""
-    for value in values:
-        for form in (value, base64.b64encode(value.encode()).decode()):
-            text = text.replace(form, "<value>")
-    return re.sub(r"\s+", " ", text).strip()[:ERROR_CHARACTERS]
+def reason(error: str) -> str:
+    """One fixed word for kubectl's standard error. Its text can hold a kubeconfig's path and token, which no list of known values covers, so none is shown."""
+    if "orbidden" in error or "nauthorized" in error:
+        return "refused"
+    if "(NotFound)" in error:
+        return "not found"
+    if any(
+        text in error for text in ("connection refused", "was refused", "no such host", "i/o timeout", "Unable to connect", "couldn't get current server API")
+    ):
+        return "unreachable"
+    return "failed"
 
 
 def stored_data(output: str) -> dict[str, str]:
@@ -130,12 +134,11 @@ def manifest(name: str, namespace: str, wanted: dict[str, str]) -> str:
 def apply_secrets(run: Runner, kubectl: list[str], namespace: str, files: SecretFiles, database_user: str, *, check_only: bool = False) -> list[str]:
     """Make each secret match its files and return the names of those that changed."""
     wanted = wanted_secrets(files, database_user)
-    values = [value for keys in wanted.values() for key, value in keys.items() if key != "database-user"]
     changed: list[str] = []
     for name in sorted(wanted):
         code, output, error = run([*kubectl, "get", "secret", name, "--namespace", namespace, "--output", "json"], None)
         if code != 0 and "NotFound" not in error:
-            raise SecretError(f"cannot read the secret {name}: {hide(error, values)}")
+            raise SecretError(f"cannot read the secret {name} (reason: {reason(error)})")
         if not differs(stored_data(output) if code == 0 else None, wanted[name]):
             continue
         changed.append(name)
@@ -144,7 +147,7 @@ def apply_secrets(run: Runner, kubectl: list[str], namespace: str, files: Secret
         arguments = [*kubectl, "apply", "--server-side", "--force-conflicts", "--field-manager", FIELD_MANAGER, "--namespace", namespace, "--filename", "-"]
         code, _, error = run(arguments, manifest(name, namespace, wanted[name]))
         if code != 0:
-            raise SecretError(f"cannot apply the secret {name}: {hide(error, values)}")
+            raise SecretError(f"cannot apply the secret {name} (reason: {reason(error)})")
     return changed
 
 

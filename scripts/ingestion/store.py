@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject
+from scripts.ingestion.output_file import write_new_file
 
 RANGE_BYTES = 64 * 1024 * 1024
 BLOCK_BYTES = 1024 * 1024
@@ -158,7 +159,7 @@ class S3Store:
             raise StoreError(Notice(Code.VERSIONING_OFF))
         with tempfile.TemporaryDirectory(prefix="ingestion_put_") as scratch:
             source = Path(scratch) / "object"
-            source.write_bytes(data)
+            write_new_file(source, data)
             reply = self.aws.call(
                 "s3api",
                 "put-object",

@@ -8,17 +8,21 @@ user cannot give a file to another user, so the owners here are the test user's 
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import stat
 import sys
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest import mock
 
 from tests.fast.ansible_paths import shared_module
+from tests.fast.header_secret_support import raised_text, unsafe_values
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "ansible" / "roles" / "openbao" / "library" / "openbao_bootstrap.py"
@@ -254,6 +258,77 @@ class PrepareTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch, self.assertRaisesRegex(bootstrap.BootstrapError, "unlock key file is missing"):
             bootstrap.prepare(Path(scratch) / "secrets", Path(scratch) / "none.env", MY_OWNER, check_only=False)
         self.assertFalse((Path(scratch) / "secrets").exists())
+
+
+PLANTED_MARKER = "planted-vault-token"
+REFUSAL = "the token that OpenBao gave is not a valid token"
+
+
+class FakeConnection:
+    """An HTTP connection that sends nothing: it keeps each request and answers every one with the same status and body."""
+
+    requests: list[tuple[str, str, dict[str, str]]] = []
+    answer: tuple[int, bytes] = (200, b"{}")
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        pass
+
+    def request(self, method: str, path: str, body: str | None, headers: dict[str, str]) -> None:
+        self.requests.append((method, path, headers))
+
+    def getresponse(self) -> Any:
+        status, body = self.answer
+        return mock.Mock(status=status, read=lambda: body)
+
+    def close(self) -> None:
+        pass
+
+
+class TokenHeaderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        FakeConnection.requests = []
+        FakeConnection.answer = (200, b"{}")
+        patcher = mock.patch.object(bootstrap.http.client, "HTTPConnection", FakeConnection)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.api = bootstrap.Api("http://127.0.0.1:8200")
+
+    def test_a_token_of_the_header_safe_form_goes_into_the_header_as_it_is(self) -> None:
+        for token in ("hvs.CAESIJ-_x~y+z/w==", "s.abc", "a"):
+            with self.subTest(token=token):
+                self.api.call("GET", "sys/health", token)
+                self.assertEqual({"X-Vault-Token": token}, FakeConnection.requests[-1][2])
+        self.api.call("GET", "sys/seal-status")
+        self.assertEqual({}, FakeConnection.requests[-1][2])
+
+    def test_a_token_a_header_cannot_hold_is_refused_before_any_request_with_the_fixed_message_and_no_error_holds_it(self) -> None:
+        for name, token in unsafe_values(PLANTED_MARKER).items():
+            with self.subTest(character=name):
+                error, text = raised_text(partial(self.api.call, "GET", "sys/health", token), bootstrap.BootstrapError, "call")
+                self.assertEqual(REFUSAL, str(error))
+                self.assertNotIn(PLANTED_MARKER, text)
+        self.assertEqual([], FakeConnection.requests)
+
+    def test_a_login_reply_with_such_a_token_is_refused_at_its_first_use_and_no_error_holds_it(self) -> None:
+        for name, token in unsafe_values(PLANTED_MARKER).items():
+            with self.subTest(character=name):
+                FakeConnection.answer = (200, json.dumps({"auth": {"client_token": token}}).encode())
+                issued = self.api.login("admin", "an-admin-secret-id")
+                FakeConnection.requests = []
+                error, text = raised_text(partial(self.api.must, "GET", "sys/policies/acl/service_a", issued), bootstrap.BootstrapError, "call")
+                self.assertEqual(REFUSAL, str(error))
+                self.assertNotIn(PLANTED_MARKER, text)
+                self.assertEqual([], FakeConnection.requests)
+
+    def test_a_login_reply_whose_token_is_not_text_is_refused_and_no_token_is_issued(self) -> None:
+        """``True`` would go into the header as ``True``: a token must be a string, and an empty one is none."""
+        for what, token in {"true": True, "number": 5, "list": ["x"], "object": {"a": "b"}, "empty": "", "null": None}.items():
+            with self.subTest(token=what):
+                FakeConnection.answer = (200, json.dumps({"auth": {"client_token": token}}).encode())
+                error, _ = raised_text(lambda: self.api.login("admin", "an-admin-secret-id"), bootstrap.BootstrapError, "login")
+                self.assertIn("the login of role admin", str(error))
+        FakeConnection.answer = (200, json.dumps({"auth": {"client_token": "hvs.CAESIJ-_x~y+z/w=="}}).encode())
+        self.assertEqual("hvs.CAESIJ-_x~y+z/w==", self.api.login("admin", "an-admin-secret-id"))
 
 
 if __name__ == "__main__":

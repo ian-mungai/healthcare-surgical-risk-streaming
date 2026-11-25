@@ -5,12 +5,16 @@ The candidates are plain data in ``tests/fixtures/vitaldb/candidates.tsv`` (one 
 a case that a later step may use, once it has verified the copy, as part of the fixed sample. The choice follows the rules in ``SLOTS`` and uses neither
 an outcome nor a hand-picked number. Training and validation are development data. Run from the repository root:
 
-    .venv/bin/python -m scripts.sample.candidates build --output tests/fixtures/vitaldb/candidates.tsv
+    mkdir -p runs/sample
+    .venv/bin/python -m scripts.sample.candidates build --output runs/sample/candidates_new.tsv
+    diff tests/fixtures/vitaldb/candidates.tsv runs/sample/candidates_new.tsv
     .venv/bin/python -m scripts.sample.candidates check
 
-``build`` writes the candidate file only after the pinned checksum list, the clinical table and the track list match their pins. ``check`` also compares
-the tracked file with a rebuild and with the checksum list. Each run reads into a new temporary folder and removes it. Every line either command writes
-is a ``Notice``: a candidate is named by its line in the candidate file or its place in the rebuild, never by its case number, key or size.
+``build`` never replaces a path, so it writes to a fresh path. A change of the tracked file is made by hand after the diff above is reviewed: copy the new
+file over ``tests/fixtures/vitaldb/candidates.tsv`` yourself and commit it. ``build`` writes the candidate file only after the pinned checksum list, the
+clinical table and the track list match their pins. ``check`` also compares the tracked file with a rebuild and with the checksum list. Each run reads into
+a new temporary folder and removes it. Every line either command writes is a ``Notice``: a candidate is named by its line in the candidate file or its place
+in the rebuild, never by its case number, key or size.
 
 VitalDB credit: Lee, H., & Jung, C. (2022). VitalDB, a high-fidelity multi-parameter vital signs database in surgical patients (version 1.0.0). PhysioNet.
 https://doi.org/10.13026/czw8-9p62. Source: https://physionet.org/content/vitaldb/1.0.0/. Licence: https://creativecommons.org/licenses/by/4.0/.
@@ -31,6 +35,7 @@ from typing import Any
 
 from scripts.ingestion.closed import QuietParser, parse_json
 from scripts.ingestion.notice import ClosedError, Code, Notice, Subject, render
+from scripts.ingestion.output_file import check_new_output, write_new_file
 from scripts.project_config import ROOT
 from scripts.sample.publisher import (
     BUCKET,
@@ -148,7 +153,7 @@ def case_key(case: int) -> str:
 def read_text(path: Path, role: Subject) -> str:
     """The text of a file the command reads. Raise ``PublisherError`` that names the file by its role, never by its path."""
     try:
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     except OSError, UnicodeDecodeError:
         raise PublisherError(Notice(Code.CANNOT_READ, subject=role)) from None
 
@@ -333,7 +338,7 @@ def read_inputs(release: dict[str, Any], workdir: Path) -> tuple[list[CaseFacts]
     sums_path = workdir / "SHA256SUMS.txt"
     download_key(checksum_list["key"], sums_path)
     read_pinned(Subject.CHECKSUM_LIST, sums_path, checksum_list["size_bytes"], checksum_list["sha256"])
-    sums = parse_checksum_list(sums_path.read_text())
+    sums = parse_checksum_list(read_text(sums_path, Subject.CHECKSUM_LIST))
     for table in release["tables"]:
         if sums.get(table["key"]) != table["sha256"]:
             raise PublisherError(Notice(Code.TABLE_NOT_IN_LIST, subject=TABLE_SUBJECTS[table["key"]]))
@@ -403,24 +408,23 @@ def report(notices: Sequence[Notice]) -> int:
     return 1 if notices else 0
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run ``build`` or ``check`` and return 1 on any problem, with its cause on standard error."""
     parser = QuietParser(prog=PROGRAM, description=(__doc__ or "").splitlines()[0])
     parser.add_argument("command", choices=["build", "check"])
     parser.add_argument("--release", type=Path, default=RELEASE_FILE, help="the release pin")
     parser.add_argument("--candidates", type=Path, default=CANDIDATES_FILE, help="check: the tracked candidate file")
     parser.add_argument("--output", type=Path, help="build: where to write the candidate file")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "build" and args.output is None:
         raise SystemExit(render(Notice(Code.BUILD_NEEDS_OUTPUT)))
     try:
+        if args.command == "build":
+            check_new_output(args.output)
         tracked = read_candidates(args.candidates) if args.command == "check" else []
         candidates, sums, sizes = rebuild(args.release)
         if args.command == "build":
-            try:
-                args.output.write_text(format_candidates(candidates))
-            except OSError:
-                raise PublisherError(Notice(Code.CANNOT_WRITE, subject=Subject.CANDIDATE_FILE)) from None
+            write_new_file(args.output, format_candidates(candidates))
             sys.stdout.write(f"{render(Notice(Code.WROTE, count=len(candidates)))}\n")
             return 0
         problems = candidate_problems(tracked) + listing_problems(tracked, sums, sizes) + difference_problems(tracked, candidates)

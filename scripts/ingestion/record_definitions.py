@@ -43,7 +43,10 @@ READ_PREFIX = "records_input/"
 MAIN_BRANCH = "main"
 # Read on Nov 22 2026 (PST): the destination from the S3 Data Lake page of docs.airbyte.com and from its metadata.yaml and Kotlin specification on the master
 # branch of github.com/airbytehq/airbyte, the file source from its metadata.yaml and spec.json there, and the three linux/amd64 image digests from Docker Hub
-# (``docker buildx imagetools inspect <image> --raw``, the manifest of platform linux/amd64). source-s3 is the raw connection's pin, one shared definition.
+# (``docker buildx imagetools inspect <image> --raw``, the manifest of platform linux/amd64). source-s3 is the raw connection's pin.
+# The file source was pinned again on Nov 24 2026 (PST) to 0.6.1, the tag that Airbyte chart 2.5.0 ships (read on the host). Its digest is the linux/amd64 entry
+# of the image index of ``airbyte/source-file:0.6.1``, read from the Docker Hub registry API (GET /v2/airbyte/source-file/manifests/0.6.1).
+# Every connection takes Airbyte's one definition of an image and requires its tag to equal the pin; the client creates no definition.
 PINNED_ON = "2026-11-22"
 
 
@@ -63,7 +66,7 @@ class Connector:
 
 
 SOURCE_S3 = Connector("airbyte/source-s3", "4.17.1", "sha256:0ca33028218a3c166cf8802e2f955e285f6c167b043a36e9f300768ea4e2299b")
-SOURCE_FILE = Connector("airbyte/source-file", "0.6.2", "sha256:61a0a57dcc3a7e2cef473a094e765afe8ed606788042279e04297a0f71fb054a")
+SOURCE_FILE = Connector("airbyte/source-file", "0.6.1", "sha256:a732c04bc4581ed11517a515f3673b43b420f1553308037efefdc6c930e20c6d")
 DESTINATION = Connector("airbyte/destination-s3-data-lake", "0.4.2", "sha256:6d48ee57e2b43e27ed4b05892bedcbbf85d672e485cdba704c77156ff48fd4bc")
 
 

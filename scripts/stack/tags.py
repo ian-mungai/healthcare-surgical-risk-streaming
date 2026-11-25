@@ -16,7 +16,6 @@ it is absent. A folder that the run folder writer would name ``*_<run id>`` must
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import http.client
 import json
@@ -34,6 +33,8 @@ from types import FrameType
 from typing import Any
 from urllib.parse import quote
 
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import FixedTextError, describe_error
 from scripts.stack.nessie import BODY_LIMIT_BYTES, HASH, NessieClient, NessieConflict, NessieError, Reference
 
 RUN_TAG_PREFIX = "run-"
@@ -56,8 +57,9 @@ class NotOnTrunk(NessieError):
     """The hash is not in the history of the trunk, or the trunk is not a branch. No tag is made or accepted."""
 
 
-class RecordNotPublished(NessieError):
-    """The tag was made and the run folder's record could not be published. The tag is left in place."""
+class RecordNotPublished(NessieError, FixedTextError):
+    """The tag was made and the run folder's record could not be published. The tag is left in place. Its text is constant advice (``not_published_advice``)
+    that holds no tag, hash, path or exception text."""
 
 
 class TagConflict(NessieError):
@@ -351,16 +353,21 @@ def tag_and_record(client: NessieClient, run_id: str, merged_hash: str, folder: 
     except Exception as error:
         if stage == "before":
             raise
-        if made:
-            left = f"the tag {prepared.tag} was made at {merged_hash} and is left in place"
-        elif stage == "posting":
-            left = f"the tag {prepared.tag} may have been made at {merged_hash} and is left in place if it was"
-        else:
-            left = f"the tag {prepared.tag} was already in place at {merged_hash}"
-        raise RecordNotPublished(f"the record could not be published ({error}); {left}") from error
+        raise RecordNotPublished(not_published_advice(stage, made=made)) from error
     finally:
         with contextlib.suppress(OSError):
             Path(staging).unlink(missing_ok=True)
+
+
+def not_published_advice(stage: str, *, made: bool) -> str:
+    """The constant advice of ``RecordNotPublished``: what the operator must know about the tag when the record could not be published."""
+    if made:
+        left = "the run's tag was made and is left in place"
+    elif stage == "posting":
+        left = "the run's tag may have been made and is left in place if it was"
+    else:
+        left = "the run's tag was already in place"
+    return f"RecordNotPublished: the record could not be published; {left}"
 
 
 def version_record(result: TagResult) -> dict[str, Any]:
@@ -391,7 +398,7 @@ def stage_record(folder: Path, record: dict[str, Any]) -> str:
     except OSError as error:
         if staging:
             Path(staging).unlink(missing_ok=True)
-        raise TagConflict(f"the run folder {folder} cannot be written ({type(error).__name__}: {error}): no tag was made") from error
+        raise TagConflict(f"the run folder cannot be written ({type(error).__name__}): no tag was made") from error
     return staging
 
 
@@ -429,9 +436,7 @@ def write_version_record(folder: Path, result: TagResult) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     """Tag a run's merged hash and record it. Exit 0 when the tag and the record are as asked, 1 when Nessie or a record refuses, 2 for bad input."""
-    parser = argparse.ArgumentParser(
-        prog="scripts.stack.tags", description="Tag a run's merged hash and write the tag, hash and snapshot IDs into its run folder."
-    )
+    parser = QuietParser(prog="scripts.stack.tags", description="Tag a run's merged hash and write the tag, hash and snapshot IDs into its run folder.")
     commands = parser.add_subparsers(dest="command", required=True)
     tag = commands.add_parser("tag")
     tag.add_argument("--run-id", required=True)
@@ -451,18 +456,18 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(arguments.deadline_seconds) or not 0 < arguments.deadline_seconds <= MAX_DEADLINE_SECONDS:
             raise TagError(f"the deadline must be a finite number of seconds above 0 and at most {MAX_DEADLINE_SECONDS:g}")
     except TagError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 2
 
     def expire(signal_number: int, frame: FrameType | None) -> None:
-        raise DeadlineExceeded(f"the run passed its deadline of {arguments.deadline_seconds:g} seconds and was stopped")
+        raise DeadlineExceeded("the run passed its deadline and was stopped")
 
     previous = signal.signal(signal.SIGALRM, expire)
     signal.setitimer(signal.ITIMER_REAL, arguments.deadline_seconds)
     try:
         result, written = tag_and_record(TagClient(uri, arguments.deadline_seconds), arguments.run_id, arguments.hash, arguments.run_folder, arguments.trunk)
     except NessieError as error:
-        sys.stderr.write(f"{error}\n")
+        sys.stderr.write(f"{describe_error(error)}\n")
         return 1
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)

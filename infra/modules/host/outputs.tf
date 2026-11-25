@@ -3,6 +3,11 @@ output "instance_id" {
   value       = aws_instance.host.id
 }
 
+output "image_id" {
+  description = "AMI of the host."
+  value       = aws_instance.host.ami
+}
+
 output "public_ip" {
   description = "Public address of the host."
   value       = aws_instance.host.public_ip

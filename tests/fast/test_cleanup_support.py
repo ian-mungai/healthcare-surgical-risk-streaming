@@ -157,6 +157,18 @@ class Scrub(unittest.TestCase):
                 self.assertFalse(scrub_tree(scratch))
             self.assertTrue(scratch.exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root can search every folder")
+    def test_a_folder_behind_an_unsearchable_parent_is_not_reported_as_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            scratch = Path(parent) / "scratch"
+            scratch.mkdir()
+            os.chmod(parent, 0)
+            try:
+                with mock.patch("tests.fast.cleanup_support.shutil.rmtree"):
+                    self.assertFalse(scrub_tree(scratch))
+            finally:
+                os.chmod(parent, 0o700)
+
     def test_a_folder_that_is_not_there_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             self.assertTrue(scrub_tree(Path(parent) / "none"))

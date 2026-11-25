@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from casefile.folder_store import HEALTH_NAME as HEALTH_NAME
+from casefile.folder_store import SCHEDULE_NAME as SCHEDULE_NAME
+from casefile.folder_store import STATE_FOLDER_NAMES as STATE_FOLDER_NAMES
+from casefile.folder_store import STATE_NAME as STATE_NAME
+from casefile.folder_store import is_state_folder_name as is_state_folder_name
 from replay.events.run import DEFAULT_CHECKPOINT_EVENTS, MAX_SPEED, MIN_SPEED
 
 
@@ -47,12 +52,8 @@ class RunRecord:
     idle_checkpoint_seconds: float = 5.0
 
     @property
-    def state_path(self) -> Path:
-        return Path(self.state_dir) / "state.json"
-
-    @property
     def schedule_path(self) -> Path:
-        return Path(self.state_dir) / "schedule.json"
+        return Path(self.state_dir) / SCHEDULE_NAME
 
 
 REQUIRED: dict[str, type | tuple[type, ...]] = {

@@ -11,8 +11,12 @@ this order, each step only when the one before it passed:
 4. the Spark job (``spark/jobs/table_checks.py``, started by ``runner``) checks every table and prints its result;
 5. the result is read and held to the plan: the same branch, hash, tables and snapshots, every check's verdict derived from its counts, and an exit code that
    agrees with it;
-6. only when every check passed, and the branch is still at the checked hash, a pending record is written and the branch is merged into the default branch
-   with one request.
+6. only when every check passed, and the branch is still at the checked hash, the default branch must be at the base head that the load record names (the head
+   that the branch was made from), so a head that moved, even one that came back with the same contents, is refused and the load is rerun; then the contents
+   of that head and of the branch are compared in full, each key by its name parts: every key that differs must be one of this load's tables, or a namespace
+   that holds them and the default branch lacks (``output_problem``), so another changed table, or an edited or removed namespace, is never merged with the
+   load, and a listing that leaves a content out is an error;
+7. then a pending record is written and the branch is merged into the default branch with one request.
 
 The catalog's history is the one source of the merge. The receipt (``table_checks.json``, saved in the run folder against the manifest's reference) takes its
 merge commit and that commit's parent from the commit in the history whose last three lines are this load's, never from what was sent or answered.
@@ -32,6 +36,12 @@ a reviewer saw 90 seconds against a budget of 70. This is an accepted limit; the
 A run in which a check fails merges nothing and leaves the load branch for inspection. A run in which the merge request fails or times out may still have
 merged, and ends as ``merge_outcome_open`` or ``merge_not_found``: the history of main is then the only record of whether it did. A rerun after a merge runs
 nothing and merges nothing more. A rerun after a failed check checks again and replaces the result. Messages name no data value.
+
+The job's own output is never kept: a refused or failed run keeps only a fixed refusal code and numbers in ``job_output.txt``, and the reply of the job holds
+its exit code and its standard output only. A ``job_output.txt`` of any other form (one that an earlier controller wrote from the job's output) is removed under
+the lock once the run folder holds this load's receipt or none, before the run goes on, whatever it ends as; a folder refused as another load's is left
+untouched. A saved receipt's checks that are not a result of the current form (an earlier format, or a count of a
+clinical table) are removed when the receipt is returned or rebuilt, and the receipt says so.
 """
 
 from __future__ import annotations
@@ -42,17 +52,19 @@ import json
 import math
 import os
 import re
-import tempfile
+import stat
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.ingestion.selection import pinned_release
 from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
@@ -60,14 +72,30 @@ from scripts.sample.candidates import RELEASE_FILE
 from scripts.stack.groups import Settings, compose_arguments, rendered_environment
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
+from scripts.stack.tags import paged
 from spark import table_checks as rules
 
-LOAD_RECORD_FORMAT = "load_record_1"
+LOAD_RECORD_FORMAT = "load_record_2"
+LEGACY_LOAD_RECORD_FORMAT = "load_record_1"
 RUN_FORMAT = "table_checks_run_1"
 RESULT_FILE = "table_checks.json"
 PLAN_FILE = "plan.json"
 RESULT_PREFIX = "RESULT "
 JOB_OUTPUT_FILE = "job_output.txt"
+# The only refusals that ``JOB_OUTPUT_FILE`` can name. The job's own text is never kept: it can hold counts and values of a held-out patient's rows.
+REFUSAL_CODES = ("no_result", "several_results", "result_refused", "exit_code_disagrees", "checks_failed")
+# The bounds of the two numbers of ``JOB_OUTPUT_FILE``: an exit code of a process, and the number of result lines. A larger number is never kept.
+MAX_EXIT_CODE = 255
+MAX_RESULT_LINES = 9999
+KEPT_OUTPUT_FORM = re.compile(
+    rb"refusal: (" + b"|".join(code.encode() for code in REFUSAL_CODES) + rb")\nexit code: (-?[0-9]{1,3})\nresult lines: ([0-9]{1,4})\n"
+)
+# The longest file of the form is 64 bytes, so a file that is not of the form is never read past this many bytes.
+KEPT_OUTPUT_LIMIT = 80
+SAVED_CHECKS_REMOVED_NOTE = (
+    "the saved checks of this receipt were removed: they were not a result of the current form, which holds no count of a clinical table"
+)
+REBUILT_NOTE = "the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch"
 # One fixed directory for the lock and the pending merge record of every load: a folder of ``dagster_data``, the named volume that the code location already
 # mounts at ``/opt/dagster/data``, so a pending record survives a restart of the code location. (``/run/dagster`` is a tmpfs and does not.)
 STATE_DIRECTORY = Path("/opt/dagster/data/table_checks")
@@ -88,7 +116,7 @@ MANIFEST_LINE_PREFIX = "records-manifest: "
 SOURCE_LINE_PREFIX = "records-source: "
 BRANCH_LINE_PREFIX = "records-branch: "
 MANIFEST_FIELDS: Mapping[str, type] = {"bucket": str, "key": str, "version_id": str, "sha256": str}
-LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "manifest": dict, "tables": dict}
+LOAD_RECORD_FIELDS: Mapping[str, type] = {"format": str, "branch": str, "branch_hash": str, "base_hash": str, "manifest": dict, "tables": dict}
 FILE_TABLES = tuple(spec.name for spec in rules.TABLES if spec.source == "file")
 
 
@@ -140,12 +168,14 @@ class MergeCommit:
 
 @dataclass(frozen=True, slots=True)
 class LoadRecord:
-    """What the load step recorded: the branch it wrote, that branch's head hash, the manifest it loaded from and each table's snapshot ID."""
+    """What the load step recorded: the branch it wrote, that branch's head hash, the manifest it loaded from, each table's snapshot ID and the hash of the
+    default branch that the load branch was made from, which is the only head the branch may be merged onto."""
 
     branch: str
     branch_hash: str
     manifest: ManifestRef
     tables: dict[str, int]
+    base_hash: str
 
     @property
     def document(self) -> dict[str, Any]:
@@ -154,11 +184,10 @@ class LoadRecord:
 
 @dataclass(frozen=True, slots=True)
 class RunnerReply:
-    """What the Spark job's process ended with."""
+    """What the Spark job's process ended with: its exit code and its standard output. Its standard error is never read."""
 
     exit_code: int
     stdout: str
-    stderr: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +225,8 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
         try:
             result = run_command("docker", arguments, timeout=deadline_seconds, env=environment)
         except TimeoutExpired:
-            return RunnerReply(124, "", f"the table checks job did not finish within {deadline_seconds:g} seconds and was stopped")
-        return RunnerReply(result.returncode, result.stdout, result.stderr)
+            return RunnerReply(124, "")
+        return RunnerReply(result.returncode, result.stdout)
 
     return start
 
@@ -210,7 +239,7 @@ def closed(value: Any, fields: Mapping[str, type], what: str) -> dict[str, Any]:
 
 
 def parse_load_record(text: str) -> LoadRecord:
-    """The load record from the text of the ``<run ID>.load_record.json`` file, which holds exactly its five fields.
+    """The load record from the text of the ``<run ID>.load_record.json`` file, which holds exactly its six fields.
 
     Refuse an unknown, missing or mistyped field, a hash that is not 64 hex digits and any table list but ours.
     """
@@ -220,17 +249,19 @@ def parse_load_record(text: str) -> LoadRecord:
         raise TableChecksError(str(error)) from None
     except ValueError:
         raise TableChecksError("the load record is not JSON") from None
+    if isinstance(document, dict) and document.get("format") == LEGACY_LOAD_RECORD_FORMAT:
+        raise TableChecksError("the load record is of version 1 and names no base head: the load step makes it again from its run record")
     fields = closed(document, LOAD_RECORD_FIELDS, "the load record")
     manifest = closed(fields["manifest"], MANIFEST_FIELDS, "the load record's manifest")
     tables = fields["tables"]
     names = [spec.name for spec in rules.TABLES]
     if fields["format"] != LOAD_RECORD_FORMAT or not BRANCH_NAME.fullmatch(fields["branch"]) or fields["branch"] == "main":
         raise TableChecksError("the load record has another format or names no load branch")
-    if not rules.HASH.fullmatch(fields["branch_hash"]) or not rules.HASH.fullmatch(manifest["sha256"]):
+    if not all(rules.HASH.fullmatch(fields[name]) for name in ("branch_hash", "base_hash")) or not rules.HASH.fullmatch(manifest["sha256"]):
         raise TableChecksError("the load record holds a hash that is not 64 lower-case hex digits")
     if sorted(tables) != sorted(names) or any(type(snapshot) is not int for snapshot in tables.values()):
         raise TableChecksError(f"the load record must give an integer snapshot ID for exactly the tables {', '.join(names)}")
-    return LoadRecord(fields["branch"], fields["branch_hash"], ManifestRef(**manifest), {name: tables[name] for name in names})
+    return LoadRecord(fields["branch"], fields["branch_hash"], ManifestRef(**manifest), {name: tables[name] for name in names}, fields["base_hash"])
 
 
 def manifest_line(sha256: str) -> str:
@@ -257,7 +288,7 @@ def branch_line(branch: str) -> str:
 def read_track_pin(path: Path = TRACKED_RELEASE_FILE) -> rules.TrackPin:
     """The track list's pinned row count and digest from the tracked release file, whose path is fixed in code. The default is the only caller's path."""
     try:
-        return rules.track_pin(json.loads(path.read_text()))
+        return rules.track_pin(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError) as error:
         raise TableChecksError(f"the release file cannot be used for the track list's pin: {type(error).__name__}") from None
 
@@ -330,18 +361,17 @@ def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Pa
             version = versions.get((entry.key, entry.version_id))
             if version is None:
                 raise TableChecksError(f"the manifest's version of the file for {name} is no longer listed")
-            digest, size = hashlib.sha256(), 0
-            fd, partial = tempfile.mkstemp(dir=staging, prefix=f".{name}.")
-            with os.fdopen(fd, "wb") as handle:
-                for block in store.iter_version(version):
-                    digest.update(block)
-                    handle.write(block)
-                    size += len(block)
-            if digest.hexdigest() != entry.sha256 or size != entry.size:
-                Path(partial).unlink()
+            digest, blocks = hashlib.sha256(), []
+            for block in store.iter_version(version):
+                digest.update(block)
+                blocks.append(block)
+            data = b"".join(blocks)
+            if digest.hexdigest() != entry.sha256 or len(data) != entry.size:
                 raise TableChecksError(f"the bytes read for {name} are not the verified file of the manifest")
-            secure(Path(partial), STAGING_FILE_MODE, gid)
-            os.replace(partial, staging / f"{name}.csv")
+            path = staging / f"{name}.csv"
+            replace_owned_file(path, data, state_root=staging, mode=STAGING_FILE_MODE)
+            secure(path, STAGING_FILE_MODE, gid)
+            size = len(data)
             staged.append(Staged(name, f"{name}.csv", entry.sha256, size))
     except BaseException:
         remove_staged(staging)
@@ -352,7 +382,7 @@ def stage_verified_files(store: ObjectStore, reference: ManifestRef, staging: Pa
 def write_plan(staging: Path, document: Mapping[str, Any], gid: int) -> None:
     """Write the plan into the staging folder with the same mode and group as the staged files."""
     path = staging / PLAN_FILE
-    path.write_text(json.dumps(document, indent=1) + "\n")
+    replace_owned_file(path, json.dumps(document, indent=1) + "\n", state_root=staging, mode=STAGING_FILE_MODE)
     secure(path, STAGING_FILE_MODE, gid)
 
 
@@ -362,9 +392,8 @@ def remove_staged(staging: Path) -> None:
         return
     for name in (*(f"{table}.csv" for table in FILE_TABLES), PLAN_FILE):
         (staging / name).unlink(missing_ok=True)
-    for partial in staging.glob(".*"):
-        if partial.is_file():
-            partial.unlink()
+    for partial in list_files(staging, ".*"):
+        partial.unlink()
     with contextlib.suppress(OSError):
         staging.rmdir()
 
@@ -388,39 +417,82 @@ def build_plan(record: LoadRecord, staged: list[Staged], pin: rules.TrackPin, em
     }
 
 
-def keep_output(run_folder: Path, reply: RunnerReply) -> None:
-    """Keep the raw output of the job in a private file of the run folder. It can hold values of the data, so it is never put into a message."""
+def keep_output(run_folder: Path, code: str, exit_code: int, result_lines: int) -> None:
+    """Keep a fixed refusal code, the job's exit code and the number of result lines in a private file of the run folder.
+
+    The job's standard output and error are never kept: they can hold a count or a value of a held-out patient's rows, and the clinical tables seal both
+    (the owner's decision D). The two numbers are read by this controller and not copied from the job's text.
+    """
+    if code not in REFUSAL_CODES or type(exit_code) is not int or type(result_lines) is not int:
+        raise TableChecksError("the job output file takes a code of the table of refusals and two whole numbers")
+    if not -MAX_EXIT_CODE <= exit_code <= MAX_EXIT_CODE or not 0 <= result_lines <= MAX_RESULT_LINES:
+        raise TableChecksError("the job output file takes an exit code and a number of result lines that are within their bounds")
     run_folder.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(run_folder / JOB_OUTPUT_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        handle.write(f"exit code {reply.exit_code}\n--- standard output ---\n{reply.stdout}\n--- standard error ---\n{reply.stderr}\n")
+    replace_owned_file(run_folder / JOB_OUTPUT_FILE, output_text(code, exit_code, result_lines), state_root=run_folder, mode=0o600)
+
+
+def output_text(code: str, exit_code: int, result_lines: int) -> str:
+    """The text of ``JOB_OUTPUT_FILE`` that ``keep_output`` writes for these values."""
+    return f"refusal: {code}\nexit code: {exit_code}\nresult lines: {result_lines}\n"
+
+
+def written_by_keep_output(content: bytes) -> bool:
+    """True only for the exact bytes that ``keep_output`` writes for some values within its bounds: no leading zero, no ``-0``, no number out of bounds."""
+    found = KEPT_OUTPUT_FORM.fullmatch(content)
+    if found is None:
+        return False
+    code, exit_code, result_lines = found.group(1).decode(), int(found.group(2)), int(found.group(3))
+    within = -MAX_EXIT_CODE <= exit_code <= MAX_EXIT_CODE and 0 <= result_lines <= MAX_RESULT_LINES
+    return within and output_text(code, exit_code, result_lines).encode() == content
+
+
+def drop_unfixed_output(run_folder: Path) -> None:
+    """Remove a ``job_output.txt`` that is not of the fixed form that ``keep_output`` writes, whoever wrote it: an earlier controller kept the job's own output.
+
+    Call it under the load's lock. A file of the form stays as it is. Any other file, a link or any other kind of file but a folder is removed (a link is
+    removed and never followed). A folder of that name stops the run: it is not removed.
+    """
+    path = run_folder / JOB_OUTPUT_FILE
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(status.st_mode):
+        raise TableChecksError(f"{JOB_OUTPUT_FILE} in the run folder is a folder, so this run did nothing; remove it and run again")
+    if stat.S_ISREG(status.st_mode):
+        with path.open("rb") as handle:
+            if written_by_keep_output(handle.read(KEPT_OUTPUT_LIMIT)):
+                return
+    path.unlink(missing_ok=True)
 
 
 def read_result(reply: RunnerReply, plan: rules.Plan, run_folder: Path) -> tuple[rules.JobResult, dict[str, Any]]:
     """The job's one result held to the plan it was run for, with pass or fail derived from its checks, and an exit code that agrees with it.
 
     The output must hold exactly one ``RESULT`` line. The document kept is the validated one (``JobResult.document``), never the job's own text. Every message
-    here is fixed text and numbers; the raw output of the job goes to ``JOB_OUTPUT_FILE`` of the run folder, also when the result is refused.
+    here is fixed text and numbers. A refused or failed run keeps ``JOB_OUTPUT_FILE`` in the run folder: a fixed refusal code and numbers, never the output.
     """
     lines = [line for line in reply.stdout.splitlines() if line.startswith(RESULT_PREFIX)]
     if len(lines) != 1:
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "no_result" if not lines else "several_results", reply.exit_code, len(lines))
         what = "printed no result" if not lines else "printed more than one result"
-        raise TableChecksError(f"the table checks job ended with exit code {reply.exit_code} and {what}; its output is in {JOB_OUTPUT_FILE} of the run folder")
+        raise TableChecksError(
+            f"the table checks job ended with exit code {reply.exit_code} and {what}; its refusal code is in {JOB_OUTPUT_FILE} of the run folder"
+        )
     try:
         result = rules.parse_result(lines[0].removeprefix(RESULT_PREFIX), plan)
     except rules.RulesError:
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "result_refused", reply.exit_code, len(lines))
         raise TableChecksError(
-            f"the table checks job's result is not a result for this plan; the job's output is in {JOB_OUTPUT_FILE} of the run folder"
+            f"the table checks job's result is not a result for this plan; its refusal code is in {JOB_OUTPUT_FILE} of the run folder"
         ) from None
     if reply.exit_code != (0 if result.passed else 1):
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "exit_code_disagrees", reply.exit_code, len(lines))
         raise TableChecksError(
-            f"the table checks job ended with exit code {reply.exit_code}, which does not agree with its result; its output is in {JOB_OUTPUT_FILE}"
+            f"the table checks job ended with exit code {reply.exit_code}, which does not agree with its result; its refusal code is in {JOB_OUTPUT_FILE}"
         )
     if not result.passed:
-        keep_output(run_folder, reply)
+        keep_output(run_folder, "checks_failed", reply.exit_code, len(lines))
     return result, result.document()
 
 
@@ -438,7 +510,7 @@ def pending_path(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Pat
 def load_lock(manifest_sha256: str, directory: Path = STATE_DIRECTORY) -> Iterator[None]:
     """Hold the one lock of a load: a second run of the same load fails at once with a clear message. The lock ends with the process, so a crash leaves none."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    handle = lock_path(manifest_sha256, directory).open("w")
+    handle = lock_path(manifest_sha256, directory).open("w", encoding="utf-8")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -519,7 +591,7 @@ def read_pending(state_directory: Path, record: LoadRecord) -> Pending | None:
         return None
     try:
         pending = closed(
-            json.loads(path.read_text()),
+            json.loads(path.read_text(encoding="utf-8")),
             {"format": str, "manifest": str, "branch": str, "source": str, "started": float, "run_id": str},
             "the pending merge record",
         )
@@ -548,14 +620,7 @@ def write_pending(state_directory: Path, record: LoadRecord, started: float, run
         "started": started,
         "run_id": run_id,
     }
-    fd, partial = tempfile.mkstemp(dir=state_directory, prefix=".pending.")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        os.replace(partial, pending_path(record.manifest.sha256, state_directory))
-    except BaseException:
-        Path(partial).unlink(missing_ok=True)
-        raise
+    replace_owned_file(pending_path(record.manifest.sha256, state_directory), json.dumps(document, indent=2, sort_keys=True) + "\n", state_root=state_directory)
 
 
 def open_message(record: LoadRecord, state_directory: Path) -> str:
@@ -574,20 +639,12 @@ def write_result(run_folder: Path, document: Mapping[str, Any]) -> None:
     existing = run_folder / RESULT_FILE
     if existing.is_file() and document.get("merged") is not True:
         try:
-            was_merged = json.loads(existing.read_text()).get("merged") is True
+            was_merged = json.loads(existing.read_text(encoding="utf-8")).get("merged") is True
         except ValueError, AttributeError:
             was_merged = False
         if was_merged:
             raise TableChecksError("the receipt of this load says merged, and a receipt that says merged is never replaced by one that says it is not")
-    fd, partial = tempfile.mkstemp(dir=run_folder, prefix=".table_checks.")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        os.chmod(partial, 0o644)
-        os.replace(partial, run_folder / RESULT_FILE)
-    except BaseException:
-        Path(partial).unlink(missing_ok=True)
-        raise
+    replace_owned_file(run_folder / RESULT_FILE, json.dumps(document, indent=2, sort_keys=True) + "\n", state_root=run_folder, mode=0o644)
 
 
 def saved_result(run_folder: Path, record: LoadRecord) -> dict[str, Any] | None:
@@ -596,7 +653,7 @@ def saved_result(run_folder: Path, record: LoadRecord) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        document = json.loads(path.read_text())
+        document = json.loads(path.read_text(encoding="utf-8"))
         same = document["manifest"] == asdict(record.manifest) and document["load"] == record.document
     except ValueError, KeyError, TypeError:
         same = False
@@ -639,15 +696,81 @@ def wait_for_merge(nessie: NessieClient, record: LoadRecord, default: str, timin
         return None
 
 
+Key = tuple[str, ...]
+
+
+def reference_contents(nessie: NessieClient, reference: str) -> dict[Key, str]:
+    """Every content of ``reference`` (a name or ``name@hash``) by the name parts that Nessie gave, each as its type and whole content in canonical JSON.
+
+    An entry with no name parts of text, no type or no content object is an error and never an empty content: two listings that both leave the content out
+    would otherwise look equal.
+    """
+    found: dict[Key, str] = {}
+    for item in paged(nessie, f"/trees/{quote(reference, safe='@')}/entries", "entries", {"content": "true"}):
+        name = item.get("name")
+        elements = name.get("elements") if isinstance(name, dict) else None
+        kind, content = item.get("type"), item.get("content")
+        if not isinstance(elements, list) or not elements or not all(isinstance(part, str) and part for part in elements):
+            raise TableChecksError("Nessie's answer for the contents is not in the expected form")
+        if not isinstance(kind, str) or not isinstance(content, dict) or tuple(elements) in found:
+            raise TableChecksError("Nessie's answer for the contents is not in the expected form")
+        found[tuple(elements)] = json.dumps({"type": kind, "content": content}, sort_keys=True)
+    return found
+
+
+def parent_namespaces(keys: Iterable[Key]) -> set[Key]:
+    """The namespaces that hold the tables ``keys``: every proper prefix of a table's name parts."""
+    return {key[:length] for key in keys for length in range(1, len(key))}
+
+
+def shown(key: Key) -> str:
+    return ".".join(key)
+
+
+def output_problem(base: Mapping[Key, str], branch: Mapping[Key, str], written: Iterable[Key]) -> str | None:
+    """Why the change from the default branch to the load branch is not exactly the output of this load, or ``None``.
+
+    The keys whose content differs, or that only one side holds, must be the tables that the load wrote and the namespaces that hold them and the default
+    branch lacks. An edit or a removal of an existing namespace is a change like any other. A table of the load that the default branch already holds as the
+    branch has it was not written by this load. The rule is the one of ``spark.bronze.publication.output_problem``, over contents given as text and keys
+    given as name parts.
+    """
+    expected = set(written)
+    changed = {key for key in base.keys() | branch.keys() if base.get(key) != branch.get(key)}
+    created = {key for key in parent_namespaces(expected) if key not in base and key in branch}
+    other = sorted(key for key in changed if key not in expected and key not in created)
+    if other:
+        names = ", ".join(shown(key) for key in other[:5])
+        return f"the load branch changes {names} against the default branch, which this load did not write: nothing was merged"
+    unchanged = sorted(key for key in expected if key not in changed)
+    if unchanged:
+        return f"the table {shown(unchanged[0])} is on the default branch as the load branch holds it, so this load did not write it: nothing was merged"
+    return None
+
+
+class StaleBaseError(TableChecksError):
+    """The default branch is not at the head that the load branch was made from. Nothing is saved for the load, so a fresh load can use the folder."""
+
+
+def require_base(head: str, record: LoadRecord) -> None:
+    """Raise ``StaleBaseError`` unless ``head``, the default branch's head, is the recorded base head of the load."""
+    if head != record.base_hash:
+        raise StaleBaseError(
+            "the default branch is not at the recorded base head that the load branch was made from, so a merge could carry another change: rerun the load"
+        )
+
+
 def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path, timing: Timing, run_id: str) -> MergeCommit:
     """Merge the branch at the checked hash into the default branch and return the merge commit as the history holds it. A request is never sent twice.
 
-    The request carries the recorded hash, the one Spark read, so what is merged is what was checked, and the head of the default branch that the log was
-    searched from as its expected target hash. Nessie 0.110.1 can also accept an older expected hash after a compatible commit on the target, so that hash is a
-    guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record, with the run ID of the checks, is written before
-    the request. The request is sent once: after a failure of it, whatever the failure, the history is searched until one deadline has passed, and a merge
-    not found by then ends as ``merge_outcome_open`` with the pending record kept. After a success answer the merge commit must be in the history
-    (``merge_not_found`` otherwise). The caller builds the receipt from the commit and its parent, never from what was sent or answered.
+    The request carries the recorded hash, the one Spark read, so what is merged is what was checked, and the checked base hash of the load (the head that
+    ``require_base`` just confirmed) as its expected target hash: ``NessieClient.merge`` puts it in the request path ``/trees/<target>@<hash>/history/merge``
+    (``scripts/stack/nessie.py``, ``merge``), so a target that moved is refused on the server. Nessie 0.110.1 can also accept an older expected hash after a
+    compatible commit on the target, so that hash is a guard and not a guarantee. A branch that has moved since the checks is refused here. The pending record,
+    with the run ID of the checks, is written before the request. The request is sent once: after a failure of it, whatever the failure, the history is searched
+    until one deadline has passed, and a merge not found by then ends as ``merge_outcome_open`` with the pending record kept. After a success answer the merge
+    commit must be in the history (``merge_not_found`` otherwise). The caller builds the receipt from the commit and its parent, never from what was sent or
+    answered.
 
     A second request for the same source is a no-op in Nessie 0.110.1: it answers that nothing was applied, which ``NessieClient.merge`` raises as an error.
     The design does not rely on it, because a request that timed out can still be applied later: only the history says what happened.
@@ -660,12 +783,20 @@ def merge_branch(nessie: NessieClient, record: LoadRecord, state_directory: Path
     if earlier is not None:
         confirm_main(nessie, record, default, earlier.hash)
         return earlier
+    require_base(head, record)
+    problem = output_problem(
+        reference_contents(nessie, f"{default}@{head}"),
+        reference_contents(nessie, f"{record.branch}@{record.branch_hash}"),
+        ((rules.NAMESPACE, table) for table in record.tables),
+    )
+    if problem is not None:
+        raise TableChecksError(problem)
     message = "\n".join(
         [f"merge {record.branch}: table checks passed", "", branch_line(record.branch), source_line(record.branch_hash), manifest_line(record.manifest.sha256)]
     )
     write_pending(state_directory, record, timing.wall(), run_id)
     try:
-        nessie.merge(record.branch, default, head, message, source_hash=record.branch_hash)
+        nessie.merge(record.branch, default, record.base_hash, message, source_hash=record.branch_hash)
     except NessieError:
         found = wait_for_merge(nessie, record, default, timing)
         if found is None:
@@ -733,10 +864,49 @@ def record_merge(run_folder: Path, state_directory: Path, record: LoadRecord, do
     return Outcome(True, True, document)
 
 
-def attempt_evidence(held: dict[str, Any] | None, pending: Pending | None) -> bool:
-    """Whether the saved receipt holds passed checks of the attempt that the pending record names: only then do they stand for the merge that was found."""
-    checked = held.get("checked") if held is not None and held["passed"] is True else None
-    return isinstance(checked, dict) and pending is not None and checked.get("run_id") == pending.run_id
+def usable_checks(record: LoadRecord, track_pin: rules.TrackPin, held: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The ``checked`` of a saved receipt when it is a result of the current form for this load, read again by the rules that read the job's result, else None.
+
+    A result of the earlier format, one with a count of a sealed table or any other form that ``parse_saved_result`` refuses gives None, so it is never
+    returned again or written into a new receipt. The run ID and the empty form are the saved result's own: the attempt is matched to its pending record apart.
+    """
+    checked = held.get("checked") if held is not None else None
+    if type(checked) is not dict:
+        return None
+    run_id, empty_form = checked.get("run_id"), checked.get("empty_form")
+    if type(run_id) is not str or rules.RUN_ID.fullmatch(run_id) is None or empty_form not in rules.EMPTY_FORMS:
+        return None
+    tables = tuple(
+        rules.PlanTable(
+            spec.name,
+            record.tables[spec.name],
+            rows=track_pin.rows if spec.source == "pin" else 0,
+            rows_sha256=track_pin.sha256 if spec.source == "pin" else "",
+        )
+        for spec in rules.TABLES
+    )
+    try:
+        return rules.parse_saved_result(checked, rules.Plan(run_id, record.branch, record.branch_hash, empty_form, tables)).document()
+    except rules.RulesError:
+        return None
+
+
+def attempt_evidence(record: LoadRecord, track_pin: rules.TrackPin, held: dict[str, Any] | None, pending: Pending | None) -> bool:
+    """Whether the saved receipt holds passed checks of the current form and of the attempt that the pending record names: only then do they stand for the
+    merge that was found."""
+    checked = usable_checks(record, track_pin, held) if held is not None and held["passed"] is True else None
+    return checked is not None and pending is not None and checked["run_id"] == pending.run_id
+
+
+def without_old_checks(run_folder: Path, record: LoadRecord, track_pin: rules.TrackPin, held: dict[str, Any]) -> dict[str, Any]:
+    """A completed receipt as it is returned: its saved checks stay when they are of the current form. Any other ``checked`` is removed, with a note, from the
+    returned receipt and from the file, so a count of a sealed table of an earlier run is neither returned nor kept."""
+    if held.get("checked") is None or usable_checks(record, track_pin, held) is not None:
+        return held
+    notes = held.get("notes")
+    document = {**held, "checked": None, "notes": [*(notes if isinstance(notes, list) else []), SAVED_CHECKS_REMOVED_NOTE]}
+    write_result(run_folder, document)
+    return document
 
 
 def run_locked(
@@ -756,25 +926,29 @@ def run_locked(
 
     A receipt that says merged ends the run (and removes a pending record left over). If the history holds this load's merge commit, the receipt is written
     from it and nothing is sent. If a pending record of this load exists and the history does not hold the commit, the run ends as ``merge_outcome_open``,
-    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``.
+    every time, until the operator removes the record. Otherwise the checks run, and a load that passed is merged by ``merge_branch``. Once the receipt is
+    known to be this load's (or absent), a job output file of another form than the fixed one is removed, so no other way out of this function leaves one. A
+    folder refused as another load's is left exactly as it is.
     """
     held = saved_result(run_folder, record)
+    drop_unfixed_output(run_folder)
     if held is not None and held["merged"] is True:
         clear_pending(state_directory, record)
-        return Outcome(True, True, held)
+        return Outcome(True, True, without_old_checks(run_folder, record, track_pin, held))
     default = default_branch(nessie)
     pending = read_pending(state_directory, record)
     found = merged_commit(nessie, record, main_head(nessie, default), deadline_for(nessie, timing))
     if found is not None:
         confirm_main(nessie, record, default, found.hash)
-        evidence = held if attempt_evidence(held, pending) else None
+        evidence = held if attempt_evidence(record, track_pin, held, pending) else None
         document = evidence if evidence is not None else receipt(record, empty_form, None, passed=True)
         if evidence is None:
-            document["notes"].append("the checks of the run that merged this load are not in this receipt: it was rebuilt from the log of the default branch")
+            document["notes"].append(REBUILT_NOTE)
         return record_merge(run_folder, state_directory, record, document, default, found)
     if pending is not None:
         raise MergeOutcomeOpen(open_message(record, state_directory))
     confirm_load(nessie, record)
+    require_base(main_head(nessie, default), record)
     try:
         staged = stage_verified_files(store, record.manifest, staging, staging_gid)
         plan_document = build_plan(record, staged, track_pin, empty_form, uuid.uuid4().hex)
@@ -788,8 +962,13 @@ def run_locked(
         remove_staged(staging)
     result, checked = read_result(reply, plan, run_folder)
     document = receipt(record, empty_form, checked, passed=result.passed)
+    require_base(main_head(nessie, default), record)
     write_result(run_folder, document)
     if not result.passed:
         return Outcome(False, False, document)
-    commit = merge_branch(nessie, record, state_directory, timing, result.run_id)
+    try:
+        commit = merge_branch(nessie, record, state_directory, timing, result.run_id)
+    except StaleBaseError:
+        (run_folder / RESULT_FILE).unlink(missing_ok=True)
+        raise
     return record_merge(run_folder, state_directory, record, document, default, commit)

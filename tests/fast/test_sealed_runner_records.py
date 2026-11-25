@@ -27,6 +27,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
+from scripts.sample.candidates import CANDIDATES_FILE, read_candidates
 from tests.e2e import run_record
 from tests.e2e.run_record import Record
 from tests.fast import test_silver_acceptance as accept
@@ -313,7 +314,8 @@ class DryRun(unittest.TestCase):
 
     def test_the_dry_run_plans_the_reference_names_and_no_name_twice(self) -> None:
         module = runner("silver_cases")
-        names = module.planned_reference_names()
+        with mock.patch.object(module, "read_candidates", side_effect=AssertionError("the dry plan reads the list")):
+            names = module.planned_reference_names(read_candidates(CANDIDATES_FILE))
         self.assertIsInstance(names, list)
         self.assertEqual(len(names), len(set(names)))
 

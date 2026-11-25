@@ -9,7 +9,6 @@ published checksum file.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import io
 import platform
@@ -17,8 +16,11 @@ import sys
 import tarfile
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from scripts.ingestion.closed import QuietParser
+from scripts.ingestion.notice import describe_error
+from scripts.ingestion.output_file import replace_owned_file
 from scripts.process import run_command
 from scripts.quality import push_hook, worktree_scan_hook
 
@@ -38,6 +40,15 @@ class Tool:
     member: str
     target: str
     assets: dict[Platform, tuple[str, str]]
+
+    @property
+    def folder(self) -> Path:
+        """The folder of the installed file: the tools folder constant plus the folder part of the pinned target."""
+        return TOOLS / PurePosixPath(self.target).parent
+
+    @property
+    def path(self) -> Path:
+        return self.folder / PurePosixPath(self.target).name
 
 
 GITLEAKS = Tool(
@@ -142,16 +153,15 @@ def settle(tool: Tool, *, check: bool) -> bool:
         sys.stderr.write(f"{label}: no verified archive in .tools/downloads; run the installer without --check\n")
         return False
     binary = pinned_binary(tool, archive)
-    target = TOOLS / tool.target
+    target = tool.path
     if target.is_file() and target.read_bytes() == binary and (target.stat().st_mode & 0o777) == BINARY_MODE:
         sys.stdout.write(f"{label}: installed and verified\n")
         return True
     if check:
         sys.stderr.write(f"{label}: the installed binary is missing or differs from the pinned archive\n")
         return False
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(binary)
-    target.chmod(BINARY_MODE)
+    tool.folder.mkdir(parents=True, exist_ok=True)
+    replace_owned_file(target, binary, state_root=tool.folder, mode=BINARY_MODE)
     sys.stdout.write(f"{label}: installed from the verified archive\n")
     return True
 
@@ -166,7 +176,7 @@ def settle_hook(*, check: bool) -> bool:
     try:
         worktree_scan_hook.install(ROOT)
     except worktree_scan_hook.KeptHookError as error:
-        sys.stderr.write(f"working-tree privacy hook: {error}\n")
+        sys.stderr.write(f"working-tree privacy hook: {describe_error(error)}\n")
         return False
     sys.stdout.write("working-tree privacy hook: installed\n")
     return True
@@ -182,8 +192,8 @@ def settle_push_guard(*, check: bool) -> bool:
         return False
     try:
         push_hook.install(ROOT)
-    except worktree_scan_hook.KeptHookError as error:
-        sys.stderr.write(f"push hook: {error}\n")
+    except worktree_scan_hook.KeptHookError:
+        sys.stderr.write(f"push hook: {push_hook.KEPT_REFUSAL}\n")
         return False
     sys.stdout.write("push hook: installed\n")
     return True
@@ -191,7 +201,7 @@ def settle_push_guard(*, check: bool) -> bool:
 
 def main() -> int:
     """Install or check every pinned tool and return 1 when one is missing or differs."""
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser = QuietParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--check", action="store_true", help="verify the installed binaries without downloading or writing")
     check = parser.parse_args().check
     results = [settle(tool, check=check) for tool in TOOL_LIST]

@@ -4,7 +4,8 @@
 of the selection, so the selection is the tracked release pin's two tables and 6,388 case files and nothing a wildcard could add. It copies raw files,
 with their folders, through the delivery method "Copy raw files". The destination writes the ``landing`` prefix of the project's bucket and the
 metadata record of each file as JSON lines. The connection has no schedule, so only the orchestrator starts it. It syncs incrementally, so a rerun
-copies only a file that is new. The document holds no key, no secret and no name of a field that takes one: the apply module holds one closed table of
+copies only a file that is new. Each connector is held as an image and an exact tag: the apply module takes Airbyte's one built-in definition of the image and
+refuses it when its tag is another. The document holds no key, no secret and no name of a field that takes one: the apply module holds one closed table of
 the two field paths of each pinned connector and fills them from two root-only files on the host. The document is built on the owner's computer, where
 no key is.
 
@@ -35,8 +36,6 @@ from scripts.sample.publisher import REGION as PUBLISHER_REGION
 
 SOURCE_REPOSITORY = "airbyte/source-s3"
 DESTINATION_REPOSITORY = "airbyte/destination-s3"
-SOURCE_DEFINITION_NAME = "s3_source_pinned"
-DESTINATION_DEFINITION_NAME = "s3_destination_pinned"
 SOURCE_NAME = "vitaldb_release"
 DESTINATION_NAME = "project_landing"
 CONNECTION_NAME = "vitaldb_raw_copy"
@@ -119,19 +118,21 @@ def destination_configuration(bucket: str, region: str) -> dict[str, Any]:
     }
 
 
-def pinned_definition(name: str, repository: str, tag: str, field: str) -> dict[str, str]:
+def pinned_definition(repository: str, tag: str, field: str) -> dict[str, str]:
+    """The image and the exact tag that the connection must run. Airbyte already holds one built-in definition for the image; the module takes it by the image
+    and refuses it when its tag is not this one. No name is held, because a name selects nothing."""
     if FULL_VERSION.fullmatch(tag) is None:
         raise ConnectionDefinitionError(Notice(Code.CONNECTION_TAG, fields=(field,)))
-    return {"name": name, "dockerRepository": repository, "dockerImageTag": tag}
+    return {"dockerRepository": repository, "dockerImageTag": tag}
 
 
 def source_definition(tag: str) -> dict[str, str]:
-    """The one pinned definition of the S3 source connector. Every connection that reads S3 takes it by this name, so all of them run the same version."""
-    return pinned_definition(SOURCE_DEFINITION_NAME, SOURCE_REPOSITORY, tag, "source_tag")
+    """The pinned S3 source connector. Every connection that reads S3 takes Airbyte's one definition of the image, at this tag, so all run the same version."""
+    return pinned_definition(SOURCE_REPOSITORY, tag, "source_tag")
 
 
 def destination_definition(tag: str) -> dict[str, str]:
-    return pinned_definition(DESTINATION_DEFINITION_NAME, DESTINATION_REPOSITORY, tag, "destination_tag")
+    return pinned_definition(DESTINATION_REPOSITORY, tag, "destination_tag")
 
 
 def require_pinned_payloads(selection: Selection) -> Selection:
@@ -181,7 +182,7 @@ def desired_state(selection: Selection, *, bucket: str, region: str, source_tag:
 
 def chosen_selection(arguments: argparse.Namespace) -> Selection:
     if arguments.selection:
-        return require_pinned_payloads(Selection.from_json(arguments.selection.read_text()))
+        return require_pinned_payloads(Selection.from_json(arguments.selection.read_text(encoding="utf-8")))
     return fixed_sample_selection() if arguments.fixed_sample else full_release_selection()
 
 
@@ -221,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         for notice in error.notices:
             sys.stderr.write(f"{render(notice)}\n")
         return 1
-    except OSError:
+    except OSError, UnicodeDecodeError:
         sys.stderr.write("cannot read the selection file\n")
         return 1
 

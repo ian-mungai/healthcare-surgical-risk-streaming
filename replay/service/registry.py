@@ -16,6 +16,9 @@ from urllib.parse import quote, urlsplit
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 BODY_LIMIT_BYTES = 4_000_000
+ADDRESS_TEXT = (
+    "the registry address must be a plain http URL with a host and a port from 0 to 65535 if it has one, such as http://127.0.0.1:8080/apis/registry/v3"
+)
 RULE_VIOLATION = "RuleViolationException"
 
 
@@ -45,11 +48,15 @@ class RegistryClient:
     """Calls to one registry. ``base_url`` ends in ``/apis/registry/v3``."""
 
     def __init__(self, base_url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
-        parts = urlsplit(base_url)
+        try:
+            parts = urlsplit(base_url)
+            port = parts.port
+        except ValueError:
+            raise RegistryError(ADDRESS_TEXT) from None
         if parts.scheme != "http" or not parts.hostname or parts.query or parts.fragment:
-            raise RegistryError("the registry address must be a plain http URL with a host, such as http://127.0.0.1:8080/apis/registry/v3")
+            raise RegistryError(ADDRESS_TEXT)
         self.host = parts.hostname
-        self.port = parts.port or 80
+        self.port = port or 80
         self.prefix = parts.path.rstrip("/")
         self.timeout_seconds = timeout_seconds
 

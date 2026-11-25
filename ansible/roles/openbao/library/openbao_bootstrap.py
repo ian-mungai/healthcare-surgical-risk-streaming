@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -46,6 +47,9 @@ SECRET_BYTES = 32
 HTTP_SECONDS = 10
 READY_POLL_SECONDS = 1
 ERROR_CHARACTERS = 300
+# The form of a token that goes into a header: the characters of OpenBao's tokens and of a bearer token (RFC 6750, b64token), and nothing else. A control
+# character such as a line break makes the HTTP library's header error carry the token's text.
+TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
 class BootstrapError(RuntimeError):
@@ -147,6 +151,8 @@ class Api:
         self.port = parts.port or 80
 
     def call(self, method: str, path: str, token: str | None = None, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
+        if token and TOKEN_FORM.fullmatch(token) is None:
+            raise BootstrapError("the token that OpenBao gave is not a valid token")
         connection = http.client.HTTPConnection(self.host, self.port, timeout=HTTP_SECONDS)
         headers = {"X-Vault-Token": token} if token else {}
         try:
@@ -189,6 +195,8 @@ class Api:
     def login(self, role: str, secret_id: str) -> str:
         status, document = self.call("POST", "auth/approle/login", body={"role_id": role, "secret_id": secret_id})
         token = (document.get("auth") or {}).get("client_token")
+        if status == 200 and token and type(token) is not str:
+            raise BootstrapError(f"the login of role {role} gave a token that is not text")
         if status != 200 or not token:
             raise BootstrapError(
                 f"the login of role {role} was refused (HTTP {status}); if OpenBao started with another admin secret ID, its data volume must be reset"

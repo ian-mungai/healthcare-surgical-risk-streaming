@@ -115,7 +115,7 @@ def pinned_release() -> PinnedRelease:
 @functools.cache
 def pinned_values() -> tuple[str, str, str, str, str]:
     try:
-        pin = parse_json(RELEASE_FILE.read_text(), Subject.TRACKED_PIN)
+        pin = parse_json(RELEASE_FILE.read_text(encoding="utf-8"), Subject.TRACKED_PIN)
     except ClosedInputError, OSError, UnicodeDecodeError:
         raise SelectionError(Notice(Code.PIN_UNREADABLE)) from None
     problems = release_problems(pin)

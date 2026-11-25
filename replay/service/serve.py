@@ -15,11 +15,26 @@ are still in the inbox.
 
 ``serve`` takes the requests one at a time in name order and reads the manifest reference from beside the record. A finished run's record moves to ``done/``
 and a failed run's to ``failed/``, with its reference and ``results/<name>.json``. A record that cannot be read, is not a valid run record or has no
-reference fails at once with its reason. A request that already has a finished or failed result is only moved: it is never run again and its result is never
-written again. A result file that is not a valid terminal result (larger than 64 KiB, not a file that can be read, not UTF-8 or JSON, too deeply nested, not an
-object, no ``finished`` or ``failed`` outcome) is logged, kept beside its place as ``<name>.json.invalid`` for inspection and treated as no result; judging it
-can never raise. A run that a stop signal ends stays in the inbox, so the restarted service runs it
-again and the replay resumes from its saved position.
+reference fails at once with its reason, and so does one with a path that would put a file where the loop takes it for a request, each with a fixed code
+that names no path: a ``state_dir`` that is the inbox, inside it or a folder that holds it (``state_dir_overlaps_inbox``: the replay's checkpoint would sit
+among the requests and be archived as a failed one), a ``read_log`` inside the inbox (``read_log_in_inbox``: the run would append to a request) and a path with
+a NUL or a character that no file name holds (``invalid_path``). A relative ``state_dir`` or ``read_log`` is taken from the folder that holds the resolved
+inbox, by ``submit``, by the check, by the run and by the commands that read an archived record (``--inbox``) alike, so every spelling of the inbox gives one
+place. Only these two paths of a record are compared with the inbox (the object store's root and the manifest reference are not), in ``places.py``, by what
+the file system says: links and ``..`` resolved, and the same device and inode counting as the same place, so two spellings of one folder on a
+case-insensitive volume are caught. The check comes before the start count and the retry cap, so no start count is written for a refused request and the cap
+never hides the reason. The loop still writes the refusal's result in ``results/`` and archives the request in ``failed/``, as for any failed request. An
+error of the check that nothing handles (a defect, not a refusal) counts as a start, so a service that restarts on it fails the request after the third start
+like any other. ``submit`` refuses the same records with the same codes.
+``serve`` returns 2 at start, before it writes anything, and ``submit`` refuses everything, when a folder of the service (``results``, ``done``, ``failed``,
+``reserved`` or ``locks``) is the inbox itself (``service_folder_is_inbox``). ``serve`` returns 2 at start too when its health file is inside the inbox
+(``health_file_in_inbox``), by the folder that the write renames into, so a link in the inbox that points out counts, and when its path is malformed
+(``invalid_path``).
+
+A request that already has a finished or failed result is only moved: it is never run again and its result is never written again. A result file that is not a
+valid terminal result (larger than 64 KiB, not a file that can be read, not UTF-8 or JSON, too deeply nested, not an object, no ``finished`` or ``failed``
+outcome) is logged, kept beside its place as ``<name>.json.invalid`` for inspection and treated as no result; judging it can never raise. A run that a stop
+signal ends stays in the inbox, so the restarted service runs it again and the replay resumes from its saved position.
 
 Before it starts a request, ``serve`` adds one to the count in ``<run ID>.attempts`` beside it. A request that is found with the count at 3 has stopped the
 service three times, whatever the error was, so it fails with that reason and is archived without a replay and the next request runs. A planned stop ends
@@ -41,16 +56,20 @@ import functools
 import json
 import os
 import re
-import secrets
+import stat
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
-from replay.service.run_record import RunRecord, RunRecordError, parse_run_record
-from replay.service.state_file import atomic_write
+from replay.service import places
+from replay.service.run_record import HEALTH_NAME, RunRecord, RunRecordError, parse_run_record
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.manifest import ManifestError, ManifestRef
+from scripts.ingestion.notice import Code, Notice, describe_error
+from scripts.ingestion.output_file import replace_owned_file, write_new_file
 
 BEAT_SECONDS = 5.0
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9_]{0,63}")
@@ -68,6 +87,23 @@ MAX_ATTEMPTS = 3
 LOCK_SECONDS = 30.0
 LOCK_POLL_SECONDS = 0.01
 FILE_MODE = 0o640
+RESULTS = "results"
+SERVICE_FOLDERS = (RESULTS, RESERVED, LOCKS, *TERMINAL_OUTCOMES.values())
+STATE_DIR_CODE = "state_dir_overlaps_inbox"
+READ_LOG_CODE = "read_log_in_inbox"
+INVALID_PATH_CODE = "invalid_path"
+SERVICE_FOLDER_CODE = "service_folder_is_inbox"
+HEALTH_FILE_CODE = "health_file_in_inbox"
+HEALTH_FILE_MESSAGE = f"{HEALTH_FILE_CODE}: the health file must be outside the inbox, where the loop would take it for a request"
+STATE_DIR_MESSAGE = (
+    f"{STATE_DIR_CODE}: the run record's state_dir must share no place with the inbox: it is not the inbox, not inside it and not a folder that holds it"
+)
+READ_LOG_MESSAGE = f"{READ_LOG_CODE}: the run record's read_log must be outside the inbox, where the loop would take what is appended to it for a request"
+INVALID_PATH_MESSAGE = f"{INVALID_PATH_CODE}: a path of the run record cannot be a path: it holds a NUL or a character that no file name holds"
+SERVICE_FOLDER_MESSAGE = (
+    f"{SERVICE_FOLDER_CODE}: the folders results, done, failed, reserved and locks must be other folders than the inbox, where the loop would take what it "
+    "keeps in them for a request"
+)
 
 
 class SubmitError(ValueError):
@@ -86,8 +122,9 @@ class Outcome:
 class Health:
     """The health file: the status, the request that runs, the last result and the wall time of the last progress, written at most every few seconds."""
 
-    def __init__(self, path: Path, clock: Callable[[], float]) -> None:
-        self.path = path
+    def __init__(self, state: Path, clock: Callable[[], float]) -> None:
+        self.state = state
+        self.path = state / HEALTH_NAME
         self.clock = clock
         self.written = float("-inf")
         self.last: dict[str, Any] | None = None
@@ -95,7 +132,8 @@ class Health:
     def beat(self, status: str, request: str = "", *, force: bool = False) -> None:
         now = self.clock()
         if force or now - self.written >= BEAT_SECONDS:
-            atomic_write(self.path, json.dumps({"status": status, "updated": now, "request": request, "last": self.last}, sort_keys=True) + "\n")
+            text = json.dumps({"status": status, "updated": now, "request": request, "last": self.last}, sort_keys=True) + "\n"
+            replace_owned_file(self.path, text, state_root=self.state, mode=FILE_MODE)
             self.written = now
 
 
@@ -112,7 +150,7 @@ def healthy(path: Path, now: float, max_age_seconds: float) -> bool:
 
 
 def next_request(inbox: Path) -> Path | None:
-    requests = sorted(path for path in inbox.glob("*.json") if path.is_file())
+    requests = list_files(inbox, "*.json")
     return requests[0] if requests else None
 
 
@@ -190,7 +228,7 @@ def read_result(path: Path) -> tuple[str | None, str]:
 def kept_outcome(inbox: Path, request: Path, log: Callable[..., None]) -> str | None:
     """``finished`` or ``failed`` when a terminal result of this request is already written, else None. A result file that is not a valid terminal result is
     logged with its reason and renamed with the suffix ``.invalid``, and counts as no result. Nothing in the file can raise out of here."""
-    path = inbox / "results" / request.name
+    path = inbox / RESULTS / request.name
     outcome, reason = read_result(path)
     if outcome is not None or not reason:
         return outcome
@@ -218,35 +256,81 @@ def result_text(request: Path, outcome: Outcome) -> str:
 
 
 def keep(inbox: Path, request: Path, outcome: Outcome) -> dict[str, Any]:
-    """Write the request's result, then move the request to ``done/`` or ``failed/``. A stop between the two leaves the result, and the restart only moves."""
+    """Write the request's result, then move the request to ``done/`` or ``failed/``. A stop between the two leaves the result, and the restart only moves.
+    The result is a new file: a path that is held in any form stops the service with a fixed error, never replaces it."""
     text = result_text(request, outcome)
-    atomic_write(inbox / "results" / request.name, text)
+    (inbox / RESULTS).mkdir(parents=True, exist_ok=True)
+    write_new_file(inbox / RESULTS / request.name, text, mode=FILE_MODE)
     archive(inbox, request, outcome.kind)
     result: dict[str, Any] = json.loads(text)
     return result
 
 
+def anchor_record(record: RunRecord, inbox: Path) -> RunRecord:
+    """The run record with its relative ``state_dir`` and ``read_log`` taken from the folder that holds the resolved inbox: the one base of ``submit``, of the
+    check, of the run and of the commands that read an archived record."""
+    store = record.object_store
+    if store.read_log:  # an empty read log means no log, so it is left empty
+        store = replace(store, read_log=str(places.anchored(store.read_log, inbox)))
+    return replace(record, state_dir=str(places.anchored(record.state_dir, inbox)), object_store=store)
+
+
 def queued_record(request: Path) -> RunRecord:
-    """The run record of a request, with its manifest reference taken from the file that ``submit`` wrote beside it. A request without it is refused."""
+    """The run record of a request, with its manifest reference taken from the file that ``submit`` wrote beside it and its relative ``state_dir`` and
+    ``read_log`` taken from the folder that holds the resolved inbox (``anchor_record``). A request without the reference is refused."""
     record = parse_run_record(request.read_text())
     reference = reference_of(request)
     if not reference.is_file():
         raise RunRecordError("the manifest reference that was submitted with this record is missing")
-    return replace(record, manifest_reference=str(reference))
+    return replace(anchor_record(record, request.parent), manifest_reference=str(reference))
+
+
+def path_refusal(record: RunRecord, inbox: Path) -> str | None:
+    """The fixed text that refuses a run record whose paths put a file where the loop would take it for a request, or None. The state folder must share no place
+    with the inbox: the checkpoint would sit among the requests and be archived as a failed one. The read log must not be inside it: the run would append to a
+    request. A path that cannot be a path is refused as such. Every comparison is by what the file system says (``places``), and nothing is written."""
+    try:
+        if places.shares_place(places.anchored(record.state_dir, inbox), inbox):
+            return STATE_DIR_MESSAGE
+        if record.object_store.read_log and places.inside(places.anchored(record.object_store.read_log, inbox), inbox):
+            return READ_LOG_MESSAGE
+    except places.PathError:
+        return INVALID_PATH_MESSAGE
+    return None
+
+
+def folders_refusal(inbox: Path) -> str | None:
+    """The fixed text that refuses a folder of the service (``SERVICE_FOLDERS``) that is the inbox itself, where the results and the archived requests would be
+    taken for requests, or None. A link counts, and so do two spellings of one folder."""
+    try:
+        return SERVICE_FOLDER_MESSAGE if any(places.same_place(inbox / name, inbox) for name in SERVICE_FOLDERS) else None
+    except places.PathError:
+        return INVALID_PATH_MESSAGE
+
+
+def start_refusal(inbox: Path, health_path: Path) -> str | None:
+    """The fixed text that refuses the start, or None: a health file placed in the inbox by its folder or by where it resolves (``places.written_into``),
+    which the loop would take for a request, or a folder of the service that is the inbox."""
+    try:
+        return HEALTH_FILE_MESSAGE if places.written_into(health_path, inbox) else folders_refusal(inbox)
+    except places.PathError:
+        return INVALID_PATH_MESSAGE
 
 
 def unusable(request: Path) -> Outcome | None:
-    """A failed outcome with its reason when the request cannot be read or is not a valid run record with its reference, else None."""
+    """A failed outcome with its reason when the request cannot be read, is not a valid run record with its reference or names a path that shares a place with
+    the inbox (the folder of the request), else None. Nothing is written before this answer."""
     try:
-        queued_record(request)
+        record = queued_record(request)
     except (OSError, ValueError) as error:
-        return Outcome("failed", 2, f"{type(error).__name__}: {error}")
-    return None
+        return Outcome("failed", 2, describe_error(error))
+    refusal = path_refusal(record, request.parent)
+    return None if refusal is None else Outcome("failed", 2, refusal)
 
 
 def serve(
     inbox: Path,
-    health_path: Path,
+    state: Path,
     run_request: Callable[[Path, Callable[[], None]], Outcome],
     stopped: Callable[[], bool],
     clock: Callable[[], float],
@@ -255,9 +339,20 @@ def serve(
     log: Callable[..., None] = lambda event, **fields: None,
 ) -> int:
     """Serve the inbox until ``stopped`` says so. ``run_request`` runs one record and calls the beat it is given as the run makes progress. A record that is
-    not a valid run record never reaches it."""
+    not a valid run record never reaches it. A health file inside the inbox stops the start with 2 before anything is written: it is a ``.json`` file, so the
+    loop would take it for a request."""
+    if (refusal := start_refusal(inbox, state / HEALTH_NAME)) is not None:
+        log("serve_refused", message=refusal)
+        return 2
     inbox.mkdir(parents=True, exist_ok=True)
-    health = Health(health_path, clock)
+    # The inbox is taken by its real path from here on, as the start check above compared it, so a service that names its inbox by a link writes its
+    # start counts and results through the owned-file helpers, which refuse a folder that is a link.
+    inbox = Path(os.path.realpath(inbox, strict=True))
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ClosedInputError(Notice(Code.OWNED_REFUSED)) from None
+    health = Health(state, clock)
     health.beat("waiting", force=True)
     while not stopped():
         request = next_request(inbox)
@@ -268,25 +363,35 @@ def serve(
         if (earlier := kept_outcome(inbox, request, log)) is not None:
             archive(inbox, request, earlier)
             continue
+        try:
+            refused = unusable(request)
+        except Exception as error:
+            # A defect in the check, not a refusal of the record: it counts as a start, so a service that restarts on it stops after MAX_ATTEMPTS starts.
+            started = started_count(request)
+            if started < MAX_ATTEMPTS:
+                replace_owned_file(attempts_of(request), f"{started + 1}\n", state_root=inbox, mode=FILE_MODE)
+                log("request_check_failed", request=request.stem, error=type(error).__name__)
+                raise
+            refused = Outcome("failed", 2, f"the service stopped during this request {MAX_ATTEMPTS} times")
+        if refused is not None:
+            health.last = keep(inbox, request, refused)
+            health.beat("waiting", force=True)
+            continue
         started = started_count(request)
         if started >= MAX_ATTEMPTS:
             health.last = keep(inbox, request, Outcome("failed", 2, f"the service stopped during this request {MAX_ATTEMPTS} times"))
             health.beat("waiting", force=True)
             continue
-        atomic_write(attempts_of(request), f"{started + 1}\n")
-        if (refused := unusable(request)) is not None:
-            health.last = keep(inbox, request, refused)
-            health.beat("waiting", force=True)
-            continue
+        replace_owned_file(attempts_of(request), f"{started + 1}\n", state_root=inbox, mode=FILE_MODE)
         health.beat("running", request.stem, force=True)
         try:
             outcome = run_request(request, functools.partial(health.beat, "running", request.stem))
         except (ArithmeticError, ValueError) as error:
-            outcome = Outcome("failed", 2, f"{type(error).__name__}: {error}")
+            outcome = Outcome("failed", 2, describe_error(error))
         if outcome.kind == "stopped" or stopped():
             if outcome.kind != "stopped":
                 log("request_left_queued", request=request.stem, outcome=outcome.kind, error=outcome.error)
-            atomic_write(attempts_of(request), f"{started}\n")
+            replace_owned_file(attempts_of(request), f"{started}\n", state_root=inbox, mode=FILE_MODE)
             break
         health.last = keep(inbox, request, outcome)
         health.beat("waiting", force=True)
@@ -295,34 +400,48 @@ def serve(
 
 
 def claim(path: Path, data: bytes) -> bool:
-    """Create ``path`` with exactly ``data`` when it does not exist and say so. The bytes are complete when the file appears, and no second claim succeeds."""
+    """Create ``path`` with exactly ``data`` when it does not exist and say so. The bytes are complete when the file appears, and no second claim succeeds.
+    A path that is held in any form (a link too) is not claimed."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.claiming")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, FILE_MODE)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
+        write_new_file(path, data, mode=FILE_MODE)
+    except ClosedInputError as error:
+        if any(notice.code is Code.OUTPUT_EXISTS for notice in error.notices):
             return False
-        return True
-    finally:
-        temporary.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def queue_file(path: Path, data: bytes) -> None:
+    """Put one file of the queue entry in the inbox. A regular file that holds the very same bytes (a stop left it) stays; any other path that is held, a link
+    too, is refused and never replaced."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        write_new_file(path, data, mode=FILE_MODE)
+        return
+    if regular_bytes(path) != data:
+        raise SubmitError("the queue already holds another file under this run ID")
 
 
 def reserve(inbox: Path, name: str, data: bytes, what: str, run_id: str) -> None:
     """Reserve ``reserved/<name>`` with ``data``. Bytes that equal the reservation already held pass; other bytes are refused."""
     path = inbox / RESERVED / name
-    if not claim(path, data) and path.read_bytes() != data:
+    if not claim(path, data) and regular_bytes(path) != data:
         raise SubmitError(f"the run ID {run_id} already holds another {what}; use a new run ID")
 
 
 def record_held(inbox: Path, name: str) -> Path | None:
     """The file of the record ``name`` in the inbox, ``done/`` or ``failed/``, else None."""
     return next((path for path in (inbox / name, inbox / "done" / name, inbox / "failed" / name) if path.is_file()), None)
+
+
+def regular_bytes(path: Path) -> bytes | None:
+    """The bytes of a regular file, or None for a path that is missing, unreadable or a link, a folder or another kind of entry."""
+    try:
+        return path.read_bytes() if stat.S_ISREG(os.lstat(path).st_mode) else None
+    except OSError:
+        return None
 
 
 def bytes_of(path: Path) -> bytes | None:
@@ -338,7 +457,7 @@ def conflicts_with_held(inbox: Path, name: str, record_bytes: bytes, reference_b
     not yet the record: the reference is then looked for beside the record, in the inbox and in the folder that the written result names."""
     if (inbox / RESERVED / (Path(name).stem + REFERENCE_SUFFIX)).exists() or (earlier := record_held(inbox, name)) is None:
         return False
-    outcome, _ = read_result(inbox / "results" / name)
+    outcome, _ = read_result(inbox / RESULTS / name)
     reference_name = reference_of(Path(name)).name
     sides = [earlier.parent, inbox, *([inbox / TERMINAL_OUTCOMES[outcome]] if outcome else [])]
     reference = next((side / reference_name for side in sides if (side / reference_name).is_file()), None)
@@ -378,6 +497,8 @@ def submit(inbox: Path, record_data: bytes | str, reference_data: bytes | str) -
         raise SubmitError(str(error)) from None
     if not RUN_ID.fullmatch(record.run_id):
         raise SubmitError("the run ID must be lower-case letters, digits and underscores, at most 64")
+    if (refusal := folders_refusal(inbox) or path_refusal(record, inbox)) is not None:
+        raise SubmitError(refusal)
     name = f"{record.run_id}.json"
     with held(inbox, record.run_id):
         if conflicts_with_held(inbox, name, record_bytes, reference_bytes):
@@ -386,8 +507,9 @@ def submit(inbox: Path, record_data: bytes | str, reference_data: bytes | str) -
         reserve(inbox, record.run_id + REFERENCE_SUFFIX, reference_bytes, "manifest reference", record.run_id)
         if record_held(inbox, name) is not None:
             return "already submitted"
-        atomic_write(reference_of(inbox / name), reference_bytes)
-        atomic_write(inbox / name, record_bytes)
+        inbox.mkdir(parents=True, exist_ok=True)
+        queue_file(reference_of(inbox / name), reference_bytes)
+        queue_file(inbox / name, record_bytes)
     return "submitted"
 
 
@@ -396,7 +518,7 @@ def submit_command(inbox: Path, reference_file: Path, stream: BinaryIO, out: Tex
     try:
         record, reference = read_submission(reference_file, stream)
         out.write(submit(inbox, record, reference) + "\n")
-    except SubmitError as error:
-        log("submit_refused", message=str(error))
+    except (SubmitError, ClosedInputError) as error:
+        log("submit_refused", message=describe_error(error))
         return 2
     return 0

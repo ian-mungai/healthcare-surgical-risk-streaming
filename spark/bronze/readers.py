@@ -9,14 +9,20 @@ import hashlib
 from pathlib import Path
 
 from casefile.decoding import clinical_times
-from casefile.folder_store import FolderStore
+from casefile.folder_store import FolderStore, ReadLog
 from scripts.ingestion.store import ObjectStore
 from spark.bronze.inputs import CLINICAL_LIMIT_BYTES, CaseFile, InputError, StoreSpec, VerifiedInputs
 
 
+def create_read_log(path: Path) -> None:
+    """Make the read log of the job, once, in the driver and before any read: it is always a new file, so a path that exists in any form is refused with
+    ``CANNOT_WRITE``. The driver's store and the partitions then attach to it (``open_store``)."""
+    ReadLog.create(path).close()
+
+
 def open_store(spec: StoreSpec) -> ObjectStore:
     if spec.kind == "folder" and spec.root:
-        return FolderStore(Path(spec.root), spec.bucket, Path(spec.read_log) if spec.read_log else None)
+        return FolderStore(Path(spec.root), spec.bucket, ReadLog.attach(Path(spec.read_log)) if spec.read_log else None)
     if spec.kind == "s3" and spec.region:
         from casefile.s3_store import S3ReadStore  # boto3 is needed only on the host
 

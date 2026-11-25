@@ -19,7 +19,7 @@ from pathlib import Path
 
 from scripts.ingestion.gate import GateRefused
 from scripts.ingestion.manifest import ManifestRef, publish_manifest
-from spark.bronze.inputs import CaseFile, InputError, fetch_case, verify_inputs
+from spark.bronze.inputs import CaseFile, InputError, StoreSpec, fetch_case, verify_inputs
 from tests.fast.ingestion_support import SOURCE, SOURCE_PREFIX, Landed, landed_set, list_text_for, pin_the_synthetic_list, synthetic_pin
 
 CASE_ONE = SOURCE["vital_files/0001.vital"]
@@ -115,6 +115,27 @@ class Fetch(unittest.TestCase):
         path = fetch_case(self.landed.store, bound, self.folder)
         self.assertEqual(CASE_ONE, path.read_bytes())
         self.assertEqual([bound.version_id], [read.version_id for read in self.landed.store.reads])
+
+
+class ReadLogChoice(unittest.TestCase):
+    """The driver makes a read log only when the selected store carries a log path: the folder store. The S3 store has none."""
+
+    def test_a_folder_store_with_a_log_path_makes_that_log(self) -> None:
+        self.assertEqual(Path("/run/reads.log"), StoreSpec("folder", "bucket", "/landed", "", "/run/reads.log").log_to_create)
+
+    def test_a_folder_store_without_a_log_path_makes_none(self) -> None:
+        self.assertIsNone(StoreSpec("folder", "bucket", "/landed", "", "").log_to_create)
+
+    def test_an_s3_store_makes_none_even_when_a_log_path_was_given_to_the_job(self) -> None:
+        self.assertIsNone(StoreSpec("s3", "bucket", "", "us-west-2").log_to_create)
+        self.assertIsNone(StoreSpec("s3", "bucket", "", "us-west-2", "/run/reads.log").log_to_create)
+
+
+class DecodeCreatesTheLogOnlyForTheFolderStore(unittest.TestCase):
+    def test_the_job_asks_the_selected_store_and_not_its_own_argument(self) -> None:
+        source = Path("spark/jobs/bronze_decode.py").read_text()
+        self.assertIn("spec.log_to_create", source)
+        self.assertNotIn("if arguments.read_log:", source)
 
 
 if __name__ == "__main__":

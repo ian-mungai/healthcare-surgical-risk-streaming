@@ -42,9 +42,7 @@ that the load read>``, 64 lower case hex digits, as the load's record names it (
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -52,8 +50,12 @@ from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
 from scripts.ingestion.airbyte_api import ACTIVE_STATUSES, TERMINAL_STATUSES, AirbyteError
+from scripts.ingestion.closed import ClosedInputError
+from scripts.ingestion.folder import list_files
 from scripts.ingestion.gate import verify_before_read
 from scripts.ingestion.manifest import ManifestRef
+from scripts.ingestion.notice import Code
+from scripts.ingestion.output_file import replace_owned_file, write_new_file
 from scripts.ingestion.record_copy import (
     Copied,
     CopyError,
@@ -81,11 +83,12 @@ from scripts.ingestion.store import StoreError
 
 SUCCEEDED = "succeeded"
 ENDED_WITHOUT_SUCCESS = tuple(status for status in TERMINAL_STATUSES if status != SUCCEEDED)
-LOAD_RECORD_FORMAT = "load_record_1"
+LOAD_RECORD_FORMAT = "load_record_2"
+LEGACY_LOAD_RECORD_FORMAT = "load_record_1"
 LOAD_RECORD_FILE = "{run_id}.load_record.json"
 OWN_FIELDS = ("run_id", "manifest_sha256", "base_hash", "head_hash", "snapshots", "jobs", "copies", "connectors")
-LOAD_RECORD_FIELDS = ("format", "branch", "branch_hash", "manifest", "tables")
-RECORD_FIELDS = (*OWN_FIELDS, *LOAD_RECORD_FIELDS)
+LOAD_RECORD_FIELDS = ("format", "branch", "branch_hash", "base_hash", "manifest", "tables")
+RECORD_FIELDS = (*OWN_FIELDS, *(name for name in LOAD_RECORD_FIELDS if name not in OWN_FIELDS))
 COPY_FIELDS = ("table", "source_key", "key", "version_id", "sha256", "size")
 SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 MANIFEST_LINE = re.compile(r"^records-manifest: ([0-9a-f]{64})$", re.MULTILINE)
@@ -152,6 +155,10 @@ class Catalog(Protocol):
 
 
 class RecordAirbyte(Protocol):
+    def check_definitions(self) -> None:
+        """Raise ``AirbyteError`` unless Airbyte holds exactly one definition of each of the three pinned images, at the pinned tag. Only reads are made."""
+        ...
+
     def find_connection_ids(self) -> dict[str, str]:
         """The connections of the three tables that exist now, by table name. Nothing is created or changed."""
         ...
@@ -205,11 +212,12 @@ class LoadResult:
         return self.manifest.sha256
 
     def load_record(self) -> dict[str, Any]:
-        """The five fields that the table checks read as ``load_record_1``: format, branch, the branch head after the last sync, manifest, table snapshots."""
+        """The six fields that the table checks read as ``load_record_2``: format, branch, branch head, base head, manifest, snapshots."""
         return {
             "format": LOAD_RECORD_FORMAT,
             "branch": self.branch,
             "branch_hash": self.head_hash,
+            "base_hash": self.base_hash,
             "manifest": asdict(self.manifest),
             "tables": dict(self.snapshots),
         }
@@ -230,13 +238,15 @@ class LoadResult:
         return json.dumps(document, indent=2, sort_keys=True) + "\n"
 
     def load_record_json(self) -> str:
-        """Exactly the five fields and no other, because the table checks' parser refuses a record with any other field."""
+        """Exactly the six fields and no other, because the table checks' parser refuses a record with any other field."""
         return json.dumps(self.load_record(), indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def from_json(cls, text: str) -> LoadResult:
         try:
             document = json.loads(text)
+            if isinstance(document, dict) and document.get("format") == LEGACY_LOAD_RECORD_FORMAT:
+                document = {**document, "format": LOAD_RECORD_FORMAT}
             if not isinstance(document, dict) or set(document) != set(RECORD_FIELDS):
                 raise ValueError
             copies = tuple(Copied(**entry) for entry in document["copies"] if set(entry) == set(COPY_FIELDS))
@@ -281,27 +291,71 @@ def record_path(record_dir: Path, run_id: str) -> Path:
 def read_record(record_dir: Path, run_id: str) -> LoadResult | None:
     path = record_path(record_dir, run_id)
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
+    except OSError, UnicodeDecodeError:
         raise LoadError("the record of this run cannot be read") from None
     return LoadResult.from_json(text)
 
 
 def write_load_record(record_dir: Path, result: LoadResult) -> Path:
-    """Write the file for the table checks whole under its final name. It is replaced by the same content when a retry writes it again."""
+    """Write the file for the table checks whole under its final name. It belongs to its run, so a retry after a stop replaces it through
+    ``replace_owned_file``; a link, a folder or any other entry in its place is refused."""
     final = record_dir / LOAD_RECORD_FILE.format(run_id=result.run_id)
-    descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=record_dir)
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(result.load_record_json())
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, final)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+        replace_owned_file(final, result.load_record_json(), state_root=record_dir, mode=0o644)
+    except ClosedInputError:
+        raise LoadError("the file for the table checks cannot be written: its place is not a regular file of this folder") from None
     return final
+
+
+def keep_load_record(record_dir: Path, result: LoadResult) -> Path:
+    """The file for the table checks of a finished run: made when it is missing, left alone when it agrees with the record, refused when it does not.
+    A file of version 1 agrees when its five fields match the record, and it is not rewritten."""
+    final = record_dir / LOAD_RECORD_FILE.format(run_id=result.run_id)
+    if not final.is_symlink() and not final.exists():
+        return write_load_record(record_dir, result)
+    if not final.is_file() or final.is_symlink() or current_load_record_text(final) != result.load_record_json():
+        raise LoadError("the file for the table checks does not agree with the record of this finished run")
+    return final
+
+
+def legacy_fields_agree(document: dict[str, Any], full: LoadResult) -> bool:
+    """Whether a file of version 1 holds exactly its five fields and each equals the field of the full run record."""
+    expected = {
+        "format": LEGACY_LOAD_RECORD_FORMAT,
+        "branch": full.branch,
+        "branch_hash": full.head_hash,
+        "manifest": asdict(full.manifest),
+        "tables": dict(full.snapshots),
+    }
+    return document == expected
+
+
+def current_load_record_text(path: Path) -> str:
+    """The text of the file for the table checks at ``path`` in the current format. It only reads: nothing is written, replaced or touched.
+
+    Version 1 wrote five fields and no base head. Its full run record, beside it, saved the base head. The five fields are checked against that record, a
+    mismatch is refused, and the current text is made in memory from the record. A file of the current format is returned as it is, and the table checks'
+    parser judges it.
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(document, dict) or document.get("format") != LEGACY_LOAD_RECORD_FORMAT:
+        return text
+    run_id = path.name.removesuffix(LOAD_RECORD_FILE.format(run_id=""))
+    if not run_id or path.name != LOAD_RECORD_FILE.format(run_id=run_id):
+        raise LoadError("the load record is of version 1 and its name does not give a run ID")
+    full = read_record(path.parent, run_id)
+    if full is None:
+        raise LoadError("the load record is of version 1 and the full record that it is made again from is missing")
+    if not legacy_fields_agree(document, full):
+        raise LoadError("the load record is of version 1 and does not agree with the full record beside it")
+    return full.load_record_json()
 
 
 def write_record(record_dir: Path, result: LoadResult) -> Path:
@@ -312,28 +366,24 @@ def write_record(record_dir: Path, result: LoadResult) -> Path:
     record_dir.mkdir(parents=True, exist_ok=True)
     write_load_record(record_dir, result)
     final = record_path(record_dir, result.run_id)
-    descriptor, temporary = tempfile.mkstemp(prefix=".writing_", dir=record_dir)
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(result.to_json())
-        os.chmod(temporary, 0o644)
-        os.link(temporary, final)
-    except FileExistsError:
-        raise LoadError("the record of this run exists and is not replaced") from None
-    finally:
-        os.unlink(temporary)
+        write_new_file(final, result.to_json(), mode=0o644)
+    except ClosedInputError as error:
+        if any(notice.code is Code.OUTPUT_EXISTS for notice in error.notices):
+            raise LoadError("the record of this run exists and is not replaced") from None
+        raise
     return final
 
 
 def earlier_record(record_dir: Path, sha256: str) -> LoadResult | None:
     """The record of the newest file in ``record_dir`` whose manifest is ``sha256``, or None. A file that is not a record is not one."""
     found: list[tuple[float, str, LoadResult]] = []
-    for path in sorted(record_dir.glob("*.json")) if record_dir.is_dir() else []:
+    for path in list_files(record_dir, "*.json"):
         try:
-            record = LoadResult.from_json(path.read_text())
-            modified = path.stat().st_mtime
-        except LoadError, OSError:
+            record = LoadResult.from_json(path.read_text(encoding="utf-8"))
+        except LoadError, UnicodeDecodeError:
             continue
+        modified = path.stat().st_mtime
         if record.manifest_sha256 == sha256:
             found.append((modified, path.name, record))
     return max(found, key=lambda item: item[:2])[2] if found else None
@@ -511,6 +561,7 @@ def load_records(
     finished = read_record(record_dir, run_id)
     if finished is not None:
         result = confirm_finished(finished, reference, catalog)
+        keep_load_record(record_dir, result)
         remove_all(store, run_id, state)
         return result
     if catalog.has_recorded_manifest(reference.sha256):
@@ -519,6 +570,7 @@ def load_records(
             raise LoadError("the default branch records this manifest but this host keeps no record of its load")
         return earlier
     leftover = owned_leftover(catalog, state, branch)
+    airbyte.check_definitions()
     if any(airbyte.running_jobs(identity) for identity in airbyte.find_connection_ids().values()):
         raise LoadError("a sync of a record connection is already running")
     copies = copy_bound_versions(store, reference, run_id, state, entries)
