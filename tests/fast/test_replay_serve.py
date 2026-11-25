@@ -752,7 +752,7 @@ class ServeStartTest(unittest.TestCase):
                 self.assertTrue(logged[0].startswith('{"event": "serve_refused", "message": "health_file_in_inbox: '), logged[0])
                 self.assertNotIn("replay_start_", logged[0], "the text is fixed: it names no path")
 
-    def test_a_health_file_that_is_a_link_in_the_inbox_is_refused_because_its_write_would_replace_the_link_inside_the_inbox(self) -> None:
+    def test_a_health_file_that_is_a_link_in_the_inbox_is_refused_and_the_link_stays(self) -> None:
         def link_out(target: str) -> Callable[[Path], Path]:
             def make(inbox: Path) -> Path:
                 (inbox.parent / "outside").mkdir(exist_ok=True)

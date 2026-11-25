@@ -192,13 +192,19 @@ uninstall) : > "$STAND_IN/recovered"; : > "$STAND_IN/status"; : > "$STAND_IN/his
 *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
 """
-K3S_STAND_IN = (
-    "#!/bin/sh\n"
-    'echo "$*" >> "$STAND_IN/log"\n'
-    'if [ -e "$STAND_IN/flag_fail_restart" ] && [ "$2" = rollout ]; then\n'
-    '  echo "Error: LEAKED-STDERR rollout" >&2; echo "LEAKED-STDOUT rollout"; exit 1\n'
-    "fi\n"
-)
+# The k3s stand-in logs each call and answers ``kubectl get deployment --output name`` with two deployments (``flag_no_deployments`` lists none).
+# ``flag_fail_restart`` fails the restart and ``flag_fail_rollout`` fails the rollout status of the second deployment, each with text that must never
+# reach the task log.
+K3S_STAND_IN = """#!/bin/sh
+echo "$*" >> "$STAND_IN/log"
+leak() { echo "Error: LEAKED-STDERR $1" >&2; echo "LEAKED-STDOUT $1"; exit 1; }
+case "$2 $3" in
+"rollout restart") [ -e "$STAND_IN/flag_fail_restart" ] && leak restart ;;
+"get deployment") [ -e "$STAND_IN/flag_no_deployments" ] || printf 'deployment.apps/airbyte-server\ndeployment.apps/airbyte-workload-launcher\n' ;;
+"rollout status") [ -e "$STAND_IN/flag_fail_rollout" ] && [ "$4" = deployment.apps/airbyte-workload-launcher ] && leak rollout ;;
+esac
+exit 0
+"""
 CHART_SHA = "c" * 64
 DEADLINE = 600
 UPGRADE = "upgrade --install"
@@ -209,7 +215,12 @@ CONFIGMAP_A = "".join(f"{name}\n" for name in VALUES_FILES)
 CONFIGMAP_B = CONFIGMAP_A.replace("host.values.yaml\n", HOST_VALUES_B)
 LEAK = "LEAKED"
 RECORD = "release_inputs.sha256"
-RESTART = ["kubectl rollout restart deployment", "kubectl wait --for=condition=Available deployment --all"]
+RESTART = [
+    "kubectl rollout restart deployment",
+    "kubectl get deployment",
+    "kubectl rollout status deployment.apps/airbyte-server",
+    "kubectl rollout status deployment.apps/airbyte-workload-launcher",
+]
 
 
 def history(*states: str) -> list[dict[str, object]]:
@@ -403,11 +414,6 @@ class ReleaseRecoveryTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertEqual([], log, "the first run recorded its inputs in the form that the second run reads")
 
-    def test_a_deployed_release_with_changed_inputs_is_upgraded_with_no_recovery(self) -> None:
-        code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
-        self.assertEqual(0, code, output)
-        self.assertEqual([UPGRADE, *RESTART], self.commands(log))
-
     def test_an_upgrade_of_a_deployed_release_restarts_every_deployment_and_waits_for_each_so_changed_settings_reach_the_pods(self) -> None:
         """The chart passes its settings to the pods as environment values from one ConfigMap, which a pod reads only when it starts, and an upgrade that
         changes only that ConfigMap leaves the pods running (live host, Nov 24 2026: the workload launcher kept a 256Mi sidecar limit after the limits file
@@ -416,7 +422,24 @@ class ReleaseRecoveryTest(unittest.TestCase):
         code, output, log = self.run_release("deployed", history("deployed"), recorded="other")
         self.assertEqual(0, code, output)
         self.assertEqual([UPGRADE, *RESTART], self.commands(log))
-        self.assertIn(f"kubectl wait --for=condition=Available deployment --all --namespace airbyte --timeout={DEADLINE}s", log)
+        self.assertIn(f"kubectl rollout status deployment.apps/airbyte-workload-launcher --namespace airbyte --timeout={DEADLINE}s", log)
+
+    def test_a_release_whose_latest_revision_failed_is_upgraded_and_restarted(self) -> None:
+        """Helm upgrades a release whose latest revision failed over an older deployed one, and its pods still run the old settings."""
+        code, output, log = self.run_release("failed", history("deployed", "failed"), recorded="other")
+        self.assertEqual(0, code, output)
+        self.assertEqual([UPGRADE, *RESTART], self.commands(log))
+
+    def test_a_rollout_that_does_not_finish_or_finds_no_deployment_stops_the_run_and_leaves_no_record(self) -> None:
+        """The new pods must be ready before the inputs are recorded: an Available condition can still hold on an old replica alone."""
+        for flag in ("fail_rollout", "no_deployments"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as scratch:
+                box = ReleaseSandbox(scratch, "deployed", history("deployed"), "other", {})
+                code, output, _ = box.run(flags=(flag,))
+                self.assertNotEqual(0, code)
+                self.assertIn("could not restart the Airbyte deployments", output)
+                self.assertNotIn(LEAK, output)
+                self.assertFalse(box.record().exists())
 
     def test_a_first_install_restarts_nothing_because_every_pod_starts_with_the_new_settings(self) -> None:
         code, output, log = self.run_release(NOT_INSTALLED, recorded="none")
@@ -457,7 +480,8 @@ class ReleaseRecoveryTest(unittest.TestCase):
             with self.subTest(status=status or "not installed"):
                 code, output, log = self.run_release(status, history("deployed", "failed"), recorded="match")
                 self.assertEqual(0, code, output)
-                self.assertEqual([UPGRADE], self.commands(log))
+                # An existing release keeps its pods, so the upgrade restarts them; only a release not installed starts every pod new.
+                self.assertEqual([UPGRADE, *([] if status == NOT_INSTALLED else RESTART)], self.commands(log))
 
     def test_a_transient_error_on_a_second_status_read_changes_nothing_when_no_recovery_ran(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
