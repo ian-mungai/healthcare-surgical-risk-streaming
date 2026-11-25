@@ -7,8 +7,11 @@ The values are synthetic markers; each case looks for them in every output and e
 
 from __future__ import annotations
 
+import getpass
 import io
 import json
+import sys
+import warnings
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
@@ -16,6 +19,8 @@ from unittest import mock
 
 from scripts.infra import external_intake
 from scripts.infra.external_intake import Ask, IntakeError, Source
+from scripts.process import run_command
+from scripts.project_config import ROOT
 from tests.fast.ansible_paths import shared_module
 from tests.fast.openbao_stand_in import Role, StandIn
 from tests.fast.test_external_intake_script import ADMIN_MARKER, LIST, NAME, OTHER, VALUE, Case
@@ -90,6 +95,53 @@ class PromptSourceTest(IntakeCase):
                 self.assertNotIn(answer.strip() or "x" * 40, str(caught.exception))
                 self.assertEqual(1, len(self.sent))
         self.assertEqual(0, self.server.writes())
+
+
+class PromptRefusalTest(IntakeCase):
+    """A prompt that cannot hide the typing or gets no input is a fixed refusal that names the secret: no echoed read and no traceback."""
+
+    def refusal(self, read: Callable[[str], str]) -> str:
+        prompt = external_intake.prompt_source(read, is_terminal=lambda: True)
+        with self.assertRaises(IntakeError) as caught:
+            try:
+                self.intake(prompt)
+            except KeyboardInterrupt:
+                self.fail("an interrupt escaped the refusal")
+        self.assertEqual(0, self.server.writes())
+        return str(caught.exception)
+
+    def test_end_of_input_and_an_interrupt_are_refusals_that_name_the_secret(self) -> None:
+        for error in (EOFError, KeyboardInterrupt):
+            with self.subTest(error=error.__name__):
+
+                def read(_: str, error: type[BaseException] = error) -> str:
+                    raise error
+
+                self.assertIn(NAME, self.refusal(read))
+
+    def test_a_read_that_can_only_echo_is_refused_before_its_answer_is_used(self) -> None:
+        def echoing(_: str) -> str:
+            warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning, stacklevel=1)
+            return VALUE
+
+        message = self.refusal(echoing)
+        self.assertIn(NAME, message)
+        self.assertNotIn(VALUE, message)
+
+    def test_the_real_getpass_without_a_terminal_reads_nothing_and_is_refused_by_name(self) -> None:
+        code = (
+            "import sys\n"
+            "from scripts.infra import external_intake\n"
+            "class Item:\n    name = 'dockerhub_read'\n"
+            "try:\n    external_intake.prompt_source(is_terminal=lambda: True)(Item)\n"
+            "except external_intake.IntakeError as error:\n    print('REFUSED:' + str(error))\n"
+            "print('LEFT:' + sys.stdin.read().strip())\n"
+        )
+        result = run_command(sys.executable, ["-c", code], cwd=ROOT, env={"PYTHONPATH": str(ROOT)}, input_text=f"{VALUE}\n", timeout=60)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(f"REFUSED:{external_intake.MESSAGES['no_hiding'].format(name=NAME)}", result.stdout)
+        self.assertIn(f"LEFT:{VALUE}", result.stdout, "the answer on standard input was not read")
+        self.assertEqual("", result.stderr, "no warning and no echoed prompt answer")
 
 
 class LocalOpenBaoSourceTest(IntakeCase):

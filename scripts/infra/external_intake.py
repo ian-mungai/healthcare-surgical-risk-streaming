@@ -19,6 +19,7 @@ import importlib.util
 import json
 import re
 import sys
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -44,6 +45,11 @@ MESSAGES = {
         "terminal to ask on: run it in a terminal or set EXTERNAL_SECRETS_SOURCE=openbao in .env"
     ),
     "no_answer": "no value was given for external secret {name}",
+    "no_hiding": (
+        "the terminal cannot hide what is typed for external secret {name}, so nothing was read: run the command in a terminal that hides typing "
+        "or set EXTERNAL_SECRETS_SOURCE=openbao in .env"
+    ),
+    "no_input": "no value was entered for external secret {name}: the input ended or was stopped",
     "bad_form": "the value for external secret {name} is not in the form of its check, so nothing was sent",
     "not_found": (
         "external secret {name} is empty in the host's OpenBao and this computer's OpenBao holds none under that name: store it "
@@ -113,7 +119,15 @@ def prompt_source(read: Callable[[str], str] | None = None, is_terminal: Callabl
     def ask(item: Any) -> str:
         if not (is_terminal or sys.stdin.isatty)():
             raise IntakeError(MESSAGES["no_terminal"].format(name=item.name))
-        answer = (read or getpass.getpass)(f"Value of external secret {item.name} (hidden, kept in no file): ").strip()
+        try:
+            with warnings.catch_warnings():
+                # Without a terminal that can hide the typing, getpass warns and then reads with the echo on: the warning is an error, so nothing is read.
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                answer = (read or getpass.getpass)(f"Value of external secret {item.name} (hidden, kept in no file): ").strip()
+        except getpass.GetPassWarning:
+            raise IntakeError(MESSAGES["no_hiding"].format(name=item.name)) from None
+        except EOFError, KeyboardInterrupt:
+            raise IntakeError(MESSAGES["no_input"].format(name=item.name)) from None
         if not answer:
             raise IntakeError(MESSAGES["no_answer"].format(name=item.name))
         return answer
