@@ -435,5 +435,25 @@ class Leftovers(unittest.TestCase):
                 self.assertFalse(self.module.removable_folder(path, suffix))
 
 
+class ContainerListing(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = runner()
+
+    def test_a_listing_of_ids_and_names_is_a_list_of_pairs(self) -> None:
+        self.assertEqual(
+            [("0123456789ab", "p5h_ab12cd_c1"), ("fedcba987654", "other")], self.module.container_listing(0, "0123456789ab p5h_ab12cd_c1\nfedcba987654 other\n")
+        )
+
+    def test_no_container_is_an_empty_list_only_when_the_command_succeeded(self) -> None:
+        self.assertEqual([], self.module.container_listing(0, ""))
+        self.assertIsNone(self.module.container_listing(255, ""))
+        self.assertIsNone(self.module.container_listing(1, "0123456789ab p5h_ab12cd_c1"))
+
+    def test_output_that_is_not_an_id_and_a_name_per_line_is_not_a_list(self) -> None:
+        for out in ("ssh: connection timed out", "0123456789ab", "0123456789ab a b", "xyz p5h_ab12cd_c1", "0123456789ab p5h_ab12cd_c1\nWarning: x"):
+            with self.subTest(out=out):
+                self.assertIsNone(self.module.container_listing(0, out))
+
+
 if __name__ == "__main__":
     unittest.main()
