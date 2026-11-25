@@ -679,6 +679,39 @@ class HostUpTest(unittest.TestCase):
         for name in ("wait_until_reachable", "run_ansible", "write_inventory"):
             self.calls[name].assert_not_called()
 
+    def test_a_missing_or_malformed_image_repository_stops_a_run_that_deploys_a_host_before_any_bootstrap_or_terraform_call(self) -> None:
+        missing = {key: value for key, value in CONFIGURATION.items() if key != "IMAGE_REPOSITORY"}
+        bad = [missing] + [
+            CONFIGURATION | {"IMAGE_REPOSITORY": value} for value in ("", "acct", "Acct/Images", "my-acct/images", "docker.io/acct/images", "acct/images:tag")
+        ]
+        for configuration in bad:
+            for confirm in ("", "123456"):
+                with self.subTest(repository=configuration.get("IMAGE_REPOSITORY", "missing"), confirm=confirm), tempfile.TemporaryDirectory() as scratch:
+                    path = binding_file(Path(scratch), backend="s3", provision_host=True)
+                    with mock.patch.object(state_bootstrap, "create", return_value=0) as create, self.assertRaisesRegex(HostError, "IMAGE_REPOSITORY"):
+                        self.run_up(path, configuration=configuration, confirm=confirm)
+                    create.assert_not_called()
+                    for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "run_ansible", "write_inventory"):
+                        self.calls[name].assert_not_called()
+
+    def test_a_run_with_no_binding_yet_is_checked_before_the_bootstrap_creates_anything(self) -> None:
+        missing = {key: value for key, value in CONFIGURATION.items() if key != "IMAGE_REPOSITORY"}
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "run_binding.json"
+            with mock.patch.object(state_bootstrap, "create", return_value=0) as create, self.assertRaisesRegex(HostError, "IMAGE_REPOSITORY"):
+                self.run_up(path, configuration=missing)
+        create.assert_not_called()
+
+    def test_a_run_that_deploys_no_host_does_not_need_an_image_repository(self) -> None:
+        missing = {key: value for key, value in CONFIGURATION.items() if key != "IMAGE_REPOSITORY"}
+        for backend, provision in (("local", False), ("s3", False)):
+            with self.subTest(backend=backend, provision=provision), tempfile.TemporaryDirectory() as scratch:
+                path = binding_file(Path(scratch), backend=backend, provision_host=provision)
+                with mock.patch.object(state_bootstrap, "create", return_value=0) as create:
+                    code, _ = self.run_up(path, configuration=missing)
+                self.assertEqual(0, code)
+                create.assert_called_once()
+
     def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             path = binding_file(Path(scratch), backend="s3", provision_host=True)

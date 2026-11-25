@@ -504,6 +504,8 @@ def place_project_key(run_id: str, address: str, profile: str) -> None:
 def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
     existing = load_run(binding) if binding.is_file() else None
     backend, provision_host = (existing.backend, existing.provision_host) if existing else ("s3", True)
+    if backend != "local" and provision_host:
+        registry_user(configuration)
     if state_bootstrap.create(aws, configuration, binding, backend, provision_host) != 0:
         raise HostError("the state bootstrap step failed")
     run = load_run(binding)
