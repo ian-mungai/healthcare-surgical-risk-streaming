@@ -35,6 +35,7 @@ from spark.jobs import bronze_clinical_lab as job
 from spark.result_file import release_reserved, reserve
 from spark.session import start_deadline
 from spark.settings import SettingsError
+from tests.fast.internal_line_support import assert_internal
 from tests.fast.test_bronze_job_sequence import BRANCH, HASH, Harness
 
 MARKER = "MARKER_9917"
@@ -110,7 +111,10 @@ class Endings(unittest.TestCase):
             with self.subTest(expected=expected):
                 code, out, err = invoke(self.argv, raising(error))
                 self.assertEqual((status, ""), (code, out))
-                self.assertEqual(f"{JOB}: {expected}: failed\n", err)
+                if expected == "internal_error":
+                    assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual(f"{JOB}: {expected}: failed\n", err)
                 self.assertEqual(
                     {"job": JOB, "command": "verify", "branch": BRANCH, "passed": False, "diagnostics": [{"code": expected}]},
                     self.written(),
@@ -189,7 +193,8 @@ class Endings(unittest.TestCase):
 
         with mock.patch("os.link", refuse):
             code, out, err = invoke(self.argv, lambda arguments: self.verified())
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertEqual([], os.listdir(self.folder))
 
     def test_the_file_is_the_same_whatever_the_streams_hold(self) -> None:

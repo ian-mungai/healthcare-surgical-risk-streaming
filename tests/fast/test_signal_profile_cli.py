@@ -26,6 +26,7 @@ from spark.profile.cli import JOB, run
 from spark.profile.grid_rule import GRID_ORIGIN, RULE_END
 from spark.settings import SettingsError
 from spark.split_cli import start_deadline
+from tests.fast.internal_line_support import assert_internal
 
 MARKER = "MARKER_8731"
 
@@ -105,7 +106,8 @@ class CommandLine(unittest.TestCase):
         code, out, err = invoke(["verify", "--branch", "b"], raising(SettingsError(MARKER)))
         self.assertEqual((2, "", "signal_profile: settings\n"), (code, out, err))
         code, out, err = invoke(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "", "signal_profile: internal_error\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, "signal_profile", "signal_profile: internal_error", (), MARKER)
 
 
 class Watchdog(unittest.TestCase):

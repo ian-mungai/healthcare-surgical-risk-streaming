@@ -25,6 +25,7 @@ from spark.gold_dimensions import DIMENSIONS, Dimension, GoldDimensionsError
 from spark.gold_dimensions_run import CHECKS, JOB, run, run_build, run_verify
 from spark.jobs import gold_dimensions
 from spark.settings import SettingsError
+from tests.fast.internal_line_support import ENTRY_FRAME, assert_internal, error_with_raising_loader
 
 NAMES = tuple(item.name for item in DIMENSIONS)
 OPEN_NAMES = tuple(item.name for item in DIMENSIONS if item.name != "dim_lab_test")
@@ -348,7 +349,21 @@ class CommandTests(unittest.TestCase):
                     raise error
 
                 code, out, err = self.call(["verify", "--branch", "x"], execute)
-                self.assertEqual((wanted[0], "", f"{JOB}: {wanted[1]}\n"), (code, out, err))
+                if wanted[1] == "internal_error":
+                    self.assertEqual((wanted[0], ""), (code, out))
+                    assert_internal(self, err, JOB, f"{JOB}: internal_error", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual((wanted[0], "", f"{JOB}: {wanted[1]}\n"), (code, out, err))
+
+    def test_an_error_whose_source_loader_raises_is_still_exit_70_with_both_lines(self) -> None:
+        error = error_with_raising_loader(self)
+
+        def execute(arguments: Namespace) -> dict[str, Any]:
+            raise error
+
+        code, out, err = self.call(["verify", "--branch", "x"], execute)
+        self.assertEqual((70, ""), (code, out))
+        self.assertEqual(ENTRY_FRAME, assert_internal(self, err, JOB, f"{JOB}: internal_error", ("builtins.KeyError",), "the loader failed")[-1])
 
 
 if __name__ == "__main__":

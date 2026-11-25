@@ -45,8 +45,10 @@ from typing import Any
 from unittest import mock
 
 from scripts.process import TimeoutExpired
+from spark.internal_diagnostic import internal_error_line
 from spark.settings import SettingsError
 from tests.e2e.run_record import Record
+from tests.fast.internal_line_support import ENTRY_FRAME
 
 E2E = Path(__file__).resolve().parents[1] / "e2e"
 
@@ -336,6 +338,65 @@ class Refusals(unittest.TestCase):
             code, out, err = stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
         self.assertEqual((1, "gold_dimensions: empty_source: failed\n"), (code, err))
         self.assertIn("out 4417", out)
+
+    def test_the_diagnostic_line_of_an_internal_error_is_not_returned_and_not_counted_as_unknown(self) -> None:
+        classes = "builtins.RuntimeError <- builtins.OSError"
+        lines = f"gold_dimensions: internal_error\ngold_dimensions: internal_error class={classes} frames={ENTRY_FRAME} | {ENTRY_FRAME}\n"
+        stack = self.stack([(70, "", lines)])
+        code, _, err = stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
+        self.assertEqual((70, "gold_dimensions: internal_error\n"), (code, err))
+        self.assertEqual(0, stack.unknown_lines)
+
+    def counted(self, code: int, *lines: str) -> int:
+        """The unknown lines of one run of the Gold command that ended with exit code ``code`` and wrote ``lines`` (each with the prefix of the job)."""
+        stack = self.stack([(code, "", "".join(f"gold_dimensions: {line}\n" for line in lines))])
+        stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
+        return int(stack.unknown_lines)
+
+    def test_a_line_that_is_shaped_like_the_diagnostic_line_but_holds_text_is_counted_as_unknown(self) -> None:
+        for text in (
+            f"internal_error class=builtins.RuntimeError frames={ENTRY_FRAME} message",
+            "internal_error class=builtins.RuntimeError: boom frames=",
+            "internal_error class=a frames=",
+            "internal_error class=builtins.RuntimeError frames=/x/a.py:1:f",
+            "internal_error class=" + "C" * 121 + " frames=",
+            "internal_error class=builtins.NotAClass frames=",
+            "internal_error class=builtins.RuntimeError frames=a-b.py:1:f",
+            "internal_error class=builtins.RuntimeError frames=other | other",
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(1, self.counted(70, "internal_error", text))
+
+    def test_a_diagnostic_line_is_unknown_on_any_exit_code_but_70(self) -> None:
+        diagnostic = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
+        for code, first in ((1, "branch_missing"), (1, "internal_error"), (2, "internal_error"), (0, "internal_error")):
+            with self.subTest(code=code, first=first):
+                self.assertEqual(1, self.counted(code, first, diagnostic))
+        self.assertEqual(0, self.counted(70, "internal_error", diagnostic))
+
+    def test_a_line_number_in_any_form_a_generated_file_and_a_second_pair_are_unknown(self) -> None:
+        good = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
+        generated = good.replace("spark/result_file.py", "spark/generated_by_data.py")
+        for number in ("2", "02", "7316254", "0"):  # the older format had a line number: the runners refuse it
+            with self.subTest(number=number):
+                self.assertEqual(1, self.counted(70, "internal_error", good.replace(".py:", f".py:{number}:")))
+        self.assertEqual(1, self.counted(70, "internal_error", generated))
+        self.assertEqual(
+            2, self.counted(70, "internal_error", good, "internal_error", good)
+        )  # a second pair makes both diagnostics unknown (the code lines are known)
+        self.assertEqual(0, self.counted(70, "internal_error", good))
+
+    def test_two_diagnostic_lines_on_one_internal_error_are_one_unknown_and_so_is_one_that_follows_another_code(self) -> None:
+        diagnostic = f"internal_error class=builtins.KeyError frames={ENTRY_FRAME}"
+        self.assertEqual(1, self.counted(70, "internal_error", diagnostic, diagnostic))
+        self.assertEqual(1, self.counted(70, "settings", diagnostic))
+        self.assertEqual(1, self.counted(70, diagnostic))
+
+    def test_every_line_that_the_producer_prints_for_an_error_is_known_even_with_a_hyphen_in_a_name(self) -> None:
+        for name, module in (("A-b", "m-n"), ("C" * 500, "m"), ("has space", "")):
+            with self.subTest(name=name[:10]):
+                error = type(name, (Exception,), {"__module__": module})("MARKER_4417")
+                self.assertEqual(0, self.counted(70, "internal_error", internal_error_line(error)))
 
     def test_a_sealed_job_still_returns_no_error_text(self) -> None:
         stack = self.stack([])
@@ -866,8 +927,19 @@ class ProducerLines(unittest.TestCase):
         self.fail("the producer raised nothing")
         return []
 
+    @staticmethod
+    def without_diagnostic(lines: list[str]) -> list[str]:
+        """The lines of a run without the diagnostic line of classes and frames, which the adapter drops (``test_the_diagnostic_line_...``)."""
+        return [line for line in lines if " internal_error class=" not in line]
+
+    def test_the_diagnostic_line_of_the_real_job_is_not_a_code(self) -> None:
+        printed = self.printed(RuntimeError("x"))
+        self.assertEqual(["gold_dimensions: internal_error"], printed[:1])
+        self.assertEqual(2, len(printed))
+        self.assertEqual(["internal_error"], self.module.codes("\n".join(printed) + "\n"))
+
     def generic_lines(self) -> list[str]:
-        lines = self.printed(argv=["nothing"]) + self.printed(SettingsError("x")) + self.printed(RuntimeError("x"))
+        lines = self.printed(argv=["nothing"]) + self.printed(SettingsError("x")) + self.without_diagnostic(self.printed(RuntimeError("x")))
         lines += self.printed(self.run_module.NessieError("x", status=404, error_code=self.run_module.REFERENCE_NOT_FOUND))
         lines += self.printed(self.run_module.NessieError("x", status=500))
         start = importlib.import_module("spark.split_cli")

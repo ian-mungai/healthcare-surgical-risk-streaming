@@ -22,6 +22,7 @@ from scripts.stack.nessie import NessieConflict, NessieError
 from spark.bronze.publication import PublicationError
 from spark.bronze_clinical_lab import BronzeRulesError
 from spark.bronze_clinical_lab_run import JOB, NotABranch, SourceNotInHistory, parser
+from spark.internal_diagnostic import internal_error_line
 from spark.result_file import INTERNAL_EXIT_CODE, line_of, run_sealed
 from spark.settings import SettingsError
 
@@ -73,13 +74,14 @@ def check_lines(result: dict[str, Any]) -> list[str]:
 
 
 def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace], dict[str, Any]], job: str = JOB) -> tuple[int, dict[str, Any], list[str]]:
-    """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error, each a fixed code and the flag."""
+    """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error, each a fixed code and the flag (an
+    ``internal_error`` adds the line of its classes and frames)."""
     try:
         result = execute(arguments)
     except Exception as error:
         status, code = code_of(error)
         document = {"job": JOB, "command": arguments.command, "branch": arguments.branch, "passed": False, "diagnostics": [{"code": code}]}
-        return status, document, [line_of(code)]
+        return status, document, [line_of(code), *([internal_error_line(error)] if code == "internal_error" else [])]
     if result["passed"]:
         return 0, {**result, "diagnostics": []}, []
     return 1, {**result, "diagnostics": [{"code": CHECKS_FAILED}]}, check_lines(result)

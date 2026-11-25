@@ -42,6 +42,8 @@ from scripts.stack.nessie import NessieError
 from spark import result_file
 from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, release_reserved, reserve, result_path, run_sealed, write_reserved
 from spark.settings import SettingsError
+from tests.fast.internal_line_support import ENTRY, ENTRY_FRAME, LINE_MARKER, OWN_FILE, assert_internal, error_with_marked_line, error_with_raising_loader
+from tests.fast.pyspark_recovery import message_naming, recover_python_exception
 
 DOCUMENT = {"job": "j", "passed": True, "diagnostics": []}
 
@@ -292,9 +294,14 @@ class Sealed(unittest.TestCase):
         for error, status, expected in endings:
             with self.subTest(expected=expected):
                 code, out, err = sealed(self.argv, raising(error))
-                self.assertEqual((status, "", f"{JOB}: {expected}: failed\n"), (code, out, err))
+                if expected == "internal_error":
+                    self.assertEqual((status, ""), (code, out))
+                    assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual((status, "", f"{JOB}: {expected}: failed\n"), (code, out, err))
                 self.assertEqual({"mode": "verify", "branch": "b", "job": JOB, "diagnostics": [{"code": expected}]}, self.written())
                 self.assertNotIn(MARKER, Path(self.path).read_text())
+                self.assertNotIn("class=", Path(self.path).read_text())
                 os.remove(self.path)
 
     def test_a_bad_call_is_usage_and_writes_nothing_and_does_not_run_the_job(self) -> None:
@@ -350,6 +357,35 @@ class Sealed(unittest.TestCase):
             run_sealed(toy_parser(), self.argv, execute, JOB)
         self.assertEqual([], os.listdir(self.folder))
 
+    def test_an_error_whose_source_loader_raises_is_still_exit_70_with_the_result_written_and_the_line_of_its_frames(self) -> None:
+        error = error_with_raising_loader(self)
+        code, out, err = sealed(self.argv, raising(error))
+        self.assertEqual((70, ""), (code, out))
+        frames = assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.KeyError",), "the loader failed")
+        self.assertEqual(ENTRY_FRAME, frames[-1])
+        self.assertEqual({"mode": "verify", "branch": "b", "job": JOB, "diagnostics": [{"code": "internal_error"}]}, self.written())
+
+    def test_a_line_number_on_a_tracked_frame_is_not_in_standard_error_or_the_result_file(self) -> None:
+        code, out, err = sealed(self.argv, raising(error_with_marked_line(self)))
+        self.assertEqual((70, ""), (code, out))
+        frames = assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.KeyError",), LINE_MARKER)
+        self.assertEqual(ENTRY_FRAME, frames[-1])
+        self.assertNotIn(LINE_MARKER, Path(self.path).read_text())
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+
+    def test_a_frame_that_pyspark_rebuilds_from_a_message_is_other_in_standard_error_and_the_result_file(self) -> None:
+        # PySpark 4.1.4 makes a code object for each ``File ..., line ..., in ...`` line of a message, so a message can name a real tracked file and function.
+        error = recover_python_exception(RuntimeError(message_naming(OWN_FILE, ENTRY, int(LINE_MARKER), MARKER)))
+        code, out, err = sealed(self.argv, raising(error))
+        self.assertEqual((70, ""), (code, out))
+        frames = assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.RuntimeError",), MARKER)
+        self.assertEqual("other", frames[-1])  # the frame of the message is the innermost, and no frame names what the message says
+        self.assertNotIn(ENTRY_FRAME, frames)
+        for text in (MARKER, LINE_MARKER, ENTRY_FRAME, "Traceback"):
+            self.assertNotIn(text, err)
+            self.assertNotIn(text, Path(self.path).read_text())
+        self.assertEqual(["result.json"], os.listdir(self.folder))
+
     def test_a_file_that_cannot_be_written_is_internal_error_with_no_file_and_no_result_line(self) -> None:
         link = os.link
 
@@ -360,7 +396,8 @@ class Sealed(unittest.TestCase):
 
         with mock.patch("os.link", refuse):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertIs(result_file.INTERNAL_EXIT_CODE, 70)
         self.assertEqual([], os.listdir(self.folder))
 
@@ -374,7 +411,8 @@ class Sealed(unittest.TestCase):
 
         with mock.patch("os.unlink", unlink):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertEqual(["result.json", "result.json.part"], sorted(os.listdir(self.folder)))
 
     def test_a_link_that_fails_and_a_part_name_that_cannot_be_removed_leave_the_part_file_in_both_writers(self) -> None:
@@ -418,7 +456,8 @@ class Sealed(unittest.TestCase):
 
         with mock.patch("os.link", refuse_link), mock.patch("os.unlink", unlink_once):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertEqual(1, len(refused))
         self.assertEqual([], os.listdir(self.folder))
 

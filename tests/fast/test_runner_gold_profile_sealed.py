@@ -31,7 +31,9 @@ from typing import Any
 from unittest import mock
 
 from spark import split_table
+from spark.internal_diagnostic import internal_error_line
 from tests.e2e.run_record import Record
+from tests.fast.internal_line_support import ENTRY_FRAME
 from tests.fast.test_runner_gold_sealed import healthy_result, runner, texts
 from tests.fast.test_runner_setup_builds import stand_in_stack
 
@@ -360,10 +362,48 @@ class ProfileDroppedSteps(unittest.TestCase):
             ("WARN jvm 31337\nTraceback (most recent call last):\nsomething STEP first_read\n", 0),
         ):
             with self.subTest(stream=stream[:40]):
-                kept, dropped = self.module.Stack.known_lines(["/data/stand_in.py", "load_clinical", "b"], stream)
+                kept, dropped = self.module.Stack.known_lines(["/data/stand_in.py", "load_clinical", "b"], stream, 1)
                 self.assertEqual(wanted, dropped)
                 for line in kept:
                     self.assertTrue(self.module.STAND_IN_LINE.fullmatch(line))
+
+    def test_the_diagnostic_line_of_an_internal_error_is_not_a_dropped_line_and_a_line_with_text_is(self) -> None:
+        job = ["-m", "spark.jobs.signal_profile"]
+        code, diagnostic = (
+            "signal_profile: internal_error\n",
+            f"signal_profile: internal_error class=builtins.KeyError <- builtins.OSError frames=other | {ENTRY_FRAME} | {ENTRY_FRAME}\n",
+        )
+        self.assertEqual((["signal_profile: internal_error"], 0), self.module.Stack.known_lines(job, code + diagnostic, 70))
+        for text in (
+            f"signal_profile: internal_error class=builtins.KeyError frames={ENTRY_FRAME} text\n",
+            "signal_profile: internal_error class=a: b frames=\n",
+            "signal_profile: internal_error class=" + "C" * 121 + " frames=\n",
+            "signal_profile: internal_error class=builtins.NotAClass frames=\n",
+            "signal_profile: internal_error class=builtins.KeyError frames=a-b.py:1:f\n",
+            "signal_profile: internal_error class=builtins.KeyError frames=other | other\n",
+        ):
+            with self.subTest(text=text[:70]):
+                self.assertEqual((["signal_profile: internal_error"], 1), self.module.Stack.known_lines(job, code + text, 70))
+
+    def test_a_diagnostic_line_is_dropped_and_counted_on_any_exit_code_but_70_and_anywhere_but_after_the_code(self) -> None:
+        job = ["-m", "spark.jobs.signal_profile"]
+        code = "signal_profile: internal_error\n"
+        line = f"signal_profile: internal_error class=builtins.KeyError frames={ENTRY_FRAME}\n"
+        for status in (0, 1, 2, 137):
+            with self.subTest(status=status):
+                self.assertEqual((["signal_profile: internal_error"], 1), self.module.Stack.known_lines(job, code + line, status))
+        for text in (line, "signal_profile: branch_missing\n" + line, code + line + line, code + "signal_profile: settings\n" + line):
+            with self.subTest(text=text[:60]):
+                kept, dropped = self.module.Stack.known_lines(job, text, 70)
+                self.assertGreaterEqual(dropped, 1)
+
+    def test_every_line_that_the_producer_prints_for_an_error_is_known_even_with_a_hyphen_in_a_name(self) -> None:
+        job = ["-m", "spark.jobs.signal_profile"]
+        for name, module in (("A-b", "m-n"), ("C" * 500, "m"), ("has space", "")):
+            with self.subTest(name=name[:10]):
+                error = type(name, (Exception,), {"__module__": module})("MARKER_4417")
+                stream = f"signal_profile: internal_error\nsignal_profile: {internal_error_line(error)}\n"
+                self.assertEqual((["signal_profile: internal_error"], 0), self.module.Stack.known_lines(job, stream, 70))
 
     def test_the_stack_keeps_the_count_for_the_case(self) -> None:
         stack, _, _ = stand_in_stack(self, self.module, None, 1, out="", err=self.DROPPED)

@@ -25,6 +25,7 @@ from spark.jobs import table_maintenance as job
 from spark.maintenance import RetentionError
 from spark.settings import SettingsError
 from tests.fast import test_table_maintenance as base
+from tests.fast.internal_line_support import assert_internal
 
 MARKER = "MARKER_6633"
 CODES = re.compile(r"^table_maintenance: [a-z_]+\n$")
@@ -64,7 +65,11 @@ class Endings(unittest.TestCase):
         for error, status, expected in endings:
             with self.subTest(expected=expected, error=type(error).__name__):
                 code, out, err = main([], error)
-                self.assertEqual((status, "", f"table_maintenance: {expected}\n"), (code, out, err))
+                if expected == "internal_error":
+                    self.assertEqual((status, ""), (code, out))
+                    assert_internal(self, err, "table_maintenance", "table_maintenance: internal_error", (f"builtins.{type(error).__name__}",), MARKER)
+                else:
+                    self.assertEqual((status, "", f"table_maintenance: {expected}\n"), (code, out, err))
 
     def test_a_bad_argument_is_usage_and_is_not_echoed(self) -> None:
         for argv in (["--table", f"a.{MARKER}!"], ["--table", f"{MARKER}"], ["--deadline-seconds", MARKER], [f"--{MARKER}"], ["--table"], ["--trunk"]):

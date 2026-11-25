@@ -7,8 +7,10 @@ holds and writes nothing. The merge or the publication of the branch is the call
 
 The test set is sealed. A message or the result holds codes, dimension names and counts, and never a case, a patient, a key or an argument. The lab test
 dimension reads the laboratory table, which holds the results of held-out patients: its counts and its write stay inside the job, the result holds one pass
-flag for it, and its failures print as ``<code>: failed``. The command line
-prints fixed codes only: ``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` and the codes of a failed check.
+flag for it, and its failures print as ``<code>: failed``. The command line writes two kinds of line on standard error and no other. The first is a fixed code:
+``usage``, ``settings``, ``branch_missing``, ``catalog_error``, ``internal_error`` or the code of a failed check. The second is the one diagnostic of an
+``internal_error``, directly after its code: the class labels of a fixed list and the frames of the tracked code in the fixed inventory
+(``spark/internal_diagnostic.py``), and no text of an error.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from typing import Any, Protocol
 
 from scripts.stack.nessie import NessieError
 from spark.gold_dimensions import BY_NAME, DIMENSIONS, Dimension, GoldDimensionsError, frozen_problems, input_problems, output_problems, unit, version_date
+from spark.internal_diagnostic import internal_error_line
 from spark.settings import SettingsError
 from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, reference_name
 
@@ -182,8 +185,9 @@ def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict
     except SettingsError:
         report("settings")
         return 2
-    except Exception:
+    except Exception as error:
         report("internal_error")
+        report(internal_error_line(error))
         return INTERNAL_EXIT_CODE
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0

@@ -30,6 +30,7 @@ from spark.result_file import release_reserved, reserve
 from spark.settings import SettingsError, number_setting
 from spark.split_cli import open_client, run, start_deadline
 from spark.split_table import PatientSplitError
+from tests.fast.internal_line_support import assert_internal
 
 MARKER = "MARKER_8731"
 
@@ -93,7 +94,12 @@ class CommandLineTest(unittest.TestCase):
         )
         for error, status, code in refusals:
             with self.subTest(code=code):
-                self.assertEqual((status, "", f"patient_split: {code}: failed\n"), invoke(["verify", "--branch", "b"], raising(error)))
+                result = invoke(["verify", "--branch", "b"], raising(error))
+                if code == "internal_error":
+                    self.assertEqual((status, ""), result[:2])
+                    assert_internal(self, result[2], "patient_split", "patient_split: internal_error: failed", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual((status, "", f"patient_split: {code}: failed\n"), result)
 
     def test_a_marker_in_any_bad_argument_reaches_no_output(self) -> None:
         for argv in (
@@ -140,7 +146,8 @@ class CommandLineTest(unittest.TestCase):
         for error in (RuntimeError(f"boom {MARKER}"), ValueError(f"bad value {MARKER}"), KeyError(MARKER), OSError(f"no file {MARKER}")):
             with self.subTest(error=type(error).__name__):
                 code, out, err = invoke(["build", "--branch", "b"], raising(error))
-                self.assertEqual((70, "", "patient_split: internal_error: failed\n"), (code, out, err))
+                self.assertEqual((70, ""), (code, out))
+                assert_internal(self, err, "patient_split", "patient_split: internal_error: failed", (f"builtins.{type(error).__name__}",), MARKER)
 
     def test_a_failed_check_prints_its_codes_one_to_a_line(self) -> None:
         code, out, err = invoke(["build", "--branch", "b"], raising(PatientSplitError("two_sets: failed", "rule_mismatch: failed")))
