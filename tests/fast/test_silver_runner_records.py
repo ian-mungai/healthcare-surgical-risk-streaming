@@ -627,12 +627,16 @@ class RunnerSource(unittest.TestCase):
     def test_the_run_removes_the_scratch_folder_in_a_finally_block(self) -> None:
         for name, source in self.sources().items():
             with self.subTest(runner=name):
+                tree = ast.parse(source)
                 removing = [
-                    any(re.search(r"(?:rmtree|scrub_tree)\(scratch", ast.unparse(statement)) for statement in node.finalbody)
-                    for node in ast.walk(ast.parse(source))
+                    any(re.search(r"(?:rmtree|scrub_tree)\(scratch|clean_up\(\w+, scratch", ast.unparse(statement)) for statement in node.finalbody)
+                    for node in ast.walk(tree)
                     if isinstance(node, ast.Try)
                 ]
                 self.assertIn(True, removing)
+                # A runner that hands the removal to ``clean_up`` removes the scratch folder inside it, and ``clean_up`` is what its ``finally`` calls.
+                for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "clean_up"):
+                    self.assertTrue(any(re.search(r"rmtree\(scratch", ast.unparse(statement)) for statement in function.body))
 
     def test_a_removal_is_judged_by_proven_absent_and_never_by_exists(self) -> None:
         for name, source in self.sources().items():

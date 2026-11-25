@@ -22,7 +22,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -83,9 +83,13 @@ def put_namespace(*elements: str) -> dict[str, Any]:
 
 
 class NessieClient:
-    """Calls to one Nessie server. ``base_url`` ends in ``/api/v2``. Every call ends within ``timeout_seconds``."""
+    """Calls to one Nessie server. ``base_url`` ends in ``/api/v2``. Every call ends within ``timeout_seconds``.
 
-    def __init__(self, base_url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
+    ``remaining`` is for a caller that has a deadline for the whole run: it gives the seconds of the run that are left, or None when there is no deadline. It is
+    read at the start of each call, so a call gets the shorter of ``timeout_seconds`` and the rest of the run, and a call is not sent when nothing is left.
+    """
+
+    def __init__(self, base_url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS, remaining: Callable[[], float | None] | None = None) -> None:
         try:
             parts = urlsplit(base_url)
             port = parts.port
@@ -97,11 +101,23 @@ class NessieClient:
         self.port = port or 80
         self.prefix = parts.path.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.remaining = remaining
+
+    def call_timeout(self) -> float:
+        """The seconds that the call that starts now may take: ``timeout_seconds`` or the rest of the run, whichever is shorter. Raises ``NessieError`` when the
+        run has no time left."""
+        left = None if self.remaining is None else self.remaining()
+        if left is None:
+            return self.timeout_seconds
+        if left <= 0:
+            raise NessieError("the deadline of the run passed before the call was sent")
+        return min(self.timeout_seconds, left)
 
     def send(self, method: str, target: str, payload: bytes | None) -> tuple[int, bytes]:
         """One HTTP exchange on the wire: the status and the body. A caller that cannot reach the server directly overrides this one method."""
+        timeout = self.call_timeout()
         headers = {"Accept": "application/json", **({"Content-Type": "application/json"} if payload is not None else {})}
-        connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_seconds)
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
         try:
             connection.request(method, target, body=payload, headers=headers)
             response = connection.getresponse()
