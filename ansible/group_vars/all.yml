@@ -104,11 +104,10 @@ compose_stack_start_deadline_seconds: 900
 compose_stack_health_deadline_seconds: 180
 compose_stack_pull_deadline_seconds: 1800
 compose_stack_provision_deadline_seconds: 120
-# The private Docker Hub repository's login for the pull: the account name and the path of one temporary file. The read-only access token is kept in the host's OpenBao
-# (compose/external_secrets.txt: dockerhub_read); just before the login the pull step writes it to that file, owned by compose_stack_owner with mode 0400, and it removes
-# the file right after. The account name is set by the deploy; the role stops with a fixed message while it or the path is missing.
+# The private Docker Hub repository's login for the pull: the account name. The read-only access token is kept in the host's OpenBao (compose/external_secrets.txt:
+# dockerhub_read); the pull step reads it from there into a hidden result and hands it to the pull's shell on standard input, so no file holds it. The account name is
+# set by the deploy; the role stops with a fixed message while it is missing.
 compose_stack_registry_user: ""
-compose_stack_registry_token_file: "{{ compose_stack_secrets_directory }}/registry_token"
 # The parent of the pull's own Docker client configuration folders (mode 0700, owned by compose_stack_owner). The pull makes one fresh folder under it, holds the login in
 # that folder only and removes the folder; the parent is made when it is missing and is never removed or changed, and nothing else in it is read or changed.
 compose_stack_registry_config_directory: "{{ compose_stack_directory }}/registry_docker"

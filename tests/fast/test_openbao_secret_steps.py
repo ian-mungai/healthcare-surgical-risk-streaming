@@ -1,8 +1,9 @@
-"""The two steps of the OpenBao module that move a secret between OpenBao and a file on the host.
+"""The two steps of the OpenBao module that move a secret between OpenBao and the host.
 
-``fetch`` writes an external secret from OpenBao to a root-only file for its consumer (the login to Docker Hub reads that file once, and the playbook removes it
-right after). ``generated`` keeps a secret that the host makes for itself (the Grafana administrator password): made once, stored in OpenBao while its path is
-empty, and written from OpenBao to the file that its container reads. The server is the stand-in of ``tests/fast/openbao_stand_in.py``; the values are markers.
+``read`` returns an external secret from OpenBao to the playbook for its consumer, which hands it to one task's standard input (the pull of the images reads
+the Docker Hub token that way) and writes no file. ``generated`` keeps a secret that the host makes for itself (the Grafana administrator password): made once,
+stored in OpenBao while its path is empty, and written from OpenBao to the file that its container reads. The server is the stand-in of
+``tests/fast/openbao_stand_in.py``; the values are markers.
 """
 
 from __future__ import annotations
@@ -46,17 +47,15 @@ class StepCase(unittest.TestCase):
         self.server.__enter__()
         self.addCleanup(self.server.__exit__)
 
-    def fetch(self, destination: Path, *, consumer: str = "deploy", name: str = NAME, check_only: bool = False) -> dict[str, Any]:
+    def read(self, *, consumer: str = "deploy", name: str = NAME) -> dict[str, Any]:
         parameters = {
             "secrets_directory": str(self.secrets),
             "external_secrets_file": str(LIST),
             "address": self.server.address,
             "consumer": consumer,
             "name": name,
-            "dest": str(destination),
-            "file_owner": OWNER_TEXT,
         }
-        return dict(bootstrap.fetch_external(parameters, check_only=check_only))
+        return dict(bootstrap.read_external(parameters))
 
     def generated(self, destination: Path, *, check_only: bool = False) -> dict[str, Any]:
         parameters = {
@@ -69,39 +68,26 @@ class StepCase(unittest.TestCase):
         return dict(bootstrap.generated_secret(parameters, check_only=check_only))
 
 
-class FetchTest(StepCase):
-    def test_the_consumer_gets_the_value_in_a_root_only_file_and_the_result_holds_no_value(self) -> None:
+class ReadTest(StepCase):
+    def test_the_consumer_gets_the_value_in_the_result_and_the_step_changes_and_writes_nothing(self) -> None:
         self.server.versions[f"external/{NAME}"] = [VALUE]
-        target = self.folder / "token"
-        result = self.fetch(target)
-        self.assertEqual(VALUE, target.read_text())
-        self.assertEqual(0o400, stat.S_IMODE(target.stat().st_mode))
-        self.assertEqual(MY_OWNER, (target.stat().st_uid, target.stat().st_gid))
-        self.assertTrue(result["changed"])
-        self.assertNotIn(VALUE, repr(result))
+        before = sorted(path.name for path in self.folder.rglob("*"))
+        result = self.read()
+        self.assertEqual({"changed": False, "value": VALUE}, result)
+        self.assertEqual(before, sorted(path.name for path in self.folder.rglob("*")), "no file of any name was made")
+        self.assertEqual(0, self.server.writes())
 
-    def test_a_second_fetch_of_the_same_value_changes_nothing_and_a_new_value_replaces_the_file(self) -> None:
+    def test_the_value_is_the_text_that_is_stored_now(self) -> None:
         self.server.versions[f"external/{NAME}"] = [VALUE]
-        target = self.folder / "token"
-        self.fetch(target)
-        self.assertFalse(self.fetch(target)["changed"])
+        self.assertEqual(VALUE, self.read()["value"])
         newer = "dckr_pat_" + "ReplacedMarkerValue0123456"
         self.server.versions[f"external/{NAME}"].append(newer)
-        self.assertTrue(self.fetch(target)["changed"])
-        self.assertEqual(newer, target.read_text())
-
-    def test_a_file_with_the_right_text_and_a_looser_mode_is_given_mode_0400_and_reported_as_changed(self) -> None:
-        self.server.versions[f"external/{NAME}"] = [VALUE]
-        target = self.folder / "token"
-        target.write_text(VALUE)
-        target.chmod(0o640)
-        self.assertTrue(self.fetch(target)["changed"])
-        self.assertEqual((0o400, VALUE), (stat.S_IMODE(target.stat().st_mode), target.read_text()))
+        self.assertEqual(newer, self.read()["value"])
 
     def test_a_refused_login_names_the_role_and_the_status_and_gives_no_advice_to_reset_the_data(self) -> None:
         (self.secrets / "openbao" / "deploy.secret_id").write_text("a-secret-id-that-the-server-does-not-know")
         with self.assertRaises(bootstrap.BootstrapError) as caught:
-            self.fetch(self.folder / "token")
+            self.read()
         text = str(caught.exception)
         self.assertIn("the login of role deploy was refused (HTTP 400)", text)
         for advice in ("reset", "volume"):
@@ -111,36 +97,32 @@ class FetchTest(StepCase):
     def test_a_secret_of_another_consumer_is_refused_before_any_call(self) -> None:
         self.server.versions[f"external/{NAME}"] = [VALUE]
         with self.assertRaises(bootstrap.BootstrapError) as caught:
-            self.fetch(self.folder / "token", consumer="nessie")
+            self.read(consumer="nessie")
         self.assertIn(NAME, str(caught.exception))
         self.assertEqual([], self.server.calls)
-        self.assertFalse((self.folder / "token").exists())
 
-    def test_a_policy_that_does_not_let_the_consumer_read_is_a_server_refusal_with_no_file(self) -> None:
+    def test_a_policy_that_does_not_let_the_consumer_read_is_a_server_refusal_that_holds_no_value(self) -> None:
         self.server.versions[f"external/{NAME}"] = [VALUE]
         self.server.roles["deploy"].readable = ()
         with self.assertRaises(bootstrap.BootstrapError) as caught:
-            self.fetch(self.folder / "token")
+            self.read()
         self.assertNotIn(VALUE, str(caught.exception))
-        self.assertFalse((self.folder / "token").exists())
 
-    def test_an_empty_path_is_refused_by_name_with_the_way_to_fill_it_and_no_file(self) -> None:
+    def test_an_empty_path_is_refused_by_name_with_the_way_to_fill_it(self) -> None:
         with self.assertRaises(bootstrap.BootstrapError) as caught:
-            self.fetch(self.folder / "token")
+            self.read()
         self.assertIn(NAME, str(caught.exception))
         self.assertIn("intake", str(caught.exception))
-        self.assertFalse((self.folder / "token").exists())
 
-    def test_a_stored_value_that_fails_its_form_is_refused_and_not_written_and_no_error_holds_it(self) -> None:
+    def test_a_stored_value_that_fails_its_form_is_refused_and_no_error_holds_it(self) -> None:
         for stored in ("not a token", VALUE + "\n", ""):
             self.server.versions[f"external/{NAME}"] = [stored]
             with self.subTest(stored=stored[:8]), self.assertRaises(bootstrap.BootstrapError) as caught:
-                self.fetch(self.folder / "token")
+                self.read()
             if stored.strip():
                 self.assertNotIn(stored.strip(), str(caught.exception))
-            self.assertFalse((self.folder / "token").exists())
 
-    def test_a_stored_text_that_does_not_match_its_digest_or_has_none_is_refused_and_no_file_is_written(self) -> None:
+    def test_a_stored_text_that_does_not_match_its_digest_or_has_none_is_refused(self) -> None:
         for label in ("another digest", "no digest"):
             self.server.versions[f"external/{NAME}"] = [VALUE]
             self.server.bare.discard(f"external/{NAME}")
@@ -149,14 +131,8 @@ class FetchTest(StepCase):
             else:
                 self.server.digests[f"external/{NAME}"] = {0: "0" * 64}
             with self.subTest(label), self.assertRaises(bootstrap.BootstrapError) as caught:
-                self.fetch(self.folder / "token")
+                self.read()
             self.assertNotIn(VALUE, str(caught.exception))
-            self.assertFalse((self.folder / "token").exists())
-
-    def test_a_check_run_writes_no_file(self) -> None:
-        self.server.versions[f"external/{NAME}"] = [VALUE]
-        self.assertTrue(self.fetch(self.folder / "token", check_only=True)["changed"])
-        self.assertFalse((self.folder / "token").exists())
 
 
 class GeneratedTest(StepCase):

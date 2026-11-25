@@ -55,6 +55,7 @@ case "$verb" in
   login|logout) echo "the role must not run docker $verb" >&2; exit 1 ;;
   pull)
     ps -ww -eo args= >> "$here/ps.log"
+    grep -rlF -- '@TOKEN@' "$here/.." 2>/dev/null | grep -v "/bin/docker$" >> "$here/token_files.log"
     if [ -f "$here/fail_pull" ]; then echo "pull failed" >&2; exit 1; fi
     if [ ! -f "$store/config.json" ]; then echo "pull denied: not logged in" >&2; exit 1; fi
     cp "$store/config.json" "$here/pull_config.json"
@@ -378,7 +379,7 @@ class SecretRecreateTest(unittest.TestCase):
 
 
 class PullTest(unittest.TestCase):
-    """The pull reads the token that the deploy consumer takes from the host's OpenBao (here a stand-in server) and removes the token file after."""
+    """The pull reads the token that the deploy consumer takes from the host's OpenBao (here a stand-in server) on its standard input. No file holds it."""
 
     TOKEN = "dckr_pat_example_token_value_0123"  # noqa: S105 - a stand-in value that proves the token never reaches a command line, an environment or the output
     LOGIN = "deploy-login-marker"
@@ -387,6 +388,7 @@ class PullTest(unittest.TestCase):
 
     def prepare_pull(self, folder: Path, *, stored: str | None = TOKEN) -> tuple[Path, dict[str, object]]:
         stand_in = prepare(folder)
+        stand_in.write_text(stand_in.read_text().replace("@TOKEN@", self.TOKEN))
         (folder / "platform").mkdir()
         secrets = folder / "secrets"
         (secrets / "openbao").mkdir(parents=True)
@@ -400,11 +402,9 @@ class PullTest(unittest.TestCase):
             folder,
             stand_in,
             compose_stack_registry_user=self.USER,
-            compose_stack_registry_token_file=str(folder / "registry_token"),
             openbao_address=server.address,
             openbao_secrets_directory=str(secrets),
             openbao_external_secrets_file=str(ROOT / "compose" / "external_secrets.txt"),
-            secret_files_root_owner=f"{os.getuid()}:{os.getgid()}",
         )
         return stand_in, values
 
@@ -455,7 +455,7 @@ class PullTest(unittest.TestCase):
             parent_mode = stat.S_IMODE(parent.stat().st_mode)
             used = json.loads((stand_in.parent / "pull_config.json").read_text())
             file_mode = (stand_in.parent / "pull_file_mode.log").read_text().strip()
-            left_behind = (folder / "registry_token").exists()
+            holders = (stand_in.parent / "token_files.log").read_text()
         self.assertEqual(0, code, output)
         self.assertEqual(["compose --project-name sample --profile batch pull --quiet"], logged)
         self.assertEqual(1, len(seen))
@@ -467,7 +467,7 @@ class PullTest(unittest.TestCase):
         self.assertEqual({"auths": {"https://index.docker.io/v1/": {"auth": auth}}}, used, "one auth entry for Docker Hub and nothing else")
         self.assertEqual([], listing, "the folder is removed and the parent stays")
         self.assertEqual(0o700, parent_mode)
-        self.assertFalse(left_behind, "the temporary token file is removed right after the pull")
+        self.assertEqual("", holders, "no file under the scratch folder held the token while the pull ran")
 
     def test_the_token_is_on_no_command_line_in_no_environment_and_in_no_output(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -560,11 +560,11 @@ class PullTest(unittest.TestCase):
             (stand_in.parent / "fail_pull").write_text("")
             code, output = run_tasks("pull_images.yml", values)
             left = os.listdir(self.parent(folder))
-            left_behind = (folder / "registry_token").exists()
+            holders = (stand_in.parent / "token_files.log").read_text()
         self.assertNotEqual(0, code, output)
         self.assertIn("the image pull failed with status 1", output)
         self.assertEqual([], left)
-        self.assertFalse(left_behind)
+        self.assertEqual("", holders)
         self.assertNotIn(self.TOKEN, output)
 
     def test_a_pull_that_runs_past_its_deadline_is_ended_by_the_task_with_a_fixed_message_and_its_folder_is_removed(self) -> None:
@@ -602,7 +602,6 @@ class PullTest(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assertEqual([], calls(stand_in), "no docker call at all")
                 self.assertFalse(self.parent(folder).exists(), "nothing was written, not even the parent")
-                self.assertFalse((folder / "registry_token").exists())
                 self.assertNotIn(self.TOKEN, output)
                 self.assertNotIn("not a docker hub token", output)
 
@@ -619,22 +618,42 @@ class PullTest(unittest.TestCase):
         self.assertNotIn(self.TOKEN, output)
         self.assertIn("the login of role deploy was refused", output)
 
-    def test_an_unset_user_or_token_file_setting_is_refused_by_name(self) -> None:
-        for name in ("compose_stack_registry_user", "compose_stack_registry_token_file"):
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as scratch:
-                stand_in, values = self.prepare_pull(Path(scratch))
-                values[name] = ""
-                code, output = run_tasks("pull_images.yml", values)
-                self.assertNotEqual(0, code)
-                self.assertIn("set compose_stack_registry_user and compose_stack_registry_token_file", output)
-                self.assertEqual([], calls(stand_in))
+    def test_an_unset_user_setting_is_refused_by_name_before_any_read_or_docker_call(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            stand_in, values = self.prepare_pull(Path(scratch))
+            values["compose_stack_registry_user"] = ""
+            code, output = run_tasks("pull_images.yml", values)
+        self.assertNotEqual(0, code)
+        self.assertIn("set compose_stack_registry_user", output)
+        self.assertNotIn("Read the registry token", output)
+        self.assertEqual([], calls(stand_in))
 
-    def test_the_task_file_runs_no_docker_login_or_logout_and_keeps_no_token_in_a_variable(self) -> None:
+    def test_the_task_file_runs_no_docker_login_or_logout_and_hands_the_token_from_a_hidden_read_to_the_shell_without_a_file(self) -> None:
         text = (ROLE / "tasks" / "pull_images.yml").read_text()
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-        for word in ("login'", "logout'", "docker login", "docker logout", "slurp", "b64decode", "--password"):
+        for word in (
+            "login'",
+            "logout'",
+            "docker login",
+            "docker logout",
+            "slurp",
+            "b64decode",
+            "--password",
+            "registry_token_file",
+            "fetch_external",
+            "dest:",
+        ):
             self.assertNotIn(word, code)
-        self.assertNotIn("registry_token.content", code)
+        parsed: Any = load_yaml(text)
+        tasks = parsed[1]["block"]
+        pull = next(task for task in tasks if "ansible.builtin.shell" in task)
+        self.assertEqual("{{ openbao_external_read.value }}", pull["ansible.builtin.shell"]["stdin"])
+        self.assertTrue(pull.get("no_log"))
+        reading: Any = load_yaml((ROLES / "openbao" / "tasks" / "read_external.yml").read_text())
+        self.assertEqual(1, len(reading))
+        self.assertTrue(reading[0].get("no_log"), "the read of the token is hidden")
+        self.assertEqual("openbao_external_read", reading[0]["register"])
+        self.assertNotIn("compose_stack_registry_token_file", (ROOT / "ansible" / "group_vars" / "all.yml").read_text())
 
 
 class SourceCoverageTest(unittest.TestCase):

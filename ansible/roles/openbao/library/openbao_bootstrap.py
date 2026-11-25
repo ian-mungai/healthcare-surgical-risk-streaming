@@ -10,10 +10,10 @@ the numeric user on its list line, or by root when the line has none) and, for a
 path. A server that already matches needs no change and the step reports none. It reports every secret file with its owner, for the role's check. A
 service that left the list keeps its role and is reported as unlisted, never removed; its policy loses every external grant, and its other rules stay.
 
-``step: fetch`` writes one external secret (``compose/external_secrets.txt``) from OpenBao to a file for its consumer, after the consumer logs in with
-its own AppRole: the pull of the images reads the Docker Hub token that way and removes the file right after. ``step: generated`` keeps a secret that
-the host makes for itself (the Grafana administrator password): made once, stored in OpenBao while its path is empty and written from OpenBao to the
-file that its container reads.
+``step: read`` returns one external secret (``compose/external_secrets.txt``) from OpenBao in its result, after the consumer logs in with its own AppRole,
+and writes no file: the pull of the images reads the Docker Hub token that way and hands it to one task's standard input. The calling task hides its result.
+``step: generated`` keeps a secret that the host makes for itself (the Grafana administrator password): made once, stored in OpenBao while its path is empty
+and written from OpenBao to the file that its container reads.
 
 It uses only the standard library and runs on the host's Python. No secret is a module argument, a command line, a log line or a message.
 """
@@ -401,10 +401,11 @@ def write_when_different(dest: Path, value: str, owner: tuple[int, int], *, chec
     return True
 
 
-def fetch_external(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
-    """Write an external secret from OpenBao to a file for its consumer, after the consumer logs in with its own AppRole.
+def read_external(params: dict[str, Any]) -> dict[str, Any]:
+    """Return an external secret from OpenBao to the playbook, after the consumer logs in with its own AppRole. Nothing is written.
 
-    The list names the consumer of each secret, and a consumer reads only its own. The value goes to the file and to no result, argument or message."""
+    The list names the consumer of each secret, and a consumer reads only its own. The value is in the result and in no argument or message: the task that calls
+    this step hides its result and hands the value to one task's standard input."""
     name, consumer = str(params["name"]), str(params["consumer"])
     try:
         declared = {item.name: item for item in parse_external(Path(params["external_secrets_file"]).read_text())}
@@ -421,8 +422,7 @@ def fetch_external(params: dict[str, Any], *, check_only: bool) -> dict[str, Any
         raise BootstrapError(f"external secret {name} is empty in OpenBao: the launcher's intake (make host-up) stores it before the images are pulled")
     if not form_ok(declared[name].check, value):
         raise BootstrapError(f"the value stored for external secret {name} is not in the form of its check")
-    changed = write_when_different(Path(params["dest"]), value, parse_owner(params["file_owner"], allow_root=True), check_only=check_only)
-    return {"changed": changed}
+    return {"changed": False, "value": value}
 
 
 def generated_secret(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
@@ -489,13 +489,13 @@ def reconcile(params: dict[str, Any], *, check_only: bool) -> dict[str, Any]:
 def main() -> None:
     module = AnsibleModule(
         argument_spec={
-            "step": {"type": "str", "required": True, "choices": ["prepare", "reconcile", "fetch", "generated"]},
+            "step": {"type": "str", "required": True, "choices": ["prepare", "reconcile", "read", "generated"]},
             "consumer": {"type": "str"},
             "name": {"type": "str"},
             "dest": {"type": "path"},
             "secrets_directory": {"type": "path", "required": True},
             "unlock_key_file": {"type": "path"},
-            "file_owner": {"type": "str", "required": True},
+            "file_owner": {"type": "str"},
             "root_owner": {"type": "str", "default": "0:0"},
             "services_file": {"type": "path"},
             "tools_file": {"type": "path"},
@@ -505,6 +505,7 @@ def main() -> None:
             "token_ttl_seconds": {"type": "int", "default": 3600},
             "token_max_ttl_seconds": {"type": "int", "default": 86400},
         },
+        required_if=[("step", step, ("file_owner",)) for step in ("prepare", "reconcile", "generated")],
         supports_check_mode=True,
     )
     params = module.params
@@ -515,12 +516,11 @@ def main() -> None:
             created = prepare(Path(params["secrets_directory"]), unlock, owner, check_only=module.check_mode)
             files = [{"path": str(secret_file(Path(params["secrets_directory"]), ADMIN_ID_FILE)), "owner": params["file_owner"]}]
             module.exit_json(changed=created, created=[ADMIN_ID_FILE] if created else [], secret_files=files)
-        if params["step"] in ("fetch", "generated"):
-            needed = ("address", "dest", "name") + (("consumer", "external_secrets_file") if params["step"] == "fetch" else ())
+        if params["step"] in ("read", "generated"):
+            needed = ("address", "name") + (("consumer", "external_secrets_file") if params["step"] == "read" else ("dest",))
             if not all(params[key] for key in needed):
                 raise BootstrapError(f"the {params['step']} step needs {', '.join(needed)}")
-            run = fetch_external if params["step"] == "fetch" else generated_secret
-            module.exit_json(**run(params, check_only=module.check_mode))
+            module.exit_json(**(read_external(params) if params["step"] == "read" else generated_secret(params, check_only=module.check_mode)))
         if not all(params[key] for key in ("services_file", "tools_file", "address")):
             raise BootstrapError("the reconcile step needs services_file, tools_file and address")
         module.exit_json(**reconcile(params, check_only=module.check_mode))
