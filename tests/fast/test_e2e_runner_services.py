@@ -376,6 +376,25 @@ class RunnerInterruptTest(unittest.TestCase):
                     start()
                 self.assertEqual(({}, 1), (engine.boxes, len(engine.launches())))
 
+    def test_a_stalled_step_whose_container_survives_is_not_undone_or_tried_again(self) -> None:
+        """The launch returns after a stall, and the removal fails: the step is not undone while its own container may still run, and nothing starts again."""
+        for name in ("silver_labels", "silver_cases"):
+            engine = Engine(on_start=finishes(137), removal_fails=True)
+            module: Any = importlib.import_module(f"tests.e2e.{name}")
+            stack = module.Stack.__new__(module.Stack)
+            stack.record, stack.log, stack.stalls, stack.project = types.SimpleNamespace(commands=[]), [], [], "p"
+            stack.watch = lambda done, stalled: stalled.set()
+            stack.run = lambda args, timeout=60, stdin=None, engine=engine: FakeTarget(engine).run(args, timeout=timeout)
+            reset: list[bool] = []
+            with (
+                self.subTest(name=name),
+                mock.patch.object(module.Stack, "compose", new_callable=mock.PropertyMock, return_value=["docker", "compose"]),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaisesRegex(SlotBusy, f"{1:064x} \\(exited\\)"),
+            ):
+                stack.job(["-m", f"spark.jobs.{name}", "build"], reset=lambda reset=reset: reset.append(True))
+            self.assertEqual((1, []), (len(engine.launches()), reset))
+
     def test_a_labels_step_that_passes_its_limit_is_not_tried_again_while_its_own_container_survives(self) -> None:
         def killed(engine: Engine, box: Box) -> CompletedProcess[str]:
             raise TimeoutExpired("docker", 5)

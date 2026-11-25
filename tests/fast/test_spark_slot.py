@@ -228,6 +228,22 @@ class SlotTest(unittest.TestCase):
 
         return docker
 
+    def test_only_the_whole_refusal_of_the_slots_name_with_status_1_and_no_output_can_be_a_refused_create(self) -> None:
+        exact = CONFLICT.format(name=SLOT_NAME, other="a" * 64)
+        progress = f" Container {SLOT_NAME}  Error {exact}\n{exact}\n"
+        self.assertTrue(slot.refused_by_name(CompletedProcess([], 1, "", progress)))
+        for label, code, out, err in (
+            ("another status", 42, "", exact),
+            ("success", 0, "", exact),
+            ("the job wrote output", 1, "RESULT {}\n", exact),
+            ("the words alone", 1, "", "x is already in use"),
+            ("a cut refusal", 1, "", exact.split(" You have")[0]),
+            ("another name", 1, "", CONFLICT.format(name="another", other="a" * 64)),
+            ("a short ID", 1, "", CONFLICT.format(name=SLOT_NAME, other="a" * 12)),
+        ):
+            with self.subTest(label):
+                self.assertFalse(slot.refused_by_name(CompletedProcess([], code, out, err)))
+
     def test_a_refused_create_whose_winner_is_gone_before_the_reread_is_busy_and_never_a_job_result(self) -> None:
         with self.assertRaisesRegex(SlotBusy, SLOT_NAME):
             run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=self.winner_gone_before_the_reread())
