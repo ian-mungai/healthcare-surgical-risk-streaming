@@ -1,11 +1,12 @@
 # Deploys the Compose stack. A service that needs its own database account cannot become healthy before the account exists, so the order is: place the
 # Compose files, write the gateway's settings, render the limits and host settings, create the password files and check them, create the Grafana password
-# file, build the images the project makes itself, create Airbyte's namespace on k3s and write the k3s token and certificate authority that the code
+# file, create the AIStor credential files and install the script that places its licence, build the images the project makes itself, create Airbyte's namespace on k3s and write the k3s token and certificate authority that the code
 # location reads as Compose secrets, so a new host deploys in one pass, start PostgreSQL alone and wait for it, make the PostgreSQL accounts match the tool
-# list, prepare the secret store's first start, start the remaining services but the orchestration services and wait for them, make the Kafka
-# topics and the registry's rules match their lists, make the secret store match the service list, and last check the AIStor licence file, start AIStor (the
-# services of compose_stack_storage_services start apart, so a missing licence refuses that step after everything else is deployed) and make the AIStor project
-# user, the one use of its root pair. The orchestration services (the code location and what waits for it) start last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
+# list, prepare the secret store's first start, start the remaining services but the orchestration services and AIStor and wait for them, make the Kafka
+# topics and the registry's rules match their lists, and make the secret store match the service list. AIStor (the services of compose_stack_storage_services
+# start apart) is not started here: it needs its licence, which the launcher places after this playbook, so it starts in the AIStor step (ansible/storage.yml, storage.yml
+# of this role), which skips it with a recorded state when the licence is missing. The orchestration services (the code location and what waits for it) start
+# last, from start_orchestration.yml, which the connection playbook runs after the Airbyte role and the key placement: the
 # code location mounts files that only they can make, and it gives Nessie's main branch its first commit. A second run changes nothing.
 - name: Place the Compose files
   ansible.builtin.include_tasks: place_files.yml
@@ -27,6 +28,9 @@
 
 - name: Create the AIStor credential files
   ansible.builtin.include_tasks: aistor_credentials.yml
+
+- name: Install the script that places AIStor's licence, which the launcher runs after this playbook
+  ansible.builtin.include_tasks: aistor_licence_script.yml
 
 - name: Build the images the project makes itself
   ansible.builtin.include_tasks: build_images.yml
@@ -70,14 +74,3 @@
   ansible.builtin.include_role:
     name: openbao
     tasks_from: bootstrap.yml
-
-- name: Refuse a missing or empty AIStor licence file, which stops the start of AIStor and nothing before it
-  ansible.builtin.include_tasks: aistor_licence.yml
-
-- name: Start AIStor and wait for its health
-  ansible.builtin.include_tasks: start.yml
-  vars:
-    compose_stack_start_services: "{{ compose_stack_storage_services }}"
-
-- name: Make the AIStor project user and its policy, the only use of the root pair (a second run makes no call that writes)
-  ansible.builtin.include_tasks: aistor_project_user.yml

@@ -64,6 +64,15 @@ compose_stack_owner: root
 # is missing or empty. The services that start apart from the rest, after their own step: AIStor starts after the check of its licence file.
 compose_stack_aistor_licence_file: "{{ compose_stack_secrets_directory }}/aistor/licence"
 compose_stack_storage_services: [aistor]
+# The licence is placed by the launcher, never by a task: it reads the key at secret/aistor_licence in the owner's OpenBao and pipes it, on standard input of one SSH
+# command, to the script below, which the host playbook installs with a sudoers drop-in that turns off sudo's recording for that one command line. The folder of the
+# platform's scripts is shared with the key script of the Airbyte role. The state file says whether the AIStor step started the server or skipped it for want of a
+# licence; make storage-up reads it, and the playbook of the AIStor step writes it.
+compose_stack_bin_directory: /opt/platform/bin
+compose_stack_aistor_licence_script: "{{ compose_stack_bin_directory }}/aistor_licence_install"
+compose_stack_aistor_licence_sudoers: /etc/sudoers.d/aistor_licence_install
+compose_stack_visudo: /usr/sbin/visudo
+compose_stack_aistor_state_file: "{{ compose_stack_compose_directory }}/aistor.state"
 # The AIStor step (aistor_project_user.yml) verifies the project user as that user and uses AIStor's root pair only when that sign-in is refused: it makes the
 # project's one user and one policy, and every other client (Terraform, the storage command, its checks) signs in as that user. The user's password is a generated
 # root-only file beside the root files; the step keeps the user and the password in OpenBao (compose_stack_aistor_openbao_path) after that pair has signed in, and

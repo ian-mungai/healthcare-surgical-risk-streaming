@@ -117,6 +117,7 @@ class Stand(unittest.TestCase):
         self.aws_calls: list[tuple[list[str], dict[str, str]]] = []
         self.ssh_commands: list[str] = []
         self.login_id: str | None = LOGIN_ID
+        self.state: str | None = "started\n"
         Gateway.requests = []
         Gateway.stored = {"user": FIRST_VALUE, "password": SECOND_VALUE}
         Gateway.statuses = {}
@@ -136,6 +137,8 @@ class Stand(unittest.TestCase):
 
     def ssh_output(self, run_id: str, address: str, command: str, timeout: float) -> str | None:
         self.ssh_commands.append(command)
+        if command.endswith("/aistor.state"):
+            return self.state
         return None if self.login_id is None or not command.endswith("/openbao/aistor.secret_id") else self.login_id + "\n"
 
     def run_command(self, program: str, arguments: list[str], **keywords: Any) -> CompletedProcess[str]:
@@ -575,6 +578,40 @@ class UpTest(Stand):
         self.versioning = "Suspended"
         with self.assertRaises(storage.StorageError):
             self.up(code)
+
+
+class AistorStateTest(UpTest):
+    """The AIStor step records on the host whether it started the server or skipped it for want of a licence: the command says so and goes no further."""
+
+    def test_a_host_that_skipped_aistor_for_want_of_a_licence_stops_the_run_with_the_owners_step_before_openbao_and_terraform(self) -> None:
+        self.state = "skipped: no AIStor licence file was on the host at the last deploy; place the licence and deploy again\n"
+        with self.assertRaises(storage.StorageError) as caught:
+            self.up()
+        message = str(caught.exception)
+        self.assertIn("secret/aistor_licence", message)
+        self.assertIn("make host-up", message)
+        self.assertEqual([], Gateway.requests, "OpenBao is not asked")
+        self.assertEqual([], self.calls)
+        self.assertNotIn("sudo -n cat", " ".join(self.ssh_commands), "no secret ID is read from the host")
+
+    def test_a_host_with_no_record_is_refused_and_told_to_deploy_first(self) -> None:
+        for state in (None, "", "something else\n"):
+            with self.subTest(state=state):
+                self.state = state
+                with self.assertRaises(storage.StorageError) as caught:
+                    self.up()
+                self.assertIn("make host-up", str(caught.exception))
+                self.assertEqual([], Gateway.requests)
+
+    def test_a_host_that_started_aistor_goes_on_and_the_command_asks_for_the_record_with_one_fixed_read(self) -> None:
+        self.assertEqual(0, self.up())
+        self.assertIn("cat /opt/platform/compose/aistor.state", self.ssh_commands)
+        self.assertEqual(self.ssh_commands.index("cat /opt/platform/compose/aistor.state"), 0)
+
+    def test_the_state_file_is_the_one_the_deploy_writes(self) -> None:
+        variables = group_variables()
+        compose = str(variables["compose_stack_compose_directory"]).replace("{{ compose_stack_directory }}", str(variables["compose_stack_directory"]))
+        self.assertEqual(str(variables["compose_stack_aistor_state_file"]).replace("{{ compose_stack_compose_directory }}", compose), storage.STATE_FILE)
 
 
 class AccountBeforeTerraformTest(UpTest):

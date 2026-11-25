@@ -1,0 +1,13 @@
+# The AIStor step of the host deployment, after the host playbook and the launcher's placement of AIStor's licence (scripts.infra.host). It starts AIStor and makes its
+# project user when the licence file is on the host, and when it is not it skips AIStor, records that in the state file and goes on: the deploy carries on with the
+# project key placement and the connection step, so Airbyte and the rest do not wait for a licence. A later deploy with the licence in place starts AIStor.
+- name: Start AIStor when its licence is on the host
+  hosts: platform
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Start AIStor and make its project user, or skip them and record why
+      ansible.builtin.include_role:
+        name: compose_stack
+        tasks_from: storage.yml

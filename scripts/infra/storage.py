@@ -61,6 +61,7 @@ from scripts.stack.caddy import RoutesError, load_routes
 from scripts.stack.yaml_text import load_yaml
 
 SECRETS_DIRECTORY = "/opt/platform/secrets"
+STATE_FILE = "/opt/platform/compose/aistor.state"
 STORAGE_ROUTE = "aistor"
 STORAGE_REGION = "us-east-1"
 OPENBAO_ROUTE = "openbao"
@@ -415,6 +416,18 @@ def check_versioning(address: str, bucket: str, credentials: Credentials) -> Non
     sys.stdout.write(f"versioning of the bucket {bucket} is Enabled\n")
 
 
+def require_started(run_id: str, address: str) -> None:
+    """Refuse a host whose AIStor step did not start the server. The step records ``started`` or ``skipped`` (for want of a licence) in a file of the host."""
+    state = (ssh_output(run_id, address, f"cat {STATE_FILE}", SSH_SECONDS) or "").strip()
+    if state.startswith("skipped"):
+        raise StorageError(
+            "AIStor is not running on the host: the last deploy skipped it because no licence file was there. Store the licence at secret/aistor_licence "
+            "in this computer's OpenBao (references/local_machine.md, Local secrets) and run make host-up again"
+        )
+    if not state.startswith("started"):
+        raise StorageError("the host holds no record that AIStor started (or SSH did not answer): run make host-up first")
+
+
 def storage_up(configuration: dict[str, str], binding: Path, confirm: str) -> int:
     require_provider_hashes(ROOT / SOURCE_FOLDER / ".terraform.lock.hcl")
     run = load_run(binding)
@@ -423,6 +436,7 @@ def storage_up(configuration: dict[str, str], binding: Path, confirm: str) -> in
         address = host_peer(host_name).address
     except HostError as error:
         raise StorageError(f"the host {host_name} is not reachable over Tailscale: {error}") from None
+    require_started(run.run_id, address)
     credentials = read_credentials(run.run_id, address)
     if confirm:
         apply_plan(run, confirm, configuration, address, credentials)

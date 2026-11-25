@@ -40,7 +40,7 @@ check-terraform:
 	.tools/bin/trivy config --cache-dir $(CURDIR)/.tools/trivy_embedded_cache --skip-check-update --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .terraform --quiet infra
 
 check-ansible:
-	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml connection.yml
+	cd ansible && ANSIBLE_CONFIG=ansible.cfg ../.venv/bin/ansible-playbook --syntax-check host.yml storage.yml connection.yml
 
 test-fast:
 	$(PYTHON) -m unittest discover --start-directory tests/fast --top-level-directory .

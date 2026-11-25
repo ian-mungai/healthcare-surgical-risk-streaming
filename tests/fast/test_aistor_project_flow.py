@@ -153,6 +153,10 @@ def tasks_of(name: str) -> list[dict[str, Any]]:
     return [task for task in document if isinstance(task, dict)] if isinstance(document, list) else []
 
 
+def roles_of(name: str) -> list[dict[str, Any]]:
+    return [task["ansible.builtin.include_role"] for task in tasks_of(name) if "ansible.builtin.include_role" in task]
+
+
 def includes() -> list[str]:
     return [str(task["ansible.builtin.include_tasks"]) for task in tasks_of("main.yml") if "ansible.builtin.include_tasks" in task]
 
@@ -325,27 +329,26 @@ class ProjectPasswordFileTest(unittest.TestCase):
 
 class OrderTest(unittest.TestCase):
     def test_the_password_file_exists_before_the_aistor_step_reads_it_and_openbao_is_matched_before_that_step_logs_in_to_it(self) -> None:
-        names = includes()
-        self.assertLess(names.index("aistor_credentials.yml"), names.index("aistor_project_user.yml"))
-        main = (TASKS / "main.yml").read_text()
-        self.assertLess(
-            main.index("tasks_from: bootstrap.yml"),
-            main.index("aistor_project_user.yml"),
-            "the admin role and its secret ID file exist before the step logs in",
+        self.assertIn("aistor_credentials.yml", includes(), "the host playbook makes the credential files; the AIStor playbook runs after it")
+        self.assertNotIn("aistor_project_user.yml", includes(), "the AIStor step is not part of the host playbook")
+        self.assertIn(
+            "openbao/bootstrap.yml",
+            [f"{role['name']}/{role['tasks_from']}" for role in roles_of("main.yml")],
+            "the admin role and its secret ID file are made in the host play",
         )
+        self.assertIn("aistor_project_user.yml", [task.get("ansible.builtin.include_tasks") for task in StoragePlaybookTest().tasks()])
 
-    def test_the_bootstrap_runs_after_aistor_is_started_and_healthy_and_after_the_licence_check_and_nothing_follows_it_that_needs_root(self) -> None:
-        names = includes()
-        self.assertEqual("aistor_project_user.yml", names[-1])
-        start = [
-            index
-            for index, task in enumerate(tasks_of("main.yml"))
-            if (task.get("vars") or {}).get("compose_stack_start_services") == "{{ compose_stack_storage_services }}"
-        ]
-        self.assertEqual(1, len(start))
-        order = [task.get("ansible.builtin.include_tasks") for task in tasks_of("main.yml")]
-        self.assertLess(order.index("aistor_licence.yml"), start[0])
-        self.assertLess(start[0], order.index("aistor_project_user.yml"))
+    def test_the_aistor_step_checks_the_licence_then_starts_aistor_then_makes_the_project_user_and_nothing_of_it_is_in_the_host_tasks(self) -> None:
+        order = [task.get("ansible.builtin.include_tasks") for task in StoragePlaybookTest().tasks()]
+        self.assertEqual(["aistor_licence.yml", "start.yml", "aistor_project_user.yml"], [name for name in order if name])
+        starts = [task for task in StoragePlaybookTest().tasks() if task.get("ansible.builtin.include_tasks") == "start.yml"]
+        self.assertEqual("{{ compose_stack_storage_services }}", starts[0]["vars"]["compose_stack_start_services"])
+        for name in ("aistor_licence.yml", "aistor_project_user.yml"):
+            self.assertNotIn(name, includes())
+        self.assertEqual(
+            [],
+            [task for task in tasks_of("main.yml") if (task.get("vars") or {}).get("compose_stack_start_services") == "{{ compose_stack_storage_services }}"],
+        )
 
     def test_the_bootstrap_task_is_hidden_names_the_password_by_file_only_and_gives_the_bucket_from_the_launcher(self) -> None:
         (task,) = tasks_of("aistor_project_user.yml")
@@ -378,6 +381,80 @@ class OrderTest(unittest.TestCase):
 
         variables = host.deploy_variables({"S3_BUCKET": "example-project"}, "c" * 40)
         self.assertEqual("example-project", variables["aistor_bucket"])
+
+
+class StoragePlaybookTest(unittest.TestCase):
+    """The AIStor step skips AIStor, with a recorded state, when the licence is absent, and starts it when the licence is on the host."""
+
+    def tasks(self) -> list[dict[str, Any]]:
+        """The tasks of the one block that holds the step."""
+        (block,) = tasks_of("storage.yml")
+        return list(block["block"])
+
+    def rescue(self) -> list[dict[str, Any]]:
+        (block,) = tasks_of("storage.yml")
+        return list(block["rescue"])
+
+    def test_the_playbook_is_one_play_on_the_platform_that_includes_the_role_file_of_the_aistor_step(self) -> None:
+        document = load_yaml((ROOT / "ansible" / "storage.yml").read_text())
+        self.assertIsInstance(document, list)
+        (play,) = document if isinstance(document, list) else []
+        self.assertEqual(("platform", True, False), (play["hosts"], play["become"], play["gather_facts"]))
+        (task,) = play["tasks"]
+        self.assertEqual({"name": "compose_stack", "tasks_from": "storage.yml"}, task["ansible.builtin.include_role"])
+
+    def test_the_host_playbook_has_no_aistor_start_so_a_missing_licence_stops_nothing_before_it(self) -> None:
+        text = (ROOT / "ansible" / "host.yml").read_text()
+        self.assertNotIn("storage.yml", text)
+        self.assertNotIn("aistor", text)
+
+    def test_every_step_after_the_licence_check_runs_only_when_the_licence_file_is_present_and_the_skip_runs_only_when_it_is_not(self) -> None:
+        by_include = {task.get("ansible.builtin.include_tasks"): task for task in self.tasks() if task.get("ansible.builtin.include_tasks")}
+        self.assertNotIn("when", by_include["aistor_licence.yml"])
+        for name in ("start.yml", "aistor_project_user.yml"):
+            self.assertEqual("compose_stack_aistor_licence_present", by_include[name]["when"], name)
+        skip = next(task for task in self.tasks() if "ansible.builtin.copy" in task and "skipped" in str(task))
+        self.assertEqual("not compose_stack_aistor_licence_present", skip["when"])
+
+    def test_the_state_file_records_skipped_or_started_in_a_file_that_anyone_may_read_and_only_root_writes_and_holds_no_secret(self) -> None:
+        records = [task for task in self.tasks() if "ansible.builtin.copy" in task]
+        self.assertEqual(2, len(records))
+        contents = {task["when"]: task["ansible.builtin.copy"] for task in records}
+        skipped, started = contents["not compose_stack_aistor_licence_present"], contents["compose_stack_aistor_licence_present"]
+        self.assertTrue(skipped["content"].startswith("skipped"))
+        self.assertTrue(started["content"].startswith("started"))
+        for record in (skipped, started):
+            self.assertEqual("{{ compose_stack_aistor_state_file }}", record["dest"])
+            self.assertEqual("0644", record["mode"])
+            self.assertEqual("{{ compose_stack_owner }}", record["owner"])
+        self.assertEqual("{{ compose_stack_compose_directory }}/aistor.state", group_variables()["compose_stack_aistor_state_file"])
+
+    def test_the_started_record_follows_the_project_user_so_a_failed_step_never_leaves_started_behind(self) -> None:
+        order = [
+            task.get("ansible.builtin.include_tasks") or "copy " + str(task["ansible.builtin.copy"]["content"]).split(":")[0].strip()
+            for task in self.tasks()
+            if task.get("ansible.builtin.include_tasks") or "ansible.builtin.copy" in task
+        ]
+        self.assertEqual(["aistor_licence.yml", "copy skipped", "start.yml", "aistor_project_user.yml", "copy started"], [name.strip() for name in order])
+
+    def test_a_step_that_fails_removes_its_record_and_stops_with_a_fixed_message_so_no_earlier_claim_stays(self) -> None:
+        remove, stop = self.rescue()
+        self.assertEqual("absent", remove["ansible.builtin.file"]["state"])
+        self.assertEqual("{{ compose_stack_aistor_state_file }}", remove["ansible.builtin.file"]["path"])
+        self.assertEqual("ansible.builtin.fail", next(key for key in stop if key.startswith("ansible.")))
+        self.assertNotIn("{{", stop["ansible.builtin.fail"]["msg"], "no variable of the failure is in the message")
+
+    def test_the_licence_script_is_installed_by_the_host_playbook_with_the_sudoers_drop_in_checked_by_visudo(self) -> None:
+        names = includes()
+        self.assertLess(names.index("aistor_credentials.yml"), names.index("aistor_licence_script.yml"))
+        tasks = tasks_of("aistor_licence_script.yml")
+        copies = {task["ansible.builtin.copy"]["dest"]: task["ansible.builtin.copy"] for task in tasks if "ansible.builtin.copy" in task}
+        script = copies["{{ compose_stack_aistor_licence_script }}"]
+        self.assertEqual(("0700", "{{ role_path }}/files/aistor_licence_install.py"), (script["mode"], script["src"]))
+        sudoers = copies["{{ compose_stack_aistor_licence_sudoers }}"]
+        self.assertEqual(("0440", "{{ compose_stack_visudo }} -cf %s"), (sudoers["mode"], sudoers["validate"]))
+        helper = copies["{{ compose_stack_bin_directory }}/secret_files.py"]
+        self.assertEqual("0600", helper["mode"])
 
 
 class OpenBaoStepTest(unittest.TestCase):

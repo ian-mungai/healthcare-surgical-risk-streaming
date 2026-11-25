@@ -170,7 +170,7 @@ def step_order() -> list[str]:
 
 
 class StepOrderTest(unittest.TestCase):
-    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_matches_openbao_starts_aistor_and_makes_its_project_user_last(
+    def test_the_role_starts_postgresql_first_makes_its_accounts_prepares_openbao_starts_the_rest_and_matches_openbao_last_and_leaves_aistor_to_its_own_step(
         self,
     ) -> None:
         self.assertEqual(
@@ -182,6 +182,7 @@ class StepOrderTest(unittest.TestCase):
                 "verify_secrets.yml",
                 "grafana_password.yml",
                 "aistor_credentials.yml",
+                "aistor_licence_script.yml",
                 "build_images.yml",
                 "airbyte/cluster.yml",
                 "airbyte/group_access.yml",
@@ -192,9 +193,6 @@ class StepOrderTest(unittest.TestCase):
                 "kafka.yml",
                 "registry.yml",
                 "openbao/bootstrap.yml",
-                "aistor_licence.yml",
-                "start.yml {{ compose_stack_storage_services }}",
-                "aistor_project_user.yml",
             ],
             step_order(),
         )
@@ -540,9 +538,9 @@ class AistorStatOutputTest(unittest.TestCase):
 
 
 class AistorLicenceTest(unittest.TestCase):
-    """The deploy step for AIStor refuses a licence file that is missing, empty, white space only, not a plain file or not root's alone by one fixed message."""
+    """The licence check refuses a file that is there and empty, blank, not plain or not root's alone, by one fixed message; a missing file is no failure."""
 
-    MESSAGE = "the AIStor licence file is missing, is empty or is not a plain file that only"
+    MESSAGE = "the AIStor licence file is empty or is not a plain file that only"
 
     def check(self, content: str | None, *, mode: int = 0o400, link: bool = False, variable: str | None = None, unset: bool = False) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as scratch:
@@ -571,22 +569,35 @@ class AistorLicenceTest(unittest.TestCase):
         self.assertRegex(output, CHANGED_NONE)
         self.assertNotIn("a-licence-key", output)
 
-    def test_a_missing_empty_or_blank_file_a_link_or_another_mode_is_refused_by_the_fixed_message_and_no_content_is_printed(self) -> None:
+    def test_a_missing_file_is_not_a_failure_because_the_aistor_step_skips_aistor_for_it(self) -> None:
+        code, output = self.check(None)
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_an_empty_or_blank_file_a_link_or_another_mode_is_refused_by_the_fixed_message_and_no_content_is_printed(self) -> None:
         for label, kwargs in (
-            ("missing", {"content": None}),
             ("empty", {"content": ""}),
             ("spaces and line breaks only", {"content": " \n\t\n  \n"}),
             ("mode 0600", {"content": "secret-licence-text", "mode": 0o600}),
             ("mode 0440", {"content": "secret-licence-text", "mode": 0o440}),
             ("mode 0444", {"content": "secret-licence-text", "mode": 0o444}),
             ("a link", {"content": "secret-licence-text", "link": True}),
+        ):
+            with self.subTest(label):
+                code, output = self.check(**kwargs)
+                self.assertNotEqual(0, code)
+                self.assertIn(self.MESSAGE, output)
+                self.assertNotIn("secret-licence-text", output)
+
+    def test_an_empty_variable_or_no_variable_is_refused_by_a_message_that_names_the_variable(self) -> None:
+        for label, kwargs in (
             ("an empty variable", {"content": "secret-licence-text", "variable": ""}),
             ("no variable", {"content": "secret-licence-text", "unset": True}),
         ):
             with self.subTest(label):
                 code, output = self.check(**kwargs)
                 self.assertNotEqual(0, code)
-                self.assertIn(self.MESSAGE, output)
+                self.assertIn("compose_stack_aistor_licence_file", output)
                 self.assertNotIn("secret-licence-text", output)
 
     def test_a_file_that_another_user_owns_is_refused(self) -> None:
@@ -599,6 +610,57 @@ class AistorLicenceTest(unittest.TestCase):
             code, output = run_tasks(["aistor_licence.yml"], variables(folder) | {"compose_stack_owner": "nobody"})
         self.assertNotEqual(0, code)
         self.assertIn(self.MESSAGE, output)
+
+
+class AistorStepWithoutLicenceTest(unittest.TestCase):
+    """With no licence file the AIStor step skips AIStor, records it, starts nothing and succeeds, so the rest of the deploy goes on."""
+
+    def run_step(self, folder: Path) -> tuple[int, str]:
+        values = variables(folder) | {
+            "compose_stack_aistor_state_file": str(folder / "compose" / "aistor.state"),
+            "compose_stack_storage_services": ["aistor"],
+        }
+        (folder / "compose").mkdir(exist_ok=True)
+        return run_tasks(["storage.yml"], values)
+
+    def test_a_missing_licence_gives_a_recorded_skip_and_a_successful_step_that_starts_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            code, output = self.run_step(folder)
+            state = folder / "compose" / "aistor.state"
+            text, mode = state.read_text(), stat.S_IMODE(state.stat().st_mode)
+        self.assertEqual(0, code, output)
+        self.assertTrue(text.startswith("skipped"))
+        self.assertEqual(0o644, mode)
+        self.assertIn("AIStor is skipped", output)
+        for name in ("Start AIStor and wait for its health", "Verify the AIStor project user as itself", "Record that AIStor started"):
+            self.assertRegex(output, rf"{name}[^\n]*\] \*+\nskipping: \[localhost\]", f"{name} is skipped")
+        self.assertNotIn("included: ", output.split("Say that AIStor is skipped")[1], "no task file is included after the skip")
+
+    def test_a_second_run_with_the_licence_still_missing_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            self.run_step(folder)
+            code, output = self.run_step(folder)
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_licence_that_is_there_but_empty_fails_the_step_and_leaves_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            licence = folder / "secrets" / "aistor" / "licence"
+            licence.parent.mkdir(parents=True, mode=0o700)
+            licence.write_text("")
+            licence.chmod(0o400)
+            (folder / "compose").mkdir()
+            (folder / "compose" / "aistor.state").write_text("started\n")
+            code, output = self.run_step(folder)
+            left = (folder / "compose" / "aistor.state").exists()
+        self.assertNotEqual(0, code)
+        self.assertIn("the AIStor step failed and its record is removed", output)
+        self.assertFalse(left, "a step that fails leaves no earlier claim")
 
 
 class SecretsCheckTest(unittest.TestCase):

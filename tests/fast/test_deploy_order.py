@@ -34,8 +34,11 @@ PRODUCERS = {
 }
 # The two copies of the project profile's key are made by the launcher's step after the host playbook, never by a task, so Ansible never holds the key.
 KEY_STEP = ("launcher", "place_project_key")
-FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP}
+# AIStor's licence is placed by the launcher too, between the host playbook and the AIStor step: it reads the licence in the owner's OpenBao and pipes it on.
+LICENCE_STEP = ("launcher", "place_aistor_licence")
+FILE_PRODUCERS = {"airbyte_api/aws_access_key_id": KEY_STEP, "airbyte_api/aws_secret_access_key": KEY_STEP, "aistor/licence": LICENCE_STEP}
 CONNECTION = ROOT / "ansible" / "connection.yml"
+STORAGE = ROOT / "ansible" / "storage.yml"
 STORAGE_NAME = "compose_stack_storage_services"
 DEFERRED = "{{ compose_stack_orchestration_services + " + STORAGE_NAME + " }}"
 
@@ -67,6 +70,8 @@ def expand_file(role: str, file: str, variables: dict[str, Any]) -> list[Event]:
 
 
 def expand_task(role: str, task: dict[str, Any]) -> list[Event]:
+    if "block" in task:
+        return [event for inner in task["block"] for event in expand_task(role, inner)]
     variables = dict(task.get("vars") or {})
     if "ansible.builtin.include_tasks" in task:
         return expand_file(role, task["ansible.builtin.include_tasks"], variables)
@@ -101,8 +106,8 @@ def play_events(path: Path) -> list[Event]:
 
 
 def playbook_events() -> list[Event]:
-    """The host playbook, the launcher's key step and the connection playbook, in the order ``host_up`` runs them."""
-    return [*play_events(HOST), Event(*KEY_STEP), *play_events(CONNECTION)]
+    """The host playbook, the licence step, the AIStor playbook, the key step and the connection playbook, in the order ``host_up`` runs them."""
+    return [*play_events(HOST), Event(*LICENCE_STEP), *play_events(STORAGE), Event(*KEY_STEP), *play_events(CONNECTION)]
 
 
 def all_services() -> dict[str, dict[str, str]]:
@@ -176,15 +181,19 @@ class DeployOrderTest(unittest.TestCase):
                     problems.append(f"{service}: {secret_file} is made by {producer[1]} after the service starts")
         self.assertEqual([], problems)
 
-    def test_the_storage_service_starts_alone_after_the_licence_check_and_after_its_credential_files_and_no_other_start_names_it(self) -> None:
+    def test_the_storage_service_starts_alone_after_the_licence_is_placed_and_checked_and_after_its_credential_files_and_no_other_start_names_it(self) -> None:
         events = playbook_events()
         starts = start_positions(events)
         positions = {(event.role, event.file): index for index, event in reversed(list(enumerate(events)))}
         self.assertEqual(["aistor"], variable(STORAGE_NAME))
         for service in variable(STORAGE_NAME):
             with self.subTest(service):
+                self.assertGreater(starts[service], positions[LICENCE_STEP], "the launcher places the licence before the AIStor step starts the server")
                 self.assertGreater(starts[service], positions[("compose_stack", "aistor_licence.yml")])
                 self.assertGreater(starts[service], positions[("compose_stack", "aistor_credentials.yml")])
+                self.assertGreater(
+                    starts[service], positions[("compose_stack", "aistor_licence_script.yml")], "the script that places the licence is installed first"
+                )
                 named = [index for index, event in enumerate(events) if event.file == "start.yml" and service in (named_services(event) or [])]
                 self.assertEqual([starts[service]], named, "only the storage step names the service")
         general = [event for event in events if event.file == "start.yml" and not named_services(event)]
@@ -205,9 +214,24 @@ class DeployOrderTest(unittest.TestCase):
         for service in variable("compose_stack_orchestration_services"):
             with self.subTest(service):
                 self.assertGreater(starts[service], key)
-        for service in set(all_services()) - set(variable("compose_stack_orchestration_services")):
+        for service in set(all_services()) - set(variable("compose_stack_orchestration_services")) - set(variable(STORAGE_NAME)):
             with self.subTest(service):
                 self.assertLess(starts[service], made, "everything else starts first, so the Airbyte role finds its database and the stack")
+        for service in variable(STORAGE_NAME):
+            with self.subTest(service):
+                self.assertGreater(starts[service], made, "AIStor starts in its own step after the host playbook, and the Airbyte role needs nothing of it")
+                self.assertLess(starts[service], key)
+
+    def test_the_aistor_step_is_a_playbook_of_its_own_between_the_host_playbook_and_the_key_step(self) -> None:
+        host_files = {(event.role, event.file) for event in play_events(HOST)}
+        storage_files = {(event.role, event.file) for event in play_events(STORAGE)}
+        for name in ("storage.yml", "aistor_licence.yml", "aistor_project_user.yml"):
+            self.assertIn(("compose_stack", name), storage_files)
+            self.assertNotIn(("compose_stack", name), host_files)
+        self.assertIn(("compose_stack", "aistor_licence_script.yml"), host_files)
+        events = playbook_events()
+        self.assertLess(events.index(Event(*LICENCE_STEP)), events.index(Event(*KEY_STEP)))
+        self.assertLess(max(index for index, event in enumerate(events) if event.file == "aistor_project_user.yml"), events.index(Event(*KEY_STEP)))
 
     def test_the_orchestration_start_is_a_task_of_the_connection_playbook_and_not_of_the_host_playbook(self) -> None:
         host_files = {(event.role, event.file) for event in play_events(HOST)}

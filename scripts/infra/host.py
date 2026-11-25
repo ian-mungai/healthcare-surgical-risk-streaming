@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from scripts.aws_cli import Aws, AwsError
-from scripts.infra import state_bootstrap
+from scripts.infra import aistor_licence, state_bootstrap
 from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
@@ -53,12 +53,14 @@ POLL_SECONDS = 10
 SSH_ATTEMPT_SECONDS = 30
 # The host setup may take the sum of the deadlines of every task on the path of ansible/host.yml (each include counted once per call, each retried task once
 # per attempt, each loop once per item) plus a tenth, in whole five minutes. tests/fast/test_host_budget.py walks the playbook, works the sum out from the task
-# files and fails when this figure is lower. The connection step has its own budget from the same sum over ansible/connection.yml (the Airbyte connection step
-# and the start of the orchestration services).
-HOST_SETUP_TIMEOUT_SECONDS = 30300
+# files and fails when this figure is lower. The AIStor step (ansible/storage.yml: the licence check, the start of AIStor and its project user) and the
+# connection step (ansible/connection.yml: the Airbyte connection step and the start of the orchestration services) have budgets of their own from the same sum.
+HOST_SETUP_TIMEOUT_SECONDS = 24600
 CONNECTION_TIMEOUT_SECONDS = 4800
+STORAGE_TIMEOUT_SECONDS = 3000
 PLAYBOOKS = {
     "host.yml": ("host setup", "ansible_output.txt", HOST_SETUP_TIMEOUT_SECONDS),
+    "storage.yml": ("AIStor step", "ansible_storage_output.txt", STORAGE_TIMEOUT_SECONDS),
     "connection.yml": ("connection step", "ansible_connection_output.txt", CONNECTION_TIMEOUT_SECONDS),
 }
 KEY_SCRIPT = "/opt/platform/bin/airbyte_key_install"
@@ -93,6 +95,31 @@ KEY_MESSAGES = {
     "script_cannot_write": "the key script on the host could not write the key files under the secrets folder; check the folder's owner and free space",
     "script_unknown": "the key script on the host answered with something that this program does not know",
 }
+# AIStor's licence is placed the same way: the launcher reads it from this computer's OpenBao (scripts/infra/aistor_licence.py) and sends it on standard input
+# of one SSH command to a root-owned script that the host playbook installs, with its own sudoers drop-in that turns off sudo's recording for that command line.
+LICENCE_SCRIPT = "/opt/platform/bin/aistor_licence_install"
+LICENCE_COMMAND = ["/usr/bin/python3", "-I", LICENCE_SCRIPT]
+LICENCE_SUDOERS_FILE = "/etc/sudoers.d/aistor_licence_install"
+LICENCE_POLICY_SOURCE = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "compose_stack" / "files" / "aistor_licence_install.sudoers"
+LICENCE_SEND_SECONDS = 60
+LICENCE_REFUSALS = ("oversized", "empty", "bad_form", "bad_owner", "cannot_write")
+LICENCE_MESSAGES = {
+    "policy_missing": "the sudo policy file for the licence script is missing or cannot be read on the host; the host playbook installs it, so run it first",
+    "policy_differs": "the sudo policy file for the licence script on the host is not the repository's; the host playbook installs the right one, run it first",
+    "ssh_failed": "the licence could not be sent to the host (exit status {status})",
+    "ssh_timeout": "sending the licence to the host did not finish within {seconds} seconds",
+    "script_oversized": "the licence script on the host refused the licence: it is larger than the script accepts",
+    "script_empty": "the licence script on the host refused the licence: it is empty",
+    "script_bad_form": "the licence script on the host refused the licence: it is not ASCII text without control characters",
+    "script_bad_owner": "the licence script on the host refused its owner option: it is not a numeric uid:gid that the system takes",
+    "script_cannot_write": "the licence script on the host could not write the licence file under the secrets folder; check the folder's owner and free space",
+    "script_unknown": "the licence script on the host answered with something that this program does not know",
+}
+LICENCE_ABSENT_NOTICE = (
+    "AIStor is skipped: this computer's OpenBao holds no AIStor licence at secret/aistor_licence (field value), so the host has none to start the server with. "
+    "The deploy goes on with everything else (Airbyte, the connection step and the rest). Store the licence at that path (references/local_machine.md, "
+    "Local secrets) and run make host-up again: AIStor then starts."
+)
 GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
@@ -441,27 +468,61 @@ def exported_key(profile: str) -> dict[str, str]:
     return {"aws_access_key_id": key_id, "aws_secret_access_key": value}
 
 
-def check_sudo_policy(run_id: str, address: str) -> None:
-    """Refuse, before the key is read, a host whose sudo policy file for the key script is missing or is not the repository's file.
+def check_policy_file(run_id: str, address: str, source: Path, target: str, messages: dict[str, str]) -> None:
+    """Refuse, before a secret is sent, a host whose sudo policy file for the script is missing or is not the repository's file.
 
-    The file turns sudo's recording of input and output off for the key script's command line, and the key arrives on standard input. The check reads
-    the file's SHA-256 with one remote call (``sudo -n sha256sum <file>``). It shows that the repository's file is in place unchanged. It does not
-    read sudo's effective settings, whose output format the sudoers manual does not define, so the first host run also proves the effect with a marker
-    test."""
-    expected = hashlib.sha256(KEY_POLICY_SOURCE.read_bytes()).hexdigest()
+    The file turns sudo's recording of input and output off for the script's command line, and the secret arrives on standard input. The check reads the file's
+    SHA-256 with one remote call (``sudo -n sha256sum <file>``). It shows that the repository's file is in place unchanged. It does not read sudo's effective
+    settings, whose output format the sudoers manual does not define, so the first host run also proves the effect with a marker test."""
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
     try:
-        result = run_command(
-            "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", SUDOERS_FILE], timeout=KEY_SEND_SECONDS
-        )
+        result = run_command("ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", "-n", "/usr/bin/sha256sum", target], timeout=KEY_SEND_SECONDS)
     except TimeoutExpired:
-        raise HostError(KEY_MESSAGES["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
+        raise HostError(messages["ssh_timeout"].format(seconds=KEY_SEND_SECONDS)) from None
     if result.returncode == 255:
-        raise HostError(KEY_MESSAGES["ssh_failed"].format(status=255))
+        raise HostError(messages["ssh_failed"].format(status=255))
     if result.returncode != 0:
-        raise HostError(KEY_MESSAGES["policy_missing"])
+        raise HostError(messages["policy_missing"])
     words = result.stdout.split()
     if not words or words[0] != expected:
-        raise HostError(KEY_MESSAGES["policy_differs"])
+        raise HostError(messages["policy_differs"])
+
+
+def check_sudo_policy(run_id: str, address: str) -> None:
+    """The check for the key script's sudo policy file."""
+    check_policy_file(run_id, address, KEY_POLICY_SOURCE, SUDOERS_FILE, KEY_MESSAGES)
+
+
+def place_aistor_licence(run_id: str, address: str) -> str:
+    """Read AIStor's licence from this computer's OpenBao and place it on the host through one SSH command. Return ``placed``, ``unchanged`` or ``absent``.
+
+    The licence is read in memory (``scripts/infra/aistor_licence.py``) and written to the standard input of ``ssh <host> sudo /usr/bin/python3 -I <the licence
+    script>``, which writes the one root-only file. It is never in an argument list, an environment variable, a file on this computer, an output or an error
+    text; every failure is a fixed message. A licence that this computer's OpenBao does not hold (its 404) is no failure: the notice is printed, nothing is sent
+    and the host playbook's AIStor step skips AIStor and records that it did."""
+    try:
+        licence = aistor_licence.read_licence()
+    except aistor_licence.LicenceError as error:
+        raise HostError(str(error)) from None
+    if licence is None:
+        sys.stdout.write(f"{LICENCE_ABSENT_NOTICE}\n")
+        return "absent"
+    check_policy_file(run_id, address, LICENCE_POLICY_SOURCE, LICENCE_SUDOERS_FILE, LICENCE_MESSAGES)
+    try:
+        sent = run_command(
+            "ssh", [*ssh_arguments(run_id), f"{HOST_USER}@{address}", "sudo", *LICENCE_COMMAND], input_text=licence, timeout=LICENCE_SEND_SECONDS
+        )
+    except TimeoutExpired:
+        raise HostError(LICENCE_MESSAGES["ssh_timeout"].format(seconds=LICENCE_SEND_SECONDS)) from None
+    code = sent.stdout.strip()
+    if sent.returncode == 0 and code in ("placed", "unchanged"):
+        sys.stdout.write("the AIStor licence is placed on the host\n" if code == "placed" else "the AIStor licence is in place on the host and unchanged\n")
+        return code
+    if sent.returncode == 3 and code in LICENCE_REFUSALS:
+        raise HostError(LICENCE_MESSAGES[f"script_{code}"])
+    if sent.returncode not in (0, 3):
+        raise HostError(LICENCE_MESSAGES["ssh_failed"].format(status=sent.returncode))
+    raise HostError(LICENCE_MESSAGES["script_unknown"])
 
 
 def place_project_key(run_id: str, address: str, profile: str) -> None:
@@ -520,6 +581,8 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     require_current_inputs(plan)
     variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deploy_variables(configuration, platform_commit())
     run_ansible(run.run_id, address, variables)
+    place_aistor_licence(run.run_id, address)
+    run_ansible(run.run_id, address, variables, "storage.yml")
     place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
     run_ansible(run.run_id, address, variables, "connection.yml")
     write_inventory(binding)
