@@ -98,8 +98,8 @@ class StartTest(unittest.TestCase):
         self.assertEqual("selection_differs", caught.exception.error_code)
         self.assertEqual(0, api.started)
 
-    def test_a_connection_whose_list_has_one_file_twice_instead_of_another_is_refused(self) -> None:
-        api = StandIn((*WANTED[:-1], WANTED[0]))
+    def test_a_connection_whose_list_holds_the_whole_sample_and_one_file_twice_is_refused(self) -> None:
+        api = StandIn((*WANTED, WANTED[0]))
         with self.assertRaises(RawCopyError) as caught:
             start(api, WANTED)
         self.assertEqual("selection_differs", caught.exception.error_code)
@@ -243,7 +243,7 @@ class ConnectionReadTest(unittest.TestCase):
         self.assertEqual(RawConnection(CONNECTION, WANTED), found)
 
     def test_no_connection_of_the_name_and_two_connections_of_the_name_are_refused(self) -> None:
-        for connections in ([], [{"name": CONNECTION_NAME, "connectionId": "a", "sourceId": "s"}] * 2):
+        for connections in ([], [{"name": CONNECTION_NAME, "connectionId": "a", "sourceId": "source_1"}] * 2):
             with self.subTest(count=len(connections)), self.assertRaises(AirbyteError):
                 self.api(connections).raw_connection()
 
