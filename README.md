@@ -73,6 +73,20 @@ The commands read the compose folder from `STACK_COMPOSE_DIRECTORY` (default: th
 
 The patient assignment rule, one split by patient for all models, is in `scripts/sample/split.py`. Rebuild the candidate cases for the fixed sample with `.venv/bin/python -m scripts.sample.candidates check`.
 
+## Lake layer identities
+
+Each Spark job runs under the AWS role of one lake layer, so a job reaches only the warehouse folder of its own layer. Nessie's catalog keeps a table in the warehouse folder of its namespace, so a layer's prefix is `warehouse/<namespace>/`. `scripts/stack/job_workloads.py` names the workload of each job in `spark/jobs`, and `infra/environments/dev.tfvars` holds the grants.
+
+| Workload | Reads | Writes and deletes | Compose service and profile |
+| --- | --- | --- | --- |
+| `bronze` | `landing`, `manifests`, `warehouse/raw_records`, `warehouse/bronze` | `warehouse/bronze` | `spark_bronze`, `batch_bronze` |
+| `silver` | `warehouse/raw_records`, `warehouse/bronze`, `warehouse/silver` | `warehouse/silver` | `spark_silver`, `batch_silver` |
+| `gold` | `warehouse/bronze`, `warehouse/silver`, `warehouse/gold` | `warehouse/gold` | `spark_gold`, `batch_gold` |
+| `stream` | `warehouse/feature`, `warehouse/stream` | the same two prefixes | none yet |
+| `maintenance` | `warehouse` | writes `warehouse`, deletes nothing | `spark_maintenance`, `batch_maintenance` |
+
+The Airbyte load owns `warehouse/raw_records`, and no workload role writes it. The table checks job runs as `bronze`, the reconciliation job as `silver` and the catalog proof as `maintenance`. Terraform refuses a grant that lets a workload write another layer's prefix, write `raw_records`, or delete in the whole warehouse prefix.
+
 ## Credit
 
 The recordings come from VitalDB, an open dataset of monitor recordings from 6,388 surgical cases. Seoul National University Hospital recorded them and PhysioNet publishes them at <https://physionet.org/content/vitaldb/1.0.0/>.

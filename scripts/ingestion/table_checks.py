@@ -70,6 +70,7 @@ from scripts.ingestion.store import ObjectStore
 from scripts.process import TimeoutExpired, run_command
 from scripts.sample.candidates import RELEASE_FILE
 from scripts.stack.groups import Settings, compose_arguments, rendered_environment
+from scripts.stack.job_workloads import profile_of_job, service_of
 from scripts.stack.limits import load_limits
 from scripts.stack.nessie import NessieClient, NessieError
 from scripts.stack.tags import paged
@@ -101,6 +102,7 @@ REBUILT_NOTE = "the checks of the run that merged this load are not in this rece
 STATE_DIRECTORY = Path("/opt/dagster/data/table_checks")
 # The job runs as the Spark user of the Spark image, with the launcher's own group as its primary group. The staged folder is 0750 and each staged file 0640
 # in that group, set by the launcher, so the job reads them and no other user does.
+JOB = "table_checks"
 SPARK_UID = 10100
 STAGING_GID = 10001
 STAGING_FOLDER_MODE = 0o750
@@ -203,7 +205,8 @@ Runner = Callable[[Path], RunnerReply]
 
 
 def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_seconds: float) -> Runner:
-    """A runner that starts the job as a one-off of the stack's ``spark`` service, in the ``batch`` profile and with no service it depends on started.
+    """A runner that starts the job as a one-off of the Bronze service that ``scripts/stack/job_workloads.py`` names, in that service's own profile and with no
+    service it depends on started. The job reads the loaded tables with the Bronze credentials, which cannot write them.
 
     The staging folders are subfolders of ``directory``, which this process sees and which is the Docker volume ``volume``; the job sees that volume,
     read-only, at ``/staging``. The job runs as ``SPARK_UID`` with ``STAGING_GID`` as its group, the group of the staged files. The environment of the command
@@ -217,9 +220,9 @@ def compose_runner(settings: Settings, *, volume: str, directory: str, deadline_
             raise TableChecksError("the staging folder is not a folder of the staging volume, which the job could not see")
         arguments = compose_arguments(
             settings,
-            "batch",
+            profile_of_job(JOB),
             *["run", "--rm", "--no-TTY", "--no-deps", "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
-            *["--entrypoint", "python", "spark", "-m", "spark.jobs.table_checks", "--staging", f"/staging/{staging.name}"],
+            *["--entrypoint", "python", service_of(JOB), "-m", f"spark.jobs.{JOB}", "--staging", f"/staging/{staging.name}"],
         )
         environment = rendered_environment(load_limits(settings.limits_file))
         try:

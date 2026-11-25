@@ -45,9 +45,22 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 768
-  spark:
+  # One service for each Spark workload, each in its own group: one job runs at a time, so a group holds one job. The heavy figure takes the largest.
+  spark_bronze:
     runtime: compose
-    group: batch
+    group: batch_bronze
+    memory_limit_mib: 4096
+  spark_silver:
+    runtime: compose
+    group: batch_silver
+    memory_limit_mib: 4096
+  spark_gold:
+    runtime: compose
+    group: batch_gold
+    memory_limit_mib: 4096
+  spark_maintenance:
+    runtime: compose
+    group: batch_maintenance
     memory_limit_mib: 4096
   trino:
     runtime: compose

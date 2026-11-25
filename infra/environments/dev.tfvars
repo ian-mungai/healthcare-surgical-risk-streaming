@@ -12,8 +12,36 @@ workloads = {
   ingestion_check = {
     access = { landing = ["read"], manifests = ["read", "write"] }
   }
-  spark = {
-    access = { warehouse = ["read", "write", "delete"] }
+  bronze = {
+    access = {
+      landing                 = ["read"]
+      manifests               = ["read"]
+      "warehouse/raw_records" = ["read"]
+      "warehouse/bronze"      = ["read", "write", "delete"]
+    }
+  }
+  silver = {
+    access = {
+      "warehouse/raw_records" = ["read"]
+      "warehouse/bronze"      = ["read"]
+      "warehouse/silver"      = ["read", "write", "delete"]
+    }
+  }
+  gold = {
+    access = {
+      "warehouse/bronze" = ["read"]
+      "warehouse/silver" = ["read"]
+      "warehouse/gold"   = ["read", "write", "delete"]
+    }
+  }
+  stream = {
+    access = {
+      "warehouse/feature" = ["read", "write", "delete"]
+      "warehouse/stream"  = ["read", "write", "delete"]
+    }
+  }
+  maintenance = {
+    access = { warehouse = ["read", "write"] }
   }
   trino = {
     access = { warehouse = ["read"] }

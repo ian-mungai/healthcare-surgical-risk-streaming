@@ -1,0 +1,45 @@
+services:
+  spark_gold:
+    image: surgical-risk-spark:4.1.4
+    build:
+      context: ../..
+      dockerfile: spark/Dockerfile
+    platform: linux/amd64
+    profiles: [batch_gold]
+    mem_limit: ${MEM_LIMIT_SPARK_GOLD:?render the limits first}
+    restart: "no"
+    user: "10100:10100"
+    group_add: ["20108"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      nessie:
+        condition: service_healthy
+    entrypoint: [python, -m, spark.jobs.gold_dimensions]
+    environment:
+      NESSIE_URI: ${NESSIE_URI:-http://nessie:19120/api/v2}
+      WAREHOUSE_LOCATION: ${WAREHOUSE_LOCATION:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_CONFIG_FILE: /etc/workload_access/client_config
+      AWS_EC2_METADATA_DISABLED: "true"
+    configs:
+      - source: gold_aws_client_config
+        target: /etc/workload_access/client_config
+    volumes:
+      - spark_gold_scratch:/scratch
+      - lake_warehouse:/warehouse
+      - workload_access_gold:/run/workload_access:ro
+
+configs:
+  gold_aws_client_config:
+    file: ${AWS_CLIENT_CONFIG_FILE:-/etc/workload_access/client_config}
+
+volumes:
+  spark_gold_scratch:
+  lake_warehouse:
+  workload_access_gold:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${GOLD_ACCESS_DIR:-/run/workload_access/gold}

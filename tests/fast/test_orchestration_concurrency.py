@@ -56,8 +56,8 @@ class DeclaredJobGroupsTest(unittest.TestCase):
         self.assertEqual([], unknown_groups(JOB_GROUPS, LIMITS))
 
     def test_a_planted_job_of_a_real_group_passes_and_one_of_an_unknown_group_is_named(self) -> None:
-        self.assertEqual([], unknown_groups({"bronze": "batch"}, LIMITS))
-        self.assertEqual(["bronze: no_such_group"], unknown_groups({"bronze": "no_such_group", "silver": "batch"}, LIMITS))
+        self.assertEqual([], unknown_groups({"bronze": "batch_bronze"}, LIMITS))
+        self.assertEqual(["bronze: no_such_group"], unknown_groups({"bronze": "no_such_group", "silver": "batch_silver"}, LIMITS))
 
     def test_a_declared_job_gets_the_tags_of_its_group_and_an_undeclared_job_is_refused(self) -> None:
         with tempfile.TemporaryDirectory(prefix="concurrency_jobs_") as scratch:

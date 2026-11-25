@@ -1,7 +1,8 @@
 """The three numbers that Terraform takes from the limits file to calculate the heavy-job figure.
 
 The limits loader is the one reader of the file, so a malformed file is refused here and never reaches Terraform. The numbers are the host's reserve, the sum
-of the limits of the always-on groups and the Spark job's limit, and each is a positive whole number.
+of the limits of the always-on groups and the largest limit of the Spark job services (one job runs at a time, each under its own layer's identity), and each
+is a positive whole number.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,10 +33,22 @@ services:
     runtime: compose
     group: supporting
     memory_limit_mib: 2000
-  spark:
+  spark_bronze:
     runtime: compose
-    group: batch
+    group: batch_bronze
     memory_limit_mib: 3000
+  spark_silver:
+    runtime: compose
+    group: batch_silver
+    memory_limit_mib: 2500
+  spark_gold:
+    runtime: compose
+    group: batch_gold
+    memory_limit_mib: 2000
+  spark_maintenance:
+    runtime: compose
+    group: batch_maintenance
+    memory_limit_mib: 1000
   airbyte_server:
     runtime: k3s
     group: ingestion
@@ -58,9 +72,16 @@ class DocumentTest(unittest.TestCase):
         with self.assertRaisesRegex(LimitsError, "always-on"):
             heavy_inputs_document(parse_limits(GOOD.replace("group: supporting", "group: renamed")))
 
-    def test_a_limits_file_with_no_spark_service_is_refused(self) -> None:
-        with self.assertRaisesRegex(LimitsError, "spark"):
-            heavy_inputs_document(parse_limits(GOOD.replace("  spark:", "  spark_renamed:")))
+    def test_a_limits_file_without_one_of_the_spark_job_services_is_refused_and_names_it(self) -> None:
+        for name in ("spark_bronze", "spark_silver", "spark_gold", "spark_maintenance"):
+            with self.subTest(name=name), self.assertRaisesRegex(LimitsError, name):
+                heavy_inputs_document(parse_limits(GOOD.replace(f"  {name}:", f"  {name}_renamed:")))
+
+    def test_the_largest_spark_limit_is_the_figure_whichever_service_holds_it(self) -> None:
+        for name, large in (("spark_silver", 3600), ("spark_gold", 3700), ("spark_maintenance", 3800)):
+            with self.subTest(name=name):
+                text = re.sub(rf"(  {name}:\n(?:.*\n){{2}}    memory_limit_mib: )\d+", rf"\g<1>{large}", GOOD)
+                self.assertEqual(large, heavy_inputs_document(parse_limits(text))["spark_limit_mib"])
 
     def test_the_tracked_file_gives_the_sums_read_again_from_the_yaml(self) -> None:
         document: Any = load_yaml(LIMITS_FILE.read_text())
@@ -68,7 +89,7 @@ class DocumentTest(unittest.TestCase):
         expected = {
             "host_reserve_mib": document["host_reserve_mib"],
             "always_on_limits_mib": sum(entry["memory_limit_mib"] for entry in services.values() if entry["group"] == "supporting"),
-            "spark_limit_mib": services["spark"]["memory_limit_mib"],
+            "spark_limit_mib": max(services[name]["memory_limit_mib"] for name in ("spark_bronze", "spark_silver", "spark_gold", "spark_maintenance")),
         }
         self.assertEqual(expected, heavy_inputs_document(load_limits(LIMITS_FILE)))
         self.assertTrue(all(isinstance(value, int) and value > 0 for value in expected.values()))

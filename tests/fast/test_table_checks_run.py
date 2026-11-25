@@ -2053,7 +2053,8 @@ class RerunTest(unittest.TestCase):
 
 
 class ComposeRunnerTest(unittest.TestCase):
-    """The command that starts the job through the stack's Compose files: the batch profile, no dependency started, the staging volume read-only."""
+    """The command that starts the job through the stack's Compose files: the Bronze service and its profile, no dependency started, the staging
+    volume read-only."""
 
     def settings(self) -> Settings:
         return Settings(compose_directory=ROOT / "compose", project="stack_example", host_env=Path("/opt/stack/compose/host.env"))
@@ -2070,9 +2071,9 @@ class ComposeRunnerTest(unittest.TestCase):
         text = " ".join(arguments)
         self.assertIn(f"compose --project-directory {ROOT / 'compose'}", text)
         self.assertIn("--project-name stack_example", text)
-        self.assertIn("--profile batch run --rm --no-TTY --no-deps", text)
+        self.assertIn("--profile batch_bronze run --rm --no-TTY --no-deps", text)
         self.assertIn("--volume stack_example_table_check_staging:/staging:ro", text)
-        self.assertTrue(text.endswith("--entrypoint python spark -m spark.jobs.table_checks --staging /staging/run_one"), text)
+        self.assertTrue(text.endswith("--entrypoint python spark_bronze -m spark.jobs.table_checks --staging /staging/run_one"), text)
         self.assertEqual((0, "RESULT {}\n"), (reply.exit_code, reply.stdout))
 
     def test_the_command_runs_the_job_as_the_spark_user_with_the_launchers_group_and_the_environment_carries_the_memory_limit(self) -> None:
@@ -2084,9 +2085,9 @@ class ComposeRunnerTest(unittest.TestCase):
         arguments = started.call_args.args[1]
         self.assertEqual(f"{run.SPARK_UID}:{run.STAGING_GID}", arguments[arguments.index("--user") + 1])
         environment = started.call_args.kwargs["env"]
-        expected = rendered_environment(load_limits(ROOT / "compose" / "limits.yml"))["MEM_LIMIT_SPARK"]
+        expected = rendered_environment(load_limits(ROOT / "compose" / "limits.yml"))["MEM_LIMIT_SPARK_BRONZE"]
         self.assertRegex(expected, r"^[0-9]+m$")
-        self.assertEqual(expected, environment["MEM_LIMIT_SPARK"])
+        self.assertEqual(expected, environment["MEM_LIMIT_SPARK_BRONZE"])
         every = {name for name in rendered_environment(load_limits(ROOT / "compose" / "limits.yml")) if name.startswith("MEM_LIMIT_")}
         self.assertTrue(every <= set(environment))
 

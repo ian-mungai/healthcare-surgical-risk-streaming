@@ -130,7 +130,7 @@ variable "provision_host" {
 }
 
 variable "workloads" {
-  description = "Workloads that get their own role. Each names the prefixes of the run's bound bucket it reaches, with the modes read, write and delete for each (delete only on warehouse and records_input), and whether it reads the publisher's dataset. Terraform builds the resource patterns from the bound bucket."
+  description = "Workloads that get their own role. Each names the prefixes of the run's bound bucket it reaches, with the modes read, write and delete for each (delete only on records_input and on the warehouse layer prefixes, never on the whole warehouse prefix), and whether it reads the publisher's dataset. Terraform builds the resource patterns from the bound bucket."
   type = map(object({
     access         = map(list(string))
     publisher_read = optional(bool, false)

@@ -40,6 +40,24 @@ variable "records_writer" {
   default     = "orchestrator"
 }
 
+variable "layer_writers" {
+  description = "The warehouse prefixes that each hold the tables of one lake layer, each with the name of the one workload that may write and delete it. Nessie's catalog puts a table in a folder of the warehouse prefix that is named for its namespace and the table, so the prefix of a layer is the folder of its namespace."
+  type        = map(string)
+  default = {
+    "warehouse/bronze"  = "bronze"
+    "warehouse/silver"  = "silver"
+    "warehouse/gold"    = "gold"
+    "warehouse/feature" = "stream"
+    "warehouse/stream"  = "stream"
+  }
+}
+
+variable "warehouse_writer" {
+  description = "Name of the one workload that may write the whole warehouse prefix, which the table maintenance needs to rewrite the files of every layer. It may not delete there."
+  type        = string
+  default     = "maintenance"
+}
+
 variable "workloads" {
   description = "Workloads that get their own role. Each names the prefixes it reaches, with the modes read, write and delete for each, and whether it reads the publisher's dataset. The variable file gives no bucket and no resource pattern."
   type = map(object({
@@ -48,8 +66,8 @@ variable "workloads" {
   }))
 
   validation {
-    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix in keys(workload.access) : contains(["landing", "manifests", "warehouse", "records_input"], prefix)])])
-    error_message = "A workload may name only the landing, manifests, warehouse and records_input prefixes. The state prefix, the airbyte prefix, another bucket and a wildcard are refused."
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix in keys(workload.access) : contains(concat(["landing", "manifests", "warehouse", "warehouse/raw_records", "records_input"], keys(var.layer_writers)), prefix)])])
+    error_message = "A workload may name only the landing, manifests, warehouse and records_input prefixes, the warehouse raw_records prefix and the warehouse layer prefixes. The state prefix, the airbyte prefix, another bucket and a wildcard are refused."
   }
 
   validation {
@@ -58,8 +76,23 @@ variable "workloads" {
   }
 
   validation {
-    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix, modes in workload.access : prefix == "warehouse" || prefix == "records_input" || !contains(modes, "delete")])])
-    error_message = "Only the warehouse and records_input prefixes may have the delete mode."
+    condition     = alltrue([for workload in values(var.workloads) : alltrue([for prefix, modes in workload.access : prefix == "records_input" || contains(keys(var.layer_writers), prefix) || !contains(modes, "delete")])])
+    error_message = "Only the records_input prefix and the warehouse layer prefixes may have the delete mode: no workload deletes in the whole warehouse prefix, in landing or in manifests."
+  }
+
+  validation {
+    condition     = alltrue([for name, workload in var.workloads : alltrue([for prefix, writer in var.layer_writers : writer == name || length(setintersection(lookup(workload.access, prefix, []), ["write", "delete"])) == 0])])
+    error_message = "Only the workload that layer_writers names for a warehouse layer prefix may write or delete it."
+  }
+
+  validation {
+    condition     = alltrue([for workload in values(var.workloads) : length(setintersection(lookup(workload.access, "warehouse/raw_records", []), ["write", "delete"])) == 0])
+    error_message = "No workload may write or delete the warehouse raw_records prefix: the Airbyte load that owns it holds its own key."
+  }
+
+  validation {
+    condition     = alltrue([for name, workload in var.workloads : name == var.warehouse_writer || !contains(lookup(workload.access, "warehouse", []), "write")])
+    error_message = "Only the workload named in warehouse_writer may write the whole warehouse prefix."
   }
 
   validation {

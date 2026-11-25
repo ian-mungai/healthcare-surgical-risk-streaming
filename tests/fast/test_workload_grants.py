@@ -16,13 +16,33 @@ from typing import Any
 from scripts.infra.host import PROJECT_WORKLOAD_GIDS
 
 TFVARS = Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars"
-# The design's grants: Airbyte lands the copy and reads the publisher; the checksum check reads the copy and writes the manifests; Spark builds and maintains
-# the tables; Trino reads them; the replay reads the copy and the manifests; the orchestrator's record load reads the copy and the manifests and makes, reads
-# and deletes the versions of its own read copies under records_input.
+# The design's grants: Airbyte lands the copy and reads the publisher; the checksum check reads the copy and writes the manifests; each Spark layer workload
+# reads what its layer is built from and writes its own layer's folder of the warehouse (Bronze also reads the copy and the manifests, and the loaded tables;
+# Silver reads the loaded tables and Bronze; Gold reads Silver and Bronze); the streaming job writes its own two folders; the maintenance job rewrites the files
+# of every layer and deletes nothing; Trino reads the tables; the replay reads the copy and the manifests; the orchestrator's record load reads the copy and
+# the manifests and makes, reads and deletes the versions of its own read copies under records_input.
 DECLARED: dict[str, dict[str, Any]] = {
     "airbyte": {"access": {"landing": {"write"}}, "publisher_read": True},
     "ingestion_check": {"access": {"landing": {"read"}, "manifests": {"read", "write"}}, "publisher_read": False},
-    "spark": {"access": {"warehouse": {"read", "write", "delete"}}, "publisher_read": False},
+    "bronze": {
+        "access": {
+            "landing": {"read"},
+            "manifests": {"read"},
+            "warehouse/raw_records": {"read"},
+            "warehouse/bronze": {"read", "write", "delete"},
+        },
+        "publisher_read": False,
+    },
+    "silver": {
+        "access": {"warehouse/raw_records": {"read"}, "warehouse/bronze": {"read"}, "warehouse/silver": {"read", "write", "delete"}},
+        "publisher_read": False,
+    },
+    "gold": {
+        "access": {"warehouse/bronze": {"read"}, "warehouse/silver": {"read"}, "warehouse/gold": {"read", "write", "delete"}},
+        "publisher_read": False,
+    },
+    "stream": {"access": {"warehouse/feature": {"read", "write", "delete"}, "warehouse/stream": {"read", "write", "delete"}}, "publisher_read": False},
+    "maintenance": {"access": {"warehouse": {"read", "write"}}, "publisher_read": False},
     "trino": {"access": {"warehouse": {"read"}}, "publisher_read": False},
     "replay": {"access": {"landing": {"read"}, "manifests": {"read"}}, "publisher_read": False},
     "orchestrator": {"access": {"landing": {"read"}, "manifests": {"read"}, "records_input": {"read", "write", "delete"}}, "publisher_read": False},
@@ -52,7 +72,9 @@ def value(items: list[str]) -> Any:
         document: dict[str, Any] = {}
         while items[0] != "}":
             name, equals = items.pop(0), items.pop(0)
-            if equals != "=" or not re.fullmatch(r"[a-z_][a-z0-9_]*", name) or name in document:
+            if name.startswith('"') and re.fullmatch(r'"[a-z_]+(/[a-z_]+)?"', name):
+                name = name.strip('"')
+            if equals != "=" or not re.fullmatch(r"[a-z_][a-z0-9_/]*", name) or name in document:
                 raise FormError(f"not one name = value at {name}")
             document[name] = value(items)
             if items[0] == ",":
@@ -156,6 +178,51 @@ class PlantedGrantTest(unittest.TestCase):
         for label, (new, named) in cases.items():
             with self.subTest(label):
                 found = self.planted(block, new)
+                self.assertEqual(1, len(found), found)
+                self.assertTrue(found[0].startswith(named), found)
+
+    def test_a_layer_workload_that_reaches_another_layer_or_the_raw_prefixes_is_named(self) -> None:
+        silver = '"warehouse/bronze"      = ["read"]\n      "warehouse/silver"      = ["read", "write", "delete"]'
+        gold = '"warehouse/bronze" = ["read"]\n      "warehouse/silver" = ["read"]\n      "warehouse/gold"   = ["read", "write", "delete"]'
+        bronze = '"warehouse/bronze"      = ["read", "write", "delete"]'
+        cases = {
+            "silver writes bronze": (
+                silver,
+                silver.replace('"warehouse/bronze"      = ["read"]', '"warehouse/bronze"      = ["read", "write"]'),
+                "silver: warehouse/bronze ['write']",
+            ),
+            "silver deletes bronze": (
+                silver,
+                silver.replace('"warehouse/bronze"      = ["read"]', '"warehouse/bronze"      = ["read", "delete"]'),
+                "silver: warehouse/bronze ['delete']",
+            ),
+            "gold reads landing": (gold, gold + '\n      landing = ["read"]', "gold: landing ['read']"),
+            "gold reads manifests": (gold, gold + '\n      manifests = ["read"]', "gold: manifests ['read']"),
+            "gold writes silver": (
+                gold,
+                gold.replace('"warehouse/silver" = ["read"]', '"warehouse/silver" = ["read", "write"]'),
+                "gold: warehouse/silver ['write']",
+            ),
+            "bronze writes gold": (bronze, bronze + '\n      "warehouse/gold" = ["read", "write"]', "bronze: warehouse/gold ['read', 'write']"),
+            "bronze writes raw_records": (
+                '"warehouse/raw_records" = ["read"]\n      "warehouse/bronze"      = ["read", "write", "delete"]',
+                '"warehouse/raw_records" = ["read", "write"]\n      "warehouse/bronze"      = ["read", "write", "delete"]',
+                "bronze: warehouse/raw_records ['write']",
+            ),
+            "maintenance deletes": (
+                'access = { warehouse = ["read", "write"] }',
+                'access = { warehouse = ["read", "write", "delete"] }',
+                "maintenance: warehouse ['delete']",
+            ),
+            "trino writes": (
+                'trino = {\n    access = { warehouse = ["read"] }',
+                'trino = {\n    access = { warehouse = ["read", "write"] }',
+                "trino: warehouse ['write']",
+            ),
+        }
+        for label, (old, new, named) in cases.items():
+            with self.subTest(label):
+                found = self.planted(old, new)
                 self.assertEqual(1, len(found), found)
                 self.assertTrue(found[0].startswith(named), found)
 
