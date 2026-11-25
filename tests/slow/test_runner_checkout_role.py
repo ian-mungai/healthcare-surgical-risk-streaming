@@ -31,6 +31,7 @@ OWNER = pwd.getpwuid(os.getuid()).pw_name
 GROUP = grp.getgrgid(os.getgid()).gr_name
 VERSION = ".".join(str(part) for part in sys.version_info[:3])
 MARKER = ".runner_checkout.json"
+MANIFEST = "runner_manifest.json"
 CHANGED_NONE = re.compile(r"changed=0\s")
 GIT_ENV = {
     "PATH": os.environ["PATH"],
@@ -136,7 +137,7 @@ class PlacementTest(unittest.TestCase):
         folder = scratch.folder(scratch.commit_a)
         tracked = set(scratch.git("ls-tree", "-r", "--name-only", scratch.commit_a).stdout.split())
         self.assertEqual(0, code, output)
-        self.assertEqual(tracked | {MARKER}, files_under(folder))
+        self.assertEqual(tracked | {MARKER, MANIFEST}, files_under(folder))
         self.assertEqual("A = 1\n", (folder / "app" / "a.py").read_text())
         self.assertFalse((folder / ".git").exists())
         self.assertEqual([], [path for path in folder.rglob(".git*") if ".venv" not in path.parts and path.name != ".gitignore"])
@@ -256,6 +257,104 @@ class RedeployTest(unittest.TestCase):
         self.assertEqual(0, code, output)
         self.assertEqual(VERSION, json.loads(marker.read_text())["python"])
         self.assertFalse((scratch.folder(scratch.commit_a) / "tests" / "e2e" / "silver_signals.py").exists())
+
+
+class ManifestTest(unittest.TestCase):
+    """The source manifest ``runner_manifest.json`` in the folder's root: what the streaming host runner checks its provenance with."""
+
+    def deployed(self) -> tuple[Scratch, Path]:
+        scratch = Scratch(self)
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        return scratch, scratch.folder(scratch.commit_a)
+
+    def test_it_holds_exactly_the_commit_and_every_archived_file_with_the_sha256_of_its_bytes(self) -> None:
+        scratch, folder = self.deployed()
+        document = json.loads((folder / MANIFEST).read_text())
+        tracked = set(scratch.git("ls-tree", "-r", "--name-only", scratch.commit_a).stdout.split())
+        self.assertEqual(["commit", "files"], sorted(document))
+        self.assertEqual(scratch.commit_a, document["commit"])
+        self.assertEqual(tracked, set(document["files"]))
+        for name, digest in document["files"].items():
+            with self.subTest(name=name):
+                self.assertEqual(hashlib.sha256((folder / name).read_bytes()).hexdigest(), digest)
+        self.assertEqual(
+            {"app/a.py": hashlib.sha256(b"A = 1\n").hexdigest()}, {name: digest for name, digest in document["files"].items() if name == "app/a.py"}
+        )
+
+    def test_it_lists_no_environment_file_no_marker_no_manifest_and_no_placed_runner(self) -> None:
+        scratch, folder = self.deployed()
+        (folder / "tests" / "e2e" / "silver_signals.py").write_text("PLACED = 1\n")
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        names = set(json.loads((folder / MANIFEST).read_text())["files"])
+        self.assertNotIn("tests/e2e/silver_signals.py", names)
+        self.assertEqual([], [name for name in names if name.startswith(".venv") or name in (MARKER, MANIFEST)])
+
+    def test_it_is_read_only_to_its_owner_closed_to_others_and_written_before_the_marker(self) -> None:
+        _, folder = self.deployed()
+        manifest = folder / MANIFEST
+        self.assertEqual(0o400, stat.S_IMODE(manifest.stat().st_mode))
+        self.assertEqual((OWNER, GROUP), (pwd.getpwuid(manifest.stat().st_uid).pw_name, grp.getgrgid(manifest.stat().st_gid).gr_name))
+        self.assertLessEqual(manifest.stat().st_mtime_ns, (folder / MARKER).stat().st_mtime_ns)
+
+    def test_a_second_deploy_of_the_same_commit_leaves_the_manifest_and_a_placed_runner_as_they_are(self) -> None:
+        scratch, folder = self.deployed()
+        placed = folder / "tests" / "e2e" / "silver_signals.py"
+        placed.write_text("PLACED = 1\n")
+        before = (folder / MANIFEST).stat().st_mtime_ns
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        self.assertRegex(output, CHANGED_NONE)
+        self.assertEqual(before, (folder / MANIFEST).stat().st_mtime_ns)
+        self.assertEqual("PLACED = 1\n", placed.read_text())
+
+    def test_a_changed_archived_file_makes_the_folder_unfinished_and_the_next_deploy_builds_it_again(self) -> None:
+        scratch, folder = self.deployed()
+        placed = folder / "tests" / "e2e" / "silver_signals.py"
+        placed.write_text("PLACED = 1\n")
+        (folder / "app" / "a.py").chmod(0o640)
+        (folder / "app" / "a.py").write_text("A = 99\n")
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        self.assertEqual("A = 1\n", (folder / "app" / "a.py").read_text())
+        self.assertFalse(placed.exists(), "a rebuilt folder holds no placed runner")
+
+    def test_a_removed_archived_file_makes_the_folder_unfinished(self) -> None:
+        scratch, folder = self.deployed()
+        (folder / "app" / "a.py").unlink()
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        self.assertEqual("A = 1\n", (folder / "app" / "a.py").read_text())
+
+    def test_a_missing_manifest_makes_the_folder_unfinished_and_the_next_deploy_builds_it_again(self) -> None:
+        scratch, folder = self.deployed()
+        placed = folder / "tests" / "e2e" / "silver_signals.py"
+        placed.write_text("PLACED = 1\n")
+        (folder / MANIFEST).unlink()
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        self.assertTrue((folder / MANIFEST).is_file())
+        self.assertFalse(placed.exists())
+
+    def test_a_manifest_that_was_edited_to_fit_a_changed_file_is_not_the_one_of_the_commit_and_the_check_still_passes_only_for_its_own_commit(self) -> None:
+        scratch, folder = self.deployed()
+        document = json.loads((folder / MANIFEST).read_text())
+        document["commit"] = "e" * 40
+        (folder / MANIFEST).chmod(0o600)
+        (folder / MANIFEST).write_text(json.dumps(document))
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        self.assertEqual(scratch.commit_a, json.loads((folder / MANIFEST).read_text())["commit"])
+
+    def test_a_link_in_the_archive_fails_the_deploy_before_a_marker_is_written(self) -> None:
+        scratch = Scratch(self)
+        (scratch.repo / "link_to_a.py").symlink_to("app/a.py")
+        commit = scratch.commit({})
+        code, output = scratch.run(commit)
+        self.assertNotEqual(0, code)
+        self.assertIn("link_to_a.py", output)
+        self.assertFalse((scratch.folder(commit) / MARKER).exists())
 
 
 class InterpreterTest(unittest.TestCase):

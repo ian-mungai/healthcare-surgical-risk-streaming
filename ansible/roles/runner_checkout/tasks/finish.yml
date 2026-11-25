@@ -1,5 +1,6 @@
-# Reads runner_checkout_folder, runner_checkout_marker, runner_checkout_expected, runner_checkout_owner, runner_checkout_group and runner_checkout_file_mode. Closes
-# the folder, checks it, and writes the marker last, so a folder with a marker is a finished one and a failed deploy leaves a folder that the next run removes.
+# Reads runner_checkout_folder, runner_checkout_commit, runner_checkout_manifest, runner_checkout_manifest_mode, runner_checkout_marker, runner_checkout_expected,
+# runner_checkout_owner, runner_checkout_group and runner_checkout_file_mode. Closes the folder, writes the source manifest of the files that git archive placed (before any
+# runner is placed, and read-only to its owner), checks the folder, and writes the marker last, so a folder with a marker is a finished one and a failed deploy leaves a folder that the next run removes.
 # A link is not followed: the environment's interpreter link leads to the shared interpreter, which stays as it is.
 - name: Close every entry of the folder to everyone but its owner and group
   ansible.builtin.file:
@@ -10,6 +11,16 @@
     owner: "{{ runner_checkout_owner }}"
     group: "{{ runner_checkout_group }}"
     mode: "{{ runner_checkout_file_mode }}"
+
+- name: Write the source manifest of the files that the archive placed
+  runner_manifest:
+    folder: "{{ runner_checkout_folder }}"
+    commit: "{{ runner_checkout_commit }}"
+    state: write
+    owner: "{{ runner_checkout_owner }}"
+    group: "{{ runner_checkout_group }}"
+    mode: "{{ runner_checkout_manifest_mode }}"
+  timeout: "{{ runner_checkout_manifest_deadline_seconds }}"
 
 - name: List every entry of the folder without following a link
   ansible.builtin.find:
@@ -27,6 +38,7 @@
   loop:
     - "{{ runner_checkout_folder }}"
     - "{{ runner_checkout_folder }}/.git"
+    - "{{ runner_checkout_manifest }}"
   register: runner_checkout_roots
 
 - name: Refuse a folder that others can reach, that another user owns or that holds Git history
@@ -36,8 +48,10 @@
       - runner_checkout_entries.files | rejectattr('islnk') | rejectattr('pw_name', 'equalto', runner_checkout_owner) | list | length == 0
       - runner_checkout_roots.results[0].stat.mode is regex('^0?[0-7][0-5]0$')
       - not runner_checkout_roots.results[1].stat.exists
+      - runner_checkout_roots.results[2].stat.isreg | default(false)
+      - runner_checkout_roots.results[2].stat.mode is regex('^0?400$')
     quiet: true
-    fail_msg: the runner folder is open to other users, is not owned by the deploy user, or holds a .git folder
+    fail_msg: the runner folder is open to other users, is not owned by the deploy user, holds a .git folder, or has no source manifest that only its owner reads
 
 - name: Write the marker that says the folder is finished
   ansible.builtin.copy:

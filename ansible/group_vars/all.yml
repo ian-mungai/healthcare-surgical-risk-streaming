@@ -221,6 +221,11 @@ runner_checkout_expected:
   python_archive_sha256: "{{ runner_checkout_python_archive_sha256 }}"
   requirements: "{{ runner_checkout_requirements }}"
 runner_checkout_marker_text: "{{ runner_checkout_expected | to_json(sort_keys=True) }}\n"
+# The source manifest, written in the folder's root before the marker: {"commit": "<40 hex>", "files": {"<path relative to the folder>": "<SHA-256>"}} for every file that
+# git archive placed (not .venv, the marker, the manifest or a runner that the launcher places later). Only its owner reads it (0400). The streaming host runner checks its
+# provenance with it, and a deploy of a finished folder checks the files against it and builds the folder again when one changed, is gone or the manifest is not there.
+runner_checkout_manifest: "{{ runner_checkout_folder }}/runner_manifest.json"
+runner_checkout_manifest_mode: "0400"
 # Each deadline is in seconds. The install deadline covers every package of the lock file.
 runner_checkout_download_deadline_seconds: 120
 runner_checkout_unpack_deadline_seconds: 120
@@ -228,3 +233,4 @@ runner_checkout_archive_deadline_seconds: 120
 runner_checkout_environment_deadline_seconds: 120
 runner_checkout_install_deadline_seconds: 900
 runner_checkout_check_deadline_seconds: 60
+runner_checkout_manifest_deadline_seconds: 120

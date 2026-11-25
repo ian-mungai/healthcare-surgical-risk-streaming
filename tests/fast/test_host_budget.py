@@ -304,14 +304,17 @@ class HostSetupBudgetTest(unittest.TestCase):
         found = playbook_occurrences("host.yml")
         names = group_variables()
         python = sum(int(names[f"runner_checkout_{name}_deadline_seconds"]) for name in ("download", "unpack", "check"))
-        code = sum(int(names[f"runner_checkout_{name}_deadline_seconds"]) for name in ("archive", "unpack", "unpack", "environment", "check", "install"))
+        code = sum(
+            int(names[f"runner_checkout_{name}_deadline_seconds"])
+            for name in ("archive", "unpack", "unpack", "environment", "check", "install", "manifest", "manifest")
+        )
         self.assertEqual(
             python + code,
             parts()["runner_checkout"],
-            "the interpreter's download, unpack and check, then the archive, its copy and unpack, the environment, its check and the install",
+            "the interpreter's download, unpack and check, then the archive, its copy and unpack, the environment, its check, the install and the manifest",
         )
         timed = [item for item in found if item.role == "runner_checkout" and task_seconds(item)]
-        self.assertEqual(9, len(timed))
+        self.assertEqual(11, len(timed))
 
     def test_the_rollback_and_the_uninstall_count_once_and_the_install_counts_beside_the_recovery(self) -> None:
         found = playbook_occurrences("host.yml")

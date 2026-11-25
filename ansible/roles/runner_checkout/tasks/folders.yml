@@ -1,6 +1,7 @@
 # Reads runner_checkout_directory, runner_checkout_folder, runner_checkout_marker, runner_checkout_expected, runner_checkout_commit, runner_checkout_owner and
-# runner_checkout_group. Sets runner_checkout_complete. A folder is finished when its marker holds exactly what this deploy expects. Nothing here removes anything
-# when the folder is finished: a runner that the launcher placed in it stays.
+# runner_checkout_group. Sets runner_checkout_complete. A folder is finished when its marker holds exactly what this deploy expects and every file of its source manifest is
+# there with the manifest's hash (a missing manifest is a folder that is not finished). Nothing here removes anything when the folder is finished: a runner that the launcher
+# placed in it stays, because the manifest does not list it.
 - name: Create the runner folder for its owner and group only
   ansible.builtin.file:
     path: "{{ runner_checkout_directory }}"
@@ -21,8 +22,21 @@
   register: runner_checkout_marker_content
   when: runner_checkout_marker_stat.stat.isreg | default(false)
 
-- name: Find out whether the folder is finished for this commit, interpreter and requirements
+- name: Find out whether the marker is the one of this commit, interpreter and requirements
   ansible.builtin.set_fact:
-    runner_checkout_complete: >-
+    runner_checkout_marker_matches: >-
       {{ (runner_checkout_marker_stat.stat.isreg | default(false))
       and (runner_checkout_marker_content.content | default('') | b64decode) == runner_checkout_marker_text }}
+
+- name: Check the files of a folder with this marker against its source manifest
+  runner_manifest:
+    folder: "{{ runner_checkout_folder }}"
+    commit: "{{ runner_checkout_commit }}"
+    state: verify
+  register: runner_checkout_manifest_check
+  when: runner_checkout_marker_matches
+  timeout: "{{ runner_checkout_manifest_deadline_seconds }}"
+
+- name: Find out whether the folder is finished
+  ansible.builtin.set_fact:
+    runner_checkout_complete: "{{ runner_checkout_marker_matches and (runner_checkout_manifest_check.intact | default(false)) }}"
