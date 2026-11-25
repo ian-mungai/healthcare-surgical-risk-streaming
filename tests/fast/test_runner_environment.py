@@ -15,6 +15,7 @@ Failure modes covered here:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import re
@@ -23,6 +24,7 @@ import sys
 import tempfile
 import unittest
 import venv
+import zipfile
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -142,6 +144,53 @@ class VerdictTest(Checkout):
         found = self.check()
         self.assertEqual(21, len(found))
         self.assertEqual("and 10 more", found[-1])
+
+
+class InlineOptionTest(Checkout):
+    """A lock line that carries pip's options on the line itself, as pip accepts it: the options are not a part of the environment marker."""
+
+    def wheel(self) -> str:
+        """One tiny wheel in ``wheels/``; returns its SHA-256."""
+        path = self.base / "wheels" / "runner_probe-1.0-py3-none-any.whl"
+        path.parent.mkdir()
+        with zipfile.ZipFile(path, "w") as wheel:
+            wheel.writestr("runner_probe.py", "VALUE = 1\n")
+            wheel.writestr("runner_probe-1.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: runner-probe\nVersion: 1.0\n")
+            wheel.writestr("runner_probe-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            wheel.writestr("runner_probe-1.0.dist-info/RECORD", "")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def pip_would_install(self) -> str:
+        environment = {"PATH": os.environ["PATH"], "HOME": str(self.base), "PIP_CONFIG_FILE": os.devnull}
+        arguments = ["-m", "pip", "install", "--dry-run", "--require-hashes", "--no-index", "--no-cache-dir", "--disable-pip-version-check"]
+        arguments += ["--find-links", str(self.base / "wheels"), "--requirement", str(self.folder / LOCK)]
+        result = run_command(str(self.folder / ".venv" / "bin" / "python"), arguments, env=environment, timeout=120)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        return str(result.stdout)
+
+    def test_a_line_that_pip_accepts_with_its_hash_on_the_line_is_read_by_its_marker_alone(self) -> None:
+        digest = self.wheel()
+        lines = {
+            "one line": f"runner-probe==1.0 ; python_version >= '3' --hash=sha256:{digest}\n",
+            "two hashes, one on a continuation line": f"runner-probe==1.0 ; python_version >= '3' --hash=sha256:{digest} \\\n    --hash=sha256:{'0' * 64}\n",
+            "a comment after the hash": f"runner-probe==1.0 ; python_version >= '3' --hash=sha256:{digest}  # via -r requirements.in\n",
+            "a comment after the marker": f"runner-probe==1.0 ; python_version >= '3'  # a note\n    # --hash=sha256:{digest}\n",
+        }
+        for name, text in lines.items():
+            with self.subTest(case=name):
+                self.lock(text)
+                if name != "a comment after the marker":
+                    self.assertIn("Would install runner-probe-1.0", self.pip_would_install())
+                self.assertEqual(["in the lock files but not installed: runner-probe"], self.check())
+        self.lock(lines["one line"])
+        add_distribution(self.folder, "runner-probe", "1.0")
+        self.assertEqual([], self.check())
+
+    def test_a_false_marker_with_its_hash_on_the_line_requires_nothing_and_pip_agrees(self) -> None:
+        digest = self.wheel()
+        self.lock(f"runner-probe==1.0 ; python_version < '3' --hash=sha256:{digest}\n")
+        self.assertNotIn("Would install", self.pip_would_install())
+        self.assertEqual([], self.check())
 
 
 class InterpreterTest(Checkout):

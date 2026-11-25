@@ -27,6 +27,9 @@ ENVIRONMENT = ".venv"
 IGNORED = frozenset({"pip"})
 SHOWN_PROBLEMS = 20
 LOCK_ENTRY = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s;\\]+)[ \t]*(;[^\\\n]*)?", re.MULTILINE)
+# Where the requirement of a line ends and the marker with it: at a comment (``#`` after white space) or at pip's first option (a token after a space that
+# starts with ``-``, such as ``--hash=``), as pip splits a requirements line.
+MARKER_END = re.compile(r"\s#| -")
 # The one program that the folder's interpreter runs besides --version: its installed packages, and each marker of the lock files evaluated for it.
 REPORT = "\n".join(
     (
@@ -69,7 +72,9 @@ def locked(folder: Path, requirements: list[str]) -> list[tuple[str, str, str]]:
         if REQUIREMENT_FORM.fullmatch(name) is None:
             raise EnvironmentCheckError("a lock file is not a plain relative path")
         text = (folder / name).read_text()
-        found += [(normalized(match.group(1)), match.group(2), (match.group(3) or "").lstrip(";").strip()) for match in LOCK_ENTRY.finditer(text)]
+        for match in LOCK_ENTRY.finditer(text):
+            marker = MARKER_END.split((match.group(3) or "").lstrip(";"), maxsplit=1)[0].strip()
+            found.append((normalized(match.group(1)), match.group(2), marker))
     if not found:
         raise EnvironmentCheckError("the lock files pin no requirement")
     return found

@@ -16,6 +16,7 @@ import ast
 import importlib.metadata
 import re
 import sys
+import warnings
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -118,9 +119,13 @@ def uses_dynamic_import(tree: ast.AST) -> bool:
 
 
 def parsed(text: str, file: str) -> ast.AST | None:
-    """The syntax tree of a file, or None when the text is not valid Python (the error text is never kept: it holds a line of the file)."""
+    """The syntax tree of a file, or None when the text is not valid Python: it must compile, which also refuses what only the parser accepts (a ``return``
+    outside a function). The code is never run. The text of an error or a warning is never kept or shown: it can hold a line of the file."""
     try:
-        return ast.parse(text, file)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compile(text, file, "exec", dont_inherit=True)
+            return ast.parse(text, file)
     except SyntaxError, ValueError, RecursionError, MemoryError:
         return None
 
@@ -167,6 +172,8 @@ def exported_names(source: Source, module: str, seen: frozenset[str] = frozenset
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             names.add(node.name)
             open_ended = open_ended or node.name == "__getattr__"
+        elif isinstance(node, ast.TypeAlias):
+            names |= stored_names(node.name)
         elif isinstance(node, ast.Assign):
             names |= set().union(*(stored_names(target) for target in node.targets))
         elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.For | ast.AsyncFor):

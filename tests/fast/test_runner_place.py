@@ -775,6 +775,32 @@ class RemoteCommandTest(unittest.TestCase):
         self.reset()
         self.assertEqual(0, self.send().returncode, "the marker as the role writes it is accepted")
 
+    def test_a_marker_with_a_non_standard_constant_or_a_value_outside_the_roles_schema_stops_the_command(self) -> None:
+        """The role's schema is its refusal of a pin of the wrong form: an exact version 3.x.y and at least one plain relative requirements path."""
+        requirements = {
+            "no requirements file": [],
+            "NaN among the requirements": ["requirements.txt", float("nan")],
+            "an infinity among the requirements": ["requirements.txt", float("inf")],
+            "a number among the requirements": ["requirements.txt", 1],
+            "an empty requirements path": [""],
+            "a requirements path that climbs out": ["../requirements.txt"],
+            "an absolute requirements path": ["/etc/passwd"],
+            "a requirements path with a space": ["a b.txt"],
+        }
+        texts = {name: self.marker_text(requirements=value) for name, value in requirements.items()}
+        for name, version in {"an empty": "", "a short": "3.14", "another major": "2.7.18", "a suffixed": "3.14.10rc1", "a two-line": "3.14.10\n"}.items():
+            texts[f"{name} Python version"] = self.marker_text(python=version)
+        for name, text in texts.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.marker.write_text(text)
+                result = self.send()
+                self.assertEqual((runner_place.NO_FOLDER_CODE, runner_place.NO_FOLDER_WORD), (result.returncode, result.stdout.strip()))
+                self.assertFalse((self.folder / FIRST).exists())
+        self.reset()
+        self.marker.write_text(self.marker_text(requirements=["requirements.txt", "spark/requirements.txt"], python="3.9.0"))
+        self.assertEqual(0, self.send().returncode, "another valid version and a nested requirements path are accepted")
+
     def test_the_destination_folder_is_made_when_it_is_missing_and_a_file_in_its_place_stops_the_command(self) -> None:
         (self.folder / "tests" / "e2e").rmdir()
         self.assertEqual(0, self.send().returncode)

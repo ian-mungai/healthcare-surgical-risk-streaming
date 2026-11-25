@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from scripts.infra.runner_imports import LOADED_BY_PATH, DiskSource, OverlaySource, closure, locked_distributions, unlocked
@@ -224,6 +225,39 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(["scripts/bad.py: the file is not valid Python, so its imports cannot be read"], found.unreadable)
         self.assertEqual({"vitaldb": {"scripts/good.py"}}, {name: set(places) for name, places in found.third_party.items()})
         self.assertNotIn("secret_value", " ".join(found.unreadable))
+
+    def test_a_file_that_parses_but_does_not_compile_is_reported_with_the_same_fixed_text_and_is_never_run(self) -> None:
+        ran = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="never_ran_"))) / "ran"
+        for name, line in {
+            "a return outside a function": "return private_value",
+            "an await outside a function": "await private_value",
+            "a break outside a loop": "break",
+            "a nonlocal at the top": "nonlocal private_value",
+            "a name used before its global": "def go():\n    private_value = 1\n    global private_value",
+        }.items():
+            with self.subTest(case=name):
+                text = f"from pathlib import Path\nPath({str(ran)!r}).touch()\nimport vitaldb\n{line}\n"
+                found = closure(self.tree({**self.BASE, "tests/run.py": text}), ["tests/run.py"])
+                self.assertEqual(["tests/run.py: the file is not valid Python, so its imports cannot be read"], found.unreadable)
+        self.assertFalse(ran.exists(), "the check compiled the file and did not run it")
+
+    def test_a_file_that_makes_the_compiler_warn_is_read_and_no_warning_shows_its_line(self) -> None:
+        text = "import vitaldb\nx = 1\nif x is 1:\n    pattern = 'private_value \\d'\n"
+        with warnings.catch_warnings(record=True) as shown:
+            warnings.simplefilter("always")
+            found = closure(self.tree({**self.BASE, "tests/run.py": text}), ["tests/run.py"])
+        self.assertEqual(([], {"vitaldb"}), (found.unreadable, set(found.third_party)))
+        self.assertEqual([], [str(warning.message) for warning in shown])
+
+    def test_a_name_that_a_type_statement_makes_is_one_that_its_module_exports(self) -> None:
+        files = {
+            **self.BASE,
+            "tests/helper.py": "type Row = tuple[int, str]\ntype Pair[T] = tuple[T, T]\nif True:\n    type Nested = int\n",
+            "tests/run.py": "from .helper import Nested, Pair, Row\n",
+        }
+        self.assertEqual([], closure(self.tree(files), ["tests/run.py"]).missing)
+        files["tests/run.py"] = "from .helper import T\n"
+        self.assertEqual(["tests/run.py: tests.helper has no name T and no submodule of that name"], closure(self.tree(files), ["tests/run.py"]).missing)
 
     def test_a_file_that_the_source_does_not_hold_is_reported_and_an_overlay_replaces_the_text_that_the_base_holds(self) -> None:
         base = self.tree({**self.BASE, "tests/run.py": "import json\n"})

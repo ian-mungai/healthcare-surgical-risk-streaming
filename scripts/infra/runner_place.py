@@ -56,7 +56,11 @@ RUNNER_DIRECTORY = "/opt/platform/runner"
 MARKER = ".runner_checkout.json"
 # The fields of the marker that the role writes (``runner_checkout_expected`` in ansible/group_vars/all.yml; a fast test holds them equal).
 MARKER_FIELDS = ("commit", "python", "python_archive_sha256", "requirements")
-# The program that the host's Python runs on the marker: valid JSON, one object, exactly the fields of MARKER_FIELDS (none repeated) and this commit.
+# The forms that the role's first task asserts for the interpreter pin and for each requirements path (a fast test holds them equal).
+PYTHON_FORM = re.compile(r"3\.[0-9]+\.[0-9]+")
+LOCK_FORM = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
+# The program that the host's Python runs on the marker: standard JSON (no NaN or Infinity), one object, exactly the fields of MARKER_FIELDS (none repeated),
+# this commit, and a pin, a digest and requirements paths of the forms that the role writes.
 MARKER_CHECK = "\n".join(
     (
         "import json, re, sys",
@@ -65,15 +69,20 @@ MARKER_CHECK = "\n".join(
         "    if len(set(names)) != len(names):",
         "        raise ValueError(names)",
         "    return dict(pairs)",
+        "def refuse(constant):",
+        "    raise ValueError(constant)",
+        "def formed(value, form):",
+        "    return isinstance(value, str) and re.fullmatch(form, value) is not None",
         "try:",
         "    with open(sys.argv[1], encoding='utf-8') as handle:",
-        "        document = json.load(handle, object_pairs_hook=only)",
+        "        document = json.load(handle, object_pairs_hook=only, parse_constant=refuse)",
         "except (OSError, ValueError):",
         "    sys.exit(1)",
         f"fields = {MARKER_FIELDS!r}",
         "good = isinstance(document, dict) and sorted(document) == sorted(fields) and document['commit'] == sys.argv[2]",
-        "good = good and isinstance(document['python'], str) and isinstance(document['requirements'], list)",
-        "good = good and isinstance(document['python_archive_sha256'], str) and re.fullmatch('[0-9a-f]{64}', document['python_archive_sha256']) is not None",
+        f"good = good and formed(document['python'], {PYTHON_FORM.pattern!r}) and formed(document['python_archive_sha256'], '[0-9a-f]{{64}}')",
+        "good = good and isinstance(document['requirements'], list) and len(document['requirements']) > 0",
+        f"good = good and all(formed(name, {LOCK_FORM.pattern!r}) for name in document['requirements'])",
         "sys.exit(0 if good else 1)",
         "",
     )
@@ -87,7 +96,6 @@ NAMES_VARIABLE = "HOST_RUNNER_NAMES"
 RUNNER_FORM = re.compile(r"tests/e2e/[a-z][a-z0-9_]*\.py")
 COMMIT_FORM = re.compile(r"[0-9a-f]{40}")
 DIGEST_FORM = re.compile(r"[0-9a-f]{64}")
-LOCK_FORM = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
 MAX_BYTES = 1024 * 1024
 SSH_SECONDS = 60
 GIT_SECONDS = 30
