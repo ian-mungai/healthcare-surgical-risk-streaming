@@ -362,6 +362,8 @@ class OpenBaoStandIn:
     def route(self, method: str, path: str, body: dict[str, Any], listing: bool) -> tuple[int, dict[str, Any]]:
         if listing and path == "auth/approle/role":
             return 200, {"data": {"keys": sorted(self.roles)}}
+        if listing and path == "sys/policies/acl":
+            return 200, {"data": {"keys": sorted(self.policies)}}
         parts = path.split("/")
         if path.startswith("sys/policies/acl/"):
             name = parts[-1]
