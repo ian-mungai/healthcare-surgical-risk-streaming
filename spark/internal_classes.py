@@ -99,6 +99,8 @@ PROJECT_CLASSES = (
     "replay.service.wire_codec.FormatMismatch",
     "scripts.aws_cli.AwsError",
     "scripts.aws_cli.AwsTimeout",
+    "scripts.images.pins.PinError",
+    "scripts.images.publish.PublishError",
     "scripts.infra.host.FixedHostError",
     "scripts.infra.host.HostError",
     "scripts.infra.host.NoPeerError",
