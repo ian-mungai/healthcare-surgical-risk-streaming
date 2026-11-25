@@ -88,6 +88,7 @@ def pinned_terraform() -> Path:
 
 
 CONFIGURATION_PARTS = ("modules", "environments")
+UBUNTU_BUILD_FILE = "ubuntu_build.json"
 HEAVY_INPUTS_FILE = "heavy_inputs.tfvars.json"
 HEAVY_INPUT_NAMES = ("host_reserve_mib", "always_on_limits_mib", "spark_limit_mib")
 BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
@@ -141,8 +142,8 @@ def configuration_folder(run: RunBinding) -> Path:
 
 
 def configuration_files(source: Path) -> list[Path]:
-    """The top-level files a run's copy takes: the Terraform files and the provider lock, and no variable file that Terraform would load unasked."""
-    return [*sorted(item for item in source.glob("*.tf") if item.name != "backend_override.tf"), source / ".terraform.lock.hcl"]
+    """The top-level files a run's copy takes: the Terraform files, the pinned Ubuntu build and the provider lock, and no unasked variable file."""
+    return [*sorted(item for item in source.glob("*.tf") if item.name != "backend_override.tf"), source / UBUNTU_BUILD_FILE, source / ".terraform.lock.hcl"]
 
 
 def heavy_inputs() -> str:

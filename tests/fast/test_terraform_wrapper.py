@@ -146,9 +146,15 @@ LOCAL_RECORD = {"backend": {"type": "local", "config": {"path": LOCAL.state_keys
 class ConfigurationCopyTest(unittest.TestCase):
     def test_a_runs_copy_takes_no_variable_file_that_terraform_loads_unasked(self) -> None:
         source = Path(tempfile.mkdtemp(prefix="configuration_"))
-        for name in ("main.tf", "backend_override.tf", "extra.auto.tfvars", "terraform.tfvars", ".terraform.lock.hcl"):
+        for name in ("main.tf", "backend_override.tf", "extra.auto.tfvars", "terraform.tfvars", ".terraform.lock.hcl", "ubuntu_build.json", "other.json"):
             (source / name).write_text("")
-        self.assertEqual(["main.tf", ".terraform.lock.hcl"], [item.name for item in configuration_files(source)])
+        self.assertEqual(["main.tf", "ubuntu_build.json", ".terraform.lock.hcl"], [item.name for item in configuration_files(source)])
+
+    def test_a_runs_copy_takes_the_pinned_ubuntu_build_that_main_tf_reads(self) -> None:
+        """``infra/main.tf`` reads ``ubuntu_build.json`` beside it: a copy without the file would fail every plan at its first read."""
+        source = Path(tempfile.mkdtemp(prefix="configuration_"))
+        (source / "ubuntu_build.json").write_text("{}")
+        self.assertIn("ubuntu_build.json", [item.name for item in configuration_files(source)])
 
 
 def configuration_folder_of(root: Path) -> Path:
@@ -185,18 +191,25 @@ class PrivateFilesTest(unittest.TestCase):
         source = self.root / "infra"
         for folder in ("modules/host", "environments"):
             (source / folder).mkdir(parents=True)
-        for name in ("main.tf", ".terraform.lock.hcl", "modules/host/main.tf", "modules/host/extra.auto.tfvars", "environments/dev.tfvars"):
+        for name in (
+            "main.tf",
+            ".terraform.lock.hcl",
+            "ubuntu_build.json",
+            "modules/host/main.tf",
+            "modules/host/extra.auto.tfvars",
+            "environments/dev.tfvars",
+        ):
             (source / name).write_text("")
         (source / "environments" / "other.auto.tfvars.json").write_text("{}")
         copied = prepare_configuration(RUN)
         names = sorted(path.relative_to(copied).as_posix() for path in copied.rglob("*") if path.is_file())
-        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "main.tf", "modules/host/main.tf"], names)
+        self.assertEqual([".terraform.lock.hcl", "environments/dev.tfvars", "main.tf", "modules/host/main.tf", "ubuntu_build.json"], names)
 
     def prepare_source(self) -> None:
         source = self.root / "infra"
         for folder in ("modules/host", "environments"):
             (source / folder).mkdir(parents=True)
-        for name in ("main.tf", ".terraform.lock.hcl", "modules/host/main.tf", "environments/dev.tfvars"):
+        for name in ("main.tf", ".terraform.lock.hcl", "ubuntu_build.json", "modules/host/main.tf", "environments/dev.tfvars"):
             (source / name).write_text("")
 
     def refuse_limits(self) -> None:
@@ -484,6 +497,7 @@ class SavedPlanTest(unittest.TestCase):
         for folder in ("modules", "environments"):
             (self.root / "infra" / folder).mkdir(parents=True)
         (self.root / "infra" / ".terraform.lock.hcl").write_text("")
+        (self.root / "infra" / "ubuntu_build.json").write_text("{}")
         (self.root / "infra" / "environments" / "dev.tfvars").write_text(
             (Path(__file__).resolve().parents[2] / "infra" / "environments" / "dev.tfvars").read_text()
         )
