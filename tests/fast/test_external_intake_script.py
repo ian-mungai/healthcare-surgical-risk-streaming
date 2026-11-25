@@ -124,6 +124,13 @@ class WriteTest(Case):
         self.assertEqual((0, "written\n", ""), self.run_script({"name": NAME, "value": VALUE}))
         self.assertEqual(VALUE, self.server.stored(f"external/{NAME}"))
 
+    def test_a_write_that_the_server_answers_with_a_status_other_than_200_is_a_code_and_stores_nothing(self) -> None:
+        for status in (500, 204):
+            with self.subTest(status=status):
+                self.server.fail_next("POST", "/v1/secret/data/", status, "answer")
+                self.assertEqual((3, "cannot_write\n", ""), self.run_script({"name": NAME, "value": VALUE}))
+                self.assertIsNone(self.server.stored(f"external/{NAME}"))
+
     def test_a_write_that_never_arrived_completes_on_the_next_run(self) -> None:
         self.server.drop_next("POST", "/v1/secret/data/")
         code, out, _ = self.run_script({"name": NAME, "value": VALUE})

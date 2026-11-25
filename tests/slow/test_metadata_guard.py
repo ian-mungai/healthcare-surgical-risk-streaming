@@ -14,7 +14,7 @@ from pathlib import Path
 
 from scripts.process import run_command
 from scripts.project_config import ROOT
-from tests.slow.ansible_support import load_list, role_order, run_task_file
+from tests.slow.ansible_support import included_roles, load_list, role_order, run_task_file
 
 ROLE = ROOT / "ansible" / "roles" / "metadata_guard"
 SCRIPT = ROLE / "files" / "metadata_guard.sh"
@@ -148,7 +148,15 @@ class RoleContractTest(unittest.TestCase):
 
     def test_the_guard_runs_before_the_roles_that_start_workloads(self) -> None:
         roles = role_order("host.yml")
-        self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access", "unlock_key", "compose_stack", "airbyte"], roles)
+        self.assertEqual(["metadata_guard", "docker", "k3s", "workload_access", "unlock_key", "compose_stack"], roles)
+
+    def test_the_stack_playbook_that_follows_the_host_playbook_and_the_intake_starts_the_rest_of_the_workloads_after_the_guard(self) -> None:
+        self.assertEqual(["compose_stack", "airbyte"], [name for name, _ in included_roles("stack.yml")])
+        self.assertEqual(
+            "metadata_guard",
+            role_order("host.yml")[0],
+            "the guard is the first role of the first playbook, so every workload of the stack playbook starts after it",
+        )
 
 
 RUNTIME_UNITS = ["docker.service", "containerd.service", "k3s.service"]

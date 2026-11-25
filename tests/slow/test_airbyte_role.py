@@ -24,7 +24,7 @@ from scripts.stack.limits import load_limits
 from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import GROUP_VARIABLES, group_variables
 from tests.fast.test_postgres_accounts import TOOLS_FILE, accounts
-from tests.slow.ansible_support import ROLES, environment, run_playbook
+from tests.slow.ansible_support import ROLES, environment, included_roles, run_playbook
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROLES / "airbyte"
@@ -1032,13 +1032,23 @@ class ChartCheckTest(unittest.TestCase):
 
 
 class PlaybookTest(unittest.TestCase):
-    def test_the_role_is_added_after_the_compose_stack_in_the_playbook(self) -> None:
+    """The deployment is split in three runs, in this order: the host playbook, the launcher's intake of the external secrets, the stack playbook."""
+
+    def test_the_role_is_not_in_the_host_playbook_and_follows_the_stack_deployment_in_the_stack_playbook(self) -> None:
         playbook = load_yaml((ROOT / "ansible" / "host.yml").read_text())
         if not isinstance(playbook, list):
             self.fail("the playbook must be a list")
         roles = [str(role) for role in playbook[0]["roles"]]
-        self.assertEqual("airbyte", roles[-1])
-        self.assertLess(roles.index("compose_stack"), roles.index("airbyte"))
+        self.assertEqual("compose_stack", roles[-1], "the host playbook ends with the part that prepares OpenBao and installs the intake script")
+        self.assertNotIn("airbyte", roles, "the role needs the images that the stack playbook pulls with the token that the intake stores")
+        self.assertEqual([("compose_stack", "deploy.yml"), ("airbyte", "main.yml")], included_roles("stack.yml"))
+
+    def test_the_launcher_runs_the_host_playbook_then_the_intake_then_the_stack_playbook(self) -> None:
+        source = (ROOT / "scripts" / "infra" / "host.py").read_text()
+        order = [
+            source.index(step) for step in ("run_ansible(run.run_id, address, variables)\n", "place_external_secrets(run.run_id", 'variables, "stack.yml")')
+        ]
+        self.assertEqual(sorted(order), order)
 
 
 if __name__ == "__main__":
