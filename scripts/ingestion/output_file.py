@@ -14,11 +14,11 @@ output name of 255 bytes works.
 
 ``publish_reserved`` is for an output whose staging file the caller reserved first (the result file of a sealed job: ``<path>.part`` is made before any work, so
 that a path that cannot hold it is a bad call, and a watchdog removes it by name). The reserved file is the only staging file: the text is written into it, and
-it is linked to the output with ``os.link``, which fails when the output exists, and then its name is removed. The reserved name is removed on every path, a
-refusal too, so removing that one name (the watchdog does) removes every staged byte. A reserved name that is already gone after the link is a clean end. A
-removal that fails after the link is refused with fixed text, because both names stay. A removal that fails after a refusal leaves that refusal as it was. The
-reserved file must lie in the folder of the output and be a plain file with no other name. A link or any other kind of entry at the reserved name is refused
-with fixed text.
+it is linked to the output with ``os.link``, which fails when the output exists, and then its name is removed. Removing the reserved name is attempted on every
+path, a refusal too, so removing that one name (the watchdog does) removes every staged byte; a name that cannot be removed stays. A reserved name that is
+already gone after the link is a clean end. A removal that fails after the link is refused with fixed text, because both names stay. A removal that fails after
+a refusal leaves that refusal as it was. The reserved file must lie in the folder of the output and be a plain file with no other name. A link or any other kind
+of entry at the reserved name is refused with fixed text.
 
 ``replace_owned_file`` is for the state that a long-running command owns and must update (a heartbeat, a queue count, a saved position). ``state_root`` is a
 folder from a fixed source: a module constant, a folder that the same command created in this run, or the service's state-folder setting. It is never built

@@ -93,10 +93,10 @@ def release_reserved() -> None:
 def write_reserved(path: str, document: dict[str, Any]) -> None:
     """Write the whole document into the reserved part file and link it to ``path`` (``publish_reserved``: the part file is the only staging file, so a reader
     sees no file or the whole file and the watchdog's release of the part file removes every staged byte), then release the reserved name. A file that
-    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A write or link that fails leaves no result file, and no part
-    file when the part name can be removed. A part name that cannot be removed leaves the part file: after a failed link the part file stays (the end of
-    the call tries to remove it once more, so a second attempt can succeed while the call still raises), and after the link both names stay, the result
-    file whole, and the call raises."""
+    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A write or link that fails leaves no result file. Every
+    removal of the part name is an attempt: after a failed link and after a successful one, the end of the call (``release_reserved``) tries once more, so
+    a part file whose first removal failed can be gone when the call raises, and one whose name still cannot be removed stays (the watchdog's removal is an
+    attempt too). After a successful link a failed removal raises, with the result file whole: a sealed job then ends as ``internal_error``, exit 70."""
     try:
         publish_reserved(Path(path + ".part"), Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
     finally:
