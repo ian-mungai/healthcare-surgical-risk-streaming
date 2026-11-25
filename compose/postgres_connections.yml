@@ -13,7 +13,7 @@
 # For each client: max is the most connections it may hold at once, and equals the total of its settings (value times count) plus its allotment. The allotment is
 # the connections that no tracked setting caps (a figure that the tool fixes in its code): the tool opens them on use, and the entry gives the figure that the
 # budget reserves for them. A pool that a setting can cap has no allotment. A setting with count 0
-# holds no connection (an idle-pool figure that must not exceed its maximum) and is checked only for its value. The margin is for the administrator's own sessions,
+# holds no connection (an idle-pool figure that must not exceed its maximum, or a switch with the value false that keeps a thread pool off) and is checked only for its value. The margin is for the administrator's own sessions,
 # the provisioning step, the health checks and the one-shot schema setup of Temporal. A restart does not overlap an old and a new pod of a client: the role gives
 # every Airbyte deployment that holds connections the Recreate strategy (ansible/roles/airbyte/tasks/release.yml), and Compose stops a container before it starts the new one.
 postgres:
@@ -120,14 +120,21 @@ clients:
     source: dagster-webserver 1.13.31 cli.py (DEFAULT_POOL_MAX_OVERFLOW = 20, option --db-pool-max-overflow); dagster-postgres 0.29.31 run_storage.py, event_log.py and schedule_storage.py (pool_size 1)
 
   # The daemon runs one thread for each daemon type plus the heartbeat thread, and each statement is its own short connection: the sensor, backfill, scheduler,
-  # run queue, run monitoring, asset, event log consumer and freshness daemons are eight threads, so the allotment is those eight and the heartbeat. (An earlier figure
-  # of 10 held one spare; the Airbyte pools' caps use that slot.)
+  # run queue, run monitoring, asset, event log consumer and freshness daemons are eight threads, so the allotment is those eight and the heartbeat. The pools
+  # that would add threads are off: backfills.use_threads is false in orchestration/dagster.yaml (unset, BackfillDaemon starts min(32, CPUs + 4) workers, 12 on 8 CPUs), and the
+  # sensors, schedules, auto-materialize and run queue's dequeue (dequeue_use_threads) default to no pool. The spare slot of an earlier figure (10) is not back: the
+  # eight and the heartbeat make 9, and the Airbyte pools' caps use the one that was left.
   dagster_daemon:
     account: dagster
     services: [dagster_daemon]
     max: 9
     allotment: 9
-    source: dagster 1.13.31 _core/instance/methods/daemon_methods.py (get_required_daemon_types); dagster-postgres 0.29.31 (NullPool)
+    settings:
+      - {file: orchestration/dagster.yaml, path: backfills.use_threads, value: false, count: 0}
+    source: >-
+      dagster 1.13.31 _core/instance/methods/daemon_methods.py (get_required_daemon_types), _daemon/daemon.py (BackfillDaemon: use_threads defaults to True when the key is
+      unset, and max_workers None gives ThreadPoolExecutor's min(32, CPUs + 4); SensorDaemon starts a pool only when use_threads is set), _scheduler/scheduler.py (the same for schedules), _daemon/asset_daemon.py
+      and _core/run_coordinator/queued_run_coordinator.py (dequeue_use_threads default False), _core/instance/config.py (backfills.use_threads); dagster-postgres 0.29.31 (NullPool)
 
   # The code location serves the gRPC API with its own instance (two simultaneous statements at most) and starts each run as a process: a run holds at most two
   # connections at once (the in-process executor runs the steps in turn, and the event log and the run heartbeat are the two writers). The run queue's

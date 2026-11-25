@@ -25,6 +25,11 @@ concurrency:
     # Each run is a process that holds up to two PostgreSQL connections at once, so this number is part of the budget in compose/postgres_connections.yml. The default is 10.
     max_concurrent_runs: 3
 
+# The daemon runs the backfills in its own backfill thread. Dagster 1.13.31 (daemon.py, BackfillDaemon) starts a pool of min(32, CPUs + 4) worker threads when this
+# key is not set (12 on a host with 8 CPUs), and each worker can hold a PostgreSQL connection, so the key is part of the budget in compose/postgres_connections.yml.
+backfills:
+  use_threads: false
+
 run_launcher:
   module: dagster
   class: DefaultRunLauncher

@@ -179,7 +179,7 @@ EXPECTED_CLIENTS: dict[str, tuple[str, int, int, frozenset[tuple[str, str, str |
         3,
         frozenset({(COMPOSE + "dagster_webserver.yml", "services.dagster_webserver.command", "--db-pool-max-overflow", 2, 3)}),
     ),
-    "dagster_daemon": ("dagster", 9, 9, frozenset()),
+    "dagster_daemon": ("dagster", 9, 9, frozenset({("orchestration/dagster.yaml", "backfills.use_threads", None, False, 0)})),
     "dagster_code_location": (
         "dagster",
         8,
@@ -255,6 +255,11 @@ class TrackedBudgetTest(unittest.TestCase):
 
     def test_the_tracked_configuration_caps_each_client_at_its_stated_figure(self) -> None:
         self.assertEqual([], setting_problems(self.budget, lambda name: (ROOT / name).read_text()))
+
+    def test_the_dagster_instance_runs_the_backfills_in_the_daemons_own_thread(self) -> None:
+        """Dagster 1.13.31 (daemon.py, BackfillDaemon) starts a pool of threads when ``backfills.use_threads`` is not set, and each can hold a connection."""
+        document = mapping(load_yaml((ROOT / "orchestration" / "dagster.yaml").read_text()))
+        self.assertEqual({"use_threads": False}, document.get("backfills"))
 
     def test_the_server_is_started_with_the_slots_that_the_budget_states(self) -> None:
         self.assertEqual([], postgres_problems(self.budget, (ROOT / POSTGRES_FILE).read_text()))
@@ -413,6 +418,20 @@ class LoaderTest(unittest.TestCase):
         self.assertIn("nessie", refused(GOOD.replace("services: [nessie]", "services: []")))
         self.assertIn("path", refused(GOOD.replace("path: services.nessie.environment.QUARKUS_DATASOURCE_POSTGRESQL_JDBC_MAX_SIZE, ", "")))
 
+    def test_a_switch_that_must_stay_off_is_a_setting_with_the_value_false_and_no_connection(self) -> None:
+        text = GOOD.replace("count: 4}", "count: 4}\n      - {file: orchestration/dagster.yaml, path: backfills.use_threads, value: false, count: 0}", 1)
+        budget = parse_budget(text)
+        switch = budget.clients["temporal"].settings[-1]
+        self.assertEqual((False, 0), (switch.value, switch.count))
+        self.assertEqual([], budget_problems(budget), "a switch adds no connection to the client's settings")
+
+    def test_a_switch_that_holds_a_connection_or_is_on_is_refused(self) -> None:
+        switch = "- {file: orchestration/dagster.yaml, path: backfills.use_threads, value: %s, count: %s}"
+        for value, count in (("false", "1"), ("true", "0"), ("true", "1")):
+            with self.subTest(value=value, count=count):
+                text = GOOD.replace("count: 4}", "count: 4}\n      " + switch % (value, count), 1)
+                self.assertIn("value", refused(text))
+
     def test_a_repeated_client_is_refused_not_merged(self) -> None:
         self.assertIn("nessie", refused(GOOD.replace("  temporal:", "  nessie:\n    account: nessie\n  temporal:")))
 
@@ -525,6 +544,17 @@ class SettingTest(unittest.TestCase):
             files["compose/services/nessie.yml"] = f"services:\n  nessie:\n    environment:\n      JAVA_TOOL_OPTIONS: '{options}'\n"
             problems = setting_problems(budget, reader(files))
             self.assertTrue(any("datasources.config.maximum-pool-size" in problem for problem in problems), (options, problems))
+
+    def test_a_switch_is_read_from_the_file_and_a_file_that_turns_it_on_or_leaves_it_out_is_named(self) -> None:
+        """Dagster starts a thread pool for backfills when ``backfills`` is unset, so an absent switch is as wrong as one that is on."""
+        text = GOOD.replace("count: 4}", "count: 4}\n      - {file: orchestration/dagster.yaml, path: backfills.use_threads, value: false, count: 0}", 1)
+        budget = parse_budget(text)
+        files = {**FILES, "orchestration/dagster.yaml": "backfills:\n  use_threads: false\n"}
+        self.assertEqual([], setting_problems(budget, reader(files)))
+        for document in ("backfills:\n  use_threads: true\n", "backfills:\n  num_workers: 4\n", "telemetry:\n  enabled: false\n"):
+            with self.subTest(document=document):
+                problems = setting_problems(budget, reader({**FILES, "orchestration/dagster.yaml": document}))
+                self.assertTrue(any("backfills.use_threads" in problem for problem in problems), problems)
 
     def test_a_setting_that_names_both_a_flag_and_a_java_property_is_refused(self) -> None:
         both = GOOD.replace("count: 1}", "count: 1, flag: --a, java_property: b}", 1)

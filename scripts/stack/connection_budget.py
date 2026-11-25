@@ -29,7 +29,7 @@ class BudgetError(ValueError):
 class Setting:
     file: str
     path: str
-    value: int
+    value: int | bool
     count: int
     flag: str | None
     java_property: str | None
@@ -90,9 +90,17 @@ def parse_setting(client: str, entry: object) -> Setting:
         raise BudgetError(f"{what}: flag and java_property must be text")
     if flag is not None and java_property is not None:
         raise BudgetError(f"{what}: a setting names a flag or a java_property, not both")
-    if not whole_number(setting["value"], minimum=1) or not whole_number(setting["count"], minimum=0):
-        raise BudgetError(f"{what}: value must be a positive whole number and count a whole number (0 for a setting that holds no connection)")
-    return Setting(file, path, int(str(setting["value"])), int(str(setting["count"])), flag, java_property)
+    if not whole_number(setting["count"], minimum=0):
+        raise BudgetError(f"{what}: count must be a whole number (0 for a setting that holds no connection)")
+    value = setting["value"]
+    if value is False:
+        # A switch that must stay off (a thread pool that the tool starts when the switch is unset): it holds no connection itself.
+        if setting["count"] != 0:
+            raise BudgetError(f"{what}: a switch with the value false holds no connection, so its count must be 0")
+        return Setting(file, path, False, 0, flag, java_property)
+    if not whole_number(value, minimum=1):
+        raise BudgetError(f"{what}: value must be a positive whole number or false for a switch that must stay off")
+    return Setting(file, path, int(str(value)), int(str(setting["count"])), flag, java_property)
 
 
 def parse_client(name: str, entry: object) -> Client:
