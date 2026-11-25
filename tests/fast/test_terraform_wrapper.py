@@ -608,6 +608,13 @@ class ConfirmedPlanTest(unittest.TestCase):
             apply_plan(elsewhere, CODE, ENV | {"AWS_REGION": "eu-west-1"})
         self.assertNotIn("apply", self.calls)
 
+    def test_a_host_plan_of_another_region_that_the_pin_does_not_name_is_refused_for_its_region_and_not_for_its_image(self) -> None:
+        """The region is the first cause: a plan made for a region the run is not bound to says so, even when the pin has no image for that region."""
+        self.plan_text = json.dumps(host_plan(PINNED_AMI, region="ap-south-1"))
+        with self.assertRaisesRegex(WrapperError, r"the plan was made for the region 'ap-south-1' and the run is bound to 'us-west-2'; save a new plan"):
+            apply_plan(RUN, CODE, ENV)
+        self.assertNotIn("apply", self.calls)
+
     def test_a_plan_whose_json_names_no_text_region_is_refused_before_any_apply(self) -> None:
         good = {name: {"value": value} for name, value in HEAVY_INPUTS.items()}
         documents: dict[str, object] = {

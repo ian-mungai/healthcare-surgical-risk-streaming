@@ -465,12 +465,13 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         stale = stale_inputs_problem(applied_plan)
         if stale:
             raise WrapperError(f"refused before any change: {stale}")
-        moved = stale_pin_problem(applied_plan)
-        if moved:
-            raise WrapperError(f"refused before any change: {moved}")
+        # The region comes before the pinned image: a plan made for another region names that cause, even where the pin has no image for that region.
         elsewhere = plan_region_problem(run, applied_plan)
         if elsewhere:
             raise WrapperError(f"refused before any change: {elsewhere}")
+        moved = stale_pin_problem(applied_plan)
+        if moved:
+            raise WrapperError(f"refused before any change: {moved}")
         output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
         kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
         sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")

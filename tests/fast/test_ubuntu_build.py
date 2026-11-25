@@ -16,8 +16,9 @@ Failure modes covered here:
 - No region has an AMI: refused, so the host would have no image.
 - A tracked or new file of any folder other than the pin names an Ubuntu AMI, the pinned serial or a build's release folder: refused, named by file
   and line.
-- Any tracked or new file of any folder (Terraform, IAM policy, script, YAML, shell; each read as Latin-1 bytes, so no encoding hides a token) uses the
-  parameter store in a closed list of forms (a resource, an IAM action, the AWS command line, a client, a managed policy named for it, a public parameter
+- Any tracked or new file of any folder (Terraform, IAM policy, script, YAML, shell; each read as Latin-1 bytes, so a token written as contiguous
+  ASCII bytes is found in any encoding that keeps ASCII as is) uses the parameter store in a closed list of forms (a resource, an IAM action,
+  the AWS command line, a client, a managed policy named for it, a public parameter
   path): refused, named by file and line. Prose that only says a host starts without the service passes. Only this file is
   left out of that scan, because its patterns and fixtures are the forms.
 """
@@ -48,7 +49,8 @@ IMAGE_KEYS = {"url", "sha256"}
 BUILD_NAMES = (re.compile(r"\bami-[0-9a-f]{17}\b"), re.compile(r"\brelease-\d{8}\b"), re.compile(r"ubuntu-noble-24\.04-[a-z0-9]+-server-\d{8}"))
 # What uses the parameter store, by the way it is used and never by the word alone, so prose that says a host starts without it passes: a Terraform
 # resource, an IAM action, the AWS command line, a client of the service, a managed policy named for it and the paths of the public parameters. Each pattern
-# ignores case. This list is closed: a use in another form is added here with its test.
+# ignores case, and the name of the service as a whole quoted string (an argument list, a keyword, a helper's first argument) counts as a use. This list
+# is closed: a use in another form is added here with its test.
 SSM_NAMES = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -56,7 +58,7 @@ SSM_NAMES = tuple(
         r"[\"']ssm:",
         r"\bssm:[A-Za-z*]",
         r"aws\s+ssm\s",
-        r"client\(\s*[\"']ssm[\"']",
+        r"[\"']ssm[\"']",
         r"/aws/service/",
         r"AmazonSSM|AmazonEC2RoleforSSM",
         r"arn:aws:iam::aws:policy/[^\s\"']*ssm",
@@ -97,7 +99,8 @@ def pin_problems(pin: Any) -> list[str]:
 
 def scanned_files(root: Path, skip: tuple[str, ...] = ()) -> dict[str, str]:
     """Every file of the repository at ``root`` that Git tracks or that is new and not ignored, as text by name. The pin itself and the files of ``skip`` are
-    left out. A file is read as bytes and decoded as Latin-1, which keeps every ASCII token of any text encoding and refuses no file, binary or not."""
+    left out. A file is read as bytes and decoded as Latin-1, which finds every token written as contiguous ASCII bytes (UTF-8, Latin-1 and other
+    ASCII-compatible encodings; not UTF-16) and refuses no file, binary or not."""
     listed = git_in(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", keep_newlines=True).stdout
     names = sorted({name for name in listed.split("\0") if name and name != PIN and name not in skip and (root / name).is_file()})
     return {name: text for name in names if (text := read_latin_1(root, name)) is not None}
@@ -250,6 +253,10 @@ class NoParameterStoreLookupTest(unittest.TestCase):
             "a boto3 client with spaces": 'boto3.client( "ss' + 'm" )',
             "the parameter path": 'name = "/aws/serv' + 'ice/canonical/ubuntu/server/24.04"',
             "another parameter path": "/aws/serv" + "ice/ami-amazon-linux-latest/x",
+            "the AWS CLI service as an argument list": '["aws", "ss' + 'm", "get-parameter"]',
+            "a boto3 client by keyword": 'boto3.client(service_name="ss' + 'm")',
+            "the project's command helper": 'run_command("aws", ["ss' + 'm", "get-parameter", "--name", x])',
+            "the project's AWS helper": "aws.call('ss" + "m', 'get-parameter')",
         }
         for label, line in forms.items():
             with self.subTest(form=label):
@@ -264,7 +271,7 @@ class NoParameterStoreLookupTest(unittest.TestCase):
         }
         self.assertEqual([], hits(files, SSM_NAMES))
 
-    def test_no_text_file_of_the_repository_uses_the_parameter_store(self) -> None:
+    def test_no_file_of_the_repository_uses_the_parameter_store(self) -> None:
         files = scanned_files(ROOT, skip=(GUARD,))
         self.assertIn("infra/modules/host/main.tf", files)
         self.assertIn("scripts/infra/host.py", files)
