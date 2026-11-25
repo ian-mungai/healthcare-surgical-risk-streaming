@@ -3,7 +3,9 @@
 The images come from ``compose_stack_built_images`` in the group variables. Each image's folder is staged from ``git archive`` of HEAD, so an untracked
 file and a Git-ignored file (the handoff, the project standard, ``.env``) cannot enter an image. The pin file is left out of every folder, because a pin of an
 image must not change the hash of the image that holds the Compose folder. The tag holds the hash of the folder, so the same files give the same tag, and a tag
-that the pin file or the repository already holds is never built or pushed again. The command relies on the ``docker login`` that this computer already has.
+that the repository already holds is never built or pushed again, and a pin that the pin file already holds must equal the digest that the repository gives
+its tag. A push follows only when the repository's own answer says that the tag is absent. The pin file is written once, after every image has resolved.
+The command relies on the ``docker login`` that this computer already has.
 It reads, prints and writes no token, and every message is fixed text: no output of Docker or Git is ever shown.
 """
 
@@ -32,7 +34,7 @@ PUSH_SECONDS = 1800
 INSPECT_SECONDS = 120
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 LOGIN_WORDS = ("denied", "unauthorized", "authentication required", "requested access")
-MISSING_WORDS = ("not found", "manifest unknown", "name unknown")
+STARTED_TEXT = "could not be started: it is not installed, not on the path or not executable"
 LOGIN_TEXT = "the push was refused: run docker login on this computer, then run the command again"
 NOT_PLAIN = "a source holds a symbolic link or another file that is not a plain file"
 
@@ -71,6 +73,8 @@ def git(settings: Settings, arguments: Sequence[str]) -> str:
         done = run_command("git", arguments, cwd=settings.root, env=git_environment(), timeout=GIT_SECONDS)
     except TimeoutExpired as error:
         raise PublishError(timeout_text("git", GIT_SECONDS)) from error
+    except OSError as error:
+        raise PublishError(f"git {STARTED_TEXT}") from error
     if done.returncode != 0:
         raise PublishError("git could not read the repository")
     return done.stdout
@@ -131,6 +135,8 @@ def docker(settings: Settings, arguments: Sequence[str], seconds: int, label: st
         done = run_command(settings.docker, arguments, timeout=seconds)
     except TimeoutExpired as error:
         raise PublishError(timeout_text(label, seconds)) from error
+    except OSError as error:
+        raise PublishError(f"docker {STARTED_TEXT}") from error
     return done.returncode, (done.stdout + done.stderr).lower()
 
 
@@ -147,11 +153,13 @@ def push_image(settings: Settings, name: str, tag: str) -> None:
 
 
 def remote_digest(settings: Settings, name: str, tag: str) -> str | None:
-    """The digest that the repository holds for the tag, or None when it holds no such tag."""
+    """The digest that the repository holds for the tag, or None only when its own answer says that this tag is absent (``ERROR: <tag>: not found``).
+
+    Any other failure of the read (the network, a timeout, another not-found text, a missing login) is a refusal, so a push never follows a read that failed."""
     code, output = docker(settings, ["buildx", "imagetools", "inspect", "--format", "{{.Manifest.Digest}}", tag], INSPECT_SECONDS, "docker inspect")
     if code == 0:
         return output.strip()
-    if any(word in output for word in MISSING_WORDS):
+    if re.fullmatch(rf"error: (?:docker\.io/)?{re.escape(tag.lower())}: not found", output.strip()):
         return None
     raise PublishError(LOGIN_TEXT if any(word in output for word in LOGIN_WORDS) else f"{name}: the repository could not be read")
 
@@ -171,9 +179,12 @@ def publish_image(settings: Settings, image: dict[str, Any], found: dict[str, di
     folder = scratch / name
     folder.mkdir()
     tag = image_tag(settings, image, stage(settings, image, folder))
-    if found.get(name, {}).get("tag") == tag:
-        return found, f"{name}: already pinned"
+    pinned = found.get(name, {}).get("tag") == tag
     digest = remote_digest(settings, name, tag)
+    if pinned:
+        if digest is None:
+            raise PublishError(f"{name}: the repository does not hold the pinned tag: remove its entry from the pin file and run the command again")
+        return pin_image(found, name, tag, digest, settings.repository), f"{name}: already pinned"
     if digest is not None:
         return pin_image(found, name, tag, digest, settings.repository), f"{name}: pinned from the repository"
     build_image(settings, image, folder, tag)
@@ -185,7 +196,8 @@ def publish_image(settings: Settings, image: dict[str, Any], found: dict[str, di
 
 
 def publish(settings: Settings) -> list[str]:
-    """Publish every image of the list in order. Each pin is written as soon as its image is done, so a later failure keeps the earlier pins."""
+    """Publish every image of the list in order and write the pin file once, after the last image. A failure before then changes no pin: the next run finds the
+    tags that were pushed in the repository and pins them from there."""
     require_clean(settings)
     try:
         found = pins.load(settings.pin_file)
@@ -193,17 +205,17 @@ def publish(settings: Settings) -> list[str]:
         raise PublishError(str(error)) from error
     if any(not value["digest"].startswith(settings.repository + "@") for value in found.values()):
         raise PublishError("the pin file holds another repository than IMAGE_REPOSITORY")
+    resolved = found
     messages: list[str] = []
     with tempfile.TemporaryDirectory(prefix="images_") as scratch:
         for image in settings.images:
-            updated, message = publish_image(settings, image, found, Path(scratch))
-            if updated != found:
-                try:
-                    pins.write(settings.pin_file, updated)
-                except pins.PinError as error:
-                    raise PublishError(str(error)) from error
-            found = updated
+            resolved, message = publish_image(settings, image, resolved, Path(scratch))
             messages.append(message)
+    if resolved != found:
+        try:
+            pins.write(settings.pin_file, resolved)
+        except pins.PinError as error:
+            raise PublishError(str(error)) from error
     return messages
 
 

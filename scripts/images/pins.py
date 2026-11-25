@@ -78,16 +78,18 @@ def write(path: Path, found: dict[str, dict[str, str]]) -> None:
     validate(found)
     body = "images:\n" + "".join(f"  {name}:\n    tag: {found[name]['tag']}\n    digest: {found[name]['digest']}\n" for name in sorted(found))
     text = HEADER + (body if found else "images: {}\n")
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".image_pins_")
+    temporary: str | None = None
     try:
+        descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".image_pins_")
         with os.fdopen(descriptor, "w") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     except OSError as error:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
         raise PinError("the pin file could not be written") from error
 
 

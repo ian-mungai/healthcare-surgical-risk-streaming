@@ -113,6 +113,17 @@ class FileTest(unittest.TestCase):
         self.assertEqual(before, self.file.read_text())
         self.assertEqual(["image_pins.yml"], os.listdir(self.file.parent))
 
+    def test_a_temporary_file_that_cannot_be_made_is_the_fixed_write_failure_and_leaves_the_old_file_and_no_other_file(self) -> None:
+        pins.write(self.file, {"spark": entry("spark")})
+        before = self.file.read_text()
+        for error in (PermissionError("no"), OSError("disk full")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch("scripts.images.pins.tempfile.mkstemp", side_effect=error), self.assertRaises(PinError) as raised:
+                    pins.write(self.file, {"spark": entry("spark", "b" * 64)})
+                self.assertEqual("the pin file could not be written", str(raised.exception))
+                self.assertEqual(before, self.file.read_text())
+                self.assertEqual(["image_pins.yml"], os.listdir(self.file.parent))
+
     def test_a_file_that_is_not_yaml_or_has_no_images_mapping_is_refused_with_fixed_text(self) -> None:
         for text in ("images: [", "images: 3\n", "other: {}\n", "images:\n  spark: {tag: x, digest: y}\n"):
             with self.subTest(text=text):
@@ -127,15 +138,55 @@ class FileTest(unittest.TestCase):
 
 
 class RealFilesTest(unittest.TestCase):
+    def check_complete(self, path: Path) -> None:
+        """The pin file is valid, and each pin of it names its own image and version in its tag. The repository is whatever the pins name, never a fixture."""
+        found = pins.load(path)
+        images = pins.load_images()
+        names = [image["name"] for image in images]
+        self.assertEqual(len(names), len(set(names)), "the list names each image once")
+        if not found:
+            return
+        self.assertEqual(sorted(names), sorted(found))
+        repositories = {value["tag"].partition(":")[0] for value in found.values()}
+        self.assertEqual(1, len(repositories), "every pin names one repository")
+        (repository,) = repositories
+        for image in images:
+            self.assertTrue(found[image["name"]]["tag"].startswith(f"{repository}:{image['name']}-{image['tag'].partition(':')[2]}-"))
+            self.assertTrue(found[image["name"]]["digest"].startswith(f"{repository}@sha256:"))
+
+    def other_pins(self, repository: str) -> Path:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "image_pins.yml"
+        found = {
+            image["name"]: {
+                "tag": f"{repository}:{image['name']}-{image['tag'].partition(':')[2]}-{HASH}",
+                "digest": f"{repository}@sha256:{DIGEST}",
+            }
+            for image in pins.load_images()
+        }
+        pins.write(path, found)
+        return path
+
     def test_the_tracked_pin_file_is_valid_and_is_either_empty_before_the_first_publish_or_complete(self) -> None:
-        found = pins.load(pins.PIN_FILE)
-        names = [image["name"] for image in pins.load_images()]
-        self.assertEqual(sorted(names), sorted(names), "the list names each image once")
-        self.assertEqual(len(names), len(set(names)))
-        if found:
-            self.assertEqual(sorted(names), sorted(found))
-            for image in pins.load_images():
-                self.assertTrue(found[image["name"]]["tag"].startswith(f"{REPOSITORY}:{image['name']}-{image['tag'].partition(':')[2]}-"))
+        self.check_complete(pins.PIN_FILE)
+
+    def test_a_complete_pin_file_of_the_owners_own_repository_passes_the_check_and_not_only_a_fixture_name(self) -> None:
+        for repository in ("someaccount/real_images", "a/b", "acct1/my.images-2"):
+            with self.subTest(repository=repository):
+                self.check_complete(self.other_pins(repository))
+
+    def test_a_pin_file_that_names_two_repositories_or_the_wrong_version_fails_the_check(self) -> None:
+        path = self.other_pins("someaccount/real_images")
+        found = pins.load(path)
+        first = pins.load_images()[0]["name"]
+        mixed = {**found, first: {"tag": found[first]["tag"].replace("someaccount/real_images", "x/y"), "digest": f"x/y@sha256:{DIGEST}"}}
+        with self.assertRaises(PinError):
+            pins.write(path, mixed)
+        stale = {**found, first: {**found[first], "tag": found[first]["tag"].replace("-", "-9", 1)}}
+        pins.write(path, stale)
+        with self.assertRaises(AssertionError):
+            self.check_complete(path)
 
     def test_the_images_come_from_the_one_list_in_the_group_variables_and_the_repository_is_not_a_group_variable(self) -> None:
         import yaml

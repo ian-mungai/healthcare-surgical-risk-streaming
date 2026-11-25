@@ -15,6 +15,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scripts.images import pins, publish
 from scripts.images.publish import PublishError, Settings
@@ -58,7 +59,11 @@ if args[:3] == ["buildx", "imagetools", "inspect"]:
     if tag in state:
         print(state[tag])
         sys.exit(0)
-    sys.stderr.write("ERROR: {CANARY_TEXT} " + tag + ": not found\\n")
+    broken = here / "inspect_fails"
+    if broken.exists():
+        sys.stderr.write(broken.read_text().replace("TAG", tag) or "ERROR: {CANARY_TEXT} the registry is unreachable\\n")
+        sys.exit(1)
+    sys.stderr.write("ERROR: docker.io/" + tag + ": not found\\n")
     sys.exit(1)
 sys.exit(3)
 """
@@ -253,12 +258,42 @@ class PushTest(Case):
             self.assertEqual(f"{REPOSITORY}@{digest_of(found[name]['tag'])}", found[name]["digest"])
         self.assertTrue(any(line.startswith("buildx imagetools inspect --format {{.Manifest.Digest}} ") for line in self.calls()))
 
-    def test_a_second_run_with_the_pins_in_place_makes_no_docker_call_and_changes_no_byte(self) -> None:
+    def test_a_second_run_with_the_pins_in_place_reads_each_digest_but_builds_pushes_and_writes_nothing(self) -> None:
         self.run_publish()
         text = self.pin_file.read_text()
+        before = len(self.calls())
+        with mock.patch.object(pins, "write") as written:
+            self.assertEqual(["app: already pinned", "tool: already pinned"], self.run_publish())
+        written.assert_not_called()
+        added = self.calls()[before:]
+        self.assertEqual(2, len(added))
+        self.assertTrue(all(line.startswith("buildx imagetools inspect ") for line in added), added)
+        self.assertEqual(text, self.pin_file.read_text())
+
+    def test_a_pin_that_was_edited_by_hand_to_another_digest_with_the_same_tag_is_refused_and_no_pin_changes(self) -> None:
+        self.run_publish()
+        found = pins.load(self.pin_file)
+        edited = {**found, "tool": {**found["tool"], "digest": f"{REPOSITORY}@sha256:{'e' * 64}"}}
+        pins.write(self.pin_file, edited)
+        text = self.pin_file.read_text()
         before = self.calls()
-        self.assertEqual(["app: already pinned", "tool: already pinned"], self.run_publish())
-        self.assertEqual(before, self.calls())
+        with self.assertRaises(PublishError) as raised:
+            self.run_publish()
+        self.assertEqual("tool: the tag already has a different digest in the pin file", str(raised.exception))
+        self.assertEqual(text, self.pin_file.read_text())
+        self.assertEqual([], [line for line in self.calls()[len(before) :] if not line.startswith("buildx imagetools inspect ")])
+
+    def test_a_pinned_tag_that_the_repository_no_longer_holds_is_refused_and_not_pushed_again(self) -> None:
+        self.run_publish()
+        text = self.pin_file.read_text()
+        (self.bin / "remote.json").write_text("{}")
+        before = len(self.pushes())
+        with self.assertRaises(PublishError) as raised:
+            self.run_publish()
+        self.assertEqual(
+            "app: the repository does not hold the pinned tag: remove its entry from the pin file and run the command again", str(raised.exception)
+        )
+        self.assertEqual(before, len(self.pushes()))
         self.assertEqual(text, self.pin_file.read_text())
 
     def test_a_tag_that_the_repository_holds_but_the_pins_lack_is_pinned_without_a_build_or_a_push(self) -> None:
@@ -297,11 +332,93 @@ class PushTest(Case):
         self.assertNotIn(CANARY_TEXT, str(raised.exception))
         self.assertEqual("images: {}\n", self.pin_file.read_text())
 
-    def test_an_image_that_fails_leaves_the_pins_of_the_images_before_it(self) -> None:
+    def test_an_image_that_fails_changes_no_pin_and_the_retry_pins_the_pushed_image_from_the_repository_without_a_second_push(self) -> None:
+        before = self.pin_file.read_text()
         (self.bin / "deny").write_text("tool")
         with self.assertRaises(PublishError):
             self.run_publish()
-        self.assertEqual(["app"], list(pins.load(self.pin_file)))
+        self.assertEqual(before, self.pin_file.read_text())
+        self.assertEqual(1, len([line for line in self.pushes() if " app-" in line or "images:app-" in line]))
+        (self.bin / "deny").unlink()
+        self.assertEqual(["app: pinned from the repository", "tool: pushed and pinned"], self.run_publish())
+        self.assertEqual(["app", "tool"], list(pins.load(self.pin_file)))
+        self.assertEqual(1, len([line for line in self.pushes() if "images:app-" in line]), "the app tag was pushed once in all")
+
+    def test_the_pin_file_is_written_once_after_every_image_has_resolved(self) -> None:
+        with mock.patch.object(pins, "write", wraps=pins.write) as written:
+            self.run_publish()
+        self.assertEqual(1, written.call_count)
+        self.assertEqual({"app", "tool"}, set(written.call_args.args[1]))
+
+
+class InspectFailureTest(Case):
+    """Only the registry's own answer that the tag is absent lets a push follow. Any other failure of the read is a fixed refusal, with no build and no push."""
+
+    def refuse(self, text: str) -> str:
+        (self.bin / "inspect_fails").write_text(text)
+        with self.assertRaises(PublishError) as raised:
+            self.run_publish()
+        self.assertEqual([], self.pushes())
+        self.assertEqual([], self.builds())
+        self.assertNotIn(CANARY_TEXT, str(raised.exception))
+        self.assertEqual("images: {}\n", self.pin_file.read_text())
+        return str(raised.exception)
+
+    def test_an_unreachable_registry_or_a_timeout_or_any_other_failure_of_the_read_is_not_read_as_an_absent_tag(self) -> None:
+        for text in (
+            "",
+            f"ERROR: {CANARY_TEXT} Get https://registry-1.docker.io/v2/: dial tcp: i/o timeout\n",
+            f"ERROR: {CANARY_TEXT} 500 Internal Server Error\n",
+            f"docker: 'buildx' is not a docker command: {CANARY_TEXT} not found\n",
+            f"ERROR: {CANARY_TEXT} command not found\n",
+            f"ERROR: {CANARY_TEXT} repository not found\n",
+            f"ERROR: {CANARY_TEXT} manifest unknown\n",
+            f"ERROR: {CANARY_TEXT} name unknown\n",
+            "ERROR: docker.io/example/other_images:app-1.2-000000000000: not found\n",
+            "ERROR: docker.io/TAG: not found, and the registry also said: x\n",
+            "WARNING: slow\nERROR: docker.io/TAG: not found\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual("app: the repository could not be read", self.refuse(text))
+
+    def test_a_refused_login_in_the_read_gives_the_login_text(self) -> None:
+        self.assertEqual(
+            "the push was refused: run docker login on this computer, then run the command again",
+            self.refuse(f"ERROR: {CANARY_TEXT} requested access to the resource is denied\n"),
+        )
+
+    def test_the_registrys_own_not_found_answer_for_the_exact_tag_lets_the_push_follow_with_or_without_the_docker_io_prefix(self) -> None:
+        for answer in ("ERROR: docker.io/TAG: not found\n", "ERROR: TAG: not found\r\n", "error: docker.io/TAG: Not Found\n\n"):
+            with self.subTest(answer=answer):
+                self.setUp()
+                (self.bin / "inspect_fails").write_text(answer)
+                self.assertEqual(["app: pushed and pinned"], self.run_publish(images=IMAGES[:1]))
+                self.assertEqual(1, len(self.pushes()))
+
+
+class MissingToolTest(Case):
+    def test_a_missing_docker_is_a_fixed_message_and_not_a_traceback(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = publish.main([], settings=self.settings(docker=str(self.bin / "no_such_docker")))
+        self.assertEqual(1, code)
+        self.assertEqual("publish: docker could not be started: it is not installed, not on the path or not executable\n", err.getvalue())
+
+    def test_a_missing_git_is_a_fixed_message_and_not_a_traceback(self) -> None:
+        err = io.StringIO()
+        with mock.patch.object(publish, "run_command", side_effect=FileNotFoundError("git")), contextlib.redirect_stderr(err):
+            code = publish.main([], settings=self.settings())
+        self.assertEqual(1, code)
+        self.assertEqual("publish: git could not be started: it is not installed, not on the path or not executable\n", err.getvalue())
+
+    def test_a_pin_file_that_cannot_be_written_is_a_fixed_message_and_the_old_file_stays(self) -> None:
+        before = self.pin_file.read_text()
+        err = io.StringIO()
+        with mock.patch("scripts.images.pins.tempfile.mkstemp", side_effect=PermissionError("no")), contextlib.redirect_stderr(err):
+            code = publish.main([], settings=self.settings())
+        self.assertEqual(1, code)
+        self.assertEqual("publish: the pin file could not be written\n", err.getvalue())
+        self.assertEqual(before, self.pin_file.read_text())
 
 
 class OutputTest(Case):
