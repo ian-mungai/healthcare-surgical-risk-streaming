@@ -18,6 +18,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -29,7 +30,6 @@ from tests.slow.ansible_support import ROLES, load_variable, run_playbook
 
 ROLE = ROLES / "compose_stack"
 CHANGED_NONE = re.compile(r"changed=0\s")
-GRACE_SECONDS = 5
 SOURCE_PATH = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 
 STAND_IN = r"""#!/bin/sh
@@ -66,8 +66,10 @@ case "$verb" in
     cp "$store/config.json" "$here/pull_config.json"
     ls -l "$store/config.json" | cut -c1-10 >> "$here/pull_file_mode.log"
     if [ -f "$here/ignore_term_pull" ]; then
-      trap '' TERM
+      trap 'echo term >> "$here/term.log"' TERM
       echo $$ > "$here/pull.pid"
+      echo "$PPID" > "$here/shell.pid"
+      if [ -f "$here/kill_shell" ]; then kill -s KILL "$PPID"; fi
       while :; do
         [ -d "$DOCKER_CONFIG" ] || touch "$here/folder_gone_early"
         sleep 1
@@ -453,7 +455,9 @@ class PullTest(unittest.TestCase):
             parent_mode = stat.S_IMODE(parent.stat().st_mode)
             used = json.loads((stand_in.parent / "pull_config.json").read_text())
             file_mode = (stand_in.parent / "pull_file_mode.log").read_text().strip()
+            running = self.running_from(scratch)
         self.assertEqual(0, code, output)
+        self.assertEqual([], running, "the task left a process of its own: the pull, the shell or its watchdog")
         self.assertEqual(["compose --project-name sample --profile batch pull --quiet"], logged)
         self.assertEqual(1, len(seen))
         used_folder, mode = seen[0]
@@ -526,6 +530,33 @@ class PullTest(unittest.TestCase):
             self.assertEqual([], left)
             self.assertNotIn(self.TOKEN, output)
 
+    def test_the_login_file_is_checked_as_raw_bytes_so_a_nul_or_other_stray_byte_is_refused_before_the_pull(self) -> None:
+        """A program on the PATH that runs right after the file is written (``chmod``) changes its bytes. A shell read that drops NUL would not see it."""
+        head = '{"auths": {"https://index.docker.io/v1/": {"auth": "'
+        changes = {
+            "nul at the end": "printf '\\000' >> \"$2\"",
+            "nul inside": f'printf \'{head}eA\\000=="}}}}\\n\' > "$2"',
+            "non-ascii byte": f'printf \'{head}eA\\303\\251="}}}}\\n\' > "$2"',
+            "second line": "printf '{}\\n' >> \"$2\"",
+            "carriage return": "printf '\\r' >> \"$2\"",
+            "no final newline": 'printf \'%s\' "$(cat "$2")" > "$2"',
+        }
+        for label, change in changes.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, values = self.prepare_pull(folder)
+                helpers = folder / "helpers"
+                helpers.mkdir()
+                shim = helpers / "chmod"
+                shim.write_text(f'#!/bin/sh\n{change}\nexec /bin/chmod "$@"\n')
+                shim.chmod(0o755)
+                code, output = run_tasks("pull_images.yml", values, environment={"PATH": f"{helpers}:/usr/bin:/bin"})
+                left = os.listdir(self.parent(folder))
+            self.assertNotEqual(0, code, output)
+            self.assertIn("the pull's login file is not a file with exactly one auth entry and no credsStore or credHelpers key", output)
+            self.assertEqual([], calls(stand_in), "no Docker command ran with that file")
+            self.assertEqual([], left)
+
     def test_the_task_file_has_no_refusal_for_a_credential_helper_on_the_path(self) -> None:
         text = (ROLE / "tasks" / "pull_images.yml").read_text()
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
@@ -591,53 +622,185 @@ class PullTest(unittest.TestCase):
         self.assertEqual([], left)
         self.assertNotIn(self.TOKEN, output)
 
+    def pull_numbers(self) -> dict[str, int]:
+        """The reserve, the TERM grace and the KILL wait that the pull task's block sets, read from the file."""
+        tasks: Any = load_yaml((ROLE / "tasks" / "pull_images.yml").read_text())
+        block = next(task for task in tasks if "block" in task)
+        return {name: int(block["vars"][f"compose_stack_pull_{name}_seconds"]) for name in ("reserve", "grace", "reap")}
+
+    def ignoring_run(self, folder: Path, deadline: int, *markers: str) -> tuple[Path, int, str]:
+        """A run whose pull ignores TERM, with the given marker files, at an Ansible timeout of ``deadline`` seconds."""
+        stand_in, values = self.prepare_pull(folder)
+        for marker in ("ignore_term_pull", *markers):
+            (stand_in.parent / marker).write_text("")
+        code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": deadline})
+        return stand_in, code, output
+
+    @staticmethod
+    def running_from(scratch: str) -> list[str]:
+        """The processes whose command line holds the run's folder, after at most three seconds for the last one to go."""
+        found: list[str] = []
+        for _ in range(30):
+            listing = subprocess.run(["/bin/ps", "-ww", "-axo", "args="], capture_output=True, text=True, check=False).stdout  # noqa: S603
+            found = [line for line in listing.splitlines() if scratch in line and "ps -ww" not in line]
+            if not found:
+                break
+            time.sleep(0.1)
+        return found
+
+    @staticmethod
+    def terms(stand_in: Path) -> list[str]:
+        """One line for each TERM that the pull received."""
+        log = stand_in.parent / "term.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def watch_pull(self, stand_in: Path) -> int:
+        """The pull's pid, once the pull has started, and an end of the test that kills it if it is still there."""
+        pid = int((stand_in.parent / "pull.pid").read_text())
+        self.addCleanup(self.kill_quietly, pid)
+        return pid
+
+    def signal_shell(self, stand_in: Path, count: int, gap: float) -> threading.Thread:
+        """Send TERM to the task's shell ``count`` times, ``gap`` seconds apart, once the pull has started, while the test waits for the run."""
+
+        def send() -> None:
+            marker = stand_in.parent / "shell.pid"
+            for _ in range(300):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                time.sleep(0.1)
+            pid = int(marker.read_text())
+            for index in range(count):
+                if index:
+                    time.sleep(gap)
+                os.kill(pid, signal.SIGTERM)
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        self.addCleanup(thread.join)
+        return thread
+
+    def test_a_pull_deadline_that_leaves_no_time_for_the_shells_own_end_is_refused_before_any_docker_call(self) -> None:
+        reserve = self.pull_numbers()["reserve"]
+        for deadline in (3, reserve):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, code, output = self.ignoring_run(folder, deadline)
+                made = self.parent(folder).exists()
+            self.assertNotEqual(0, code, output)
+            self.assertIn(f"compose_stack_pull_deadline_seconds must be more than {reserve}", output)
+            self.assertEqual([], calls(stand_in))
+            self.assertFalse(made)
+            self.assertNotIn("expected time frame", output, "Ansible's own timeout ended the task: the role's own end did not fit inside it")
+
     def test_a_pull_that_runs_past_its_deadline_is_ended_by_the_task_with_a_fixed_message_and_its_folder_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
             (stand_in.parent / "hang_pull").write_text("")
-            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": 3})
+            deadline = self.pull_numbers()["reserve"] + 1
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": deadline})
             left = os.listdir(self.parent(folder))
         self.assertNotEqual(0, code, output)
-        self.assertIn("the image pull ran past its deadline of 3 seconds", output)
+        self.assertIn(f"the image pull ran past its deadline of {deadline} seconds", output)
         self.assertEqual([], left)
         self.assertNotIn(self.TOKEN, output)
 
-    def test_a_pull_that_ignores_the_term_signal_is_killed_with_its_whole_group_before_the_folder_is_removed_and_the_task_names_the_deadline(self) -> None:
+    def test_a_pull_that_ignores_term_is_killed_with_its_group_before_the_folder_goes_and_the_deadline_is_named_inside_ansibles_timeout(self) -> None:
+        deadline = self.pull_numbers()["reserve"] + 5
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, code, output = self.ignoring_run(folder, deadline)
+            left = os.listdir(self.parent(folder))
+            pid = self.watch_pull(stand_in)
+            gone = self.is_gone(pid, tries=1)
+            early = (stand_in.parent / "folder_gone_early").exists()
+            terms = self.terms(stand_in)
+        self.assertNotEqual(0, code, output)
+        self.assertIn(f"the image pull ran past its deadline of {deadline} seconds", output)
+        self.assertNotIn("expected time frame", output, "Ansible's own timeout ended the task before the role's own end")
+        self.assertTrue(gone, "the pull was still there when the task returned: one TERM is not enough")
+        self.assertFalse(early, "the folder was removed while the pull still ran")
+        self.assertEqual([], left, "the folder was still there when the task returned")
+        self.assertEqual(["term"], terms, "the group got TERM once and then KILL")
+        self.assertNotIn(self.TOKEN, output)
+
+    def test_a_pull_that_ends_on_the_term_signal_is_not_held_for_the_whole_grace(self) -> None:
+        """A run that ends on TERM takes about the time of a run that ends by itself, plus the one second of the deadline, and not the grace on top."""
+        numbers = self.pull_numbers()
+        times = {}
+        for marker in ("none", "hang_pull"):
+            with tempfile.TemporaryDirectory() as scratch:
+                folder = Path(scratch)
+                stand_in, values = self.prepare_pull(folder)
+                if marker != "none":
+                    (stand_in.parent / marker).write_text("")
+                started = time.monotonic()
+                run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": numbers["reserve"] + 1})
+                times[marker] = time.monotonic() - started
+        self.assertLess(times["hang_pull"], times["none"] + numbers["grace"] - 2, str(times))
+
+    def test_a_cancelled_task_keeps_the_login_folder_until_the_client_that_ignores_term_is_reaped(self) -> None:
+        deadline = self.pull_numbers()["reserve"] + 20
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
             (stand_in.parent / "ignore_term_pull").write_text("")
-            started = time.monotonic()
-            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": 14})
-            elapsed = time.monotonic() - started
+            self.signal_shell(stand_in, 1, 0)
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": deadline})
             left = os.listdir(self.parent(folder))
-            pid = int((stand_in.parent / "pull.pid").read_text())
-            self.addCleanup(self.kill_quietly, pid)
-            gone = self.is_gone(pid)
+            pid = self.watch_pull(stand_in)
+            gone = self.is_gone(pid, tries=1)
             early = (stand_in.parent / "folder_gone_early").exists()
+            terms = self.terms(stand_in)
         self.assertNotEqual(0, code, output)
-        self.assertIn("the image pull ran past its deadline of 14 seconds", output)
-        self.assertTrue(gone, "the pull survived the task: one TERM is not enough")
-        self.assertFalse(early, "the folder was removed while the pull still ran")
+        self.assertFalse(early, "the folder was removed while the client was still alive on the signal path")
+        self.assertTrue(gone, "the client was still there when the task returned")
         self.assertEqual([], left)
-        self.assertLess(elapsed, 14 + 20, "the task ended well inside Ansible's own timeout plus its start-up")
-        self.assertNotIn(self.TOKEN, output)
+        self.assertEqual(["term"], terms)
 
-    def test_a_pull_that_ends_on_the_term_signal_is_not_held_for_the_whole_grace(self) -> None:
+    def test_a_second_term_during_the_cleanup_changes_nothing_and_the_cleanup_runs_once(self) -> None:
+        deadline = self.pull_numbers()["reserve"] + 20
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             stand_in, values = self.prepare_pull(folder)
-            (stand_in.parent / "hang_pull").write_text("")
-            started = time.monotonic()
-            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": 3})
-            elapsed = time.monotonic() - started
+            (stand_in.parent / "ignore_term_pull").write_text("")
+            self.signal_shell(stand_in, 2, 1.5)
+            code, output = run_tasks("pull_images.yml", values | {"compose_stack_pull_deadline_seconds": deadline})
+            left = os.listdir(self.parent(folder))
+            pid = self.watch_pull(stand_in)
+            gone = self.is_gone(pid, tries=1)
+            early = (stand_in.parent / "folder_gone_early").exists()
+            terms = self.terms(stand_in)
         self.assertNotEqual(0, code, output)
-        self.assertLess(elapsed, 3 + GRACE_SECONDS + 15)
+        self.assertTrue(gone, "a second TERM interrupted the cleanup and left the client")
+        self.assertEqual([], left, "a second TERM interrupted the cleanup and left the folder")
+        self.assertFalse(early)
+        self.assertEqual(["term"], terms, "the cleanup ran more than once")
+
+    def test_a_killed_shell_leaves_its_watchdog_to_kill_the_pull_group_and_remove_the_folder_after_the_client_is_gone(self) -> None:
+        deadline = self.pull_numbers()["reserve"] + 20
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            stand_in, code, output = self.ignoring_run(folder, deadline, "kill_shell")
+            pid = self.watch_pull(stand_in)
+            gone = self.is_gone(pid, tries=300)
+            for _ in range(50):
+                left = os.listdir(self.parent(folder))
+                if not left:
+                    break
+                time.sleep(0.1)
+            early = (stand_in.parent / "folder_gone_early").exists()
+            terms = self.terms(stand_in)
+        self.assertNotEqual(0, code, output)
+        self.assertTrue(gone, "nothing killed the pull group after its shell was killed")
+        self.assertEqual([], left, "nothing removed the folder after its shell was killed")
+        self.assertFalse(early, "the folder was removed while the client still ran")
+        self.assertEqual(["term"], terms)
 
     @staticmethod
-    def is_gone(pid: int) -> bool:
-        for _ in range(50):
+    def is_gone(pid: int, tries: int = 50) -> bool:
+        for _ in range(tries):
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
