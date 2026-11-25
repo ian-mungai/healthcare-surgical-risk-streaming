@@ -69,7 +69,7 @@ Every later deploy makes no call with the root pair and no write. It reads the l
 
 AIStor's licence (the Free licence from MinIO) is kept in this computer's OpenBao at `secret/aistor_licence`, field `value`. `make host-up` reads it with a token of its own from the Keychain item `openbao-aistor-licence-token`, never with the owner's full token (`openbao-owner-token`), and places it on the host as one root-only file (mode 0400, the file that the server reads through `--license`, as the AIStor container install guide shows) through a script that sudo does not record; it is never printed, logged or put in an Ansible variable. The token's OpenBao policy `aistor-licence-read` allows `read` on `secret/data/aistor_licence` and nothing else.
 
-The owner makes that token once, in a separate terminal so no value reaches a chat (`references/local_machine.md`, Local secrets). The policy and the token need administration rights that the owner's token (`owner-secrets`) does not have, so first generate a root token with the unseal key as item 3 of that section says (`bao operator generate-root`) and revoke it at the end of these steps. Then run, in this order (the token is never printed: it goes to the clipboard, then into the Keychain at `security`'s own hidden prompt, and then the clipboard is cleared):
+The owner makes that token once, in a separate terminal so no value reaches a chat (`references/local_machine.md`, Local secrets). The policy and the token need administration rights that the owner's token (`owner-secrets`) does not have, so first generate a root token with the unseal key as item 3 of that section says (`bao operator generate-root`) and revoke it at the end of these steps. The token is made with `-orphan` because a token that is made as a child of the administration token is revoked with it by `bao token revoke -self` ([token hierarchies and orphan tokens](https://openbao.org/docs/concepts/tokens/#token-hierarchies-and-orphan-tokens)); `-orphan` needs the root token's rights. Then run, in this order (the token is never printed: it goes to the clipboard, then into the Keychain at `security`'s own hidden prompt, and then the clipboard is cleared):
 
 ```zsh
 export BAO_ADDR=http://127.0.0.1:8200
@@ -77,13 +77,20 @@ read -rs "BAO_TOKEN?Administration token: " && export BAO_TOKEN; echo
 bao policy write aistor-licence-read - <<'POLICY'
 path "secret/data/aistor_licence" { capabilities = ["read"] }
 POLICY
-bao token create -field=token -policy=aistor-licence-read -no-default-policy -period=768h | pbcopy
+bao token create -field=token -orphan -policy=aistor-licence-read -no-default-policy -period=768h | pbcopy
 bao token revoke -self; unset BAO_TOKEN
 security add-generic-password -a "$USER" -s openbao-aistor-licence-token -U -w   # paste at the hidden prompt, twice
 pbcopy < /dev/null
 ```
 
-Save the licence itself with the command in `references/local_machine.md` (item 5), with the name `aistor_licence`. A periodic token expires after 768 hours without a renewal, and the unseal job renews only `openbao-agent-token` and `openbao-owner-token`: when the launcher says that OpenBao refused the read (HTTP 403), run the steps again from `bao policy write` with a new administration token.
+Save the licence itself with the command in `references/local_machine.md` (item 5), with the name `aistor_licence`. Then check, after the administration token is revoked, that the saved token still works. The command reads the licence path with the token from the Keychain item, in the environment of that one command, and sends the value to `/dev/null`, so nothing is printed. An empty token stops the command before `bao` runs, because `bao` would use its token helper file instead. A 403 answer means the token or its policy is wrong (make the token again from `bao policy write`), and a 404 answer means that the licence is not saved yet:
+
+```zsh
+export BAO_ADDR=http://127.0.0.1:8200
+token="$(security find-generic-password -a "$USER" -s openbao-aistor-licence-token -w)" && BAO_TOKEN="$token" bao read secret/data/aistor_licence > /dev/null && echo "The licence token reads the licence path."; unset token
+```
+
+A periodic token expires after 768 hours without a renewal, and the unseal job renews only `openbao-agent-token` and `openbao-owner-token`: when the launcher says that OpenBao refused the read (HTTP 403), run the steps again from `bao policy write` with a new administration token.
 
 A computer without that Keychain item, or without the `security` command (Linux), has no licence source. A licence that OpenBao does not hold is the same case for the deploy: nothing is sent, and the deploy goes on with everything else (Airbyte, the connection step and the rest). `make host-up` tells the AIStor playbook only one non-secret fact, `placed` (the licence is on the host) or `absent`. With `placed`, a licence file that is missing on the host fails the AIStor step. With `absent` and no licence file on the host, the playbook skips AIStor and writes `skipped` to `/opt/platform/compose/aistor.state`, and only then does `make host-up` read that record and print the notice (it names this step when the cause is a missing token); with `absent` and a licence file already on the host, AIStor starts with that file and the notice says so. Save the licence, make the token if it is missing and run `make host-up` again: AIStor starts and the record says `started`. `make storage-up` reads that record first and, for a skipped AIStor, names this step.
 

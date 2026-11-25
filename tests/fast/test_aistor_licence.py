@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import io
 import json
+import re
 import unittest
 from pathlib import Path
 from typing import Any
@@ -251,7 +252,7 @@ class OwnerSetupStepTest(unittest.TestCase):
         text = self.readme()
         self.assertIn("bao policy write aistor-licence-read -", text)
         self.assertIn(f'path "{aistor_licence.LOCAL_PATH}" {{ capabilities = ["read"] }}', text)
-        self.assertRegex(text, r"bao token create -field=token -policy=aistor-licence-read -no-default-policy -period=\d+h")
+        self.assertRegex(text, r"bao token create -field=token -orphan -policy=aistor-licence-read -no-default-policy -period=\d+h")
         self.assertIn(f'security add-generic-password -a "$USER" -s {aistor_licence.KEYCHAIN_ITEM} -U -w', text)
         for name in ("aistor-licence-read", aistor_licence.KEYCHAIN_ITEM):
             self.assertIn(name, aistor_licence.SETUP_MESSAGE)
@@ -264,6 +265,27 @@ class OwnerSetupStepTest(unittest.TestCase):
         self.assertIn('read -rs "BAO_TOKEN?', step)
         self.assertNotIn('echo "$', step)
         self.assertRegex(step, r"bao token create [^\n]*\| pbcopy")
+
+    def test_the_token_is_an_orphan_so_revoking_the_administration_token_does_not_revoke_it(self) -> None:
+        text = self.readme()
+        (create,) = re.findall(r"^bao token create [^\n]*", text, re.MULTILINE)
+        self.assertIn(" -orphan ", create + " ", "a child of the administration token is revoked with it")
+        self.assertLess(text.index("bao token create -field"), text.index("\nbao token revoke -self;"))
+        self.assertIn("openbao.org/docs/concepts/tokens/#token-hierarchies-and-orphan-tokens", text)
+
+    def test_after_the_administration_token_is_revoked_the_saved_token_is_checked_by_reading_the_licence_path_without_printing_it(self) -> None:
+        text = self.readme()
+        after = text[text.index("\nbao token revoke -self;") :]
+        (line,) = re.findall(r"^[^\n]*bao read secret/data/aistor_licence[^\n]*", after, re.MULTILINE)
+        self.assertIn("security find-generic-password", line)
+        self.assertIn(aistor_licence.KEYCHAIN_ITEM, line)
+        self.assertRegex(line, r"> ?/dev/null", "the value goes nowhere")
+        self.assertNotRegex(line, r"-field|-format|\| *(?:cat|echo|pbcopy|tee)|\becho \"?\$", "the value is never printed")
+        self.assertIn(
+            "&&",
+            line.split("security find-generic-password")[1].split("bao read")[0],
+            "an empty token never reaches bao, which would use its token helper file",
+        )
 
     def test_the_readme_says_that_the_launcher_never_uses_the_owners_full_token(self) -> None:
         self.assertIn("never with the owner's full token (`openbao-owner-token`)", self.readme())
