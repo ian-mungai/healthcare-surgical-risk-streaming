@@ -115,9 +115,22 @@ class RoleTaskFilesTest(unittest.TestCase):
         self.assertIs(True, made[0].get("no_log"))
         for task in self.tasks("aistor_licence.yml"):
             with self.subTest(task=task.get("name")):
-                self.assertFalse(
-                    {"secret_file", "ansible.builtin.slurp", "ansible.builtin.copy", "ansible.builtin.file", "ansible.builtin.lineinfile"} & set(task)
-                )
+                self.assertFalse({"secret_file", "ansible.builtin.slurp", "ansible.builtin.copy", "ansible.builtin.lineinfile"} & set(task))
+                if "ansible.builtin.file" in task:
+                    # The one use of the file module removes the files that an interrupted write left: it can make no licence file.
+                    self.assertEqual("absent", task["ansible.builtin.file"]["state"])
+                    self.assertEqual("{{ item.path }}", task["ansible.builtin.file"]["path"])
+                    self.assertEqual("{{ compose_stack_aistor_licence_leftovers.files }}", task["loop"])
+
+    def test_the_licence_check_looks_only_for_the_temporary_names_of_the_licence_file_and_removes_only_what_it_found(self) -> None:
+        found = [task["ansible.builtin.find"] for task in self.tasks("aistor_licence.yml") if "ansible.builtin.find" in task]
+        self.assertEqual(1, len(found))
+        self.assertIs(True, found[0]["use_regex"])
+        self.assertIs(True, found[0]["hidden"])
+        self.assertIs(False, found[0]["follow"])
+        self.assertEqual("file", found[0]["file_type"])
+        self.assertEqual("{{ compose_stack_aistor_licence_file | dirname }}", found[0]["paths"])
+        self.assertEqual(r"^\.{{ compose_stack_aistor_licence_file | basename | regex_escape }}\.[0-9a-f]{8}\.new$", found[0]["patterns"])
 
     def test_the_licence_check_stats_the_file_without_following_a_link_and_the_credentials_check_does_too(self) -> None:
         for name in ("aistor_licence.yml", "verify_aistor_credentials.yml"):

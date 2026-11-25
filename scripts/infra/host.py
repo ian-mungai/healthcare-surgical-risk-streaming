@@ -120,6 +120,21 @@ LICENCE_ABSENT_NOTICE = (
     "The deploy goes on with everything else (Airbyte, the connection step and the rest). Store the licence at that path (references/local_machine.md, "
     "Local secrets) and run make host-up again: AIStor then starts."
 )
+LICENCE_NO_SOURCE_NOTICE = (
+    f"AIStor is skipped: {aistor_licence.SETUP_MESSAGE}. The deploy goes on with everything else (Airbyte, the connection step and the rest). "
+    "After the owner's step is done and the licence is stored, run make host-up again: AIStor then starts."
+)
+LICENCE_KEPT_NOTICE = (
+    "AIStor started with the licence file that was already on the host: this computer sent no licence this time "
+    "(it has no licence source, or its OpenBao holds none)."
+)
+LICENCE_UNCONFIRMED_NOTICE = (
+    "AIStor: could not confirm from the host whether the server started or was skipped for want of a licence; "
+    "make storage-up reads the host's record and says which."
+)
+AISTOR_STATE_FILE = "/opt/platform/compose/aistor.state"
+# What the launcher tells the AIStor playbook about the licence: ``placed`` (the licence is on the host, new or unchanged) or ``absent`` (none was sent).
+PLACEMENT_FACTS = {"placed": "placed", "unchanged": "placed", "absent": "absent", "no_source": "absent"}
 GIT_TIMEOUT_SECONDS = 30
 RELEASE_DEADLINE_SECONDS = 300
 WORKLOAD_GID_BASE = 20000
@@ -493,19 +508,30 @@ def check_sudo_policy(run_id: str, address: str) -> None:
     check_policy_file(run_id, address, KEY_POLICY_SOURCE, SUDOERS_FILE, KEY_MESSAGES)
 
 
+def licence_fact(code: str) -> str:
+    """The non-secret fact for the AIStor playbook that a placement code stands for: ``placed`` or ``absent``."""
+    if not isinstance(code, str) or code not in PLACEMENT_FACTS:
+        raise ValueError("the licence placement is not one of placed, unchanged, absent and no_source")
+    return PLACEMENT_FACTS[code]
+
+
 def place_aistor_licence(run_id: str, address: str) -> str:
-    """Read AIStor's licence from this computer's OpenBao and place it on the host through one SSH command. Return ``placed``, ``unchanged`` or ``absent``.
+    """Read AIStor's licence from this computer's OpenBao and place it on the host through one SSH command.
+
+    Return ``placed``, ``unchanged``, ``absent`` or ``no_source``.
 
     The licence is read in memory (``scripts/infra/aistor_licence.py``) and written to the standard input of ``ssh <host> sudo /usr/bin/python3 -I <the licence
     script>``, which writes the one root-only file. It is never in an argument list, an environment variable, a file on this computer, an output or an error
-    text; every failure is a fixed message. A licence that this computer's OpenBao does not hold (its 404) is no failure: the notice is printed, nothing is sent
-    and the host playbook's AIStor step skips AIStor and records that it did."""
+    text; every failure is a fixed message. A licence that this computer's OpenBao does not hold (its 404) is ``absent``, and a computer with no Keychain
+    item for the licence token or no ``security`` command is ``no_source``: neither is a failure, nothing is sent and no notice is printed here, because
+    only the host can confirm that it has no licence (``report_aistor_state``)."""
     try:
         licence = aistor_licence.read_licence()
+    except aistor_licence.NoLicenceSource:
+        return "no_source"
     except aistor_licence.LicenceError as error:
         raise HostError(str(error)) from None
     if licence is None:
-        sys.stdout.write(f"{LICENCE_ABSENT_NOTICE}\n")
         return "absent"
     check_policy_file(run_id, address, LICENCE_POLICY_SOURCE, LICENCE_SUDOERS_FILE, LICENCE_MESSAGES)
     try:
@@ -523,6 +549,23 @@ def place_aistor_licence(run_id: str, address: str) -> str:
     if sent.returncode not in (0, 3):
         raise HostError(LICENCE_MESSAGES["ssh_failed"].format(status=sent.returncode))
     raise HostError(LICENCE_MESSAGES["script_unknown"])
+
+
+def report_aistor_state(run_id: str, address: str, placement: str) -> None:
+    """After the AIStor playbook: say whether AIStor was skipped, only when this computer sent no licence and the host's own record confirms the skip.
+
+    The record is the file that the playbook writes (``skipped: ...`` or ``started``), read with one fixed read-only command. When it cannot be read or is not a
+    known record, the notice says that the state is unconfirmed and claims no skip."""
+    if licence_fact(placement) == "placed":
+        return
+    state = ssh_output(run_id, address, f"cat {AISTOR_STATE_FILE}", SSH_ATTEMPT_SECONDS)
+    record = state.strip() if state else ""
+    if record.startswith("skipped:"):
+        sys.stdout.write(f"{LICENCE_NO_SOURCE_NOTICE if placement == 'no_source' else LICENCE_ABSENT_NOTICE}\n")
+    elif record == "started":
+        sys.stdout.write(f"{LICENCE_KEPT_NOTICE}\n")
+    else:
+        sys.stdout.write(f"{LICENCE_UNCONFIRMED_NOTICE}\n")
 
 
 def place_project_key(run_id: str, address: str, profile: str) -> None:
@@ -581,8 +624,9 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     require_current_inputs(plan)
     variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deploy_variables(configuration, platform_commit())
     run_ansible(run.run_id, address, variables)
-    place_aistor_licence(run.run_id, address)
-    run_ansible(run.run_id, address, variables, "storage.yml")
+    placement = place_aistor_licence(run.run_id, address)
+    run_ansible(run.run_id, address, variables | {"aistor_licence_placement": licence_fact(placement)}, "storage.yml")
+    report_aistor_state(run.run_id, address, placement)
     place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
     run_ansible(run.run_id, address, variables, "connection.yml")
     write_inventory(binding)

@@ -542,7 +542,17 @@ class AistorLicenceTest(unittest.TestCase):
 
     MESSAGE = "the AIStor licence file is empty or is not a plain file that only"
 
-    def check(self, content: str | None, *, mode: int = 0o400, link: bool = False, variable: str | None = None, unset: bool = False) -> tuple[int, str]:
+    def check(
+        self,
+        content: str | None,
+        *,
+        mode: int = 0o400,
+        link: bool = False,
+        variable: str | None = None,
+        unset: bool = False,
+        placement: str | None = None,
+        leftovers: tuple[str, ...] = (),
+    ) -> tuple[int, str]:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
             target = folder / "secrets" / "aistor" / "licence"
@@ -556,12 +566,19 @@ class AistorLicenceTest(unittest.TestCase):
                 else:
                     target.write_text(content)
                     target.chmod(mode)
+            for name in leftovers:
+                (target.parent / name).write_text("left-behind-licence-text")
+                (target.parent / name).chmod(0o400)
             values = variables(folder)
             if variable is not None:
                 values["compose_stack_aistor_licence_file"] = variable
             if unset:
                 del values["compose_stack_aistor_licence_file"]
-            return run_tasks(["aistor_licence.yml"], values)
+            if placement is not None:
+                values["aistor_licence_placement"] = placement
+            result = run_tasks(["aistor_licence.yml"], values)
+            self.remaining = sorted(entry.name for entry in target.parent.iterdir())
+            return result
 
     def test_a_private_file_with_content_passes_and_nothing_is_changed_or_printed(self) -> None:
         code, output = self.check("a-licence-key-with-some-length\n")
@@ -589,6 +606,44 @@ class AistorLicenceTest(unittest.TestCase):
                 self.assertIn(self.MESSAGE, output)
                 self.assertNotIn("secret-licence-text", output)
 
+    def test_a_licence_that_the_launcher_placed_and_that_is_missing_on_the_host_fails_with_a_fixed_message(self) -> None:
+        code, output = self.check(None, placement="placed")
+        self.assertNotEqual(0, code)
+        self.assertIn("the launcher placed the AIStor licence, but the licence file is missing on the host", output)
+
+    def test_a_licence_that_the_launcher_placed_and_is_on_the_host_passes(self) -> None:
+        code, output = self.check("a-licence-key-with-some-length\n", placement="placed")
+        self.assertEqual(0, code, output)
+
+    def test_no_licence_from_the_launcher_is_no_failure_whether_the_host_has_a_file_or_not(self) -> None:
+        for label, content in (("no file", None), ("an older file", "a-licence-key-with-some-length\n")):
+            with self.subTest(label):
+                code, output = self.check(content, placement="absent")
+                self.assertEqual(0, code, output)
+                self.assertRegex(output, CHANGED_NONE)
+
+    def test_a_placement_that_is_neither_placed_nor_absent_is_refused_by_a_message_that_names_the_variable(self) -> None:
+        for value in ("maybe", "", "PLACED", "unchanged"):
+            with self.subTest(value=value):
+                code, output = self.check("a-licence-key-with-some-length\n", placement=value)
+                self.assertNotEqual(0, code)
+                self.assertIn("aistor_licence_placement", output)
+
+    def test_the_second_0400_file_that_an_interrupted_write_left_is_removed_at_every_deploy_and_nothing_else_is_touched(self) -> None:
+        left = (".licence.0123abcd.new", ".licence.ffffffff.new")
+        kept = (".licence.0123abc.new", "licence.0123abcd.new", ".licence.0123abcd.old", ".other.0123abcd.new")
+        code, output = self.check("a-licence-key-with-some-length\n", leftovers=left + kept)
+        self.assertEqual(0, code, output)
+        self.assertEqual(sorted(["licence", *kept]), self.remaining)
+        self.assertNotIn("left-behind-licence-text", output)
+
+    def test_the_leftover_is_removed_even_when_the_licence_is_absent_and_a_clean_folder_changes_nothing(self) -> None:
+        code, output = self.check(None, leftovers=(".licence.0123abcd.new",))
+        self.assertEqual(0, code, output)
+        self.assertEqual([], self.remaining)
+        code, output = self.check("a-licence-key-with-some-length\n")
+        self.assertRegex(output, CHANGED_NONE)
+
     def test_an_empty_variable_or_no_variable_is_refused_by_a_message_that_names_the_variable(self) -> None:
         for label, kwargs in (
             ("an empty variable", {"content": "secret-licence-text", "variable": ""}),
@@ -615,11 +670,13 @@ class AistorLicenceTest(unittest.TestCase):
 class AistorStepWithoutLicenceTest(unittest.TestCase):
     """With no licence file the AIStor step skips AIStor, records it, starts nothing and succeeds, so the rest of the deploy goes on."""
 
-    def run_step(self, folder: Path) -> tuple[int, str]:
+    def run_step(self, folder: Path, placement: str | None = None) -> tuple[int, str]:
         values = variables(folder) | {
             "compose_stack_aistor_state_file": str(folder / "compose" / "aistor.state"),
             "compose_stack_storage_services": ["aistor"],
         }
+        if placement is not None:
+            values["aistor_licence_placement"] = placement
         (folder / "compose").mkdir(exist_ok=True)
         return run_tasks(["storage.yml"], values)
 
@@ -637,6 +694,29 @@ class AistorStepWithoutLicenceTest(unittest.TestCase):
         for name in ("Start AIStor and wait for its health", "Verify the AIStor project user as itself", "Record that AIStor started"):
             self.assertRegex(output, rf"{name}[^\n]*\] \*+\nskipping: \[localhost\]", f"{name} is skipped")
         self.assertNotIn("included: ", output.split("Say that AIStor is skipped")[1], "no task file is included after the skip")
+
+    def test_the_skip_notice_and_the_record_come_only_when_the_host_has_no_licence_file_and_the_launcher_sent_none(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            code, output = self.run_step(folder, "absent")
+            state = (folder / "compose" / "aistor.state").read_text()
+        self.assertEqual(0, code, output)
+        self.assertTrue(state.startswith("skipped:"))
+        self.assertIn("AIStor is skipped", output)
+
+    def test_a_launcher_that_placed_the_licence_when_the_file_is_missing_fails_the_step_with_no_skip_notice_and_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            (folder / "secrets" / "aistor").mkdir(parents=True, mode=0o700)
+            (folder / "compose").mkdir()
+            (folder / "compose" / "aistor.state").write_text("started\n")
+            code, output = self.run_step(folder, "placed")
+            left = (folder / "compose" / "aistor.state").exists()
+        self.assertNotEqual(0, code)
+        self.assertIn("the launcher placed the AIStor licence, but the licence file is missing on the host", output)
+        self.assertNotIn("AIStor is skipped", output, "no skip is claimed for a licence that was placed")
+        self.assertFalse(left)
 
     def test_a_second_run_with_the_licence_still_missing_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

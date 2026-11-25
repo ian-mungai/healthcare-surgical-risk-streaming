@@ -1,6 +1,10 @@
-# Reads compose_stack_aistor_licence_file and compose_stack_owner, and sets compose_stack_aistor_licence_present. The licence is placed by the launcher (scripts.infra.host),
-# which reads it from the owner's OpenBao: one file on the host that only compose_stack_owner reads (mode 0400). A file that is missing is no failure: the fact is
-# false and the AIStor step skips AIStor. The step never creates the file and never prints its content, and it makes no checksum of it. Its content is not read into
+# Reads compose_stack_aistor_licence_file, compose_stack_owner and aistor_licence_placement (the launcher's non-secret fact: placed when the licence was placed on the
+# host, absent when this computer sent none; unset when the playbook runs without the launcher), and sets compose_stack_aistor_licence_present. The licence is placed
+# by the launcher (scripts.infra.host), which reads it from the owner's OpenBao: one file on the host that only compose_stack_owner reads (mode 0400). A file that is
+# missing is no failure when the launcher sent none: the fact is false and the AIStor step skips AIStor, and only that skip is announced. When the launcher says that it
+# placed the licence and the file is missing, the step fails. It also removes the second 0400 file that an interrupted write of the licence can leave (a name of the
+# form .licence.<8 hex>.new, which holds a copy of the licence), so no such copy outlives the deploy that follows. The step never creates the licence file and never
+# prints its content, and it makes no checksum of it. Its content is not read into
 # a variable: a search for a line with any character that is not white space answers by its exit status only. A file that is there and is empty, white space only,
 # not a plain file, of another owner or of any other mode stops the deploy with one fixed message, so a licence that was placed badly is never taken for an absent one.
 - name: Check the AIStor licence file
@@ -15,6 +19,31 @@
         quiet: true
         fail_msg: "the AIStor licence file is not named: set compose_stack_aistor_licence_file"
 
+    - name: Stop when the launcher's placement fact is not placed or absent
+      ansible.builtin.assert:
+        that: aistor_licence_placement | default('unknown') in ['placed', 'absent', 'unknown']
+        quiet: true
+        fail_msg: "aistor_licence_placement must be placed or absent: the launcher gives it"
+
+    - name: Look for the files that an interrupted write of the licence left
+      ansible.builtin.find:
+        paths: "{{ compose_stack_aistor_licence_file | dirname }}"
+        patterns: '^\.{{ compose_stack_aistor_licence_file | basename | regex_escape }}\.[0-9a-f]{8}\.new$'
+        use_regex: true
+        hidden: true
+        file_type: file
+        follow: false
+      register: compose_stack_aistor_licence_leftovers
+      check_mode: false
+
+    - name: Remove those files, each a second copy of a licence
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ compose_stack_aistor_licence_leftovers.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
     - name: Look at the licence file
       ansible.builtin.stat:
         path: "{{ compose_stack_aistor_licence_file }}"
@@ -26,6 +55,13 @@
     - name: Find whether the licence file is there
       ansible.builtin.set_fact:
         compose_stack_aistor_licence_present: "{{ compose_stack_aistor_licence_stat.stat.exists }}"
+
+    - name: Stop when the launcher placed the licence and the file is missing on the host
+      ansible.builtin.assert:
+        that: compose_stack_aistor_licence_present
+        quiet: true
+        fail_msg: "the launcher placed the AIStor licence, but the licence file is missing on the host: run make host-up again"
+      when: aistor_licence_placement | default('unknown') == 'placed'
 
     - name: Stop when the licence file is not a plain file or is readable by anyone but its owner
       ansible.builtin.assert:

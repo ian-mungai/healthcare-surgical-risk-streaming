@@ -232,6 +232,12 @@ class FakeSshRecordTest(unittest.TestCase):
         self.assertEqual(2, errors.count("Permission denied"), errors)
 
 
+def placed_after(order: list[str], name: str) -> str:
+    """Record a step in ``order`` and give the placement code of a licence that was placed."""
+    order.append(name)
+    return "placed"
+
+
 @dataclass(frozen=True)
 class FakeAws(Aws):
     state: str = "running"
@@ -637,6 +643,7 @@ class HostUpTest(unittest.TestCase):
             "wait_until_reachable",
             "run_ansible",
             "place_aistor_licence",
+            "report_aistor_state",
             "place_project_key",
             "instance_id",
             "platform_commit",
@@ -645,6 +652,7 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
+            calls["place_aistor_licence"].return_value = "placed"
             calls["state_json"].return_value = heavy_state(11008) if state is None else state
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")
             if on_wait is not None:
@@ -696,8 +704,13 @@ class HostUpTest(unittest.TestCase):
             "the host playbook first, the AIStor playbook second, the connection playbook third",
         )
         calls["place_aistor_licence"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net")
+        calls["report_aistor_state"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net", "placed")
         calls["place_project_key"].assert_called_once_with("20260101t0000-abcdef", "platform-dev.example.ts.net", "example_project_dev")
-        self.assertEqual(calls["run_ansible"].call_args_list[0].args[2], calls["run_ansible"].call_args_list[1].args[2])
+        self.assertEqual(
+            calls["run_ansible"].call_args_list[0].args[2] | {"aistor_licence_placement": "placed"},
+            calls["run_ansible"].call_args_list[1].args[2],
+            "the AIStor playbook gets the placement as a non-secret fact and nothing else more",
+        )
         self.assertEqual(calls["run_ansible"].call_args_list[0].args[2], calls["run_ansible"].call_args_list[2].args[2])
         self.assertEqual(
             {
@@ -802,7 +815,8 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(host, "run_ansible", side_effect=lambda run_id, address, variables, playbook="host.yml": order.append(f"ansible {playbook}"))
             )
-            stack.enter_context(mock.patch.object(host, "place_aistor_licence", side_effect=lambda *arguments: order.append("licence")))
+            stack.enter_context(mock.patch.object(host, "place_aistor_licence", side_effect=lambda *arguments: placed_after(order, "licence")))
+            stack.enter_context(mock.patch.object(host, "report_aistor_state", side_effect=lambda *arguments: order.append("report")))
             stack.enter_context(mock.patch.object(host, "place_project_key", side_effect=lambda *arguments: order.append("key")))
             stack.enter_context(mock.patch.object(host, "write_inventory", side_effect=lambda binding: order.append("inventory")))
             for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
@@ -814,7 +828,7 @@ class HostUpTest(unittest.TestCase):
             host.platform_commit.return_value = "a" * 40  # type: ignore[attr-defined]
             with contextlib.redirect_stdout(io.StringIO()):
                 host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
-        self.assertEqual(["ansible host.yml", "licence", "ansible storage.yml", "key", "ansible connection.yml", "inventory"], order)
+        self.assertEqual(["ansible host.yml", "licence", "ansible storage.yml", "report", "key", "ansible connection.yml", "inventory"], order)
 
     def test_a_failure_of_the_key_step_stops_the_run_before_the_connection_playbook_and_the_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
@@ -822,7 +836,7 @@ class HostUpTest(unittest.TestCase):
             write_plan_json(path.parent, "apply.json", 11008)
             stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
             run = stack.enter_context(mock.patch.object(host, "run_ansible"))
-            stack.enter_context(mock.patch.object(host, "place_aistor_licence"))
+            stack.enter_context(mock.patch.object(host, "place_aistor_licence", return_value="placed"))
             stack.enter_context(mock.patch.object(host, "place_project_key", side_effect=HostError("a fixed message")))
             inventory = stack.enter_context(mock.patch.object(host, "write_inventory"))
             for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
@@ -858,15 +872,18 @@ class HostUpTest(unittest.TestCase):
         key.assert_not_called()
         licence.assert_not_called()
 
-    def test_a_licence_that_is_absent_does_not_stop_the_run_and_the_aistor_playbook_the_key_and_the_connection_playbook_still_run(self) -> None:
+    def absent_run(self, reader: mock.Mock, state: str) -> tuple[int, str, mock.Mock, mock.Mock, mock.Mock, mock.Mock]:
+        """One up run whose licence is not placed: the read of the licence is ``reader``, and the host's state file says ``state``."""
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
             path = binding_file(Path(scratch), backend="s3", provision_host=True)
             write_plan_json(path.parent, "apply.json", 11008)
             stack.enter_context(mock.patch.object(state_bootstrap, "create", return_value=0))
-            run = stack.enter_context(mock.patch.object(host, "run_ansible"))
-            reader = stack.enter_context(mock.patch.object(aistor_licence, "read_licence", return_value=None))
-            ssh = stack.enter_context(mock.patch.object(host, "run_command"))
+            run = stack.enter_context(
+                mock.patch.object(host, "run_ansible", side_effect=lambda *arguments: output.write(f"[{arguments[3] if len(arguments) > 3 else 'host.yml'}]\n"))
+            )
+            stack.enter_context(mock.patch.object(aistor_licence, "read_licence", reader))
+            ssh = stack.enter_context(mock.patch.object(host, "run_command", return_value=CompletedProcess(["ssh"], 0, state, "")))
             key = stack.enter_context(mock.patch.object(host, "place_project_key"))
             inventory = stack.enter_context(mock.patch.object(host, "write_inventory"))
             for name in ("save_plan", "apply_plan", "state_json", "wait_until_reachable", "instance_id", "platform_commit"):
@@ -878,14 +895,44 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "ROOT", path.parent))
             with contextlib.redirect_stdout(output):
                 code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, "")
+        return code, output.getvalue(), run, ssh, key, inventory
+
+    SKIPPED_STATE = "skipped: no AIStor licence file was on the host at the last deploy; place the licence and deploy again\n"
+
+    def test_a_licence_that_is_absent_does_not_stop_the_run_and_the_notice_comes_after_the_host_confirmed_the_skip(self) -> None:
+        reader = mock.Mock(return_value=None)
+        code, text, run, ssh, key, inventory = self.absent_run(reader, self.SKIPPED_STATE)
         self.assertEqual(0, code)
         reader.assert_called_once()
-        ssh.assert_not_called()
         self.assertEqual(["host.yml", "storage.yml", "connection.yml"], [call.args[3] if len(call.args) > 3 else "host.yml" for call in run.call_args_list])
+        self.assertEqual("absent", run.call_args_list[1].args[2]["aistor_licence_placement"])
+        self.assertNotIn("aistor_licence_placement", run.call_args_list[0].args[2])
+        self.assertEqual(1, ssh.call_count, "one read of the state file, and no sending of a licence")
+        self.assertIn("cat /opt/platform/compose/aistor.state", ssh.call_args.args[1])
+        self.assertNotIn("sudo", json.dumps(ssh.call_args.args[1]))
         key.assert_called_once()
         inventory.assert_called_once()
-        self.assertIn("AIStor is skipped", output.getvalue())
-        self.assertIn("the host platform-dev is up and its inventory is written", output.getvalue())
+        self.assertLess(text.index("[storage.yml]"), text.index("AIStor is skipped"), "the notice follows the host's confirmation")
+        self.assertLess(text.index("AIStor is skipped"), text.index("[connection.yml]"))
+        self.assertIn("secret/aistor_licence", text)
+        self.assertIn("the host platform-dev is up and its inventory is written", text)
+
+    def test_a_computer_with_no_licence_source_skips_aistor_the_same_way_and_the_notice_names_the_owners_step(self) -> None:
+        reader = mock.Mock(side_effect=aistor_licence.NoLicenceSource(aistor_licence.SETUP_MESSAGE))
+        code, text, run, ssh, key, inventory = self.absent_run(reader, self.SKIPPED_STATE)
+        self.assertEqual(0, code)
+        self.assertEqual("absent", run.call_args_list[1].args[2]["aistor_licence_placement"])
+        self.assertIn("AIStor is skipped", text)
+        self.assertIn("openbao-aistor-licence-token", text)
+        self.assertIn("README.md", text)
+        key.assert_called_once()
+        inventory.assert_called_once()
+
+    def test_a_host_that_started_with_an_older_licence_file_gets_no_skip_notice(self) -> None:
+        code, text, run, ssh, key, inventory = self.absent_run(mock.Mock(return_value=None), "started\n")
+        self.assertEqual(0, code)
+        self.assertIn("started with the licence file that was already on the host", text)
+        self.assertNotIn("AIStor is skipped", text)
 
     def test_a_failure_of_the_licence_step_stops_the_run_before_the_aistor_playbook_the_key_and_the_connection_playbook(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
@@ -977,6 +1024,7 @@ class HostUpTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(host, "ROOT", Path(scratch)))
             calls = {name: stack.enter_context(mock.patch.object(host, name)) for name in names}
             calls["save_plan"].return_value = 0
+            calls["place_aistor_licence"].return_value = "placed"
             calls["state_json"].return_value = heavy_state(11008)
             write_plan_json(Path(scratch), "apply.json", 11008)
             calls["wait_until_reachable"].return_value = Peer("platform-dev.example.ts.net", "nNEWCNTRL")

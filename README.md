@@ -6,7 +6,7 @@ In development. The first phase builds the host and its lifecycle. It adds the r
 
 ## Install
 
-You need macOS on Apple silicon or Linux on x86-64, the two platforms that `scripts/quality/install_tools.py` pins tools for, with Python 3.14, Git, GNU Make and curl. The host commands also need the AWS CLI, OpenSSH and the Tailscale client.
+You need macOS on Apple silicon or Linux on x86-64, the two platforms that `scripts/quality/install_tools.py` pins tools for, with Python 3.14, Git, GNU Make and curl. The host commands also need the AWS CLI, OpenSSH and the Tailscale client. Reading AIStor's licence from this computer's OpenBao also needs the macOS Keychain (the `security` command): without it the deploy skips AIStor with a notice and goes on (see the AIStor licence step below).
 
 ```sh
 make setup  # create .venv, install the pinned tools (gitleaks, Terraform 1.16.4, tflint, Trivy), the commit and commit message hooks, the working-tree privacy hook and the pre-push hook
@@ -85,7 +85,9 @@ pbcopy < /dev/null
 
 Save the licence itself with the command in `references/local_machine.md` (item 5), with the name `aistor_licence`. A periodic token expires after 768 hours without a renewal, and the unseal job renews only `openbao-agent-token` and `openbao-owner-token`: when the launcher says that OpenBao refused the read (HTTP 403), run the steps again from `bao policy write` with a new administration token.
 
-A computer without that Keychain item, or without the `security` command, makes `make host-up` stop with a fixed message that names this step. While the licence is in neither place (OpenBao holds none), the deploy prints a notice, skips AIStor and writes `skipped` to `/opt/platform/compose/aistor.state` on the host, and goes on with everything else (Airbyte, the connection step and the rest). Save the licence and run `make host-up` again: AIStor starts and the record says `started`. `make storage-up` reads that record first and, for a skipped AIStor, names this step.
+A computer without that Keychain item, or without the `security` command (Linux), has no licence source. A licence that OpenBao does not hold is the same case for the deploy: nothing is sent, and the deploy goes on with everything else (Airbyte, the connection step and the rest). `make host-up` tells the AIStor playbook only one non-secret fact, `placed` (the licence is on the host) or `absent`. With `placed`, a licence file that is missing on the host fails the AIStor step. With `absent` and no licence file on the host, the playbook skips AIStor and writes `skipped` to `/opt/platform/compose/aistor.state`, and only then does `make host-up` read that record and print the notice (it names this step when the cause is a missing token); with `absent` and a licence file already on the host, AIStor starts with that file and the notice says so. Save the licence, make the token if it is missing and run `make host-up` again: AIStor starts and the record says `started`. `make storage-up` reads that record first and, for a skipped AIStor, names this step.
+
+An interrupted placement can leave a second `0400` file, `.licence.<8 hex>.new`, that holds a copy of the licence. The placement script removes it when the SSH session drops or the script is told to stop (a hangup or a termination), and every deploy's licence check removes any that is left by a kill that cannot be caught, before the licence is read.
 
 Each service belongs to the group that `compose/limits.yml` gives it. The always-on group (`supporting`) starts with the stack. Every other group is a Compose profile of the same name and starts when a job or an operator asks for it, after the admission check. Airbyte's workloads in k3s are scaled through the Kubernetes API. A group that does not fit the available memory waits and then fails with the check's four figures.
 

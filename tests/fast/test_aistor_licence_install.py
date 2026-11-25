@@ -11,6 +11,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -114,6 +115,21 @@ class ScriptTest(unittest.TestCase):
             self.module.parse_licence(b"\xff\xfe" + LICENCE.encode())
         self.assertEqual("bad_form", caught.exception.code)
 
+    def test_a_hangup_or_termination_in_the_middle_of_a_write_removes_the_temporary_file_so_no_second_0400_copy_of_the_licence_is_left(self) -> None:
+        # The helper beside this copy of the script signals its own process after it has written the temporary file, as a dropped SSH session or a stop does.
+        helper = self.script.parent / "secret_files.py"
+        original = helper.read_text()
+        hold = "            os.fsync(handle.fileno())\n"
+        self.assertIn(hold, original)
+        for sent in (signal.SIGHUP, signal.SIGTERM):
+            with self.subTest(signal=sent.name):
+                helper.write_text(original.replace(hold, hold + f"            os.kill(os.getpid(), {int(sent)})\n", 1))
+                directory = self.folder / f"secrets_{sent.name}"
+                code, out, err = self.run_script(LICENCE, directory=directory)
+                self.assertEqual((3, ""), (code, out), "the script stops by its own refusal status and prints no code, not by the signal")
+                self.assertNotIn(LICENCE, err)
+                self.assertEqual([], sorted(path.name for path in (directory / "aistor").iterdir()), "no temporary file and no licence file is left")
+
     def test_a_licence_of_more_than_one_line_is_kept_line_for_line(self) -> None:
         text = f"{LICENCE}\nsecond-line-of-the-licence"
         self.assertEqual((0, "placed\n", ""), self.run_script(text + "\n")[:3])
@@ -165,7 +181,8 @@ class FormTest(unittest.TestCase):
         text = SCRIPT.read_text()
         imports: Any = [line for line in text.splitlines() if line.startswith(("import ", "from "))]
         self.assertTrue(
-            all(name.split()[1].split(".")[0] in {"__future__", "argparse", "importlib", "re", "sys", "pathlib", "typing"} for name in imports), imports
+            all(name.split()[1].split(".")[0] in {"__future__", "argparse", "importlib", "re", "signal", "sys", "pathlib", "typing"} for name in imports),
+            imports,
         )
 
 

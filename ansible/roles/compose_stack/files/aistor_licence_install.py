@@ -9,9 +9,10 @@ input over 16 KiB (``oversized``), bytes that are not ASCII text or hold a contr
 file is written through a fresh temporary file that is flushed and synced before it takes its place, mode 0400, so the file is whole or absent and
 never empty. The text is kept as it was sent with its edge white space trimmed. The leftovers of an interrupted write are removed at the start, a file
 with other text is replaced, a file with another mode or owner is given the right ones, and a second run with the same licence changes nothing. A file
-that cannot be written is ``cannot_write``. The script prints one code (``placed``, ``unchanged`` or a refusal) and nothing else, and exits 0 for the
-first two and 3 otherwise: the licence is in no output, no error and no log. It uses only the standard library and the helper that the role installs
-beside it, and runs on the host's Python.
+that cannot be written is ``cannot_write``. A hangup or termination in the middle of a write is an exit with status 3 and no code, and the helper's
+cleanup removes the temporary file; a kill that cannot be caught leaves it, and the deploy's licence check (``aistor_licence.yml``) removes it. The
+script prints one code (``placed``, ``unchanged`` or a refusal) and nothing else, and exits 0 for the first two and 3 otherwise: the licence is in no
+output, no error and no log. It uses only the standard library and the helper that the role installs beside it, and runs on the host's Python.
 
 The launcher starts it as ``sudo /usr/bin/python3 -I <this file>``: the host's interpreter in isolated mode (no environment variable, no user site
 folder and no script folder on the import path), so that the command that sudo matches, and the sudoers entry that turns off its input recording, name
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import signal
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -128,7 +130,14 @@ class QuietParser(argparse.ArgumentParser):
         raise SystemExit(3)
 
 
+def stop_cleanly(signum: int, frame: object) -> NoReturn:
+    """Turn a hangup (a dropped SSH session) or a termination into an exit, so the helper removes its temporary file, a second 0400 copy of the licence."""
+    raise SystemExit(3)
+
+
 def main(argv: list[str] | None = None) -> int:
+    signal.signal(signal.SIGHUP, stop_cleanly)
+    signal.signal(signal.SIGTERM, stop_cleanly)
     parser = QuietParser(description="Place AIStor's licence from standard input.")
     parser.add_argument("--directory", default=DEFAULT_DIRECTORY, help="the secrets folder")
     parser.add_argument("--owner", default=DEFAULT_OWNER, help="the numeric user and group of the root-only file, uid:gid")

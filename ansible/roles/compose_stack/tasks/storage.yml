@@ -1,5 +1,7 @@
-# The AIStor step. Reads compose_stack_aistor_state_file, compose_stack_owner, compose_stack_group, compose_stack_aistor_licence_file and compose_stack_storage_services.
-# The licence file is placed by the launcher before this step (scripts.infra.host). When it is missing the server cannot serve a call, so this step does not start it:
+# The AIStor step. Reads compose_stack_aistor_state_file, compose_stack_owner, compose_stack_group, compose_stack_aistor_licence_file, compose_stack_storage_services
+# and aistor_licence_placement (placed or absent: what the launcher did with the licence). The licence file is placed by the launcher before this step (scripts.infra.host).
+# When the launcher says that it placed the licence and the file is missing, the step fails (aistor_licence.yml). When this computer sent none and the file is missing
+# on the host, the server cannot serve a call, so this step does not start it, and the skip is announced only then:
 # it records "skipped" in the state file that make storage-up reads and goes on, and the deploy's other steps run. When the file is there (malformed is refused by
 # aistor_licence.yml), AIStor starts, its project user is verified and, if need be, made, and the state file says "started" only after both. The state file is removed
 # on any failure of the step, so a step that fails never leaves an earlier claim behind, and it is written again only when its content changes. A second run with the
@@ -21,8 +23,8 @@
     - name: Say that AIStor is skipped
       ansible.builtin.debug:
         msg: >-
-          AIStor is skipped: the licence file {{ compose_stack_aistor_licence_file }} is missing. The deploy goes on; store the licence in the owner's OpenBao at
-          secret/aistor_licence and run make host-up again.
+          AIStor is skipped: this computer sent no licence and the licence file {{ compose_stack_aistor_licence_file }} is missing on the host. The deploy goes on;
+          store the licence in the owner's OpenBao at secret/aistor_licence (README.md, AIStor's licence, names the owner's step) and run make host-up again.
       when: not compose_stack_aistor_licence_present
 
     - name: Start AIStor and wait for its health

@@ -189,6 +189,58 @@ class ReadTest(unittest.TestCase):
         self.assertNotIn("print(", (ROOT / "scripts" / "infra" / "aistor_licence.py").read_text())
 
 
+class ReportTest(unittest.TestCase):
+    """The notice that AIStor is skipped is printed after the host has said that it has no licence, and never before."""
+
+    STATE = "skipped: no AIStor licence file was on the host at the last deploy; place the licence and deploy again\n"
+
+    def report(self, placement: str, state: str | None) -> str:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.object(host, "ssh_output", return_value=state) as ssh:
+            host.report_aistor_state(RUN_ID, ADDRESS, placement)
+        self.ssh = ssh
+        return output.getvalue()
+
+    def test_a_skipped_aistor_prints_the_notice_for_its_reason_after_the_host_confirmed_it(self) -> None:
+        absent = self.report("absent", self.STATE)
+        self.assertIn("AIStor is skipped", absent)
+        self.assertIn("secret/aistor_licence", absent)
+        self.assertIn("make host-up", absent)
+        no_source = self.report("no_source", self.STATE)
+        self.assertIn("AIStor is skipped", no_source)
+        self.assertIn("openbao-aistor-licence-token", no_source)
+        self.assertIn("README.md", no_source)
+        self.assertIn("aistor-licence-read", no_source)
+
+    def test_the_state_is_read_with_one_fixed_read_only_command_on_the_file_the_playbook_writes(self) -> None:
+        self.report("absent", self.STATE)
+        run_id, address, command, _ = self.ssh.call_args.args
+        self.assertEqual((RUN_ID, ADDRESS, f"cat {host.AISTOR_STATE_FILE}"), (run_id, address, command))
+        variables = group_variables()
+        self.assertEqual("{{ compose_stack_compose_directory }}/aistor.state", variables["compose_stack_aistor_state_file"])
+        self.assertEqual("/opt/platform/compose/aistor.state", host.AISTOR_STATE_FILE)
+
+    def test_a_licence_that_was_placed_prints_nothing_and_reads_nothing(self) -> None:
+        for placement in ("placed", "unchanged"):
+            with self.subTest(placement):
+                self.assertEqual("", self.report(placement, self.STATE))
+                self.ssh.assert_not_called()
+
+    def test_an_aistor_that_started_with_a_licence_file_that_was_already_on_the_host_says_so_and_does_not_claim_a_skip(self) -> None:
+        for placement in ("absent", "no_source"):
+            with self.subTest(placement):
+                text = self.report(placement, "started\n")
+                self.assertIn("started with the licence file that was already on the host", text)
+                self.assertNotIn("is skipped", text)
+
+    def test_a_state_that_cannot_be_read_or_is_not_a_known_record_claims_no_skip(self) -> None:
+        for state in (None, "", "garbage\n", "skipped-but-not-really"):
+            with self.subTest(state=state):
+                text = self.report("absent", state)
+                self.assertNotIn("is skipped", text)
+                self.assertIn("could not confirm", text)
+
+
 class OwnerSetupStepTest(unittest.TestCase):
     """The README holds the exact commands of the owner's one-time step, and they match what the launcher reads."""
 
@@ -224,16 +276,21 @@ class PlaceTest(unittest.TestCase):
         self.runs: list[tuple[str, list[str], dict[str, Any]]] = []
         self.sudoers = ROLES / "compose_stack" / "files" / "aistor_licence_install.sudoers"
         self.policy_status, self.script_status, self.script_output = 0, 0, "placed\n"
-        self.licence: str | None = LICENCE
+        self.licence: str | None | Exception = LICENCE
         self.output = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.output))
         for patcher in (
             mock.patch.object(host, "run_command", side_effect=self.run_command),
-            mock.patch.object(aistor_licence, "read_licence", side_effect=lambda: self.licence),
+            mock.patch.object(aistor_licence, "read_licence", side_effect=self.read_licence),
             mock.patch.object(host, "ssh_arguments", return_value=["-o", "BatchMode=yes"]),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def read_licence(self) -> str | None:
+        if isinstance(self.licence, Exception):
+            raise self.licence
+        return self.licence
 
     def run_command(self, program: str, arguments: list[str], **keywords: Any) -> CompletedProcess[str]:
         self.runs.append((program, arguments, keywords))
@@ -265,15 +322,33 @@ class PlaceTest(unittest.TestCase):
         self.assertEqual(1, len(self.runs))
         self.assertNotIn(LICENCE, self.everything())
 
-    def test_a_licence_that_is_not_in_the_local_openbao_prints_the_notice_makes_no_ssh_call_and_is_not_an_error(self) -> None:
+    def test_a_licence_that_is_not_in_the_local_openbao_makes_no_ssh_call_prints_no_notice_yet_and_is_not_an_error(self) -> None:
         self.licence = None
         self.assertEqual("absent", host.place_aistor_licence(RUN_ID, ADDRESS))
         self.assertEqual([], self.runs)
-        printed = self.output.getvalue()
-        self.assertIn("AIStor", printed)
-        self.assertIn("skipped", printed)
-        self.assertIn("secret/aistor_licence", printed)
-        self.assertIn("make host-up", printed)
+        self.assertEqual("", self.output.getvalue(), "the notice waits until the host has confirmed that it has no licence")
+
+    def test_a_computer_with_no_licence_source_makes_no_ssh_call_prints_no_notice_yet_and_is_not_an_error(self) -> None:
+        self.licence = aistor_licence.NoLicenceSource(aistor_licence.SETUP_MESSAGE)
+        self.assertEqual("no_source", host.place_aistor_licence(RUN_ID, ADDRESS))
+        self.assertEqual([], self.runs)
+        self.assertEqual("", self.output.getvalue())
+
+    def test_a_failure_to_read_the_licence_still_stops_the_deploy_with_the_fixed_message(self) -> None:
+        self.licence = aistor_licence.LicenceError("this computer's OpenBao refused the read of the AIStor licence (HTTP 403)")
+        with self.assertRaises(HostError) as caught:
+            host.place_aistor_licence(RUN_ID, ADDRESS)
+        self.assertIn("HTTP 403", str(caught.exception))
+        self.assertEqual([], self.runs)
+
+    def test_the_placement_is_given_to_ansible_as_placed_or_absent_and_nothing_else(self) -> None:
+        self.assertEqual("placed", host.licence_fact("placed"))
+        self.assertEqual("placed", host.licence_fact("unchanged"))
+        self.assertEqual("absent", host.licence_fact("absent"))
+        self.assertEqual("absent", host.licence_fact("no_source"))
+        for other in ("", "skipped", "PLACED", None, 5):
+            with self.subTest(other=other), self.assertRaises(ValueError):
+                host.licence_fact(other)  # type: ignore[arg-type]
 
     def test_each_answer_of_the_script_is_a_fixed_message_and_the_refusals_name_no_value(self) -> None:
         for code in ("oversized", "empty", "bad_form", "bad_owner", "cannot_write"):
