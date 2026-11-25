@@ -32,6 +32,8 @@ ALLOWED = {
     "ansible/roles/compose_stack/library/aistor_project_user.py",
 }
 ROOT_NAMES = re.compile(r"aistor_root_|aistor/root_|MINIO_ROOT|\broot_user\b|\broot_password\b")
+# The name of the owner's approval of one root repair holds "aistor_root_" but names no root file and no root variable, so the scans below do not count it.
+APPROVAL_NAME = "compose_stack_aistor_root_repair"
 ROOT_VALUE = re.compile(r"MINIO_ROOT_(?:USER|PASSWORD)(?!_FILE)|MINIO_USER|MINIO_PASSWORD|MC_HOST_")
 TASKS = ROOT / "ansible" / "roles" / "compose_stack" / "tasks"
 
@@ -52,14 +54,14 @@ def repository_files() -> dict[str, str]:
 
 def root_use_problems(files: dict[str, str]) -> list[str]:
     """Each file that names a root file or variable without being allowed to, and each root variable set as a value anywhere."""
-    found = [f"{name}: names AIStor's root pair" for name, text in files.items() if name not in ALLOWED and ROOT_NAMES.search(text)]
+    found = [f"{name}: names AIStor's root pair" for name, text in files.items() if name not in ALLOWED and ROOT_NAMES.search(text.replace(APPROVAL_NAME, ""))]
     found += [f"{name}: sets a root variable as a value" for name, text in files.items() if re.search(r"MINIO_ROOT_(?:USER|PASSWORD)(?!_FILE)", text)]
     return found
 
 
 MODULE_FILE = "ansible/roles/compose_stack/library/aistor_project_user.py"
 ROOT_SCRIPT_KINDS = {"read", "user_add", "policy_create"}
-ROOT_CALL_KINDS = {"read", "user_add", "policy_create", "sign_in"}
+ROOT_CALL_KINDS = {"read", "user_add", "policy_create", "sign_in", "audit"}
 # Every call the module may make with the root pair, as the first three words that mc gets. A new one needs a new line here, and so a reviewer's eye.
 ROOT_READS = {
     ("admin", "policy", "info"),
@@ -128,7 +130,7 @@ def module_root_problems(text: str) -> list[str]:
     literals = [
         node.value
         for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "aistor_root" in node.value and id(node) not in skipped
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "aistor_root" in node.value.replace(APPROVAL_NAME, "") and id(node) not in skipped
     ]
     if len(literals) != 2:
         problems.append(f"the module names a root file in {len(literals)} places, not the 2 of ROOT_PAIR_FILES")
@@ -182,6 +184,12 @@ class RootUseTest(unittest.TestCase):
         self.assertEqual(
             ["scripts/new.py: names AIStor's root pair", "scripts/new.py: sets a root variable as a value"],
             root_use_problems({"scripts/new.py": "MINIO_ROOT_PASSWORD=abc"}),
+        )
+
+    def test_the_name_of_the_approval_is_not_a_root_file_but_a_root_file_next_to_it_is_still_found(self) -> None:
+        self.assertEqual([], root_use_problems({"scripts/new.py": f"{APPROVAL_NAME}: true"}))
+        self.assertEqual(
+            ["scripts/new.py: names AIStor's root pair"], root_use_problems({"scripts/new.py": f"{APPROVAL_NAME}: true\ncat aistor/root_password"})
         )
 
     def test_a_root_variable_as_a_value_is_found_even_in_an_allowed_file(self) -> None:
@@ -246,9 +254,15 @@ class ModuleRootUseTest(unittest.TestCase):
         )
         self.assertIn("the module reads or sets an environment", module_root_problems(self.text() + "\nimport os\nVALUE = os.environ\n"))
 
-    def test_the_project_users_sign_in_script_is_not_among_the_scripts_that_read_the_pair(self) -> None:
+    def test_the_project_users_sign_in_script_and_the_audit_script_are_not_among_the_scripts_that_read_the_pair(self) -> None:
         self.assertEqual({"read", "user_add", "policy_create"}, ROOT_SCRIPT_KINDS)
         self.assertNotIn("sign_in", ROOT_SCRIPT_KINDS)
+        self.assertNotIn("audit", ROOT_SCRIPT_KINDS)
+
+    def test_the_audit_script_that_reads_the_root_files_is_found(self) -> None:
+        planted = self.text().replace('"audit": (\n        f\'IFS= read', '"audit": (\n        f\'{ROOT_SIGN_IN}; IFS= read')
+        self.assertNotEqual(self.text(), planted)
+        self.assertIn("the script audit reads the root pair", module_root_problems(planted))
 
 
 class ModeCheckTest(unittest.TestCase):
@@ -313,12 +327,12 @@ class ProjectPasswordFileTest(unittest.TestCase):
         make = tasks_of("aistor_credentials.yml")[0]
         self.assertEqual("{{ secret_files_root_owner }}", make["secret_file"]["owner"])
         self.assertTrue(make["secret_file"]["refuse_edge_whitespace"])
-        self.assertEqual(["root_user", "root_password", "project_password"], make["loop"])
+        self.assertEqual(["root_user", "root_password", "project_password", "audit_password"], make["loop"])
         self.assertIs(True, make["no_log"])
 
-    def test_the_check_covers_each_of_the_three_files(self) -> None:
+    def test_the_check_covers_each_of_the_four_files(self) -> None:
         stat_task = next(task for task in tasks_of("verify_aistor_credentials.yml") if "ansible.builtin.stat" in task)
-        self.assertEqual(["root_user", "root_password", "project_password"], stat_task["loop"])
+        self.assertEqual(["root_user", "root_password", "project_password", "audit_password"], stat_task["loop"])
 
     def test_the_project_user_is_not_the_root_name_and_the_policy_is_not_a_built_in_one(self) -> None:
         variables = group_variables()
@@ -350,23 +364,64 @@ class OrderTest(unittest.TestCase):
             [task for task in tasks_of("main.yml") if (task.get("vars") or {}).get("compose_stack_start_services") == "{{ compose_stack_storage_services }}"],
         )
 
-    def test_the_bootstrap_task_is_hidden_names_the_password_by_file_only_and_gives_the_bucket_from_the_launcher(self) -> None:
+    def test_the_bootstrap_task_is_hidden_names_the_passwords_by_file_only_and_gives_the_bucket_from_the_launcher(self) -> None:
         (task,) = tasks_of("aistor_project_user.yml")
         self.assertIs(True, task["no_log"])
         self.assertEqual(
-            {"compose_command", "service", "user", "policy", "bucket", "password_file", "openbao_address", "openbao_secret_id_file", "openbao_path", "rotate"},
+            {
+                "compose_command",
+                "service",
+                "user",
+                "policy",
+                "bucket",
+                "password_file",
+                "audit_user",
+                "audit_policy",
+                "audit_password_file",
+                "marker_file",
+                "openbao_address",
+                "openbao_secret_id_file",
+                "openbao_path",
+                "audit_openbao_path",
+                "repair",
+            },
             set(task["aistor_project_user"]),
         )
         params = task["aistor_project_user"]
         self.assertEqual("{{ aistor_bucket }}", params["bucket"])
         self.assertEqual("{{ compose_stack_aistor_project_password_file }}", params["password_file"])
-        self.assertEqual("{{ compose_stack_aistor_rotate_password }}", params["rotate"])
+        self.assertEqual("{{ compose_stack_aistor_audit_password_file }}", params["audit_password_file"])
+        self.assertEqual("{{ compose_stack_aistor_root_repair }}", params["repair"])
+        self.assertEqual("{{ compose_stack_aistor_bootstrap_marker }}", params["marker_file"])
         self.assertEqual("{{ compose_stack_secrets_directory }}/openbao/bootstrap.secret_id", params["openbao_secret_id_file"])
         self.assertEqual("{{ compose_stack_aistor_openbao_path }}", params["openbao_path"])
-        self.assertNotIn("password:", str(params).replace("password_file", "").replace("rotate_password", ""))
+        self.assertEqual("{{ compose_stack_aistor_audit_openbao_path }}", params["audit_openbao_path"])
+        self.assertNotIn("password:", str(params).replace("password_file", "").replace("root_repair", ""))
 
-    def test_the_rotation_is_off_by_default_so_a_new_password_file_is_never_set_on_the_user_without_the_owner(self) -> None:
-        self.assertIs(False, group_variables()["compose_stack_aistor_rotate_password"])
+    def test_the_root_repair_is_off_by_default_so_the_root_pair_is_never_used_again_without_the_owner(self) -> None:
+        variables = group_variables()
+        self.assertIs(False, variables["compose_stack_aistor_root_repair"])
+        self.assertNotIn("compose_stack_aistor_rotate_password", variables)
+
+    def test_the_marker_is_a_root_only_file_beside_the_state_file_and_the_audit_identity_has_names_and_paths_of_its_own(self) -> None:
+        variables = group_variables()
+        self.assertEqual("{{ compose_stack_compose_directory }}/aistor.bootstrap", variables["compose_stack_aistor_bootstrap_marker"])
+        self.assertNotEqual(variables["compose_stack_aistor_project_user"], variables["compose_stack_aistor_audit_user"])
+        self.assertNotEqual(variables["compose_stack_aistor_project_policy"], variables["compose_stack_aistor_audit_policy"])
+        self.assertNotIn(str(variables["compose_stack_aistor_audit_user"]).lower(), {"minioadmin", "root", "admin"})
+        self.assertNotIn(variables["compose_stack_aistor_audit_policy"], {"consoleAdmin", "readwrite", "readonly", "writeonly", "diagnostics"})
+        self.assertEqual("{{ compose_stack_secrets_directory }}/aistor/audit_password", variables["compose_stack_aistor_audit_password_file"])
+
+    def test_the_audit_sign_in_is_at_a_path_that_the_aistor_services_role_cannot_read_and_that_terraforms_identity_never_names(self) -> None:
+        variables = group_variables()
+        self.assertEqual("secret/data/services/{{ compose_stack_aistor_service }}/audit", variables["compose_stack_aistor_audit_openbao_path"])
+        self.assertNotEqual(variables["compose_stack_aistor_openbao_path"], variables["compose_stack_aistor_audit_openbao_path"])
+        from scripts.infra import storage
+
+        self.assertNotIn("audit", Path(storage.__file__).read_text().lower(), "the storage command and Terraform sign in as the bucket-only project user")
+        for name, text in repository_files().items():
+            if name.startswith("infra/storage/") and name.endswith(".tf"):
+                self.assertNotIn("audit", text.lower(), name)
 
     def test_the_openbao_path_is_the_one_that_the_aistor_role_reads_and_that_the_storage_command_asks_for(self) -> None:
         from scripts.infra import storage

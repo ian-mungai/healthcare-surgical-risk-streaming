@@ -171,6 +171,12 @@ class ProjectUserPolicyTest(unittest.TestCase):
         self.assertNotIn("metadata", text)
         self.assertNotIn("list", text)
 
+    def test_the_clients_policy_cannot_read_the_audit_identitys_path_which_only_the_deploys_admin_role_reads(self) -> None:
+        text = bootstrap.policy_text("aistor", single_path="aistor")
+        self.assertNotIn("audit", text)
+        self.assertNotIn("secret/data/services/aistor/audit", text)
+        self.assertNotIn("secret/data/services/aistor/audit", bootstrap.policy_text("nessie"))
+
     def test_the_policy_of_a_service_that_is_not_the_client_is_what_it_was(self) -> None:
         self.assertEqual(bootstrap.policy_text("nessie"), bootstrap.policy_text("nessie", single_path=None))
         self.assertIn("secret/data/services/nessie/*", bootstrap.policy_text("nessie"))

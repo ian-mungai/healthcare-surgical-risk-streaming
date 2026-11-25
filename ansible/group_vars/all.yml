@@ -73,21 +73,32 @@ compose_stack_aistor_licence_script: "{{ compose_stack_bin_directory }}/aistor_l
 compose_stack_aistor_licence_sudoers: /etc/sudoers.d/aistor_licence_install
 compose_stack_visudo: /usr/sbin/visudo
 compose_stack_aistor_state_file: "{{ compose_stack_compose_directory }}/aistor.state"
-# The AIStor step (aistor_project_user.yml) verifies the project user as that user and uses AIStor's root pair only when that sign-in is refused: it makes the
-# project's one user and one policy, and every other client (Terraform, the storage command, its checks) signs in as that user. The user's password is a generated
-# root-only file beside the root files; the step keeps the user and the password in OpenBao (compose_stack_aistor_openbao_path) after that pair has signed in, and
-# that service's own role alone reads it. The bucket is given by the launcher as aistor_bucket (the S3_BUCKET value of the project profile). The policy name must
+# The AIStor step (aistor_project_user.yml) makes the project's one user and one policy and a read-only audit identity with AIStor's root pair on the FIRST
+# bootstrap of a host only, and ends it with a root-only marker file. Every other client (Terraform, the storage command, its checks) signs in as the project user.
+# A later deploy reads the live state as the audit identity and the project user, makes no root call and no write, and fails with a fixed message that names each
+# difference. The passwords are generated root-only files beside the root files; the step keeps each sign-in in OpenBao after that pair has signed in. The project
+# user's sign-in is read by that service's own role (compose_stack_aistor_openbao_path); the audit identity's is read by the deploy's admin role alone
+# (compose_stack_aistor_audit_openbao_path). The bucket is given by the launcher as aistor_bucket (the S3_BUCKET value of the project profile). A policy name must
 # not be one of AIStor's built-in policies.
 compose_stack_aistor_service: aistor
 compose_stack_aistor_project_user: project_user
 compose_stack_aistor_project_policy: project_bucket
 compose_stack_aistor_project_password_file: "{{ compose_stack_secrets_directory }}/aistor/project_password"
-# The path of the project user's sign-in in OpenBao (version 2 secret engine). The OpenBao step gives the service's own role a policy that reads this one path and
-# nothing else, the AIStor step reads and writes it as the admin role after the sign-in has been verified, and the storage command reads it as the service's role.
+compose_stack_aistor_audit_user: project_audit
+compose_stack_aistor_audit_policy: project_audit_read
+compose_stack_aistor_audit_password_file: "{{ compose_stack_secrets_directory }}/aistor/audit_password"
+# The marker that ends the first bootstrap of this host: a root-only plain file (mode 0400) beside the state file, written last. While it is absent the next deploy is
+# the first bootstrap again. Remove it only by hand, and only to make the next deploy a first bootstrap.
+compose_stack_aistor_bootstrap_marker: "{{ compose_stack_compose_directory }}/aistor.bootstrap"
+# The paths of the sign-ins in OpenBao (version 2 secret engine). The OpenBao step gives the service's own role a policy that reads the project path and nothing
+# else, so the audit path is read and written by the admin role of the deploy only, after the sign-in has been verified.
 compose_stack_aistor_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/aistor"
-# The owner's approval to set the password file's value on a project user that exists and that neither OpenBao's sign-in nor the file signs in as. Off: the AIStor
-# step then refuses, changes no password and writes nothing to OpenBao. The owner sets it to true for the one deploy that rotates and sets it back to false.
-compose_stack_aistor_rotate_password: false
+compose_stack_aistor_audit_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/audit"
+# The owner's approval to use AIStor's root pair again for one deploy, after the first bootstrap: it makes the project's accounts match their definition (removes a
+# policy or group that is not theirs, restores a missing user, policy or OpenBao entry) and, only for an account that exists and that neither OpenBao's sign-in nor
+# the file signs in as, sets the password file's value on it. Off: a refused sign-in or any difference fails the deploy and changes nothing. The owner sets it to
+# true for the one deploy that repairs and sets it back to false.
+compose_stack_aistor_root_repair: false
 compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.

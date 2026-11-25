@@ -391,9 +391,9 @@ class GrafanaPasswordTest(unittest.TestCase):
 
 
 class AistorCredentialsTest(unittest.TestCase):
-    """AIStor's root user and password and the project user's password are three files of root, mode 0400, made once, never printed or replaced."""
+    """AIStor's root user and password and the project and audit passwords are four files of root, mode 0400, made once, never printed or replaced."""
 
-    FILES = ("root_user", "root_password", "project_password")
+    FILES = ("root_user", "root_password", "project_password", "audit_password")
 
     def values(self, folder: Path) -> dict[str, object]:
         return variables(folder)
@@ -481,7 +481,7 @@ class AistorCredentialVerifyTest(unittest.TestCase):
             folder = Path(scratch)
             target = folder / "secrets" / "aistor"
             target.mkdir(parents=True, mode=0o700)
-            for name in ("root_user", "root_password", "project_password"):
+            for name in ("root_user", "root_password", "project_password", "audit_password"):
                 if not create and name == "root_password":
                     continue
                 if link and name == "root_password":
@@ -523,7 +523,7 @@ class AistorStatOutputTest(unittest.TestCase):
             folder = Path(scratch)
             target = folder / "secrets" / "aistor"
             target.mkdir(parents=True, mode=0o700)
-            for name in ("root_user", "root_password", "project_password", "licence"):
+            for name in ("root_user", "root_password", "project_password", "audit_password", "licence"):
                 (target / name).write_text("planted-value-0123456789")
                 (target / name).chmod(0o400)
             digest = hashlib.sha1(b"planted-value-0123456789", usedforsecurity=False).hexdigest()

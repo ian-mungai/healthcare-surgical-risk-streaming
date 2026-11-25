@@ -1,10 +1,13 @@
 # Reads compose_stack_docker, compose_stack_aistor_service, compose_stack_aistor_project_user, compose_stack_aistor_project_policy, compose_stack_aistor_project_password_file,
-# compose_stack_aistor_openbao_path, compose_stack_aistor_rotate_password, compose_stack_secrets_directory, openbao_port and aistor_bucket (the launcher gives the bucket).
-# The project user signs in as itself with the sign-in that OpenBao keeps, so a deploy that matches makes no call with AIStor's root pair and no write. Only a refused
-# sign-in or a changed policy sends the step to the root pair, which the module's script reads inside the AIStor container from the container's own secrets mount.
-# OpenBao is logged in to as the bootstrap role, whose secret ID file is root-only on the host, and is written with the sign-in only after that pair has signed in.
-# The task is hidden, so neither password reaches a log.
-- name: Verify the AIStor project user as itself, and make its user and policy with the root pair that the server's container reads only when that fails
+# compose_stack_aistor_audit_user, compose_stack_aistor_audit_policy, compose_stack_aistor_audit_password_file, compose_stack_aistor_bootstrap_marker,
+# compose_stack_aistor_openbao_path, compose_stack_aistor_audit_openbao_path, compose_stack_aistor_root_repair, compose_stack_secrets_directory, openbao_port and
+# aistor_bucket (the launcher gives the bucket).
+# The first bootstrap of a host (the marker file is absent) makes the project user, its policy and the audit identity with the root pair, which the module's script
+# reads inside the AIStor container from the container's own secrets mount, keeps both sign-ins in OpenBao after each pair has signed in, and writes the marker last.
+# Every later deploy reads the live state as the audit identity and as the project user with the sign-ins that OpenBao keeps, makes no root call and no write, and
+# fails with a fixed message that names each difference. Only compose_stack_aistor_root_repair: true, for one deploy, lets the root pair repair what differs.
+# OpenBao is logged in to as the bootstrap role, whose secret ID file is root-only on the host. The task is hidden, so no password reaches a log.
+- name: Make the AIStor accounts on the first bootstrap with the root pair, and afterwards check the live state as the audit identity and the project user
   aistor_project_user:
     compose_command: "{{ compose_stack_docker }}"
     service: "{{ compose_stack_aistor_service }}"
@@ -12,9 +15,14 @@
     policy: "{{ compose_stack_aistor_project_policy }}"
     bucket: "{{ aistor_bucket }}"
     password_file: "{{ compose_stack_aistor_project_password_file }}"
+    audit_user: "{{ compose_stack_aistor_audit_user }}"
+    audit_policy: "{{ compose_stack_aistor_audit_policy }}"
+    audit_password_file: "{{ compose_stack_aistor_audit_password_file }}"
+    marker_file: "{{ compose_stack_aistor_bootstrap_marker }}"
     openbao_address: "http://127.0.0.1:{{ openbao_port }}"
     openbao_secret_id_file: "{{ compose_stack_secrets_directory }}/openbao/bootstrap.secret_id"
     openbao_path: "{{ compose_stack_aistor_openbao_path }}"
-    rotate: "{{ compose_stack_aistor_rotate_password }}"
+    audit_openbao_path: "{{ compose_stack_aistor_audit_openbao_path }}"
+    repair: "{{ compose_stack_aistor_root_repair }}"
   timeout: 300
   no_log: true
