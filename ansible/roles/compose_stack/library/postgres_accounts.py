@@ -9,6 +9,9 @@ mode or owner is given the right ones, and its password is kept.
 password or attributes differ from the file and removes every grant on a tool's databases, so that only the tool's own account (and the administrator)
 can connect. A server that already matches needs no change and the step reports none.
 
+``step: slots`` reads how many connections each account holds and how many the server allows to ordinary accounts, and reports whether they are all held. It
+changes nothing and prints counts by account name only, never a query, an address or a password.
+
 A line of the tool list is a bare tool name, which owns one database named for the tool, or ``tool: database database ...``, which owns the databases it
 lists. A database belongs to one tool: a name listed twice or owned by another tool is refused.
 
@@ -183,6 +186,51 @@ FROM pg_database d WHERE d.datname = ANY (string_to_array(:'databases', ',')) OR
 """
 
 
+SLOTS_QUERY = """\
+SELECT 'setting', name, setting FROM pg_settings WHERE name IN ('max_connections', 'superuser_reserved_connections') ORDER BY name;
+SELECT 'held', r.rolname, count(*) FROM pg_stat_activity a JOIN pg_roles r ON r.oid = a.usesysid
+WHERE a.backend_type = 'client backend' AND NOT r.rolsuper GROUP BY r.rolname ORDER BY r.rolname;
+"""
+BUDGET_FILE_NAME = "compose/postgres_connections.yml"
+
+
+@dataclass(frozen=True)
+class Slots:
+    max_connections: int
+    reserved: int
+    held: dict[str, int]
+
+
+def parse_slots(output: str) -> Slots:
+    settings: dict[str, int] = {}
+    held: dict[str, int] = {}
+    for line in output.splitlines():
+        parts = line.split("|")
+        if len(parts) == 3 and parts[0] == "setting" and parts[1] in ("max_connections", "superuser_reserved_connections") and parts[2].isdigit():
+            settings[parts[1]] = int(parts[2])
+        elif len(parts) == 3 and parts[0] == "held" and parts[2].isdigit():
+            held[parts[1]] = int(parts[2])
+        else:
+            raise AccountError("the slots query returned a line of an unexpected shape")
+    if set(settings) != {"max_connections", "superuser_reserved_connections"}:
+        raise AccountError("the slots query did not return both settings")
+    return Slots(settings["max_connections"], settings["superuser_reserved_connections"], held)
+
+
+def slots_report(slots: Slots) -> tuple[bool, str]:
+    """Whether every slot for ordinary accounts is held, and the sentence for a failed start: cause, figures, holders and budget file."""
+    usable = slots.max_connections - slots.reserved
+    used = sum(slots.held.values())
+    holders = ", ".join(f"{name} {count}" for name, count in sorted(slots.held.items())) or "none"
+    if used >= usable:
+        return True, (
+            f"PostgreSQL connection slots are full: {used} of {usable} slots for ordinary accounts are held ({holders}), "
+            f"so a tool that connects now is refused with 'remaining connection slots are reserved for roles with the SUPERUSER attribute'. "
+            f"Each tool's maximum is in {BUDGET_FILE_NAME}."
+        )
+    return False, f"PostgreSQL connection slots are not full now: {used} of {usable} slots for ordinary accounts are held ({holders})."
+
+
 def tool_variable(tools: dict[str, list[str]]) -> str:
     """The value of the psql variable ``tools``, which the state query splits into the listed accounts."""
     return ",".join(tools)
@@ -264,7 +312,7 @@ def make_password_files(store: PasswordStore, owners: dict[str, tuple[int, int]]
 def main() -> None:
     module = AnsibleModule(
         argument_spec={
-            "step": {"type": "str", "required": True, "choices": ["passwords", "provision"]},
+            "step": {"type": "str", "required": True, "choices": ["passwords", "provision", "slots"]},
             "tools_file": {"type": "path", "required": True},
             "secrets_directory": {"type": "path", "required": True},
             "services_file": {"type": "path"},
@@ -293,6 +341,9 @@ def main() -> None:
         if not module.params["compose_command"]:
             raise AccountError("the provision step needs compose_command")
         server = Server(lambda args, data: module.run_command(args, data=data, check_rc=False), module.params["compose_command"])
+        if module.params["step"] == "slots":
+            full, message = slots_report(parse_slots(server.psql(SLOTS_QUERY, tools)))
+            module.exit_json(changed=False, full=full, message=message)
         roles, databases = parse_state(server.psql(STATE_QUERY, tools))
         actions = plan(tools, roles, databases, store.read)
         if actions and not module.check_mode:

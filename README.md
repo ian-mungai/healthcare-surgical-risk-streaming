@@ -69,6 +69,8 @@ make group-up GROUP=<name>     # admit and start the group, and wait until its s
 make group-down GROUP=<name>   # stop the group's services and leave every other service running
 ```
 
+The shared PostgreSQL server has 100 connection slots and keeps 3 for superusers. `compose/postgres_connections.yml` gives each client (Temporal, Airbyte's pods, Apicurio, Nessie, Alloy and the three Dagster services) a maximum, and a fast test fails when the maxima and the margin pass 97 or when a tracked file does not carry the cap that its entry states. When the start of the stack fails, the failure message says "PostgreSQL connection slots are full" and shows how many slots each account holds, if that is the cause.
+
 The commands read the compose folder from `STACK_COMPOSE_DIRECTORY` (default: this repository's `compose`).
 
 The patient assignment rule, one split by patient for all models, is in `scripts/sample/split.py`. Rebuild the candidate cases for the fixed sample with `.venv/bin/python -m scripts.sample.candidates check`.

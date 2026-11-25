@@ -19,6 +19,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from scripts.stack.yaml_text import load_yaml
 from tests.fast.ansible_paths import shared_module
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -386,6 +387,75 @@ class ServerFailureTest(unittest.TestCase):
                 with self.subTest(reason=reason, sign=sign):
                     self.assertIn(f"(reason: {reason})", self.failure(f"psql: {sign}"))
         self.assertEqual(self.SIGNS, {word: tuple(signs) for word, signs in accounts.REASONS})
+
+
+class SlotsTest(unittest.TestCase):
+    """The read of the connection slots, which the failed health wait of the start shows: counts by account name, never a query, a host or a password."""
+
+    OUTPUT = "setting|max_connections|100\nsetting|superuser_reserved_connections|3\nheld|airbyte|75\nheld|apicurio|20\nheld|nessie|1\n"
+
+    def report(self, output: str) -> tuple[bool, str]:
+        full, message = accounts.slots_report(accounts.parse_slots(output))
+        return bool(full), str(message)
+
+    def test_the_output_is_read_back_as_the_slots_and_the_connections_each_account_holds(self) -> None:
+        slots = accounts.parse_slots(self.OUTPUT)
+        self.assertEqual((100, 3, {"airbyte": 75, "apicurio": 20, "nessie": 1}), (slots.max_connections, slots.reserved, slots.held))
+
+    def test_a_server_whose_ordinary_slots_are_all_held_is_full_and_the_message_names_the_cause_the_figures_the_holders_and_the_budget(self) -> None:
+        full, message = self.report(self.OUTPUT.replace("airbyte|75", "airbyte|76"))
+        self.assertTrue(full)
+        self.assertIn("PostgreSQL connection slots are full", message)
+        self.assertIn("97 of 97", message)
+        self.assertIn("airbyte 76, apicurio 20, nessie 1", message)
+        self.assertIn("compose/postgres_connections.yml", message)
+
+    def test_one_slot_free_is_not_full_and_the_message_does_not_name_the_cause(self) -> None:
+        full, message = self.report(self.OUTPUT)
+        self.assertFalse(full)
+        self.assertNotIn("slots are full", message)
+        self.assertIn("96 of 97", message)
+
+    def test_a_server_with_no_ordinary_connection_is_not_full(self) -> None:
+        full, message = self.report("setting|max_connections|100\nsetting|superuser_reserved_connections|3\n")
+        self.assertFalse(full)
+        self.assertIn("0 of 97", message)
+
+    def test_a_line_of_another_shape_or_a_missing_setting_is_refused_without_echoing_it(self) -> None:
+        for output in ("held|airbyte|many\n", "setting|max_connections|100\n", "setting|work_mem|4\n", "something secret-looking\n"):
+            with self.subTest(output=output), self.assertRaises(accounts.AccountError) as caught:
+                accounts.parse_slots(output)
+            self.assertNotIn("secret-looking", str(caught.exception))
+            self.assertNotIn("many", str(caught.exception))
+
+    def test_the_query_counts_connections_of_ordinary_accounts_and_reads_no_query_text_address_or_name_of_a_database(self) -> None:
+        for column in ("query", "client_addr", "datname", "application_name"):
+            self.assertNotIn(column, accounts.SLOTS_QUERY)
+        self.assertIn("NOT r.rolsuper", accounts.SLOTS_QUERY)
+
+    def test_the_server_returns_the_answer_of_the_slots_query(self) -> None:
+        calls: list[str] = []
+
+        def run(command: list[str], data: str) -> tuple[int, str, str]:
+            calls.append(data)
+            return 0, self.OUTPUT, ""
+
+        self.assertEqual(self.OUTPUT, accounts.Server(run, ["docker", "compose"]).psql(accounts.SLOTS_QUERY, {"nessie": ["nessie"]}))
+        self.assertEqual([accounts.SLOTS_QUERY], calls)
+
+    def test_the_start_reads_the_slots_after_a_failed_health_wait_and_the_failure_message_leads_with_what_it_found(self) -> None:
+        document: Any = load_yaml((ROOT / "ansible" / "roles" / "compose_stack" / "tasks" / "start.yml").read_text())
+        self.assertIsInstance(document, list)
+        block = next(task for task in document if isinstance(task, dict) and "rescue" in task)
+        rescue = block["rescue"]
+        read = next(task for task in rescue if "postgres_accounts" in task)
+        self.assertEqual("slots", read["postgres_accounts"]["step"])
+        self.assertIs(False, read["failed_when"])
+        self.assertEqual("compose_stack_slots", read["register"])
+        self.assertLess(rescue.index(read), max(index for index, task in enumerate(rescue) if "ansible.builtin.fail" in task))
+        message = next(task for task in rescue if "ansible.builtin.fail" in task)["ansible.builtin.fail"]["msg"]
+        self.assertIn("compose_stack_slots.message", message)
+        self.assertLess(message.index("compose_stack_slots.message"), message.index("The services did not become healthy"))
 
 
 if __name__ == "__main__":
