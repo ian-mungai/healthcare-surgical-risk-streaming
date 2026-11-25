@@ -115,12 +115,12 @@ class NoCountInTheRunner(unittest.TestCase):
         return [str(count), f"{count:,}"]
 
     def test_the_source_of_the_runner_holds_no_form_of_the_test_set_count_and_no_frozen_counts(self) -> None:
-        source = (ROOT / "tests" / "e2e" / "silver_cases.py").read_text()
         runner("silver_cases")
-        for form in self.forms():
-            with self.subTest(form):
-                self.assertNotIn(form, source)
-        self.assertNotIn("FROZEN_COUNTS", source)
+        source = (ROOT / "tests" / "e2e" / "silver_cases.py").read_text()
+        for label, form in zip(("the plain form", "the grouped form"), self.forms(), strict=True):
+            with self.subTest(label):
+                self.assertFalse(form in source, "the runner source holds a form of the test-set count")
+        self.assertFalse("FROZEN_COUNTS" in source, "the runner source holds the name of the old frozen counts")
 
     def test_the_host_part_of_the_runner_never_reads_the_split_rule_counts(self) -> None:
         """Only the program that runs in the container reads ``PINNED_COUNTS`` (it is a string there); no name, import or attribute of the host code does."""
