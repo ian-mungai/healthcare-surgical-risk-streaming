@@ -21,7 +21,9 @@ PATTERNS = {
 }
 
 
+IMAGE_REPOSITORY_PATTERN = r"[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*"
 OPTIONAL_PATTERNS = {
+    "IMAGE_REPOSITORY": re.compile(IMAGE_REPOSITORY_PATTERN),
     "TAILSCALE_CLIENT_ID": re.compile(r"(?!tskey)\S+"),
     "TAILSCALE_AUDIENCE": re.compile(r"\S+"),
     "EVIDENCE_VERIFIER_KEY": re.compile(r"\S+"),

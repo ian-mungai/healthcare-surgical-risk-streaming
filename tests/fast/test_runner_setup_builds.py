@@ -31,6 +31,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.process import run_command
+from tests.fast.git_fixture import clean_git_env
 from tests.fast.label_accept import accepted, empty_exit_ok, refusal_ok
 from tests.fast.test_outcome_acceptance import split_run
 from tests.fast.test_silver_acceptance import written
@@ -235,7 +236,7 @@ class SealedList(unittest.TestCase):
 
 def git_tracked(folder: Path) -> list[str]:
     """The names of the files Git tracks directly in ``folder``."""
-    listed = run_command("git", ["ls-files", "--", "."], cwd=folder, timeout=60)
+    listed = run_command("git", ["ls-files", "--", "."], cwd=folder, env=clean_git_env(), timeout=60)
     return [name for name in listed.stdout.splitlines() if "/" not in name]
 
 

@@ -1,0 +1,3 @@
+# Written by make images-push: each project image by the tag that was pushed and the digest that Docker Hub gave it. Do not edit by hand.
+# An empty list means that nothing was pushed yet. The host's Compose settings (IMAGE_<NAME>) are rendered from this file.
+images: {}
