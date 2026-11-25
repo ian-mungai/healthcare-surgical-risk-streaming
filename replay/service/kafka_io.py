@@ -16,7 +16,7 @@ from typing import Any
 from confluent_kafka import OFFSET_BEGINNING, Consumer, KafkaError, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient
 
-from replay.events.formats import FORMATS, KIND_FORMAT
+from replay.events.formats import FORMATS, INPUT_TOPIC, KIND_FORMAT
 from replay.events.identity import partition_of
 from replay.events.stream import OutgoingEvent
 from replay.service.check import Received
@@ -59,7 +59,8 @@ def partition_count(bootstrap_servers: str, topic: str) -> int:
 
 
 class KafkaSink:
-    def __init__(self, bootstrap_servers: str, writer: Writer, partitions: int, flush_timeout_seconds: float = 60.0) -> None:
+    def __init__(self, bootstrap_servers: str, writer: Writer, partitions: int, flush_timeout_seconds: float = 60.0, *, input_topic: str = INPUT_TOPIC) -> None:
+        self.input_topic = input_topic
         self.producer = Producer(producer_settings(bootstrap_servers))
         self.partitions = partitions
         self.writer = writer
@@ -70,6 +71,11 @@ class KafkaSink:
         if error is not None:
             self.failures.append(f"{message.topic()}: {error.name()}")
 
+    def topic_of(self, format_key: str) -> str:
+        """The topic of a format: the run's input topic for a format that the deployed list puts on ``replay_events``, else the format's own."""
+        topic = FORMATS[format_key].topic
+        return self.input_topic if topic == INPUT_TOPIC else topic
+
     def send(self, event: OutgoingEvent) -> None:
         format_key = KIND_FORMAT[event.kind]
         value = self.writer.message(format_key, event.payload)
@@ -77,7 +83,7 @@ class KafkaSink:
         while True:
             try:
                 self.producer.produce(
-                    FORMATS[format_key].topic,
+                    self.topic_of(format_key),
                     key=str(event.room).encode(),
                     value=value,
                     partition=partition_of(event.room, self.partitions),

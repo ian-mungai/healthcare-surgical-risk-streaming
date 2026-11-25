@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib
-import json
 import os
 import re
 import tempfile
@@ -83,9 +82,9 @@ class PlatformTargetRules(HostRunnerCase):
     def test_a_platform_service_takes_only_the_verbs_the_batch_needs(self) -> None:
         for arguments in (
             ("exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "--list"),
+            ("exec", "-T", "kafka", "/opt/kafka/bin/kafka-get-offsets.sh", "--bootstrap-server", "kafka:9092", "--topic", "replay_events_p8h_abcd1234_control"),
             ("stop", "kafka"),
             ("start", "kafka"),
-            ("up", "--detach", "--wait", "--wait-timeout", "400", "kafka"),
         ):
             with self.subTest(arguments=arguments):
                 self.assertEqual("platform", self.module.compose_target(arguments))
@@ -116,19 +115,29 @@ class PlatformTargetRules(HostRunnerCase):
             ("exec", "-T", "nessie", "ls"),
             ("run", "--rm", "kafka"),
             ("pause", "kafka"),
+            ("up", "--detach", "--wait", "--wait-timeout", "400", "kafka"),
+            ("up", "--no-recreate", "kafka"),
+            ("stop", "kafka", "apicurio"),
+            ("stop", "kafka", "replay"),
+            ("start", "kafka", "nessie"),
+            ("start", "apicurio", "kafka"),
+            ("stop", "--timeout", "1", "kafka"),
+            ("exec", "-T", "kafka", "sh", "-c", "rm -rf /var/lib/kafka/data"),
+            ("exec", "-T", "kafka", "/opt/kafka/bin/kafka-delete-records.sh"),
+            ("exec", "-T", "kafka", "/opt/kafka/bin/../bin/kafka-topics.sh"),
+            ("exec", "kafka", "/opt/kafka/bin/kafka-topics.sh"),
+            ("exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "&&", "nessie"),
         ):
             with self.subTest(arguments=arguments), self.assertRaises(self.module.PlatformRefusal):
                 self.module.compose_target(arguments)
 
-    def test_a_platform_up_never_recreates_the_broker(self) -> None:
-        arguments = self.module.platform_arguments(("up", "--detach", "--wait", "--wait-timeout", "400", "kafka"))
-        self.assertEqual("up", arguments[0])
-        self.assertIn("--no-recreate", arguments)
-        self.assertEqual(("stop", "kafka"), self.module.platform_arguments(("stop", "kafka")))
+    def test_no_platform_up_exists_so_the_broker_is_never_recreated(self) -> None:
+        self.assertNotIn("up", self.module.PLATFORM_VERBS)
+        self.assertFalse(hasattr(self.module, "platform_arguments"))
 
     def test_the_platform_command_names_the_deployed_project_and_both_env_files(self) -> None:
         stack = self.stack()
-        self.run_stack(stack, "compose", "exec", "-T", "kafka", "true")
+        self.run_stack(stack, "compose", "exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "--list")
         program, arguments = self.calls[-1]
         self.assertEqual("sudo", program)
         self.assertEqual(("-n", "docker", "compose"), arguments[:3])
@@ -204,52 +213,153 @@ class Cleanup(HostRunnerCase):
             runner.assert_not_called()
 
 
+PLATFORM_TOPICS = ("replay_events", "feature_ready", "warnings", "risk_scores", "__consumer_offsets")
+
+
 class Topics(HostRunnerCase):
-    def test_the_input_topic_is_made_with_the_settings_of_the_deployed_list(self) -> None:
-        rows = self.module.topic_rows()
-        arguments = self.module.create_arguments("replay_events", rows)
-        text = " ".join(arguments)
-        self.assertIn("--partitions 10", text)
-        self.assertIn("retention.ms=129600000", text)
-        self.assertIn("retention.bytes=2147483648", text)
-        self.assertIn("segment.bytes=134217728", text)
-        self.assertIn("flush.messages=1", text)
-        self.assertIn("cleanup.policy=delete", text)
-        self.assertIn("--topic replay_events", text)
+    """The batch's topics are its own: named with the run's token, refused when they exist, deleted only when this run made them."""
 
-    def test_a_private_output_topic_takes_the_settings_of_feature_ready(self) -> None:
-        rows = self.module.topic_rows()
-        private = " ".join(self.module.create_arguments("feature_ready_control", rows))
-        deployed = " ".join(self.module.create_arguments("feature_ready", rows))
-        self.assertEqual(deployed.replace("--topic feature_ready", "--topic feature_ready_control"), private)
+    def topic_arguments(self, flag: str) -> list[tuple[str, ...]]:
+        return [arguments for _, arguments in self.calls if flag in arguments]
 
-    def test_a_topic_of_the_platform_is_not_the_batchs_to_create_or_delete(self) -> None:
-        rows = self.module.topic_rows()
-        for name in ("feature_ready", "warnings", "risk_scores", "other", "feature_ready_"):
+    def test_a_run_topic_name_holds_the_kind_the_run_token_and_the_case(self) -> None:
+        self.assertEqual("replay_events_p8h_0123abcd_control", self.module.run_topic("input", "0123abcd", "control"))
+        self.assertEqual("feature_ready_p8h_0123abcd_control", self.module.run_topic("output", "0123abcd", "control"))
+
+    def test_only_a_name_of_this_run_passes_the_check(self) -> None:
+        for name in (
+            *PLATFORM_TOPICS,
+            "replay_events_",
+            "feature_ready_control",
+            "replay_events_p8h_ffffffff_control",
+            "replay_events_p8h_0123abcd",
+            "replay_events_p8h_0123abcd_Control",
+        ):
             with self.subTest(name=name), self.assertRaises(self.module.PlatformRefusal):
-                self.module.check_private_topic(name)
-        self.assertEqual("feature_ready_control", self.module.check_private_topic("feature_ready_control"))
-        with self.assertRaises(self.module.PlatformRefusal):
-            self.module.create_arguments("warnings_x", rows)
+                self.module.check_run_topic(name, "0123abcd")
+        for name in ("replay_events_p8h_0123abcd_control", "feature_ready_p8h_0123abcd_broker_restart"):
+            self.assertEqual(name, self.module.check_run_topic(name, "0123abcd"))
 
-    def test_a_stack_refuses_to_create_a_topic_of_the_platform_and_makes_the_input_topic(self) -> None:
+    def test_the_input_topic_is_made_with_the_settings_of_the_deployed_input_topic(self) -> None:
+        rows = self.module.topic_rows()
+        text = " ".join(self.module.create_arguments("replay_events_p8h_0123abcd_control", rows, "0123abcd"))
+        for wanted in (
+            "--partitions 10",
+            "retention.ms=129600000",
+            "retention.bytes=2147483648",
+            "segment.bytes=134217728",
+            "flush.messages=1",
+            "cleanup.policy=delete",
+        ):
+            self.assertIn(wanted, text)
+        self.assertIn("--topic replay_events_p8h_0123abcd_control", text)
+
+    def test_a_run_output_topic_takes_the_settings_of_feature_ready(self) -> None:
+        rows = self.module.topic_rows()
+        private = " ".join(self.module.create_arguments("feature_ready_p8h_0123abcd_control", rows, "0123abcd"))
+        deployed = " ".join(rows_arguments(self.module, rows))
+        self.assertEqual(deployed.replace("--topic feature_ready", "--topic feature_ready_p8h_0123abcd_control"), private)
+
+    def test_a_creation_never_says_if_not_exists(self) -> None:
+        rows = self.module.topic_rows()
+        for name in ("replay_events_p8h_0123abcd_a", "feature_ready_p8h_0123abcd_a"):
+            self.assertNotIn("--if-not-exists", self.module.create_arguments(name, rows, "0123abcd"))
+
+    def test_a_platform_topic_is_not_the_batchs_to_create(self) -> None:
+        rows = self.module.topic_rows()
+        for name in PLATFORM_TOPICS:
+            with self.subTest(name=name), self.assertRaises(self.module.PlatformRefusal):
+                self.module.create_arguments(name, rows, "0123abcd")
+
+    def test_a_stack_refuses_to_create_a_platform_topic_or_one_of_another_run(self) -> None:
         stack = self.stack()
-        for name in ("warnings", "risk_scores", "feature_ready"):
+        for name in (*PLATFORM_TOPICS, "replay_events_p8h_ffffffff_control"):
             with self.subTest(name=name), self.assertRaises(self.module.PlatformRefusal):
                 self.run_stack(stack, "create_topic", name)
-        self.assertFalse([arguments for _, arguments in self.calls if "--create" in arguments])
-        self.run_stack(stack, "create_topic", "replay_events")
-        self.assertTrue([arguments for _, arguments in self.calls if "--create" in arguments])
-        self.assertEqual([], stack.private_topics)
+        self.assertFalse(self.topic_arguments("--create"))
+        self.assertEqual([], stack.created_topics)
 
-    def test_a_stack_deletes_only_its_private_topics_and_resets_the_input_topic(self) -> None:
+    def test_a_stack_refuses_a_topic_that_already_exists_and_sends_no_creation(self) -> None:
+        answers = {"--never": done()}
+        stack = self.stack(answers)
+        existing = self.module.run_topic("input", stack.token, "control")
+        answers["--list"] = done(0, f"{existing}\nwarnings\n")
+        with self.assertRaises(self.module.Blocked):
+            self.run_stack(stack, "create_topic", existing)
+        self.assertFalse(self.topic_arguments("--create"))
+        self.assertEqual([], stack.created_topics)
+
+    def test_a_stack_records_a_topic_it_made_and_names_it_with_its_own_token(self) -> None:
+        stack = self.stack({"--list": done(0, "")})
+        topic = self.run_stack(stack, "new_input_topic", "control")
+        self.assertEqual(f"replay_events_p8h_{stack.token}_control", topic)
+        self.assertEqual(topic, stack.input_topic)
+        self.assertEqual(topic, stack.env["STREAM_INPUT_TOPIC"])
+        output = self.run_stack(stack, "new_output_topic", "control")
+        self.assertEqual(f"feature_ready_p8h_{stack.token}_control", output)
+        self.assertEqual([topic, output], stack.created_topics)
+        self.assertEqual({topic, output}, {arguments[arguments.index("--topic") + 1] for arguments in self.topic_arguments("--create")})
+
+    def test_a_whole_run_of_topic_work_never_creates_or_deletes_a_platform_topic(self) -> None:
         stack = self.stack({"--list": done(0, "")})
         with mock.patch.object(self.module.time, "sleep", lambda seconds: None):
-            self.run_stack(stack, "create_topic", "feature_ready_control")
-            failed = self.run_stack(stack, "drop_private_topics")
+            for case in ("control", "resent", "late"):
+                self.run_stack(stack, "new_input_topic", case)
+                self.run_stack(stack, "new_output_topic", case)
+            failed = self.run_stack(stack, "drop_run_topics")
         self.assertEqual([], failed)
-        deleted = [arguments[arguments.index("--topic") + 1] for _, arguments in self.calls if "--delete" in arguments]
-        self.assertEqual({"feature_ready_control", "replay_events"}, set(deleted))
+        touched = [arguments[arguments.index("--topic") + 1] for flag in ("--create", "--delete") for arguments in self.topic_arguments(flag)]
+        self.assertEqual(12, len(touched))
+        for name in touched:
+            self.assertIn(f"_p8h_{stack.token}_", name)
+            self.assertNotIn(name, PLATFORM_TOPICS)
+        self.assertEqual([], stack.created_topics)
+
+    def test_a_deletion_removes_only_the_topics_this_run_recorded_and_goes_on_after_a_failure(self) -> None:
+        stack = self.stack({"--list": done(0, "")})
+        self.run_stack(stack, "new_input_topic", "control")
+        self.run_stack(stack, "new_output_topic", "control")
+        first, second = stack.created_topics
+        stack.created_topics.append("replay_events")
+        outcomes = {first: done(1, "", "no"), second: done(0, "")}
+
+        def deleting(*arguments: str, **options: Any) -> CompletedProcess[str]:
+            if "--delete" in arguments:
+                return outcomes.get(arguments[arguments.index("--topic") + 1], done(0, ""))
+            return done(0, "")
+
+        stack.compose = deleting
+        failed = stack.drop_run_topics()
+        self.assertTrue(any(first in item for item in failed))
+        self.assertTrue(any("replay_events" in item for item in failed))
+        self.assertNotIn(second, stack.created_topics)
+
+    def test_the_input_topic_is_never_reset(self) -> None:
+        stack = self.stack()
+        with self.assertRaises(self.module.PlatformRefusal):
+            stack.reset_input_topic()
+        self.assertFalse(self.topic_arguments("--delete"))
+
+    def test_starting_the_stack_sends_no_creation_and_no_deletion(self) -> None:
+        stack = self.stack({"ps": done(0, "abc\n"), "inspect": done(0, "healthy\n"), "--describe": done(0, "PartitionCount: 10")})
+        self.run_stack(stack, "start")
+        self.assertFalse(self.topic_arguments("--create"))
+        self.assertFalse(self.topic_arguments("--delete"))
+
+    def test_the_topic_tool_refuses_a_creation_deletion_or_change_of_a_topic_that_is_not_the_runs(self) -> None:
+        stack = self.stack()
+        for flag in ("--create", "--delete", "--alter"):
+            for name in PLATFORM_TOPICS:
+                with self.subTest(flag=flag, name=name), self.assertRaises(self.module.PlatformRefusal):
+                    self.run_stack(stack, "topics_tool", flag, "--topic", name)
+        self.assertFalse([arguments for _, arguments in self.calls if "kafka-topics.sh" in " ".join(arguments)])
+
+
+def rows_arguments(module: ModuleType, rows: dict[str, Any]) -> list[str]:
+    """The creation arguments of the deployed ``feature_ready`` topic as the old runner built them, for comparison with a run topic's."""
+    row = rows["feature_ready"]
+    configs = [item for key, value in row.configs().items() for item in ("--config", f"{key}={value}")]
+    return ["--create", "--topic", "feature_ready", "--partitions", str(row.partitions), "--replication-factor", "1", *configs]
 
 
 class Environment(HostRunnerCase):
@@ -353,19 +463,12 @@ class Overlay(unittest.TestCase):
     def test_the_images_and_folders_are_variables_not_literals(self) -> None:
         services = self.document["services"]
         self.assertEqual("${REPLAY_IMAGE:?name the replay image}", services["replay"]["image"])
-        for name in ("stream", "probe", "batch"):
+        self.assertEqual("${REPLAY_IMAGE:?name the replay image}", services["batch"]["image"])
+        for name in ("stream", "probe"):
             self.assertEqual("${SPARK_IMAGE:?name the Spark image}", services[name]["image"])
 
 
 class Measurement(HostRunnerCase):
-    def test_a_stats_line_gives_the_name_the_processor_share_and_the_memory_in_mib(self) -> None:
-        line = json.dumps({"Name": "p8-host-x-stream-1", "CPUPerc": "187.5%", "MemUsage": "1.5GiB / 4GiB"})
-        self.assertEqual(("p8-host-x-stream-1", 187.5, 1536.0), self.module.parse_stats_line(line))
-        small = json.dumps({"Name": "k", "CPUPerc": "0.00%", "MemUsage": "512KiB / 1GiB"})
-        self.assertEqual(("k", 0.0, 0.5), self.module.parse_stats_line(small))
-        self.assertIsNone(self.module.parse_stats_line("not json"))
-        self.assertIsNone(self.module.parse_stats_line(json.dumps({"Name": "k", "CPUPerc": "--", "MemUsage": "--"})))
-
     def test_the_summary_takes_the_peaks_and_the_time_the_lag_took_to_drain(self) -> None:
         samples = [
             self.module.Sample(0.0, {0: 100, 1: 50}, {"stream": (10.0, 500.0), "kafka": (5.0, 900.0)}),
@@ -452,7 +555,11 @@ class Arguments(HostRunnerCase):
             "the phase 7 batch tables are not built on the host yet",
             "lifecycle-format upgrade",
             "compat_probe",
-            "resets the deployed topic replay_events",
+            "the deployed topics replay_events and feature_ready are never written, deleted or made again",
+            "runs/stream_host_<run>/inventory.json",
+            "the parity probe runs in the replay image",
+            "os._exit at a save",
+            "the memory gate reads the host's MemAvailable",
             "--teardown",
             "flush.messages=1",
             "no full-release copy, no full-history load",
