@@ -862,6 +862,118 @@ class PendingLaunch(Hosted):
             self.host.stack.replay(["/out/x.py"], replay_access=False)
         self.assertEqual([self.host.stack.launched[-1]], list(self.host.stack.pending))
 
+    def test_a_launch_is_pending_before_its_command_is_sent_and_a_confirmed_exit_clears_it(self) -> None:
+        original = self.target.run
+        seen: list[bool] = []
+
+        def watching(args: list[str], **options: Any) -> tuple[int, str, str]:
+            if "--name" in args and "run" in args:
+                seen.append(args[args.index("--name") + 1] in self.host.stack.pending)
+            return original(args, **options)
+
+        self.target.run = watching  # type: ignore[method-assign]
+        self.assertEqual(0, self.host.stack.replay(["/out/x.py"], replay_access=False)[0])
+        self.assertEqual([True], seen, "the launch was not registered as pending before the command was sent")
+        self.assertEqual({}, self.host.stack.pending, "a confirmed exit did not clear the pending launch")
+
+    def test_an_interrupt_right_after_the_ssh_call_returned_255_leaves_the_launch_pending(self) -> None:
+        original = self.target.run
+        returned: list[bool] = []
+
+        def after_return(args: list[str], **options: Any) -> tuple[int, str, str]:
+            result = original(args, **options)
+            if "--name" in args and "run" in args:
+                returned.append(True)
+            return result
+
+        def interrupted() -> float:
+            if returned:
+                raise KeyboardInterrupt
+            return self.time.clock()
+
+        self.target.timeouts, self.target.start_after = 1, 10**6
+        self.target.run = after_return  # type: ignore[method-assign]
+        self.host.stack.clock = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.host.stack.replay(["/out/x.py"], replay_access=False)
+        self.assertEqual([self.host.stack.launched[-1]], list(self.host.stack.pending), "an interrupt after the 255 left no pending launch")
+
+    def test_the_time_of_a_pending_launch_is_the_end_of_its_call_not_its_start(self) -> None:
+        original = self.target.run
+
+        def slow(args: list[str], **options: Any) -> tuple[int, str, str]:
+            if "--name" in args and "run" in args:
+                self.time.now += 2400
+            return original(args, **options)
+
+        self.target.timeouts, self.target.start_after = 1, 10**6
+        self.target.run = slow  # type: ignore[method-assign]
+        self.host.stack.replay(["/out/x.py"], replay_access=False)
+        self.assertEqual({self.host.stack.launched[-1]: self.time.now}, self.host.stack.pending)
+
+    def test_every_call_of_the_settlement_is_capped_by_the_time_that_remains(self) -> None:
+        self.timed_out(start_after=3)
+        original = self.target.run
+        deadline = max(self.host.stack.pending.values()) + self.module.PENDING_SETTLE_SECONDS
+        calls: list[tuple[str, float, float]] = []
+
+        def timed(args: list[str], **options: Any) -> tuple[int, str, str]:
+            calls.append((" ".join(args[:3]), options.get("timeout", 180.0), deadline - self.time.now))
+            return original(args, **options)
+
+        self.target.run = timed  # type: ignore[method-assign]
+        self.module.settle_pending(self.host)
+        self.assertTrue([call for call in calls if call[0].startswith("docker ps")])
+        self.assertTrue([call for call in calls if call[0].startswith("docker rm")], "no removal was made, so the cap of a removal is not tested")
+        for call, timeout, remaining in calls:
+            self.assertGreater(remaining, 0, f"{call} was sent after the settlement time ended")
+            self.assertLessEqual(timeout, remaining, f"{call} may run for {timeout} seconds with {remaining} seconds left")
+
+    def test_the_last_poll_of_the_settlement_does_not_run_past_the_deadline(self) -> None:
+        self.timed_out()
+        original = self.target.run
+        deadline = max(self.host.stack.pending.values()) + self.module.PENDING_SETTLE_SECONDS
+        ends: list[float] = []
+
+        def timed(args: list[str], **options: Any) -> tuple[int, str, str]:
+            ends.append(self.time.now + options.get("timeout", 180.0))
+            return original(args, **options)
+
+        self.target.run = timed  # type: ignore[method-assign]
+        with mock.patch.object(self.module, "PENDING_POLL_SECONDS", 7):
+            self.module.settle_pending(self.host)
+        self.assertLessEqual(max(ends), deadline)
+
+    def test_a_final_inventory_that_cannot_confirm_the_cleanup_keeps_everything_and_names_it(self) -> None:
+        name = self.timed_out(start_after=1)
+        self.target.ps_codes = [0, 0, 255, 255, 255]
+        self.target.ps_code = 255
+        passed, text = self.module.remove_everything(self.host)
+        self.assertFalse(passed)
+        self.assert_kept(text)
+        self.assertIn(name, text)
+        self.assertIn(name, self.host.stack.pending)
+
+    def test_a_timed_out_spark_launch_is_recorded_under_its_container_name_not_an_environment_key(self) -> None:
+        self.target.timeouts, self.target.start_after = 1, 10**6
+        code = self.host.stack.spark(["/out/x.py"], environment={"JOB_DEADLINE_SECONDS": "2100", "OTHER": "1"})[0]
+        self.assertEqual(255, code)
+        real = self.host.stack.launched[0]
+        self.assertEqual(1, len(self.host.stack.launched))
+        self.assertTrue(real.endswith("_c1"), real)
+        self.assertEqual([real], list(self.host.stack.pending))
+        self.assertEqual([real], self.target.launches)
+
+    def test_a_timed_out_spark_launch_that_starts_late_is_found_and_removed_by_its_name(self) -> None:
+        self.target.timeouts, self.target.start_after = 1, 8
+        self.assertEqual(255, self.host.stack.spark(["/out/x.py"], environment={"JOB_DEADLINE_SECONDS": "2100"})[0])
+        passed, text = self.module.remove_everything(self.host)
+        self.assertIn("container started late", self.events)
+        self.assertTrue(passed, text)
+        self.assertEqual({}, self.target.containers)
+        self.assertEqual({}, self.host.stack.pending)
+        self.assertLess(sum(self.time.slept), self.module.PENDING_SETTLE_SECONDS, "the wait did not end when the launch's own container was seen and removed")
+
 
 class AcceptedLimits(unittest.TestCase):
     """The limits that the owner accepted are in the runner's docstring and in every record that the runner writes."""
@@ -945,6 +1057,34 @@ class TagProof(Hosted):
         self.assertFalse(passed)
         self.assertIn("tag_pending.json", text)
         self.assertIn(self.tag, text)
+
+    def test_a_tag_whose_pending_record_is_not_complete_is_a_failure_even_with_a_saved_record(self) -> None:
+        pending = json.loads((self.run_folder / "tag_pending.json").read_text())
+        (self.run_folder / "tag_pending.json").write_text(json.dumps({**pending, "state": "pending"}))
+        self.assertTrue((self.run_folder / "data_version.json").exists())
+        passed, text = self.module.prove_tag(self.host)
+        self.assertFalse(passed)
+        self.assertIn("tag_pending.json", text)
+        self.assertIn(self.tag, text)
+
+    def test_a_pending_record_that_cannot_be_read_is_a_failure_that_names_it_even_with_a_saved_record(self) -> None:
+        (self.run_folder / "tag_pending.json").write_text("{not json")
+        passed, text = self.module.prove_tag(self.host)
+        self.assertFalse(passed)
+        self.assertIn("tag_pending.json", text)
+
+    def test_a_complete_pending_record_with_a_saved_record_is_proved(self) -> None:
+        pending = json.loads((self.run_folder / "tag_pending.json").read_text())
+        self.assertEqual("complete", pending["state"])
+        passed, text = self.module.prove_tag(self.host)
+        self.assertTrue(passed, text)
+
+    def test_the_cleanup_fails_naming_an_incomplete_pending_record_even_with_a_saved_record(self) -> None:
+        pending = json.loads((self.run_folder / "tag_pending.json").read_text())
+        (self.run_folder / "tag_pending.json").write_text(json.dumps({**pending, "state": "pending"}))
+        passed, text = self.module.remove_everything(self.host)
+        self.assertFalse(passed)
+        self.assertIn("tag_pending.json", text)
 
     def test_a_saved_record_with_no_tag_is_a_failure(self) -> None:
         del self.nessie.references[self.tag]
