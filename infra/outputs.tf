@@ -4,7 +4,7 @@ output "host_instance_id" {
 }
 
 output "host_image_id" {
-  description = "AMI of the host: the pinned Canonical Ubuntu 24.04 build for the run's region. Null for a host that already exists. Marked sensitive because the AWS provider marks the instance's attributes so (live plan, Nov 24 2026); the image check reads the plan's own JSON, never this output."
+  description = "AMI recorded for the Terraform-managed EC2 instance. Null when Terraform manages no host. Sensitive because an instance made from the former SSM lookup keeps that lookup's sensitive mark in state."
   value       = one(module.host[*].image_id)
   sensitive   = true
 
