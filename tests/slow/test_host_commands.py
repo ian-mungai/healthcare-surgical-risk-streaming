@@ -505,6 +505,7 @@ CONFIGURATION = {
     "ENVIRONMENT": "dev",
     "PROJECT_NAME": "example_project",
     "S3_BUCKET": "example-bucket",
+    "IMAGE_REPOSITORY": "exampleaccount/example-images",
 }
 
 
@@ -582,6 +583,7 @@ class HostUpTest(unittest.TestCase):
         state: dict[str, Any] | None = None,
         planned: dict[str, tuple[object, int]] | None = None,
         on_wait: Callable[..., object] | None = None,
+        configuration: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, mock.Mock]]:
         """``planned`` gives the saved plan files by name as the planned figure and its age in seconds. The default is one apply plan with 11008."""
         for name, (figure, age) in ({"apply.json": (11008, 0)} if planned is None else planned).items():
@@ -610,7 +612,7 @@ class HostUpTest(unittest.TestCase):
             self.calls = calls
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
+                code = host.host_up(FakeAws("project", "us-west-2"), configuration or CONFIGURATION, path, confirm)
             self.output = output.getvalue()
         return code, calls
 
@@ -661,11 +663,21 @@ class HostUpTest(unittest.TestCase):
                 "compose_stack_platform_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
+                "compose_stack_registry_user": "exampleaccount",
             },
             calls["run_ansible"].call_args_list[0].args[2],
         )
         calls["write_inventory"].assert_called_once_with(path)
         self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
+
+    def test_a_missing_image_repository_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
+        bad = {key: value for key, value in CONFIGURATION.items() if key != "IMAGE_REPOSITORY"}
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0), self.assertRaisesRegex(HostError, "IMAGE_REPOSITORY"):
+                self.run_up(path, configuration=bad)
+        for name in ("wait_until_reachable", "run_ansible", "write_inventory"):
+            self.calls[name].assert_not_called()
 
     def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -989,9 +1001,53 @@ class DeployVariablesTest(unittest.TestCase):
                 "compose_stack_platform_commit": "b" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
+                "compose_stack_registry_user": "exampleaccount",
             },
             host.deploy_variables(CONFIGURATION, "b" * 40),
         )
+
+    def test_the_registry_user_is_the_account_part_of_the_image_repository_and_nothing_else_of_it(self) -> None:
+        for repository, user in (("acct/images", "acct"), ("acct1/my.images_2", "acct1"), ("0acct/images__x--y", "0acct")):
+            with self.subTest(repository=repository):
+                values = host.deploy_variables(CONFIGURATION | {"IMAGE_REPOSITORY": repository}, "b" * 40)
+                self.assertEqual(user, values["compose_stack_registry_user"])
+                self.assertNotIn(repository, json.dumps(values))
+
+    def test_a_missing_or_malformed_image_repository_stops_the_deploy_by_the_key_name_and_never_its_value(self) -> None:
+        bad = {key: value for key, value in CONFIGURATION.items() if key != "IMAGE_REPOSITORY"}
+        with self.assertRaisesRegex(HostError, "IMAGE_REPOSITORY is missing in .env"):
+            host.deploy_variables(bad, "b" * 40)
+        for value in (
+            "Acct/Images",
+            "acct",
+            "acct/Images",
+            "docker.io/acct/images",
+            "docker.io/images",
+            "my.registry/images",
+            "localhost/images",
+            "my-acct/images",
+            "acct/images:tag",
+            "acct/images@sha256:" + "a" * 64,
+            "acct/images/extra",
+            "acct/-images",
+            "acct/images-",
+            "acct/images..x",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(HostError) as raised:
+                    host.deploy_variables(CONFIGURATION | {"IMAGE_REPOSITORY": value}, "b" * 40)
+                self.assertIn("IMAGE_REPOSITORY", str(raised.exception))
+                self.assertNotIn(value, str(raised.exception))
+
+    def test_the_variables_the_launcher_sends_satisfy_the_registry_user_check_of_the_pull_tasks(self) -> None:
+        from tests.slow.test_compose_stack_start import PullTest, run_tasks
+
+        with tempfile.TemporaryDirectory() as scratch:
+            stand_in, values = PullTest().prepare_pull(Path(scratch))
+            values["compose_stack_registry_user"] = host.deploy_variables(CONFIGURATION, "b" * 40)["compose_stack_registry_user"]
+            code, output = run_tasks("pull_images.yml", values)
+            self.assertEqual(0, code, output)
+            self.assertIn("login --username exampleaccount --password-stdin", (stand_in.parent / "calls.log").read_text())
 
     def test_a_bucket_name_that_s3_refuses_stops_the_deploy_before_ansible_runs(self) -> None:
         with self.assertRaises(WarehouseError):

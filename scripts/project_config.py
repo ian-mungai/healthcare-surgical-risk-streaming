@@ -21,7 +21,11 @@ PATTERNS = {
 }
 
 
-IMAGE_REPOSITORY_PATTERN = r"[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*"
+# One Docker Hub ``<namespace>/<repository>``. The namespace is an account name: lowercase letters and digits, which holds no dot, so no registry host (and not
+# ``localhost``). The repository is one path component of Docker's reference grammar: lowercase letters and digits, joined by ``.``, ``_``, ``__`` or ``-``.
+# A tag, a digest and a second slash are not part of it.
+IMAGE_ACCOUNT_PATTERN = r"(?!localhost/)[a-z0-9]+"
+IMAGE_REPOSITORY_PATTERN = IMAGE_ACCOUNT_PATTERN + r"/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 OPTIONAL_PATTERNS = {
     "IMAGE_REPOSITORY": re.compile(IMAGE_REPOSITORY_PATTERN),
     "TAILSCALE_CLIENT_ID": re.compile(r"(?!tskey)\S+"),

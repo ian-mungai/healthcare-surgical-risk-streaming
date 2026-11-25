@@ -35,7 +35,7 @@ from scripts.infra.created import DEVICE_FILE, module_resources
 from scripts.infra.inventory import write_inventory
 from scripts.infra.terraform_wrapper import WrapperError, apply_plan, kept_note, load_run, save_plan, stale_inputs_problem, state_json
 from scripts.process import TimeoutExpired, partial_text, run_command, timeout_text
-from scripts.project_config import PATTERNS, ROOT, ConfigurationError, load_configuration
+from scripts.project_config import OPTIONAL_PATTERNS, PATTERNS, ROOT, ConfigurationError, load_configuration
 from scripts.stack.warehouse import WarehouseError, warehouse_location
 
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
@@ -365,13 +365,25 @@ def platform_commit() -> str:
     return run_command("git", ["rev-parse", "HEAD"], cwd=ROOT, timeout=GIT_TIMEOUT_SECONDS, check=True).stdout.strip()
 
 
+def registry_user(configuration: dict[str, str]) -> str:
+    """The Docker Hub account of IMAGE_REPOSITORY (``<account>/<repository>``), which the host logs in as. A bad value is refused by the key's name."""
+    repository = configuration.get("IMAGE_REPOSITORY", "")
+    if not repository:
+        raise HostError("IMAGE_REPOSITORY is missing in .env: copy the line from .env.example and fill it in")
+    if OPTIONAL_PATTERNS["IMAGE_REPOSITORY"].fullmatch(repository) is None:
+        raise HostError("IMAGE_REPOSITORY in .env is malformed: it must be <account>/<repository>, lowercase, with no registry host, tag or digest")
+    return repository.partition("/")[0]
+
+
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
-    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, and the bucket that Airbyte's
-    connection copies into. No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host without Ansible."""
+    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, the bucket that Airbyte's
+    connection copies into, and the Docker Hub account that the host logs in as to pull the project's images. No variable holds the AWS profile or the key: the
+    launcher reads the key itself and sends it to the host without Ansible."""
     return {
         "compose_stack_platform_commit": commit,
         "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
         "airbyte_landing_bucket": configuration["S3_BUCKET"],
+        "compose_stack_registry_user": registry_user(configuration),
     }
 
 
@@ -509,11 +521,12 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     plan = saved_plan(run.run_id, applied=bool(confirm))
     require_current_inputs(plan)
     heavy_memory = heavy_memory_variables(state, planned_heavy_figure(plan))
+    deployment = deploy_variables(configuration, platform_commit())
     peer = wait_until_reachable(aws, run.run_id, instance_id(state), host_name)
     address = peer.address
     record_tailscale_device(run.run_id, host_name, peer.device_id)
     require_current_inputs(plan)
-    variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deploy_variables(configuration, platform_commit())
+    variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deployment
     run_ansible(run.run_id, address, variables)
     place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
     run_ansible(run.run_id, address, variables, "connection.yml")
