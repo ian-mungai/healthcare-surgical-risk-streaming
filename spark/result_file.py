@@ -83,7 +83,8 @@ def reserve(path: str) -> str | None:
 
 
 def release_reserved() -> None:
-    """Remove every part file that this process reserved and did not release. The watchdog and the end of a call use it, so that no part file is left."""
+    """Remove every part file that this process reserved and did not release. The watchdog and the end of a call use it, so that no part file is left. A name
+    that cannot be removed stays: the name gets one attempt here and the error is dropped."""
     while RESERVED:
         with contextlib.suppress(OSError):
             os.unlink(RESERVED.pop())
@@ -92,8 +93,10 @@ def release_reserved() -> None:
 def write_reserved(path: str, document: dict[str, Any]) -> None:
     """Write the whole document into the reserved part file and link it to ``path`` (``publish_reserved``: the part file is the only staging file, so a reader
     sees no file or the whole file and the watchdog's release of the part file removes every staged byte), then release the reserved name. A file that
-    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A write or link that fails leaves no part file and no result
-    file. A part name that cannot be removed after the link leaves both names: the result file is whole and the call raises."""
+    appeared at ``path`` after the reservation is never replaced: that is a ``ClosedInputError``. A write or link that fails leaves no result file, and no part
+    file when the part name can be removed. A part name that cannot be removed leaves the part file: after a failed link the part file stays (the end of
+    the call tries to remove it once more, so a second attempt can succeed while the call still raises), and after the link both names stay, the result
+    file whole, and the call raises."""
     try:
         publish_reserved(Path(path + ".part"), Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
     finally:
@@ -140,9 +143,9 @@ def run_sealed(
     close: Callable[[argparse.Namespace, Callable[[argparse.Namespace], dict[str, Any]], str], tuple[int, dict[str, Any], list[str]]] = ending,
 ) -> int:
     """Parse the call, reserve the result file, run ``execute``, write the result file and then print the operator lines. A path that cannot hold a result is
-    a bad call and nothing runs. A result that cannot be written is ``internal_error``. A bad call and the watchdog write no file and leave no part file. The
-    job prints no result line: the caller reads the file. ``close`` maps the end of ``execute`` to the exit code, the document and the lines (a job with its
-    own list of codes passes its own)."""
+    a bad call and nothing runs. A result that cannot be written is ``internal_error``. A bad call and the watchdog write no file and leave no part file,
+    unless the part name cannot be removed. The job prints no result line: the caller reads the file. ``close`` maps the end of ``execute`` to the exit code,
+    the document and the lines (a job with its own list of codes passes its own)."""
     arguments = command.parse_args(argv)
     if reserve(arguments.result) is None:
         sys.stderr.write(f"{job}: usage\n")

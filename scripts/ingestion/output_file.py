@@ -7,7 +7,8 @@ leads nowhere), a folder and a name that differs from an existing one only in le
 (this module makes no folder). ``write_new_file`` writes the content to a private temporary file in the folder of the output, then puts it in place with
 ``os.link``, which fails when the path has appeared since the check, so nothing is replaced even by a late writer. The temporary file is removed on every
 path (``remove_staging``): a name that is already gone is a clean end, and a removal that fails after the output was put in place (both names would stay) is
-refused with fixed text, so it is not a success and it shows no text of the system. An output that a command appends to as it runs calls ``check_new_output``
+refused with fixed text, so it is not a success and it shows no text of the system. A removal that fails after a failed write or link is dropped, so the
+refusal stays and the temporary file stays too. An output that a command appends to as it runs calls ``check_new_output``
 first and creates the file with an exclusive open of its own. The temporary name is a dot, eight hex digits and ``.part``, never the name of the output, so an
 output name of 255 bytes works.
 

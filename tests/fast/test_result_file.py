@@ -8,8 +8,10 @@ Failure modes covered here:
   file is replaced or a caller reads another one.
 - A file that appears at the path while the job runs is replaced, so a result that a caller already holds is overwritten. The document is put in place with
   ``publish_reserved`` (a hard link, which fails when the path exists), so nothing is replaced even by a late writer.
-- A reader sees half a file: the document is written whole into the reserved part file and linked into place. A write or link that fails leaves neither
-  file. A part name that cannot be removed after the link leaves both names (the result is whole) and ends as ``internal_error``, exit 70.
+- A reader sees half a file: the document is written whole into the reserved part file and linked into place. A write or link that fails leaves no result
+  file, and no part file when the part name can be removed. A part name that cannot be removed leaves the part file after a failed link as well as both
+  names after the link (the result is whole). A removal that fails once and works at the end of the call leaves no part file, and the call still ends as
+  ``internal_error``, exit 70.
 - A path that passes the preflight but cannot hold its part file (a name of 255 bytes: ``<name>.part`` is too long) fails only after the job ran. The part
   file is reserved (created exclusively) before any work, and a reservation that fails is a bad call: ``usage``, exit 2, and nothing runs.
 - A job that the watchdog stops leaves its reserved part file, or a second staging file that holds the whole result, for a reader to take for a result. The
@@ -35,6 +37,7 @@ from typing import Any
 from unittest import mock
 
 from scripts.ingestion.closed import ClosedInputError, QuietParser
+from scripts.ingestion.output_file import write_new_file
 from scripts.stack.nessie import NessieError
 from spark import result_file
 from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, release_reserved, reserve, result_path, run_sealed, write_reserved
@@ -186,7 +189,7 @@ class Writing(unittest.TestCase):
             self.written({"x": object()})
         self.assertEqual([], os.listdir(self.folder))
 
-    def test_every_failed_write_leaves_no_file_of_its_own_and_no_part_file(self) -> None:
+    def test_a_failed_write_leaves_no_result_file_and_no_part_file_when_the_part_name_can_be_removed(self) -> None:
         def refuse(source: str, target: str) -> None:
             raise OSError("disk full")
 
@@ -373,6 +376,51 @@ class Sealed(unittest.TestCase):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
         self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
         self.assertEqual(["result.json", "result.json.part"], sorted(os.listdir(self.folder)))
+
+    def test_a_link_that_fails_and_a_part_name_that_cannot_be_removed_leave_the_part_file_in_both_writers(self) -> None:
+        real_unlink = os.unlink
+
+        def refuse_link(source: object, target: object) -> None:
+            raise OSError(errno.ENOSPC, "disk full")
+
+        def refuse_unlink(target: object, *arguments: Any, **keywords: Any) -> None:
+            if str(target).endswith(".part"):
+                raise OSError(errno.EIO, "input output error")
+            real_unlink(target, *arguments, **keywords)  # type: ignore[arg-type]
+
+        self.assertIsNotNone(reserve(self.path))
+        with mock.patch("os.link", refuse_link), mock.patch("os.unlink", refuse_unlink), self.assertRaises(ClosedInputError):
+            write_reserved(self.path, DOCUMENT)
+        self.assertEqual(["result.json.part"], os.listdir(self.folder))
+        os.unlink(f"{self.path}.part")
+        with mock.patch("os.link", refuse_link), mock.patch("os.unlink", refuse_unlink), self.assertRaises(ClosedInputError):
+            write_new_file(Path(self.path), "{}\n", mode=FILE_MODE)
+        left = os.listdir(self.folder)
+        self.assertEqual(1, len(left))
+        self.assertTrue(left[0].endswith(".part") and left[0] != "result.json.part")
+
+    def test_a_part_name_that_fails_to_be_removed_once_is_removed_at_the_end_and_the_call_still_ends_as_exit_70(self) -> None:
+        real_unlink = os.unlink
+        refused: list[str] = []
+
+        def unlink_once(target: object, *arguments: Any, **keywords: Any) -> None:
+            if str(target) == f"{self.path}.part" and not refused:
+                refused.append(str(target))
+                raise OSError(errno.EIO, "input output error")
+            real_unlink(target, *arguments, **keywords)  # type: ignore[arg-type]
+
+        real_link = os.link
+
+        def refuse_link(source: Any, target: Any) -> None:
+            if str(target) == self.path:
+                raise OSError(errno.ENOSPC, "disk full")
+            real_link(source, target)
+
+        with mock.patch("os.link", refuse_link), mock.patch("os.unlink", unlink_once):
+            code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
+        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual(1, len(refused))
+        self.assertEqual([], os.listdir(self.folder))
 
     def test_a_sealed_error_keeps_its_problems_in_order(self) -> None:
         self.assertEqual(["a: failed", "b: failed"], SealedError("a: failed", "b: failed").problems)

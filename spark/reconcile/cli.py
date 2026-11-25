@@ -76,8 +76,9 @@ def usable(path: str) -> bool:
 
 
 def write_result(path: str, document: dict[str, Any]) -> None:
-    """Write the whole document to a new file at ``path`` (``write_new_file``: a path that exists in any form is refused, and a failed write leaves no part
-    file; a part name that cannot be removed after the link stays beside the whole file and the call raises)."""
+    """Write the whole document to a new file at ``path`` (``write_new_file``: a path that exists in any form is refused, and a failed write leaves no result
+    file and no part file when the part name can be removed; a part name that cannot be removed stays, after a failed link as after a link that worked
+    (beside the whole file), and the call raises)."""
     write_new_file(Path(path), json.dumps(document, sort_keys=True) + "\n", mode=FILE_MODE)
 
 
