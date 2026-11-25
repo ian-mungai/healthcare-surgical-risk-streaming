@@ -281,11 +281,8 @@ class OwnerSetupStepTest(unittest.TestCase):
         self.assertIn(aistor_licence.KEYCHAIN_ITEM, line)
         self.assertRegex(line, r"> ?/dev/null", "the value goes nowhere")
         self.assertNotRegex(line, r"-field|-format|\| *(?:cat|echo|pbcopy|tee)|\becho \"?\$", "the value is never printed")
-        self.assertIn(
-            "&&",
-            line.split("security find-generic-password")[1].split("bao read")[0],
-            "an empty token never reaches bao, which would use its token helper file",
-        )
+        between = line.split("security find-generic-password")[1].split("bao read")[0]
+        self.assertRegex(between, r'\[\[ -n "\$token" \]\] &&', "an empty token never reaches bao, which would use its token helper file")
 
     def test_the_readme_says_that_the_launcher_never_uses_the_owners_full_token(self) -> None:
         self.assertIn("never with the owner's full token (`openbao-owner-token`)", self.readme())

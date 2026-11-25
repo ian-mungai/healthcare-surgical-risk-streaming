@@ -625,7 +625,7 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deploy_variables(configuration, platform_commit())
     run_ansible(run.run_id, address, variables)
     placement = place_aistor_licence(run.run_id, address)
-    storage_variables = variables | {"aistor_licence_placement": licence_fact(placement)} | ({"aistor_repair_once": True} if aistor_repair else {})
+    storage_variables = variables | {"aistor_licence_placement": licence_fact(placement)} | {"aistor_repair_once": aistor_repair}
     run_ansible(run.run_id, address, storage_variables, "storage.yml")
     report_aistor_state(run.run_id, address, placement)
     place_project_key(run.run_id, address, configuration["AWS_PROFILE"])

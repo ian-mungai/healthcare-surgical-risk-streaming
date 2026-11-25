@@ -733,8 +733,10 @@ class HostUpTest(unittest.TestCase):
             path = binding_file(Path(scratch), backend="s3", provision_host=True)
             with mock.patch.object(state_bootstrap, "create", return_value=0):
                 _, calls = self.run_up(path)
-        for item in calls["run_ansible"].call_args_list:
-            self.assertNotIn("aistor_repair_once", item.args[2], "no variable of a run that did not ask for the repair holds it")
+        by_playbook = {(item.args[3:] or ("host.yml",))[0]: item.args[2] for item in calls["run_ansible"].call_args_list}
+        self.assertIs(False, by_playbook["storage.yml"]["aistor_repair_once"], "an explicit false outranks any inventory value of the same name")
+        for name in ("host.yml", "connection.yml"):
+            self.assertNotIn("aistor_repair_once", by_playbook[name], name)
 
     def test_the_aistor_repair_of_one_run_reaches_the_aistor_playbook_only_and_as_a_true_boolean(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -775,9 +777,20 @@ class HostUpTest(unittest.TestCase):
 
     def test_the_makefile_passes_the_flag_for_host_up_alone_and_only_when_the_run_names_it(self) -> None:
         text = (ROOT / "Makefile").read_text()
-        recipe = text[text.index("\nhost-up:") :].split("\n\n")[0]
-        self.assertIn("$(if $(AISTOR_REPAIR),--aistor-repair)", recipe)
         self.assertEqual(1, text.count("--aistor-repair"))
+        clean = {key: value for key, value in os.environ.items() if key != "AISTOR_REPAIR"}
+        cases = [
+            ("command line 1", ["AISTOR_REPAIR=1"], clean, True),
+            ("command line 0", ["AISTOR_REPAIR=0"], clean, False),
+            ("command line yes", ["AISTOR_REPAIR=yes"], clean, False),
+            ("not named", [], clean, False),
+            ("exported 1", [], clean | {"AISTOR_REPAIR": "1"}, False),
+        ]
+        for label, words, environment, wanted in cases:
+            with self.subTest(label):
+                shown = run_command("make", ["-n", "host-up", *words], cwd=ROOT, env=environment, timeout=60)
+                self.assertEqual(0, shown.returncode, shown.stderr)
+                self.assertEqual(wanted, "--aistor-repair" in shown.stdout, shown.stdout)
 
     def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

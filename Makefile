@@ -55,7 +55,7 @@ test-deadline:
 	$(PYTHON) -m tests.e2e.deadline
 
 host-up:
-	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM)) $(if $(AISTOR_REPAIR),--aistor-repair)
+	$(PYTHON) -m scripts.infra.host up $(if $(CONFIRM),--confirm $(CONFIRM)) $(if $(and $(filter command line,$(origin AISTOR_REPAIR)),$(filter 1,$(AISTOR_REPAIR))),--aistor-repair)
 
 storage-up:
 	$(PYTHON) -m scripts.infra.storage up $(if $(CONFIRM),--confirm $(CONFIRM))

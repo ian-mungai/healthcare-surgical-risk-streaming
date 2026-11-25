@@ -5,7 +5,7 @@
 # The first bootstrap of a host (the marker file is absent) makes the project user, its policy and the audit identity with the root pair, which the module's script
 # reads inside the AIStor container from the container's own secrets mount, keeps both sign-ins in OpenBao after each pair has signed in, and writes the marker last.
 # Every later deploy reads the live state as the audit identity and as the project user with the sign-ins that OpenBao keeps, makes no root call and no write, and
-# fails with a fixed message that names each difference. Only aistor_repair_once, which the launcher passes as an extra variable for the one run of `make host-up AISTOR_REPAIR=1` and which no inventory file holds, lets the root pair repair what differs.
+# fails with a fixed message that names each difference. Only aistor_repair_once, which the launcher passes as an extra variable on every run (true for the one run of `make host-up AISTOR_REPAIR=1`, false otherwise, so an inventory value never decides it), lets the root pair repair what differs.
 # OpenBao is logged in to as the bootstrap role, whose secret ID file is root-only on the host. The task is hidden, so no password reaches a log.
 - name: Refuse the old approval, which an inventory file could keep true for later deploys
   ansible.builtin.assert:
