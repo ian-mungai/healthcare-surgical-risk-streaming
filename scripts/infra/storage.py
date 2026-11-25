@@ -2,19 +2,26 @@
 
 Run from the repository root under the project profile in ``.env``, through ``make``:
 
-``make storage-up`` finds the host over Tailscale, reads AIStor's root user and password from the host's secret files over SSH into memory, saves a Terraform
+``make storage-up`` finds the host over Tailscale, reads the project user's name and password from the host's OpenBao into memory, saves a Terraform
 plan of ``infra/storage`` and, when it changes anything, prints the changes and a confirmation code and stops for the owner's review.
 ``make storage-up CONFIRM=<CODE>`` applies exactly the reviewed plan. A run with nothing to change goes straight to the checks, so a second run changes nothing.
 After a plan with no change or an apply, the command refuses a state file that holds either credential and asks AIStor, through the AWS command line,
 whether the bucket's versioning is Enabled.
 
-The two credentials reach Terraform only as the environment of its own process (the provider reads ``MINIO_USER`` and ``MINIO_PASSWORD``), never as an
-argument, a variable, a plan, a state or a printed line. The state is the local file ``runs/<RUN_ID>/storage/terraform.tfstate``. Every wait has a deadline.
+The command signs in as the project user and never as root: AIStor's root pair stays in root-only files on the host, is used once by the deploy to make the
+project user and is not read here. The read goes through the gateway's OpenBao route with the ``aistor`` service's own AppRole: the command reads that role's
+secret ID over SSH (a root-only file on the host) and asks OpenBao for the secret at ``secret/services/aistor/aistor``, which only that role reads. The two
+credentials reach Terraform only as the environment of its own process (the provider reads ``MINIO_USER`` and ``MINIO_PASSWORD``, and takes them in no
+other form without writing them to the plan), and the AWS command line takes them only as ``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY`` in the
+environment of its one call (the profile files stay off), never as an argument, a variable, a plan, a state or a printed
+line. The state is the local file ``runs/<RUN_ID>/storage/terraform.tfstate``. Every wait has a deadline.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -50,8 +57,15 @@ from scripts.stack.caddy import RoutesError, load_routes
 SECRETS_DIRECTORY = "/opt/platform/secrets"
 STORAGE_ROUTE = "aistor"
 STORAGE_REGION = "us-east-1"
-CREDENTIAL_FORM = re.compile(r"[A-Za-z0-9_-]{16,128}")
+OPENBAO_ROUTE = "openbao"
+OPENBAO_ROLE = "aistor"
+OPENBAO_PATH = f"secret/data/services/{OPENBAO_ROLE}/aistor"
+LOGIN_FORM = re.compile(r"[A-Za-z0-9_-]{16,128}")
+TOKEN_FORM = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+USER_FORM = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,63}")
+PASSWORD_FORM = re.compile(r"[A-Za-z0-9_-]{16,128}")
 SSH_SECONDS = 30
+OPENBAO_SECONDS = 15
 CHECK_SECONDS = 60
 WORKSPACE = "default"
 SOURCE_FOLDER = Path("infra") / "storage"
@@ -63,33 +77,70 @@ class StorageError(RuntimeError):
 
 @dataclass(frozen=True)
 class Credentials:
-    """AIStor's root user and password, read from the host's files. Neither is in the text form of the object."""
+    """The project user's name and password, read from the host's OpenBao. Neither is in the text form of the object."""
 
     user: str = field(repr=False)
     password: str = field(repr=False)
 
 
-def endpoint(address: str) -> str:
-    """The host name and the port of the gateway's AIStor route, the address of the S3 API over Tailscale."""
+def endpoint(address: str, route: str = STORAGE_ROUTE) -> str:
+    """The host name and the port of one route of the gateway (the AIStor route by default, the address of the S3 API over Tailscale)."""
     try:
-        routes = [route for route in load_routes() if route.name == STORAGE_ROUTE]
+        routes = [item for item in load_routes() if item.name == route]
     except RoutesError as error:
         raise StorageError(f"the gateway's route list cannot be read: {error}") from None
     if len(routes) != 1:
-        raise StorageError(f"the gateway's route list must hold exactly one route named {STORAGE_ROUTE}")
+        raise StorageError(f"the gateway's route list must hold exactly one route named {route}")
     return f"{address}:{routes[0].port}"
 
 
+def openbao_call(host: str, port: int, method: str, path: str, body: dict[str, Any] | None = None, token: str | None = None) -> tuple[int, dict[str, Any]]:
+    """One call to OpenBao through the gateway over HTTPS. A failure to answer is a fixed message: the library's text may hold an address or a value."""
+    if token is not None and TOKEN_FORM.fullmatch(token) is None:
+        raise StorageError("OpenBao gave a token of a form that a header cannot carry")
+    connection = http.client.HTTPSConnection(host, port, timeout=OPENBAO_SECONDS)
+    try:
+        connection.request(method, path, json.dumps(body) if body is not None else None, {"X-Vault-Token": token} if token else {})
+        response = connection.getresponse()
+        raw = response.read().decode(errors="replace")
+    except OSError, http.client.HTTPException:
+        raise StorageError("OpenBao through the gateway gave no answer: is the host up, and does the gateway's certificate match its name?") from None
+    finally:
+        connection.close()
+    try:
+        document = json.loads(raw) if raw else {}
+    except ValueError:
+        document = {}
+    return response.status, document if isinstance(document, dict) else {}
+
+
 def read_credentials(run_id: str, address: str) -> Credentials:
-    """Read the root user and the root password over SSH with sudo and check their form. A refusal is a fixed message that holds no value."""
-    found: dict[str, str] = {}
-    for name in ("root_user", "root_password"):
-        answer = ssh_output(run_id, address, f"sudo -n cat {SECRETS_DIRECTORY}/aistor/{name}", SSH_SECONDS)
-        value = (answer or "").removesuffix("\n")
-        if CREDENTIAL_FORM.fullmatch(value) is None:
-            raise StorageError(f"the host gave no valid AIStor {name.replace('_', ' ')}: the deploy creates the file, so run make host-up first")
-        found[name] = value
-    return Credentials(found["root_user"], found["root_password"])
+    """Read the project user's name and password from OpenBao as the ``aistor`` role, whose secret ID comes over SSH. A refusal is a fixed message.
+
+    No file of AIStor's root pair is read. The secret ID file is the role's own, root-only on the host, and the role reads only the project user's path.
+    """
+    answer = ssh_output(run_id, address, f"sudo -n cat {SECRETS_DIRECTORY}/openbao/{OPENBAO_ROLE}.secret_id", SSH_SECONDS)
+    login_id = (answer or "").removesuffix("\n")
+    if LOGIN_FORM.fullmatch(login_id) is None:
+        raise StorageError("the host gave no valid OpenBao secret ID for the aistor role: the deploy creates the file, so run make host-up first")
+    host, _, port = endpoint(address, OPENBAO_ROUTE).rpartition(":")
+    status, document = openbao_call(host, int(port), "POST", "/v1/auth/approle/login", {"role_id": OPENBAO_ROLE, "secret_id": login_id})
+    token = (document.get("auth") or {}).get("client_token")
+    if status != 200 or not isinstance(token, str) or not token:
+        raise StorageError(f"OpenBao refused the login of the {OPENBAO_ROLE} role (HTTP {status}): the deploy makes the role, so run make host-up first")
+    try:
+        status, document = openbao_call(host, int(port), "GET", f"/v1/{OPENBAO_PATH}", token=token)
+    finally:
+        with contextlib.suppress(StorageError):
+            openbao_call(host, int(port), "POST", "/v1/auth/token/revoke-self", token=token)
+    stored = (document.get("data") or {}).get("data") if status == 200 else None
+    stored = stored if isinstance(stored, dict) else {}
+    user, password = stored.get("user"), stored.get("password")
+    if status != 200:
+        raise StorageError(f"OpenBao holds no project user sign-in for the {OPENBAO_ROLE} role (HTTP {status}): the deploy makes it, so run make host-up first")
+    if not (isinstance(user, str) and USER_FORM.fullmatch(user) and isinstance(password, str) and PASSWORD_FORM.fullmatch(password)):
+        raise StorageError("the project user's sign-in in OpenBao is not of the expected form")
+    return Credentials(user, password)
 
 
 def redact(text: str, credentials: Credentials) -> str:
@@ -221,7 +272,7 @@ def binding_problems(run: RunBinding, saved: dict[str, Any], plan: bytes, code: 
 
 
 def state_leaks(text: str, credentials: Credentials) -> list[str]:
-    """The names of the credentials that a state file's text holds, in the plain form, the JSON-escaped form or the hexadecimal form."""
+    """The names of the project user's credentials that a state file's text holds, in the plain, JSON-escaped or hexadecimal form."""
     found = []
     for name, value in (("user", credentials.user), ("password", credentials.password)):
         if any(form in text for form in (value, json.dumps(value)[1:-1], value.encode().hex(), value.encode().hex().upper())):
@@ -235,7 +286,8 @@ def check_state(run: RunBinding, credentials: Credentials) -> None:
     leaks = state_leaks(state.read_text(), credentials) if state.is_file() else []
     if leaks:
         raise StorageError(
-            f"the Terraform state of this run holds the root {' and '.join(leaks)}: do not use it; the file is runs/{run.run_id}/storage/terraform.tfstate"
+            f"the Terraform state of this run holds the project user's {' and '.join(leaks)}: do not use it; "
+            f"the file is runs/{run.run_id}/storage/terraform.tfstate"
         )
 
 
@@ -263,7 +315,10 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str], addres
 
 
 def check_versioning(address: str, bucket: str, credentials: Credentials) -> None:
-    """Ask AIStor through the AWS command line, with the root pair in the call's environment only, and refuse any answer but Enabled."""
+    """Ask AIStor through the AWS command line and refuse any answer but Enabled.
+
+    The project user is in the call's environment only: the AWS command line takes a sign-in no other way unless a profile file holds it.
+    """
     kept = {name: value for name, value in os.environ.items() if not name.startswith(("AWS_", "MINIO_", "TF_"))}
     environment = kept | {
         "AWS_ACCESS_KEY_ID": credentials.user,

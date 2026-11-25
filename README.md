@@ -60,7 +60,10 @@ make evidence-export              # pack the run's evidence with a manifest
 make evidence-verify              # check the export and sign its receipt on the owner's computer
 make teardown-plan                # save the destroy plan and record what may be deleted
 make host-destroy CONFIRM=<code>  # destroy only after every guard passes
+make storage-up                   # save a plan for the AIStor bucket for review, or with CONFIRM=<code> apply it and check the bucket's versioning
 ```
+
+AIStor keeps its root user and password only in root-only files on the host (mode 0400, made once at the first deploy, given to the server through `MINIO_ROOT_USER_FILE` and `MINIO_ROOT_PASSWORD_FILE`). Nothing uses them for the project's work. The deploy uses them once, inside the AIStor container, to make one project user and its policy (the project's bucket and nothing else, no admin action) and then makes no further call with them. The project user's password is a third root-only file on the host that the deploy copies into the host's OpenBao, where only the `aistor` service's role reads it. `make storage-up` and every other storage client sign in as the project user; workloads use STS.
 
 Each service belongs to the group that `compose/limits.yml` gives it. The always-on group (`supporting`) starts with the stack. Every other group is a Compose profile of the same name and starts when a job or an operator asks for it, after the admission check. Airbyte's workloads in k3s are scaled through the Kubernetes API. A group that does not fit the available memory waits and then fails with the check's four figures.
 

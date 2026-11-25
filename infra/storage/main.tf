@@ -1,5 +1,5 @@
-# The provider reads the root sign-in from its own environment, which the storage command sets for each Terraform call from the host's files. No sign-in value is a
-# variable, a provider argument or a value of this configuration, so none reaches the plan or the state.
+# The provider reads the project user's sign-in from its own environment, which the storage command sets for each Terraform call from the host's OpenBao. The
+# root pair is never used here. No sign-in value is a variable, a provider argument or a value of this configuration, so none reaches the plan or the state.
 provider "minio" {
   minio_server = var.endpoint
   minio_ssl    = true
