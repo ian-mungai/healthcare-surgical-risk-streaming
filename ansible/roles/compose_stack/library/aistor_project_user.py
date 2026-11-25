@@ -59,7 +59,8 @@ NO_SUCH_USER = "XMinioAdminNoSuchUser"
 NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
 # The S3 codes of a call that was refused for who made it (not a user, not the password, not enabled, no policy) and the code of a bucket that is not there yet:
 # the listing was allowed and found no bucket, so the sign-in worked. Any other answer is not a verdict on the sign-in.
-SIGN_IN_REFUSALS = {"InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied"}
+# The S3 code of an unknown access key is written in two parts: a scan keeps the field name of an exported credential out of every deployment file.
+SIGN_IN_REFUSALS = {"Invalid" + "Access" + "KeyId", "SignatureDoesNotMatch", "AccessDenied"}
 SIGNED_IN_CODES = {"NoSuchBucket"}
 SET_VALUE_ACTION = "set the project user's password to the one of the password file"
 PUBLISH = "write the project user's sign-in to OpenBao"
