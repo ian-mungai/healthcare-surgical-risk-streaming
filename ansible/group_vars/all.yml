@@ -65,10 +65,10 @@ compose_stack_postgres_port: 5432
 openbao_port: 8200
 # The Docker socket on the host. The code location reaches it through the socket's group, which the role reads from the socket at each deploy.
 compose_stack_docker_socket: /var/run/docker.sock
-# The images the project makes itself, until it pushes them to a registry: the tag that the Compose files name, the name of the image's folder under
-# compose_stack_directory/images, the repository's folders that the folder holds, the build context (a source, or "." for the whole folder; the first source
-# when unset), the Dockerfile (in the context when unset) and the named build contexts that the Dockerfile copies from. The host builds each image and builds
-# it again only when its folder changes.
+# The images the project makes itself. The owner's computer builds and pushes them (make images-push, scripts/images/publish.py), which reads this list and nothing else:
+# the tag that holds the version (the repository and the folder's hash complete it), the name of the image (its pin in compose/image_pins.yml), the repository's folders
+# that the image's folder holds, the build context (a source, or "." for the whole folder; the first source when unset), the Dockerfile (in the context when unset) and
+# the named build contexts that the Dockerfile copies from. The host builds nothing: it pulls the pinned digests (pull_images.yml).
 compose_stack_built_images:
   - tag: surgical-risk-dagster:1.13.31
     name: dagster
@@ -96,11 +96,16 @@ compose_stack_nessie_namespace: surgical_risk
 compose_stack_orchestration_services: [dagster_code_location, dagster_daemon, dagster_webserver]
 # An empty project name keeps the one fixed name in compose.yml.
 compose_stack_project: ""
-# Each deadline is in seconds. The start deadline covers pulling the images and the health deadline each service's health check.
+# Each deadline is in seconds. The start deadline covers starting the containers and the health deadline each service's health check. The pull deadline covers the
+# pull of every image after the login.
 compose_stack_start_deadline_seconds: 900
 compose_stack_health_deadline_seconds: 180
-compose_stack_build_deadline_seconds: 1800
+compose_stack_pull_deadline_seconds: 1800
 compose_stack_provision_deadline_seconds: 120
+# The private Docker Hub repository's login for the pull: the account name and one file on the host that holds a read-only access token, owned by compose_stack_owner with
+# mode 0400. Both are set by the deploy that places the token; the role stops with a fixed message while either is missing, and it creates neither.
+compose_stack_registry_user: ""
+compose_stack_registry_token_file: "{{ compose_stack_secrets_directory }}/registry_token"
 compose_stack_command:
   - docker
   - compose

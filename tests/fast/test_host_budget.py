@@ -276,11 +276,10 @@ class HostSetupBudgetTest(unittest.TestCase):
         key = one(found, "main.yml", "Install Docker's package signing key, checked against its pinned hash")
         self.assertEqual(60, task_seconds(key))
 
-    def test_a_loop_runs_a_timed_task_for_each_item_and_the_build_loop_waits_for_each_build(self) -> None:
+    def test_a_loop_runs_a_timed_task_for_each_item_and_the_pull_waits_for_its_one_deadline(self) -> None:
         found = playbook_occurrences("host.yml")
-        build = one(found, "build_images.yml", "Build each image whose folder differs from the one it was built from, or that does not exist")
-        images = len(group_variables()["compose_stack_built_images"])
-        self.assertEqual(images * int(group_variables()["compose_stack_build_deadline_seconds"]), task_seconds(build))
+        pull = one(found, "pull_images.yml", "Pull every image of the Compose files, each by its digest")
+        self.assertEqual(int(group_variables()["compose_stack_pull_deadline_seconds"]), task_seconds(pull))
         listed = Occurrence("r", "f", {"name": "x", "timeout": 7, "loop": [1, 2, 3]}, ())
         self.assertEqual(21, task_seconds(listed))
 

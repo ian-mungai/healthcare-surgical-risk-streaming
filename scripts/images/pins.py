@@ -107,12 +107,17 @@ def render_environment(found: dict[str, dict[str, str]], names: list[str]) -> st
     return "".join(f"{variable_name(name)}={found[name]['digest']}\n" for name in sorted(names))
 
 
-def main() -> int:
-    if sys.argv[1:] != ["render"]:
-        sys.stderr.write("usage: python -m scripts.images.pins render\n")
+def main(arguments: list[str] | None = None) -> int:
+    given = sys.argv[1:] if arguments is None else arguments
+    if given == ["render"]:
+        path = PIN_FILE
+    elif len(given) == 3 and given[:2] == ["render", "--pins"]:
+        path = Path(given[2])
+    else:
+        sys.stderr.write("usage: python -m scripts.images.pins render [--pins <file>]\n")
         return 2
     try:
-        sys.stdout.write(render_environment(load(), [image["name"] for image in load_images()]))
+        sys.stdout.write(render_environment(load(path), [image["name"] for image in load_images()]))
     except PinError as error:
         sys.stderr.write(f"image pins: {error}\n")
         return 1

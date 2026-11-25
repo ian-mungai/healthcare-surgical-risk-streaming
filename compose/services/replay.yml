@@ -2,10 +2,7 @@
 # it into Kafka and returns to waiting. Its health check reads the health file that the waiting or running service keeps fresh.
 services:
   replay:
-    image: surgical-risk-replay:1.7.2
-    build:
-      context: ../..
-      dockerfile: replay/Dockerfile
+    image: ${IMAGE_REPLAY:?render the image pins first}
     platform: linux/amd64
     mem_limit: ${MEM_LIMIT_REPLAY:?render the limits first}
     restart: unless-stopped

@@ -1,9 +1,6 @@
 services:
   spark:
-    image: surgical-risk-spark:4.1.4
-    build:
-      context: ../..
-      dockerfile: spark/Dockerfile
+    image: ${IMAGE_SPARK:?render the image pins first}
     platform: linux/amd64
     profiles: [batch]
     mem_limit: ${MEM_LIMIT_SPARK:?render the limits first}

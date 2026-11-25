@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from scripts.images import pins
 from scripts.stack.limits import load_limits, render_environment
 from scripts.stack.yaml_text import load_yaml
 from tests.slow.ansible_support import ROLES, run_playbook
@@ -30,8 +31,21 @@ TOOL_GID = next((group for group in os.getgroups() if group != GID), GID)
 CHANGED_NONE = re.compile(r"changed=0\s")
 
 
+def pin_file(folder: Path) -> Path:
+    """A complete pin file of a placeholder repository, because the tracked one is empty until the first push."""
+    path = folder / "image_pins.yml"
+    repository = "example/project_images"
+    entries = "".join(
+        f"  {image['name']}:\n    tag: {repository}:{image['name']}-{image['tag'].partition(':')[2]}-0123456789ab\n    digest: {repository}@sha256:{'a' * 64}\n"
+        for image in pins.load_images()
+    )
+    path.write_text("images:\n" + entries)
+    return path
+
+
 def variables(folder: Path) -> dict[str, object]:
     return {
+        "compose_stack_pin_file": str(pin_file(folder)),
         "compose_stack_directory": str(folder),
         "compose_stack_compose_directory": str(folder / "compose"),
         "compose_stack_secrets_directory": str(folder / "secrets"),
@@ -92,7 +106,8 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(
             f"SECRETS_DIR={folder / 'secrets'}\nPOSTGRES_HOST_PORT=15432\nOPENBAO_HOST_PORT=18200\nOPENBAO_UNLOCK_KEY_FILE={folder / 'unlock.env'}\n"
             f"DOCKER_SOCKET_GID={socket_gid}\nSTACK_K3S_NAMESPACE=airbyte\nSTACK_K3S_RELEASE=airbyte\nPLATFORM_COMMIT={'c' * 40}\n"
-            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n",
+            "WAREHOUSE_LOCATION=s3://example-bucket/warehouse/\nAWS_REGION=us-west-2\n"
+            + "".join(f"IMAGE_{name}=example/project_images@sha256:{'a' * 64}\n" for name in ("DAGSTER", "REPLAY", "SPARK")),
             host,
         )
         self.assertEqual("HEAVY_MEMORY_MIB=11008\n", heavy)
@@ -178,7 +193,7 @@ class StepOrderTest(unittest.TestCase):
                 "passwords.yml",
                 "verify_secrets.yml",
                 "grafana_password.yml",
-                "build_images.yml",
+                "pull_images.yml",
                 "airbyte/cluster.yml",
                 "airbyte/group_access.yml",
                 "start.yml postgres",

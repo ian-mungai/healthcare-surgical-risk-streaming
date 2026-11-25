@@ -162,11 +162,11 @@ class NoOtherImageTest(unittest.TestCase):
 
 
 class HostSourcesTest(unittest.TestCase):
-    """The host builds each image in ``compose_stack_built_images`` from a folder that holds only the image's ``sources``. A ``COPY`` of a path outside them
-    passes on this computer, where the whole repository is the context, and fails on the host with "not found" (the replay image's ``features/sampling.py``,
-    added by the streaming job)."""
+    """The publish command builds each image in ``compose_stack_built_images`` from a folder that holds only the image's ``sources``, taken from HEAD.
+    A ``COPY`` of a path outside them passes on a build of the whole repository and fails in the staged folder with "not found"
+    (the replay image's ``features/sampling.py``, added by the streaming job)."""
 
-    def test_every_copy_of_an_image_built_on_the_host_comes_from_its_sources(self) -> None:
+    def test_every_copy_of_a_published_image_comes_from_its_sources(self) -> None:
         import yaml
 
         images = yaml.safe_load((ROOT / "ansible" / "group_vars" / "all.yml").read_text())["compose_stack_built_images"]
@@ -178,7 +178,7 @@ class HostSourcesTest(unittest.TestCase):
                 with self.subTest(image=image["name"], source=source):
                     self.assertTrue(
                         any(source == folder or source.startswith(folder + "/") for folder in image["sources"]),
-                        f"{image['dockerfile']} copies {source}, which is outside the sources {image['sources']} that reach the host",
+                        f"{image['dockerfile']} copies {source}, which is outside the sources {image['sources']} that reach the image",
                     )
 
 

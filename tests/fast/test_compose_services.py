@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from scripts.images import pins
 from scripts.infra.host import PROJECT_WORKLOAD_GIDS
 from scripts.stack.limits import load_limits, variable_name
 from scripts.stack.yaml_text import load_yaml
@@ -22,8 +23,8 @@ COMPOSE = Path(__file__).resolve().parents[2] / "compose"
 ROOT_FILE = COMPOSE / "compose.yml"
 SERVICES = COMPOSE / "services"
 IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest@)[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
-PROJECT_IMAGE = re.compile(r"^surgical-risk-[a-z0-9_-]+:(?!latest(?:@|$))[0-9][A-Za-z0-9._-]*(?:@sha256:[0-9a-f]{64})?$")
-BATCH_IMAGE = re.compile(r"^[a-z0-9./_-]+:(?!latest$)[A-Za-z0-9._-]+$")
+PROJECT_IMAGE = re.compile(r"^\$\{(IMAGE_[A-Z0-9_]+):\?render the image pins first\}$")
+PROJECT_VARIABLES = {pins.variable_name(image["name"]) for image in pins.load_images()}
 RESTART_POLICIES = {"always", "unless-stopped"}
 HEALTHCHECK_FIELDS = {"test", "interval", "timeout", "retries", "start_period"}
 HOST_NETWORK_SERVICES = {"caddy"}
@@ -59,13 +60,14 @@ def service_problems(name: str, document: dict[str, Any]) -> list[str]:
     service = services[name]
     image = str(service.get("image", ""))
     batch = service.get("profiles") == ["batch"]
-    build = service.get("build")
-    if batch and not (isinstance(build, dict) and build.get("dockerfile") and BATCH_IMAGE.match(image)):
-        problems.append(f"{name}: a batch job's image must be built from a tracked Dockerfile and named by a tag other than latest")
-    elif not batch and not (PROJECT_IMAGE if image.startswith("surgical-risk-") else IMAGE).match(image):
-        problems.append(
-            f"{name}: image must be pinned by a tag other than latest and by a sha256 digest (a project-built image: a version tag, the digest once pushed)"
-        )
+    project = PROJECT_IMAGE.match(image)
+    if image.startswith("${"):
+        if project is None or project.group(1) not in PROJECT_VARIABLES:
+            problems.append(f"{name}: image must name a project image through the one setting of the pin file (IMAGE_<NAME>), and the list must name the image")
+    elif not IMAGE.match(image):
+        problems.append(f"{name}: image must be pinned by a tag other than latest and by a sha256 digest, or be a project image named through the pin file")
+    if "build" in service:
+        problems.append(f"{name}: no service builds an image on the host: the owner's computer builds and pushes the project images")
     if service.get("platform") != "linux/amd64":
         problems.append(f"{name}: platform must be linux/amd64")
     if not re.fullmatch(rf"\$\{{{variable_name(name)}:\?[^}}]+\}}", str(service.get("mem_limit", ""))):
@@ -718,6 +720,53 @@ class WorkloadAccessTest(unittest.TestCase):
                 self.assertIn("not in the table", problems[0])
 
 
+class ProjectImageTest(unittest.TestCase):
+    """Each Compose service of a project image reads the digest of the pin file, and no service names a local tag."""
+
+    def project_services(self) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for path in sorted(SERVICES.glob("*.yml")):
+            (service,) = load(path)["services"].values()
+            if str(service["image"]).startswith("${"):
+                found[path.stem] = str(service["image"])
+        return found
+
+    def complete_pins(self) -> dict[str, dict[str, str]]:
+        repository = "example/project_images"
+        return {
+            image["name"]: {
+                "tag": f"{repository}:{image['name']}-{image['tag'].partition(':')[2]}-0123456789ab",
+                "digest": f"{repository}@sha256:{str(index) * 64}",
+            }
+            for index, image in enumerate(pins.load_images(), start=1)
+        }
+
+    def test_every_image_of_the_list_is_named_by_a_service_and_every_project_setting_is_one_of_the_list(self) -> None:
+        used = {PROJECT_IMAGE.match(image).group(1) for image in self.project_services().values()}  # type: ignore[union-attr]
+        self.assertEqual(PROJECT_VARIABLES, used)
+
+    def test_the_rendered_setting_of_every_project_service_is_the_digest_of_the_pin_file_and_no_service_names_a_tag_of_the_project(self) -> None:
+        found = self.complete_pins()
+        rendered = dict(line.split("=", 1) for line in pins.render_environment(found, [image["name"] for image in pins.load_images()]).splitlines())
+        for service, image in self.project_services().items():
+            variable = PROJECT_IMAGE.match(image).group(1)  # type: ignore[union-attr]
+            with self.subTest(service=service):
+                self.assertRegex(rendered[variable], r"^[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
+        for path in sorted(SERVICES.glob("*.yml")):
+            (service,) = load(path)["services"].values()
+            with self.subTest(file=path.name):
+                self.assertNotIn("surgical-risk-", str(service["image"]))
+                self.assertNotIn("build", service)
+
+    def test_a_tracked_pin_file_with_entries_gives_every_project_service_its_digest(self) -> None:
+        found = pins.load(pins.PIN_FILE)
+        if not found:
+            self.skipTest("nothing was pushed yet: the pin file is empty")
+        rendered = pins.render_environment(found, [image["name"] for image in pins.load_images()])
+        for image in self.project_services().values():
+            self.assertIn(PROJECT_IMAGE.match(image).group(1) + "=", rendered)  # type: ignore[union-attr]
+
+
 class PlantedDefectTest(unittest.TestCase):
     def good(self) -> dict[str, Any]:
         return copy.deepcopy(load(SERVICES / "postgres.yml"))
@@ -742,16 +791,27 @@ class PlantedDefectTest(unittest.TestCase):
                 self.assertEqual(1, len(problems))
                 self.assertIn("mem_limit", problems[0])
 
-    def test_a_project_built_image_needs_a_version_tag_and_a_digest_is_optional_until_it_is_pushed(self) -> None:
-        digest = "@sha256:" + "a" * 64
-        for image in ("surgical-risk-dagster:1.13.31", f"surgical-risk-dagster:1.13.31{digest}"):
-            with self.subTest(image=image):
-                self.assertEqual([], self.defect(lambda _document, service, image=image: service.update(image=image)))
-        for image in ("surgical-risk-dagster", "surgical-risk-dagster:latest", f"surgical-risk-dagster:latest{digest}", "other-dagster:1.13.31"):
+    def test_a_project_image_must_come_from_the_pin_file_setting_and_never_from_a_local_tag_a_built_name_or_another_setting(self) -> None:
+        good = "${IMAGE_DAGSTER:?render the image pins first}"
+        self.assertEqual([], self.defect(lambda _document, service: service.update(image=good)))
+        for image in (
+            "surgical-risk-dagster:1.13.31",
+            "surgical-risk-dagster",
+            "${IMAGE_DAGSTER}",
+            "${IMAGE_OTHER:?render the image pins first}",
+            "${IMAGE_DAGSTER:-surgical-risk-dagster:1}",
+            "${MEM_LIMIT_POSTGRES:?render the image pins first}",
+            "other-dagster:1.13.31",
+        ):
             with self.subTest(image=image):
                 problems = self.defect(lambda _document, service, image=image: service.update(image=image))
                 self.assertEqual(1, len(problems))
                 self.assertIn("image", problems[0])
+
+    def test_a_service_that_builds_an_image_on_the_host_is_named(self) -> None:
+        problems = self.defect(lambda _document, service: service.update(build={"context": "../..", "dockerfile": "x/Dockerfile"}))
+        self.assertEqual(1, len(problems))
+        self.assertIn("builds", problems[0])
 
     def test_an_image_without_a_digest_or_with_latest_is_named(self) -> None:
         for image in ("postgres:18.7", "postgres@sha256:" + "a" * 64, "postgres:latest@sha256:" + "a" * 64, "postgres:18.7@sha256:abc"):

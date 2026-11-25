@@ -90,15 +90,16 @@ class BatchExceptionTest(unittest.TestCase):
                 self.assertEqual(1, len(problems))
                 self.assertIn("restart", problems[0])
 
-    def test_a_batch_job_with_no_dockerfile_or_a_moving_tag_is_named(self) -> None:
+    def test_a_batch_job_that_builds_on_the_host_or_names_a_local_or_moving_image_is_named(self) -> None:
         for mutate in (
-            lambda _d, s: s.pop("build"),
+            lambda _d, s: s.update(build={"context": "../..", "dockerfile": "spark/Dockerfile"}),
             lambda _d, s: s.update(image="surgical-risk-spark:latest"),
-            lambda _d, s: s.update(image="surgical-risk-spark"),
+            lambda _d, s: s.update(image="surgical-risk-spark:4.1.4"),
+            lambda _d, s: s.update(image="spark:4.1.4"),
         ):
             problems = self.defect(mutate)
             self.assertEqual(1, len(problems))
-            self.assertIn("image", problems[0])
+            self.assertTrue("image" in problems[0] or "builds" in problems[0], problems)
 
     def test_only_the_batch_profile_earns_the_exception(self) -> None:
         for profiles in (["debug"], ["batch", "debug"], []):

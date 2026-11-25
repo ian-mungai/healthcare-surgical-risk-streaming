@@ -1,0 +1,65 @@
+# Reads compose_stack_docker (its first word is the docker command), compose_stack_registry_user, compose_stack_registry_token_file and
+# compose_stack_pull_deadline_seconds. The project's images are in one private Docker Hub repository, which the owner's computer pushed to (make images-push) and
+# which compose/image_pins.yml names by digest. The host builds nothing: it logs in with a read-only access token, pulls every image that the Compose files name
+# (including the batch profile's), and logs out again, so no login stays in the docker user's configuration. The token is one file on the host, which only
+# root reads. It reaches Docker through standard input only: it is on no command line, in no printed output and in no variable that a task keeps.
+- name: Stop when the registry user or the token file is not set
+  ansible.builtin.assert:
+    that:
+      - compose_stack_registry_user | default('') | length > 0
+      - compose_stack_registry_token_file | default('') | length > 0
+    quiet: true
+    fail_msg: "set compose_stack_registry_user and compose_stack_registry_token_file: the project's images are in a private Docker Hub repository"
+
+- name: Look at the registry token file
+  ansible.builtin.stat:
+    path: "{{ compose_stack_registry_token_file }}"
+  register: compose_stack_registry_token_stat
+
+- name: Stop when the registry token file is missing, empty, not a plain file or readable by anyone but root
+  ansible.builtin.assert:
+    that:
+      - compose_stack_registry_token_stat.stat.exists
+      - compose_stack_registry_token_stat.stat.isreg | default(false)
+      - compose_stack_registry_token_stat.stat.size | default(0) | int > 0
+      - compose_stack_registry_token_stat.stat.pw_name | default('') == compose_stack_owner
+      - compose_stack_registry_token_stat.stat.mode | default('') == '0400'
+    quiet: true
+    fail_msg: "the registry token file is missing, is empty or is not a plain file that only {{ compose_stack_owner }} reads (mode 0400)"
+
+- name: Log in, pull the images and log out
+  block:
+    - name: Read the registry token
+      ansible.builtin.slurp:
+        src: "{{ compose_stack_registry_token_file }}"
+      register: compose_stack_registry_token
+      check_mode: false
+      no_log: true
+
+    - name: Stop when the registry token file holds only white space
+      ansible.builtin.assert:
+        that: compose_stack_registry_token.content | b64decode | trim | length > 0
+        quiet: true
+        fail_msg: "the registry token file is empty"
+      no_log: true
+
+    - name: Log in to Docker Hub with the token on standard input
+      ansible.builtin.command:
+        argv: "{{ [compose_stack_docker[0], 'login', '--username', compose_stack_registry_user, '--password-stdin'] }}"
+        stdin: "{{ compose_stack_registry_token.content | b64decode | trim }}"
+      changed_when: false
+      no_log: true
+      timeout: 60
+
+    - name: Pull every image of the Compose files, each by its digest
+      ansible.builtin.command:
+        argv: "{{ compose_stack_docker + ['--profile', 'batch', 'pull', '--quiet'] }}"
+      changed_when: false
+      timeout: "{{ compose_stack_pull_deadline_seconds | int }}"
+  always:
+    - name: Log out of Docker Hub
+      ansible.builtin.command:
+        argv: "{{ [compose_stack_docker[0], 'logout'] }}"
+      changed_when: false
+      failed_when: false
+      timeout: 60

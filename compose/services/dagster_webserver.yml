@@ -1,6 +1,6 @@
 services:
   dagster_webserver:
-    image: surgical-risk-dagster:1.13.31
+    image: ${IMAGE_DAGSTER:?render the image pins first}
     platform: linux/amd64
     mem_limit: ${MEM_LIMIT_DAGSTER_WEBSERVER:?render the limits first}
     restart: unless-stopped
