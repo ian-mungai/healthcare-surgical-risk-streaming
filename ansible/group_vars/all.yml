@@ -58,6 +58,8 @@ compose_stack_secrets_directory: "{{ compose_stack_directory }}/secrets"
 compose_stack_tools_file: "{{ compose_stack_compose_directory }}/postgres_tools.txt"
 # One line for each service that reads a secret. A numeric user and group at the end of a line name the owner of that service's files.
 compose_stack_services_file: "{{ compose_stack_compose_directory }}/openbao_services.txt"
+# One line for each secret that a third party issues: its consumer, OpenBao path and form check. The launcher's intake writes the values (scripts/infra/host.py).
+compose_stack_external_secrets_file: "{{ compose_stack_compose_directory }}/external_secrets.txt"
 compose_stack_owner: root
 compose_stack_group: root
 compose_stack_postgres_port: 5432

@@ -50,6 +50,8 @@ initialize "first_start" {
         path "auth/approle/role/*" { capabilities = ["create", "read", "update", "list"] }
         path "secret/data/services/*" { capabilities = ["create", "read", "update"] }
         path "secret/metadata/services/*" { capabilities = ["read", "list"] }
+        path "secret/data/external/*" { capabilities = ["create", "read", "update", "delete"] }
+        path "secret/metadata/external/*" { capabilities = ["read", "list"] }
       EOT
     }
   }
