@@ -8,11 +8,14 @@ do. The planted cases put each stale name into a clean text and expect the scan 
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import importlib
+import io
 import re
 import types
 import unittest
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
@@ -21,7 +24,7 @@ from unittest import mock
 from scripts.process import TimeoutExpired
 from scripts.stack.job_workloads import JOB_WORKLOADS, SERVICE_WORKLOADS, SPARK_SERVICES
 from scripts.stack.spark_slot import OWNER_LABEL, SLOT_NAME, SlotBusy, SlotError
-from tests.fast.spark_engine import Engine, finishes
+from tests.fast.spark_engine import Box, Engine, finishes
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNERS = sorted((ROOT / "tests" / "e2e").glob("*.py")) + sorted((ROOT / "tests" / "e2e").glob("*/*.py"))
@@ -152,15 +155,41 @@ class LaunchHelperTest(unittest.TestCase):
         self.assertFalse(hasattr(self.launch, "SPARK_FILTERS"))
 
 
-def spark_launches_without_the_slot(text: str) -> list[str]:
-    """Each line of a runner that starts a one-off of a Spark service (``"run", "--rm"`` with a Spark profile of the job helper) in a file that never names the
-    slot's options (``slot_words`` or ``launch_options``), as ``line N``."""
-    names_the_slot = "slot_words(" in text or "launch_options(" in text or "launch_in_slot(" in text
-    starts = [
-        number for number, line in enumerate(text.splitlines(), start=1) if '"run", "--rm"' in line and ("profile_of_job" in line or "profile_for" in line)
-    ]
-    starts += [number for number, line in enumerate(text.splitlines(), start=1) if '"run",' in line and "--no-deps" in line and "profile_of_job" in line]
-    return [] if names_the_slot else [f"line {number}" for number in sorted(set(starts))]
+SLOT_OPTIONS = frozenset({"slot_words", "launch_options"})
+SERVICE_NAMES = frozenset({"service_of", "service_for", "profile_of_job", "profile_for", "launch_words"})
+# A removal of every container that a listing returned, in place of the one cleanup path that removes the launch's own container.
+HAND_REMOVAL = re.compile(r"""docker\("rm", "-f", \*|def remove_timed_out""")
+
+
+def called_name(node: ast.AST) -> str:
+    return getattr(node.func, "id", getattr(node.func, "attr", "")) if isinstance(node, ast.Call) else ""
+
+
+def spark_launch_problems(text: str) -> list[str]:
+    """What is wrong with the Spark one-offs of a runner: the words of a ``docker compose run`` (a list or a call that holds ``run``, ``--no-deps`` and a name
+    of the job helper or the slot's options) must take the slot, must not use ``--rm``, and the function that holds them must start them through
+    ``launch_in_slot``, the one launch and cleanup path. A removal of listed containers by hand is a second cleanup path."""
+    tree = ast.parse(text)
+    outers: list[ast.Module | ast.ClassDef] = [tree, *(node for node in tree.body if isinstance(node, ast.ClassDef))]
+    functions = [node for outer in outers for node in outer.body if isinstance(node, ast.FunctionDef)]
+    found = [f"a removal by hand: line {number}" for number, line in enumerate(text.splitlines(), start=1) if HAND_REMOVAL.search(line)]
+    for function in functions:
+        shared = any(called_name(node) == "launch_in_slot" for node in ast.walk(function))
+        for node in ast.walk(function):
+            if not isinstance(node, (ast.List, ast.Call)):
+                continue
+            words = node.elts if isinstance(node, ast.List) else node.args
+            constants = {word.value for word in words if isinstance(word, ast.Constant)}
+            if not {"run", "--no-deps"} <= constants:
+                continue
+            takes = any(isinstance(word, ast.Starred) and called_name(word.value) in SLOT_OPTIONS for word in words)
+            if not takes and not any(called_name(inner) in SERVICE_NAMES for word in words for inner in ast.walk(word)):
+                continue
+            wrong = [] if takes else ["no slot"]
+            wrong += ["--rm"] if "--rm" in constants else []
+            wrong += [] if shared else ["outside the shared path"]
+            found += [f"{what}: line {node.lineno}" for what in wrong]
+    return found
 
 
 class FakeTarget:
@@ -256,20 +285,149 @@ class CatalogProofLaunchTest(unittest.TestCase):
         self.assertEqual(1, len(self.engine.launches()))
 
 
+def interrupted(engine: Engine, box: Box) -> CompletedProcess[str]:
+    raise KeyboardInterrupt
+
+
+@unittest.skipUnless((ROOT / "tests" / "e2e" / "spark_launch.py").is_file(), "the untracked runners are not here")
+class RunnerInterruptTest(unittest.TestCase):
+    """An interrupt during a runner's Spark job stops and removes the runner's own container, or names the one that survives, and starts nothing again."""
+
+    def catalog_proof_on_the_host(self, engine: Engine) -> Callable[[], object]:
+        proof: Any = importlib.import_module("tests.e2e.catalog_proof")
+        stack = proof.Stack(FakeTarget(engine, over_ssh=True), types.SimpleNamespace(commands=[]), [])
+        return lambda: stack.job(["--branch", "b"])
+
+    def bronze_decode(self, engine: Engine) -> Callable[[], object]:
+        module: Any = importlib.import_module("tests.e2e.bronze_decode")
+        run = module.Run.__new__(module.Run)
+        run.compose_dir, run.record, run.log = Path("/c"), types.SimpleNamespace(commands=[]), []
+        self.enterContext(mock.patch.object(module, "run_command", engine.run_command))
+        return lambda: run.job(["--branch", "b"])
+
+    def retention(self, engine: Engine) -> Any:
+        module: Any = importlib.import_module("tests.e2e.snapshot_retention")
+        retention = module.Retention.__new__(module.Retention)
+        retention.stack = types.SimpleNamespace(compose=["docker", "compose"], target=FakeTarget(engine), log=[])
+        retention.record = types.SimpleNamespace(commands=[])
+        return retention
+
+    def retention_script(self, engine: Engine) -> Callable[[], object]:
+        retention = self.retention(engine)
+        return lambda: retention.python_job("print()")
+
+    def retention_maintenance(self, engine: Engine) -> Callable[[], object]:
+        retention = self.retention(engine)
+        return lambda: retention.maintenance("--dry-run")
+
+    def joined_stack(self, engine: Engine) -> Callable[[], object]:
+        module: Any = importlib.import_module("tests.e2e.stack_joined")
+        run = module.Run.__new__(module.Run)
+        run.docker_command, run.project, run.environment = ["docker", "compose"], "p", {}
+        run.record, run.log, run.ports = types.SimpleNamespace(commands=[], expect=mock.Mock()), [], {"nessie": 1}
+        self.enterContext(mock.patch.object(module, "run_command", engine.run_command))
+        nessie = mock.Mock()
+        nessie.return_value.reference.return_value.hash = "h"
+        self.enterContext(mock.patch.object(module, "NessieClient", nessie))
+        return lambda: module.spark_proof(run)
+
+    def labels_stack(self, engine: Engine) -> Any:
+        module: Any = importlib.import_module("tests.e2e.silver_labels")
+        stack = module.Stack.__new__(module.Stack)
+        stack.record, stack.log, stack.stalls, stack.project = types.SimpleNamespace(commands=[]), [], [], "p"
+        stack.watch = lambda done, stalled: None
+        stack.run = lambda args, timeout=60, stdin=None: FakeTarget(engine).run(args, timeout=timeout)
+        self.enterContext(mock.patch.object(module.Stack, "compose", new_callable=mock.PropertyMock, return_value=["docker", "compose"]))
+        return stack
+
+    def labels(self, engine: Engine) -> Callable[[], object]:
+        stack = self.labels_stack(engine)
+        return lambda: stack.job(["-m", "spark.jobs.silver_labels", "build"])
+
+    def runners(self) -> list[Callable[[Engine], Callable[[], object]]]:
+        return [self.catalog_proof_on_the_host, self.bronze_decode, self.retention_script, self.retention_maintenance, self.joined_stack, self.labels]
+
+    def test_an_interrupt_removes_the_runners_own_container_and_no_other_job_starts(self) -> None:
+        for runner in self.runners():
+            engine = Engine(on_start=interrupted)
+            start = runner(engine)
+            with self.subTest(runner=runner.__name__):
+                with self.assertRaises(KeyboardInterrupt):
+                    start()
+                self.assertEqual({}, engine.boxes)
+                self.assertEqual(1, len(engine.launches()))
+
+    def test_an_interrupt_whose_removal_fails_names_the_surviving_container_and_its_state(self) -> None:
+        for runner in self.runners():
+            engine = Engine(on_start=interrupted, removal_fails=True)
+            start = runner(engine)
+            with self.subTest(runner=runner.__name__):
+                with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(KeyboardInterrupt):
+                    start()
+                self.assertIn(f"container {1:064x} (exited)", error.getvalue())
+                self.assertEqual(1, len(engine.launches()))
+
+    def test_a_finished_job_of_each_runner_leaves_no_container(self) -> None:
+        for runner in self.runners():
+            engine = Engine(on_start=finishes(3, "", "failed\n"))
+            start = runner(engine)
+            with self.subTest(runner=runner.__name__):
+                with contextlib.suppress(Exception):
+                    start()
+                self.assertEqual(({}, 1), (engine.boxes, len(engine.launches())))
+
+    def test_a_labels_step_that_passes_its_limit_is_not_tried_again_while_its_own_container_survives(self) -> None:
+        def killed(engine: Engine, box: Box) -> CompletedProcess[str]:
+            raise TimeoutExpired("docker", 5)
+
+        engine = Engine(on_start=killed, removal_fails=True)
+        reset: list[bool] = []
+        stack = self.labels_stack(engine)
+        with self.assertRaisesRegex(SlotError, f"container {1:064x} \\(exited\\)"):
+            stack.job(["-m", "spark.jobs.silver_labels", "build"], reset=lambda: reset.append(True))
+        self.assertEqual((1, []), (len(engine.launches()), reset))
+
+    def test_a_labels_step_that_passes_its_limit_is_tried_again_only_after_its_container_is_gone(self) -> None:
+        held: list[int] = []
+
+        def killed(engine: Engine, box: Box) -> CompletedProcess[str]:
+            held.append(len(engine.named()))
+            raise TimeoutExpired("docker", 5)
+
+        engine = Engine(on_start=killed)
+        stack = self.labels_stack(engine)
+        with self.assertRaisesRegex(RuntimeError, "stalled"):
+            stack.job(["-m", "spark.jobs.silver_labels", "build"])
+        self.assertEqual(({}, {1}), (engine.boxes, set(held)))
+        self.assertEqual(len(held), len(engine.launches()))
+
+
 @unittest.skipUnless(RUNNERS, "the untracked runners are not here")
 class RunnerSlotScanTest(unittest.TestCase):
-    """A runner that starts a one-off of a Spark service names the slot's options, so Docker refuses a second Spark container on the engine."""
+    """A runner that starts a one-off of a Spark service takes the slot and goes through the one launch and cleanup path."""
 
-    def test_every_runner_that_starts_a_spark_one_off_names_the_slot(self) -> None:
-        found = {path.relative_to(ROOT).as_posix(): spark_launches_without_the_slot(path.read_text()) for path in RUNNERS if path.name != "spark_launch.py"}
+    def test_every_runner_starts_its_spark_one_offs_through_the_shared_path(self) -> None:
+        found = {path.relative_to(ROOT).as_posix(): spark_launch_problems(path.read_text()) for path in RUNNERS if path.name != "spark_launch.py"}
         self.assertEqual({}, {name: hits for name, hits in found.items() if hits})
 
-    def test_the_scan_names_a_planted_launch_without_the_slot_and_accepts_each_way_to_take_it(self) -> None:
-        planted = 'command = [*self.compose, "--profile", profile_of_job(job), "run", "--rm", "--no-TTY", "--no-deps", service_of(job)]'
-        self.assertEqual(["line 1"], spark_launches_without_the_slot(planted))
-        for taken in ("*slot_words(), ", "*launch_options(arguments, JOB), ", "launch_in_slot(run, build, 9), "):
-            with self.subTest(taken=taken):
-                self.assertEqual([], spark_launches_without_the_slot(planted.replace("service_of(job)", taken + "service_of(job)")))
+    def test_the_scan_names_each_planted_way_around_the_shared_path(self) -> None:
+        good = (
+            "def job(self):\n"
+            '    command = ["--profile", profile_of_job(job), "run", "--no-deps", *slot_words(), service_of(job)]\n'
+            "    return launch_in_slot(self.run, command, 9)\n"
+        )
+        self.assertEqual([], spark_launch_problems(good))
+        planted = {
+            "no slot: line 2": good.replace("*slot_words(), ", ""),
+            "--rm: line 2": good.replace('"run", ', '"run", "--rm", '),
+            "outside the shared path: line 2": good.replace("launch_in_slot(self.run, command, 9)", "self.run(command, 9)"),
+            "a removal by hand: line 3": good.replace("    return", '    self.docker("rm", "-f", *self.spark_containers())\n    return').replace(
+                "    command", "    command", 1
+            ),
+        }
+        for expected, text in planted.items():
+            with self.subTest(expected=expected):
+                self.assertEqual([expected], spark_launch_problems(text))
 
 
 @unittest.skipUnless(RUNNERS, "the untracked runners are not here")

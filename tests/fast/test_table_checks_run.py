@@ -2085,7 +2085,7 @@ class ComposeRunnerTest(unittest.TestCase):
         text = " ".join(arguments)
         self.assertIn(f"compose --project-directory {ROOT / 'compose'}", text)
         self.assertIn("--project-name stack_example", text)
-        self.assertIn("--profile batch_bronze run --rm --no-TTY --no-deps", text)
+        self.assertIn("--profile batch_bronze run --no-TTY --no-deps", text)
         self.assertIn("--volume stack_example_table_check_staging:/staging:ro", text)
         self.assertIn(f"--name {SLOT_NAME}", text)
         self.assertTrue(text.endswith("spark_bronze table_checks --staging /staging/run_one"), text)

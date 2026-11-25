@@ -13,10 +13,15 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from subprocess import CompletedProcess
+from typing import Any
 
 SLOT_NAME = "surgical-risk-spark-slot"
 OWNER_LABEL = "surgical-risk.spark_slot_owner"
-CONFLICT = 'Error response from daemon: Conflict. The container name "/{name}" is already in use by container "{other}".'
+# The whole refusal of Docker Engine 29.9.3 for a name that exists (``nameConflictError`` in ``daemon/errors.go``), as the client shows it.
+CONFLICT = (
+    'Error response from daemon: Conflict. The container name "/{name}" is already in use by container "{other}". '
+    "You have to remove (or rename) that container to be able to reuse that name."
+)
 
 
 @dataclass
@@ -26,6 +31,18 @@ class Box:
     state: str
     labels: dict[str, str]
     auto_remove: bool = False
+
+
+def with_a_free_slot(run: Callable[..., tuple[int, str, str]]) -> Callable[..., tuple[int, str, str]]:
+    """The ``run`` of a runner's stand-in on an engine whose slot is free: it answers the reads of the slot's name with no container, which a launch makes
+    before and after its job, and gives every other command to ``run``."""
+
+    def answer(command: list[str], *arguments: Any, **keywords: Any) -> tuple[int, str, str]:
+        if command[:3] == ["docker", "container", "ls"]:
+            return 0, "", ""
+        return run(command, *arguments, **keywords)
+
+    return answer
 
 
 def finishes(code: int = 0, out: str = "", err: str = "") -> Callable[[Engine, Box], CompletedProcess[str]]:
@@ -91,8 +108,8 @@ class Engine:
         labels = dict(item.split("=", 1) for flag, item in zip(tail, tail[1:], strict=False) if flag == "--label")
         existing = self.named(name)
         if existing:
-            return CompletedProcess(words, 1, "", CONFLICT.format(name=name, other=existing[0].id[:12]))
-        box = self.add(name, "running", labels, "--rm" in tail)
+            return CompletedProcess(words, 1, "", CONFLICT.format(name=name, other=existing[0].id) + "\n")
+        box = self.add(name, "running", labels, "--rm" in tail)  # the engine removes it at its exit only when a launch asks for that
         result = self.on_start(self, box)  # a TimeoutExpired from here leaves the container as it is: the client is gone and the container is not
         if box.id in self.boxes:
             if box.auto_remove:

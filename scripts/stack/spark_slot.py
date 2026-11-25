@@ -7,16 +7,21 @@ https://docs.docker.com/reference/cli/docker/compose/run/), so a second launch f
 between the check and the start: the engine decides, once, when it creates the container.
 
 The slot is held exactly as long as the container exists. A client that is killed, a restart of the code location container and a ``docker pause`` of the
-job change nothing, because the container is the holder and not the process that started it. A launch that passes its deadline stops and removes its own
-container (the one that carries its own ``OWNER_LABEL`` value, by container ID), reads the engine again and reports the slot as free only when the container is
-gone. A container with the slot's name that another launch started is never touched. A container that is left over (exited, not removed) keeps the name, so
-the slot stays busy and its state is in the message: remove that container by hand.
+job change nothing, because the container is the holder and not the process that started it. No launch uses ``--rm``: every launcher ends through ``run_owned``,
+the one cleanup path, which after success, failure, a deadline or an interrupt stops and removes only its own container (the one that carries its own
+``OWNER_LABEL`` value, by container ID), reads the engine again and reports a container that survives with its ID and state. A container with the slot's name
+that another launch started is never touched. A container that is left over (a launcher that was killed, or a removal that failed) keeps the name, so the slot
+stays busy: remove that container by hand.
+
+The container that stays after its job is also how a launcher knows whether the engine created it. A launch counts as refused at its create step only when the
+command exited 1, wrote nothing on standard output, wrote the engine's whole refusal of the slot's name (``NAME_REFUSAL``) and the engine holds no container of
+this launch under the name. A job whose container was created is therefore never started a second time, whatever it printed.
 
 Before it starts a container, a launcher also reads which Spark services of its project are alive (running, paused or restarting): a service container that
-does not carry the slot's name, such as one of an older version, holds the slot too. A wait is bounded by a deadline that every read obeys: a read gets the
-time that is left, and a free reading that arrives after the deadline admits nothing. The Dagster runs of the Spark groups share the run tag
-``surgical_risk/spark`` (``orchestration/surgical_risk/concurrency.py``), which the run queue limits to one. ``group-up`` starts no Spark group
-(``scripts/stack/groups.py``).
+does not carry the slot's name, such as one of an older version, holds the slot too. A wait is bounded by a deadline that every read before a start obeys: the
+time that is left is computed before each one, none starts at or after the end of the wait, and a free reading at or after it admits nothing. The Dagster runs
+of the Spark groups share the run tag ``surgical_risk/spark`` (``orchestration/surgical_risk/concurrency.py``), which the run queue limits to one.
+``group-up`` starts no Spark group (``scripts/stack/groups.py``).
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
+import re
+import sys
 import time
 import uuid
 from collections.abc import Callable, Collection, Sequence
@@ -39,8 +46,15 @@ POLL_SECONDS = 5.0
 # The most that one read of the engine may take, and the time that the stop of a container may take before it is removed by force.
 READ_SECONDS = 60.0
 STOP_SECONDS = 30
-# The words of the daemon's refusal of a name that exists (Docker's "Conflict. The container name ... is already in use").
-CONFLICT_TEXT = "is already in use"
+# The whole refusal of Docker Engine 29.9.3 for the slot's name (``nameConflictError``), which Compose passes on from the create step of a one-off, and
+# Compose's exit status then: https://github.com/moby/moby/blob/docker-v29.9.3/daemon/errors.go#L55-L63
+# and https://github.com/docker/compose/blob/v5.8.0/pkg/compose/run.go#L197-L205
+NAME_REFUSAL = re.compile(
+    rf'Error response from daemon: Conflict\. The container name "/{SLOT_NAME}" is already in use by container "[0-9a-f]{{64}}"\. '
+    r"You have to remove \(or rename\) that container to be able to reuse that name\."
+)
+REFUSED_STATUS = 1
+LIVE_STATES = frozenset({"running", "paused", "restarting"})
 LISTING = '{{.ID}}|{{.State}}|{{.Label "' + OWNER_LABEL + '"}}'
 
 Docker = Callable[[Sequence[str], float], CompletedProcess[str]]
@@ -129,34 +143,118 @@ def slot_container(docker: Docker, timeout: float = READ_SECONDS) -> SlotContain
     return None
 
 
-def remove_owned(docker: Docker, owner: str) -> None:
+def require_free(docker: Docker, timeout: float = READ_SECONDS) -> None:
+    """Raise ``SlotBusy``, with the container's ID and state, while any container has the slot's name. No launch or retry starts while one does."""
+    held = slot_container(docker, timeout)
+    if held is not None:
+        raise SlotBusy(f"the one Spark slot is held by the container {SLOT_NAME}, ID {held.id} ({held.state}): one Spark job runs at a time")
+
+
+def clear_owned(docker: Docker, owner: str) -> str | None:
     """Stop and remove the container of this launch, by ID, and read the engine again. Another launch's container is left as it is.
 
-    A ``SlotError`` means that the container of this launch is still there: the slot is not free.
+    Return ``None`` when no container of this launch is left, else the report of the one that is, or may be, with its ID and state: the slot is not free.
+    The report holds fixed words, the slot's name and the engine's ID and state only.
     """
-    found = slot_container(docker)
-    if found is None or found.owner != owner:
-        return
-    for words, limit in (
-        (["container", "stop", "--time", str(STOP_SECONDS), found.id], STOP_SECONDS + READ_SECONDS),
-        (["container", "rm", "--force", found.id], READ_SECONDS),
-    ):
-        with contextlib.suppress(TimeoutExpired, FileNotFoundError):
-            docker(words, limit)
-    left = slot_container(docker)
-    if left is not None and left.id == found.id:
-        raise SlotError(
-            f"the container of the one Spark slot ({SLOT_NAME}) is still there after it was stopped and removed: remove it with docker container rm --force"
+    try:
+        found = slot_container(docker)
+    except SlotError:
+        return (
+            f"the container of the one Spark slot cannot be read: this launch's container may still hold the slot ({SLOT_NAME}): "
+            "check it with docker container ls --all"
         )
+    if found is None or found.owner != owner:
+        return None
+    stop = (["container", "stop", "--time", str(STOP_SECONDS), found.id], STOP_SECONDS + READ_SECONDS)
+    remove = (["container", "rm", "--force", "--volumes", found.id], READ_SECONDS)
+    for words, limit in (stop, remove) if found.state in LIVE_STATES else (remove,):
+        # A command that fails in any way is judged by the next read, which names what is left.
+        with contextlib.suppress(Exception):
+            docker(words, limit)
+    try:
+        left = slot_container(docker)
+    except SlotError:
+        return (
+            f"the container of the one Spark slot cannot be read after its removal: container {found.id} (last read {found.state}) may still hold the slot "
+            f"({SLOT_NAME}): check it with docker container ls --all"
+        )
+    if left is None or left.id != found.id:
+        return None
+    return (
+        f"the container of the one Spark slot ({SLOT_NAME}) is still there after it was stopped and removed: container {left.id} ({left.state}); "
+        f"remove it with docker container rm --force {left.id}"
+    )
 
 
-def lost_the_name(docker: Docker, result: CompletedProcess[str], owner: str) -> bool:
-    """Whether a failed launch failed on the slot's name: the daemon's conflict text, and a container of another launch under the name now. A job that prints
-    the same words is not taken for a conflict, because no other container has the name then, and the job is never started a second time."""
-    if result.returncode == 0 or CONFLICT_TEXT not in result.stderr:
+def remove_owned(docker: Docker, owner: str) -> None:
+    """``clear_owned``, or the ``SlotError`` that holds its report."""
+    report = clear_owned(docker, owner)
+    if report is not None:
+        raise SlotError(report)
+
+
+def end_owned(docker: Docker, owner: str) -> None:
+    """``settle_owned`` for an ending that already has a result or an error: its report goes to standard error and hides neither."""
+    report = settle_owned(docker, owner)
+    if report is not None:
+        sys.stderr.write(f"spark_slot: {report}\n")
+
+
+def settle_owned(docker: Docker, owner: str) -> str | None:
+    """``clear_owned`` for the end of a launch. A cleanup that is cut short is run once more, so one interrupt during it skips no removal; the interrupt is
+    raised after the report is written. A failure of the cleanup itself is a report and never an exception."""
+    interrupt: BaseException | None = None
+    report: str | None = f"the cleanup did not finish: the one Spark slot ({SLOT_NAME}) may still be held; check it with docker container ls --all"
+    for _ in range(2):
+        try:
+            report = clear_owned(docker, owner)
+            break
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                interrupt = interrupt or error
+    if interrupt is not None:
+        if report is not None:
+            sys.stderr.write(f"spark_slot: {report}\n")
+        raise interrupt
+    return report
+
+
+def refused_by_name(result: CompletedProcess[str]) -> bool:
+    """Whether the command's own result can be the engine's refusal to create the slot's container: its exit status, no output and the whole refusal."""
+    return result.returncode == REFUSED_STATUS and not result.stdout and NAME_REFUSAL.search(result.stderr) is not None
+
+
+def lost_the_name(docker: Docker, result: CompletedProcess[str], owner: str, read_seconds: Callable[[], float] = lambda: READ_SECONDS) -> bool:
+    """Whether the engine refused to create this launch's container: ``refused_by_name``, and the engine holds no container of this launch under the name.
+    A created container stays until ``run_owned`` removes it, so its job is never taken for a refusal. The holder that won can be gone by this read."""
+    if not refused_by_name(result):
         return False
-    found = slot_container(docker)
-    return found is not None and found.owner != owner
+    found = slot_container(docker, read_seconds())
+    return found is None or found.owner != owner
+
+
+def run_owned(
+    docker: Docker, owner: str, start: Callable[[], CompletedProcess[str]], read_seconds: Callable[[], float] = lambda: READ_SECONDS
+) -> tuple[CompletedProcess[str], bool]:
+    """The one launch and cleanup path of every launcher: run ``start``, and whatever ends it, end the container of this launch.
+
+    Return the result and whether the engine refused the create (no job ran). A deadline is raised only when the container is gone, else a ``SlotError``
+    names it. An interrupt or any other failure is raised as it is, after a surviving container is reported.
+    """
+    try:
+        result = start()
+        if lost_the_name(docker, result, owner, read_seconds):
+            return result, True
+    except TimeoutExpired:
+        report = settle_owned(docker, owner)
+        if report is not None:
+            raise SlotError(report) from None
+        raise
+    except BaseException:
+        end_owned(docker, owner)
+        raise
+    end_owned(docker, owner)
+    return result, False
 
 
 def holder_text(docker: Docker, timeout: float) -> tuple[str, ...]:
@@ -180,44 +278,39 @@ def run_in_slot(
     """Start one Spark container in the slot and return its result, or raise ``SlotBusy`` when the slot stays taken for ``wait_seconds``.
 
     ``build`` returns the ``docker`` arguments of the launch from the slot's options (``slot_options``), which it puts before the service name. ``running``
-    reads the live services within the seconds that it is given. A positive wait is a deadline for every read: each read gets the time that is left, a free
-    reading after the deadline admits nothing, and each sleep is cut to the time that is left. With no wait the first reading decides.
+    reads the live services within the seconds that it is given. A positive wait is a deadline for every read before a start: each read gets the time that is
+    left, none starts at or after the end of the wait, a free reading at or after it admits nothing, and each sleep is cut to the time that is left. With no
+    wait the first reading decides.
 
-    When the container passes ``deadline_seconds``, its client is killed by ``run_command`` and this function stops and removes the container of this launch
-    before it raises ``TimeoutExpired``. If the container cannot be removed it raises ``SlotError``.
+    A refused create is tried again only within the wait that is left. A job whose container was created is run once. ``run_owned`` ends the container: when
+    it passes ``deadline_seconds``, its client is killed by ``run_command`` and it is stopped and removed before ``TimeoutExpired`` is raised, or a
+    ``SlotError`` names it.
     """
     wait = checked_wait(wait_seconds)
     call = docker or local_docker(env)
     owner = new_owner()
     started = clock()
     holders: tuple[str, ...] = ()
-    while True:
-        remaining = wait - (clock() - started)
-        if wait > 0 and remaining <= 0:
+
+    def read_seconds() -> float:
+        """The seconds of the next admission read: what is left of the wait and at most ``READ_SECONDS``. No read starts at or after the end of the wait."""
+        if wait == 0:
+            return READ_SECONDS
+        left = wait - (clock() - started)
+        if left <= 0:
             raise SlotBusy(busy_message(holders) if holders else f"the wait of {wait:g} seconds ended before the slot was read as free")
-        read_seconds = READ_SECONDS if wait == 0 else min(READ_SECONDS, remaining)
-        holders = spark_holders(running(read_seconds)) or holder_text(call, read_seconds)
-        if not holders and wait > 0 and clock() - started > wait:
-            raise SlotBusy(f"the wait of {wait:g} seconds ended before the slot was read as free")
+        return min(READ_SECONDS, left)
+
+    while True:
+        holders = spark_holders(running(read_seconds())) or holder_text(call, read_seconds())
         if not holders:
-            result = launch(call, build, owner, deadline_seconds)
-            if not lost_the_name(call, result, owner):
+            if wait > 0 and clock() - started >= wait:
+                raise SlotBusy(f"the wait of {wait:g} seconds ended before the slot was read as free")
+            result, refused = run_owned(call, owner, lambda: call(build(slot_options(owner)), deadline_seconds), read_seconds)
+            if not refused:
                 return result
             holders = (f"the container {SLOT_NAME}",)
         remaining = wait - (clock() - started)
         if remaining <= 0:
             raise SlotBusy(busy_message(holders))
         sleep(min(poll_seconds, remaining))
-
-
-def launch(docker: Docker, build: BuildArguments, owner: str, deadline_seconds: float) -> CompletedProcess[str]:
-    """Run the launch. Whatever ends it without a result (a deadline, an interrupt, a failure of the program) ends the container of this launch too."""
-    try:
-        return docker(build(slot_options(owner)), deadline_seconds)
-    except TimeoutExpired:
-        remove_owned(docker, owner)
-        raise
-    except BaseException:
-        with contextlib.suppress(Exception):
-            remove_owned(docker, owner)
-        raise

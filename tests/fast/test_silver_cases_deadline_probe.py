@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from tests.e2e.run_record import Record
+from tests.fast.spark_engine import with_a_free_slot
 from tests.fast.test_runner_gold_sealed import runner
 
 LINE = "silver_cases: timeout"
@@ -107,7 +108,7 @@ class StackDiagnostic(unittest.TestCase):
         log: list[str] = []
         record = Record(feature="t", slug="t", rerun="none")
         stack = module.Stack(folder / "compose", "project", folder / "data", record, log)
-        stack.run = lambda command, limit, **_: (124, "", error)
+        stack.run = with_a_free_slot(lambda command, limit, **_: (124, "", error))
         stack.watch = lambda done, stalled: None
         sealed = ("cases", "verify", "stalled_catalog")
         answer: tuple[int, dict[str, Any], str, float]
@@ -173,7 +174,7 @@ class ComposeProgress(unittest.TestCase):
             commands.append(command)
             return self.compose_like(command, limit, **keywords)
 
-        stack.run = run
+        stack.run = with_a_free_slot(run)
         stack.watch = lambda done, stalled: None
         return stack, commands
 
@@ -189,7 +190,7 @@ class ComposeProgress(unittest.TestCase):
         self.assertLess(command.index("--progress"), command.index("run"))
         self.assertEqual("quiet", command[command.index("--progress") + 1])
         # The exact-line check is still the one that decides: a stop line with another line beside it gives nothing.
-        stack.run = lambda command, limit, **_: (124, "", LINE + "\nanother line\n")
+        stack.run = with_a_free_slot(lambda command, limit, **_: (124, "", LINE + "\nanother line\n"))
         self.assertEqual("", stack.job_with_line(["-c", "pass"], None, None, {}, 300, ("cases", "verify", "stalled_catalog"), LINE)[2])
 
     def test_every_job_of_the_stack_runs_without_progress(self) -> None:

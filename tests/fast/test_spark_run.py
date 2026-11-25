@@ -45,7 +45,7 @@ class SparkRunTest(unittest.TestCase):
         self.assertEqual(0, self.go(["table_maintenance", "--dry-run"]))
         (launch,) = self.engine.launches()
         text = " ".join(launch)
-        self.assertIn("--profile batch_maintenance run --rm --no-TTY --no-deps", text)
+        self.assertIn("--profile batch_maintenance run --no-TTY --no-deps", text)
         self.assertTrue(text.endswith("spark_maintenance table_maintenance --dry-run"), text)
         self.assertNotIn("--entrypoint", text)
         self.assertEqual("job output\n", self.output.getvalue())

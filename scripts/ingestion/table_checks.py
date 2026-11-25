@@ -223,8 +223,9 @@ def compose_runner(
 
     The container is named ``spark_slot.SLOT_NAME``, which Docker allows once at a time on the engine, so the job holds the one Spark slot
     (``scripts/stack/spark_slot.py``) as long as its container exists: it does not start while a Spark container of any launcher is alive, and no other Spark
-    job starts before this container is gone, even if this process is killed or the code location restarts. A job that passes its deadline is stopped and its
-    container removed first. ``running`` reads the live services within the seconds it is given and defaults to the stack's own.
+    job starts before this container is gone, even if this process is killed or the code location restarts. This process removes the container when the job
+    ends (``run_owned``), also after a deadline or a failure; after a kill or a restart the exited container stays and is removed by hand.
+    ``running`` reads the live services within the seconds it is given and defaults to the stack's own.
     """
     root = Path(directory)
     read_running = running or (lambda timeout: running_services(settings, load_limits(settings.limits_file), timeout))
@@ -237,7 +238,7 @@ def compose_runner(
             return compose_arguments(
                 settings,
                 profile_of_job(JOB),
-                *["run", "--rm", "--no-TTY", "--no-deps", *options, "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
+                *["run", "--no-TTY", "--no-deps", *options, "--user", f"{SPARK_UID}:{STAGING_GID}", "--volume", f"{volume}:/staging:ro"],
                 *job_command(JOB, "--staging", f"/staging/{staging.name}"),
             )
 

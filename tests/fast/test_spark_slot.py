@@ -31,7 +31,7 @@ from scripts.stack.job_workloads import SPARK_GROUPS, SPARK_SERVICES
 from scripts.stack.limits import LIMITS_FILE, load_limits
 from scripts.stack.spark_slot import SlotBusy, SlotError, run_in_slot, spark_holders
 from scripts.stack.yaml_text import load_yaml
-from tests.fast.spark_engine import OWNER_LABEL, SLOT_NAME, Box, Engine, finishes
+from tests.fast.spark_engine import CONFLICT, OWNER_LABEL, SLOT_NAME, Box, Engine, finishes
 
 ROOT = Path(__file__).resolve().parents[2]
 CODE_FOLDER = ROOT / "orchestration" / "surgical_risk"
@@ -95,7 +95,7 @@ class SlotTest(unittest.TestCase):
         self.now += seconds
 
     def build(self, options: Sequence[str]) -> list[str]:
-        return ["compose", "run", "--rm", "--no-TTY", *options, "spark_maintenance", "table_maintenance"]
+        return ["compose", "run", "--no-TTY", *options, "spark_maintenance", "table_maintenance"]
 
     def record_read(self, seconds: float) -> list[str]:
         self.reads.append(seconds)
@@ -178,11 +178,194 @@ class SlotTest(unittest.TestCase):
         self.assertEqual("the_other_launch", next(iter(self.engine.boxes.values())).labels[OWNER_LABEL])
         self.assertFalse([call for call in self.engine.calls if call[:2] in (["container", "stop"], ["container", "rm"])])
 
-    def test_a_job_that_prints_the_conflict_words_is_not_started_twice(self) -> None:
-        self.engine.on_start = finishes(1, "", "x is already in use")
-        result = self.go(wait=30)
-        self.assertEqual(1, result.returncode)
+    def taken_when_free(self, owner: str = "the_other_launch") -> Callable[[Sequence[str], float], CompletedProcess[str]]:
+        """Another launcher that takes the name as soon as it is free after the first launch: it can take it only when no container has it."""
+        launched: list[bool] = []
+
+        def docker(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            if arguments[:2] == ["container", "ls"] and launched == [True]:
+                launched.append(True)
+                if not self.engine.named():
+                    self.engine.hold(owner=owner)
+            reply = self.engine.docker(arguments, timeout)
+            if arguments[0] == "compose" and not launched:
+                launched.append(True)
+            return reply
+
+        return docker
+
+    def test_a_failed_job_whose_output_holds_the_conflict_words_is_never_run_again_even_when_another_launcher_wants_the_name(self) -> None:
+        """The probe: the job exits 42 (or 1) and writes the words of the refusal, and another launcher takes the name before the reread."""
+        exact = CONFLICT.format(name=SLOT_NAME, other="f" * 64)
+        for code, text in ((42, "x is already in use"), (42, exact), (1, "x is already in use"), (1, exact)):
+            self.engine = Engine(on_start=finishes(code, "", f"{text}\n"))
+            self.now = 0.0
+
+            def leave(seconds: float) -> None:
+                self.now += seconds
+                for box in self.engine.named():
+                    del self.engine.boxes[box.id]
+
+            with self.subTest(code=code, text=text):
+                result = run_in_slot(
+                    self.build, running=lambda _: [], deadline_seconds=100, wait_seconds=30, clock=self.clock, sleep=leave, docker=self.taken_when_free()
+                )
+                self.assertEqual(code, result.returncode)
+                self.assertEqual(1, len(self.engine.launches()))
+
+    def winner_gone_before_the_reread(self, times: int = 1) -> Callable[[Sequence[str], float], CompletedProcess[str]]:
+        """Another launcher takes the name just before the launch, so the engine refuses the create, and its container is gone before the next read."""
+        done: list[bool] = []
+
+        def docker(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            if arguments[0] != "compose" or len(done) >= times:
+                return self.engine.docker(arguments, timeout)
+            done.append(True)
+            winner = self.engine.hold(owner="the_winner")
+            reply = self.engine.docker(arguments, timeout)
+            del self.engine.boxes[winner.id]
+            return reply
+
+        return docker
+
+    def test_a_refused_create_whose_winner_is_gone_before_the_reread_is_busy_and_never_a_job_result(self) -> None:
+        with self.assertRaisesRegex(SlotBusy, SLOT_NAME):
+            run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=self.winner_gone_before_the_reread())
         self.assertEqual(1, len(self.engine.launches()))
+
+    def test_a_refused_create_is_tried_again_within_the_wait_that_is_left(self) -> None:
+        result = run_in_slot(
+            self.build,
+            running=lambda _: [],
+            deadline_seconds=100,
+            wait_seconds=30,
+            poll_seconds=5,
+            clock=self.clock,
+            sleep=self.sleep,
+            docker=self.winner_gone_before_the_reread(),
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(2, len(self.engine.launches()))
+        self.assertEqual(5, self.now)
+
+    def test_the_name_read_gets_the_time_left_after_the_service_read(self) -> None:
+        """The probe: the first read takes 0.75 seconds of a wait of 1 second."""
+        reads: list[float] = []
+
+        def services(seconds: float) -> list[str]:
+            self.now += 0.75
+            return []
+
+        def docker(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            if arguments[:2] == ["container", "ls"] and not self.engine.launches():
+                reads.append(timeout)
+            return self.engine.docker(arguments, timeout)
+
+        run_in_slot(self.build, running=services, deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=docker)
+        self.assertEqual([0.25], reads)
+
+    def test_no_name_read_starts_at_or_after_the_deadline(self) -> None:
+        for taken in (1.0, 1.5):
+            self.now, self.engine = 0.0, Engine()
+
+            def services(seconds: float, taken: float = taken) -> list[str]:
+                self.now += taken
+                return []
+
+            with self.subTest(taken=taken), self.assertRaisesRegex(SlotBusy, "wait of 1 seconds ended"):
+                run_in_slot(self.build, running=services, deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=self.engine.docker)
+            self.assertEqual([], self.engine.calls)
+
+    def test_a_free_reading_that_lands_exactly_at_the_deadline_does_not_admit(self) -> None:
+        def docker(arguments: Sequence[str], timeout: float) -> CompletedProcess[str]:
+            self.now = 1.0
+            return self.engine.docker(arguments, timeout)
+
+        with self.assertRaisesRegex(SlotBusy, "wait of 1 seconds ended"):
+            run_in_slot(self.build, running=lambda _: [], deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=docker)
+        self.assertEqual([], self.engine.launches())
+
+    def test_the_reread_after_a_refused_create_gets_the_time_left_and_does_not_start_after_the_deadline(self) -> None:
+        for taken, expected in ((0.75, [1, 0.25]), (1.0, [1])):
+            self.now, self.engine = 0.0, Engine()
+            reads: list[float] = []
+            refusing = self.winner_gone_before_the_reread()
+
+            def docker(arguments: Sequence[str], timeout: float, taken: float = taken, reads: list[float] = reads, refusing: Any = refusing) -> Any:
+                if arguments[:2] == ["container", "ls"]:
+                    reads.append(timeout)
+                reply = refusing(arguments, timeout)
+                if arguments[0] == "compose":
+                    self.now += taken
+                return reply
+
+            with self.subTest(taken=taken), self.assertRaises(SlotBusy):
+                run_in_slot(self.build, running=lambda _: [], deadline_seconds=100, wait_seconds=1, clock=self.clock, sleep=self.sleep, docker=docker)
+            self.assertEqual(expected, reads[: len(expected)])
+            self.assertEqual(1, len(self.engine.launches()))
+
+    def test_a_finished_job_has_its_container_removed_by_id_whatever_its_exit_status(self) -> None:
+        for code in (0, 1, 42):
+            self.engine = Engine(on_start=finishes(code))
+            with self.subTest(code=code):
+                self.assertEqual(code, self.go().returncode)
+                self.assertEqual({}, self.engine.boxes)
+                self.assertIn(["container", "rm", "--force", "--volumes", f"{1:064x}"], self.engine.calls)
+
+    def test_a_finished_job_whose_container_cannot_be_removed_keeps_its_result_and_reports_the_holder(self) -> None:
+        self.engine.on_start = finishes(3)
+        self.engine.removal_fails = True
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(3, self.go().returncode)
+        self.assertIn(f"{1:064x} (exited)", error.getvalue())
+
+    def test_an_interrupt_or_a_failure_whose_cleanup_fails_reports_the_surviving_container_and_its_state(self) -> None:
+        """The probe: an interrupt while the removal fails. The old code hid the cleanup error and said nothing."""
+        for kind in (KeyboardInterrupt, OSError):
+            self.engine = Engine(removal_fails=True)
+
+            def end(engine: Engine, box: Box, kind: type[BaseException] = kind) -> CompletedProcess[str]:
+                raise kind
+
+            self.engine.on_start = end
+            with self.subTest(kind=kind.__name__), contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(kind):
+                self.go()
+            self.assertIn(f"{1:064x} (exited)", error.getvalue())
+            self.assertIn(SLOT_NAME, error.getvalue())
+
+    def test_a_deadline_whose_cleanup_fails_names_the_surviving_container_and_its_state(self) -> None:
+        self.engine.on_start = killed
+        self.engine.removal_fails = True
+        with self.assertRaisesRegex(SlotError, f"{1:064x} \\(exited\\)"):
+            self.go()
+
+    def test_an_interrupt_that_lands_in_the_cleanup_does_not_skip_the_removal(self) -> None:
+        """Ctrl-C during the stop of a container, after a success and after a deadline: the removal is run again and the interrupt is raised."""
+        for start in (finishes(), killed):
+            self.engine = Engine(on_start=start)
+            pressed: list[bool] = []
+
+            def docker(arguments: Sequence[str], timeout: float, pressed: list[bool] = pressed) -> CompletedProcess[str]:
+                if arguments[:2] in (["container", "stop"], ["container", "rm"]) and not pressed:
+                    pressed.append(True)
+                    raise KeyboardInterrupt
+                return self.engine.docker(arguments, timeout)
+
+            with self.subTest(start=start.__name__), self.assertRaises(KeyboardInterrupt):
+                run_in_slot(self.build, running=lambda _: [], deadline_seconds=1, docker=docker)
+            self.assertEqual({}, self.engine.boxes)
+
+    def test_a_free_slot_is_required_and_the_refusal_names_the_holding_container_and_its_state(self) -> None:
+        slot.require_free(self.engine.docker)
+        held = self.engine.hold(state="paused")
+        with self.assertRaisesRegex(SlotBusy, f"{held.id} \\(paused\\)|\\(paused\\).*{held.id}"):
+            slot.require_free(self.engine.docker)
+
+    def test_no_launcher_of_the_repository_removes_its_container_with_the_run_option(self) -> None:
+        """The container that is left after the job is the engine's proof that the create succeeded, so the shared cleanup removes it and ``--rm`` does not."""
+        for path in ("scripts/stack/spark_run.py", "scripts/ingestion/table_checks.py"):
+            with self.subTest(path=path):
+                self.assertNotIn('"--rm"', (ROOT / path).read_text())
 
     def test_a_container_of_a_killed_launcher_holds_the_slot_for_every_later_launcher(self) -> None:
         """A restart of the code location clears its memory file system and every file in it: the container is what holds the slot."""
@@ -203,7 +386,7 @@ class SlotTest(unittest.TestCase):
         self.assertEqual({}, self.engine.boxes)
         box_id = f"{1:064x}"
         self.assertIn(["container", "stop", "--time", str(slot.STOP_SECONDS), box_id], self.engine.calls)
-        self.assertIn(["container", "rm", "--force", box_id], self.engine.calls)
+        self.assertIn(["container", "rm", "--force", "--volumes", box_id], self.engine.calls)
         self.engine.on_start = finishes()
         self.assertEqual(0, self.go().returncode)
 
@@ -233,7 +416,7 @@ class SlotTest(unittest.TestCase):
             self.go()
         self.assertEqual({}, self.engine.boxes)
         self.engine.removal_fails = True
-        with self.assertRaises(KeyboardInterrupt):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
             self.go()
 
     def test_a_wait_ends_when_the_holder_is_gone_and_not_later_than_its_deadline(self) -> None:

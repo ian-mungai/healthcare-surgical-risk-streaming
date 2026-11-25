@@ -4,7 +4,10 @@ The job starts as ``docker compose run`` in the service and profile of its workl
 point, which refuses a job that is not mapped to its workload. The container is named ``spark_slot.SLOT_NAME``, which Docker allows once at a time on the
 engine: the one Spark slot (``scripts/stack/spark_slot.py``) is held as long as that container exists, so the command does not start while any other Spark
 container (the table checks one-off, another ``spark_run``, a Spark service) is alive, whichever process or container started it. A job that passes its
-deadline is stopped and its container removed before the command reports it. Run it in the code location container, which reaches the Docker engine:
+deadline is stopped and its container removed before the command reports it. The command removes the container of a finished job too (no ``--rm``); one that
+cannot be removed is reported with its ID and state on standard error, keeps the slot and leaves the exit status as the job's own.
+
+Run it in the code location container, which reaches the Docker engine:
 
     docker compose exec dagster_code_location python -m scripts.stack.spark_run table_maintenance --dry-run
 
@@ -66,7 +69,7 @@ def main(argv: Sequence[str] | None = None, *, running: Running | None = None) -
         limits = load_limits(settings.limits_file)
         environment = rendered_environment(limits)
         result = run_in_slot(
-            lambda options: compose_arguments(settings, profile, "run", "--rm", "--no-TTY", "--no-deps", *options, *words),
+            lambda options: compose_arguments(settings, profile, "run", "--no-TTY", "--no-deps", *options, *words),
             running=running or (lambda timeout: running_services(settings, limits, timeout)),
             deadline_seconds=arguments.deadline_seconds,
             env=environment,
