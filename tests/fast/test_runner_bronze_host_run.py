@@ -19,6 +19,9 @@ Failure modes covered here:
   not checked against the saved record, or a pass is printed with no tag evidence in the run's folder.
 - An interrupt right after Nessie accepted the tag post leaves a tag that no file of the run's folder names: the pending tag record is not saved before
   the post, is not kept on every outcome, is marked complete before the tag is verified, or a pass is printed while it is not complete.
+- A launch whose SSH call timed out or failed is not pending, so both inventories read empty while its container is still starting and the cleanup deletes the
+  branches and the folder under it; the wait for it has no fixed deadline, ends before the last attempt's deadline, or ends with a launch unresolved and the
+  record still passes.
 - A case file is read before the whole run's object versions are confirmed, or before the Spark workload's own access is proved.
 """
 
@@ -123,6 +126,9 @@ class FakeTarget:
         self.containers: dict[str, str] = {}
         self.launches: list[str] = []
         self.hang = False
+        self.timeouts = 0
+        self.start_after = 0
+        self.starting: list[list[Any]] = []
         self.folders: set[str] = set()
         self.files: dict[str, str] = {}
         self.replies: dict[str, str] = {}
@@ -136,10 +142,15 @@ class FakeTarget:
     def run(self, args: list[str], *, stdin: str | None = None, timeout: float = 180.0) -> tuple[int, str, str]:
         self.calls.append(list(args))
         self.events.append("target " + " ".join(args[:3]))
+        self.advance()
         head = args[0]
         if head == "docker" and "run" in args and "--name" in args:
             name = args[args.index("--name") + 1]
             self.launches.append(name)
+            if self.timeouts:
+                self.timeouts -= 1
+                self.starting.append([name, self.start_after])
+                return 255, "", "TimeoutExpired"
             if self.hang:
                 self.containers[f"{len(self.launches):012x}"] = name
         if head == "mkdir":
@@ -176,8 +187,38 @@ class FakeTarget:
             return 0, self.files.get(args[-1], ""), ""
         return 0, "", ""
 
+    def advance(self) -> None:
+        """A launch whose call timed out starts its container some commands later, as a slow host does."""
+        for item in list(self.starting):
+            item[1] -= 1
+            if item[1] <= 0:
+                self.starting.remove(item)
+                self.containers[f"{len(self.launches) + 100 + len(self.containers):012x}"] = item[0]
+                self.events.append("container started late")
+
+    def finish_starting(self) -> None:
+        """The host goes on after the run ended: every container that was still starting is there now."""
+        for item in list(self.starting):
+            item[1] = 1
+        self.advance()
+
     def write_text(self, path: str, text: str) -> None:
         self.run(["tee", path], stdin=text)
+
+
+class FakeClock:
+    """The clock and the sleep of the stack's wait: a sleep only moves the clock, so no test waits."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
 
 
 class Hosted(unittest.TestCase):
@@ -194,6 +235,8 @@ class Hosted(unittest.TestCase):
         record = Record(feature="test", slug="bronze_host_test", rerun="test")
         stack = self.module.HostStack(self.target, record, [], SUFFIX)
         stack.region = "eu-west-1"
+        self.time = FakeClock()
+        stack.clock, stack.sleep = self.time.clock, self.time.sleep
         self.run_folder = Path(tempfile.mkdtemp(prefix="bronze_host_test_run_"))
         self.addCleanup(shutil.rmtree, self.run_folder, ignore_errors=True)
         self.host = self.module.HostRun(stack, self.nessie, record, ManifestRef.from_json(REFERENCE), None, {}, self.run_folder)
@@ -714,6 +757,151 @@ class CleanupOrder(Hosted):
         self.assertIn("other_runs_job", text)
         self.assertEqual({"bbbbbbbbbbbb": "other_runs_job"}, self.target.containers)
         self.assertEqual([], [name for name in self.references() if name.startswith(PREFIX)])
+
+
+class PendingLaunch(Hosted):
+    """A launch whose SSH call timed out or failed is pending: the container may still be starting, so the cleanup waits, looks again by the run's label and
+    removes it before the branches and the folder go."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.made_folder()
+        self.host.branch("trunk", "main")
+        self.kept_names = [f"{PREFIX}_trunk"]
+
+    def timed_out(self, *, start_after: int = 10**6) -> str:
+        self.target.timeouts, self.target.start_after = 1, start_after
+        code = self.host.stack.replay(["/out/x.py"], replay_access=False)[0]
+        self.assertEqual(255, code)
+        return str(self.host.stack.launched[-1])
+
+    def assert_kept(self, text: str) -> None:
+        self.assertEqual(self.kept_names, [name for name in self.references() if name.startswith(PREFIX)])
+        self.assertFalse([target for method, target in self.nessie.calls if method == "DELETE"])
+        self.assertIn(self.host.stack.folder, self.target.folders)
+        self.assertFalse([call for call in self.target.calls if call[0] == "rm"])
+        self.assertIn(self.host.stack.folder, text)
+        self.assertIn(f"{PREFIX}_trunk", text)
+
+    def test_a_container_that_starts_after_both_inventories_is_removed_before_the_branches_and_the_folder(self) -> None:
+        self.timed_out(start_after=8)
+        passed, text = self.module.remove_everything(self.host)
+        self.assertIn("container started late", self.events, "the cleanup ended before the container started: it did not wait for the pending launch")
+        started = self.events.index("container started late")
+        removed = next(number for number, event in enumerate(self.events) if event.startswith("target docker rm") and number > started)
+        deleted = next(number for number, event in enumerate(self.events) if event == "nessie DELETE")
+        folder = next(number for number, event in enumerate(self.events) if event.startswith("target rm"))
+        self.assertLess(removed, deleted)
+        self.assertLess(removed, folder)
+        self.target.finish_starting()
+        self.assertEqual({}, self.target.containers)
+        self.assertTrue(passed, text)
+        self.assertEqual({}, self.host.stack.pending)
+        self.assertEqual([], [name for name in self.references() if name.startswith(PREFIX)])
+        self.assertNotIn(self.host.stack.folder, self.target.folders)
+
+    def test_the_wait_ends_at_a_fixed_deadline_after_the_last_launch_attempt(self) -> None:
+        self.timed_out()
+        self.time.now += 50
+        last = self.timed_out()
+        attempted = self.time.now
+        with mock.patch.object(self.module, "PENDING_POLL_SECONDS", 7):
+            passed, text = self.module.remove_everything(self.host)
+        self.assertTrue(passed, text)
+        self.assertEqual(attempted + self.module.PENDING_SETTLE_SECONDS, self.time.now)
+        self.assertNotIn(last, self.host.stack.pending)
+
+    def test_a_pending_launch_that_cannot_be_resolved_keeps_the_branches_and_the_folder_and_names_them(self) -> None:
+        name = self.timed_out()
+        self.target.ps_code = 255
+        passed, text = self.module.remove_everything(self.host)
+        self.assertFalse(passed)
+        self.assert_kept(text)
+        self.assertIn(name, text)
+        self.assertIn(name, self.host.stack.pending)
+
+    def test_a_late_container_that_cannot_be_removed_keeps_the_branches_and_the_folder_and_names_them(self) -> None:
+        name = self.timed_out(start_after=2)
+        self.target.rm_code = 1
+        passed, text = self.module.remove_everything(self.host)
+        self.assertFalse(passed)
+        self.assert_kept(text)
+        self.assertIn(name, text)
+
+    def test_a_late_container_that_is_seen_and_removed_ends_the_wait_early(self) -> None:
+        self.timed_out(start_after=1)
+        passed, text = self.module.remove_everything(self.host)
+        self.assertTrue(passed, text)
+        self.assertEqual({}, self.target.containers)
+        self.assertLess(sum(self.time.slept), self.module.PENDING_SETTLE_SECONDS)
+
+    def test_a_launch_that_exits_by_itself_is_not_pending_and_the_cleanup_does_not_wait(self) -> None:
+        original = self.target.run
+        failed: list[str] = []
+
+        def failing(args: list[str], **options: Any) -> tuple[int, str, str]:
+            code, out, err = original(args, **options)
+            if "--name" in args and not failed:
+                failed.append(args[args.index("--name") + 1])
+                return 1, out, err
+            return code, out, err
+
+        self.target.run = failing  # type: ignore[method-assign]
+        self.assertEqual(1, self.host.stack.replay(["/out/x.py"], replay_access=False)[0])
+        self.assertEqual({}, self.host.stack.pending)
+        passed, text = self.module.remove_everything(self.host)
+        self.assertTrue(passed, text)
+        self.assertEqual([], self.time.slept)
+
+    def test_a_launch_that_an_interrupt_cut_short_is_pending(self) -> None:
+        def interrupted(args: list[str], **options: Any) -> tuple[int, str, str]:
+            raise KeyboardInterrupt
+
+        self.target.run = interrupted  # type: ignore[method-assign]
+        with self.assertRaises(KeyboardInterrupt):
+            self.host.stack.replay(["/out/x.py"], replay_access=False)
+        self.assertEqual([self.host.stack.launched[-1]], list(self.host.stack.pending))
+
+
+class AcceptedLimits(unittest.TestCase):
+    """The limits that the owner accepted are in the runner's docstring and in every record that the runner writes."""
+
+    def setUp(self) -> None:
+        self.module = runner()
+
+    def recorded(self) -> list[str]:
+        scratch = Path(tempfile.mkdtemp(prefix="bronze_host_test_limits_"))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        reference = scratch / "reference.json"
+        reference.write_text(REFERENCE)
+        seen: list[Record] = []
+
+        def finish(record: Record, *_: Any, **__: Any) -> int:
+            seen.append(record)
+            return 0
+
+        with (
+            mock.patch("sys.argv", ["bronze_host", "--manifest-reference", str(reference)]),
+            mock.patch.object(run_record, "ROOT", scratch),
+            mock.patch.object(self.module, "run_host", return_value=""),
+            mock.patch.object(self.module, "finish", side_effect=finish),
+        ):
+            self.assertEqual(0, self.module.main())
+        return list(seen[0].limits)
+
+    def test_the_record_names_the_two_accepted_limits_and_the_wait_of_the_pending_launches(self) -> None:
+        limits = " ".join(self.recorded())
+        self.assertIn("replaced by another actor during a failed clinical edit", limits)
+        self.assertIn("reuses the same token after the first run released it", limits)
+        self.assertIn("delayed container", limits)
+        self.assertIn(f"{self.module.PENDING_SETTLE_SECONDS} seconds", limits)
+
+    def test_the_docstring_names_the_accepted_limits_and_the_pending_launches(self) -> None:
+        text = " ".join((self.module.__doc__ or "").split())
+        self.assertIn("replaced by another actor during a failed clinical edit", text)
+        self.assertIn("reuses the same token after the first run released it", text)
+        self.assertIn("pending", text)
+        self.assertIn(self.module.PENDING_NAME, text)
 
 
 class TagProof(Hosted):
