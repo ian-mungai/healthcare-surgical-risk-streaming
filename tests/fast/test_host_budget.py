@@ -312,7 +312,7 @@ class HostSetupBudgetTest(unittest.TestCase):
             """Commands that run under timeout: the task's deadline is the command's deadline and the grace that lets timeout stop the command first."""
             return sum(seconds(name) + grace for name in deadlines)
 
-        python = seconds("download") + under_timeout("unpack", "check", "remove", "remove", "remove", "check")
+        python = seconds("download") + under_timeout("unpack", "check", "remove", "remove", "check")
         controller = under_timeout("remove", "archive") + seconds("manifest")
         decision = seconds("manifest") + seconds("environment_check")
         retries = 1 + int(names["runner_checkout_stop_check_retries"])
@@ -321,16 +321,17 @@ class HostSetupBudgetTest(unittest.TestCase):
             under_timeout("remove", "remove")
             + seconds("unpack")
             + under_timeout("unpack", "environment", "check", "install", "remove")
-            + stop_check
+            + 2 * stop_check
             + under_timeout("remove")
         )
         closing = under_timeout("close", "close") + seconds("manifest") + seconds("scan")
         self.assertEqual(
             python + controller + decision + build + closing,
             parts()["runner_checkout"],
-            "the interpreter's download, unpack, checks, removals and publish; the controller's archive, its read and its scratch removal; "
-            "the manifest and environment checks; the removals, the copy, the unpack, the environment, its check, the install, the archive's removals "
-            "and the stop check; the closing, the manifest and the listing",
+            "the interpreter's download, unpack, checks and removals (the old folders after the link changed, the new folder of a failed install); "
+            "the controller's archive, its read and its scratch removal; the manifest and environment checks; the removals, the copy, the unpack, "
+            "the environment, its check, the install, the archive's removals and the two stop checks (before anything is removed, and after a failed build); "
+            "the closing, the manifest and the listing",
         )
         timed = [item for item in found if item.role == "runner_checkout" and task_seconds(item)]
         self.assertEqual(26, len(timed))

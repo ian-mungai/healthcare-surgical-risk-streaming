@@ -1,8 +1,13 @@
 # Reads runner_checkout_commit, runner_checkout_scratch (the controller's folder with runner.tar), runner_checkout_directory, runner_checkout_folder, runner_checkout_archive_file,
-# the owner, group and mode, and the deadlines. Runs only for a folder that is not finished. Every folder or file under the runner folder except this commit's is removed, and
-# this commit's own unfinished folder too, each by one command with a deadline (rm under timeout), and a link among them is removed and never followed. The commit's new folder is
-# made, checked to be a real folder of the deploy user, and filled from the archive. When a command of the build fails or passes its deadline, no cleanup runs until no process
-# still works in the folder (pgrep, tried again a few times), and then only the archive file is removed: the unfinished folder has no marker, so the next run removes it.
+# the owner, group and mode, and the deadlines. Runs only for a folder that is not finished. Before anything is removed, no process of an earlier build (the process groups in
+# the record that every command of a build writes) and none that works in the runner folder may still work (processes.yml), so a retry prunes nothing under a live process. Then
+# every folder or file under the runner folder except this commit's is removed, and this commit's own unfinished folder too, each by one command with a deadline (rm under
+# timeout), and a link among them is removed and never followed. The commit's new folder is made, checked to be a real folder of the deploy user, and filled from the archive.
+# When a command of the build fails or passes its deadline, no cleanup runs until no process of the build works any more (processes.yml again), and then only the archive file
+# is removed: the unfinished folder has no marker, so the next run removes it.
+- name: Confirm that no process of an earlier build still works before anything is removed
+  ansible.builtin.include_tasks: processes.yml
+
 - name: Place the commit's code, build the environment and remove the old folders
   block:
     - name: Remove every folder or file under the runner folder except this commit's
@@ -69,7 +74,9 @@
 
     - name: Unpack the archive
       ansible.builtin.command:
-        argv:
+        argv: "{{ runner_checkout_track + unpack }}"
+      vars:
+        unpack:
           - timeout
           - "--kill-after={{ runner_checkout_kill_after_seconds }}"
           - "{{ runner_checkout_unpack_deadline_seconds }}"
@@ -91,28 +98,8 @@
       changed_when: true
       timeout: "{{ runner_checkout_remove_deadline_seconds + runner_checkout_stop_grace_seconds }}"
   rescue:
-    - name: Confirm that no process of the failed build still works in the runner folder
-      ansible.builtin.command:
-        argv:
-          - timeout
-          - "--kill-after={{ runner_checkout_kill_after_seconds }}"
-          - "{{ runner_checkout_stop_check_deadline_seconds }}"
-          - pgrep
-          - -f
-          - --
-          - "[{{ runner_checkout_folder[0] }}]{{ runner_checkout_folder[1:] }}/"
-      register: runner_checkout_still_working
-      changed_when: false
-      failed_when: runner_checkout_still_working.rc not in [0, 1]
-      until: runner_checkout_still_working.rc == 1
-      retries: "{{ runner_checkout_stop_check_retries }}"
-      delay: "{{ runner_checkout_stop_check_delay_seconds }}"
-      timeout: "{{ runner_checkout_stop_check_deadline_seconds + runner_checkout_stop_grace_seconds }}"
-
-    - name: Refuse to clean up while a process still works in the runner folder
-      ansible.builtin.fail:
-        msg: a process still works in the runner folder {{ runner_checkout_folder }} after the build failed, so nothing was cleaned up; stop it and deploy again
-      when: runner_checkout_still_working.rc != 1
+    - name: Confirm that no process of the failed build still works
+      ansible.builtin.include_tasks: processes.yml
 
     - name: Remove the archive from the host after the failed build
       ansible.builtin.command:

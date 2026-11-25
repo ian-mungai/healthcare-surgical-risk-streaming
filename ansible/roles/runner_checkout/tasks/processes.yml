@@ -1,0 +1,29 @@
+# Reads runner_checkout_build_record, runner_checkout_process_script, runner_checkout_directory and the stop check's deadline, retries and delay. Fails when a process that a
+# build of the runner folder started (a group of the record) or that works in the runner folder (its command line names the folder) still works after the retries, so that
+# nothing is removed or cleaned up under a live process; it removes the record when none is left. Nothing here changes a file but the record.
+- name: Look for a process of a build, or one that works in the runner folder, that still works
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - "--kill-after={{ runner_checkout_kill_after_seconds }}"
+      - "{{ runner_checkout_stop_check_deadline_seconds }}"
+      - sh
+      - -c
+      - "{{ runner_checkout_process_script }}"
+      - sh
+      - "{{ runner_checkout_build_record }}"
+      - "[{{ runner_checkout_directory[0] }}]{{ runner_checkout_directory[1:] }}/"
+  register: runner_checkout_still_working
+  changed_when: false
+  failed_when: runner_checkout_still_working.rc not in [0, 1]
+  until: runner_checkout_still_working.rc == 0
+  retries: "{{ runner_checkout_stop_check_retries }}"
+  delay: "{{ runner_checkout_stop_check_delay_seconds }}"
+  timeout: "{{ runner_checkout_stop_check_deadline_seconds + runner_checkout_stop_grace_seconds }}"
+
+- name: Refuse to remove or clean up while a process of a build still works
+  ansible.builtin.fail:
+    msg: >-
+      a process that a build of the runner folder started, or one that works in {{ runner_checkout_directory }}, still works, so nothing was cleaned up or removed; stop it and deploy
+      again (the processes of a build are the process groups in {{ runner_checkout_build_record }}; remove that file when the system gave those numbers to unrelated processes)
+  when: runner_checkout_still_working.rc != 0

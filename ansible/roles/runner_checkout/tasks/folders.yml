@@ -1,6 +1,7 @@
 # Reads runner_checkout_directory, runner_checkout_folder, runner_checkout_marker, runner_checkout_marker_text, runner_checkout_commit, runner_checkout_owner,
 # runner_checkout_group and runner_checkout_archive_files. Sets runner_checkout_complete. The runner folder and the commit's folder must be real folders owned by the deploy
-# user: a link is never followed, written through or made the place of a finished folder. A folder is finished when its marker (a plain file) holds exactly what this deploy
+# user: a link is never followed, written through or made the place of a finished folder, and an existing runner folder that another user owns is refused before the role
+# changes its owner, group or mode (so that a rebuild never prunes a folder that is not the deploy user's). A folder is finished when its marker (a plain file) holds exactly what this deploy
 # expects, the manifest and every file of it are exactly the files and hashes of the controller's archive, and the environment runs, says the pinned version and holds exactly
 # what the lock files pin (a missing manifest, a missing file or a broken environment is a folder that is not finished). Nothing here removes anything when the folder is
 # finished: a runner that the launcher placed in it stays, because the manifest does not list it.
@@ -16,6 +17,13 @@
       - not runner_checkout_directory_before.stat.exists or (runner_checkout_directory_before.stat.isdir and not runner_checkout_directory_before.stat.islnk)
     quiet: true
     fail_msg: "{{ runner_checkout_directory }} is a link or is not a folder: the role does not follow a link, so remove it on the host first"
+
+- name: Refuse a runner folder that another user owns before anything is changed in it
+  ansible.builtin.assert:
+    that:
+      - not runner_checkout_directory_before.stat.exists or runner_checkout_directory_before.stat.pw_name == runner_checkout_owner
+    quiet: true
+    fail_msg: "{{ runner_checkout_directory }} is owned by another user than {{ runner_checkout_owner }}: the role does not take it over and prunes nothing in it, so check it on the host first"
 
 - name: Create the runner folder for its owner and group only
   ansible.builtin.file:

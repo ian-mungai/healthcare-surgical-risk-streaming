@@ -64,7 +64,8 @@ class DeadlineTest(unittest.TestCase):
             with self.subTest(file=file, task=task["name"]):
                 argv = task[str(module_name(task, ("command",)))]["argv"]
                 if isinstance(argv, str):
-                    argv = task["vars"]["install_start"]
+                    self.assertIn("runner_checkout_track", argv, "a string argv is the tracked wrapper and the command that the task's vars give")
+                    argv = next(value for value in task["vars"].values() if isinstance(value, list) and value[:1] == ["timeout"])
                 self.assertEqual("timeout", argv[0], "the command is started by timeout, which stops it and its processes at the place where it runs")
                 kill_after, deadline = number(str(argv[1]).removeprefix("--kill-after=")), number(argv[2])
                 self.assertEqual("--kill-after=", str(argv[1])[:13])
@@ -101,15 +102,28 @@ class DeadlineTest(unittest.TestCase):
             with self.subTest(file=file, task=task["name"]):
                 self.assertIsNone(module_name(task, SHELL_MODULES))
 
-    def test_a_failed_build_confirms_that_no_process_still_works_in_the_folder_before_it_removes_anything(self) -> None:
-        text = (ROLE / "tasks" / "archive.yml").read_text()
-        document: Any = load_yaml(text)
-        rescue = document[0]["rescue"]
+    def test_a_build_confirms_that_no_process_of_a_build_still_works_before_it_removes_anything_and_before_it_cleans_up_after_a_failure(self) -> None:
+        document: Any = load_yaml((ROLE / "tasks" / "archive.yml").read_text())
+        self.assertEqual("Confirm that no process of an earlier build still works before anything is removed", document[0]["name"])
+        self.assertEqual("processes.yml", document[0]["ansible.builtin.include_tasks"])
+        self.assertIn("block", document[1], "the check comes before the block that removes the other folders")
+        rescue = document[1]["rescue"]
         names = [task["name"] for task in rescue]
-        self.assertEqual("Confirm that no process of the failed build still works in the runner folder", names[0])
-        self.assertIn("until", rescue[0])
-        self.assertIn("pgrep", str(rescue[0]))
-        self.assertEqual(["Confirm", "Refuse", "Remove", "Fail"], [name.split()[0] for name in names], "the check comes first and the removal only after it")
+        self.assertEqual("Confirm that no process of the failed build still works", names[0])
+        self.assertEqual("processes.yml", rescue[0]["ansible.builtin.include_tasks"])
+        self.assertEqual(["Confirm", "Remove", "Fail"], [name.split()[0] for name in names], "the check comes first and the removal only after it")
+        check: Any = load_yaml((ROLE / "tasks" / "processes.yml").read_text())
+        self.assertIn("until", check[0])
+        self.assertIn("runner_checkout_process_script", str(check[0]))
+        self.assertIn("runner_checkout_build_record", str(check[0]))
+        self.assertEqual("ansible.builtin.fail", next(key for key in check[1] if key.startswith("ansible.builtin.")))
+
+    def test_the_commands_that_leave_processes_behind_start_through_the_program_that_records_their_process_group(self) -> None:
+        names = sorted(task["name"] for _, task in role_tasks() if module_name(task, ("command",)) and "runner_checkout_track" in str(task))
+        self.assertEqual(["Install the hash-pinned requirements", "Make the environment", "Unpack the archive"], names)
+        script = str(group_variables()["runner_checkout_process_script"])
+        for part in ("kill -0 --", "pgrep -f", 'rm -f -- "$1"'):
+            self.assertIn(part, script)
 
 
 class PinnedInstallTest(unittest.TestCase):

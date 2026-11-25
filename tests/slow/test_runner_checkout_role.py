@@ -20,11 +20,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
 from pathlib import Path
 
+from scripts.infra import runner_place
 from scripts.process import CompletedProcess, run_command
 from tests.fast.ansible_paths import GROUP_VARIABLES, group_variables
 from tests.slow.ansible_support import ROLES, environment
@@ -77,10 +79,11 @@ class Scratch:
         self.git("init", "--quiet", "--initial-branch", "main")
         (self.repo / ".gitignore").write_text("ignored_runner.py\n")
         self.commit_a = self.commit({"requirements.txt": self.requirements(), "app/a.py": "A = 1\n", "tests/e2e/tracked.py": "T = 1\n"})
-        interpreter = self.python_root / VERSION / "bin" / f"python{VERSION.rsplit('.', 1)[0]}"
+        interpreter = self.python_root / f"{VERSION}-fixture" / "bin" / f"python{VERSION.rsplit('.', 1)[0]}"
         interpreter.parent.mkdir(parents=True)
         interpreter.symlink_to(Path(sys.executable))
-        (self.python_root / VERSION / PYTHON_MARKER).write_text(PINNED_DIGEST + "\n")
+        (self.python_root / f"{VERSION}-fixture" / PYTHON_MARKER).write_text(PINNED_DIGEST + "\n")
+        (self.python_root / VERSION).symlink_to(f"{VERSION}-fixture")
         self.scratch_root = self.base / "controller_scratch"
         self.scratch_root.mkdir()
 
@@ -192,6 +195,36 @@ class PlacementTest(unittest.TestCase):
                 code, _ = scratch.run(commit)
                 self.assertNotEqual(0, code)
                 self.assertFalse(scratch.folder(commit).exists())
+
+    def test_a_commit_that_the_repository_cannot_give_fails_before_the_interpreter_is_downloaded_or_any_folder_of_the_host_is_made(self) -> None:
+        scratch = Scratch(self)
+        (scratch.repo / "app" / "bad_link").symlink_to("/etc/passwd")
+        scratch.git("add", "app/bad_link")
+        scratch.git("commit", "--quiet", "-m", "chore: link")
+        with_link = scratch.git("rev-parse", "HEAD").stdout.strip()
+        fresh = scratch.base / "fresh_python"
+        for name, commit in (("not in the repository", "f" * 40), ("holds a link", with_link)):
+            with self.subTest(commit=name):
+                code, _ = scratch.run(commit, runner_checkout_python_directory=str(fresh))
+                self.assertNotEqual(0, code)
+                self.assertFalse(fresh.exists(), "the interpreter's folder was made before the archive was read")
+                self.assertFalse(scratch.runner_root.exists(), "the runner folder was made before the archive was read")
+
+    def test_the_marker_that_the_role_writes_is_accepted_by_the_guard_of_the_runner_placement_and_a_changed_commit_is_not(self) -> None:
+        scratch = Scratch(self)
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        directory = str(scratch.runner_root)
+        for commit, expected in ((scratch.commit_a, 0), ("e" * 40, 3)):
+            guard = runner_place.runner_folder_guard(commit, directory)
+            if expected == 0:
+                result = run_command("sh", ["-c", guard + "echo accepted"], timeout=30)
+                self.assertEqual((0, "accepted"), (result.returncode, result.stdout.strip()), result.stderr)
+            else:
+                (scratch.runner_root / commit).mkdir()
+                shutil.copy(scratch.folder(scratch.commit_a) / MARKER, scratch.runner_root / commit / MARKER)
+                result = run_command("sh", ["-c", guard + "echo accepted"], timeout=30)
+                self.assertEqual((expected, runner_place.NO_FOLDER_WORD), (result.returncode, result.stdout.strip()), "the marker of another commit")
 
 
 class ProtectionTest(unittest.TestCase):
@@ -401,6 +434,22 @@ class RealFolderTest(unittest.TestCase):
         self.assertEqual(0o755, stat.S_IMODE(target.stat().st_mode))
         self.assertTrue(scratch.runner_root.is_symlink())
 
+    def test_a_runner_folder_that_another_user_owns_fails_the_deploy_before_any_change_and_nothing_in_it_is_pruned(self) -> None:
+        scratch = Scratch(self)
+        foreign = "root" if OWNER != "root" else "nobody"
+        scratch.runner_root.mkdir()
+        scratch.runner_root.chmod(0o711)
+        (scratch.runner_root / "older_folder").mkdir()
+        (scratch.runner_root / "older_folder" / "keep.txt").write_text("keep\n")
+        code, output = scratch.run(scratch.commit_a, runner_checkout_owner=foreign)
+        self.assertNotEqual(0, code)
+        self.assertIn('"msg": "', output)
+        self.assertRegex(output, r'"msg": "[^"]*is owned by another user', "the refusal of the check itself is the message of the failure")
+        self.assertNotIn("chown failed", output, "the role did not try to take the folder over")
+        self.assertEqual(0o711, stat.S_IMODE(scratch.runner_root.stat().st_mode), "no permission was changed")
+        self.assertEqual("keep\n", (scratch.runner_root / "older_folder" / "keep.txt").read_text())
+        self.assertEqual(["older_folder"], sorted(path.name for path in scratch.runner_root.iterdir()))
+
     def test_a_commit_folder_that_is_a_link_to_a_finished_copy_is_replaced_by_a_real_folder_and_the_target_is_not_touched(self) -> None:
         scratch = Scratch(self)
         self.assertEqual(0, scratch.run(scratch.commit_a)[0])
@@ -558,6 +607,31 @@ class EnvironmentCheckTest(unittest.TestCase):
                 self.assertEqual([], [path.name for path in venv_site(folder).glob("stray_package*")])
                 self.assertTrue(next(venv_site(folder).glob("runner_probe-1.0.dist-info")).is_dir())
 
+    def test_a_package_whose_marker_is_true_for_the_interpreter_and_that_is_missing_builds_the_folder_again_and_one_whose_marker_is_false_is_not_installed(
+        self,
+    ) -> None:
+        scratch = Scratch(self)
+        lock = (
+            f"runner-probe==1.0 ; platform_python_implementation == 'CPython' \\\n    --hash=sha256:{scratch.wheel_hash}\n"
+            f"other-probe==1.0 ; platform_python_implementation == 'NoSuchPython' \\\n    --hash=sha256:{'0' * 64}\n"
+        )
+        commit = scratch.commit({"requirements.txt": lock})
+        code, output = scratch.run(commit)
+        self.assertEqual(0, code, output)
+        folder = scratch.folder(commit)
+        self.assertEqual([], list(venv_site(folder).glob("other_probe*")), "the marker is false here, so pip did not install it")
+        placed = folder / "tests" / "e2e" / "silver_signals.py"
+        placed.parent.mkdir(parents=True, exist_ok=True)
+        placed.write_text("PLACED = 1\n")
+        code, output = scratch.run(commit)
+        self.assertEqual(0, code, output)
+        self.assertTrue(placed.exists(), "the environment holds what the lock files require here, so the folder is kept")
+        shutil.rmtree(next(venv_site(folder).glob("runner_probe-1.0.dist-info")))
+        code, output = scratch.run(commit)
+        self.assertEqual(0, code, output)
+        self.assertFalse(placed.exists(), "a package that the marker requires here was missing, so the folder was built again")
+        self.assertTrue(next(venv_site(folder).glob("runner_probe-1.0.dist-info")).is_dir())
+
     def test_an_environment_whose_interpreter_says_another_version_or_does_not_run_builds_the_folder_again(self) -> None:
         for case in ("another version", "does not run"):
             with self.subTest(case=case):
@@ -615,7 +689,7 @@ class DeadlineTest(unittest.TestCase):
         self.assertFalse(Path(f"{scratch.folder(scratch.commit_a)}.tar").exists())
         self.assertEqual([], list(scratch.scratch_root.iterdir()), "the controller's scratch folder is removed")
 
-    def test_a_process_that_still_works_in_the_folder_stops_the_cleanup_and_the_deploy_says_so(self) -> None:
+    def test_a_process_that_still_works_in_the_runner_folder_stops_the_deploy_before_anything_is_removed_and_the_deploy_says_so(self) -> None:
         scratch = Scratch(self)
         commit = scratch.commit({"requirements.txt": scratch.requirements("0" * 64)})
         folder = scratch.folder(commit)
@@ -624,7 +698,8 @@ class DeadlineTest(unittest.TestCase):
         code, output = scratch.run(commit, runner_checkout_stop_check_retries=2)
         self.assertNotEqual(0, code)
         self.assertIn("so nothing was cleaned up", output)
-        self.assertTrue(Path(f"{folder}.tar").exists(), "nothing was cleaned up while the process worked")
+        self.assertFalse(folder.exists(), "the process that works in the runner folder stopped the deploy before it removed or made anything")
+        self.assertFalse(Path(f"{folder}.tar").exists())
         worker.kill()
         worker.wait()
 
@@ -640,6 +715,59 @@ class DeadlineTest(unittest.TestCase):
         self.assertIn("The runner folder was not finished", output)
         self.assertFalse(Path(f"{folder}.tar").exists())
         worker.wait(timeout=60)
+
+    ORPHAN = (
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f"  --version) echo 'Python {VERSION}' ;;\n"
+        '  -m) case "$2" in\n'
+        '        venv) mkdir -p "$3/bin" && cp "$0" "$3/bin/python" ;;\n'
+        '        pip) cd "${0%/.venv/bin/python}" && { sleep 7005 </dev/null >/dev/null 2>&1 & } ; exit 1 ;;\n'
+        "        *) exit 0 ;;\n"
+        "      esac ;;\n"
+        "esac\n"
+    )
+
+    def orphan_interpreter(self, scratch: Scratch) -> None:
+        """An interpreter whose install step leaves a process behind that works in the checkout (its working folder) and names no path in its command line."""
+        self.stub_interpreter(scratch)
+        (scratch.python_root / VERSION / "bin" / f"python{VERSION.rsplit('.', 1)[0]}").write_text(self.ORPHAN)
+        self.addCleanup(run_command, "pkill", ["-f", "sleep 7005"], timeout=10)
+
+    def test_a_process_that_the_build_started_and_that_works_in_the_checkout_stops_the_cleanup_even_when_its_command_line_names_no_path(self) -> None:
+        scratch = Scratch(self)
+        self.orphan_interpreter(scratch)
+        code, output = scratch.run(scratch.commit_a, runner_checkout_stop_check_retries=1)
+        self.assertNotEqual(0, code)
+        self.assertEqual(0, self.pgrep("sleep 7005"), "the process of the failed install is still there")
+        self.assertIn("so nothing was cleaned up", output)
+        self.assertTrue(Path(f"{scratch.folder(scratch.commit_a)}.tar").exists(), "nothing was cleaned up while the process worked")
+
+    def test_a_retry_removes_nothing_while_a_process_of_the_failed_build_still_works_and_goes_on_when_it_is_gone(self) -> None:
+        scratch = Scratch(self)
+        self.orphan_interpreter(scratch)
+        self.assertNotEqual(0, scratch.run(scratch.commit_a, runner_checkout_stop_check_retries=1)[0])
+        stale = scratch.runner_root / "another_folder"
+        stale.mkdir()
+        (stale / "keep.txt").write_text("keep\n")
+        before = sorted(path.name for path in scratch.runner_root.iterdir())
+        code, output = scratch.run(scratch.commit_a, runner_checkout_stop_check_retries=1)
+        self.assertNotEqual(0, code)
+        self.assertIn("so nothing was cleaned up", output)
+        self.assertEqual(before, sorted(path.name for path in scratch.runner_root.iterdir()), "the retry pruned nothing before it looked for the process")
+        self.assertEqual("keep\n", (stale / "keep.txt").read_text())
+        run_command("pkill", ["-f", "sleep 7005"], timeout=10)
+        for _ in range(50):
+            if self.pgrep("sleep 7005") == 1:
+                break
+            time.sleep(0.1)
+        interpreter = scratch.python_root / VERSION / "bin" / f"python{VERSION.rsplit('.', 1)[0]}"
+        interpreter.unlink()
+        interpreter.symlink_to(Path(sys.executable))
+        code, output = scratch.run(scratch.commit_a)
+        self.assertEqual(0, code, output)
+        self.assertFalse(stale.exists(), "once the process was gone the retry pruned the other folders and built this one")
+        self.assertTrue((scratch.folder(scratch.commit_a) / MARKER).is_file())
 
     def test_a_failed_build_with_no_process_left_removes_the_archive_and_says_which_step_failed(self) -> None:
         scratch = Scratch(self)
@@ -686,13 +814,19 @@ class InterpreterTest(unittest.TestCase):
     def installed(self, scratch: Scratch) -> Path:
         return scratch.base / "fresh_python" / VERSION
 
+    def entries(self, scratch: Scratch) -> list[str]:
+        """The names in the interpreters' folder with each link's target: the published link and the folders that the role made."""
+        found = sorted((path.name, os.readlink(path) if path.is_symlink() else "") for path in (scratch.base / "fresh_python").iterdir())
+        return [f"{name} -> {target}" if target else name for name, target in found]
+
     def test_the_installed_interpreter_carries_the_digest_of_the_archive_it_came_from(self) -> None:
         scratch = Scratch(self)
         archive, digest = self.archive(scratch.base, f"Python {VERSION}")
         self.assertEqual(0, self.run_python(scratch, archive, digest)[0])
         self.assertEqual(digest, (self.installed(scratch) / PYTHON_MARKER).read_text().strip())
         self.assertEqual(0o755, stat.S_IMODE(self.installed(scratch).stat().st_mode))
-        self.assertEqual([], [path.name for path in (scratch.base / "fresh_python").iterdir() if path.name != VERSION], "no temporary folder is left")
+        self.assertEqual([VERSION], [path.name for path in (scratch.base / "fresh_python").iterdir() if path.is_symlink()], "the published name is a link")
+        self.assertEqual(2, len(self.entries(scratch)), "the link and the one folder that it names: no temporary folder is left")
 
     def test_an_archive_of_the_same_version_with_another_digest_replaces_the_installed_interpreter(self) -> None:
         scratch = Scratch(self)
@@ -724,12 +858,80 @@ class InterpreterTest(unittest.TestCase):
         archive, digest = self.archive(scratch.base, f"Python {VERSION}")
         self.assertEqual(0, self.run_python(scratch, archive, digest)[0])
         before = (self.installed(scratch) / "bin" / f"python{VERSION.rsplit('.', 1)[0]}").read_text()
+        before_entries = self.entries(scratch)
         wrong, wrong_digest = self.archive(scratch.base, "Python 3.14.0", name="wrong.tar.gz")
         code, _ = self.run_python(scratch, wrong, wrong_digest)
         self.assertNotEqual(0, code)
         self.assertEqual(before, (self.installed(scratch) / "bin" / f"python{VERSION.rsplit('.', 1)[0]}").read_text())
         self.assertEqual(digest, (self.installed(scratch) / PYTHON_MARKER).read_text().strip())
-        self.assertEqual([VERSION], sorted(path.name for path in (scratch.base / "fresh_python").iterdir()))
+        self.assertEqual(before_entries, self.entries(scratch), "the installed folder and its link are as they were and no temporary folder is left")
+
+    def test_the_published_interpreter_is_a_link_to_a_folder_of_its_own_and_the_old_folder_is_removed_after_the_link_changed(self) -> None:
+        scratch = Scratch(self)
+        archive, digest = self.archive(scratch.base, f"Python {VERSION}")
+        self.assertEqual(0, self.run_python(scratch, archive, digest)[0])
+        first = os.readlink(self.installed(scratch))
+        second, other = self.archive(scratch.base, f"Python {VERSION}", name="second.tar.gz", comment="# the second archive")
+        self.assertEqual(0, self.run_python(scratch, second, other)[0])
+        later = os.readlink(self.installed(scratch))
+        self.assertNotEqual(first, later)
+        self.assertRegex(later, rf"^{re.escape(VERSION)}-[A-Za-z0-9_]+$")
+        self.assertEqual([f"{VERSION} -> {later}", later], self.entries(scratch), "the folder of the first archive is gone")
+
+    def test_the_interpreter_is_there_at_every_moment_while_another_archive_replaces_it(self) -> None:
+        scratch = Scratch(self)
+        archive, digest = self.archive(scratch.base, f"Python {VERSION}")
+        self.assertEqual(0, self.run_python(scratch, archive, digest)[0])
+        second, other = self.archive(scratch.base, f"Python {VERSION}", name="second.tar.gz", comment="# the second archive")
+        interpreter = self.installed(scratch) / "bin" / f"python{VERSION.rsplit('.', 1)[0]}"
+        gone: list[float] = []
+        looked = [0]
+        stop = threading.Event()
+
+        def watch() -> None:
+            while not stop.is_set():
+                looked[0] += 1
+                try:
+                    os.stat(interpreter)
+                except OSError:
+                    gone.append(time.monotonic())
+
+        watcher = threading.Thread(target=watch)
+        watcher.start()
+        try:
+            code, output = self.run_python(scratch, second, other)
+        finally:
+            stop.set()
+            watcher.join(timeout=30)
+        self.assertEqual(0, code, output)
+        self.assertGreater(looked[0], 1000, "the watcher looked often enough")
+        self.assertEqual(0, len(gone), "the interpreter was missing while it was replaced")
+        self.assertIn("# the second archive", interpreter.read_text())
+
+    def test_a_folder_that_is_not_the_roles_link_is_refused_and_left_as_it_is(self) -> None:
+        scratch = Scratch(self)
+        archive, digest = self.archive(scratch.base, f"Python {VERSION}")
+        installed = self.installed(scratch)
+        (installed / "bin").mkdir(parents=True)
+        (installed / "bin" / "kept.txt").write_text("not made by the role\n")
+        code, output = self.run_python(scratch, archive, digest)
+        self.assertNotEqual(0, code)
+        self.assertIn("is not a link that this role made", output)
+        self.assertEqual("not made by the role\n", (installed / "bin" / "kept.txt").read_text())
+        self.assertEqual([VERSION], self.entries(scratch), "nothing was unpacked beside it")
+
+    def test_a_folder_left_by_an_install_that_never_finished_is_removed_with_the_next_good_install_and_other_folders_stay(self) -> None:
+        scratch = Scratch(self)
+        archive, digest = self.archive(scratch.base, f"Python {VERSION}")
+        unfinished = scratch.base / "fresh_python" / f"{VERSION}-unfinished"
+        unrelated = scratch.base / "fresh_python" / "other_tool"
+        unrelated.mkdir(parents=True)
+        unfinished.mkdir()
+        (unfinished / "half.txt").write_text("a crash left this\n")
+        code, output = self.run_python(scratch, archive, digest)
+        self.assertEqual(0, code, output)
+        self.assertFalse(unfinished.exists())
+        self.assertTrue(unrelated.is_dir())
 
     def test_an_archive_that_cannot_be_unpacked_publishes_nothing(self) -> None:
         scratch = Scratch(self)

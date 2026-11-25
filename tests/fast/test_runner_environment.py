@@ -7,8 +7,8 @@ Failure modes covered here:
 
 - An environment whose interpreter is missing, does not run or is another version passes, so a folder with a broken environment is kept.
 - A package that the lock file does not pin is installed, or a pin is not installed or is another version, and the folder is kept.
-- A pin with an environment marker is read as always required, so a build that was right on this platform is rebuilt for ever, or as never required while it is
-  installed in another version.
+- A pin with an environment marker is read as always required, so a build that was right on this platform is rebuilt for ever, or as never required, so that
+  a package that the marker requires here (``cffi`` on CPython) is missing and the folder is kept. The marker is evaluated for the folder's own interpreter.
 - A program of the check that never ends holds the deploy, or is left running when the check gives up.
 - A lock file name that leaves the folder is read.
 """
@@ -64,7 +64,7 @@ class Checkout(unittest.TestCase):
         holder = tempfile.TemporaryDirectory(prefix="environment_template_")
         cls.addClassCleanup(holder.cleanup)
         cls.template = Path(holder.name) / "checkout"
-        venv.create(cls.template / ".venv", with_pip=False, symlinks=True)
+        venv.create(cls.template / ".venv", with_pip=True, symlinks=True)
 
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="environment_")))
@@ -100,15 +100,37 @@ class VerdictTest(Checkout):
             self.check(),
         )
 
-    def test_a_pin_with_a_marker_may_be_absent_and_is_checked_when_it_is_installed(self) -> None:
-        marked = "cffi==2.1.1 ; platform_python_implementation != 'PyPy' \\\n    --hash=sha256:00\n"
-        self.lock(marked)
-        self.assertEqual([], self.check(), "absent: the marker is not evaluated, so it is not required")
+    def test_a_pin_whose_marker_is_true_for_the_interpreter_is_required_and_is_checked_by_version(self) -> None:
+        self.lock("cffi==2.1.1 ; platform_python_implementation == 'CPython' \\\n    --hash=sha256:00\n")
+        self.assertEqual(["in the lock files but not installed: cffi"], self.check(), "absent: the marker is true on CPython, so cffi is required")
         add_distribution(self.folder, "cffi", "2.0.0")
         self.assertEqual(["another version than the lock files: cffi"], self.check())
         shutil.rmtree(next((self.folder / ".venv" / "lib").glob("python*/site-packages")) / "cffi-2.0.0.dist-info")
         add_distribution(self.folder, "cffi", "2.1.1")
         self.assertEqual([], self.check())
+
+    def test_a_pin_whose_marker_is_false_for_the_interpreter_may_be_absent_and_is_not_one_of_the_pins_when_it_is_installed(self) -> None:
+        self.lock("cffi==2.1.1 ; platform_python_implementation != 'CPython' \\\n    --hash=sha256:00\n")
+        self.assertEqual([], self.check(), "absent: the marker is false here, so pip would not install it")
+        add_distribution(self.folder, "cffi", "2.1.1")
+        self.assertEqual(["installed but not in the lock files: cffi"], self.check())
+
+    def test_markers_are_evaluated_with_the_interpreters_own_values_and_each_of_two_pins_of_one_name_counts_only_where_its_marker_is_true(self) -> None:
+        self.lock(
+            "both==1.0 ; python_version < '3' \\\n    --hash=sha256:00\n"
+            "both==2.0 ; python_version >= '3' and sys_platform != 'no-such-platform' \\\n    --hash=sha256:11\n"
+            "other==1.0 ; implementation_name == 'cpython' and os_name != 'no-such-os' \\\n    --hash=sha256:22\n"
+        )
+        add_distribution(self.folder, "both", "2.0")
+        self.assertEqual(["in the lock files but not installed: other"], self.check())
+        shutil.rmtree(next((self.folder / ".venv" / "lib").glob("python*/site-packages")) / "both-2.0.dist-info")
+        add_distribution(self.folder, "both", "1.0")
+        add_distribution(self.folder, "other", "1.0")
+        self.assertEqual(["another version than the lock files: both"], self.check())
+
+    def test_a_marker_that_cannot_be_read_is_a_problem_of_the_environment_check_and_not_a_pass(self) -> None:
+        self.lock("odd==1.0 ; not a marker at all \\\n    --hash=sha256:00\n")
+        self.assertEqual(["the environment's installed packages or the lock files' markers cannot be read"], self.check())
 
     def test_names_are_compared_in_the_form_that_pip_compares(self) -> None:
         add_distribution(self.folder, "Typing_Extensions", "4.0")
@@ -159,6 +181,7 @@ class FormTest(unittest.TestCase):
         self.assertIn('"check"', text)
         imports = {name.split(".")[0] for name in re.findall(r"(?m)^(?:from|import) ([a-z_.]+)", text)}
         self.assertLessEqual(imports, {"__future__", "json", "os", "re", "signal", "subprocess", "pathlib", "typing", "ansible"})
+        self.assertNotIn("packaging", imports, "the markers are evaluated by the folder's own interpreter: the host's Python needs no package")
         self.assertTrue(os.path.isfile(LIBRARY / "runner_environment.py"))
 
 

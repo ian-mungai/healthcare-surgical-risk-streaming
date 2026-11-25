@@ -204,6 +204,8 @@ runner_checkout_python_download_directory: /usr/local/src
 runner_checkout_python_url: >-
   https://github.com/astral-sh/python-build-standalone/releases/download/{{ runner_checkout_python_build }}/cpython-{{ runner_checkout_python_version }}%2B{{ runner_checkout_python_build }}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
 runner_checkout_python_archive: "{{ runner_checkout_python_download_directory }}/cpython-{{ runner_checkout_python_version }}-{{ runner_checkout_python_build }}-x86_64-linux-gnu.tar.gz"
+# The published name of the interpreter: a link that the role makes to a folder of its own beside it (the version, a dash and a random suffix) and replaces in one atomic
+# rename, so that an interrupted or failed install leaves the interpreter that was there.
 runner_checkout_python_home: "{{ runner_checkout_python_directory }}/{{ runner_checkout_python_version }}"
 runner_checkout_python: "{{ runner_checkout_python_home }}/bin/python{{ runner_checkout_python_version.split('.')[:2] | join('.') }}"
 # The files, relative to the folder, that the environment's packages come from: every one is installed with --require-hashes, so every requirement in it must carry a hash.
@@ -231,8 +233,9 @@ runner_checkout_manifest_mode: "0400"
 # The hashes of the runner files that the launcher places (make host-runners-place), written on the host by the launcher so that a runner can check its own file. It is
 # not in the manifest, which is written before any placement, and the deploy never touches it: a finished folder keeps it, a new folder starts without it.
 runner_checkout_placed_runners: "{{ runner_checkout_folder }}/placed_runners.json"
-# The marker in the interpreter's folder that names the SHA-256 of the archive it was unpacked from: an installed interpreter is reused only when it names the pinned archive,
-# and it is published (one rename) only after it ran in a temporary folder and said its version, so another archive of the same version replaces it and a failed install changes nothing.
+# The marker in the interpreter's folder (read through the published link) that names the SHA-256 of the archive it was unpacked from: an installed interpreter is reused only
+# when it names the pinned archive, and it is published (one atomic replacement of the link) only after it ran in a folder of its own and said its version, so another archive of
+# the same version replaces it and a failed install changes nothing.
 runner_checkout_python_marker: "{{ runner_checkout_python_home }}/.archive_sha256"
 # Each deadline is in seconds. The install deadline covers every package of the lock file. Every command of the role runs under timeout with a kill-after of
 # runner_checkout_kill_after_seconds, so that it is stopped, with every process it started, where it runs, and the task's own deadline is the command's deadline plus
@@ -251,7 +254,41 @@ runner_checkout_close_deadline_seconds: 120
 runner_checkout_scan_deadline_seconds: 60
 runner_checkout_kill_after_seconds: 5
 runner_checkout_stop_grace_seconds: 15
-# After a failed build nothing is cleaned up until no process works in the folder: pgrep, with its own deadline, tried again this many times, this many seconds apart.
+# The processes of a build. Each command that can leave a process behind (the unpack, the environment and the install) starts through a program that makes its process group
+# and writes the group's number as one line in the record, runner_checkout_build_record (beside the runner folder, so that no prune takes it). Before a build removes anything,
+# and after a failed build before any cleanup, runner_checkout_process_script looks at every group of the record (kill -0 on the group: one live process of it is enough, wherever
+# it works and whatever its command line says) and at every process whose command line names the runner folder, and removes the record when none is left. A group number that
+# the system gave to another process after a restart looks live: the deploy then names the record, and its owner removes it once it is clear that nothing of the build works.
+runner_checkout_build_record: "{{ runner_checkout_directory }}.build_processes"
+runner_checkout_track:
+  - python3
+  - -I
+  - -c
+  - |
+    import os, sys
+    try:
+        os.setpgid(0, 0)
+    except PermissionError:
+        pass
+    descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.write(descriptor, (str(os.getpgrp()) + "\n").encode())
+    os.close(descriptor)
+    os.execvp(sys.argv[2], sys.argv[2:])
+  - "{{ runner_checkout_build_record }}"
+runner_checkout_process_script: |
+  live=0
+  if test -f "$1"; then
+    while read -r group; do
+      case "$group" in ''|*[!0-9]*) continue ;; esac
+      if kill -0 -- "-$group" 2>/dev/null; then live=1; fi
+    done < "$1"
+  fi
+  pgrep -f -- "$2" >/dev/null 2>&1
+  case $? in 0) live=1 ;; 1) ;; *) exit 2 ;; esac
+  if test "$live" = 0; then rm -f -- "$1"; fi
+  exit "$live"
+# After a failed build, and before a retry removes anything, nothing is cleaned up until no process of the build works: the script, with its own deadline, tried again this many
+# times, this many seconds apart.
 runner_checkout_stop_check_deadline_seconds: 10
 runner_checkout_stop_check_retries: 3
 runner_checkout_stop_check_delay_seconds: 5

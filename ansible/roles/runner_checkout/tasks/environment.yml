@@ -1,9 +1,11 @@
 # Reads runner_checkout_folder, runner_checkout_python, runner_checkout_requirements, runner_checkout_python_version and the deadlines. The environment is made from
 # the pinned interpreter and filled with every package from the hash-pinned requirements: pip refuses a requirement with no hash, a hash that does not match and a
-# source build, so the folder holds exactly what the lock files name. Each command runs under timeout with a kill-after.
+# source build, so the folder holds exactly what the lock files name. Each command runs under timeout with a kill-after, started through the program that records its process group (runner_checkout_track).
 - name: Make the environment
   ansible.builtin.command:
-    argv:
+    argv: "{{ runner_checkout_track + make_environment }}"
+  vars:
+    make_environment:
       - timeout
       - "--kill-after={{ runner_checkout_kill_after_seconds }}"
       - "{{ runner_checkout_environment_deadline_seconds }}"
@@ -35,7 +37,7 @@
 
 - name: Install the hash-pinned requirements
   ansible.builtin.command:
-    argv: "{{ install_start + requirement_arguments }}"
+    argv: "{{ runner_checkout_track + install_start + requirement_arguments }}"
   vars:
     install_start:
       - timeout
