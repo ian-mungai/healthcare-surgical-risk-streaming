@@ -35,6 +35,7 @@ from spark.settings import SettingsError
 from spark.silver_cases_sql import ownership_query
 from spark.split_cli import start_deadline
 from spark.split_table import RULE_VERSION
+from tests.fast.internal_line_support import assert_internal
 from tests.fast.test_replay_image import ignore_rules, imported_files
 from tests.fast.test_silver_signals_image import ROOT
 from tests.fast.test_spark_bronze_image import DOCKERFILE, IGNORE_FILE, image_problems
@@ -113,7 +114,8 @@ class CommandLine(unittest.TestCase):
         self.assertEqual((2, "", "silver_reconcile: settings\n"), (code, out, err))
         os.remove(f"{self.folder}/result.json")
         code, out, err = self.call(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "", "silver_reconcile: internal_error\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, "silver_reconcile", "silver_reconcile: internal_error", (), MARKER)
 
 
 def read_file(folder: str) -> Any:
@@ -279,7 +281,8 @@ class ResultFile(unittest.TestCase):
 
         with mock.patch("scripts.ingestion.output_file.os.link", refuse):
             code, out, err = self.call()
-        self.assertEqual((70, "", "silver_reconcile: internal_error\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, "silver_reconcile", "silver_reconcile: internal_error", (), MARKER)
         self.assertEqual([], os.listdir(self.folder))
 
     def test_the_file_is_readable_by_another_user_and_is_not_executable(self) -> None:

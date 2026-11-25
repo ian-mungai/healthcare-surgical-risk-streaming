@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieError
+from spark.internal_diagnostic import internal_error_line
 from spark.profile.checks import SignalProfileError
 from spark.settings import SettingsError
 from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, reference_name
@@ -58,8 +59,9 @@ def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict
     except SettingsError:
         sys.stderr.write(f"{JOB}: settings\n")
         return 2
-    except Exception:
-        sys.stderr.write(f"{JOB}: internal_error\n")
+    except Exception as error:
+        diagnostic = internal_error_line(error)
+        sys.stderr.write(f"{JOB}: internal_error\n{JOB}: {diagnostic}\n")
         return INTERNAL_EXIT_CODE
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0

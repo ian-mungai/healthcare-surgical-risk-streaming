@@ -40,6 +40,7 @@ from typing import Any
 from scripts.stack.nessie import NessieError
 from scripts.stack.tags import TableSnapshot, TagClient, default_branch, list_references, list_tags, table_snapshots
 from spark.catalog import add_catalog, required_environment
+from spark.internal_diagnostic import internal_error_line
 from spark.maintenance import (
     CHECKS_RUN,
     JOB,
@@ -195,15 +196,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return refuse("catalog_error", 1)
     except SettingsError:
         return refuse("settings", 2)
-    except Exception:
-        return refuse("internal_error", INTERNAL_EXIT_CODE)
+    except Exception as error:
+        return refuse("internal_error", INTERNAL_EXIT_CODE, internal_error_line(error))
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0
 
 
-def refuse(code: str, status: int) -> int:
-    """End with one fixed code on standard error and no text of the error."""
+def refuse(code: str, status: int, diagnostic: str | None = None) -> int:
+    """End with one fixed code on standard error and no text of the error. An ``internal_error`` adds the line of its classes and frames (``diagnostic``)."""
     sys.stderr.write(f"{JOB}: {code}\n")
+    if diagnostic is not None:
+        sys.stderr.write(f"{JOB}: {diagnostic}\n")
     return status
 
 

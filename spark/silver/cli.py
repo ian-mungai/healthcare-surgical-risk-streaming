@@ -11,8 +11,8 @@ Standard output stays empty, and standard error holds the codes for an operator:
 The rules are those of the patient split job (``spark/split_cli.py``, whose settings, deadline and Nessie client this job also uses): the parser prints
 ``usage`` for any bad call (and writes no file, as it has no call to answer), a setting that cannot be used is ``settings``, an error from Nessie or from
 anything else that is not mapped is one of ``branch_missing``, ``catalog_error`` and ``internal_error``, and every refusal prints one line for each code, each
-the job's name, the code and a flag (``<job>: <code>: failed``), never a count and never text after the code. A result that cannot be written is an
-``internal_error``.
+the job's name, the code and a flag (``<job>: <code>: failed``), never a count and never text after the code. An ``internal_error`` adds one line of the
+classes and code frames of the error (``spark/internal_diagnostic.py``). A result that cannot be written is an ``internal_error``.
 Exit 0 on success, 1 on a failed check or a failed upstream, 2 on a bad call or setting, 70 on anything else.
 """
 
@@ -25,6 +25,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from scripts.stack.nessie import NessieError
+from spark.internal_diagnostic import internal_error_line
 from spark.result_file import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, add_result_option, line_of, problem_code, run_sealed
 from spark.settings import SettingsError
 from spark.silver.checks import SilverSignalsError
@@ -60,7 +61,8 @@ def parser(job: str = JOB) -> argparse.ArgumentParser:
 
 def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace], dict[str, Any]], job: str) -> tuple[int, dict[str, Any], list[str]]:
     """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error. The document is the result, or the refusal
-    with its codes. Every line is a code and the flag, and no text of an error is used. A result that is not JSON is an ``internal_error`` refusal."""
+    with its codes. Every line is a code and the flag, and no text of an error is used (an ``internal_error`` adds the line of its classes and frames). A result
+    that is not JSON is an ``internal_error`` refusal."""
 
     def refused(status: int, codes: list[str]) -> tuple[int, dict[str, Any], list[str]]:
         return status, {"job": job, "mode": arguments.mode, "refusal": codes}, [line_of(problem_code(code)) for code in codes]
@@ -74,8 +76,9 @@ def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace]
         return refused(1, ["branch_missing" if error.status == NOT_FOUND and error.error_code == REFERENCE_NOT_FOUND else "catalog_error"])
     except SettingsError:
         return refused(2, ["settings"])
-    except Exception:
-        return refused(INTERNAL_EXIT_CODE, ["internal_error"])
+    except Exception as error:
+        status, document, lines = refused(INTERNAL_EXIT_CODE, ["internal_error"])
+        return status, document, [*lines, internal_error_line(error)]
     return 0, result, []
 
 

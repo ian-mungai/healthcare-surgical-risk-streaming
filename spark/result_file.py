@@ -8,7 +8,8 @@ fails when the path exists), so that a reader sees no file or the whole file and
 ``release_reserved`` so that the job it stops leaves no part file, not even one that holds a result (the stop may come right before the link).
 ``run_sealed`` is the whole ending of a job whose failures are problems of the form ``code: failed`` (the patient split job and the Silver cases job; the Silver
 signals and hypotension jobs use the same reserve, write and release in ``spark/silver/cli.py``): every line that it prints for a refusal is a fixed code and
-the flag, never a count. This module imports no Spark.
+the flag, never a count. An ``internal_error`` adds one line of the classes and code frames of the error and nothing it holds
+(``spark/internal_diagnostic.py``). This module imports no Spark.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import Any
 from scripts.ingestion.closed import ClosedInputError
 from scripts.ingestion.output_file import check_new_output, publish_reserved, write_new_file
 from scripts.stack.nessie import NessieError
+from spark.internal_diagnostic import internal_error_line
 from spark.settings import SettingsError
 
 RESULT_PATH_LIMIT = 4096
@@ -119,7 +121,8 @@ def failure(job: str, arguments: argparse.Namespace, codes: Sequence[str]) -> di
 
 
 def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace], dict[str, Any]], job: str) -> tuple[int, dict[str, Any], list[str]]:
-    """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error. No text of an error is used."""
+    """Run ``execute`` and return the exit code, the document of the result file and the lines for standard error. No text of an error is used: an unexpected
+    error is the code and the one line of ``internal_error_line`` (its classes and frames)."""
     try:
         result = execute(arguments)
     except SealedError as error:
@@ -130,8 +133,8 @@ def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace]
         return 1, failure(job, arguments, [code]), [line_of(code)]
     except SettingsError:
         return 2, failure(job, arguments, ["settings"]), [line_of("settings")]
-    except Exception:
-        return INTERNAL_EXIT_CODE, failure(job, arguments, ["internal_error"]), [line_of("internal_error")]
+    except Exception as error:
+        return INTERNAL_EXIT_CODE, failure(job, arguments, ["internal_error"]), [line_of("internal_error"), internal_error_line(error)]
     return 0, {**result, "diagnostics": []}, []
 
 
@@ -154,8 +157,9 @@ def run_sealed(
         status, document, lines = close(arguments, execute, job)
         try:
             write_reserved(arguments.result, document)
-        except Exception:
-            sys.stderr.write(f"{job}: {line_of('internal_error')}\n")
+        except Exception as error:
+            diagnostic = internal_error_line(error)
+            sys.stderr.write(f"{job}: {line_of('internal_error')}\n{job}: {diagnostic}\n")
             return INTERNAL_EXIT_CODE
     finally:
         release_reserved()

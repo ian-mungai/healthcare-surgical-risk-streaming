@@ -337,6 +337,24 @@ class Refusals(unittest.TestCase):
         self.assertEqual((1, "gold_dimensions: empty_source: failed\n"), (code, err))
         self.assertIn("out 4417", out)
 
+    def test_the_diagnostic_line_of_an_internal_error_is_not_returned_and_not_counted_as_unknown(self) -> None:
+        lines = "gold_dimensions: internal_error\ngold_dimensions: internal_error class=builtins.RuntimeError <- builtins.OSError frames=a.py:1:f | b.py:2:g\n"
+        stack = self.stack([(70, "", lines)])
+        code, _, err = stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
+        self.assertEqual((70, "gold_dimensions: internal_error\n"), (code, err))
+        self.assertEqual(0, stack.unknown_lines)
+
+    def test_a_line_that_is_shaped_like_the_diagnostic_line_but_holds_text_is_counted_as_unknown(self) -> None:
+        for text in (
+            "internal_error class=builtins.RuntimeError frames=a.py:1:f message",
+            "internal_error class=builtins.RuntimeError: boom frames=",
+            "internal_error class=a frames=/x/a.py:1:f",
+        ):
+            with self.subTest(text=text):
+                stack = self.stack([(70, "", f"gold_dimensions: {text}\n")])
+                stack.run(["docker", "compose", "run", "--entrypoint", "python", "spark"])
+                self.assertEqual(1, stack.unknown_lines)
+
     def test_a_sealed_job_still_returns_no_error_text(self) -> None:
         stack = self.stack([])
 
@@ -866,8 +884,19 @@ class ProducerLines(unittest.TestCase):
         self.fail("the producer raised nothing")
         return []
 
+    @staticmethod
+    def without_diagnostic(lines: list[str]) -> list[str]:
+        """The lines of a run without the diagnostic line of classes and frames, which the adapter drops (``test_the_diagnostic_line_...``)."""
+        return [line for line in lines if " internal_error class=" not in line]
+
+    def test_the_diagnostic_line_of_the_real_job_is_not_a_code(self) -> None:
+        printed = self.printed(RuntimeError("x"))
+        self.assertEqual(["gold_dimensions: internal_error"], printed[:1])
+        self.assertEqual(2, len(printed))
+        self.assertEqual(["internal_error"], self.module.codes("\n".join(printed) + "\n"))
+
     def generic_lines(self) -> list[str]:
-        lines = self.printed(argv=["nothing"]) + self.printed(SettingsError("x")) + self.printed(RuntimeError("x"))
+        lines = self.printed(argv=["nothing"]) + self.printed(SettingsError("x")) + self.without_diagnostic(self.printed(RuntimeError("x")))
         lines += self.printed(self.run_module.NessieError("x", status=404, error_code=self.run_module.REFERENCE_NOT_FOUND))
         lines += self.printed(self.run_module.NessieError("x", status=500))
         start = importlib.import_module("spark.split_cli")

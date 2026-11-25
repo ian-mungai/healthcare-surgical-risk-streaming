@@ -365,6 +365,17 @@ class ProfileDroppedSteps(unittest.TestCase):
                 for line in kept:
                     self.assertTrue(self.module.STAND_IN_LINE.fullmatch(line))
 
+    def test_the_diagnostic_line_of_an_internal_error_is_not_a_dropped_line_and_a_line_with_text_is(self) -> None:
+        job = ["-m", "spark.jobs.signal_profile"]
+        code, diagnostic = (
+            "signal_profile: internal_error\n",
+            "signal_profile: internal_error class=builtins.KeyError <- builtins.OSError frames=cli.py:63:run | q.py:9:go\n",
+        )
+        self.assertEqual((["signal_profile: internal_error"], 0), self.module.Stack.known_lines(job, code + diagnostic))
+        for text in ("signal_profile: internal_error class=builtins.KeyError frames=a.py:1:f text\n", "signal_profile: internal_error class=a: b frames=\n"):
+            with self.subTest(text=text):
+                self.assertEqual((["signal_profile: internal_error"], 1), self.module.Stack.known_lines(job, code + text))
+
     def test_the_stack_keeps_the_count_for_the_case(self) -> None:
         stack, _, _ = stand_in_stack(self, self.module, None, 1, out="", err=self.DROPPED)
         stack.job(["/data/stand_in.py", "load_clinical", "b"])

@@ -25,6 +25,7 @@ from spark.gold_dimensions import DIMENSIONS, Dimension, GoldDimensionsError
 from spark.gold_dimensions_run import CHECKS, JOB, run, run_build, run_verify
 from spark.jobs import gold_dimensions
 from spark.settings import SettingsError
+from tests.fast.internal_line_support import assert_internal
 
 NAMES = tuple(item.name for item in DIMENSIONS)
 OPEN_NAMES = tuple(item.name for item in DIMENSIONS if item.name != "dim_lab_test")
@@ -348,7 +349,11 @@ class CommandTests(unittest.TestCase):
                     raise error
 
                 code, out, err = self.call(["verify", "--branch", "x"], execute)
-                self.assertEqual((wanted[0], "", f"{JOB}: {wanted[1]}\n"), (code, out, err))
+                if wanted[1] == "internal_error":
+                    self.assertEqual((wanted[0], ""), (code, out))
+                    assert_internal(self, err, JOB, f"{JOB}: internal_error", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual((wanted[0], "", f"{JOB}: {wanted[1]}\n"), (code, out, err))
 
 
 if __name__ == "__main__":

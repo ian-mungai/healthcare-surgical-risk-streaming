@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 from scripts.stack.nessie import NessieError
 from spark.gold_dimensions import BY_NAME, DIMENSIONS, Dimension, GoldDimensionsError, frozen_problems, input_problems, output_problems, unit, version_date
+from spark.internal_diagnostic import internal_error_line
 from spark.settings import SettingsError
 from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, reference_name
 
@@ -182,8 +183,9 @@ def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict
     except SettingsError:
         report("settings")
         return 2
-    except Exception:
+    except Exception as error:
         report("internal_error")
+        report(internal_error_line(error))
         return INTERNAL_EXIT_CODE
     sys.stdout.write(RESULT_PREFIX + json.dumps(result, sort_keys=True) + "\n")
     return 0

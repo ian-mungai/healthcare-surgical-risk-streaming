@@ -26,6 +26,7 @@ from typing import Any
 
 from scripts.ingestion.output_file import write_new_file
 from scripts.stack.nessie import NessieError
+from spark.internal_diagnostic import internal_error_line
 from spark.reconcile.checks import ReconcileError
 from spark.settings import SettingsError
 from spark.split_cli import INTERNAL_EXIT_CODE, NOT_FOUND, REFERENCE_NOT_FOUND, reference_name
@@ -114,8 +115,8 @@ def ending(arguments: argparse.Namespace, execute: Callable[[argparse.Namespace]
         return 1, failure(arguments, [code]), [code]
     except SettingsError:
         return 2, failure(arguments, ["settings"]), ["settings"]
-    except Exception:
-        return INTERNAL_EXIT_CODE, failure(arguments, ["internal_error"]), ["internal_error"]
+    except Exception as error:
+        return INTERNAL_EXIT_CODE, failure(arguments, ["internal_error"]), ["internal_error", internal_error_line(error)]
     return 0, {**result, "diagnostics": []}, []
 
 
@@ -129,8 +130,9 @@ def run(argv: Sequence[str] | None, execute: Callable[[argparse.Namespace], dict
     code, document, problems = ending(arguments, execute)
     try:
         write_result(arguments.result, document)
-    except Exception:
-        sys.stderr.write(f"{JOB}: internal_error\n")
+    except Exception as error:
+        diagnostic = internal_error_line(error)
+        sys.stderr.write(f"{JOB}: internal_error\n{JOB}: {diagnostic}\n")
         return INTERNAL_EXIT_CODE
     for problem in problems:
         sys.stderr.write(f"{JOB}: {problem}\n")

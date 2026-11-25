@@ -42,6 +42,7 @@ from scripts.stack.nessie import NessieError
 from spark import result_file
 from spark.result_file import FILE_MODE, Once, SealedError, add_result_option, release_reserved, reserve, result_path, run_sealed, write_reserved
 from spark.settings import SettingsError
+from tests.fast.internal_line_support import assert_internal
 
 DOCUMENT = {"job": "j", "passed": True, "diagnostics": []}
 
@@ -292,9 +293,14 @@ class Sealed(unittest.TestCase):
         for error, status, expected in endings:
             with self.subTest(expected=expected):
                 code, out, err = sealed(self.argv, raising(error))
-                self.assertEqual((status, "", f"{JOB}: {expected}: failed\n"), (code, out, err))
+                if expected == "internal_error":
+                    self.assertEqual((status, ""), (code, out))
+                    assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual((status, "", f"{JOB}: {expected}: failed\n"), (code, out, err))
                 self.assertEqual({"mode": "verify", "branch": "b", "job": JOB, "diagnostics": [{"code": expected}]}, self.written())
                 self.assertNotIn(MARKER, Path(self.path).read_text())
+                self.assertNotIn("class=", Path(self.path).read_text())
                 os.remove(self.path)
 
     def test_a_bad_call_is_usage_and_writes_nothing_and_does_not_run_the_job(self) -> None:
@@ -360,7 +366,8 @@ class Sealed(unittest.TestCase):
 
         with mock.patch("os.link", refuse):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertIs(result_file.INTERNAL_EXIT_CODE, 70)
         self.assertEqual([], os.listdir(self.folder))
 
@@ -374,7 +381,8 @@ class Sealed(unittest.TestCase):
 
         with mock.patch("os.unlink", unlink):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertEqual(["result.json", "result.json.part"], sorted(os.listdir(self.folder)))
 
     def test_a_link_that_fails_and_a_part_name_that_cannot_be_removed_leave_the_part_file_in_both_writers(self) -> None:
@@ -418,7 +426,8 @@ class Sealed(unittest.TestCase):
 
         with mock.patch("os.link", refuse_link), mock.patch("os.unlink", unlink_once):
             code, out, err = sealed(self.argv, lambda arguments: {"mode": "verify"})
-        self.assertEqual((70, "", f"{JOB}: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, JOB, f"{JOB}: internal_error: failed", (), MARKER)
         self.assertEqual(1, len(refused))
         self.assertEqual([], os.listdir(self.folder))
 

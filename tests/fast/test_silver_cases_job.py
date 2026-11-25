@@ -39,6 +39,7 @@ from spark.silver_cases_run import (
     run_verify,
     start_deadline,
 )
+from tests.fast.internal_line_support import assert_internal
 
 LENGTHS = [3600, 7200, 5400, 4800, 9000, 1800]
 # The job reads three Bronze and Silver inputs and writes four tables, and names the snapshot of each of the seven.
@@ -477,7 +478,12 @@ class CommandLineTest(unittest.TestCase):
         )
         for error, status, code in refusals:
             with self.subTest(code=code):
-                self.assertEqual((status, "", f"silver_cases: {code}: failed\n"), invoke(["build", "--branch", "b"], raising(error)))
+                result = invoke(["build", "--branch", "b"], raising(error))
+                if code == "internal_error":
+                    self.assertEqual((status, ""), result[:2])
+                    assert_internal(self, result[2], "silver_cases", "silver_cases: internal_error: failed", ("builtins.RuntimeError",), MARKER)
+                else:
+                    self.assertEqual((status, "", f"silver_cases: {code}: failed\n"), result)
 
     def test_the_arguments_are_a_mode_a_branch_a_base_for_build_and_the_pinned_flag(self) -> None:
         seen: list[Namespace] = []
@@ -542,7 +548,8 @@ class CommandLineTest(unittest.TestCase):
         code, _, err = invoke(["build", "--branch", "b"], raising(SettingsError(f"{MARKER} is not set")))
         self.assertEqual((2, "silver_cases: settings: failed\n"), (code, err))
         code, _, err = invoke(["build", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "silver_cases: internal_error: failed\n"), (code, err))
+        self.assertEqual(70, code)
+        assert_internal(self, err, "silver_cases", "silver_cases: internal_error: failed", ("builtins.RuntimeError",), MARKER)
 
 
 class DeadlineTest(unittest.TestCase):

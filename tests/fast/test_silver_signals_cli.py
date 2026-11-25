@@ -11,7 +11,8 @@ Failure modes covered here:
 - A path that cannot hold its part file (a folder that is not there, a name of 255 bytes) is found only after the job ran, and the job's work is lost. The
   part file is reserved before ``execute``, and a failed reservation is a bad call: ``usage``, exit 2, and nothing runs.
 - A job that the watchdog stops, or a file that appears while the job runs, leaves a part file or is written over.
-- A line of standard error holds a code without the flag, or text after the code: every printed line is ``<job>: <code>: failed``.
+- A line of standard error holds a code without the flag, or text after the code: every printed line is ``<job>: <code>: failed``, except the one line of
+  classes and frames after ``internal_error`` (``test_internal_diagnostic.py`` holds its rules).
 
 - An extra or a malformed argument, or a branch name that Nessie would refuse, is echoed by the argument parser.
 - A failed check, a missing branch, a settings error or any other error carries text of its own into the output.
@@ -43,6 +44,7 @@ from spark.silver.checks import SilverSignalsError
 from spark.silver.cli import JOB, run
 from spark.split_cli import start_deadline
 from spark.split_table import schema_problems
+from tests.fast.internal_line_support import assert_internal, split_lines
 
 MARKER = "MARKER_8731"
 PART = "result.json.part"
@@ -210,7 +212,8 @@ class CommandLine(InFolder):
         self.assertEqual({"job": "silver_signals", "mode": "verify", "refusal": ["settings"]}, self.document())
         self.path.unlink()
         code, out, err = self.call(["verify", "--branch", "b"], raising(RuntimeError(MARKER)))
-        self.assertEqual((70, "", "silver_signals: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", ("builtins.RuntimeError",), MARKER)
         self.assertEqual({"job": "silver_signals", "mode": "verify", "refusal": ["internal_error"]}, self.document())
         self.assertNotIn(MARKER, self.path.read_text())
 
@@ -221,7 +224,8 @@ class CommandLine(InFolder):
         ):
             with self.subTest(name):
                 code, out, err = self.call(["build", "--branch", "b"], execute)
-                self.assertEqual((70, "", "silver_signals: internal_error: failed\n"), (code, out, err))
+                self.assertEqual((70, ""), (code, out))
+                assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", (), MARKER)
                 self.assertEqual({"job": "silver_signals", "mode": "build", "refusal": ["internal_error"]}, self.document())
                 self.assertEqual(["result.json"], self.left())
                 self.path.unlink()
@@ -240,7 +244,8 @@ class CommandLine(InFolder):
         ):
             with self.subTest(name), mock.patch("os.link", refuse):
                 code, out, err = self.call(["build", "--branch", "b"], execute)
-                self.assertEqual((70, "", "silver_signals: internal_error: failed\n"), (code, out, err))
+                self.assertEqual((70, ""), (code, out))
+                assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", (), MARKER)
                 self.assertEqual([], self.left())
 
     def test_a_folder_that_is_not_there_is_a_bad_call_and_the_job_does_not_run(self) -> None:
@@ -313,7 +318,8 @@ class CommandLine(InFolder):
             return {"mode": parsed.mode}
 
         code, out, err = self.call(["build", "--branch", "b"], execute)
-        self.assertEqual((70, "", "silver_signals: internal_error: failed\n"), (code, out, err))
+        self.assertEqual((70, ""), (code, out))
+        assert_internal(self, err, "silver_signals", "silver_signals: internal_error: failed", (), MARKER)
         self.assertEqual("other", self.path.read_text())
         self.assertEqual(["result.json"], self.left())
 
@@ -337,7 +343,9 @@ class CommandLine(InFolder):
                 _, out, err = self.call(["verify", "--branch", "b"], raising(error))
                 self.assertEqual("", out)
                 self.assertTrue(err.endswith("\n"))
-                for line in err.splitlines():
+                rest, found = split_lines(err, "silver_signals")
+                self.assertEqual(1 if type(error) is RuntimeError else 0, len(found))
+                for line in rest:
                     self.assertRegex(line, r"^silver_signals: [a-z_]+: failed$")
 
     def test_the_hypotension_job_prints_its_own_name(self) -> None:
