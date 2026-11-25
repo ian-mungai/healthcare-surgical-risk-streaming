@@ -36,7 +36,7 @@ from scripts.project_config import ENVIRONMENTS
 
 STATE_KEYS = ["state/dev/terraform.tfstate", "state/dev/terraform.tfstate.tflock"]
 RUN = RunBinding("20260101t0000-abcdef", "c0ffee", "s3", "us-west-2", "example-project", "default", STATE_KEYS, "verified", bucket_creation="created")
-SETTINGS = {"S3_BUCKET": "example-project", "ENVIRONMENT": "dev", "AWS_ACCOUNT_ID": "example-account"}
+SETTINGS = {"S3_BUCKET": "example-project", "ENVIRONMENT": "dev", "AWS_ACCOUNT_ID": "example-account", "AWS_REGION": "us-west-2"}
 ACCOUNT = "example-account"
 
 
@@ -126,7 +126,9 @@ class ApplyRecordTest(unittest.TestCase):
             mock.patch.object(terraform_wrapper, "binding_problems", return_value=[]),
             mock.patch.object(terraform_wrapper, "stale_inputs_problem", return_value=None),
             mock.patch.object(terraform_wrapper, "approved_plan_copy", return_value=Path(scratch) / "approved.tfplan"),
-            mock.patch.object(terraform_wrapper, "terraform", side_effect=["{}", "Apply complete! Resources: 1 added"]),
+            mock.patch.object(
+                terraform_wrapper, "terraform", side_effect=['{"variables": {"aws_region": {"value": "us-west-2"}}}', "Apply complete! Resources: 1 added"]
+            ),
             mock.patch.object(terraform_wrapper, "save_raw", side_effect=OSError("disk full")),
             mock.patch.object(terraform_wrapper, "record_created") as recorded,
             mock.patch("sys.stdout") as printed,

@@ -14,6 +14,8 @@ makes a plan, and of no other call, so a limits file that the loader refuses sto
 variable file. Before it applies a plan it reads that plan's own JSON, and a plan whose three heavy inputs are not the whole numbers that
 the loader gives is refused. A plan that was made with other numbers gets no confirmation code when it is saved, as a courtesy that writes no state.
 A destroy plan is not checked: the figure has no effect when the host is destroyed.
+Terraform gets the run's bound region as ``aws_region`` after the variable file, which names no region, and ``.env``'s AWS_REGION must equal it. Before it
+applies a plan that creates the host, the wrapper also refuses a plan whose AMI is not the one ``infra/ubuntu_build.json`` names now for the plan's region.
 A change of a root output counts as a change of the plan. ``plan --destroy`` saves a destroy plan the same way; this command never applies one.
 """
 
@@ -89,6 +91,7 @@ def pinned_terraform() -> Path:
 
 
 CONFIGURATION_PARTS = ("modules", "environments")
+UBUNTU_BUILD_FILE = "ubuntu_build.json"
 HEAVY_INPUTS_FILE = "heavy_inputs.tfvars.json"
 HEAVY_INPUT_NAMES = ("host_reserve_mib", "always_on_limits_mib", "spark_limit_mib")
 BOUND_BACKEND_KEYS = {"s3": ("bucket", "key", "region"), "local": ("path",)}
@@ -103,10 +106,22 @@ def backend_override(run: RunBinding) -> str | None:
 
 def run_variables(run: RunBinding, configuration: dict[str, str]) -> dict[str, str]:
     """The Terraform variables that come from the run and not from the environment's variable file."""
-    values = {"data_bucket_name": run.bucket, "aws_profile": configuration["AWS_PROFILE"], "provision_host": "true" if run.provision_host else "false"}
+    values = {
+        "data_bucket_name": run.bucket,
+        "aws_profile": configuration["AWS_PROFILE"],
+        "provision_host": "true" if run.provision_host else "false",
+        "aws_region": run.region,
+    }
     if run.bucket_mode == "short_lived":
         values["test_run_id"] = run_suffix(run.run_id)
     return values
+
+
+def region_problem(run: RunBinding, configuration: dict[str, str]) -> str | None:
+    """Why the run may not go on: its bound region is not the AWS_REGION of ``.env``. The binding's region is the one that Terraform and the backend get."""
+    if run.region != configuration["AWS_REGION"]:
+        return "the run is bound to a region other than the AWS_REGION of .env; bind the run again or correct AWS_REGION"
+    return None
 
 
 def backend_arguments(run: RunBinding, profile: str) -> list[str]:
@@ -145,8 +160,8 @@ def configuration_folder(run: RunBinding) -> Path:
 
 
 def configuration_files(source: Path) -> list[Path]:
-    """The top-level files a run's copy takes: the Terraform files and the provider lock, and no variable file that Terraform would load unasked."""
-    return [*sorted(item for item in source.glob("*.tf") if item.name != "backend_override.tf"), source / ".terraform.lock.hcl"]
+    """The top-level files a run's copy takes: the Terraform files, the pinned Ubuntu build and the provider lock, and no unasked variable file."""
+    return [*sorted(item for item in source.glob("*.tf") if item.name != "backend_override.tf"), source / UBUNTU_BUILD_FILE, source / ".terraform.lock.hcl"]
 
 
 def heavy_inputs() -> str:
@@ -177,6 +192,60 @@ def stale_inputs_problem(plan: object) -> str | None:
         return None
     planned, current = difference
     return f"the limits changed after this plan was saved; save a new plan: the plan was made with {planned} and the limits now give {current}"
+
+
+def pinned_ami(region: object) -> str | None:
+    """The AMI that the Ubuntu pin file names now for ``region``, or None when the file, the region or the AMI is missing or not text."""
+    try:
+        amis = json.loads((ROOT / "infra" / UBUNTU_BUILD_FILE).read_text()).get("amis")
+        ami = amis.get(region) if isinstance(amis, dict) and isinstance(region, str) else None
+    except OSError, ValueError, AttributeError:
+        return None
+    return ami if isinstance(ami, str) else None
+
+
+def planned_host_image(plan: object) -> tuple[bool, object, object]:
+    """Whether the plan creates the host, the AMI that it gives the host and the region it was made for. A document of any other shape creates no host."""
+    if not isinstance(plan, dict):
+        return False, None, None
+    changes = plan.get("resource_changes")
+    for change in changes if isinstance(changes, list) else []:
+        if not isinstance(change, dict) or change.get("type") != "aws_instance" or change.get("name") != "host":
+            continue
+        inner = change.get("change")
+        actions = inner.get("actions") if isinstance(inner, dict) else None
+        if not isinstance(actions, list) or "create" not in actions:
+            continue
+        after = inner.get("after") if isinstance(inner, dict) else None
+        variables = plan.get("variables")
+        region = variables.get("aws_region") if isinstance(variables, dict) else None
+        return True, after.get("ami") if isinstance(after, dict) else None, region.get("value") if isinstance(region, dict) else None
+    return False, None, None
+
+
+def stale_pin_problem(plan: object) -> str | None:
+    """The refusal for a plan that creates the host with another AMI than the Ubuntu pin names now for the plan's region, or None.
+
+    A host that already exists ignores a later AMI, so only a plan that creates the host is checked, and only an apply asks: a deploy to a host that was
+    created has no use for the pin.
+    """
+    creates, planned, region = planned_host_image(plan)
+    if not creates:
+        return None
+    current = pinned_ami(region)
+    if isinstance(planned, str) and planned == current:
+        return None
+    return f"the Ubuntu pin changed after this plan was saved; save a new plan: the plan creates the host from {planned!r} and the pin now gives {current!r}"
+
+
+def plan_region_problem(run: RunBinding, plan: object) -> str | None:
+    """The refusal for a plan whose own ``aws_region`` variable is not the run's bound region, or has no text value, or None."""
+    variables = plan.get("variables") if isinstance(plan, dict) else None
+    entry = variables.get("aws_region") if isinstance(variables, dict) else None
+    planned = entry.get("value") if isinstance(entry, dict) else None
+    if planned == run.region:
+        return None
+    return f"the plan was made for the region {planned!r} and the run is bound to {run.region!r}; save a new plan"
 
 
 def environment_override_problems(environment: Mapping[str, str]) -> list[str]:
@@ -270,6 +339,9 @@ def initialise(run: RunBinding, configuration: dict[str, str], inputs: str | Non
     mode_problem = bucket_problem(run, configuration)
     if mode_problem:
         raise WrapperError(f"refused before any plan or change: {mode_problem}")
+    mismatch = region_problem(run, configuration)
+    if mismatch:
+        raise WrapperError(f"refused before any plan or change: {mismatch}")
     folder = prepare_configuration(run, inputs)
     terraform(run, ["init", "-input=false", "-reconfigure", *backend_arguments(run, configuration["AWS_PROFILE"])], INIT_TIMEOUT_SECONDS)
     record_file = folder / ".terraform" / "terraform.tfstate"
@@ -370,9 +442,13 @@ def save_plan(run: RunBinding, configuration: dict[str, str], action: str) -> in
 
 
 def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None = None) -> int:
-    mode_problem = bucket_problem(run, configuration or load_configuration())
+    configuration = configuration or load_configuration()
+    mode_problem = bucket_problem(run, configuration)
     if mode_problem:
         raise WrapperError(f"refused before any change: {mode_problem}")
+    mismatch = region_problem(run, configuration)
+    if mismatch:
+        raise WrapperError(f"refused before any change: {mismatch}; then save a new plan")
     folder = ROOT / "runs" / run.run_id / "plans"
     plan_file = folder / "apply.tfplan"
     binding_file = folder / "apply_binding.json"
@@ -384,7 +460,8 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         raise WrapperError("refused before any change: " + "; ".join(problems))
     approved = approved_plan_copy(run, plan)
     try:
-        # The one check on the plan that is applied: its own JSON, read from the exact bytes that were checked, holds the three numbers the loader gives now.
+        # The checks on the plan that is applied read its own JSON, from the exact bytes that were checked: the three numbers the loader gives now, the
+        # pinned image of a created host and the region of the run's binding.
         try:
             applied_plan = json.loads(terraform(run, ["show", "-json", str(approved)], PLAN_TIMEOUT_SECONDS))
         except ValueError as error:
@@ -392,6 +469,13 @@ def apply_plan(run: RunBinding, code: str, configuration: dict[str, str] | None 
         stale = stale_inputs_problem(applied_plan)
         if stale:
             raise WrapperError(f"refused before any change: {stale}")
+        # The region comes before the pinned image: a plan made for another region names that cause, even where the pin has no image for that region.
+        elsewhere = plan_region_problem(run, applied_plan)
+        if elsewhere:
+            raise WrapperError(f"refused before any change: {elsewhere}")
+        moved = stale_pin_problem(applied_plan)
+        if moved:
+            raise WrapperError(f"refused before any change: {moved}")
         output = terraform(run, ["apply", "-input=false", "-no-color", str(approved)], APPLY_TIMEOUT_SECONDS)
         kept = kept_note(run.run_id, "apply_output.txt", output, "raw output")
         sys.stdout.write(next((line for line in output.splitlines() if line.startswith("Apply complete")), "the apply finished") + f"; {kept}\n")

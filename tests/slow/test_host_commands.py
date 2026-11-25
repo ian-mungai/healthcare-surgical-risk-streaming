@@ -571,6 +571,7 @@ class StopAndStartWithRefusedLimitsTest(unittest.TestCase):
         for folder in ("modules", "environments"):
             (self.root / "infra" / folder).mkdir(parents=True)
         (self.root / "infra" / ".terraform.lock.hcl").write_text("")
+        (self.root / "infra" / "ubuntu_build.json").write_text("{}")
         self.binding = binding_file(self.root, backend="s3", provision_host=True)
         record = self.root / ".tools" / "terraform" / "20260101t0000-abcdef" / "config" / ".terraform" / "terraform.tfstate"
         record.parent.mkdir(parents=True)
