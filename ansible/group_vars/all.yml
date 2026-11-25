@@ -181,3 +181,50 @@ airbyte_public_url: ""
 airbyte_release_deadline_seconds: 1200
 airbyte_ready_deadline_seconds: 300
 airbyte_health_deadline_seconds: 120
+
+# The runner checkout: the deployed commit's code and a pinned Python environment for the native host-mode runners, in one folder that only the deploy user and its group
+# read (mode 0750, no secret in it). The folder is /opt/platform/runner/<commit>. It holds the commit's tracked files from git archive (no Git history), a .venv built from the
+# hash-pinned requirements and, once the launcher places them, the Git-ignored runner files. The next deploy of another commit removes the old folder; a second deploy of the
+# same commit changes nothing and keeps the placed runners. A stopped host keeps the folder with its disk; destroying the host removes the disk and the folder with it.
+# The commit is the one the stack is deployed from (the launcher gives it as runner_checkout_commit).
+runner_checkout_directory: /opt/platform/runner
+runner_checkout_owner: ubuntu
+runner_checkout_group: ubuntu
+# The folder and the runner folder for the owner and its group only; every entry below them keeps its owner's bits and loses every bit of others.
+runner_checkout_mode: "0750"
+runner_checkout_file_mode: "u=rwX,g=rX,o="
+# The interpreter. Ubuntu 24.04 ships Python 3.12 and the project is pinned to Python 3.14 (the pyproject, the Dockerfiles' python:3.14.10 and the Ruff and MyPy targets), so the
+# host gets the python-build-standalone build for x86-64 glibc, in a folder named for its version beside the other tools. The archive's SHA-256 is the one in the release's own
+# SHA256SUMS (read Nov 25 2026, and equal to the hash of the downloaded file). Change the pin only with its hash, after reading the release notes.
+runner_checkout_python_version: 3.14.10
+runner_checkout_python_build: "20261110"
+runner_checkout_python_archive_sha256: c2ff2e97422f5d3896a16e0317fd212ba977bbf2688d93a6f7a03d817506bd30
+runner_checkout_python_directory: /opt/platform/python
+runner_checkout_python_download_directory: /usr/local/src
+runner_checkout_python_url: >-
+  https://github.com/astral-sh/python-build-standalone/releases/download/{{ runner_checkout_python_build }}/cpython-{{ runner_checkout_python_version }}%2B{{ runner_checkout_python_build }}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+runner_checkout_python_archive: "{{ runner_checkout_python_download_directory }}/cpython-{{ runner_checkout_python_version }}-{{ runner_checkout_python_build }}-x86_64-linux-gnu.tar.gz"
+runner_checkout_python_home: "{{ runner_checkout_python_directory }}/{{ runner_checkout_python_version }}"
+runner_checkout_python: "{{ runner_checkout_python_home }}/bin/python{{ runner_checkout_python_version.split('.')[:2] | join('.') }}"
+# The files, relative to the folder, that the environment's packages come from: every one is installed with --require-hashes, so every requirement in it must carry a hash.
+runner_checkout_requirements:
+  - requirements.txt
+runner_checkout_folder: "{{ runner_checkout_directory }}/{{ runner_checkout_commit }}"
+# The archive on its way to the host, beside the folder, removed once it is unpacked (and by the next deploy if a failure left it).
+runner_checkout_archive_file: "{{ runner_checkout_folder }}.tar"
+# The marker that is written last. Its text is the JSON of what the folder was built from, so another commit's folder, another interpreter pin or other requirements files
+# make the folder unfinished. The launcher's placement reads the same name.
+runner_checkout_marker: "{{ runner_checkout_folder }}/.runner_checkout.json"
+runner_checkout_expected:
+  commit: "{{ runner_checkout_commit }}"
+  python: "{{ runner_checkout_python_version }}"
+  python_archive_sha256: "{{ runner_checkout_python_archive_sha256 }}"
+  requirements: "{{ runner_checkout_requirements }}"
+runner_checkout_marker_text: "{{ runner_checkout_expected | to_json(sort_keys=True) }}\n"
+# Each deadline is in seconds. The install deadline covers every package of the lock file.
+runner_checkout_download_deadline_seconds: 120
+runner_checkout_unpack_deadline_seconds: 120
+runner_checkout_archive_deadline_seconds: 120
+runner_checkout_environment_deadline_seconds: 120
+runner_checkout_install_deadline_seconds: 900
+runner_checkout_check_deadline_seconds: 60

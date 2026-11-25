@@ -1,0 +1,31 @@
+# Places the deployed commit's code and a pinned Python environment in one folder for the native host-mode runners, and nothing else. The order: refuse a commit or pin of the
+# wrong form, install the pinned interpreter once (a root-owned folder named for its version, beside the others of this host), decide whether this commit's folder is
+# finished, and only when it is not, make the commit's code with git archive on the controller (no Git history), remove every other folder under the runner folder and
+# the unfinished one, place the code, build the environment from the hash-pinned requirements, close the folder to everyone but its owner and its group, check that,
+# and write the finished marker last. The marker names the commit, the interpreter pin and the requirements, so a second run of the same commit changes nothing and
+# keeps the runner files that the launcher placed there, and a new commit, a new interpreter pin or an unfinished folder replaces the folder. The role reads no
+# Compose, Docker, Kubernetes or secret setting and writes outside its own two folders and the interpreter archive's folder never.
+- name: Refuse a commit, an interpreter pin or a requirements file of the wrong form
+  ansible.builtin.assert:
+    that:
+      - runner_checkout_commit is regex('^[0-9a-f]{40}$')
+      - runner_checkout_python_version is regex('^3\.[0-9]+\.[0-9]+$')
+      - runner_checkout_python_archive_sha256 is regex('^[0-9a-f]{64}$')
+      - runner_checkout_requirements | length > 0
+      - runner_checkout_requirements | reject('regex', '^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$') | list | length == 0
+    quiet: true
+    fail_msg: the commit must be 40 lowercase hexadecimal digits, the interpreter pin an exact version with a SHA-256 and each requirements file a plain relative path
+
+- name: Install the pinned interpreter
+  ansible.builtin.include_tasks: python.yml
+
+- name: Decide whether this commit's folder is finished and remove every other folder
+  ansible.builtin.include_tasks: folders.yml
+
+- name: Make the commit's code with git archive on the controller
+  ansible.builtin.include_tasks: archive.yml
+  when: not runner_checkout_complete
+
+- name: Check the finished folder and write its marker
+  ansible.builtin.include_tasks: finish.yml
+  when: not runner_checkout_complete

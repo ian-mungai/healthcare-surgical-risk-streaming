@@ -1,0 +1,48 @@
+# Reads runner_checkout_python_url, runner_checkout_python_archive, runner_checkout_python_archive_sha256, runner_checkout_python_home, runner_checkout_python,
+# runner_checkout_python_version and the deadlines. The interpreter is one exact version from a python-build-standalone archive whose SHA-256 is pinned: get_url
+# refuses an archive with another hash, and the unpacked interpreter must say the pinned version. An installed interpreter is not downloaded again. It is kept in a folder named for its version, so a new pin
+# installs beside the old one, and it is shared and public software: the folder is open to read, and no runner folder or secret lives in it.
+- name: Look for the installed interpreter
+  ansible.builtin.stat:
+    path: "{{ runner_checkout_python }}"
+    follow: false
+  register: runner_checkout_interpreter_stat
+
+- name: Download the interpreter's archive of the pinned version, checked against its pinned hash
+  ansible.builtin.get_url:
+    url: "{{ runner_checkout_python_url }}"
+    dest: "{{ runner_checkout_python_archive }}"
+    checksum: "sha256:{{ runner_checkout_python_archive_sha256 }}"
+    mode: "0644"
+  when: not runner_checkout_interpreter_stat.stat.exists
+  timeout: "{{ runner_checkout_download_deadline_seconds }}"
+
+- name: Create the folder of the pinned interpreter
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ runner_checkout_python_directory }}"
+    - "{{ runner_checkout_python_home }}"
+
+- name: Unpack the interpreter
+  ansible.builtin.command:
+    argv: [tar, -xzf, "{{ runner_checkout_python_archive }}", -C, "{{ runner_checkout_python_home }}", --strip-components=1, --no-same-owner]
+    creates: "{{ runner_checkout_python }}"
+  when: not runner_checkout_interpreter_stat.stat.exists
+  timeout: "{{ runner_checkout_unpack_deadline_seconds }}"
+
+- name: Read the installed interpreter's version
+  ansible.builtin.command:
+    argv: ["{{ runner_checkout_python }}", --version]
+  register: runner_checkout_interpreter
+  changed_when: false
+  timeout: "{{ runner_checkout_check_deadline_seconds }}"
+
+- name: Confirm that the interpreter is the pinned version
+  ansible.builtin.assert:
+    that:
+      - runner_checkout_interpreter.stdout | trim == 'Python ' ~ runner_checkout_python_version
+    quiet: true
+    fail_msg: "The interpreter says {{ runner_checkout_interpreter.stdout | trim }} and the pin is Python {{ runner_checkout_python_version }}."

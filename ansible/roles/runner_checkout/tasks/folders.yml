@@ -1,0 +1,28 @@
+# Reads runner_checkout_directory, runner_checkout_folder, runner_checkout_marker, runner_checkout_expected, runner_checkout_commit, runner_checkout_owner and
+# runner_checkout_group. Sets runner_checkout_complete. A folder is finished when its marker holds exactly what this deploy expects. Nothing here removes anything
+# when the folder is finished: a runner that the launcher placed in it stays.
+- name: Create the runner folder for its owner and group only
+  ansible.builtin.file:
+    path: "{{ runner_checkout_directory }}"
+    state: directory
+    owner: "{{ runner_checkout_owner }}"
+    group: "{{ runner_checkout_group }}"
+    mode: "{{ runner_checkout_mode }}"
+
+- name: Look for the finished marker of this commit's folder
+  ansible.builtin.stat:
+    path: "{{ runner_checkout_marker }}"
+    follow: false
+  register: runner_checkout_marker_stat
+
+- name: Read the marker
+  ansible.builtin.slurp:
+    src: "{{ runner_checkout_marker }}"
+  register: runner_checkout_marker_content
+  when: runner_checkout_marker_stat.stat.isreg | default(false)
+
+- name: Find out whether the folder is finished for this commit, interpreter and requirements
+  ansible.builtin.set_fact:
+    runner_checkout_complete: >-
+      {{ (runner_checkout_marker_stat.stat.isreg | default(false))
+      and (runner_checkout_marker_content.content | default('') | b64decode) == runner_checkout_marker_text }}

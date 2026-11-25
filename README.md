@@ -55,12 +55,15 @@ Each host command runs under the project's AWS profile named in `.env`.
 make host-up                      # save a plan for review, or with CONFIRM=<code> apply it and set up the host
 make host-stop                    # stop the host and keep its disk
 make host-start                   # start the host again
+make host-runners-place RUNNERS="tests/e2e/silver_signals.py ..."  # place named Git-ignored runner files in the runner folder of the deployed commit
 make inventory                    # list every resource the run created
 make evidence-export              # pack the run's evidence with a manifest
 make evidence-verify              # check the export and sign its receipt on the owner's computer
 make teardown-plan                # save the destroy plan and record what may be deleted
 make host-destroy CONFIRM=<code>  # destroy only after every guard passes
 ```
+
+The deploy also makes one runner folder on the host for the native host-mode runners: `/opt/platform/runner/<commit>`, owned by the SSH user, mode 0750 and holding no secret. It holds the deployed commit's tracked files from `git archive` (no Git history, no ignored or uncommitted file) and a `.venv` built from the hash-pinned `requirements.txt` with `--require-hashes` and `--only-binary :all:`. The interpreter is Python 3.14.10 (the project's pin; Ubuntu 24.04 ships 3.12) from a python-build-standalone archive whose SHA-256 is pinned in `ansible/group_vars/all.yml`, kept in `/opt/platform/python/3.14.10`. A second deploy of the same commit changes nothing and keeps the placed runners. A deploy of another commit, or of another interpreter pin, removes every other folder under `/opt/platform/runner` and builds the new one. A stopped host keeps the folder on its disk, and `make host-destroy` removes it with the disk. The folder changes nothing that the stack runs. The Git-ignored runners are not in the archive: `make host-runners-place` sends each named file (one `.py` file directly under `tests/e2e/`, not in the commit, a plain text file of at most 1 MiB that passes the privacy scan) over SSH into the folder and records its SHA-256 in `runs/<run id>/runner_files.json`. On the host, run a runner from the folder: `cd /opt/platform/runner/<commit> && .venv/bin/python -m tests.e2e.<runner>`.
 
 Each service belongs to the group that `compose/limits.yml` gives it. The always-on group (`supporting`) starts with the stack. Every other group is a Compose profile of the same name and starts when a job or an operator asks for it, after the admission check. Airbyte's workloads in k3s are scaled through the Kubernetes API. A group that does not fit the available memory waits and then fails with the check's four figures.
 

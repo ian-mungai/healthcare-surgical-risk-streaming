@@ -300,6 +300,19 @@ class HostSetupBudgetTest(unittest.TestCase):
                 self.assertIn("timeout", item.task, "a cold install downloads packages, and only the lock wait has a deadline without it")
                 self.assertGreater(task_seconds(item), int(item.task[APT]["lock_timeout"]))
 
+    def test_the_runner_checkout_role_counts_each_of_its_deadlines_once_and_the_budget_covers_them(self) -> None:
+        found = playbook_occurrences("host.yml")
+        names = group_variables()
+        python = sum(int(names[f"runner_checkout_{name}_deadline_seconds"]) for name in ("download", "unpack", "check"))
+        code = sum(int(names[f"runner_checkout_{name}_deadline_seconds"]) for name in ("archive", "unpack", "unpack", "environment", "check", "install"))
+        self.assertEqual(
+            python + code,
+            parts()["runner_checkout"],
+            "the interpreter's download, unpack and check, then the archive, its copy and unpack, the environment, its check and the install",
+        )
+        timed = [item for item in found if item.role == "runner_checkout" and task_seconds(item)]
+        self.assertEqual(9, len(timed))
+
     def test_the_rollback_and_the_uninstall_count_once_and_the_install_counts_beside_the_recovery(self) -> None:
         found = playbook_occurrences("host.yml")
         deadline = int(group_variables()["airbyte_release_deadline_seconds"])

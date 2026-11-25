@@ -703,6 +703,7 @@ class HostUpTest(unittest.TestCase):
                 "workload_access_workloads": [],
                 "compose_stack_heavy_memory_mib": 11008,
                 "compose_stack_platform_commit": "a" * 40,
+                "runner_checkout_commit": "a" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
             },
@@ -1031,6 +1032,7 @@ class DeployVariablesTest(unittest.TestCase):
         self.assertEqual(
             {
                 "compose_stack_platform_commit": "b" * 40,
+                "runner_checkout_commit": "b" * 40,
                 "compose_stack_warehouse_location": "s3://example-bucket/warehouse/",
                 "airbyte_landing_bucket": "example-bucket",
             },

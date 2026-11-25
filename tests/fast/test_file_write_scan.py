@@ -220,6 +220,10 @@ OWNED_ROOTS: dict[tuple[str, str, str], tuple[int, str]] = {
     ("scripts/ingestion/table_checks.py", "write_result", "run_folder"): (1, "The run folder of the load; the name is the fixed RESULT_FILE"),
     ("scripts/infra/inventory.py", "write_inventory", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed inventory.json"),
     ("scripts/infra/host.py", "record_tailscale_device", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed DEVICE_FILE"),
+    ("scripts/infra/runner_place.py", "record_files", "folder"): (
+        1,
+        "RUNS / run ID, made by host_runners_place before the call; the name is the fixed RECORD_FILE",
+    ),
     ("scripts/infra/host.py", "keep_host_keys_of", "folder"): (1, "RUNS / run ID, made in this call; the name is the fixed known_hosts_instance"),
     ("scripts/infra/state_bootstrap.py", "RunBinding.write", "state_root"): (
         1,

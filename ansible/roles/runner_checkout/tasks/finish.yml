@@ -1,0 +1,48 @@
+# Reads runner_checkout_folder, runner_checkout_marker, runner_checkout_expected, runner_checkout_owner, runner_checkout_group and runner_checkout_file_mode. Closes
+# the folder, checks it, and writes the marker last, so a folder with a marker is a finished one and a failed deploy leaves a folder that the next run removes.
+# A link is not followed: the environment's interpreter link leads to the shared interpreter, which stays as it is.
+- name: Close every entry of the folder to everyone but its owner and group
+  ansible.builtin.file:
+    path: "{{ runner_checkout_folder }}"
+    state: directory
+    recurse: true
+    follow: false
+    owner: "{{ runner_checkout_owner }}"
+    group: "{{ runner_checkout_group }}"
+    mode: "{{ runner_checkout_file_mode }}"
+
+- name: List every entry of the folder without following a link
+  ansible.builtin.find:
+    paths: "{{ runner_checkout_folder }}"
+    file_type: any
+    recurse: true
+    hidden: true
+    follow: false
+  register: runner_checkout_entries
+
+- name: Look at the folder itself and the Git folder
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ runner_checkout_folder }}"
+    - "{{ runner_checkout_folder }}/.git"
+  register: runner_checkout_roots
+
+- name: Refuse a folder that others can reach, that another user owns or that holds Git history
+  ansible.builtin.assert:
+    that:
+      - runner_checkout_entries.files | rejectattr('islnk') | rejectattr('mode', 'search', '0$') | list | length == 0
+      - runner_checkout_entries.files | rejectattr('islnk') | rejectattr('pw_name', 'equalto', runner_checkout_owner) | list | length == 0
+      - runner_checkout_roots.results[0].stat.mode is regex('^0?[0-7][0-5]0$')
+      - not runner_checkout_roots.results[1].stat.exists
+    quiet: true
+    fail_msg: the runner folder is open to other users, is not owned by the deploy user, or holds a .git folder
+
+- name: Write the marker that says the folder is finished
+  ansible.builtin.copy:
+    dest: "{{ runner_checkout_marker }}"
+    content: "{{ runner_checkout_marker_text }}"
+    owner: "{{ runner_checkout_owner }}"
+    group: "{{ runner_checkout_group }}"
+    mode: "0640"

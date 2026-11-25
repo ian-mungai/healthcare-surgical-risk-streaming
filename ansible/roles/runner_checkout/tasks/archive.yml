@@ -1,0 +1,80 @@
+# Reads runner_checkout_commit, runner_checkout_source_root (default: the repository's root), runner_checkout_archive_deadline_seconds, runner_checkout_folder and the
+# owner, group and mode. The code is git archive of the commit: the commit's tracked files and nothing else (no .git folder, no history, no ignored or uncommitted file),
+# made on the controller before anything on the host changes, so a commit that the repository does not hold fails the deploy with the previous folder in place.
+- name: Make a private folder for the archive on the controller
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: runner_checkout_
+  register: runner_checkout_scratch
+  delegate_to: localhost
+  become: false
+
+- name: Place the commit's code, build the environment and remove the old folders
+  block:
+    - name: Make the archive of the commit's tracked files
+      ansible.builtin.command:
+        argv:
+          - git
+          - -C
+          - "{{ runner_checkout_source_root | default(role_path ~ '/../../..') }}"
+          - archive
+          - --format=tar
+          - --output
+          - "{{ runner_checkout_scratch.path }}/runner.tar"
+          - "{{ runner_checkout_commit }}"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      timeout: "{{ runner_checkout_archive_deadline_seconds }}"
+
+    - name: Find every folder or file under the runner folder except this commit's
+      ansible.builtin.find:
+        paths: "{{ runner_checkout_directory }}"
+        file_type: any
+        hidden: true
+        excludes: ["{{ runner_checkout_commit }}"]
+      register: runner_checkout_old
+
+    - name: Remove them, and this commit's own folder that has no finished marker
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ (runner_checkout_old.files | map(attribute='path') | list) + [runner_checkout_folder] }}"
+
+    - name: Create this commit's folder for its owner and group only
+      ansible.builtin.file:
+        path: "{{ runner_checkout_folder }}"
+        state: directory
+        owner: "{{ runner_checkout_owner }}"
+        group: "{{ runner_checkout_group }}"
+        mode: "{{ runner_checkout_mode }}"
+
+    - name: Copy the archive to the runner folder's parent
+      ansible.builtin.copy:
+        src: "{{ runner_checkout_scratch.path }}/runner.tar"
+        dest: "{{ runner_checkout_archive_file }}"
+        owner: "{{ runner_checkout_owner }}"
+        group: "{{ runner_checkout_group }}"
+        mode: "0600"
+      timeout: "{{ runner_checkout_unpack_deadline_seconds }}"
+
+    - name: Unpack the archive
+      ansible.builtin.command:
+        argv: [tar, -xf, "{{ runner_checkout_archive_file }}", -C, "{{ runner_checkout_folder }}", --no-same-owner]
+      changed_when: true
+      timeout: "{{ runner_checkout_unpack_deadline_seconds }}"
+
+    - name: Build the environment from the hash-pinned requirements
+      ansible.builtin.include_tasks: environment.yml
+  always:
+    - name: Remove the archive from the host
+      ansible.builtin.file:
+        path: "{{ runner_checkout_archive_file }}"
+        state: absent
+
+    - name: Remove the archive from the controller
+      ansible.builtin.file:
+        path: "{{ runner_checkout_scratch.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false

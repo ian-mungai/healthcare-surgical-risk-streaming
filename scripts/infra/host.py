@@ -9,6 +9,7 @@ for SSH, runs the Ansible host setup and writes the inventory. A run with nothin
 checks, so a second run changes nothing.
 ``make host-stop`` stops the instance, keeps its disk and prints what still bills.
 ``make host-start`` starts it and waits until it answers over Tailscale.
+``make host-runners-place RUNNERS="..."`` (``scripts/infra/runner_place.py``) places named Git-ignored runner files in the runner folder that the deploy made.
 ``host check --host-name <NAME> --instance-id <ID>`` is the deploy workflow's check: the peer with that name and tag must answer over
 SSH as the instance with that ID.
 
@@ -378,10 +379,12 @@ def platform_commit() -> str:
 
 
 def deploy_variables(configuration: dict[str, str], commit: str) -> dict[str, Any]:
-    """The Ansible variables of the stack's host settings: the deployed commit, the warehouse location of the configured bucket, and the bucket that Airbyte's
-    connection copies into. No variable holds the AWS profile or the key: the launcher reads the key itself and sends it to the host without Ansible."""
+    """The Ansible variables of the stack's host settings: the deployed commit (the stack's and the name of the runner folder), the warehouse location of the
+    configured bucket, and the bucket that Airbyte's connection copies into. No variable holds the AWS profile or the key: the launcher reads the key itself and
+    sends it to the host without Ansible."""
     return {
         "compose_stack_platform_commit": commit,
+        "runner_checkout_commit": commit,
         "compose_stack_warehouse_location": warehouse_location(configuration["S3_BUCKET"]),
         "airbyte_landing_bucket": configuration["S3_BUCKET"],
     }
