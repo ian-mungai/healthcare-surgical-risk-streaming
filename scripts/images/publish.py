@@ -13,6 +13,9 @@ such line for the tag is refused. The pin file is written once, after every imag
 Accepted behavior: a push that succeeded but whose pin was not saved is pushed again on the next run and may overwrite that unpinned tag. Nothing pins it, so
 no host pulls it.
 
+Accepted limit (owner, Nov 25 2026): two publishes at the same time can replace the digest of a pinned tag, because each reads the pin file before the other has
+written it. The command takes no lock. Trigger to revisit: more than one person or process publishes. Today only the owner publishes, by hand.
+
 The command relies on the ``docker login`` that this computer already has. It reads, prints and writes no token, and every message is fixed text: no output
 of Docker or Git is ever shown.
 """
