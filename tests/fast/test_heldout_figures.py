@@ -16,7 +16,22 @@ What the scan finds in a runner (a file of ``tests/e2e/``, any depth):
   a count of the patients of each set is, is a carrier too, unless it is a comparison or a ``bool``, ``all``, ``any`` or ``len`` of one. This is a best-effort
   check of the source: the sealed runners also hold ``sink_leaks`` of ``tests/fast/outcome_accept.py`` to what they record.
 
+The allowed constants (``EXPECTATION_CONSTANTS``) of a sealed runner's texts are read as the runner holds them, so each name that a text uses is held to one
+binding (``constant_findings``): exactly one binding at the top of the module, an assignment or an import; no second binding anywhere in the module (an
+assignment, an augmented assignment, a loop, an import, a ``global`` statement, a call of ``globals``, ``exec`` or ``eval``); and no function, class or
+comprehension that writes a record binds the name itself (a variable, a parameter, a loop, ``with`` or comprehension target, an ``except`` or ``match`` name,
+an import or a nested definition). A literal binding is read from the source and any other from the imported runner. Rules: ``constant_unbound``,
+``constant_not_assigned``, ``constant_rebound`` and ``constant_shadowed``.
+
 Counts of development patients are allowed in a runner.
+
+Limits of this scan, stated as they are accepted:
+
+- A binding that the module makes by name at run time (``setattr`` of the module, a store through ``sys.modules``) is not seen: the scan reads the names of
+  the source, and ``globals``, ``exec`` and ``eval`` are the dynamic forms that it names.
+- A raw ``ast.parse`` of an ignored runner that does not parse, in some other test modules (``test_runner_checkout_seal.py``, ``test_runner_staging.py``,
+  ``test_outcome_acceptance.py`` and the ``FlagNames`` test of ``test_runner_profile_flow.py``), can print the malformed source line in local test output. The
+  ignored runners are on no hosted run.
 """
 
 from __future__ import annotations
@@ -26,6 +41,7 @@ import contextlib
 import io
 import re
 import tempfile
+import textwrap
 import traceback
 import unittest
 from collections.abc import Callable, Mapping
@@ -352,30 +368,126 @@ def expectation_findings(source: str, values: Mapping[str, Any], figures: tuple[
     return sorted(set(found), key=lambda item: (item[1], item[0]))
 
 
-def used_constants(tree: ast.AST) -> set[str]:
-    """The names of ``EXPECTATION_CONSTANTS`` that a runner puts into its written texts."""
-    return {
-        item.value.id
-        for node in text_nodes_of(tree)
-        for item in ast.walk(node)
-        if isinstance(item, ast.FormattedValue) and isinstance(item.value, ast.Name) and item.value.id in EXPECTATION_CONSTANTS
-    }
+def constant_uses(tree: ast.AST) -> dict[str, int]:
+    """The names of ``EXPECTATION_CONSTANTS`` that a runner puts into its written texts, each with the line of its first use."""
+    uses: dict[str, int] = {}
+    for node in text_nodes_of(tree):
+        for item in ast.walk(node):
+            if isinstance(item, ast.FormattedValue) and isinstance(item.value, ast.Name) and item.value.id in EXPECTATION_CONSTANTS:
+                uses[item.value.id] = min(uses.get(item.value.id, item.lineno), item.lineno)
+    return uses
+
+
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+DYNAMIC_CALLS = frozenset({"globals", "exec", "eval"})
+
+
+def names_bound_by(node: ast.AST) -> list[str]:
+    """The names that one node binds in the scope around it: a stored or deleted name (an assignment, an augmented assignment, a loop, ``with`` or comprehension
+    target, a walrus), a parameter, an ``except`` name, an import, a function or a class, a ``match`` capture and a ``nonlocal`` statement."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+        return [node.id]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) and node.name:
+        return [node.name]
+    if isinstance(node, ast.MatchMapping) and node.rest:
+        return [node.rest]
+    if isinstance(node, ast.alias):
+        return [(node.asname or node.name).split(".")[0]]
+    if isinstance(node, ast.Nonlocal):
+        return list(node.names)
+    return []
+
+
+def top_bindings(tree: ast.Module) -> dict[str, ast.stmt]:
+    """The statement of each name that the module binds directly at its top, as a plain binding: one name on the left of an assignment (with a value), or a name
+    that an ``import`` or ``from ... import`` statement brings in (the project's own constant, as ``CUTOFF_FRACTIONS`` of ``spark.silver_cases`` is)."""
+    found: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            found[node.targets[0].id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            found[node.target.id] = node
+        elif isinstance(node, ast.Import | ast.ImportFrom):
+            found.update({name: node for item in node.names for name in names_bound_by(item)})
+    return found
+
+
+def constant_findings(tree: ast.Module, uses: Mapping[str, int]) -> list[tuple[str, int]]:
+    """The rule and the 1-based line of each unsafe binding of an allowed constant that a runner's texts use. The value that the scan reads for a constant must
+    be the value that a record prints, so each name needs exactly one binding at the top of the module and nothing else that can bind it:
+
+    - ``constant_unbound``: the module binds no such name, so its value is not the runner's;
+    - ``constant_not_assigned``: the one binding is not an assignment or an import at the top of the module (a condition, a loop, an unpacking, a function);
+    - ``constant_rebound``: the module binds the name again (a second assignment, an augmented assignment, a loop or an import), a ``global`` statement
+      names it, or the module calls ``globals``, ``exec`` or ``eval``;
+    - ``constant_shadowed``: a function, a class or a comprehension that writes a record (one of its texts is inside it) binds the name as its own: a
+      variable, a parameter, a loop, ``with`` or comprehension target, an ``except`` or ``match`` name, an import or a nested definition, in it or in what it
+      holds."""
+    if not uses:
+        return []
+    texts = {id(node) for node in text_nodes_of(tree)}
+    writers: dict[int, bool] = {}
+
+    def writes(scope: ast.AST) -> bool:
+        if id(scope) not in writers:
+            writers[id(scope)] = any(id(node) in texts for node in ast.walk(scope))
+        return writers[id(scope)]
+
+    module: dict[str, list[int]] = {name: [] for name in uses}
+    found: list[tuple[str, int]] = []
+    pending: list[tuple[ast.AST, tuple[ast.AST, ...]]] = [(tree, ())]
+    while pending:
+        node, scopes = pending.pop()
+        line = getattr(node, "lineno", 0)
+        for name in (name for name in names_bound_by(node) if name in uses):
+            if not scopes:
+                module[name].append(line)
+            elif any(writes(scope) for scope in scopes):
+                found.append(("constant_shadowed", line))
+        if isinstance(node, ast.Global):
+            found += [("constant_rebound", line) for name in node.names if name in uses]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in DYNAMIC_CALLS:
+            found.append(("constant_rebound", line))
+        inner = (*scopes, node) if isinstance(node, SCOPES) else scopes
+        pending.extend((child, inner) for child in ast.iter_child_nodes(node))
+    assigned = top_bindings(tree)
+    for name, lines in module.items():
+        ordered = sorted(lines)
+        if not ordered:
+            found.append(("constant_unbound", uses[name]))
+        elif len(ordered) > 1:
+            found += [("constant_rebound", line) for line in ordered[1:]]
+        elif name not in assigned:
+            found.append(("constant_not_assigned", ordered[0]))
+    return sorted(set(found), key=lambda item: (item[1], item[0]))
 
 
 def constant_values(path: Path, source: str) -> dict[str, Any]:
-    """The values of the allowed constants that a runner uses in its texts: the written constant where the runner assigns one at the top, and otherwise the
-    value that the imported runner holds (an import failure is named by file and line or class only)."""
+    """The values of the allowed constants that a runner uses in its texts: the written constant where the one binding at the top is a literal, and
+    otherwise the value that the imported runner holds for it (an import failure is named by file and line or class only). ``constant_findings`` holds the
+    binding to be one."""
     tree = ast.parse(source)
-    wanted = used_constants(tree)
+    wanted = set(constant_uses(tree))
     values: dict[str, Any] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in wanted:
+    for name, node in top_bindings(tree).items():
+        if name in wanted and isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
             with contextlib.suppress(ValueError):
-                values[node.targets[0].id] = ast.literal_eval(node.value)
+                values[name] = ast.literal_eval(node.value)
     if wanted - values.keys():
         module = safe_import(f"tests.e2e.{path.stem}", path.name)
         values |= {name: getattr(module, name) for name in wanted - values.keys() if hasattr(module, name)}
     return values
+
+
+def sealed_findings(path: Path, source: str) -> list[tuple[str, int]]:
+    """The rule and the 1-based line of each place where a sealed runner's written texts break the expectation rules. The constants are read only after
+    ``constant_findings`` finds each used name bound once at the top of the module and nowhere else: an unsafe binding is the finding, and no value is read."""
+    tree = ast.parse(source)
+    if found := constant_findings(tree, constant_uses(tree)):
+        return found
+    return expectation_findings(source, constant_values(path, source))
 
 
 class ScanFailed(Exception):
@@ -763,6 +875,153 @@ class ScannerFindsEveryWay(unittest.TestCase):
                 self.assertEqual([], findings(source, label))
 
 
+class AllowedConstantsAreBoundOnce(unittest.TestCase):
+    """The allowed constants are read from the one literal that a runner binds at the top of its module (the reviewer's probes: a function-local variable of an
+    allowed name that carries a count into a record, and a reassignment that is computed after the literal). A name that a text uses must have exactly one
+    binding at the top of the module, an assignment that nothing rebinds anywhere, and no function, class or comprehension that writes a record may bind it."""
+
+    RECORD = 'record.limits.append(f"a step that gives no result within {JOB_SECONDS} seconds fails the run")\n'
+    HEAD = "JOB_SECONDS = 1800\n"
+    PATH = E2E / "a_plant.py"
+
+    @classmethod
+    def plants(cls) -> tuple[tuple[str, str, str], ...]:
+        count = FIGURE
+        record = cls.RECORD
+        indented = textwrap.indent(record, "    ")
+        return (
+            ("constant_shadowed", "a local variable of finish", f"{cls.HEAD}def finish(run, record):\n    JOB_SECONDS = {count}\n{indented}"),
+            ("constant_shadowed", "a local that is the count by a sum", f"{cls.HEAD}def finish(run, record):\n    JOB_SECONDS = {count - 1} + 1\n{indented}"),
+            ("constant_shadowed", "a local that is read from a call", f"{cls.HEAD}def finish(run, record):\n    JOB_SECONDS = len(run.patients)\n{indented}"),
+            ("constant_shadowed", "a local with an annotation", f"{cls.HEAD}def finish(run, record):\n    JOB_SECONDS: int = {count}\n{indented}"),
+            ("constant_shadowed", "a local that is unpacked", f"{cls.HEAD}def finish(run, record):\n    JOB_SECONDS, other = run.pair\n{indented}"),
+            ("constant_shadowed", "a parameter", f"{cls.HEAD}def finish(run, record, JOB_SECONDS={count}):\n{indented}"),
+            ("constant_shadowed", "a keyword-only parameter", f"{cls.HEAD}def finish(run, record, *, JOB_SECONDS={count}):\n{indented}"),
+            (
+                "constant_shadowed",
+                "a loop target",
+                f"{cls.HEAD}def finish(run, record):\n    for JOB_SECONDS in run.counts:\n{textwrap.indent(indented, '    ')}",
+            ),
+            (
+                "constant_shadowed",
+                "a with target",
+                f"{cls.HEAD}def finish(run, record):\n    with run.open() as JOB_SECONDS:\n{textwrap.indent(indented, '    ')}",
+            ),
+            (
+                "constant_shadowed",
+                "an except name",
+                f"{cls.HEAD}def finish(run, record):\n    try:\n        run.stop()\n    except OSError as JOB_SECONDS:\n{textwrap.indent(indented, 8 * ' ')}",
+            ),
+            (
+                "constant_shadowed",
+                "a walrus",
+                f"{cls.HEAD}def finish(run, record):\n    if (JOB_SECONDS := run.count):\n{textwrap.indent(indented, '        ')}",
+            ),
+            ("constant_shadowed", "a local import", f"{cls.HEAD}def finish(run, record):\n    from other import count as JOB_SECONDS\n{indented}"),
+            ("constant_shadowed", "a local function", f"{cls.HEAD}def finish(run, record):\n    def JOB_SECONDS():\n        return 1\n{indented}"),
+            ("constant_shadowed", "a local in an async function", f"{cls.HEAD}async def finish(run, record):\n    JOB_SECONDS = {count}\n{indented}"),
+            (
+                "constant_shadowed",
+                "a local of the function that holds the function that writes",
+                f"{cls.HEAD}def outer(run, record):\n    JOB_SECONDS = {count}\n    def finish():\n{textwrap.indent(indented, '    ')}",
+            ),
+            (
+                "constant_shadowed",
+                "a variable of the class body that writes",
+                f'{cls.HEAD}class Finish:\n    JOB_SECONDS = {count}\n    record.limits.append(f"within {{JOB_SECONDS}} seconds")\n',
+            ),
+            (
+                "constant_shadowed",
+                "a comprehension target",
+                f'{cls.HEAD}[record.limits.append(f"within {{JOB_SECONDS}} seconds") for JOB_SECONDS in run.counts]\n',
+            ),
+            (
+                "constant_shadowed",
+                "a match capture",
+                f"{cls.HEAD}def finish(run, record):\n    match run.pair:\n        case [JOB_SECONDS, _]:\n{textwrap.indent(indented, '            ')}",
+            ),
+            ("constant_rebound", "a computed reassignment after the literal", f"JOB_SECONDS = 1800\nJOB_SECONDS = {count - 1} + 1\n{record}"),
+            ("constant_rebound", "a reassignment from a call", f"JOB_SECONDS = 1800\nJOB_SECONDS = len(CASES)\n{record}"),
+            ("constant_rebound", "an augmented assignment", f"JOB_SECONDS = 1800\nJOB_SECONDS += {count - 1800}\n{record}"),
+            ("constant_rebound", "a second literal", f"JOB_SECONDS = 1800\nJOB_SECONDS = {count}\n{record}"),
+            ("constant_rebound", "a rebinding in a condition", f"JOB_SECONDS = 1800\nif run:\n    JOB_SECONDS = {count}\n{record}"),
+            ("constant_rebound", "a rebinding by a loop at the top", f"JOB_SECONDS = 1800\nfor JOB_SECONDS in COUNTS:\n    pass\n{record}"),
+            ("constant_rebound", "a rebinding by an import", f"JOB_SECONDS = 1800\nfrom other import JOB_SECONDS\n{record}"),
+            ("constant_rebound", "a rebinding by a function", f"JOB_SECONDS = 1800\ndef JOB_SECONDS():\n    return {count}\n{record}"),
+            (
+                "constant_rebound",
+                "a global statement and an assignment in a function",
+                f"JOB_SECONDS = 1800\ndef setup():\n    global JOB_SECONDS\n    JOB_SECONDS = {count}\n{record}",
+            ),
+            (
+                "constant_rebound",
+                "a global statement and an augmented assignment",
+                f"JOB_SECONDS = 1800\ndef setup():\n    global JOB_SECONDS\n    JOB_SECONDS += 1\n{record}",
+            ),
+            ("constant_rebound", "a store through globals", f'JOB_SECONDS = 1800\nglobals()["JOB_SECONDS"] = {count}\n{record}'),
+            ("constant_rebound", "an exec", f'JOB_SECONDS = 1800\nexec("JOB_SECONDS = {count}")\n{record}'),
+            ("constant_not_assigned", "a binding that is an import in a condition", f"if run:\n    from other import JOB_SECONDS\n{record}"),
+            ("constant_unbound", "a name that only a function imports", f"def setup():\n    from other import JOB_SECONDS\n{record}"),
+            ("constant_not_assigned", "a binding in a condition", f"if run:\n    JOB_SECONDS = 1800\n{record}"),
+            ("constant_not_assigned", "a binding that is an unpacking", f"JOB_SECONDS, OTHER = 1800, 1\n{record}"),
+            ("constant_not_assigned", "a binding that is a function", f"def JOB_SECONDS():\n    return 1\n{record}"),
+            ("constant_unbound", "a name that nothing binds", record),
+        )
+
+    CONTROLS = (
+        ("the literal at the top", f"{HEAD}{RECORD}"),
+        ("the literal with an annotation", f"JOB_SECONDS: int = 1800\n{RECORD}"),
+        ("the literal read by a function that writes", f"{HEAD}def finish(run, record):\n{textwrap.indent(RECORD, '    ')}"),
+        ("a local variable of another name", f"{HEAD}def finish(run, record):\n    seconds = 3\n{textwrap.indent(RECORD, '    ')}"),
+        (
+            "a local of the allowed name in a function that writes no record",
+            f"{HEAD}def helper(run):\n    JOB_SECONDS = len(run)\n    return JOB_SECONDS\n{RECORD}",
+        ),
+        ("a parameter of the allowed name in a function that writes no record", f"{HEAD}def helper(JOB_SECONDS):\n    return JOB_SECONDS\n{RECORD}"),
+        ("a name that no text uses, bound twice", "JOB_SECONDS = 1800\nJOB_SECONDS = 1\nrecord.limits.append('written text')\n"),
+        ("another allowed name that no text uses, bound in a function", f"{HEAD}def finish(run, record):\n    IMAGE = 1\n{textwrap.indent(RECORD, '    ')}"),
+        ("an attribute of another object with the name", f"{HEAD}signals.JOB_SECONDS = 5\n{RECORD}"),
+        ("a keyword argument with the name", f"{HEAD}run(JOB_SECONDS=5)\n{RECORD}"),
+        ("a global statement of another name", f"{HEAD}def setup():\n    global OTHER\n    OTHER = 1\n{RECORD}"),
+    )
+
+    IMPORTED = (
+        ("the one import at the top", f"from other import JOB_SECONDS\n{RECORD}"),
+        ("the one import at the top under another name", f"from other import SECONDS as JOB_SECONDS\n{RECORD}"),
+        ("the one assignment at the top from a call", f"JOB_SECONDS = int(os.environ['SECONDS'])\n{RECORD}"),
+    )
+
+    def named(self, source: str) -> set[str]:
+        return {name for name, _ in scanned("a plant", partial(sealed_findings, self.PATH), source)}
+
+    def test_each_plant_is_named_by_its_rule(self) -> None:
+        for rule, label, source in self.plants():
+            with self.subTest(plant=label):
+                self.assertIn(rule, self.named(source), f"the plant {label} is not named by {rule}")
+
+    def test_each_control_is_quiet(self) -> None:
+        for label, source in self.CONTROLS:
+            with self.subTest(control=label):
+                self.assertEqual(set(), self.named(source), f"the control {label} is named")
+
+    def test_a_name_that_is_imported_or_computed_once_at_the_top_is_quiet_and_read_from_the_runner(self) -> None:
+        for label, source in self.IMPORTED:
+            with self.subTest(control=label):
+                tree = ast.parse(source)
+                self.assertEqual([], constant_findings(tree, constant_uses(tree)), f"the control {label} is named")
+
+    def test_a_finding_names_the_line_and_never_the_count(self) -> None:
+        found = scanned("a plant", partial(sealed_findings, self.PATH), f"{self.HEAD}def finish(run, record):\n    JOB_SECONDS = {FIGURE}\n    {self.RECORD}")
+        self.assertEqual([("constant_shadowed", 3)], found)
+        self.assertFalse(str(FIGURE) in repr(found), "a finding holds the figure")
+
+    def test_the_unsafe_binding_is_named_even_when_the_literal_text_is_clean(self) -> None:
+        """The text as it is written with the literal is clean: only the binding check names the shadow (the reviewer's probe)."""
+        source = f"{self.HEAD}def finish(run, record):\n    JOB_SECONDS = {FIGURE}\n    {self.RECORD}"
+        self.assertEqual([], expectation_findings(source, {"JOB_SECONDS": 1800}))
+        self.assertEqual({"constant_shadowed"}, self.named(source))
+
+
 PASSED_ON = "def check(self, text):\n    self.record.expect('c', 'k', text, sealed_observed({'a': True}), ok is True)\n"
 
 
@@ -925,8 +1184,7 @@ class ExpectationTexts(unittest.TestCase):
         for path in paths:
             with self.subTest(runner=path.name):
                 source = path.read_text()
-                values: dict[str, Any] = scanned(path.name, partial(constant_values, path), source)
-                found = scanned(path.name, partial(expectation_findings, values=values), source)
+                found = scanned(path.name, partial(sealed_findings, path), source)
                 self.assertEqual([], found, f"{path.name}: the rule and the line of each text that is not written text or that holds a figure")
 
 
