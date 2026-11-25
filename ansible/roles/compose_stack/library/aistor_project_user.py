@@ -3,19 +3,28 @@
 THE ONLY USE OF THE ROOT PAIR, AND ONLY ONCE PER HOST. The owner decided that root credentials are kept in a file, are secured on the disk and are not used
 for the project's work. This module's root calls make the project user, the project policy and the attachment of one to the other, and the read-only audit
 identity of the next paragraph. They run only on the FIRST bootstrap of a host, which ends when a root-only marker file is written on the host
-(``marker_file``), and again only for one deploy that the owner approved with ``compose_stack_aistor_root_repair: true`` (the module's ``repair``). Everything
+(``marker_file``), and again only for one run that the owner approved with ``make host-up AISTOR_REPAIR=1``. The launcher gives that approval as the extra
+variable ``aistor_repair_once`` of that one run, which is the module's ``repair``, and no inventory file holds it. Everything
 else (Terraform, the storage command, the checks, the workloads) signs in as the project user, or through STS, and never as root. After the marker exists, a
 refused sign-in, a missing OpenBao entry or any difference in the live state fails the deploy with a fixed message that names what differs, and changes
 nothing. A refusal whose S3 code is ``AccessDenied`` (which an offline or unlicensed server also answers) is a failure and never a reason to use root.
 
 THE LIVE CHECK. A redeploy trusts no saved digest. It reads the live state as a second identity, the audit identity: an AIStor user whose one policy allows
-the two admin actions ``admin:GetUser`` (``mc admin user info``, which also lists the groups) and ``admin:GetPolicy`` (``mc admin policy info``) and no S3
+the two admin actions ``admin:GetUser`` (the raw ``GetUserInfo`` request of the next paragraph) and ``admin:GetPolicy`` (``mc admin policy info``) and no S3
 call (``GetUserAdminAction`` and ``GetPolicyAdminAction`` of github.com/minio/pkg ``policy/admin-action.go``, commit e87292ba, lines 104-105 and 175-176; the
 handlers ``GetUserInfo`` and ``InfoCannedPolicy`` of github.com/minio/minio ``cmd/admin-handlers-users.go``, commit 7aac2a2c, lines 204 and 1558, require
 exactly them). Its sign-in is in OpenBao at its own path, which only the deploy's admin role reads. Terraform's identity stays the bucket-only project user.
 The check holds that the project user is enabled, holds exactly the project policy by name and no other, is in no group, and that the project policy's
 document equals the desired one; it then lists the project's bucket as the project user with the sign-in that OpenBao keeps. The audit identity is held to the
 same exact form.
+
+THE RAW USER READ. ``mc admin user info`` also fetches each group's description (``GetGroupDescription``, which needs ``admin:GetGroup``;
+``cmd/admin-user-info.go`` lines 67-91 of github.com/minio/mc), so a user in an added group made the check fail with a bare ``AccessDenied`` that named no
+group. The check sends the one admin request ``GET /minio/admin/v3/user-info?accessKey=<user>`` itself, with the AIStor container's own curl (its health
+check in compose/services/aistor.yml uses it) (``--aws-sigv4``, the same signature that ``mc`` makes), and reads the policy names, the status and the group
+names of the JSON answer (``GetUserInfo`` of ``cmd/iam-store.go``, lines 1658-1669 of github.com/minio/minio, written with ``madmin.UserInfo``), so the two
+admin actions are enough and an added group is named. The password reaches curl as the text of a config on its standard input, never as an argument. The
+answer is turned into the form of ``mc --json admin user info``, so one reader serves both, and a failed call is reported by its exit status alone.
 
 OpenBao is written with a sign-in only after that pair has signed in, so a password file that was lost and made again never replaces the working value. When
 the user exists and no password signs in, the module changes no password and writes nothing: it refuses, unless the owner approved the repair for one deploy.
@@ -74,7 +83,8 @@ NO_SUCH_POLICY = "XMinioAdminNoSuchPolicy"
 # an unknown access key is written in two parts: a scan keeps the field name of an exported credential out of every deployment file.
 SIGN_IN_REFUSALS = {"Invalid" + "Access" + "KeyId", "SignatureDoesNotMatch"}
 SIGNED_IN_CODES = {"NoSuchBucket"}
-APPROVAL = "compose_stack_aistor_root_repair"
+EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+APPROVAL = "AISTOR_REPAIR=1 on the one run of make host-up"
 PUBLISH = "write the project user's sign-in to OpenBao"
 PUBLISH_AUDIT = "write the audit identity's sign-in to OpenBao"
 RECORD = "record the first bootstrap on the host"
@@ -87,6 +97,14 @@ SCRIPTS = {
     # The calls as the audit identity: its user is the first argument, the rest are the words of one ``mc`` call, and its password comes on standard input.
     "audit": (
         f'IFS= read -r secret_value && user=$1 && shift && MC_HOST_{ALIAS}="http://$user:$secret_value@127.0.0.1:9000" exec mc --no-color --json "$@" 2>&1'
+    ),
+    # The raw ``GetUserInfo`` request as the audit identity (``mc admin user info`` also fetches each group's description, which needs ``admin:GetGroup``). Its
+    # user is the first argument and the account to read the second. Its password comes on standard input and goes into the config that curl reads from standard
+    # input, so it is no argument of curl. The answer is the body, a new line and the HTTP status.
+    "audit_user": (
+        'IFS= read -r secret_value && printf \'user = "%s:%s"\\n\' "$1" "$secret_value" | curl --silent --show-error --max-time 20 --config - '
+        f"--aws-sigv4 aws:amz:us-east-1:s3 --header 'x-amz-content-sha256: {EMPTY_BODY_SHA256}' --write-out '\\n%{{http_code}}' "
+        '"http://127.0.0.1:9000/minio/admin/v3/user-info?accessKey=$2" 2>&1'
     ),
     "policy_create": (
         f'file=$(mktemp) && cat > "$file" && {ROOT_SIGN_IN} mc --no-color admin policy create {ALIAS} "$1" "$file"; status=$?; rm -f "$file"; exit $status'
@@ -107,8 +125,8 @@ BUCKET_ACTIONS = [
     "s3:DeleteBucketPolicy",
     "s3:GetBucketTagging",
 ]
-# The audit identity's actions: ``mc admin user info`` (which also lists the groups) and ``mc admin policy info``. The sources are in the module's docstring
-# and in the table ADMIN_CALLS of the unit test, which a test holds equal to this list.
+# The audit identity's actions: the raw ``GetUserInfo`` request (which also gives the group names) and ``mc admin policy info``. The sources are in
+# the module's docstring and in the table ADMIN_CALLS of the unit test, which a test holds equal to this list.
 AUDIT_ACTIONS = ["admin:GetUser", "admin:GetPolicy"]
 MARKER_TEXT = "the first bootstrap of the AIStor project user and its audit identity finished on this host\n"
 
@@ -280,9 +298,34 @@ def audit_read(runner: Runner, user: str, password: str, *words: str) -> Result:
     return runner(Call("audit", (user, *words), password + "\n"))
 
 
+def audit_user_info(runner: Runner, user: str, password: str, name: str) -> Result:
+    """One user's information as the audit identity, from the raw ``GetUserInfo`` answer, in the form of ``mc --json admin user info``.
+
+    The admin call needs ``admin:GetUser`` and nothing else (cmd/iam-store.go ``GetUserInfo`` of github.com/minio/minio gives the policy names, the status and
+    the group names), where ``mc admin user info`` also reads each group's description and so needs ``admin:GetGroup`` (cmd/admin-user-info.go of
+    github.com/minio/mc). A failed call is reported by its exit status alone: curl's own text is never kept."""
+    result = runner(Call("audit_user", (user, name), password + "\n"))
+    if result.status != 0:
+        return Result(result.status, "")
+    body, _, code = result.output.rstrip("\n").rpartition("\n")
+    if code != "200":
+        try:
+            found = answer_of(body).get("Code")
+        except BootstrapError:
+            found = None
+        failure = {"status": "error", "error": {"cause": {"error": {"Code": found if isinstance(found, str) else None}}}}
+        return Result(1, json.dumps(failure))
+    document = answer_of(body)
+    names = document.get("memberOf") or []
+    if not isinstance(names, list) or not isinstance(document.get("policyName", ""), str) or not isinstance(document.get("status"), str):
+        raise BootstrapError("the answer for the user is not user information")
+    shaped = {"status": "success", "accessKey": name, "policyName": document.get("policyName", ""), "userStatus": document["status"]}
+    return Result(0, json.dumps(shaped | {"memberOf": [{"name": group} for group in names]}))
+
+
 def audit_signed_in(runner: Runner, user: str, password: str) -> bool:
     """Whether the audit identity signs in with this password: it reads its own user information, which its policy allows."""
-    return verdict(audit_read(runner, user, password, "admin", "user", "info", ALIAS, user), "the audit identity")
+    return verdict(audit_user_info(runner, user, password, user), "the audit identity")
 
 
 def read(runner: Runner, *words: str) -> Result:
@@ -361,7 +404,7 @@ def kept_sign_in(stored: dict[str, Any] | None, user: str) -> str | None:
 def refusal(account: Account) -> BootstrapError:
     return BootstrapError(
         f"{account.label} exists, but neither the sign-in that OpenBao keeps nor the password file signs in: no password is changed and nothing is written to "
-        f"OpenBao. To set the password file's value on the user, the owner approves it for one deploy with {APPROVAL}: true"
+        f"OpenBao. To set the password file's value on the user, the owner approves it with {APPROVAL}"
     )
 
 
@@ -437,11 +480,11 @@ def safe_name(name: str) -> str:
     return name if GROUP_NAME.fullmatch(name) else "a policy whose name is of another form"
 
 
-def live_differences(read_as_audit: Callable[..., Result], account: Account) -> list[str]:
+def live_differences(read_as_audit: Callable[..., Result], user_as_audit: Callable[[str], Result], account: Account) -> list[str]:
     """What differs between one account's live state and its definition, from the answers of the audit identity: the user is there and enabled, holds
     exactly its policy by name and no group, and the policy's document is the desired one."""
     differences: list[str] = []
-    answer = read_as_audit("admin", "user", "info", ALIAS, account.user)
+    answer = user_as_audit(account.user)
     if is_absent(answer, NO_SUCH_USER):
         differences.append(f"{account.label} does not exist")
     else:
@@ -475,8 +518,8 @@ def checked(result: Result, what: str) -> None:
     code = error_code(result)
     if code in SIGN_IN_REFUSALS:
         raise BootstrapError(
-            "the audit identity's sign-in that OpenBao keeps is refused: nothing was changed. To repair it with the root pair, the owner approves "
-            f"{APPROVAL}: true for one deploy"
+            "the audit identity's sign-in that OpenBao keeps is refused: nothing was changed. To repair it with the root pair, the owner approves it "
+            f"with {APPROVAL}"
         )
     if code == "AccessDenied":
         raise BootstrapError(
@@ -496,21 +539,23 @@ def verify_live(runner: Runner, project: Account, audit: Account, bucket: str) -
         password = kept_sign_in(account.store.read(), account.user)
         if password is None:
             raise BootstrapError(
-                f"OpenBao keeps no sign-in for {account.label}: nothing was changed. To repair it with the root pair, the owner approves "
-                f"{APPROVAL}: true for one deploy"
+                f"OpenBao keeps no sign-in for {account.label}: nothing was changed. To repair it with the root pair, the owner approves it with {APPROVAL}"
             )
         pairs[account.name] = password
 
     def as_audit(*words: str) -> Result:
         return audit_read(runner, audit.user, pairs["audit"], *words)
 
-    differences = live_differences(as_audit, audit) + live_differences(as_audit, project)
+    def user_as_audit(name: str) -> Result:
+        return audit_user_info(runner, audit.user, pairs["audit"], name)
+
+    differences = live_differences(as_audit, user_as_audit, audit) + live_differences(as_audit, user_as_audit, project)
     if not differences and not signed_in(runner, project.user, bucket, pairs["project"]):
         differences.append(f"the sign-in that OpenBao keeps for {project.label} is refused")
     if differences:
         raise BootstrapError(
             f"AIStor differs from the project's definition: {'; '.join(differences)}. Nothing was changed and the root pair was not used. "
-            f"To repair it with the root pair, the owner approves {APPROVAL}: true for one deploy"
+            f"To repair it with the root pair, the owner approves it with {APPROVAL}"
         )
 
 

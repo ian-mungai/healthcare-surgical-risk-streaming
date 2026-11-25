@@ -1,12 +1,20 @@
 # Reads compose_stack_docker, compose_stack_aistor_service, compose_stack_aistor_project_user, compose_stack_aistor_project_policy, compose_stack_aistor_project_password_file,
 # compose_stack_aistor_audit_user, compose_stack_aistor_audit_policy, compose_stack_aistor_audit_password_file, compose_stack_aistor_bootstrap_marker,
-# compose_stack_aistor_openbao_path, compose_stack_aistor_audit_openbao_path, compose_stack_aistor_root_repair, compose_stack_secrets_directory, openbao_port and
-# aistor_bucket (the launcher gives the bucket).
+# compose_stack_aistor_openbao_path, compose_stack_aistor_audit_openbao_path, compose_stack_secrets_directory, openbao_port, aistor_bucket (the launcher gives the bucket) and aistor_repair_once (the
+# launcher gives it for one run only).
 # The first bootstrap of a host (the marker file is absent) makes the project user, its policy and the audit identity with the root pair, which the module's script
 # reads inside the AIStor container from the container's own secrets mount, keeps both sign-ins in OpenBao after each pair has signed in, and writes the marker last.
 # Every later deploy reads the live state as the audit identity and as the project user with the sign-ins that OpenBao keeps, makes no root call and no write, and
-# fails with a fixed message that names each difference. Only compose_stack_aistor_root_repair: true, for one deploy, lets the root pair repair what differs.
+# fails with a fixed message that names each difference. Only aistor_repair_once, which the launcher passes as an extra variable for the one run of `make host-up AISTOR_REPAIR=1` and which no inventory file holds, lets the root pair repair what differs.
 # OpenBao is logged in to as the bootstrap role, whose secret ID file is root-only on the host. The task is hidden, so no password reaches a log.
+- name: Refuse the old approval, which an inventory file could keep true for later deploys
+  ansible.builtin.assert:
+    that:
+      - compose_stack_aistor_root_repair is not defined
+    quiet: true
+    fail_msg: >-
+      compose_stack_aistor_root_repair is no longer read, whatever its value, so it cannot stay true for later deploys: remove it from the inventory. The owner
+      approves the root repair for one run only, with make host-up CONFIRM=<code> AISTOR_REPAIR=1.
 - name: Make the AIStor accounts on the first bootstrap with the root pair, and afterwards check the live state as the audit identity and the project user
   aistor_project_user:
     compose_command: "{{ compose_stack_docker }}"
@@ -23,6 +31,6 @@
     openbao_secret_id_file: "{{ compose_stack_secrets_directory }}/openbao/bootstrap.secret_id"
     openbao_path: "{{ compose_stack_aistor_openbao_path }}"
     audit_openbao_path: "{{ compose_stack_aistor_audit_openbao_path }}"
-    repair: "{{ compose_stack_aistor_root_repair }}"
+    repair: "{{ aistor_repair_once | default(false) | bool }}"
   timeout: 300
   no_log: true

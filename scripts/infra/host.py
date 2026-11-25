@@ -598,7 +598,7 @@ def place_project_key(run_id: str, address: str, profile: str) -> None:
     raise HostError(KEY_MESSAGES["script_unknown"])
 
 
-def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str) -> int:
+def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str, *, aistor_repair: bool = False) -> int:
     existing = load_run(binding) if binding.is_file() else None
     backend, provision_host = (existing.backend, existing.provision_host) if existing else ("s3", True)
     if state_bootstrap.create(aws, configuration, binding, backend, provision_host) != 0:
@@ -625,7 +625,8 @@ def host_up(aws: Aws, configuration: dict[str, str], binding: Path, confirm: str
     variables = workload_variables(state, configuration["AWS_REGION"]) | heavy_memory | deploy_variables(configuration, platform_commit())
     run_ansible(run.run_id, address, variables)
     placement = place_aistor_licence(run.run_id, address)
-    run_ansible(run.run_id, address, variables | {"aistor_licence_placement": licence_fact(placement)}, "storage.yml")
+    storage_variables = variables | {"aistor_licence_placement": licence_fact(placement)} | ({"aistor_repair_once": True} if aistor_repair else {})
+    run_ansible(run.run_id, address, storage_variables, "storage.yml")
     report_aistor_state(run.run_id, address, placement)
     place_project_key(run.run_id, address, configuration["AWS_PROFILE"])
     run_ansible(run.run_id, address, variables, "connection.yml")
@@ -672,8 +673,13 @@ def main() -> int:
     parser.add_argument("--host-name", default="", help="check: the host's Tailscale name, for example platform-dev")
     parser.add_argument("--instance-id", default="", help="check: the EC2 instance ID that the host must answer with")
     parser.add_argument("--confirm", default="", help="up: the confirmation code of the reviewed plan")
+    parser.add_argument(
+        "--aistor-repair", action="store_true", help="up: let this one run repair AIStor's accounts with the root pair (make host-up AISTOR_REPAIR=1)"
+    )
     parser.add_argument("--binding", type=Path, default=state_bootstrap.DEFAULT_BINDING, help="the run binding file; the default is runs/run_binding.json")
     arguments = parser.parse_args()
+    if arguments.aistor_repair and arguments.command != "up":
+        parser.error("--aistor-repair belongs to up alone")
     if arguments.command == "check" and not arguments.host_name:
         parser.error("check needs --host-name")
     if arguments.command == "check" and INSTANCE_ID_FORM.fullmatch(arguments.instance_id) is None:
@@ -684,7 +690,7 @@ def main() -> int:
         configuration = load_configuration()
         aws = Aws(configuration["AWS_PROFILE"], configuration["AWS_REGION"])
         if arguments.command == "up":
-            return host_up(aws, configuration, arguments.binding, arguments.confirm)
+            return host_up(aws, configuration, arguments.binding, arguments.confirm, aistor_repair=arguments.aistor_repair)
         return (host_stop if arguments.command == "stop" else host_start)(aws, configuration, arguments.binding)
     except (ConfigurationError, WrapperError, HostError, AwsError, WarehouseError) as error:
         sys.stderr.write(f"{describe_error(error)}\n")

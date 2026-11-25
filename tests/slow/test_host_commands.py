@@ -631,6 +631,7 @@ class HostUpTest(unittest.TestCase):
         state: dict[str, Any] | None = None,
         planned: dict[str, tuple[object, int]] | None = None,
         on_wait: Callable[..., object] | None = None,
+        aistor_repair: bool = False,
     ) -> tuple[int, dict[str, mock.Mock]]:
         """``planned`` gives the saved plan files by name as the planned figure and its age in seconds. The default is one apply plan with 11008."""
         for name, (figure, age) in ({"apply.json": (11008, 0)} if planned is None else planned).items():
@@ -662,7 +663,7 @@ class HostUpTest(unittest.TestCase):
             self.calls = calls
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm)
+                code = host.host_up(FakeAws("project", "us-west-2"), CONFIGURATION, path, confirm, aistor_repair=aistor_repair)
             self.output = output.getvalue()
         return code, calls
 
@@ -726,6 +727,57 @@ class HostUpTest(unittest.TestCase):
         )
         calls["write_inventory"].assert_called_once_with(path)
         self.assertEqual({"host_name": "platform-dev", "device_id": "nNEWCNTRL"}, recorded)
+
+    def test_the_aistor_repair_is_off_in_every_playbook_unless_the_one_run_asks_for_it(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0):
+                _, calls = self.run_up(path)
+        for item in calls["run_ansible"].call_args_list:
+            self.assertNotIn("aistor_repair_once", item.args[2], "no variable of a run that did not ask for the repair holds it")
+
+    def test_the_aistor_repair_of_one_run_reaches_the_aistor_playbook_only_and_as_a_true_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = binding_file(Path(scratch), backend="s3", provision_host=True)
+            with mock.patch.object(state_bootstrap, "create", return_value=0):
+                _, calls = self.run_up(path, aistor_repair=True)
+        by_playbook = {(item.args[3:] or ("host.yml",))[0]: item.args[2] for item in calls["run_ansible"].call_args_list}
+        self.assertIs(True, by_playbook["storage.yml"]["aistor_repair_once"])
+        self.assertEqual(by_playbook["host.yml"] | {"aistor_licence_placement": "placed", "aistor_repair_once": True}, by_playbook["storage.yml"])
+        for name in ("host.yml", "connection.yml"):
+            self.assertNotIn("aistor_repair_once", by_playbook[name], name)
+
+    def test_the_aistor_repair_is_a_flag_of_the_up_command_only_and_is_not_kept_for_the_next_run(self) -> None:
+        for command in ("stop", "start", "check"):
+            with self.subTest(command), mock.patch.object(sys, "argv", ["host", command, "--aistor-repair"]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    host.main()
+                self.assertNotEqual(0, caught.exception.code)
+        seen: list[bool] = []
+
+        def record(*args: object, **kwargs: bool) -> int:
+            seen.append(kwargs["aistor_repair"])
+            return 0
+
+        with (
+            mock.patch.object(sys, "argv", ["host", "up", "--aistor-repair"]),
+            mock.patch.object(host, "load_configuration", return_value=CONFIGURATION),
+            mock.patch.object(host, "host_up", side_effect=record),
+        ):
+            self.assertEqual(0, host.main())
+        with (
+            mock.patch.object(sys, "argv", ["host", "up"]),
+            mock.patch.object(host, "load_configuration", return_value=CONFIGURATION),
+            mock.patch.object(host, "host_up", side_effect=record),
+        ):
+            self.assertEqual(0, host.main())
+        self.assertEqual([True, False], seen)
+
+    def test_the_makefile_passes_the_flag_for_host_up_alone_and_only_when_the_run_names_it(self) -> None:
+        text = (ROOT / "Makefile").read_text()
+        recipe = text[text.index("\nhost-up:") :].split("\n\n")[0]
+        self.assertIn("$(if $(AISTOR_REPAIR),--aistor-repair)", recipe)
+        self.assertEqual(1, text.count("--aistor-repair"))
 
     def test_a_state_with_no_usable_heavy_figure_stops_the_up_run_before_it_waits_for_the_host_or_runs_ansible(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

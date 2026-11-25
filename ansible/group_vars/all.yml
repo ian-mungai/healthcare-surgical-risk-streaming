@@ -94,11 +94,7 @@ compose_stack_aistor_bootstrap_marker: "{{ compose_stack_compose_directory }}/ai
 # else, so the audit path is read and written by the admin role of the deploy only, after the sign-in has been verified.
 compose_stack_aistor_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/aistor"
 compose_stack_aistor_audit_openbao_path: "secret/data/services/{{ compose_stack_aistor_service }}/audit"
-# The owner's approval to use AIStor's root pair again for one deploy, after the first bootstrap: it makes the project's accounts match their definition (removes a
-# policy or group that is not theirs, restores a missing user, policy or OpenBao entry) and, only for an account that exists and that neither OpenBao's sign-in nor
-# the file signs in as, sets the password file's value on it. Off: a refused sign-in or any difference fails the deploy and changes nothing. The owner sets it to
-# true for the one deploy that repairs and sets it back to false.
-compose_stack_aistor_root_repair: false
+# AIStor's use of the root pair for a repair is no inventory variable: the owner approves it for one run with `make host-up AISTOR_REPAIR=1`, and no later run keeps it.
 compose_stack_group: root
 compose_stack_postgres_port: 5432
 # The port that OpenBao's container publishes on the host's local address. The OpenBao role reaches the server on it.

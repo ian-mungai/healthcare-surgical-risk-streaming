@@ -61,7 +61,7 @@ def root_use_problems(files: dict[str, str]) -> list[str]:
 
 MODULE_FILE = "ansible/roles/compose_stack/library/aistor_project_user.py"
 ROOT_SCRIPT_KINDS = {"read", "user_add", "policy_create"}
-ROOT_CALL_KINDS = {"read", "user_add", "policy_create", "sign_in", "audit"}
+ROOT_CALL_KINDS = {"read", "user_add", "policy_create", "sign_in", "audit", "audit_user"}
 # Every call the module may make with the root pair, as the first three words that mc gets. A new one needs a new line here, and so a reviewer's eye.
 ROOT_READS = {
     ("admin", "policy", "info"),
@@ -365,7 +365,7 @@ class OrderTest(unittest.TestCase):
         )
 
     def test_the_bootstrap_task_is_hidden_names_the_passwords_by_file_only_and_gives_the_bucket_from_the_launcher(self) -> None:
-        (task,) = tasks_of("aistor_project_user.yml")
+        (task,) = [task for task in tasks_of("aistor_project_user.yml") if "aistor_project_user" in task]
         self.assertIs(True, task["no_log"])
         self.assertEqual(
             {
@@ -391,17 +391,51 @@ class OrderTest(unittest.TestCase):
         self.assertEqual("{{ aistor_bucket }}", params["bucket"])
         self.assertEqual("{{ compose_stack_aistor_project_password_file }}", params["password_file"])
         self.assertEqual("{{ compose_stack_aistor_audit_password_file }}", params["audit_password_file"])
-        self.assertEqual("{{ compose_stack_aistor_root_repair }}", params["repair"])
+        self.assertEqual("{{ aistor_repair_once | default(false) | bool }}", params["repair"])
         self.assertEqual("{{ compose_stack_aistor_bootstrap_marker }}", params["marker_file"])
         self.assertEqual("{{ compose_stack_secrets_directory }}/openbao/bootstrap.secret_id", params["openbao_secret_id_file"])
         self.assertEqual("{{ compose_stack_aistor_openbao_path }}", params["openbao_path"])
         self.assertEqual("{{ compose_stack_aistor_audit_openbao_path }}", params["audit_openbao_path"])
         self.assertNotIn("password:", str(params).replace("password_file", "").replace("root_repair", ""))
 
-    def test_the_root_repair_is_off_by_default_so_the_root_pair_is_never_used_again_without_the_owner(self) -> None:
+    def repair(self, **facts: Any) -> bool:
+        """What the task gives the module's ``repair``, evaluated as Ansible evaluates the template."""
+        (task,) = [task for task in tasks_of("aistor_project_user.yml") if "aistor_project_user" in task]
+        environment = Environment(autoescape=True)
+        environment.filters["bool"] = lambda value: str(value).lower() in ("true", "yes", "1")
+        return environment.from_string(task["aistor_project_user"]["repair"]).render(**facts) == "True"
+
+    def test_the_root_repair_is_off_unless_the_one_run_names_it_so_the_root_pair_is_never_used_again_without_the_owner(self) -> None:
+        self.assertIs(False, self.repair())
+        self.assertIs(False, self.repair(aistor_repair_once=False))
+        self.assertIs(False, self.repair(aistor_repair_once="false"))
+        self.assertIs(True, self.repair(aistor_repair_once=True))
+        self.assertNotIn("compose_stack_aistor_rotate_password", group_variables())
+
+    def test_no_inventory_file_holds_the_approval_so_it_cannot_stay_true_for_later_deploys(self) -> None:
         variables = group_variables()
-        self.assertIs(False, variables["compose_stack_aistor_root_repair"])
-        self.assertNotIn("compose_stack_aistor_rotate_password", variables)
+        for name in ("compose_stack_aistor_root_repair", "aistor_repair_once"):
+            self.assertNotIn(name, variables)
+        holders = [
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "ansible").rglob("*")
+            if path.is_file() and path.suffix in (".yml", ".yaml", ".ini", ".cfg", ".json") and "aistor_repair_once" in path.read_text()
+        ]
+        self.assertEqual(["ansible/roles/compose_stack/tasks/aistor_project_user.yml"], holders, "only the task that gives it to the module names it")
+
+    def test_an_inventory_value_of_the_old_approval_is_refused_by_name_before_the_module_runs(self) -> None:
+        tasks = tasks_of("aistor_project_user.yml")
+        guard = tasks[0]
+        self.assertIn("ansible.builtin.assert", guard)
+        self.assertLess(0, len([task for task in tasks if "aistor_project_user" in task]))
+        self.assertIs(True, evaluate_assertions(guard))
+        for value in (True, False, "true"):
+            with self.subTest(value=value):
+                self.assertIs(False, evaluate_assertions(guard, compose_stack_aistor_root_repair=value), "any value of it is refused, even false")
+        message = guard["ansible.builtin.assert"]["fail_msg"]
+        self.assertIn("compose_stack_aistor_root_repair", message)
+        self.assertIn("make host-up", message)
+        self.assertIn("AISTOR_REPAIR=1", message)
 
     def test_the_marker_is_a_root_only_file_beside_the_state_file_and_the_audit_identity_has_names_and_paths_of_its_own(self) -> None:
         variables = group_variables()

@@ -65,11 +65,11 @@ PROVIDER_CALLS = {
     "s3:PutBucketVersioning": "versioning:98 SetBucketVersioning and versioning:231 SuspendVersioning",
     "s3:DeleteBucket": "bucket:478 RemoveBucket when the bucket is destroyed (force_destroy = false)",
 }
-# The audit identity's actions, each with the handler that needs it. ``mc admin user info`` calls GetUserInfo, which also gives the groups; ``mc admin policy
-# info`` calls InfoCannedPolicy. Sources: github.com/minio/pkg policy/admin-action.go (commit e87292ba) and github.com/minio/minio cmd/admin-handlers-users.go
-# (commit 7aac2a2c). No other admin action and no S3 action is in the policy.
+# The audit identity's actions, each with the handler that needs it. The raw GetUserInfo request (``mc admin user info`` is not used: it also needs
+# admin:GetGroup) gives the groups too; ``mc admin policy info`` calls InfoCannedPolicy. Sources: github.com/minio/pkg policy/admin-action.go (commit
+# e87292ba) and github.com/minio/minio cmd/admin-handlers-users.go (commit 7aac2a2c). No other admin action and no S3 action is in the policy.
 ADMIN_CALLS = {
-    "admin:GetUser": "admin-action.go:104-105 GetUserAdminAction, required by GetUserInfo (admin-handlers-users.go:204) for mc admin user info",
+    "admin:GetUser": "admin-action.go:104-105 GetUserAdminAction, required by GetUserInfo (admin-handlers-users.go:204) for the raw user-info request",
     "admin:GetPolicy": "admin-action.go:175-176 GetPolicyAdminAction, required by InfoCannedPolicy (admin-handlers-users.go:1558) for mc admin policy info",
 }
 
@@ -108,7 +108,12 @@ FIRST_ACTIONS = [
 ]
 OTHER_VALUE = "example-older-password-0123456789abcdef"
 LOST_VALUE = "example-regenerated-password-0123456789abcdef"
-APPROVAL = "compose_stack_aistor_root_repair"
+APPROVAL = "AISTOR_REPAIR=1"
+
+
+def raw_error(code: str, status: int) -> Any:
+    """The answer of a raw admin request that the server refused: its JSON error (``writeErrorResponseJSON``), a new line and the HTTP status."""
+    return bootstrap.Result(0, json.dumps({"Code": code, "Message": "text", "RequestID": "0"}) + f"\n{status}")
 
 
 def error_answer(code: str) -> Any:
@@ -147,6 +152,8 @@ class Server:
             return self.sign_in(words, call.stdin.rstrip("\n"))
         if kind == "audit":
             return self.audit(words[0], words[1:], call.stdin.rstrip("\n"))
+        if kind == "audit_user":
+            return self.raw_user(words[0], words[1], call.stdin.rstrip("\n"))
         if kind == "read" and words[:3] in (["admin", "policy", "info"], ["admin", "user", "info"]):
             return self.info(words)
         self.order.append(kind if kind != "read" else " ".join(words[:3]))
@@ -223,10 +230,37 @@ class Server:
         needed = {"user": "admin:GetUser", "policy": "admin:GetPolicy"}[words[1]]
         if words[0] != "admin" or words[2] != "info" or not self.allows(user, needed):
             return error_answer("AccessDenied")
+        if words[1] == "user" and self.users.get(words[4], {}).get("groups") and not self.allows(user, "admin:GetGroup"):
+            # ``mc admin user info`` also fetches each group's description (GetGroupDescription, which needs admin:GetGroup) and stops with that error.
+            return error_answer("AccessDenied")
         return self.info(words)
 
+    def raw_user(self, name: str, target: str, password: str) -> Any:
+        """The answer of the raw ``GetUserInfo`` request that the audit identity makes, as the host's curl prints it: the body, a new line and the HTTP status.
+
+        The handler allows a user to read its own record without the action (``checkDenyOnly``) and needs ``admin:GetUser`` for any other. It gives the policy
+        names, the status and the group names, and reads no group: ``admin:GetGroup`` is not needed."""
+        forced = self.audit_answer
+        if forced is not None:
+            code = bootstrap.error_code(forced)
+            return raw_error(code, 403) if code else bootstrap.Result(forced.status, forced.output)
+        user = self.users.get(name)
+        if user is None or user["status"] != "enabled":
+            return raw_error(AUTH_ERROR, 403)
+        if user["password"] != password:
+            return raw_error("SignatureDoesNotMatch", 403)
+        if target != name and not self.allows(user, "admin:GetUser"):
+            return raw_error("AccessDenied", 403)
+        found = self.users.get(target)
+        if found is None:
+            return raw_error("XMinioAdminNoSuchUser", 404)
+        body: dict[str, Any] = {"policyName": ",".join(found["policies"]), "status": found["status"], "updatedAt": "2026-11-25T00:00:00Z"}
+        if found["groups"]:
+            body["memberOf"] = list(found["groups"])
+        return bootstrap.Result(0, json.dumps(body) + "\n200")
+
     def root_calls(self) -> list[Any]:
-        return [call for call in self.calls if call.kind not in ("sign_in", "audit")]
+        return [call for call in self.calls if call.kind not in ("sign_in", "audit", "audit_user")]
 
     def writes(self) -> list[str]:
         return [call.kind if call.kind != "read" else " ".join(call.arguments[:3]) for call in self.calls if self.is_write(call)]
@@ -234,7 +268,7 @@ class Server:
     @staticmethod
     def is_write(call: Any) -> bool:
         written = {("admin", "policy", "attach"), ("admin", "policy", "detach"), ("admin", "user", "enable"), ("admin", "group", "remove")}
-        return call.kind not in ("read", "sign_in", "audit") or tuple(call.arguments[:3]) in written
+        return call.kind not in ("read", "sign_in", "audit", "audit_user") or tuple(call.arguments[:3]) in written
 
 
 @dataclass
@@ -443,7 +477,7 @@ class CommandLineTest(unittest.TestCase):
             line = bootstrap.command_line(COMPOSE, "aistor", call)
             text = "\n".join(line)
             self.assertEqual([*COMPOSE, "exec", "-T", "aistor", "sh", "-c"], line[: len(COMPOSE) + 5])
-            if call.kind in ("sign_in", "audit"):
+            if call.kind in ("sign_in", "audit", "audit_user"):
                 self.assertNotIn("/run/secrets/aistor_root", text, "the sign-in as the project user or the audit identity never reads the root pair")
                 continue
             self.assertIn("/run/secrets/aistor_root_user", text)
@@ -485,13 +519,30 @@ class CommandLineTest(unittest.TestCase):
         self.assertNotIn("aistor_root", script)
         self.assertNotIn("ROOT_SIGN_IN", script)
 
+    def test_the_raw_user_script_reads_one_users_record_with_curl_and_takes_the_password_from_standard_input_into_curls_own_config_and_never_an_argument(
+        self,
+    ) -> None:
+        script = bootstrap.SCRIPTS["audit_user"]
+        self.assertIn("IFS= read -r secret_value", script)
+        self.assertIn('printf \'user = "%s:%s"\\n\' "$1" "$secret_value" | curl', script, "the pair is the text of a config on curl's standard input")
+        self.assertIn("--config -", script)
+        self.assertIn("--aws-sigv4 aws:amz:us-east-1:s3", script)
+        self.assertIn('"http://127.0.0.1:9000/minio/admin/v3/user-info?accessKey=$2"', script, "the admin call GetUserInfo, which reads no group")
+        self.assertNotRegex(script, r"--user|-u |--data|\$secret_value[^\"]", "the password is in no argument of curl")
+        self.assertNotIn("aistor_root", script)
+        self.assertNotIn("ROOT_SIGN_IN", script)
+        self.assertNotIn("--fail", script, "an answer of a refused call keeps its body, which holds the S3 code")
+
     def test_the_audit_call_holds_the_user_and_the_words_as_arguments_and_the_password_on_standard_input(self) -> None:
         world = deployed()
         world.run()
         first = world.server.calls[0]
-        self.assertEqual(("audit", AUDIT_VALUE + "\n"), (first.kind, first.stdin))
-        self.assertEqual((AUDIT_USER, "admin", "user", "info", "aistor", AUDIT_USER), first.arguments)
+        self.assertEqual(("audit_user", AUDIT_VALUE + "\n"), (first.kind, first.stdin))
+        self.assertEqual((AUDIT_USER, AUDIT_USER), first.arguments)
         self.assertNotIn(AUDIT_VALUE, "\n".join(bootstrap.command_line(COMPOSE, "aistor", first)))
+        policy_read = world.server.calls[1]
+        self.assertEqual(("audit", AUDIT_VALUE + "\n"), (policy_read.kind, policy_read.stdin))
+        self.assertEqual((AUDIT_USER, "admin", "policy", "info", "aistor", AUDIT_POLICY), policy_read.arguments)
 
     def test_the_sign_in_call_holds_the_user_and_the_bucket_as_arguments_and_the_password_on_standard_input(self) -> None:
         world = deployed()
@@ -781,7 +832,7 @@ class LiveCheckTest(unittest.TestCase):
         self.assertIn(APPROVAL, message, "the message names the one approval that lets the root pair repair it")
         self.assertEqual([], world.server.root_calls(), "no call as root")
         self.assertEqual([], world.server.writes())
-        self.assertTrue(set(kinds(world.server)) <= {"audit", "sign_in"})
+        self.assertTrue(set(kinds(world.server)) <= {"audit", "audit_user", "sign_in"})
         self.assertEqual(([], []), (world.bao.written, world.audit_bao.written))
         for value in (PROJECT_VALUE, AUDIT_VALUE, ROOT_SECOND):
             self.assertNotIn(value, message)
@@ -792,6 +843,40 @@ class LiveCheckTest(unittest.TestCase):
 
     def test_the_reviewers_probe_a_group_added_is_found(self) -> None:
         self.differs(lambda server: server.users[USER]["groups"].append("admins"), "the project user is a member of the group admins")
+
+    def test_the_reviewers_probe_the_group_description_lookup_of_mc_needs_admin_getgroup_so_the_check_reads_the_raw_user_answer_and_names_the_group(
+        self,
+    ) -> None:
+        world = deployed()
+        world.server.users[USER]["groups"].append("admins")
+        mc_call = bootstrap.Call("audit", (AUDIT_USER, "admin", "user", "info", "aistor", USER), AUDIT_VALUE + "\n")
+        self.assertEqual("AccessDenied", bootstrap.error_code(world.server(mc_call)), "the probe: mc stops at the group's description without admin:GetGroup")
+        self.assertEqual(["admin:GetUser", "admin:GetPolicy"], bootstrap.AUDIT_ACTIONS, "the grant stays the two actions")
+        world.server.calls.clear()
+        with self.assertRaises(bootstrap.BootstrapError) as caught:
+            world.run()
+        self.assertIn("the project user is a member of the group admins", str(caught.exception))
+        self.assertNotIn("AccessDenied", str(caught.exception))
+        through_mc = [call for call in world.server.calls if call.kind == "audit" and call.arguments[1:4] == ("admin", "user", "info")]
+        self.assertEqual([], through_mc, "no call reads a user through mc")
+
+    def test_the_raw_answer_is_turned_into_the_form_that_the_rest_of_the_check_reads_and_a_failed_call_keeps_no_output(self) -> None:
+        body = json.dumps({"policyName": f"{POLICY},b", "status": "disabled", "memberOf": ["g1", "g2"], "updatedAt": "2026-11-25T00:00:00Z"})
+        done = bootstrap.audit_user_info(lambda call: bootstrap.Result(0, body + "\n200"), AUDIT_USER, AUDIT_VALUE, USER)
+        self.assertEqual((0, ("disabled", [POLICY, "b"], ["g1", "g2"])), (done.status, bootstrap.parse_user_info(done.output, USER)))
+        bare = bootstrap.audit_user_info(lambda call: bootstrap.Result(0, json.dumps({"status": "enabled"}) + "\n200"), AUDIT_USER, AUDIT_VALUE, USER)
+        self.assertEqual(("enabled", [], []), bootstrap.parse_user_info(bare.output, USER))
+        for code in ("XMinioAdminNoSuchUser", "AccessDenied", "SignatureDoesNotMatch"):
+            with self.subTest(code=code):
+                answer = bootstrap.audit_user_info(lambda call, code=code: raw_error(code, 403), AUDIT_USER, AUDIT_VALUE, USER)
+                self.assertEqual(code, bootstrap.error_code(answer))
+        failed = bootstrap.audit_user_info(lambda call: bootstrap.Result(7, f"curl: (7) {NOT_AN_ANSWER} {AUDIT_VALUE}"), AUDIT_USER, AUDIT_VALUE, USER)
+        self.assertEqual((7, ""), (failed.status, failed.output))
+        for text in ("<html>gateway</html>\n502", "garbage\n200", "[]\n200", json.dumps({"status": 5}) + "\n200", json.dumps({"memberOf": "g"}) + "\n200"):
+            with self.subTest(text=text), self.assertRaises(bootstrap.BootstrapError):
+                answer = bootstrap.audit_user_info(lambda call, text=text: bootstrap.Result(0, text), AUDIT_USER, AUDIT_VALUE, USER)
+                self.assertIsNone(bootstrap.error_code(answer))
+                bootstrap.checked(answer, "read the user") if answer.status else bootstrap.parse_user_info(answer.output, USER)
 
     def test_the_reviewers_probe_a_removed_bucket_versioning_read_in_the_policy_is_found(self) -> None:
         def mutate(server: Server) -> None:
@@ -854,7 +939,7 @@ class LiveCheckTest(unittest.TestCase):
     ) -> None:
         world = deployed()
         self.assertEqual([], world.run())
-        self.assertEqual(["audit", "audit", "audit", "audit", "sign_in"], [call.kind for call in world.server.calls])
+        self.assertEqual(["audit_user", "audit", "audit_user", "audit", "sign_in"], [call.kind for call in world.server.calls])
         self.assertEqual([], world.server.root_calls())
         self.assertEqual([], world.server.writes())
         self.assertEqual(([], [], 0), (world.bao.written, world.audit_bao.written, world.marker.writes))
@@ -1030,11 +1115,11 @@ class SignInTest(unittest.TestCase):
         def answered(result: Any) -> Any:
             return bootstrap.audit_signed_in(lambda call: result, AUDIT_USER, AUDIT_VALUE)
 
-        self.assertIs(True, answered(bootstrap.Result(0, "")))
+        self.assertIs(True, answered(bootstrap.Result(0, json.dumps({"status": "enabled", "policyName": AUDIT_POLICY}) + "\n200")))
         for code in ("InvalidAccessKeyId", "SignatureDoesNotMatch"):
             with self.subTest(code=code):
-                self.assertIs(False, answered(error_answer(code)))
-        for result in (error_answer("AccessDenied"), error_answer("InternalError"), bootstrap.Result(1, NOT_AN_ANSWER)):
+                self.assertIs(False, answered(raw_error(code, 403)))
+        for result in (raw_error("AccessDenied", 403), raw_error("InternalError", 500), bootstrap.Result(1, NOT_AN_ANSWER)):
             with self.subTest(result=result), self.assertRaises(bootstrap.BootstrapError):
                 answered(result)
 
@@ -1055,7 +1140,9 @@ class VerifyBeforePublishTest(unittest.TestCase):
         world.audit_bao.stored = None
         world.marker.exists = False
         self.assertEqual([PUBLISH, PUBLISH_AUDIT, RECORD], world.run())
-        self.assertEqual({"sign_in", "audit"}, {kind for kind in kinds(world.server) if kind in ("sign_in", "audit")}, "the passwords signed in")
+        self.assertEqual(
+            {"sign_in", "audit_user"}, {kind for kind in kinds(world.server) if kind in ("sign_in", "audit", "audit_user")}, "the passwords signed in"
+        )
 
     def test_a_sign_in_in_openbao_that_no_longer_works_is_replaced_by_the_files_password_when_that_one_signs_in(self) -> None:
         world = deployed()
