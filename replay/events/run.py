@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from replay.events.event_list import EVENT_LIST_REFUSAL_CODE, EVENT_LIST_VERSION
+from replay.events.formats import INPUT_TOPIC, is_input_topic
 from replay.events.recording import CaseRecording
 from replay.events.schedule import FrozenSchedule, ScheduledOccurrence, admitted_occurrences
 from replay.events.stream import CaseEvent, OutgoingEvent, occurrence_events, outgoing
@@ -47,11 +48,13 @@ class ReplayError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class RunSettings:
-    """What the run record holds besides the schedule: the speed, how often the position is written and how long a wait must be to write it first."""
+    """What the run record holds besides the schedule: the speed, how often the position is written, how long a wait must be to write it first and the input
+    topic that the messages go to (the saved position counts that topic's messages only)."""
 
     speed: float
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVENTS
     idle_checkpoint_us: int = DEFAULT_IDLE_CHECKPOINT_US
+    input_topic: str = INPUT_TOPIC
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.speed) or not MIN_SPEED <= self.speed <= MAX_SPEED:
@@ -81,6 +84,7 @@ class RunState:
     admissions: dict[str, int] = field(default_factory=dict)
     finished: bool = False
     event_list: str = EVENT_LIST_VERSION
+    input_topic: str = INPUT_TOPIC
 
     def to_json(self) -> str:
         document = {
@@ -92,6 +96,7 @@ class RunState:
             "admissions": dict(sorted(self.admissions.items())),
             "finished": self.finished,
             "event_list": self.event_list,
+            "input_topic": self.input_topic,
         }
         return json.dumps(document, indent=1, sort_keys=True) + "\n"
 
@@ -112,6 +117,9 @@ class RunState:
                     f"{EVENT_LIST_VERSION}: it is not resumed, start the run again under a new run ID"
                 )
             first = document["first_send"]
+            topic = document.get("input_topic", INPUT_TOPIC)
+            if not is_input_topic(topic):
+                raise ReplayError("the saved state names an input topic that no run may use")
             return cls(
                 document["schedule_sha256"],
                 {int(room): RoomPosition(*value) for room, value in document["positions"].items()},
@@ -120,6 +128,7 @@ class RunState:
                 {key: int(value) for key, value in document["admissions"].items()},
                 bool(document["finished"]),
                 document["event_list"],
+                topic,
             )
         except (ValueError, KeyError, TypeError) as error:
             if isinstance(error, ReplayError):
@@ -204,6 +213,11 @@ class Replayer:
         saved = self.store.load()
         if saved is not None and saved.schedule_sha256 != self.frozen.sha256:
             raise ReplayError("the saved state belongs to another schedule than the frozen one; it is not resumed")
+        if saved is not None and saved.input_topic != self.settings.input_topic:
+            raise ReplayError(
+                f"the saved state counts the messages of the input topic {saved.input_topic} and this run's input topic is {self.settings.input_topic}: "
+                "it is not resumed, start the run again under a new run ID"
+            )
         if saved is not None and saved.finished:
             return RunResult(0, True)
         state = saved or RunState(self.frozen.sha256, {room: RoomPosition(0, 0) for room in self.rooms})
@@ -220,7 +234,9 @@ class Replayer:
         def checkpoint(*, finished: bool) -> None:
             nonlocal unsaved
             self.sink.flush()
-            self.store.save(RunState(self.frozen.sha256, dict(positions), anchor, first_send, dict(admissions), finished, EVENT_LIST_VERSION))
+            self.store.save(
+                RunState(self.frozen.sha256, dict(positions), anchor, first_send, dict(admissions), finished, EVENT_LIST_VERSION, self.settings.input_topic)
+            )
             unsaved = 0
 
         while True:

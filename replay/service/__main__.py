@@ -157,7 +157,7 @@ def replay_record(record: RunRecord, flag: StopFlag, beat: Callable[[], None]) -
         beat()
         return flag.is_set()
 
-    settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000))
+    settings = RunSettings(record.speed, record.checkpoint_every, round(record.idle_checkpoint_seconds * 1_000_000), record.input_topic)
     replayer = Replayer(frozen.schedule, settings, source, sink, StateFile(Path(record.state_dir)), SystemClock(flag, poll), stop_requested)
     log("replay_start", run_id=record.run_id, speed=record.speed, schedule_sha256=frozen.schedule.sha256)
     result = replayer.run()

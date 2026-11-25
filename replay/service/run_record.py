@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,7 @@ from casefile.folder_store import SCHEDULE_NAME as SCHEDULE_NAME
 from casefile.folder_store import STATE_FOLDER_NAMES as STATE_FOLDER_NAMES
 from casefile.folder_store import STATE_NAME as STATE_NAME
 from casefile.folder_store import is_state_folder_name as is_state_folder_name
-from replay.events.formats import INPUT_TOPIC
+from replay.events.formats import INPUT_TOPIC, is_input_topic
 from replay.events.run import DEFAULT_CHECKPOINT_EVENTS, MAX_SPEED, MIN_SPEED
 
 
@@ -73,7 +72,6 @@ REQUIRED: dict[str, type | tuple[type, ...]] = {
     "state_dir": str,
 }
 OPTIONAL: dict[str, type | tuple[type, ...]] = {"cases": list, "checkpoint_every": int, "idle_checkpoint_seconds": (int, float), "input_topic": str}
-OWN_INPUT_TOPIC = re.compile(rf"{INPUT_TOPIC}_[a-z0-9_]{{1,200}}")
 TIMING_FIELDS = ("stagger_seconds", "turnover_seconds", "window_seconds", "idle_checkpoint_seconds")
 MAX_TIMING_SECONDS = 86_400
 
@@ -111,7 +109,7 @@ def parse_run_record(text: str) -> RunRecord:
     if store["kind"] not in ("folder", "s3") or (store["kind"] == "folder" and "root" not in store) or (store["kind"] == "s3" and "region" not in store):
         raise RunRecordError("object_store is a folder with a root or an s3 store with a region")
     topic = document.get("input_topic", INPUT_TOPIC)
-    if topic != INPUT_TOPIC and not OWN_INPUT_TOPIC.fullmatch(topic):
+    if not is_input_topic(topic):
         raise RunRecordError(f"input_topic is {INPUT_TOPIC} or a topic of this run named {INPUT_TOPIC}_<lower case letters, digits and underscores>")
     cases = document.get("cases")
     if cases is not None and (not cases or any(not isinstance(case, int) or isinstance(case, bool) for case in cases)):

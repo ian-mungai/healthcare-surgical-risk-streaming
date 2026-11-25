@@ -109,6 +109,88 @@ class SinkTopics(unittest.TestCase):
         self.assertEqual({"replay_events_p8h_x"}, {call.args[0] for call in producer.produce.call_args_list})
 
 
+class FakeConsumer:
+    """A consumer over fixed messages of one partition: the end offset is the count, and ``poll`` returns them in order."""
+
+    def __init__(self, messages: list[Any]) -> None:
+        self.messages = list(messages)
+
+    def list_topics(self, topic: str, timeout: float) -> Any:
+        return mock.Mock(topics={topic: mock.Mock(partitions={0: None})})
+
+    def get_watermark_offsets(self, partition: Any, timeout: float) -> tuple[int, int]:
+        return 0, len(self.messages)
+
+    def assign(self, partitions: Any) -> None:
+        pass
+
+    def poll(self, timeout: float) -> Any:
+        return self.messages.pop(0) if self.messages else None
+
+    def close(self) -> None:
+        pass
+
+
+class FakeMessage:
+    def __init__(self, offset: int, stamp: tuple[int, int]) -> None:
+        self.at, self.stamp = offset, stamp
+
+    def error(self) -> None:
+        return None
+
+    def topic(self) -> str:
+        return "replay_events_p8h_x"
+
+    def partition(self) -> int:
+        return 0
+
+    def offset(self) -> int:
+        return self.at
+
+    def value(self) -> bytes:
+        return b"x"
+
+    def timestamp(self) -> tuple[int, int]:
+        return self.stamp
+
+
+class FakeReader:
+    def decode(self, value: bytes) -> tuple[int, dict[str, Any]]:
+        return 1, {}
+
+    def record_name(self, content_id: int) -> str:
+        return "NumericReading"
+
+
+class ReadAppendTimes(unittest.TestCase):
+    """The reader keeps the broker's own append time of a message when the topic stamps it, and never takes a producer's time for it."""
+
+    def setUp(self) -> None:
+        stand_ins = {name: mock.MagicMock() for name in LIBRARIES if importlib.util.find_spec(name.split(".")[0]) is None}
+        patched = mock.patch.dict(sys.modules, stand_ins)
+        patched.start()
+        self.addCleanup(patched.stop)
+        for name in ("replay.service.kafka_io", "replay.service.wire_codec"):
+            sys.modules.pop(name, None)
+            self.addCleanup(sys.modules.pop, name, None)
+        self.kafka_io = importlib.import_module("replay.service.kafka_io")
+
+    def read(self, stamps: list[tuple[int, int]]) -> list[Any]:
+        consumer = FakeConsumer([FakeMessage(offset, stamp) for offset, stamp in enumerate(stamps)])
+        with mock.patch.object(self.kafka_io, "Consumer", lambda settings: consumer):
+            received: list[Any] = self.kafka_io.read_all("kafka:9092", FakeReader(), ["replay_events_p8h_x"], 5.0)
+        return received
+
+    def test_a_message_of_a_topic_that_stamps_append_time_carries_it(self) -> None:
+        received = self.read([(self.kafka_io.TIMESTAMP_LOG_APPEND_TIME, 1_700_000_000_123), (self.kafka_io.TIMESTAMP_LOG_APPEND_TIME, 1_700_000_000_456)])
+        self.assertEqual([1_700_000_000_123, 1_700_000_000_456], [item.appended_ms for item in received])
+
+    def test_a_producers_create_time_is_not_an_append_time(self) -> None:
+        received = self.read([(CREATE_TIME, 5), (NOT_AVAILABLE, 0)])
+        self.assertEqual([None, None], [item.appended_ms for item in received])
+
+
+CREATE_TIME, NOT_AVAILABLE = 1, 0
 SERVICE = Path(__file__).resolve().parents[2] / "replay" / "service" / "__main__.py"
 
 
@@ -130,6 +212,11 @@ class CommandsUseTheRecordsTopic(unittest.TestCase):
 
     def test_the_replay_looks_up_the_partitions_of_the_records_topic(self) -> None:
         self.assertEqual(["partition_count(record.kafka_bootstrap, record.input_topic)"], self.calls("replay_record", "partition_count"))
+
+    def test_the_replays_settings_carry_the_records_topic_for_its_saved_state(self) -> None:
+        settings = self.calls("replay_record", "RunSettings")
+        self.assertEqual(1, len(settings))
+        self.assertIn("record.input_topic", settings[0])
 
     def test_the_replay_builds_its_sink_for_the_records_topic(self) -> None:
         sinks = self.calls("replay_record", "KafkaSink")

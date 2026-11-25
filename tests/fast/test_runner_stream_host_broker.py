@@ -9,13 +9,19 @@ Failure modes covered here:
   start is skipped, so the deployed broker stays stopped for every other user of the host.
 - The start does not wait for the broker to be healthy, waits with no deadline, or starts another container than the deployed one (a recreation).
 - The recovery is shown by a replacement job, by a job that ran to its deadline and exited 0, or by offsets that were committed before the broker went down.
+- A Ctrl-C or a SIGTERM that arrives while the broker is down stops the start (or the wait for the same container to be healthy), so the deployed broker stays
+  stopped for every other user of the host.
+- A read of the committed offsets that succeeds only after the deadline of the recovery is taken as the recovery.
 """
 
 from __future__ import annotations
 
 import importlib
+import os
+import signal
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -56,20 +62,30 @@ class FakeStack:
         self.fail_stop: Exception | None = None
         self.fail_start: Exception | None = None
         self.containers: list[str] = []
+        self.on_stop: Callable[[], None] | None = None
+        self.on_start: Callable[[], None] | None = None
+        self.on_read: Callable[[], None] | None = None
 
     def stop_broker(self, timeout: float) -> None:
         self.events.append("stop")
+        if self.on_stop:
+            self.on_stop()
         if self.fail_stop:
             raise self.fail_stop
 
     def start_broker(self, timeout: float) -> None:
         self.events.append("start")
+        if self.on_start:
+            self.on_start()
         if self.fail_start:
             raise self.fail_start
+        self.events.append("ready")
 
     def committed_offsets(self, container: str, case: str, timeout: float = 60, *, strict: bool = False) -> dict[int, int]:
         self.events.append("committed")
         self.containers.append(container)
+        if self.on_read:
+            self.on_read()
         answer = self.committed.pop(0) if len(self.committed) > 1 else self.committed[0]
         if isinstance(answer, Exception):
             raise answer
@@ -102,27 +118,27 @@ class StopAndStart(RestartCase):
     def test_the_broker_is_started_after_the_read_of_the_offsets(self) -> None:
         stack = FakeStack(self.features, [{0: 5, 1: 9}])
         committed, behind = self.features.restart_broker_while_unread(stack, "job", "case", {0: 10, 1: 9}, self.deadline())
-        self.assertEqual(["stop", "committed", "start"], stack.events)
+        self.assertEqual(["stop", "committed", "start", "ready"], stack.events)
         self.assertEqual(({0: 5, 1: 9}, {0: 10}), (committed, behind))
 
     def test_the_start_is_sent_when_the_read_of_the_offsets_fails(self) -> None:
         stack = FakeStack(self.features, [self.blocked("the read failed")])
         with self.assertRaisesRegex(self.blocked, "the read failed"):
             self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
-        self.assertEqual(["stop", "committed", "start"], stack.events)
+        self.assertEqual(["stop", "committed", "start", "ready"], stack.events)
 
     def test_the_start_is_sent_when_the_stop_itself_fails(self) -> None:
         stack = FakeStack(self.features, [{0: 5}])
         stack.fail_stop = self.blocked("the stop timed out")
         with self.assertRaisesRegex(self.blocked, "the stop timed out"):
             self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
-        self.assertEqual(["stop", "start"], stack.events)
+        self.assertEqual(["stop", "start", "ready"], stack.events)
 
     def test_the_start_is_sent_when_nothing_was_unread(self) -> None:
         stack = FakeStack(self.features, [{0: 10}])
         with self.assertRaisesRegex(self.blocked, "nothing was unread"):
             self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
-        self.assertEqual(["stop", "committed", "start"], stack.events)
+        self.assertEqual(["stop", "committed", "start", "ready"], stack.events)
 
     def test_the_start_is_sent_when_the_deadline_of_the_gate_passes_after_the_stop(self) -> None:
         stack = FakeStack(self.features, [{0: 5}])
@@ -135,7 +151,7 @@ class StopAndStart(RestartCase):
         stack.stop_broker = late_stop  # type: ignore[method-assign]
         with self.assertRaises(self.blocked):
             self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
-        self.assertEqual("start", stack.events[-1])
+        self.assertEqual("ready", stack.events[-1])
 
     def test_a_start_that_fails_is_reported_beside_the_error_that_came_first(self) -> None:
         stack = FakeStack(self.features, [self.blocked("the read failed")])
@@ -143,6 +159,88 @@ class StopAndStart(RestartCase):
         with self.assertRaisesRegex(self.blocked, "did not become healthy") as caught:
             self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
         self.assertIn("the read failed", str(caught.exception.__context__))
+
+
+class Terminated(BaseException):
+    """What the run's SIGTERM handler raises (the host runner's own ``Terminated`` does the same)."""
+
+
+class Interrupts(RestartCase):
+    """The broker is down from the stop to the end of its start. A signal in that time waits until the broker is running and healthy again."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        saved = signal.signal(signal.SIGTERM, self.raise_terminated)
+        self.addCleanup(signal.signal, signal.SIGTERM, saved)
+        saved = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, saved)
+        self.before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+
+    @staticmethod
+    def raise_terminated(signum: int, frame: object) -> None:
+        raise Terminated
+
+    def test_a_sigterm_during_the_start_does_not_end_the_start_and_is_raised_again_after_it(self) -> None:
+        stack = FakeStack(self.features, [{0: 5}])
+        stack.on_start = lambda: os.kill(os.getpid(), signal.SIGTERM)
+        with self.assertRaises(Terminated):
+            self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
+        self.assertEqual(["stop", "committed", "start", "ready"], stack.events)
+        self.assertEqual(self.before, {number: signal.getsignal(number) for number in self.before})
+
+    def test_a_sigint_during_the_start_does_not_end_the_start_and_raises_after_it(self) -> None:
+        stack = FakeStack(self.features, [{0: 5}])
+        stack.on_start = lambda: os.kill(os.getpid(), signal.SIGINT)
+        with self.assertRaises(KeyboardInterrupt):
+            self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
+        self.assertEqual(["stop", "committed", "start", "ready"], stack.events)
+
+    def test_a_signal_during_the_stop_or_the_read_still_ends_with_the_start(self) -> None:
+        for hook in ("on_stop", "on_read"):
+            with self.subTest(hook=hook):
+                stack = FakeStack(self.features, [{0: 5}])
+                setattr(stack, hook, lambda: os.kill(os.getpid(), signal.SIGTERM))
+                with self.assertRaises(Terminated):
+                    self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
+                self.assertEqual("ready", stack.events[-1])
+
+    def test_a_signal_during_a_start_that_fails_still_reaches_the_caller_and_the_failure_stays_visible(self) -> None:
+        stack = FakeStack(self.features, [{0: 5}])
+        stack.on_start = lambda: os.kill(os.getpid(), signal.SIGINT)
+        stack.fail_start = self.blocked("the broker did not become healthy")
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            self.features.restart_broker_while_unread(stack, "job", "case", {0: 10}, self.deadline())
+        self.assertIn("did not become healthy", str(caught.exception.__context__))
+
+    def test_the_health_check_of_the_same_container_is_not_cut_short_either(self) -> None:
+        """The real host stack: the signal arrives while the first health reading is taken, and the reading that says healthy is still taken."""
+        calls: list[tuple[str, ...]] = []
+        health = ["true starting\n", "true healthy\n"]
+
+        def runner(program: str, args: list[str], **options: Any) -> CompletedProcess[str]:
+            calls.append(tuple(args))
+            if "inspect" in args:
+                if len(health) == 2:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return done(0, health.pop(0))
+            if "ps" in args:
+                return done(0, "abc123\n")
+            if args[0] == "exec":
+                return done(0, '{"replay_events": {"0": 5}}\n')
+            return done()
+
+        record = Record(feature="stand-in", slug="stand_in", rerun="none")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        work = Path(scratch.name)
+        (work / "run").mkdir()
+        with mock.patch.object(self.host, "run_command", runner):
+            stack = self.host.HostStack(record, [], "replay:test", "spark:test", work / "landed", work / "run", work)
+            stack.input_topic = "replay_events"
+            with self.assertRaises(KeyboardInterrupt):
+                self.features.restart_broker_while_unread(stack, "abc123", "case", {0: 10}, self.deadline())
+        self.assertEqual([], health)
+        self.assertEqual(1, len([call for call in calls if call[-2:] == ("start", "kafka")]))
 
 
 class Recovery(RestartCase):
@@ -167,6 +265,17 @@ class Recovery(RestartCase):
         with self.assertRaises(self.blocked):
             self.features.await_recovery(stack, "job", "case", {0: 10}, self.clock.now + 3)
         self.assertLess(self.clock.now, 1000 + 60)
+
+    def test_a_read_that_succeeds_only_after_the_deadline_is_not_a_recovery(self) -> None:
+        stack = FakeStack(self.features, [{0: 10}], running=[True])
+        stack.on_read = lambda: setattr(self.clock, "now", self.clock.now + 500)
+        with self.assertRaisesRegex(self.blocked, "within"):
+            self.features.await_recovery(stack, "job", "case", {0: 10}, self.clock.now + 60)
+
+    def test_a_read_that_returns_in_time_is_a_recovery(self) -> None:
+        stack = FakeStack(self.features, [{0: 10}], running=[True])
+        stack.on_read = lambda: setattr(self.clock, "now", self.clock.now + 5)
+        self.assertEqual({0: 10}, self.features.await_recovery(stack, "job", "case", {0: 10}, self.clock.now + 60))
 
     def test_only_the_named_container_is_read(self) -> None:
         stack = FakeStack(self.features, [{0: 10}])

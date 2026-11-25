@@ -11,6 +11,9 @@ Failure modes covered here:
 - Ten rooms are compared by their count only, so two rooms in one partition, or a room in another partition, pass.
 - A storage reading that failed (the ``du`` exit status, an empty answer) is taken as zero bytes.
 - The overlap of rooms is read from the schedule and not from what the replay sent, or an occurrence with no observed end is taken as not overlapping.
+- The overlap is judged from the replay time that a message carries (the schedule again, in the payload) and not from the time at which the broker appended it.
+- The ten-room run is accepted with final offsets for fewer than ten partitions, with no reading taken while the replay played, or with no final reading of the
+  lag against the end offsets that were fixed when the replay ended.
 - An occurrence ID that another room or another run reuses shares the state of the first (the late event, the readings or the count of one leaks into the
   other), and the check looks at the occurrence ID only.
 """
@@ -18,6 +21,7 @@ Failure modes covered here:
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import unittest
 from types import ModuleType
@@ -26,6 +30,8 @@ from unittest import mock
 
 from scripts.process import CompletedProcess
 from tests.e2e.run_record import ROOT
+
+BOUNDS = ROOT / "tests" / "e2e" / "stream_stack" / "read_bounds.py"
 
 RUNNERS = (ROOT / "tests" / "e2e" / "stream_host.py", ROOT / "tests" / "e2e" / "stream_features.py")
 SECOND = 1_000_000
@@ -82,6 +88,65 @@ class FinalOffsets(RoomsCase):
 
     def test_a_replay_that_sent_nothing_proves_nothing(self) -> None:
         self.assertTrue(self.host.final_offset_problems({}, {}))
+
+    def test_ten_rooms_need_final_offsets_for_all_ten_partitions(self) -> None:
+        ends = {partition: 7 for partition in range(10)}
+        self.assertEqual([], self.host.final_offset_problems(dict(ends), ends, range(10)))
+        nine = {partition: 7 for partition in range(9)}
+        found = self.host.final_offset_problems(dict(nine), nine, range(10))
+        self.assertTrue(any("partition 9" in item for item in found), found)
+        found = self.host.final_offset_problems(dict(nine), nine)
+        self.assertEqual([], found, "without a required set the old reading stands")
+
+    def test_a_partition_that_holds_no_event_is_a_room_that_sent_nothing(self) -> None:
+        ends = {partition: 7 for partition in range(10)}
+        ends[4] = 0
+        found = self.host.final_offset_problems(dict(ends), ends, range(10))
+        self.assertTrue(any("partition 4" in item for item in found), found)
+
+    def test_a_partition_that_the_job_did_not_report_is_named(self) -> None:
+        ends = {partition: 7 for partition in range(10)}
+        committed = {partition: 7 for partition in range(10) if partition != 6}
+        found = self.host.final_offset_problems(committed, ends, range(10))
+        self.assertTrue(any("partition 6" in item for item in found), found)
+
+
+class Measurement(RoomsCase):
+    def sample(self, seconds: float, lag: int = 1, usage: bool = True) -> Any:
+        return self.host.Sample(seconds, {0: lag}, {"stream": (1.0, 2.0)} if usage else {})
+
+    def problems(self, samples: list[Any], window: tuple[float, float] = (10.0, 40.0), final: int = 5) -> list[str]:
+        ends = {partition: 7 for partition in range(10)}
+        committed = {partition: 7 for partition in range(10)}
+        committed[0] = final
+        found: list[str] = self.host.measurement_problems(samples, window, ends, committed, range(10))
+        return found
+
+    def test_a_reading_while_the_replay_played_and_a_drained_end_pass(self) -> None:
+        self.assertEqual([], self.problems([self.sample(5.0), self.sample(20.0)], final=7))
+
+    def test_no_reading_while_the_replay_played_is_a_problem(self) -> None:
+        found = self.problems([self.sample(5.0), self.sample(55.0)], final=7)
+        self.assertTrue(any("while the replay played" in item for item in found), found)
+
+    def test_a_reading_with_no_usage_does_not_count_as_a_reading_of_the_run(self) -> None:
+        found = self.problems([self.sample(20.0, usage=False)], final=7)
+        self.assertTrue(any("while the replay played" in item for item in found), found)
+
+    def test_a_final_lag_against_the_fixed_end_offsets_must_be_zero_in_every_partition(self) -> None:
+        found = self.problems([self.sample(20.0)], final=5)
+        self.assertTrue(any("final lag" in item for item in found), found)
+
+    def test_the_final_reading_is_a_sample_of_the_lag_against_the_fixed_ends(self) -> None:
+        reading = self.host.final_reading(9.0, {0: 7, 1: 7}, {0: 5, 1: 7})
+        self.assertEqual((9.0, {0: 2, 1: 0}, {}), (reading.seconds, reading.lag, reading.usage))
+
+    def test_the_drain_time_is_the_final_reading_against_the_fixed_ends_when_the_live_readings_never_reached_zero(self) -> None:
+        samples = [self.sample(1.0, lag=50), self.sample(6.0, lag=3)]
+        samples.append(self.host.final_reading(9.0, {0: 7}, {0: 7}))
+        summary = self.host.summarize(samples)
+        self.assertEqual(9.0, summary["drained_at_seconds"])
+        self.assertEqual(8.0, summary["drain_seconds_after_peak"])
 
 
 class Sampling(RoomsCase):
@@ -149,7 +214,7 @@ class Storage(RoomsCase):
 class Overlap(RoomsCase):
     def bounds(self, *rows: tuple[int, str, int, int]) -> list[dict[str, Any]]:
         return [
-            {"room": room, "occurrence_id": identity, "first_us": first * SECOND, "last_us": last * SECOND, "messages": 10}
+            {"room": room, "occurrence_id": identity, "first_us": first * SECOND, "last_us": last * SECOND, "messages": 10, "clock": "log_append_time"}
             for room, identity, first, last in rows
         ]
 
@@ -168,7 +233,19 @@ class Overlap(RoomsCase):
 
     def test_an_occurrence_with_no_observed_message_is_refused(self) -> None:
         with self.assertRaises(ValueError):
-            self.host.observed_overlap([{"room": 0, "occurrence_id": "1.0", "first_us": 0, "last_us": 0, "messages": 0}])
+            self.host.observed_overlap([{"room": 0, "occurrence_id": "1.0", "first_us": 0, "last_us": 0, "messages": 0, "clock": "log_append_time"}])
+
+    def test_times_that_are_not_the_brokers_append_times_are_refused(self) -> None:
+        for clock in (None, "replay_time", "create_time"):
+            with self.subTest(clock=clock):
+                rows = self.bounds((0, "1.0", 0, 100), (1, "2.0", 50, 150))
+                for row in rows:
+                    if clock is None:
+                        del row["clock"]
+                    else:
+                        row["clock"] = clock
+                with self.assertRaisesRegex(ValueError, "append"):
+                    self.host.observed_overlap(rows)
 
     def test_the_observed_occurrences_must_be_the_manifests_occurrences(self) -> None:
         self.assertEqual([], self.host.bounds_problems(self.bounds((0, "1.0", 0, 9), (1, "2.0", 0, 9)), {"1.0": 0, "2.0": 1}))
@@ -176,6 +253,40 @@ class Overlap(RoomsCase):
         self.assertTrue(any("2.0" in item for item in found))
         found = self.host.bounds_problems(self.bounds((3, "1.0", 0, 9)), {"1.0": 0})
         self.assertTrue(any("room" in item for item in found))
+
+
+def load_bounds() -> Any:
+    spec = importlib.util.spec_from_file_location("read_bounds_probe", BOUNDS)
+    if spec is None or spec.loader is None:
+        raise ImportError(str(BOUNDS))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Received:
+    def __init__(self, room: int, occurrence: str, replay_us: int, appended_ms: int | None) -> None:
+        self.payload = {"room": room, "occurrence_id": occurrence, "replay_time_us": replay_us}
+        self.appended_ms = appended_ms
+
+
+@unittest.skipUnless(BOUNDS.is_file(), "the temporary probe is not in this checkout")
+class BoundsProbe(unittest.TestCase):
+    def test_the_bounds_are_the_brokers_append_times_and_not_the_replay_times_of_the_payloads(self) -> None:
+        module = load_bounds()
+        rows = module.bounds_of([Received(0, "1.0", 5_000_000, 1_000_000), Received(0, "1.0", 9_000_000, 1_000_300), Received(1, "2.0", 1, 1_000_100)])
+        self.assertEqual(
+            [
+                {"room": 0, "occurrence_id": "1.0", "first_us": 1_000_000_000, "last_us": 1_000_300_000, "messages": 2, "clock": "log_append_time"},
+                {"room": 1, "occurrence_id": "2.0", "first_us": 1_000_100_000, "last_us": 1_000_100_000, "messages": 1, "clock": "log_append_time"},
+            ],
+            rows,
+        )
+
+    def test_a_message_with_no_append_time_refuses_the_whole_answer(self) -> None:
+        module = load_bounds()
+        with self.assertRaisesRegex(ValueError, "append"):
+            module.bounds_of([Received(0, "1.0", 5, 1_000_000), Received(0, "1.0", 6, None)])
 
 
 class Isolation(RoomsCase):

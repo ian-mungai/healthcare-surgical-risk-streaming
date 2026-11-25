@@ -42,6 +42,7 @@ class FakeStack:
         self.hook = hook
         self.references = ["stream_control_0123abcd"]
         self.created_topics = ["replay_events_p8h_0123abcd_control"]
+        self.ambiguous: list[str] = []
         self.project = "p8-host-0123abcd"
 
     def step(self, name: str) -> Any:
@@ -159,6 +160,24 @@ class Order(FinishCase):
         self.assertEqual(1, code)
         self.assertIn("remove_containers", self.events)
         self.assertEqual([], __import__("json").loads((self.evidence.folder / "inventory.json").read_text())["references"])
+
+
+class Unconfirmed(FinishCase):
+    def test_an_object_whose_creation_gave_no_clear_answer_is_reported_kept_and_fails_the_run(self) -> None:
+        stack = FakeStack(self.events)
+        stack.ambiguous = ["topic replay_events_p8h_0123abcd_late"]
+        code = self.finalize(stack)
+        self.assertEqual(1, code)
+        document = __import__("json").loads((self.evidence.folder / "inventory.json").read_text())
+        self.assertEqual(["topic replay_events_p8h_0123abcd_late"], document["unconfirmed"])
+        record = __import__("json").loads((self.evidence.folder / "record.json").read_text())
+        failed = [item for item in record["observations"] if not item["passed"]]
+        self.assertTrue(any("kept" in item["step"] for item in failed), failed)
+        self.assertEqual(["stop_producers", "drop_topics", "inventory", "remove_containers"], self.events)
+
+    def test_a_run_with_nothing_unconfirmed_has_an_empty_list_and_passes(self) -> None:
+        self.assertEqual(0, self.finalize(FakeStack(self.events)))
+        self.assertEqual([], __import__("json").loads((self.evidence.folder / "inventory.json").read_text())["unconfirmed"])
 
 
 class Interrupts(FinishCase):

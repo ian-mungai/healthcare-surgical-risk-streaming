@@ -12,6 +12,8 @@ Failure modes covered here:
 - The replay's restart is tested by a kill at a random instant, so the IDs that are sent again are not known: the check only says that some are repeated.
 - The saved position moved on after the fault (the unsaved batch was saved), so the restart sends nothing again and the case passes with nothing proved.
 - The restart case reads the topics a second time, which the replay refuses.
+- The late-event probe takes its input topic from its arguments and writes to the deployed ``replay_events`` (or to any topic that the sink would take) on the
+  host, where only the topic of the run may be written.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -296,6 +299,90 @@ class FaultHook(unittest.TestCase):
         fault.before_save()
         fault.saved("s")
         self.assertFalse(self.path.exists())
+
+
+PLANT = PROBES / "plant_late.py"
+LIBRARIES = ("confluent_kafka", "confluent_kafka.admin", "fastavro", "fastavro.schema")
+
+
+def plant_arguments(topic: str) -> list[str]:
+    """The arguments of the late-event probe as the replay image runs it: ``python plant_late.py <bootstrap> <registry> <run> <topic> <second run>``."""
+    return ["plant_late.py", "kafka:9092", "http://registry", "run_a", topic, "run_b"]
+
+
+def load_plant(topic: str) -> ModuleType:
+    """The late-event probe module, loaded with its arguments in ``sys.argv`` (it reads them when it is imported)."""
+    stand_ins = {name: mock.MagicMock() for name in LIBRARIES if importlib.util.find_spec(name.split(".")[0]) is None}
+    spec = importlib.util.spec_from_file_location("plant_late_probe", PLANT)
+    if spec is None or spec.loader is None:
+        raise ImportError(str(PLANT))
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(sys.modules, stand_ins), mock.patch.object(sys, "argv", plant_arguments(topic)):
+        spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(PLANT.is_file(), "the temporary probe is not in this checkout")
+class PlantTopic(unittest.TestCase):
+    def run_main(self, topic: str, required: str | None) -> tuple[int, mock.Mock]:
+        module = load_plant(topic)
+        environment = {} if required is None else {"REQUIRE_RUN_TOPIC": required}
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(sys, "argv", plant_arguments(topic)),
+            mock.patch.object(module, "KafkaSink") as sink,
+            mock.patch.object(module, "RegistryClient"),
+            mock.patch.object(module, "Writer"),
+        ):
+            sink.return_value.send.side_effect = RuntimeError("stop after the first message")
+            try:
+                code = module.main()
+            except RuntimeError:
+                code = 0
+        return code, sink
+
+    def test_on_the_host_the_deployed_input_topic_is_refused_before_a_sink_exists(self) -> None:
+        code, sink = self.run_main("replay_events", "true")
+        self.assertEqual(2, code)
+        sink.assert_not_called()
+
+    def test_on_the_host_a_name_that_is_not_a_run_topic_is_refused_before_a_sink_exists(self) -> None:
+        for topic in ("feature_ready", "warnings", "replay_events_", "Replay_events_x", "other"):
+            with self.subTest(topic=topic):
+                code, sink = self.run_main(topic, "true")
+                self.assertEqual(2, code)
+                sink.assert_not_called()
+
+    def test_on_the_host_a_topic_of_a_run_is_taken(self) -> None:
+        code, sink = self.run_main("replay_events_p8h_0123abcd_late", "true")
+        self.assertEqual(0, code)
+        self.assertEqual("replay_events_p8h_0123abcd_late", sink.call_args.kwargs["input_topic"])
+
+    def test_the_local_stack_may_still_use_the_deployed_name_of_its_own_throwaway_broker(self) -> None:
+        code, sink = self.run_main("replay_events", None)
+        self.assertEqual(0, code)
+        self.assertEqual("replay_events", sink.call_args.kwargs["input_topic"])
+
+    def test_the_host_overlay_requires_a_run_topic_for_every_probe_of_its_replay_service(self) -> None:
+        document: Any = load_yaml(OVERLAY.read_text())
+        self.assertEqual("true", document["services"]["replay"]["environment"]["REQUIRE_RUN_TOPIC"])
+
+
+@unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")
+class PlantGuard(ReplayCase):
+    def plant(self, topic: str) -> tuple[str, ...]:
+        return ("run", "--rm", "-T", "--no-deps", "--entrypoint", "python", "replay", "/probe/plant_late.py", "kafka:9092", "http://r", "run_a", topic, "run_b")
+
+    def test_the_host_sends_the_probe_only_with_a_topic_of_its_own_run(self) -> None:
+        stack = self.stack()
+        for topic in ("replay_events", "feature_ready", "replay_events_p8h_ffffffff_late", f"feature_ready_p8h_{stack.token}_late"):
+            with self.subTest(topic=topic), self.assertRaises(self.host.PlatformRefusal):
+                stack.compose(*self.plant(topic))
+        stack.compose(*self.plant(f"replay_events_p8h_{stack.token}_late"))
+
+    def test_another_probe_is_not_held_to_the_rule(self) -> None:
+        stack = self.stack()
+        stack.compose("run", "--rm", "-T", "--no-deps", "--entrypoint", "python", "replay", "/probe/read_ready.py", "kafka:9092", "http://r", "t")
 
 
 @unittest.skipUnless(all(path.is_file() for path in RUNNERS), "the temporary runners are not in this checkout")

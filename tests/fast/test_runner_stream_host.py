@@ -15,6 +15,9 @@ Failure modes covered here:
   recreate it), uses a literal memory limit or points a service at a host name that is not the platform's.
 - A topic that is not the batch's own (``feature_ready`` itself, ``warnings``, ``risk_scores``) is created or deleted by the batch.
 - The ten-room measurement accepts a run that sampled nothing, or reads the lag, the memory or the processor use from the wrong sample.
+- A topic that the broker already held (the creation answers ``TopicExistsException``) is taken as the run's own and deleted at the end, or a creation that gave
+  no clear answer (a timeout, an interrupt) is taken as not made and left behind.
+- The run's input topics do not stamp the broker's own append time, so the overlap of rooms is judged from a time that the producer chose.
 """
 
 from __future__ import annotations
@@ -334,6 +337,54 @@ class Topics(HostRunnerCase):
         self.assertTrue(any("replay_events" in item for item in failed))
         self.assertNotIn(second, stack.created_topics)
 
+    def test_a_creation_that_answers_topic_exists_is_not_the_runs_and_is_never_deleted(self) -> None:
+        stack = self.stack(
+            {"--create": done(1, "", "Error while executing topic command : Topic 'x' already exists.\nTopicExistsException"), "--list": done(0, "")}
+        )
+        topic = self.module.run_topic("input", stack.token, "control")
+        with self.assertRaisesRegex(self.module.Blocked, "not this run's"):
+            self.run_stack(stack, "create_topic", topic)
+        self.assertEqual(([], []), (stack.created_topics, stack.ambiguous))
+        self.run_stack(stack, "drop_run_topics")
+        self.assertFalse(self.topic_arguments("--delete"))
+
+    def test_a_creation_that_gave_no_answer_is_kept_for_inspection_and_never_deleted(self) -> None:
+        stack = self.stack({"--list": done(0, "")})
+        topic = self.module.run_topic("input", stack.token, "control")
+
+        def silent(program: str, args: list[str], **options: Any) -> CompletedProcess[str]:
+            self.calls.append((program, tuple(args)))
+            if "--create" in args:
+                raise self.module.TimeoutExpired(args, 180)
+            return done(0, "")
+
+        self.runner = silent
+        with self.assertRaises(self.module.TimeoutExpired):
+            self.run_stack(stack, "create_topic", topic)
+        self.assertEqual(([], [f"topic {topic}"]), (stack.created_topics, stack.ambiguous))
+        self.run_stack(stack, "drop_run_topics")
+        self.assertFalse(self.topic_arguments("--delete"))
+
+    def test_a_creation_that_failed_for_another_reason_may_have_made_the_topic_and_is_kept(self) -> None:
+        stack = self.stack({"--create": done(1, "", "TimeoutException: Timed out waiting for a node assignment"), "--list": done(0, "")})
+        topic = self.module.run_topic("input", stack.token, "control")
+        with self.assertRaises(self.module.Blocked):
+            self.run_stack(stack, "create_topic", topic)
+        self.assertEqual(([], [f"topic {topic}"]), (stack.created_topics, stack.ambiguous))
+
+    def test_a_confirmed_creation_is_the_runs_and_is_not_ambiguous(self) -> None:
+        stack = self.stack({"--list": done(0, "")})
+        topic = self.module.run_topic("input", stack.token, "control")
+        self.run_stack(stack, "create_topic", topic)
+        self.assertEqual(([topic], []), (stack.created_topics, stack.ambiguous))
+
+    def test_the_input_topics_stamp_the_brokers_append_time_and_the_output_topics_keep_the_deployed_settings(self) -> None:
+        rows = self.module.topic_rows()
+        stamped = self.module.create_arguments("replay_events_p8h_0123abcd_control", rows, "0123abcd")
+        self.assertIn("message.timestamp.type=LogAppendTime", stamped)
+        plain = self.module.create_arguments("feature_ready_p8h_0123abcd_control", rows, "0123abcd")
+        self.assertFalse([item for item in plain if "timestamp" in item])
+
     def test_the_input_topic_is_never_reset(self) -> None:
         stack = self.stack()
         with self.assertRaises(self.module.PlatformRefusal):
@@ -547,6 +598,15 @@ class Arguments(HostRunnerCase):
         with contextlib.redirect_stderr(__import__("io").StringIO()), self.assertRaises(SystemExit):
             self.module.parse_arguments(["--landed-cache", "/data/landed", "--only", "everything"])
 
+    def test_the_module_text_says_what_the_runner_does(self) -> None:
+        text = " ".join((self.module.__doc__ or "").split())
+        self.assertNotIn("up --no-recreate", text, "the broker is never sent an up")
+        self.assertNotIn("the probe in the Spark image", text, "the parity probe runs in the replay image")
+        self.assertIn("exec``, ``stop`` and ``start``", text)
+        self.assertIn("the replay image", text)
+        self.assertIn("runner_manifest.json", text)
+        self.assertNotIn("repository root of the commit that ``make host-up`` deployed", text)
+
     def test_the_limits_name_what_the_host_run_does_not_prove(self) -> None:
         text = "\n".join(self.module.HOST_LIMITS)
         for phrase in (
@@ -563,6 +623,9 @@ class Arguments(HostRunnerCase):
             "--teardown",
             "flush.messages=1",
             "no full-release copy, no full-history load",
+            "runner_manifest.json",
+            "LogAppendTime",
+            "only after the server confirmed its creation",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
